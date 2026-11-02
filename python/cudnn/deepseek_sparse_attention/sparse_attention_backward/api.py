@@ -58,7 +58,7 @@ class SparseAttentionBackward(APIBase):
         backend unchanged. H16 ``topk_max <= 256`` and H32 ``topk_max <= 128``
         accept the mode but retain the ordinary backend. On SM90,
         ``deterministic_dkv_relay_cluster_size`` exposes the deterministic dKV
-        relay width (4, 8, or 16); ``None`` selects the default width 8.
+        relay width (4, 8, or 16); ``None`` selects the default width 16.
         """
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -468,7 +468,9 @@ class SparseAttentionBackward(APIBase):
         pairing makes its overlap decision on device and launches only stages
         compiled by ``compile()``, so replay needs no host branch or D2H read.
         SM100 runtime inputs must match the sample contract used to compile the
-        plan. SM90 retains its legacy first-execute compilation behavior.
+        plan. SM90 retains its legacy first-execute compilation behavior; after
+        one eager warm-up, its allocation-free execute path is CUDA Graph
+        capturable with fixed tensor addresses.
         Inputs, outputs, and the live workspace must not overlap; concurrent
         executions need distinct output and workspace storage.
         """
@@ -610,7 +612,7 @@ def sparse_attention_backward_wrapper(
     The wrapper stages strided inputs and outputs and allocates omitted outputs
     or workspace on the launch stream; the plan's ``execute()`` does neither.
     ``deterministic_dkv_relay_cluster_size`` is an SM90-only deterministic
-    tuning parameter; it accepts 4, 8, or 16 and defaults to 8.
+    tuning parameter; it accepts 4, 8, or 16 and defaults to 16.
     """
     if q_cluster_mode not in ("off", "adaptive_pair"):
         raise ValueError(f"q_cluster_mode must be 'off' or 'adaptive_pair', got {q_cluster_mode!r}")

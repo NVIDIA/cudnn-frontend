@@ -4993,7 +4993,7 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected_cluster8 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(16 * (sk_r + 1) * hd_r * 4)
     expected_cluster4 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(32 * (sk_r + 1) * hd_r * 4)
     expected_cluster16 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(8 * (sk_r + 1) * hd_r * 4)
-    assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_cluster8
+    assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_cluster16
     assert (
         flash_attn_bwd_sm90_workspace_size(
             s_q,
@@ -5029,7 +5029,7 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected_large_cluster8 = 2 * large_stats + ws_align(16 * (1088 + 9) * 576 * 4)
     expected_large_cluster4 = 2 * large_stats + ws_align(32 * (1088 + 5) * 576 * 4)
     expected_large_cluster16 = 2 * large_stats + ws_align(8 * (1088 + 17) * 576 * 4)
-    assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_cluster8
+    assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_cluster16
     assert (
         flash_attn_bwd_sm90_workspace_size(
             1025,
@@ -5182,6 +5182,99 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=93)
+def test_DSA_sparse_attention_backward_sm90_default_relay_cuda_graph():
+    """The default C16 relay replays with poisoned storage and changed sparse inputs."""
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cuda-python not installed")
+
+    _require_sm90()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        96,
+        576,
+        128,
+        s_q=129,
+        s_kv=256,
+        has_topk_length=True,
+        deterministic=True,
+    )
+    assert plan.deterministic_dkv_relay_cluster_size is None
+    assert plan._sm90_deterministic_dkv_relay_cluster_size == 16
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    saved_topk_idxs = topk_idxs.clone()
+    saved_topk_length = topk_length.clone()
+    changed_topk_idxs = topk_idxs.roll(1, dims=1)
+    launch_stream = torch.cuda.Stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    stream = cuda.CUstream(launch_stream.cuda_stream)
+
+    def poison():
+        for buffer in (workspace, *outputs):
+            buffer.view(torch.uint8).fill_(0xA5)
+
+    def execute():
+        dq, dkv, d_sink = outputs
+        return plan.execute(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+
+    with torch.cuda.stream(launch_stream):
+        poison()
+        execute()  # Populate the legacy SM90 concrete-tensor compile caches.
+        eager = tuple(tensor.clone() for tensor in outputs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=launch_stream):
+            execute()
+        for repeat in range(3):
+            with torch.cuda.stream(launch_stream):
+                poison()
+                graph.replay()
+            torch.cuda.synchronize()
+            for name, actual, expected in zip(("dQ", "dKV", "dSink"), outputs, eager):
+                assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} differs on graph replay {repeat}"
+
+        with torch.cuda.stream(launch_stream):
+            topk_idxs.copy_(changed_topk_idxs)
+            topk_length.fill_(64)
+            poison()
+            execute()
+            changed_eager = tuple(tensor.clone() for tensor in outputs)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(launch_stream):
+            poison()
+            graph.replay()
+        torch.cuda.synchronize()
+        for name, actual, expected in zip(("dQ", "dKV", "dSink"), outputs, changed_eager):
+            assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} graph replay ignores changed sparse inputs"
+    finally:
+        with torch.cuda.stream(launch_stream):
+            topk_idxs.copy_(saved_topk_idxs)
+            topk_length.copy_(saved_topk_length)
+        launch_stream.synchronize()
+        graph.reset()
 
 
 @pytest.mark.L0

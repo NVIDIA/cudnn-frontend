@@ -249,7 +249,7 @@ the split count is fixed when the plan is compiled.
 
 On SM90, `deterministic=True` uses a row-aware relay with cluster size
 `C in {4, 8, 16}` for H16/H32/H64/H96/H128. The public
-`deterministic_dkv_relay_cluster_size` argument selects `C` and defaults to 8.
+`deterministic_dkv_relay_cluster_size` argument selects `C` and defaults to 16.
 Each 128-query wave launches `128 / C` clusters and gives one FP32 dKV plane
 to each cluster. A setup kernel builds packed `C`-bit rank
 masks for every referenced `(query wave, M64 head tile, KV row)`. A relay CTA waits only
@@ -270,6 +270,14 @@ The SM90 deterministic dKV allocation is
 (K64 / (32 / C)) / D32)`.
 The caller-owned workspace is cleared and the masks are rebuilt on every
 execution, so changing `topk_idxs` or `topk_length` between launches is safe.
+After one eager execution populates the SM90 concrete-tensor compile caches,
+the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
+the declared tensor shapes and addresses fixed while allowing tensor contents,
+including `topk_idxs` and `topk_length`, to change.
+On the target L20X sweep (BF16 H64 D576/Dv512, top-k 2048), cluster-16
+reduced deterministic latency by 2.8% to 9.6% versus cluster-8 across
+Q=1024..16384 while approximately halving relay workspace, so it is the
+default as well as the memory-minimizing option.
 Here `C` is the physical thread-block cluster width, not the number of FP32
 planes. Widths 32 and 64 are therefore not accepted; their plane-count-like
 values should not be passed as cluster sizes.
@@ -428,7 +436,7 @@ result = DSA.sparse_attention_backward_wrapper(
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
     deterministic=True,  # optional; SM90/SM100 H16/H32/H64/H96/H128
-    deterministic_dkv_relay_cluster_size=8,  # optional SM90 relay width: 4, 8, or 16
+    deterministic_dkv_relay_cluster_size=16,  # optional SM90 relay width: 4, 8, or 16
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
