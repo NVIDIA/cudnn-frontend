@@ -64,8 +64,15 @@ make_reducer(fe::PointwiseMode_t mode) {
 
 enum class Compute_spelling { UNSET, SINGULAR, PLURAL };
 
+struct Expandable_graph : fe::graph::Graph {
+    fe::error_t
+    expand() {
+        return expand_subtree();
+    }
+};
+
 struct Custom_graph {
-    fe::graph::Graph graph;
+    Expandable_graph graph;
     std::vector<Tensor_t> outputs;
 };
 
@@ -838,6 +845,9 @@ TEST_CASE("Custom reduction rejects reducer return arity before backend emission
     REQUIRE(custom.graph.validate().is_good());
     // expand_node invokes the reducer and checks its return count before any
     // backend tensors, operations, or operation graph are created.
+    auto expanded = custom.graph.expand();
+    REQUIRE(expanded.get_code() == fe::error_code_t::INVALID_VALUE);
+    REQUIRE(expanded.get_message().find("return one tensor per stream") != std::string::npos);
     auto status = custom.graph.build_operation_graph(static_cast<cudnnHandle_t>(nullptr));
     REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
     REQUIRE(status.get_message().find("return one tensor per stream") != std::string::npos);
