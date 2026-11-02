@@ -400,6 +400,45 @@ because the earlier cluster-4 crossover did not generalize across SM100
 devices. An explicit Q=4K cluster-4 profiling experiment attributed its local
 gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
 9.696 ms; this is implementation evidence, not the portable automatic policy.
+Use `--deterministic-relay-cluster-size {4,8,16,32,64}` with `--deterministic on`
+to benchmark an exact relay specialization. The option applies only to
+deterministic cases when `--deterministic both` is selected; omitted means the
+automatic policy. It is valid only for large-context generic-M64 cases and may
+request more workspace than the automatic memory-first budget. The logical
+cluster-32 option uses two ordered 16-CTA hardware-cluster phases and four
+FP32 planes, halving the dominant data-plane workspace from cluster-16.
+Cluster-64 is an explicit emergency memory-first option with four ordered
+16-CTA phases, two FP32 planes, and a 64-bit packed row mask; the automatic
+policy never selects it.
+On the SM100 test environment, a CP64-sized Q=16K/KV=1M H64/D576 case with
+BF16 and top-k 64 reduced complete scratch from 20.008 GiB to 11.008 GiB and
+changed warmed `execute()` latency from 10.915 ms to 8.303 ms. At
+Q=4K/KV=65537 H64/D512 and top-k 129, complete scratch fell from 1.033 GiB to
+0.533 GiB and latency changed from 2.101 ms to 2.052 ms. Both measurements use
+three timed calls after warm-up; the option remains workload-specific rather
+than part of the automatic policy.
+
+An explicit cluster-64 experiment shows the remaining tradeoff. All rows use
+the same SM100 BF16 input generator and ten warm-ups; top-k 129 and 64 use 50
+timed calls, while top-k 2048 uses 30.
+
+| Shape | Top-k | Logical CTAs/group | Workspace GiB | Latency ms | TFLOPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4096 / KV65537 / H64 / D512 | 129 | 16 | 1.033 | 2.095 | 82.64 |
+| Q4096 / KV65537 / H64 / D512 | 129 | 32 | 0.533 | **2.050** | **84.47** |
+| Q4096 / KV65537 / H64 / D512 | 129 | 64 | **0.283** | 3.478 | 49.78 |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 16 | 20.008 | 11.129 | 33.19 |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 32 | 11.008 | **8.258** | **44.73** |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 64 | **6.508** | 10.971 | 33.67 |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 16 | 20.008 | 73.000 | 161.92 |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 32 | 11.008 | **68.901** | **171.55** |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 64 | **6.508** | 126.322 | 93.57 |
+
+Cluster-64 saves another 40.9% of complete CP64-sized scratch relative to
+cluster-32, but regresses latency by 32.9% at top-k 64 and 83.3% at top-k
+2048. Four serialized phases expose only 32 CTAs per phase, compared with two
+64-CTA phases for cluster-32, and the row protocol uses 64-bit rather than
+32-bit atomics. Prefer cluster-32 unless the 11.008 GiB allocation does not fit.
 The optimized trace has no separate dKV prefold kernel; fixed-order conversion
 takes 1.452 ms and workspace clearing 0.658 ms.
 
