@@ -183,7 +183,7 @@ def test_bsa_attention_backward_fixed_blocks():
     ],
 )
 @pytest.mark.parametrize("variable_counts", [False, True])
-def test_bsa_attention_backward_sm100_blk64(
+def test_bsa_attention_backward_blk64(
     bucket_size_blocks,
     seqlen_k,
     softmax_scale,
@@ -193,8 +193,8 @@ def test_bsa_attention_backward_sm100_blk64(
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
-    if major not in {10, 11}:
-        pytest.skip("blk64 backward test is specific to SM100/SM110")
+    if major not in {9, 10, 11}:
+        pytest.skip("blk64 backward test is specific to SM90/SM100/SM110")
 
     ops = _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
@@ -246,7 +246,7 @@ def test_bsa_attention_backward_sm100_blk64(
         block_sizes,
         sparse_block_size=64,
         softmax_scale=softmax_scale,
-        use_clc=False,
+        **({} if major == 9 else {"use_clc": False}),
         q2k_block_nums=counts,
     )
     backward = ops.block_sparse_attention_backward(

@@ -120,28 +120,36 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
+@pytest.mark.parametrize("clc,splits", [(False, 1), (False, 2), (True, 1), (True, 2)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, variable):
-    bsa = _bsa()
+    bsa = _paired_bsa()
+    sm90 = torch.cuda.get_device_capability()[0] == 9
+    if sm90 and clc:
+        pytest.skip("CLC scheduling is SM100-only")
     if variable:
         _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface.bsa_attn_fwd_blk64_cutedsl, "compile_cache", {})
+    monkeypatch.setattr(interface.bsa_attn_fwd, "compile_cache", {})
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
     torch.manual_seed(27191)
-    q = torch.randn((1, 2, 193, 128), device="cuda", dtype=torch.bfloat16)
+    # The SM90 forward needs whole query blocks; the backward partial-query tail is covered elsewhere.
+    seqlen_q = 256 if sm90 else 193
+    q = torch.randn((1, 2, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 2, 129, 128), device="cuda", dtype=torch.bfloat16)
     v, do = torch.randn_like(k), torch.randn_like(q)
     indices = torch.arange(3, device="cuda", dtype=torch.int32).view(1, 1, 1, 3).expand(1, 2, 4, 3).contiguous()
     counts = torch.tensor([3, 0, 1, 2], device="cuda", dtype=torch.int32).view(1, 1, 4).expand(1, 2, 4).contiguous() if variable else None
     sizes = torch.tensor([64, 37, 1], device="cuda", dtype=torch.int32)
-    mask = block_sparse_mask(indices, 3, sizes, 193, 129, 64, counts)
+    mask = block_sparse_mask(indices, 3, sizes, seqlen_q, 129, 64, counts)
     nonempty = torch.isfinite(mask).any(-1, keepdim=True)
     kwargs = dict(block_sparse_num=3, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64)
     cache_sizes = []
-    # Changing the sign never recompiles the backward; the forward compiles one extra, separately specialized
-    # nonpositive-scale kernel so the positive-scale softmax loop stays free of the masking-order branch.
+    # The forward compiles one extra, separately specialized nonpositive-scale kernel so the positive-scale
+    # softmax loop stays free of the masking-order branch. Changing the sign never recompiles the SM100
+    # backward; SM90 specializes its backward the same way as its forward.
+    clc_kwargs = {} if sm90 else dict(use_clc=clc)
     for scale in (128**-0.5, 0.0, -(128**-0.5), 128**-0.5):
         qr, kr, vr = [t.double().detach().requires_grad_() for t in (q, k, v)]
         scores = (qr @ kr.transpose(-1, -2)) * scale + mask
@@ -149,16 +157,21 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
         expected = probabilities @ vr
         expected.backward(do.double())
         output, lse = bsa.block_sparse_attention_forward(
-            q, k, v, indices, **kwargs, softmax_scale=scale, use_clc=clc, kv_splits=splits, allow_empty_block_nums=True
+            q, k, v, indices, **kwargs, softmax_scale=scale, **clc_kwargs, kv_splits=splits, allow_empty_block_nums=True
         )
         gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, softmax_scale=scale, bucket_size_blocks=3)
         torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.03, rtol=0.03)
         for got, ref in zip((output, *gradients), (expected, qr.grad, kr.grad, vr.grad)):
             torch.testing.assert_close(got.double(), ref, atol=0.03, rtol=0.03)
-        cache_sizes.append((len(interface.bsa_attn_fwd_blk64_cutedsl.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)))
+        forward_cache = interface.bsa_attn_fwd if sm90 else interface.bsa_attn_fwd_blk64_cutedsl
+        cache_sizes.append((len(forward_cache.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)))
     forward_sizes, backward_sizes = zip(*cache_sizes)
-    assert set(backward_sizes) == {backward_sizes[0]}
-    assert forward_sizes == (forward_sizes[0], forward_sizes[0] + 1, forward_sizes[0] + 1, forward_sizes[0] + 1)
+    specialized = (forward_sizes[0], forward_sizes[0] + 1, forward_sizes[0] + 1, forward_sizes[0] + 1)
+    assert forward_sizes == specialized
+    if sm90:
+        assert backward_sizes == (backward_sizes[0], backward_sizes[0] + 1, backward_sizes[0] + 1, backward_sizes[0] + 1)
+    else:
+        assert set(backward_sizes) == {backward_sizes[0]}
 
 
 @pytest.mark.L1

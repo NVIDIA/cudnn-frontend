@@ -1149,9 +1149,13 @@ def test_bsa_attention_forward_sm100_blk64_auto_split_counts_stay_valid(monkeypa
 @pytest.mark.parametrize(
     ("heads", "seqlen", "count", "expected_splits"),
     (
-        (40, 131072, 256, 2),  # 64 MiB of K/V per head vs 50 MiB L2
-        (20, 262144, 512, 4),
-        (10, 524288, 1024, 8),
+        (40, 131072, 256, 4),  # 64 MiB of K/V per head vs 50 MiB L2; about L2 / 2 per split
+        (20, 262144, 512, 8),
+        (10, 524288, 1024, 16),
+        (4, 262144, 128, 4),  # a split keeps at least 32 blocks of each row
+        (8, 131072, 256, 1),  # 64 MiB pays only with 16+ heads
+        (2, 262144, 512, 1),  # fewer than 4 heads need more than 4x L2
+        (2, 524288, 256, 8),  # fewer than 4 heads: above 4x L2
         (40, 65536, 128, 1),  # 32 MiB per head fits in L2
         (40, 131072, 2048, 1),  # dense lists lost 12% when split
         (40, 8192, 64, 1),  # fewer Q tiles per head than resident CTAs
@@ -1159,7 +1163,7 @@ def test_bsa_attention_forward_sm100_blk64_auto_split_counts_stay_valid(monkeypa
     ),
 )
 def test_bsa_attention_forward_sm90_blk64_auto_split_policy(monkeypatch, heads, seqlen, count, expected_splits):
-    """The SM90 policy sizes a split's per-head K/V to L2 and declines unmeasured regimes (metadata only)."""
+    """The SM90 policy splits a head's K/V into about L2 / 2 once it clearly exceeds L2, and declines unmeasured regimes (metadata only)."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     _import_bsa()

@@ -155,15 +155,16 @@ package-wide downstream dependency floor is unchanged.
 
 `kv_splits=2..256` computes FP32 partial outputs and combines them, with
 workspace growing linearly in the split count. SM90 accepts an explicit integer
-split count or `kv_splits="auto"` (the default stays 1). On SM90 the split
-count is chosen so one split's K/V region of a head fits in about 3/4 of L2:
-once a head's K/V exceeds L2 the unsplit kernel turns DRAM-bound, and a split
-grid orders every Q tile of one KV range before the next. The BF16/FP16 MHA
-policy applies at one head per wave (`ceil(S_q / 64)` at least `3 * SMs`), at most 25% density and fixed
-counts, and declines (one split) otherwise; it was measured on H100 with
-independent random indices (64 MiB K/V per head: 2 splits, +20%; 128 MiB: 4,
-+70%; 256 MiB: 8, +94%; dense lists lose 12%). A caller-provided output
-also resolves to one split. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
+split count or `kv_splits="auto"` (the default stays 1). On SM90, once a head's K/V
+exceeds L2 the unsplit kernel turns DRAM-bound, and a split grid orders every Q tile of one KV
+range before the next. The automatic policy splits only when a head's K/V clearly exceeds L2,
+with a threshold that rises as heads fall (above 1x L2 with 16+ heads, 1.5x with 4-15, 4x with
+fewer), and then keeps about L2 / 2 of K/V per split while each split still holds at least 32
+blocks of a row. The BF16/FP16 MHA policy applies at one head per wave (`ceil(S_q / 64)` at least
+`3 * SMs`), at most 25% density and fixed counts, and declines (one split) otherwise. It was
+measured on H100 with independent random indices and video-generation top-k masks (for example 128 MiB K/V per head with 4-8
+heads: 4-8 splits, +27-67%; 256 MiB: 8-16 splits, up to +86%); 32 MiB per head never gained.
+A caller-provided output also resolves to one split. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
@@ -378,10 +379,14 @@ blk128-shaped kernel: a CTA walks the pair's Q blocks once, ordered
 first-only / common / second-only, and each of its two compute warpgroups
 computes only the Q blocks of its own KV block, so Q/dO loads and the dQ
 reduction are shared and Q/dO are read in a single sweep.
-Pairing metadata is limited to 64 MiB; fixed counts or unsupported metadata
-layouts use regular tasks. Duplicate sparse edges retain their multiplicity.
+Pairing metadata is limited to 64 MiB; unsupported metadata layouts use regular tasks, and so do
+fixed counts on SM100. On SM90, fixed counts pair as well (the wrapper supplies the full per-row
+count), which measured faster on long video-generation masks; the query bucket stays 384, which
+measured fastest against 96 through a single group. Duplicate sparse edges retain their multiplicity.
 Paired tasks retain FP32 dK/dV accumulation even with a single query bucket;
-regular tasks can use the direct dK/dV epilogue when its alignment requirements hold.
+on SM90 and SM100, regular tasks store dK/dV directly in the output dtype, without the FP32
+workspace and its conversion pass, when all query blocks fall in one query bucket and
+`seqlen_k` is a multiple of 64.
 The initial eight-KV matching is refined within 32-KV windows, with refinement
 skipped above 1024 bitset words. Metadata construction is included in the
 wrapper's work and is rebuilt for each call.

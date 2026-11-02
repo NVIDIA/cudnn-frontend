@@ -722,19 +722,23 @@ def _sm90_blk64_auto_kv_splits(
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
 ) -> int:
-    """Choose SM90 blk64 splits so one split's K/V region of a head fits in L2.
+    """Choose SM90 blk64 splits from the K/V footprint of one head, gated by head count and list length.
 
     The non-split kernel walks each Q tile's list in lockstep only while a wave starts together; once CTAs
     retire and refill, the resident CTAs sit at random list positions and together touch the whole head's
-    K/V. When that exceeds L2 the kernel turns DRAM-bound (BF16 H100, 128K: L2 hit 40%, DRAM 85%). Lists are
-    ascending, so a split is a KV range, and the split grid orders all Q tiles of one split before the next:
-    the resident working set becomes kv_bytes_per_head / splits.
+    K/V. When that far exceeds L2 the kernel turns DRAM-bound. Lists are ascending, so a split is a KV
+    range, and the split grid orders all Q tiles of one split before the next: the resident working set
+    becomes kv_bytes_per_head / splits, at the cost of FP32 partials and a combine pass.
 
-    Measured on H100 BF16 MHA D128 with independent random indices, Sq == Sk, 12.5% density: 64 MB/head
-    -> 2 splits (+20%), 128 MB -> 4 (+70%), 256 MB -> 8 (+94%); more splits plateau. Dense lists (100%) lose
-    12%; 3% density gains 8% at 2 splits and loses at 4. This metadata-only policy cannot see shared or local
-    KV neighborhoods, which need explicitly benchmarked split counts. Unmeasured regimes return 1: GQA,
-    variable counts, Q tiles per head below the resident CTA count, density above 25%.
+    Measured on H100 (50 MiB L2) BF16 MHA D128 with fixed counts: independent random indices
+    (H 1-40, 32-256 MiB K/V per head, 128-1024 blocks per row) and video-generation top-k masks. Splitting pays only once a head's K/V clearly exceeds L2, and the
+    threshold rises as heads fall: 64 MiB gains with 16+ heads (+11-28%) but loses with 1-4 heads and is
+    mixed at 8 (a 61 MiB, 8-head video mask lost 7%); with 1-3 heads even 112-128 MiB loses or barely
+    gains. Above the threshold the best split keeps about L2 / 2 per split (128 MiB: 4-8, +27-67%;
+    256 MiB: 8-16, +9-86%; a 357 MiB video mask: 16, +78-84%) while a split still holds at least 32 blocks of
+    each row. 32 MiB per head never gained. This metadata-only policy cannot see shared or local KV
+    neighborhoods. Unmeasured regimes return 1: GQA, variable counts, Q tiles per head below the resident
+    CTA count, density above 25%.
     """
     if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
         return 1
@@ -750,8 +754,11 @@ def _sm90_blk64_auto_kv_splits(
     if l2_bytes <= 0 or _ceil_div_int(seqlen_q, 64) < 3 * props.multi_processor_count:
         return 1
     kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+    min_bytes = l2_bytes if heads >= 16 else (3 * l2_bytes // 2 if heads >= 4 else 4 * l2_bytes)
+    if kv_bytes_per_head <= min_bytes:
+        return 1
     splits = 1
-    while kv_bytes_per_head > splits * l2_bytes * 3 // 4 and splits < max_kv_splits and kv_blocks // (splits * 2) >= 16:
+    while kv_bytes_per_head > splits * l2_bytes // 2 and splits < max_kv_splits and kv_blocks // (splits * 2) >= 32:
         splits *= 2
     return splits
 
@@ -896,6 +903,8 @@ def _bsa_attn_fwd_sm90_blk64(
         else q2k_nums_cute
     )
 
+    # NaN takes the masking-safe nonpositive path as well (as on SM100).
+    nonpositive_scale = not (float(softmax_scale) > 0.0)
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     fwd_kernel = BlockSparseAttnForwardSm90Blk64(
         gqa_ratio=gqa_ratio,
@@ -908,6 +917,7 @@ def _bsa_attn_fwd_sm90_blk64(
         has_block_sizes=has_block_sizes,
         num_splits=kv_splits,
         allow_empty_block_nums=allow_empty_block_nums,
+        nonpositive_scale=nonpositive_scale,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -922,6 +932,7 @@ def _bsa_attn_fwd_sm90_blk64(
             has_block_sizes,
             kv_splits,
             allow_empty_block_nums,
+            nonpositive_scale,
         ),
         (
             q_t,
@@ -3274,19 +3285,27 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         pair_words = (num_q_blocks + 31) // 32
         pair_count = (num_kv_blocks + 1) // 2
         pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
-        use_paired_kv = _blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
+        # On SM90 fixed-count lists pair as well (measured faster on long video masks): a full per-row
+        # count describes the same edges, so build it whenever the task count could pass the gate.
+        pair_nums = q2k_block_nums
+        if pair_nums is None and batch_size * num_heads * num_kv_blocks >= _BLK64_PAIRED_KV_MIN_KV_TASKS:
+            pair_nums = torch.full((batch_size, num_heads, num_q_blocks), block_sparse_num, dtype=torch.int32, device=q.device)
+        use_paired_kv = _blk64_use_paired_kv(q2k_block_index, pair_nums, num_kv_blocks, pair_bytes)
         pair_tensors = ()
         if use_paired_kv:
             pair_tensors = (
                 q2k_block_index,
-                q2k_block_nums,
+                pair_nums,
                 torch.empty((batch_size, num_heads, num_kv_blocks, pair_words), dtype=torch.int32, device=q.device),
                 torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device),
                 torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device),
                 torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device),
             )
-        scale_nonpositive = softmax_scale <= 0
+        # NaN takes the masking-safe nonpositive path as well (as on SM100).
+        scale_nonpositive = not (softmax_scale > 0)
         has_kv_tail = seqlen_k % sparse_block_size != 0
+        # A single Q bucket gives each CTA a whole dK/dV tile, which it then stores directly.
+        direct_kv = not use_paired_kv and num_q_groups == 1 and not has_kv_tail
 
         dtype = torch2cute_dtype_map[q.dtype]
         workspace = _empty_bwd_workspace_with_zeroed_accum(
@@ -3299,11 +3318,12 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             round_k_to=BlockSparseAttnBackwardSm90Blk64.tile_n,
             round_d_to=32,
             zero_dq_accum=False,
+            include_dkv_accum=not direct_kv,
             device=q.device,
         )
 
         current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
-        stage_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
+        stage_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim, direct_kv=direct_kv, nonpositive_scale=scale_nonpositive)
         problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
         compile_key = _sm90_bwd_compile_key(
@@ -3317,7 +3337,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
                 stage_kernel.Q_stage,
             ),
             (dout, out, q, k, v, dq, dk, dv, lse),
-        ) + ((bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else (None,))
+        ) + ((bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else (None, direct_kv, scale_nonpositive))
 
         if compile_key not in _bsa_attn_bwd_bucketed_k2q_csr.compile_cache:
             # Building the paired kernel enumerates its matchings, so it happens only on a cache miss.
