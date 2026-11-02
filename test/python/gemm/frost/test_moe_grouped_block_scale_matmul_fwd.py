@@ -2960,6 +2960,27 @@ def test_sm120_moe_block_scale_declines_signed_negative_scale() -> None:
     engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="mxfp4", negative_scale=(True, True)))
 
 
+@requires_sm100
+def test_sm100_moe_block_scale_declines_signed_negative_scale() -> None:
+    """The SM100 MoE block-scale templates (normal and swap-AB) read the E4M3 token and weight scales
+    as unsigned ``.ue4m3`` too, so a graph that declares signed scales is declined instead of run on
+    ``|s|``; without the attribute, or on E8M0 scales (no sign bit), the graph keeps its plan."""
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
+    engine = FrostGemmEngine()
+    for side in ("SFA", "SFB"):
+        flagged = _build_graph(2, 512, 256, 512, num_groups=2, combo="nvfp4", negative_scale=(side == "SFA", side == "SFB"))
+        match = f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"
+        with pytest.raises(NotImplementedError, match=match):
+            engine.check_support(flagged)
+        for swap_ab in (False, True):
+            with pytest.raises(NotImplementedError, match=match):
+                C100.jit_from_cudnn_graph(flagged, config=replace(by_name(_SM100_BS_CFG), swap_ab=swap_ab))
+    engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="nvfp4"))
+    engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="mxfp4", negative_scale=(True, True)))
+
+
 @requires_sm120
 @pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["fwd", "swap_ab"])
