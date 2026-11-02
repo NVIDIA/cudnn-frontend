@@ -519,6 +519,7 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         self.mask_rows_per_word = self.mask_word_bits // relay_cluster_size
         self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word
         self.data_plane_elems = padded_seqlen_kv * padded_head_dim
+        assert self.data_plane_elems % self.mask_word_elements == 0, "relay masks require naturally aligned words"
 
     @cute.jit
     def __call__(
@@ -528,6 +529,7 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         mTopkLength: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
+        """Launch one mask-builder CTA per query and batch item."""
         self.kernel(mdKVaccum, mTopkIdxs, mTopkLength).launch(
             grid=[mTopkIdxs.shape[1], 1, mTopkIdxs.shape[0]],
             block=[256, 1, 1],
@@ -543,6 +545,7 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         kv_row: Int32,
         batch_idx: Int32,
     ):
+        """Address the packed ownership word for one query/head/KV row."""
         plane_idx = (query_idx % self.q_wave_ctas) // self.relay_cluster_size
         wave_idx = query_idx // self.q_wave_ctas
         phase_idx = head_tile * self.num_waves + wave_idx
@@ -557,6 +560,7 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         mTopkIdxs: cute.Tensor,
         mTopkLength: Optional[cute.Tensor],
     ):
+        """Set every logical relay rank that may update each sparse KV row."""
         query_idx, _, batch_idx = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         topk = mTopkIdxs.shape[2]
@@ -644,6 +648,7 @@ class FlashAttentionDSABackwardSm90:
         self.mask_rows_per_word = self.mask_word_bits // relay_cluster_size
         self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word if deterministic else 0
         self.data_plane_elems = padded_seqlen_kv * padded_head_dim
+        assert self.data_plane_elems % self.mask_word_elements == 0, "relay masks require naturally aligned words"
         assert not deterministic or (
             relay_cluster_size in SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES and q_wave_ctas == 128 and num_dkv_shards == q_wave_ctas // relay_cluster_size
         )
@@ -1095,6 +1100,7 @@ class FlashAttentionDSABackwardSm90:
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
     ):
+        """Run one physical cluster phase of the SM90 DSA backward mainloop."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if cutlass.const_expr(self.deterministic):
@@ -1245,6 +1251,7 @@ class FlashAttentionDSABackwardSm90:
         batch_idx: Int32,
         kv_row: Int32,
     ):
+        """Address the packed ownership word shared by one logical relay."""
         plane_idx = (m_block % self.q_wave_ctas) // self.relay_cluster_size
         wave_idx = m_block // self.q_wave_ctas
         phase_idx = head_idx * self.num_waves + wave_idx

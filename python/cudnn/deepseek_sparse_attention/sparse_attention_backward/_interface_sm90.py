@@ -394,8 +394,8 @@ def flash_attn_bwd_sm90(
         relay_cluster_size,
         _DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
         num_relay_waves,
-        seqlen_k_rounded,
-        head_dim_rounded,
+        seqlen_k_rounded if deterministic else 0,
+        head_dim_rounded if deterministic else 0,
     )
     if compile_key not in flash_attn_bwd_sm90.compile_cache:
         q_tensor = to_cute_tensor(q4)
@@ -427,8 +427,8 @@ def flash_attn_bwd_sm90(
             relay_cluster_size=relay_cluster_size,
             q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
             num_waves=num_relay_waves,
-            padded_seqlen_kv=seqlen_k_rounded,
-            padded_head_dim=head_dim_rounded,
+            padded_seqlen_kv=seqlen_k_rounded if deterministic else 0,
+            padded_head_dim=head_dim_rounded if deterministic else 0,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,

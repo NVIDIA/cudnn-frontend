@@ -5433,7 +5433,7 @@ def test_DSA_sparse_attention_backward_sm90_multiphase_relay_repeat100(relay_clu
         deterministic_relay_cluster_size=relay_cluster_size,
     )
     q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
-    topk_idxs.copy_(topk_idxs[0].expand_as(topk_idxs))
+    topk_idxs.copy_(topk_idxs[0].clone().expand_as(topk_idxs))
     shared_out, shared_lse = ref_sparse_attention_forward_chunked(
         q,
         kv,
