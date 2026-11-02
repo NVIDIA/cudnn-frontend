@@ -45,6 +45,15 @@ F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR, D512_FLAVOR})
 FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset({D512_FLAVOR})
 
 
+def supports_mxfp8_split_sink(*, device_cc, d_shape, thd=False, paged=False):
+    """Exact-D128 dense MXFP8 partials fold the sink once in the final combine.
+
+    Padding, block-scaled output and gated splits retain their separate declines.
+    The logical head dimensions, rather than their covering tile, bound this domain.
+    """
+    return device_cc in ((12, 0), (12, 1)) and d_shape == (128, 128) and not thd and not paged
+
+
 def head_tile(d: int, granule: int) -> int:
     """A head dim rounded up to a whole ``granule``-column head tile."""
     return -(-d // granule) * granule
