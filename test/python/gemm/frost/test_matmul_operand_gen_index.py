@@ -152,7 +152,8 @@ def test_frost_operand_index_maps_and_binding(monkeypatch, side, mode, swapped, 
     source = compiler._render_template(chain, snippets, _config(swapped))
     ast.parse(source)
     assert "mainloop_needs_coordinates = True" in source and "mainloop_koob_fix = True" in source
-    assert "ml_raw_m = _m_idx" in source and "ml_batch = tile_l // split_k_slices" in source
+    assert "_decode_scheduled_tile(_m_idx, _n_idx, gridx, gridy, cluster_m, cluster_n, swizzle_w)" in source
+    assert "ml_batch = tile_l // split_k_slices" in source
     assert before == repr([(dict(n.params), [(t.get_dim(), t.get_stride()) for t in n.outputs.values()]) for n in g.nodes])
 
 
