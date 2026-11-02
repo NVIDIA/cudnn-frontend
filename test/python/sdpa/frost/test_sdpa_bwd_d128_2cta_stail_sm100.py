@@ -104,7 +104,8 @@ _STATS_FORMS = ("ldg", "tma_ring")
 _STATS_CENSUS = {
     "bar_sync_1_256": r"bar\.sync\s+1,\s*256",
     "st_shared_b32": r"st\.shared\.b32",
-    "bulk_g2s_plain": r"cp\.async\.bulk\.shared::cluster\.global\.mbarrier",
+    # Non-multicast copies use either destination spelling, depending on the DSL build.
+    "bulk_g2s_plain": r"cp\.async\.bulk\.shared::(?:cta|cluster)\.global\.mbarrier",
     "mbarrier_init": r"mbarrier\.init",
     "ld_global": r"ld\.global",
     "fence_proxy_async": r"fence\.proxy\.async",
