@@ -44,14 +44,19 @@ def test_sm120_stats_use_log2(d, dv, dtype, sq, skv, causal, split, cudnn_handle
         (i for i, n in enumerate(names) if n.startswith("sdpa_fwd_prefill_sm120[") and (getattr(graph.plans[i].knobs, "split_kv", 1) > 1) == split),
         None,
     )
-    if index is None and not split:
-        pytest.skip(f"the SM120 engine ranks only split plans for this shape: {names}")
-    assert index is not None, f"no split SM120 plan in {names}"
+    # Whether a shape ranks split or unsplit plans depends on the device's SM count (a 5060 Ti ranks no split plan
+    # for 77 x 384, a 5090 does); the S_q = 1 decode shapes rank split plans on both.
+    if index is None:
+        pytest.skip(f"the SM120 engine ranks no {'split' if split else 'unsplit'} plan for this shape on this device: {names}")
     graph.select_plan(index)
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
+    # The fixture handle runs on its own nonblocking stream; order the input writes and sentinel fills before it.
+    execution_stream = torch.cuda.ExternalStream(cudnn.get_stream(cudnn_handle))
+    execution_stream.wait_stream(torch.cuda.current_stream())
     graph.execute({nq: q, nk: k, nv: v, out: o, st: stats}, workspace, handle=cudnn_handle)
+    torch.cuda.current_stream().wait_stream(execution_stream)
     torch.cuda.synchronize()
 
     kk = k.double().repeat_interleave(h // hk, 1)
