@@ -14,8 +14,6 @@ import logging
 import pytest
 import torch
 
-import cudnn  # noqa: F401
-
 if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
 
@@ -25,7 +23,6 @@ try:
 except ImportError:
     pytest.skip("torch.nn.attention.varlen with varlen_attn_out required", allow_module_level=True)
 
-import cudnn.torch as provider  # noqa: E402
 from cudnn.torch import sdpa_provider  # noqa: E402
 
 if not sdpa_provider._has_backend_arg(torch.ops.torch_attn._varlen_attn.default):
@@ -37,7 +34,7 @@ CUDNN = [SDPBackend.CUDNN_ATTENTION]
 
 @pytest.fixture
 def overrides():
-    handle = provider.install_sdpa_overrides()
+    handle = sdpa_provider.install_sdpa_overrides()
     yield handle
     handle.remove()
 
@@ -52,12 +49,12 @@ def _inputs(lens=(128, 256), H=4, D=64):
 
 
 def _calls_since(before):
-    return {key: n - before[key] for key, n in provider.calls.items() if n != before[key]}
+    return {key: n - before[key] for key, n in sdpa_provider.calls.items() if n != before[key]}
 
 
 def _attn(backends, **kwargs):
     q, k, v, cu, mx = _inputs()
-    before = dict(provider.calls)
+    before = dict(sdpa_provider.calls)
     with sdpa_kernel(backends):
         out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0), **kwargs)
     out.backward(torch.ones_like(out))
@@ -85,7 +82,7 @@ def test_out_variant_honors_the_selection(overrides, backends, expected):
     q, k, v, cu, mx = _inputs()
     with torch.no_grad():
         out = torch.empty_like(q)
-        before = dict(provider.calls)
+        before = dict(sdpa_provider.calls)
         with sdpa_kernel(backends):
             varlen_attn_out(out, q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
         assert _calls_since(before) == expected
@@ -100,7 +97,7 @@ def test_selected_cudnn_config_the_python_path_declines_runs_torchs_cudnn(overri
     # does. The call must stay on cuDNN rather than drop to flash.
     q, k, v, cu, mx = _inputs()
     seqused_k = (cu[1:] - cu[:-1]).to(torch.int32)
-    before = dict(provider.calls)
+    before = dict(sdpa_provider.calls)
     with torch.no_grad(), sdpa_kernel(CUDNN), caplog.at_level(logging.INFO, logger="torch.nn.attention.varlen"):
         varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0), seqused_k=seqused_k)
     assert _calls_since(before) == {"fwd_torch": 1}
