@@ -3364,8 +3364,9 @@ inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
 
-    // A deviceless AoT graph without a target SM keeps sm_version 0 and skips this gate.
-    if (context.get_sm_version() == 0 && detail::get_backend_version() >= 91100) {
+    // An unset target (-1, or 0) resolves from the current device; a deviceless AoT graph without a target stays
+    // unresolved and skips this gate.
+    if (context.get_sm_version() <= 0 && detail::get_backend_version() >= 91100) {
         (void)context.populate_sm_version_from_device();
     }
     CHECK_CUDNN_FRONTEND_ERROR(check_backend_supports_sm_(context.get_sm_version()));

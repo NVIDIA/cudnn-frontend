@@ -50,3 +50,12 @@ def test_cudnn_911_keeps_a_turing_target():
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     except cudnn.cudnnGraphNotSupportedError as error:  # heuristics for a foreign target may decline on their own
         assert _MESSAGE not in str(error)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (7, 5), reason="needs a GPU below compute capability 7.5")
+def test_cudnn_911_declines_the_current_pre_turing_device():
+    """Without sm_version the target is unset (-1); plan creation resolves it from the device before the gate, so a
+    graph that goes straight to build_plans() is declined there too, not only by check_support()."""
+    graph = _conv_graph(None)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=_MESSAGE):
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
