@@ -12,6 +12,7 @@ from test_utils import torch_fork_set_rng
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
     _require_mxfp4_indexer,
     _require_sm90,
+    _require_sm100 as _require_sm100_family,
     dsa_init,
     expand_mxfp8_scale,
     make_random_mxfp4,
@@ -92,6 +93,58 @@ def _sm100_mqa_inputs(b, s_q, s_k, h_q=64, d=128):
     k = torch.randn(b, s_k, 1, d, dtype=torch.bfloat16, device=device)
     w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device)
     return q, k, w
+
+
+@torch_fork_set_rng(seed=2026)
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
+@pytest.mark.parametrize(
+    "s_q,s_k,ratio,offset",
+    [
+        pytest.param(17, 257, 1, 257, marks=pytest.mark.L0, id="partial-tiles"),
+        pytest.param(2049, 2053, 1, 2053, marks=pytest.mark.L1, id="persistent-reuse"),
+        pytest.param(17, 257, 4, 0, marks=pytest.mark.L0, id="empty-causal-tiles"),
+    ],
+)
+def test_DSA_indexer_forward_per_head_publication(s_q, s_k, ratio, offset, weight_dtype):
+    """Run under racecheck: numerical parity alone does not detect an unordered W handoff."""
+    _require_sm100_family()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    q = torch.randn(1, s_q, 32, 128, device="cuda", dtype=torch.bfloat16) / 128**0.5
+    k = torch.randn(1, s_k, 1, 128, device="cuda", dtype=torch.bfloat16)
+    w = (torch.randn(1, s_q, 32, device="cuda", dtype=torch.float32) / 32**0.5).to(weight_dtype)
+    offsets = torch.full((1,), offset, device="cuda", dtype=torch.int32)
+
+    # Bound the FP64 oracle's [B, Q, H, K] intermediates independently of the
+    # persistent kernel workload. Chunk i starts at global query offset+i.
+    expected = torch.empty(1, s_q, s_k, device="cuda", dtype=torch.float32)
+    for first in range(0, s_q, 32):
+        expected[:, first : first + 32] = ref_indexer_forward(
+            q[:, first : first + 32],
+            k,
+            w[:, first : first + 32],
+            ratio,
+            q_causal_offsets=offsets + first,
+            compute_dtype=torch.float64,
+        )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        actual = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=offsets)["scores"]
+    torch.cuda.current_stream().wait_stream(side)
+    torch.testing.assert_close(actual, expected, atol=5e-5, rtol=2e-5)
+
+    repeated = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=offsets)["scores"]
+    torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+    w.neg_()
+    changed = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=offsets)["scores"]
+    expected = torch.where(torch.isneginf(expected), expected, -expected)
+    torch.testing.assert_close(changed, expected, atol=5e-5, rtol=2e-5)
 
 
 def _allocation_count() -> int:
