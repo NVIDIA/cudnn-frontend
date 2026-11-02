@@ -29,7 +29,7 @@ from .helpers import (
     note_frost_routing,
 )
 from .random_config import packed_token_capacity
-from .fp16 import _apply_plan_pin
+from .fp16 import _apply_plan_pin, kv_packed
 
 # fmt: off
 
@@ -133,8 +133,9 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         v = graph_fwd.tensor(uid=GraphFwdUid.v, dim=(num_blocks, h_v, block_size, d_vo), stride=(block_size * h_v * d_vo, block_size * d_vo, d_vo, 1), data_type=cudnn_itype)
 
         use_padding_mask = True
-        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
-        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+        if not is_ragged:
+            kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+            q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
         k_block_table = graph_fwd.tensor(uid=GraphFwdUid.k_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
         v_block_table = graph_fwd.tensor(uid=GraphFwdUid.v_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
 
@@ -148,19 +149,22 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
             kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
 
         q_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.q_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
-        k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
-        v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         o_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.o_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         stats_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.stats_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if generate_stats else None
         q.set_ragged_offset(q_ragged_offset)
-        k.set_ragged_offset(k_ragged_offset)
-        v.set_ragged_offset(v_ragged_offset)
         if with_ragged_offset_multiplier:
             # Offsets are stored in coarser units (divided out in the allocation);
             # the engine multiplies back to element offsets.
             q.set_ragged_offset_multiplier(d_qk)
-            k.set_ragged_offset_multiplier(d_qk)
-            v.set_ragged_offset_multiplier(d_vo)
+        if block_size == 0:
+            # Only unpaged K/V are packed. Page pools never carry ragged offsets.
+            k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+            v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+            k.set_ragged_offset(k_ragged_offset)
+            v.set_ragged_offset(v_ragged_offset)
+            if with_ragged_offset_multiplier:
+                k.set_ragged_offset_multiplier(d_qk)
+                v.set_ragged_offset_multiplier(d_vo)
 
     q_descale = graph_fwd.tensor(uid=GraphFwdUid.q_descale, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
     k_descale = graph_fwd.tensor(uid=GraphFwdUid.k_descale, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
@@ -875,6 +879,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         torch_otype = torch.float8_e4m3fn
     deterministic = cfg.is_determin if hasattr(cfg, 'is_determin') else False
     is_ragged = cfg.is_ragged if hasattr(cfg, 'is_ragged') else False
+    is_kv_packed = kv_packed(cfg)
     left_bound = cfg.left_bound if hasattr(cfg, 'left_bound') else None
     right_bound = cfg.right_bound if hasattr(cfg, 'right_bound') else None
     diag_align = cfg.diag_align if hasattr(cfg, 'diag_align') else None
@@ -914,8 +919,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         v_off_mult = d_vo if with_ragged_offset_multiplier else 1
         o_off_mult = d_vo if with_ragged_offset_multiplier else 1
         q_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * d_qk // q_off_mult).to(torch.int64)
-        k_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_k * d_qk // k_off_mult).to(torch.int64)
-        v_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_v * d_vo // v_off_mult).to(torch.int64)
+        if is_kv_packed:
+            k_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_k * d_qk // k_off_mult).to(torch.int64)
+            v_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_v * d_vo // v_off_mult).to(torch.int64)
         o_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * d_vo // o_off_mult).to(torch.int64)
         stats_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * 1).to(torch.int64)
         if is_cu_seq_len:
@@ -926,7 +932,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     try:
         graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, generate_stats=generate_stats, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
                                        max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
-                                       max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
+                                       max_total_seq_len_kv=max_t_kv if (is_kv_packed and getattr(cfg, "declare_total_seq_len", False)) else None,
                                        o_block_scale=o_block_scale, softmax_precision=softmax_precision)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -1022,6 +1028,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     if is_ragged:
         q_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", q_fp8), torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda"), max_t_q)
+    if is_kv_packed:
         k_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", k_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv)
         v_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", v_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv)
 
@@ -1078,8 +1085,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
+        if not is_ragged:
+            variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
+            variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = k_block_table_gpu
         variant_pack[int(GraphFwdUid.v_block_table)] = v_block_table_gpu
 
@@ -1091,8 +1099,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
             variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
         variant_pack[int(GraphFwdUid.q_ragged_offset)] = q_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
+        if is_kv_packed:
+            variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
+            variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.o_ragged_offset)] = o_ragged_offset_gpu
         if generate_stats:
             variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
@@ -1109,6 +1118,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         profile_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
     graph_fwd.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
+    if not perf and generate_stats and is_ragged and is_paged:
+        # Packed Stats follow Q's live token prefix; the page pools remain dense.
+        # Check them before Amax_O, whose known backend defect can xfail its check.
+        stats_ref_packed = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
+        live_q = sum(seq_len_q_list)
+        torch.testing.assert_close(stats_gpu[:live_q], stats_ref_packed[:live_q], atol=2e-2, rtol=2e-2)
     # Amax_O on a backend-served graph: a known backend defect xfails that check only (see BACKEND_AMAX_O_ISSUE).
     amax_known_issue = BACKEND_AMAX_O_ISSUE if getattr(graph_fwd, "selected_engine", None) is None else None
 

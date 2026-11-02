@@ -102,10 +102,8 @@ def paged():
         data_type=_f16(),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_FULL),
         diag_align=RandomChoice(DIAG_BOTH),
-        # paged + ragged (packed THD Q/O against a paged KV cache) is a valid
-        # serving combo but deferred: harness support only existed for f16 —
-        # tracked as a suite-wide extension (f16 + fp8) in the issue tracker.
-        is_ragged_or_padded_or_full=RandomChoice({"padded": 2, "cu_padded": 1}),
+        # Packed THD Q/O and padded Q/O share the same dense paged KV pools.
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 2, "padded": 2, "cu_padded": 1}),
         block_size=RandomBlockSize(min=1, max=1024, with_high_probability=[1, 32, 128]),
         with_sink_token=RandomChoice({True: 1, False: 3}),
     )
@@ -120,8 +118,8 @@ PAGED = SuiteSpec(
     rng_seed=887,
     knobs=paged,
     post=post_paged,
-    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("layout padded/cu_padded", "block size 1..1024", "sink"),
-    pinned=("infer", "s_q<=64", "layout padded", "paged KV"),
+    fuzzed=COMMON_FUZZ + MASK_FUZZ + ("layout ragged/padded/cu_padded", "block size 1..1024", "sink"),
+    pinned=("infer", "s_q<=64", "paged KV"),
 )
 
 SUITES = [DECODE, PAGED]

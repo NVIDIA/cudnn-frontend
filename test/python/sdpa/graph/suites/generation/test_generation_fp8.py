@@ -100,7 +100,7 @@ def fp8_paged():
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 1}),
         with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
         diag_align=RandomChoice(DIAG_TL),
-        is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1}),
         block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64]),
     )
 
@@ -119,9 +119,10 @@ PAGED = SuiteSpec(
     + (
         "e4m3/e5m2 in",
         "out fp8/fp16",
+        "layout ragged/padded",
         "block size 16..128",
     ),
-    pinned=("infer", "no mask", "diag TL", "layout padded", "paged KV"),
+    pinned=("infer", "no mask", "diag TL", "paged KV"),
 )
 
 SUITES = [DECODE, PAGED]
