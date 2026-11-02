@@ -29,6 +29,7 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.tensor_adapter import has_tcgen05
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
@@ -434,8 +435,8 @@ class IndexerBackward(APIBase):
         capability = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 or self.deterministic else None)
         major, _ = capability
         self._runtime_error_if(
-            major != 9 and major < 10,
-            f"IndexerBackward requires SM90 or SM100+, found SM{major}",
+            major != 9 and not has_tcgen05(major),
+            f"IndexerBackward requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{major}",
         )
         if not self.use_v2 and major >= 10:
             self._value_error_if(
@@ -846,8 +847,8 @@ class DenseIndexerBackward(APIBase):
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
-            major != 9 and major < 10,
-            f"DenseIndexerBackward requires SM90 or SM100+, found SM{major}",
+            major != 9 and not has_tcgen05(major),
+            f"DenseIndexerBackward requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{major}",
         )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
         self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
