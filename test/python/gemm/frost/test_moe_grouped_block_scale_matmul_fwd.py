@@ -735,7 +735,9 @@ def _run_gather_block_scale(
     fake_side=None,
     swiglu=False,
     aligned=False,
+    k_pad_byte=0,
 ):
+    """``k_pad_byte`` (non-zero) fills the weight blob's F8_128x4 K padding and the token scale rows' tail."""
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
 
     torch.manual_seed(208)
@@ -783,10 +785,15 @@ def _run_gather_block_scale(
     sf_dtype = torch.float8_e4m3fn if combo == "nvfp4" else torch.float8_e8m0fnu
     scales = (2.0 ** torch.randint(-2, 2, (1, t, sf_k), device="cuda")).to(sf_dtype)
     ws = (2.0 ** torch.randint(-2, 2, (e, n, sf_k), device="cuda")).to(sf_dtype)
-    backing = torch.full((1, t, _ceil_div(sf_k, 16) * 16 + 16), 0xA5, device="cuda", dtype=torch.uint8)
+    tail = k_pad_byte or 0xA5
+    backing = torch.full((1, t, _ceil_div(sf_k, 16) * 16 + 16), tail, device="cuda", dtype=torch.uint8)
     sf = backing[:, :, :sf_k].view(sf_dtype)
     sf.copy_(scales)
-    wsf = torch.stack([_to_blocked(ws[j]).view(torch.uint8) for j in range(e)]).view(e, _ceil_div(n, 128) * 128, _ceil_div(sf_k, 4) * 4).view(sf_dtype)
+    wsf = (
+        torch.stack([_to_blocked(ws[j], k_pad_byte).view(torch.uint8) for j in range(e)])
+        .view(e, _ceil_div(n, 128) * 128, _ceil_div(sf_k, 4) * 4)
+        .view(sf_dtype)
+    )
     starts = [0, 256, 256, 512, 768] if aligned else [0, 3, 3, 131, 258]
     starts.extend([r, r])
     fto = torch.tensor(starts, device="cuda", dtype=torch.int64 if aligned else torch.int32)
@@ -836,7 +843,7 @@ def _run_gather_block_scale(
         if swiglu:
             ref = torch.nn.functional.silu(ref) * ref
         torch.testing.assert_close(out[0], ref.to(torch.bfloat16), atol=0.5, rtol=0.02)
-        assert torch.all(backing[:, :, sf_k:] == 0xA5)
+        assert torch.all(backing[:, :, sf_k:] == tail)
 
     launch()
     check()
@@ -2925,6 +2932,47 @@ def test_e2e_k_padding_scales_are_ignored_sm120(combo, K, swap_ab) -> None:
         swap_ab=swap_ab,
         k_pad_byte=k_pad_byte,
     )
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("cta_group", [1, 2])
+@pytest.mark.parametrize(
+    "combo,K",
+    [
+        ("mxfp8", 2880),  # gpt-oss hidden: 90 K-scales, pad slots 90-91
+        ("mxfp4", 160),  # 5: pad slots 5-7
+        ("nvfp4", 288),  # 18: pad slots 18-19
+    ],
+)
+def test_e2e_k_padding_scales_are_ignored_sm100(combo, K, cta_group, swap_ab) -> None:
+    """The SM100 twin of test_e2e_k_padding_scales_are_ignored_sm120: NaN-encoded K-padding bytes in the token and
+    weight F8_128x4 blobs (UE8M0 0xFF, UE4M3 0x7F) must not reach the output."""
+    cluster, mode = ("1x1", "1ctamma") if cta_group == 1 else ("2x1", "2ctamma")
+    _run_e2e(
+        E=2,
+        S=384,
+        N=256,
+        K=K,
+        offsets_list=[0, 130, 130, 300, 384],
+        combo=combo,
+        config_name=f"CONFIG_sm100_128x128x128_128x128x32_cluster{cluster}_{mode}",
+        cta_group=cta_group,
+        swap_ab=swap_ab,
+        k_pad_byte=0x7F if combo == "nvfp4" else 0xFF,
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("combo,k", [("mxfp8", 320), ("mxfp4", 416), ("nvfp4", 288)])
+def test_gather_k_padding_scales_are_ignored_sm100(combo, k, swap_ab) -> None:
+    """GATHER twin of test_e2e_k_padding_scales_are_ignored_sm100: the gathered token scales and the weight blob both
+    end each row's last F8_128x4 word in NaN-encoded padding (UE8M0 0xFF, UE4M3 0x7F)."""
+    from cudnn.gemm.frost import compiler as C
+
+    cfg = replace(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=swap_ab)
+    _run_gather_block_scale(C, cfg, combo=combo, k=k, k_pad_byte=0x7F if combo == "nvfp4" else 0xFF)
 
 
 @requires_sm120

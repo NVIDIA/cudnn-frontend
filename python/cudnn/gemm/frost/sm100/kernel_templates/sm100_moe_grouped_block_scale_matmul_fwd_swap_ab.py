@@ -16,6 +16,7 @@ from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization 
 )
 from cudnn.gemm.frost.tile_helpers import (
     extract_block_scale_sfb,
+    mask_block_scale_k_padding,
     moe_scatter_row,
     moe_combine_add,
     moe_combine_swap_bulk,
@@ -980,6 +981,15 @@ def _kernel(
             )
         if cutlass.const_expr(cta_group == 1):
             ab_full_phase_bit = cutlass.Int32(0)
+            # When ceil(K / block_size) is not a multiple of 4, each SF row's last word ends in blob padding; the
+            # MMA warp masks it in the K tile that holds it (see mask_block_scale_k_padding).
+            sf_k_blocks = k // block_size
+            sf_pad_word = (sf_k_blocks - 1) // 4
+            sf_pad_live = sf_k_blocks - sf_pad_word * 4
+            sf_pad_tile = sf_pad_word // sf_tma_box_k
+            sf_pad_atom = sf_pad_word - sf_pad_tile * sf_tma_box_k
+            sf_pad_keep = cutlass.Uint32((cutlass.Uint64(1) << cutlass.Uint64(8 * sf_pad_live)) - cutlass.Uint64(1))
+            sf_pad_peer = None
             ab_iter = cutlass.Int32(0)
             acc_empty_phase_bit = cutlass.Int32(1)
             tile_iter = cutlass.Int32(0)
@@ -1150,6 +1160,25 @@ def _kernel(
                             time_limit=10_000_000,
                         ):
                             pass
+                        if sf_pad_live < 4 and k_tile_idx == sf_pad_tile:
+                            for _pa in cutlass.range_constexpr(0 if fake_dequant_a else num_sfa_operands):
+                                mask_block_scale_k_padding(
+                                    smem_sfa_list[_pa].subview(sfa_smem_bytes * stage),
+                                    sf_pad_atom,
+                                    sf_pad_keep,
+                                    sfa_smem_bytes // (512 * sf_tma_box_k),
+                                    sf_tma_box_k,
+                                    sf_pad_peer,
+                                )
+                            for _pb in cutlass.range_constexpr(0 if fake_dequant_b else num_sfb_operands):
+                                mask_block_scale_k_padding(
+                                    smem_sfb_list[_pb].subview(sfb_smem_bytes * stage),
+                                    sf_pad_atom,
+                                    sf_pad_keep,
+                                    sfb_smem_bytes // (512 * sf_tma_box_k),
+                                    sf_tma_box_k,
+                                    sf_pad_peer,
+                                )
 
                         if cutlass.const_expr(_sfb_needs_sub_tile):
                             sf_n_start = (sfb_tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]) % 128
@@ -1292,6 +1321,15 @@ def _kernel(
             peer_cta_rank = cta_rank_in_cluster ^ 1
             if is_pair_leader:
                 ab_full_phase_bit = cutlass.Int32(0)
+                # When ceil(K / block_size) is not a multiple of 4, each SF row's last word ends in blob padding; the
+                # MMA warp masks it in the K tile that holds it (see mask_block_scale_k_padding).
+                sf_k_blocks = k // block_size
+                sf_pad_word = (sf_k_blocks - 1) // 4
+                sf_pad_live = sf_k_blocks - sf_pad_word * 4
+                sf_pad_tile = sf_pad_word // sf_tma_box_k
+                sf_pad_atom = sf_pad_word - sf_pad_tile * sf_tma_box_k
+                sf_pad_keep = cutlass.Uint32((cutlass.Uint64(1) << cutlass.Uint64(8 * sf_pad_live)) - cutlass.Uint64(1))
+                sf_pad_peer = peer_cta_rank
                 ab_iter = cutlass.Int32(0)
                 acc_empty_phase_bit = cutlass.Int32(1)
                 tile_iter = cutlass.Int32(0)
@@ -1458,6 +1496,25 @@ def _kernel(
                                 time_limit=10_000_000,
                             ):
                                 pass
+                            if sf_pad_live < 4 and k_tile_idx == sf_pad_tile:
+                                for _pa in cutlass.range_constexpr(0 if fake_dequant_a else num_sfa_operands):
+                                    mask_block_scale_k_padding(
+                                        smem_sfa_list[_pa].subview(sfa_smem_bytes * stage),
+                                        sf_pad_atom,
+                                        sf_pad_keep,
+                                        sfa_smem_bytes // (512 * sf_tma_box_k),
+                                        sf_tma_box_k,
+                                        sf_pad_peer,
+                                    )
+                                for _pb in cutlass.range_constexpr(0 if fake_dequant_b else num_sfb_operands):
+                                    mask_block_scale_k_padding(
+                                        smem_sfb_list[_pb].subview(sfb_smem_bytes * stage),
+                                        sf_pad_atom,
+                                        sf_pad_keep,
+                                        sfb_smem_bytes // (512 * sf_tma_box_k),
+                                        sf_tma_box_k,
+                                        sf_pad_peer,
+                                    )
 
                             # Disjoint words let all SF copies precede the K-tile's MMAs.
                             for sf_load_word in cutlass.range_constexpr(num_sf_atoms if _sf_words_resident else 0):

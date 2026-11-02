@@ -2345,7 +2345,7 @@ def test_sm103_rejects_misaligned_runtime_k(_pretend_sm103):
 # End-to-end numerics (sm103 GPU only)
 
 
-def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1, split_k=1):
+def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1, split_k=1, k_pad_byte=0):
     dev = "cuda"
     torch.manual_seed(0)
     bs = 16 if combo == "nvfp4" else 32
@@ -2386,8 +2386,8 @@ def _run_sm103_numeric(combo, config_name, M, N, K, cta_group=1, split_k=1):
             a_rt,
             b_rt,
             c,
-            _to_blocked(sfa_log).view(1, mp, kp),
-            _to_blocked(sfb_log).view(1, np_, kp),
+            _to_blocked(sfa_log, k_pad_byte).view(1, mp, kp),
+            _to_blocked(sfb_log, k_pad_byte).view(1, np_, kp),
         ),
         workspace=ws,
     )
@@ -3554,6 +3554,24 @@ def test_sm120_block_scale_ignores_k_padding_scales(combo, config_name, K, split
     _run_bs_numeric(combo, config_name, 256, 200, K, split_k=split_k, k_pad_byte=0x7F if combo == "nvfp4" else 0xFF)
 
 
+@requires_sm100
+@pytest.mark.parametrize(
+    "combo, config_name, K, split_k",
+    [
+        ("mxfp8", "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", 320, 1),  # 10 K-scales: pad slots 10-11
+        ("mxfp8", "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma", 320, 1),  # the peer CTA's SF too
+        ("mxfp4", "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", 416, 1),  # 13: pad slots 13-15
+        ("nvfp4", "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", 352, 1),  # 22: pad slots 22-23
+        ("mxfp8", "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", 1088, 3),  # 34: in the last split's last K tile
+    ],
+)
+def test_sm100_block_scale_ignores_k_padding_scales(combo, config_name, K, split_k):
+    """The SM100 twin of test_sm120_block_scale_ignores_k_padding_scales: the SF TMA box loads each row's last
+    F8_128x4 word whole, and the tcgen05.cp'd K-padding bytes scale the zero-filled K blocks. A NaN encoding there
+    (UE8M0 0xFF, UE4M3 0x7F) used to make every output element NaN."""
+    _run_bs_numeric(combo, config_name, 256, 200, K, split_k=split_k, k_pad_byte=0x7F if combo == "nvfp4" else 0xFF)
+
+
 @requires_sm120
 @pytest.mark.parametrize(
     "combo,config_name,S,M,N,K",
@@ -3820,3 +3838,18 @@ def test_sm120_block_scale_declines_signed_negative_scale():
         assert "is_negative_scale=True" in str(exc)
     else:
         assert not any(g.get_plan_name_at_index(i).startswith("frost_gemm") for i in range(g.get_execution_plan_count()))
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "combo,config_name,K,cta_group,split_k",
+    [
+        ("nvfp4", _CFG_128, 1568, 1, 1),  # 98 K-scales: pad slots 98-99 in the second K tile
+        ("mxfp4", _CFG_128, 1600, 1, 1),  # 50: pad slots 50-51
+        ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster2x1", 1568, 2, 1),  # the peer CTA's SF too
+        ("nvfp4", _CFG_128, 4064, 1, 3),  # 254: in the last split's last K tile
+    ],
+)
+def test_sm103_block_scale_ignores_k_padding_scales(combo, config_name, K, cta_group, split_k):
+    """NaN-encoded K-padding bytes in both F8_128x4 blobs (UE4M3 0x7F, UE8M0 0xFF) must not reach the output."""
+    _run_sm103_numeric(combo, config_name, 256, 256, K, cta_group=cta_group, split_k=split_k, k_pad_byte=0x7F if combo == "nvfp4" else 0xFF)

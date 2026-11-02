@@ -111,6 +111,35 @@ def extract_block_scale_sfb(stage, n_start, tile_n: cutlass.Constexpr, k_atoms: 
     nvvm.bar_warp_sync(0xFFFFFFFF)
 
 
+@cute.jit
+def mask_block_scale_k_padding(stage, atom, keep, row_blocks: cutlass.Constexpr, k_atoms: cutlass.Constexpr, peer_rank=None):
+    """AND one F8_128x4 K word of a staged SF tile with ``keep`` in every row of every 128-row block.
+
+    ``atom`` is the tile-local K word that holds each row's last real scale. When ceil(K / block_size) is not a
+    multiple of 4, that word's high bytes are blob padding the MMAs of the TMA-zero-filled K blocks would read: a NaN
+    encoding there (UE8M0 0xFF, UE4M3 0x7F / 0xFF) gives 0 x NaN. ``peer_rank`` also masks the same stage of the CTA
+    pair's other CTA, whose SF the leader's cta_group::2 tcgen05.cp reads. Called by the MMA warp after the stage's SF
+    barrier and before its tcgen05.cp."""
+    words = cutlass.Array(base=stage.data_ptr(), shape=row_blocks * 128 * k_atoms, dtype=cutlass.Int32)
+    lane = cute.arch.lane_idx()
+    # A lane's 4 words are one row-quad of the atom: 16 contiguous bytes, so one vector access each. All loads go out
+    # before any store so the peer CTA's distributed-shared-memory round trips overlap.
+    # Int32 lanes: a live mask spans at most 3 bytes, and Vector & yields Int32.
+    keep_word = cutlass.Int32(keep)
+    keep4 = cutlass.Vector.from_elements((keep_word, keep_word, keep_word, keep_word), cutlass.Int32)
+    quads = [words.data_ptr(blk * (128 * k_atoms) + atom * 128 + lane * 4) for blk in range(row_blocks)]
+    if cutlass.const_expr(peer_rank is not None):
+        quads = quads + [nvvm.mapa(q, peer_rank) for q in quads]
+    values = [q.load(count=4) for q in quads]
+    for i in cutlass.range_constexpr(len(quads)):
+        quads[i].store(values[i] & keep4, alignment=16)
+    if cutlass.const_expr(peer_rank is not None):
+        cute.arch.fence_proxy("async.shared", space="cluster")
+    else:
+        cute.arch.fence_proxy("async.shared", space="cta")
+    nvvm.bar_warp_sync(0xFFFFFFFF)
+
+
 def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
     """Group-local linear tile index -> (m, n) under an N-super-block walk."""
     blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))

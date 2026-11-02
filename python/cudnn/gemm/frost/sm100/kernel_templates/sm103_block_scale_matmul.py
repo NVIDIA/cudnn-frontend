@@ -12,6 +12,7 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
+    mask_block_scale_k_padding,
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
     tcgen05_mma_block_scale as _tcgen05_mma_block_scale,
@@ -951,6 +952,15 @@ def _kernel(
         if cutlass.const_expr(cta_group == 2):
             peer_cta_rank = cta_rank_in_cluster ^ 1
         if is_pair_leader:
+            # When ceil(K / block_size) is not a multiple of 4, each SF row's last word ends in blob padding; the
+            # MMA warp masks it in the SF group that holds it (see mask_block_scale_k_padding).
+            sf_k_blocks = k // block_size
+            sf_pad_word = (sf_k_blocks - 1) // 4
+            sf_pad_live = sf_k_blocks - sf_pad_word * 4
+            sf_pad_keep = cutlass.Uint32((cutlass.Uint64(1) << cutlass.Uint64(8 * sf_pad_live)) - cutlass.Uint64(1))
+            sf_pad_peer = None
+            if cutlass.const_expr(cta_group == 2):
+                sf_pad_peer = peer_cta_rank
             mma_slot_stage = cutlass.Int32(0)  # ring pos of the tile's first chunk
             mma_slot_phase = cutlass.Int32(0)
             mma_sf_stage = cutlass.Int32(0)
@@ -1131,6 +1141,26 @@ def _kernel(
                             _grp = _kj // mmas_per_sf_group
                             while not nvvm.mbarrier_try_wait_parity(sf_full_mbar_ptr.subview(mma_sf_stage), mma_sf_phase, time_limit=10_000_000):
                                 pass
+                            sf_pad_atom = sf_pad_word - (k_tile_idx * sf_tma_box_k + _grp * sf_atoms_per_group)
+                            if sf_pad_live < 4 and sf_pad_atom >= 0 and sf_pad_atom < sf_atoms_per_group:
+                                for _pa in cutlass.range_constexpr(num_a_operands):
+                                    mask_block_scale_k_padding(
+                                        smem_sfa_list[_pa].subview(sfa_group_bytes * mma_sf_stage),
+                                        sf_pad_atom,
+                                        sf_pad_keep,
+                                        sfa_group_bytes // (512 * sf_atoms_per_group),
+                                        sf_atoms_per_group,
+                                        sf_pad_peer,
+                                    )
+                                for _pb in cutlass.range_constexpr(num_b_operands):
+                                    mask_block_scale_k_padding(
+                                        smem_sfb_list[_pb].subview(sfb_group_bytes * mma_sf_stage),
+                                        sf_pad_atom,
+                                        sf_pad_keep,
+                                        sfb_group_bytes // (512 * sf_atoms_per_group),
+                                        sf_atoms_per_group,
+                                        sf_pad_peer,
+                                    )
                             desc_sfa_bases = [desc_sfa_roots[i].advance_start_address(sfa_group_bytes * mma_sf_stage) for i in range(num_a_operands)]
                             desc_sfb_bases = [desc_sfb_roots[j].advance_start_address(sfb_group_bytes * mma_sf_stage) for j in range(num_b_operands)]
                             for _at in cutlass.range_constexpr(sf_atoms_per_group):
