@@ -266,21 +266,97 @@ def _f8_128x4_k_padding(quant: BlockQuantizeSpec, swapped: bool) -> bool:
     return quant.scale_reorder == "F8_128x4" and not (quant.grouped_by_moe and token_axis)
 
 
-def _emit_f8_128x4_k_pad_zero(quant: BlockQuantizeSpec, block: str, num_blocks: str, sidx: str, scale_tap_idx: int) -> list[str]:
-    """Zero the padding slots after a scale row's last real block.
+def _emit_f8_128x4_k_pad_zero(quant: BlockQuantizeSpec, last_block: str, last_sidx: str, scale_tap_idx: int) -> list[str]:
+    """Zero the padding slots behind a scale row's last real block (``last_block``, stored at ``last_sidx``).
 
     A consumer whose K is the quantized axis multiplies them against its zero-filled
     K tail, so a stale NaN encoding (E8M0 0xFF, E4M3 0x7F/0xFF) poisons its whole output
-    row. They share the last block's 4-byte quad, so the lane storing that block
-    writes them. Rows that pad the blob to a whole 128-row atom stay unwritten: only
+    row. They share the last block's 4-byte quad and follow it, so its writer stores raw
+    0x00 bytes there. Rows that pad the blob to a whole 128-row atom stay unwritten: only
     consumer rows that are never stored read them. Same rule as the sm120 tree (#2011)."""
     store_dtype = _scale_store_dtype(quant.scale_dtype)
     zero = "cutlass.Int8(0)" if store_dtype == "cutlass.Int8" else f"cutlass.Int8(0).bitcast({store_dtype})"
-    lines = [f"if {block} + 1 == {num_blocks}:"]
+    lines = []
     for slot in range(1, 4):
-        lines.append(f"    if {block} % 4 < {4 - slot}:")
-        lines.append(f"        (gC_tap_{scale_tap_idx}_ptr + {sidx} + {slot}).store({zero}, alignment=1)")
+        lines.append(f"if {last_block} % 4 < {4 - slot}:")
+        lines.append(f"    (gC_tap_{scale_tap_idx}_ptr + {last_sidx} + {slot}).store({zero}, alignment=1)")
     return lines
+
+
+def _emit_block_quant_row_k_pad(
+    quant: BlockQuantizeSpec,
+    quant_idx: int,
+    output_dtype: Dtype,
+    scale_tap_idx: int,
+    chain: FusionChain,
+    vsize: int,
+    row_pred: str | None,
+) -> list[str]:
+    """Zero a row-quant scale row's K padding once per epilogue vector.
+
+    Only an N that ends a scale row inside a quad has padding; that test is uniform, so an N of whole
+    quads skips this and runs the emitter's stores alone. Then only the thread whose block window holds
+    the row's last real block writes, under the predicate that block's own store ran under."""
+    p, bs = f"_q{quant_idx}", quant.block_size
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    n_sub = vsize // bs
+    nb = f"(N // {bs})"
+    # Mirrors the row emitter: its vector path stores block k under `col_j + (k + 1) * bs <= N` with or without a
+    # row predicate; its scalar path under the row predicate only, with the vector or swapped-block width.
+    vector_scales = not swapped and output_dtype == "fp4_e2m1" and bs == 16 and n_sub == 4 and quant.scale_reorder == "F8_128x4"
+    # No assignment in the branch and the index math inlined into it (runs only once it is taken). Measured in PTX for
+    # sm_100a: assigning in the branch, nesting the residue test outside it, or branch-free stores at computed offsets
+    # each made the kernel unpack and repack the quantized output vector held across this block byte by byte.
+    last = f"({nb} - 1)"
+    kl = f"({last} - {p}_scol0)"
+    conds = [f"({kl} >= 0)", f"({kl} < {n_sub})"]
+    if row_pred is not None:
+        conds.insert(0, f"({row_pred})")
+    if vector_scales or (row_pred is not None and swapped):
+        conds.append(f"(col_j + ({kl} + 1) * {bs} <= {'group_end' if swapped else 'N'})")
+    elif row_pred is not None:
+        conds.append(f"(col_j + {vsize} <= N)")
+    # The last block's slot is the window's first slot moved by whole 512-byte quad strides and within its quad: an
+    # F8_128x4 row index differs between two of its blocks only in those two terms.
+    lsidx = f"({p}_sidx0 + (({last} // 4) - ({p}_scol0 // 4)) * 512 + ({last} % 4) - ({p}_scol0 % 4))"
+    lines = [f"if ({nb} % 4 != 0) & {' & '.join(conds)}:"]
+    lines.extend(f"    {line}" for line in _emit_f8_128x4_k_pad_zero(quant, last, lsidx, scale_tap_idx))
+    return lines
+
+
+def _emit_block_quant_col_k_pad(
+    quant: BlockQuantizeSpec, quant_idx: int, scale_tap_idx: int, chain: FusionChain, vsize: int, row_pred: str | None
+) -> list[str]:
+    """Zero a col-quant scale row's K (= M) padding: only an M that ends the scale rows inside a quad has any (a
+    uniform test), and only the lanes holding the last real M block write it, under each column's store predicate."""
+    p = f"_q{quant_idx}"
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    col_bound = "group_end" if swapped else "N"
+    n_groups = vsize // (16 if quant.block_size == 16 else 32)
+    nb = f"(M // {quant.block_size})"
+    lines = [f"if ({nb} % 4 != 0) & ({p}_mb + 1 == {nb}):"]
+    for k in range(n_groups):
+        pads = _emit_f8_128x4_k_pad_zero(quant, f"{p}_mb", f"{p}_sidx{k}", scale_tap_idx)
+        if row_pred is None:
+            lines.extend(f"    {line}" for line in pads)
+        else:
+            col_pred = f"{p}_n{k} < {col_bound}" if swapped else f"col_j + {vsize} <= N"
+            lines.append(f"    if ({row_pred}) & ({col_pred}):")
+            lines.extend(f"        {line}" for line in pads)
+    return lines
+
+
+def _emit_block_quant_k_pad(
+    quant: BlockQuantizeSpec, quant_idx: int, output_dtype: Dtype, scale_tap_idx: int, chain: FusionChain, vsize: int, row_pred: str | None
+) -> list[str]:
+    """The K-padding stores of one quantized output, emitted at the END of the epilogue body: the emitters' scale and
+    data stores stay develop's, and no quantized value is live across the padding branch (a packed vector held across
+    it is unpacked and repacked byte by byte). They read only the emitter's top-level indices."""
+    if not _f8_128x4_k_padding(quant, isinstance(chain.moe, MoeSwapAbSpec)):
+        return []
+    if quant.axis == 1:
+        return _emit_block_quant_col_k_pad(quant, quant_idx, scale_tap_idx, chain, vsize, row_pred)
+    return _emit_block_quant_row_k_pad(quant, quant_idx, output_dtype, scale_tap_idx, chain, vsize, row_pred)
 
 
 def _emit_block_quant_col(
@@ -299,7 +375,6 @@ def _emit_block_quant_col(
     p = f"_q{quant_idx}"
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
     col_bound = "group_end" if swapped else "N"
-    k_padding = _f8_128x4_k_padding(quant, swapped)
     scale_dtype = _scale_store_dtype(quant.scale_dtype)
     G = 16 if quant.block_size == 16 else 32
     if vsize % G != 0:
@@ -424,15 +499,13 @@ def _emit_block_quant_col(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"{p}_mb * quant_scale_stride_m_{quant_idx} + {p}_n{k} * quant_scale_stride_n_{quant_idx}"
             )
-        stores = [f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"]
-        if k_padding:
-            stores.extend(_emit_f8_128x4_k_pad_zero(quant, f"{p}_mb", f"(M // {quant.block_size})", f"{p}_sidx{k}", scale_tap_idx))
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"
         if row_pred is None:
-            lines.extend(stores)
+            lines.append(_st)
         else:
             col_pred = f"{p}_n{k} < {col_bound}" if swapped else f"col_j + {vsize} <= N"
             lines.append(f"if ({row_pred}) & ({col_pred}):")
-            lines.extend(f"    {line}" for line in stores)
+            lines.append(f"    {_st}")
     return lines
 
 
@@ -451,17 +524,7 @@ def _emit_block_quant(
     """Generate block-quantized data and scale stores."""
     if quant.axis == 1:
         return _emit_block_quant_col(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
-    p, bs = f"_q{quant_idx}", quant.block_size
-
-    def pad(k: int) -> list[str]:
-        return _emit_f8_128x4_k_pad_zero(quant, f"{p}_scol{k}", f"(N // {bs})", f"{p}_sidx{k}", scale_tap_idx)
-
-    # The shared row emitter stores only real blocks; pad behind each scalar scale store, under its predicate and in
-    # its scope (the vector path defines blocks 1-3's indices only in its scalar fallback).
-    padding = pad if _f8_128x4_k_padding(quant, isinstance(chain.moe, MoeSwapAbSpec)) else None
-    return _emit_block_quant_row(
-        quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred, after_scale_store=padding
-    )
+    return _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
@@ -493,8 +556,6 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
     b, m, n = tap.dim
     m_expr = "1" if m == 1 else "sym_m"
     n_expr = "1" if n == 1 else "sym_n"
-    if n != 1 and tap.dtype == "fp4_e2m1" and not tap.is_reduction and not tap.is_quant_scale:
-        n_expr = "(sym_n // 2)"  # byte-packed pairs, as the undimensioned branch above binds them
     l_expr = "1" if b == 1 else "sym_l"
     if tap.is_reduction and chain is not None:
         red_idx = int(tap.source.rsplit("_", 1)[1])
@@ -568,6 +629,7 @@ def generate(
                 source_uses[specs[oi].source_ref],
             )
         )
+    k_pad_lines: list[str] = []
     for si in output_order:
         spec = specs[si]
         src = _parent_value(spec.source_ref)
@@ -587,6 +649,9 @@ def generate(
                     vsize,
                     store_row_pred,
                 )
+            )
+            k_pad_lines.extend(
+                _emit_block_quant_k_pad(chain.quants[spec.quant_idx], spec.quant_idx, spec.dtype, _scale_tap_idx(spec.quant_idx), chain, vsize, store_row_pred)
             )
             src = qv
         if si in tma_slots:
@@ -624,6 +689,8 @@ def generate(
                 _tap_of[len(specs) + red_idx], red_idx, red, red_source, chain, vsize, store_row_pred, col_bound=col_bound, chunk_elems=red_chunk
             )
         )
+
+    body_lines.extend(k_pad_lines)
 
     if tma_slots and any(red.mode in ("mul", "mul_no_zeros") for red in chain.reductions):
         body_lines.append("nvvm.bar_warp_sync(0xFFFFFFFF)")

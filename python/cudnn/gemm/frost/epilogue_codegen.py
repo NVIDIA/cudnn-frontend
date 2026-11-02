@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import importlib
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .arch_family import active_family
@@ -1188,12 +1187,8 @@ def _emit_block_quant_row(
     batch_index_expr: str = "tile_l",
     vsize: int = 32,
     row_pred: str | None = None,
-    after_scale_store: Callable[[int], list[str]] | None = None,
 ) -> list[str]:
-    """Generate row block-quantized data and scales.
-
-    ``after_scale_store(k)`` returns lines emitted right after block ``k``'s scalar scale store, under its
-    predicate; the 4-byte vector store of a whole F8_128x4 column atom skips them (all four blocks are real)."""
+    """Generate row block-quantized data and scales."""
     p = f"_q{quant_idx}"
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
     col_bound = "group_end" if swapped else "N"
@@ -1267,15 +1262,13 @@ def _emit_block_quant_row(
             if k:
                 del lines[index_start:]
             continue
-        _st = [f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)"]
-        if after_scale_store is not None:
-            _st.extend(after_scale_store(k))
+        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)"
         if row_pred is None:
-            lines.extend(_st)
+            lines.append(_st)
         else:
             width = (k + 1) * bs if swapped else vsize
             lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
-            lines.extend(f"    {line}" for line in _st)
+            lines.append(f"    {_st}")
     if vector_scales:
         # A whole F8_128x4 column atom is contiguous. Keep the scalar path for
         # unaligned carriers, atom boundaries and a partial runtime N drain.
@@ -1299,8 +1292,6 @@ def _emit_block_quant_row(
                 f"    if {row_guard}(col_j + {(k + 1) * bs} <= N):",
                 f"        (gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)",
             ]
-            if after_scale_store is not None:
-                lines.extend(f"        {line}" for line in after_scale_store(k))
     return lines
 
 

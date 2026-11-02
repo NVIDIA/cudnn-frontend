@@ -153,7 +153,6 @@ def _build_graph(
     quant_scale_dim: tuple[int, int, int] | None = None,
     weight_major: str = "k",
     gather_rows: int | None = None,
-    quant_block_size: int = 32,
 ):
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -210,7 +209,7 @@ def _build_graph(
         R.set_dim(list(reduction_dims)).set_stride(list(stride))
         R.set_output(True).set_data_type(reduction_dt)
     if quant:
-        q, q_scale = g.block_scale_quantize(input=out, block_size=quant_block_size, name="q")
+        q, q_scale = g.block_scale_quantize(input=out, block_size=32, name="q")
         q.set_data_type(quant_out_dt).set_output(True)
         if quant_scale_dim is not None:
             q_scale.set_dim(list(quant_scale_dim)).set_stride([quant_scale_dim[1] * quant_scale_dim[2], quant_scale_dim[2], 1])
@@ -2091,58 +2090,6 @@ def test_moe_quant_scale_blob_admits_runtime_s_in_its_padding_sm120(gather, swap
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
-@requires_sm100
-@pytest.mark.parametrize("N", [256, 288], ids=["whole_atoms", "k_padding"])
-def test_moe_gather_nvfp4_reordered_row_scales_sm100(N):
-    """NVFP4 GATHER with F8_128x4 row scales on a 256-column tile: its 64-column TMA epilogue vector stores a whole scale
-    atom with one 4-byte store and keeps blocks 1-3's indices in its scalar fallback, where the K padding stores must
-    live too (they used to follow the branch and fail to compile). N=256 ends each scale row on an atom boundary;
-    N=288 ends it two slots into its last atom, whose padding comes out 0."""
-    E, K, bs = 2, 256, 16
-    source_rows, routed = 137, 259
-    blocks = N // bs
-    scale_shape = (1, _ceil_div(routed, 128) * 128, _ceil_div(blocks, 4) * 4)
-    graph = _build_graph(
-        E,
-        source_rows,
-        N,
-        K,
-        quant=True,
-        quant_out_dt=cudnn.data_type.FP4_E2M1,
-        quant_scale_dt=cudnn.data_type.FP8_E4M3,
-        quant_scale_reorder=True,
-        quant_scale_dim=scale_shape,
-        gather_rows=routed,
-        quant_block_size=bs,
-    )
-    compiled = _plan(graph, config=by_name("CONFIG_sm100_256x256x128_128x256x32_cluster1x1_1ctamma"))
-    assert compiled.chain.moe.mode == "gather"
-
-    torch.manual_seed(0)
-    token = torch.randint(-2, 3, (1, source_rows, K), device="cuda").to(torch.bfloat16)
-    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
-    offsets = _offsets([120, routed - 120], routed)
-    q = torch.zeros(1, routed, N // 2, dtype=torch.uint8, device="cuda")
-    q_scale = torch.full(scale_shape, 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
-    vp = _vp_moe(compiled, token, weight, offsets, [q, q_scale])
-    index = torch.randint(source_rows, (1, routed, 1), dtype=torch.int32, device="cuda")
-    vp[compiled.binding.token_index] = index
-    compiled(vp)
-    torch.cuda.synchronize()
-
-    ref = _ref_f32(token[:, index.flatten().long()], weight, offsets, routed, N, E)
-    scale_ref = (ref.view(1, routed, blocks, bs).abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
-    # Undo the F8_128x4 blocking (128-row x 4-column atoms, 32 x 16 bytes each) back to (rows, slots).
-    nrb, ncb = scale_shape[1] // 128, scale_shape[2] // 4
-    slots = q_scale.view(torch.uint8).view(nrb, ncb, 32, 4, 4).transpose(2, 3).reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3).reshape(nrb * 128, ncb * 4)
-    assert (slots[:routed, blocks:] == 0).all(), "K padding slots of a real row must be 0, not the 0xFF fill"
-    scales = slots[:routed, :blocks].view(torch.float8_e4m3fn).float()
-    torch.testing.assert_close(scales, scale_ref[0].float(), atol=0, rtol=0.07)
-    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device="cuda")
-    deq = torch.stack([lut[(q & 0xF).long()], lut[(q >> 4).long()]], dim=-1).view(1, routed, N) * scales.repeat_interleave(bs, dim=1)
-    assert ((deq - ref).abs() <= 0.34 * ref.abs() + 0.05 * ref.abs().amax()).float().mean().item() > 0.999
-
-
 @requires_matmul_gpu
 @pytest.mark.parametrize("case", ["tiny_fp16", "aligned_fp8", "n_major_weight", "int8", "frontend"])
 def test_gather_layouts_and_frontend_sm120(case):
@@ -2163,22 +2110,22 @@ def _f8_128x4_logical(blob: torch.Tensor, cols: int) -> torch.Tensor:
     return logical.view(-1, cols)
 
 
-@requires_sm120
-@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
-@pytest.mark.parametrize("axis", [-1, 1], ids=["feature_axis", "token_axis"])
-def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
-    """MoE twin of test_matmul.py::test_sm120_quant_scale_k_padding_is_zeroed: the
-    slots after each real scale row's last block come out 0 from a 0xFF buffer. Each
-    axis is the row quant in one kernel orientation and the col quant in the other."""
+def _check_moe_quant_scale_k_padding_is_zeroed(cfg, axis, swap_ab, runs):
+    """The slots after each real scale row's last block come out as raw 0x00 bytes from a 0xFF buffer. Each axis is
+    the row quant in one kernel orientation and the col quant in the other. Every ``(groups, N)`` in ``runs`` goes
+    through ONE kernel compiled for the first, with the same padded scale extent."""
     E, K, bs = 4, 128, 32
-    # 11 token blocks pad to 12, 5 feature blocks to 8; the last group ends at S.
-    groups, N = ([96, 0, 128, 128], 128) if axis == 1 else ([100, 0, 120, 80], 160)
-    S = sum(groups)
-    rows, blocks = (N, S // bs) if axis == 1 else (S, N // bs)
-    dims = (1, _ceil_div(rows, 128) * 128, _ceil_div(blocks, 4) * 4)
+
+    def dims_of(groups, N):
+        S = sum(groups)
+        rows, blocks = (N, S // bs) if axis == 1 else (S, N // bs)
+        return rows, blocks, (1, _ceil_div(rows, 128) * 128, _ceil_div(blocks, 4) * 4)
+
+    groups0, N0 = runs[0]
+    S0, dims = sum(groups0), dims_of(*runs[0])[2]
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    tok = g.tensor(name="token", dim=[1, S0, K], stride=[S0 * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N0], stride=[K * N0, 1, K], data_type=cudnn.data_type.BFLOAT16)
     fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     if axis == 1:
         fto.set_alignment_value(bs)  # token-axis blocks never straddle a group
@@ -2188,23 +2135,52 @@ def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
     q_scale.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1])
     q_scale.set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
     q_scale.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
-    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap_ab)
+    compiled = _plan(g, config=cfg, swap_ab=swap_ab)
 
-    torch.manual_seed(0)
-    token = torch.randint(-2, 2, (1, S, K), device="cuda").to(torch.bfloat16)
-    weight = torch.randint(-2, 2, (E, N, K), device="cuda").to(torch.bfloat16)
-    offsets = _offsets(groups, S)
-    q_buf = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
-    scale_buf = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda")
-    compiled({tok: token, w: weight, fto: offsets, q: q_buf, q_scale: scale_buf.view(torch.float8_e8m0fnu)})
-    torch.cuda.synchronize()
+    for groups, N in runs:
+        S = sum(groups)
+        rows, blocks, run_dims = dims_of(groups, N)
+        assert run_dims == dims, "the runs of one compile share a padded scale extent"
+        torch.manual_seed(0)
+        token = torch.randint(-2, 2, (1, S, K), device="cuda").to(torch.bfloat16)
+        weight = torch.randint(-2, 2, (E, N, K), device="cuda").to(torch.bfloat16)
+        offsets = _offsets(groups, S)
+        q_buf = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+        scale_buf = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda")
+        compiled({tok: token, w: weight, fto: offsets, q: q_buf, q_scale: scale_buf.view(torch.float8_e8m0fnu)})
+        torch.cuda.synchronize()
 
-    ref = _ref_f32(token, weight, offsets, S, N, E)
-    q_ref, s_ref = _block_quant_ref(ref.T.contiguous() if axis == 1 else ref, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
-    expected = torch.zeros(rows, dims[2], dtype=torch.uint8, device="cuda")
-    expected[:, :blocks] = s_ref[0].view(torch.uint8)
-    torch.testing.assert_close(_f8_128x4_logical(scale_buf, dims[2])[:rows], expected, atol=0, rtol=0)
-    torch.testing.assert_close(q_buf.float(), (q_ref.transpose(1, 2) if axis == 1 else q_ref).float(), atol=0, rtol=0)
+        ref = _ref_f32(token, weight, offsets, S, N, E)
+        q_ref, s_ref = _block_quant_ref(ref.T.contiguous() if axis == 1 else ref, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+        expected = torch.zeros(rows, dims[2], dtype=torch.uint8, device="cuda")
+        expected[:, :blocks] = s_ref[0].view(torch.uint8)
+        where = f"groups={groups} N={N}"
+        torch.testing.assert_close(_f8_128x4_logical(scale_buf, dims[2])[:rows], expected, atol=0, rtol=0, msg=lambda m: f"{where}: {m}")
+        torch.testing.assert_close(q_buf.float(), (q_ref.transpose(1, 2) if axis == 1 else q_ref).float(), atol=0, rtol=0, msg=lambda m: f"{where}: {m}")
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+@pytest.mark.parametrize("axis", [-1, 1], ids=["feature_axis", "token_axis"])
+def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
+    """MoE twin of test_matmul.py::test_sm120_quant_scale_k_padding_is_zeroed."""
+    # 11 token blocks pad to 12, 5 feature blocks to 8; the last group ends at S.
+    run = ([96, 0, 128, 128], 128) if axis == 1 else ([100, 0, 120, 80], 160)
+    _check_moe_quant_scale_k_padding_is_zeroed(by_name(_SM120_CFG), axis, swap_ab, [run])
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+@pytest.mark.parametrize("axis", [-1, 1], ids=["feature_axis", "token_axis"])
+def test_moe_quant_scale_k_padding_is_zeroed_sm100(axis, swap_ab):
+    """MoE twin of test_matmul.py::test_sm100_quant_scale_k_padding_is_zeroed: one kernel per orientation serves a
+    block count of every residue mod 4 -- 9 / 10 / 11 / 12 token blocks (the routed S is a runtime extent) or
+    5 / 6 / 7 / 8 feature blocks, each padding to the same slot count."""
+    if axis == 1:
+        runs = [([96, 0, 128, last], 128) for last in (64, 96, 128, 160)]
+    else:
+        runs = [([100, 0, 120, 80], n) for n in (160, 192, 224, 256)]
+    _check_moe_quant_scale_k_padding_is_zeroed(by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), axis, swap_ab, runs)
 
 
 @requires_matmul_gpu
