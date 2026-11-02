@@ -419,7 +419,7 @@ class DenseIndexerBackward2QGemmSm100:
         assert heads == 64, "the dense SM100 kernel is built for H=64 only"
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-        self.heads_padded = int(math.ceil(heads / 8) * 8)
+        self.heads_padded = 64
 
         # GEMM tilers (M, N, K) — same as 1Q
         self.gemm1_tiler = (self.heads_padded, self.block_I, self.head_dim_padded)
@@ -1229,19 +1229,18 @@ class DenseIndexerBackward2QGemmSm100:
         """Load warp: TMA Q_q0+Q_q1 once, TMA K per-block (2-stage), W for both Q tokens, GradSignal per-block (2-stage per Q token)."""
         lane_id = tidx % self.WARP_SIZE
 
-        # Load W for q0: sW_full[0..heads-1]
-        W_PER_THREAD = const_expr((self.heads + self.WARP_SIZE - 1) // self.WARP_SIZE)
+        # Load W for q0: sW_full[0..heads-1]. H64 is a whole number of warps,
+        # so every lane's index is in range.
+        W_PER_THREAD = const_expr(self.heads // self.WARP_SIZE)
         for wi in cutlass.range_constexpr(W_PER_THREAD):
             idx = wi * self.WARP_SIZE + lane_id
-            if idx < self.heads:
-                sW_full[idx] = mW_b[q0_local, idx]
+            sW_full[idx] = mW_b[q0_local, idx]
 
         # Load W for q1: sW_full[heads..2*heads-1] (guarded)
         if has_q1:
             for wi in cutlass.range_constexpr(W_PER_THREAD):
                 idx = wi * self.WARP_SIZE + lane_id
-                if idx < self.heads:
-                    sW_full[self.heads + idx] = mW_b[q1_local, idx]
+                sW_full[self.heads + idx] = mW_b[q1_local, idx]
 
         cute.arch.fence_view_async_shared()
         # Every load-warp lane publishes its own sW stores.
@@ -1526,9 +1525,7 @@ class DenseIndexerBackward2QGemmSm100:
         w_reg_h1: Float32,
     ):
         """Compute dS and accumulate dW for one block using grad_signal from sGS."""
-        use_stmatrix_ds = const_expr(
-            self.heads_padded == 64 and self.block_I == 128,
-        )
+        use_stmatrix_ds = const_expr(self.block_I == 128)
         for ei in cutlass.range(0, cute.size(tSrS), 2, unroll_full=True):
             if const_expr(use_stmatrix_ds):
                 h0 = cute.get(tCcS[ei], mode=[0])
@@ -1625,12 +1622,10 @@ class DenseIndexerBackward2QGemmSm100:
             Float32,
         )
 
-        # The production H64 x I128 tile has the same 16dp256b8x ownership as
-        # the sparse kernel. Derive STMatrix R2S ownership directly from the
-        # TMEM load; other factory shapes retain native coordinate stores.
-        use_stmatrix_ds = const_expr(
-            self.heads_padded == 64 and self.block_I == 128,
-        )
+        # The I128 tile has the same 16dp256b8x ownership as the sparse kernel.
+        # Derive STMatrix R2S ownership directly from the TMEM load; block_I=64
+        # retains native coordinate stores.
+        use_stmatrix_ds = const_expr(self.block_I == 128)
         if const_expr(use_stmatrix_ds):
             tStS_epi = tStS[((None, None), 0, 0)]
             tiled_tmem_load_s = tcgen05.make_tmem_copy(
@@ -1685,10 +1680,9 @@ class DenseIndexerBackward2QGemmSm100:
                     my_second_h = h_check
         tSrS_shape = tCcS.shape
 
-        # dQ uses the same canonical 2-D ownership for H64 x D128.
-        use_stmatrix_dq = const_expr(
-            self.heads_padded == 64 and self.head_dim_padded == 128,
-        )
+        # dQ uses the same canonical 2-D ownership for D128; D64 retains
+        # native coordinate stores.
+        use_stmatrix_dq = const_expr(self.head_dim_padded == 128)
         if const_expr(use_stmatrix_dq):
             tDqDq_0_load_view = tDqDq_0[((None, None), 0, 0)]
             tDqDq_1_load_view = tDqDq_1[((None, None), 0, 0)]
@@ -1733,13 +1727,14 @@ class DenseIndexerBackward2QGemmSm100:
         # Wait for W loaded
         cute.arch.mbarrier_wait(mbar + MBAR_2Q_W_LOADED, Int32(0))
 
-        w_q0_h0 = Float32(sW_full[my_first_h]) if my_first_h < self.heads else Float32(0.0)
-        w_q0_h1 = Float32(sW_full[my_second_h]) if my_second_h < self.heads else Float32(0.0)
+        # The M64 tile has no padded heads, so both owned heads are real.
+        w_q0_h0 = Float32(sW_full[my_first_h])
+        w_q0_h1 = Float32(sW_full[my_second_h])
         w_q1_h0 = Float32(0.0)
         w_q1_h1 = Float32(0.0)
         if has_q1:
-            w_q1_h0 = Float32(sW_full[self.heads + my_first_h]) if my_first_h < self.heads else Float32(0.0)
-            w_q1_h1 = Float32(sW_full[self.heads + my_second_h]) if my_second_h < self.heads else Float32(0.0)
+            w_q1_h0 = Float32(sW_full[self.heads + my_first_h])
+            w_q1_h1 = Float32(sW_full[self.heads + my_second_h])
 
         s_full_phase = Int32(0)
         gs_0_phase = Int32(0)
