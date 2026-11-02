@@ -50,6 +50,15 @@ from block_sparse_attention.cutedsl.bsa_utils import make_fixed_metadata, make_v
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
+def _disable_tf32_matmul(request):
+    """Turn off TF32 torch matmuls for the reference and restore the flag at teardown. monkeypatch.setattr cannot
+    do this since pytest 9.2: torch.backends.cuda.matmul serves allow_tf32 through __getattr__/__setattr__, so
+    monkeypatch finds no instance value to restore and its teardown deletes the attribute, raising AttributeError."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    request.addfinalizer(lambda: setattr(torch.backends.cuda.matmul, "allow_tf32", previous))
+
+
 @pytest.mark.L0
 def test_sm120_fa4_blk128_rejects_old_dsl_before_kernel_import(monkeypatch):
     """Reject an unsupported installed DSL before importing the FA4 kernel."""
@@ -540,11 +549,11 @@ def test_bsa_attention_forward_sm90_blk64_large_logits_max_rises(dtype, q_value,
 @pytest.mark.L0
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @torch_fork_set_rng(seed=5)
-def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype, monkeypatch):
+def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype, request):
     """Even query rows see equal ~1e10 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
     holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
     # A TF32 reference is off by ~7e4 on the even-row LSE (~5.7e8), past the 1e3 bound; the kernel is within ~10.
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    _disable_tf32_matmul(request)
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -771,7 +780,7 @@ def test_bsa_attention_forward_sm100_blk64():
 @pytest.mark.parametrize("variable_counts", (False, True), ids=("fixed", "variable_with_empty"))
 @pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
 @torch_fork_set_rng(seed=4593)
-def test_bsa_attention_forward_sm100_blk64_persistent_query_replay(use_clc, layout, variable_counts, with_block_sizes, monkeypatch):
+def test_bsa_attention_forward_sm100_blk64_persistent_query_replay(use_clc, layout, variable_counts, with_block_sizes, request):
     """Multiple persistent waves exercise KV-ring rotation, empty queries and changed-input replay.
 
     Repeat distinct query tiles to bound the independent dense reference while
@@ -781,7 +790,7 @@ def test_bsa_attention_forward_sm100_blk64_persistent_query_replay(use_clc, layo
     """
     if torch.cuda.get_device_capability()[0] not in {10, 11}:
         pytest.skip("persistent blk64 forward requires SM100/SM110")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    _disable_tf32_matmul(request)
     ops = _import_bsa()
     batch, heads, pattern_tiles, capacity = 2, 4, 9, 32
     copies = max(2, math.ceil(4 * torch.cuda.get_device_properties(0).multi_processor_count / (batch * heads * pattern_tiles)))
