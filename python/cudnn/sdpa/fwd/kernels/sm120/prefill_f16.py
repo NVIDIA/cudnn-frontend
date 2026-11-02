@@ -86,7 +86,12 @@ from cudnn.sdpa.fwd.config_sm120 import (
     validate_params,
 )
 
-from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, bias_host as _host_bias, compile_host as _compile_prepared_host
+from cudnn.sdpa.fwd.kernels.sm120 import prepared_host as _prepared_host
+
+# Module exports inspected dynamically by prepared._positional_order.
+_host = _prepared_host.host
+_host_bias = _prepared_host.bias_host
+_compile_prepared_host = _prepared_host.compile_host
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
