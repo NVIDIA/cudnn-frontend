@@ -5785,6 +5785,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, compiled at plan time with runtime token totals.
 
+    Exact FP16/BF16 D128 additionally accepts dense queries over independent
+    HND/NHD K/V page pools, with independent block tables and device KV lengths.
+    This native paged leg is unsplit and uses the 64/128-row prefill tiles;
+    it retains equal K/V page capacities and the shared page-size domain.
+
     Half and per-tensor FP8 THD and zero-copy dense plans use a
     prepared pointer entry: pointers, sequence lengths and Int64 strides bind
     at execute without tensor reconstruction. Head geometry and scheduler
@@ -5833,7 +5838,30 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.pv_bf16,
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
         )
-        self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
+        if self.paged:
+            self._not_implemented_error_if(self.thd or self.split_kv != 1, "SM120 paged KV requires dense Q and split_kv=1")
+            self._not_implemented_error_if(
+                self.q_desc.ndim != 4
+                or self.v_desc.ndim != 4
+                or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
+                or (self.q_desc.shape[3], self.v_desc.shape[3]) != (128, 128),
+                "SM120 paged KV requires exact D_QK=D_V=128 and FP16/BF16",
+            )
+            self._not_implemented_error_if(self.tile_m in _SM120_DECODE_Q_TILES, "SM120 paged KV requires a prefill tile (tile_m=64 or 128)")
+            self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
+            self._value_error_if(
+                self.paged_max_seq_len_kv is None or not 0 < self.paged_max_seq_len_kv < 2**31,
+                "SM120 paged KV requires a positive int32 paged_max_seq_len_kv",
+            )
+            p = self.paged_page_size
+            self._not_implemented_error_if(
+                p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0),
+                "SM120 paged KV requires a page size divisible by 8 that divides 128 or is a multiple of 128",
+            )
+            self._not_implemented_error_if(
+                any(desc is not None for desc in (self.bias_desc, self.kv_mask_desc, self.score_max_desc, self.score_sum_exp_desc)),
+                "SM120 paged KV does not serve bias, kv_mask or score side outputs",
+            )
         self._not_implemented_error_if(self.gate_desc is not None, "epilogue gate fusion is served by the SM107 d256 SDPA engines only")
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
@@ -5881,8 +5909,18 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         b, h_q, s_q, d_q = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         d_v = self.v_desc.shape[3]
-        self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_q), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        if self.paged:
+            self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_q), name="K")
+            self._check_tensor_shape(self.v_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_v), name="V")
+            from cudnn.sdpa.fwd.prepared import _paged_pool_layout
+
+            for desc in (self.k_desc, self.v_desc):
+                strides = self._paged_pool_stride(desc)
+                _paged_pool_layout(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize, strides[1] < strides[2], h_kv, self.paged_page_size, 128)
+            s_kv = int(self.paged_max_seq_len_kv)
+        else:
+            self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_q), name="K")
+            self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
@@ -6213,6 +6251,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
             negate_scores=self._score_negated,
+            page_size=self.paged_page_size,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
@@ -6283,8 +6322,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sf_k: Optional[torch.Tensor] = None,
         sf_v: Optional[torch.Tensor] = None,
         sf_o: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization.
+
+        ``block_table`` / ``block_table_v``: paged plans bind int32
+        ``(B, max_pages)`` tables (rank-4 graph carriers are accepted too).
+        The V table defaults to the K table; each pool retains its own layout.
 
         ``sf_o``: the block-scaled O scale-factor buffer (FP8 or MXFP8 with
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
@@ -6317,6 +6362,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             not self.has_sink and sinks is not None,
             "this specialization was compiled without sink support; construct the API with has_sink=True",
         )
+        self._value_error_if(not self.paged and (block_table is not None or block_table_v is not None), "page tables require a paged plan")
+        if self.paged:
+            self._value_error_if(block_table is None, "paged KV requires block_table")
+            block_table_v = block_table if block_table_v is None else block_table_v
         self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
         self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
@@ -6383,7 +6432,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 _ensure_current_context(stream_int, q_tensor.device.index)
                 execute_native_dense_tensors(
                     self._dense_spec,
-                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
+                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, block_table, block_table_v, None),
                     current_stream,
                     scale_softmax_log2,
                     ws_ptr,
@@ -6472,7 +6521,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         return n
 
     def _can_prepare_layout(self):
-        operands = (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
+        operands = (self.q_desc,) + (() if self.paged else (self.k_desc, self.v_desc)) + (() if self.split_kv > 1 else (self.o_desc,))
         return self.thd or all(self._prepared_operand_layout(desc) is not None for desc in operands)
 
     def _can_prepare_fp8(self):

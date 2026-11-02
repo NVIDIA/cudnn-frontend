@@ -293,6 +293,8 @@ class TemplateParams:
     # attn_scale < 0: the kernel negates Q as it loads it and runs at |attn_scale|, so the raw-score row max still
     # bounds P (#1435). APPEND-ONLY, default False.
     negate_scores: bool = False
+    # Native exact-D128 dense-query page loads; zero retains the dense ABI.
+    page_size: int = 0
 
 
 def validate_params(
@@ -301,6 +303,7 @@ def validate_params(
     allowed_o_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allow_right_band: bool = True,
     decode_tile: bool = False,
+    allow_paged: bool = False,
 ) -> None:
     """Validate the SM120 template specialization.
 
@@ -315,6 +318,16 @@ def validate_params(
     ``DECODE_Q_TILES`` at its stage-width KV tile; every other template is
     built for the ``SEQ_Q_TILES``.
     """
+
+    if params.page_size:
+        if not allow_paged:
+            raise NotImplementedError("SM120 paged KV is served by the exact D128 half prefill template only")
+        if params.page_size % 8 or params.page_size < 8:
+            raise ValueError("SM120 paged KV requires a positive page size divisible by 8")
+        if params.thd_varlen or params.split_kv != 1 or decode_tile:
+            raise NotImplementedError("SM120 paged KV serves dense queries with unsplit prefill tiles only")
+        if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+            raise NotImplementedError("SM120 paged KV serves FP16/BF16 only")
 
     if params.dtype_qkv not in allowed_dtypes:
         raise ValueError(f"SM120 SDPA: dtype_qkv must be one of {allowed_dtypes}; got {params.dtype_qkv}")
