@@ -301,18 +301,18 @@ def test_analyzer_leaky_relu_mainloop_keeps_attribute_gate(side, op, attrs, unsu
 
 
 @pytest.mark.parametrize("side", ["a", "b"])
-def test_analyzer_mainloop_gen_index_diagnostic(side) -> None:
+def test_analyzer_mainloop_gen_index_axis(side) -> None:
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     M = N = K = 128
     A = graph.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = graph.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     value = graph.gen_index(input=A if side == "a" else B, axis=2, name="index")
     graph.matmul(A=value if side == "a" else A, B=value if side == "b" else B).set_output(True)
-    with pytest.raises(ValueError) as exc:
-        analyze(graph)
-    assert str(exc.value) == (
-        f"matmul {side.upper()} operand producer 'index': gen_index is unsupported " "in mainloop fusion (requires logical operand coordinates)"
-    )
+    from cudnn.gemm.frost.fusion_ir import Axis
+
+    chain = analyze(graph)
+    ops = chain.mainloop_a_ops if side == "a" else chain.mainloop_b_ops
+    assert ops[0].index_expr.axes == {Axis.K if side == "a" else Axis.N}
 
 
 @pytest.mark.parametrize("slope", [float("nan"), float("inf"), -float("inf")])

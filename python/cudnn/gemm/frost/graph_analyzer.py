@@ -28,6 +28,7 @@ from .fusion_ir import (
     FusionOp,
     Axis,
     IndexExpr,
+    IndexMap,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -1579,7 +1580,8 @@ def _lower_matrix_indices(
 
     This handles the plain pointwise/GEMM scope only: epilogue structural views
     and reductions are excluded by the caller. Prepared batch extents are fixed,
-    while GEMM descendants retain live M/N even when prepared at extent one.
+    while operands and GEMM descendants retain live matrix coordinates even
+    when prepared at extent one.
     """
 
     @lru_cache(maxsize=None)
@@ -1589,21 +1591,50 @@ def _lower_matrix_indices(
         producer = producers.get(tid)
         return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
 
+    operand_nodes = set()
+
+    def collect_operands(tid):
+        if tid in operand_nodes:
+            return
+        operand_nodes.add(tid)
+        producer = producers.get(tid)
+        if producer is not None:
+            for source in producer.inputs:
+                collect_operands(source)
+
+    for source in producers[matmul_output].inputs:
+        collect_operands(source)
     lowered = []
     for op in ops:
-        if op.cudnn_name == "gen_index":
+        if op.cudnn_name == "gen_index" and op.index_expr is None:
             source = op.inputs[0]
             dim = ranked_shapes[source]
-            expr = matrix_axis_index(dim, dict(op.op_attrs).get("axis"))
+            axis = dict(op.op_attrs).get("axis")
+            expr = matrix_axis_index(dim, axis)
             # Consumer matrix coordinates -> singleton producer coordinates.
             # Auxiliary-only branches keep their unit extents when broadcast;
             # compose before codegen/dtype rounding, not as a kernel fixup.
-            broadcast = {a: IndexExpr.constant(0) for a, extent in zip((Axis.M, Axis.N), dim[-2:]) if extent == 1}
-            if broadcast and not follows_matmul_shape(source):
-                expr = expr.substitute(broadcast)
+            if op.output not in operand_nodes and not follows_matmul_shape(source):
+                coordinates = tuple(matrix_axis_index(dim, i) for i in range(len(dim)))
+                expr = IndexMap.broadcast(dim, dim).apply(coordinates)[index(axis)]
             op = replace(op, index_expr=expr)
         lowered.append(op)
     return lowered
+
+
+def _operand_index_expression(shape, steps, axis):
+    """Compose consumer-to-producer views, then bind folded matrix coordinates."""
+    mapping = IndexMap.identity(shape)
+    for step in steps:
+        view = (
+            IndexMap.reshape(mapping.consumer_shape, step.argument) if step.kind == "reshape" else IndexMap.permutation(mapping.consumer_shape, step.argument)
+        )
+        mapping = mapping.compose(view)
+    axis = index(axis)
+    if not 0 <= axis < len(mapping.producer_shape):
+        raise ValueError("gen_index requires a valid logical producer axis")
+    coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
+    return mapping.apply(coordinates)[axis]
 
 
 def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
@@ -1732,13 +1763,12 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         reshaped = any(step.kind == "reshape" for step in steps)
         primary = next((i for i in op.inputs if not all(d == 1 for d in shape(i))), op.inputs[0])
         if reshaped:
-            if op.cudnn_name == "gen_index":
-                raise ValueError("reshape operand producer 'gen_index' is unsupported")
             if any(not all(d == 1 for d in shape(i)) and shape(i) != shape(primary) for i in op.inputs):
                 raise ValueError("reshape fusion supports equal-shaped pointwise operands or scalar auxiliaries, not partial broadcasts")
         inputs = [i if reshaped and i != primary and all(d == 1 for d in shape(i)) else project(i, steps) for i in op.inputs]
         output = alias(tid, steps, meta[inputs[op.inputs.index(primary)]])
-        projected_ops.append(replace(op, inputs=inputs, output=output))
+        expr = _operand_index_expression(shape(tid), steps, dict(op.op_attrs).get("axis")) if op.cudnn_name == "gen_index" else op.index_expr
+        projected_ops.append(replace(op, inputs=inputs, output=output, index_expr=expr))
         return output
 
     if structural:
@@ -1823,7 +1853,7 @@ def _walk_mainloop_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk operand pointwise ops to a graph input (scalar aux, or per-K multiply on either operand)."""
+    """Lower one same-carrier operand DAG, including indices and scalar/per-K auxiliaries."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
@@ -1855,25 +1885,38 @@ def _walk_mainloop_chain(
         expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
         return m.dim == expected and source_dim[3 - k_axis] != 1
 
-    # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
-    steps: list[tuple] = []
-    cur = operand_id
-    while cur in op_by_output:
-        producer = op_by_output[cur]
+    fops: list[FusionOp] = []
+
+    @lru_cache(maxsize=None)
+    def index_branch(tid):
+        producer = op_by_output.get(tid)
+        if producer is None:
+            return False
+        return producer.cudnn_name == "gen_index" or (producer.cudnn_name in _UNARY_OP_MAP and index_branch(producer.inputs[0]))
+
+    @lru_cache(maxsize=None)
+    def visit(tid):
+        producer = op_by_output.get(tid)
+        if producer is None:
+            return tid, -1
+        if _is_output(meta, tid):
+            raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: materialized intermediate outputs cannot be absorbed")
+        allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
         if producer.cudnn_name == "gen_index":
-            raise ValueError(
-                f"matmul {label} operand producer {producer.op_name!r}: gen_index is unsupported in mainloop fusion (requires logical operand coordinates)"
-            )
-        if producer.cudnn_name in _UNARY_OP_MAP or producer.cudnn_name in _BINARY_OP_MAP:
-            allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
-            for key, value in producer.op_attrs:
-                if key not in allowed_attrs:
-                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
-                if not isfinite(value):
-                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+            allowed_attrs = frozenset(("axis",))
+        for key, value in producer.op_attrs:
+            if key not in allowed_attrs:
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
+            if not isfinite(value):
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+        expr = producer.index_expr
         if producer.cudnn_name in _UNARY_OP_MAP:
-            steps.append((producer.cudnn_name, False, None, True, producer))
-            (cur,) = producer.inputs
+            root, parent = visit(producer.inputs[0])
+            if producer.cudnn_name == "gen_index":
+                if expr is None:
+                    raise ValueError(f"matmul {label} gen_index requires normalized logical operand coordinates")
+                expr = expr.substitute({Axis.N if label == "A" else Axis.M: IndexExpr.coordinate(Axis.K)})
+            fop = FusionOp(op=_UNARY_OP_MAP[producer.cudnn_name], parent_idx=parent, index_expr=expr)
         elif producer.cudnn_name in _BINARY_OP_MAP:
             i0, i1 = producer.inputs
             s0, s1 = _is_scalar_input(i0), _is_scalar_input(i1)
@@ -1885,58 +1928,52 @@ def _walk_mainloop_chain(
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif producer.cudnn_name == "mul" and _is_per_k_input(i1, i0):
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif index_branch(i0) or index_branch(i1):
+                root, parent = visit(i0)
+                other_root, other = visit(i1)
+                if root != other_root:
+                    raise ValueError("mainloop index fan-in requires the same storage carrier on both branches")
+                fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], parent_idx=parent, parent_idx_b=other)
+                aux_id = None
             else:
                 raise ValueError(
-                    f"matmul {label} operand is produced by binary op "
-                    f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
-                    "fusion supports a binary op with exactly one SCALAR graph-input aux "
-                    "(e.g. A * alpha), or mul with an A-side [1,1,K] or B-side [1,K,1] scale"
+                    f"matmul {label} operand is produced by binary op {producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
+                    "fusion supports a binary op with exactly one SCALAR graph-input aux, per-K mul, or a same-carrier gen_index branch"
                 )
-            aux_meta = meta[aux_id]
-            if aux_id not in aux_seen:
-                aux_seen.add(aux_id)
-                scalar_aux = _is_scalar_input(aux_id)
-                aux_tensors.append(
-                    TensorRef(
-                        name=aux_meta.name,
-                        dim=aux_meta.dim,
-                        stride=aux_meta.stride,
-                        dtype=aux_meta.dtype,
-                        bcast_mode="scalar" if scalar_aux else "per_k",
-                        reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
+            if aux_id is not None:
+                root, parent = visit(chain_id)
+                aux_meta = meta[aux_id]
+                if aux_id not in aux_seen:
+                    aux_seen.add(aux_id)
+                    scalar_aux = _is_scalar_input(aux_id)
+                    aux_tensors.append(
+                        TensorRef(
+                            name=aux_meta.name,
+                            dim=aux_meta.dim,
+                            stride=aux_meta.stride,
+                            dtype=aux_meta.dtype,
+                            bcast_mode="scalar" if scalar_aux else "per_k",
+                            reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
+                        )
                     )
-                )
-                aux_objs.append(aux_meta.tensor)
-            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs, producer))
-            cur = chain_id
+                    aux_objs.append(aux_meta.tensor)
+                fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], aux=aux_meta.name, aux_on_rhs=aux_on_rhs, parent_idx=parent)
         else:
             raise ValueError(
-                f"matmul {label} operand is produced by op {producer.op_name!r} "
-                f"({producer.cudnn_name!r}) which is not a pointwise op — mainloop "
-                "fusion supports unary ops, scalar-aux binary ops and per-K mul"
+                f"matmul {label} operand is produced by op {producer.op_name!r} ({producer.cudnn_name!r}) which is not a pointwise op — mainloop fusion supports unary ops, scalar-aux binary ops and per-K mul"
             )
-    steps.reverse()
-    fops: list[FusionOp] = []
-    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs, producer) in enumerate(steps):
-        parent = idx - 1 if idx > 0 else -1
-        if is_binary:
-            fops.append(
-                FusionOp(
-                    op=_BINARY_OP_MAP[cudnn_name],
-                    aux=aux_name,
-                    aux_on_rhs=aux_on_rhs,
-                    parent_idx=parent,
-                )
+        fops.append(
+            replace(
+                fop,
+                attrs=producer.op_attrs,
+                compute_dtype=producer.compute_dtype or compute_dtype,
+                out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
             )
-        else:
-            fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
-        fops[-1] = replace(
-            fops[-1],
-            attrs=producer.op_attrs,
-            compute_dtype=producer.compute_dtype or compute_dtype,
-            out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
         )
-    return cur, fops
+        return root, len(fops) - 1
+
+    root, _ = visit(operand_id)
+    return root, fops
 
 
 def _build_multi_gemm_chain(

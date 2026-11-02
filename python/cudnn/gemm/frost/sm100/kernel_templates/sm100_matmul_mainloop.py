@@ -1086,9 +1086,18 @@ def _kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_ml = cutlass.Int32(0)
+        if cutlass.const_expr(mainloop_has_index):
+            tile_m, tile_n, tile_l = init_tile_m, init_tile_n, init_tile_l
         if cutlass.const_expr(split_k_slices > 1):
             tile_l = bidz  # this tile's z coord
         while is_valid != 0:
+            if cutlass.const_expr(mainloop_has_index):
+                ml_coord_m = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+                if cutlass.const_expr(cta_group == 1):
+                    ml_coord_n = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
+                else:
+                    ml_coord_n = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
+                ml_batch = tile_l // split_k_slices
             if cutlass.const_expr(split_k_slices > 1):
                 split_idx = cutlass.Int64(tile_l % split_k_slices)
                 k_tiles_per_split = num_k_tiles // split_k_slices
@@ -1272,6 +1281,19 @@ def _kernel(
             _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             cute.arch.fence_proxy("async.shared", space="cta")
             is_valid = vld
+            if cutlass.const_expr(mainloop_has_index):
+                ml_raw_m = _m_idx >> _preferred_cluster_m_shift
+                ml_raw_n = _n_idx >> _preferred_cluster_n_shift
+                ml_nt_m = gridx >> _preferred_cluster_m_shift
+                ml_nt_n = gridy >> _preferred_cluster_n_shift
+                if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+                    if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                        ml_raw_m = _m_idx >> _fallback_cluster_m_shift
+                        ml_raw_n = _n_idx >> _fallback_cluster_n_shift
+                        ml_nt_m = gridx >> _fallback_cluster_m_shift
+                        ml_nt_n = gridy >> _fallback_cluster_n_shift
+                tile_m, tile_n = _l2_swizzle_tile(ml_raw_m, ml_raw_n, ml_nt_m, ml_nt_n, swizzle_w, identity=tile_swizzle_n == 1)
+                tile_l = _l_idx
             if cutlass.const_expr(split_k_slices > 1):
                 tile_l = _l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)

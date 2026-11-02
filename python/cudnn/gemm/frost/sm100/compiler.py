@@ -695,6 +695,7 @@ def _render_tile_constants(
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
+        lines.append(f"mainloop_has_index = {any(op.index_expr is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}")
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
