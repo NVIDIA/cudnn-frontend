@@ -2709,6 +2709,13 @@ def _splitk_workspace_bytes(chain: FusionChain, config: TileConfig) -> int:
     return align_up(config.split_k_slices * chain.matmul.batch * chain.matmul.M * chain.matmul.N * 4)
 
 
+def _splitk_reduction_drifts(red) -> bool:
+    """Whether ``red`` is an fp32 sum over all of M and N, which the split-K reducer adds with one same-address atomic
+    per output vector, so its rounding drifts with the vector count (constant-input AVG 2.8% low at 3000x3000x1024
+    split 2, 8.6% low at 8192x7168x1024); max / min / amax and int32 sums are exact under atomics."""
+    return red.dim[1] == 1 and red.dim[2] == 1 and red.mode in ("add", "avg", "norm1", "norm2") and red.compute_dtype == "fp32"
+
+
 def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None" = None) -> TileConfig:
     """Layer split-K onto the selected config when the output grid underfills the GPU and K is deep."""
     if config.split_k_slices != 1:
@@ -3014,6 +3021,10 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
         reasons.append("packed fp4 output")
     if chain.matmul.accum_dtype != "fp32":
         reasons.append(f"{chain.matmul.accum_dtype} accumulation (fp32 partials only)")
+    # The automatic pick and every explicit path (a config, a replayed SPLIT_K_SLC knob) share this numerics gate.
+    drifting = sorted({red.mode for red in chain.reductions if _splitk_reduction_drifts(red)})
+    if drifting:
+        reasons.append(f"fp32 {'/'.join(drifting)} reduction over all of M and N (the reducer adds it with one same-address atomic per vector, which drifts)")
     if chain.matmul.batch * config.split_k_slices > 65535:
         reasons.append(f"grid.z={chain.matmul.batch * config.split_k_slices} exceeds CUDA's 65535 limit")
     if config.split_k_slices > 32:

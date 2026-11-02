@@ -4412,15 +4412,15 @@ def _splitk_tile_reduction_graph(batch, mode):
     return g
 
 
-@requires_sm120
+@requires_matmul_gpu
 @pytest.mark.parametrize("batch", (1, 2), ids=("scalar", "per_batch"))
 @pytest.mark.parametrize("mode", ("ADD", "AVG", "NORM1"))
 def test_splitk_declines_tile_invariant_fp32_sum(monkeypatch, mode, batch):
     """An explicit split-K config declines an fp32 sum over all of M and N, as the automatic pick does.
 
     The reducer adds such a sum with one same-address atomic per output vector, so its rounding drifts
-    with the vector count: a constant-input AVG at 3000x3000x1024 came back 2.8% low at split 2 (1.5e-5
-    unsplit). AMAX is exact under atomics and keeps the explicit split."""
+    with the vector count: a constant-input AVG at 3000x3000x1024 came back 2.8% low at split 2 on both
+    families (SM120 1.5e-5 unsplit). AMAX is exact under atomics and keeps the explicit split."""
     from dataclasses import replace
 
     from cudnn.gemm.frost import compiler
