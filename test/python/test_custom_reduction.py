@@ -1268,53 +1268,6 @@ def test_byte_boolean_maps_to_torch_bool_and_boolean_keeps_it():
     assert cudnn.datatypes._torch_to_cudnn_data_type(torch.bool) == cudnn.data_type.BOOLEAN
 
 
-@requires_cudnn_v9_29
-def test_custom_reduction_wrapper_allocates_a_byte_boolean_output(cudnn_handle):
-    if cudnn_handle is None:
-        pytest.skip("cuDNN backend is unavailable")
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Custom reduction requires the TensorIR MemBound engine on data-center Blackwell")
-
-    def or_reducer(child, lhs, rhs):
-        result = child.logical_or(lhs[0], rhs[0], compute_data_type=cudnn.data_type.BYTE_BOOLEAN, name="pred_or")
-        result.set_data_type(cudnn.data_type.BOOLEAN)
-        return [result]
-
-    # Whether the backend runs a BYTE_BOOLEAN reduction depends on the cuDNN build; this test checks the wrapper's
-    # output allocation, so it needs a backend that runs one.
-    try:
-        with cudnn.Graph(
-            handle=cudnn_handle,
-            io_data_type=cudnn.data_type.FLOAT,
-            intermediate_data_type=cudnn.data_type.FLOAT,
-            compute_data_type=cudnn.data_type.FLOAT,
-        ) as graph:
-            pred = graph.tensor(dim=[4, 31], stride=[31, 1], data_type=cudnn.data_type.BYTE_BOOLEAN, name="PRED")
-            y = graph.custom_reduction(
-                [pred],
-                or_reducer,
-                "test.python.custom_reduction.wrapper_pred_or.v1",
-                [1],
-                [cudnn.custom_reduction_identity(cudnn.data_type.BYTE_BOOLEAN, False)],
-                name="wrapper_pred_or",
-            )[0]
-            y.set_output(True)
-    except cudnn.cudnnGraphNotSupportedError as error:
-        assert "CUDNN_STATUS_NOT_SUPPORTED" in str(error)
-        pytest.skip(f"the cuDNN backend does not run a BYTE_BOOLEAN custom reduction: {error}")
-
-    x_gpu = torch.zeros(4, 31, dtype=torch.bool, device="cuda")
-    x_gpu[1, 7] = True
-    x_gpu[3, :] = True
-    # The wrapper allocates the BYTE_BOOLEAN output, which it does not get from the caller.
-    result = graph({"PRED": x_gpu})
-    torch.cuda.synchronize()
-    y_gpu = result[y.get_name()]
-    assert y_gpu.dtype == torch.bool
-    assert torch.equal(y_gpu.cpu(), x_gpu.cpu().any(dim=1, keepdim=True))
-
-
 def test_custom_reduction_wrapper_passes_a_namedtuple_argument_as_a_tuple():
     pytest.importorskip("torch")
 

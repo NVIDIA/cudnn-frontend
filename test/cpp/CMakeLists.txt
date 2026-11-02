@@ -26,6 +26,7 @@ add_executable(
     custom_reduction.cpp
     custom_reduction_backend.cpp
     custom_reduction_boundary.cpp
+    custom_reduction_xla_hlo.cpp
     pointwise_tests.cpp
     plans.cpp
     serialize.cpp
