@@ -41,6 +41,13 @@ One linear-attention node per graph.
 | backward outputs | `dQ, dK, dV, dG, dBeta, d_initial_state` (+ `d_a_log`, `d_dt_bias` under `safe_gate`) | same | same plus `dW` | same as GDN | `dQ (dC), dK (dB), dV (dx), dG (ddt), dA, d_initial_state, d_dt_bias, dD, dZ` |
 | summaries (context parallelism) | `<op>_summary(k, v, g, beta, cu_seqlens[, initial_state])` gives `final_state` + `transition` `[N, HO, K, K]` fp32; `<op>_summary_bwd` gives `d_initial_state` + `transition` | same | same | same | `mamba2_summary(x, dt, A, B, cu_seqlens[, initial_state, dt_bias])`; `transition` `[N, H]` fp32, the log2 of the span's decay product |
 
+For distributed KDA integrations, the explicit Kimi CP state merge
+([docs](/operations/LinearAttention/kimi_cp_merge),
+[GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/linear_attention/kimi_cp_merge.md))
+combines caller-gathered FP32 affine summaries with IEEE FP32 arithmetic. It
+leaves summary generation, communication, overlap, and autograd orchestration
+to the downstream framework.
+
 `T` is the total token count of the packed batch, `N` the number of sequences. Dtypes are kernel-native and strict:
 callers convert, and every gradient comes back in its input's dtype. `cu_seqlens` is int32 or int64.
 

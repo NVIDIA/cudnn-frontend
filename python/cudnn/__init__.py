@@ -404,6 +404,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "gated_attention_block_backward": (".gated_attention_block", "gated_attention_block_backward"),
     "GatedAttentionBlockFwd": (".gated_attention_block", "GatedAttentionBlockFwd"),
     "GatedAttentionBlockBwd": (".gated_attention_block", "GatedAttentionBlockBwd"),
+    "KimiCPMerge": (".linear_attention", "KimiCPMerge"),
+    "kimi_cp_merge": (".linear_attention", "kimi_cp_merge"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
