@@ -8,9 +8,9 @@
 (128 everywhere for the dense Q of the base path).  Forward output rows and
 backward gradient rows that fall on padding are zero.
 
-``sparse_block_size`` is 128 or 64.  The blk64 layout is forward only: it holds
-just the M64 x N256 page walks, one Q block per tile, and its Q rows are all
-valid.
+``sparse_block_size`` is 128 or 64.  The blk64 layout is forward only and its Q
+rows are all valid: on SM100/SM103 it holds the M64 x N256 page walks, one Q
+block per tile; on SM90 the walks of Q block pairs (2p, 2p + 1).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import torch
 from torch import Tensor
 
 from cudnn.block_sparse_attention.csrc.utils.kpage_utils import BLOCK
-from ._build import Blk64ForwardTables, WalkTables, build_walk_tables, build_walk_tables_blk64
+from ._build import Blk64ForwardTables, Blk64PairForwardTables, WalkTables, build_pair_walk_tables_blk64, build_walk_tables, build_walk_tables_blk64
 
 __all__ = ["KPageLayout", "prepare_layout"]
 
@@ -46,7 +46,8 @@ class KPageLayout:
     _q_sizes: Tensor  # [nQ] int32
     _kv_sizes: Tensor  # [nKV] int32
     _tables: Optional[WalkTables]  # None for sparse_block_size == 64
-    _blk64_tables: Blk64ForwardTables
+    _blk64_tables: Optional[Blk64ForwardTables]  # None on SM90
+    _pair_tables: Optional[Blk64PairForwardTables]  # SM90 blk64 only
     _has_partial_q: Optional[bool]  # None when validate=False
     _has_partial_kv: Optional[bool]
     _source: tuple = ()  # identity of the metadata arguments the layout was built from
@@ -187,9 +188,14 @@ def prepare_layout(
         kv_sizes = kv_sizes.clone()
         kv_sizes[-1:].clamp_(max=seqlen_k % block)
     partial_q, partial_kv = _validate_metadata(idx, cnt, q_sizes, kv_sizes, allow_empty_block_nums, block) if validate else (None, None)
+    pair_tables = None
     if block == 64:
-        # Forward only: the M64 x N256 walks, one Q block per tile, every Q row valid.
-        tables, blk64_tables = None, build_walk_tables_blk64(idx, cnt, kv_sizes)
+        # Forward only, every Q row valid: SM90 walks Q block pairs, SM100/SM103 the M64 x N256 walks of one Q block.
+        tables = blk64_tables = None
+        if torch.cuda.get_device_capability(idx.device)[0] == 9:
+            pair_tables = build_pair_walk_tables_blk64(idx, cnt, kv_sizes)
+        else:
+            blk64_tables = build_walk_tables_blk64(idx, cnt, kv_sizes)
         partial_q = partial_kv = False
     else:
         tables, blk64_tables = build_walk_tables(idx, cnt, q_sizes, kv_sizes, H, bwd_kv_groups=bwd_kv_groups)
@@ -205,6 +211,7 @@ def prepare_layout(
         _kv_sizes=kv_sizes,
         _tables=tables,
         _blk64_tables=blk64_tables,
+        _pair_tables=pair_tables,
         _has_partial_q=partial_q if seqlen_q % block == 0 else True,
         _has_partial_kv=partial_kv if seqlen_k % block == 0 else True,
         _source=source,

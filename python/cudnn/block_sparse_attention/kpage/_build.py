@@ -622,6 +622,51 @@ def build_walk_tables_blk64(
     )
 
 
+@dataclass
+class Blk64PairForwardTables:
+    """Forward page walks for the SM90 Q-paired kernel: one walk per pair of 64-row Q blocks (2p, 2p + 1).
+
+    A walk covers the union of both KV lists, ordered first-only, common, second-only, as 8-page (128-row) tiles.
+    Compute WG0 (Q block 2p) runs tiles [0, ranges[..., 2]), WG1 (Q block 2p + 1) tiles [ranges[..., 3], ranges[..., 4]);
+    each masks its tiles with its own keep words (rows of its own blocks only, padding excluded).
+    """
+
+    page_table: Tensor  # [total_tiles, 8] int32 page ids; dummy ids >= num_kv_blocks * 4 load as zeros
+    keep: Tensor  # [total_tiles, 2, 4] int32 packed per-WG keep bits, two Page16 entries per word
+    ranges: Tensor  # [H, num_pairs, 5] int32: tile offset, tiles, WG0 end, WG1 begin, WG1 end
+
+
+def build_pair_walk_tables_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+) -> Blk64PairForwardTables:
+    """Q-pair page walks for sparse_block_size=64 metadata.  One readback sizes the tables."""
+    from ._build_kernels import current_stream, pair_walk_fill, pair_walk_stats
+
+    dev = kv_sizes.device
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage blk64 runs a batch as independent heads; batch must be 1"
+    assert q2k_block_index.dtype == torch.int32 and q2k_block_nums.dtype == torch.int32 and kv_sizes.dtype == torch.int32
+    n_pairs = (n_q_blocks + 1) // 2
+    words = (kv_sizes.numel() + 31) // 32
+
+    stream = current_stream()
+    bits = torch.zeros((num_heads * n_pairs, 2, words), dtype=torch.int32, device=dev)
+    class_pages = torch.empty((num_heads * n_pairs, 3), dtype=torch.int32, device=dev)
+    pair_walk_stats(q2k_block_index.view(num_heads, n_q_blocks, cap), q2k_block_nums.view(num_heads, n_q_blocks), kv_sizes, bits, class_pages, stream)
+    tiles = (class_pages.sum(dim=1, dtype=torch.int32) + FRAGS_PER_TILE - 1) // FRAGS_PER_TILE
+    tile_offsets = torch.cumsum(tiles, dim=0, dtype=torch.int32) - tiles
+    total_tiles = int((tile_offsets[-1] + tiles[-1]).cpu())
+
+    nt = max(total_tiles, 1)
+    page_table = torch.empty((nt, FRAGS_PER_TILE), dtype=torch.int32, device=dev)
+    keep = torch.empty((nt, 2, 4), dtype=torch.int32, device=dev)
+    ranges = torch.empty((num_heads * n_pairs, 5), dtype=torch.int32, device=dev)
+    pair_walk_fill(kv_sizes, bits, class_pages, tile_offsets, page_table, keep, ranges, stream)
+    return Blk64PairForwardTables(page_table=page_table, keep=keep, ranges=ranges.view(num_heads, n_pairs, 5))
+
+
 # ---------------------------------------------------------------------------
 # padding rows
 # ---------------------------------------------------------------------------

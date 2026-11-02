@@ -209,9 +209,10 @@ def block_sparse_attention_forward(
     Callers must satisfy the "Sparse metadata" value ranges in
     ``docs/operations/sparse_attention/bsa.md``.
 
-    ``kpage`` selects the SM100/SM103 KPage kernels, which gather the
-    valid 16-row pages of partially occupied K/V blocks into full MMA tiles
-    (blk128, or blk64 for the forward).
+    ``kpage`` selects the KPage kernels, which gather the valid 16-row pages
+    of partially occupied K/V blocks into full MMA tiles: SM100/SM103 blk128,
+    or blk64 for the forward; SM90 blk64 forward, where adjacent query blocks
+    also share each K/V tile of their common KV blocks.
     Pass ``True`` to build the page layout from the metadata on this call, or
     a :class:`KPageLayout` from :func:`kpage_prepare_layout` to reuse one.
     See "KPage" in ``docs/operations/sparse_attention/bsa.md`` for the contract.
@@ -656,7 +657,8 @@ def kpage_prepare_layout(
     first backward call.  ``bwd_kv_groups`` overrides the number of Q groups
     the backward walk of each K/V tile is split into.  With
     ``sparse_block_size=64`` the layout serves the forward only and takes no
-    ``q_block_sizes``, ``with_backward`` or ``bwd_kv_groups``.
+    ``q_block_sizes``, ``with_backward`` or ``bwd_kv_groups``; it is built for
+    the architecture of the metadata's device (SM90 or SM100/SM103).
     """
     from . import _kpage_api
 

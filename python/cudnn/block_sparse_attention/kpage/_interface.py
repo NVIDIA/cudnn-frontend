@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Compile-cached launchers for the KPage forward (M128 x N128 and M64 x N256
-# routes) and the KV-owned paged backward, plus the forward/backward entry
-# points called from api.py.
+# routes on SM100/SM103, Q-paired blk64 on SM90) and the KV-owned paged backward,
+# plus the forward/backward entry points called from api.py.
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from torch import Tensor
 
 import cutlass.cute as cute
 
-from cudnn.block_sparse_attention._interface import _get_device_arch, torch2cute_dtype_map
+from cudnn.block_sparse_attention._interface import _get_device_arch, _to_cute_tensor, torch2cute_dtype_map
 from cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost import _bwd_postprocess_convert, _bwd_preprocess
 from cudnn.block_sparse_attention.csrc.bwd.sm100_blk128.bsa_bwd_sm100_kpage import (
     BlockSparseAttnBackwardSm100KPage,
@@ -23,9 +23,10 @@ from cudnn.block_sparse_attention.csrc.bwd.sm100_blk128.bsa_bwd_sm100_kpage impo
 )
 from cudnn.block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100_kpage import BlockSparseAttnForwardSm100KPage
 from cudnn.block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100_kpage_q64 import BlockSparseAttnForwardSm100KPageQ64
+from cudnn.block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90_kpage import BlockSparseAttnForwardSm90KPage
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import get_broadcast_dims, to_cute_tensor as to_cute_tensor_static
 from cudnn.block_sparse_attention.csrc.utils.kpage_utils import BLOCK, HEAD_DIM, PAGE
-from ._build import PagedKVWalkTables, set_pad_q_stats, zero_pad_forward_state, zero_pad_rows
+from ._build import Blk64PairForwardTables, PagedKVWalkTables, set_pad_q_stats, zero_pad_forward_state, zero_pad_rows
 from ._compile import compile_key, current_stream, fake_stream, to_cute_tensor
 from ._layout import KPageLayout
 
@@ -162,6 +163,32 @@ def _fwd_m64(
 _fwd_m64.compile_cache = {}
 
 
+def _fwd_sm90_pairs(q: Tensor, k: Tensor, v: Tensor, out: Tensor, lse: Tensor, tables: Blk64PairForwardTables, softmax_scale: float) -> None:
+    """SM90 blk64 forward over Q-pair walks; q/k/v/out are [1, B * H, S, D] views, lse [1, B * H, S]."""
+    head_dim = q.shape[-1]
+    nonpositive_scale = not softmax_scale > 0.0
+    # The kernel takes (S, D, H, B) Q/K/O, (D, S, H, B) V and (S, H, B) LSE views.
+    views = (q.permute(2, 3, 1, 0), k.permute(2, 3, 1, 0), v.permute(3, 2, 1, 0), out.permute(2, 3, 1, 0), lse.permute(2, 1, 0))
+    tensors = (*views, tables.page_table, tables.keep, tables.ranges)
+    key = compile_key("kpage_fwd_sm90_pairs", (torch2cute_dtype_map[q.dtype], head_dim, nonpositive_scale, _get_device_arch()), tensors)
+    cache = _fwd_sm90_pairs.compile_cache
+    if key not in cache:
+        leading = (1, 1, 0, 1, 0, 1, 2, 2)
+        aligns = (128, 128, 128, 128, 4, 16, 16, 4)
+        converted = [_to_cute_tensor(t, assumed_align=a, leading_dim=d) for t, d, a in zip(tensors, leading, aligns)]
+        cache[key] = cute.compile(
+            BlockSparseAttnForwardSm90KPage(head_dim, nonpositive_scale=nonpositive_scale),
+            *converted,
+            softmax_scale,
+            fake_stream(),
+            options="--enable-tvm-ffi",
+        )
+    cache[key](*(t.detach() for t in tensors), softmax_scale, current_stream())
+
+
+_fwd_sm90_pairs.compile_cache = {}
+
+
 def _bwd_paged_kv(
     dout: Tensor,
     q: Tensor,
@@ -279,7 +306,9 @@ def forward(q: Tensor, k: Tensor, v: Tensor, layout: KPageLayout, softmax_scale:
     out = torch.empty_like(q)  # keeps BHSD or BSHD strides
     lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
     t64 = layout._blk64_tables
-    if t64.work_indices.numel() > 0:
+    if layout._pair_tables is not None:
+        _fwd_sm90_pairs(q, k, v, out, lse, layout._pair_tables, softmax_scale)
+    elif t64 is not None and t64.work_indices.numel() > 0:
         _fwd_m64(q, k, v, out, lse, t64.page_table, t64.mask_table, t64.tile_offsets, t64.iter_counts, t64.full_iter_counts, t64.work_indices, softmax_scale)
     t128 = layout._tables  # None on the blk64 path: every Q block is one M64 tile
     if t128 is not None and t128.work_indices.numel() > 0:

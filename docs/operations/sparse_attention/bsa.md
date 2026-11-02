@@ -507,6 +507,14 @@ block is one tile of the M64 x N256 kernel, whose 256-row K/V stage is
 gathered from sixteen 16-row pages, so a selected 64-row block with `v` valid
 rows costs `16 * ceil(v / 16)` rows instead of 64.
 
+On SM90 the same call runs a kernel that pairs adjacent query blocks
+(`2p`, `2p + 1`): one CTA walks the union of their KV block lists as 16-row
+pages gathered into 128-row K/V tiles, ordered first-only, common,
+second-only, and its two compute warpgroups (one per query block) compute only
+their own blocks' tiles. K/V of the blocks both query blocks select are thus
+loaded once, on top of the page compaction. The layout holds these pair walks
+when it is built on an SM90 device.
+
 ```python
 o, lse = block_sparse_attention_forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, sparse_block_size=64, kpage=True)
 
@@ -532,6 +540,9 @@ more than the base kernel's whole-block load. On random top-k patterns
 about 0.3-1 ms per call on those shapes, so reuse a layout from
 `kpage_prepare_layout` whenever the metadata repeats; with `kpage=True` the
 build is paid on every call. Benchmark your own patterns before switching.
+On SM90 the gain also grows with the overlap of adjacent query blocks' KV
+lists (local or video-like patterns); full blocks with little overlap, such as
+independent top-k selections, run slower than the base kernel.
 
 ## Current support
 
@@ -548,6 +559,7 @@ build is paid on every call. Benchmark your own patterns before switching.
 | SM100/SM103 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 | SM100/SM103 | 128, `kpage=True` | BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM100/SM103 | 64, `kpage=True` | BF16 | QK=128, V=128 | MHA |
+| SM90 | 64, `kpage=True` | BF16 | QK=128, V=128 | MHA |
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |

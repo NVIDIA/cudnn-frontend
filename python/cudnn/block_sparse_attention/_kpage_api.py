@@ -28,6 +28,15 @@ def _require_cutedsl() -> None:
         )
 
 
+def _require_arch(arch: int, sparse_block_size: int) -> None:
+    """KPage runs on SM100/SM103, and on SM90 for the blk64 forward."""
+    if arch // 10 == 10 or (arch // 10 == 9 and sparse_block_size == 64):
+        return
+    if arch // 10 == 9:
+        raise NotImplementedError("SM90 kpage supports sparse_block_size=64 (forward only)")
+    raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, or SM90 for the blk64 forward; found SM{arch}")
+
+
 def _normalize_metadata(
     q2k_block_index: torch.Tensor,
     block_sparse_num: Optional[int],
@@ -110,10 +119,9 @@ def prepare_layout(
 ) -> KPageLayout:
     _require_cutedsl()
     major, minor = torch.cuda.get_device_capability(q2k_block_index.device)
-    if major != 10:
-        raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, found SM{major}{minor}")
     if sparse_block_size not in (64, 128):
         raise ValueError(f"sparse_block_size must be 64 or 128, got {sparse_block_size}")
+    _require_arch(major * 10 + minor, sparse_block_size)
     if sparse_block_size == 64 and (q_block_sizes is not None or with_backward or bwd_kv_groups is not None):
         raise NotImplementedError("the blk64 KPage path is forward only and takes no q_block_sizes, with_backward or bwd_kv_groups")
     for name, seqlen in (("seqlen_q", seqlen_q), ("seqlen_k", seqlen_k)):
@@ -167,8 +175,7 @@ def resolve_layout(
 ) -> KPageLayout:
     """Check the KPage contract for one call (tensors as BHSD views) and return the layout to run."""
     _require_cutedsl()
-    if arch // 10 != 10:  # the kernels are validated on SM100/SM103 only
-        raise NotImplementedError(f"kpage requires an SM100/SM103 GPU, found SM{arch}")
+    _require_arch(arch, sparse_block_size)
     if sparse_block_size not in (64, 128):
         raise NotImplementedError("kpage requires sparse_block_size=128 (or 64 for the forward)")
     if q.dtype != torch.bfloat16:

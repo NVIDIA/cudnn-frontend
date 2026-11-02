@@ -3,7 +3,9 @@
 
 """KPage forward over sparse_block_size=64 metadata (kpage=True / kpage=KPageLayout) against the base blk64 kernel and the fp32 reference.
 
-The contract is the BSA one: ``block_sizes`` masks keys, every query row is valid.  The path is forward only.
+The contract is the BSA one: ``block_sizes`` masks keys, every query row is valid.  The path is forward only.  It runs
+on SM100/SM103 (one walk per query block) and on SM90 (one walk per pair of query blocks, which the odd block counts
+and the unsorted random lists below exercise).
 """
 
 import importlib
@@ -23,8 +25,8 @@ def _import_bsa():
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
-    if major != 10:
-        pytest.skip("kpage is specific to SM100/SM103")
+    if major not in (9, 10):
+        pytest.skip("the blk64 KPage forward runs on SM90 and SM100/SM103")
     try:
         from cudnn import BSA
 
@@ -129,10 +131,13 @@ def test_kpage_blk64_nonpositive_softmax_scale(softmax_scale):
     q2k, nums = _random_metadata(heads, num_blocks, num_blocks, kmax=6)
     o_ref, lse_ref = _reference(q, k, v, q2k, nums, bs, softmax_scale=softmax_scale)
     paged = _run(BSA, q, k, v, q2k, nums, bs, kpage=True, softmax_scale=softmax_scale)
-    base = _run(BSA, q, k, v, q2k, nums, bs, softmax_scale=softmax_scale)
+    base = _run(BSA, q, k, v, q2k, nums, bs, softmax_scale=softmax_scale) if torch.cuda.get_device_capability()[0] != 9 else None
     torch.testing.assert_close(paged["o_tensor"].float(), o_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(paged["lse_tensor"], lse_ref, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(paged["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
+    # The SM90 base blk64 forward does not support nonpositive scales with partial blocks (NaN), so SM90 checks the
+    # reference only.
+    if torch.cuda.get_device_capability()[0] != 9:
+        torch.testing.assert_close(paged["o_tensor"].float(), base["o_tensor"].float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.L0
@@ -228,13 +233,18 @@ def test_kpage_blk64_rejects_unsupported_configurations():
         BSA.block_sparse_attention_forward(q.half(), k.half(), v.half(), q2k, 2, bs, sparse_block_size=BLOCK, kpage=True)
     # seqlen_q and seqlen_k must be multiples of 64
     q_tail = q[:, :, : seqlen - 16].contiguous()
-    with pytest.raises(NotImplementedError, match="multiples of 64"):
+    with pytest.raises(NotImplementedError, match="multiples? of 64"):
         BSA.block_sparse_attention_forward(q_tail, k, v, q2k, 2, bs, sparse_block_size=BLOCK, kpage=True)
     # metadata contract, with the blk64 block size
     with pytest.raises(ValueError, match="block_sizes"):
         BSA.kpage_prepare_layout(q2k, 2, torch.full((num_blocks,), 100, dtype=torch.int32, device="cuda"), sparse_block_size=BLOCK)
-    # a layout is bound to its sparse_block_size
     q2k_128 = torch.tensor([0, 1], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, heads, 2, 2).contiguous()
-    layout_128 = BSA.kpage_prepare_layout(q2k_128, 2, torch.full((2,), 128, dtype=torch.int32, device="cuda"))
-    with pytest.raises(ValueError, match="sparse_block_size"):
-        _run(BSA, q, k, v, q2k, None, bs, kpage=layout_128)
+    if torch.cuda.get_device_capability()[0] == 9:
+        # SM90 runs the blk64 forward only
+        with pytest.raises(NotImplementedError, match="sparse_block_size=64"):
+            BSA.kpage_prepare_layout(q2k_128, 2, torch.full((2,), 128, dtype=torch.int32, device="cuda"))
+    else:
+        # a layout is bound to its sparse_block_size
+        layout_128 = BSA.kpage_prepare_layout(q2k_128, 2, torch.full((2,), 128, dtype=torch.int32, device="cuda"))
+        with pytest.raises(ValueError, match="sparse_block_size"):
+            _run(BSA, q, k, v, q2k, None, bs, kpage=layout_128)
