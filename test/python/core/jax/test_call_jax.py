@@ -6,13 +6,14 @@ import pytest
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-requirement_error = cutedsl_requirement_error("JAX bridge tests")
+requirement_error = cutedsl_requirement_error("JAX bridge tests", min_version=(4, 7, 1))
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 
+import cutlass
 import cutlass.cute as cute
 from cutlass.jax import TensorSpec
 from cudnn.jax import call, zeros_init
@@ -163,3 +164,77 @@ def test_explicit_alias_with_initialized_output():
     np.testing.assert_array_equal(y, x + 1)
     np.testing.assert_array_equal(accumulator, x * 2)
     np.testing.assert_array_equal(z, x + 3)
+
+
+@cute.jit
+def optional_pair(stream, missing_input, x, leading, y, middle, z, trailing):
+    if cutlass.const_expr(missing_input is not None or leading is not None or middle is not None or trailing is not None):
+        raise ValueError("absent slots must reach the launcher as None")
+    pair(stream, x, y, z)
+
+
+def test_initialized_outputs_preserve_none_slots():
+    desc = jax.ShapeDtypeStruct((32,), jnp.float32)
+    spec = TensorSpec(layout=(0,))
+    run = jax.jit(
+        call(
+            optional_pair,
+            output_shape_dtype=(None, desc, None, desc, None),
+            input_spec=(None, spec),
+            output_spec=(None, spec, None, spec, None),
+            initialized_outputs={3: zeros_init},
+        )
+    )
+    for offset in (1, 5):
+        x = jnp.arange(32, dtype=jnp.float32) + offset
+        leading, y, middle, z, trailing = run(None, x)
+        assert leading is None and middle is None and trailing is None
+        np.testing.assert_array_equal(y, x + 3)
+        np.testing.assert_array_equal(z, x)
+
+
+@cute.jit
+def optional_alias(stream, missing_input, x, missing_output, accumulator, z):
+    if cutlass.const_expr(missing_input is not None or missing_output is not None):
+        raise ValueError("absent slots must reach the launcher as None")
+    mixed_kernel(x, x, accumulator, z).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+
+def test_explicit_alias_with_none_slots_and_initialized_output():
+    desc = jax.ShapeDtypeStruct((32,), jnp.float32)
+    run = jax.jit(
+        call(
+            optional_alias,
+            output_shape_dtype=[desc, None, desc, desc],
+            input_output_aliases={1: 0},
+            initialized_outputs={2: zeros_init},
+        )
+    )
+    x = jnp.arange(32, dtype=jnp.float32)
+    outputs = run(None, x)
+    assert isinstance(outputs, list)
+    y, missing, accumulator, z = outputs
+    assert missing is None
+    np.testing.assert_array_equal(y, x + 1)
+    np.testing.assert_array_equal(accumulator, x * 2)
+    np.testing.assert_array_equal(z, x + 3)
+
+
+@pytest.mark.parametrize(
+    "initialized,aliases,error",
+    [
+        (2, {}, "absent output cannot be initialized"),
+        (3, {1: 2}, "absent output cannot be aliased"),
+        (3, {0: 1}, "absent input cannot be aliased"),
+    ],
+)
+def test_rejects_initialized_or_aliased_none_slots(initialized, aliases, error):
+    desc = jax.ShapeDtypeStruct((32,), jnp.float32)
+    with pytest.raises(ValueError, match=error):
+        run = call(
+            optional_pair,
+            output_shape_dtype=(None, desc, None, desc, None),
+            initialized_outputs={initialized: zeros_init},
+            input_output_aliases=aliases,
+        )
+        run(None, np.zeros(32, dtype=np.float32))

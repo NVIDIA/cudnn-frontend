@@ -52,6 +52,18 @@ def test_healthy_or_absent_dsl_yields_no_version_error(dsl_state, state):
     assert buffers.cutedsl_requirement_error("x") is None
 
 
+@pytest.mark.parametrize("version,too_old", [("4.7.0", True), ("4.7.1", False)])
+def test_jax_floor_does_not_raise_the_default_floor(dsl_state, version, too_old):
+    dsl_state(True, ("nvidia-cutlass-dsl", version))
+    assert buffers.cutedsl_requirement_error("native kernel") is None
+    message = buffers.cutedsl_requirement_error("cudnn.jax", min_version=(4, 7, 1))
+    if too_old:
+        assert "requires nvidia-cutlass-dsl >= 4.7.1" in message
+        assert f"found {version}" in message
+    else:
+        assert message is None
+
+
 def test_lazy_import_wrapper_distinguishes_too_old_from_missing(dsl_state):
     inner = TypeError("set_name_prefix() got an unexpected keyword argument 'remove_cutlass_symbol'")
 

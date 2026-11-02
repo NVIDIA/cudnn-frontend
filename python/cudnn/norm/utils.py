@@ -47,17 +47,13 @@ def fake_rows(dtype, *cols, rows=None, align=16):
     return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
 
 
-def sm_count():
-    """Multiprocessor count of the current device (cached)."""
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
+def sm_count() -> int:
+    """Multiprocessor count of the build or current CUDA device, cached per device."""
+    from cudnn.frost.device import current_device, multiprocessor_count
 
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
+    return multiprocessor_count(current_device())
 
 
-_SM_COUNT = None
 _COOP_OCC = {}
 COOP_OCC_MAX = 4
 
@@ -90,31 +86,15 @@ def run_coop(key, run):
             occ //= 2
 
 
-_SMEM_CAPACITY = None
-
-
 def smem_capacity():
-    """Per-block shared memory budget for the CURRENT architecture, via the CuTe DSL.
+    """Opt-in per-block shared memory limit of the build/current CUDA device.
 
-    ``cutlass.memory.get_smem_capacity_in_bytes()`` resolves the running arch through
-    ``CuTeDSL.get_arch_enum()`` and returns the per-BLOCK opt-in limit, which is what a
-    launch is actually validated against. Two reasons not to hardcode it:
-
-    * it is architecture-dependent -- 232448 on sm_90/sm_100, but 101376 on sm_120, so
-      a Blackwell constant does not merely mis-tune elsewhere, it over-requests and the
-      launch fails;
-    * it is NOT ``shared_memory_per_multiprocessor`` (233472 on sm_100). Sizing against
-      the per-SM figure leaves a 1 KB window where the driver rejects the launch
-      instead of us rejecting it first.
-
-    Queried once and cached; the call itself is ~4 us.
+    Use the per-device driver cache: the DSL's ambient architecture may describe
+    another GPU, and the larger per-SM limit is not a valid per-block budget.
     """
-    global _SMEM_CAPACITY
-    if _SMEM_CAPACITY is None:
-        from cutlass.memory import get_smem_capacity_in_bytes
+    from cudnn.frost.device import current_device, shared_memory_per_block_optin
 
-        _SMEM_CAPACITY = int(get_smem_capacity_in_bytes())
-    return _SMEM_CAPACITY
+    return shared_memory_per_block_optin(current_device())
 
 
 def smem_budget(preferred_bytes):
