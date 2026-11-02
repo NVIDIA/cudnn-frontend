@@ -489,6 +489,13 @@ class MainloopKernelTemplate(KernelTemplate):
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         for side, ops in (("A", chain.mainloop_a_ops), ("B", chain.mainloop_b_ops)):
+            if any(op.op == "gen_index" for op in ops):
+                dtype = getattr(chain.matmul, f"{side.lower()}_dtype")
+                load_dtype = getattr(chain, f"mainloop_{side.lower()}_load_dtype")
+                if dtype not in ("bf16", "fp16") or load_dtype is not None:
+                    return f"{self.file}: mainloop gen_index requires BF16/FP16 {side} with no operand load cast"
+                if any(op.op == "gen_index" and op.index_expr is None for op in ops):
+                    return f"{self.file}: mainloop gen_index requires lowered logical coordinates"
             for op in ops:
                 if op.op not in _SUPPORTED_MAINLOOP_OPS:
                     return f"{self.file} cannot fuse mainloop op {op.op!r} on " f"operand {side} (supported: unary + scalar-aux binary, per-K mul)"
