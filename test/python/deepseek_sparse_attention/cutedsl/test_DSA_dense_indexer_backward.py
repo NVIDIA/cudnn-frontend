@@ -317,22 +317,30 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
     check_ref_dense_indexer_backward(index_q, weights, index_k, attn_score, attn_l1norm, d_index_q, d_weights, d_index_k, grad_scale=1.0)
 
 
+_DENSE_ARCH_ERROR = (RuntimeError, "DenseIndexerBackward requires SM90 or capability in")
+_DENSE_HEADS_ERROR = (ValueError, "requires heads == 64")
+_DENSE_SM90_TILE_ERROR = (ValueError, "SM90 DenseIndexerBackward requires D=128 and block_I=128")
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "capability,heads,head_dim,block_I,match",
+    "capability,heads,head_dim,block_I,error",
     [
-        pytest.param((10, 0), 32, 128, 128, "requires heads == 64", id="sm100-h32"),
-        pytest.param((10, 0), 128, 128, 128, "requires heads == 64", id="sm100-h128"),
-        pytest.param((10, 0), 64, 96, 128, r"SM100 DenseIndexerBackward requires D in \(64, 128\)", id="sm100-d96"),
-        pytest.param((10, 0), 64, 128, 256, r"SM100 DenseIndexerBackward requires block_I in \(64, 128\)", id="sm100-block_i256"),
-        pytest.param((9, 0), 128, 128, 128, "requires heads == 64", id="sm90-h128"),
-        pytest.param((9, 0), 64, 64, 128, "SM90 DenseIndexerBackward requires D=128 and block_I=128", id="sm90-d64"),
-        pytest.param((9, 0), 64, 128, 64, "SM90 DenseIndexerBackward requires D=128 and block_I=128", id="sm90-block_i64"),
+        pytest.param((10, 7), 64, 128, 128, _DENSE_ARCH_ERROR, id="sm107"),
+        pytest.param((12, 0), 64, 128, 128, _DENSE_ARCH_ERROR, id="sm120"),
+        pytest.param((10, 0), 32, 128, 128, _DENSE_HEADS_ERROR, id="sm100-h32"),
+        pytest.param((10, 0), 128, 128, 128, _DENSE_HEADS_ERROR, id="sm100-h128"),
+        pytest.param((10, 0), 64, 96, 128, (ValueError, r"SM100 DenseIndexerBackward requires D in \(64, 128\)"), id="sm100-d96"),
+        pytest.param((10, 0), 64, 128, 256, (ValueError, r"SM100 DenseIndexerBackward requires block_I in \(64, 128\)"), id="sm100-block_i256"),
+        pytest.param((9, 0), 128, 128, 128, _DENSE_HEADS_ERROR, id="sm90-h128"),
+        pytest.param((9, 0), 64, 64, 128, _DENSE_SM90_TILE_ERROR, id="sm90-d64"),
+        pytest.param((9, 0), 64, 128, 64, _DENSE_SM90_TILE_ERROR, id="sm90-block_i64"),
     ],
 )
 @torch_fork_set_rng(seed=0)
-def test_DSA_dense_indexer_backward_rejects_unsupported_plans(monkeypatch, capability, heads, head_dim, block_I, match):
-    """check_support admits only the tiles each dense kernel serves: H64 on both
+def test_DSA_dense_indexer_backward_rejects_unsupported_plans(monkeypatch, capability, heads, head_dim, block_I, error):
+    """check_support admits SM90 and the validated SM100-family devices only, and
+    only the tiles each dense kernel serves: H64 on both
     arches (H96 is no legal TCGEN05 M and H128 exceeds the SM100 launch
     resources; SM90 WGMMA M is 64), D and block_I in {64, 128} on SM100 (TCGEN05
     M), and the validated D128 x I128 tile on SM90. Declines happen before any
@@ -348,7 +356,7 @@ def test_DSA_dense_indexer_backward_rejects_unsupported_plans(monkeypatch, capab
     index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None)
     attn_before, index_before = attn_score.clone(), index_score.clone()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error[0], match=error[1]):
         DSA.dense_indexer_backward_wrapper(
             index_q,
             weights,

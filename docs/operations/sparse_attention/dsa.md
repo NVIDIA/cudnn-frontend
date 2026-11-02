@@ -919,7 +919,7 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
   - `q_causal_offsets` (optional): same offsets used for the corresponding
     Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
-- **Constraints** — SM90 or SM100+, `H == 64`, `ratio >= 1`; SM100 accepts
+- **Constraints** — SM90, SM100 or SM103, `H == 64`, `ratio >= 1`; SM100 accepts
   `D in {64, 128}` and `block_I in {64, 128}`, SM90 `D == 128` and
   `block_I == 128`
 - **Scratch** — the dK reduction targets a pre-zeroed fp32 buffer: an fp32

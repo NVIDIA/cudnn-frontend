@@ -827,8 +827,8 @@ def test_execute_allocates_nothing_and_never_synchronizes(monkeypatch, determini
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_indexer_backward_gpu()
-    if deterministic and torch.cuda.get_device_capability() not in deterministic_dk_sm100.INDEXER_BACKWARD_SM100_CAPABILITIES:
-        pytest.skip("deterministic IndexerBackward requires SM100/SM103")
+    if deterministic:
+        _require_sm100_family()
     DSA = _import_dsa()
     inputs = _idxbwd_inputs()
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs

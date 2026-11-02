@@ -30,8 +30,6 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.tensor_adapter import has_tcgen05
-
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
@@ -725,10 +723,13 @@ class DenseIndexerBackward(APIBase):
         self.head_dim = int(head_dim)
 
     def check_support(self) -> bool:
-        major, _ = torch.cuda.get_device_capability()
+        capability = torch.cuda.get_device_capability()
+        major, _ = capability
+        # Same admission as IndexerBackward: SM90 and the SM100-family devices
+        # the dense kernel is validated on, not every tcgen05 part.
         self._runtime_error_if(
-            major != 9 and not has_tcgen05(major),
-            f"DenseIndexerBackward requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{major}",
+            major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+            f"DenseIndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
         self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
