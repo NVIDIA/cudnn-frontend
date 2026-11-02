@@ -403,6 +403,51 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                     gLSElog2[tidx] = lse_log2
 
 
+class _FlashAttentionDSABackwardDSinkSm90:
+    """Deterministic fixed-order dSink reduction for Hopper DSA backward."""
+
+    @cute.jit
+    def __call__(
+        self,
+        mdPsum: cute.Tensor,
+        mLSE: cute.Tensor,
+        mAttnSink: cute.Tensor,
+        mdSink: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(mdPsum, mLSE, mAttnSink, mdSink).launch(
+            grid=[mLSE.shape[2], mLSE.shape[0], 1],
+            block=[32, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mdPsum: cute.Tensor,
+        mLSE: cute.Tensor,
+        mAttnSink: cute.Tensor,
+        mdSink: cute.Tensor,
+    ):
+        head_idx, batch_idx, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        LOG2_E = math.log2(math.e)
+        sink_log2 = mAttnSink[head_idx] * LOG2_E
+        acc = Float32(0.0)
+        for q_idx in cutlass.range(tidx, mLSE.shape[1], 32):
+            lse_row = mLSE[batch_idx, q_idx, head_idx]
+            p_sink = Float32(0.0)
+            if lse_row != Float32.inf:
+                lse_log2 = lse_row * LOG2_E
+                p_sink = Float32(1.0) / (Float32(1.0) + cute.math.exp2(lse_log2 - sink_log2))
+                if lse_log2 == sink_log2:
+                    p_sink = Float32(0.5)
+            acc += -p_sink * mdPsum[batch_idx, q_idx, head_idx]
+        acc = warp_reduce(acc, operator.add)
+        if tidx == 0:
+            mdSink[head_idx] = acc
+
+
 class FlashAttentionDSABackwardSm90:
     arch = 90
     # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST).
@@ -424,6 +469,8 @@ class FlashAttentionDSABackwardSm90:
         num_threads: int = 384,
         have_topk_length: bool = True,
         max_topk: int = 0,
+        deterministic: bool = False,
+        num_dkv_shards: int = 1,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -449,6 +496,9 @@ class FlashAttentionDSABackwardSm90:
         self.dQ_swapAB = dQ_swapAB
         self.have_topk_length = have_topk_length
         self.max_topk = max_topk
+        self.deterministic = deterministic
+        self.num_dkv_shards = num_dkv_shards
+        assert not deterministic or num_dkv_shards in (32, 64, 128)
         # wg0 is consumer and producer, wg1 is consumer
         self.num_mma_warp_groups = self.num_threads // 128
 
@@ -737,7 +787,7 @@ class FlashAttentionDSABackwardSm90:
         self.num_mma_regs = 256
 
         self._setup_attributes()
-        SharedStorage = self._get_shared_storage_cls()
+        self.shared_storage = self._get_shared_storage_cls()
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1]))
@@ -773,73 +823,80 @@ class FlashAttentionDSABackwardSm90:
         )
 
         # One CTA per query/head tile; TMA predicates the final partial head tile.
-        # num_splits=1; defaults: is_split_kv=False, cluster_shape_mn=(1, 1).
-        TileScheduler = SingleTileHeadFastScheduler
+        # Deterministic execution bounds the live grid to one query wave and
+        # serializes head tiles, so each CTA owns one FP32 dKV plane.
+        LOG2_E = math.log2(math.e)
+        softmax_scale_log2 = softmax_scale * LOG2_E
+        total_q = cute.size(mQ.shape[3])
+        total_head_tiles = cute.size(mQ.shape[2]) * self.qhead_tiles
+        q_wave_size = self.num_dkv_shards if cutlass.const_expr(self.deterministic) else total_q
+        head_tiles_per_launch = 1 if cutlass.const_expr(self.deterministic) else total_head_tiles
+        head_phases = total_head_tiles if cutlass.const_expr(self.deterministic) else 1
         tile_sched_args = TileSchedulerArguments(
-            cute.size(mQ.shape[3]),
-            cute.size(mQ.shape[2]) * self.qhead_tiles,
+            q_wave_size,
+            head_tiles_per_launch,
             cute.size(mQ.shape[4]),
-            1,  # num_splits
+            1,
             cute.size(mKV.shape[0]),
             mQ.shape[1],
             mKV.shape[1],
-            total_q=cute.size(mQ.shape[3]) * cute.size(mQ.shape[4]),
+            total_q=total_q * cute.size(mQ.shape[4]),
             tile_shape_mn=(self.tile_m, self.tile_n),
             mCuSeqlensQ=None,
             mSeqUsedQ=None,
             element_size=self.dtype.width // 8,
         )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-
-        LOG2_E = math.log2(math.e)
-        softmax_scale_log2 = softmax_scale * LOG2_E
-
-        self.kernel(
-            tma_tensor_Q,
-            mKV,
-            tma_tensor_dO,  # mKV is regular tensor (not TMA)
-            tma_tensor_dQ,
-            tma_tensor_dQ_64,
-            mdKV,
-            mTopkIdxs,
-            mTopkLength,  # sparse KV indices + per-q length
-            tma_atom_Q,
-            tma_atom_dO,
-            tma_atom_dQ,
-            tma_atom_dQ_64,
-            mLSE,
-            mdPsum,
-            self.sQ_layout,
-            self.sKV_layout,
-            self.sPdS_layout,
-            self.sdO_layout,
-            self.sKV_quarter_layout,
-            self.sKV_192_layout,
-            self.sV_layout,
-            self.sQ_half_layout,
-            self.sQ_64_layout,
-            self.sQ_quarter_layout,
-            self.sdO_chunk_layout,
-            self.sQ_chunk_layout,
-            self.r2s_tiled_copy_dKVatomic,
-            tiled_mma_SdP,
-            tiled_mma_dKV,
-            tiled_mma_dQ_wg0,
-            tiled_mma_dQ_wg1,
-            tiled_mma_dQ_wg1_192,
-            softmax_scale_log2,
-            softmax_scale,
-            tile_sched_params,
-            TileScheduler,
-            SharedStorage,
-        ).launch(
-            grid=grid_dim,
-            block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
-            stream=stream,
-            min_blocks_per_mp=1,
-        )
+        self.tile_sched_params = SingleTileHeadFastScheduler.to_underlying_arguments(tile_sched_args)
+        self.grid_dim = SingleTileHeadFastScheduler.get_grid_shape(self.tile_sched_params)
+        for q_offset in cutlass.range(0, total_q, q_wave_size, unroll=1):
+            for head_offset in cutlass.range(0, head_phases, unroll=1):
+                self.kernel(
+                    tma_tensor_Q,
+                    mKV,
+                    tma_tensor_dO,
+                    tma_tensor_dQ,
+                    tma_tensor_dQ_64,
+                    mdKV,
+                    mTopkIdxs,
+                    mTopkLength,
+                    tma_atom_Q,
+                    tma_atom_dO,
+                    tma_atom_dQ,
+                    tma_atom_dQ_64,
+                    mLSE,
+                    mdPsum,
+                    self.sQ_layout,
+                    self.sKV_layout,
+                    self.sPdS_layout,
+                    self.sdO_layout,
+                    self.sKV_quarter_layout,
+                    self.sKV_192_layout,
+                    self.sV_layout,
+                    self.sQ_half_layout,
+                    self.sQ_64_layout,
+                    self.sQ_quarter_layout,
+                    self.sdO_chunk_layout,
+                    self.sQ_chunk_layout,
+                    self.r2s_tiled_copy_dKVatomic,
+                    tiled_mma_SdP,
+                    tiled_mma_dKV,
+                    tiled_mma_dQ_wg0,
+                    tiled_mma_dQ_wg1,
+                    tiled_mma_dQ_wg1_192,
+                    softmax_scale_log2,
+                    softmax_scale,
+                    self.tile_sched_params,
+                    q_offset,
+                    head_offset,
+                    SingleTileHeadFastScheduler,
+                    self.shared_storage,
+                ).launch(
+                    grid=self.grid_dim,
+                    block=[self.num_threads, 1, 1],
+                    smem=self.shared_storage.size_in_bytes(),
+                    stream=stream,
+                    min_blocks_per_mp=1,
+                )
 
     @cute.kernel
     def kernel(
@@ -879,10 +936,17 @@ class FlashAttentionDSABackwardSm90:
         softmax_scale_log2,
         softmax_scale,
         tile_sched_params: ParamsBase,
+        q_offset: Int32,
+        head_offset: Int32,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        if cutlass.const_expr(self.deterministic):
+            local_query = cute.arch.block_idx()[0]
+            if local_query + q_offset >= mQ.shape[3]:
+                cute.arch.nvvm.exit()
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
@@ -973,6 +1037,8 @@ class FlashAttentionDSABackwardSm90:
                 tidx,
                 softmax_scale_log2,
                 softmax_scale,
+                q_offset,
+                head_offset,
                 TileSchedulerCls,
             )
         else:
@@ -1006,6 +1072,8 @@ class FlashAttentionDSABackwardSm90:
                 mTopkIdxs,  # per-q length + scatter indices
                 mKV.shape[0],
                 tidx,
+                q_offset,
+                head_offset,
                 TileSchedulerCls,
             )
 
@@ -1043,6 +1111,8 @@ class FlashAttentionDSABackwardSm90:
         tidx: Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
+        q_offset: Int32,
+        head_offset: Int32,
         TileSchedulerCls: Callable,
     ):
         """WG0 mainloop: identical to V3.1 — dQ[0:256] = 128+128, no 576-specific logic."""
@@ -1158,6 +1228,9 @@ class FlashAttentionDSABackwardSm90:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if cutlass.const_expr(self.deterministic):
+                m_block += q_offset
+                head_idx += head_offset
             head_idx_kv = head_idx // self.qhead_tiles
             head_tile = head_idx - head_idx_kv * self.qhead_tiles
 
@@ -1648,6 +1721,8 @@ class FlashAttentionDSABackwardSm90:
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32 for scatter
         max_seqlen_kv: Int32,
         tidx: Int32,
+        q_offset: Int32,
+        head_offset: Int32,
         TileSchedulerCls: Callable,
     ):
         """WG1 mainloop: 9-chunk dKV pipeline + 2 G4_half (dQ) + AtomicAdd scatter."""
@@ -1716,6 +1791,9 @@ class FlashAttentionDSABackwardSm90:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if cutlass.const_expr(self.deterministic):
+                m_block += q_offset
+                head_idx += head_offset
             head_idx_kv = head_idx // self.qhead_tiles
 
             seq_idx = m_block
@@ -1731,7 +1809,8 @@ class FlashAttentionDSABackwardSm90:
             n_block_max = (topK + self.tile_n - 1) // self.tile_n
 
             # scatter AtomicAdd — flat gmem dKVaccum for per-row addressing
-            mdKVaccum_cur = mdKVaccum[None, head_idx_kv, batch_idx]
+            accumulator_idx = m_block % self.num_dkv_shards if cutlass.const_expr(self.deterministic) else head_idx_kv
+            mdKVaccum_cur = mdKVaccum[None, accumulator_idx, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
 
             n_block = n_block_max - 1
@@ -2247,6 +2326,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         head_dim: int = 512,
         num_threads: int = 128,
         N_hdim_chunks: int = 4,
+        num_dkv_shards: int = 1,
     ):
         self.dtype = dtype
         self.hdim_chunk = hdim_chunk
@@ -2254,6 +2334,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         self.head_dim = head_dim
         self.num_threads = num_threads
         self.N_hdim_chunks = N_hdim_chunks
+        self.num_dkv_shards = num_dkv_shards
         hdim_multiple_of = 32
         self.head_dim_rounded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         assert hdim_chunk % 16 == 0, "hdim_chunk must be a multiple of 16"
@@ -2267,7 +2348,7 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         seqlen_k: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        num_head_kv = mdKVaccum.shape[1]
+        num_head_kv = mdKV.shape[2]
         num_batch = mdKVaccum.shape[0]
         seqlen_k_rounded = mdKVaccum.shape[2] // self.head_dim_rounded
         num_n_blocks = cute.ceil_div(seqlen_k_rounded, self.tile_n)
@@ -2297,7 +2378,6 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         n_block = m_block // self.N_hdim_chunks
         chunk_k = m_block % self.N_hdim_chunks
 
-        mdKVaccum_cur = mdKVaccum[batch_idx, head_idx, None]
         mdKV_cur = mdKV[batch_idx, None, head_idx, None]
 
         sdKV_ptr = cute.arch.get_dyn_smem(self.dtype)
@@ -2310,12 +2390,13 @@ class _FlashAttentionDSABackwardPostprocessSm90:
         )
 
         self._fake_to_smem(
-            mdKVaccum_cur,
+            mdKVaccum,
             sdKV,
             tidx,
             n_block,
             chunk_k,
             seqlen_k,
+            batch_idx,
         )
         cute.arch.sync_threads()
         self._smem_to_gmem(
@@ -2330,12 +2411,13 @@ class _FlashAttentionDSABackwardPostprocessSm90:
     @cute.jit
     def _fake_to_smem(
         self,
-        mdKVaccum_cur: cute.Tensor,
+        mdKVaccum: cute.Tensor,
         sdKV: cute.Tensor,
         tidx: cutlass.Int32,
         n_block: cutlass.Int32,
         chunk_k: cutlass.Int32,
         seqlen_k: cutlass.Int32,
+        batch_idx: cutlass.Int32,
     ):
         """Phase 1: gmem f32 (fake-col) -> cvt f32->bf16 -> smem (real-col).
 
@@ -2356,7 +2438,9 @@ class _FlashAttentionDSABackwardPostprocessSm90:
             kv_row = n_block * self.tile_n + row
             if kv_row < seqlen_k:
                 fake_addr = kv_row * self.head_dim_rounded + chunk_k * self.hdim_chunk + fake_col
-                val_f32 = mdKVaccum_cur[fake_addr]
+                val_f32 = Float32(0.0)
+                for shard_idx in cutlass.range_constexpr(self.num_dkv_shards):
+                    val_f32 += mdKVaccum[batch_idx, shard_idx, fake_addr]
                 sdKV[row, real_col] = self.dtype(val_f32)
             else:
                 sdKV[row, real_col] = self.dtype(0)

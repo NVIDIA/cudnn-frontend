@@ -18,10 +18,12 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tens
 from cudnn.frost.buffers import memset_zero_async
 
 from .dsa_bwd_sm90 import (
+    _FlashAttentionDSABackwardDSinkSm90,
     FlashAttentionDSABackwardSm90,
     _FlashAttentionDSABackwardPostprocessSm90,
     _FlashAttentionDSABackwardPreprocessSm90,
 )
+from .dsa_bwd_sm100_deterministic import deterministic_dkv_shards
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -44,11 +46,12 @@ def _workspace_extents(total_s_q: int, total_s_kv: int, head_dim: int) -> Tuple[
     return _round_up(total_s_q, _M_BLOCK_SIZE), _round_up(total_s_kv, _N_BLOCK_SIZE), _round_up(head_dim, _HEAD_DIM_MULTIPLE)
 
 
-def flash_attn_bwd_sm90_workspace_size(total_s_q: int, total_s_kv: int, head_dim: int, num_heads: int) -> int:
-    """Caller scratch for one SM90 launch: FP32 dPsum, log2-scaled LSE, and the dKV accumulator."""
+def flash_attn_bwd_sm90_workspace_size(total_s_q: int, total_s_kv: int, head_dim: int, num_heads: int, deterministic: bool = False) -> int:
+    """Caller scratch for SM90 stats and one or more FP32 dKV planes."""
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
     stats_bytes = ws_align(seqlen_q_rounded * int(num_heads) * torch.float32.itemsize)
-    return 2 * stats_bytes + ws_align(seqlen_k_rounded * head_dim_rounded * torch.float32.itemsize)
+    num_dkv_shards = deterministic_dkv_shards(total_s_q) if deterministic else 1
+    return 2 * stats_bytes + ws_align(num_dkv_shards * seqlen_k_rounded * head_dim_rounded * torch.float32.itemsize)
 
 
 def flash_attn_bwd_sm90(
@@ -66,6 +69,7 @@ def flash_attn_bwd_sm90(
     softmax_scale: Optional[float] = None,
     topk_length: Optional[torch.Tensor] = None,
     current_stream=None,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -92,6 +96,8 @@ def flash_attn_bwd_sm90(
         softmax_scale: float (default: 1/sqrt(headdim))
         topk_length: (total_S_q,) int32, optional per-query valid prefix
             length, clamped to `[0, topk_max]` by the kernel.
+        deterministic: use bounded FP32 dKV planes and fixed-order dSink/dKV
+            reductions for bitwise-reproducible backward results.
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -144,15 +150,23 @@ def flash_attn_bwd_sm90(
     current_stream = resolve_stream(current_stream)
 
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
-    carver = WorkspaceCarver(workspace, flash_attn_bwd_sm90_workspace_size(total_S_q, total_S_kv, head_dim, num_head), _WORKSPACE_OWNER)
+    num_dkv_shards = deterministic_dkv_shards(total_S_q) if deterministic else 1
+    carver = WorkspaceCarver(
+        workspace,
+        flash_attn_bwd_sm90_workspace_size(total_S_q, total_S_kv, head_dim, num_head, deterministic=deterministic),
+        _WORKSPACE_OWNER,
+    )
     if workspace.device != q.device:
         raise ValueError(f"{_WORKSPACE_OWNER} workspace must be on q's device {q.device}, got {workspace.device}")
     dpsum = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     lse_log2 = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
-    dkv_accum = carver.take(seqlen_k_rounded * head_dim_rounded, torch.float32).view(1, num_head_kv, seqlen_k_rounded * head_dim_rounded)
-    # The main kernel atomic-adds into dkv_accum and the preprocess kernel into d_sink (R4).
+    dkv_accum = carver.take(num_dkv_shards * seqlen_k_rounded * head_dim_rounded, torch.float32).view(1, num_dkv_shards, seqlen_k_rounded * head_dim_rounded)
+    # The main kernel atomic-adds into either one ordinary accumulator or
+    # fixed-owner deterministic planes. Ordinary preprocessing also atomics
+    # into d_sink; deterministic mode overwrites it in a separate reduction.
     memset_zero_async(dkv_accum.data_ptr(), dkv_accum.numel() * dkv_accum.element_size(), int(current_stream))
-    memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
+    if not deterministic:
+        memset_zero_async(d_sink.data_ptr(), d_sink.numel() * d_sink.element_size(), int(current_stream))
 
     # --- wrap flat tensors as batch=1 4D views for the CuTe DSL kernel ---
     q4 = q.unsqueeze(0)  # (1, total_S_q, H, D)
@@ -184,13 +198,14 @@ def flash_attn_bwd_sm90(
         head_dim_v,
         m_block_size,
         num_threads,
+        deterministic,
     )
     if compile_key_pre not in flash_attn_bwd_sm90.compile_cache_pre:
         o_tensor, do_tensor = [to_cute_tensor(t) for t in (out4, dout4)]
         dpsum_tensor, lse_log2_tensor = [to_cute_tensor(t) for t in (dpsum, lse_log2)]
         lse_tensor = to_cute_tensor(lse4, assumed_align=4)
         attn_sink_tensor = to_cute_tensor(attn_sink)
-        d_sink_tensor = to_cute_tensor(d_sink)
+        d_sink_tensor = None if deterministic else to_cute_tensor(d_sink)
         fa_bwd_pre = _FlashAttentionDSABackwardPreprocessSm90(
             dtype,
             head_dim_v,
@@ -220,12 +235,31 @@ def flash_attn_bwd_sm90(
         lse4,
         lse_log2,
         attn_sink,
-        d_sink,
+        None if deterministic else d_sink,
         None,
         None,
         None,
         current_stream,
     )
+
+    if deterministic:
+        compile_key_dsink = (num_head,)
+        if compile_key_dsink not in flash_attn_bwd_sm90.compile_cache_dsink:
+            dpsum_tensor = to_cute_tensor(dpsum)
+            lse_tensor = to_cute_tensor(lse4, assumed_align=4)
+            attn_sink_tensor = to_cute_tensor(attn_sink)
+            d_sink_tensor = to_cute_tensor(d_sink)
+            dsink_reduce = _FlashAttentionDSABackwardDSinkSm90()
+            flash_attn_bwd_sm90.compile_cache_dsink[compile_key_dsink] = cute.compile(
+                dsink_reduce,
+                dpsum_tensor,
+                lse_tensor,
+                attn_sink_tensor,
+                d_sink_tensor,
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        flash_attn_bwd_sm90.compile_cache_dsink[compile_key_dsink](dpsum, lse4, attn_sink, d_sink, current_stream)
 
     # --- main kernel ---
     have_topk_length = tlen4 is not None
@@ -249,6 +283,8 @@ def flash_attn_bwd_sm90(
         dQ_swapAB,
         have_topk_length,
         max_topk,
+        deterministic,
+        num_dkv_shards,
     )
     if compile_key not in flash_attn_bwd_sm90.compile_cache:
         q_tensor = to_cute_tensor(q4)
@@ -275,6 +311,8 @@ def flash_attn_bwd_sm90(
             num_threads=num_threads,
             have_topk_length=have_topk_length,
             max_topk=max_topk,
+            deterministic=deterministic,
+            num_dkv_shards=num_dkv_shards,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,
@@ -318,6 +356,7 @@ def flash_attn_bwd_sm90(
         head_dim,
         num_threads_post,
         N_hdim_chunks,
+        num_dkv_shards,
     )
     if compile_key_post not in flash_attn_bwd_sm90.compile_cache_post:
         dkv_accum_tensor = to_cute_tensor(dkv_accum)
@@ -330,6 +369,7 @@ def flash_attn_bwd_sm90(
             head_dim=head_dim,
             num_threads=num_threads_post,
             N_hdim_chunks=N_hdim_chunks,
+            num_dkv_shards=num_dkv_shards,
         )
         flash_attn_bwd_sm90.compile_cache_post[compile_key_post] = cute.compile(
             postprocess,
@@ -351,5 +391,6 @@ def flash_attn_bwd_sm90(
 
 
 flash_attn_bwd_sm90.compile_cache_pre = {}
+flash_attn_bwd_sm90.compile_cache_dsink = {}
 flash_attn_bwd_sm90.compile_cache = {}
 flash_attn_bwd_sm90.compile_cache_post = {}

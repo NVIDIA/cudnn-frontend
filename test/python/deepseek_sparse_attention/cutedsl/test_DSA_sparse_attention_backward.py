@@ -4975,7 +4975,7 @@ def test_DSA_sparse_attention_backward_rejects_unsupported_head_dim_runtime():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=90)
 def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
-    """SM90 reports its FP32 dPsum / log2-LSE / dKV-accumulator scratch (R2) instead of allocating it per call."""
+    """SM90 reports ordinary or deterministic FP32 scratch (R2)."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90 import flash_attn_bwd_sm90_workspace_size
         from cudnn.api_base import ws_align
@@ -4987,6 +4987,8 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected = 2 * ws_align(sq_r * num_heads * 4) + ws_align(sk_r * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
     assert flash_attn_bwd_sm90_workspace_size(64, 64, 512, 16) == 2 * ws_align(64 * 16 * 4) + ws_align(64 * 512 * 4)
+    expected_deterministic = 2 * ws_align(sq_r * num_heads * 4) + ws_align(32 * sk_r * hd_r * 4)
+    assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_deterministic
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         return
@@ -5019,6 +5021,67 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(32, 576, 64, has_topk_length=True)
     assert plan.scratch_workspace_bytes() == flash_attn_bwd_sm90_workspace_size(8, 256, 576, 32)
     _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=92)
+def test_DSA_sparse_attention_backward_sm90_deterministic_bounded_waves():
+    """Hopper dQ, dKV, and dSink stay bitwise stable across a shard boundary."""
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        96,
+        576,
+        64,
+        s_q=33,
+        s_kv=256,
+        has_topk_length=True,
+        deterministic=True,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def run():
+        dq, dkv, d_sink = outputs
+        for tensor in (*outputs, workspace):
+            tensor.view(torch.uint8).fill_(0xA5)
+        result = plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+        torch.cuda.synchronize()
+        return tuple(tensor.clone() for tensor in result)
+
+    reference = run()
+    for repeat in range(1, 4):
+        actual = run()
+        for name, actual_tensor, reference_tensor in zip(("dQ", "dKV", "dSink"), actual, reference):
+            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), f"{name} differs at repetition {repeat}"
+
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        *reference,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 @pytest.mark.L0

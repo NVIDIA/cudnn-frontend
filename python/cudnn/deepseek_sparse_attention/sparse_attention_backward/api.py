@@ -176,8 +176,8 @@ class SparseAttentionBackward(APIBase):
                 "q_cluster_mode='adaptive_pair' requires contiguous SM100 BF16 H16/H32 Dqk576 inputs, " "non-deterministic execution, and 1 <= topk <= 2048",
             )
         self._value_error_if(
-            self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
-            f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
+            self.deterministic and (major not in (9, 10) or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
+            f"deterministic DSA backward requires SM90/SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
         )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
@@ -324,7 +324,7 @@ class SparseAttentionBackward(APIBase):
                     self._wide_addressing,
                 )
             return
-        if self.deterministic:
+        if self.deterministic and self._device_major == 10:
             total_s_q, num_heads, head_dim = self.q_desc.shape
             head_dim_v = self.out_desc.shape[2]
             kernel_cls = _iface_sm100._get_sm100_kernel_class(
@@ -397,7 +397,13 @@ class SparseAttentionBackward(APIBase):
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
-            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(total_s_q, total_s_kv, head_dim, num_heads)
+            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(
+                total_s_q,
+                total_s_kv,
+                head_dim,
+                num_heads,
+                deterministic=self.deterministic,
+            )
         return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
             total_s_q,
             total_s_kv,
@@ -509,6 +515,7 @@ class SparseAttentionBackward(APIBase):
                     softmax_scale=scale,
                     topk_length=topk_length,
                     current_stream=current_stream,
+                    deterministic=self.deterministic,
                 )
             return _iface_sm100.flash_attn_bwd_sm100(
                 q,
