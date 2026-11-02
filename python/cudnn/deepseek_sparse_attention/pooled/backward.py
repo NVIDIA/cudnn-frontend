@@ -311,3 +311,44 @@ def pooled_sparse_attention_backward(
     return TupleDict(
         dq=result["dq"].reshape(b, s, h, d), dkv=result["dkv"].reshape(b, s_k, d), d_sink=result["d_sink"], token_ids=token_ids, topk_length=topk_length
     )
+
+
+def pooled_teacher_recompute(
+    q_attn: torch.Tensor,
+    k_attn: torch.Tensor,
+    lse: torch.Tensor,
+    token_ids: torch.Tensor,
+    topk_length: torch.Tensor,
+    k_pools: int,
+    pool_size: int = 4,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    stream=None,
+) -> TupleDict:
+    """Pool-level teacher straight from the sparse attention score recompute. Returns ``{'target' (B, S, K)}``.
+
+    ``token_ids`` is the compact pool-grouped expansion with global ids and
+    ``topk_length`` its per-row valid count including the tail; the tail is
+    excluded by rounding the length down to whole pools.
+    """
+    from cudnn.deepseek_sparse_attention.score_recompute._interface_sm100 import _sparse_attn_score_recompute
+
+    b, s, h, d = q_attn.shape
+    if softmax_scale is None:
+        softmax_scale = d**-0.5
+    if out is None:
+        out = torch.empty(b, s, k_pools, dtype=torch.float32, device=q_attn.device)
+    pool_tokens = (topk_length.to(torch.int32) // pool_size * pool_size).contiguous()
+    _sparse_attn_score_recompute(
+        q_attn.contiguous(),
+        k_attn.contiguous(),
+        lse.contiguous().float(),
+        token_ids.to(torch.int32).contiguous(),
+        float(softmax_scale),
+        out=out,
+        topk_length=pool_tokens,
+        topk_indices_global=True,
+        pool_size=pool_size,
+        current_stream=None if stream is None else _stream_handle(stream),
+    )
+    return TupleDict(target=out)

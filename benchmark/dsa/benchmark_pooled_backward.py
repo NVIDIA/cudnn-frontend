@@ -114,6 +114,15 @@ def cudnn_indexer_chain(c, timer, grad_loss):
     tt = teacher()
     stages["pool_target_us"] = timer(lambda: PB.pooled_indexer_target(tt, c["pool_ids"], pool_size)["target"])
     target = PB.pooled_indexer_target(tt, c["pool_ids"], pool_size)["target"]
+
+    def teacher_fused():
+        return PB.pooled_teacher_recompute(c["q_attn"], c["k_attn"], c["lse"], c["token_ids"], c["topk_length"], c["k_pools"], pool_size, c["softmax_scale"])[
+            "target"
+        ]
+
+    stages["teacher_fused_us"] = timer(teacher_fused)
+    fused = teacher_fused()
+    stages["teacher_fused_rel_diff"] = ((fused - target).norm() / target.norm()).item()
     pred = predict()
     d_pooled = torch.empty_like(c["pooled"], dtype=torch.float32)
     work = target.clone()
@@ -133,6 +142,7 @@ def cudnn_indexer_chain(c, timer, grad_loss):
 
     stages["chain_total_us"] = timer(full)
     stages["chain_with_teacher_us"] = stages["chain_total_us"] + stages["teacher_recompute_us"] + stages["pool_target_us"]
+    stages["chain_with_fused_teacher_us"] = stages["chain_total_us"] + stages["teacher_fused_us"]
     return stages
 
 

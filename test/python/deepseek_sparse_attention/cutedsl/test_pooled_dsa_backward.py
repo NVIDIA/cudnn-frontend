@@ -138,3 +138,32 @@ def test_pooled_sparse_attention_backward_matches_compaction_route():
     )
     assert _rel(got["dq"].reshape(s, h, d), ref["dq"]) < 2e-2
     assert _rel(got["dkv"].reshape(s, d), ref["dkv"]) < 2e-2
+
+
+@pytest.mark.parametrize("batch,seqlen,k_pools", [(1, 2048, 128), (2, 1500, 64)])
+def test_pooled_teacher_recompute_matches_unfused(batch, seqlen, k_pools):
+    from cudnn.deepseek_sparse_attention.score_recompute.api import sparse_attn_score_recompute_wrapper
+
+    c = R.make_case(batch, seqlen, torch.device("cuda"), topk_tokens=k_pools * 4, seed=11)
+    pool_size = 4
+    _, pool_ids = _selected(c, k_pools)
+    q, kv, positions = c["q_attn"], c["k_attn"], c["positions"]
+    softmax_scale = q.shape[-1] ** -0.5
+    expanded = PB.pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k=seqlen, global_ids=True)
+    token_ids, length = expanded["token_ids"], expanded["topk_length"]
+    lse = _dense_causal_lse(q, kv, softmax_scale)
+    fused = PB.pooled_teacher_recompute(q, kv, lse, token_ids, length, k_pools, pool_size, softmax_scale)["target"]
+    unfused = sparse_attn_score_recompute_wrapper(q, kv, lse, token_ids, softmax_scale, topk_length=length, topk_indices_global=True)["target"]
+    expected = PB.pooled_indexer_target(unfused, pool_ids, pool_size)["target"]
+    assert fused.shape == (batch, seqlen, k_pools)
+    assert torch.isfinite(fused).all()
+    assert _rel(fused, expected) < 1e-3
+    assert (fused - expected).abs().max().item() < 1e-3
+    reference = PB.pooled_indexer_target(
+        ref_sparse_attn_score_recompute(
+            q, kv, lse, token_ids - (torch.arange(batch, device="cuda") * seqlen).view(batch, 1, 1) * (token_ids >= 0), softmax_scale, topk_length=length
+        ),
+        pool_ids,
+        pool_size,
+    )["target"]
+    assert _rel(fused, reference) < 2e-2
