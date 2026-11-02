@@ -24,6 +24,10 @@ from .dsa_bwd_sm90 import (
     _FlashAttentionDSABackwardPostprocessSm90,
     _FlashAttentionDSABackwardPreprocessSm90,
 )
+from ._sm90_relay import (
+    SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    normalize_sm90_relay_cluster_size,
+)
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -35,8 +39,6 @@ _M_BLOCK_SIZE = 64
 _N_BLOCK_SIZE = 64
 _HEAD_DIM_MULTIPLE = 32
 _DETERMINISTIC_Q_WAVE_CTAS = 128
-_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8, 16)
-_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 8
 _WORKSPACE_OWNER = "SparseAttentionBackward (SM90)"
 
 
@@ -57,11 +59,7 @@ def _deterministic_relay_layout(
     relay_cluster_size: int,
 ) -> Tuple[int, int, int, int, int]:
     """Return (planes, physical plane elements, mask rows, waves, head tiles)."""
-    if relay_cluster_size not in _DETERMINISTIC_RELAY_CLUSTER_SIZES:
-        raise ValueError(
-            f"SM90 deterministic dKV relay cluster size must be one of {_DETERMINISTIC_RELAY_CLUSTER_SIZES} "
-            f"(32, 16, or 8 FP32 planes), got {relay_cluster_size}"
-        )
+    relay_cluster_size = normalize_sm90_relay_cluster_size(relay_cluster_size)
     _, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
     num_waves = _round_up(total_s_q, _DETERMINISTIC_Q_WAVE_CTAS) // _DETERMINISTIC_Q_WAVE_CTAS
     num_head_tiles = _round_up(num_heads, _M_BLOCK_SIZE) // _M_BLOCK_SIZE
@@ -80,7 +78,7 @@ def flash_attn_bwd_sm90_workspace_size(
     head_dim: int,
     num_heads: int,
     deterministic: bool = False,
-    deterministic_dkv_relay_cluster_size: int = _DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    deterministic_dkv_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
 ) -> int:
     """Caller scratch for SM90 stats and ordinary or relayed FP32 dKV planes."""
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
@@ -115,7 +113,7 @@ def flash_attn_bwd_sm90(
     topk_length: Optional[torch.Tensor] = None,
     current_stream=None,
     deterministic: bool = False,
-    deterministic_dkv_relay_cluster_size: int = _DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    deterministic_dkv_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -199,7 +197,7 @@ def flash_attn_bwd_sm90(
 
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     if deterministic:
-        relay_cluster_size = int(deterministic_dkv_relay_cluster_size)
+        relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_dkv_relay_cluster_size)
         num_dkv_shards, physical_plane_elems, relay_mask_rows, num_relay_waves, num_head_tiles = _deterministic_relay_layout(
             total_S_q,
             total_S_kv,

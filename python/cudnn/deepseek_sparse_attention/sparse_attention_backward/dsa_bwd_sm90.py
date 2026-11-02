@@ -51,6 +51,7 @@ from cudnn.deepseek_sparse_attention.utils.sm90.primitives import (
     transpose_view,
     warp_reduce,
 )
+from ._sm90_relay import SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES
 
 
 @dsl_user_op
@@ -619,7 +620,9 @@ class FlashAttentionDSABackwardSm90:
         self.mask_rows_per_word = 32 // relay_cluster_size
         self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word if deterministic else 0
         self.data_plane_elems = padded_seqlen_kv * padded_head_dim
-        assert not deterministic or (relay_cluster_size in (4, 8, 16) and q_wave_ctas == 128 and num_dkv_shards == q_wave_ctas // relay_cluster_size)
+        assert not deterministic or (
+            relay_cluster_size in SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES and q_wave_ctas == 128 and num_dkv_shards == q_wave_ctas // relay_cluster_size
+        )
         # wg0 is consumer and producer, wg1 is consumer
         self.num_mma_warp_groups = self.num_threads // 128
 

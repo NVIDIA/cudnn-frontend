@@ -24,6 +24,10 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
+from ._sm90_relay import (
+    SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    normalize_sm90_relay_cluster_size,
+)
 
 
 class SparseAttentionBackward(APIBase):
@@ -69,8 +73,10 @@ class SparseAttentionBackward(APIBase):
         self.softmax_scale = softmax_scale
         self.deterministic = bool(deterministic)
         self.q_cluster_mode = q_cluster_mode
-        self.deterministic_dkv_relay_cluster_size = None if deterministic_dkv_relay_cluster_size is None else int(deterministic_dkv_relay_cluster_size)
-        self._sm90_deterministic_dkv_relay_cluster_size = 8
+        self.deterministic_dkv_relay_cluster_size = (
+            None if deterministic_dkv_relay_cluster_size is None else normalize_sm90_relay_cluster_size(deterministic_dkv_relay_cluster_size)
+        )
+        self._sm90_deterministic_dkv_relay_cluster_size = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE
         self._backend = None
         self._backend_block_tile = None
         self._device_major = None
@@ -194,12 +200,8 @@ class SparseAttentionBackward(APIBase):
         )
         if major == 9 and self.deterministic:
             relay_cluster_size = self.deterministic_dkv_relay_cluster_size
-            self._sm90_deterministic_dkv_relay_cluster_size = 8 if relay_cluster_size is None else relay_cluster_size
-            self._value_error_if(
-                self._sm90_deterministic_dkv_relay_cluster_size not in (4, 8, 16),
-                "SM90 deterministic_dkv_relay_cluster_size must be 4, 8, or 16 "
-                "(32, 16, or 8 FP32 planes), "
-                f"got {self._sm90_deterministic_dkv_relay_cluster_size}",
+            self._sm90_deterministic_dkv_relay_cluster_size = (
+                SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE if relay_cluster_size is None else relay_cluster_size
             )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
@@ -590,7 +592,7 @@ def sparse_attention_backward_wrapper(
     Dispatches to SM90 or SM100 from the input device and tensor metadata. The
     returned ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
     ``deterministic=True`` for bitwise-reproducible
-    H16/H32/H64/H96/H128 gradients on SM100. The optional reusable uint8
+    H16/H32/H64/H96/H128 gradients on SM90 or SM100. The optional reusable uint8
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
 
@@ -613,13 +615,9 @@ def sparse_attention_backward_wrapper(
     if q_cluster_mode not in ("off", "adaptive_pair"):
         raise ValueError(f"q_cluster_mode must be 'off' or 'adaptive_pair', got {q_cluster_mode!r}")
     if deterministic_dkv_relay_cluster_size is not None:
-        deterministic_dkv_relay_cluster_size = int(deterministic_dkv_relay_cluster_size)
         if not deterministic:
             raise ValueError("deterministic_dkv_relay_cluster_size requires deterministic=True")
-        if deterministic_dkv_relay_cluster_size not in (4, 8, 16):
-            raise ValueError(
-                "SM90 deterministic_dkv_relay_cluster_size must be 4, 8, or 16 " f"(32, 16, or 8 FP32 planes), got {deterministic_dkv_relay_cluster_size}"
-            )
+        deterministic_dkv_relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_dkv_relay_cluster_size)
         if device_capability(q.device)[0] != 9:
             raise ValueError("deterministic_dkv_relay_cluster_size is supported only on SM90")
     # The plan addresses contiguous tensors only (check_support declines the rest, R5).

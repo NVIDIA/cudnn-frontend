@@ -252,14 +252,15 @@ On SM90, `deterministic=True` uses a row-aware relay with cluster size
 `deterministic_dkv_relay_cluster_size` argument selects `C` and defaults to 8.
 Each 128-query wave launches `128 / C` clusters and gives one FP32 dKV plane
 to each cluster. A setup kernel builds packed `C`-bit rank
-masks for every `(query wave, M64 head tile, KV row)`. A relay CTA waits only
+masks for every referenced `(query wave, M64 head tile, KV row)`. A relay CTA waits only
 for lower cluster ranks that actually update the same row; a 128-thread WG1
 barrier carries the acquired visibility to every reducer lane, and the matching
 barrier publishes all relaxed FP32 reductions before one lane release-clears
-that rank's ownership bit at GPU scope. Head tiles and later query waves are
+that rank's ownership bit at GPU scope when a successor exists. Head tiles and later query waves are
 stream-ordered, while disjoint sparse rows within a cluster can progress
 independently. The postprocess kernel combines the `128 / C` planes in fixed
-order, and one warp per head computes `d_sink` in query order. Duplicate valid
+order, and one warp per head computes `d_sink` with a fixed strided-lane/tree
+reduction order. Duplicate valid
 top-k indices within one query row remain outside this deterministic contract.
 
 The SM90 deterministic dKV allocation is

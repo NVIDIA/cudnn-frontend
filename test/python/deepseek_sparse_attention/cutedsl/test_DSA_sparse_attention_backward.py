@@ -5016,7 +5016,7 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
         )
         == expected_cluster16
     )
-    with pytest.raises(ValueError, match="cluster size must be one of"):
+    with pytest.raises(ValueError, match="must be 4, 8, or 16"):
         flash_attn_bwd_sm90_workspace_size(
             s_q,
             s_kv,
@@ -5101,6 +5101,8 @@ def test_DSA_sparse_attention_backward_sm90_relay_cluster_size_rejects_before_st
         api.sparse_attention_backward_wrapper(*args, deterministic=False, deterministic_dkv_relay_cluster_size=4)
     with pytest.raises(ValueError, match="must be 4, 8, or 16"):
         api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_dkv_relay_cluster_size=32)
+    with pytest.raises(ValueError, match="must be an integer"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_dkv_relay_cluster_size=4.5)
 
 
 @pytest.mark.L0
