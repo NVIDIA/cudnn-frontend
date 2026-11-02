@@ -16,7 +16,8 @@ def note_frost_routing(graph, label="graph"):
     this AFTER it: graph.selected_engine is the python engine that serves the
     graph, or None for the cuDNN backend. conftest.py prints the aggregate at
     the end of the run so the FROST-vs-native split stays visible while ops
-    transition to FROST.
+    transition to FROST. Also print the selected backend plan name so a failed
+    test identifies the native engine and knobs, not only the forward route.
     """
     import frost_routing
 
@@ -43,6 +44,10 @@ def note_frost_routing(graph, label="graph"):
             frost_routing.note(f"frost:{engine.name}:arms={arms}")
         frost_routing.LAST_ARMS = arms
     else:
+        index = getattr(graph, "_plan_index", None)
+        if index is not None:
+            name = graph.get_plan_name_at_index(index)
+            print(f"@@@@ {label} graph: native plan '{name}' serves this graph")
         frost_routing.note(f"native:{label}")
         frost_routing.LAST_PLAN = (None, None)
         frost_routing.LAST_ARMS = None
