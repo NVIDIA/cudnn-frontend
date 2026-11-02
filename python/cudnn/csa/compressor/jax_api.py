@@ -267,9 +267,9 @@ def csa_compressor_backward_jax_sm100(
         return call(
             _compressor_bwd_r128_adapter,
             output_shape_dtype=shapes,
-            # Only grad_ape needs zeros, but every output is initialized because the
-            # bridge's argument order for partially aliased outputs is not guaranteed.
-            initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init},
+            # KV/score are fully written. Identical zero inputs can be CSE'd into
+            # one buffer and alias both writable results; only atomic APE needs init.
+            initialized_outputs={2: zeros_init},
             ratio=ratio,
             head_dim=head_dim,
             coff=coff,
@@ -283,7 +283,9 @@ def csa_compressor_backward_jax_sm100(
     return call(
         _compressor_bwd_adapter,
         output_shape_dtype=shapes,
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init},
+        # KV/score are fully written. Identical zero inputs can be CSE'd into
+        # one buffer and alias both writable results; only atomic APE needs init.
+        initialized_outputs={2: zeros_init},
         ratio=ratio,
         head_dim=head_dim,
         coff=coff,

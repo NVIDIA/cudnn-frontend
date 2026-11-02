@@ -96,6 +96,17 @@ remains in JAX. Inputs use flat global index lists; physical Top-K width must be
 a multiple of 64. Transformer Engine's `dsa_indexer` and `dsa_sparse_attention`
 provide the differentiable JAX APIs and own their VJPs.
 
+For packed THD indexer inputs, pass `q=[Tq,64,128]`, `k=[Tk,1,128]`,
+`weights=[Tq,64]`, paired INT32 `cu_seqlens_q`/`cu_seqlens_k`, and positive
+static `max_seqlen_q`/`max_seqlen_k`. Prefixes describe contiguous segments
+starting at position zero and valid rows within the tensor capacities.
+Callers own prefix values; no device-to-host validation is performed.
+The K bound must cover `ceil(max_seqlen_q / 4)`, including partial query tails.
+Output is `[Tq, ceil4(max_seqlen_k)]` FP32; columns are **segment-local** key
+positions and invalid entries are `-inf`. Convert selected columns to packed
+key rows using that query's segment prefix before constructing sparse-attention
+IDs. THD changes neither sparse-attention input coordinates nor its layout.
+
 ### DSA Namespace
 
 ```python

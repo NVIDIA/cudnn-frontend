@@ -25,41 +25,82 @@ _sparse_bwd_kernels: dict[tuple, Any] = {}
 
 
 @cute.jit
-def _indexer_adapter(stream, q, k, weights, scores, denom, *, kernel, sm_scale, seqlen_q, seqlen_k):
-    kernel(
-        q,
-        k,
-        weights,
-        scores,
-        denom,
-        cutlass.Float32(sm_scale),
-        cutlass.Int32(seqlen_q),
-        cutlass.Int32(seqlen_k),
-        None,
-        None,
-        None,
-        stream,
-    )
+def _indexer_adapter(stream, q, k, weights, *buffers, kernel, is_varlen, sm_scale, seqlen_q, seqlen_k):
+    # The bridge accepts arrays only: dense calls omit the two prefix operands.
+    if cutlass.const_expr(is_varlen):
+        cu_q, cu_k, scores, denom = buffers
+    else:
+        scores, denom = buffers
+        cu_q, cu_k = None, None
+    kernel(q, k, weights, scores, denom, cutlass.Float32(sm_scale), cutlass.Int32(seqlen_q), cutlass.Int32(seqlen_k), cu_q, cu_k, None, stream)
 
 
-def indexer_forward_jax_sm100(q: Any, k: Any, weights: Any, *, ratio: int = 4, sm_scale: float = 1.0) -> Any:
-    """Compute dense ratio-causal DSv4 indexer scores using CuTeDSL."""
-    if q.ndim != 4 or k.ndim != 4 or weights.ndim != 3:
-        raise ValueError("q/k/weights must use BSHD/BSHD/BSH layouts")
-    batch, seqlen_q, heads, head_dim = q.shape
-    if k.shape[0] != batch or k.shape[2:] != (1, head_dim):
-        raise ValueError(f"k must have shape ({batch}, S_k, 1, {head_dim}), got {k.shape}")
-    seqlen_k = k.shape[1]
-    if weights.shape != (batch, seqlen_q, heads):
-        raise ValueError(f"weights must have shape {(batch, seqlen_q, heads)}, got {weights.shape}")
-    if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or weights.dtype != jnp.bfloat16:
-        raise TypeError("q, k, and weights must be bfloat16")
+def indexer_forward_jax_sm100(
+    q: Any,
+    k: Any,
+    weights: Any,
+    *,
+    ratio: int = 4,
+    sm_scale: float = 1.0,
+    cu_seqlens_q: Any = None,
+    cu_seqlens_k: Any = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+) -> Any:
+    """Dense ratio-causal scores for BSHD or contiguous packed THD inputs.
+
+    THD takes Q [Tq,64,128], K [Tk,1,128], weights [Tq,64], matching INT32
+    prefixes and static maximum lengths. Prefixes start at zero, are monotonic,
+    and end at valid rows within the tensor capacities; callers own these values.
+    Each segment's timeline starts at zero. max_seqlen_k must cover the partial
+    final query block as well as the actual key lengths. Returns [Tq,ceil4(maxK)]
+    FP32 scores indexed by segment-local key position, with invalid entries -inf.
+    """
+    if q.ndim not in (3, 4):
+        raise ValueError("q must use BSHD or THD layout")
+    is_varlen = q.ndim == 3
+    heads, head_dim = q.shape[-2:]
     if head_dim != 128 or heads != 64 or ratio != 4:
         raise ValueError("DSv4 JAX indexer requires H=64, D=128, ratio=4")
-    if seqlen_k % 4:
-        raise ValueError("indexer K length must be a multiple of four for FP32 TMA stores")
+    if is_varlen:
+        if k.ndim != 3 or k.shape[1:] != (1, head_dim) or weights.shape != q.shape[:2]:
+            raise ValueError("packed k/weights must have shapes [Tk,1,D]/[Tq,H]")
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise ValueError("THD requires both sequence prefixes")
+        if (
+            cu_seqlens_q.ndim != 1
+            or cu_seqlens_q.size < 2
+            or cu_seqlens_k.shape != cu_seqlens_q.shape
+            or cu_seqlens_q.dtype != jnp.int32
+            or cu_seqlens_k.dtype != jnp.int32
+        ):
+            raise ValueError("sequence prefixes must be matching 1-D INT32 arrays")
+        if any(not isinstance(n, int) or isinstance(n, bool) or n <= 0 for n in (max_seqlen_q, max_seqlen_k)):
+            raise ValueError("THD requires positive static maximum sequence lengths")
+        if max_seqlen_k < (max_seqlen_q + ratio - 1) // ratio:
+            raise ValueError("max_seqlen_k must cover ceil(max_seqlen_q / ratio)")
+        if q.shape[0] == 0 or k.shape[0] == 0:
+            raise ValueError("THD requires nonempty Q/K storage capacities")
+        seqlen_q, seqlen_k = max_seqlen_q, (max_seqlen_k + 3) // 4 * 4
+        score_shape, denom_shape = (q.shape[0], seqlen_k), (q.shape[0],)
+        operands = (q, k, weights, cu_seqlens_q, cu_seqlens_k)
+    else:
+        if any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)):
+            raise ValueError("sequence prefixes and maximum lengths are only accepted for THD")
+        batch, seqlen_q = q.shape[:2]
+        if k.ndim != 4 or k.shape[0] != batch or k.shape[2:] != (1, head_dim):
+            raise ValueError(f"k must have shape ({batch}, S_k, 1, {head_dim}), got {k.shape}")
+        if weights.shape != (batch, seqlen_q, heads):
+            raise ValueError(f"weights must have shape {(batch, seqlen_q, heads)}, got {weights.shape}")
+        seqlen_k = k.shape[1]
+        if seqlen_k % 4:
+            raise ValueError("indexer K length must be a multiple of four for FP32 TMA stores")
+        score_shape, denom_shape = (batch, seqlen_q, seqlen_k), (batch, seqlen_q)
+        operands = (q, k, weights)
+    if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or weights.dtype != jnp.bfloat16:
+        raise TypeError("q, k, and weights must be bfloat16")
 
-    key = (head_dim, heads, ratio)
+    key = (head_dim, heads, ratio, is_varlen)
     kernel = _indexer_kernels.get(key)
     if kernel is None:
         kernel = IndexerScoreUnifiedSm100(
@@ -70,24 +111,21 @@ def indexer_forward_jax_sm100(q: Any, k: Any, weights: Any, *, ratio: int = 4, s
             k_block_size=64,
             kv_stage=4,
             ratio=ratio,
-            is_varlen=False,
+            is_varlen=is_varlen,
             compute_lse=False,
             is_compressed_logits=False,
         )
         _indexer_kernels[key] = kernel
-
     scores, _ = call(
         _indexer_adapter,
-        output_shape_dtype=(
-            jax.ShapeDtypeStruct((batch, seqlen_q, seqlen_k), jnp.float32),
-            jax.ShapeDtypeStruct((batch, seqlen_q), jnp.float32),
-        ),
+        output_shape_dtype=(jax.ShapeDtypeStruct(score_shape, jnp.float32), jax.ShapeDtypeStruct(denom_shape, jnp.float32)),
         initialized_outputs={0: neg_inf_init, 1: zeros_init},
         kernel=kernel,
+        is_varlen=is_varlen,
         sm_scale=float(sm_scale),
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
-    )(q, k, weights)
+    )(*operands)
     return scores
 
 

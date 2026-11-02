@@ -39,7 +39,8 @@ def _check_against_reference(reference, inputs, *, ratio, coff, out_tol, grad_to
     got = jax.jit(lambda x, s, a: csa_compressor_forward_jax_sm100(x, s, a, cu, cu_comp, total_comp=kv.shape[0] // ratio, ratio=ratio, coff=coff))(
         kv, score, ape
     )
-    grads = csa_compressor_backward_jax_sm100(kv, score, ape, cu, cu_comp, jnp.ones_like(got), ratio=ratio, coff=coff)
+    # Include JIT buffer assignment: eager calls do not expose zero-buffer CSE.
+    grads = jax.jit(lambda x, s, a, go: csa_compressor_backward_jax_sm100(x, s, a, cu, cu_comp, go, ratio=ratio, coff=coff))(kv, score, ape, jnp.ones_like(got))
     ref_grads = jax.grad(lambda x, s, a: reference(x, s, a).astype(jnp.float32).sum(), argnums=(0, 1, 2))(kv, score, ape)
 
     pairs = [(got, reference(kv, score, ape), out_tol)]
