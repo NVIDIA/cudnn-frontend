@@ -3757,9 +3757,7 @@ def test_sm120_render_smoke() -> None:
                 assert f"b_is_n_major = {b_major == 'n'}" in src, combo
 
 
-@requires_sm120
-@pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
-def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
+def _check_quant_scale_k_padding_is_zeroed(config_name, axes, M, N) -> None:
     """An F8_128x4 quant-scale row holds roundup(blocks, 4) slots. A block-scaled
     GEMM whose K is the quantized axis reads the padding slots against its
     zero-filled K tail, so a stale 0xFF (the E8M0 NaN) there turns the whole
@@ -3767,7 +3765,7 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     buffer held: here 0xFF. Rows past the last real row of a 128-row atom stay
     unchecked. ``row_col`` also runs the row quant under the col quant's row
     predicate."""
-    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    cfg = _resolve(config_name)
     K, bs = 128, 32
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
@@ -3809,6 +3807,18 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
 # ---------------------------------------------------------------------------
 # Two-kernel split-K
 # ---------------------------------------------------------------------------
+
+
+@requires_sm120
+@pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
+def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
+    _check_quant_scale_k_padding_is_zeroed("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", axes, M, N)
+
+
+@requires_sm100
+@pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
+def test_sm100_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
+    _check_quant_scale_k_padding_is_zeroed("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", axes, M, N)
 
 
 def _splitk_graph(B, M, N, K, io_dt=cudnn.data_type.BFLOAT16, out_dt=cudnn.data_type.BFLOAT16, dynamic=False):

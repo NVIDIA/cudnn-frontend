@@ -2753,6 +2753,10 @@ def _run_moe_swap_ab_quant(case, *, block_scale=False):
                     if part.numel() == 0:
                         continue
                     padded = torch.full((_ceil_div(part.shape[0], 128) * 128, _ceil_div(part.shape[1], 4) * 4), 0xA5, device="cuda", dtype=torch.uint8)
+                    if not (grouped and axis == 1):
+                        # A real scale row's K padding slots come out 0 (token-axis group segments have none);
+                        # rows that only pad the 128-row atom stay unwritten.
+                        padded[: part.shape[0], part.shape[1] :] = 0
                     padded[: part.shape[0], : part.shape[1]] = part.view(torch.uint8)
                     packed = _to_blocked(padded).flatten()
                     expected[cursor : cursor + packed.numel()] = packed
