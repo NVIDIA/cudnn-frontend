@@ -164,6 +164,7 @@ def _get_sm100_kernel_class(
     total_s_kv: Optional[int] = None,
     head_dim: Optional[int] = None,
     num_heads: int = 64,
+    deterministic_relay_cluster_size: Optional[int] = None,
 ):
     """Load the selected implementation without perturbing other variants.
 
@@ -171,6 +172,11 @@ def _get_sm100_kernel_class(
     conditionals in a shared class measurably perturbs the code generation
     of the tuned paths.
     """
+    if deterministic_relay_cluster_size is not None:
+        if not deterministic:
+            raise ValueError("deterministic_relay_cluster_size requires deterministic=True")
+        if backend != "generic_m64":
+            raise ValueError("deterministic_relay_cluster_size is supported only by the deterministic generic_m64 backend")
     if backend == "h128_2cta_m64":
         from .dsa_bwd_sm100_h128_2cta import FlashAttentionDSABackwardSm100H128TwoCTA, FlashAttentionDSABackwardSm100H128TwoCTADeterministic
 
@@ -194,7 +200,13 @@ def _get_sm100_kernel_class(
     if deterministic:
         if total_s_q is None or total_s_kv is None or head_dim is None:
             raise ValueError("deterministic SM100 kernel selection requires total_s_q, total_s_kv, and head_dim")
-        kernel_cls = deterministic_kernel_class(total_s_q, total_s_kv, head_dim, num_heads)
+        kernel_cls = deterministic_kernel_class(
+            total_s_q,
+            total_s_kv,
+            head_dim,
+            num_heads,
+            deterministic_relay_cluster_size,
+        )
         if getattr(kernel_cls, "dkv_relay_cluster_size", 1) > 1:
             dsl_error = cutedsl_requirement_error("deterministic DSA backward cluster relay")
             if dsl_error is not None:
@@ -415,6 +427,7 @@ def flash_attn_bwd_sm100(
     workspace: Optional[torch.Tensor] = None,
     *,
     d_sink: Optional[torch.Tensor] = None,
+    deterministic_relay_cluster_size: Optional[int] = None,
     _compiled_kernel=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
@@ -441,9 +454,13 @@ def flash_attn_bwd_sm100(
         dkv: preallocated (total_S_kv, headdim), same dtype as kv
         d_sink: preallocated (nheads,) float32
         deterministic: use ordered bounded-wave scratch accumulation; large
-            generic-M64 plans use row-aware four-, eight-, or sixteen-CTA
-            cluster relays, while supported BF16 H96/H128 envelopes retain
-            their two-CTA kernels
+            generic-M64 plans automatically use row-aware four-, eight-, or
+            sixteen-CTA cluster relays, while supported BF16 H96/H128
+            envelopes retain their two-CTA kernels
+        deterministic_relay_cluster_size: optional exact 4-, 8-, 16-, 32-, or
+            64-CTA logical relay for a deterministic generic-M64 large-context
+            launch; 32/64 use two/four ordered 16-CTA physical launches; invalid or
+            inapplicable requests fail instead of falling back
         current_stream: CUDA stream handle for all initialization, main, and
             reduction launches; defaults to the current CUDA stream (the plan
             API selects Q's device context before entering this function)
@@ -541,6 +558,15 @@ def flash_attn_bwd_sm100(
         device_capability=device_capability,
         deterministic=deterministic,
     )
+    kernel_cls = _get_sm100_kernel_class(
+        backend,
+        deterministic,
+        total_S_q,
+        total_S_kv,
+        head_dim,
+        num_head,
+        deterministic_relay_cluster_size,
+    )
     if backend in ("h96_d576_2cta_m64", "h128_d576_2cta_m64"):
         # The D576 two-CTA kernel has its own plan-time compile and launch
         # contract (see ``_interface_sm100_d576``); it shares this entry point
@@ -564,9 +590,8 @@ def flash_attn_bwd_sm100(
             workspace=workspace,
             deterministic=deterministic,
         )
-    kernel_cls = _get_sm100_kernel_class(backend, deterministic, total_S_q, total_S_kv, head_dim, num_head)
     deterministic_shards = kernel_cls.num_dkv_shards if deterministic else 0
-    deterministic_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1) if deterministic else 0
+    selected_relay_cluster_size = getattr(kernel_cls, "dkv_relay_cluster_size", 1) if deterministic else 0
     uses_h128_two_cta = backend == "h128_2cta_m64"
     batch_size = 1
 
@@ -579,6 +604,7 @@ def flash_attn_bwd_sm100(
         num_head,
         deterministic,
         backend,
+        deterministic_relay_cluster_size,
     )
     workspace_LSE_OdO, workspace_dKV = _carve_workspace_sm100(
         workspace,
@@ -616,7 +642,7 @@ def flash_attn_bwd_sm100(
         num_head,
         block_tile,
         deterministic_shards,
-        deterministic_relay_cluster_size,
+        selected_relay_cluster_size,
         device.index,
         max_topk,
         has_topk_length,
