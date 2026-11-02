@@ -454,6 +454,8 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
     b, m, n = tap.dim
     m_expr = "1" if m == 1 else "sym_m"
     n_expr = "1" if n == 1 else "sym_n"
+    if n != 1 and tap.dtype == "fp4_e2m1" and not tap.is_reduction and not tap.is_quant_scale:
+        n_expr = "(sym_n // 2)"  # byte-packed pairs, as the undimensioned branch above binds them
     l_expr = "1" if b == 1 else "sym_l"
     if tap.is_reduction and chain is not None:
         red_idx = int(tap.source.rsplit("_", 1)[1])
