@@ -115,9 +115,13 @@ navigation:
           - page: Fused Conv3D + Bias + Residual + RMSNorm + SiLU
             path: ../../operations/convolutions/conv3d_postops.md
             slug: conv3d_postops
-      - page: Custom Reduction
+      - section: Custom Reduction
         path: ../../operations/CustomReduction.md
         slug: operations/CustomReduction
+        contents:
+          - page: How custom reductions work
+            path: ../../operations/custom_reduction/overview.md
+            slug: overview
       - page: FFT Causal Conv1d
         path: ../../operations/FFTCausalConv1d.md
         slug: operations/FFTCausalConv1d

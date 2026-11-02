@@ -1,5 +1,7 @@
 # Custom Reduction
 
+For a conceptual walkthrough, see How custom reductions work ([docs](/operations/CustomReduction/overview), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/custom_reduction/overview.md)).
+
 A custom reduction reduces one or more input tensors along the same dimensions. Each input is a stream. A reducer callback that you write sets how two values of a stream combine. The callback can read the values of all streams, so a reduction such as argmax (a value stream and an index stream) is one operation.
 
 The frontend calls the reducer when it builds the operation graph. After an expansion that succeeds, the frontend keeps the child graph and does not call the reducer again. If the reducer throws an exception, the build returns `INVALID_VALUE` with the exception message (Python: a `RuntimeError` that contains the type and the message of the Python exception). If the reducer throws an exception or the frontend refuses the child graph, the frontend does not keep the child graph, and the next build calls the reducer again. The reducer adds pointwise operations to a child graph. cuDNN runs that child graph for each combination step.
@@ -89,7 +91,7 @@ argmin(Custom_reduction_attributes attributes,
 - `argmax` and `argmin` reduce two streams: stream 0 holds the values and stream 1 holds the index of each element along the reduced dimensions (for example 0 to N−1), in a tensor of the full input shape. Among equal values, the lowest index value wins.
 - `value_type` and `index_type` are the data types of the two streams; the identities have exactly these types. A value stream that is not `FLOAT`, `HALF`, `BFLOAT16` or `DOUBLE`, or an index stream that is not `INT32` or `INT64`, gives `INVALID_VALUE` from `validate`.
 - The identities are `(-inf, largest index)` for argmax and `(+inf, largest index)` for argmin, and `(NaN, largest index)` for `IGNORE_NAN`, where the largest index is the maximum of the index type. Each is a two-sided identity of its body for any index values smaller than the largest index.
-- The frontend builds the graph for each stream type; the cuDNN library decides which stream types and body forms it runs, and this can change with the library version. If the library does not support the graph, the build returns its status unchanged (`GRAPH_NOT_SUPPORTED` for a not-supported status). Known limits at cuDNN 9.29: the library does not run a `DOUBLE` value stream or an `INT64` index stream, and it does not run a custom reduction with more than one graph output, so read the index output or the value output, not both.
+- The frontend builds the graph for each stream type; the cuDNN library decides which stream types and body forms it runs, and this can change with the library version. If the library does not support the graph, the build returns its status unchanged (`GRAPH_NOT_SUPPORTED` for a not-supported status).
 
 The rule sets the result for NaN values. Each rule gives the lowest index among equal values, and `-0` equals `+0`.
 
