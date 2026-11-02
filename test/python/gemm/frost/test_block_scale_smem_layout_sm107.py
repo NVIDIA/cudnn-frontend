@@ -337,10 +337,7 @@ def _catalog_smem_geometries(mma_tile_k_bytes: int) -> list[str]:
 
 @pytest.mark.parametrize("template", [_DENSE_TEMPLATE, _MOE_TEMPLATE])
 def test_sf_rings_are_declared_before_ab_rings(template):
-    """Source order IS the SMEM layout.  Both block-scale templates must declare the
-    scale-factor rings before the A/B rings, every ring root must be a
-    ``Tcgen05SmemDesc.build()`` operand (that is WHY the order matters), and the
-    reason must be written next to the declarations so nobody reorders it back."""
+    """Keep descriptor roots in declaration order and link their protocol."""
     src = (_TEMPLATES_DIR / template).read_text()
 
     def decl(name: str) -> int:
@@ -362,9 +359,11 @@ def test_sf_rings_are_declared_before_ab_rings(template):
         assert re.search(pat, src), f"{template}: {lst} is no longer a Tcgen05SmemDesc.build() root"
 
     comment = src[max(0, sfa - 1600) : sfa]
-    assert (
-        "descriptors.py:513-522" in comment and "14 bits" in comment
-    ), f"{template}: the 14-bit build() mask rationale must sit right above the ring declarations"
+    assert "README.md#sm100-block-scale-descriptor-roots" in comment, f"{template}: descriptor roots must link their protocol"
+    readme = (Path(__file__).resolve().parents[4] / "python/cudnn/frost/README.md").read_text()
+    protocol = readme.split("## SM100 block-scale descriptor roots\n", 1)[1].split("\n## ", 1)[0]
+    assert "14-bit" in protocol and "16-byte" in protocol and "262144" in protocol
+    assert "_block_scale_smem_desc_roots" in protocol
 
 
 def test_model_reproduces_the_forced_stage_gpu_sweep(rubin):

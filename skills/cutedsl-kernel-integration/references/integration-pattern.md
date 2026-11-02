@@ -48,7 +48,7 @@ Use this routing table before choosing the package namespace:
 Follow the closest template instead of inventing a new lifecycle.
 
 - Public functions:
-  - Name each function `cudnn.ops.<op_name>_<direction>` (PyTorch) or `cudnn.ops.<op_name>_<direction>_jax` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
+  - Name each function `cudnn.ops.<op_name>_<direction>` (PyTorch) or `cudnn.ops.<op_name>_<direction>_jax` (JAX), following `docs/operations/api_conventions.md`.
   - Validate dtype, shape, stride, tiling, architecture, and unsupported combinations before compiling.
   - For fused kernels, validate epilogue-specific constraints: activation mode, auxiliary inputs/outputs, output shape/stride contract, dtype compatibility, and unsupported activation/config combinations.
   - For dense blockscaled epilogue kernels, model every public output explicitly. Common contracts include `C` plus `AB12`, split `D1/D2`, `amax`, `SFC`, `SFD1/SFD2`, or probability inputs such as `prob_tensor`.
@@ -138,7 +138,7 @@ Do not expose `_get_rubin_kernel()` or Rubin module paths in public docs unless 
 
 Export public functions from `cudnn.ops`, so callers import them as `from cudnn.ops import ...`.
 
-Add each function to the `_LAZY_EXPORTS` table in `python/cudnn/ops/__init__.py` rather than importing it eagerly; `__all__` follows the table. For an op in a family (see `docs/fe-oss-apis/api_conventions.md`), use the table in `python/cudnn/ops/<family>/__init__.py`. Route the name to the module that implements it:
+Add each function to the `_LAZY_EXPORTS` table in `python/cudnn/ops/__init__.py` rather than importing it eagerly; `__all__` follows the table. For an op in a family (see `docs/operations/api_conventions.md`), use the table in `python/cudnn/ops/<family>/__init__.py`. Route the name to the module that implements it:
 
 ```python
 _LAZY_EXPORTS = {
@@ -166,11 +166,12 @@ Add an FE OSS API doc page for user-facing APIs.
 
 Common locations:
 
-- GEMM fusions: `docs/fe-oss-apis/gemm_fusions/<operation>.md`
-- Attention-specific pages: `docs/fe-oss-apis/attention/<operation>.md`
-- Other frontend-only APIs: `docs/fe-oss-apis/<operation>.md`
+- GEMM fusions: `docs/operations/gemm_fusions/<operation>.md`
+- Sparse attention: `docs/operations/sparse_attention/<operation>.md`
+- Other attention pages: `docs/operations/attention/<operation>.md`
+- Other frontend-only APIs: `docs/operations/<family>/<operation>.md`
 
-Update `docs/fe-oss-apis/overview.md` with a link to the new page or to the broader operation anchor used by nearby docs. If the operation is summarized from a broader operation page such as `docs/operations/Attention.md`, update that operation page and keep the FE OSS page and operation summary in sync.
+List the page under its operation in `docs/fern/versions/latest.yml` and link it from `docs/operations/overview.md`. Keep related operation summaries in sync.
 
 The doc page should cover:
 

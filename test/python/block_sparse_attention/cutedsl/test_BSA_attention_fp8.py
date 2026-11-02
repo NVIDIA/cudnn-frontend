@@ -363,7 +363,7 @@ def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
 @pytest.mark.L0
 @pytest.mark.parametrize("arch", (90, 120))
 def test_bsa_fp8_blk128_dispatch_preserves_v_layout_and_metadata(monkeypatch, arch):
-    """The two native blk128 paths share an API but require different V storage."""
+    """Pin each blk128 path's V layout, K scaling and sparse metadata."""
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: arch)
@@ -379,14 +379,14 @@ def test_bsa_fp8_blk128_dispatch_preserves_v_layout_and_metadata(monkeypatch, ar
 
     def quantize(actual_q, actual_k, actual_v, **kwargs):
         assert actual_q is actual_k is actual_v is q
-        assert kwargs == ({"v_layout": "bhds"} if arch == 90 else {"v_block_size": 128})
+        assert kwargs == ({"v_layout": "bhds"} if arch == 90 else {"v_block_size": 128, "k_quant_block_size": 16})
         calls.append("quantize")
         return quantized
 
     def launch(*args, **kwargs):
         assert args[:6] == quantized
         assert args[6] is indices and args[7:] == (1, 0.125)
-        assert kwargs == ({} if arch == 90 else dict(block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=128, v_block_size=128))
+        assert kwargs == ({} if arch == 90 else dict(block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=128, v_block_size=128, k_quant_block_size=16))
         calls.append("launch")
         return expected, None
 

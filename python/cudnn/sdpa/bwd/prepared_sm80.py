@@ -13,33 +13,46 @@ from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES, execute
 RO_ROLES = ("ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_do", "ragged_dq", "ragged_dk", "ragged_dv", "ragged_stats")
 
 
+def stats_storage_facts(tensor, fact, operand):
+    """Keep the standalone declared-stride binding without rebuilding a view."""
+    if fact.span < operand.span:
+        available = tensor.untyped_storage().nbytes() // tensor.element_size() - tensor.storage_offset()
+        if available < operand.span:
+            raise ValueError("sdpa_bwd_sm80: stats backing storage is too small for the declared strides")
+        fact = fact._replace(span=operand.span)
+    return fact
+
+
 def native_layouts(api):
     """Select native vector-aligned operands with complete declarations."""
-    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+    return native_decline_reason(api) is None
 
-    if api._has_rope or (api.head_dim_qk, api.head_dim_v) != (api.flavor_d_qk, api.flavor_d_v):
-        return False
+
+def native_decline_reason(api):
+    from cudnn.sdpa.native_sm80 import data_layout_mismatch
+
+    if api._has_rope:
+        return "SM80 RoPE backward requires staging and is not supported by the native adapter"
     for role in ROLES[:5] + ROLES[6:9]:
         desc = getattr(api, role + "_desc")
-        if not dense_layout_ok(desc.shape, desc.stride) or any(n > 1 and st % 8 for n, st in zip(desc.shape[:-1], desc.stride[:-1])):
-            return False
-    # Older direct adapters declared only has_bias or omitted auxiliary gradient
-    # descriptors. Their optional runtime-output contract uses the staged
-    # prepared recipe, which validates and binds auxiliary outputs per call.
+        reason = data_layout_mismatch(role, desc.shape, desc.stride, thd=api.thd)
+        if reason is not None:
+            return reason
     if api._has_bias:
         if api.bias_desc is None or api.dbias_desc is None:
-            return False
+            return "SM80 bias and dbias must both be declared for native backward"
     elif api.bias_desc is not None or api.dbias_desc is not None:
-        return False
+        return "SM80 bias and dbias declarations require has_bias=True"
     if (api.sink_desc is not None) != (api.dsink_desc is not None):
-        return False
-    for desc in (api.sink_desc, api.dsink_desc, api.bias_desc, api.dbias_desc):
+        return "SM80 sink and dsink must both be declared for native backward"
+    for role in ("sink", "dsink", "bias", "dbias"):
+        desc = getattr(api, role + "_desc")
         if desc is not None and not desc.is_contiguous():
-            return False
-    return True
+            return f"SM80 {role}: native backward requires contiguous storage; got stride {tuple(desc.stride)}"
+    return None
 
 
-def build_spec(api, d64_module, *, staged=False):
+def build_spec(api, d64_module):
     """Compile the chain with plan-time strides and dynamic packed capacities."""
     from .kernels.sm80.prepared_host import compile_host, launch_bounds, thd_origins
     from cudnn.sdpa.fwd.kernels.sm80.packed_init import FROST_SOURCE_DIGEST as init_digest
@@ -88,7 +101,9 @@ def build_spec(api, d64_module, *, staged=False):
                             shape, strides = (api._t_q_phys, api.h_q), (api.h_q, 1)
                         else:
                             hs = api._thd_lse_head_stride or api._t_q_phys
-                            shape, strides = (1, api.h_q, hs), (api.h_q * hs, hs, 1)
+                            # Head padding is storage pitch, not additional
+                            # logical rows (including after the last head).
+                            shape, strides = (1, api.h_q, api._t_q_phys), (api.h_q * hs, hs, 1)
                 span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
                 alignment = 16 if role in ROLES[:5] + ROLES[6:9] else desc.dtype.itemsize
                 op = Operand(str(desc.dtype).split(".")[-1], shape, strides, span, alignment, desc.dtype.itemsize)
@@ -103,16 +118,7 @@ def build_spec(api, d64_module, *, staged=False):
         else:
             geometry.append(((math.prod(op.shape),), (1,)))
     roles = ROLES
-    if staged:
-        # The existing native entry retains its fifteen-operand ABI. Only the
-        # staged wrapper supplies a precomputed RoPE table.
-        roles += ("rope",)
-        shape = (api._rope_max_s, api.flavor_d_qk // 2, 2)
-        strides = (api.flavor_d_qk, 2, 1)
-        operands.append(Operand("float32", shape, strides, math.prod(shape), 4, 4) if api._has_rope else None)
-        geometry.append((shape, strides) if api._has_rope else None)
-    # The offset operands trail the geometry operands (and RoPE); the compiled
-    # geometry itself is unchanged.
+    # Offset operands follow the unchanged native geometry.
     origins = thd_origins(api)
     for o in origins or (None,) * len(RO_ROLES):
         width = 8 if o is not None and o[3] == "int64" else 4
@@ -132,8 +138,8 @@ def build_spec(api, d64_module, *, staged=False):
             elif role == "stats":
                 if api._thd_lse_token_major:
                     shape = (-1, api.h_q)
-                elif not api._thd_lse_head_stride:
-                    shape, strides = (1, api.h_q, -1), (0, -1, 1)
+                else:
+                    shape, strides = (1, api.h_q, -1), (0, api._thd_lse_head_stride or -1, 1)
             normalized[i] = (shape, strides)
         compile_geometry = tuple(normalized)
     key = template_key(
@@ -183,6 +189,12 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
     facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
     facts.update(zip(RO_ROLES, map(facts_of_tensor, ro_tensors or (None,) * len(RO_ROLES))))
+    # Moving padded declarations off staging must preserve the standalone
+    # auxiliary-output shape checks, before any accumulator is initialized.
+    for role in ("dbias", "dsink"):
+        desc, fact = getattr(api, role + "_desc"), facts[role]
+        if desc is not None and fact is not None and fact.shape != tuple(desc.shape):
+            raise ValueError(f"sdpa_bwd_sm80: {role} must match the declared logical shape {tuple(desc.shape)}")
     if api.thd:
         for role in ("seq_q", "seq_kv"):
             f = facts[role]
@@ -192,10 +204,20 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
     if stats is not None:
         if api.thd:
             op = spec.operands[5]
-            if stats.shape != op.shape or stats.strides != op.strides:
+            if api._thd_lse_token_major:
+                matches = stats.shape == op.shape and stats.strides == op.strides
+            else:
+                # Accept either a logical-row slice or the legacy full-pitch
+                # carrier. Only stepped strides determine addressed storage.
+                matches = (
+                    stats.shape in (op.shape, (1, api.h_q, op.strides[1])) and stats.strides[2] == 1 and (api.h_q == 1 or stats.strides[1] == op.strides[1])
+                )
+            if not matches:
                 raise ValueError("THD stats must match the declared packed layout")
         elif stats.numel != api.batch_size * api.h_q * api.s_q_max or (api._lse_stride is None and not stats.contiguous):
             raise ValueError("stats must match the declared element count and storage layout")
+        if not api.thd:
+            facts["stats"] = stats_storage_facts(tensors[5], stats, spec.operands[5])
     # Stats has always been a storage binding: compact plans accept flat buffers,
     # and strided plans reinterpret the declared strides after checking capacity.
     geometry = tuple((op.shape, op.strides) if op is not None and i < 9 and i != 5 else None for i, op in enumerate(spec.operands))

@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Paged live-page counts are scalar integer arithmetic. Preserve the existing
+`(length + page_size - 1) // page_size` expression in persistent loaders:
+CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations
+and fail with an illegal `cute.derefine`, even when both inputs are scalar.
+The page8 case in `TestNativeSingleQPaged` exercises the initial and next-work
+page counts. For an opaque compiler failure, retain the module after the
+failing pass with line information; raw pre-pass IR can point at unrelated
+constants with the same value.
+
 **Rule S1 — Respect the declared Stats (LSE) packing: packed and explicitly
 padded Stats are different contracts.**
 
@@ -15,6 +24,11 @@ padded Stats are different contracts.**
   callers take head-major `(H, head_stride)`. A dense-padded declaration
   (per-sequence stride) mis-addresses under that packing — it must be
   rejected for a packed Stats declaration, not silently accepted and mis-read.
+- The packed-layout requirement applies to the **graph declaration**, not
+  the shape of a variant-pack buffer. A flat or capacity-shaped carrier is raw
+  storage: bind the declared strides after checking its exposed storage span.
+  Do not require a packed carrier shape or infer packing from its strides.
+  Standalone APIs without graph storage semantics retain their layout checks.
 - Validate by stride, not by a `thd`/`packed` flag: token-major is
   `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1` with
   `stride_h` the declared head stride, which must cover the **packed token
@@ -33,6 +47,13 @@ padded Stats are different contracts.**
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+
+Packed graph Stats can also arrive as a `(T, H, 1)` carrier for either packing.
+Validate its token/head strides and capacity against the declaration, then bind
+the same storage without copying. The SM80 detector
+`test_graph_thd_independent_pitches_rebind_replay` covers both carrier forms,
+fresh pointers, changed-length replay, and pre-launch rejection of short or
+incorrectly pitched carriers.
 
 An explicitly padded Stats output is a separate existing forward contract:
 when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
@@ -92,6 +113,13 @@ and layout, not just its paged path. Assert the prepared THD spec contains
 `origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
 THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
 gaps, independent port origins, rebinding, and changed-length replay.
+
+A test that changes a port's token pitch must update that port's physical
+ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
+an SDPA output's generated name need not be `o`. A prefix-only kernel can mask
+an incorrect fixture until physical-origin addressing is enabled. The SM80
+`test_graph_thd_independent_pitches_rebind_replay` and
+`test_independent_origins_rebind_replay` check these two contracts separately.
 
 For single-Q ragged split decode, physical Q-offset differences can include
 storage gaps. The combine must use the declared device Q lengths (ordinary or
@@ -279,6 +307,28 @@ that loops dimension subtiles must not also request multiple loads per subtile.
 `TestD256Fp8HeadPadding::test_paged_rebind_replay` covers partial K/V heads,
 short and wide pages, independent pools/tables, sinks and changed-length replay.
 
+Native backward gradient outputs must not overwrite each other.
+
+
+- A native route replacing ordered staged copy-back must reject overlapping
+  gradient address sets before any initialization or launch, on both graph and
+  standalone calls. Recheck current pointers on every binding.
+- Shared allocation or overlapping bounding spans do not imply overlapping
+  elements: disjoint interleaved Q/K/V gradients remain valid. Use declared
+  strides even when the graph binds flat storage or raw pointers.
+- Cache disjointness geometry at plan time. Regular padded interleaves need
+  a bounded check even when outer padding defeats the stride-GCD shortcut;
+  include head/batch carry gaps and recheck current pointer offsets. Compare
+  the result against an address-set oracle with mixed layouts, different block
+  widths and both pointer orders. Measure large declarations without walking
+  every row per bind.
+- Detectors: `test_native_gradient_overlap_rejected_before_entry`,
+  `test_native_shared_gradient_storage_matches_address_oracle`, and
+  `test_native_overlapping_gradients_rejected_before_writes`. Preserve the
+  existing legal interleaved-gradient tests. When retiring a staged copy-order
+  path, replace its overlap case with a pre-launch rejection test that guards
+  the same output and workspace storage.
+
 **Rule S6 — A kernel feature lands on every arch line's test file, and its
 other-arch lowerings are smoke-compiled from whatever GPU you have.**
 
@@ -369,6 +419,13 @@ RELATIVE to the reference magnitude (`max_err <= rel * max|ref|`; with |dq|
 batch, where the linear offsets are largest. Rendering a kernel host-only for
 a `>= 2^31` geometry and grepping its PTX for `mul.wide.s32` / `cvt.s64.s32`
 on the address path shows the wrap before any GPU run.
+
+For paired dQ and dK/dV schedulers, bound each decoder's Int32 divisor using
+its own tile count and operand footprint. FP8 dQ derives its swizzle from
+K/V while dK/dV derives it from Q/dO; checking just one misses asymmetric
+sequence lengths. The host-only detector
+`test_fp8_accumulation_swizzle_accounts_for_byte_payload` exercises both
+orientations, the last safe tile and the first overflowing row.
 
 **Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
 
@@ -489,10 +546,60 @@ production kernels gain no debug knob or timing-dependent assertion.
   generated by `benchmark/placement_gen/gen.py` from a frozen sweep and qualified on a frozen holdout. Never edit
   `TABLE` by hand; regenerate it and cite the study in the entry.
 - A new FROST-vs-backend boundary first tries a study: a class key read off graph facts and, per class, one monotone
-  threshold on whichever `placement_table.FEATURES` scalar (cost proxy, parallel tiles) fits the training grid best,
+  threshold on whichever `placement_table.FEATURES` scalar (cost proxy, parallel tiles, query rows, KV per request, query tokens per request) fits the training grid best,
   qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
+- Test study ownership through `class_key` and the matched entry's `study`, not a global absence of entries for another
+  measured class. Square causal masks canonicalize to bottom-right; use unequal Q/KV lengths to test the top-left class.
+  Re-run placement-table tests on the actual develop integration when another study lands in the same table.
+- An entry answers for its whole class, so the grid must reach the class's extremes and straddle every boundary. Three
+  misses each found in review or on a holdout:
+  - an `always` fitted on long prefills that also claimed q = KV = 16 (FROST 2x slower there);
+  - a threshold placed midway across an unmeasured 32-64 tile gap;
+  - a power-of-two head grid that never saw the unpacked GQA regime (d512 decode at G = 12-96, 5-21x slower).
+
+  Draw holdouts OFF the training lattice (odd head counts, batches, off-tile lengths), and add a key field only when it
+  follows the kernel (`_unpacked_decode` reads the row's own pack decision).
+
+
+**Rule S13 — Register redistribution must converge at warpgroup scope.**
+
+All four warps in a warpgroup must execute the same `setmaxnreg` instruction.
+Put a shared service-role register release before branching into individual
+MMA, load, store and scheduler warps; calling the same helper separately from
+those branches emits distinct instructions and violates the PTX contract.
+An increase in one warpgroup may wait for registers released by another, so
+keep the original register budget and ensure every releasing warp can reach it.
+
+Detector: inspect generated PTX/SASS around the kernel's role dispatch. The
+service warpgroup must reach one common `setmaxnreg.dec` / `USETMAXREG.DEALLOC`
+site before splitting into roles. Separate sites reached by individual warps
+are invalid even when their immediate register counts match. Repeated CUDA
+Graph replay and sanitizer checks are also required; a single launch cannot
+establish liveness. See the [PTX setmaxnreg contract](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg).
+
+`test_sdpa_fp8_sm107.py::TestNativeHalfRegisterRelease` cross-compiles the
+D32/D64/D128 half body, including packed Stats and three softmax warpgroups,
+and counts the two common release sites (correction and service groups).
+The selected SM107 CI entry collects these checks; they also cross-compile
+from other architectures when the installed tools support the target.
+
+
+**Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
+
+An empty tile can skip memory transfers and arithmetic, but its output path
+must still wait until the loader has observed the buffer's empty phase.
+Otherwise zero-output completion can release the buffer before the loader's
+initial wait, making that parity wait target the next cycle forever.
+For D192 accumulation, publish zero-byte K/V full arrivals for empty tiles and
+consume those phases on every tile before signaling output completion.
+
+Detector: `test_d192_causal_empty_kv_tiles` repeatedly replays a causal graph
+whose KV extent exceeds Q. Packed kernels also need declared-envelope tails
+and live/empty transitions; a sanitizer pass or a single launch does not
+establish liveness.
+
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
@@ -871,6 +978,18 @@ replay after previously active rows become fully masked. The detector is
 
 ## Adapter declines that other suites pin
 
+For SM80 native admission, distinguish stepped dense axes from packed THD
+addressing: THD never reads the declared batch stride. A shared dense-layout
+predicate can silently select staging for an otherwise valid packed graph.
+Keep per-port graph/standalone rejection checks and legal gapped THD controls
+in `test_sdpa_native_admission_sm80.py`, plus actual launch-count/replay checks.
+Keep declaration-only validators in `native_sm80.py`, outside prepared launch
+modules: the latter depend back on adapter helpers and can introduce import
+cycles when called by `check_support()`. After removing a supported route,
+remove its unreachable test branches and name the retained decline/replay
+cases for the contract they actually assert.
+
+
 `gated_attention_block` runs the SDPA forward adapter as its attention stage, and
 its tests pin the adapter's declines by message (`match="multiple of 128"`).
 Those tests run only on the `oss` CI lanes (`python/*/cutedsl`, SM107). A change
@@ -881,6 +1000,16 @@ for the old message.
 
 
 ## Prepared THD launch bounds and setup
+
+Compiled host defaults must be serializable by `compiled_cache._json_plain`.
+A tuple default such as `table_strides=(0, 0)` silently prevents artifact
+persistence, even when normal execution passes. Use `None` for optional runtime
+metadata defaults and supply the actual tuple through the binder. Run
+`test_f16_host_entries_carry_only_record_reproducible_defaults` and the affected
+flavor's `TestNativeHalfStrides::test_artifact_reload`. D256 also needs
+`test_prefill_artifact_reload`: the short-Q fixture selects the separate decode
+host. The prefill test asserts its actual module; both tests forbid JIT in the
+second process and check output after replay.
 
 Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
 per-port dtype tuple in the prepared artifact key, alongside origin strides and

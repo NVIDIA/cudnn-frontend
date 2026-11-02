@@ -9,6 +9,7 @@ This directory contains benchmarking tools for linear attention operations (GDN/
 - `Dockerfile` - Docker container setup for running benchmarks
 - `benchmark_single_linear_attention.py` - Single linear attention benchmark script
 - `plot_results.py` - Renders the charts under `results/` from a sweep CSV
+- `steep_decay/` - Standalone GDN-2 steep-decay reproduction and its summary script (see its notes)
 - `results/<variant>/<gpu>/` - Dated sweep CSVs and the charts rendered from them
 
 ## Quick Start

@@ -12,8 +12,8 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_bsa_jax_torch_parity(layout):
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("JAX BSA requires SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("JAX BSA requires SM100 or SM103")
     from cudnn.frost.buffers import cutedsl_requirement_error
 
     requirement_error = cutedsl_requirement_error("JAX BSA parity tests")
@@ -47,8 +47,8 @@ def test_bsa_jax_torch_parity(layout):
 
 
 def test_torch_runtime_without_jax():
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("This isolation case uses SM100 blk128")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("This isolation case uses SM100/SM103 blk128")
     script = """
 import sys
 class NoJax:

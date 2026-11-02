@@ -112,6 +112,7 @@ from cutlass.utils.blackwell_helpers import (
 )
 
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cudnn.tensor_adapter import has_tcgen05
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 from cudnn.api_base import WorkspaceCarver, ws_align
@@ -3900,8 +3901,8 @@ def _build_cute_dsl_kernel(
     persistent_grid_size = None
     if deterministic:
         persistent_grid_size = deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
-    if torch.cuda.get_device_capability()[0] < 10:
-        raise RuntimeError("Requires SM100+")
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        raise RuntimeError("Requires SM100+ with tcgen05 (not cc 12.x)")
     if persistent_grid_size is None:
         persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 

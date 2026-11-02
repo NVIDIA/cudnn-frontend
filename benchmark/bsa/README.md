@@ -4,7 +4,27 @@
 | --- | --- |
 | `benchmark_sm90_blk128.py` | SM90: native blk128 vs. the same sparse graph expressed in blk64 |
 | `benchmark_sm120_blk128.py` | SM120: native blk128 BF16 forward |
+| `benchmark_sm120_fp8_blk128.py` | SM120: FP8 blk64 vs blk128, or blk128 per-16-token vs per-token K scaling |
 | `benchmark_sm100_kpage.py` | SM100/SM103: blk128 BSA with and without `kpage` on layouts from open-source video sparse-attention systems |
+
+## SM120 per-token FP8 Q/K
+
+Requires an SM120 GPU and CuTe DSL >= 4.8.0. Q uses one scale per
+token/head in both modes; `--compare-per-token` compares K scales over
+16 tokens against K scales over one token, with D=128 and unchanged
+per-channel V. The default invocation still compares blk64 against blk128.
+
+```bash
+python benchmark/bsa/benchmark_sm120_fp8_blk128.py \
+  --compare-per-token --sequence 4096 --densities 0.125 0.5 1 \
+  --patterns strided local --repeats 21
+```
+
+The report separates prequantized attention from the public wrapper including
+Q/K/V quantization, checks sampled output error, and alternates A/B graph
+replays on the same sparse mask. Finer scaling can increase attention-only
+latency even when faster preprocessing improves the total. Neither synthetic
+error nor latency is an end-to-end model-quality measurement.
 
 ## `benchmark_sm100_kpage.py`
 

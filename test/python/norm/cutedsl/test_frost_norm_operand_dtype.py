@@ -110,4 +110,6 @@ def test_cache_entry_is_not_shared_across_parameter_dtypes():
     torch.cuda.synchronize()
     ref = F.group_norm(x2.double(), 24, g2.double(), b2.double(), 1e-5)
     err = (y.double() - ref).abs().max().item()
-    assert err < 2e-2, f"matching-dtype InstanceNorm wrong after the shared compile (max {err:.2e})"
+    torch.testing.assert_close(
+        y, ref, check_dtype=False, msg=lambda detail: f"matching-dtype InstanceNorm wrong after the shared compile (max {err:.2e}): {detail}"
+    )

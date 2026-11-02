@@ -53,6 +53,7 @@ from cudnn.tensor_adapter import (
     default_stream,
     framework_dtype,
     get_compute_capability,
+    has_tcgen05,
     get_device,
     get_shape,
     get_strides,
@@ -1126,8 +1127,8 @@ def _normalize_dglu_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     capability = major * 10 + minor
-    if capability < 100:
-        raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+, found SM{capability}")
+    if not has_tcgen05(major):
+        raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
     return normalized, backend
 
 
@@ -1364,7 +1365,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
     ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
-    no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
+    no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
     """
     if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options

@@ -79,7 +79,7 @@ These APIs are not selected automatically by `cudnn.pygraph`.
   normalization-and-padding variant writes current frames and zeros but leaves
   existing-history interiors for the caller to fill.
 
-See the [fused Conv3D + post-operations API reference](../fe-oss-apis/conv3d_postops.md)
+See the [fused Conv3D + post-operations API reference](/operations/Convolutions/conv3d_postops)
 for the complete per-variant channel table, tensor shapes, normalization math,
 weight formats, and history/stream contracts.
 

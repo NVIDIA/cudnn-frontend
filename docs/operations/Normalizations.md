@@ -261,7 +261,7 @@ The experimental direct Python API `RmsNormSiluPadSm100` combines optional
 bias/residual addition, normalization, SiLU, padding, and history/cache copies
 for C160/C320/C640 BF16 tensors. It does not perform convolution. See
 [fused Conv3D + post-operations](Convolutions.md#cute-dsl-fused-conv3d--post-operations) for
-requirements and the [API reference](../fe-oss-apis/conv3d_postops.md) for the
+requirements and the [API reference](/operations/Convolutions/conv3d_postops) for the
 exact normalization and tensor-layout contracts.
 
 ## Adaptive Layernorm Forward

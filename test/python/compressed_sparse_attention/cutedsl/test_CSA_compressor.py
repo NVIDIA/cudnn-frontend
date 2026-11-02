@@ -15,7 +15,7 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     so absolute deviations scale with input magnitude — and carry fp64-oracle parity
     on inputs whose fp32 intermediates stay finite (inputs that overflow the
     reference's fp32 intermediates reproduce its NaN pattern instead: the committed
-    gate's overflow-intermediate case; see docs/fe-oss-apis/csa.md and the gate's
+    gate's overflow-intermediate case; see docs/operations/sparse_attention/csa.md and the gate's
     scaled-input case). Both families are also compared against the verbatim
     upstream eager numerics (tolerance), over ragged THD packs including segments
     shorter than ``ratio``;

@@ -314,6 +314,15 @@ def _sm100_blk64_requires_int64_kv_strides(
     return False
 
 
+def _sm100_blk64_require_int32_sage_q_strides(q: torch.Tensor) -> None:
+    """Decline a Sage FP8 Q whose batch stride does not fit the Int32 stride leaf.
+
+    The Sage Q view takes Int32 strides (there is no Int64 variant like K/V's exact layout) and
+    `_validate_sm100_blk64_int32_bounds` skips stride(0), so a batch stride >= 2**31 elements would silently truncate.
+    """
+    _sm100_blk64_require_int32("sage_fp8 q.stride(0)", q.stride(0))
+
+
 def _sm100_blk64_has_partial_kv_tail(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1476,9 +1485,14 @@ def _bsa_attn_fwd_sm120_fp8(
     *,
     sparse_block_size: int = 64,
     v_block_size: int = 0,
+    k_quant_block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch native SM120 Sage FP8 with unchanged 64- or 128-block metadata."""
     _require_sage_fp8_cutedsl()
+    if type(k_quant_block_size) is not int or k_quant_block_size not in (1, 16):
+        raise ValueError("k_quant_block_size must be 1 or 16")
+    if k_quant_block_size == 1 and sparse_block_size != 128:
+        raise NotImplementedError("per-token K scaling requires SM120 blk128")
     assert sparse_block_size in (64, 128)
     assert v_block_size in (0, 128)
     assert v_block_size == 0 or sparse_block_size == 128
@@ -1502,7 +1516,7 @@ def _bsa_attn_fwd_sm120_fp8(
     else:
         assert v_fp8.shape == k_fp8.shape
     assert q_scale.shape == (batch, num_heads, seqlen_q)
-    assert k_scale.shape == (batch, num_heads, _ceil_div_int(seqlen_k, 16))
+    assert k_scale.shape == (batch, num_heads, _ceil_div_int(seqlen_k, k_quant_block_size))
     assert v_scale.shape == (num_heads, head_dim)
 
     num_q_blocks = _ceil_div_int(seqlen_q, sparse_block_size)
@@ -1586,6 +1600,34 @@ def _bsa_attn_fwd_sm120_fp8(
         for index, tensor in enumerate(runtime_tensors)
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
+    tile_m = sparse_block_size
+    wave_split = 0
+    # Short loops benefit from consuming each K32 probability chunk promptly.
+    # Long fixed-count loops amortize conversion/synchronization over K64.
+    # This is a scheduling choice, not a change to the N128 softmax reduction.
+    p_tile_size = 32
+    if sparse_block_size == 128 and k_quant_block_size == 1 and v_block_size == 128 and not has_block_nums and fixed_block_sparse_num >= 128:
+        p_tile_size = 64
+    k_scale_tma = (
+        sparse_block_size == 128
+        and k_quant_block_size == 1
+        and v_block_size == 128
+        and k_scale_t.dtype == torch.float32
+        and k_scale_t.data_ptr() % 16 == 0
+        and k_scale_t.stride(0) == 1
+        and all(stride > 0 and stride % 4 == 0 for stride in k_scale_t.stride()[1:])
+    )
+    if sparse_block_size == 128 and k_quant_block_size == 1 and v_block_size == 128 and not has_block_nums and not has_block_sizes:
+        num_sms = _get_device_sm_count_for_device(q_fp8.device.index)
+        num_query_tiles = num_q_blocks * batch * num_heads
+        # Split a short, sparse wave into twice as many M64 CTAs. Longer
+        # loops retain M128 so K/V loads are amortized over more query rows.
+        if fixed_block_sparse_num <= 4 and num_sms <= num_query_tiles <= 2 * num_sms:
+            tile_m = 64
+        elif fixed_block_sparse_num >= 16 and num_sms < num_query_tiles <= num_sms + num_sms // 2:
+            # A small final wave wastes most SMs at M128. Split only that
+            # wave; full M64 dispatch repeats too many K/V loads in dense loops.
+            wave_split = num_sms
     fwd_kernel = Kernel(
         gqa_ratio=1,
         head_dim=head_dim,
@@ -1598,6 +1640,11 @@ def _bsa_attn_fwd_sm120_fp8(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
         **({"v_block_size": v_block_size} if v_block_size else {}),
+        **(
+            {"k_quant_block_size": k_quant_block_size, "tile_m": tile_m, "wave_split": wave_split, "k_scale_tma": k_scale_tma, "_p_tile_size": p_tile_size}
+            if sparse_block_size == 128
+            else {}
+        ),
     )
     compile_options = getattr(fwd_kernel, "_compile_options", "")
     if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
@@ -1607,6 +1654,11 @@ def _bsa_attn_fwd_sm120_fp8(
         (
             _get_device_arch(),
             v_block_size,
+            k_quant_block_size,
+            tile_m,
+            wave_split,
+            k_scale_tma,
+            p_tile_size,
             head_dim,
             has_block_nums,
             has_block_sizes,
@@ -1940,6 +1992,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     )
     if is_sage_fp8:
         assert q_bhsd.is_contiguous() and k_bhsd.is_contiguous() and v_bhsd.is_contiguous(), "Sage FP8 requires fully contiguous BHSD Q/K/V tensors"
+        _sm100_blk64_require_int32_sage_q_strides(q_bhsd)
     use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
     use_exact_kv_layout = use_int64_kv_strides or _sm100_blk64_has_partial_kv_tail(k_bhsd, v_bhsd)
 
@@ -2319,10 +2372,15 @@ def bsa_fp8_blk128_fwd(
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
     kv_splits: int = 1,
+    k_quant_block_size: int = 16,
 ) -> torch.Tensor:
     """Quantize BF16 inputs and launch native SM90, SM100/SM103, or SM120 FP8 blk128."""
     arch = _get_device_arch_for_device(q.device.index)
     arch_family = arch // 10
+    if type(k_quant_block_size) is not int or k_quant_block_size not in (1, 16):
+        raise ValueError("k_quant_block_size must be 1 or 16")
+    if k_quant_block_size == 1 and arch_family != 12:
+        raise NotImplementedError("per-token K scaling requires SM120 blk128")
     if arch in (100, 103):
         _require_sm100_fp8_blk128_cutedsl()
         from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
@@ -2353,7 +2411,7 @@ def bsa_fp8_blk128_fwd(
         raise NotImplementedError("Sage FP8 native blk128 requires SM90, SM100/SM103, or SM120")
     from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
 
-    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128, k_quant_block_size=k_quant_block_size)
     out, _ = _bsa_attn_fwd_sm120_fp8(
         *quantized,
         q2k_block_index,
@@ -2363,6 +2421,7 @@ def bsa_fp8_blk128_fwd(
         q2k_block_nums=q2k_block_nums,
         sparse_block_size=128,
         v_block_size=128,
+        k_quant_block_size=k_quant_block_size,
     )
     return out
 

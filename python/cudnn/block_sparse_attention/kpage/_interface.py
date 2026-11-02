@@ -47,8 +47,9 @@ def _fwd_m128(
     head_dim = q.shape[-1]
     qhead_per_kvhead = q.shape[1] // k.shape[1]
     tail_page = k.shape[2] % PAGE != 0  # K/V end inside a page: row-extent descriptors
+    nonpositive_scale = not softmax_scale > 0.0  # scale the scores before the masks (NaN/inf otherwise)
     tensors = (q, k, v, out, lse, page_table, mask_table, tile_offsets, tile_counts, full_tile_counts, work_indices)
-    key = compile_key("kpage_fwd_m128", (torch2cute_dtype_map[q.dtype], head_dim, qhead_per_kvhead, tail_page, _get_device_arch()), tensors)
+    key = compile_key("kpage_fwd_m128", (torch2cute_dtype_map[q.dtype], head_dim, qhead_per_kvhead, tail_page, nonpositive_scale, _get_device_arch()), tensors)
     cache = _fwd_m128.compile_cache
     if key not in cache:
         q_t, k_t, v_t, o_t = [to_cute_tensor(t, (0, 1, 2)) for t in (q, k, v, out)]
@@ -58,7 +59,7 @@ def _fwd_m128(
         to_t, tc_t, ft_t = [to_cute_tensor(t, (0, 1, 2), assumed_align=4) for t in (tile_offsets, tile_counts, full_tile_counts)]
         wi_t = to_cute_tensor(work_indices, 0, assumed_align=4)
         cache[key] = cute.compile(
-            BlockSparseAttnForwardSm100KPage(head_dim, head_dim, qhead_per_kvhead=qhead_per_kvhead, tail_page=tail_page),
+            BlockSparseAttnForwardSm100KPage(head_dim, head_dim, qhead_per_kvhead=qhead_per_kvhead, tail_page=tail_page, nonpositive_scale=nonpositive_scale),
             q_t,
             k_t,
             v_t,
@@ -111,8 +112,9 @@ def _fwd_m64(
     head_dim = q.shape[-1]
     qhead_per_kvhead = q.shape[1] // k.shape[1]
     tail_page = k.shape[2] % PAGE != 0
+    nonpositive_scale = not softmax_scale > 0.0  # scale the scores before the masks (NaN/inf otherwise)
     tensors = (q, k, v, out, lse, page_table, mask_table, tile_offsets, iter_counts, full_iter_counts, work_indices)
-    key = compile_key("kpage_fwd_m64", (torch2cute_dtype_map[q.dtype], head_dim, qhead_per_kvhead, tail_page, _get_device_arch()), tensors)
+    key = compile_key("kpage_fwd_m64", (torch2cute_dtype_map[q.dtype], head_dim, qhead_per_kvhead, tail_page, nonpositive_scale, _get_device_arch()), tensors)
     cache = _fwd_m64.compile_cache
     if key not in cache:
         q_t, k_t, v_t, o_t = [to_cute_tensor(t, (0, 1, 2)) for t in (q, k, v, out)]
@@ -122,7 +124,9 @@ def _fwd_m64(
         to_t, ic_t, fi_t = [to_cute_tensor(t, (0, 1, 2), assumed_align=4) for t in (tile_offsets, iter_counts, full_iter_counts)]
         wi_t = to_cute_tensor(work_indices, 0, assumed_align=4)
         cache[key] = cute.compile(
-            BlockSparseAttnForwardSm100KPageQ64(head_dim, head_dim, qhead_per_kvhead=qhead_per_kvhead, tail_page=tail_page),
+            BlockSparseAttnForwardSm100KPageQ64(
+                head_dim, head_dim, qhead_per_kvhead=qhead_per_kvhead, tail_page=tail_page, nonpositive_scale=nonpositive_scale
+            ),
             q_t,
             k_t,
             v_t,
@@ -268,7 +272,7 @@ _bwd_paged_kv.compile_cache = {}
 
 
 def forward(q: Tensor, k: Tensor, v: Tensor, layout: KPageLayout, softmax_scale: Optional[float]) -> Tuple[Tensor, Tensor]:
-    """Forward over a prepared layout; returns (o, lse) with zeroed padding rows."""
+    """Forward over a prepared layout; returns (o, lse) with zeroed padding rows (blk128; the blk64 path has none)."""
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(HEAD_DIM)
     softmax_scale = float(softmax_scale)
@@ -277,8 +281,8 @@ def forward(q: Tensor, k: Tensor, v: Tensor, layout: KPageLayout, softmax_scale:
     t64 = layout._blk64_tables
     if t64.work_indices.numel() > 0:
         _fwd_m64(q, k, v, out, lse, t64.page_table, t64.mask_table, t64.tile_offsets, t64.iter_counts, t64.full_iter_counts, t64.work_indices, softmax_scale)
-    t128 = layout._tables
-    if t128.work_indices.numel() > 0:
+    t128 = layout._tables  # None on the blk64 path: every Q block is one M64 tile
+    if t128 is not None and t128.work_indices.numel() > 0:
         _fwd_m128(
             q, k, v, out, lse, t128.page_table, t128.mask_table, t128.tile_offsets, t128.tile_counts, t128.full_tile_counts, t128.work_indices, softmax_scale
         )

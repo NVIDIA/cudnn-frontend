@@ -153,6 +153,44 @@ def test_kpage_bsa_semantics_matches_base_kernel(seqlen_q_blocks, kv_block_sizes
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=13)
+@pytest.mark.parametrize("route", ["m128", "m64"])
+@pytest.mark.parametrize("softmax_scale", [0.125, 0.0, -0.125])
+def test_kpage_softmax_scale_sign_with_partial_blocks(softmax_scale, route):
+    """Zero and negative scales with partially valid key blocks, on both forward routes and the backward.
+
+    max(scale * S) is not scale * max(S) for a negative scale, and a masked key's -inf times a zero or negative
+    scale is NaN / +inf; the M64 route also shares its first softmax step with the later ones.  ``m64`` gives every
+    query block 64 valid rows, so all of them take the M64 x N256 kernel.
+    """
+    BSA = _import_bsa()
+    heads, num_blocks = 2, 4
+    seqlen = num_blocks * BLOCK
+    bs = torch.tensor([128, 40, 128, 7], dtype=torch.int32, device="cuda")
+    q_sizes = torch.full((num_blocks,), 64 if route == "m64" else BLOCK, dtype=torch.int32, device="cuda")
+    q, k, v, do = _inputs(heads, bs)
+    kv_valid = _valid_rows(bs)
+    k[0, :, ~kv_valid] = v[0, :, ~kv_valid] = 1000.0  # masked keys may hold any finite value
+    q_valid = _valid_rows(q_sizes)
+    do[0, :, ~q_valid] = 0.0  # padding query rows carry dO = 0
+    q2k = torch.arange(num_blocks, dtype=torch.int32, device="cuda").view(1, 1, 1, num_blocks).expand(1, heads, num_blocks, num_blocks).contiguous()
+    layout = BSA.kpage_prepare_layout(q2k, num_blocks, bs, q_block_sizes=q_sizes)
+    mask = block_sparse_mask(q2k, num_blocks, bs, seqlen, seqlen, BLOCK)
+    o_ref, lse_ref, dq_ref, dk_ref, dv_ref = attention_backward_reference(q, k, v, do, mask, softmax_scale=softmax_scale)
+
+    forward = BSA.block_sparse_attention_forward(q, k, v, q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale)
+    _check(forward["o_tensor"], o_ref, q_valid, tol=2e-2)
+    torch.testing.assert_close(forward["lse_tensor"][0, :, q_valid], lse_ref[0, :, q_valid], atol=1e-3, rtol=1e-3)
+
+    backward = BSA.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], q2k, num_blocks, bs, kpage=layout, softmax_scale=softmax_scale
+    )
+    _check(backward["dq_tensor"], dq_ref, q_valid, tol=3e-2)
+    _check(backward["dk_tensor"], dk_ref, kv_valid, tol=3e-2)
+    _check(backward["dv_tensor"], dv_ref, kv_valid, tol=3e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=12)
 def test_kpage_layout_reuse_and_preallocated_outputs():
     BSA = _import_bsa()
@@ -217,8 +255,6 @@ def test_kpage_rejects_unsupported_configurations():
     q2k = torch.tensor([0, 2], dtype=torch.int32, device="cuda").view(1, 1, 1, 2).expand(1, heads, num_blocks, 2).contiguous()
     bs = torch.full((num_blocks,), BLOCK, dtype=torch.int32, device="cuda")
 
-    with pytest.raises(NotImplementedError, match="sparse_block_size=128"):
-        BSA.block_sparse_attention_forward(q, k, v, q2k, 2, bs, sparse_block_size=64, kpage=True)
     with pytest.raises(NotImplementedError, match="contiguous q2k_block_index"):
         BSA.block_sparse_attention_forward(q, k, v, q2k.transpose(2, 3).contiguous().transpose(2, 3), 2, bs, kpage=True)
     q2, k2, v2 = (torch.randn((2, seqlen, heads, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3))
