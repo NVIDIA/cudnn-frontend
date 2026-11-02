@@ -64,10 +64,12 @@ def _deterministic_relay_layout(
     num_waves = _round_up(total_s_q, _DETERMINISTIC_Q_WAVE_CTAS) // _DETERMINISTIC_Q_WAVE_CTAS
     num_head_tiles = _round_up(num_heads, _M_BLOCK_SIZE) // _M_BLOCK_SIZE
     num_dkv_planes = _DETERMINISTIC_Q_WAVE_CTAS // relay_cluster_size
-    mask_rows_per_word = 32 // relay_cluster_size
+    mask_word_bits = 64 if relay_cluster_size == 64 else 32
+    mask_rows_per_word = mask_word_bits // relay_cluster_size
     words_per_phase = seqlen_k_rounded // mask_rows_per_word
     mask_words = num_waves * num_head_tiles * words_per_phase
-    mask_rows = _round_up(mask_words, head_dim_rounded) // head_dim_rounded
+    mask_storage_elems = mask_words * (mask_word_bits // 32)
+    mask_rows = _round_up(mask_storage_elems, head_dim_rounded) // head_dim_rounded
     physical_plane_elems = (seqlen_k_rounded + mask_rows) * head_dim_rounded
     return num_dkv_planes, physical_plane_elems, mask_rows, num_waves, num_head_tiles
 
@@ -78,7 +80,7 @@ def flash_attn_bwd_sm90_workspace_size(
     head_dim: int,
     num_heads: int,
     deterministic: bool = False,
-    deterministic_dkv_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    deterministic_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
 ) -> int:
     """Caller scratch for SM90 stats and ordinary or relayed FP32 dKV planes."""
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
@@ -89,7 +91,7 @@ def flash_attn_bwd_sm90_workspace_size(
             total_s_kv,
             head_dim,
             num_heads,
-            deterministic_dkv_relay_cluster_size,
+            deterministic_relay_cluster_size,
         )
         dkv_elems = num_dkv_planes * physical_plane_elems
     else:
@@ -113,7 +115,7 @@ def flash_attn_bwd_sm90(
     topk_length: Optional[torch.Tensor] = None,
     current_stream=None,
     deterministic: bool = False,
-    deterministic_dkv_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    deterministic_relay_cluster_size: int = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
 
@@ -142,8 +144,9 @@ def flash_attn_bwd_sm90(
             length, clamped to `[0, topk_max]` by the kernel.
         deterministic: use clustered, row-aware FP32 dKV relays and
             fixed-order dSink/dKV reductions for bitwise-reproducible results.
-        deterministic_dkv_relay_cluster_size: SM90 dKV relay width: 4, 8, or
-            16. A smaller width uses more FP32 planes.
+        deterministic_relay_cluster_size: SM90 logical dKV relay width: 4, 8,
+            16, 32, or 64. A smaller width uses more FP32 planes. Widths 32
+            and 64 use two and four ordered physical C16 launches.
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -197,7 +200,7 @@ def flash_attn_bwd_sm90(
 
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     if deterministic:
-        relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_dkv_relay_cluster_size)
+        relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_relay_cluster_size)
         num_dkv_shards, physical_plane_elems, relay_mask_rows, num_relay_waves, num_head_tiles = _deterministic_relay_layout(
             total_S_q,
             total_S_kv,
@@ -220,7 +223,7 @@ def flash_attn_bwd_sm90(
             head_dim,
             num_head,
             deterministic=deterministic,
-            deterministic_dkv_relay_cluster_size=deterministic_dkv_relay_cluster_size,
+            deterministic_relay_cluster_size=deterministic_relay_cluster_size,
         ),
         _WORKSPACE_OWNER,
     )

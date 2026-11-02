@@ -12,7 +12,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass import Boolean, Float32, Int32, Uint32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint32, Uint64, const_expr
 from cutlass._mlir.dialects import arith, nvvm
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cutlass_dsl import dsl_user_op
@@ -78,6 +78,21 @@ def _wait_lower_relay_ranks(mask_ptr, lower_rank_mask: Uint32):
     acquire_loop = cutlass.while_generate([acquired], lambda value: (value & lower_rank_mask) != Uint32(0))
     with acquire_loop as [value]:
         value = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+        cutlass.yield_out([value])
+
+
+@cute.jit
+def _wait_lower_relay_ranks64(mask_ptr, lower_rank_mask: Uint64):
+    """Acquire every lower logical relay rank from a 64-bit ownership word."""
+    current = cute.arch.load(mask_ptr, Uint64, sem="relaxed", scope="gpu")
+    loop = cutlass.while_generate([current], lambda value: (value & lower_rank_mask) != Uint64(0))
+    with loop as [value]:
+        value = cute.arch.load(mask_ptr, Uint64, sem="relaxed", scope="gpu")
+        cutlass.yield_out([value])
+    acquired = cute.arch.load(mask_ptr, Uint64, sem="acquire", scope="gpu")
+    acquire_loop = cutlass.while_generate([acquired], lambda value: (value & lower_rank_mask) != Uint64(0))
+    with acquire_loop as [value]:
+        value = cute.arch.load(mask_ptr, Uint64, sem="acquire", scope="gpu")
         cutlass.yield_out([value])
 
 
@@ -498,7 +513,10 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         self.seqlen_kv = seqlen_kv
         self.padded_seqlen_kv = padded_seqlen_kv
         self.padded_head_dim = padded_head_dim
-        self.mask_rows_per_word = 32 // relay_cluster_size
+        self.mask_dtype = Uint64 if relay_cluster_size == 64 else Uint32
+        self.mask_word_bits = 64 if relay_cluster_size == 64 else 32
+        self.mask_word_elements = self.mask_word_bits // 32
+        self.mask_rows_per_word = self.mask_word_bits // relay_cluster_size
         self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word
         self.data_plane_elems = padded_seqlen_kv * padded_head_dim
 
@@ -530,7 +548,7 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
         phase_idx = head_tile * self.num_waves + wave_idx
         word_offset = phase_idx * self.words_per_phase + kv_row // self.mask_rows_per_word
         plane = mdKVaccum[batch_idx, plane_idx, None]
-        return cute.recast_ptr(plane.iterator + self.data_plane_elems + word_offset, dtype=Uint32)
+        return cute.recast_ptr(plane.iterator, dtype=self.mask_dtype) + self.data_plane_elems // self.mask_word_elements + word_offset
 
     @cute.kernel
     def kernel(
@@ -546,11 +564,12 @@ class _FlashAttentionDSABackwardRelayMasksSm90:
             topk = mTopkLength[batch_idx, query_idx]
         topk = min(max(topk, Int32(0)), mTopkIdxs.shape[2])
         rank = query_idx % self.relay_cluster_size
-        rank_bit = Uint32(1) << Uint32(rank)
+        mask_dtype = self.mask_dtype
+        rank_bit = mask_dtype(1) << mask_dtype(rank)
         for slot in cutlass.range(tidx, topk, 256):
             kv_row = mTopkIdxs[batch_idx, query_idx, slot]
             if kv_row >= 0 and kv_row < self.seqlen_kv:
-                row_shift = Uint32((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
+                row_shift = mask_dtype((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
                 bit = rank_bit << row_shift
                 for head_tile in cutlass.range_constexpr(self.num_head_tiles):
                     mask_ptr = self._mask_word_ptr(mdKVaccum, query_idx, head_tile, kv_row, batch_idx)
@@ -613,11 +632,16 @@ class FlashAttentionDSABackwardSm90:
         self.deterministic = deterministic
         self.num_dkv_shards = num_dkv_shards
         self.relay_cluster_size = relay_cluster_size
+        self.physical_relay_cluster_size = min(relay_cluster_size, 16)
+        self.relay_phases = relay_cluster_size // self.physical_relay_cluster_size
         self.q_wave_ctas = q_wave_ctas
         self.num_waves = num_waves
         self.padded_seqlen_kv = padded_seqlen_kv
         self.padded_head_dim = padded_head_dim
-        self.mask_rows_per_word = 32 // relay_cluster_size
+        self.mask_dtype = Uint64 if relay_cluster_size == 64 else Uint32
+        self.mask_word_bits = 64 if relay_cluster_size == 64 else 32
+        self.mask_word_elements = self.mask_word_bits // 32
+        self.mask_rows_per_word = self.mask_word_bits // relay_cluster_size
         self.words_per_phase = padded_seqlen_kv // self.mask_rows_per_word if deterministic else 0
         self.data_plane_elems = padded_seqlen_kv * padded_head_dim
         assert not deterministic or (
@@ -947,17 +971,19 @@ class FlashAttentionDSABackwardSm90:
         )
 
         # One CTA per query/head tile; TMA predicates the final partial head tile.
-        # Deterministic execution bounds the live grid to one query wave and
-        # serializes head tiles, so each CTA owns one FP32 dKV plane.
+        # Deterministic execution bounds the logical grid to one query wave and
+        # serializes head tiles. Logical C32/C64 groups are split into two/four
+        # ordered physical C16 launches that reuse the same FP32 plane.
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
         total_q = cute.size(mQ.shape[3])
         total_head_tiles = cute.size(mQ.shape[2]) * self.qhead_tiles
         q_wave_size = self.q_wave_ctas if cutlass.const_expr(self.deterministic) else total_q
+        q_launch_size = q_wave_size // self.relay_phases
         head_tiles_per_launch = 1 if cutlass.const_expr(self.deterministic) else total_head_tiles
         head_phases = total_head_tiles if cutlass.const_expr(self.deterministic) else 1
         tile_sched_args = TileSchedulerArguments(
-            q_wave_size,
+            q_launch_size,
             head_tiles_per_launch,
             cute.size(mQ.shape[4]),
             1,
@@ -974,54 +1000,56 @@ class FlashAttentionDSABackwardSm90:
         self.grid_dim = SingleTileHeadFastScheduler.get_grid_shape(self.tile_sched_params)
         for q_offset in cutlass.range(0, total_q, q_wave_size, unroll=1):
             for head_offset in cutlass.range(0, head_phases, unroll=1):
-                self.kernel(
-                    tma_tensor_Q,
-                    mKV,
-                    tma_tensor_dO,
-                    tma_tensor_dQ,
-                    tma_tensor_dQ_64,
-                    mdKV,
-                    mTopkIdxs,
-                    mTopkLength,
-                    tma_atom_Q,
-                    tma_atom_dO,
-                    tma_atom_dQ,
-                    tma_atom_dQ_64,
-                    mLSE,
-                    mdPsum,
-                    self.sQ_layout,
-                    self.sKV_layout,
-                    self.sPdS_layout,
-                    self.sdO_layout,
-                    self.sKV_quarter_layout,
-                    self.sKV_192_layout,
-                    self.sV_layout,
-                    self.sQ_half_layout,
-                    self.sQ_64_layout,
-                    self.sQ_quarter_layout,
-                    self.sdO_chunk_layout,
-                    self.sQ_chunk_layout,
-                    self.r2s_tiled_copy_dKVatomic,
-                    tiled_mma_SdP,
-                    tiled_mma_dKV,
-                    tiled_mma_dQ_wg0,
-                    tiled_mma_dQ_wg1,
-                    tiled_mma_dQ_wg1_192,
-                    softmax_scale_log2,
-                    softmax_scale,
-                    self.tile_sched_params,
-                    q_offset,
-                    head_offset,
-                    SingleTileHeadFastScheduler,
-                    self.shared_storage,
-                ).launch(
-                    grid=self.grid_dim,
-                    block=[self.num_threads, 1, 1],
-                    cluster=[self.relay_cluster_size, 1, 1],
-                    smem=self.shared_storage.size_in_bytes(),
-                    stream=stream,
-                    min_blocks_per_mp=1,
-                )
+                for relay_phase in cutlass.range_constexpr(self.relay_phases):
+                    self.kernel(
+                        tma_tensor_Q,
+                        mKV,
+                        tma_tensor_dO,
+                        tma_tensor_dQ,
+                        tma_tensor_dQ_64,
+                        mdKV,
+                        mTopkIdxs,
+                        mTopkLength,
+                        tma_atom_Q,
+                        tma_atom_dO,
+                        tma_atom_dQ,
+                        tma_atom_dQ_64,
+                        mLSE,
+                        mdPsum,
+                        self.sQ_layout,
+                        self.sKV_layout,
+                        self.sPdS_layout,
+                        self.sdO_layout,
+                        self.sKV_quarter_layout,
+                        self.sKV_192_layout,
+                        self.sV_layout,
+                        self.sQ_half_layout,
+                        self.sQ_64_layout,
+                        self.sQ_quarter_layout,
+                        self.sdO_chunk_layout,
+                        self.sQ_chunk_layout,
+                        self.r2s_tiled_copy_dKVatomic,
+                        tiled_mma_SdP,
+                        tiled_mma_dKV,
+                        tiled_mma_dQ_wg0,
+                        tiled_mma_dQ_wg1,
+                        tiled_mma_dQ_wg1_192,
+                        softmax_scale_log2,
+                        softmax_scale,
+                        self.tile_sched_params,
+                        q_offset,
+                        head_offset,
+                        relay_phase * self.physical_relay_cluster_size,
+                        SingleTileHeadFastScheduler,
+                        self.shared_storage,
+                    ).launch(
+                        grid=self.grid_dim,
+                        block=[self.num_threads, 1, 1],
+                        cluster=[self.physical_relay_cluster_size, 1, 1],
+                        smem=self.shared_storage.size_in_bytes(),
+                        stream=stream,
+                        min_blocks_per_mp=1,
+                    )
 
     @cute.kernel
     def kernel(
@@ -1063,6 +1091,7 @@ class FlashAttentionDSABackwardSm90:
         tile_sched_params: ParamsBase,
         q_offset: Int32,
         head_offset: Int32,
+        relay_rank_offset: Int32,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
     ):
@@ -1070,7 +1099,10 @@ class FlashAttentionDSABackwardSm90:
 
         if cutlass.const_expr(self.deterministic):
             local_query = cute.arch.block_idx()[0]
-            if local_query + q_offset >= mQ.shape[3]:
+            logical_group_idx = local_query // self.physical_relay_cluster_size
+            physical_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            query_idx = q_offset + logical_group_idx * self.relay_cluster_size + relay_rank_offset + physical_rank
+            if query_idx >= mQ.shape[3]:
                 cute.arch.nvvm.exit()
 
         if warp_idx == 0:
@@ -1164,6 +1196,7 @@ class FlashAttentionDSABackwardSm90:
                 softmax_scale,
                 q_offset,
                 head_offset,
+                relay_rank_offset,
                 TileSchedulerCls,
             )
         else:
@@ -1199,6 +1232,7 @@ class FlashAttentionDSABackwardSm90:
                 tidx,
                 q_offset,
                 head_offset,
+                relay_rank_offset,
                 TileSchedulerCls,
             )
 
@@ -1216,7 +1250,7 @@ class FlashAttentionDSABackwardSm90:
         phase_idx = head_idx * self.num_waves + wave_idx
         word_offset = phase_idx * self.words_per_phase + kv_row // self.mask_rows_per_word
         plane = mdKVaccum[None, plane_idx, batch_idx]
-        return cute.recast_ptr(plane.iterator + self.data_plane_elems + word_offset, dtype=Uint32)
+        return cute.recast_ptr(plane.iterator, dtype=self.mask_dtype) + self.data_plane_elems // self.mask_word_elements + word_offset
 
     @cute.jit
     def acquire_dkv_relay(
@@ -1232,17 +1266,21 @@ class FlashAttentionDSABackwardSm90:
         wg_tidx: Int32,
     ):
         """Import lower-rank releases before this CTA updates a sparse KV tile."""
-        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        lower_rank_bits = (Uint32(1) << Uint32(rank)) - Uint32(1)
+        rank = m_block % self.relay_cluster_size
+        mask_dtype = self.mask_dtype
+        lower_rank_bits = (mask_dtype(1) << mask_dtype(rank)) - mask_dtype(1)
         if wg_tidx < self.tile_n and rank > 0:
             slot = n_block * self.tile_n + wg_tidx
             if slot < topk:
                 kv_row = mTopkIdxs_cur[slot]
                 if kv_row >= 0 and kv_row < max_seqlen_kv:
-                    row_shift = Uint32((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
+                    row_shift = mask_dtype((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
                     lower_rank_mask = lower_rank_bits << row_shift
                     mask_ptr = self._relay_mask_word_ptr(mdKVaccum, m_block, head_idx, batch_idx, kv_row)
-                    _wait_lower_relay_ranks(mask_ptr, lower_rank_mask)
+                    if cutlass.const_expr(self.mask_word_bits == 64):
+                        _wait_lower_relay_ranks64(mask_ptr, lower_rank_mask)
+                    else:
+                        _wait_lower_relay_ranks(mask_ptr, lower_rank_mask)
         if rank > 0:
             _partial_cta_sync(int(NamedBarrierBwd.DKVRelay), self.num_threads_per_warp_group)
 
@@ -1260,7 +1298,8 @@ class FlashAttentionDSABackwardSm90:
         wg_tidx: Int32,
     ):
         """Publish this CTA's dKV updates before a later relay rank acquires them."""
-        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        rank = m_block % self.relay_cluster_size
+        mask_dtype = self.mask_dtype
         if rank < self.relay_cluster_size - 1:
             _partial_cta_sync(int(NamedBarrierBwd.DKVRelay), self.num_threads_per_warp_group)
         if wg_tidx < self.tile_n and rank < self.relay_cluster_size - 1:
@@ -1268,14 +1307,14 @@ class FlashAttentionDSABackwardSm90:
             if slot < topk:
                 kv_row = mTopkIdxs_cur[slot]
                 if kv_row >= 0 and kv_row < max_seqlen_kv:
-                    row_shift = Uint32((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
-                    bit_shift = row_shift + Uint32(rank)
+                    row_shift = mask_dtype((kv_row % self.mask_rows_per_word) * self.relay_cluster_size)
+                    bit_shift = row_shift + mask_dtype(rank)
                     mask_ptr = self._relay_mask_word_ptr(mdKVaccum, m_block, head_idx, batch_idx, kv_row)
-                    word = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
-                    row_mask = (word >> row_shift) & Uint32((1 << self.relay_cluster_size) - 1)
-                    current_bit = Uint32(1) << Uint32(rank)
-                    if (row_mask & ~current_bit) != Uint32(0):
-                        keep_mask = ~(Uint32(1) << bit_shift)
+                    word = cute.arch.load(mask_ptr, mask_dtype, sem="relaxed", scope="gpu")
+                    row_mask = (word >> row_shift) & mask_dtype((1 << self.relay_cluster_size) - 1)
+                    current_bit = mask_dtype(1) << mask_dtype(rank)
+                    if (row_mask & ~current_bit) != mask_dtype(0):
+                        keep_mask = ~(mask_dtype(1) << bit_shift)
                         cute.arch.atomic_and(mask_ptr.llvm_ptr, keep_mask, sem="release", scope="gpu")
 
     @cute.jit
@@ -1314,6 +1353,7 @@ class FlashAttentionDSABackwardSm90:
         softmax_scale: Float32,
         q_offset: Int32,
         head_offset: Int32,
+        relay_rank_offset: Int32,
         TileSchedulerCls: Callable,
     ):
         """WG0 mainloop: identical to V3.1 — dQ[0:256] = 128+128, no 576-specific logic."""
@@ -1430,7 +1470,9 @@ class FlashAttentionDSABackwardSm90:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if cutlass.const_expr(self.deterministic):
-                m_block += q_offset
+                logical_group_idx = m_block // self.physical_relay_cluster_size
+                physical_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                m_block = q_offset + logical_group_idx * self.relay_cluster_size + relay_rank_offset + physical_rank
                 head_idx += head_offset
             head_idx_kv = head_idx // self.qhead_tiles
             head_tile = head_idx - head_idx_kv * self.qhead_tiles
@@ -1924,6 +1966,7 @@ class FlashAttentionDSABackwardSm90:
         tidx: Int32,
         q_offset: Int32,
         head_offset: Int32,
+        relay_rank_offset: Int32,
         TileSchedulerCls: Callable,
     ):
         """WG1 mainloop: 9-chunk dKV pipeline + 2 G4_half (dQ) + AtomicAdd scatter."""
@@ -1993,7 +2036,9 @@ class FlashAttentionDSABackwardSm90:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if cutlass.const_expr(self.deterministic):
-                m_block += q_offset
+                logical_group_idx = m_block // self.physical_relay_cluster_size
+                physical_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                m_block = q_offset + logical_group_idx * self.relay_cluster_size + relay_rank_offset + physical_rank
                 head_idx += head_offset
             head_idx_kv = head_idx // self.qhead_tiles
 
