@@ -12,7 +12,7 @@ import inspect
 from test_utils import assert_bitwise_runs, torch_fork_set_rng
 
 from cudnn.api_base import ws_align
-from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100_family, _require_sm100
+from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
     _indexer_predict_distribution,
     check_ref_indexer_backward,
@@ -74,6 +74,14 @@ def _require_indexer_backward_gpu():
     capability = torch.cuda.get_device_capability()
     if capability[0] != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES:
         pytest.skip(f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}")
+
+
+def _require_indexer_backward_sm100():
+    """Skip unless the current GPU is an SM100-family part the kernel admits."""
+    from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import INDEXER_BACKWARD_SM100_CAPABILITIES
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in INDEXER_BACKWARD_SM100_CAPABILITIES:
+        pytest.skip(f"this hardware-validation case requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}")
 
 
 # A non-unit softmax scale exercises the kernels' sm_scale fold (SM100 folds it
@@ -265,28 +273,34 @@ _ARCH_ERROR = (RuntimeError, "IndexerBackward requires SM90 or capability in")
 _DETERMINISTIC_CAPABILITY_ERROR = (ValueError, "deterministic IndexerBackward requires capability")
 
 
-def _envelope_case(capability, error=None, *, id, deterministic=False, old_dsl=False, h=64, d=128, block_I=128, topk=128, sm_scale=1.0):
-    return pytest.param(capability, deterministic, old_dsl, h, d, block_I, topk, sm_scale, error, id=id)
+def _envelope_case(capability, error=None, *, id, deterministic=False, dsl=None, h=64, d=128, block_I=128, topk=128, sm_scale=1.0):
+    # ``dsl`` patches the installed CuTe DSL: "old" (below the runtime floor),
+    # "sm107a" / "no_sm107a" (with / without the SM107 target).
+    if dsl is None and capability == (10, 7):
+        dsl = "sm107a"
+    return pytest.param(capability, deterministic, dsl, h, d, block_I, topk, sm_scale, error, id=id)
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "capability,deterministic,old_dsl,h,d,block_I,topk,sm_scale,error",
+    "capability,deterministic,dsl,h,d,block_I,topk,sm_scale,error",
     [
-        # Admitted: SM90 H64; SM100/SM103 H64 and compact H32; deterministic SM103.
+        # Admitted: SM90 H64; SM100/SM103/SM107 H64 and compact H32; deterministic SM103/SM107.
         _envelope_case((9, 0), id="sm90-h64"),
         _envelope_case((10, 0), id="sm100-h64"),
         _envelope_case((10, 0), h=32, id="sm100-h32"),
         _envelope_case((10, 3), id="sm103-h64"),
+        _envelope_case((10, 7), id="sm107-h64"),
         _envelope_case((10, 3), deterministic=True, id="deterministic-sm103"),
+        _envelope_case((10, 7), deterministic=True, id="deterministic-sm107"),
         # Architecture: SM90 and the validated SM100-family devices only.
         _envelope_case((8, 0), _ARCH_ERROR, id="sm80"),
-        _envelope_case((10, 7), _ARCH_ERROR, id="sm107"),
+        _envelope_case((11, 0), _ARCH_ERROR, id="sm110"),
         _envelope_case((12, 0), _ARCH_ERROR, id="sm120"),
         _envelope_case((9, 0), _DETERMINISTIC_CAPABILITY_ERROR, deterministic=True, id="deterministic-sm90"),
-        _envelope_case((10, 7), _DETERMINISTIC_CAPABILITY_ERROR, deterministic=True, id="deterministic-sm107"),
-        # Rule 7: a DSL below the runtime floor is declined by version.
-        _envelope_case((10, 0), (RuntimeError, r"IndexerBackward requires nvidia-cutlass-dsl >= [\d.]+; found 4\.6\.2"), old_dsl=True, id="old-dsl"),
+        # Rule 7: a DSL below the runtime floor, or without sm_107a on SM107, is declined by version.
+        _envelope_case((10, 0), (RuntimeError, r"IndexerBackward requires nvidia-cutlass-dsl >= [\d.]+; found 4\.6\.2"), dsl="old", id="old-dsl"),
+        _envelope_case((10, 7), (RuntimeError, "SM107 requires a CuTe DSL build supporting sm_107a"), dsl="no_sm107a", id="sm107-no-sm107a-dsl"),
         # Tile shapes the kernels build: H (TCGEN05 / WGMMA M), D, block_I, whole top-k blocks.
         _envelope_case((9, 0), (ValueError, "SM90 IndexerBackward requires H=64"), h=32, id="sm90-h32"),
         _envelope_case((9, 0), (ValueError, "SM90 IndexerBackward requires H=64"), h=128, id="sm90-h128"),
@@ -301,7 +315,7 @@ def _envelope_case(capability, error=None, *, id, deterministic=False, old_dsl=F
         _envelope_case((10, 0), (ValueError, "finite sm_scale > 0"), sm_scale=float("nan"), id="sm_scale_nan"),
     ],
 )
-def test_DSA_indexer_backward_check_support_envelope(monkeypatch, capability, deterministic, old_dsl, h, d, block_I, topk, sm_scale, error):
+def test_DSA_indexer_backward_check_support_envelope(monkeypatch, capability, deterministic, dsl, h, d, block_I, topk, sm_scale, error):
     """check_support admits exactly what the kernels serve natively and declines
     everything else -- architecture, DSL version, tile shape, sm_scale -- with a
     clean error before ``attn_score`` is touched. Capability and DSL version are
@@ -331,8 +345,10 @@ def test_DSA_indexer_backward_check_support_envelope(monkeypatch, capability, de
         deterministic=deterministic,
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
-    if old_dsl:
+    if dsl == "old":
         monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    elif dsl in ("sm107a", "no_sm107a"):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: dsl == "sm107a")
 
     attn_before = attn_score.clone()
     if error is None:
@@ -828,7 +844,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(monkeypatch, determini
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_indexer_backward_gpu()
     if deterministic:
-        _require_sm100_family()
+        _require_indexer_backward_sm100()
     DSA = _import_dsa()
     inputs = _idxbwd_inputs()
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
@@ -938,7 +954,7 @@ def test_DSA_indexer_backward_deterministic_contract(dk_dtype, repeats, topk_ind
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     cfg = dict(b=2, s_q=NUM_DK_PRODUCER_CTAS // 2 + 1, s_kv=257, head_dim=128, qhead_per_kv_head=64, topk=512)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1053,7 +1069,7 @@ def test_DSA_indexer_backward_deterministic_compact_h32(dk_dtype, topk_indices_g
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     # With 96 planes, 194 rows makes producer zero revisit its dK plane twice.
     cfg = dict(b=2, s_q=97, s_kv=seqlen_k, head_dim=128, qhead_per_kv_head=32, topk=topk)
@@ -1143,7 +1159,7 @@ def test_DSA_indexer_backward_deterministic_plane_specializations(dk_planes, s_q
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1221,7 +1237,7 @@ def test_DSA_indexer_backward_deterministic_workspace_alias_rejected_before_laun
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1288,7 +1304,7 @@ def test_DSA_indexer_backward_deterministic_workspace_allows_disjoint_view_of_sa
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     source_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1427,7 +1443,7 @@ def test_DSA_indexer_backward_deterministic_cuda_graph(s_q):
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1505,7 +1521,7 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(s_q, topk):
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_sm100_family()
+    _require_indexer_backward_sm100()
 
     # With 96 planes, 193 rows makes a producer consume three different rows.
     cfg = dict(b=1, s_q=s_q, s_kv=2048, head_dim=128, qhead_per_kv_head=64, topk=topk)

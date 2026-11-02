@@ -32,7 +32,7 @@ import cuda.bindings.driver as cuda
 
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
-from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, memset_zero_async
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     resolve_stream as _resolve_stream,
@@ -237,7 +237,7 @@ class IndexerBackward(APIBase):
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
-    ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=32 or
+    ``deterministic=True`` is an SM100/SM103/SM107 request-or-fail policy for H=32 or
     H=64, D=128, block_I=128, and 128-multiple top-k in
     [128, 2048]. It launches up
     to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
@@ -404,10 +404,11 @@ class IndexerBackward(APIBase):
             major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
             f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
-        # Rule 7: decline a CuTe DSL below the runtime floor by version here,
-        # before kernel 1 touches attn_score; the SM100 kernel builds its K
-        # loads on the TMA Gather4 operation that every DSL at the floor ships.
-        dsl_error = cutedsl_requirement_error("IndexerBackward")
+        # Rule 7: decline a CuTe DSL below the runtime floor, or one without the
+        # sm_107a target on SM107, by version here, before kernel 1 touches
+        # attn_score; the SM100 kernel builds its K loads on the TMA Gather4
+        # operation that every DSL at the floor ships.
+        dsl_error = cutedsl_requirement_error("IndexerBackward") or cutedsl_arch_requirement_error(capability)
         self._runtime_error_if(dsl_error is not None, dsl_error)
         if major == 9:
             # The SM90 warpgroup GEMMs use the head count as their M, and
@@ -731,6 +732,10 @@ class DenseIndexerBackward(APIBase):
             major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
             f"DenseIndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
+        # Rule 7: decline a CuTe DSL below the runtime floor, or one without the
+        # sm_107a target on SM107, by version before any score buffer moves.
+        dsl_error = cutedsl_requirement_error("DenseIndexerBackward") or cutedsl_arch_requirement_error(capability)
+        self._runtime_error_if(dsl_error is not None, dsl_error)
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
         self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
         self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
@@ -952,9 +957,9 @@ def indexer_backward_wrapper(
             mode, the live scratch prefix must not overlap any input or output;
             ``execute`` rejects such aliases before clearing the planes.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
-            on SM100/SM103. Fixed-owner producer CTAs accumulate into
+            on SM100/SM103/SM107. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. Requires SM100/SM103, H in {32, 64}, D=128,
+            ``d_index_k``. Requires SM100/SM103/SM107, H in {32, 64}, D=128,
             block_I=128, and topk % 128 == 0 with 128 <= topk <= 2048. A
             warmed plan with preallocated outputs
             and workspace remains CUDA Graph compatible. Valid top-k indices

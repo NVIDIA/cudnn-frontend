@@ -806,20 +806,21 @@ indexer tower:
    `dIndexK_f32` accumulator.
 3. In ordinary execution with a BF16 `d_index_k`, a pure-torch copy (kernel 3)
    casts `dIndexK_f32` to BF16; an fp32 `d_index_k` is the accumulator itself
-   and needs no kernel 3. On SM100 and SM103 that private BF16-path accumulator
+   and needs no kernel 3. On SM100-family GPUs that private BF16-path accumulator
    is column-permuted, so kernel 2 can issue 16-byte reductions straight from
    registers without SMEM staging; the same copy restores the natural order.
    Deterministic execution instead uses the fixed-order reduction below to
    write the requested output dtype directly.
 
-`IndexerBackward` / `indexer_backward_wrapper` run on SM90 and on SM100/SM103.
+`IndexerBackward` / `indexer_backward_wrapper` run on SM90 and on SM100/SM103/SM107
+(SM107 needs a CuTe DSL with the `sm_107a` target).
 `check_support` admits `D == 128`, `block_I == 128`, a positive top-k that is a
 multiple of `block_I` (callers with other logical extents pad the top-k tensors
-with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103
+with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103/SM107
 additionally require `H in {32, 64}` and SM90 requires `H == 64`. `d_index_q`
 and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
 
-With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
+With `deterministic=True` on SM100, SM103 or SM107, kernel 2 launches a fixed producer
 grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
 `deterministic_dk_planes` specialization selects 96, 128, or 148 producer
 planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
@@ -838,7 +839,7 @@ missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100/SM103, `D == 128`,
+`deterministic=True` is request-or-fail and supports SM100/SM103/SM107, `D == 128`,
 `block_I == 128`, `H in {32, 64}`, and `topk % 128 == 0` for
 `128 <= topk <= 2048`. Each producer CTA owns one plane and processes the fixed
 row stripe `cta`, `cta + num_ctas`, .... The main GEMM therefore retains its
@@ -919,9 +920,9 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
   - `q_causal_offsets` (optional): same offsets used for the corresponding
     Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
-- **Constraints** — SM90, SM100 or SM103, `H == 64`, `ratio >= 1`; SM100 accepts
-  `D in {64, 128}` and `block_I in {64, 128}`, SM90 `D == 128` and
-  `block_I == 128`
+- **Constraints** — SM90, SM100, SM103 or SM107, `H == 64`, `ratio >= 1`;
+  SM100-family GPUs accept `D in {64, 128}` and `block_I in {64, 128}`, SM90
+  `D == 128` and `block_I == 128`
 - **Scratch** — the dK reduction targets a pre-zeroed fp32 buffer: an fp32
   `d_index_k` in place, a BF16 `d_index_k` through an fp32 accumulator carved
   from the caller's workspace (`DenseIndexerBackward.scratch_workspace_bytes()`

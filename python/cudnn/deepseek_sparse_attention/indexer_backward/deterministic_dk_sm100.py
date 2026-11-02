@@ -25,7 +25,9 @@ DEFAULT_DK_PLANES = SUPPORTED_DK_PLANES[0]
 # inspect the default policy.
 NUM_DK_PRODUCER_CTAS = DEFAULT_DK_PLANES
 NUM_DK_PLANES = DEFAULT_DK_PLANES
-INDEXER_BACKWARD_SM100_CAPABILITIES = ((10, 0), (10, 3))
+# SM100, SM103 and SM107 (Rubin); SM107 also needs a DSL with the sm_107a target,
+# which IndexerBackward.check_support verifies (Rule 7).
+INDEXER_BACKWARD_SM100_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _compile_cache: dict = {}
 
 
