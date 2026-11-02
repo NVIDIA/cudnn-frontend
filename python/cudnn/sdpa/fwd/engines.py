@@ -1589,6 +1589,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return facts.invalid
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
+    if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64):
+        from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
+
+        why = native_d64_mismatch(
+            thd=facts.thd,
+            sink=facts.has_sink,
+            pack_gqa=bool(knobs.pack_gqa) if isinstance(knobs, SdpaFwdKnobs) else False,
+            q_lengths=facts.seq_q_trim or facts.seq_q_t is not None or facts.cu_seq_q_t is not None,
+            kv_lengths=facts.padded or facts.seq_kv_t is not None or facts.cu_seq_kv_t is not None,
+            window_left=facts.window_left,
+            window_right=(facts.right_bound or 1) if facts.right_band_widening else None,
+            bottom_right=facts.causal and facts.bottom_right,
+            s_q=facts.s_q,
+            s_kv=facts.s_kv,
+        )
+        if why is not None:
+            return why
     if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
@@ -4200,7 +4217,7 @@ def _sm120_mxfp8_spec() -> EngineSpec:
 
 
 def _sm90_spec() -> EngineSpec:
-    """D512 tile with TMA padding; the adapter declines unserved native declarations at build."""
+    """Native dense D64 and D512 with bounded TMA padding."""
     from cudnn.sdpa.fwd.config_sm90 import D_ALIGN, D_TILE, TILE_M, TILE_N
 
     return EngineSpec(
@@ -4210,15 +4227,15 @@ def _sm90_spec() -> EngineSpec:
             sm_lo=90,
             sm_hi=90,
             phase="prefill",
-            d_shapes=frozenset({(D_TILE, D_TILE)}),
+            d_shapes=frozenset({(64, 64), (D_TILE, D_TILE)}),
             # The envelope floor is a ROW decision, not a template one:
             # config_sm90.head_dims_mismatch still serves every multiple of 8 in
             # (0, 512] for a direct adapter caller. Unfloored, the sole cc-9.0 row
             # would take a d64 graph at 8x zero-padding -- and lead the preference
             # order while doing it. 256 = at most 2x padding, matching the SM120
-            # d512 flavor. d <= 256 f16 Hopper graphs get no FROST plan and fall
-            # back to the backend; an exact (512, 512) hit is unaffected.
-            d_envelope_floors=(((D_TILE, D_TILE), 256),),
+            # d512 flavor. The separate exact D64 flavor keeps its own floor
+            # at 63; every other small head remains backend-served.
+            d_envelope_floors=(((64, 64), 63), ((D_TILE, D_TILE), 256)),
             d_pad_multiple=D_ALIGN,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
@@ -4241,6 +4258,7 @@ def _sm90_spec() -> EngineSpec:
             tile_ns=frozenset({TILE_N}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_d_shapes=frozenset({(D_TILE, D_TILE)}),
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM90),

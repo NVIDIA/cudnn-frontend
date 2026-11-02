@@ -277,7 +277,7 @@ overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
 tensors or tensor-launch fallback.
 Forward only; optional Stats do not provide a backward implementation. Q/K/V/O
-all use FP16 or all BF16. The native head tile is **(512, 512)**. The row's
+all use FP16 or all BF16. The D512 leg's native head tile is **(512, 512)**. Its
 envelope is floored at 256 (`d_envelope_floors`): `D_QK` and `D_V`
 independently accept positive multiples of 8 in **(256, 512]**, and the exact
 native hit always passes. Pairs inside the envelope are **envelope-served at
@@ -285,13 +285,35 @@ the full D512 compute cost**, with TMA zero-fill and output clipping, so the
 floor caps that at 2x padding.
 
 The floor is a **routing** change, not only a claim change: SM90 is the only
-cc-9.0 row, so an f16/bf16 Hopper graph with either head dim at or below 256
-now gets no FROST plan at all and falls back to the cuDNN backend. Unfloored,
+cc-9.0 row, so an f16/bf16 Hopper graph with either head dim at or below 256,
+except the exact native D64 leg below, gets no FROST plan and falls back to the cuDNN backend. Unfloored,
 this row led the preference order and took such graphs at up to 64x
 zero-padding. Deliberate asymmetry: `config_sm90.head_dims_mismatch` still
-serves every multiple of 8 in `(0, 512]`, so a direct standalone-adapter caller
-keeps the full envelope — the row is narrower than the adapter, which is the
-safe direction.
+serves every multiple of 8 in `(0, 512]`; outside the exact D64 specialization,
+the standalone adapter keeps the existing full D512 envelope. Exact D64 selects
+the native body only when its feature checks pass. Otherwise, standalone
+declarations retain the existing D512 path, including sinks, window/right bands,
+device lengths, THD and PackGQA when that path supports them. The graph D64 row
+keeps its narrower admission.
+
+**Native D64 draft (not Hopper-qualified).** Exact `D_QK=D_V=64` dense FP16/BF16
+MHA and unpacked GQA select `sm90/prefill_d64_f16.py`: two warpgroups (256
+threads), QK and PV both m64n64k64 (four SS k16 steps each), one shared P tile,
+and a full 64-column output fragment. No D512 zero-padding. Optional FP32 Stats
+(natural or base 2), causal top-left/bottom-right (the existing unpadded
+bottom-right `S_q > S_kv` decline remains), native aligned dense strides
+and NATURAL/LPT/LPT_L2 use the existing prepared pointer contract. THD,
+device lengths/padding, sinks, window/right bands and PackGQA decline; paging,
+split-KV and quantized types retain the row's existing declines. The exact-only
+D64 floor is 63, so smaller heads do not acquire a new envelope. D64 remains
+backend-first; D512 placement is unchanged.
+
+`test_sdpa_native_d64_sm90.py` separates graph-domain checks and sm_90a
+cross-compilation from actual SM90 numerical/replay tests. Cross-compilation
+on SM120 is evidence of valid target code generation only. No Hopper numerical,
+memory-safety, synchronization, capture/rebinding or performance qualification
+has been performed for this D64 body; the D512 hardware results below do not
+qualify D64. Keep this change in draft until the Hopper detectors run.
 
 H200 validation (2026-09-20, on `b100e342`; DSL 4.8.0.dev0, cuDNN 9.24.0,
 torch 2.14.0+cu130). The SM90 L0/L1 conformance suites — 21 files, not yet in
