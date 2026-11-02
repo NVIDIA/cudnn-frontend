@@ -187,13 +187,11 @@ class FlashAttentionDSABackwardSm100:
         self.dQ4_mma_tiler = (64, block_tile, block_tile)
         self.dKV4_mma_tiler = (64, block_tile, block_tile)
 
-        # Preserve the established D512 split. D576 moves eight registers
-        # from the idle/MMA roles to compute while exactly retaining the CTA
-        # pool: 128*64 + 128*128 + 256*128 + 128*32 = 61440.
-        self.num_regs_load_KV = 64
+        # CTA register pool: 128*load_KV + 128*compute + 256*reduce + 128*mma = 61440.
+        self.num_regs_load_KV = 40 if self.same_hdim_kv else 64
         self.num_regs_compute = 120 if self.same_hdim_kv else 128
-        self.num_regs_reduce = 128
-        self.num_regs_mma = 40 if self.same_hdim_kv else 32
+        self.num_regs_reduce = 144 if self.same_hdim_kv else 128
+        self.num_regs_mma = 32
         self.num_regs_empty = self.num_regs_mma
         self.num_regs_load = self.num_regs_mma
 
@@ -2242,24 +2240,6 @@ class FlashAttentionDSABackwardSm100:
             # Notify for P
             compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
             compute_mma_P_producer_state.advance()
-            if cutlass.const_expr(mPoolTarget is not None):
-                _partial_cta_sync(self.compute_sync_barrier.barrier_id, self.compute_sync_barrier.num_threads)
-                sP_tile = sP_store[None, None, p_stage_written]
-                half_heads = self.block_tile // 2
-                slot = tidx_in_wg // 2
-                head_base = (tidx_in_wg % 2) * half_heads
-                pool_mass = Float32(0.0)
-                for _j in cutlass.range_constexpr(half_heads):
-                    pool_mass = pool_mass + Float32(sP_tile[head_base + _j, slot])
-                for _o in (1, 2, 4) if self.pool_size == 4 else (1, 2, 4, 8, 16):
-                    pool_mass = pool_mass + cute.arch.shuffle_sync_bfly(pool_mass, offset=_o, mask=-1, mask_and_clamp=31)
-                threads_per_pool = 2 * self.pool_size
-                pool_index = tile_index * (self.block_tile // self.pool_size) + tidx_in_wg // threads_per_pool
-                pooled_limit = topk - topk % self.pool_size
-                if tidx_in_wg % threads_per_pool == 0 and pool_index < cute.size(mPoolTarget.shape[0]):
-                    if pool_index * self.pool_size >= pooled_limit:
-                        pool_mass = Float32(0.0)
-                    mPoolTarget[pool_index, (token_idx, batch_idx)] = pool_mass
 
             mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
             compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
@@ -2305,6 +2285,23 @@ class FlashAttentionDSABackwardSm100:
 
             compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
             compute_mma_dS_producer_state.advance()
+            if cutlass.const_expr(mPoolTarget is not None):
+                sP_tile = sP_store[None, None, p_stage_written]
+                half_heads = self.block_tile // 2
+                slot = tidx_in_wg // 2
+                head_base = (tidx_in_wg % 2) * half_heads
+                pool_mass = Float32(0.0)
+                for _j in cutlass.range_constexpr(half_heads):
+                    pool_mass = pool_mass + Float32(sP_tile[head_base + ((_j + slot) % half_heads), slot])
+                for _o in (1, 2, 4) if self.pool_size == 4 else (1, 2, 4, 8, 16):
+                    pool_mass = pool_mass + cute.arch.shuffle_sync_bfly(pool_mass, offset=_o, mask=-1, mask_and_clamp=31)
+                threads_per_pool = 2 * self.pool_size
+                pool_index = tile_index * (self.block_tile // self.pool_size) + tidx_in_wg // threads_per_pool
+                pooled_limit = topk - topk % self.pool_size
+                if tidx_in_wg % threads_per_pool == 0 and pool_index < cute.size(mPoolTarget.shape[0]):
+                    if pool_index * self.pool_size >= pooled_limit:
+                        pool_mass = Float32(0.0)
+                    mPoolTarget[pool_index, (token_idx, batch_idx)] = pool_mass
 
             tile_index -= 1
 
