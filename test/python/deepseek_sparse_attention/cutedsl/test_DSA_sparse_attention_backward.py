@@ -132,6 +132,7 @@ def _plan_case(
     has_topk_length=False,
     deterministic=False,
     q_cluster_mode="off",
+    deterministic_dkv_relay_cluster_size=None,
     compile_plan=True,
 ):
     """Inputs, a checked plan, caller-owned outputs, and scratch for one route."""
@@ -158,6 +159,7 @@ def _plan_case(
         softmax_scale=softmax_scale,
         deterministic=deterministic,
         q_cluster_mode=q_cluster_mode,
+        deterministic_dkv_relay_cluster_size=deterministic_dkv_relay_cluster_size,
     )
     assert plan.check_support()
     if compile_plan:
@@ -4987,12 +4989,45 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected = 2 * ws_align(sq_r * num_heads * 4) + ws_align(sk_r * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
     assert flash_attn_bwd_sm90_workspace_size(64, 64, 512, 16) == 2 * ws_align(64 * 16 * 4) + ws_align(64 * 512 * 4)
-    # One packed rank-mask row follows each of the sixteen cluster-8 planes.
-    expected_deterministic = 2 * ws_align(sq_r * num_heads * 4) + ws_align(16 * (sk_r + 1) * hd_r * 4)
-    assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_deterministic
+    # One packed rank-mask row follows each cluster-8 or cluster-4 plane.
+    expected_cluster8 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(16 * (sk_r + 1) * hd_r * 4)
+    expected_cluster4 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(32 * (sk_r + 1) * hd_r * 4)
+    assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_cluster8
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_dkv_relay_cluster_size=4,
+        )
+        == expected_cluster4
+    )
+    with pytest.raises(ValueError, match="cluster size must be one of"):
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_dkv_relay_cluster_size=2,
+        )
     large_stats = ws_align(1088 * 128 * 4)
-    expected_large_relay = 2 * large_stats + ws_align(16 * (1088 + 9) * 576 * 4)
-    assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_relay
+    expected_large_cluster8 = 2 * large_stats + ws_align(16 * (1088 + 9) * 576 * 4)
+    expected_large_cluster4 = 2 * large_stats + ws_align(32 * (1088 + 5) * 576 * 4)
+    assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_cluster8
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_dkv_relay_cluster_size=4,
+        )
+        == expected_large_cluster4
+    )
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         return
@@ -5010,6 +5045,38 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     )
     assert plan.check_support()
     assert plan.scratch_workspace_bytes() == expected
+
+    cluster4_plan = DSA.SparseAttentionBackward(
+        sample_q=torch.empty(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device),
+        sample_kv=torch.empty(s_kv, head_dim, dtype=torch.bfloat16, device=device),
+        sample_out=torch.empty(s_q, num_heads, 512, dtype=torch.bfloat16, device=device),
+        sample_dout=torch.empty(s_q, num_heads, 512, dtype=torch.bfloat16, device=device),
+        sample_lse=torch.empty(s_q, num_heads, dtype=torch.float32, device=device),
+        sample_attn_sink=torch.empty(num_heads, dtype=torch.float32, device=device),
+        sample_topk_idxs=torch.empty(s_q, 64, dtype=torch.int32, device=device),
+        deterministic=True,
+        deterministic_dkv_relay_cluster_size=4,
+    )
+    assert cluster4_plan.check_support()
+    assert cluster4_plan.scratch_workspace_bytes() == expected_cluster4
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_cluster_size_rejects_before_staging(monkeypatch):
+    """Invalid public relay attributes fail before the wrapper stages inputs."""
+    _require_sm90()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
+
+    def forbidden_staging(*args, **kwargs):
+        raise AssertionError("invalid relay configuration reached input staging")
+
+    monkeypatch.setattr(api, "contiguous_on_stream", forbidden_staging)
+    q = torch.empty(0, device="cuda")
+    args = (q, None, None, None, None, None, None)
+    with pytest.raises(ValueError, match="requires deterministic=True"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=False, deterministic_dkv_relay_cluster_size=4)
+    with pytest.raises(ValueError, match="must be 4 or 8"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_dkv_relay_cluster_size=2)
 
 
 @pytest.mark.L0
@@ -5030,7 +5097,8 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
 @pytest.mark.L0
 @torch_fork_set_rng(seed=92)
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["compact", "lengths"])
-def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length):
+@pytest.mark.parametrize("relay_cluster_size", [4, 8], ids=["cluster4", "cluster8"])
+def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length, relay_cluster_size):
     """Hopper relay ranks, head phases, and query waves stay bitwise stable."""
     try:
         from cuda.bindings import driver as cuda
@@ -5046,6 +5114,7 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length)
         s_kv=256,
         has_topk_length=has_topk_length,
         deterministic=True,
+        deterministic_dkv_relay_cluster_size=relay_cluster_size,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
