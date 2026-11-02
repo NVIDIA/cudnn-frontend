@@ -4437,7 +4437,9 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
 
     # qhpkv controls the query-head tiling and must remain part of the main
     # compile key, independently of the runtime tensor shape.
-    assert any(key[1:4] == (head_dim, head_dim_v, num_heads) for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache)
+    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-7] is False]
+    assert matching_keys
+    assert all(key[-2:] == (0, 0) for key in matching_keys), "non-deterministic kernels must not specialize on rounded KV extents"
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
     assert torch.isfinite(dq).all()
