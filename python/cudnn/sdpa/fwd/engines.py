@@ -1826,7 +1826,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and (
                         (
                             (facts.is_fp8 or facts.is_mxfp8)
-                            and not supports_quantized_split_sink(device_cc=facts.device_cc, pertensor=facts.is_fp8, thd=facts.thd)
+                            and not supports_quantized_split_sink(
+                                device_cc=facts.device_cc,
+                                pertensor=facts.is_fp8,
+                                thd=facts.thd,
+                                d_shape=(facts.d_qk, facts.d_v),
+                                paged=facts.has_paged_kv,
+                            )
                         )
                         or facts.has_epilogue_gate
                         or capabilities.sm_lo not in (100, 107, 120)
@@ -1854,7 +1860,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
                 )
             ):
-                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103/SM107 per-tensor FP8 and SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
+                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103/SM107 per-tensor FP8, SM120 exact D128 dense per-tensor FP8 and SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
             if (
                 facts.has_sink
                 and (facts.is_fp8 or facts.is_mxfp8)
@@ -4103,7 +4109,9 @@ def _sm120_fp8_spec() -> EngineSpec:
     to compact storage.
     Attention sinks fold into the softmax denominator: the sink is a virtual
     column with no V row — it rescales O and enters the LSE. THD (ragged) is
-    served with token- or head-major Stats.
+    served with token- or head-major Stats. An explicit sink split is qualified
+    only for exact D128 unpadded dense graphs; its partials omit the sink and
+    the final combine folds it once.
     """
     from cudnn.sdpa.fwd.config_sm120 import GENERAL_HEAD_TILE_MAX, FP8_GENERAL_HEAD_TILES
 
