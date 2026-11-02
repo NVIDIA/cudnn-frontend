@@ -167,3 +167,37 @@ def test_pooled_teacher_recompute_matches_unfused(batch, seqlen, k_pools):
         pool_size,
     )["target"]
     assert _rel(fused, reference) < 2e-2
+
+
+@pytest.mark.parametrize("seqlen,k_pools", [(2048, 128), (1500, 64)])
+def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pools):
+    from cudnn.deepseek_sparse_attention.sparse_attention_forward.api import sparse_attention_forward_wrapper
+
+    c = R.make_case(1, seqlen, torch.device("cuda"), topk_tokens=k_pools * 4, seed=13)
+    pool_size = 4
+    _, pool_ids = _selected(c, k_pools)
+    q, kv, positions = c["q_attn"], c["k_attn"], c["positions"]
+    s, h, d = q.shape[1:]
+    softmax_scale = d**-0.5
+    expanded = PB.pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k=s, global_ids=True)
+    token_ids, length = expanded["token_ids"], expanded["topk_length"]
+    fwd = sparse_attention_forward_wrapper(
+        q.reshape(s, h, d), kv.reshape(s, d), token_ids.reshape(s, -1), topk_length=length.reshape(s), softmax_scale=softmax_scale
+    )
+    out, lse = fwd["out"].reshape(1, s, h, -1), fwd["lse"].reshape(1, s, h).float()
+    dout = torch.randn_like(out)
+    plain = PB.pooled_sparse_attention_backward(
+        q, kv, out, dout, lse, pool_ids, positions, pool_size, softmax_scale=softmax_scale, token_ids=token_ids, topk_length=length
+    )
+    fused = PB.pooled_sparse_attention_backward_with_teacher(
+        q, kv, out, dout, lse, pool_ids, positions, k_pools, pool_size, softmax_scale=softmax_scale, token_ids=token_ids, topk_length=length
+    )
+    assert _rel(fused["dq"], plain["dq"]) < 1e-5
+    assert _rel(fused["dkv"], plain["dkv"]) < 1e-4
+    teacher = PB.pooled_teacher_recompute(q, kv, lse, token_ids, length, k_pools, pool_size, softmax_scale)["target"]
+    assert fused["target"].shape == teacher.shape and torch.isfinite(fused["target"]).all()
+    has_pool = ((positions + 1) // pool_size) >= 1
+    assert torch.allclose(fused["target"].sum(-1)[has_pool], torch.ones_like(teacher.sum(-1)[has_pool]), atol=1e-4)
+    assert (fused["target"][~has_pool] == 0).all()
+    assert _rel(fused["target"], teacher) < 5e-3
+    assert (fused["target"] - teacher).abs().max().item() < 2e-3

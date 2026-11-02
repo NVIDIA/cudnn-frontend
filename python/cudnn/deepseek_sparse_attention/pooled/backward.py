@@ -352,3 +352,78 @@ def pooled_teacher_recompute(
         current_stream=None if stream is None else _stream_handle(stream),
     )
     return TupleDict(target=out)
+
+
+def pooled_sparse_attention_backward_with_teacher(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    pool_ids: torch.Tensor,
+    positions: torch.Tensor,
+    k_pools: int,
+    pool_size: int = 4,
+    softmax_scale: Optional[float] = None,
+    token_ids: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    dq: Optional[torch.Tensor] = None,
+    dkv: Optional[torch.Tensor] = None,
+    target: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    stream=None,
+) -> TupleDict:
+    """Sparse attention backward that also emits the pool-level teacher.
+
+    Same layouts as ``pooled_sparse_attention_backward``; ``target`` is
+    (B, S, K) FP32, renormalized over the valid pools (zero rows when a query
+    has no complete pool). Returns ``{'dq', 'dkv', 'd_sink', 'target', 'token_ids', 'topk_length'}``.
+    """
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as _iface
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common import flash_attn_bwd_sm100_workspace_size
+
+    b, s, h, d = q.shape
+    s_k = kv.shape[1]
+    if softmax_scale is None:
+        softmax_scale = d**-0.5
+    if token_ids is None or topk_length is None:
+        expanded = pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k=s_k, global_ids=True, stream=stream)
+        token_ids, topk_length = expanded["token_ids"], expanded["topk_length"]
+    q2, kv2, out2, dout2, lse2 = (
+        q.reshape(b * s, h, d).contiguous(),
+        kv.reshape(b * s_k, d).contiguous(),
+        out.reshape(b * s, h, -1).contiguous(),
+        dout.reshape(b * s, h, -1).contiguous(),
+        lse.reshape(b * s, h).float().contiguous(),
+    )
+    if dq is None:
+        dq = torch.empty_like(q)
+    if dkv is None:
+        dkv = torch.empty_like(kv)
+    if target is None:
+        target = torch.empty(b, s, k_pools, dtype=torch.float32, device=q.device)
+    target.zero_()
+    d_sink = torch.empty(h, dtype=torch.float32, device=q.device)
+    attn_sink = torch.full((h,), float("-inf"), dtype=torch.float32, device=q.device)
+    if workspace is None:
+        workspace = torch.empty(flash_attn_bwd_sm100_workspace_size(b * s, b * s_k, d, h), dtype=torch.uint8, device=q.device)
+    _iface.flash_attn_bwd_sm100(
+        q2,
+        kv2,
+        out2,
+        dout2,
+        lse2,
+        attn_sink,
+        token_ids.reshape(b * s, -1).contiguous(),
+        softmax_scale=float(softmax_scale),
+        topk_length=topk_length.reshape(b * s).contiguous(),
+        dq=dq.view(b * s, h, d),
+        dkv=dkv.view(b * s_k, d),
+        current_stream=None if stream is None else _stream_handle(stream),
+        workspace=workspace,
+        d_sink=d_sink,
+        pool_target=target.view(b * s, k_pools),
+        pool_size=pool_size,
+    )
+    target.div_(target.sum(dim=-1, keepdim=True).clamp(min=1e-12))
+    return TupleDict(dq=dq, dkv=dkv, d_sink=d_sink, target=target, token_ids=token_ids, topk_length=topk_length)

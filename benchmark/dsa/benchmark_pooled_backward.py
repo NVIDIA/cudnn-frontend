@@ -206,6 +206,29 @@ def attention_side(c, timer):
     res["attn_bwd_open_source_kernel_us"] = timer(kernel_open_source)
     res["attn_bwd_open_source_total_us"] = res["attn_bwd_open_source_kernel_us"] + res["argsort_compaction_us"]
     res["attn_bwd_pooled_total_us"] = timer(kernel_pooled)
+
+    def kernel_pooled_with_teacher():
+        return PB.pooled_sparse_attention_backward_with_teacher(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            c["pool_ids"],
+            c["positions"],
+            c["k_pools"],
+            pool_size,
+            softmax_scale=c["softmax_scale"],
+            token_ids=c["token_ids"],
+            topk_length=c["topk_length"],
+        )
+
+    res["attn_bwd_with_teacher_us"] = timer(kernel_pooled_with_teacher)
+    fused_t = kernel_pooled_with_teacher()["target"]
+    teacher_sep = PB.pooled_teacher_recompute(
+        c["q_attn"], c["k_attn"], c["lse"], c["token_ids"], c["topk_length"], c["k_pools"], pool_size, c["softmax_scale"]
+    )["target"]
+    res["teacher_in_bwd_rel_diff"] = ((fused_t - teacher_sep).norm() / teacher_sep.norm()).item()
     # agreement of the two routes
     a = kernel_open_source()
     b = kernel_pooled()

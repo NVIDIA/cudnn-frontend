@@ -429,8 +429,14 @@ def flash_attn_bwd_sm100(
     d_sink: Optional[torch.Tensor] = None,
     deterministic_relay_cluster_size: Optional[int] = None,
     _compiled_kernel=None,
+    pool_target: Optional[torch.Tensor] = None,
+    pool_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
+
+    ``pool_target`` (total_S_q, k_pools) FP32 receives the unnormalized pool-level
+    teacher mass (P summed over heads and over each ``pool_size`` consecutive
+    slots, the trailing partial pool excluded); generic M64 backend only.
 
     Accepts flat (unbatched) contiguous tensors with global topk indices.
     Internally wraps as batch=1 for the CuTe DSL kernel and never repacks.
@@ -644,9 +650,17 @@ def flash_attn_bwd_sm100(
         deterministic_shards,
         selected_relay_cluster_size,
         device.index,
+        pool_size,
         max_topk,
         has_topk_length,
     )
+    if pool_target is not None:
+        if pool_size not in (4, 16) or backend != "generic_m64" or deterministic:
+            raise ValueError("pool_target requires pool_size in (4, 16), the generic M64 backend and non-deterministic execution")
+        if pool_target.dtype != torch.float32 or pool_target.dim() != 2 or pool_target.shape[0] != total_S_q or not pool_target.is_contiguous():
+            raise ValueError(f"pool_target must be a contiguous fp32 ({total_S_q}, k_pools) tensor, got {tuple(pool_target.shape)} {pool_target.dtype}")
+    elif pool_size:
+        raise ValueError("pool_size needs a pool_target tensor")
 
     compiled_kernel = _compiled_kernel
     if compiled_kernel is None and compile_key not in flash_attn_bwd_sm100.compile_cache:
@@ -674,7 +688,9 @@ def flash_attn_bwd_sm100(
             head_dim_v=head_dim_v,
             block_tile=block_tile,
             max_topk=max_topk,
+            **({"pool_size": pool_size} if pool_size else {}),
         )
+        pool_target_compile_args = (to_cute_tensor(pool_target, assumed_align=8),) if pool_size else ()
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
             flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(
@@ -695,6 +711,7 @@ def flash_attn_bwd_sm100(
                 workspace_dKV_tensor,
                 softmax_scale,
                 current_stream,
+                *pool_target_compile_args,
                 options=compile_options(gpu_arch=_sm100_gpu_arch_flag(device_capability)),
             )
     if compiled_kernel is None:
@@ -718,6 +735,7 @@ def flash_attn_bwd_sm100(
             workspace_dKV,
             softmax_scale,
             current_stream,
+            *((pool_target,) if pool_size else ()),
         )
 
     return dq, dkv, d_sink
