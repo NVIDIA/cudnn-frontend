@@ -35,7 +35,7 @@ _M_BLOCK_SIZE = 64
 _N_BLOCK_SIZE = 64
 _HEAD_DIM_MULTIPLE = 32
 _DETERMINISTIC_Q_WAVE_CTAS = 128
-_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8)
+_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8, 16)
 _DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 8
 _WORKSPACE_OWNER = "SparseAttentionBackward (SM90)"
 
@@ -58,7 +58,10 @@ def _deterministic_relay_layout(
 ) -> Tuple[int, int, int, int, int]:
     """Return (planes, physical plane elements, mask rows, waves, head tiles)."""
     if relay_cluster_size not in _DETERMINISTIC_RELAY_CLUSTER_SIZES:
-        raise ValueError(f"SM90 deterministic dKV relay cluster size must be one of {_DETERMINISTIC_RELAY_CLUSTER_SIZES}, got {relay_cluster_size}")
+        raise ValueError(
+            f"SM90 deterministic dKV relay cluster size must be one of {_DETERMINISTIC_RELAY_CLUSTER_SIZES} "
+            f"(32, 16, or 8 FP32 planes), got {relay_cluster_size}"
+        )
     _, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
     num_waves = _round_up(total_s_q, _DETERMINISTIC_Q_WAVE_CTAS) // _DETERMINISTIC_Q_WAVE_CTAS
     num_head_tiles = _round_up(num_heads, _M_BLOCK_SIZE) // _M_BLOCK_SIZE
@@ -141,8 +144,8 @@ def flash_attn_bwd_sm90(
             length, clamped to `[0, topk_max]` by the kernel.
         deterministic: use clustered, row-aware FP32 dKV relays and
             fixed-order dSink/dKV reductions for bitwise-reproducible results.
-        deterministic_dkv_relay_cluster_size: SM90 dKV relay width, either 4
-            or 8. A smaller width uses more FP32 planes.
+        deterministic_dkv_relay_cluster_size: SM90 dKV relay width: 4, 8, or
+            16. A smaller width uses more FP32 planes.
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients

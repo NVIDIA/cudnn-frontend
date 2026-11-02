@@ -248,7 +248,7 @@ batches split each query's top-k range across otherwise idle two-SM clusters;
 the split count is fixed when the plan is compiled.
 
 On SM90, `deterministic=True` uses a row-aware relay with cluster size
-`C in {4, 8}` for H16/H32/H64/H96/H128. The public
+`C in {4, 8, 16}` for H16/H32/H64/H96/H128. The public
 `deterministic_dkv_relay_cluster_size` argument selects `C` and defaults to 8.
 Each 128-query wave launches `128 / C` clusters and gives one FP32 dKV plane
 to each cluster. A setup kernel builds packed `C`-bit rank
@@ -269,6 +269,9 @@ The SM90 deterministic dKV allocation is
 (K64 / (32 / C)) / D32)`.
 The caller-owned workspace is cleared and the masks are rebuilt on every
 execution, so changing `topk_idxs` or `topk_length` between launches is safe.
+Here `C` is the physical thread-block cluster width, not the number of FP32
+planes. Widths 32 and 64 are therefore not accepted; their plane-count-like
+values should not be passed as cluster sizes.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
@@ -424,7 +427,7 @@ result = DSA.sparse_attention_backward_wrapper(
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
     deterministic=True,  # optional; SM90/SM100 H16/H32/H64/H96/H128
-    deterministic_dkv_relay_cluster_size=8,  # optional SM90 relay width: 4 or 8
+    deterministic_dkv_relay_cluster_size=8,  # optional SM90 relay width: 4, 8, or 16
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]

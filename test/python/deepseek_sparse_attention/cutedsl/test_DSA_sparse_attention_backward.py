@@ -4989,9 +4989,10 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected = 2 * ws_align(sq_r * num_heads * 4) + ws_align(sk_r * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
     assert flash_attn_bwd_sm90_workspace_size(64, 64, 512, 16) == 2 * ws_align(64 * 16 * 4) + ws_align(64 * 512 * 4)
-    # One packed rank-mask row follows each cluster-8 or cluster-4 plane.
+    # One packed rank-mask row follows every cluster-4/8/16 plane.
     expected_cluster8 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(16 * (sk_r + 1) * hd_r * 4)
     expected_cluster4 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(32 * (sk_r + 1) * hd_r * 4)
+    expected_cluster16 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(8 * (sk_r + 1) * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_cluster8
     assert (
         flash_attn_bwd_sm90_workspace_size(
@@ -5003,6 +5004,17 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
             deterministic_dkv_relay_cluster_size=4,
         )
         == expected_cluster4
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_dkv_relay_cluster_size=16,
+        )
+        == expected_cluster16
     )
     with pytest.raises(ValueError, match="cluster size must be one of"):
         flash_attn_bwd_sm90_workspace_size(
@@ -5016,6 +5028,7 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     large_stats = ws_align(1088 * 128 * 4)
     expected_large_cluster8 = 2 * large_stats + ws_align(16 * (1088 + 9) * 576 * 4)
     expected_large_cluster4 = 2 * large_stats + ws_align(32 * (1088 + 5) * 576 * 4)
+    expected_large_cluster16 = 2 * large_stats + ws_align(8 * (1088 + 17) * 576 * 4)
     assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_cluster8
     assert (
         flash_attn_bwd_sm90_workspace_size(
@@ -5027,6 +5040,17 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
             deterministic_dkv_relay_cluster_size=4,
         )
         == expected_large_cluster4
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_dkv_relay_cluster_size=16,
+        )
+        == expected_large_cluster16
     )
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
@@ -5075,8 +5099,8 @@ def test_DSA_sparse_attention_backward_sm90_relay_cluster_size_rejects_before_st
     args = (q, None, None, None, None, None, None)
     with pytest.raises(ValueError, match="requires deterministic=True"):
         api.sparse_attention_backward_wrapper(*args, deterministic=False, deterministic_dkv_relay_cluster_size=4)
-    with pytest.raises(ValueError, match="must be 4 or 8"):
-        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_dkv_relay_cluster_size=2)
+    with pytest.raises(ValueError, match="must be 4, 8, or 16"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_dkv_relay_cluster_size=32)
 
 
 @pytest.mark.L0
@@ -5097,7 +5121,7 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
 @pytest.mark.L0
 @torch_fork_set_rng(seed=92)
 @pytest.mark.parametrize("has_topk_length", [False, True], ids=["compact", "lengths"])
-@pytest.mark.parametrize("relay_cluster_size", [4, 8], ids=["cluster4", "cluster8"])
+@pytest.mark.parametrize("relay_cluster_size", [4, 8, 16], ids=["cluster4", "cluster8", "cluster16"])
 def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length, relay_cluster_size):
     """Hopper relay ranks, head phases, and query waves stay bitwise stable."""
     try:

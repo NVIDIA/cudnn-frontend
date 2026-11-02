@@ -54,7 +54,7 @@ class SparseAttentionBackward(APIBase):
         backend unchanged. H16 ``topk_max <= 256`` and H32 ``topk_max <= 128``
         accept the mode but retain the ordinary backend. On SM90,
         ``deterministic_dkv_relay_cluster_size`` exposes the deterministic dKV
-        relay width (4 or 8); ``None`` selects the default width 8.
+        relay width (4, 8, or 16); ``None`` selects the default width 8.
         """
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -196,8 +196,10 @@ class SparseAttentionBackward(APIBase):
             relay_cluster_size = self.deterministic_dkv_relay_cluster_size
             self._sm90_deterministic_dkv_relay_cluster_size = 8 if relay_cluster_size is None else relay_cluster_size
             self._value_error_if(
-                self._sm90_deterministic_dkv_relay_cluster_size not in (4, 8),
-                "SM90 deterministic_dkv_relay_cluster_size must be 4 or 8, " f"got {self._sm90_deterministic_dkv_relay_cluster_size}",
+                self._sm90_deterministic_dkv_relay_cluster_size not in (4, 8, 16),
+                "SM90 deterministic_dkv_relay_cluster_size must be 4, 8, or 16 "
+                "(32, 16, or 8 FP32 planes), "
+                f"got {self._sm90_deterministic_dkv_relay_cluster_size}",
             )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
@@ -401,11 +403,11 @@ class SparseAttentionBackward(APIBase):
         exceed 16 GiB instead use 8, 16, or 32 planes plus packed row-relay
         masks; the eight-plane memory-first tier is selected when the preferred
         relay would exceed 32 GiB. Deterministic H96/H128 D576 two-CTA plans use
-        the compact 96-plane capacity. On SM90, cluster size 8 uses sixteen
-        planes and cluster size 4 uses thirty-two planes, each followed by its
-        packed relay-mask rows. The returned size is authoritative for this
-        plan; ``execute()`` accepts a larger contiguous uint8 buffer on the plan
-        device but never allocates one.
+        the compact 96-plane capacity. On SM90, cluster sizes 4, 8, and 16 use
+        thirty-two, sixteen, and eight planes respectively, each followed by
+        its packed relay-mask rows. The returned size is authoritative for
+        this plan; ``execute()`` accepts a larger contiguous uint8 buffer on
+        the plan device but never allocates one.
         """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)
@@ -606,7 +608,7 @@ def sparse_attention_backward_wrapper(
     The wrapper stages strided inputs and outputs and allocates omitted outputs
     or workspace on the launch stream; the plan's ``execute()`` does neither.
     ``deterministic_dkv_relay_cluster_size`` is an SM90-only deterministic
-    tuning parameter; it accepts 4 or 8 and defaults to 8.
+    tuning parameter; it accepts 4, 8, or 16 and defaults to 8.
     """
     if q_cluster_mode not in ("off", "adaptive_pair"):
         raise ValueError(f"q_cluster_mode must be 'off' or 'adaptive_pair', got {q_cluster_mode!r}")
@@ -614,8 +616,10 @@ def sparse_attention_backward_wrapper(
         deterministic_dkv_relay_cluster_size = int(deterministic_dkv_relay_cluster_size)
         if not deterministic:
             raise ValueError("deterministic_dkv_relay_cluster_size requires deterministic=True")
-        if deterministic_dkv_relay_cluster_size not in (4, 8):
-            raise ValueError(f"SM90 deterministic_dkv_relay_cluster_size must be 4 or 8, got {deterministic_dkv_relay_cluster_size}")
+        if deterministic_dkv_relay_cluster_size not in (4, 8, 16):
+            raise ValueError(
+                "SM90 deterministic_dkv_relay_cluster_size must be 4, 8, or 16 " f"(32, 16, or 8 FP32 planes), got {deterministic_dkv_relay_cluster_size}"
+            )
         if device_capability(q.device)[0] != 9:
             raise ValueError("deterministic_dkv_relay_cluster_size is supported only on SM90")
     # The plan addresses contiguous tensors only (check_support declines the rest, R5).
