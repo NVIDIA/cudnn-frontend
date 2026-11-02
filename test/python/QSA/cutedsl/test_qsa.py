@@ -124,12 +124,16 @@ def assert_close(actual, expected):
 @pytest.mark.L0
 def test_signature():
     tail = ["sel_blocks", "lo", "hi", "blk_base", "tok_base", "block_first", "block_last", "scale", "block_size"]
-    for function, prefix in ((qsa_forward, ["q", "k", "v"]), (qsa_backward, ["grad_out", "q", "k", "v", "out_fp32", "lse"])):
+    for function, prefix, options in (
+        (qsa_forward, ["q", "k", "v"], []),
+        (qsa_backward, ["grad_out", "q", "k", "v", "out_fp32", "lse"], ["ds_precision"]),
+    ):
         signature = inspect.signature(function)
-        assert list(signature.parameters) == prefix + tail
+        assert list(signature.parameters) == prefix + tail + options
         assert all(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in signature.parameters.values())
         assert signature.parameters["block_size"].default == 4
-        assert all(p.default is inspect.Parameter.empty for name, p in signature.parameters.items() if name != "block_size")
+        assert all(p.default is inspect.Parameter.empty for name, p in signature.parameters.items() if name not in ("block_size", *options))
+    assert inspect.signature(qsa_backward).parameters["ds_precision"].default == "bf16"
 
 
 @pytest.mark.L0
@@ -264,12 +268,6 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 
 
 @pytest.mark.L0
-@pytest.mark.xfail(
-    reason="the engine rounds dS to bf16 once before the dQ MMA, so the analytically zero dQ of this construction "
-    "keeps a residual above the absolute floor; a multi-part bf16 dS needs SMEM the query kernel does not have",
-    raises=AssertionError,
-    strict=False,
-)
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
 def test_backward_cancellation(supported_gpu, heads, large_logits):
@@ -285,7 +283,9 @@ def test_backward_cancellation(supported_gpu, heads, large_logits):
     out, lse = out.float(), lse.float()
     grad_out = inputs["q"] * 0.125
     expected = reference(inputs, grad_out, out, lse)
-    actual = qsa_backward(grad_out, **inputs, out_fp32=out, lse=lse)
+    # The default rounds dS to bf16 once before the dQ MMAs, which leaves the analytically zero dQ of this construction
+    # above the absolute floor; the fp32 option keeps the cancellation.
+    actual = qsa_backward(grad_out, **inputs, out_fp32=out, lse=lse, ds_precision="fp32")
     for grad, ref in zip(actual, expected):
         assert_close(grad, ref)
 

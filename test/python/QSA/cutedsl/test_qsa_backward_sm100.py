@@ -72,12 +72,13 @@ def _miles_metadata(idx, lengths):
     return [sel, lo, hi, blk_base, lo.clone(), block_first, block_last]
 
 
-def _bitmap_backward(inputs, meta):
-    return tuple(qsa_backward(inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], *meta, SCALE, 4))
+def _bitmap_backward(inputs, meta, **options):
+    return tuple(qsa_backward(inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], *meta, SCALE, 4, **options))
 
 
-def _indexed_backward(inputs, cu_seqlens=None):
-    options = {} if cu_seqlens is None else dict(selection_mode="causal_topk", cu_seqlens=cu_seqlens)
+def _indexed_backward(inputs, cu_seqlens=None, **options):
+    if cu_seqlens is not None:
+        options = dict(options, selection_mode="causal_topk", cu_seqlens=cu_seqlens)
     return tuple(
         qsa_indexed_backward(inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], inputs["topk_idxs"], SCALE, **options)
     )
@@ -325,6 +326,18 @@ def test_cuda12_compiler_declines_12q1kv(monkeypatch):
         _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (4101,)))
     inputs = _inputs((4101,), 2, seed=9)
     _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (4101,))))
+
+
+@pytest.mark.L1
+def test_fp32_ds_option_on_both_entries():
+    # ds_precision="fp32" feeds the dQ MMAs three bf16 parts of dS on the dense and the sparse paths of both entries
+    # (test_backward_cancellation checks the accuracy it buys); the engine plans carry the parts.
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    inputs = _inputs((24000,), 1, seed=5)
+    _check(inputs, _indexed_backward(inputs, ds_precision="fp32"))
+    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (24000,)), ds_precision="fp32"))
+    assert any(key[0] == 24000 and key[-1] == 3 for key in engine._PLANS)
 
 
 @pytest.mark.L1

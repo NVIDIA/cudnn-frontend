@@ -42,9 +42,14 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
+    ds_precision: str = "bf16",
 ) -> TupleDict:
     ...  # dq, dk, dv
 ```
+
+`ds_precision` selects how dS reaches the dQ MMAs: `"bf16"` rounds it once,
+as FlashAttention does; `"fp32"` feeds three bf16 parts of its fp32 value,
+which keeps a dQ whose terms nearly cancel accurate at a higher cost.
 
 Both calls return a `TupleDict`. Tuple unpacking follows the order above; string
 keys have the same names. Forward and backward are explicit calls. The forward
@@ -166,7 +171,9 @@ K/V gradient contributions from all query heads are summed. Floating-point
 reductions can change low bits between runs. The dense prefix of each sequence
 runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
 on chip; the remaining queries write bf16 P / dS records that a key-major pass
-sums per block, so no per-pair floating-point atomics are issued. A nonfinite
+sums per block, so no per-pair floating-point atomics are issued. dS reaches
+the dQ MMAs rounded once to bf16, or as three bf16 parts of its fp32 value
+with `ds_precision="fp32"`. A nonfinite
 K / V value of a masked token adds exact zeros; one of a selected token poisons
 the queries that select it and that block's dK / dV, nothing else (a
 nonfinite Q or dO value can also reach the dQ of the query pair processed just

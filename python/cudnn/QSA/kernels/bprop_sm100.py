@@ -31,6 +31,10 @@ I32 = cutlass.Int32
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
+# dS^T reaches the dQ MMAs in bf16 parts of its fp32 value: one keeps a single rounding (the default, as FlashAttention
+# does), three keep the cancellation of nearly equal dS rows (ds_precision="fp32").
+DQ_PARTS_DEFAULT = 1
+
 # Geometry: GQ head rows per query in the MMA tiles, HKV in (1, 2) KV heads. The kernels take HKV and GH, the real
 # query heads per KV head (12, or 6 for the four-way tensor-parallel shard), as compile-time parameters: with GH < GQ
 # the tile rows past GH read zero Q / dO, lse = +inf and delta = 0, so their P and dS are zero and dQ skips them.
@@ -46,9 +50,10 @@ NTHREADS = 512
 # column: the softmax warps zero the rows of the chunk the MMA must not see, and the 512 B after a stage, which its
 # last K-step reads the same way, never hold K or V (see the layout below).
 CHB = 12
-NKS = 3  # K stages, so K(c+1) streams in while S(c), dP(c) and dQ(c-1) run
 
-# shared memory of the query-major kernel (bytes from a 1024-aligned base): [K0][pad][K1][dO][K2][Q][V][dS]
+# shared memory of the query-major kernel (bytes from a 1024-aligned base): [K0][pad][K1][dO][K2][Q][V][dS] with one
+# dS^T part, [K0][pad][K1][dO][Q][V][dS x 3] with three (the third K stage, which lets K(c+1) stream in while S(c),
+# dP(c) and dQ(c-1) run, pays for the parts).
 # A chunk slot is 8 MMA rows in 4 KB: one block of one query with two KV heads (row = 2 * token + head, one SW128 box)
 # or the same block number of two consecutive queries with one KV head (row = 4 * query + token, two 2 KB boxes).
 BLK_SMEM = 4096
@@ -63,14 +68,19 @@ Q_BYTES = 4 * QSLAB  # [4 slabs][24 rows x 128 B] with SW128: rows 0-11 are KV h
 OFF_K = 0
 GAP01 = 1024  # the zero pad between stages 0 and 1
 GAP12 = Q_BYTES  # dO sits between stages 1 and 2
-OFF_DO = OFF_K + 2 * K_STAGE + GAP01
-OFF_Q = OFF_K + 3 * K_STAGE + GAP01 + GAP12
-OFF_V = OFF_Q + Q_BYTES
 # dS^T as [row groups][3 column chunks][8 rows x 16 B], the MN-major B operand of dQ^T. One KV head needs two row groups
 # per slot (rows 4-7 of each stay zero and mask the other query's tokens that share the K^T atom).
-OFF_DS = OFF_V + K_STAGE
-DS_BYTES = 2 * CHB * 384
-SMEM_BYTES = OFF_DS + DS_BYTES
+DS_BYTES = 2 * CHB * 384  # one bf16 part of dS^T
+
+
+def _query_layout(parts):
+    # K stages and the dO, Q, V and dS offsets of the query-major kernel for the number of dS^T parts
+    nks = 3 if parts == 1 else 2
+    off_do = OFF_K + 2 * K_STAGE + GAP01
+    off_q = off_do + GAP12 + (nks - 2) * K_STAGE
+    off_v = off_q + Q_BYTES
+    return nks, off_do, off_q, off_v, off_v + K_STAGE
+
 
 # tensor memory columns of the query-major kernel
 TM_S = 0  # S^T, double buffered at a 64-column pitch
@@ -248,9 +258,11 @@ def qsa_bwd_sparse_query_kernel(
     scale: F32,
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
+    DQ_PARTS: cutlass.Constexpr[int],
 ):
     # An item is one sparse query (two KV heads) or two consecutive ones of the compacted list (one KV head), see the
     # SMEM layout note.
+    NKS, OFF_DO, OFF_Q, OFF_V, OFF_DS = _query_layout(DQ_PARTS)
     HQ = GH * HKV
     PAIR = HKV == 1
     QSTEP = 2 if PAIR else 1
@@ -266,7 +278,7 @@ def qsa_bwd_sparse_query_kernel(
     warp = cute.arch.warp_idx()
     lane = tidx % 32
 
-    smem = cutlass.Array(I32, SMEM_BYTES // 4, space=cutlass.AddressSpace.smem, alignment=1024)
+    smem = cutlass.Array(I32, (OFF_DS + DQ_PARTS * DS_BYTES) // 4, space=cutlass.AddressSpace.smem, alignment=1024)
     b_qf = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     b_qe = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     b_kf = cutlass.Array(cutlass.Int64, NKS, space=cutlass.AddressSpace.smem, alignment=8)
@@ -288,7 +300,7 @@ def qsa_bwd_sparse_query_kernel(
     # zero the whole operand region once, so padding rows and stale rows stay finite
     zero4 = cutlass.Vector.from_elements([I32(0), I32(0), I32(0), I32(0)], I32)
     sbase = smem.data_ptr()
-    for it in cutlass.range(tidx, SMEM_BYTES // 16, NTHREADS, unroll=1):
+    for it in cutlass.range(tidx, (OFF_DS + DQ_PARTS * DS_BYTES) // 16, NTHREADS, unroll=1):
         (sbase + it * 4).store(zero4, alignment=16)
 
     if warp == 0:
@@ -592,22 +604,24 @@ def qsa_bwd_sparse_query_kernel(
                                 nkk = nv3
                             else:
                                 nkk = (nv3 + 1) >> 1
+                            # one pass per bf16 part of dS^T
                             for hh in cutlass.range_constexpr(2):
-                                for kk in cutlass.range(nkk, unroll=1):
-                                    if cutlass.const_expr(PAIR):
-                                        a_k = dk_mn.advance_start_address(hh * 2 * 512 + kk * BLK_SMEM)
-                                    else:
-                                        a_k = dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM)
-                                    if prims.elect_sync():
-                                        prims.tcgen05_mma(
-                                            prims.Tcgen05MMAKind.F16,
-                                            prims.CTAGroup.CTA_1,
-                                            prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
-                                            a_k,
-                                            d_ds_mn3.advance_start_address(kk * 768),
-                                            idesc_q3,
-                                            acc_q | (kk > 0),
-                                        )
+                                for part in cutlass.range_constexpr(DQ_PARTS):
+                                    for kk in cutlass.range(nkk, unroll=1):
+                                        if cutlass.const_expr(PAIR):
+                                            a_k = dk_mn.advance_start_address(hh * 2 * 512 + kk * BLK_SMEM)
+                                        else:
+                                            a_k = dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM)
+                                        if prims.elect_sync():
+                                            prims.tcgen05_mma(
+                                                prims.Tcgen05MMAKind.F16,
+                                                prims.CTAGroup.CTA_1,
+                                                prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
+                                                a_k,
+                                                d_ds_mn3.advance_start_address(part * DS_BYTES + kk * 768),
+                                                idesc_q3,
+                                                acc_q | (part > 0) | (kk > 0),
+                                            )
                             if prims.elect_sync():
                                 prims.tcgen05_commit(b_ke.subview(kb), group=prims.CTAGroup.CTA_1)
                                 prims.tcgen05_commit(b_dsf, group=prims.CTAGroup.CTA_1)
@@ -738,25 +752,35 @@ def qsa_bwd_sparse_query_kernel(
                         # packed bf16 words
                         prw = prob_v.to(BF16).bitcast(I32)
                         drw = ds_v.to(BF16).bitcast(I32)
-                        dwords = []
-                        for n in cutlass.range_constexpr(16):
-                            dv_ = I32(0)
-                            if cutlass.const_expr(n < 6):
-                                if hrow == 0:
-                                    dv_ = drw[n]
-                            elif cutlass.const_expr(n < 12):
-                                if hrow == 1:
-                                    dv_ = drw[n - 6]
-                            dwords.append(dv_)
-                        dvec = cutlass.Vector.from_elements(dwords, I32)
+                        # dS^T for the dQ MMA in DQ_PARTS bf16 parts of its fp32 value (three keep the cancellation of
+                        # nearly equal rows); the record keeps the first
+                        dvecs = []
+                        res = ds_v
+                        for part in cutlass.range_constexpr(DQ_PARTS):
+                            bp = res.to(BF16)
+                            if cutlass.const_expr(part + 1 < DQ_PARTS):
+                                res = res - bp.to(F32)
+                            bpw = bp.bitcast(I32)
+                            dwords = []
+                            for n in cutlass.range_constexpr(16):
+                                dv_ = I32(0)
+                                if cutlass.const_expr(n < 6):
+                                    if hrow == 0:
+                                        dv_ = bpw[n]
+                                elif cutlass.const_expr(n < 12):
+                                    if hrow == 1:
+                                        dv_ = bpw[n - 6]
+                                dwords.append(dv_)
+                            dvecs.append(cutlass.Vector.from_elements(dwords, I32))
 
-                        # dQ(c-1) has finished reading the single dS^T SMEM buffer
+                        # dQ(c-1) has finished reading the dS^T SMEM buffers
                         _wait(b_dsf, (cgc & 1) ^ 1)
                         # dS^T row -> SMEM (MN-major core matrices: 3 n-chunks of 8 at 128 B). Slots past CHB have no
                         # row group.
                         if jrow < CHB:
-                            for nc in cutlass.range_constexpr(3):
-                                (sbase + ds_off + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
+                            for part in cutlass.range_constexpr(DQ_PARTS):
+                                for nc in cutlass.range_constexpr(3):
+                                    (sbase + ds_off + part * (DS_BYTES // 4) + nc * 32).store(dvecs[part][nc * 4 : nc * 4 + 4], alignment=16)
                         prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
@@ -971,6 +995,7 @@ def _sparse_query_host(
     scale: F32,
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
+    DQ_PARTS: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     T = q.shape[0]
@@ -1014,6 +1039,7 @@ def _sparse_query_host(
         scale,
         HKV,
         GH,
+        DQ_PARTS,
     ).launch(grid=(nctas, 1, 1), block=(NTHREADS, 1, 1), stream=stream)
 
 
@@ -2529,7 +2555,7 @@ DP_HS = 4 * DP_QSLAB
 DP_OFF_E = 2 * DP_KSLAB
 DP_OFF_L = DP_OFF_E + DP_NE * DP_HS
 DP_CM = 16 * 6 * 128
-DP_NX = 3  # rank 0's dQ^T holds an exchange buffer for DQL = 2 more groups, so a third buffer keeps the exchange moving
+DP_NX = 3  # P slots of rank 1. Rank 0 never writes its P ring, so its dS slots (R0 groups of DQ_PARTS parts) span both rings
 DP_OFF_P = DP_OFF_L + DP_NL * DP_HS
 DP_OFF_DS = DP_OFF_P + DP_NX * DP_CM
 DP_ST_W = DP_N * 128
@@ -2581,8 +2607,14 @@ def qsa_bwd_dense_pair_kernel(
     PDL: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
+    DQ_PARTS: cutlass.Constexpr[int],
 ):
     HQ = GH * HKV
+    # Rank 0 keeps the dS parts of R0 groups in flight and issues dQ^T DQL groups late, so the dS round trip through
+    # rank 1 overlaps DQL groups of its work. Rank 1 writes dS once dQ^T of the previous group has read it, so one slot
+    # holds its parts.
+    R0 = min(DP_NX, (2 * DP_NX) // DQ_PARTS)
+    DQL = R0 - 1
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     warp = cute.arch.warp_idx()
@@ -2689,10 +2721,14 @@ def qsa_bwd_dense_pair_kernel(
                     prims.mbarrier_init(b_xr.subview(s), 1)
                     prims.mbarrier_init(b_xe.subview(s), 1)
                 prims.fence_mbarrier_init()
-                # receiver-armed exchange: each rank arms its own "received" barriers for the first DP_NX groups
+                # receiver-armed exchange: each rank arms its own "received" barriers for the first groups
                 for s in cutlass.range_constexpr(DP_NX):
                     if s < nk:
-                        prims.mbarrier_arrive_expect_tx(b_xr.subview(s), DP_CM)
+                        if rank == 0:
+                            if cutlass.const_expr(s < R0):
+                                prims.mbarrier_arrive_expect_tx(b_xr.subview(s), DQ_PARTS * DP_CM)
+                        else:
+                            prims.mbarrier_arrive_expect_tx(b_xr.subview(s), DP_CM)
                 prims.mbarrier_init(b_dqf, 1)
                 prims.mbarrier_init(b_dqe, 4)
                 prims.mbarrier_init(b_kvd, 1)
@@ -2764,9 +2800,7 @@ def qsa_bwd_dense_pair_kernel(
             _wait(b_vt, 0)
             _wait(b_ks, 0)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            # rank 0 issues dQ^T(k - DQL) after the backward MMAs of k - 1, so the dS round trip through rank 1
-            # overlaps two groups of rank-0 work
-            DQL = 2
+            d_x0 = _desc(sbase + DP_OFF_P // 4, 768, 128, SWN)
             for k in cutlass.range(nk + DQL, unroll=1):
                 se = k % DP_NE
                 if k < nk:
@@ -2828,16 +2862,17 @@ def qsa_bwd_dense_pair_kernel(
                                     idesc_kv,
                                     acc0 | (kk > 0),
                                 )
-                            for kk in cutlass.range_constexpr(8):
-                                prims.tcgen05_mma(
-                                    prims.Tcgen05MMAKind.F16,
-                                    prims.CTAGroup.CTA_1,
-                                    t_dq,
-                                    d_kmn.advance_start_address(kk * 2048),
-                                    d_dsb.advance_start_address(xb * DP_CM + kk * 1536),
-                                    idesc_q,
-                                    kk > 0,
-                                )
+                            for part in cutlass.range_constexpr(DQ_PARTS):
+                                for kk in cutlass.range_constexpr(8):
+                                    prims.tcgen05_mma(
+                                        prims.Tcgen05MMAKind.F16,
+                                        prims.CTAGroup.CTA_1,
+                                        t_dq,
+                                        d_kmn.advance_start_address(kk * 2048),
+                                        d_dsb.advance_start_address(part * DP_CM + kk * 1536),
+                                        idesc_q,
+                                        (part > 0) | (kk > 0),
+                                    )
                             prims.tcgen05_commit(b_pe.subview(xb), group=prims.CTAGroup.CTA_1)
                             prims.tcgen05_commit(b_le.subview(sl), group=prims.CTAGroup.CTA_1)
                             prims.tcgen05_commit(b_dqf, group=prims.CTAGroup.CTA_1)
@@ -2847,28 +2882,29 @@ def qsa_bwd_dense_pair_kernel(
                     if k >= DQL:
                         # Rank 0's half of dQ^T for group k - DQL needs the dS that rank 1 sends back.
                         kq = k - DQL
-                        xq = kq % DP_NX
-                        _wait(b_xr.subview(xq), (kq // DP_NX) & 1)
+                        xq = kq % R0
+                        _wait(b_xr.subview(xq), (kq // R0) & 1)
                         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-                        if kq + DP_NX < nk:
+                        if kq + R0 < nk:
                             if prims.elect_sync():
-                                # arm the buffer for dS(kq + DP_NX). Rank 1 only sends it after P(kq + DP_NX),
-                                # which our softmax sends only after the dQ^T MMAs below have completed.
-                                prims.mbarrier_arrive_expect_tx(b_xr.subview(xq), DP_CM)
+                                # arm the slot for dS(kq + R0). Rank 1 only sends it after P(kq + R0), which our
+                                # softmax sends only after the dQ^T MMAs below have completed.
+                                prims.mbarrier_arrive_expect_tx(b_xr.subview(xq), DQ_PARTS * DP_CM)
                         if kq >= 1:
                             _wait(b_dqe, (kq - 1) & 1)
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                         if prims.elect_sync():
-                            for kk in cutlass.range_constexpr(8):
-                                prims.tcgen05_mma(
-                                    prims.Tcgen05MMAKind.F16,
-                                    prims.CTAGroup.CTA_1,
-                                    t_dq,
-                                    d_kmn.advance_start_address(kk * 2048),
-                                    d_dsb.advance_start_address(xq * DP_CM + kk * 1536),
-                                    idesc_q,
-                                    kk > 0,
-                                )
+                            for part in cutlass.range_constexpr(DQ_PARTS):
+                                for kk in cutlass.range_constexpr(8):
+                                    prims.tcgen05_mma(
+                                        prims.Tcgen05MMAKind.F16,
+                                        prims.CTAGroup.CTA_1,
+                                        t_dq,
+                                        d_kmn.advance_start_address(kk * 2048),
+                                        d_x0.advance_start_address((xq * DQ_PARTS + part) * DP_CM + kk * 1536),
+                                        idesc_q,
+                                        (part > 0) | (kk > 0),
+                                    )
                             prims.tcgen05_commit(b_dqf, group=prims.CTAGroup.CTA_1)
                             prims.tcgen05_commit(b_xe.subview(xq), group=prims.CTAGroup.CTA_1)
         elif warp >= 4 and warp < 12:
@@ -2980,10 +3016,10 @@ def qsa_bwd_dense_pair_kernel(
                         # dV(k-1) has read the TMEM P^T slot
                         kp = k - 1
                         _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
-                    if k >= DP_NX:
-                        # dQ^T(k - DP_NX) has completed: rank 1 has read P(k - DP_NX) (dS(k - DP_NX) arrived) and may receive into its
-                        # buffer again, and our dS buffer is free for dS(k)
-                        _wait(b_xe.subview(xb), ((k // DP_NX) & 1) ^ 1)
+                    if k >= R0:
+                        # dQ^T(k - R0) has completed: rank 1 has read P(k - R0) (dS(k - R0) arrived) and may receive into
+                        # its buffer again, and our dS slot is free for dS(k)
+                        _wait(b_xe.subview(k % R0), ((k // R0) & 1) ^ 1)
                     if hf == 0:
                         prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[0]).as_ptr(I32), ovec[0:8])
                         prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1]).as_ptr(I32), ovec[8:12])
@@ -3063,11 +3099,21 @@ def qsa_bwd_dense_pair_kernel(
                                 d0 = pv[0] * dw[2 * hp] * scale
                             if pv[1] != 0.0:
                                 d1 = pv[1] * dw[2 * hp + 1] * scale
-                            dpk.append(cutlass.Vector.from_elements([d0, d1], F32).to(BF16).bitcast(I32)[0])
-                    dvec = cutlass.Vector.from_elements(dpk, I32)
+                            dpk.append(d0)
+                            dpk.append(d1)
+                    # dS^T for the dQ^T MMAs in DQ_PARTS bf16 parts of its fp32 value (three keep the cancellation of
+                    # nearly equal rows); dK takes the first
+                    dparts = []
+                    res = cutlass.Vector.from_elements(dpk, F32)
+                    for part in cutlass.range_constexpr(DQ_PARTS):
+                        bp = res.to(BF16)
+                        if cutlass.const_expr(part + 1 < DQ_PARTS):
+                            res = res - bp.to(F32)
+                        dparts.append(bp.bitcast(I32))
+                    dvec = dparts[0]
                     if k >= 1:
-                        # dK / dQ^T(k-1) have read the TMEM dS^T slot (and k - DP_NX this SMEM buffer). The copy of dS(k - DP_NX)
-                        # has landed and rank 0's dQ^T(k - DP_NX) has consumed it (both implied by the arrival of P(k)).
+                        # dK / dQ^T(k-1) have read the TMEM dS^T slot and the SMEM parts. The copy of dS(k - R0) has landed
+                        # and rank 0's dQ^T(k - R0) has consumed it (both implied by the arrival of P(k)).
                         kp = k - 1
                         _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
                     if hf == 0:
@@ -3076,10 +3122,13 @@ def qsa_bwd_dense_pair_kernel(
                     else:
                         prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1] + 4).as_ptr(I32), dvec[0:4])
                         prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[2]).as_ptr(I32), dvec[4:12])
-                    rb = prims.mapa(b_xr.subview(xb), peer)
-                    for nc in cutlass.range_constexpr(3):
-                        (sbase + xoffd + xb * (DP_CM // 4) + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
-                        _st_async16(prims.mapa(sbase + xoffd + xb * (DP_CM // 4) + nc * 32, peer), dvec[nc * 4 : nc * 4 + 4], rb)
+                    # the parts go to our slot and to rank 0's slot of the group, whose region starts at the P ring
+                    x0 = k % R0
+                    rb = prims.mapa(b_xr.subview(x0), peer)
+                    for part in cutlass.range_constexpr(DQ_PARTS):
+                        for nc in cutlass.range_constexpr(3):
+                            (sbase + xoffd + part * (DP_CM // 4) + nc * 32).store(dparts[part][nc * 4 : nc * 4 + 4], alignment=16)
+                            _st_async16(prims.mapa(sbase + xoff + (x0 * DQ_PARTS + part) * (DP_CM // 4) + nc * 32, peer), dparts[part][nc * 4 : nc * 4 + 4], rb)
                     prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
                     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
@@ -3132,9 +3181,11 @@ def qsa_bwd_dense_pair_kernel(
             if prims.elect_sync():
                 prims.mbarrier_arrive(b_ks)
             stg0 = sbase + (DP_OFF_ST + qd * DP_ST_W) // 4
-            # rank 0 sends P straight into the peer (st.async) and never touches its own P buffers, so they hold a
-            # second staging box per drain warp: the reduce of group k-1 may still be reading while k is staged
-            stg1 = sbase + (DP_OFF_P + qd * DP_ST_W) // 4
+            # rank 0 sends P straight into the peer (st.async) and never touches its own P buffers, so the room its dS
+            # slots leave holds a second staging box per drain warp: the reduce of group k-1 may still be reading while
+            # k is staged
+            STG2 = R0 * DQ_PARTS * DP_CM + 4 * DP_ST_W <= 2 * DP_NX * DP_CM
+            stg1 = sbase + (DP_OFF_P + R0 * DQ_PARTS * DP_CM + qd * DP_ST_W) // 4
             for k in cutlass.range(nk, unroll=1):
                 g = g_top - 1 - _rot(k, off, nk)
                 _wait(b_dqf, k & 1)
@@ -3149,11 +3200,13 @@ def qsa_bwd_dense_pair_kernel(
                 # the reduce that last used this staging box must have finished reading it. Rank 0 has two boxes,
                 # so one reduce may stay in flight, and rank 1 has one.
                 stg = stg0
-                if rank == 0:
-                    if (k & 1) == 1:
-                        stg = stg1
-                if rank == 0:
-                    prims.cp_async_bulk_wait_group(1, read=True)
+                if cutlass.const_expr(STG2):
+                    if rank == 0:
+                        if (k & 1) == 1:
+                            stg = stg1
+                        prims.cp_async_bulk_wait_group(1, read=True)
+                    else:
+                        prims.cp_async_bulk_wait_group(0, read=True)
                 else:
                     prims.cp_async_bulk_wait_group(0, read=True)
                 prims.bar_warp_sync(0xFFFFFFFF)
@@ -3224,6 +3277,7 @@ def _dpair_host(
     PDL: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
+    DQ_PARTS: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     HQ = GH * HKV
@@ -3270,6 +3324,7 @@ def _dpair_host(
         PDL,
         HKV,
         GH,
+        DQ_PARTS,
     ).launch(grid=(nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
 
 
@@ -3313,10 +3368,20 @@ class LaunchPlan:
     """
 
     def __init__(
-        self, seq_len: int, num_sms: int, hkv: int, seq_mode: int, num_seqs: int = 1, max_seq_len: Optional[int] = None, arch: int = 100, gq: int = GQ
+        self,
+        seq_len: int,
+        num_sms: int,
+        hkv: int,
+        seq_mode: int,
+        num_seqs: int = 1,
+        max_seq_len: Optional[int] = None,
+        arch: int = 100,
+        gq: int = GQ,
+        dq_parts: int = DQ_PARTS_DEFAULT,
     ):
         T = int(seq_len)
         assert hkv in (1, 2), f"{hkv} KV heads"
+        assert dq_parts in (1, 3), f"{dq_parts} dS parts"
         assert gq == GQ or (gq == 6 and hkv == 1), f"{gq} query heads per KV head with {hkv} KV heads"
         assert 1 <= T <= max_packed_len(hkv), f"sequence length {T} outside [1, {max_packed_len(hkv)}]"
         HKV = hkv
@@ -3325,6 +3390,7 @@ class LaunchPlan:
         PAD = _pad(hkv)
         self.hkv = hkv
         self.gq = gq
+        self.dq_parts = dq_parts
         self.arch = int(arch)
         self.seq_len = T
         self.seq_mode = seq_mode
@@ -3428,13 +3494,22 @@ class LaunchPlan:
 _PLANS: dict = {}
 
 
-def plan_for(seq_len: int, device: torch.device, hkv: int, seq_mode: int, num_seqs: int = 1, gq: int = GQ) -> LaunchPlan:
+def plan_for(seq_len: int, device: torch.device, hkv: int, seq_mode: int, num_seqs: int = 1, gq: int = GQ, dq_parts: int = DQ_PARTS_DEFAULT) -> LaunchPlan:
     """The plan of a geometry, built once per process."""
-    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index, int(gq))
+    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index, int(gq), int(dq_parts))
     plan = _PLANS.get(key)
     if plan is None:
         cc = torch.cuda.get_device_capability(device)
-        plan = LaunchPlan(seq_len, torch.cuda.get_device_properties(device).multi_processor_count, hkv, seq_mode, num_seqs, arch=cc[0] * 10 + cc[1], gq=gq)
+        plan = LaunchPlan(
+            seq_len,
+            torch.cuda.get_device_properties(device).multi_processor_count,
+            hkv,
+            seq_mode,
+            num_seqs,
+            arch=cc[0] * 10 + cc[1],
+            gq=gq,
+            dq_parts=dq_parts,
+        )
         _PLANS[key] = plan
     return plan
 
@@ -3460,8 +3535,9 @@ def compile_kernels(plan: LaunchPlan) -> dict:
         names += ["dense", "fin"]
     hkv = plan.hkv
     gq = plan.gq
+    parts = plan.dq_parts
     HQ = gq * hkv
-    cache = _COMPILED.setdefault((hkv, gq, plan.arch), {})
+    cache = _COMPILED.setdefault((hkv, gq, parts, plan.arch), {})
     missing = [name for name in names if name not in cache]
     if missing:
         sym_t = cute.sym_int64()
@@ -3559,10 +3635,11 @@ def compile_kernels(plan: LaunchPlan) -> dict:
                 F32(1),
                 hkv,
                 gq,
+                parts,
                 stream,
             ),
-            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, gq, stream),
-            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, gq, stream),
+            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, gq, parts, stream),
+            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, gq, parts, stream),
             "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
             "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
         }
@@ -3773,7 +3850,7 @@ def dsl_cuda_major():
     return CUDA_VERSION.major
 
 
-def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch):
+def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch, dq_parts=DQ_PARTS_DEFAULT):
     """``cudnn.ops.qsa_backward`` on SM100 / SM103: the compacted selection through the launch sequence above."""
     from cudnn.api_base import TupleDict, WorkspaceCarver
     from .. import _metadata
@@ -3787,7 +3864,7 @@ def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, blo
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
     # the sequences come from tok_base on the device; there are at most as many as blocks
-    plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv)
+    plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, dq_parts=dq_parts)
     fns = compile_kernels(plan)
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
     scratch = plan.carve(WorkspaceCarver(workspace, plan.workspace_bytes(), "qsa_backward"))

@@ -13,7 +13,7 @@ from torch import Tensor
 
 from cudnn._device import device_info
 
-from ._contract import check_inputs, check_tensor
+from ._contract import check_inputs, check_tensor, ds_parts
 
 
 def _implementation(q, direction):
@@ -90,12 +90,18 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
+    ds_precision: str = "bf16",
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE."""
+    """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE.
+
+    ``ds_precision`` selects how dS reaches the dQ MMAs: ``"bf16"`` rounds it once, ``"fp32"`` feeds three bf16 parts of
+    its fp32 value, which keeps a dQ whose terms nearly cancel accurate at a higher cost.
+    """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
+    parts = ds_parts(ds_precision)
     check_tensor("grad_out", grad_out, q.shape, q.dtype, q.device, 16)
     check_tensor("out_fp32", out_fp32, q.shape, torch.float32, q.device, 16)
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     with torch.cuda.device(q.device):
         impl, arch = _implementation(q, "bprop")
-        return impl.backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, float(scale), arch)
+        return impl.backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, float(scale), arch, dq_parts=parts)

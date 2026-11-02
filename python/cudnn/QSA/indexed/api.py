@@ -12,7 +12,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn._torch_stream import stream_context
-from cudnn.QSA._contract import check_tensor
+from cudnn.QSA._contract import check_tensor, ds_parts
 
 QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
 
@@ -52,10 +52,11 @@ class _QsaIndexedPlan(APIBase):
     ``cu_seqlens`` when the caller has them.
     """
 
-    def __init__(self, total, width, device, direction, num_seqs=0, hq=12):
+    def __init__(self, total, width, device, direction, num_seqs=0, hq=12, dq_parts=1):
         with torch.cuda.device(device):
             super().__init__()
         self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
+        self.dq_parts = dq_parts
         self.num_seqs = num_seqs
         self.layouts = [
             ("ids", (total, width // 4), torch.int32),
@@ -90,7 +91,7 @@ class _QsaIndexedPlan(APIBase):
                     "Indexed QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
                 )
             mode = engine.SEQ_CU if self.num_seqs else engine.SEQ_SINGLE
-            self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq)
+            self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq, self.dq_parts)
             self.workspace_bytes += self.engine_plan.workspace_bytes()
         self._is_supported = True
         return True
@@ -187,8 +188,8 @@ class _QsaIndexedPlan(APIBase):
 
 
 @lru_cache(maxsize=32)
-def _plan(total, width, device, direction, num_seqs=0, hq=12):
-    plan = _QsaIndexedPlan(total, width, device, direction, num_seqs, hq)
+def _plan(total, width, device, direction, num_seqs=0, hq=12, dq_parts=1):
+    plan = _QsaIndexedPlan(total, width, device, direction, num_seqs, hq, dq_parts)
     plan.check_support()
     plan.compile()
     return plan
@@ -205,7 +206,9 @@ def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     return TupleDict(zip(("out", "out_fp32", "lse"), outputs))
 
 
-def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None):
+def qsa_indexed_backward(
+    grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None, ds_precision="bf16"
+):
     """Return BF16 ``(dq, dk, dv)`` using forward's FP32 output and LSE.
 
     ``general`` preserves arbitrary group ordering, padding holes and empty rows and treats the rows as one sequence,
@@ -213,9 +216,12 @@ def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16
     document on the dense prefix path. ``causal_topk`` declares the top-512 complete four-token blocks plus causal-tail
     contract described in ``docs/operations/sparse_attention/qsa_indexed.md``; its packed form takes device int32
     ``cu_seqlens`` (``[B + 1]`` prefix sums) and an optional host ``max_seq_len`` bound. Both modes run the same engine.
+    ``ds_precision`` is ``"bf16"`` (dS rounded once before the dQ MMAs) or ``"fp32"`` (three bf16 parts of its fp32
+    value, keeping a dQ whose terms nearly cancel accurate at a higher cost).
     """
     if not isinstance(selection_mode, str) or selection_mode not in ("general", "causal_topk"):
         raise ValueError("selection_mode must be 'general' or 'causal_topk'")
+    parts = ds_parts(ds_precision)
     if selection_mode == "general" and (cu_seqlens is not None or max_seq_len is not None):
         raise ValueError("cu_seqlens and max_seq_len require selection_mode='causal_topk'; general selection encodes its bounds in indices")
     if grad_out is None:
@@ -228,7 +234,7 @@ def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16
             raise ValueError(f"max_seq_len must be a host integer in [1, {total}]")
         if cu_seqlens is None and max_seq_len is not None and max_seq_len != total:
             raise ValueError("Without cu_seqlens, max_seq_len must equal the single sequence's token count")
-    plan = _plan(total, width, q.device, "bprop", 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1, q.shape[1])
+    plan = _plan(total, width, q.device, "bprop", 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1, q.shape[1], parts)
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
