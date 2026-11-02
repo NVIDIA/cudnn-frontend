@@ -133,7 +133,7 @@ def test_signature():
         assert all(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in signature.parameters.values())
         assert signature.parameters["block_size"].default == 4
         assert all(p.default is inspect.Parameter.empty for name, p in signature.parameters.items() if name not in ("block_size", *options))
-    assert inspect.signature(qsa_backward).parameters["ds_precision"].default == "bf16"
+    assert inspect.signature(qsa_backward).parameters["ds_precision"].default == "fp32"
 
 
 @pytest.mark.L0
@@ -283,9 +283,9 @@ def test_backward_cancellation(supported_gpu, heads, large_logits):
     out, lse = out.float(), lse.float()
     grad_out = inputs["q"] * 0.125
     expected = reference(inputs, grad_out, out, lse)
-    # The default rounds dS to bf16 once before the dQ MMAs, which leaves the analytically zero dQ of this construction
-    # above the absolute floor; the fp32 option keeps the cancellation.
-    actual = qsa_backward(grad_out, **inputs, out_fp32=out, lse=lse, ds_precision="fp32")
+    # The default feeds the dQ MMAs three bf16 parts of dS, which keeps the analytically zero dQ of this construction
+    # within the absolute floor (a single rounding, ds_precision="bf16", does not).
+    actual = qsa_backward(grad_out, **inputs, out_fp32=out, lse=lse)
     for grad, ref in zip(actual, expected):
         assert_close(grad, ref)
 

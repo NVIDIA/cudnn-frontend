@@ -90,12 +90,12 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
-    ds_precision: str = "bf16",
+    ds_precision: str = "fp32",
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE.
 
-    ``ds_precision`` selects how dS reaches the dQ MMAs: ``"bf16"`` rounds it once, ``"fp32"`` feeds three bf16 parts of
-    its fp32 value, which keeps a dQ whose terms nearly cancel accurate at a higher cost.
+    ``ds_precision`` selects how dS reaches the dQ MMAs: ``"fp32"`` feeds three bf16 parts of its fp32 value, which keeps
+    a dQ whose terms nearly cancel accurate; ``"bf16"`` rounds it once, as FlashAttention does, at a lower cost.
     """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     parts = ds_parts(ds_precision)

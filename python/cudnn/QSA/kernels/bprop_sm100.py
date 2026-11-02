@@ -31,9 +31,9 @@ I32 = cutlass.Int32
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
-# dS^T reaches the dQ MMAs in bf16 parts of its fp32 value: one keeps a single rounding (the default, as FlashAttention
-# does), three keep the cancellation of nearly equal dS rows (ds_precision="fp32").
-DQ_PARTS_DEFAULT = 1
+# dS^T reaches the dQ MMAs in bf16 parts of its fp32 value: three keep the cancellation of nearly equal dS rows (the
+# default), one keeps a single rounding as FlashAttention does (ds_precision="bf16", the faster option).
+DQ_PARTS_DEFAULT = 3
 
 # Geometry: GQ head rows per query in the MMA tiles, HKV in (1, 2) KV heads. The kernels take HKV and GH, the real
 # query heads per KV head (12, or 6 for the four-way tensor-parallel shard), as compile-time parameters: with GH < GQ

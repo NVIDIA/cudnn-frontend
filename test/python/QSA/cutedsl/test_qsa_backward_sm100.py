@@ -329,15 +329,15 @@ def test_cuda12_compiler_declines_12q1kv(monkeypatch):
 
 
 @pytest.mark.L1
-def test_fp32_ds_option_on_both_entries():
-    # ds_precision="fp32" feeds the dQ MMAs three bf16 parts of dS on the dense and the sparse paths of both entries
-    # (test_backward_cancellation checks the accuracy it buys); the engine plans carry the parts.
+def test_bf16_ds_option_on_both_entries():
+    # ds_precision="bf16" rounds dS once before the dQ MMAs on the dense and the sparse paths of both entries and stays
+    # within the ordinary bounds (test_backward_cancellation covers the accuracy the default keeps); the plans carry it.
     from cudnn.QSA.kernels import bprop_sm100 as engine
 
     inputs = _inputs((24000,), 1, seed=5)
-    _check(inputs, _indexed_backward(inputs, ds_precision="fp32"))
-    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (24000,)), ds_precision="fp32"))
-    assert any(key[0] == 24000 and key[-1] == 3 for key in engine._PLANS)
+    _check(inputs, _indexed_backward(inputs, ds_precision="bf16"))
+    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (24000,)), ds_precision="bf16"))
+    assert any(key[0] == 24000 and key[-1] == 1 for key in engine._PLANS)
 
 
 @pytest.mark.L1

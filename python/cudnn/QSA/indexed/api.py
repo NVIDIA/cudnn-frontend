@@ -207,7 +207,7 @@ def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
 
 
 def qsa_indexed_backward(
-    grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None, ds_precision="bf16"
+    grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None, ds_precision="fp32"
 ):
     """Return BF16 ``(dq, dk, dv)`` using forward's FP32 output and LSE.
 
@@ -216,8 +216,8 @@ def qsa_indexed_backward(
     document on the dense prefix path. ``causal_topk`` declares the top-512 complete four-token blocks plus causal-tail
     contract described in ``docs/operations/sparse_attention/qsa_indexed.md``; its packed form takes device int32
     ``cu_seqlens`` (``[B + 1]`` prefix sums) and an optional host ``max_seq_len`` bound. Both modes run the same engine.
-    ``ds_precision`` is ``"bf16"`` (dS rounded once before the dQ MMAs) or ``"fp32"`` (three bf16 parts of its fp32
-    value, keeping a dQ whose terms nearly cancel accurate at a higher cost).
+    ``ds_precision`` is ``"fp32"`` (three bf16 parts of dS reach the dQ MMAs, keeping a dQ whose terms nearly cancel
+    accurate) or ``"bf16"`` (dS rounded once, as FlashAttention does, at a lower cost).
     """
     if not isinstance(selection_mode, str) or selection_mode not in ("general", "causal_topk"):
         raise ValueError("selection_mode must be 'general' or 'causal_topk'")

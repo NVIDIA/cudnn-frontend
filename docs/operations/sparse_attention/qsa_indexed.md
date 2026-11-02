@@ -109,7 +109,7 @@ These device-value promises are caller contracts, not host-side checks.
 Use `general` for arbitrary selections. Passing `cu_seqlens` or `max_seq_len`
 with `general` is rejected because that mode obtains its bounds from indices.
 The keyword-only arguments preserve existing positional calls; `ds_precision`
-(`"bf16"` by default, `"fp32"` for the three-part dS of [QSA](qsa.md)) applies
+(`"fp32"` by default, `"bf16"` for the single rounding of [QSA](qsa.md)) applies
 to both modes. Both modes run
 the backward engine described in [QSA](qsa.md), which also gives the record and
 workspace sizing.
