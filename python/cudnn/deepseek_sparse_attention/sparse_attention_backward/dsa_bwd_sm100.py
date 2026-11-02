@@ -2286,13 +2286,16 @@ class FlashAttentionDSABackwardSm100:
             compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
             compute_mma_dS_producer_state.advance()
             if cutlass.const_expr(mPoolTarget is not None):
-                sP_tile = sP_store[None, None, p_stage_written]
-                half_heads = self.block_tile // 2
+                sP_chunks = cute.zipped_divide(sP_store[None, None, p_stage_written], (8, 1))
+                chunks_per_half = self.block_tile // 16
                 slot = tidx_in_wg // 2
-                head_base = (tidx_in_wg % 2) * half_heads
+                chunk_base = (tidx_in_wg % 2) * chunks_per_half
+                rP_chunk = cute.make_rmem_tensor(sP_chunks[None, (0, 0)].shape, self.element_dtype)
                 pool_mass = Float32(0.0)
-                for _j in cutlass.range_constexpr(half_heads):
-                    pool_mass = pool_mass + Float32(sP_tile[head_base + ((_j + slot) % half_heads), slot])
+                for _k in cutlass.range_constexpr(chunks_per_half):
+                    cute.autovec_copy(sP_chunks[None, (chunk_base + _k, slot)], rP_chunk)
+                    for _e in cutlass.range_constexpr(8):
+                        pool_mass = pool_mass + Float32(rP_chunk[_e])
                 for _o in (1, 2, 4) if self.pool_size == 4 else (1, 2, 4, 8, 16):
                     pool_mass = pool_mass + cute.arch.shuffle_sync_bfly(pool_mass, offset=_o, mask=-1, mask_and_clamp=31)
                 threads_per_pool = 2 * self.pool_size
