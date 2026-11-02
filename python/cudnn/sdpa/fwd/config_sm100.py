@@ -530,13 +530,14 @@ def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
     return d_shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
 
 
-def supports_quantized_split_sink(*, device_cc, pertensor, thd):
-    """Per-tensor SM100/SM103/SM107 dense-Q partials fold the sink in combine.
+def supports_quantized_split_sink(*, device_cc, pertensor, thd, d_shape=None, paged=False):
+    """Qualified per-tensor dense-Q partials fold the sink in combine.
 
     Existing split, packing and paged head-dimension domains still apply.
-    MXFP8, packed queries and native SM120 need separate qualification.
+    SM120 serves exact D128 with dense KV only; use the logical dimensions,
+    not the covering head tile. MXFP8 and packed queries stay outside this gate.
     """
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and pertensor and not thd
+    return pertensor and not thd and (device_cc in ((10, 0), (10, 3), (10, 7)) or (device_cc in ((12, 0), (12, 1)) and d_shape == (128, 128) and not paged))
 
 
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):

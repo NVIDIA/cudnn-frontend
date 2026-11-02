@@ -266,8 +266,8 @@ def test_sm120_causal_split_requires_the_natural_scheduler():
 # --- An attention sink under a split ----------------------------------------
 #
 # The half templates write sink-free partials under a split and the combine
-# folds each head's sink once. The FP8 / MXFP8 templates fold it in their
-# epilogue, so they keep the pair declined (mismatch, config, adapter).
+# folds each head's sink once. Qualified D128 per-tensor FP8 lowering also
+# compiles sink-free partials; other FP8 and all MXFP8 sink splits decline.
 
 
 @pytest.mark.parametrize("split_kv", [1, 4], ids=["unsplit", "split4"])
@@ -316,8 +316,8 @@ def _sink_decode_facts(**over):
 
 
 @pytest.mark.parametrize("d", [64, 128, 256, 512])
-def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
-    """mismatch() and the template backstop admit a split sink graph at f16 / bf16 and decline it at FP8."""
+def test_sm120_split_sink_is_eligible_on_half_and_exact_fp8_d128(d):
+    """The graph admits qualified D128 FP8; a direct sink-folding template still declines the pair."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
     from cudnn.sdpa.fwd.config_sm120 import TemplateParams, validate_params
@@ -329,7 +329,7 @@ def test_sm120_split_sink_is_eligible_on_the_half_row_only(d):
     if d <= 256:
         fp8 = _sink_decode_facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
         reason = mismatch(rows["sdpa_fwd_prefill_sm120_fp8"], fp8, knobs)
-        assert reason is not None, "SM120 FP8 sink/split is still unsupported"
+        assert (reason is None) == (d == 128), reason
     validate_params(TemplateParams(has_sink=True, split_kv=4))
     with pytest.raises(ValueError, match="served by the FP16/BF16 templates only"):
         validate_params(TemplateParams(dtype_qkv=DTYPE_E4M3, has_sink=True, split_kv=4), allowed_dtypes=(DTYPE_E4M3,))
