@@ -45,18 +45,26 @@ _BS_2 = [
     ("sm100_block_scale_matmul.py", 2),
     ("sm103_block_scale_matmul.py", 2),
 ]
-_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1)]
-_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2)]
+_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 1)]
+_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 2)]
 _MOE_BS_1 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 1),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 1),
 ]
 _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 2),
 ]
-_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1)]
-_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2)]
-_MOE_SWAP_1 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1)]
-_MOE_SWAP_2 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2)]
+_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 1)]
+_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 2)]
+_MOE_SWAP_1 = [
+    ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 1),
+]
+_MOE_SWAP_2 = [
+    ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 2),
+]
 
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
 # is no LDTM shape, no TMEM row base and no span list to share -- and its store
