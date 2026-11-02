@@ -124,7 +124,7 @@ class IndexerBackwardSm90:
         # Public forward/topk returns global KV ids by default. Sparse mode
         # decodes them to local per-batch ids before indexing K/dK views.
         self.topk_indices_global = topk_indices_global
-        assert heads >= 64
+        assert heads == 64, "the warpgroup GEMMs use the head count as WGMMA M, which must be 64"
         assert is_dense or topk % block_I == 0
         self.num_topk_blocks = (topk + block_I - 1) // block_I
         self.grad_signal_smem_size = self.block_I if is_dense else self.topk

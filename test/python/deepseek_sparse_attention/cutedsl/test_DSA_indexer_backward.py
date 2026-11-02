@@ -1535,7 +1535,8 @@ _ARCH_ERROR = (RuntimeError, "IndexerBackward requires SM90 or capability in")
     "capability,heads,error",
     [
         pytest.param((9, 0), 64, None, id="sm90-h64"),
-        pytest.param((9, 0), 32, (ValueError, "SM90 IndexerBackward requires H>=64"), id="sm90-h32"),
+        pytest.param((9, 0), 32, (ValueError, "SM90 IndexerBackward requires H=64"), id="sm90-h32"),
+        pytest.param((9, 0), 128, (ValueError, "SM90 IndexerBackward requires H=64"), id="sm90-h128"),
         pytest.param((10, 0), 32, None, id="sm100-h32"),
         pytest.param((10, 3), 64, None, id="sm103-h64"),
         pytest.param((10, 7), 64, _ARCH_ERROR, id="sm107"),

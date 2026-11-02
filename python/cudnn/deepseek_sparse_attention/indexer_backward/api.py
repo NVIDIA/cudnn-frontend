@@ -407,14 +407,15 @@ class IndexerBackward(APIBase):
             f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
         if major == 9:
-            # The SM90 warpgroup GEMMs tile the head dimension in M64 steps.
+            # The SM90 warpgroup GEMMs use the head count as their M, and
+            # WGMMA's M is fixed at 64.
             self._value_error_if(
-                self.heads < 64,
-                f"SM90 IndexerBackward requires H>=64, got H={self.heads}",
+                self.heads != 64,
+                f"SM90 IndexerBackward requires H=64, got H={self.heads}",
             )
         else:
-            # TCGEN05 needs a legal M (64), so only H64 and the compact H32
-            # (zero-padded to M64 inside the kernel) are served.
+            # TCGEN05 takes M in {64, 128}; H128 exceeds the SMEM budget, so
+            # only H64 and the compact H32 (zero-padded to M64) are served.
             self._value_error_if(
                 self.heads not in (32, 64),
                 f"SM100 IndexerBackward requires H=32 or H=64, got H={self.heads}",

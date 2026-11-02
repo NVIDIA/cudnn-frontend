@@ -816,7 +816,7 @@ indexer tower:
 `check_support` admits `D == 128`, `block_I == 128`, a positive top-k that is a
 multiple of `block_I` (callers with other logical extents pad the top-k tensors
 with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103
-additionally require `H in {32, 64}` and SM90 requires `H >= 64`. `d_index_q`
+additionally require `H in {32, 64}` and SM90 requires `H == 64`. `d_index_q`
 and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
 
 With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer

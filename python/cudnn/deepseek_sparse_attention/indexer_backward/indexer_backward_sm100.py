@@ -480,7 +480,7 @@ class IndexerBackwardSm100:
         # False, mTopkIdx carries local-per-batch ids and the kernel adds
         # ``batch_idx * S_k_per_batch`` to convert. Const_expr-branched.
         self.topk_indices_global = topk_indices_global
-        assert heads == 32 or heads >= 64, "supported head counts are H=32 and H>=64"
+        assert heads in (32, 64), "supported head counts are H=32 and H=64"
         assert topk > 0
         assert topk % block_I == 0
         self.num_topk_blocks = topk // block_I
@@ -493,7 +493,7 @@ class IndexerBackwardSm100:
         # TCGEN05 requires M >= 64. H32 keeps the public tensors compact and
         # zero-fills only the upper half of the internal Q/dS tiles; no H64
         # global tensors or caller-side padding traffic is needed.
-        self.heads_padded = 64 if heads == 32 else int(math.ceil(heads / 8) * 8)
+        self.heads_padded = 64
         # Half-dS publication is specialized for the production TopK=512,
         # H64 x I128 fragment map. Larger TopK values retain the full-dS drain
         # order because the additional barrier traffic regresses them.
