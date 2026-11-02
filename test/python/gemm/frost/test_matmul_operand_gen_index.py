@@ -17,8 +17,10 @@ import pytest
 import torch
 
 from cudnn.engines import ExecutionContext
+from cudnn.frost.workspace import DEFAULT_ALIGN
 from cudnn.gemm.frost.engine import _FrostGemmPlan
 from cudnn.gemm.frost.fusion_ir import Axis, swap_ab
+from cudnn.gemm.frost import graph_analyzer
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, swap_ab_binding
 from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
 from cudnn.gemm.frost.tile_config import by_name
@@ -50,8 +52,11 @@ def _graph(side="a", mode="reshape", dtype=BF16, axis=1, combine=True, spatial=1
             strides[-2], strides[-1] = 1, source[-2]
         value = tensors[key] = g.tensor(name=key, dim=list(source), stride=strides, data_type=dtype)
         if key in side:
-            indexed = g.gen_index(input=value, axis=axis, name=f"{key}_index").set_data_type(dtype)
-            value = g.add(a=value, b=indexed).set_data_type(dtype) if combine else indexed
+            carrier = value
+            for logical_axis in axis if isinstance(axis, tuple) else (axis,):
+                name = f"{key}_index_{logical_axis}" if isinstance(axis, tuple) else f"{key}_index"
+                indexed = g.gen_index(input=carrier, axis=logical_axis, name=name).set_data_type(dtype)
+                value = g.add(a=value, b=indexed).set_data_type(dtype) if combine else indexed
             value = g.leaky_relu(input=value, negative_slope=0.125).set_data_type(dtype)
         for kind, argument in steps:
             if kind == "reshape":
@@ -83,18 +88,20 @@ def _view(value, steps):
 
 def _reference(value, steps, axis, combine=True):
     """Independent Cartesian indices and framework views, never IndexExpr evaluation."""
-    shape = [1] * value.ndim
-    shape[axis] = value.shape[axis]
-    index = torch.arange(value.shape[axis], device=value.device, dtype=torch.float32).reshape(shape).expand(value.shape).to(value.dtype)
-    result = (value.float() + index.float()).to(value.dtype) if combine else index
+    result = value
+    for logical_axis in axis if isinstance(axis, tuple) else (axis,):
+        shape = [1] * value.ndim
+        shape[logical_axis] = value.shape[logical_axis]
+        index = torch.arange(value.shape[logical_axis], device=value.device, dtype=torch.float32).reshape(shape).expand(value.shape).to(value.dtype)
+        result = (result.float() + index.float()).to(value.dtype) if combine else index
     result = torch.nn.functional.leaky_relu(result.float(), 0.125).to(value.dtype)
     return _view(result, steps)
 
 
-def _pack(g, tensors, buffers):
+def _pack(g, tensors, buffers, workspace=None):
     return g._normalize(
         {t.get_uid(): buffers[key] for key, t in tensors.items()},
-        None,
+        workspace,
         [t.get_uid() for t in tensors.values()],
         [list(buffers[key].shape) for key in tensors],
         [list(buffers[key].stride()) for key in tensors],
@@ -150,15 +157,83 @@ def test_frost_operand_index_maps_and_binding(monkeypatch, side, mode, swapped, 
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("side", ("a", "b"))
+def test_frost_operand_indices_share_map_and_fragment_coordinates(monkeypatch, side):
+    """Several axes share one analysis-local view map and one fragment decode."""
+    build_map = graph_analyzer._operand_view_index_map
+    calls = []
+
+    def counted_map(shape, steps):
+        calls.append((shape, steps))
+        return build_map(shape, steps)
+
+    monkeypatch.setattr(graph_analyzer, "_operand_view_index_map", counted_map)
+    g, _, _ = _graph(side, "consecutive", axis=(0, 1, 3))
+    for _ in range(2):
+        calls.clear()
+        chain = analyze(g)
+        assert len(calls) == 1  # rebuilt for a new analysis, shared across its axes
+        snippet = epilogue_codegen.generate_mainloop(chain, side)
+        ast.parse(snippet)
+        tag = f"ml_{side}_coords"
+        assert snippet.count(f"{tag}_linear =") == 1
+        assert snippet.count(f"{tag}_valid[{tag}_lane] =") == 1
+        assert snippet.count(f"if {tag}_valid[") == 3
+        assert f"{tag}_valid.load().to_vector()" in snippet
+        assert "ml_mask_lane" not in snippet
+
+
+@pytest.mark.L0
+def test_frost_operand_index_split_k_workspace_binding(monkeypatch):
+    """The real split-K workspace requirement reaches the graph-coordinate executor."""
+    g, tensors, _ = _graph("ab", spatial=136)
+    chain, binding = analyze_with_binding(g)
+    monkeypatch.setattr(compiler, "_check_plan_device", lambda device: None)
+    config = _config(split=2)
+    plan = compiler.CompiledFusedGemm(
+        chain,
+        config,
+        [],
+        Path("unused"),
+        lambda *args: None,
+        binding=binding,
+        vec_bytes_epi=16,
+        workspace_bytes=compiler._splitk_workspace_bytes(chain, config),
+    )
+    engine = _FrostGemmPlan(plan)
+    frames = []
+    engine._launch = lambda operands, graph_order, **kwargs: frames.append(kwargs["workspace"])
+    buffers = _buffers(tensors, fill=1)
+    required = engine.get_workspace_size()
+    assert required > 0
+    with pytest.raises(ValueError, match="workspace"):
+        engine.execute(g, _pack(g, tensors, buffers), ExecutionContext(stream=0))
+    assert not frames
+    # CUDA allocations satisfy this alignment; align the CPU fixture explicitly.
+    storage = torch.empty(required + DEFAULT_ALIGN - 1, dtype=torch.uint8)
+    offset = -storage.data_ptr() % DEFAULT_ALIGN
+    workspace = storage[offset : offset + required]
+    pack = _pack(g, tensors, buffers, workspace)
+    assert pack.workspace == workspace.data_ptr()
+    assert pack.workspace_bytes == required
+    with pytest.raises(ValueError, match="workspace"):
+        engine.execute(g, _pack(g, tensors, buffers, workspace[:-1]), ExecutionContext(stream=0))
+    assert not frames
+    for _ in range(2):
+        engine.execute(g, pack, ExecutionContext(stream=0))
+    assert len(frames) == 2 and all(frame.nbytes == required for frame in frames)
+
+
+@pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for generated operand transform")
+@pytest.mark.parametrize("axis", (1, (0, 1, 3)), ids=("one-index", "shared-indices"))
 @pytest.mark.parametrize(
     "side,mode,swapped,dtype", list(product(("a", "b"), ("reshape", "transpose_reshape", "reshape_transpose", "consecutive"), (False, True), (BF16, FP16)))
 )
-def test_frost_operand_index_generated_transform(tmp_path, side, mode, swapped, dtype):
+def test_frost_operand_index_generated_transform(tmp_path, side, mode, swapped, dtype, axis):
     """Execute actual transform fragments on SM90+, not full Blackwell scheduling."""
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("generated fragments require SM90+")
-    axis = 1
     g, tensors, views = _graph(side, mode, dtype=dtype, axis=axis)
     chain = analyze(g)
     if swapped:
@@ -241,9 +316,13 @@ def test_frost_operand_index_gpu(side, mode, swapped, cta_group, split, axis):
     plan = compiler.jit_from_cudnn_graph(g, _config(swapped, cta_group, split))
     engine = _FrostGemmPlan(plan)
     stream = torch.cuda.Stream()
+    # Caller-owned scratch is allocated outside capture and retained until all
+    # graphs are reset. Indexed split-K plans need partial-output workspace.
+    required = engine.get_workspace_size()
+    workspace = torch.empty(required, dtype=torch.uint8, device="cuda") if required else None
     for fill in (1, 3):
         buffers = _buffers(tensors, "cuda", fill)
-        pack = _pack(g, tensors, buffers)
+        pack = _pack(g, tensors, buffers, workspace)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             engine.execute(g, pack, ExecutionContext(stream=stream.cuda_stream))

@@ -857,27 +857,46 @@ _MAINLOOP_IDENTITY_CAST_INTRINSICS: dict[tuple[Dtype, Dtype], str] = {
 }
 
 
-def _mainloop_index_coordinates(chain, operand, lane):
-    """Decode logical unswizzled SMEM elements into GEMM operand coordinates.
+def _mainloop_local_coordinates(linear, group=None):
+    """Decode an unswizzled SMEM offset; group=None denotes K-major storage."""
+    if group is not None:
+        return (
+            f"(({linear} // ({group} * cta_tile_mnk[2])) * {group} + {linear} % {group})",
+            f"({linear} % ({group} * cta_tile_mnk[2])) // {group}",
+        )
+    return f"({linear} // cta_tile_mnk[2])", f"{linear} % cta_tile_mnk[2]"
+
+
+def _prepare_mainloop_index_coordinates(chain, operand):
+    """Prepare coordinates and validity once per transformed operand fragment.
 
     MN-major TMA groups consecutive M/N elements inside each K column. K-major
     vectors advance K. Tile origins belong to the mainloop scheduler, not IR.
     """
-    linear = f"(cutlass.Int64(ml_L) + {lane})"
+    tag = f"ml_{operand}_coords"
+    linear = f"{tag}_linear"
     mn_major = chain.matmul.a_major == "m" if operand == "a" else chain.matmul.b_major == "n"
-    if mn_major:
-        group = f"{operand}_tma_group_elems"
-        local_mn = f"(({linear} // ({group} * cta_tile_mnk[2])) * {group} + {linear} % {group})"
-        local_k = f"(({linear} % ({group} * cta_tile_mnk[2])) // {group})"
-    else:
-        local_mn, local_k = f"({linear} // cta_tile_mnk[2])", f"({linear} % cta_tile_mnk[2])"
+    local_mn, local_k = _mainloop_local_coordinates(linear, f"{operand}_tma_group_elems" if mn_major else None)
     batch = chain.matmul.a_batch if operand == "a" else chain.matmul.b_batch
     mn_axis = Axis.M if operand == "a" else Axis.N
-    return {
+    extent = "m" if operand == "a" else "n"
+    lane = f"{tag}_lane"
+    lines = [
+        f"{tag}_mn = cute.make_rmem_tensor(ml_vec_elems, cutlass.Int64)",
+        f"{tag}_k = cute.make_rmem_tensor(ml_vec_elems, cutlass.Int64)",
+        f"{tag}_valid = cute.make_rmem_tensor(ml_vec_elems, cutlass.Boolean)",
+        f"for {lane} in cutlass.range_constexpr(ml_vec_elems):",
+        f"    {linear} = cutlass.Int64(ml_L) + {lane}",
+        f"    {tag}_mn[{lane}] = cutlass.Int64(ml_coord_{extent}) + {local_mn}",
+        f"    {tag}_k[{lane}] = cutlass.Int64(k_tile_idx) * cta_tile_mnk[2] + {local_k}",
+        f"    {tag}_valid[{lane}] = ({tag}_k[{lane}] < k) & ({tag}_mn[{lane}] < {extent})",
+    ]
+    coordinates = {
         Axis.BATCH: "0" if batch == 1 else "ml_batch",
-        mn_axis: f"(cutlass.Int64(ml_coord_{'m' if operand == 'a' else 'n'}) + {local_mn})",
-        Axis.K: f"(cutlass.Int64(k_tile_idx) * cta_tile_mnk[2] + {local_k})",
+        mn_axis: f"{tag}_mn",
+        Axis.K: f"{tag}_k",
     }
+    return lines, coordinates, f"{tag}_valid"
 
 
 def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
@@ -898,7 +917,10 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     if identity_cast_intrinsic is not None:
         cvt = f"{identity_cast_intrinsic}({vec_var}.ir_value(), ml_vec_elems)"
         return f"{out_var} = cutlass.Vector({cvt}, dtype={ab_dtype})"
+    has_index = any(op.op == "gen_index" for op in ops)
     lines: list[str] = []
+    if has_index:
+        lines, index_coordinates, index_valid = _prepare_mainloop_index_coordinates(chain, operand)
     result_var: dict[int, str] = {-1: vec_var}
     for i, op in enumerate(ops):
         parent = op.resolved_parent_idx(i)
@@ -914,14 +936,17 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
                 dt = DTYPE_TO_CUTLASS[op.compute_dtype]
                 # The renderer selects logical (unswizzled) vector accesses for
                 # this path. The operand is K-major, so vector lanes advance K.
+                local_k = _mainloop_local_coordinates("ml_L")[1]
+                scale_k = f"{index_coordinates[Axis.K]}[{tag}_lane]" if has_index else f"{tag}_k + {tag}_lane"
+                scale_valid = f"{index_valid}[{tag}_lane]" if has_index else f"{tag}_gk < k"
                 lines.extend(
                     [
                         f"{tag}_scale = cute.make_rmem_tensor(ml_vec_elems, {dt})",
-                        f"{tag}_k = k_tile_idx * cta_tile_mnk[2] + ml_L % cta_tile_mnk[2]",
+                        *([] if has_index else [f"{tag}_k = k_tile_idx * cta_tile_mnk[2] + {local_k}"]),
                         f"for {tag}_lane in cutlass.range_constexpr(ml_vec_elems):",
-                        f"    {tag}_gk = {tag}_k + {tag}_lane",
+                        f"    {tag}_gk = {scale_k}",
                         f"    {tag}_scale[{tag}_lane] = {dt}(0.0)",
-                        f"    if {tag}_gk < k:",
+                        f"    if {scale_valid}:",
                         f"        {tag}_scale[{tag}_lane] = ({ptr} + {tag}_gk).load().to({dt})",
                     ]
                 )
@@ -938,15 +963,14 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
             if op.index_expr is None:
                 raise ValueError("mainloop gen_index requires a lowered coordinate expression")
             dt = DTYPE_TO_CUTLASS[op.compute_dtype]
-            coordinates = _mainloop_index_coordinates(chain, operand, f"{tag}_lane")
+            coordinates = {axis: value if axis == Axis.BATCH else f"{value}[{tag}_lane]" for axis, value in index_coordinates.items()}
             expression = _render_index_expr(op.index_expr, coordinates)
-            row_axis, row_extent = (Axis.M, "m") if operand == "a" else (Axis.N, "n")
             lines.extend(
                 [
                     f"{tag}_index = cute.make_rmem_tensor(ml_vec_elems, {dt})",
                     f"for {tag}_lane in cutlass.range_constexpr(ml_vec_elems):",
                     f"    {tag}_index[{tag}_lane] = {dt}(0)",
-                    f"    if ({coordinates[Axis.K]} < k) & ({coordinates[row_axis]} < {row_extent}):",
+                    f"    if {index_valid}[{tag}_lane]:",
                     f"        {tag}_index[{tag}_lane] = {dt}({expression})",
                 ]
             )
@@ -961,27 +985,20 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         result_var[i] = cur
     terminal_var = result_var[len(ops) - 1]
     lines.append(f"{out_var} = ({terminal_var}).to({ab_dtype})")
-    if any(op.index_expr is not None for op in ops):
-        coordinates = _mainloop_index_coordinates(chain, operand, "ml_mask_lane")
-        row_axis, row_extent = (Axis.M, "m") if operand == "a" else (Axis.N, "n")
-        lines.extend(
-            [
-                "ml_index_valid = cute.make_rmem_tensor(ml_vec_elems, cutlass.Boolean)",
-                "for ml_mask_lane in cutlass.range_constexpr(ml_vec_elems):",
-                f"    ml_index_valid[ml_mask_lane] = ({coordinates[Axis.K]} < k) & ({coordinates[row_axis]} < {row_extent})",
-                f"{out_var} = cutlass._mlir_helpers.vector.where(ml_index_valid.load().to_vector(), {out_var}, cutlass.full_like({out_var}, 0.0))",
-            ]
-        )
+    if has_index:
+        lines.append(f"{out_var} = cutlass._mlir_helpers.vector.where({index_valid}.load().to_vector(), {out_var}, cutlass.full_like({out_var}, 0.0))")
         return "\n".join(lines)
     major = "a_is_m_major" if operand == "a" else "b_is_n_major"
     group = f"{operand}_tma_group_elems"
+    mn_major_k = _mainloop_local_coordinates("ml_L", group)[1]
+    k_major_k = _mainloop_local_coordinates("ml_L")[1]
     lines.extend(
         [
             "if cutlass.const_expr(mainloop_koob_fix):",
             f"    if cutlass.const_expr({major}):",
-            f"        ml_k_of_L = (ml_L % ({group} * cta_tile_mnk[2])) // {group}",
+            f"        ml_k_of_L = {mn_major_k}",
             "    else:",
-            "        ml_k_of_L = ml_L % cta_tile_mnk[2]",
+            f"        ml_k_of_L = {k_major_k}",
             f"    ml_valid = cutlass.full_like({out_var}.to(cutlass.Float32), cutlass.Float32(ml_k_of_L)) < cutlass.full_like({out_var}.to(cutlass.Float32), cutlass.Float32(k - k_tile_idx * cta_tile_mnk[2]))",
             f"    {out_var} = cutlass._mlir_helpers.vector.where(ml_valid, {out_var}, cutlass.full_like({out_var}, 0.0))",
         ]
@@ -1315,7 +1332,8 @@ _SHARED_EXPORTS = {
     "_MAINLOOP_IDX_BASE": _MAINLOOP_IDX_BASE,
     "_MAINLOOP_IDENTITY_CAST_INTRINSICS": _MAINLOOP_IDENTITY_CAST_INTRINSICS,
     "generate_mainloop": generate_mainloop,
-    "_mainloop_index_coordinates": _mainloop_index_coordinates,
+    "_mainloop_local_coordinates": _mainloop_local_coordinates,
+    "_prepare_mainloop_index_coordinates": _prepare_mainloop_index_coordinates,
     "_emit_splitk_partial_store": _emit_splitk_partial_store,
 }
 

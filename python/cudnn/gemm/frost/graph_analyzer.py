@@ -1622,14 +1622,19 @@ def _lower_matrix_indices(
     return lowered
 
 
-def _operand_index_expression(shape, steps, axis):
-    """Compose consumer-to-producer views, then bind folded matrix coordinates."""
+def _operand_view_index_map(shape, steps):
+    """Compose logical consumer-to-producer views independently of index axes."""
     mapping = IndexMap.identity(shape)
     for step in steps:
         view = (
             IndexMap.reshape(mapping.consumer_shape, step.argument) if step.kind == "reshape" else IndexMap.permutation(mapping.consumer_shape, step.argument)
         )
         mapping = mapping.compose(view)
+    return mapping
+
+
+def _operand_index_expression(mapping, axis):
+    """Select a producer axis and bind it to folded matrix coordinates."""
     axis = index(axis)
     if not 0 <= axis < len(mapping.producer_shape):
         raise ValueError("gen_index requires a valid logical producer axis")
@@ -1746,6 +1751,12 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         return id(result)
 
     @lru_cache(maxsize=None)
+    def operand_index_map(dim, steps):
+        # Analysis-local cache: axes on the same view chain share one map,
+        # without retaining graphs or geometry across compilation requests.
+        return _operand_view_index_map(dim, steps)
+
+    @lru_cache(maxsize=None)
     def project(tid, steps=()):
         op = producers.get(tid)
         if op is None:
@@ -1767,7 +1778,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
                 raise ValueError("reshape fusion supports equal-shaped pointwise operands or scalar auxiliaries, not partial broadcasts")
         inputs = [i if reshaped and i != primary and all(d == 1 for d in shape(i)) else project(i, steps) for i in op.inputs]
         output = alias(tid, steps, meta[inputs[op.inputs.index(primary)]])
-        expr = _operand_index_expression(shape(tid), steps, dict(op.op_attrs).get("axis")) if op.cudnn_name == "gen_index" else op.index_expr
+        expr = _operand_index_expression(operand_index_map(shape(tid), steps), dict(op.op_attrs).get("axis")) if op.cudnn_name == "gen_index" else op.index_expr
         projected_ops.append(replace(op, inputs=inputs, output=output, index_expr=expr))
         return output
 
