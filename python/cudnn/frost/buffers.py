@@ -615,8 +615,12 @@ def cutedsl_arch_requirement_error(device_cc):
 
     The TARGET half of the public probe :func:`cudnn.frost.cutedsl_runtime_available`: cc 10.7 needs a DSL whose
     ``Arch`` knows ``sm_107a`` (the public 4.8.0 wheel is the first), so the floor is 4.7.0 everywhere and 4.8.0 on
-    cc 10.7. None when the part is not cc 10.7 or the target is present; otherwise the message names the installed
-    DSL."""
+    cc 10.7. A part below cc 8.0 has no target in any CuTe DSL (its ``Arch`` starts at ``sm_80``; compiling for a
+    Turing part raises ``KeyError: 'sm_75'`` inside the DSL), so it is refused without importing the DSL. None when
+    the target is present; otherwise the message names the part or the installed DSL."""
+    if device_cc is not None and tuple(device_cc) < (8, 0):
+        major, minor = device_cc
+        return f"the CuTe DSL has no target below SM80 (its Arch starts at sm_80); found cc {major}.{minor}"
     if device_cc != (10, 7) or _cutedsl_has_sm107():
         return None
     _, version = cutedsl_state()
