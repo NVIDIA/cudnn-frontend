@@ -29,6 +29,7 @@ from .fusion_ir import (
     Axis,
     IndexExpr,
     IndexMap,
+    OperandAccess,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -142,6 +143,8 @@ class _RecordedOp:
     permutation: tuple[int, ...] = ()
     reshape_mode: str = "VIEW_ONLY"
     index_expr: IndexExpr | None = None
+    aux_input: int | None = None
+    aux_mapping: IndexMap | None = None
 
 
 @dataclass
@@ -161,6 +164,7 @@ class _TensorMeta:
     mn_transposed: bool | None = None  # None for ordinary bindings; bool for a normalized caller-axis view
     matrix_batch: tuple[int, ...] | None = None  # original leading axes before rank normalization
     operand_view: OperandView | None = None  # fixed source shape and ordered zero-copy operations
+    coordinate_aux: bool = False
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -1633,13 +1637,18 @@ def _operand_view_index_map(shape, steps):
     return mapping
 
 
+def _matrix_map_coordinates(mapping):
+    """Bind a logical IndexMap once; users select indices or lower storage separately."""
+    coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
+    return mapping.apply(coordinates)
+
+
 def _operand_index_expression(mapping, axis):
     """Select a producer axis and bind it to folded matrix coordinates."""
     axis = index(axis)
     if not 0 <= axis < len(mapping.producer_shape):
         raise ValueError("gen_index requires a valid logical producer axis")
-    coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
-    return mapping.apply(coordinates)[axis]
+    return _matrix_map_coordinates(mapping)[axis]
 
 
 def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
@@ -1663,6 +1672,20 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         return ops
     mm = matmuls[0]
     producers = {op.output: op for op in ops}
+    operand_sides: dict[int, set[str]] = {}
+
+    def mark_operand(tid, side):
+        sides = operand_sides.setdefault(tid, set())
+        if side in sides:
+            return
+        sides.add(side)
+        node = producers.get(tid)
+        if node is not None:
+            for inp in node.inputs:
+                mark_operand(inp, side)
+
+    for tid, side in zip(mm.inputs, ("a", "b")):
+        mark_operand(tid, side)
     used, projected_ops, input_views = set(), [], {}
     names = {m.name for m in meta.values()}
 
@@ -1757,6 +1780,56 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         return _operand_view_index_map(dim, steps)
 
     @lru_cache(maxsize=None)
+    def index_only(tid):
+        node = producers.get(tid)
+        return node is not None and (node.cudnn_name == "gen_index" or (node.cudnn_name in _UNARY_OP_MAP and index_only(node.inputs[0])))
+
+    def auxiliary(op, steps):
+        """Select a full-shape carrier and map a read-only graph-input aux.
+
+        Shape broadcasting and view composition share IndexMap. Aux storage is
+        never reshaped to the carrier layout; it retains its original rank.
+        Existing scalar and affine per-K routes keep their dynamic binding ABI.
+        """
+        if op.cudnn_name not in _BINARY_OP_MAP:
+            return None
+        dim = shape(op.output)
+
+        # A full-shape pair can have either carrier. Prefer an existing DAG
+        # value, then operand dtype and a TMA-compatible contiguous matrix axis.
+        # This is a storage/rounding choice, not a broadcast-axis whitelist.
+        candidates = sorted(
+            (op.inputs, op.inputs[::-1]), key=lambda pair: (pair[0] not in producers, dtype(pair[0]) != dtype(op.output), 1 not in meta[pair[0]].stride[-2:])
+        )
+        for primary, other in candidates:
+            if shape(primary) != dim or other in producers or not meta[other].is_input or index_only(primary) or primary == other:
+                continue
+            aux_dim = shape(other)
+            broadcast = IndexMap.broadcast(aux_dim, dim)
+            if all(d == 1 for d in aux_dim):
+                return None  # constant-address scalar route already has no rank limit
+            mapping = broadcast.compose(operand_index_map(dim, steps))
+            # Preserve affine per-K's existing dynamic ABI (including transpose
+            # views). Classify the composed coordinates, not a rank whitelist.
+            # Rank-one buffers use the mapped ABI because the legacy path needs
+            # a matrix view; reshape remains under its fixed-shape contract.
+            sides = operand_sides.get(op.output, set())
+            k_axis = Axis.N if sides == {"a"} else Axis.M if sides == {"b"} else None
+            mapped_axes = frozenset().union(*(e.axes for e in _matrix_map_coordinates(mapping)))
+            if (
+                op.cudnn_name == "mul"
+                and len(aux_dim) >= 2
+                and not any(step.kind == "reshape" for step in steps)
+                and k_axis is not None
+                and mapped_axes == {k_axis}
+                and all(d == 1 or st == 1 for d, st in zip(aux_dim, meta[other].stride))
+            ):
+                return None
+            meta[other] = replace(meta[other], coordinate_aux=True)
+            return primary, other, mapping
+        return None
+
+    @lru_cache(maxsize=None)
     def project(tid, steps=()):
         op = producers.get(tid)
         if op is None:
@@ -1771,6 +1844,14 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
             used.add(tid)
             step = ViewStep("reshape", shape(tid), meta[tid].stride) if op.cudnn_name == "reshape" else ViewStep("transpose", op.permutation)
             return project(op.inputs[0], (step, *steps))
+        prepared_aux = auxiliary(op, steps)
+        if prepared_aux is not None:
+            primary, other, mapping = prepared_aux
+            carrier = project(primary, steps)
+            inputs = [carrier if i == primary else other for i in op.inputs]
+            output = alias(tid, steps, meta[carrier])
+            projected_ops.append(replace(op, inputs=inputs, output=output, aux_input=other, aux_mapping=mapping))
+            return output
         reshaped = any(step.kind == "reshape" for step in steps)
         primary = next((i for i in op.inputs if not all(d == 1 for d in shape(i))), op.inputs[0])
         if reshaped:
@@ -1817,6 +1898,14 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
                         raise ValueError("shared reshape input has an observable branch in incompatible coordinates")
                     meta[tid] = replace(m, operand_view=input_views[id(m.tensor)])
             ops = [op for op in ops if op.output in live]
+    else:
+        # Plain rank-N graphs use the very same selection/map preparation,
+        # without projecting the carrier or creating identity operand views.
+        prepared = []
+        for op in ops:
+            access = auxiliary(op, ()) if op.output in operand_sides else None
+            prepared.append(replace(op, aux_input=access[1], aux_mapping=access[2]) if access is not None else op)
+        ops = prepared
     if fold_batches:
         batch_shape = shape(mm.output)[:-2]
         ranked_shapes = {tid: shape(tid) for tid in meta}
@@ -1827,6 +1916,8 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
 
         ops = _lower_matrix_indices(ops, ranked_shapes, producers, mm.output)
         for tid, m in list(meta.items()):
+            if m.coordinate_aux:
+                continue
             dim = ranked_shapes[tid]
             if len(dim) < 2:
                 continue  # rank-one/scalar auxiliary ABI is already supported
@@ -1931,7 +2022,11 @@ def _walk_mainloop_chain(
         elif producer.cudnn_name in _BINARY_OP_MAP:
             i0, i1 = producer.inputs
             s0, s1 = _is_scalar_input(i0), _is_scalar_input(i1)
-            if s0 and not s1:
+            if producer.aux_input is not None:
+                aux_id = producer.aux_input
+                chain_id = i1 if aux_id == i0 else i0
+                aux_on_rhs = aux_id == i1
+            elif s0 and not s1:
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif s1 and not s0:
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
@@ -1957,18 +2052,27 @@ def _walk_mainloop_chain(
                 if aux_id not in aux_seen:
                     aux_seen.add(aux_id)
                     scalar_aux = _is_scalar_input(aux_id)
+                    mapped = producer.aux_mapping is not None
                     aux_tensors.append(
                         TensorRef(
                             name=aux_meta.name,
                             dim=aux_meta.dim,
                             stride=aux_meta.stride,
                             dtype=aux_meta.dtype,
-                            bcast_mode="scalar" if scalar_aux else "per_k",
-                            reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
+                            bcast_mode="per_elem" if mapped else "scalar" if scalar_aux else "per_k",
+                            reduction_axis=None if mapped or scalar_aux else (2 if label == "A" else 1),
+                            coordinate_mapped=mapped,
                         )
                     )
                     aux_objs.append(aux_meta.tensor)
                 fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], aux=aux_meta.name, aux_on_rhs=aux_on_rhs, parent_idx=parent)
+                if producer.aux_mapping is not None:
+                    mapping = producer.aux_mapping
+                    replacement = {Axis.N if label == "A" else Axis.M: IndexExpr.coordinate(Axis.K)}
+                    access = tuple(expr.substitute(replacement) for expr in _matrix_map_coordinates(mapping))
+                    dim = mapping.consumer_shape
+                    mn, k = dim[-2:] if label == "A" else dim[-2:][::-1]
+                    fop = replace(fop, operand_access=OperandAccess((prod(dim[:-2]), mn, k), access))
         else:
             raise ValueError(
                 f"matmul {label} operand is produced by op {producer.op_name!r} ({producer.cudnn_name!r}) which is not a pointwise op — mainloop fusion supports unary ops, scalar-aux binary ops and per-K mul"

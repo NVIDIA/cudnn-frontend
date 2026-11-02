@@ -497,6 +497,22 @@ class MainloopKernelTemplate(KernelTemplate):
                 if any(op.op == "gen_index" and op.index_expr is None for op in ops):
                     return f"{self.file}: mainloop gen_index requires lowered logical coordinates"
             for op in ops:
+                if op.operand_access is not None:
+                    if self.family != "sm100":
+                        return f"{self.file}: mapped operand broadcasts require the SM100 coordinate-loading pipeline"
+                    ref = chain.aux_by_name(op.aux)
+                    if (
+                        chain.has_moe
+                        or getattr(chain.matmul, f"{side.lower()}_dtype") not in ("bf16", "fp16")
+                        or getattr(chain, f"mainloop_{side.lower()}_load_dtype") is not None
+                    ):
+                        return f"{self.file}: mapped operand broadcasts require plain BF16/FP16 operands without load casts"
+                    if (
+                        ref.dtype not in ("bf16", "fp16", "fp32")
+                        or op.compute_dtype != "fp32"
+                        or op.out_dtype != getattr(chain.matmul, f"{side.lower()}_dtype")
+                    ):
+                        return f"{self.file}: mapped operand broadcasts require FP32 compute and operand-dtype results"
                 if op.op not in _SUPPORTED_MAINLOOP_OPS:
                     return f"{self.file} cannot fuse mainloop op {op.op!r} on " f"operand {side} (supported: unary + scalar-aux binary, per-K mul)"
                 if op.aux is not None and chain.aux_by_name(op.aux).bcast_mode == "per_k":

@@ -867,7 +867,7 @@ def _mainloop_local_coordinates(linear, group=None):
     return f"({linear} // cta_tile_mnk[2])", f"{linear} % cta_tile_mnk[2]"
 
 
-def _prepare_mainloop_index_coordinates(chain, operand):
+def _prepare_mainloop_coordinates(chain, operand):
     """Prepare coordinates and validity once per transformed operand fragment.
 
     MN-major TMA groups consecutive M/N elements inside each K column. K-major
@@ -899,6 +899,34 @@ def _prepare_mainloop_index_coordinates(chain, operand):
     return lines, coordinates, f"{tag}_valid"
 
 
+def _emit_operand_aux_load(op, ref, coordinates, valid, parent, tag, operand, chain):
+    """Lower logical source coordinates through runtime strides, not mode labels."""
+    dt = DTYPE_TO_CUTLASS[op.compute_dtype]
+    ptr = f"{ref.name}.iterator.raw_ptr()"
+    major = chain.matmul.a_major == "m" if operand == "a" else chain.matmul.b_major == "n"
+    varying = Axis.M if operand == "a" else Axis.N
+    varying = varying if major else Axis.K
+    invariant = varying not in op.operand_access.axes
+    lane = "0" if invariant else f"{tag}_lane"
+    bound = {axis: value if axis == Axis.BATCH else f"{value}[{lane}]" for axis, value in coordinates.items()}
+    terms = [
+        f"({_render_index_expr(expr, bound)}) * cutlass.Int64({ref.name}.stride[{i}])"
+        for i, expr in enumerate(op.operand_access.coordinates)
+        if expr != IndexExpr.constant(0)
+    ]
+    offset = " + ".join(terms) or "cutlass.Int64(0)"
+    if invariant:
+        return [f"{tag}_aux = {dt}(0)", f"if {valid}[0]:", f"    {tag}_aux = ({ptr} + {offset}).load().to({dt})"], f"cutlass.full_like({parent}, {tag}_aux)"
+    lines = [
+        f"{tag}_aux = cute.make_rmem_tensor(ml_vec_elems, {dt})",
+        f"for {lane} in cutlass.range_constexpr(ml_vec_elems):",
+        f"    {tag}_aux[{lane}] = {dt}(0)",
+        f"    if {valid}[{lane}]:",
+        f"        {tag}_aux[{lane}] = ({ptr} + {offset}).load().to({dt})",
+    ]
+    return lines, f"{tag}_aux.load().to_vector()"
+
+
 def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     """Generate one operand mainloop transform."""
     ops = chain.mainloop_a_ops if operand == "a" else chain.mainloop_b_ops
@@ -917,10 +945,10 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     if identity_cast_intrinsic is not None:
         cvt = f"{identity_cast_intrinsic}({vec_var}.ir_value(), ml_vec_elems)"
         return f"{out_var} = cutlass.Vector({cvt}, dtype={ab_dtype})"
-    has_index = any(op.op == "gen_index" for op in ops)
+    needs_coordinates = any(op.op == "gen_index" or op.operand_access is not None for op in ops)
     lines: list[str] = []
-    if has_index:
-        lines, index_coordinates, index_valid = _prepare_mainloop_index_coordinates(chain, operand)
+    if needs_coordinates:
+        lines, index_coordinates, index_valid = _prepare_mainloop_coordinates(chain, operand)
     result_var: dict[int, str] = {-1: vec_var}
     for i, op in enumerate(ops):
         parent = op.resolved_parent_idx(i)
@@ -932,17 +960,21 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         if op.aux is not None:
             ptr = f"{op.aux}.iterator.raw_ptr()"
             ref = chain.aux_by_name(op.aux)
-            if ref.bcast_mode == "per_k":
+            if op.operand_access is not None:
+                load_lines, loaded = _emit_operand_aux_load(op, ref, index_coordinates, index_valid, parent_var, tag, operand, chain)
+                lines.extend(load_lines)
+                aux_loads[op.aux] = loaded
+            elif ref.bcast_mode == "per_k":
                 dt = DTYPE_TO_CUTLASS[op.compute_dtype]
                 # The renderer selects logical (unswizzled) vector accesses for
                 # this path. The operand is K-major, so vector lanes advance K.
                 local_k = _mainloop_local_coordinates("ml_L")[1]
-                scale_k = f"{index_coordinates[Axis.K]}[{tag}_lane]" if has_index else f"{tag}_k + {tag}_lane"
-                scale_valid = f"{index_valid}[{tag}_lane]" if has_index else f"{tag}_gk < k"
+                scale_k = f"{index_coordinates[Axis.K]}[{tag}_lane]" if needs_coordinates else f"{tag}_k + {tag}_lane"
+                scale_valid = f"{index_valid}[{tag}_lane]" if needs_coordinates else f"{tag}_gk < k"
                 lines.extend(
                     [
                         f"{tag}_scale = cute.make_rmem_tensor(ml_vec_elems, {dt})",
-                        *([] if has_index else [f"{tag}_k = k_tile_idx * cta_tile_mnk[2] + {local_k}"]),
+                        *([] if needs_coordinates else [f"{tag}_k = k_tile_idx * cta_tile_mnk[2] + {local_k}"]),
                         f"for {tag}_lane in cutlass.range_constexpr(ml_vec_elems):",
                         f"    {tag}_gk = {scale_k}",
                         f"    {tag}_scale[{tag}_lane] = {dt}(0.0)",
@@ -985,7 +1017,7 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         result_var[i] = cur
     terminal_var = result_var[len(ops) - 1]
     lines.append(f"{out_var} = ({terminal_var}).to({ab_dtype})")
-    if has_index:
+    if needs_coordinates:
         lines.append(f"{out_var} = cutlass._mlir_helpers.vector.where({index_valid}.load().to_vector(), {out_var}, cutlass.full_like({out_var}, 0.0))")
         return "\n".join(lines)
     major = "a_is_m_major" if operand == "a" else "b_is_n_major"
@@ -1042,7 +1074,7 @@ class _AuxCodegen:
         """Generate bounded auxiliary loads."""
         lines: list[str] = []
         for aux in chain.aux_tensors:
-            if aux.bcast_mode not in ("per_col", "per_elem") or (not on_tma_arm and aux.stride[-1] == 1):
+            if aux.coordinate_mapped or aux.bcast_mode not in ("per_col", "per_elem") or (not on_tma_arm and aux.stride[-1] == 1):
                 continue
             n, ptr = (aux.name, _aux_ptr_var(aux.name))
             lines.append(f"_auxt_{n} = cute.make_rmem_tensor(vsize, {DTYPE_TO_CUTLASS[aux.dtype]})")
@@ -1072,6 +1104,8 @@ class _AuxCodegen:
         col = "moe_scatter_row(token_index, token_ks, col_j + _auxk, group_end, N, moe_top_k)" if swapped else "col_j + _auxk"
         lines = []
         for aux in chain.aux_tensors:
+            if aux.coordinate_mapped:
+                continue  # original-rank storage is loaded only by its operand access
             if aux.bcast_mode == "per_row":
                 idx = self.index_expr(aux, row_var=f"cute.math.min(cutlass.Int32({row}), cutlass.Int32(M) - 1)")
                 lines.append(f"{_aux_prefetch_var(aux.name)} = ({_aux_ptr_var(aux.name)} + {idx}).load()")
@@ -1146,7 +1180,8 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
         parent_raw = _parent_value(parent)
         cast_lines, parent_var = _compute_cast(parent_raw, op.compute_dtype, f"{i}_a", source_dtype=_parent_dtype(parent))
         body_lines.extend(cast_lines)
-        aux_loads = {aux.name: aux_load_expr(aux, op.compute_dtype, parent_var, bounded=bounded or aux.stride[-1] != 1) for aux in chain.aux_tensors}
+        aux_ref = chain.aux_by_name(op.aux) if op.aux is not None else None
+        aux_loads = {op.aux: aux_load_expr(aux_ref, op.compute_dtype, parent_var, bounded=bounded or aux_ref.stride[-1] != 1)} if aux_ref is not None else {}
         other_in_chain = _parent_value(op.parent_idx_b) if op.parent_idx_b is not None else None
         if other_in_chain is not None:
             cast_lines, other_in_chain = _compute_cast(other_in_chain, op.compute_dtype, f"{i}_b", source_dtype=_parent_dtype(op.parent_idx_b))
@@ -1364,7 +1399,7 @@ _SHARED_EXPORTS = {
     "_MAINLOOP_IDENTITY_CAST_INTRINSICS": _MAINLOOP_IDENTITY_CAST_INTRINSICS,
     "generate_mainloop": generate_mainloop,
     "_mainloop_local_coordinates": _mainloop_local_coordinates,
-    "_prepare_mainloop_index_coordinates": _prepare_mainloop_index_coordinates,
+    "_prepare_mainloop_coordinates": _prepare_mainloop_coordinates,
     "_emit_splitk_partial_store": _emit_splitk_partial_store,
 }
 

@@ -63,22 +63,26 @@ _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=
 
 
 def _aux_kernel_shape(aux: TensorRef) -> tuple[int | Axis, ...]:
-    """Lower logical extents to the existing minimum-rank-2 aux ABI."""
+    """Preserve mapped storage rank; legacy matrix auxiliaries use rank >= 2."""
     shape = aux.symbolic_shape
-    return (1,) * max(0, 2 - len(shape)) + shape
+    return shape if aux.coordinate_mapped else (1,) * max(0, 2 - len(shape)) + shape
 
 
 def _aux_fake_shape_code(aux: TensorRef) -> str:
     """Render lowered extents without reconstructing broadcasts."""
     symbols = {Axis.M: "sym_m", Axis.N: "sym_n", Axis.K: "sym_k", Axis.BATCH: "sym_l", Axis.GROUP: "sym_g"}
-    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux)) + ")"
+    return (
+        "("
+        + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux))
+        + (",)" if len(_aux_kernel_shape(aux)) == 1 else ")")
+    )
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
     """Check whether auxiliary strides can be encoded directly."""
     # Unit-axis strides also change when dynamic K is rebound; do not bake
     # the originally declared K-sized strides into a per-K fake tensor.
-    if aux.bcast_mode == "per_k" or len(aux.dim) not in (2, 3):
+    if aux.coordinate_mapped or aux.bcast_mode == "per_k" or len(aux.dim) not in (2, 3):
         return False
     stride1_dims = [i for i, stride in enumerate(aux.stride) if stride == 1]
     if len(stride1_dims) <= 1:
@@ -99,7 +103,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
         else:
             _rank = len(_aux_kernel_shape(aux))
-            stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + ")"
+            stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + (",)" if _rank == 1 else ")")
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
     return "\n".join(lines) if lines else "pass"
 
@@ -1093,7 +1097,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         in_slots = tuple((op.index for op in r.inputs))
         ins = tuple(((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs)))
         outs = tuple(((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs))
-        auxs = tuple((x.index, x.align, x.mainloop_scale) for x in r.aux)
+        auxs = tuple((x.index, x.align, x.mainloop_scale, x.access_rule) for x in r.aux)
         sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf))
         tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = (r.shared_layout, r.seeds)
@@ -1111,7 +1115,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         )
         mn_view_slots = (frozenset((o.index for o in r.outputs)) | frozenset((x.index for x in r.aux))) - packed_scale_slots
         aux_views = {id(x.ref): x.transposed for x in r.aux}
-        tail = tuple((i, ref, (swap_ab ^ aux_views.get(id(ref), False)) if ref is not None else (swap_ab and i in mn_view_slots)) for i, ref in tail)
+        tail = tuple(
+            (i, ref, (False if ref.coordinate_mapped else swap_ab ^ aux_views.get(id(ref), False)) if ref is not None else (swap_ab and i in mn_view_slots))
+            for i, ref in tail
+        )
         if split_k_slices > 1:
             cta_k_elems = backend._cta_k_elems(self.chain, self.config)
         if needs_workspace:
@@ -1177,10 +1184,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     gave_up["output layout"] += 1
                     return refuse(original_operands, graph_order)
                 problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
-            for idx, align, scale_rule in auxs:
+            for idx, align, scale_rule, access_rule in auxs:
                 v = operands[idx]
                 if scale_rule is not None:
                     scale_rule.check(v, k)
+                if access_rule is not None:
+                    access_rule.check(v, k, m, n)
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
                     return refuse(original_operands, graph_order)

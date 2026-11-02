@@ -1086,12 +1086,12 @@ def _kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_ml = cutlass.Int32(0)
-        if cutlass.const_expr(mainloop_has_index):
+        if cutlass.const_expr(mainloop_needs_coordinates):
             tile_m, tile_n, tile_l = init_tile_m, init_tile_n, init_tile_l
         if cutlass.const_expr(split_k_slices > 1):
             tile_l = bidz  # this tile's z coord
         while is_valid != 0:
-            if cutlass.const_expr(mainloop_has_index):
+            if cutlass.const_expr(mainloop_needs_coordinates):
                 ml_coord_m = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
                 if cutlass.const_expr(cta_group == 1):
                     ml_coord_n = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
@@ -1281,7 +1281,7 @@ def _kernel(
             _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             cute.arch.fence_proxy("async.shared", space="cta")
             is_valid = vld
-            if cutlass.const_expr(mainloop_has_index):
+            if cutlass.const_expr(mainloop_needs_coordinates):
                 ml_raw_m = _m_idx >> _preferred_cluster_m_shift
                 ml_raw_n = _n_idx >> _preferred_cluster_n_shift
                 ml_nt_m = gridx >> _preferred_cluster_m_shift
