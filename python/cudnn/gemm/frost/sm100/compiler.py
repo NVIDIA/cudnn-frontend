@@ -64,6 +64,8 @@ from ..fusion_ir import (
     FusionChain,
     MoeSwapAbSpec,
     TensorRef,
+    gemm_index,
+    is_gemm_source,
     segmented_row_scale_capacity_rows,
 )
 from ..recipe import (
@@ -2958,6 +2960,44 @@ def probe_cutedsl() -> None:
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
 
 
+# Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
+# their float attributes to int32). The others use Float32-only CuTe DSL math
+# (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or a DSL error out of
+# cute.compile instead of declining. The sm120 tree (#2022) also declines div,
+# whose `/` it lowers to the fp32 quotient's bit pattern; the sm100 epilogue
+# returns the truncated integer quotient, so div stays served here.
+_INT32_COMPUTE_OPS = frozenset(
+    ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "div", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
+)
+# The epilogue converts an int32-compute op's inputs and result with a direct
+# .to() between Int32 and their declared dtype, with no Float32 detour; between
+# Int32 and a Float8 type that cast does not compile.
+_INT32_COMPUTE_NO_CAST_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp8_e8m0")
+
+
+def _check_int32_compute(chain: FusionChain) -> None:
+    """Decline an epilogue op that computes in int32 but has no int32 emitter, or
+    whose inputs or output would need an int32 <-> fp8 conversion."""
+    for i, op in enumerate(chain.ops):
+        if op.compute_dtype != "int32":
+            continue
+        if op.op not in _INT32_COMPUTE_OPS:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32, which the sm100 epilogue emits only for {', '.join(sorted(_INT32_COMPUTE_OPS))}"
+            )
+        # The values the op reads: gen_index reads only its input's shape, and aux_load has no producing input.
+        refs = [op.parent_idx_b, op.parent_idx_c] + ([] if op.op in ("gen_index", "aux_load") else [op.resolved_parent_idx(i)])
+        dtypes = [chain.gemm_out_dtype(gemm_index(ref)) if is_gemm_source(ref) else chain.ops[ref].out_dtype for ref in refs if ref is not None]
+        if op.aux is not None:
+            dtypes.append(chain.aux_by_name(op.aux).dtype)
+        fp8 = sorted({dtype for dtype in (*dtypes, op.out_dtype) if dtype in _INT32_COMPUTE_NO_CAST_DTYPES})
+        if fp8:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32 but reads or writes {' and '.join(fp8)}; the sm100 epilogue has no int32 <-> fp8 conversion"
+            )
+
+
 def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     """Check support for one fusion chain and explicit configuration."""
     if config.swap_ab:
@@ -2967,6 +3007,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_executable(chain)
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
@@ -3037,6 +3078,7 @@ def jit_from_cudnn_graph(
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
     _check_splitk_supported(chain, config)

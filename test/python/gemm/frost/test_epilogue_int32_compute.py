@@ -19,7 +19,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from gemm_test_utils import requires_sm120
+from gemm_test_utils import requires_sm100, requires_sm120
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  -- installs the cudnn.pygraph recorder hook
@@ -299,3 +299,87 @@ def test_int32_gen_index_is_emitted_from_int32_coordinates(axis):
     int32_src, fp32_src = emit("int32"), emit("fp32")
     assert "cutlass.Int32(" in int32_src and "Float32" not in int32_src, int32_src
     assert "cutlass.Float32(" in fp32_src and "Int32" not in fp32_src, fp32_src
+
+
+# --- sm100 tree. cc 10.3 has no int8 MMA, so these graphs run a bf16 GEMM and compute only the
+# pointwise op in INT32 (compute_data_type on the op).
+_BF16 = cudnn.data_type.BFLOAT16
+_SM100_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+
+
+def _bf16_graph(op: str, out=_I32, aux=_I32):
+    """bf16 A x B -> one pointwise op computing in INT32 -> ``out`` (int32 by default)."""
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_F32, compute_data_type=_F32)
+    a = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    b = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    c = g.matmul(A=a, B=b, name="mm")
+    z = None
+    if op in _OPERANDS:
+        z = g.tensor(name="z", dim=[1, 1, N], stride=[N, N, 1], data_type=aux)
+        y = getattr(g, op)(**dict(zip(_OPERANDS[op], (c, z, z))), compute_data_type=_I32, name="op")
+    elif op == "leaky_relu":
+        y = g.leaky_relu(input=c, negative_slope=0.5, compute_data_type=_I32, name="op")
+    else:
+        y = getattr(g, op)(input=c, compute_data_type=_I32, name="op")
+    y.set_output(True).set_data_type(out)
+    return g, a, b, z, y
+
+
+_SM100_NO_INT32_EMITTER = tuple(op for op in _NO_INT32_EMITTER if op != "div")
+
+
+@requires_sm100
+@pytest.mark.parametrize("op", _SM100_NO_INT32_EMITTER)
+def test_sm100_int32_compute_op_without_an_int32_emitter_is_declined(op):
+    """check_support and the sm100 JIT decline it, instead of cute.compile raising a
+    TypeError or DSL error (cmp_lt, floor and mod did) out of build_plans()."""
+    from cudnn.gemm.frost.sm100 import compiler
+
+    g, *_ = _bf16_graph(op)
+    with pytest.raises(NotImplementedError, match=rf"\('{op}'\) computes in int32"):
+        FrostGemmEngine().check_support(g)
+    with pytest.raises(NotImplementedError, match=rf"\('{op}'\) computes in int32"):
+        compiler.jit_from_cudnn_graph(g, config=by_name(_SM100_CFG))
+
+
+@requires_sm100
+@pytest.mark.parametrize("op", tuple(op for op in _INT32_EMITTER if op != "gen_index") + ("div",))
+def test_sm100_int32_compute_op_with_an_int32_emitter_is_accepted(op):
+    """The decline keeps every op the sm100 epilogue computes in Int32, div included."""
+    g, *_ = _bf16_graph(op)
+    FrostGemmEngine().check_support(g)
+
+
+@requires_sm100
+def test_sm100_int32_div_is_exact():
+    """Unlike the sm120 tree, the sm100 epilogue returns the truncated integer quotient for
+    an int32 div, so the decline leaves it served."""
+    from cudnn.gemm.frost.sm100 import compiler
+
+    g, A, B, Z, Y = _bf16_graph("div")
+    compiled = compiler.jit_from_cudnn_graph(g, config=by_name(_SM100_CFG))
+    torch.manual_seed(0)
+    a = torch.randint(-4, 4, (1, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-4, 4, (1, N, K), device="cuda").to(torch.bfloat16)
+    z = torch.arange(N, dtype=torch.int32, device="cuda").reshape(1, 1, N) % 7 - 3
+    z = torch.where(z == 0, torch.full_like(z, 2), z)
+    y = torch.full((1, M, N), -12345, dtype=torch.int32, device="cuda")
+    compiled({A: a, B: b, Z: z, Y: y})
+    torch.cuda.synchronize()
+    c = torch.einsum("bmk,bnk->bmn", a.cpu().long(), b.cpu().long())
+    torch.testing.assert_close(y.cpu(), torch.div(c, z.cpu().long(), rounding_mode="trunc").to(torch.int32), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("edge", ("fp8_e4m3 output", "fp8_e5m2 output", "fp8_e4m3 aux"))
+def test_sm100_int32_compute_with_fp8_input_or_output_is_declined(edge):
+    """check_support and the sm100 JIT decline an int32 add with an fp8 output or aux,
+    instead of cute.compile failing on the int32 <-> fp8 conversion."""
+    from cudnn.gemm.frost.sm100 import compiler
+
+    g, *_ = _bf16_graph("add", **{k: v for k, v in _FP8_EDGES[edge].items() if k != "gemm_out"})
+    match = rf"\('add'\) computes in int32 but reads or writes {edge.split()[0]}"
+    with pytest.raises(NotImplementedError, match=match):
+        FrostGemmEngine().check_support(g)
+    with pytest.raises(NotImplementedError, match=match):
+        compiler.jit_from_cudnn_graph(g, config=by_name(_SM100_CFG))
