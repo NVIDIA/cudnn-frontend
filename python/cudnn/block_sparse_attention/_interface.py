@@ -1267,7 +1267,9 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
     bucket = 256 if bucket is None else bucket
     if bucket <= 0:
         raise ValueError("bucket_size_blocks must be positive")
-    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts)
+    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
+        indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
+    )
     dq = torch.empty_like(q) if dq is None else dq
     dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv
