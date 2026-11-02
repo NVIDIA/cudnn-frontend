@@ -800,7 +800,7 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
-        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
+        if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
             sanitize_v_tail(
                 mma_params.sV,
                 basic_params.lane,
