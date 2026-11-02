@@ -9,8 +9,10 @@ to overlap independent prologue work while preserving their data dependencies:
 
   Kernel 1 (CuTe DSL): score_grad — compute sum_grad and grad_signal from
       AttnScore and IdxScore, overwrite AttnScore with grad_signal.
-      The BF16-output path also clears its FP32 dK accumulation scratch in the
-      same launch, avoiding a standalone memset kernel.
+      In ordinary execution it also clears the FP32 dK accumulator (the fp32
+      d_index_k itself, or the private scratch behind a BF16 output) in the
+      same launch, avoiding a standalone memset kernel; deterministic planes
+      are cleared by a memset before it.
       Unsupported inputs trigger an exception before this stage launches.
   Kernel 2 (CuTe DSL): kernel_gemm — warp-specialized GEMM kernel (below).
       dK is accumulated in float32. Into a caller-visible accumulator (fp32
@@ -19,8 +21,9 @@ to overlap independent prologue work while preserving their data dependencies:
       scratch behind a BF16 output it instead issues 16-byte red.global.add.v4
       reductions straight from registers into a column-permuted layout (see
       ``_reduce_warpgroup``), which kernel 3 un-permutes while casting.
-  Kernel 3 (PyTorch):  dk_convert — cast dK from float32 to output dtype
-      (same as dQ, dW).
+  Kernel 3 (PyTorch, BF16 d_index_k only): copy the FP32 scratch into the
+      output through ``dk_column_permuted_view``, casting and restoring the
+      natural column order. dQ/dW are stored as BF16 by kernel 2.
 
 The deterministic specialization keeps kernel 2 but maps a selected persistent
 CTA count to fixed query stripes and gives each CTA one private FP32 dK plane. One
@@ -107,7 +110,6 @@ from cutlass.cute.nvgpu.cpasync.copy import (
 )
 from cutlass.cute.nvgpu.cpasync.helpers import TmaInfo
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.utils.blackwell_helpers import (
     make_trivial_tiled_mma as _make_trivial_tiled_mma,
@@ -410,7 +412,6 @@ class IndexerBackwardSm100:
     arch = 100
     WARP_SIZE = 32
     WARPGROUP_SIZE = 128
-    NUM_WARPS = 16
     THREADS_PER_CTA = 512
 
     # dK bulk-reduce staging: four reducer warps, two ping-pong buffers per
@@ -434,7 +435,6 @@ class IndexerBackwardSm100:
         heads=64,
         block_I=128,
         topk=512,
-        total_seqlen_k: int | None = None,
         total_rows: int = 1,
         persistent_grid_size: int = 1,
         topk_indices_global: bool = True,
@@ -449,7 +449,6 @@ class IndexerBackwardSm100:
             heads: Logical query-head count; H32 and H64-or-larger are valid.
             block_I: Sparse top-k block width; ``topk`` must be divisible by it.
             topk: Number of selected KV rows per query row.
-            total_seqlen_k: Runtime KV capacity metadata retained by the factory.
             total_rows: Total query rows, used only to select launch policy.
             persistent_grid_size: CTA count available to a persistent launch.
             topk_indices_global: Whether indices are already flattened across batches.
@@ -467,7 +466,6 @@ class IndexerBackwardSm100:
         self.topk = topk
         # Row and K extents are runtime values; ``total_rows`` only selects the
         # launch policy below, so one compiled kernel serves every packed shape.
-        self.total_seqlen_k = total_seqlen_k
         self.total_rows = total_rows
         self.persistent_grid_size = persistent_grid_size
         # Only the full wrapper guarantees that the immediate predecessor is
@@ -892,7 +890,6 @@ class IndexerBackwardSm100:
         storage = smem.allocate(SharedStorage)
         Q_mbar_ptr = storage.Q_mbar.data_ptr()
         mbar = storage.mbar.data_ptr()
-        tmem_holding_buf = storage.tmem_holding_buf.ptr
         tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -1320,13 +1317,12 @@ class IndexerBackwardSm100:
                     warp_idx,
                 )
                 cute.arch.sync_threads()
-            if const_expr(self.use_persistent):
-                if warp_idx == self.compute_warp_id[0]:
-                    persistent_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-                    cute.arch.dealloc_tmem(
-                        persistent_tmem_ptr,
-                        self.tmem_alloc_cols,
-                    )
+            if warp_idx == self.compute_warp_id[0]:
+                persistent_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                cute.arch.dealloc_tmem(
+                    persistent_tmem_ptr,
+                    self.tmem_alloc_cols,
+                )
 
     @cute.jit
     def _issue_cross_row_q(
@@ -1555,7 +1551,8 @@ class IndexerBackwardSm100:
                     )
                 if const_expr(self.enable_score_pdl) and it == 0:
                     # grad_signal and the FP32 dK zeroing are produced by the
-                    # preceding score grid.  Q/K/top-k setup above is
+                    # preceding score grid (deterministic planes are cleared
+                    # by an earlier memset).  Q/K/top-k setup above is
                     # independent; wait immediately before the first
                     # dependent operand load.  GW_READY -> dS -> dK barriers
                     # transitively keep the reduce role behind this wait.
@@ -1921,7 +1918,7 @@ class IndexerBackwardSm100:
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             tx_count=self.tma_copy_Q_bytes,
             cta_layout_vmnk=cute.make_layout(self.cluster_shape),
-            defer_sync=self.use_persistent,
+            defer_sync=True,
         )
         Q_producer, Q_consumer = Q_pipeline.make_participants()
         gQ = cute.local_tile(
@@ -1994,8 +1991,7 @@ class IndexerBackwardSm100:
                 mbar + MBAR_DS_HALF_1,
                 self.WARPGROUP_SIZE,
             )
-        if const_expr(self.use_persistent):
-            cute.arch.mbarrier_init_fence()
+        cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
         seqlen_k_per_batch = seqlen_k // batch_size
@@ -2100,8 +2096,6 @@ class IndexerBackwardSm100:
             if warp_idx == self.compute_warp_id[0]:
                 cute.arch.mbarrier_wait(mbar + MBAR_REDUCE_DONE, Int32(0))
                 _tcgen05_fence_after_thread_sync()
-                if const_expr(not self.use_persistent):
-                    cute.arch.dealloc_tmem(tmem_ptr_base, self.tmem_alloc_cols)
                 dQ_store_pipeline.producer_tail()
         elif warp_idx in self.k_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_kload)
@@ -2874,7 +2868,7 @@ class IndexerBackwardSm100:
         # every thread visits exactly two heads. Hoist those two conversions
         # instead of reloading BF16 weights for every score pair.
         # sm_scale is folded into the dS weights (one BF16 rounding of the
-        # scaled dS, as in the v2 backend), so dK and dQ leave their GEMMs
+        # scaled dS), so dK and dQ leave their GEMMs
         # already scaled and the per-tile dK drain needs no FP32 multiplies.
         if const_expr(use_stmatrix_ds):
             h_base = warp_id_in_wg * 16 + lane_id // 4
@@ -3599,7 +3593,7 @@ def indexer_backward_sm100(
     deterministic: bool = False,
     deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
-    """Build the default SM100 backward pipeline for one plan signature.
+    """Build the SM100 backward pipeline for one plan signature.
 
     ``deterministic=True`` replaces the cross-CTA dK atomic target with
     fixed-owner CTA-private planes and a trailing fixed-order reduction.
@@ -3621,7 +3615,7 @@ def indexer_backward_sm100(
     # THD packed varlen is supported at the wrapper level by treating the
     # packed tensors as a single B=1 BSHD batch (sparse path's topk indices
     # already encode per-batch validity, so no kernel-side cu_seqlens are
-    # needed). See ``_indexer_backward_sparse_thd`` in csrc/bwd/__init__.py.
+    # needed; see the zero-copy B=1 view guidance in dsa.md).
     return _build_cute_dsl_kernel(
         batch,
         seqlen,
@@ -3931,7 +3925,6 @@ def _score_grad_inplace(
     IndexScore,
     GradLoss,
     grad_scale,
-    block_I=128,
     dIndexK_f32=None,
     current_stream=None,
 ):
@@ -4019,7 +4012,6 @@ def _build_cute_dsl_kernel(
             heads=heads,
             block_I=block_I,
             topk=topk,
-            total_seqlen_k=batch * seqlen_k,
             total_rows=batch * seqlen,
             persistent_grid_size=persistent_grid_size,
             topk_indices_global=topk_indices_global,
@@ -4170,7 +4162,7 @@ def _build_cute_dsl_kernel(
         # ``grad_scale`` is a host scalar (Python float / 0-D fp32 tensor)
         # multiplied into ``score_grad`` as a runtime ``Float32`` arg —
         # changing it across calls does **not** trigger recompilation.
-        score_grad = partial(_score_grad_inplace, block_I=block_I)
+        score_grad = _score_grad_inplace
 
         if deterministic:
             planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim, deterministic_dk_planes)
@@ -4253,17 +4245,12 @@ def _build_cute_dsl_kernel(
                 AttnScore,
                 TopkIndices,
                 current_stream=current_stream,
-                dk_column_permuted=use_permuted_scratch,
+                dk_column_permuted=True,
             )
             with _torch_stream_context(current_stream):
-                if use_permuted_scratch:
-                    dk_column_permuted_view(dIndexK).copy_(dIndexK_f32.view(*dIndexK.shape[:-1], 8, 4, 2, 2))
-                else:
-                    dIndexK.copy_(dIndexK_f32)
+                dk_column_permuted_view(dIndexK).copy_(dIndexK_f32.view(*dIndexK.shape[:-1], 8, 4, 2, 2))
 
-    _run.score_grad = partial(_score_grad_inplace, block_I=block_I)
-    _run.score_grad_zero = partial(_score_grad_inplace, block_I=block_I)
+    _run.score_grad = _score_grad_inplace
     _run.gemm_only = _run_gemm_only
-    _run.gemm_after_score = _run_gemm_after_score
 
     return _run

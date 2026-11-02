@@ -30,6 +30,7 @@ import statistics
 import torch
 
 from cudnn import DSA
+from cudnn.api_base import ws_align
 from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
 
 
@@ -60,12 +61,12 @@ def _make_case(batch: int, seqlen_q: int, seqlen_k: int, topk: int, seed: int, t
     return q32, w32, k, attn, predict, indices
 
 
-def _outputs(q: torch.Tensor, w: torch.Tensor, k: torch.Tensor):
-    """Allocate caller-owned dQ/dW buffers and an FP32 dK accumulator."""
+def _outputs(q: torch.Tensor, w: torch.Tensor, k: torch.Tensor, dk_dtype: torch.dtype):
+    """Allocate caller-owned dQ/dW buffers and the dK output buffer."""
     return (
         torch.empty_like(q),
         torch.empty_like(w),
-        torch.empty_like(k, dtype=torch.float32),
+        torch.empty_like(k, dtype=dk_dtype),
     )
 
 
@@ -120,6 +121,12 @@ def main():
     parser.add_argument("--deterministic", action="store_true", help="Use fixed-owner dK planes and their caller-owned workspace")
     parser.add_argument("--topk-indices-global", action="store_true", help="Generate flat global KV ids, as packed DSA forward does")
     parser.add_argument(
+        "--d-index-k-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="fp32 d_index_k is the accumulator itself; bf16 runs the private column-permuted scratch plus the trailing cast",
+    )
+    parser.add_argument(
         "--profile-case",
         choices=("compact_h32", "pre_padded_h64", "eager_pad_h64"),
         default="compact_h32",
@@ -141,18 +148,26 @@ def main():
     )
     grad_loss = torch.ones((), device="cuda", dtype=torch.float32)
     l2_flush = torch.empty(256 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    workspace_bytes = deterministic_dk_workspace_bytes(args.batch, args.seqlen_k, 128) if args.deterministic else 0
+    dk_dtype = torch.float32 if args.d_index_k_dtype == "fp32" else torch.bfloat16
+    # Preallocate the caller-owned workspace so the wrapper's per-call
+    # allocation stays out of the timed region.
+    if args.deterministic:
+        workspace_bytes = deterministic_dk_workspace_bytes(args.batch, args.seqlen_k, 128)
+    elif dk_dtype == torch.bfloat16:
+        workspace_bytes = ws_align(args.batch * args.seqlen_k * 128 * 4)
+    else:
+        workspace_bytes = 0
     workspace = torch.empty(workspace_bytes, device="cuda", dtype=torch.uint8) if workspace_bytes else None
 
     attn32 = attn_base.clone()
     attn64_eager = attn_base.clone()
-    out32 = _outputs(q32, w32, k)
+    out32 = _outputs(q32, w32, k, dk_dtype)
     q64_shape = (args.batch, args.seqlen_q, 64, 128)
     w64_shape = (args.batch, args.seqlen_q, 64)
     out64_eager = (
         torch.empty(q64_shape, device=q32.device, dtype=q32.dtype),
         torch.empty(w64_shape, device=w32.device, dtype=w32.dtype),
-        torch.empty_like(k, dtype=torch.float32),
+        torch.empty_like(k, dtype=dk_dtype),
     )
 
     call_kwargs = {
@@ -179,7 +194,7 @@ def main():
             q64[:, :, :32].copy_(q32)
             w64[:, :, :32].copy_(w32)
             attn64_pre = attn_base.clone()
-            out64_pre = _outputs(q64, w64, k)
+            out64_pre = _outputs(q64, w64, k, dk_dtype)
             profile_case = (
                 "pre_padded_h64_us",
                 "dsa_indexer_bwd_pre_padded_h64",
@@ -216,9 +231,11 @@ def main():
                     },
                     "deterministic": args.deterministic,
                     "topk_indices_global": args.topk_indices_global,
+                    "d_index_k_dtype": args.d_index_k_dtype,
                     "workspace_bytes": workspace_bytes,
                 },
                 indent=2,
+                allow_nan=False,
             )
         )
         return
@@ -245,6 +262,9 @@ def main():
             timings[name].append(_time_once(label, fn, attn, attn_base, l2_flush))
 
     medians = {name: statistics.median(values) for name, values in timings.items()}
+    for name, value in medians.items():
+        if not (math.isfinite(value) and value > 0.0):
+            raise RuntimeError(f"invalid median timing for {name}: {value}")
     compact = medians["compact_h32_us"]
     baseline = medians["eager_pad_h64_us"]
     # Three GEMMs each contribute 2*B*Sq*H*D*TopK FLOPs. Report logical H32
@@ -262,6 +282,7 @@ def main():
         },
         "deterministic": args.deterministic,
         "topk_indices_global": args.topk_indices_global,
+        "d_index_k_dtype": args.d_index_k_dtype,
         "workspace_bytes": workspace_bytes,
         "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
         "samples": timings,
@@ -275,7 +296,8 @@ def main():
             "TFLOP/s uses logical H32 work: 6 * B * Sq * H * D * TopK",
         ],
     }
-    print(json.dumps(result, indent=2))
+    # allow_nan=False rejects a non-finite derived measurement at serialization.
+    print(json.dumps(result, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

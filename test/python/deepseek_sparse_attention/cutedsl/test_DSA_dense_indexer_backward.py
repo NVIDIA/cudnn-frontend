@@ -249,7 +249,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
     """Rule 8 (R2 / R9): the fp32 dK accumulator behind a bf16 d_index_k is
     carved from the caller's workspace (``scratch_workspace_bytes()``), so
     three warm executes leave the torch caching allocator's allocation count
-    unchanged; the fe_api conftest arms ``set_sync_debug_mode("error")`` around
+    unchanged; the rule8_detector conftest hook arms ``set_sync_debug_mode("error")`` around
     every execute. An fp32 d_index_k declares zero scratch. Without a workspace
     the bf16 plan raises before either score buffer is mutated."""
     major = torch.cuda.get_device_capability()[0]

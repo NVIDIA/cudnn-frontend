@@ -13,23 +13,11 @@ import inspect
 from test_utils import assert_bitwise_runs, torch_fork_set_rng
 
 from cudnn.api_base import ws_align
-from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100
+from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100_family, _require_sm100
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
     _indexer_predict_distribution,
     check_ref_indexer_backward,
 )
-
-
-def _require_sm100_family():
-    """Keep hardware-validation cases on the SM100-family parts the public gate accepts.
-
-    ``dsa_init(min_compute_capability=100)`` means "SM100 **or newer**" — it
-    compares ``major * 10 + minor`` — so an SM107/SM120 runner would fall
-    straight through it. The public gate accepts SM100 and SM103
-    (``INDEXER_BACKWARD_SM100_CAPABILITIES``), and these cases run on both.
-    """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("this hardware-validation case requires an SM100 or SM103 GPU")
 
 
 def _allocate(cfg, sm_scale: float):
@@ -78,10 +66,34 @@ def _allocate(cfg, sm_scale: float):
     return index_q, weights, index_k, attn_score, index_score, topk_indices
 
 
+def _require_indexer_backward_gpu():
+    """Skip unless the current GPU runs the sm90 or sm100 kernels."""
+    from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import INDEXER_BACKWARD_SM100_CAPABILITIES
+
+    if not torch.cuda.is_available():
+        pytest.skip("IndexerBackward requires a CUDA GPU")
+    capability = torch.cuda.get_device_capability()
+    if capability[0] != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES:
+        pytest.skip(f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}")
+
+
+# A non-unit softmax scale exercises the kernels' sm_scale fold (SM100 folds it
+# into dS; sm_scale == 1 is bit-identical either way) and keeps it runtime-only:
+# both values share one compiled kernel per shape.
+_SM_SCALE_PARAMS = pytest.mark.parametrize("sm_scale", [1.0, 128**-0.5], ids=["sm_scale_1", "sm_scale_rsqrt_d"])
+
+# The analytic grad-signal reference leaves a noise floor well below these
+# bounds, while a mis-applied sm_scale (or a dropped/doubled fold) measures far
+# outside them; the helper's loose defaults would not catch a 1.2x scale error.
+_REF_TOL = dict(cos_min=0.99, rms_rel_max=0.02)
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
+@_SM_SCALE_PARAMS
 def test_DSA_indexer_backward_wrapper(
+    sm_scale,
     dtype,
     acc_dtype,
     head_dim,
@@ -106,7 +118,7 @@ def test_DSA_indexer_backward_wrapper(
         s_q_default=128,
         s_kv_default=512,
     )
-    sm_scale = 1.0
+    _require_indexer_backward_gpu()
     # Configure loss_coeff and grad_loss so the kernel's internal
     # grad_scale = (loss_coeff / (B * S_q)) * grad_loss equals 1.0 — then
     # the reference (which uses a unit grad_scale) and the kernel agree.
@@ -133,22 +145,21 @@ def test_DSA_indexer_backward_wrapper(
     attn_score_ref = attn_score.clone()
     index_score_ref = index_score.clone()
     torch_stream.wait_stream(torch.cuda.current_stream())
-    try:
-        result = DSA.indexer_backward_wrapper(
-            index_q,
-            weights,
-            index_k,
-            attn_score,
-            index_score,
-            topk_indices,
-            sm_scale=sm_scale,
-            loss_coeff=loss_coeff,
-            grad_loss=grad_loss,
-            block_I=block_I,
-            stream=stream,
-        )
-    except (ValueError, NotImplementedError, RuntimeError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
+    # Every parametrized shape is inside the supported envelope on the gated
+    # architectures, so a raise here is a regression, not a skip.
+    result = DSA.indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale=sm_scale,
+        loss_coeff=loss_coeff,
+        grad_loss=grad_loss,
+        block_I=block_I,
+        stream=stream,
+    )
     torch_stream.synchronize()
 
     assert torch.equal(index_score, index_score_ref)
@@ -177,12 +188,14 @@ def test_DSA_indexer_backward_wrapper(
             d_index_k,
             sm_scale=sm_scale,
             grad_scale=grad_scale_expected,
+            **_REF_TOL,
         )
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_DSA_indexer_backward_wrapper_compact_h32():
+@_SM_SCALE_PARAMS
+def test_DSA_indexer_backward_wrapper_compact_h32(sm_scale):
     """SM100 keeps the public tensors at H32 while using an internal M64 tile."""
     try:
         from cudnn import DSA
@@ -198,7 +211,7 @@ def test_DSA_indexer_backward_wrapper_compact_h32():
         "qhead_per_kv_head": 32,
         "topk": 512,
     }
-    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=sm_scale)
     attn_score_ref = attn_score.clone()
     index_score_ref = index_score.clone()
 
@@ -219,7 +232,7 @@ def test_DSA_indexer_backward_wrapper_compact_h32():
         attn_score,
         index_score,
         topk_indices,
-        sm_scale=1.0,
+        sm_scale=sm_scale,
         loss_coeff=float(cfg["b"] * cfg["s_q"]),
         grad_loss=torch.ones((), dtype=torch.float32, device=index_q.device),
         block_I=128,
@@ -243,28 +256,37 @@ def test_DSA_indexer_backward_wrapper_compact_h32():
         d_index_q,
         d_weights,
         d_index_k,
-        sm_scale=1.0,
+        sm_scale=sm_scale,
         grad_scale=1.0,
+        **_REF_TOL,
     )
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "h,d,match",
+    "h,d,block_I,topk,sm_scale,match",
     [
-        pytest.param(48, 128, "requires H=32 or H>=64", id="h48"),
-        pytest.param(64, 64, "requires D=128", id="d64"),
+        pytest.param(48, 128, 128, 128, 1.0, "requires H=32 or H=64", id="h48"),
+        pytest.param(128, 128, 128, 128, 1.0, "requires H=32 or H=64", id="h128"),
+        pytest.param(64, 64, 128, 128, 1.0, "requires D=128", id="d64"),
+        pytest.param(64, 128, 64, 128, 1.0, "requires block_I=128", id="block_i64"),
+        pytest.param(64, 128, 128, 192, 1.0, "multiple of block_I", id="topk192"),
+        pytest.param(64, 128, 128, 128, 0.0, "finite sm_scale > 0", id="sm_scale_zero"),
+        pytest.param(64, 128, 128, 128, -0.5, "finite sm_scale > 0", id="sm_scale_negative"),
+        pytest.param(64, 128, 128, 128, float("nan"), "finite sm_scale > 0", id="sm_scale_nan"),
     ],
 )
-def test_DSA_indexer_backward_sm100_rejects_unsupported_heads_and_head_dim(h, d, match):
-    """The new compact contract adds H32 only, and the kernel serves D=128 only; neither silently widens the domain."""
+def test_DSA_indexer_backward_sm100_rejects_unsupported_plans(h, d, block_I, topk, sm_scale, match):
+    """check_support admits only what the SM100 kernel serves natively: H32/H64,
+    D=128, block_I=128, whole top-k blocks, and a finite positive sm_scale (the
+    relu gate reads the scaled score). Nothing reaches a kernel assert."""
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_sm100()
 
-    b, s_q, s_k, topk = 1, 1, 128, 128
+    b, s_q, s_k = 1, 1, 256
     plan = DSA.IndexerBackward(
         sample_index_q=torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda"),
         sample_weights=torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda"),
@@ -275,8 +297,8 @@ def test_DSA_indexer_backward_sm100_rejects_unsupported_heads_and_head_dim(h, d,
         sample_attn_score=torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda"),
         sample_index_score=torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda"),
         sample_topk_indices=torch.empty((b, s_q, topk), dtype=torch.int32, device="cuda"),
-        sm_scale=1.0,
-        block_I=128,
+        sm_scale=sm_scale,
+        block_I=block_I,
     )
     with pytest.raises(ValueError, match=match):
         plan.check_support()
@@ -357,10 +379,9 @@ _IDXBWD_SM_SCALE = 1.0
 def _import_dsa():
     try:
         from cudnn import DSA
-        from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    return DSA, cuda
+    return DSA
 
 
 def _idxbwd_inputs():
@@ -398,7 +419,7 @@ def test_DSA_indexer_backward_illegal_output_dtype_raises_before_mutation():
     """Each illegal output dtype raises ValueError, and the raise happens
     before kernel 1 overwrites attn_score (index_score is always read-only)."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     for label, kw in (
         ("fp32 d_index_q", {"d_index_q_dtype": torch.float32}),
@@ -435,7 +456,7 @@ def test_DSA_indexer_backward_fp32_dindexk_zeroed_internally():
     atomic-adds), so the result is independent of the buffer's incoming
     contents — a nonzero buffer does NOT return old + gradient."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
 
@@ -468,7 +489,7 @@ def test_DSA_indexer_backward_bf16_dindexk_matches_fp32_accumulator():
     un-permuted by the trailing cast; an fp32 d_index_k is accumulated in the
     natural layout. Both must hold the same gradient, column for column."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
     common = dict(sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128)
@@ -511,7 +532,7 @@ def test_DSA_indexer_backward_direct_plan_shape_stride_mismatch_raises():
     stride/layout differs from the descriptor it was compiled for, raising a
     clean ValueError BEFORE kernel 1 overwrites attn_score (no fail-dirty)."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
 
@@ -566,7 +587,7 @@ def test_DSA_indexer_backward_wrapper_cache_hit_stride_mismatch_raises():
     non-contiguous score buffer via the cached plan's execute-time signature
     check, before kernel 1 mutates either score buffer (no fail-dirty)."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
 
@@ -596,7 +617,7 @@ def test_DSA_indexer_backward_wrong_shape_plan_rejected_before_kernel1():
     silently run on a mismatched signature that only faults in the GEMM. Covers
     both the wrapper (cache miss) and a directly-built plan. Fail-hard."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
     b, s_q, h, _ = iq.shape
@@ -645,7 +666,7 @@ def test_DSA_indexer_backward_noncontiguous_index_k_plan_rejected():
     non-compact plan would be silently mis-addressed. Covers a directly-built
     plan and a wrapper first call (rejected before kernel 1). Fail-hard."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
 
@@ -688,7 +709,7 @@ def test_DSA_indexer_backward_wrong_ndim_rejected():
     with a clean ValueError (not a cryptic tuple-unpack error) by both the
     wrapper (before any allocation) and a directly-built plan."""
     _require_sm100()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
 
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = _idxbwd_inputs()
     common = dict(sm_scale=_IDXBWD_SM_SCALE, loss_coeff=loss_coeff, grad_loss=grad_loss, block_I=128)
@@ -723,13 +744,6 @@ def test_DSA_indexer_backward_wrong_ndim_rejected():
 # ===========================================================================
 
 
-def _require_indexer_backward_gpu():
-    """Skip unless the current GPU runs the sm90 or sm100 kernels."""
-    major = torch.cuda.get_device_capability()[0]
-    if major != 9 and major < 10:
-        pytest.skip("IndexerBackward requires SM90 or SM100+")
-
-
 def _build_plan(DSA, dk_dtype, inputs):
     """A checked, compiled IndexerBackward plus its output buffers (bf16 dW: the
     kernel stores dW in bf16 only)."""
@@ -760,11 +774,11 @@ _DK_DTYPE_PARAMS = pytest.mark.parametrize("dk_dtype", [torch.bfloat16, torch.fl
 @_DK_DTYPE_PARAMS
 def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allocates_nothing):
     """R9: with the caller's workspace, three warm executes leave the torch
-    caching allocator's allocation count unchanged; the fe_api conftest arms
+    caching allocator's allocation count unchanged; the rule8_detector conftest hook arms
     ``torch.cuda.set_sync_debug_mode("error")`` around every execute, so a
     host sync fails the test too. ``compile()`` allocates nothing (R11)."""
     _require_indexer_backward_gpu()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
     inputs = _idxbwd_inputs()
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
     plan, (dq, dw, dk) = _build_plan(DSA, dk_dtype, inputs)
@@ -801,7 +815,7 @@ def test_bf16_d_index_k_requires_workspace():
     overwrites attn_score, and an undersized buffer is rejected the same way.
     An fp32 d_index_k needs no scratch at all."""
     _require_indexer_backward_gpu()
-    DSA, _ = _import_dsa()
+    DSA = _import_dsa()
     inputs = _idxbwd_inputs()
     iq, w, ik, attn, idx, tk, loss_coeff, grad_loss = inputs
     b, s_k, d = ik.shape
@@ -1468,16 +1482,16 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(s_q, topk):
     )
 
 
-_DEFAULT_CAPABILITY_ERROR = (ValueError, "deterministic IndexerBackward requires capability")
+_DETERMINISTIC_CAPABILITY_ERROR = (ValueError, "deterministic IndexerBackward requires capability")
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "capability,error",
     [
-        pytest.param((9, 0), _DEFAULT_CAPABILITY_ERROR, id="sm90"),
+        pytest.param((9, 0), _DETERMINISTIC_CAPABILITY_ERROR, id="sm90"),
         pytest.param((10, 3), None, id="sm103"),
-        pytest.param((10, 7), _DEFAULT_CAPABILITY_ERROR, id="sm107"),
+        pytest.param((10, 7), _DETERMINISTIC_CAPABILITY_ERROR, id="sm107"),
     ],
 )
 @torch_fork_set_rng(seed=1707)
@@ -1501,6 +1515,58 @@ def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capabil
         sample_index_score=index_score,
         sample_topk_indices=topk_indices,
         deterministic=True,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+
+    attn_before = attn_score.clone()
+    if error is None:
+        assert plan.check_support()
+    else:
+        with pytest.raises(error[0], match=error[1]):
+            plan.check_support()
+    assert torch.equal(attn_score, attn_before)
+
+
+_ARCH_ERROR = (RuntimeError, "IndexerBackward requires SM90 or capability in")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "capability,heads,error",
+    [
+        pytest.param((9, 0), 64, None, id="sm90-h64"),
+        pytest.param((9, 0), 32, (ValueError, "SM90 IndexerBackward requires H>=64"), id="sm90-h32"),
+        pytest.param((10, 0), 32, None, id="sm100-h32"),
+        pytest.param((10, 3), 64, None, id="sm103-h64"),
+        pytest.param((10, 7), 64, _ARCH_ERROR, id="sm107"),
+        pytest.param((12, 0), 64, _ARCH_ERROR, id="sm120"),
+        pytest.param((8, 0), 64, _ARCH_ERROR, id="sm80"),
+    ],
+)
+@torch_fork_set_rng(seed=1708)
+def test_DSA_indexer_backward_architecture_gate(monkeypatch, capability, heads, error):
+    """Ordinary execution admits SM90 and the validated SM100-family devices only
+    (the SM100 kernel is a TCGEN05/TMEM design), and applies each arch's head
+    contract, all before ``attn_score`` is touched."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to build IndexerBackward tensor descriptors")
+
+    cfg = dict(b=1, s_q=2, s_kv=128, head_dim=128, qhead_per_kv_head=heads, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=torch.empty_like(index_q),
+        sample_d_weights=torch.empty_like(weights),
+        sample_d_index_k=torch.empty_like(index_k),
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
 
@@ -1584,6 +1650,43 @@ def test_DSA_indexer_backward_wrapper_keyword_only_signature():
     assert bound_deterministic.arguments["deterministic"] is True
     bound_planes = sig.bind(*sentinels, deterministic=True, deterministic_dk_planes=148)
     assert bound_planes.arguments["deterministic_dk_planes"] == 148
+
+
+@pytest.mark.L0
+def test_DSA_indexer_backward_plan_keyword_only_signature():
+    """``IndexerBackward``'s execution-policy options are keyword-only after
+    ``topk_indices_global``. That slot used to hold the removed ``backend``
+    selector, so a stale positional caller must raise ``TypeError`` instead of
+    binding its backend string to ``deterministic``."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    sig = inspect.signature(DSA.IndexerBackward.__init__)
+    params = sig.parameters
+    positional = [name for name, p in params.items() if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+    assert positional == [
+        "self",
+        "sample_index_q",
+        "sample_weights",
+        "sample_index_k",
+        "sample_d_index_q",
+        "sample_d_weights",
+        "sample_d_index_k",
+        "sample_attn_score",
+        "sample_index_score",
+        "sample_topk_indices",
+        "sm_scale",
+        "block_I",
+        "topk_indices_global",
+    ]
+    keyword_only = [name for name, p in params.items() if p.kind is inspect.Parameter.KEYWORD_ONLY]
+    assert keyword_only == ["deterministic", "deterministic_dk_planes"]
+
+    sentinels = [object() for _ in positional]
+    with pytest.raises(TypeError):
+        sig.bind(*sentinels, "default")
 
 
 @pytest.mark.L0
@@ -1695,7 +1798,6 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
             heads=64,
             block_I=128,
             topk=topk,
-            total_seqlen_k=512,
             total_rows=sm_count,
             persistent_grid_size=sm_count,
             topk_indices_global=True,
@@ -1705,7 +1807,6 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
             heads=64,
             block_I=128,
             topk=topk,
-            total_seqlen_k=512,
             total_rows=sm_count + 1,
             persistent_grid_size=sm_count,
             topk_indices_global=True,
@@ -1735,7 +1836,6 @@ def test_DSA_indexer_backward_sm100_local_ids_use_tma_gather(topk):
         heads=64,
         block_I=128,
         topk=topk,
-        total_seqlen_k=8192,
         total_rows=sm_count + 1,
         persistent_grid_size=sm_count,
         topk_indices_global=False,
@@ -1790,7 +1890,7 @@ def test_DSA_indexer_backward_sm100_score_grad_packed_rows_and_fused_dk_zero(top
         block_I=128,
         topk_indices_global=True,
     )
-    kernel.score_grad_zero(
+    kernel.score_grad(
         actual,
         predict,
         grad_loss,

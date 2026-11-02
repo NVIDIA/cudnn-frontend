@@ -12,7 +12,7 @@ Combines backend-specific CuTe-DSL kernels:
 In ordinary execution, a bf16 ``dIndexK`` output receives a trailing pure-torch
 cast from its FP32 accumulator (kernel 3); an fp32 ``dIndexK`` buffer is the
 accumulator itself. The ordinary fp32 accumulator behind a bf16 ``dIndexK`` is
-carved from the caller's workspace; the default SM100 kernel accumulates that
+carved from the caller's workspace; the SM100 kernel accumulates that
 private buffer in a column-permuted layout which the same cast restores.
 Deterministic execution instead uses a compile-time-selected set of
 CTA-private FP32 dK planes and a fixed-order reduction that converts directly to
@@ -23,6 +23,7 @@ the requested output dtype.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Optional
 
@@ -30,7 +31,6 @@ import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.tensor_adapter import has_tcgen05
-from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
 
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
@@ -221,9 +221,10 @@ class IndexerBackward(APIBase):
        avoid a fail-dirty.
     2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score``
        with ``grad_signal`` and reads ``index_score`` without modifying it).
-    3. fp32 dK accumulator zero-init — ordinary execution folds this clear into
-       kernel 1, so the atomic-add epilogue starts from zero without a separate
-       launch. An fp32 ``d_index_k`` buffer is the target directly; a bf16
+    3. fp32 dK accumulator zero-init — on SM100 ordinary execution folds this
+       clear into kernel 1, so the atomic-add epilogue starts from zero without
+       a separate launch; SM90 issues a memset on the launch stream before
+       kernel 1. An fp32 ``d_index_k`` buffer is the target directly; a bf16
        ``d_index_k`` buffer instead accumulates into a ``B * S_k * D`` fp32
        view carved from the caller's ``workspace`` and receives a trailing cast
        (kernel 3; on SM100 the private accumulator is column-permuted and the
@@ -273,10 +274,17 @@ class IndexerBackward(APIBase):
         sm_scale: float = 1.0,
         block_I: int = 128,
         topk_indices_global: bool = False,
+        *,
         deterministic: bool = False,
         deterministic_dk_planes: int = DEFAULT_DK_PLANES,
     ):
-        """Capture a shape-specialized plan and its execution policy."""
+        """Capture a shape-specialized plan and its execution policy.
+
+        ``deterministic`` and ``deterministic_dk_planes`` are keyword-only: the
+        slot after ``topk_indices_global`` used to hold the removed ``backend``
+        selector, and a stale positional caller must fail loudly instead of
+        binding its backend string to ``deterministic``.
+        """
         super().__init__()
         self.iq_desc = self._make_tensor_desc(sample_index_q, name="sample_index_q")
         self.w_desc = self._make_tensor_desc(sample_weights, name="sample_weights")
@@ -388,24 +396,50 @@ class IndexerBackward(APIBase):
         # which check the current device themselves.
         capability = torch.cuda.get_device_capability(self.iq_desc.device if self.deterministic else None)
         major, _ = capability
-        self._runtime_error_if(
-            major != 9 and not has_tcgen05(major),
-            f"IndexerBackward requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{major}",
-        )
-        if major >= 10:
-            self._value_error_if(
-                self.heads != 32 and self.heads < 64,
-                f"the default SM100 IndexerBackward requires H=32 or H>=64, got H={self.heads}",
-            )
-            # The reduce warpgroup's TMEM fragment map and dK scratch layouts
-            # cover exactly 128 columns.
-            self._value_error_if(
-                self.head_dim != 128,
-                f"the default SM100 IndexerBackward requires D=128, got D={self.head_dim}",
-            )
         self._value_error_if(
             self.deterministic and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
             f"deterministic IndexerBackward requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, " f"found {capability}",
+        )
+        # The SM100 kernel is a TCGEN05/TMEM design; admit only the SM100-family
+        # devices it is validated on rather than every major >= 10.
+        self._runtime_error_if(
+            major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+            f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
+        )
+        if major == 9:
+            # The SM90 warpgroup GEMMs tile the head dimension in M64 steps.
+            self._value_error_if(
+                self.heads < 64,
+                f"SM90 IndexerBackward requires H>=64, got H={self.heads}",
+            )
+        else:
+            # TCGEN05 needs a legal M (64), so only H64 and the compact H32
+            # (zero-padded to M64 inside the kernel) are served.
+            self._value_error_if(
+                self.heads not in (32, 64),
+                f"SM100 IndexerBackward requires H=32 or H=64, got H={self.heads}",
+            )
+        # The reduce warpgroup's TMEM fragment map and dK scratch layouts
+        # cover exactly 128 columns.
+        self._value_error_if(
+            self.head_dim != 128,
+            f"IndexerBackward requires D=128, got D={self.head_dim}",
+        )
+        # The TMEM S/dK tiles and the SM90 staging buffers are sized for
+        # 128-wide top-k blocks, and the kernels iterate whole blocks only.
+        self._value_error_if(
+            self.block_I != 128,
+            f"IndexerBackward requires block_I=128, got block_I={self.block_I}",
+        )
+        self._value_error_if(
+            self.topk <= 0 or self.topk % self.block_I != 0,
+            f"IndexerBackward requires a positive top-k that is a multiple of block_I={self.block_I}, got topk={self.topk}",
+        )
+        # The relu gate reads the scaled score, which matches the forward's
+        # ``sm_scale * sum(relu(q.k) * w)`` only for a positive scale.
+        self._value_error_if(
+            not (math.isfinite(self.sm_scale) and self.sm_scale > 0.0),
+            f"IndexerBackward requires a finite sm_scale > 0, got sm_scale={self.sm_scale}",
         )
         if self.deterministic:
             deterministic_descs = (
@@ -424,18 +458,9 @@ class IndexerBackward(APIBase):
                     desc.device != self.iq_desc.device,
                     f"deterministic IndexerBackward requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                 )
-            deterministic_heads = (32, 64)
             self._value_error_if(
-                self.heads not in deterministic_heads or self.head_dim != 128,
-                "deterministic IndexerBackward requires " f"H in {deterministic_heads}, D=128, got H={self.heads}, D={self.head_dim}",
-            )
-            self._value_error_if(
-                self.block_I != 128,
-                f"deterministic IndexerBackward requires block_I=128, got block_I={self.block_I}",
-            )
-            self._value_error_if(
-                self.topk % 128 != 0 or not (128 <= self.topk <= 2048),
-                "deterministic IndexerBackward requires topk % 128 == 0 with " f"128 <= topk <= 2048, got topk={self.topk}",
+                self.topk > 2048,
+                f"deterministic IndexerBackward requires topk <= 2048, got topk={self.topk}",
             )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
         self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
@@ -478,42 +503,33 @@ class IndexerBackward(APIBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        # indexer_backward_sm100 returns a closure whose GEMM stage lazy-
-        # compiles on first call. ``grad_scale`` is supplied at execute()
-        # time — passing it to the factory is a no-op now that it's not
-        # part of the cache key, and it's been removed from the factory
-        # signature.
+        # The factories return a closure whose GEMM stage lazy-compiles on
+        # first call; ``grad_scale`` is a runtime argument of execute().
+        # Deterministic plans build under the plan's device (their capability
+        # gate read it); the ordinary path follows the current device, as the
+        # factories' own architecture checks do.
         if self.deterministic:
-            with torch.cuda.device(self.iq_desc.device):
-                self._compiled_kernel = indexer_backward_sm100(
-                    self.batch,
-                    self.seqlen,
-                    self.seqlen_k,
-                    self.heads,
-                    self.head_dim,
-                    self.topk,
-                    sm_scale=self.sm_scale,
-                    block_I=self.block_I,
-                    topk_indices_global=self.topk_indices_global,
-                    deterministic=True,
-                    deterministic_dk_planes=self.deterministic_dk_planes,
-                )
-            return
-        # Ordinary default path: capability from the current device, unchanged
-        # from the pre-deterministic code (the specialized branches returned).
-        major, _ = torch.cuda.get_device_capability()
-        kernel_factory = indexer_backward_sm90 if major == 9 else indexer_backward_sm100
-        self._compiled_kernel = kernel_factory(
-            self.batch,
-            self.seqlen,
-            self.seqlen_k,
-            self.heads,
-            self.head_dim,
-            self.topk,
-            sm_scale=self.sm_scale,
-            block_I=self.block_I,
-            topk_indices_global=self.topk_indices_global,
-        )
+            kernel_factory, extra, device_scope = (
+                indexer_backward_sm100,
+                {"deterministic": True, "deterministic_dk_planes": self.deterministic_dk_planes},
+                torch.cuda.device(self.iq_desc.device),
+            )
+        else:
+            major, _ = torch.cuda.get_device_capability()
+            kernel_factory, extra, device_scope = (indexer_backward_sm90 if major == 9 else indexer_backward_sm100), {}, contextlib.nullcontext()
+        with device_scope:
+            self._compiled_kernel = kernel_factory(
+                self.batch,
+                self.seqlen,
+                self.seqlen_k,
+                self.heads,
+                self.head_dim,
+                self.topk,
+                sm_scale=self.sm_scale,
+                block_I=self.block_I,
+                topk_indices_global=self.topk_indices_global,
+                **extra,
+            )
 
     def scratch_workspace_bytes(self) -> int:
         """Return caller-owned scratch bytes for the selected dK policy.
@@ -909,8 +925,9 @@ def indexer_backward_wrapper(
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
             on SM100/SM103. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. H32 and H64 are supported with the 128-multiple
-            top-k contract. A warmed plan with preallocated outputs
+            ``d_index_k``. Requires SM100/SM103, H in {32, 64}, D=128,
+            block_I=128, and topk % 128 == 0 with 128 <= topk <= 2048. A
+            warmed plan with preallocated outputs
             and workspace remains CUDA Graph compatible. Valid top-k indices
             within each query row must be unique.
         deterministic_dk_planes: compile-time deterministic producer-grid and

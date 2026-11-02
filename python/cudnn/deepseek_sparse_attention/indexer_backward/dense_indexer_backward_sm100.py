@@ -66,7 +66,6 @@ from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.utils.blackwell_helpers import (
     make_trivial_tiled_mma as _make_trivial_tiled_mma,
@@ -251,7 +250,6 @@ class ScoreGradDense:
         seq_local = cute.arch.block_idx()[0]
         batch_idx = cute.arch.block_idx()[1]
         warp_id = tidx // self.WARP_SIZE
-        lane_id = tidx % self.WARP_SIZE
 
         is_varlen = const_expr(mCuSeqlensQ is not None)
 
@@ -802,8 +800,6 @@ class DenseIndexerBackward2QGemmSm100:
         sK_size = cute.cosize(sK_layout)
         sdS_size = cute.cosize(sdS_layout)
 
-        _elem_bytes = self.q_dtype.width // 8
-
         @cute.struct
         class SharedStorage:
             Q_q0_mbar: cute.struct.MemRange[cutlass.Int64, 2]  # 1-stage TMA: producer+consumer
@@ -828,7 +824,6 @@ class DenseIndexerBackward2QGemmSm100:
         Q_q1_mbar_ptr = storage.Q_q1_mbar.data_ptr()
         K_mbar_ptr = storage.K_mbar.data_ptr()
         mbar = storage.mbar.data_ptr()
-        tmem_holding_buf = storage.tmem_holding_buf.ptr
         tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -1396,7 +1391,6 @@ class DenseIndexerBackward2QGemmSm100:
 
         dk_empty_phase = Int32(0)
         ds_ready_phase = Int32(0)
-        s_full_phase = Int32(0)
         is_first_dq_q0 = True
         is_first_dq_q1 = True
 

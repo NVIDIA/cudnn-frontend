@@ -804,11 +804,20 @@ indexer tower:
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
-3. In ordinary execution, a pure-torch dtype cast (kernel 3) converts
-   `dIndexK_f32` to a BF16 output. On SM100 and SM103 that private accumulator
+3. In ordinary execution with a BF16 `d_index_k`, a pure-torch copy (kernel 3)
+   casts `dIndexK_f32` to BF16; an fp32 `d_index_k` is the accumulator itself
+   and needs no kernel 3. On SM100 and SM103 that private BF16-path accumulator
    is column-permuted, so kernel 2 can issue 16-byte reductions straight from
-   registers without SMEM staging; the same cast restores the natural order. Deterministic execution instead uses the
-   fixed-order reduction below to write the requested output dtype directly.
+   registers without SMEM staging; the same copy restores the natural order.
+   Deterministic execution instead uses the fixed-order reduction below to
+   write the requested output dtype directly.
+
+`IndexerBackward` / `indexer_backward_wrapper` run on SM90 and on SM100/SM103.
+`check_support` admits `D == 128`, `block_I == 128`, a positive top-k that is a
+multiple of `block_I` (callers with other logical extents pad the top-k tensors
+with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103
+additionally require `H in {32, 64}` and SM90 requires `H >= 64`. `d_index_q`
+and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
 
 With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
 grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
@@ -819,7 +828,8 @@ and dW stores remain single-writer.
 
 The plan owns no device memory. For non-deterministic execution, an fp32
 `d_index_k` is the accumulator itself (zeroed on the launch stream inside
-`execute`); a BF16 `d_index_k` accumulates into a `B * S_k * D` fp32 view carved
+`execute`: fused into the score-grad kernel on SM100, a memset on SM90; the
+BF16 scratch is cleared the same way, so callers never pre-zero); a BF16 `d_index_k` accumulates into a `B * S_k * D` fp32 view carved
 from the caller's workspace. `IndexerBackward.scratch_workspace_bytes()` reports
 that ordinary scratch size (0 for fp32 `d_index_k`).
 `execute(..., workspace=)` takes the uint8 buffer on `index_q.device`, and a

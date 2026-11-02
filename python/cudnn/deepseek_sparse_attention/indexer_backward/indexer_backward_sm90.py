@@ -43,8 +43,6 @@ Grid: (seqlen, batch, 1). Each CTA handles one query position.
 from __future__ import annotations
 
 import math
-from functools import partial
-from typing import Optional
 
 import cuda.bindings.driver as cuda
 import torch
@@ -69,7 +67,6 @@ from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import (
     gemm,
-    gemm_zero_init,
     make_smem_layout,
 )
 from cudnn.deepseek_sparse_attention.utils.sm90.primitives import transpose_view
@@ -740,8 +737,6 @@ class IndexerBackwardSm90:
         tDQrKt_s1 = thr_mma3.make_fragment_B(thr_mma3.partition_B(sKt_s1_half))
         tDQrKt_s2 = thr_mma3.make_fragment_B(thr_mma3.partition_B(sKt_s2_half))
         dq_acc_shape = tmma3.partition_shape_C(self.gemm3_tiler_half)
-        cDQ_half = cute.make_identity_tensor(self.gemm3_tiler_half)
-        tCcDQ_half = thr_mma3.partition_C(cDQ_half)
 
         sdS_view = cute.composition(sdS, cute.make_layout((self.heads_padded, self.block_I)))
 
@@ -772,8 +767,6 @@ class IndexerBackwardSm90:
                 sDwPartial[idx] = Float32(0.0)
         cute.arch.fence_view_async_shared()
         self.compute_sync_barrier.arrive_and_wait()
-
-        n_offset = compute_wg_idx * self.half_block_I
 
         # shared-mem store dK staging: partition sdK_staging using GEMM2's MMA layout
         sdK_staging_half = cute.local_tile(sdK_staging, (64, self.block_I), (compute_wg_idx, 0))
@@ -1397,11 +1390,7 @@ def indexer_backward_sm90(
     # single compiled kernel serves every shape. Keying them would force
     # recompiles under varlen / changing batch.
     #
-    # Use probability-domain score input (predict) to match SM100 convention.
-    # The kernel implements both modes behind const_expr(index_is_log); the
-    # unified predict path keeps the SM90 and SM100 dispatcher data flows
-    # identical. ``score_input_is_log`` is const_expr-branched, so it IS keyed.
-    score_input_is_log = False
+    # The score input is the probability-domain predict, matching SM100.
     return _build_cute_dsl_kernel(
         seqlen,
         seqlen_k,
@@ -1410,7 +1399,6 @@ def indexer_backward_sm90(
         topk,
         sm_scale,
         block_I,
-        score_input_is_log=score_input_is_log,
         topk_indices_global=topk_indices_global,
     )
 
@@ -1420,9 +1408,8 @@ class ScoreGradSm90:
 
     THREADS_PER_CTA = 128
 
-    def __init__(self, topk: int, index_is_log: bool):
+    def __init__(self, topk: int):
         self.topk = topk
-        self.index_is_log = index_is_log
 
     @cute.jit
     def __call__(
@@ -1472,12 +1459,8 @@ class ScoreGradSm90:
             if pos < self.topk:
                 target = Float32(mAttnScore[seq_idx, pos, batch_idx])
                 target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-                if const_expr(self.index_is_log):
-                    log_predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    log_clip_mask = Float32(1.0) if log_predict >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                else:
-                    predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
+                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 local_sum += -target_eff * log_clip_mask * grad_scale_f32
 
         thread_sums[tidx] = local_sum
@@ -1496,13 +1479,8 @@ class ScoreGradSm90:
             if pos < self.topk:
                 target = Float32(mAttnScore[seq_idx, pos, batch_idx])
                 target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-                if const_expr(self.index_is_log):
-                    log_predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    predict = cute.math.exp(log_predict, fastmath=True)
-                    log_clip_mask = Float32(1.0) if log_predict >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                else:
-                    predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
+                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 g_i = -target_eff * log_clip_mask * grad_scale_f32
                 mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
 
@@ -1512,7 +1490,6 @@ def _score_grad_inplace_cute(
     IndexScore,
     GradLoss,
     grad_scale,
-    index_is_log: bool = False,
     current_stream=None,
 ):
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D; defend direct
@@ -1521,13 +1498,10 @@ def _score_grad_inplace_cute(
         GradLoss = GradLoss.reshape(1)
 
     _, _, topk = AttnScore.shape
-    compile_key = (topk, bool(index_is_log))
+    compile_key = topk
     s = _resolve_stream(current_stream)
     if compile_key not in _score_grad_cute_cache:
-        kernel_obj = ScoreGradSm90(
-            topk=topk,
-            index_is_log=bool(index_is_log),
-        )
+        kernel_obj = ScoreGradSm90(topk=topk)
         _score_grad_cute_cache[compile_key] = cute.compile(
             kernel_obj,
             to_cute_tensor(AttnScore),
@@ -1552,7 +1526,6 @@ def _score_grad_inplace(
     IndexScore,
     GradLoss,
     grad_scale,
-    index_is_log: bool = False,
     current_stream=None,
 ):
     """Kernel 1: Compute clipped-log KL grad_signal from target/predict.
@@ -1586,7 +1559,6 @@ def _score_grad_inplace(
         IndexScore,
         GradLoss,
         grad_scale,
-        index_is_log=index_is_log,
         current_stream=current_stream,
     )
 
@@ -1599,7 +1571,6 @@ def _build_cute_dsl_kernel(
     topk,
     sm_scale,
     block_I,
-    score_input_is_log=True,
     topk_indices_global: bool = True,
 ):
     cap = torch.cuda.get_device_capability()[0]
@@ -1620,7 +1591,7 @@ def _build_cute_dsl_kernel(
     # ``seqlen``/``seqlen_k``/``sm_scale`` are NOT keyed: they're forwarded as
     # runtime ``cutlass.Int32``/``Float32`` args below (seqlen* unused on the
     # sparse path).
-    compile_key = (heads, dim, topk, block_I, score_input_is_log, topk_indices_global)
+    compile_key = (heads, dim, topk, block_I, topk_indices_global)
 
     def _ensure_compiled(
         IndexQ,
@@ -1744,7 +1715,6 @@ def _build_cute_dsl_kernel(
             IndexScore,
             GradLoss,
             grad_scale,
-            index_is_log=score_input_is_log,
             current_stream=current_stream,
         )
         _run_gemm_only(
@@ -1762,8 +1732,6 @@ def _build_cute_dsl_kernel(
             with _torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
-    _run.score_grad = partial(_score_grad_inplace, index_is_log=score_input_is_log)
     _run.gemm_only = _run_gemm_only
-    _run.score_input_is_log = score_input_is_log
 
     return _run

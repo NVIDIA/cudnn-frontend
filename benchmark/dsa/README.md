@@ -223,9 +223,10 @@ estimate and does not guarantee allocation success.
 
 ### Compact-H32 Indexer Backward
 
-`benchmark_dsa_indexer_h32.py` measures the default SM100 indexer-backward
-wrapper with compact H32 tensors against caller-side
-`torch.nn.functional.pad` to H64. Outputs are preallocated, H64 output slicing
+`benchmark_dsa_indexer_h32.py` measures the SM100 indexer-backward wrapper
+with compact H32 tensors against caller-side `torch.nn.functional.pad` to H64
+(fp32 `d_index_k` by default; `--d-index-k-dtype bf16` measures the BF16
+scratch path with a preallocated workspace). Outputs are preallocated, H64 output slicing
 is excluded, case order is rotated, and L2 is flushed before each CUDA-event
 sample. The script validates the H64 result against the compact path before
 timing. Profile mode also exposes already-padded H64 inputs as a kernel-only
