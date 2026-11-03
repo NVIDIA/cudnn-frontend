@@ -408,7 +408,9 @@ def pooled_sparse_attention_backward_with_teacher(
 
     Same layouts as ``pooled_sparse_attention_backward``; ``target`` is
     (B, S, K) FP32, renormalized over the valid pools (zero rows when a query
-    has no complete pool). Returns ``{'dq', 'dkv', 'd_sink', 'target', 'token_ids', 'topk_length'}``.
+    has no complete pool) and accumulated in fp32 across the attention head
+    blocks (bit-reproducible up to 128 heads); ordinary, non-deterministic
+    execution only. Returns ``{'dq', 'dkv', 'd_sink', 'target', 'token_ids', 'topk_length'}``.
     """
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as _iface
     from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common import flash_attn_bwd_sm100_workspace_size

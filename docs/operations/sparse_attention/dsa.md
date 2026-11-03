@@ -1003,7 +1003,8 @@ are excluded. ``pooled_indexer_backward`` consumes ``target`` in place and recom
 
 The underlying kernels take two options used by this composition: ``sparse_attn_score_recompute_wrapper(..., pool_size=P)`` emits the
 per-pool sums directly, and ``SparseAttentionBackward`` on SM100 accepts ``pool_target``/``pool_size`` to emit them from the backward's
-own probabilities. Supported on SM100-class GPUs with the generic single-CTA backward backend; ``pool_size`` 4 and 16 are supported.
+own probabilities, accumulating fp32 partials across the attention head blocks (bit-reproducible up to two blocks, i.e. 128 heads);
+the option is not available with ``deterministic=True``. Supported on SM100-class GPUs with the generic single-CTA backward backend; ``pool_size`` 4 and 16 are supported.
 
 ## Limitations
 
