@@ -433,8 +433,8 @@ class KdaHopperCudaEngine(BaseEngine):
             raise NotImplementedError(
                 "KdaHopperCudaEngine: composed context-parallel summaries and the composed_initial_state row (the fold into the boundary state row) are FROST-only"
             )
-        if getattr(facts, "intermediate_ports", ()):
-            raise NotImplementedError(f"KdaHopperCudaEngine: the backward summary's intermediates ({', '.join(facts.intermediate_ports)}) is FROST-only")
+        if facts.output_context or facts.input_context:
+            raise NotImplementedError("KdaHopperCudaEngine: the summaries' context is FROST-only")
         if facts.is_bwd and (facts.safe_gate or facts.has_a_log or facts.has_dt_bias):
             raise NotImplementedError("KdaHopperCudaEngine: the kernel takes log-space g directly; " "safe_gate/a_log/dt_bias are unsupported")
         # The forward kernel applies the q/k L2 norm, the safe gate and the beta

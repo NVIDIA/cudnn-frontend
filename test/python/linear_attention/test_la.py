@@ -4304,7 +4304,7 @@ CHAIN_GATE_MODES = ("l2norm", "safe", "sigmoid_beta", "neg_eigval", "beta_guard"
 @pytest.fixture(autouse=True)
 def open_chain_floor(request, monkeypatch):
     """``test_piece_chain_*`` and the ``schedule="chain"`` cases test the chain itself, so they chain wherever the slot
-    budget allows, below the KDA ``chain_min_tokens`` floor too."""
+    budget allows, below the ``chain_min_tokens`` floor too."""
     callspec = getattr(request.node, "callspec", None)
     if request.node.originalname.startswith("test_piece_chain_") or (callspec is not None and callspec.params.get("schedule") == "chain"):
         from cudnn.linear_attention.frost.common import piece_chain
@@ -5404,7 +5404,7 @@ def test_graph_api_summary_node_matches_op(backend, variant, with_state, summary
     attrs = dict(output_transition=True)
     if variant in HOUSEHOLDER_VARIANTS:
         attrs["num_householder"] = case.n
-    fs_t, transition_t = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
+    fs_t, transition_t, *_ = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
     fs_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     build_and_pin(graph, f"{variant}_summary_frost")
@@ -5440,7 +5440,7 @@ def test_graph_api_summary_bwd_node_matches_op(backend, variant, with_seed, summ
     attrs = dict(scale=1.0 / math.sqrt(K), output_transition=True)
     if variant in HOUSEHOLDER_VARIANTS:
         attrs["num_householder"] = case.n
-    x_t, transition_t = getattr(graph, f"{variant}_summary_bwd")(**ports, **attrs, name="summary_bwd")
+    x_t, transition_t, *_ = getattr(graph, f"{variant}_summary_bwd")(**ports, **attrs, name="summary_bwd")
     x_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     build_and_pin(graph, f"{variant}_summary_frost")
@@ -5856,7 +5856,7 @@ def test_state_indices_split_graph_bitwise(backend, padded):
     inputs.update(cu_seqlens=case.cu, initial_state=pool, state_indices=slots)
     graph = cudnn.pygraph()
     ports = {name: graph.tensor(list(t.shape), stride=list(t.stride()), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
-    o_port, fs_port, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
+    o_port, fs_port, _, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
     o = torch.empty_like(o_ref)
     o_port.set_output(True).set_data_type(CUDNN_DTYPE[o.dtype])
     fs_port.set_output(True).set_data_type(CUDNN_DTYPE[final_pool.dtype])
@@ -5918,7 +5918,7 @@ def test_summary_graph_mixed_state_dtypes(backend, variant, shape):
         attrs = dict(output_transition=True)
         if variant in HOUSEHOLDER_VARIANTS:
             attrs["num_householder"] = case.n
-        fs_t, transition_t = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
+        fs_t, transition_t, *_ = getattr(graph, f"{variant}_summary")(**ports, **attrs, name="summary")
         fs_t.set_output(True).set_data_type(CUDNN_DTYPE[fs_dtype])
         transition_t.set_output(True).set_data_type(CUDNN_DTYPE[transition_dtype])
         build_and_pin(graph, f"{variant}_summary_frost")
@@ -5947,7 +5947,7 @@ def test_state_indices_graph_declines_wrong_table_shape(backend):
         graph = cudnn.pygraph()
         ports = {name: graph.tensor(list(t.shape), stride=list(t.stride()), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
         ports["state_indices"] = graph.tensor(list(bad.shape), stride=list(bad.stride()), data_type=CUDNN_DTYPE[bad.dtype], name="state_indices")
-        o_port, fs_port, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
+        o_port, fs_port, _, _ = graph.gdn(**ports, scale=1.0 / math.sqrt(case.K), output_final_state=True, name="gdn")
         o_port.set_output(True).set_data_type(CUDNN_DTYPE[torch.bfloat16])
         fs_port.set_output(True).set_data_type(CUDNN_DTYPE[torch.float32])
         graph.validate()
@@ -6224,15 +6224,15 @@ def cp_forward_apply(case, leaves, cu, h_pre, m_pre, checkpoint_every_n_tokens=0
     return o, composed, checkpoints
 
 
-def cp_backward_prepare(case, leaves, cu, dO, output_intermediates=False, checkpoint_every_n_tokens=0, **op_kw):
+def cp_backward_prepare(case, leaves, cu, dO, output_context=False, checkpoint_every_n_tokens=0, **op_kw):
     """This rank's backward summary from a zero outgoing-state gradient: the backward summary op on the view of the FIRST
     local sequence (the one continuing from the previous rank) with ``output_transition``; fp32 ``(local_state_grad,
-    transition)``, the transition already the transpose the fold reads, and with ``output_intermediates`` the summary's
-    intermediates as a third element (the raw backward's keywords; a zero-size entry is one the summary does not emit)."""
+    transition)``, the transition already the transpose the fold reads, and with ``output_context`` the summary's
+    context as a third element (the uint8 buffer the raw backward takes as ``context``), None otherwise."""
     summary_bwd = getattr(la_ops, f"{CP_PREFIX[case.variant]}_summary_bwd")
     plan = dict(plan_name=f"{case.variant}_summary_frost", output_transition=True, **op_kw)
-    if output_intermediates:
-        plan.update(output_intermediates=True, checkpoint_every_n_tokens=checkpoint_every_n_tokens)
+    if output_context:
+        plan.update(output_context=True, checkpoint_every_n_tokens=checkpoint_every_n_tokens)
     if case.variant in NO_BETA_VARIANTS:
         q, k, v, g = leaves
         out = summary_bwd(dO, g, case.gates["A"], q, cu[:2], dt_bias=case.gates["dt_bias"], **plan)
@@ -6240,16 +6240,15 @@ def cp_backward_prepare(case, leaves, cu, dO, output_intermediates=False, checkp
         q, k, v, g, beta, *w = leaves
         n = (case.n,) if case.variant in HOUSEHOLDER_VARIANTS else ()
         out = summary_bwd(q, k, g, beta, dO, cu[:2], *n, scale=float(case.K**-0.5), **plan)
-    return (out[0][0], out[1][0], out[2]) if output_intermediates else (out[0][0], out[1][0])
+    return out[0][0], out[1][0], out[2] if output_context else None
 
 
-def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkpoints=None, checkpoint_every_n_tokens=0, intermediates=None, **op_kw):
+def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkpoints=None, checkpoint_every_n_tokens=0, context=None, **op_kw):
     """The local backward from the forward's composed state with the following ranks' summaries (``[P, ...]`` fp32, rank
     order) folded on the device into the one-row gradient state the last local sequence starts from: the raw
     ``torch.ops.cudnn.<op>_bwd`` with ``composed_initial_state`` and ``following_state_grad`` / ``following_transition``;
-    a zero-size composed state (no preceding rank) is ``None``.  ``intermediates`` is the backward summary's dict
-    (``output_intermediates``), passed through as keywords.  Returns the input gradients in the raw op's order with the
-    state gradient dropped."""
+    a zero-size composed state (no preceding rank) is ``None``.  ``context`` is the backward summary's context
+    (``output_context``).  Returns the input gradients in the raw op's order with the state gradient dropped."""
     raw = getattr(torch.ops.cudnn, f"{CP_PREFIX[case.variant]}_bwd")
     extra = dict(
         composed_initial_state=composed if composed.numel() else None,
@@ -6258,7 +6257,7 @@ def cp_backward_apply(case, leaves, cu, dO, composed, g_fol, t_fol, state_checkp
         following_state_grad=g_fol,
         following_transition=t_fol,
         plan_name=f"{case.variant}_frost",
-        **(intermediates or {}),
+        **({"context": context} if context is not None else {}),
         **op_kw,
     )
     if case.variant in NO_BETA_VARIANTS:
@@ -6367,24 +6366,21 @@ def test_context_parallel_protocol(backend, variant, layout, checkpoint):
         assert_rms_close(f"d{leaf}[{variant}, cp {layout}]", got, grads_whole[leaf].float(), tol)
 
 
-CP_INTERMEDIATE_VARIANTS = ("gdn", "kda", "gdn2", "gdp")
-CP_INTERMEDIATE_FULL = ("gdn", "gdp")
+CP_CONTEXT_VARIANTS = ("gdn", "kda", "gdn2", "gdp")
+CP_CONTEXT_FULL = ("gdn", "gdp")
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("mode", ["recompute", "checkpoints", "l2norm"])
-@pytest.mark.parametrize("variant", CP_INTERMEDIATE_VARIANTS)
+@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_context_parallel_intermediates(backend, variant, mode):
-    """The backward summary's intermediates (``output_intermediates``): one sequence per slab, the summary on the first
-    (only) local sequence returns the per-piece tables (GDN / GDP also the normalized rows and chunk factors; KDA and
-    GDN-2 normalize and factor in-kernel; Mamba-2's summary never chains and its backward has no per-piece pass) beside
-    ``G`` and the transition, and the raw backward given them is BITWISE the raw backward without them (the same kernels
-    read the same bytes), in recompute mode, with the forward's checkpoints at the chunk cadence, and with the q/k l2norm
-    fused in the kernels (GDP at d_v = 64, where the backward normalizes the compact rows the summary normalizes; the
-    forward summary's normalized k rows then feed the forward the same way)."""
+def test_context_parallel_context(backend, variant, mode):
+    """The backward summary's context (``output_context``): one sequence per slab, the summary on the first (only) local
+    sequence returns its context beside ``G`` and the transition, and the raw backward given it is BITWISE the raw
+    backward without it, in recompute mode, with the forward's checkpoints at the chunk cadence, and with the q/k l2norm
+    fused in the kernels (GDP at d_v = 64; the forward summary's context then feeds the forward the same way)."""
     l2norm = mode == "l2norm"
-    full = variant in CP_INTERMEDIATE_FULL
+    full = variant in CP_CONTEXT_FULL
     cadence = CP_CADENCE[variant] if mode == "checkpoints" else 0
     V = 64 if (l2norm and variant == "gdp") else 128
     case = make_case(variant, torch.bfloat16, seq_lens=[4096], H=2, K=128, V=V, lo=0.9)
@@ -6410,79 +6406,120 @@ def test_context_parallel_intermediates(backend, variant, mode):
         if l2norm and full:
             q, k, v, g, beta, *w = slab_leaves[r]
             n = (case.n,) if variant in HOUSEHOLDER_VARIANTS else ()
-            _, _, fwd_intermediates = getattr(la_ops, f"{CP_PREFIX[variant]}_summary")(
-                k, v, g, beta, *w, cus[r][-2:], *n, plan_name=f"{variant}_summary_frost", output_intermediates=True, **op_kw
+            _, _, fwd_context = getattr(la_ops, f"{CP_PREFIX[variant]}_summary")(
+                k, v, g, beta, *w, cus[r][-2:], *n, plan_name=f"{variant}_summary_frost", output_context=True, **op_kw
             )
-            assert set(fwd_intermediates) == {"k_normalized"} and fwd_intermediates["k_normalized"].dtype == k.dtype
-            assert (
-                fwd_intermediates["k_normalized"].shape == (k.shape[0] * (case.n if variant in HOUSEHOLDER_VARIANTS else 1), *k.shape[-2:])
-                or fwd_intermediates["k_normalized"].shape == k.shape
-            )
+            assert fwd_context.dtype == torch.uint8 and fwd_context.numel() > 0
             o_handed = getattr(la_ops, CP_PREFIX[variant])(
-                *args, preceding_state_update=h_all[:r], preceding_transition=m_all[:r], checkpoint_every_n_tokens=cadence, **kw, **op_kw, **fwd_intermediates
+                *args, preceding_state_update=h_all[:r], preceding_transition=m_all[:r], checkpoint_every_n_tokens=cadence, **kw, **op_kw, context=fwd_context
             )[0]
-            assert_bitwise(f"o[{variant}, rank {r} intermediates k_normalized]", o_handed, o)
+            assert_bitwise(f"o[{variant}, rank {r} context]", o_handed, o)
     prepared = [cp_backward_prepare(case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len], True, cadence, **op_kw) for r in range(slabs)]
     g_all = torch.stack([p[0] for p in prepared])
     t_all = torch.stack([p[1] for p in prepared])
     for r in range(slabs):
-        intermediates = prepared[r][2]
-        assert set(intermediates) == {"q_normalized", "k_normalized", "q_inv_norm", "k_inv_norm", "chunk_factors", "piece_transitions", "piece_state_grads"}
-        assert intermediates["piece_state_grads"].numel() > 0 and intermediates["piece_transitions"].numel() > 0
-        assert intermediates["piece_state_grads"].dtype == intermediates["piece_transitions"].dtype == torch.float32
-        assert (intermediates["chunk_factors"].numel() > 0) == full and intermediates["chunk_factors"].dtype == case.v.dtype
-        assert (intermediates["q_normalized"].numel() > 0) == (l2norm and full) and (intermediates["k_inv_norm"].numel() > 0) == (l2norm and full)
+        context = prepared[r][2]
+        assert context.dtype == torch.uint8 and context.numel() > 0
         composed, checkpoints = applied[r]
         common = (case, slab_leaves[r], cus[r], dO[r * slab_len : (r + 1) * slab_len], composed, g_all[r + 1 :], t_all[r + 1 :])
         want = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, **op_kw)
-        got = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, intermediates=intermediates, **op_kw)
+        got = cp_backward_apply(*common, checkpoints if checkpoints.numel() else None, cadence, context=context, **op_kw)
         for name, a, b in zip(cp_grad_leaves(variant), got, want):
             if name is not None:
-                assert_bitwise(f"d{name}[{variant}, {mode}, rank {r} intermediates]", a, b)
+                assert_bitwise(f"d{name}[{variant}, {mode}, rank {r} context]", a, b)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("variant", CP_INTERMEDIATE_VARIANTS)
+@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
-def test_context_parallel_intermediates_geometry(backend, variant):
-    """The per-piece tables line up only with the summary's cut: intermediates to a backward over two local sequences they are
-    left out (the per-token rows still apply), prepared at another checkpoint cadence they are refused."""
+def test_context_parallel_context_geometry(backend, variant):
+    """A one-sequence summary's context on a backward over two local sequences is bitwise the plain backward, one prepared
+    at another checkpoint cadence is refused, and one of a sequence too short to cut feeds an uncut backward bitwise."""
     case = make_case(variant, torch.bfloat16, seq_lens=[2048, 2048], H=2, K=128, V=128, lo=0.9)
     leaves = thd_tensors(case)
     set_seed(SEED + 59)
     dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
     with waive_unsupported(backend, variant):
-        g_, t_, intermediates = cp_backward_prepare(case, leaves, case.cu, dO, True)
-    assert intermediates["piece_state_grads"].numel() > 0
+        g_, t_, context = cp_backward_prepare(case, leaves, case.cu, dO, True)
+    assert context.dtype == torch.uint8 and context.numel() > 0
     want = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
-    got = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], intermediates=intermediates)
+    got = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], context=context)
     for name, a, b in zip(cp_grad_leaves(variant), got, want):
         if name is not None:
-            assert_bitwise(f"d{name}[{variant}, tables of a one-sequence summary on a two-sequence slab left out]", a, b)
+            assert_bitwise(f"d{name}[{variant}, a one-sequence summary's context on a two-sequence slab]", a, b)
     one = thd_tensors(case, window=(0, 2048))
     cu_one = case.cu[:2]
-    g_, t_, intermediates = cp_backward_prepare(case, one, cu_one, dO[:2048], True)
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="checkpoint_every_n_tokens"):
-        cp_backward_apply(
-            case, one, cu_one, dO[:2048], torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], None, 4 * CP_CADENCE[variant], intermediates=intermediates
-        )
-    leaf_only = {name: tensor for name, tensor in intermediates.items() if name in ("piece_transitions", "piece_state_grads")}
-    want = cp_backward_apply(case, one, cu_one, dO[:2048], torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
-    got = cp_backward_apply(case, one, cu_one, dO[:2048], torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], intermediates=leaf_only)
+    g_, t_, context = cp_backward_prepare(case, one, cu_one, dO[:2048], True)
+    _, composed, checkpoints = cp_forward_apply(case, one, cu_one, g_[None][:0], t_[None][:0], 4 * CP_CADENCE[variant])
+    with pytest.raises(ValueError, match="context for these tokens"):
+        cp_backward_apply(case, one, cu_one, dO[:2048], composed, g_[None][:0], t_[None][:0], checkpoints, 4 * CP_CADENCE[variant], context=context)
+    short = make_case(variant, torch.bfloat16, seq_lens=[64], H=2, K=128, V=128, lo=0.9)
+    short_leaves = thd_tensors(short)
+    dO_short = to_thd(torch.randn(short.B, short.T, short.HO, short.V, device="cuda") * 0.1).to(short.v.dtype)
+    g_, t_, context = cp_backward_prepare(short, short_leaves, short.cu, dO_short, True)
+    want = cp_backward_apply(short, short_leaves, short.cu, dO_short, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0])
+    got = cp_backward_apply(short, short_leaves, short.cu, dO_short, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], context=context)
     for name, a, b in zip(cp_grad_leaves(variant), got, want):
         if name is not None:
-            assert_bitwise(f"d{name}[{variant}, leaf tables alone]", a, b)
-    with pytest.raises(ValueError, match="come together"):
-        cp_backward_apply(
-            case,
-            one,
-            cu_one,
-            dO[:2048],
-            torch.empty(0, device="cuda"),
-            g_[None][:0],
-            t_[None][:0],
-            intermediates=dict(piece_state_grads=intermediates["piece_state_grads"]),
-        )
+            assert_bitwise(f"d{name}[{variant}, a one-piece context on an uncut backward]", a, b)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", CP_CONTEXT_VARIANTS)
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+def test_graph_api_context_matches_op(backend, variant):
+    """The context through cudnn.pygraph: ``output_context`` writes a context the ``input_context`` node reads back to the
+    op's gradients bitwise; a missing or wrong-size buffer is refused."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[2048], H=2, K=128, V=128, lo=0.9)
+    leaves = thd_tensors(case)
+    names = LEAF_NAMES[variant]
+    set_seed(SEED + 61)
+    dO = to_thd(torch.randn(case.B, case.T, case.HO, case.V, device="cuda") * 0.1).to(case.v.dtype)
+    with waive_unsupported(backend, variant):
+        g_, t_, context_op = cp_backward_prepare(case, leaves, case.cu, dO, True)
+    n = {"num_householder": case.n} if variant in HOUSEHOLDER_VARIANTS else {}
+    scale = 1.0 / math.sqrt(case.K)
+    inputs = dict(q=leaves[0], k=leaves[1], g=leaves[3], beta=leaves[4], cu_seqlens=case.cu[:2], dO=dO)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+    x_t, transition_t = getattr(graph, f"{variant}_summary_bwd")(**ports, **n, scale=scale, output_transition=True, output_context=True, name="summary_bwd")
+    x_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    transition_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    build_and_pin(graph, f"{variant}_summary_frost")
+    assert graph.get_context_size() == context_op.numel() > 0
+    context = torch.empty(graph.get_context_size(), dtype=torch.uint8, device="cuda")
+    d_initial_state = torch.empty(1, *g_.shape, dtype=torch.float32, device="cuda")
+    transition = torch.empty(1, *t_.shape, dtype=torch.float32, device="cuda")
+    pack = {ports[name]: t for name, t in inputs.items()}
+    pack.update({x_t: d_initial_state, transition_t: transition})
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="context"):
+        graph.execute(pack, workspace)
+    graph.execute(pack, workspace, context=context)
+    torch.cuda.synchronize()
+    assert_bitwise(f"d_initial_state[{variant}, graph api]", d_initial_state[0], g_)
+    assert_bitwise(f"transition[{variant}, graph api]", transition[0], t_)
+    want = cp_backward_apply(case, leaves, case.cu, dO, torch.empty(0, device="cuda"), g_[None][:0], t_[None][:0], context=context_op)
+    inputs = dict(zip(names, leaves))
+    inputs.update(cu_seqlens=case.cu, dO=dO)
+    graph = cudnn.pygraph()
+    ports = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in inputs.items()}
+    outs = getattr(graph, f"{variant}_bwd")(**ports, **n, scale=scale, input_context=True, name="bwd")
+    got = {}
+    for name, port, ref in zip(names, outs, want):
+        port.set_output(True).set_data_type(CUDNN_DTYPE[ref.dtype])
+        got[name] = torch.empty_like(ref)
+    build_and_pin(graph, f"{variant}_frost")
+    assert graph.get_context_size() == context.numel()
+    pack = {ports[name]: t for name, t in inputs.items()}
+    pack.update({port: got[name] for name, port in zip(names, outs)})
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="context"):
+        graph.execute(pack, workspace, context=context[:-1])
+    graph.execute(pack, workspace, context=context)
+    torch.cuda.synchronize()
+    for name, ref in zip(names, want):
+        assert_bitwise(f"d{name}[{variant}, graph api context]", got[name], ref)
 
 
 @pytest.mark.L0

@@ -16,9 +16,10 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
-from ..graph_analyzer import BACKWARD_CONTEXT_PORTS, analyze
+from ..graph_analyzer import analyze
 from .common.piece_chain import chain_min_tokens
-from .engine import FrostLaPlan, frost_la_gate, intermediates_gate, summary_support_gates
+from .common.context import backward_context
+from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
 # the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
 PREP_TILE_FRACTION = 0.475
@@ -56,8 +57,8 @@ class KdaFrostEngine(BaseEngine):
 
         facts = graph._facts_for(analyze)
         frost_la_gate("KdaFrostEngine", facts, "KDA")
-        if facts.is_bwd and "piece_state_grads" in facts.intermediate_ports:
-            intermediates_gate("KdaFrostEngine", facts, b_t=16, min_tokens=chain_min_tokens(reverse=True))
+        if facts.is_bwd and facts.input_context:
+            context_gate("KdaFrostEngine", facts, b_t=16, min_tokens=chain_min_tokens(reverse=True))
         if facts.d_qk not in (64, 128):
             raise NotImplementedError(f"KdaFrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
         if facts.d_v not in (64, 128):
@@ -585,7 +586,33 @@ class CompiledKdaBwd:
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
-        self.has_piece_tables = "piece_state_grads" in node.inputs and self.chain
+        self.has_context = bool(node.params.get("input_context", False))
+        self.context = (
+            backward_context(
+                self.plan_name,
+                full=False,
+                total=total,
+                num_householder=1,
+                h_q=HQ,
+                h_k=HK,
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=self.checkpoint_cadence,
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+            )
+            if self.has_context
+            else None
+        )
+        self.context_size = self.context.size if self.has_context else 0
+        same_cut = (
+            self.has_context and self.context.has_tables and B == 1 and (self.pieces, self.unit_chunks) == (self.context.pieces, self.context.unit_chunks)
+        )
+        self.has_piece_tables = same_cut and self.chain
         self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
 
         from .common.host import get_dtype
@@ -727,10 +754,8 @@ class CompiledKdaBwd:
         self.index_composed = pos.get("composed_initial_state")
         self.index_d_a_log = pos.get("d_a_log")
         self.index_d_dt_bias = pos.get("d_dt_bias")
-        self.index_piece_transitions = pos.get("piece_transitions")
-        self.index_piece_state_grads = pos.get("piece_state_grads")
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         q = views[self.index_q]
         k = views[self.index_k]
         v = views[self.index_v]
@@ -755,8 +780,9 @@ class CompiledKdaBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        state_m = views[self.index_piece_transitions] if self.has_piece_transitions else region.get("state_m")
-        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
+        context_region = self.context.regions(context) if self.has_context else {}
+        state_m = context_region["state_m"] if self.has_piece_transitions else region.get("state_m")
+        state_g = context_region["state_g"] if self.has_piece_tables else region.get("state_g")
         dcomposed = None
         if self.index_following_state_grad is not None:
             dcomposed = region["composed_dstate"]
@@ -1450,10 +1476,31 @@ class CompiledKdaSummaryBwd:
             reverse=True,
             expand_num=1,
         )
+        self.has_context = bool(node.params.get("output_context", False))
+        self.context = None
+        if self.has_context:
+            self.context = backward_context(
+                self.plan_name,
+                full=False,
+                total=total,
+                num_householder=1,
+                h_q=q.dim[1],
+                h_k=node.inputs["k"].dim[1],
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name="float16" if q.get_data_type().name == "HALF" else "bfloat16",
+                num_sm=self.num_sm,
+                cadence_tokens=self.checkpoint_cadence,
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+            )
+        self.context_size = self.context.size if self.has_context else 0
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
-        self.has_piece_tables = "piece_state_grads" in node.outputs and self.chain
+        self.has_piece_tables = self.has_context and self.context.has_tables
         layout = WorkspaceLayout()
         regions = []
         # One FP32 state and bounded-key ring per persistent CTA; sequential backward kernels share the arena.
@@ -1536,10 +1583,8 @@ class CompiledKdaSummaryBwd:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_d_initial_state = pos["d_initial_state"]
         self.index_transition = pos.get("transition")
-        self.index_piece_transitions = pos.get("piece_transitions")
-        self.index_piece_state_grads = pos.get("piece_state_grads")
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         q = views[self.index_q]
         k = views[self.index_k]
         g = views[self.index_g]
@@ -1554,8 +1599,9 @@ class CompiledKdaSummaryBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        state_m = views[self.index_piece_transitions] if self.has_piece_tables else region.get("state_m")
-        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
+        context_region = self.context.regions(context) if self.has_context else {}
+        state_m = context_region["state_m"] if self.has_piece_tables else region.get("state_m")
+        state_g = context_region["state_g"] if self.has_piece_tables else region.get("state_g")
         if self.chain:
             self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, state_m, state_g)
             return

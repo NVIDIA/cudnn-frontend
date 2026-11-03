@@ -53,8 +53,8 @@ def cutile_la_gate(engine: str, facts, op: str, dg_want) -> None:
         raise NotImplementedError(
             f"{engine}: composed context-parallel summaries and the composed_initial_state row (the fold into the boundary state row) are FROST-only"
         )
-    if facts.intermediate_ports:
-        raise NotImplementedError(f"{engine}: the backward summary's intermediates ({', '.join(facts.intermediate_ports)}) is FROST-only")
+    if facts.output_context or facts.input_context:
+        raise NotImplementedError(f"{engine}: the summaries' context is FROST-only")
 
     if not facts.uniform_io:
         raise NotImplementedError(f"{engine}: q/k/v dtypes must match")

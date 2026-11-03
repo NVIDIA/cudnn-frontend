@@ -49,7 +49,7 @@ Operands may be strided views, as the engines build their TMA descriptors from t
 
 ```python
 import torch
-from cudnn.linear_attention.ops import gated_delta_net, mamba2
+from cudnn.linear_attention.ops import gated_delta_net, gated_delta_net_summary, gated_delta_net_summary_bwd, mamba2
 
 T, H, K, V = 4096, 16, 128, 128
 cu_seqlens = torch.tensor([0, 1000, 2500, T], dtype=torch.int32, device="cuda")

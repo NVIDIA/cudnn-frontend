@@ -10,8 +10,8 @@ preceding ranks as ``preceding_state_update`` / ``preceding_transition``: the op
 one-row composed state the first local sequence starts from and returns it for the backward.  The backward mirrors it with ``mamba2_summary_bwd``
 on the first local sequence (a zero outgoing-state gradient) and ``torch.ops.cudnn.mamba2_bwd`` from the composed state
 with the following ranks' summaries folded into the one-row gradient state the last local sequence starts from.  The rank bounds come from
-the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.  Mamba-2 has no backward hand-over
-(``output_intermediates`` of the other families): its summary runs the whole sequence as one item and its backward has no
+the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.  Mamba-2 has no backward context
+(``output_context`` of the other families): its summary runs the whole sequence as one item and its backward has no
 per-piece summary pass to skip.
 """
 

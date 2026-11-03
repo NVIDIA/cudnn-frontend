@@ -16,9 +16,10 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
-from ..graph_analyzer import BACKWARD_CONTEXT_PORTS, analyze
+from ..graph_analyzer import analyze
+from .common.context import backward_context, forward_context
 from .common.host import family_slots
-from .engine import FrostLaPlan, frost_la_gate, intermediates_gate, summary_support_gates
+from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
 
 def build_gdn(graph):
@@ -48,8 +49,8 @@ def gdn_support_gates(engine: str, facts) -> None:
     """The GDN kernel family's dtype/attribute gates, shared with the GDP engine."""
     import cudnn
 
-    if facts.is_bwd and "piece_state_grads" in facts.intermediate_ports:
-        intermediates_gate(engine, facts, b_t=64, expand_num=facts.num_householder)
+    if facts.is_bwd and facts.input_context:
+        context_gate(engine, facts, b_t=64, expand_num=facts.num_householder)
     checkpoint = facts.checkpoint_every_n_tokens
     checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
     if checkpoint and checkpoint % 64 != 0:
@@ -248,7 +249,12 @@ class CompiledGdn:
         self.has_final_state = "final_state" in node.outputs
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
-        self.has_k_normalized = "k_normalized" in node.inputs
+        self.has_context = bool(node.params.get("input_context", False))
+        self.context = (
+            forward_context(self.plan_name, total=total, h_k=HK, d_k=K, io_name=self.io_name, use_qk_l2norm=self.use_qk_l2norm) if self.has_context else None
+        )
+        self.context_size = self.context.size if self.has_context else 0
+        self.has_k_normalized = self.has_context
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_sm = multiprocessor_count(self.device)
@@ -372,7 +378,6 @@ class CompiledGdn:
         self.index_beta = pos["beta"]
         self.index_cu_seqlens = pos["cu_seqlens"]
         self.index_initial_state = pos.get("initial_state")
-        self.index_k_normalized = pos.get("k_normalized")
         self.index_o = pos["O"]
         self.index_final_state = pos.get("final_state")
         self.index_state_indices = pos.get("state_indices")
@@ -384,6 +389,8 @@ class CompiledGdn:
         self.index_composed = pos.get("composed_initial_state")
         if self.chain:
             positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            if self.has_context:
+                positions |= {"context_" + name: len(names) + len(self.carve_names) + i for i, name in enumerate(self.context.names)}
             aliases = {
                 "gate": "g",
                 "o": "O",
@@ -398,10 +405,11 @@ class CompiledGdn:
                 "prefill_words": "tensormaps",
             }
             if self.use_qk_l2norm:
-                aliases |= {"q": "q_n", "k": "k_normalized" if self.has_k_normalized else "k_n"}
+                aliases |= {"q": "q_n", "k": "context_k_n" if self.has_k_normalized else "k_n"}
                 self.carve_index_q_n = self.carve_names.index("q_n")
                 self.carve_index_k_n = None if self.has_k_normalized else self.carve_names.index("k_n")
-            absent = len(names) + len(self.carve_names)
+                self.context_index_k_n = self.context.names.index("k_n") if self.has_k_normalized else None
+            absent = len(names) + len(self.carve_names) + (len(self.context.names) if self.has_context else 0)
             if not self.safe_gate:
                 positions.pop("a_log", None)
                 positions.pop("dt_bias", None)
@@ -409,7 +417,7 @@ class CompiledGdn:
             self.chain_buffers = itemgetter(*indices)
             self.chain_scalars = (int(self.pieces), int(self.n_heads_out), int(self.num_seqs), int(self.checkpoint or 0), float(self.scale))
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
         if self.index_preceding_state_update is not None:
             table = views[self.index_initial_state] if self.index_initial_state is not None else None
@@ -422,18 +430,19 @@ class CompiledGdn:
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
+            context_views = context.carve(self.context.carve) if self.has_context else ()
             if self.use_qk_l2norm:
                 self.run_l2norm_qk(
                     self.l2norm,
                     views[self.index_q],
                     views[self.index_k],
                     carved[self.carve_index_q_n],
-                    views[self.index_k_normalized] if self.has_k_normalized else carved[self.carve_index_k_n],
+                    context_views[self.context_index_k_n] if self.has_k_normalized else carved[self.carve_index_k_n],
                     None,
                     None,
                     int(stream or 0),
                 )
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)))
+            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, *context_views, None)), self.stream_type(int(stream or 0)))
             return
         k = views[self.index_k]
         v = views[self.index_v]
@@ -449,8 +458,9 @@ class CompiledGdn:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        context_region = self.context.regions(context) if self.has_context else {}
         if self.use_qk_l2norm:
-            q_n, k_n = region["q_n"], (views[self.index_k_normalized] if self.has_k_normalized else region["k_n"])
+            q_n, k_n = region["q_n"], (context_region["k_n"] if self.has_k_normalized else region["k_n"])
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(
                     q, k, q_n, k_n, None, None, skip_k=self.has_k_normalized, k_slots=family_slots(k, self.num_householder, 3), stream=stream
@@ -673,9 +683,36 @@ class CompiledGdnBwd:
         self.pack_bwd_needed = self.num_householder > 1 and not self.compact_qdo
         self.summary_q_step = self.num_householder if self.pack_bwd_needed and self.use_qk_l2norm else 1
         self.tinv_pass = self.chain or self.needs_recompute
-        self.has_normalized_rows = "q_normalized" in node.inputs
-        self.has_chunk_factors = "chunk_factors" in node.inputs and self.chain
-        self.has_piece_tables = "piece_state_grads" in node.inputs and self.chain
+        self.has_context = bool(node.params.get("input_context", False))
+        self.context = None
+        if self.has_context:
+            from .kernel import gdn_tinv_f16 as tinv_module
+
+            self.context = backward_context(
+                self.plan_name,
+                full=True,
+                total=total,
+                num_householder=self.num_householder,
+                h_q=HQ,
+                h_k=HK,
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=self.checkpoint_cadence,
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+                tinv_rows=tinv_module.tinv_rows,
+            )
+        self.context_size = self.context.size if self.has_context else 0
+        same_cut = (
+            self.has_context and self.context.has_tables and B == 1 and (self.pieces, self.unit_chunks) == (self.context.pieces, self.context.unit_chunks)
+        )
+        self.has_normalized_rows = self.has_context and self.context.has_rows
+        self.has_chunk_factors = same_cut and self.chain
+        self.has_piece_tables = same_cut and self.chain
         self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
         from .common.piece_chain import build_boundary_fold, run_boundary_fold
 
@@ -806,11 +843,7 @@ class CompiledGdnBwd:
         if self.tinv_pass:
             from .kernel import gdn_tinv_f16 as tinv_module
 
-            rows = (
-                int(node.inputs["chunk_factors"].dim[0])
-                if self.has_chunk_factors
-                else tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
-            )
+            rows = tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
             if not self.has_chunk_factors:
                 regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
             tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces, self.num_householder) // 8
@@ -851,15 +884,8 @@ class CompiledGdnBwd:
         self.index_following_state_grad = pos.get("following_state_grad")
         self.index_following_transition = pos.get("following_transition")
         self.index_composed = pos.get("composed_initial_state")
-        self.index_q_normalized = pos.get("q_normalized")
-        self.index_k_normalized = pos.get("k_normalized")
-        self.index_q_inv_norm = pos.get("q_inv_norm")
-        self.index_k_inv_norm = pos.get("k_inv_norm")
-        self.index_chunk_factors = pos.get("chunk_factors")
-        self.index_piece_transitions = pos.get("piece_transitions")
-        self.index_piece_state_grads = pos.get("piece_state_grads")
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         q = views[self.index_q]
         k = views[self.index_k]
         v = views[self.index_v]
@@ -884,13 +910,14 @@ class CompiledGdnBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        q_n = views[self.index_q_normalized] if self.has_normalized_rows else region.get("q_n")
-        k_n = views[self.index_k_normalized] if self.has_normalized_rows else region.get("k_n")
-        inv_q = views[self.index_q_inv_norm] if self.has_normalized_rows else region.get("inv_q")
-        inv_k = views[self.index_k_inv_norm] if self.has_normalized_rows else region.get("inv_k")
-        tinv = views[self.index_chunk_factors] if self.has_chunk_factors else region.get("tinv")
-        state_m = views[self.index_piece_transitions] if self.has_piece_transitions else region.get("state_m")
-        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
+        context_region = self.context.regions(context) if self.has_context else {}
+        q_n = context_region["q_n"] if self.has_normalized_rows else region.get("q_n")
+        k_n = context_region["k_n"] if self.has_normalized_rows else region.get("k_n")
+        inv_q = context_region["inv_q"] if self.has_normalized_rows else region.get("inv_q")
+        inv_k = context_region["inv_k"] if self.has_normalized_rows else region.get("inv_k")
+        tinv = context_region["tinv"] if self.has_chunk_factors else region.get("tinv")
+        state_m = context_region["state_m"] if self.has_piece_transitions else region.get("state_m")
+        state_g = context_region["state_g"] if self.has_piece_tables else region.get("state_g")
         dcomposed = None
         if self.index_following_state_grad is not None:
             dcomposed = region["composed_dstate"]
@@ -1468,7 +1495,12 @@ class CompiledGdnSummary:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
-        self.has_k_normalized = "k_normalized" in node.outputs
+        self.has_context = bool(node.params.get("output_context", False))
+        self.context = (
+            forward_context(self.plan_name, total=total, h_k=HK, d_k=K, io_name=self.io_name, use_qk_l2norm=self.use_qk_l2norm) if self.has_context else None
+        )
+        self.context_size = self.context.size if self.has_context else 0
+        self.has_k_normalized = self.has_context and self.use_qk_l2norm
         if self.use_qk_l2norm and not self.has_k_normalized:
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
         self.needs_table = self.split
@@ -1491,9 +1523,8 @@ class CompiledGdnSummary:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_final_state = pos["final_state"]
         self.index_transition = pos.get("transition")
-        self.index_k_normalized = pos.get("k_normalized")
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         k = views[self.index_k]
         v = views[self.index_v]
         g = views[self.index_g]
@@ -1507,8 +1538,9 @@ class CompiledGdnSummary:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        context_region = self.context.regions(context) if self.has_k_normalized else {}
         if self.use_qk_l2norm:
-            k_n = views[self.index_k_normalized] if self.has_k_normalized else region["k_n"]
+            k_n = context_region["k_n"] if self.has_k_normalized else region["k_n"]
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, None, None, skip_q=True, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
             else:
@@ -1885,13 +1917,37 @@ class CompiledGdnSummaryBwd:
             expand_num=self.num_householder,
             reverse=True,
         )
+        self.has_context = bool(node.params.get("output_context", False))
+        self.context = None
+        if self.has_context:
+            from .kernel import gdn_tinv_f16 as tinv_module
+
+            self.context = backward_context(
+                self.plan_name,
+                full=True,
+                total=total,
+                num_householder=self.num_householder,
+                h_q=HQ,
+                h_k=HK,
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=self.checkpoint_cadence,
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+                tinv_rows=tinv_module.tinv_rows,
+            )
+        self.context_size = self.context.size if self.has_context else 0
         self.chain = self.pieces > 0
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
-        self.has_normalized_rows = "q_normalized" in node.outputs
-        self.has_chunk_factors = "chunk_factors" in node.outputs and self.chain
-        self.has_piece_tables = "piece_state_grads" in node.outputs and self.chain
+        self.has_normalized_rows = self.has_context and self.context.has_rows
+        self.has_chunk_factors = self.has_context and self.context.has_tables
+        self.has_piece_tables = self.has_context and self.context.has_tables
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
@@ -1924,11 +1980,7 @@ class CompiledGdnSummaryBwd:
             regions.append(("recompute_tensormaps_m", layout.add(recompute_words * 8, align=128), "int64", (recompute_words,)))
             from .kernel import gdn_tinv_f16 as tinv_module
 
-            rows = (
-                int(node.outputs["chunk_factors"].dim[0])
-                if self.has_chunk_factors
-                else tinv_module.tinv_rows(total // self.num_householder, self.num_pieces, self.num_householder, self.b_t)
-            )
+            rows = tinv_module.tinv_rows(total // self.num_householder, self.num_pieces, self.num_householder, self.b_t)
             if not self.has_chunk_factors:
                 regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
             tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces, self.num_householder) // 8
@@ -1998,15 +2050,8 @@ class CompiledGdnSummaryBwd:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_d_initial_state = pos["d_initial_state"]
         self.index_transition = pos.get("transition")
-        self.index_q_normalized = pos.get("q_normalized")
-        self.index_k_normalized = pos.get("k_normalized")
-        self.index_q_inv_norm = pos.get("q_inv_norm")
-        self.index_k_inv_norm = pos.get("k_inv_norm")
-        self.index_chunk_factors = pos.get("chunk_factors")
-        self.index_piece_transitions = pos.get("piece_transitions")
-        self.index_piece_state_grads = pos.get("piece_state_grads")
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         q = views[self.index_q]
         k = views[self.index_k]
         g = views[self.index_g]
@@ -2021,13 +2066,14 @@ class CompiledGdnSummaryBwd:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
-        q_n = views[self.index_q_normalized] if self.has_normalized_rows else region.get("q_n")
-        k_n = views[self.index_k_normalized] if self.has_normalized_rows else region.get("k_n")
-        inv_q = views[self.index_q_inv_norm] if self.has_normalized_rows else None
-        inv_k = views[self.index_k_inv_norm] if self.has_normalized_rows else None
-        tinv = views[self.index_chunk_factors] if self.has_chunk_factors else region.get("tinv")
-        state_m = views[self.index_piece_transitions] if self.has_piece_tables else region.get("state_m")
-        state_g = views[self.index_piece_state_grads] if self.has_piece_tables else region.get("state_g")
+        context_region = self.context.regions(context) if self.has_context else {}
+        q_n = context_region["q_n"] if self.has_normalized_rows else region.get("q_n")
+        k_n = context_region["k_n"] if self.has_normalized_rows else region.get("k_n")
+        inv_q = context_region["inv_q"] if self.has_normalized_rows else None
+        inv_k = context_region["inv_k"] if self.has_normalized_rows else None
+        tinv = context_region["tinv"] if self.has_chunk_factors else region.get("tinv")
+        state_m = context_region["state_m"] if self.has_piece_tables else region.get("state_m")
+        state_g = context_region["state_g"] if self.has_piece_tables else region.get("state_g")
         if self.use_qk_l2norm:
             if self.l2norm is None:
                 self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, k_slots=family_slots(k, self.num_householder, 3), stream=stream)

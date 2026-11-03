@@ -48,25 +48,21 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         for port, got in (("state", facts.composed_state_dtype), ("transition", facts.composed_transition_dtype)):
             if got not in (cudnn.data_type.FLOAT, None):
                 raise NotImplementedError(f"{engine}: the composed summaries' {port} must be fp32 (the summary ops' output), got {got}")
-    for port, got in facts.intermediate_dtypes:
-        want = (facts.io_dtype,) if port in ("q_normalized", "k_normalized", "chunk_factors") else (cudnn.data_type.FLOAT,)
-        if got not in want + (None,):
-            raise NotImplementedError(f"{engine}: '{port}' must be {want[0]} (the backward summary's intermediates), got {got}")
 
 
-def intermediates_gate(engine: str, facts, *, b_t: int, expand_num: int = 1, min_tokens: int = 0) -> None:
-    """Decline a backward whose per-piece tables (``piece_state_grads`` / ``piece_transitions``) were cut by its summary
-    differently from the way this backward cuts the same tokens: the summary chains with ``compose_tail`` and no floor,
-    the backward with ``min_tokens``; both cut alike whenever both get the same ``checkpoint_every_n_tokens``.  An uncut
-    backward has no leaf pass and ignores the tables."""
-    if not facts.is_bwd or facts.op.endswith("_SUMMARY") or "piece_state_grads" not in facts.intermediate_ports:
+def context_gate(engine: str, facts, *, b_t: int, expand_num: int = 1, min_tokens: int = 0) -> None:
+    """Decline a one-sequence backward whose context's per-piece tables were cut by its summary differently from the
+    way this backward cuts the same tokens: the summary chains with ``compose_tail`` and no floor, the backward with
+    ``min_tokens``; both cut alike whenever both get the same ``checkpoint_every_n_tokens``.  An uncut backward has no
+    leaf pass and ignores the tables, and so does a multi-sequence slab."""
+    if not facts.is_bwd or facts.op.endswith("_SUMMARY") or not facts.input_context or facts.n_seq != 1:
         return
     from cudnn.frost.device import current_device, multiprocessor_count
 
     from .common.piece_chain import choose_pieces
 
     geometry = dict(
-        num_seqs=facts.n_seq,
+        num_seqs=1,
         heads_out=facts.h_o,
         num_sm=multiprocessor_count(current_device()),
         total_tokens=facts.total_t,
@@ -134,9 +130,13 @@ class FrostLaPlan(CompiledPlan):
         self.compiled = compiled
         self.ports = None
         self.indices = None
+        self.context_size = int(getattr(compiled, "context_size", 0))
 
     def get_workspace_size(self) -> int:
         return self.compiled.workspace_bytes()
+
+    def get_context_size(self) -> int:
+        return self.context_size
 
     def execute(self, graph, variant_pack, ctx) -> None:
         launch_device = variant_pack.device
@@ -156,4 +156,19 @@ class FrostLaPlan(CompiledPlan):
             raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender))
         views = variant_pack.operands(self.indices)
         workspace = Workspace.over(variant_pack, self.compiled.workspace_size, type(self.compiled).__name__)
-        self.compiled.run(views, workspace, ctx.stream)
+        if not self.context_size:
+            if ctx.context is not None:
+                raise ValueError(f"{self.compiled.plan_name}: this plan has no context (get_context_size() is 0)")
+            self.compiled.run(views, workspace, ctx.stream)
+            return
+        if ctx.context is None:
+            raise ValueError(
+                f"{self.compiled.plan_name} requires a {self.context_size}-byte context but execute() received none; "
+                f"allocate graph.get_context_size() bytes and pass the buffer as context= to execute()"
+            )
+        context = Workspace(ctx.context, 0, type(self.compiled).__name__)
+        if context.nbytes != self.context_size:
+            raise ValueError(
+                f"{self.compiled.plan_name}: the context must be {self.context_size} bytes (the summary's context for these tokens), got {context.nbytes}"
+            )
+        self.compiled.run(views, workspace, ctx.stream, context)

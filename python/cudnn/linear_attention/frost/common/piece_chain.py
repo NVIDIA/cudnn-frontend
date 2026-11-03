@@ -97,9 +97,7 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
 
 
 def chain_min_tokens(*, reverse):
-    """Total tokens below which the KDA chain lost to the uncut schedule at every head count measured (B200 and a 68-SM
-    SM100, CUDA-graph replay): the chain's own passes cost a fixed amount however short the pieces.  GDN does not use it:
-    its alternative, split-K, cuts only where the gates decay, so how it compares with the chain depends on the data."""
+    """Total tokens below which the KDA and GDN-2 chains loses to the uncut schedule."""
     return 192 if reverse else 1024
 
 

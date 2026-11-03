@@ -10,8 +10,8 @@ preceding ranks as ``preceding_state_update`` / ``preceding_transition``: the op
 one-row composed state the first local sequence starts from and returns it for the backward.  The backward mirrors it with ``gated_delta_net_summary_bwd``
 on the first local sequence (a zero outgoing-state gradient) and ``torch.ops.cudnn.gated_delta_net_bwd`` from the composed state
 with the following ranks' summaries folded into the one-row gradient state the last local sequence starts from.  The rank bounds come from
-the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.  The backward prepare also returns its intermediates (``output_intermediates``), which the apply takes back and
-skips the passes that would recompute them (a multi-sequence slab takes the per-token rows and leaves the per-piece tables).
+the rank-bound rule on the global sequence boundaries; the slabs' outputs and gradients are checked against the unsplit op.  The backward prepare also returns its context (``output_context``), the buffer the apply takes back to skip the
+passes that would recompute its intermediates (a multi-sequence slab uses the per-token rows alone).
 """
 
 from __future__ import annotations
@@ -76,10 +76,10 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
         dos.append(do[rank * slab_len : (rank + 1) * slab_len])
     summaries = []
     for t, cu in zip(slabs, cus):
-        h, m, intermediates = la_ops.gated_delta_net_summary(
-            t["k"], t["v"], t["g"], t["beta"], cu[-2:], use_qk_l2norm_in_kernel=True, output_intermediates=True
+        h, m, context = la_ops.gated_delta_net_summary(
+            t["k"], t["v"], t["g"], t["beta"], cu[-2:], use_qk_l2norm_in_kernel=True, output_context=True
         )  # the LAST local sequence, from a zero state
-        summaries.append((h[0], m[0], intermediates))
+        summaries.append((h[0], m[0], context))
     h_all = torch.stack([s[0] for s in summaries])  # what the all-gather hands every rank
     m_all = torch.stack([s[1] for s in summaries])
 
@@ -100,7 +100,7 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
             preceding_transition=m,
             checkpoint_every_n_tokens=CHECKPOINT,
             use_qk_l2norm_in_kernel=True,
-            **summaries[rank][2],
+            context=summaries[rank][2],
         )
         outputs.append((o, composed, checkpoints))
     o_cp = torch.cat([out[0] for out in outputs])
@@ -118,7 +118,7 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
     # ---- backward: prepare on the first local sequence, gather, apply with the following slice ------------------
     summaries = []
     for t, cu, do in zip(slabs, cus, dos):
-        g_, t_, intermediates = la_ops.gated_delta_net_summary_bwd(
+        g_, t_, context = la_ops.gated_delta_net_summary_bwd(
             t["q"],
             t["k"],
             t["g"],
@@ -127,11 +127,11 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
             cu[:2],
             scale=scale,
             output_transition=True,
-            output_intermediates=True,
+            output_context=True,
             checkpoint_every_n_tokens=CHECKPOINT,
             use_qk_l2norm_in_kernel=True,
         )  # the FIRST local sequence
-        summaries.append((g_[0], t_[0], intermediates))
+        summaries.append((g_[0], t_[0], context))
     g_all = torch.stack([s[0] for s in summaries])
     t_all = torch.stack([s[1] for s in summaries])
     grads = {}
@@ -156,7 +156,7 @@ def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: 
                 state_checkpoints=checkpoints if checkpoints.numel() else None,
                 checkpoint_every_n_tokens=CHECKPOINT,
                 use_qk_l2norm_in_kernel=True,
-                **summaries[rank][2],
+                context=summaries[rank][2],
             )[:5],
         ):
             if name is not None:

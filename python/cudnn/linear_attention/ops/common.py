@@ -9,8 +9,6 @@ import threading
 import torch
 import cudnn
 
-from ..graph_analyzer import BACKWARD_CONTEXT_GROUPS, BACKWARD_CONTEXT_PORTS, intermediate_dims  # noqa: F401  (re-exported to the family ops)
-
 TORCH_DTYPE_TO_CUDNN = {
     torch.float16: cudnn.data_type.HALF,
     torch.bfloat16: cudnn.data_type.BFLOAT16,
@@ -74,6 +72,19 @@ def graph_workspace(graph, device, stream=None):
         return torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device=device)
 
 
+def check_context(op, context, graph, device):
+    """The summary's context given to an apply: uint8 on ``device``, exactly the ``get_context_size()`` bytes the built
+    ``graph``'s plan reads."""
+    if context.dtype != torch.uint8:
+        raise TypeError(f"{op}: context must be uint8 (the summary's context); got {context.dtype}")
+    if context.device != device:
+        raise ValueError(f"{op}: context must be on the op's device ({device}); got {context.device}")
+    want = graph.get_context_size()
+    if context.numel() != want:
+        raise ValueError(f"{op}: context must be {want} bytes (the summary's context for these tokens); got {context.numel()}")
+    return context.contiguous()
+
+
 def get_handle(device, stream=None):
     """This thread's cuDNN handle for ``device``, rebound to ``stream``."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -101,22 +112,22 @@ def make_execution_resources(graph, device):
     return graph_workspace(graph, device, stream), get_handle(device, stream)
 
 
-def execute_graph(graph, variant_pack, workspace, handle):
+def execute_graph(graph, variant_pack, workspace, handle, context=None):
     """Execute a cached graph with caller-owned scratch and a thread-private handle.
 
     The first call is serialized because FROST plans finish lazy compilation and
     initialize immutable launch records there. Steady-state launches stay lock-free.
     """
     if getattr(graph, "_la_ops_execution_ready", False):
-        graph.execute(variant_pack, workspace=workspace, handle=handle)
+        graph.execute(variant_pack, workspace=workspace, handle=handle, context=context)
         return
     lock = _graph_lock(graph)
     with lock:
         if not getattr(graph, "_la_ops_execution_ready", False):
-            graph.execute(variant_pack, workspace=workspace, handle=handle)
+            graph.execute(variant_pack, workspace=workspace, handle=handle, context=context)
             graph._la_ops_execution_ready = True
             return
-    graph.execute(variant_pack, workspace=workspace, handle=handle)
+    graph.execute(variant_pack, workspace=workspace, handle=handle, context=context)
 
 
 def torch_dtype_to_cudnn(dtype: torch.dtype):
@@ -260,62 +271,3 @@ def summary_setup_context(ctx, inputs, output):
 def summary_backward(ctx, *grads):
     """Reject differentiation through summary-only custom ops."""
     raise RuntimeError("summaries are non-differentiable")
-
-
-def backward_context_shapes(family, *, total, num_seqs, h_q, h_k, h_o, d_k, d_v, num_householder=1, use_qk_l2norm=False):
-    """Dims per intermediate port of a family's backward summary for one geometry (``None`` = not emitted): the normalized
-    q / k rows and their inverse norms for gdn / gdp under ``use_qk_l2norm`` where the backward normalizes the same rows
-    (``num_householder == 1`` or ``d_v == 64``); for one local sequence the chunk factors (gdn / gdp) and the per-piece
-    tables (every family but mamba2).  ``total`` is the k row count (the expanded timeline for gdp)."""
-    full = family in ("gdn", "gdp")
-    expand_num = max(1, int(num_householder))
-    dims = dict(
-        k_dim=[int(total), int(h_k), int(d_k)],
-        q_dim=[int(total) // expand_num, int(h_q), int(d_k)],
-        g_dim=[int(total), int(h_o)],
-        do_dim=[int(total), int(h_o), int(d_v)],
-    )
-    out = dict.fromkeys(BACKWARD_CONTEXT_PORTS)
-    if full and use_qk_l2norm and (expand_num == 1 or int(d_v) == 64):
-        out.update({name: intermediate_dims(name, **dims) for name in ("q_normalized", "k_normalized", "q_inv_norm", "k_inv_norm")})
-    if int(num_seqs) == 1 and family != "mamba2":
-        out.update({name: intermediate_dims(name, **dims) for name in (("chunk_factors",) if full else ()) + ("piece_transitions", "piece_state_grads")})
-    return out
-
-
-def check_backward_context(op, intermediates, shapes, io_dtype, device):
-    """Validate the backward summary's intermediates given to a backward op: ``intermediates`` maps the port names to tensors or
-    None (a zero-size tensor is one the summary did not emit and counts as None); ``shapes`` is ``backward_context_shapes``
-    for the backward's own geometry.  Each group comes together; a port this backward has no use for (the per-piece
-    tables of a one-sequence summary on a multi-sequence slab, the normalized rows where the backward normalizes other
-    rows) is left out; the rest must be dense, on ``device``, in the io dtype (rows and chunk factors) or fp32 (inverse
-    norms and piece tables) and shaped as ``shapes`` says.  Returns the ports to bind."""
-    present = {name: t for name, t in intermediates.items() if t is not None and t.numel() > 0}
-    for group in BACKWARD_CONTEXT_GROUPS:
-        got = [name for name in group if name in present]
-        if got and len(got) != len(group):
-            raise ValueError(f"{op}: {', '.join(group)} come together (the backward summary's intermediates); got {', '.join(got)}")
-    bound = {}
-    for name, t in present.items():
-        want = shapes.get(name)
-        if want is None:
-            continue
-        if tuple(t.shape) != tuple(want):
-            raise ValueError(f"{op}: {name} must be {list(want)} (the summary's intermediates for these tokens); got {tuple(t.shape)}")
-        want_dtype = io_dtype if name in ("q_normalized", "k_normalized", "chunk_factors") else torch.float32
-        if t.dtype != want_dtype:
-            raise TypeError(f"{op}: {name} must be {want_dtype} (the backward summary's output); got {t.dtype}")
-        if t.device != device:
-            raise ValueError(f"{op}: {name} must be on the op's device ({device}); got {t.device}")
-        bound[name] = t.contiguous()
-    return bound
-
-
-def backward_context_outputs(shapes, io_dtype, device):
-    """The summary op's intermediate outputs for ``shapes`` (``backward_context_shapes``): a dense tensor per emitted port, a
-    zero-size one per port the summary does not emit."""
-    out = {}
-    for name, dims in shapes.items():
-        dtype = io_dtype if name in ("q_normalized", "k_normalized", "chunk_factors") else torch.float32
-        out[name] = torch.empty(dims if dims is not None else (0,), dtype=dtype, device=device)
-    return out
