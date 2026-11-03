@@ -2301,10 +2301,9 @@ class FlashAttentionDSABackwardSm100:
                 threads_per_pool = 2 * self.pool_size
                 pool_index = tile_index * (self.block_tile // self.pool_size) + tidx_in_wg // threads_per_pool
                 pooled_limit = topk - topk % self.pool_size
-                if tidx_in_wg % threads_per_pool == 0 and pool_index < cute.size(mPoolTarget.shape[0]):
-                    if pool_index * self.pool_size >= pooled_limit:
-                        pool_mass = Float32(0.0)
-                    mPoolTarget[pool_index, (token_idx, batch_idx)] = pool_mass
+                if tidx_in_wg % threads_per_pool == 0 and pool_index < cute.size(mPoolTarget.shape[0]) and pool_index * self.pool_size < pooled_limit:
+                    target_ptr = mPoolTarget.iterator + cute.crd2idx((pool_index, (token_idx, batch_idx)), mPoolTarget.layout)
+                    cute.arch.atomic_add(target_ptr.llvm_ptr, pool_mass)
 
             tile_index -= 1
 

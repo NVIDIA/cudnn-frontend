@@ -434,9 +434,10 @@ def flash_attn_bwd_sm100(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
-    ``pool_target`` (total_S_q, k_pools) FP32 receives the unnormalized pool-level
+    ``pool_target`` (total_S_q, k_pools) FP32 accumulates the unnormalized pool-level
     teacher mass (P summed over heads and over each ``pool_size`` consecutive
-    slots, the trailing partial pool excluded); generic M64 backend only.
+    slots, the trailing partial pool excluded) into the caller-zeroed tensor;
+    generic M64 backend only.
 
     Accepts flat (unbatched) contiguous tensors with global topk indices.
     Internally wraps as batch=1 for the CuTe DSL kernel and never repacks.
