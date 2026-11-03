@@ -16,7 +16,7 @@ be packed by hand and reused across mutually-exclusive kernels.  Rule:
 
 Mutually-exclusive kernel groups in this codebase:
 
-  A. FA backward dS / dQ warp-split kernel ........ ids  1..7
+  A. FA backward dS / dQ warp-split kernel ........ ids  1..10
   B. bwd sparse score 2-WG kernel
      (SparseScoreRecomputeSm90, ``num_threads=256``) ..... ids  8..13
   C. bwd score 3-WG kernel
