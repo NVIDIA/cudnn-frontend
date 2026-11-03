@@ -24,6 +24,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
+from cudnn.norm.epilogue_codegen import apply_epilogue
 from cudnn.norm.dtypes import DTYPE_TO_CUTLASS
 from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi
 from cudnn.norm._common_sm100 import (
@@ -57,6 +58,8 @@ def _ln_fwd_kernel(
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
     affine: cutlass.Constexpr = None,
+    epilogue: cutlass.Constexpr = None,
+    epilogue_inputs=None,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     r, _, _ = cute.arch.block_idx()
@@ -142,6 +145,8 @@ def _ln_fwd_kernel(
                 y = affine_gamma(mGamma[gamma_base + (j0 + e) * gamma_step], affine) * ((x - mean) * rstd)
                 if cutlass.const_expr(has_beta):
                     y = y + mBeta[gamma_base + (j0 + e) * gamma_step].to(cutlass.Float32)
+                if cutlass.const_expr(epilogue is not None):
+                    y = apply_epilogue(y, epilogue_inputs, cutlass.Int64(r) * M + j0 + e, epilogue)
                 yf[e] = y.to(mY.element_type)
             cute.autovec_copy(yf, yv[None, vi])
             vi = vi + bt
@@ -152,6 +157,8 @@ def _ln_fwd_kernel(
             y = affine_gamma(mGamma[gamma_base + j * gamma_step], affine) * ((x - mean) * rstd)
             if cutlass.const_expr(has_beta):
                 y = y + mBeta[gamma_base + j * gamma_step].to(cutlass.Float32)
+            if cutlass.const_expr(epilogue is not None):
+                y = apply_epilogue(y, epilogue_inputs, cutlass.Int64(r) * M + j, epilogue)
             mY[r, j] = y.to(mY.element_type)
             j = j + bt
 
