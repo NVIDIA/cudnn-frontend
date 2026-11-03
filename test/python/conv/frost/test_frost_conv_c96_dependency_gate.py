@@ -17,6 +17,7 @@ pytestmark = pytest.mark.L0
 
 @pytest.mark.parametrize("k", (96, 192))
 def test_frost_c96_real_dependency_gate_before_template_import(monkeypatch, k):
+    """Decline an unsupported installed DSL before either entry point imports the dense template."""
     error = requirement_error("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
     if error is None:
         pytest.skip("installed DSL satisfies the dense version gate; covered by C96 execution tests")

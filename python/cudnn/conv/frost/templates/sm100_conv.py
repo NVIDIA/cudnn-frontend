@@ -1869,6 +1869,7 @@ def _compile_cached(
     device: int,
     gpu_arch: str,
 ):
+    """Cache a specialization per build device and target, including the padded-plane scan."""
     acc_dtype = cutlass.Float32
     epilogue_op = get_epilogue_op(epilogue, epilogue_attrs)
 

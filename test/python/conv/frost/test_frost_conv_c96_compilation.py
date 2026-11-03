@@ -22,6 +22,7 @@ pytestmark = pytest.mark.L0
 )
 def test_frost_c96_architecture_admission(monkeypatch, sm, channels, k, dtype):
     # Pin the version so the architecture contract is tested with older wheels too.
+    """Restrict BF16 C96 to SM100 without removing existing SM103 channel and dtype support."""
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.9.0")))
     monkeypatch.setattr(buffers, "current_sm", lambda: sm)
     graph = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -39,6 +40,7 @@ def test_frost_c96_architecture_admission(monkeypatch, sm, channels, k, dtype):
 @requires_dense_cutedsl
 @pytest.mark.parametrize("depth,k", [(1, 96), (5, 96), (1, 192), (5, 192)])
 def test_frost_c96_compiler_uses_build_device_and_target(monkeypatch, depth, k):
+    """Separate same-architecture devices in the cache and compile each path in its own context."""
     from cudnn.conv.frost.templates import sm100_conv
 
     target, active = [0, "sm_100a"], [99]
@@ -63,6 +65,7 @@ def test_frost_c96_compiler_uses_build_device_and_target(monkeypatch, depth, k):
             return 10 + active[0]
 
     def compile_kernel(*args, options):
+        """Record compilation while checking the active device, target, occupancy, and scan argument."""
         assert active[0] == target[0]
         assert args[4] == 10 + active[0]
         assert options == f"--enable-tvm-ffi --gpu-arch {target[1]}"

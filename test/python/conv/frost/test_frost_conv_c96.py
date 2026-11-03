@@ -67,6 +67,7 @@ def _compact(tensor):
 @pytest.mark.parametrize("k", [96, 192])
 @pytest.mark.parametrize("pattern", ["random", "tail-only", "cancellation", "zero"])
 def test_frost_conv_c96_channel_remainder(shape, k, pattern):
+    """Exercise all 96 reduction channels with random, tail-only, cancelling, and zero inputs."""
     image = make_input(shape, torch.bfloat16, seed=1234)
     weight = make_input((k, 96, 3, 3, 3), torch.bfloat16, seed=5678)
     if pattern == "tail-only":
@@ -115,6 +116,7 @@ def test_frost_conv_c96_causal_impulse_and_future_perturbation():
 
 @pytest.mark.parametrize("k", [96, 192])
 def test_frost_conv_c96_history_transitions_and_reset(k):
+    """Match full-sequence output across chunk boundaries and discard history on reset."""
     image = make_input((1, 96, 9, 5, 7), torch.bfloat16, seed=210)
     weight = make_input((k, 96, 3, 3, 3), torch.bfloat16, seed=211)
     whole = _conv(image, weight)
@@ -156,6 +158,7 @@ def test_frost_conv_c96_history_partial_tiles_and_persistent_reuse(shape, histor
 
 
 def test_frost_conv_c96_oracle_detects_wrong_padding_and_missing_tail():
+    """Prove that the oracle rejects symmetric padding and a truncated channel reduction."""
     image = make_input((1, 96, 5, 5, 7), torch.bfloat16, seed=310)
     weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=311)
     causal = _reference(image, weight)
@@ -168,6 +171,7 @@ def test_frost_conv_c96_oracle_detects_wrong_padding_and_missing_tail():
 
 @pytest.mark.parametrize("unsupported", ["c32", "c80", "c95", "c97", "c112", "c160", "k128", "half", "stride2", "filter1", "symmetric", "ncdhw", "relu"])
 def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
+    """Reject unsupported channels, types, geometry, layouts, and fused epilogues."""
     from cudnn.conv.frost.engine import FrostConvEngine
 
     c = int(unsupported[1:]) if unsupported.startswith("c") else 96
@@ -200,6 +204,7 @@ def test_frost_conv_c96_declines_outside_qualified_envelope(unsupported):
 @pytest.mark.parametrize("k", [96, 192])
 def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle, k):
     # M=3*7*9 exceeds 128, selecting two CTAs and four-output K96 reuse.
+    """Rebind streams and replay changed operands without allocation or synchronization."""
     image = make_input((1, 96, 3, 7, 9), torch.bfloat16, seed=510)
     weight = make_input((k, 96, 3, 3, 3), torch.bfloat16, seed=511)
     graph, (x, w, y), output, workspace = _plan(image, weight)
@@ -241,6 +246,7 @@ def test_frost_conv_c96_stream_rebinding_and_capture(cudnn_handle, k):
 @pytest.mark.parametrize("c,dtype", [(64, torch.bfloat16), (96, torch.bfloat16), (96, torch.float32)])
 @pytest.mark.parametrize("mode", [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK, cudnn.heur_mode.OPENSOURCE])
 def test_frost_conv_c96_default_placement_and_explicit_selection(c, dtype, mode):
+    """Preserve prior plan ordering while keeping the new C96 plan explicitly selectable."""
     image = make_input((1, c, 1, 5, 7), dtype, seed=610)
     weight = make_input((96, c, 3, 3, 3), dtype, seed=611)
     output = torch.empty((1, 96, 1, 5, 7), dtype=dtype, device="cuda", memory_format=torch.channels_last_3d)
@@ -269,6 +275,7 @@ def test_frost_conv_c96_default_placement_and_explicit_selection(c, dtype, mode)
 @pytest.mark.parametrize("k", [96, 192])
 @pytest.mark.parametrize("value", [float("nan"), float("inf")], ids=["nan", "inf"])
 def test_frost_conv_c96_nonfinite_padded_filter_planes(k, value):
+    """Preserve zero-times-nonfinite products in initial and multi-frame convolutions."""
     image = _compact(torch.ones((1, 96, 2, 3, 3), device="cuda", dtype=torch.bfloat16))
     weight = _compact(torch.zeros((k, 96, 3, 3, 3), device="cuda", dtype=torch.bfloat16))
     weight[0, 0, 0, 1, 1] = value
@@ -284,6 +291,7 @@ def test_frost_conv_c96_nonfinite_padded_filter_planes(k, value):
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "negative-inf"])
 @pytest.mark.parametrize("channels", [tuple(range(96)), (0, 31, 32, 63, 64, 95), (95,)], ids=["all", "word-edges", "last"])
 def test_frost_conv_c96_initial_padded_plane_flags(value, channels):
+    """Refresh nonfinite flags across channel boundaries when the same weight storage is reused."""
     image = make_input((2, 96, 1, 7, 9), torch.bfloat16, seed=610)
     weight = _compact(torch.full((96, 96, 3, 3, 3), 0.25, device="cuda", dtype=torch.bfloat16))
     for k in channels:
@@ -297,6 +305,7 @@ def test_frost_conv_c96_initial_padded_plane_flags(value, channels):
 
 
 def test_frost_conv_c96_initial_workspace_bounds_and_aliases():
+    """Reject missing, undersized, or overlapping scratch before the initial-frame launch."""
     image = make_input((1, 96, 1, 5, 7), torch.bfloat16, seed=620)
     weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=621)
     graph, (x, w, y), output, workspace = _plan(image, weight)
@@ -326,6 +335,7 @@ def test_frost_conv_c96_initial_workspace_bounds_and_aliases():
 @pytest.mark.L0
 @pytest.mark.parametrize("ordered", [False, True])
 def test_frost_conv_c96_initial_workspace_device_before_launch(monkeypatch, ordered):
+    """Reject foreign workspace storage through both execution APIs before any launch."""
     from types import SimpleNamespace
 
     image = make_input((1, 96, 1, 5, 7), torch.bfloat16, seed=625)
@@ -334,6 +344,7 @@ def test_frost_conv_c96_initial_workspace_device_before_launch(monkeypatch, orde
     values = (image, weight, output)
 
     def call(scratch):
+        """Exercise the selected mapping or ordered execution API with the supplied workspace."""
         if ordered:
             graph.execute(values, scratch, tensor_uids=[t.uid for t in tensors])
         else:
@@ -397,6 +408,7 @@ def test_frost_conv_c96_initial_workspace_device_before_launch(monkeypatch, orde
 
 
 def test_frost_conv_c96_initial_capture_separate_workspaces(cudnn_handle):
+    """Replay concurrent captures with separate scratch and independently changing nonfinite weights."""
     image = make_input((1, 96, 1, 64, 64), torch.bfloat16, seed=630)
     weight = make_input((96, 96, 3, 3, 3), torch.bfloat16, seed=631)
     graph, ports, _, _ = _plan(image, weight)

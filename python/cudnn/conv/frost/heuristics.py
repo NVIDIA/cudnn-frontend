@@ -19,6 +19,7 @@ def analyze_facts(graph):
 
 
 def propose(kind: str, facts: ConvGraph, offered: dict[str, int]) -> list[PlanConfig]:
+    """Keep BF16 C96 backend-first while preserving existing dtype and channel preferences."""
     engine_id = offered.get("frost_conv")
     if engine_id is None:
         return []

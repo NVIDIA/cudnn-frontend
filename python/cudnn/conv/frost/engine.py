@@ -229,6 +229,7 @@ class _Sm100FrostConvPlan(CompiledPlan):
 
     @staticmethod
     def check_support(analysis: ConvGraph) -> None:
+        """Decline unsupported dense graphs before compilation, including unqualified C96 architectures."""
         _check_cutedsl("frost_conv dense convolution", DENSE_CUTEDSL_MIN_VERSION)
         _check_sm100()
 
@@ -307,6 +308,7 @@ class _Sm100FrostConvPlan(CompiledPlan):
         _check_channels_last_3d_layout(tuple(zip(("image", "weight", "Y"), tensors)))
 
     def __init__(self, compiled, tensors, device: int):
+        """Retain the declared bindings, build device, and caller workspace requirement."""
         self._compiled = compiled
         self._tensors = tuple(tensors)
         self._shapes = tuple(tuple(t.dim) for t in tensors)
@@ -321,6 +323,7 @@ class _Sm100FrostConvPlan(CompiledPlan):
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
         # The compiled artifact bakes in device properties (max active clusters), so it
         # cannot be launched on a device other than the one it was built for.
+        """Validate current storage and launch with zero-copy views and caller-owned scratch."""
         launch_device = current_device()
         if launch_device != self._device:
             raise ValueError(f"frost_conv: plan was built for cuda:{self._device}, but execute would launch on cuda:{launch_device}")

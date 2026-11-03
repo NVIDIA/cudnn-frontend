@@ -24,6 +24,7 @@ def _equal_values(a, b):
 @pytest.mark.parametrize("k", (96, 192))
 def test_frost_c96_layout_capture_and_strides(n, d, hd, k):
     # Noncompact strides and tails exercise both axes of the transpose.
+    """Check strided inputs and exceptional values before, during, and after capture replay."""
     x = torch.randn(n, 96, d + 2, 7, 18, device="cuda", dtype=torch.bfloat16)[:, :, :d, :, ::2]
     history = None if hd == 0 else torch.randn(n, 96, hd + 1, 7, 18, device=x.device, dtype=x.dtype)[:, :, :hd, :, ::2]
     y = torch.empty((n, k, d, 7, 9), dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d).normal_()
@@ -33,6 +34,7 @@ def test_frost_c96_layout_capture_and_strides(n, d, hd, k):
         return pack(x, history), unpack_bias(y, bias)
 
     def verify(outputs):
+        """Check packed storage exactly and preserve BF16 output rounding and nonfinite values."""
         a, b = outputs
         expected_x = x if history is None else torch.cat((history, x), dim=2)
         assert a.is_contiguous(memory_format=torch.channels_last_3d)
@@ -76,6 +78,7 @@ def test_frost_c96_layout_capture_and_strides(n, d, hd, k):
 
 
 def test_frost_c96_layout_rejects_invalid_operands():
+    """Reject incompatible shapes, dtypes, bias layouts, and oversized batch grids."""
     x = torch.zeros((1, 96, 1, 7, 9), device="cuda", dtype=torch.bfloat16)
     y = torch.empty_like(x, memory_format=torch.channels_last_3d)
     bias = torch.zeros(96, device=x.device, dtype=x.dtype)

@@ -35,6 +35,7 @@ def pack_kernel(
     BC: tl.constexpr,
     BS: tl.constexpr,
 ):
+    """Join strided history and current frames into compact channels-last storage."""
     c = tl.program_id(1) * BC + tl.arange(0, BC)
     s = tl.program_id(0) * BS + tl.arange(0, BS)
     n = tl.program_id(2)
@@ -63,6 +64,7 @@ def unpack_bias_kernel(Y, BIAS, OUT, C: tl.constexpr, S: tl.constexpr, BC: tl.co
 
 
 def _validate(tensor):
+    """Reject operands outside the example's CUDA BF16 and 32-bit offset contract."""
     if tensor.device.type != "cuda" or tensor.dtype != torch.bfloat16 or tensor.ndim != 5:
         raise ValueError("expected a CUDA BF16 tensor with logical NCDHW dimensions")
     if min(tensor.shape) <= 0 or min(tensor.stride()) <= 0:

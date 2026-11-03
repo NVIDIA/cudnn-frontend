@@ -22,6 +22,7 @@ def compact_channels_last(tensor):
 
 
 def run(output_channels, provider="frost", tiled_layout=False):
+    """Compare 1+4+4 chunk execution with a full-sequence causal reference at the selected output width."""
     if tiled_layout:
         from causal_c96_layout import pack, unpack_bias
 
