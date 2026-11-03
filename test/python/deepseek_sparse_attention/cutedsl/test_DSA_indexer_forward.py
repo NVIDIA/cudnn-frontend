@@ -82,7 +82,9 @@ def _allocate_inputs(cfg, weight_dtype=torch.bfloat16):
 
 
 def _require_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100+ GPU required")
 
 
@@ -648,7 +650,9 @@ def test_DSA_indexer_forward_wrapper_mxfp8_small_head_groups_match_dequant_refer
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("MXFP8 indexer forward requires SM100+")
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
@@ -697,7 +701,9 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("MXFP8 indexer forward requires SM100+")
 
     from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import make_scale_cu_seqlens_padded
@@ -752,7 +758,9 @@ def test_DSA_indexer_forward_wrapper_thd_mxfp8_compact_padded_scales(h_q):
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("THD MXFP8 indexer forward requires SM100+")
 
     device = torch.device("cuda")

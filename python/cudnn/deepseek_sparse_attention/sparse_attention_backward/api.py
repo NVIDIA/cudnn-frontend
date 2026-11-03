@@ -124,9 +124,11 @@ class SparseAttentionBackward(APIBase):
         capability = torch.cuda.get_device_capability(self.q_desc.device)
         major, _ = capability
         self._device_major = major
+        # Only SM90 and the SM100-family targets in _SM100_FAMILY_ARCH_FLAGS have a backward kernel. Any other part
+        # (cc 11.x, cc 12.x) would reach compile() as an "SM90" plan and then be dispatched to the SM100 launch.
         self._runtime_error_if(
-            major < 9,
-            f"SparseAttentionBackward requires SM90+, found SM{major}",
+            major != 9 and capability not in _iface_sm100._SM100_FAMILY_ARCH_FLAGS,
+            f"SparseAttentionBackward requires SM90 or compute capability in {tuple(_iface_sm100._SM100_FAMILY_ARCH_FLAGS)}, found {capability}",
         )
         self._value_error_if(
             self.q_desc.ndim != 3,
