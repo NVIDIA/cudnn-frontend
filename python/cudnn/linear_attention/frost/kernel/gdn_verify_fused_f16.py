@@ -149,6 +149,8 @@ chunk -> bank = 4 rg + (128 / TPR) tpr + 4 c4 mod 32, eight distinct quads per 8
 pair's half-size boxes), plus the occupancy pad of ``Cfg.CTAS_PER_SM`` derived from the device's shared memory per SM.
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -567,7 +569,7 @@ def _emit_output(cfg, values, tpr, inv, wv, zv, scv, oi, out, qout, raw):
     rounded = (((val * inv) * wv) * (zv / (FP32(1) + cute.math.exp(-zv)))).to(BF16)
     qout[oi] = _quant_fp8_word(rounded.to(FP32), scv).to(UINT8)
     out[oi] = rounded
-    if cfg.DEBUG:
+    if cutlass.const_expr(cfg.DEBUG):
         raw[oi] = val.to(BF16)
 
 
@@ -1307,9 +1309,9 @@ def frost_gdn_verify_fused(
     qout: cute.Tensor,
     cs: cute.Tensor,
     cw: cute.Tensor,
-    raw: cute.Tensor,
-    convout: cute.Tensor,
-    baout: cute.Tensor,
+    raw: Optional[cute.Tensor],
+    convout: Optional[cute.Tensor],
+    baout: Optional[cute.Tensor],
     XS: cutlass.Constexpr,
     ZS: cutlass.Constexpr,
     SS: cutlass.Constexpr,
@@ -1408,9 +1410,9 @@ def launch(
     qout: cute.Tensor,
     cs: cute.Tensor,
     cw: cute.Tensor,
-    raw: cute.Tensor,
-    convout: cute.Tensor,
-    baout: cute.Tensor,
+    raw: Optional[cute.Tensor],
+    convout: Optional[cute.Tensor],
+    baout: Optional[cute.Tensor],
     REQUESTS: cutlass.Constexpr,
     XS: cutlass.Constexpr,
     ZS: cutlass.Constexpr,
@@ -1423,7 +1425,9 @@ def launch(
     stream: cuda.CUstream,
 ):
     """One CTA per (V head, request) -- a cluster of two per head under ``TWO_CTAS_PER_HEAD``; 256 threads; ``MIN_CTAS_PER_SM`` sets
-    ptxas's register cap (1 -> 255, 2 -> 128) and ``CTAS_PER_SM`` the shared-memory cap."""
+    ptxas's register cap (1 -> 255, 2 -> 128) and ``CTAS_PER_SM`` the shared-memory cap.  ``raw`` / ``convout`` / ``baout`` are the DEBUG
+    dumps: ``None`` unless ``cfg.DEBUG`` -- the DSL specializes on ``None`` and the slots are compiled out (every use sits under the
+    DEBUG constexpr), never bound to an allocation."""
     kernel = frost_gdn_verify_fused(
         cfg, qkv, z, hidden, baweight, al, dt, state, indices, cu, accepted, w, scale, counts, out, qout, cs, cw, raw, convout, baout,
         XS, ZS, SS, IS, CSS, CST, EPS, T,

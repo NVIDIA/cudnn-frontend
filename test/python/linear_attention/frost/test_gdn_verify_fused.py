@@ -620,6 +620,15 @@ def test_compile_key_is_plan_time_only():
     assert entry.step_shape(a["state_indices"]) == (2, 4)
 
 
+def test_debug_buffers_exist_under_debug_only():
+    """Without DEBUG the kernel's three debug slots are compiled out (None), never bound to an allocation; a debug entry allocates them."""
+    plain, debug = entry.GdnVerifyFused("cpu", 1e-6), entry.GdnVerifyFused("cpu", 1e-6, debug=True)
+    assert set(plain.outputs(2, 4)) == {"qout", "out", "counts"}
+    assert plain._debug_args(plain.outputs(2, 4)) == [None, None, None]
+    assert set(debug.outputs(2, 4)) == {"qout", "out", "counts", "raw", "convout", "baout"}
+    assert tuple(debug.outputs(2, 4)["raw"].shape) == (8, kcfg.V_HEADS, kcfg.HEAD_DIM) and tuple(debug.outputs(2, 4)["baout"].shape) == (8, 2 * kcfg.V_HEADS)
+
+
 def test_torch_reference_conditioning_and_padding_bookkeeping():
     ops = make_operands(requests=4, tokens=4, seed=3, pad="last", skip="mid")
     moved = condition_conv_inputs(ops)

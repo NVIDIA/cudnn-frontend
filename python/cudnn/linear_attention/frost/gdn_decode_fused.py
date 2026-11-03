@@ -279,21 +279,32 @@ class GdnDecodeFused:
 
     def outputs(self, rows: int):
         """The per-rows output buffers (the reference kernel's set): ``qout`` fp8 [rows, 48, 128], ``out`` bf16 [rows, 48, 128],
-        ``counts`` int32 [rows * 512] (the reader tickets, zero between launches) and the debug buffers ``raw`` [rows, 48, 128] bf16,
-        ``convout`` [rows, 10240] bf16, ``baout`` [rows, 96] bf16 (written only under ``DEBUG``)."""
+        ``counts`` int32 [rows * 512] (the reader tickets, zero between launches) and, under ``DEBUG`` only, the debug buffers ``raw``
+        [rows, 48, 128] bf16, ``convout`` [rows, 10240] bf16, ``baout`` [rows, 96] bf16 -- without ``DEBUG`` the kernel's debug slots are
+        compiled out (``None``), never bound to an allocation.  Entry-owned scratch, allocated once per rows count at the first compile /
+        call for it (outside any capture; a FlashInfer runner has no workspace contract to carve it from)."""
         if rows not in self.buffers:
             import torch
 
             dev = self.device
-            self.buffers[rows] = dict(
+            buffers = dict(
                 qout=torch.empty(rows, V_HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev),
                 out=torch.empty(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
                 counts=torch.zeros(rows * TICKET_STRIDE, dtype=torch.int32, device=dev),
-                raw=torch.zeros(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
-                convout=torch.zeros(rows, QKV_CHANNELS, dtype=torch.bfloat16, device=dev),
-                baout=torch.zeros(rows, 2 * V_HEADS, dtype=torch.bfloat16, device=dev),
             )
+            if self.debug:
+                buffers.update(
+                    raw=torch.zeros(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
+                    convout=torch.zeros(rows, QKV_CHANNELS, dtype=torch.bfloat16, device=dev),
+                    baout=torch.zeros(rows, 2 * V_HEADS, dtype=torch.bfloat16, device=dev),
+                )
+            self.buffers[rows] = buffers
         return self.buffers[rows]
+
+    def _debug_args(self, b) -> list:
+        """The kernel's three DEBUG slots: the dumps' views under ``DEBUG``, else ``None`` x 3 -- the DSL specializes on ``None`` and
+        compiles the slots out, so a dead slot is never bound to an allocation."""
+        return [_flat(b["raw"]), _flat(b["convout"]), _flat(b["baout"])] if self.debug else [None, None, None]
 
     def key(self, rows, x, cs, state, z):
         """The compile key: plan-time facts only (rows, strides, the config of this rows count) -- never a runtime value (Rule 4)."""
@@ -319,9 +330,7 @@ class GdnDecodeFused:
             _flat(b["qout"].view(torch.uint8)),
             _flat(hidden),
             _flat(baw),
-            _flat(b["raw"]),
-            _flat(b["convout"]),
-            _flat(b["baout"]),
+            *self._debug_args(b),
         ]
 
     def compile(self, rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw) -> None:

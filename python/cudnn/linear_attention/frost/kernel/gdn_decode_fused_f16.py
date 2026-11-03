@@ -99,6 +99,8 @@ padded by one 16-B chunk -> bank = 4 rg + (128 / TPR) tpr + 4 c4 mod 32, eight d
 occupancy pad of ``Cfg.CTAS_PER_SM`` derived from the device's shared memory per SM.
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -930,9 +932,9 @@ def frost_gdn_decode_fused(
     qout: cute.Tensor,
     hidden: cute.Tensor,
     baweight: cute.Tensor,
-    raw: cute.Tensor,
-    convout: cute.Tensor,
-    baout: cute.Tensor,
+    raw: Optional[cute.Tensor],
+    convout: Optional[cute.Tensor],
+    baout: Optional[cute.Tensor],
     XS: cutlass.Constexpr,
     ZS: cutlass.Constexpr,
     CSS: cutlass.Constexpr,
@@ -1047,9 +1049,9 @@ def launch(
     qout: cute.Tensor,
     hidden: cute.Tensor,
     baweight: cute.Tensor,
-    raw: cute.Tensor,
-    convout: cute.Tensor,
-    baout: cute.Tensor,
+    raw: Optional[cute.Tensor],
+    convout: Optional[cute.Tensor],
+    baout: Optional[cute.Tensor],
     BATCH: cutlass.Constexpr,
     XS: cutlass.Constexpr,
     ZS: cutlass.Constexpr,
@@ -1061,7 +1063,9 @@ def launch(
     stream: cuda.CUstream,
 ):
     """One CTA per (V head, request row) -- a cluster of two per head under ``TWO_CTAS_PER_HEAD``; 256 (or 128) threads;
-    ``MIN_CTAS_PER_SM`` sets ptxas's register cap (1 -> 255, 2 -> 128 at 256 threads) and ``CTAS_PER_SM`` the shared-memory cap."""
+    ``MIN_CTAS_PER_SM`` sets ptxas's register cap (1 -> 255, 2 -> 128 at 256 threads) and ``CTAS_PER_SM`` the shared-memory cap.
+    ``raw`` / ``convout`` / ``baout`` are the DEBUG dumps: ``None`` unless ``cfg.DEBUG`` -- the DSL specializes on ``None`` and the
+    slots are compiled out (every use sits under the DEBUG constexpr), never bound to an allocation."""
     kernel = frost_gdn_decode_fused(
         cfg, x, cs, cw, al, dt, state, indices, z, w, scale, counts, out, qout, hidden, baweight, raw, convout, baout, XS, ZS, CSS, CSD, CST, SS, EPS
     )

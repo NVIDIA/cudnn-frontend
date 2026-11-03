@@ -433,23 +433,35 @@ class GdnVerifyFused:
 
     def outputs(self, requests: int, tokens: int):
         """The entry-owned buffers of a step shape: ``qout`` fp8 [rows, 48, 128] and ``out`` bf16 (the defaults when the caller passes
-        no ``out`` / ``out_bf16``), ``counts`` int32 [requests * 512] (the conv-history reader tickets, zero between launches) and the
-        debug buffers ``raw`` [rows, 48, 128] bf16, ``convout`` [rows, 10240] bf16, ``baout`` [rows, 96] bf16 (written under ``DEBUG``)."""
+        no ``out`` / ``out_bf16``), ``counts`` int32 [requests * 512] (the conv-history reader tickets, zero between launches) and, under
+        ``DEBUG`` only, the debug buffers ``raw`` [rows, 48, 128] bf16, ``convout`` [rows, 10240] bf16, ``baout`` [rows, 96] bf16 -- without
+        ``DEBUG`` the kernel's debug slots are compiled out (``None``), never bound to an allocation.  Entry-owned scratch, allocated once
+        per step shape at the first compile / call for it (outside any capture; a FlashInfer runner has no workspace contract to carve it
+        from)."""
         shape = (requests, tokens)
         if shape not in self.buffers:
             import torch
 
             dev = self.device
             rows = requests * tokens
-            self.buffers[shape] = dict(
+            buffers = dict(
                 qout=torch.empty(rows, V_HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev),
                 out=torch.empty(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
                 counts=torch.zeros(requests * TICKET_STRIDE, dtype=torch.int32, device=dev),
-                raw=torch.zeros(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
-                convout=torch.zeros(rows, QKV_CHANNELS, dtype=torch.bfloat16, device=dev),
-                baout=torch.zeros(rows, 2 * V_HEADS, dtype=torch.bfloat16, device=dev),
             )
+            if self.debug:
+                buffers.update(
+                    raw=torch.zeros(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
+                    convout=torch.zeros(rows, QKV_CHANNELS, dtype=torch.bfloat16, device=dev),
+                    baout=torch.zeros(rows, 2 * V_HEADS, dtype=torch.bfloat16, device=dev),
+                )
+            self.buffers[shape] = buffers
         return self.buffers[shape]
+
+    def _debug_args(self, b) -> list:
+        """The kernel's three DEBUG slots: the dumps' views under ``DEBUG``, else ``None`` x 3 -- the DSL specializes on ``None`` and
+        compiles the slots out, so a dead slot is never bound to an allocation."""
+        return [_flat(b["raw"]), _flat(b["convout"]), _flat(b["baout"])] if self.debug else [None, None, None]
 
     def key(self, qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state):
         """The compile key: plan-time facts only (the step shape, strides, parameter dtypes, the config of this requests count)."""
@@ -513,9 +525,7 @@ class GdnVerifyFused:
             _flat(qout.view(torch.uint8)),
             _flat(conv_state),
             _flat(conv_weight),
-            _flat(b["raw"]),
-            _flat(b["convout"]),
-            _flat(b["baout"]),
+            *self._debug_args(b),
         ]
 
     def compile(

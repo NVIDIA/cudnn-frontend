@@ -378,6 +378,15 @@ def test_compile_key_is_plan_time_only():
     assert k.cfg.SMEM_PER_SM_BYTES == kcfg.SM100_SMEM_PER_SM_BYTES  # a host entry keeps the module reading; a CUDA device replaces it
 
 
+def test_debug_buffers_exist_under_debug_only():
+    """Without DEBUG the kernel's three debug slots are compiled out (None), never bound to an allocation; a debug entry allocates them."""
+    plain, debug = entry.GdnDecodeFused("cpu", 1e-6), entry.GdnDecodeFused("cpu", 1e-6, debug=True)
+    assert set(plain.outputs(ROWS)) == {"qout", "out", "counts"}
+    assert plain._debug_args(plain.outputs(ROWS)) == [None, None, None]
+    assert set(debug.outputs(ROWS)) == {"qout", "out", "counts", "raw", "convout", "baout"}
+    assert tuple(debug.outputs(ROWS)["convout"].shape) == (ROWS, kcfg.QKV_CHANNELS) and tuple(debug.outputs(ROWS)["baout"].shape) == (ROWS, 2 * kcfg.V_HEADS)
+
+
 def test_flat_view_covers_the_footprint_with_16_byte_alignment():
     from cudnn.frost.buffers import cutedsl_requirement_error
 
