@@ -4,6 +4,10 @@
 """cudnn.linear_attention.frost: the FROST linear-attention engines (GDN, KDA, GDN-2, GDP, Mamba-2) on the SM100 / SM103 / SM107 chunked kernels
 built on Cutlass primitives; forward and backward on SM100 / SM103 / SM107, ranked ahead of the cuTile fallbacks."""
 
+# The fused GDN decode / verify step entries for SM100-class parts (``GdnDecodeFused`` / ``GdnVerifyFused``) are exported here too:
+# direct-call kernels with the FlashInfer Qwen 3.5 GDN block's argument contract, not graph engines.  Their registration as that block's
+# ``frost_fe`` backend is ``flashinfer_gdn_backend``, imported explicitly (the import registers; it is never reached from ``import cudnn``).
+
 # Lazy: importing one family's engine must not drag its neighbours in.
 import importlib
 from typing import Any
