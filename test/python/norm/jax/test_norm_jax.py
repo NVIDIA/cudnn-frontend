@@ -208,13 +208,14 @@ def test_local_calls_allow_multiple_processes(kind, monkeypatch):
         assert_close(result, desired, jnp.float32)
 
 
-def test_tracing_ignores_unrelated_cuda_devices(monkeypatch):
+@pytest.mark.parametrize("capability,target", [((10, 0), "sm_100a"), ((10, 3), "sm_103a")])
+def test_tracing_ignores_unrelated_cuda_devices(monkeypatch, capability, target):
     from cudnn.frost import device
     from cudnn.norm import jax_api
 
     selected = jax.config.jax_default_device.local_hardware_id
     properties = {
-        "compute_capability": ((10, 0), (12, 0)),
+        "compute_capability": (capability, (12, 0)),
         "multiprocessor_count": (device.multiprocessor_count(selected), 68),
         "shared_memory_per_block_optin": (device.shared_memory_per_block_optin(selected), 101376),
     }
@@ -233,14 +234,15 @@ def test_tracing_ignores_unrelated_cuda_devices(monkeypatch):
     monkeypatch.setattr(jax_api, "_backward_call", jax_api._backward_call.__wrapped__)
     weight = jnp.ones((8,), jnp.float32)
     jax.jit(jax.value_and_grad(lambda x: layer_norm_forward_jax(x, weight)[0].sum())).lower(jax.ShapeDtypeStruct((2, 8), jnp.float32))
-    assert options == ["--gpu-arch=sm_100a"] * 2
+    assert options == [f"--gpu-arch={target}"] * 2
 
 
 @pytest.mark.parametrize("kind", ["layer", "rms"])
 def test_multiple_gpus_preserve_placement_and_reuse_compilation(kind):
-    devices = [d for d in jax.local_devices() if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == "10.0"]
+    capability = str(jax.config.jax_default_device.compute_capability)
+    devices = [d for d in jax.local_devices() if d.platform == "gpu" and str(getattr(d, "compute_capability", "")) == capability]
     if len(devices) < 2:
-        pytest.skip("needs two visible SM100 GPUs")
+        pytest.skip("needs two visible SM100 or SM103 GPUs with matching capabilities")
     shape = (8, 4096)
     forward = jax.jit(lambda args: invoke(kind, args))
     gradients = jax.grad(lambda args, cotangent: jnp.sum(invoke(kind, args) * cotangent))
@@ -299,7 +301,7 @@ sys.meta_path.insert(0, RejectTorch())
 import jax
 import jax.numpy as jnp
 from cudnn.ops import layer_norm_forward_jax, rms_norm_forward_jax
-target = next(device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) == "10.0")
+target = next(device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) in ("10.0", "10.3"))
 with jax.default_device(target):
     for rows, cols in ((3, 31), (2, 16384)):
         x = jnp.arange(rows * cols, dtype=jnp.float32).reshape(rows, cols) / (rows * cols)

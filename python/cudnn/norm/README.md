@@ -70,7 +70,7 @@ y, sm, sr = norm_fprop(NormVariant.BATCH_NORM, x, gamma, beta, training=True,
 ## JAX
 
 `cudnn.ops.layer_norm_forward_jax` and `cudnn.ops.rms_norm_forward_jax`
-reuse the SM100 forward and backward kernels through XLA custom calls. They
+reuse the SM100/SM103 forward and backward kernels through XLA custom calls. They
 return `(y,)`, containing the normalized array, and support `jax.jit` and first-order
 `jax.grad`/`jax.vjp`, including gradients for optional affine parameters.
 Inputs and affine parameters share a bf16, fp16 or fp32 dtype; parameter

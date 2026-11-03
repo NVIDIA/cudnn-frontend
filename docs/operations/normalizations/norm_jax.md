@@ -2,7 +2,7 @@
 
 `cudnn.ops.layer_norm_forward_jax` and `cudnn.ops.rms_norm_forward_jax`
 return `(y,)`, a one-element tuple containing the normalized JAX array. They
-use the existing SM100 CuTeDSL normalization kernels and support eager calls,
+use the existing SM100/SM103 CuTeDSL normalization kernels and support eager calls,
 `jax.jit`, and first-order reverse-mode
 differentiation through `jax.grad` and `jax.vjp`. PyTorch is not required.
 
@@ -53,13 +53,13 @@ Install the frontend and a CUDA-enabled JAX build (>=0.6.0). The frontend alread
 on CuTeDSL; these kernels require a build at least version 4.7.1 that provides
 `cutlass.experimental.primitives`. No additional frontend dependency is introduced.
 
-Place inputs on one SM100 GPU per invocation. Independent local calls are allowed
+Place inputs on one SM100 or SM103 GPU per invocation. Independent local calls are allowed
 in multi-process JAX programs; process count and other visible devices do not
-restrict eligibility. Compilation explicitly targets SM100, and launch tuning uses the input
-device or, during tracing, JAX's default device. Use `jax.default_device` to
-select an SM100 for tracing and new arrays when the system default is another
-architecture. Existing committed arrays retain their placement and must already
-be on the intended SM100; the context does not move them. Automatic partitioning
+restrict eligibility. Compilation targets `sm_100a` or `sm_103a` according to the input
+device or, during tracing, JAX's default device; launch tuning uses the same device.
+Use `jax.default_device` to select the intended GPU for tracing and new arrays
+when the system default is another architecture. Existing committed arrays retain their placement and must already
+be on the intended GPU; the context does not move them. Automatic partitioning
 of globally sharded arrays remains outside the qualified scope.
 
 ```python
@@ -70,7 +70,7 @@ from cudnn.ops import layer_norm_forward_jax, rms_norm_forward_jax
 target = next(
     device for device in jax.local_devices()
     if device.platform == "gpu"
-    and str(getattr(device, "compute_capability", "")) == "10.0"
+    and str(getattr(device, "compute_capability", "")) in ("10.0", "10.3")
 )
 
 def loss(x, weight, bias):
@@ -106,7 +106,7 @@ with jax.default_device(target):
 
 | Feature | Supported contract |
 |---|---|
-| GPU | One SM100 GPU per invocation; no frontend restriction on process count or other visible devices |
+| GPU | One SM100 or SM103 GPU per invocation; no frontend restriction on process count or other visible devices |
 | Operations | LayerNorm and RMSNorm |
 | Input and affine dtypes | BF16, FP16, FP32; matching dtypes |
 | Normalization axes | Positive static trailing dimensions; exact shape match |
@@ -126,14 +126,14 @@ The focused suite is
 [`test/python/norm/jax/test_norm_jax.py`](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/norm/jax/test_norm_jax.py).
 It exercises the public entry points against numerical references and checks
 the documented input contract. Passing collection or an environment skip does
-not establish GPU support; qualify the suite on SM100 with CUDA-enabled JAX
+not establish GPU support; qualify the suite on the target architecture with CUDA-enabled JAX
 and the required CuTeDSL runtime.
 
 The earlier single-GPU implementation was qualified on B200 with Python 3.12,
 JAX/jaxlib 0.9.1, CUDA 13, and the internal CuTeDSL build
 `4.9.0a0.dev0+internal.master.20261002010000.3617316`. Multiple-GPU execution
 requires a separate run of the placement and compilation-reuse tests with at
-least two SM100 GPUs visible. Mixed-architecture visibility also requires
+least two GPUs of the target architecture visible. Mixed-architecture visibility also requires
 validation with the installed CuTeDSL JAX runtime; mocked device properties
 exercise frontend selection but do not qualify the runtime's binary loading.
 Run the focused suite without the parent Torch

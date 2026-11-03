@@ -12,8 +12,8 @@ import pytest
 def cuda_device():
     import jax
 
-    devices = [device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) == "10.0"]
+    devices = [device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) in ("10.0", "10.3")]
     if not devices:
-        pytest.skip("JAX norm tests require an SM100 GPU")
+        pytest.skip("JAX norm tests require an SM100 or SM103 GPU")
     with jax.default_device(devices[0]):
         yield

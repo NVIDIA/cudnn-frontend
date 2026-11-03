@@ -30,6 +30,7 @@ class _Config:
     has_beta: bool
     epsilon: float
     device: int
+    gpu_arch: str
 
 
 def _require_array(value, name):
@@ -44,15 +45,15 @@ def _target_device(*arrays):
     if len(placed) > 1:
         raise ValueError("JAX normalization arrays must be on the same GPU")
     # Tracers have no concrete placement. The default device supplies tuning
-    # properties; XLA places execution, and compilation explicitly targets SM100.
+    # properties and the compiler target; XLA places execution.
     target = next(iter(placed)) if placed else (jax.config.jax_default_device or jax.local_devices()[0])
     if target.platform != "gpu":
         raise NotImplementedError(f"JAX normalization requires a CUDA GPU; got {target.platform}")
     device = target.local_hardware_id
     capability = compute_capability(device)
-    if capability != (10, 0):
-        raise NotImplementedError(f"JAX normalization requires SM100 (compute capability 10.0); got {capability}")
-    return device
+    if capability not in ((10, 0), (10, 3)):
+        raise NotImplementedError(f"JAX normalization requires SM100 or SM103 (compute capability 10.0 or 10.3); got {capability}")
+    return device, f"sm_{capability[0]}{capability[1]}a"
 
 
 def _configuration(x, weight, bias, normalized_shape, eps, variant):
@@ -89,7 +90,8 @@ def _configuration(x, weight, bias, normalized_shape, eps, variant):
     spec = rowwise_spec(variant, x.shape, normalized_shape=shape)
     if spec.R * spec.M >= 2**31:
         raise ValueError("JAX normalization requires the flattened tensor size to fit signed int32")
-    return _Config(spec, dtypes[x.dtype], bias is not None, float(eps), _target_device(x, weight, bias))
+    device, gpu_arch = _target_device(x, weight, bias)
+    return _Config(spec, dtypes[x.dtype], bias is not None, float(eps), device, gpu_arch)
 
 
 @lru_cache(maxsize=128)
@@ -109,7 +111,7 @@ def _forward_call(config):
     dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16, "fp32": jnp.float32}[config.dtype]
     stats = jax.ShapeDtypeStruct((spec.R,), jnp.float32)
     outputs = (jax.ShapeDtypeStruct((spec.R, spec.M), dtype), stats if spec.has_mean else None, stats)
-    return call(launch, output_shape_dtype=outputs, use_static_tensors=True, compile_options="--gpu-arch=sm_100a")
+    return call(launch, output_shape_dtype=outputs, use_static_tensors=True, compile_options=f"--gpu-arch={config.gpu_arch}")
 
 
 @lru_cache(maxsize=128)
@@ -139,7 +141,7 @@ def _backward_call(config):
     initialized = {1: zeros_init}
     if config.has_beta:
         initialized[2] = zeros_init
-    return call(launch, output_shape_dtype=outputs, initialized_outputs=initialized, use_static_tensors=True, compile_options="--gpu-arch=sm_100a")
+    return call(launch, output_shape_dtype=outputs, initialized_outputs=initialized, use_static_tensors=True, compile_options=f"--gpu-arch={config.gpu_arch}")
 
 
 def _forward(config, x, weight, bias):
@@ -166,7 +168,7 @@ _normalize.defvjp(_forward, _backward)
 
 
 def layer_norm_forward_jax(x, weight=None, bias=None, *, normalized_shape=None, eps=1e-5):
-    """Normalize trailing dimensions on SM100, with first-order x/weight/bias gradients.
+    """Normalize trailing dimensions on SM100/SM103, with first-order x/weight/bias gradients.
 
     Inputs have matching BF16, FP16, or FP32 dtype. Affine parameters, when present,
     have exactly ``normalized_shape``; the default normalizes the last dimension.
@@ -180,7 +182,7 @@ def layer_norm_forward_jax(x, weight=None, bias=None, *, normalized_shape=None, 
 
 
 def rms_norm_forward_jax(x, weight=None, *, normalized_shape=None, eps=1e-5):
-    """RMS-normalize trailing dimensions on SM100, with first-order x/weight gradients.
+    """RMS-normalize trailing dimensions on SM100/SM103, with first-order x/weight gradients.
 
     The dtype, shape, and static-argument contract matches :func:`layer_norm_forward_jax`.
     No bias is applied; omitted weight means one.
