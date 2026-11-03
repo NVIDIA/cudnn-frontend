@@ -18,19 +18,20 @@ The framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.
 that calls the forward wrapper in ``forward()`` and the backward wrapper in
 ``backward()``); these APIs are pure kernels-plus-validation.
 
-Validated envelope (``check_support``): compute capability major >= 10 (SM100+), BF16 ``kv``/``score``/
-``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
+Validated envelope (``check_support``): SM90 or compute capability major >= 10,
+BF16 ``kv``/``score``/``out``, FP32 ``ape``, int32
+``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
 (``total_tokens * coff * head_dim < 2**31``), and per ratio:
 
 - ``ratio in {2, 4}``, ``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA
   configuration, ``coff == 1`` the own-block window form) — served by the generic
   kernels in ``compressor_sm100.py`` (whole window in registers; optimal at small
-  ratios, register-bound beyond ``ratio = 32``);
+  ratios, register-bound beyond ``ratio = 32``) on SM90 and newer GPUs;
 - ``ratio == 128``, ``coff in {1, 2}``, ``head_dim in {128, 512}`` — served by the
   dedicated kernels in ``compressor_sm100_r128.py`` (bucketed-schedule chunked-softmax
-  forward; staged smem backward with fused per-chunk reductions). The wrappers route
-  by ``ratio`` transparently. NOTE: the numerics contracts differ per family — see
-  below.
+  forward; staged smem backward with fused per-chunk reductions) on SM100 and newer
+  GPUs. The wrappers route by ``ratio`` transparently. NOTE: the numerics contracts
+  differ per family — see below.
 
 Numerics contract (see the kernel modules and docs/operations/sparse_attention/csa.md for details):
 fp32 arithmetic with one final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX.
@@ -69,7 +70,6 @@ from cudnn.api_base import APIBase, TupleDict
 
 from .compressor_sm100 import (
     CU_ALIGN_BYTES,
-    MINIMUM_COMPUTE_CAPABILITY_MAJOR,
     PTR_ALIGN_BYTES,
     bwd_dape_workspace_bytes,
     precompile_bwd,
@@ -93,6 +93,7 @@ _INT32_LIMIT = 2**31
 _MAX_HEAD_DIM = 128 * 65535
 # Bound + eviction policy follow python/cudnn/graph.py's graph_cache precedent.
 _API_CACHE_MAXSIZE = 256
+_SM90_CAPABILITY = (9, 0)
 
 
 class _LruDict:
@@ -321,11 +322,14 @@ class _CSACompressorBase(APIBase):
         else:
             target = torch.device("cuda", torch.cuda.current_device())
 
-        capability = torch.cuda.get_device_capability(target)
+        capability = tuple(torch.cuda.get_device_capability(target))
         self._runtime_error_if(
-            capability[0] < MINIMUM_COMPUTE_CAPABILITY_MAJOR,
-            f"CSA compressor requires compute capability major >= {MINIMUM_COMPUTE_CAPABILITY_MAJOR} "
-            f"(SM100+), found SM{capability[0]}.{capability[1]} on {target}",
+            capability != _SM90_CAPABILITY and capability[0] < 10,
+            f"CSA compressor ratio {self.ratio} requires SM90 or compute capability " f"major >= 10, found SM{capability[0]}.{capability[1]} on {target}",
+        )
+        self._runtime_error_if(
+            capability == _SM90_CAPABILITY and self.ratio == 128,
+            "CSA compressor ratio 128 is not yet supported on SM90; use ratio 2 or 4",
         )
 
         self.total_tokens = total_tokens
@@ -370,6 +374,9 @@ class _CSACompressorBase(APIBase):
 
 class CSACompressorForward(_CSACompressorBase):
     """Fused CSA compressor forward: one kernel over the whole THD pack.
+
+    Ratio 2/4 plans support SM90 and compute-capability major >= 10. Ratio 128
+    remains compute-capability major >= 10 only.
 
     Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding (for
     CUDA-graph static shapes) and are computed with first-in-segment semantics from
@@ -433,6 +440,9 @@ class CSACompressorForward(_CSACompressorBase):
 
 class CSACompressorBackward(_CSACompressorBase):
     """Fused CSA compressor backward: recompute window probs, write grads in one kernel.
+
+    Ratio 2/4 plans support SM90 and compute-capability major >= 10. Ratio 128
+    remains compute-capability major >= 10 only.
 
     ``grad_kv``/``grad_score`` may be UNINITIALIZED: the kernel writes every position —
     consumed positions get their gradients (disjoint, atomic-free stores), and every
@@ -721,7 +731,9 @@ def csa_compressor_forward_wrapper(
         cu_seqlens_comp: ``(B + 1,)`` int32 cumulative compressed-block counts,
             ``cu_seqlens_comp[b + 1] - cu_seqlens_comp[b] == seqlen_b // ratio``.
         ratio: compression ratio (tokens per output block); validated envelope:
-            {2, 4, 128} (the wrappers route to the matching kernel family by ratio).
+            {2, 4} on SM90 or compute-capability major >= 10, and 128 on
+            compute-capability major >= 10 (the wrappers route to the matching kernel
+            family by ratio).
         head_dim: output feature dimension; inferred from ``kv`` width when omitted.
         coff: 1 for the own-block window form (window = ``ratio`` tokens, no overlap) or
             2 for the overlapping-window form (window = ``2 * ratio``); validated
@@ -762,6 +774,9 @@ def csa_compressor_backward_wrapper(
     deterministic: bool = False,
 ) -> TupleDict:
     """High-level backward wrapper. Allocates the grad buffers and fills them.
+
+    Ratio 2/4 is supported on SM90 and compute-capability major >= 10; ratio 128
+    remains compute-capability major >= 10 only.
 
     ``grad_out`` is ``(total_comp, head_dim)`` BF16 (the incoming gradient of the
     forward wrapper's ``out``); gradients on static-capacity padding rows are ignored.

@@ -97,10 +97,10 @@ from cudnn._cutlass_compat import SmemAllocator
 
 _ENV_FAST_LAUNCH = "CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH"
 
-# The kernels use no architecture-specific features beyond the SM100 baseline (plain
-# loads/stores, fp32 atomics, pinned mul/fma PTX), so admit SM100 and newer GPU
-# families. ``cute.compile`` resolves the concrete SASS target from the active device.
-MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
+# The generic ratio-2/4 kernels use only CUDA-core operations available on SM90
+# (plain loads/stores, fp32 atomics, barriers, and pinned mul/fma PTX).
+# ``cute.compile`` resolves the concrete SASS target from the active device.  The
+# ratio-128 family has a separately validated architecture envelope in ``api.py``.
 
 
 # =============================================================================
