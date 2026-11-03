@@ -957,7 +957,8 @@ def test_2cta_stail_host_renders_dense_form_for_sm_100a_and_matches_its_record(t
     assert census == _EXPECTED, census  # the module census is the main kernel's: the three re-rendered helpers carry none of its rows
     assert sorted(regs) == _setmaxnreg_of(), regs
     assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels  # the same five launches as the packed chain
-    _, default = _record_kernels(_RECORD, _RECORD_TOKEN)
+    dsl_default, default = _record_kernels(_RECORD, _RECORD_TOKEN)
+    _skip_unless_record_dsl(dsl_default)  # the default record's main-kernel md5 holds for its DSL build only: another build skips before comparing
     assert kernels[_MAIN_KERNEL] == default[_MAIN_KERNEL], (
         f"the dense form re-rendered the MAIN kernel ({kernels[_MAIN_KERNEL]} vs the default record's {default[_MAIN_KERNEL]}): "
         "the twin is a host lowering, the pair body must be byte-identical"
@@ -1059,7 +1060,8 @@ def test_2cta_stail_host_renders_dq576_ldg_for_sm_107a_and_matches_its_record(tm
     assert set(kernels) == set(_OWN_KERNELS_LDG) | set(D128_THD_SHARED_KERNELS), kernels
     main = _OWN_KERNELS[2]
     assert md5 not in (md5_l, md5_d) and kernels[main] not in (kernels_l[main], kernels_d[main]), "dq_576 x ldg renders its own MAIN kernel"
-    _, ldg_record = _record_kernels(_RECORD, _RECORD_TOKEN_LDG)
+    ldg_dsl, ldg_record = _record_kernels(_RECORD, _RECORD_TOKEN_LDG)
+    _skip_unless_record_dsl(ldg_dsl)  # the ldg record's rows hold for its DSL build only: another build skips here, before any hash comparison
     assert all(kernels[k] == kernels_l[k] == ldg_record[k] for k in _OWN_KERNELS_LDG if k != main), (kernels, kernels_l, ldg_record)
     assert _RECORD_DQ576.is_file(), _RECORD_DQ576
     _assert_record(kernels, _RECORD_DQ576, _RECORD_TOKEN_DQ576_LDG, "the dq_576 x ldg rendering named for sm_107a", arch=_RECORD_ARCH_DQ576)
