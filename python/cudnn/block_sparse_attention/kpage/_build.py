@@ -682,7 +682,9 @@ class Blk64Refinement:
     """blk128 metadata rewritten as the blk64 metadata of the same function (SM90 blk128 KPage).
 
     Every 128-row block is split into its two 64-row halves; KV halves without valid rows are dropped from the lists
-    and Q halves without valid rows get count 0, so neither costs work in the blk64 forward and backward.
+    and Q halves without valid rows get count 0, so neither costs work in the blk64 forward and backward.  Only the
+    first ``block_count`` entries of a ``block_index`` row are written (the rest is uninitialized): every consumer
+    reads a row up to its count, as the blk64 metadata contract allows.
     """
 
     block_index: Tensor  # [1, H, 2 * nQ, 2 * cap] int32
@@ -704,7 +706,7 @@ def refine_blk128_to_blk64(
     batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
     assert batch == 1, "kpage runs a batch as independent heads; batch must be 1"
     dev = q2k_block_index.device
-    index64 = torch.zeros((num_heads * n_q_blocks * 2, 2 * cap), dtype=torch.int32, device=dev)
+    index64 = torch.empty((num_heads * n_q_blocks * 2, 2 * cap), dtype=torch.int32, device=dev)  # written up to each count
     count64 = torch.empty((num_heads * n_q_blocks * 2,), dtype=torch.int32, device=dev)
     sizes64 = torch.empty((2 * kv_sizes.numel(),), dtype=torch.int32, device=dev)
     refine_cute(

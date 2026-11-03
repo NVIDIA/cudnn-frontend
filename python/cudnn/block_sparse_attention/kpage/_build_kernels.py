@@ -930,7 +930,7 @@ class RefineBlk128ToBlk64:
         mBlockCount: cute.Tensor,  # [W]
         mQSizes: cute.Tensor,  # [nQ]
         mBlockSizes: cute.Tensor,  # [nKV]
-        mBlockIndex64: cute.Tensor,  # [2W, 2 * cap], zero-initialized
+        mBlockIndex64: cute.Tensor,  # [2W, 2 * cap]; entries past a row's count are left unwritten
         mBlockCount64: cute.Tensor,  # [2W]
         mBlockSizes64: cute.Tensor,  # [2 * nKV]
         stream: cuda.CUstream,
