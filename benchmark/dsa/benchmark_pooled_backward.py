@@ -94,7 +94,6 @@ def build_case(seqlen, k_pools, pool_size, seed):
 
 def cudnn_indexer_chain(c, timer, grad_loss):
     pool_size = c["pool_size"]
-    s = c["index_q"].shape[1]
     stages = {}
 
     def pooled():

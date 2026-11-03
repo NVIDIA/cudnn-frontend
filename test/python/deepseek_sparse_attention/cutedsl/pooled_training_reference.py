@@ -9,14 +9,11 @@ Layouts follow the DSA module: ``index_q`` (B, S, H, D), ``weights`` (B, S, H),
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
-from deepseek_sparse_attention.cutedsl.dsa_reference import (
-    _indexer_predict_distribution,
-    ref_sparse_attn_score_recompute,
-)
+from deepseek_sparse_attention.cutedsl.dsa_reference import _indexer_predict_distribution
 
 CLIP_LOG_MIN = -100.0
 
@@ -200,7 +197,6 @@ def naive_pooled_indexer_backward(
     # dense pooled index scores (B, S, P_k)
     index_scores = pooled_dense_scores(index_q, weights, pooled_c, sm_scale).masked_fill(~k_elig, float("-inf"))
     # teacher: full attention recompute, masked to the selected tokens
-    width = token_ids.shape[-1]
     token_mask = torch.zeros(b, s, s_k + 1, dtype=torch.bool, device=index_q.device)
     token_mask.scatter_(-1, token_ids.clamp(min=-1).long() + 1, True)
     token_mask = token_mask[..., 1:]
