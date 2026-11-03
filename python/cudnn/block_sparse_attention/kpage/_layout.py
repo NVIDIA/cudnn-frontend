@@ -92,44 +92,66 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _validate_metadata(
-    q2k_block_index: Tensor, q2k_block_nums: Tensor, q_sizes: Tensor, kv_sizes: Tensor, allow_empty: bool, block: int = BLOCK
-) -> Tuple[bool, bool]:
-    """Check the metadata contract on device with one readback; returns whether the Q / KV partition has partial blocks.
+class _MetadataCheck:
+    """The device check of the metadata contract, read back on the walk-table builder's sizing sync.
+
+    One CuTe DSL kernel reads only the listed slots of each walk, and its per-CTA result rows are copied into pinned
+    host memory behind it.  ``result()`` waits on that copy, which costs nothing once the builder's own readback has
+    synced the stream, and raises on a violation (``_raise_metadata_error`` locates it for the message).  The builders
+    run only kernels that clamp ids, counts and sizes before their readback and call ``result()`` right after it, so
+    invalid metadata never reaches a kernel that indexes memory by it.
 
     ``allow_empty`` admits query blocks with no KV pages to attend to (count 0,
     or only zero-size blocks); they get O = 0, LSE = -inf and dQ = 0.
-
-    One CuTe DSL kernel reads only the listed slots of each walk.  On a violation,
-    ``_raise_metadata_error`` locates it for the error message.
     """
-    from . import _build_kernels as kernels
 
-    cap = q2k_block_index.shape[-1]
-    walks = q2k_block_index.numel() // cap
-    dev = q2k_block_index.device
-    num_ctas = max(1, min(walks, _VALIDATE_CTAS_PER_SM * _num_sms(dev.index)))
-    scratch = torch.zeros((num_ctas, (kv_sizes.numel() + 31) // 32), dtype=torch.int32, device=dev)
-    result = torch.empty((num_ctas, kernels.VALIDATE_NUM_FLAGS), dtype=torch.int32, device=dev)
-    kernels.validate_metadata(q2k_block_index.view(walks, cap), q2k_block_nums.view(walks), q_sizes, kv_sizes, scratch, result, block, kernels.current_stream())
-    result = result.cpu()
-    low, high = result.amin(dim=0).tolist(), result.amax(dim=0).tolist()
-    counts_min, counts_max = low[kernels.VALIDATE_COUNTS_MIN], high[kernels.VALIDATE_COUNTS_MAX]
-    sizes_min, sizes_max = low[kernels.VALIDATE_SIZES_MIN], high[kernels.VALIDATE_SIZES_MAX]
-    has_oob, has_dup, has_empty_row = (high[c] != 0 for c in (kernels.VALIDATE_HAS_OOB, kernels.VALIDATE_HAS_DUP, kernels.VALIDATE_HAS_EMPTY_ROW))
-    valid = (
-        counts_min >= (0 if allow_empty else 1)
-        and counts_max <= cap
-        and not has_oob
-        and not has_dup
-        and 0 <= sizes_min
-        and sizes_max <= block
-        and (allow_empty or not has_empty_row)
-    )
-    if not valid:
-        _raise_metadata_error(q2k_block_index, q2k_block_nums, q_sizes, kv_sizes, allow_empty, block)
-        raise RuntimeError(f"KPage metadata validation: the device check flagged a violation the reference check did not find ({result.tolist()})")
-    return high[kernels.VALIDATE_PARTIAL_Q] != 0, high[kernels.VALIDATE_PARTIAL_KV] != 0
+    def __init__(self, q2k_block_index: Tensor, q2k_block_nums: Tensor, q_sizes: Tensor, kv_sizes: Tensor, allow_empty: bool, block: int = BLOCK):
+        from . import _build_kernels as kernels
+
+        cap = q2k_block_index.shape[-1]
+        walks = q2k_block_index.numel() // cap
+        dev = q2k_block_index.device
+        num_ctas = max(1, min(walks, _VALIDATE_CTAS_PER_SM * _num_sms(dev.index)))
+        scratch = torch.zeros((num_ctas, (kv_sizes.numel() + 31) // 32), dtype=torch.int32, device=dev)
+        self._device_result = torch.empty((num_ctas, kernels.VALIDATE_NUM_FLAGS), dtype=torch.int32, device=dev)
+        kernels.validate_metadata(
+            q2k_block_index.view(walks, cap), q2k_block_nums.view(walks), q_sizes, kv_sizes, scratch, self._device_result, block, kernels.current_stream()
+        )
+        self._host_result = torch.empty(self._device_result.shape, dtype=torch.int32, pin_memory=True)
+        self._host_result.copy_(self._device_result, non_blocking=True)
+        self._copied = torch.cuda.Event()
+        self._copied.record()
+        self._args = (q2k_block_index, q2k_block_nums, q_sizes, kv_sizes, allow_empty, block)
+        self._verdict: Optional[Tuple[bool, bool]] = None
+
+    def result(self) -> Tuple[bool, bool]:
+        """Whether the Q / KV partition has partial blocks; raises ``ValueError`` on a contract violation."""
+        if self._verdict is not None:
+            return self._verdict
+        from . import _build_kernels as kernels
+
+        self._copied.synchronize()
+        result = self._host_result
+        low, high = result.amin(dim=0).tolist(), result.amax(dim=0).tolist()
+        _, _, _, _, allow_empty, block = self._args
+        cap = self._args[0].shape[-1]
+        counts_min, counts_max = low[kernels.VALIDATE_COUNTS_MIN], high[kernels.VALIDATE_COUNTS_MAX]
+        sizes_min, sizes_max = low[kernels.VALIDATE_SIZES_MIN], high[kernels.VALIDATE_SIZES_MAX]
+        has_oob, has_dup, has_empty_row = (high[c] != 0 for c in (kernels.VALIDATE_HAS_OOB, kernels.VALIDATE_HAS_DUP, kernels.VALIDATE_HAS_EMPTY_ROW))
+        valid = (
+            counts_min >= (0 if allow_empty else 1)
+            and counts_max <= cap
+            and not has_oob
+            and not has_dup
+            and 0 <= sizes_min
+            and sizes_max <= block
+            and (allow_empty or not has_empty_row)
+        )
+        if not valid:
+            _raise_metadata_error(*self._args)
+            raise RuntimeError(f"KPage metadata validation: the device check flagged a violation the reference check did not find ({result.tolist()})")
+        self._verdict = (high[kernels.VALIDATE_PARTIAL_Q] != 0, high[kernels.VALIDATE_PARTIAL_KV] != 0)
+        return self._verdict
 
 
 def _raise_metadata_error(
@@ -251,14 +273,16 @@ def prepare_layout(
     if seqlen_k % block:
         kv_sizes = kv_sizes.clone()
         kv_sizes[-1:].clamp_(max=seqlen_k % block)
-    partial_q, partial_kv = _validate_metadata(idx, cnt, q_sizes, kv_sizes, allow_empty_block_nums, block) if validate else (None, None)
+    # The check is launched here and read back on the builder's sizing sync: one host sync per layout.
+    check = _MetadataCheck(idx, cnt, q_sizes, kv_sizes, allow_empty_block_nums, block) if validate else None
+    after_sizing = check.result if check is not None else None
     pair_tables = refined = pad_q_rows = None
     if block == 128 and sm90:
         if bwd_kv_groups is not None:
             raise NotImplementedError("bwd_kv_groups is specific to the SM100/SM103 KPage backward")
         # The 64-row halves of the blk128 metadata, padding halves dropped; the pair walks of one 128-row Q block.
         refined = refine_blk128_to_blk64(idx, cnt, q_sizes, kv_sizes, seqlen_q, seqlen_k)
-        pair_tables = build_pair_walk_tables_blk64(refined.block_index, refined.block_count, refined.block_sizes)
+        pair_tables = build_pair_walk_tables_blk64(refined.block_index, refined.block_count, refined.block_sizes, after_sizing)
         tables = blk64_tables = None
         rows = torch.arange(seqlen_q, device=idx.device, dtype=torch.int32)
         pad_q_rows = rows % block >= q_sizes.repeat_interleave(block)[:seqlen_q]
@@ -266,12 +290,14 @@ def prepare_layout(
         # Forward only, every Q row valid: SM90 walks Q block pairs, SM100/SM103 the M64 x N256 walks of one Q block.
         tables = blk64_tables = None
         if sm90:
-            pair_tables = build_pair_walk_tables_blk64(idx, cnt, kv_sizes)
+            pair_tables = build_pair_walk_tables_blk64(idx, cnt, kv_sizes, after_sizing)
         else:
-            blk64_tables = build_walk_tables_blk64(idx, cnt, kv_sizes)
-        partial_q = partial_kv = False
+            blk64_tables = build_walk_tables_blk64(idx, cnt, kv_sizes, after_sizing)
     else:
-        tables, blk64_tables = build_walk_tables(idx, cnt, q_sizes, kv_sizes, H, bwd_kv_groups=bwd_kv_groups)
+        tables, blk64_tables = build_walk_tables(idx, cnt, q_sizes, kv_sizes, H, bwd_kv_groups=bwd_kv_groups, after_sizing=after_sizing)
+    partial_q, partial_kv = check.result() if check is not None else (None, None)  # already read back by the builder
+    if block == 64:
+        partial_q = partial_kv = False
     return KPageLayout(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,

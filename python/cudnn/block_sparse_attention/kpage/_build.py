@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -445,6 +445,7 @@ def build_walk_tables(
     kv_sizes: Tensor,  # [nKV] int32 valid rows per KV block; device kernels clamp on load
     H: int,
     bwd_kv_groups: Optional[int] = None,
+    after_sizing: Optional[Callable[[], object]] = None,
 ) -> Tuple[WalkTables, Blk64ForwardTables]:
     """Forward page walks for both kernels, plus the deferred backward state.
 
@@ -453,7 +454,8 @@ def build_walk_tables(
     larger one to a multiple of two (M128 kernel); each Q block lands in
     exactly one work queue.  Long walks are queued first to shorten the
     persistent-scheduler tail.  One readback of the route counts sizes the
-    tables exactly.
+    tables exactly; ``after_sizing`` runs right after it, before any kernel
+    that indexes memory by the metadata unclamped.
     """
 
     dev = kv_sizes.device
@@ -495,6 +497,8 @@ def build_walk_tables(
     )
 
     n_small_q, n_large_q, total_tiles = (int(value) for value in q_route_state[2].cpu())
+    if after_sizing is not None:
+        after_sizing()
 
     # Dummy page ids are out of bounds for the TMA descriptor and load as zeros.
     nt = max(total_tiles, 1)
@@ -559,12 +563,13 @@ def build_walk_tables_blk64(
     q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
     q2k_block_nums: Tensor,  # [1, H, nQ] int32
     kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+    after_sizing: Optional[Callable[[], object]] = None,
 ) -> Blk64ForwardTables:
     """Forward page walks for sparse_block_size=64 metadata, for the M64 x N256 kernel.
 
     A 64-row Q block is one M64 tile, so the tables are indexed by the Q block itself (``[1, H, nQ]``, not the two
     halves of a 128-row block) and the M128 route is never used.  Q padding is not skipped, as in the base blk64
-    kernel.  One readback sizes the tables.
+    kernel.  One readback sizes the tables; ``after_sizing`` runs right after it.
     """
     from ._build_kernels import current_stream, walk_fill, walk_stats
 
@@ -582,6 +587,8 @@ def build_walk_tables_blk64(
     walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, stream, block=_BLOCK64)
     tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32) - iter_tiles
     total_tiles = int((tile_off[-1] + iter_tiles[-1]).cpu())
+    if after_sizing is not None:
+        after_sizing()
 
     # Dummy page ids are out of bounds for the TMA descriptor and load as zeros.
     nt = max(total_tiles, 1)
@@ -640,8 +647,9 @@ def build_pair_walk_tables_blk64(
     q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
     q2k_block_nums: Tensor,  # [1, H, nQ] int32
     kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+    after_sizing: Optional[Callable[[], object]] = None,
 ) -> Blk64PairForwardTables:
-    """Q-pair page walks for sparse_block_size=64 metadata.  One readback sizes the tables."""
+    """Q-pair page walks for sparse_block_size=64 metadata.  One readback sizes the tables; ``after_sizing`` runs right after it."""
     from ._build_kernels import current_stream, pair_walk_fill, pair_walk_stats
 
     dev = kv_sizes.device
@@ -658,6 +666,8 @@ def build_pair_walk_tables_blk64(
     tiles = (class_pages.sum(dim=1, dtype=torch.int32) + FRAGS_PER_TILE - 1) // FRAGS_PER_TILE
     tile_offsets = torch.cumsum(tiles, dim=0, dtype=torch.int32) - tiles
     total_tiles = int((tile_offsets[-1] + tiles[-1]).cpu())
+    if after_sizing is not None:
+        after_sizing()
 
     nt = max(total_tiles, 1)
     page_table = torch.empty((nt, FRAGS_PER_TILE), dtype=torch.int32, device=dev)

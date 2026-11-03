@@ -488,12 +488,13 @@ Contract, in addition to the metadata ranges above:
   no part in the computation and may hold any finite value. Backward writes
   zeros to the masked rows of `dk` and `dv`. Values on valid rows are exact.
 - `kpage_prepare_layout(validate=True)` (default) checks the metadata on the
-  device with one readback and raises `ValueError` naming the offending entry.
-  The layout build itself reads back three counts; `with_backward=True` also
-  builds the backward tables, which otherwise happens on the first backward
-  call. `seqlen_q` / `seqlen_k` are needed only when a sequence is not a
-  multiple of 128 or when `block_sizes` is omitted and `seqlen_k != seqlen_q`
-  (`kpage=True` takes them from the tensors).
+  device and raises `ValueError` naming the offending entry. The check is read
+  back together with the walk-table sizes, so a layout build synchronizes the
+  host once with or without it; `with_backward=True` also builds the backward
+  tables (one more synchronization on SM100/SM103), which otherwise happens on
+  the first backward call. `seqlen_q` / `seqlen_k` are needed only when a
+  sequence is not a multiple of 128 or when `block_sizes` is omitted and
+  `seqlen_k != seqlen_q` (`kpage=True` takes them from the tensors).
 - A `KPageLayout` remembers the metadata tensors it was built from; passing it
   together with other metadata, or with tensors of another shape, raises
   `ValueError`.

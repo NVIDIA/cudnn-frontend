@@ -863,7 +863,8 @@ class RefineBlk128ToBlk64:
         if walk < mBlockCount.shape[0]:
             n_kv = mBlockSizes.shape[0]
             count = Int32(0)
-            for e in cutlass.range(mBlockCount[walk], unroll=1):
+            # clamped: the metadata check is read back only after this kernel (on the walk-table sizing sync)
+            for e in cutlass.range(max(min(mBlockCount[walk], mBlockIndex.shape[1]), 0), unroll=1):
                 j = mBlockIndex[walk, e]
                 valid = min(max(mBlockSizes[min(max(j, 0), n_kv - 1)], 0), BLOCK)
                 if valid > 0:
