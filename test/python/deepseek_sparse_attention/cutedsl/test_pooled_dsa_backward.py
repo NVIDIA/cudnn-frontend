@@ -9,7 +9,7 @@ import torch
 from cudnn.deepseek_sparse_attention.pooled import backward as PB
 from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 from deepseek_sparse_attention.cutedsl import pooled_training_reference as R
-from deepseek_sparse_attention.cutedsl.dsa_reference import ref_sparse_attn_score_recompute
+from deepseek_sparse_attention.cutedsl.dsa_reference import ref_sparse_attention_forward, ref_sparse_attn_score_recompute
 
 pytestmark = [
     pytest.mark.L0,
@@ -87,7 +87,8 @@ def test_unpool_backward_matches_autograd(grad_dtype):
     assert _rel(got["d_ape"], ref[2]) < 1e-4
 
 
-def test_pooled_indexer_backward_matches_oracle():
+@pytest.mark.parametrize("sm_scale", [1.0, 0.25])
+def test_pooled_indexer_backward_matches_oracle(sm_scale):
     c = R.make_case(1, 1024, torch.device("cuda"), topk_tokens=512, seed=1)
     pool_size, k_pools = 4, 128
     pooled, pool_ids = _selected(c, k_pools)
@@ -99,8 +100,8 @@ def test_pooled_indexer_backward_matches_oracle():
     has_pool = ((c["positions"] + 1) // pool_size) >= 1
     assert torch.allclose(target.sum(-1)[has_pool], torch.ones_like(target.sum(-1)[has_pool]), atol=1e-4)
     grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
-    got = PB.pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target.clone(), grad_loss, pool_size, 1.0, 1.0)
-    ref = R.oracle_pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target, 1.0, 1.0, pool_size)
+    got = PB.pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target.clone(), grad_loss, pool_size, sm_scale, 1.0)
+    ref = R.oracle_pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target, sm_scale, 1.0, pool_size)
     for name, r in zip(("d_index_q", "d_weights", "d_keys", "d_gates", "d_ape"), ref):
         assert _rel(got[name], r) < 1e-2, name
 
@@ -169,11 +170,11 @@ def test_pooled_teacher_recompute_matches_unfused(batch, seqlen, k_pools):
     assert _rel(fused, reference) < 2e-2
 
 
-@pytest.mark.parametrize("seqlen,k_pools", [(2048, 128), (1500, 64)])
-def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pools):
+@pytest.mark.parametrize("seqlen,k_pools,attn_heads", [(2048, 128, 64), (1500, 64, 64), (1500, 64, 96)])
+def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pools, attn_heads):
     from cudnn.deepseek_sparse_attention.sparse_attention_forward.api import sparse_attention_forward_wrapper
 
-    c = R.make_case(1, seqlen, torch.device("cuda"), topk_tokens=k_pools * 4, seed=13)
+    c = R.make_case(1, seqlen, torch.device("cuda"), topk_tokens=k_pools * 4, attn_heads=attn_heads, seed=13)
     pool_size = 4
     _, pool_ids = _selected(c, k_pools)
     q, kv, positions = c["q_attn"], c["k_attn"], c["positions"]
@@ -181,10 +182,16 @@ def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pool
     softmax_scale = d**-0.5
     expanded = PB.pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k=s, global_ids=True)
     token_ids, length = expanded["token_ids"], expanded["topk_length"]
-    fwd = sparse_attention_forward_wrapper(
-        q.reshape(s, h, d), kv.reshape(s, d), token_ids.reshape(s, -1), topk_length=length.reshape(s), softmax_scale=softmax_scale
-    )
-    out, lse = fwd["out"].reshape(1, s, h, -1), fwd["lse"].reshape(1, s, h).float()
+    if attn_heads == 64:
+        fwd = sparse_attention_forward_wrapper(
+            q.reshape(s, h, d), kv.reshape(s, d), token_ids.reshape(s, -1), topk_length=length.reshape(s), softmax_scale=softmax_scale
+        )
+        out, lse = fwd["out"].reshape(1, s, h, -1), fwd["lse"].reshape(1, s, h).float()
+    else:
+        out, lse = ref_sparse_attention_forward(
+            q.reshape(s, h, d), kv.reshape(s, d), None, token_ids.reshape(s, -1), topk_length=length.reshape(s), softmax_scale=softmax_scale
+        )
+        out, lse = out.reshape(1, s, h, -1).to(q.dtype), lse.reshape(1, s, h).float()
     dout = torch.randn_like(out)
     plain = PB.pooled_sparse_attention_backward(
         q, kv, out, dout, lse, pool_ids, positions, pool_size, softmax_scale=softmax_scale, token_ids=token_ids, topk_length=length
@@ -194,13 +201,17 @@ def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pool
     )
     assert _rel(fused["dq"], plain["dq"]) < 1e-5
     assert _rel(fused["dkv"], plain["dkv"]) < 1e-4
-    teacher = PB.pooled_teacher_recompute(q, kv, lse, token_ids, length, k_pools, pool_size, softmax_scale)["target"]
-    assert fused["target"].shape == teacher.shape and torch.isfinite(fused["target"]).all()
+    token_target = ref_sparse_attn_score_recompute(q, kv, lse, token_ids, softmax_scale, topk_length=length)
+    reference = PB.pooled_indexer_target(token_target, pool_ids, pool_size)["target"]
+    assert fused["target"].shape == reference.shape and torch.isfinite(fused["target"]).all()
     has_pool = ((positions + 1) // pool_size) >= 1
-    assert torch.allclose(fused["target"].sum(-1)[has_pool], torch.ones_like(teacher.sum(-1)[has_pool]), atol=1e-4)
+    assert torch.allclose(fused["target"].sum(-1)[has_pool], torch.ones_like(reference.sum(-1)[has_pool]), atol=1e-4)
     assert (fused["target"][~has_pool] == 0).all()
-    assert _rel(fused["target"], teacher) < 5e-3
-    assert (fused["target"] - teacher).abs().max().item() < 2e-3
+    assert _rel(fused["target"], reference) < 5e-3
+    if attn_heads == 64:
+        teacher = PB.pooled_teacher_recompute(q, kv, lse, token_ids, length, k_pools, pool_size, softmax_scale)["target"]
+        assert _rel(fused["target"], teacher) < 5e-3
+        assert (fused["target"] - teacher).abs().max().item() < 2e-3
 
 
 def test_pooled_indexer_select_feeds_backward_without_predict_recompute():
@@ -251,3 +262,42 @@ def test_pooled_indexer_select_feeds_backward_without_predict_recompute():
     ref = R.oracle_pooled_indexer_backward(c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids, target, 1.0, 1.0, pool_size)
     for name, r in zip(("d_index_q", "d_weights", "d_keys", "d_gates", "d_ape"), ref):
         assert _rel(got[name], r) < 1e-2, name
+
+
+def _delayed_side_stream():
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(200_000_000)
+    return side
+
+
+def test_unpool_backward_runs_on_the_requested_stream():
+    c = R.make_case(2, 520, torch.device("cuda"), seed=5)
+    pool_size = c["pool_size"]
+    b, s_k, d = c["keys"].shape
+    d_pooled = torch.randn(b, s_k // pool_size, d, dtype=torch.float32, device="cuda")
+    expected = PB.unpool_backward(c["keys"], c["gates"], c["ape"], d_pooled, pool_size)
+    n_blocks = PB._grid(b * (s_k // pool_size), d_pooled.device)[3]
+    workspace = torch.zeros(n_blocks * PB._WARPS, pool_size, d, dtype=torch.float32, device="cuda")
+    side = _delayed_side_stream()
+    got = PB.unpool_backward(c["keys"], c["gates"], c["ape"], d_pooled, pool_size, workspace=workspace, stream=side)
+    torch.cuda.synchronize()
+    for name in ("d_keys", "d_gates", "d_ape"):
+        assert torch.equal(got[name], expected[name]), name
+
+
+def test_indexer_chain_runs_on_the_requested_stream():
+    c = R.make_case(1, 1024, torch.device("cuda"), topk_tokens=512, seed=19)
+    pool_size, k_pools = 4, 128
+    _, pool_ids = _selected(c, k_pools)
+    target = torch.rand(pool_ids.shape, dtype=torch.float32, device="cuda").masked_fill(pool_ids < 0, 0.0)
+    target = target / target.sum(-1, keepdim=True).clamp(min=1e-12)
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    args = (c["index_q"], c["weights"], c["keys"], c["gates"], c["ape"], pool_ids)
+    expected = PB.pooled_indexer_backward(*args, target.clone(), grad_loss, pool_size, 0.5)
+    side = _delayed_side_stream()
+    got = PB.pooled_indexer_backward(*args, target.clone(), grad_loss, pool_size, 0.5, stream=side)
+    torch.cuda.synchronize()
+    for name in ("d_index_q", "d_weights", "d_keys", "d_gates", "d_ape", "d_pooled"):
+        assert _rel(got[name], expected[name]) < 1e-4, name
