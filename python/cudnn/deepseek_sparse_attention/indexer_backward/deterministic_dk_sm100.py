@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixed-owner deterministic SM100-family indexer dK accumulation."""
+"""Fixed-owner deterministic indexer dK accumulation for SM90 and SM100."""
 
 from __future__ import annotations
 
@@ -65,9 +65,11 @@ def deterministic_dk_workspace_bytes(batch: int, seqlen_k: int, head_dim: int, n
 
 
 class DeterministicDkReduceSm100:
-    """Fold producer-private FP32 planes in numeric CTA order."""
+    """Fold producer-private FP32 planes in numeric CTA order.
 
-    arch = 100
+    The reducer uses only architecture-neutral scalar loads/adds/stores; the
+    historical class name remains for downstream import compatibility.
+    """
 
     def __init__(self, head_dim: int, num_planes: int):
         """Specialize the reducer for the contiguous dK row width."""

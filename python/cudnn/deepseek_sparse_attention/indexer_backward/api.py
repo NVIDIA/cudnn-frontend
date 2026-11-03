@@ -237,11 +237,12 @@ class IndexerBackward(APIBase):
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
-    ``deterministic=True`` is an SM100/SM103/SM107 request-or-fail policy for H=32 or
-    H=64, D=128, block_I=128, and 128-multiple top-k in
-    [128, 2048]. It launches up
-    to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
-    rows and allocates one CTA-private FP32 dK plane for each possible producer.
+    ``deterministic=True`` is an SM90/SM100/SM103/SM107 request-or-fail policy for
+    H=64 on SM90 and H=32 or H=64 on SM100-family devices, D=128,
+    block_I=128, and 128-multiple top-k in [128, 2048]. It allocates one
+    CTA-private FP32 dK plane for each of up to ``deterministic_dk_planes``
+    fixed producers. SM90 submits bounded one-row waves; SM100-family kernels
+    use fixed grid-stride row ownership.
     The plane count is a compile-time specialization selected from
     ``{96, 128, 148}`` (default 96). A final kernel folds the planes in CTA
     order.
@@ -395,8 +396,8 @@ class IndexerBackward(APIBase):
         capability = torch.cuda.get_device_capability(self.iq_desc.device if self.deterministic else None)
         major, _ = capability
         self._value_error_if(
-            self.deterministic and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
-            f"deterministic IndexerBackward requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, " f"found {capability}",
+            self.deterministic and major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+            f"deterministic IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
         # The SM100 kernel is a TCGEN05/TMEM design; admit only the SM100-family
         # devices it is validated on rather than every major >= 10.
@@ -516,8 +517,9 @@ class IndexerBackward(APIBase):
         # capability gate read it); the ordinary path follows the current
         # device, as the factories' own architecture checks do.
         if self.deterministic:
+            major, _ = torch.cuda.get_device_capability(self.iq_desc.device)
             kernel_factory, extra, device_scope = (
-                indexer_backward_sm100,
+                indexer_backward_sm90 if major == 9 else indexer_backward_sm100,
                 {"deterministic": True, "deterministic_dk_planes": self.deterministic_dk_planes},
                 torch.cuda.device(self.iq_desc.device),
             )
@@ -957,10 +959,11 @@ def indexer_backward_wrapper(
             mode, the live scratch prefix must not overlap any input or output;
             ``execute`` rejects such aliases before clearing the planes.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
-            on SM100/SM103/SM107. Fixed-owner producer CTAs accumulate into
+            on SM90/SM100/SM103/SM107. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. Requires SM100/SM103/SM107, H in {32, 64}, D=128,
-            block_I=128, and topk % 128 == 0 with 128 <= topk <= 2048. A
+            ``d_index_k``; SM90 also folds per-thread dW slots in fixed order.
+            Requires H=64 on SM90 or H in {32, 64} on SM100-family devices,
+            D=128, block_I=128, and topk % 128 == 0 with 128 <= topk <= 2048. A
             warmed plan with preallocated outputs
             and workspace remains CUDA Graph compatible. Valid top-k indices
             within each query row must be unique.
