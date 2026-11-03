@@ -160,7 +160,6 @@ def pooled_indexer_backward(
     d_keys: Optional[torch.Tensor] = None,
     d_gates: Optional[torch.Tensor] = None,
     d_ape: Optional[torch.Tensor] = None,
-    backend: str = "sm100_v2",
     stream=None,
 ) -> TupleDict:
     """Indexer-loss backward on pooled keys. Returns ``{'d_index_q', 'd_weights', 'd_keys', 'd_gates', 'd_ape', 'd_pooled'}``.
@@ -188,7 +187,6 @@ def pooled_indexer_backward(
         d_weights=d_weights,
         d_index_k=d_pooled,
         stream=stream,
-        backend=backend,
     )
     unpooled = unpool_backward(keys, gates, ape, d_pooled, pool_size, d_keys=d_keys, d_gates=d_gates, d_ape=d_ape, stream=stream)
     return TupleDict(

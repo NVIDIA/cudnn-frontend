@@ -130,7 +130,7 @@ def cudnn_indexer_chain(c, timer, grad_loss):
     def indexer_bwd():
         work.copy_(target)
         return PB.indexer_backward_wrapper(
-            c["index_q"], c["weights"], c["pooled"], work, pred, c["pool_ids"], grad_loss, sm_scale=1.0, loss_coeff=1.0, d_index_k=d_pooled, backend="sm100_v2"
+            c["index_q"], c["weights"], c["pooled"], work, pred, c["pool_ids"], grad_loss, sm_scale=1.0, loss_coeff=1.0, d_index_k=d_pooled
         )
 
     stages["indexer_backward_us"] = timer(indexer_bwd)
