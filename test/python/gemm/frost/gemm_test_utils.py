@@ -53,6 +53,24 @@ def with_static_segmented_capacity(live: torch.Tensor, total_rows: int, num_grou
     return result
 
 
+def _active_family():
+    try:
+        from cudnn.gemm.frost.arch_family import active_family
+
+        return active_family()
+    except Exception:  # noqa: BLE001 -- collection must not fail on a broken frost import; the tests themselves report that
+        return "sm100"
+
+
+# Host-level checks of the sm100 tree reached through the cudnn.gemm.frost.compiler facade (or the active tile catalog).
+# The facade serves the sm100 tree everywhere except a cc 12.x process (no GPU, SM80 and SM90 included), where it is the
+# sm120 tree; skip only there.
+requires_sm100_tree = pytest.mark.skipif(
+    _active_family() != "sm100",
+    reason=f"checks the sm100 FROST GEMM tree; this process runs the {_active_family()} tree",
+)
+
+
 def plan_as_sm100(monkeypatch):
     """The SM100 compiler, for planning-only checks of SM100 configs on any GPU.
 
