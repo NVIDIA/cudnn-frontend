@@ -284,8 +284,12 @@ def test_causal_conv1d_runs_on_a_thread_with_no_cuda_context(variant):
     calling thread; a fresh thread (an autograd worker, a DataParallel replica) has none, and the forwards failed there
     with status 5000 (CUDA_ERROR_INVALID_CONTEXT). Each primitive binds the work's context first: a fresh thread making
     no CUDA call of its own reproduces the main thread's forward and backward bitwise."""
+    import importlib
     import threading
 
+    # cudnn.ops exports are lazy: register the primitives here so the test also runs on its own (-k), not only after
+    # earlier tests in the file called the public wrappers.
+    importlib.import_module("cudnn.ops.causal_conv1d")
     ops = torch.ops.cudnn
     dtype = torch.float32
     torch.manual_seed(7)
