@@ -662,10 +662,10 @@ def build_pair_walk_tables_blk64(
     stream = current_stream()
     bits = torch.zeros((num_heads * n_pairs, 2, words), dtype=torch.int32, device=dev)
     class_pages = torch.empty((num_heads * n_pairs, 3), dtype=torch.int32, device=dev)
-    pair_walk_stats(q2k_block_index.view(num_heads, n_q_blocks, cap), q2k_block_nums.view(num_heads, n_q_blocks), kv_sizes, bits, class_pages, stream)
-    tiles = (class_pages.sum(dim=1, dtype=torch.int32) + FRAGS_PER_TILE - 1) // FRAGS_PER_TILE
-    tile_offsets = torch.cumsum(tiles, dim=0, dtype=torch.int32) - tiles
-    total_tiles = int((tile_offsets[-1] + tiles[-1]).cpu())
+    tiles = torch.empty((num_heads * n_pairs,), dtype=torch.int32, device=dev)
+    pair_walk_stats(q2k_block_index.view(num_heads, n_q_blocks, cap), q2k_block_nums.view(num_heads, n_q_blocks), kv_sizes, bits, class_pages, tiles, stream)
+    tile_ends = torch.cumsum(tiles, dim=0, dtype=torch.int32)  # inclusive; PairWalkFill subtracts its own count
+    total_tiles = int(tile_ends[-1].cpu())
     if after_sizing is not None:
         after_sizing()
 
@@ -673,7 +673,7 @@ def build_pair_walk_tables_blk64(
     page_table = torch.empty((nt, FRAGS_PER_TILE), dtype=torch.int32, device=dev)
     keep = torch.empty((nt, 2, 4), dtype=torch.int32, device=dev)
     ranges = torch.empty((num_heads * n_pairs, 5), dtype=torch.int32, device=dev)
-    pair_walk_fill(kv_sizes, bits, class_pages, tile_offsets, page_table, keep, ranges, stream)
+    pair_walk_fill(kv_sizes, bits, class_pages, tile_ends, page_table, keep, ranges, stream)
     return Blk64PairForwardTables(page_table=page_table, keep=keep, ranges=ranges.view(num_heads, n_pairs, 5))
 
 
@@ -706,6 +706,7 @@ def refine_blk128_to_blk64(
     dev = q2k_block_index.device
     index64 = torch.zeros((num_heads * n_q_blocks * 2, 2 * cap), dtype=torch.int32, device=dev)
     count64 = torch.empty((num_heads * n_q_blocks * 2,), dtype=torch.int32, device=dev)
+    sizes64 = torch.empty((2 * kv_sizes.numel(),), dtype=torch.int32, device=dev)
     refine_cute(
         q2k_block_index.view(num_heads * n_q_blocks, cap),
         q2k_block_nums.view(num_heads * n_q_blocks),
@@ -713,10 +714,10 @@ def refine_blk128_to_blk64(
         kv_sizes,
         index64,
         count64,
+        sizes64,
         current_stream(),
     )
     half = BLOCK // 2
-    sizes64 = torch.stack((kv_sizes.clamp(0, half), (kv_sizes.clamp(0, BLOCK) - half).clamp(min=0)), dim=-1).reshape(-1)
     index64 = index64.view(1, num_heads, 2 * n_q_blocks, 2 * cap)
     count64 = count64.view(1, num_heads, 2 * n_q_blocks)
     n_q64, n_kv64 = (seqlen_q + half - 1) // half, (seqlen_k + half - 1) // half

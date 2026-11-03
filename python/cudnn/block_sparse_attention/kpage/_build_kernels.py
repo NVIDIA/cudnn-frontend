@@ -510,13 +510,14 @@ class PairWalkStats(_PairWalkBase):
         mBlockSizes: cute.Tensor,  # [nKV]
         mBits: cute.Tensor,  # [H * P, 2, words], zeroed
         mClassPages: cute.Tensor,  # [H * P, 3]
+        mTiles: cute.Tensor,  # [H * P] 128-row tiles of the pair's walk
         stream: cuda.CUstream,
     ):
         @cute.struct
         class SharedStorage:
             warp_sums: cute.struct.MemRange[Int32, self.num_warps]
 
-        self.kernel(mBlockIndex, mBlockCount, mBlockSizes, mBits, mClassPages, SharedStorage).launch(
+        self.kernel(mBlockIndex, mBlockCount, mBlockSizes, mBits, mClassPages, mTiles, SharedStorage).launch(
             grid=(mBits.shape[0], 1, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
@@ -530,6 +531,7 @@ class PairWalkStats(_PairWalkBase):
         mBlockSizes: cute.Tensor,
         mBits: cute.Tensor,
         mClassPages: cute.Tensor,
+        mTiles: cute.Tensor,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
         pair_idx = cute.arch.block_idx()[0]
@@ -558,6 +560,7 @@ class PairWalkStats(_PairWalkBase):
         cute.arch.sync_threads()
 
         words = mBits.shape[2]
+        walk_pages = Int32(0)
         for cls in cutlass.range_constexpr(3):
             pages = Int32(0)
             word = thread_idx
@@ -565,8 +568,11 @@ class PairWalkStats(_PairWalkBase):
                 pages += self.word_pages(self.class_bits(mBits, pair_idx, word, cls), word, mBlockSizes)
                 word += self.num_threads
             _, total = self.block_scan(pages, warp_sums)
+            walk_pages += total
             if thread_idx == 0:
                 mClassPages[pair_idx, cls] = total
+        if thread_idx == 0:
+            mTiles[pair_idx] = (walk_pages + FRAGS_PER_TILE - 1) // FRAGS_PER_TILE
 
 
 class PairWalkFill(_PairWalkBase):
@@ -578,7 +584,7 @@ class PairWalkFill(_PairWalkBase):
         mBlockSizes: cute.Tensor,  # [nKV]
         mBits: cute.Tensor,  # [H * P, 2, words]
         mClassPages: cute.Tensor,  # [H * P, 3]
-        mTileOffsets: cute.Tensor,  # [H * P]
+        mTileEnds: cute.Tensor,  # [H * P] inclusive prefix sum of the pairs' tile counts
         mPageTable: cute.Tensor,  # [T, 8]
         mKeep: cute.Tensor,  # [T, 2, 4]
         mRanges: cute.Tensor,  # [H * P, 5]
@@ -588,7 +594,7 @@ class PairWalkFill(_PairWalkBase):
         class SharedStorage:
             warp_sums: cute.struct.MemRange[Int32, self.num_warps]
 
-        self.kernel(mBlockSizes, mBits, mClassPages, mTileOffsets, mPageTable, mKeep, mRanges, SharedStorage).launch(
+        self.kernel(mBlockSizes, mBits, mClassPages, mTileEnds, mPageTable, mKeep, mRanges, SharedStorage).launch(
             grid=(mBits.shape[0], 1, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
@@ -600,7 +606,7 @@ class PairWalkFill(_PairWalkBase):
         mBlockSizes: cute.Tensor,
         mBits: cute.Tensor,
         mClassPages: cute.Tensor,
-        mTileOffsets: cute.Tensor,
+        mTileEnds: cute.Tensor,
         mPageTable: cute.Tensor,
         mKeep: cute.Tensor,
         mRanges: cute.Tensor,
@@ -619,7 +625,7 @@ class PairWalkFill(_PairWalkBase):
         second_pages = mClassPages[pair_idx, 2]
         walk_pages = first_pages + common_pages + second_pages
         tiles = (walk_pages + FRAGS_PER_TILE - 1) // FRAGS_PER_TILE
-        tile_offset = mTileOffsets[pair_idx]
+        tile_offset = mTileEnds[pair_idx] - tiles
         slot_base = tile_offset * FRAGS_PER_TILE
 
         # Pages in class order; within a class, chunks of one bitset word per thread keep ascending block ids.
@@ -827,11 +833,15 @@ class RefineBlk128ToBlk64:
 
     KV block ``j`` with ``s`` valid rows becomes half ``2j`` (``min(s, 64)`` rows) and half ``2j + 1`` (``s - 64``
     rows); a half without valid rows is dropped from the list.  Q half ``2i`` keeps the list when Q block ``i`` has
-    a valid row and half ``2i + 1`` when it has more than 64; otherwise the half gets count 0.  One thread per walk.
+    a valid row and half ``2i + 1`` when it has more than 64; otherwise the half gets count 0.  The half sizes are
+    written to ``mBlockSizes64``.
+
+    One warp per walk: each lane takes one list entry per step, and two ballots place its halves after those of the
+    lower lanes, so the halves keep the list order (``2j`` before ``2j + 1``).
     """
 
-    def __init__(self):
-        self.num_threads = 128
+    num_threads = 128
+    num_warps = num_threads // cute.arch.WARP_SIZE
 
     @cute.jit
     def __call__(
@@ -842,10 +852,11 @@ class RefineBlk128ToBlk64:
         mBlockSizes: cute.Tensor,  # [nKV]
         mBlockIndex64: cute.Tensor,  # [2W, 2 * cap], zero-initialized
         mBlockCount64: cute.Tensor,  # [2W]
+        mBlockSizes64: cute.Tensor,  # [2 * nKV]
         stream: cuda.CUstream,
     ):
-        grid = ((mBlockCount.shape[0] + self.num_threads - 1) // self.num_threads, 1, 1)
-        self.kernel(mBlockIndex, mBlockCount, mQSizes, mBlockSizes, mBlockIndex64, mBlockCount64).launch(
+        grid = ((mBlockCount.shape[0] + self.num_warps - 1) // self.num_warps, 1, 1)
+        self.kernel(mBlockIndex, mBlockCount, mQSizes, mBlockSizes, mBlockIndex64, mBlockCount64, mBlockSizes64).launch(
             grid=grid, block=(self.num_threads, 1, 1), stream=stream
         )
 
@@ -858,26 +869,50 @@ class RefineBlk128ToBlk64:
         mBlockSizes: cute.Tensor,
         mBlockIndex64: cute.Tensor,
         mBlockCount64: cute.Tensor,
+        mBlockSizes64: cute.Tensor,
     ):
-        walk = cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
-        if walk < mBlockCount.shape[0]:
-            n_kv = mBlockSizes.shape[0]
-            count = Int32(0)
+        thread_idx = cute.arch.thread_idx()[0]
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        n_walks = mBlockCount.shape[0]
+        n_kv = mBlockSizes.shape[0]
+
+        kv = cute.arch.block_idx()[0] * self.num_threads + thread_idx
+        while kv < n_kv:
+            valid = min(max(mBlockSizes[kv], 0), BLOCK)
+            mBlockSizes64[2 * kv] = min(valid, BLOCK // 2)
+            mBlockSizes64[2 * kv + 1] = max(valid - BLOCK // 2, 0)
+            kv += cute.arch.grid_dim()[0] * self.num_threads
+
+        walk = cute.arch.block_idx()[0] * self.num_warps + warp_idx
+        if walk < n_walks:
             # clamped: the metadata check is read back only after this kernel (on the walk-table sizing sync)
-            for e in cutlass.range(max(min(mBlockCount[walk], mBlockIndex.shape[1]), 0), unroll=1):
-                j = mBlockIndex[walk, e]
-                valid = min(max(mBlockSizes[min(max(j, 0), n_kv - 1)], 0), BLOCK)
+            edge_count = max(min(mBlockCount[walk], mBlockIndex.shape[1]), 0)
+            lower_lanes = ~(Int32(-1) << lane_idx)
+            count = Int32(0)
+            base = Int32(0)
+            while base < edge_count:
+                edge_idx = base + lane_idx
+                j = Int32(0)
+                valid = Int32(0)
+                if edge_idx < edge_count:
+                    j = mBlockIndex[walk, edge_idx]
+                    valid = min(max(mBlockSizes[min(max(j, 0), n_kv - 1)], 0), BLOCK)
+                has_first = cute.arch.vote_ballot_sync(valid > 0)
+                has_second = cute.arch.vote_ballot_sync(valid > BLOCK // 2)
+                pos = count + cute.arch.popc(has_first & lower_lanes) + cute.arch.popc(has_second & lower_lanes)
                 if valid > 0:
-                    mBlockIndex64[2 * walk, count] = 2 * j
-                    mBlockIndex64[2 * walk + 1, count] = 2 * j
-                    count += 1
+                    mBlockIndex64[2 * walk, pos] = 2 * j
+                    mBlockIndex64[2 * walk + 1, pos] = 2 * j
                 if valid > BLOCK // 2:
-                    mBlockIndex64[2 * walk, count] = 2 * j + 1
-                    mBlockIndex64[2 * walk + 1, count] = 2 * j + 1
-                    count += 1
-            q_valid = mQSizes[walk % mQSizes.shape[0]]
-            mBlockCount64[2 * walk] = count if q_valid > 0 else Int32(0)
-            mBlockCount64[2 * walk + 1] = count if q_valid > BLOCK // 2 else Int32(0)
+                    mBlockIndex64[2 * walk, pos + 1] = 2 * j + 1
+                    mBlockIndex64[2 * walk + 1, pos + 1] = 2 * j + 1
+                count += cute.arch.popc(has_first) + cute.arch.popc(has_second)
+                base += cute.arch.WARP_SIZE
+            if lane_idx == 0:
+                q_valid = mQSizes[walk % mQSizes.shape[0]]
+                mBlockCount64[2 * walk] = count if q_valid > 0 else Int32(0)
+                mBlockCount64[2 * walk + 1] = count if q_valid > BLOCK // 2 else Int32(0)
 
 
 # Columns of ValidateMetadata's per-CTA result row.
@@ -1982,12 +2017,13 @@ def pair_walk_stats(
     block_sizes: Tensor,
     bits: Tensor,
     class_pages: Tensor,
+    tiles: Tensor,
     stream: cuda.CUstream = None,
 ) -> None:
     _run_metadata_kernel(
         "kpage_pair_walk_stats_blk64",
         PairWalkStats(),
-        (block_index, block_count, block_sizes, bits, class_pages),
+        (block_index, block_count, block_sizes, bits, class_pages, tiles),
         pair_walk_stats.compile_cache,
         stream,
     )
@@ -2000,7 +2036,7 @@ def pair_walk_fill(
     block_sizes: Tensor,
     bits: Tensor,
     class_pages: Tensor,
-    tile_offsets: Tensor,
+    tile_ends: Tensor,
     page_table: Tensor,
     keep: Tensor,
     ranges: Tensor,
@@ -2009,7 +2045,7 @@ def pair_walk_fill(
     _run_metadata_kernel(
         "kpage_pair_walk_fill_blk64",
         PairWalkFill(),
-        (block_sizes, bits, class_pages, tile_offsets, page_table, keep, ranges),
+        (block_sizes, bits, class_pages, tile_ends, page_table, keep, ranges),
         pair_walk_fill.compile_cache,
         stream,
     )
@@ -2025,12 +2061,13 @@ def refine_blk128_to_blk64(
     block_sizes: Tensor,
     block_index64: Tensor,
     block_count64: Tensor,
+    block_sizes64: Tensor,
     stream: cuda.CUstream = None,
 ) -> None:
     _run_metadata_kernel(
         "kpage_refine_blk128_to_blk64",
         RefineBlk128ToBlk64(),
-        (block_index, block_count, q_sizes, block_sizes, block_index64, block_count64),
+        (block_index, block_count, q_sizes, block_sizes, block_index64, block_count64, block_sizes64),
         refine_blk128_to_blk64.compile_cache,
         stream,
     )

@@ -68,13 +68,21 @@ class KPageLayout:
     _source: tuple = ()  # identity of the metadata arguments the layout was built from
     sparse_block_size: int = 128
     _refined: Optional[Blk64Refinement] = None  # SM90 blk128: the blk64 metadata the kernels run on
-    _pad_q_rows: Optional[Tensor] = None  # SM90 blk128: [seqlen_q] bool, the padding Q rows
+    _pad_q_rows: Optional[Tensor] = None  # SM90 blk128: [seqlen_q] bool, the padding Q rows; built on first use
 
     def __repr__(self) -> str:
         return (
             f"KPageLayout(seqlen_q={self.seqlen_q}, seqlen_k={self.seqlen_k}, num_heads={self.num_heads}, "
             f"num_q_blocks={self.num_q_blocks}, num_kv_blocks={self.num_kv_blocks}, kmax={self.kmax}, device={self.device})"
         )
+
+    def _padding_q_rows(self) -> Tensor:
+        """SM90 blk128: the padding Q rows ([seqlen_q] bool), built on first use (a backward with partial Q blocks)."""
+        if self._pad_q_rows is None:
+            block = self.sparse_block_size
+            rows = torch.arange(self.seqlen_q, device=self.device, dtype=torch.int32)
+            self._pad_q_rows = rows % block >= self._q_sizes.repeat_interleave(block)[: self.seqlen_q]
+        return self._pad_q_rows
 
     def build_backward(self) -> None:
         """Build the backward tables now instead of on the first backward call."""
@@ -276,7 +284,7 @@ def prepare_layout(
     # The check is launched here and read back on the builder's sizing sync: one host sync per layout.
     check = _MetadataCheck(idx, cnt, q_sizes, kv_sizes, allow_empty_block_nums, block) if validate else None
     after_sizing = check.result if check is not None else None
-    pair_tables = refined = pad_q_rows = None
+    pair_tables = refined = None
     if block == 128 and sm90:
         if bwd_kv_groups is not None:
             raise NotImplementedError("bwd_kv_groups is specific to the SM100/SM103 KPage backward")
@@ -284,8 +292,6 @@ def prepare_layout(
         refined = refine_blk128_to_blk64(idx, cnt, q_sizes, kv_sizes, seqlen_q, seqlen_k)
         pair_tables = build_pair_walk_tables_blk64(refined.block_index, refined.block_count, refined.block_sizes, after_sizing)
         tables = blk64_tables = None
-        rows = torch.arange(seqlen_q, device=idx.device, dtype=torch.int32)
-        pad_q_rows = rows % block >= q_sizes.repeat_interleave(block)[:seqlen_q]
     elif block == 64:
         # Forward only, every Q row valid: SM90 walks Q block pairs, SM100/SM103 the M64 x N256 walks of one Q block.
         tables = blk64_tables = None
@@ -316,5 +322,4 @@ def prepare_layout(
         _source=source,
         sparse_block_size=block,
         _refined=refined,
-        _pad_q_rows=pad_q_rows,
     )
