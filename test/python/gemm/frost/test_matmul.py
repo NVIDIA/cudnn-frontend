@@ -3836,6 +3836,47 @@ def test_sm100_quant_scale_k_padding_is_zeroed(axes, shapes) -> None:
     _check_quant_scale_k_padding_is_zeroed("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", axes, shapes)
 
 
+def test_sm100_k_padding_stores_only_in_the_padded_variant() -> None:
+    """A plan whose quantized outputs can end an F8_128x4 scale row inside a quad compiles its epilogue twice: once
+    without the K-padding stores (the epilogue a whole-quad call runs, with no padding branch) and once with them. The
+    launch takes the second only when the call's extents end some scale row inside a quad (row quant: N blocks, col
+    quant: M blocks). Host-only: no compile, no GPU."""
+    from types import SimpleNamespace
+
+    from cudnn.gemm.frost.compiler import _k_pad_launchable_for
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.sm100.compiler import _epi_chunk_bytes
+    from cudnn.gemm.frost.sm100.epilogue_codegen import generate, k_pad_axes
+
+    M, N, K, bs = 256, 2944, 128, 32
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    for qi, axis in enumerate((-1, 1)):
+        Q, QS = g.block_scale_quantize(input=C, block_size=bs, axis=axis, name=f"q{qi}")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        rows, blocks = (M, N // bs) if axis == -1 else (N, M // bs)
+        dims = [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+        QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    chain = analyze(g)
+    axes = k_pad_axes(chain)
+    assert sorted(axes) == [(False, bs), (True, bs)]
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    kwargs = dict(vec_bytes_epi=_epi_chunk_bytes(chain, cfg, False), output_elem_bytes=DTYPE_BYTES[chain.output_dtype])
+    plain, padded = generate(chain, **kwargs).epilogue, generate(chain, **kwargs, k_padding=True).epilogue
+    assert "% 4 != 0" not in plain, "the unpadded variant must carry no padding branch"
+    assert "(N // 32) % 4 != 0" in padded and "(M // 32) % 4 != 0" in padded
+
+    plan = SimpleNamespace(_launchable="plain", _launchable_k_pad="padded", k_pad_axes=axes)
+    assert _k_pad_launchable_for(plan, 256, 2944) == "plain"  # 8 M blocks, 92 N blocks: whole quads
+    assert _k_pad_launchable_for(plan, 256, 2912) == "padded"  # 91 N blocks
+    assert _k_pad_launchable_for(plan, 224, 2944) == "padded"  # 7 M blocks
+    assert _k_pad_launchable_for(SimpleNamespace(_launchable="plain", _launchable_k_pad=None, k_pad_axes=()), 224, 2912) == "plain"
+
+
 # ---------------------------------------------------------------------------
 # Two-kernel split-K
 # ---------------------------------------------------------------------------

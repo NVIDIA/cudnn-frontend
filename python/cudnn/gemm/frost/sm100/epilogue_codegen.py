@@ -346,6 +346,14 @@ def _emit_block_quant_col_k_pad(
     return lines
 
 
+def k_pad_axes(chain: FusionChain) -> tuple[tuple[bool, int], ...]:
+    """``(col_quant, block_size)`` of each quantized output whose F8_128x4 scale rows can end inside a quad: K padding
+    exists at runtime extents where the quantized axis (the kernel frame's M for a col quant, N for a row quant) holds a
+    block count that is not a multiple of 4. Empty when no output can carry padding."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    return tuple((quant.axis == 1, quant.block_size) for quant in chain.quants if _f8_128x4_k_padding(quant, swapped))
+
+
 def _emit_block_quant_k_pad(
     quant: BlockQuantizeSpec, quant_idx: int, output_dtype: Dtype, scale_tap_idx: int, chain: FusionChain, vsize: int, row_pred: str | None
 ) -> list[str]:
@@ -572,8 +580,13 @@ def generate(
     tma_slots: "frozenset[int]" = frozenset(),
     packed_lanes: bool = False,
     workspace_split_k: bool = False,
+    k_padding: bool = False,
 ) -> EpilogueSnippets:
-    """Produce the two hook-site snippets, the extra kernel param list, and all per-tap plumbing."""
+    """Produce the two hook-site snippets, the extra kernel param list, and all per-tap plumbing.
+
+    ``k_padding`` appends the F8_128x4 K-padding stores (:func:`_emit_block_quant_k_pad`). A plan compiles the body
+    without them, which is develop's epilogue, and -- when any quantized output can end a scale row inside a quad
+    (:func:`k_pad_axes`) -- once more with them; the launch picks the second only for extents that do."""
     vsize = vec_bytes_epi // output_elem_bytes
     scatter = chain.has_moe and chain.moe.mode == "scatter"
     row_bound = "group_end" if chain.has_moe and not isinstance(chain.moe, MoeSwapAbSpec) else "M"
@@ -650,9 +663,12 @@ def generate(
                     store_row_pred,
                 )
             )
-            k_pad_lines.extend(
-                _emit_block_quant_k_pad(chain.quants[spec.quant_idx], spec.quant_idx, spec.dtype, _scale_tap_idx(spec.quant_idx), chain, vsize, store_row_pred)
-            )
+            if k_padding:
+                k_pad_lines.extend(
+                    _emit_block_quant_k_pad(
+                        chain.quants[spec.quant_idx], spec.quant_idx, spec.dtype, _scale_tap_idx(spec.quant_idx), chain, vsize, store_row_pred
+                    )
+                )
             src = qv
         if si in tma_slots:
             _tma_j = sorted(tma_slots).index(si)

@@ -58,7 +58,7 @@ from ..dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
+from .epilogue_codegen import EpilogueSnippets, generate, k_pad_axes, tma_out_ready_marker, tma_out_value
 from ..fusion_ir import (
     ZERO_PRESERVING_OPS,
     FusionChain,
@@ -3145,6 +3145,18 @@ def _launch_moe_swap_ab(
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 
 
+def _k_pad_launchable(chain: FusionChain, config: TileConfig, render, generate_kwargs: dict):
+    """``(launchable, axes)``: the plan's second kernel, built with the F8_128x4 K-padding stores, and the quantized axes
+    that decide it (:func:`~.epilogue_codegen.k_pad_axes`) -- or ``(None, ())`` when no output can end a scale row inside a
+    quad. The plan's first kernel is the epilogue without those stores; the launch takes this one only at extents that
+    end some scale row inside a quad, so a whole-quad call runs exactly the unpadded kernel."""
+    axes = k_pad_axes(chain)
+    if not axes:
+        return None, ()
+    src = render(chain, generate(chain, **generate_kwargs, k_padding=True), config)
+    return _import_kernel(src).compile(), axes
+
+
 def _jit_moe(
     chain: FusionChain,
     config: TileConfig,
@@ -3155,15 +3167,16 @@ def _jit_moe(
     _precheck_moe(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    snippets = generate(chain, **generate_kwargs)
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, _render_template, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
@@ -3174,6 +3187,8 @@ def _jit_moe(
         device=_plan_device(),
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         _grid_ctas=grid_ctas,
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
@@ -3188,17 +3203,18 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
     """Build exactly the reduction strategy named by the config."""
     store_modes = _store_modes(chain, config)
     use_tma = _use_tma_store_epi(chain, config)
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset({0}) if (config.workspace_split_k and use_tma) else frozenset(i for i, mode in enumerate(store_modes) if mode == "tma"),
         packed_lanes=_epi_packed_lanes(config),
         workspace_split_k=config.workspace_split_k,
     )
+    snippets = generate(chain, **generate_kwargs)
     render = _render_block_scale_template if chain.has_block_scale else _render_template
     src = render(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, render, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
         chain=chain,
@@ -3207,6 +3223,8 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
         aux_names=[aux.name for aux in chain.aux_tensors],
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         binding=binding,
         store_modes=store_modes,
         use_tma_store=use_tma,
@@ -3251,15 +3269,16 @@ def _jit_moe_block_scale(
     _tmpl = select_template(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    snippets = generate(chain, **generate_kwargs)
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, _render_block_scale_template, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
@@ -3270,6 +3289,8 @@ def _jit_moe_block_scale(
         device=_plan_device(),
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
