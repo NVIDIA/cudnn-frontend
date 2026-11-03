@@ -130,6 +130,15 @@ def test_import_registered_the_backend_once():
     assert backend.FORMS == fi_support.FORMS == ("decode", "verify")
 
 
+def test_register_names_the_flashinfer_floor_without_the_registry(monkeypatch):
+    """A FlashInfer before the block's backend registry (PR #8131) is an ImportError naming that floor, not an AttributeError."""
+    assert "8131" in backend.FLASHINFER_FLOOR
+    monkeypatch.delattr(fi_api, "register_backend")
+    with pytest.raises(ImportError, match="8131"):
+        backend.register_frost_fe(replace=True)
+    assert fi_api.get_backend(backend.BACKEND) is not None, "the registration in place stays"
+
+
 def test_an_unknown_form_is_declined_by_kind_form():
     """FlashInfer's own gate stops an unknown form before any backend sees it; the backend's own answer has the same kind."""
     sup = _probe(CPU, "prefill")
@@ -254,6 +263,13 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
     monkeypatch.setattr(backend, "verify_form", failing)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
     assert (sup.served, sup.kind) == (False, "device") and "cuDeviceGetAttribute failed" in sup.reason, sup
+
+    def broken(device, requests=None, norm_eps=1e-6):
+        raise ValueError("a config regression")
+
+    monkeypatch.setattr(backend, "verify_form", broken)
+    sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
+    assert (sup.served, sup.kind) == (False, "backend") and "ValueError" in sup.reason, sup  # not a device decline: the raising probe is named by type
 
 
 def test_build_declines_parameter_dtypes_before_any_device_work():

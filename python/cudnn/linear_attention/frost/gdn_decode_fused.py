@@ -52,6 +52,7 @@ from .kernel.gdn_decode_fused_config import (
 SUPPORTED_CC_MAJOR = 10  # SM100-class parts (compute capability 10.x); the DSL's target gate (cutedsl_arch_requirement_error) decides per part
 SUPPORTED_CC_TEXT = "10.x"
 DSL_FLOOR = (4, 8, 0)
+DSL_FLOOR_TEXT = ".".join(str(x) for x in DSL_FLOOR)
 NAME = "the fused GDN decode step"
 #: the launch is grid ``(48, rows, 1)`` (``kernel/gdn_decode_fused_f16.py``), one grid row per request: CUDA caps grid Y at 65535
 MAX_ROWS = 65535
@@ -63,29 +64,12 @@ def cc_supported(cc) -> bool:
 
 
 def _dsl_version_error() -> Optional[str]:
-    """The Rule-7 gate of this kernel: the library floor (4.7.0) plus this kernel's own floor (4.8.0: the public wheel every
-    consumer pins); None when the installed DSL serves."""
-    msg = cutedsl_requirement_error(NAME)
-    if msg is not None:
-        return msg
-    installed, version = cutedsl_state()
+    """The Rule-7 gate of this kernel: its own floor (``DSL_FLOOR`` = 4.8.0, the public wheel every consumer pins, above the library's
+    ``CUTEDSL_MIN_VERSION``) through the one version parser of :mod:`cudnn.frost.buffers`; None when the installed DSL serves."""
+    installed, _ = cutedsl_state()
     if not installed:
-        return f"{NAME} requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed"
-    if version is not None and version[0] == "nvidia-cutlass-dsl":
-        parts = []
-        for component in version[1].split("+", 1)[0].split(".")[:3]:
-            digits = ""
-            for ch in component:
-                if not ch.isdigit():
-                    break
-                digits += ch
-            if not digits:
-                break
-            parts.append(int(digits))
-        parts += [0] * (3 - len(parts))
-        if tuple(parts) < DSL_FLOOR:
-            return f"{NAME} requires nvidia-cutlass-dsl >= 4.8.0; found {version[1]}. Upgrade with: pip install -U 'nvidia-cutlass-dsl>=4.8.0'"
-    return None
+        return f"{NAME} requires nvidia-cutlass-dsl >= {DSL_FLOOR_TEXT}; the CuTe DSL is not installed"
+    return cutedsl_requirement_error(NAME, floor=DSL_FLOOR)
 
 
 def device_shared_memory(device) -> Tuple[int, int]:

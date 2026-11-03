@@ -10,6 +10,11 @@ Importing this module registers the backend (:func:`register_frost_fe`; FlashInf
 
     python benchmarks/bench_qwen_3_5_gdn_block.py --register cudnn.linear_attention.frost.flashinfer_gdn_backend --backends frost frost_fe
 
+FlashInfer floor: the block's backend registry (``api.register_backend`` / ``get_backend``, the typed ``Qwen35GdnDecline`` kinds,
+``support.device_cc``, ``Qwen35GdnPlanSpec``) -- FlashInfer main at or after PR #8131 (2026-10-31); no tagged FlashInfer release carried it
+when this module was written (:data:`FLASHINFER_FLOOR`; importing this module without it raises ``ImportError`` naming the requirement),
+and FlashInfer marks the block experimental: it may change or be removed without deprecation.
+
 Served (:func:`support`, the registry's ``support_fn``: cheap, imports no kernel): both forms at the block's dense-27B geometry at
 tensor-parallel rank 1 (d_model 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4) on SM100-class parts (compute capability
 10.x) with a CuTe DSL >= 4.8.0.  The
@@ -60,6 +65,7 @@ __all__ = [
     "BACKEND",
     "DECODE",
     "DECODE_MAX_ROWS",
+    "FLASHINFER_FLOOR",
     "FORMS",
     "GEOMETRY",
     "VERIFY",
@@ -79,6 +85,11 @@ BACKEND = "frost_fe"
 DECODE = "decode"
 VERIFY = "verify"
 FORMS = (DECODE, VERIFY)
+#: the FlashInfer this backend targets: the experimental Qwen 3.5 GDN block WITH its backend registry (``api.register_backend`` /
+#: ``get_backend``, the typed ``Qwen35GdnDecline`` kinds, ``support.device_cc``, ``Qwen35GdnPlanSpec``), which FlashInfer's main branch
+#: carries from PR #8131 (2026-10-31) on; no tagged FlashInfer release carried it when this module was written, and FlashInfer marks the
+#: block experimental (it may change or be removed without deprecation)
+FLASHINFER_FLOOR = "FlashInfer main at or after PR #8131 (2026-10-31; no tagged release carries the block's backend registry yet)"
 #: the decode launch is grid ``(48, rows, 1)``: CUDA caps grid Y at 65535 -- the entry's own bound (``gdn_decode_fused.MAX_ROWS``; its
 #: ``check_support`` declines past it), so the probe and the direct entry answer alike
 DECODE_MAX_ROWS = _decode.MAX_ROWS
@@ -160,7 +171,7 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
             )
         try:
             cfg = verify_form(device, requests, float(geometry.norm_eps))
-        except Exception as exc:  # noqa: BLE001 - a probe reports, never raises
+        except RuntimeError as exc:  # the device-attribute readers' failure; anything else is a bug and propagates (FlashInfer reports it by type)
             return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel could not read this device's shared memory or SM count: {exc}")
         limit = cfg.max_tokens()
         if tokens_per_request > limit:
@@ -329,6 +340,11 @@ def register_frost_fe(*, replace: bool = False) -> str:
     backend holding the name is FlashInfer's ``ValueError`` unless ``replace`` is set."""
     from flashinfer.experimental.qwen_3_5_gdn_block import api
 
+    if not (callable(getattr(api, "register_backend", None)) and callable(getattr(api, "get_backend", None))):
+        raise ImportError(
+            f"{__name__} needs FlashInfer's Qwen 3.5 GDN block backend registry (flashinfer.experimental.qwen_3_5_gdn_block.api.register_backend / "
+            f"get_backend): {FLASHINFER_FLOOR}; the installed module has none"
+        )
     current = api.get_backend(BACKEND)
     if current is not None and not replace and getattr(current.build_fn, "__module__", None) == __name__:
         return BACKEND
@@ -339,4 +355,7 @@ def register_frost_fe(*, replace: bool = False) -> str:
 try:
     register_frost_fe()
 except ImportError as exc:
-    raise ImportError(f"{__name__} needs FlashInfer with the experimental Qwen 3.5 GDN block (flashinfer.experimental.qwen_3_5_gdn_block): {exc}") from exc
+    raise ImportError(
+        f"{__name__} needs FlashInfer with the experimental Qwen 3.5 GDN block and its backend registry (flashinfer.experimental.qwen_3_5_gdn_block; "
+        f"{FLASHINFER_FLOOR}): {exc}"
+    ) from exc

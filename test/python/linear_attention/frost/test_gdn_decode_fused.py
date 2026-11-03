@@ -339,14 +339,27 @@ def test_every_launch_re_checks_the_binding():
 
 
 def test_declines_a_dsl_below_the_floor_by_version(monkeypatch):
-    monkeypatch.setattr(entry, "cutedsl_requirement_error", lambda name: None)
-    monkeypatch.setattr(entry, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.1")))
+    """The kernel's 4.8.0 floor runs through the library's one version parser (cudnn.frost.buffers.cutedsl_too_old with the kernel's
+    floor), so a prerelease of the floor compares as the floor and an internal build is never judged by the public numbering."""
+    from cudnn.frost import buffers
+
+    def installed(state):
+        monkeypatch.setattr(buffers, "cutedsl_state", lambda: state)
+        monkeypatch.setattr(entry, "cutedsl_state", lambda: state)
+
+    installed((True, ("nvidia-cutlass-dsl", "4.7.1")))
     msg = entry._dsl_version_error()
-    assert msg is not None and "4.8.0" in msg and "4.7.1" in msg
-    monkeypatch.setattr(entry, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    assert msg is not None and "4.8.0" in msg and "4.7.1" in msg and "pip install" in msg
+    installed((True, ("nvidia-cutlass-dsl", "4.8.0")))
     assert entry._dsl_version_error() is None
-    monkeypatch.setattr(entry, "cutedsl_state", lambda: (False, None))
+    installed((True, ("nvidia-cutlass-dsl", "4.8.0rc1")))
+    assert entry._dsl_version_error() is None
+    installed((True, ("nvidia-cutlass-dsl-internal", "0.3.0+2026")))
+    assert entry._dsl_version_error() is None
+    installed((False, None))
     assert "not installed" in entry._dsl_version_error()
+    assert entry.DSL_FLOOR > buffers.CUTEDSL_MIN_VERSION, "the kernel's floor is above the library's: one call covers both"
+    assert buffers.cutedsl_too_old(("nvidia-cutlass-dsl", "4.7.9"), floor=entry.DSL_FLOOR) and not buffers.cutedsl_too_old(("nvidia-cutlass-dsl", "4.7.9"))
 
 
 def test_compile_key_is_plan_time_only():
