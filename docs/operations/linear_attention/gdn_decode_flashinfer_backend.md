@@ -127,5 +127,5 @@ Outputs were bitwise identical to the `frost` backend on every saved reference s
 serving (identical tokens and acceptance counters). End to end on the same path (three
 interleaved rounds, acceptance-length gate), the time per output token improved by +6.4 % with
 MTP (five drafts, batch 1) and +6.9 % without; those figures include the PDL launch mode of the
-fused steps and exclude the GEMM tactic changes made in the same path (the kernels alone account
-for +2.0 % and +4.6 %).
+fused steps and the GEMM tactic changes made in the same path, which are not part of this page's
+kernels (the kernels alone account for +2.0 % and +4.6 %, read against a same-snapshot control).
