@@ -1723,7 +1723,7 @@ def _epilogue_loop_accum(
     while valid != 0:
         _credit_accum(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds_accum(block, sq, causal, window)
-        for _qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _ in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen_accum(bars.ds_ready, ds_state.phase)
             ds0 = _tmem_load(tmem_base + 128, 32, cutlass.Int32)
             ds1 = _tmem_load(tmem_base + 192, 32, cutlass.Int32)
@@ -2934,7 +2934,7 @@ def _epilogue_loop_thd(
     while valid != 0:
         _credit_thd(bars.sched_empty[sched_state.idx])
         lo, hi, seq_q, seq_k, q_start = _bounds_thd(block, meta, batch, n_batch, causal)
-        for _qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _ in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen_thd(bars.ds_ready, ds_state.phase)
             ds0 = _tmem_load(tmem_base + 128, 32, cutlass.Int32)
             ds1 = _tmem_load(tmem_base + 192, 32, cutlass.Int32)
