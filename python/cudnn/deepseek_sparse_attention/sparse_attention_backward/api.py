@@ -24,7 +24,12 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
-from ._sm90_relay import SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE, sm90_deterministic_relay_requirement_error
+from ._sm90_relay import (
+    SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    sm90_deterministic_relay_accumulator_elements,
+    sm90_deterministic_relay_indexing_error,
+    sm90_deterministic_relay_requirement_error,
+)
 
 
 def _checked_deterministic_relay_cluster_size(value: Optional[int]) -> Optional[int]:
@@ -217,6 +222,16 @@ class SparseAttentionBackward(APIBase):
             head_dim not in (512, 576),
             f"head_dim must be 512 or 576, got {head_dim}",
         )
+        if major == 9 and self.deterministic:
+            accumulator_elements = sm90_deterministic_relay_accumulator_elements(
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                num_heads,
+                self._sm90_deterministic_relay_cluster_size,
+            )
+            indexing_error = sm90_deterministic_relay_indexing_error(accumulator_elements)
+            self._value_error_if(indexing_error is not None, indexing_error)
         head_dim_v = 512 if head_dim == 576 else head_dim
         expected_o_shape = (total_s_q, num_heads, head_dim_v)
         self._value_error_if(

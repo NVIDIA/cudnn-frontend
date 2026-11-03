@@ -5350,6 +5350,51 @@ def test_DSA_sparse_attention_backward_sm90_relay_cutedsl_version_gate(monkeypat
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
+    """The largest valid signed-Int32 element offset is accepted exactly."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+
+    limit = 1 << 31
+    assert _sm90_relay.sm90_deterministic_relay_indexing_error(limit) is None
+    assert _sm90_relay.sm90_deterministic_relay_indexing_error(limit + 1) == (
+        "deterministic SM90 DSA backward dKV accumulator has 2147483649 elements, " "which exceeds the signed Int32 element offset range"
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("relay_cluster_size", [4, 8, 16, 32, 64])
+def test_DSA_sparse_attention_backward_sm90_relay_host_span_matches_workspace_layout(relay_cluster_size):
+    """The support-check span calculation matches the execution workspace."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90, _sm90_relay
+
+    planes, physical_plane_elems, *_ = _interface_sm90._deterministic_relay_layout(257, 1001, 576, 96, relay_cluster_size)
+    assert _sm90_relay.sm90_deterministic_relay_accumulator_elements(257, 1001, 576, 96, relay_cluster_size) == planes * physical_plane_elems
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_rejects_oversized_accumulator_during_support_check(monkeypatch):
+    """The prepared plan rejects unsafe dynamic offsets before compilation."""
+    _require_sm90()
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
+
+    monkeypatch.setattr(api, "sm90_deterministic_relay_accumulator_elements", lambda *args: (1 << 31) + 1)
+    device = torch.device("cuda")
+    plan = DSA.SparseAttentionBackward(
+        sample_q=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_kv=torch.empty(64, 512, dtype=torch.bfloat16, device=device),
+        sample_out=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_dout=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_lse=torch.empty(1, 16, dtype=torch.float32, device=device),
+        sample_attn_sink=torch.empty(16, dtype=torch.float32, device=device),
+        sample_topk_idxs=torch.empty(1, 16, dtype=torch.int32, device=device),
+        deterministic=True,
+    )
+    with pytest.raises(ValueError, match=r"2147483649 elements.*signed Int32 element offset range"):
+        plan.check_support()
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm90_relay_rejects_old_cutedsl_before_compile(monkeypatch):
     """Prepared SM90 deterministic plans enforce the relay-specific DSL floor."""
     _require_sm90()

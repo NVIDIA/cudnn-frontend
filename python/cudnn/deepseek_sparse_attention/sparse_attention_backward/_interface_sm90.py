@@ -27,6 +27,8 @@ from .dsa_bwd_sm90 import (
 from ._sm90_relay import (
     SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
     normalize_sm90_relay_cluster_size,
+    sm90_deterministic_relay_layout,
+    sm90_deterministic_relay_indexing_error,
 )
 
 torch2cute_dtype_map = {
@@ -59,19 +61,7 @@ def _deterministic_relay_layout(
     relay_cluster_size: int,
 ) -> Tuple[int, int, int, int, int]:
     """Return (planes, physical plane elements, mask rows, waves, head tiles)."""
-    relay_cluster_size = normalize_sm90_relay_cluster_size(relay_cluster_size)
-    _, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_s_q, total_s_kv, head_dim)
-    num_waves = _round_up(total_s_q, _DETERMINISTIC_Q_WAVE_CTAS) // _DETERMINISTIC_Q_WAVE_CTAS
-    num_head_tiles = _round_up(num_heads, _M_BLOCK_SIZE) // _M_BLOCK_SIZE
-    num_dkv_planes = _DETERMINISTIC_Q_WAVE_CTAS // relay_cluster_size
-    mask_word_bits = 64 if relay_cluster_size == 64 else 32
-    mask_rows_per_word = mask_word_bits // relay_cluster_size
-    words_per_phase = seqlen_k_rounded // mask_rows_per_word
-    mask_words = num_waves * num_head_tiles * words_per_phase
-    mask_storage_elems = mask_words * (mask_word_bits // 32)
-    mask_rows = _round_up(mask_storage_elems, head_dim_rounded) // head_dim_rounded
-    physical_plane_elems = (seqlen_k_rounded + mask_rows) * head_dim_rounded
-    return num_dkv_planes, physical_plane_elems, mask_rows, num_waves, num_head_tiles
+    return sm90_deterministic_relay_layout(total_s_q, total_s_kv, head_dim, num_heads, relay_cluster_size)
 
 
 def flash_attn_bwd_sm90_workspace_size(
@@ -214,6 +204,9 @@ def flash_attn_bwd_sm90(
         num_relay_waves = 1
         num_head_tiles = 1
         num_dkv_shards = 1
+    indexing_error = sm90_deterministic_relay_indexing_error(num_dkv_shards * physical_plane_elems) if deterministic else None
+    if indexing_error is not None:
+        raise ValueError(indexing_error)
     carver = WorkspaceCarver(
         workspace,
         flash_attn_bwd_sm90_workspace_size(
