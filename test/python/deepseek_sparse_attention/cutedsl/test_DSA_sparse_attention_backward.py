@@ -4437,9 +4437,9 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
 
     # qhpkv controls the query-head tiling and must remain part of the main
     # compile key, independently of the runtime tensor shape.
-    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-7] is False]
+    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-5] is False]
     assert matching_keys
-    assert all(key[-2:] == (0, 0) for key in matching_keys), "non-deterministic kernels must not specialize on rounded KV extents"
+    assert all(key[-1] == 0 for key in matching_keys), "non-deterministic kernels must not specialize on rounded head extents"
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
     assert torch.isfinite(dq).all()
@@ -5332,6 +5332,57 @@ def test_DSA_sparse_attention_backward_sm90_relay_cluster_size_rejects_before_st
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("4.7.1", "deterministic SM90 DSA backward requires nvidia-cutlass-dsl >= 4.8.0; found 4.7.1"),
+        ("4.8.0", None),
+        ("4.9.0", None),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_relay_cutedsl_version_gate(monkeypatch, version, expected):
+    """The SM90 relay names its 4.8 DSL floor without importing a kernel."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", version)))
+    assert _sm90_relay.sm90_deterministic_relay_requirement_error() == expected
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_rejects_old_cutedsl_before_compile(monkeypatch):
+    """Prepared SM90 deterministic plans enforce the relay-specific DSL floor."""
+    _require_sm90()
+    from cudnn import DSA
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.1")))
+    device = torch.device("cuda")
+    plan = DSA.SparseAttentionBackward(
+        sample_q=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_kv=torch.empty(64, 512, dtype=torch.bfloat16, device=device),
+        sample_out=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_dout=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_lse=torch.empty(1, 16, dtype=torch.float32, device=device),
+        sample_attn_sink=torch.empty(16, dtype=torch.float32, device=device),
+        sample_topk_idxs=torch.empty(1, 16, dtype=torch.int32, device=device),
+        deterministic=True,
+    )
+    with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.7\.1"):
+        plan.check_support()
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_kernels_have_public_symbol_prefix():
+    """Every CuTeDSL kernel in the SM90 backward module uses the public prefix."""
+    module = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm90")
+    source = inspect.getsource(module)
+
+    assert source.count("@cute.kernel") == 5
+    assert source.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)') == 5
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=91)
 def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_synchronizes():
     """Recipe R9 on the Hopper route: scratch is carved from the caller workspace, outputs are the caller's."""
@@ -5412,6 +5463,58 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=94)
+def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_runtime_extents(monkeypatch):
+    """Packed Q/KV extents stay runtime values for all deterministic artifacts."""
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    launch = _interface_sm90.flash_attn_bwd_sm90
+    monkeypatch.setattr(launch, "compile_cache_relay_masks", {})
+    monkeypatch.setattr(launch, "compile_cache", {})
+    monkeypatch.setattr(launch, "compile_cache_post", {})
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def execute(s_q, s_kv):
+        plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+            64,
+            512,
+            64,
+            s_q=s_q,
+            s_kv=s_kv,
+            has_topk_length=True,
+            deterministic=True,
+            deterministic_relay_cluster_size=16,
+        )
+        dq, dkv, d_sink = outputs
+        result = plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+        torch.cuda.synchronize()
+        assert all(torch.isfinite(tensor).all() for tensor in result)
+
+    execute(65, 192)
+    compiled = {name: next(iter(getattr(launch, name).values())) for name in ("compile_cache_relay_masks", "compile_cache", "compile_cache_post")}
+    execute(129, 256)
+
+    for name, first_callable in compiled.items():
+        cache = getattr(launch, name)
+        assert len(cache) == 1, f"{name} specialized on a runtime packed extent: {tuple(cache)}"
+        assert next(iter(cache.values())) is first_callable
 
 
 @pytest.mark.L2

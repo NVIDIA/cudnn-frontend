@@ -5,8 +5,27 @@
 
 import operator
 
+from packaging.version import InvalidVersion, Version
+
 SM90_DETERMINISTIC_RELAY_CLUSTER_SIZES = (4, 8, 16, 32, 64)
 SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE = 16
+
+
+def sm90_deterministic_relay_requirement_error():
+    """Return the public CuTeDSL version error for the SM90 relay, if any."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    installed, version = cutedsl_state()
+    requirement = "deterministic SM90 DSA backward requires nvidia-cutlass-dsl >= 4.8.0"
+    if not installed:
+        return requirement
+    if version is None or version[0] != "nvidia-cutlass-dsl":
+        return None
+    try:
+        too_old = Version(version[1]).release < (4, 8, 0)
+    except InvalidVersion:
+        return None
+    return f"{requirement}; found {version[1]}" if too_old else None
 
 
 def normalize_sm90_relay_cluster_size(value) -> int:

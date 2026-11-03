@@ -24,7 +24,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
-from ._sm90_relay import SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE
+from ._sm90_relay import SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE, sm90_deterministic_relay_requirement_error
 
 
 def _checked_deterministic_relay_cluster_size(value: Optional[int]) -> Optional[int]:
@@ -205,6 +205,8 @@ class SparseAttentionBackward(APIBase):
             "deterministic_relay_cluster_size requires deterministic=True",
         )
         if major == 9 and self.deterministic:
+            relay_requirement_error = sm90_deterministic_relay_requirement_error()
+            self._runtime_error_if(relay_requirement_error is not None, relay_requirement_error)
             self._sm90_deterministic_relay_cluster_size = (
                 SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE if self.deterministic_relay_cluster_size is None else self.deterministic_relay_cluster_size
             )

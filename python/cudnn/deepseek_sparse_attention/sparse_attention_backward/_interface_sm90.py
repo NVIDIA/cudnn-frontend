@@ -201,7 +201,7 @@ def flash_attn_bwd_sm90(
     seqlen_q_rounded, seqlen_k_rounded, head_dim_rounded = _workspace_extents(total_S_q, total_S_kv, head_dim)
     if deterministic:
         relay_cluster_size = normalize_sm90_relay_cluster_size(deterministic_relay_cluster_size)
-        num_dkv_shards, physical_plane_elems, relay_mask_rows, num_relay_waves, num_head_tiles = _deterministic_relay_layout(
+        num_dkv_shards, physical_plane_elems, _, num_relay_waves, num_head_tiles = _deterministic_relay_layout(
             total_S_q,
             total_S_kv,
             head_dim,
@@ -211,7 +211,6 @@ def flash_attn_bwd_sm90(
     else:
         relay_cluster_size = 1
         physical_plane_elems = seqlen_k_rounded * head_dim_rounded
-        relay_mask_rows = 0
         num_relay_waves = 1
         num_head_tiles = 1
         num_dkv_shards = 1
@@ -341,25 +340,17 @@ def flash_attn_bwd_sm90(
             relay_cluster_size,
             have_topk_length,
             max_topk,
-            total_S_q,
-            total_S_kv,
             num_head_tiles,
-            num_relay_waves,
-            seqlen_k_rounded,
             head_dim_rounded,
-            relay_mask_rows,
         )
         if compile_key_relay_masks not in flash_attn_bwd_sm90.compile_cache_relay_masks:
-            dkv_accum_tensor = to_cute_tensor(dkv_accum)
+            dkv_accum_tensor = to_cute_tensor(dkv_accum, fully_dynamic=True)
             topk_idxs_tensor = to_cute_tensor(topk4)
             topk_length_tensor = to_cute_tensor(tlen4) if have_topk_length else None
             relay_masks = _FlashAttentionDSABackwardRelayMasksSm90(
                 relay_cluster_size=relay_cluster_size,
                 q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS,
                 num_head_tiles=num_head_tiles,
-                num_waves=num_relay_waves,
-                seqlen_kv=total_S_kv,
-                padded_seqlen_kv=seqlen_k_rounded,
                 padded_head_dim=head_dim_rounded,
             )
             flash_attn_bwd_sm90.compile_cache_relay_masks[compile_key_relay_masks] = cute.compile(
@@ -367,10 +358,21 @@ def flash_attn_bwd_sm90(
                 dkv_accum_tensor,
                 topk_idxs_tensor,
                 topk_length_tensor,
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+                cutlass.Int32(0),
                 current_stream,
                 options="--enable-tvm-ffi",
             )
-        flash_attn_bwd_sm90.compile_cache_relay_masks[compile_key_relay_masks](dkv_accum, topk4, tlen4, current_stream)
+        flash_attn_bwd_sm90.compile_cache_relay_masks[compile_key_relay_masks](
+            dkv_accum,
+            topk4,
+            tlen4,
+            num_relay_waves,
+            total_S_kv,
+            seqlen_k_rounded,
+            current_stream,
+        )
 
     compile_key = (
         dtype,
@@ -393,8 +395,6 @@ def flash_attn_bwd_sm90(
         num_dkv_shards,
         relay_cluster_size,
         _DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
-        num_relay_waves,
-        seqlen_k_rounded if deterministic else 0,
         head_dim_rounded if deterministic else 0,
     )
     if compile_key not in flash_attn_bwd_sm90.compile_cache:
@@ -403,7 +403,7 @@ def flash_attn_bwd_sm90(
         do_tensor = to_cute_tensor(dout4)
         dpsum_tensor, lse_log2_tensor = [to_cute_tensor(t) for t in (dpsum, lse_log2)]
         dq_tensor = to_cute_tensor(dq4)
-        dkv_accum_tensor = to_cute_tensor(dkv_accum)
+        dkv_accum_tensor = to_cute_tensor(dkv_accum, fully_dynamic=True)
         topk_idxs_tensor = to_cute_tensor(topk4)
         topk_length_tensor = to_cute_tensor(tlen4) if have_topk_length else None
 
@@ -426,8 +426,6 @@ def flash_attn_bwd_sm90(
             num_dkv_shards=num_dkv_shards,
             relay_cluster_size=relay_cluster_size,
             q_wave_ctas=_DETERMINISTIC_Q_WAVE_CTAS if deterministic else 1,
-            num_waves=num_relay_waves,
-            padded_seqlen_kv=seqlen_k_rounded if deterministic else 0,
             padded_head_dim=head_dim_rounded if deterministic else 0,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
@@ -441,6 +439,8 @@ def flash_attn_bwd_sm90(
             dkv_accum_tensor,
             topk_idxs_tensor,
             topk_length_tensor,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
             softmax_scale,
             current_stream,
             options="--enable-tvm-ffi",
@@ -456,6 +456,8 @@ def flash_attn_bwd_sm90(
             dkv_accum,
             topk4,
             tlen4,
+            num_relay_waves if deterministic else 0,
+            seqlen_k_rounded if deterministic else 0,
             softmax_scale,
             current_stream,
         )
@@ -475,7 +477,7 @@ def flash_attn_bwd_sm90(
         num_dkv_shards,
     )
     if compile_key_post not in flash_attn_bwd_sm90.compile_cache_post:
-        dkv_accum_tensor = to_cute_tensor(dkv_accum)
+        dkv_accum_tensor = to_cute_tensor(dkv_accum, fully_dynamic=True)
         dkv_tensor = to_cute_tensor(dkv4)
 
         postprocess = _FlashAttentionDSABackwardPostprocessSm90(
@@ -491,7 +493,7 @@ def flash_attn_bwd_sm90(
             postprocess,
             dkv_accum_tensor,
             dkv_tensor,
-            seqlen_k,
+            cutlass.Int32(0),
             current_stream,
             options="--enable-tvm-ffi",
         )
