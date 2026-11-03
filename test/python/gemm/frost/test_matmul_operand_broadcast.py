@@ -36,7 +36,7 @@ def _view(value, mode, side):
     return value
 
 
-def _graph(side, prefix, aux_shape, mode="plain", op="add", dtype=BF16, mn=8, k=16, aux_first=False, aux_dtype=FP32):
+def _graph(side, prefix, aux_shape, mode="plain", op="add", dtype=BF16, mn=8, k=16, aux_first=False, aux_dtype=FP32, aux_stride=2, mn_major=False):
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=FP32, compute_data_type=FP32)
     shape = (*prefix, mn, k) if side == "a" else (*prefix, k, mn)
     if mode == "transpose":
@@ -44,9 +44,13 @@ def _graph(side, prefix, aux_shape, mode="plain", op="add", dtype=BF16, mn=8, k=
     stride = [prod(shape[i + 1 :]) for i in range(len(shape))]
     if side == "b" and mode != "transpose":
         stride[-2:] = [1, shape[-2]]
+    if mn_major:
+        stride[-2:] = [1, shape[-2]] if side == "a" else [shape[-1], 1]
     x = g.tensor(name="x", dim=list(shape), stride=stride, data_type=dtype)
-    u = g.tensor(name="u", dim=list(aux_shape), stride=[2 * prod(aux_shape[i + 1 :]) for i in range(len(aux_shape))], data_type=aux_dtype)
-    value = getattr(g, op)(a=u if aux_first else x, b=x if aux_first else u).set_data_type(dtype)
+    u = g.tensor(name="u", dim=list(aux_shape), stride=[aux_stride * prod(aux_shape[i + 1 :]) for i in range(len(aux_shape))], data_type=aux_dtype)
+    value = x
+    for operation in (op,) if isinstance(op, str) else op:
+        value = getattr(g, operation)(a=u if aux_first else value, b=value if aux_first else u).set_data_type(dtype)
     if mode == "transpose":
         value = g.transpose(input=value, permutation=[*range(len(shape) - 2), len(shape) - 1, len(shape) - 2])
         target = (*shape[:-2], shape[-1], shape[-2])
@@ -66,10 +70,81 @@ def _graph(side, prefix, aux_shape, mode="plain", op="add", dtype=BF16, mn=8, k=
     return g, {"x": x, "u": u, "other": other, "y": y}
 
 
+def _reference_transform(x, u, operations):
+    value = x
+    for operation in (operations,) if isinstance(operations, str) else operations:
+        value = {"add": torch.add, "sub": torch.sub, "mul": torch.mul}[operation](value.float(), u).to(x.dtype)
+    return value
+
+
 def _config(swapped=False, cta_group=1, split=1):
     from dataclasses import replace
 
     return replace(by_name(f"CONFIG_sm100_128x128x64_128x128x32_cluster{cta_group}x1_{cta_group}ctamma"), swap_ab=swapped, split_k_slices=split)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix", ((), (1,), (2, 3)))
+@pytest.mark.parametrize(
+    "side,order,mode,swapped", list(product(("a", "b"), (("add", "mul"), ("mul", "add"), ("mul", "mul")), ("plain", "transpose"), (False, True)))
+)
+def test_frost_operand_aux_abi_is_shared_across_consumers(side, order, mode, swapped, prefix):
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    source_k_last = (side == "a") == (mode == "plain")
+    aux = (1,) * len(prefix) + ((1, 136) if source_k_last else (136, 1))
+    g, _ = _graph(side, prefix, aux, mode, order, mn=128, k=136, aux_stride=1)
+    chain, _ = analyze_with_binding(g)
+    if swapped:
+        chain = swap_ab(chain)
+    operand = ("b" if side == "a" else "a") if swapped else side
+    ops = getattr(chain, f"mainloop_{operand}_ops")
+    assert len(chain.aux_tensors) == 1
+    ref = chain.aux_tensors[0]
+    assert all(op.aux == ref.name for op in ops)
+    assert all((op.operand_access is not None) == ref.coordinate_mapped for op in ops)
+    if "add" in order:
+        assert ref.coordinate_mapped
+    elif mode == "plain" or side == "b":
+        assert ref.bcast_mode == "per_k"  # compatible repeated uses retain the dynamic ABI
+    assert select_template(chain, _config(swapped))._other_reject(chain, _config(swapped)) is None
+    ast.parse(epilogue_codegen.generate_mainloop(chain, operand))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("side,aux_stride,swapped", list(product(("a", "b"), (1, 2), (False, True))))
+def test_frost_operand_per_k_optimization_falls_back_for_mn_major(side, aux_stride, swapped):
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    aux = (1, 1, 136) if side == "a" else (1, 136, 1)
+    g, _ = _graph(side, (1,), aux, op="mul", mn=128, k=136, aux_stride=aux_stride, mn_major=True)
+    chain, _ = analyze_with_binding(g)
+    if swapped:
+        chain = swap_ab(chain)
+    operand = ("b" if side == "a" else "a") if swapped else side
+    assert chain.aux_tensors[0].coordinate_mapped
+    assert getattr(chain, f"mainloop_{operand}_ops")[0].operand_access is not None
+    assert select_template(chain, _config(swapped))._other_reject(chain, _config(swapped)) is None
+    ast.parse(epilogue_codegen.generate_mainloop(chain, operand))
+
+
+@pytest.mark.L0
+def test_frost_operand_aux_abi_reconciles_both_operands():
+    """A's legacy per-K candidate shares storage with B's mapped per-N use."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=FP32, compute_data_type=FP32)
+    a = g.tensor(name="a", dim=[1, 128, 136], stride=[128 * 136, 136, 1], data_type=BF16)
+    b = g.tensor(name="b", dim=[1, 136, 136], stride=[136 * 136, 1, 136], data_type=BF16)
+    u = g.tensor(name="u", dim=[1, 1, 136], stride=[136, 136, 1], data_type=FP32)
+    a = g.mul(a=a, b=u).set_data_type(BF16)
+    b = g.mul(a=b, b=u).set_data_type(BF16)
+    g.matmul(A=a, B=b).set_output(True)
+    g.validate()
+    chain, _ = analyze_with_binding(g)
+    assert len(chain.aux_tensors) == 1 and chain.aux_tensors[0].coordinate_mapped
+    assert chain.mainloop_a_ops[0].operand_access.axes == {Axis.K}
+    assert chain.mainloop_b_ops[0].operand_access.axes == {Axis.N}
+    for side in ("a", "b"):
+        ast.parse(epilogue_codegen.generate_mainloop(chain, side))
 
 
 @pytest.mark.L0
@@ -133,23 +208,29 @@ def test_frost_operand_broadcast_maps_and_rebinding(monkeypatch, side, prefix, p
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for generated broadcast fragments")
 @pytest.mark.parametrize(
-    "side,prefix,aux,mode,op,dtype,aux_dtype",
+    "side,prefix,aux,mode,op,dtype,aux_dtype,mn_major",
     [
-        ("a", (2, 3), (136, 1), "plain", "add", BF16, BF16),
-        ("b", (2, 3), (1, 136), "plain", "sub", FP16, FP16),
-        ("a", (2, 3), (1, 3, 1, 136), "reshape", "mul", BF16, FP32),
-        ("a", (2, 3), (1, 3, 1, 1), "reshape", "add", FP16, FP32),
-        ("a", (2, 3), (136,), "plain", "sub", BF16, FP32),
-        ("a", (), (136, 136), "plain", "add", BF16, FP32),
-        ("b", (1,), (136, 1), "plain", "mul", FP16, FP32),
-        ("a", (2, 3), (136,), "transpose", "add", BF16, FP32),
+        ("a", (2, 3), (136, 1), "plain", "add", BF16, BF16, False),
+        ("b", (2, 3), (1, 136), "plain", "sub", FP16, FP16, False),
+        ("a", (2, 3), (1, 3, 1, 136), "reshape", "mul", BF16, FP32, False),
+        ("a", (2, 3), (1, 3, 1, 1), "reshape", "add", FP16, FP32, False),
+        ("a", (2, 3), (136,), "plain", "sub", BF16, FP32, False),
+        ("a", (), (136, 136), "plain", "add", BF16, FP32, False),
+        ("b", (1,), (136, 1), "plain", "mul", FP16, FP32, False),
+        ("a", (2, 3), (136,), "transpose", "add", BF16, FP32, False),
+        ("a", (1,), (1, 1, 136), "plain", ("add", "mul"), BF16, FP32, False),
+        ("b", (1,), (1, 136, 1), "plain", ("mul", "add"), FP16, FP32, False),
+        ("a", (1,), (1, 1, 136), "plain", "mul", BF16, FP32, True),
+        ("b", (1,), (1, 136, 1), "plain", "mul", FP16, FP32, True),
     ],
 )
-def test_frost_operand_broadcast_generated_fragment(tmp_path, side, prefix, aux, mode, op, dtype, aux_dtype):
+def test_frost_operand_broadcast_generated_fragment(tmp_path, side, prefix, aux, mode, op, dtype, aux_dtype, mn_major):
     """Execute mapped loads with source strides, view composition, rounding and K tails."""
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("generated fragments require SM90+")
-    g, tensors = _graph(side, prefix, aux, mode, op, dtype, mn=136, k=136, aux_dtype=aux_dtype)
+    g, tensors = _graph(
+        side, prefix, aux, mode, op, dtype, mn=136, k=136, aux_dtype=aux_dtype, aux_stride=1 if isinstance(op, tuple) or mn_major else 2, mn_major=mn_major
+    )
     chain, _ = analyze_with_binding(g)
     ref = chain.aux_tensors[0]
     snippet = epilogue_codegen.generate_mainloop(chain, side)
@@ -194,7 +275,7 @@ compiled = cute.compile(entry, fake_data, fake_u, fake_data, cutlass.Int64(0), c
     spec.loader.exec_module(module)
     x = torch.empty_strided(tensors["x"].get_dim(), tensors["x"].get_stride(), device="cuda", dtype=_DTYPE[dtype]).normal_()
     u = torch.empty_strided(aux, tensors["u"].get_stride(), device="cuda", dtype=_DTYPE[aux_dtype]).normal_()
-    result = {"add": torch.add, "sub": torch.sub, "mul": torch.mul}[op](x.float(), u).to(x.dtype)
+    result = _reference_transform(x, u, op)
     raw, result = _view(x, mode, side), _view(result, mode, side)
     if side == "b":
         raw, result = raw.transpose(-1, -2), result.transpose(-1, -2)
@@ -280,20 +361,24 @@ def test_frost_operand_broadcast_storage_contract(stride, shape, m, k, error):
 
 @requires_sm100
 @pytest.mark.parametrize(
-    "side,prefix,aux,mode,op,swapped,cta,split",
+    "side,prefix,aux,mode,op,swapped,cta,split,mn_major",
     [
-        pytest.param("a", (2, 3), (128, 1), "plain", "add", False, 1, 1, marks=pytest.mark.L0),
-        pytest.param("b", (2, 3), (1, 128), "plain", "sub", False, 1, 1, marks=pytest.mark.L0),
-        pytest.param("a", (2, 3), (1, 3, 1, 136), "reshape", "mul", False, 1, 1, marks=pytest.mark.L0),
-        pytest.param("a", (2, 3), (128,), "transpose", "add", True, 1, 1, marks=pytest.mark.L1),
-        pytest.param("b", (1,), (136, 1), "plain", "mul", True, 2, 1, marks=pytest.mark.L1),
-        pytest.param("a", (2, 3), (1, 3, 1, 1), "reshape", "add", False, 1, 2, marks=pytest.mark.L1),
+        pytest.param("a", (2, 3), (128, 1), "plain", "add", False, 1, 1, False, marks=pytest.mark.L0),
+        pytest.param("b", (2, 3), (1, 128), "plain", "sub", False, 1, 1, False, marks=pytest.mark.L0),
+        pytest.param("a", (2, 3), (1, 3, 1, 136), "reshape", "mul", False, 1, 1, False, marks=pytest.mark.L0),
+        pytest.param("a", (2, 3), (128,), "transpose", "add", True, 1, 1, False, marks=pytest.mark.L1),
+        pytest.param("b", (1,), (136, 1), "plain", "mul", True, 2, 1, False, marks=pytest.mark.L1),
+        pytest.param("a", (2, 3), (1, 3, 1, 1), "reshape", "add", False, 1, 2, False, marks=pytest.mark.L1),
+        pytest.param("a", (1,), (1, 1, 136), "plain", ("add", "mul"), False, 1, 1, False, marks=pytest.mark.L0),
+        pytest.param("b", (1,), (1, 136, 1), "plain", ("mul", "add"), True, 2, 1, False, marks=pytest.mark.L1),
+        pytest.param("a", (1,), (1, 1, 136), "plain", "mul", False, 1, 1, True, marks=pytest.mark.L0),
+        pytest.param("b", (1,), (1, 136, 1), "plain", "mul", True, 2, 1, True, marks=pytest.mark.L1),
     ],
 )
-def test_frost_operand_broadcast_gpu(side, prefix, aux, mode, op, swapped, cta, split):
+def test_frost_operand_broadcast_gpu(side, prefix, aux, mode, op, swapped, cta, split, mn_major):
     """Graph-coordinate bindings, mutated auxiliary replay and bitwise repeats."""
     dtype = FP16 if swapped else BF16
-    g, tensors = _graph(side, prefix, aux, mode, op, dtype, mn=128, k=136)
+    g, tensors = _graph(side, prefix, aux, mode, op, dtype, mn=128, k=136, aux_stride=1 if isinstance(op, tuple) or mn_major else 2, mn_major=mn_major)
     plan = compiler.jit_from_cudnn_graph(g, _config(swapped, cta, split))
     engine = _FrostGemmPlan(plan)
     workspace_size = engine.get_workspace_size()
@@ -328,7 +413,7 @@ def test_frost_operand_broadcast_gpu(side, prefix, aux, mode, op, swapped, cta, 
                 buffers["y"].fill_(float("nan"))
                 captured.replay()
             stream.synchronize()
-            transformed = {"add": torch.add, "sub": torch.sub, "mul": torch.mul}[op](buffers["x"].float(), buffers["u"]).to(_DTYPE[dtype])
+            transformed = _reference_transform(buffers["x"], buffers["u"], op)
             transformed = _view(transformed, mode, side)
             a, b = (transformed, buffers["other"]) if side == "a" else (buffers["other"], transformed)
             expected = (a.float() @ b.float()).to(_DTYPE[dtype])

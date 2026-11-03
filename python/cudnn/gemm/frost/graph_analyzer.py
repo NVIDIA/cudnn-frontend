@@ -1651,7 +1651,66 @@ def _operand_index_expression(mapping, axis):
     return _matrix_map_coordinates(mapping)[axis]
 
 
-def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
+def _legacy_operand_aux_inputs(ops, meta, aux_steps, io_dtype, intermediate_dtype, compute_dtype) -> set[int]:
+    """Choose one auxiliary ABI from all operand consumers, before rank folding.
+
+    Logical accesses are already prepared. Only auxiliaries whose every use
+    admits a legacy per-K view can discard those maps. Distinct orientations
+    retain distinct zero-copy bindings. Otherwise original storage and
+    per-consumer maps remain intact.
+    """
+    if not aux_steps:
+        return set()
+    from .kernel_registry import per_k_scale_reject
+
+    producers = {op.output: op for op in ops}
+    mm = next(op for op in ops if op.cudnn_name == "matmul")
+    users: dict[int, list[tuple[str, _RecordedOp]]] = {}
+
+    @lru_cache(maxsize=None)
+    def roots(tid, side) -> frozenset[int]:
+        op = producers.get(tid)
+        if op is None:
+            return frozenset((tid,))
+        if op.aux_input is not None:
+            users.setdefault(op.aux_input, []).append((side, op))
+            inputs = [i for i in op.inputs if i != op.aux_input]
+        else:
+            inputs = [i for i in op.inputs if not (meta[i].dim and all(d == 1 for d in meta[i].dim))]
+        return frozenset().union(*(roots(i, side) for i in inputs))
+
+    storage = {side: roots(tid, side) for side, tid in zip(("a", "b"), mm.inputs)}
+    operand_dtype = {side: _resolve_out_dtype(tid, meta[tid].tensor, io_dtype, intermediate_dtype, meta) for side, tid in zip(("a", "b"), mm.inputs)}
+
+    def eligible(side, op, aux) -> bool:
+        steps = aux_steps[op.output]
+        if len(storage[side]) != 1 or len(aux.dim) < 2 or any(step.kind == "reshape" for step in steps):
+            return False
+        source = meta[next(iter(storage[side]))]
+        k_axis = Axis.N if side == "a" else Axis.M
+        axes = frozenset().union(*(expr.axes for expr in _matrix_map_coordinates(op.aux_mapping)))
+        if axes != {k_axis} or any(d != 1 and st != 1 for d, st in zip(aux.dim, aux.stride)):
+            return False
+        return (
+            per_k_scale_reject(
+                op=_BINARY_OP_MAP[op.cudnn_name],
+                operand_dtype=operand_dtype[side],
+                load_dtype=source.dtype if source.dtype != operand_dtype[side] else None,
+                major="k" if source.stride[-1 if side == "a" else -2] == 1 else "mn",
+                scale_stride=1,
+                scale_dtype=aux.dtype,
+                compute_dtype=op.compute_dtype or compute_dtype,
+                out_dtype=_resolve_out_dtype(op.output, op.output_tensor, io_dtype, intermediate_dtype, meta),
+            )
+            is None
+        )
+
+    return {aux_id for aux_id, consumers in users.items() if all(eligible(side, op, meta[aux_id]) for side, op in consumers)}
+
+
+def _normalize_operand_views(
+    ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype, compute_dtype: Dtype
+) -> list[_RecordedOp]:
     """Project ordered operand views through pointwise DAGs, then fold matrix rank.
 
     One producer map and shape/dtype cache serve reshape and transpose. Geometry
@@ -1686,7 +1745,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
 
     for tid, side in zip(mm.inputs, ("a", "b")):
         mark_operand(tid, side)
-    used, projected_ops, input_views = set(), [], {}
+    used, projected_ops, input_views, aux_steps = set(), [], {}, {}
     names = {m.name for m in meta.values()}
 
     @lru_cache(maxsize=None)
@@ -1789,7 +1848,8 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
 
         Shape broadcasting and view composition share IndexMap. Aux storage is
         never reshaped to the carrier layout; it retains its original rank.
-        Existing scalar and affine per-K routes keep their dynamic binding ABI.
+        Scalar accesses keep their existing ABI. Non-scalar accesses are first
+        mapped uniformly; legacy optimization is chosen across all consumers.
         """
         if op.cudnn_name not in _BINARY_OP_MAP:
             return None
@@ -1809,23 +1869,6 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
             if all(d == 1 for d in aux_dim):
                 return None  # constant-address scalar route already has no rank limit
             mapping = broadcast.compose(operand_index_map(dim, steps))
-            # Preserve affine per-K's existing dynamic ABI (including transpose
-            # views). Classify the composed coordinates, not a rank whitelist.
-            # Rank-one buffers use the mapped ABI because the legacy path needs
-            # a matrix view; reshape remains under its fixed-shape contract.
-            sides = operand_sides.get(op.output, set())
-            k_axis = Axis.N if sides == {"a"} else Axis.M if sides == {"b"} else None
-            mapped_axes = frozenset().union(*(e.axes for e in _matrix_map_coordinates(mapping)))
-            if (
-                op.cudnn_name == "mul"
-                and len(aux_dim) >= 2
-                and not any(step.kind == "reshape" for step in steps)
-                and k_axis is not None
-                and mapped_axes == {k_axis}
-                and all(d == 1 or st == 1 for d, st in zip(aux_dim, meta[other].stride))
-            ):
-                return None
-            meta[other] = replace(meta[other], coordinate_aux=True)
             return primary, other, mapping
         return None
 
@@ -1851,6 +1894,7 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
             inputs = [carrier if i == primary else other for i in op.inputs]
             output = alias(tid, steps, meta[carrier])
             projected_ops.append(replace(op, inputs=inputs, output=output, aux_input=other, aux_mapping=mapping))
+            aux_steps[output] = steps
             return output
         reshaped = any(step.kind == "reshape" for step in steps)
         primary = next((i for i in op.inputs if not all(d == 1 for d in shape(i))), op.inputs[0])
@@ -1905,7 +1949,20 @@ def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta
         for op in ops:
             access = auxiliary(op, ()) if op.output in operand_sides else None
             prepared.append(replace(op, aux_input=access[1], aux_mapping=access[2]) if access is not None else op)
+            if access is not None:
+                aux_steps[op.output] = ()
         ops = prepared
+    legacy_aux = _legacy_operand_aux_inputs(ops, meta, aux_steps, io_dtype, intermediate_dtype, compute_dtype)
+    prepared = []
+    for op in ops:
+        if op.aux_mapping is not None:
+            if op.aux_input in legacy_aux:
+                aux_id = project(op.aux_input, aux_steps[op.output]) if aux_steps[op.output] else op.aux_input
+                op = replace(op, inputs=[aux_id if i == op.aux_input else i for i in op.inputs], aux_input=aux_id, aux_mapping=None)
+            else:
+                meta[op.aux_input] = replace(meta[op.aux_input], coordinate_aux=True)
+        prepared.append(op)
+    ops = prepared
     if fold_batches:
         batch_shape = shape(mm.output)[:-2]
         ranked_shapes = {tid: shape(tid) for tid in meta}
@@ -2412,7 +2469,7 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
     meta = dict(state["tensor_meta"])
-    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
+    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"], state["compute_dtype"])
     return _build_chain(
         ops,
         meta,

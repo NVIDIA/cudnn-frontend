@@ -170,8 +170,6 @@ def test_frost_per_k_graph_and_render(options, cta_group, swapped):
 @pytest.mark.parametrize(
     "options,change,reason",
     [
-        ({"a_major": "m"}, {}, "K-major"),
-        ({"side": "b", "b_major": "n"}, {}, "K-major"),
         ({"K": 135}, {}, "K % 8"),
         ({}, {"compute_dtype": "int32"}, "FP32"),
         ({}, {"out_dtype": "fp32"}, "result"),
@@ -183,6 +181,13 @@ def test_frost_per_k_capability_not_ir(options, change, reason):
     if change:
         chain = replace(chain, mainloop_a_ops=[replace(chain.mainloop_a_ops[0], **change)])
     assert reason in select_template(chain, _config())._other_reject(chain, _config())
+
+
+@pytest.mark.parametrize("side", ("a", "b"))
+def test_frost_direct_per_k_ir_still_requires_k_major(side):
+    chain = analyze(_graph(side=side)[0])
+    chain = replace(chain, matmul=replace(chain.matmul, **{f"{side}_major": "m" if side == "a" else "n"}))
+    assert "K-major" in select_template(chain, _config())._other_reject(chain, _config())
 
 
 def test_frost_per_k_ir_rejects_invalid_broadcast():
