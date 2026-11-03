@@ -977,6 +977,34 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ---
 
+### 11. Pooled DSA Training Backward
+
+The pooled variant of the indexer scores pools of ``pool_size`` consecutive keys instead of single keys. Each pool key is the
+softmax-weighted (``gates + ape``) mean of its tokens; the top-``K`` pools are selected per query, and the attention itself runs
+on the tokens of the selected pools plus the incomplete tail of tokens that precede the query position. The training APIs live
+in ``cudnn.deepseek_sparse_attention`` (lazily exported) and compose with the token-level kernels above.
+
+| API | Computes | Returns |
+|---|---|---|
+| ``pooled_keys_forward(keys, gates, ape, pool_size)`` | pooled keys ``(B, S_k // P, D)`` from ``keys (B, S_k, D)``, ``gates (B, S_k)``, ``ape (P,)`` | ``{'pooled'}`` |
+| ``unpool_backward(keys, gates, ape, d_pooled, pool_size)`` | gradients of ``pooled_keys_forward`` | ``{'d_keys', 'd_gates', 'd_ape'}`` |
+| ``pooled_indexer_select(index_q, pooled, weights, k_pools, pool_size, sm_scale)`` | top-``k_pools`` pools per query under the ratio-causal rule and their softmax | ``{'pool_ids' (B, S, K) INT32, 'predict' (B, S, K) FP32, 'logits'}`` |
+| ``pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k)`` | compact token expansion: valid pools' tokens, then the tail, then ``-1`` | ``{'token_ids' (B, S, K*P + P - 1), 'topk_length' (B, S)}`` |
+| ``pooled_sparse_attention_backward(q, kv, out, dout, lse, pool_ids, positions, pool_size)`` | sparse attention backward over the expanded tokens | ``{'dq', 'dkv', 'd_sink', 'token_ids', 'topk_length'}`` |
+| ``pooled_sparse_attention_backward_with_teacher(..., k_pools, ...)`` | the same backward, plus the pool-level teacher summed inside the kernel | ``{'dq', 'dkv', 'd_sink', 'target' (B, S, K) FP32, 'token_ids', 'topk_length'}`` |
+| ``pooled_teacher_recompute(q_attn, k_attn, lse, token_ids, topk_length, k_pools, pool_size)`` | pool-level teacher from the sparse attention score recompute | ``{'target' (B, S, K)}`` |
+| ``pooled_indexer_target(token_target, pool_ids, pool_size)`` | pool-level teacher from a token-level teacher (tail dropped, renormalized) | ``{'target'}`` |
+| ``pooled_indexer_backward(index_q, weights, keys, gates, ape, pool_ids, target, grad_loss, pool_size, sm_scale, loss_coeff, pooled, predict)`` | indexer-loss backward on pooled keys through the unpooling | ``{'d_index_q', 'd_weights', 'd_keys', 'd_gates', 'd_ape', 'd_pooled'}`` |
+
+Layouts: ``q``/``out``/``dout`` are ``(B, S, H, D)``, ``kv`` is ``(B, S_k, D)``, ``lse`` is ``(B, S, H)`` FP32, ``pool_ids`` are local pool
+indices with ``-1`` for unselected slots (expected last), ``positions`` ``(B, S)`` are the query positions. The teacher ``target`` is the
+attention probability mass of each selected pool summed over heads and renormalized over the valid pools of the query; tail tokens
+are excluded. ``pooled_indexer_backward`` consumes ``target`` in place and recomputes ``predict`` when it is not supplied.
+
+The underlying kernels take two options used by this composition: ``sparse_attn_score_recompute_wrapper(..., pool_size=P)`` emits the
+per-pool sums directly, and ``SparseAttentionBackward`` on SM100 accepts ``pool_target``/``pool_size`` to emit them from the backward's
+own probabilities. Supported on SM100-class GPUs with the generic single-CTA backward backend; ``pool_size`` 4 and 8 are tested.
+
 ## Limitations
 
 - **CuTe DSL requirement** — install `nvidia-cutlass-dsl[cu13]>=4.5.0`.
