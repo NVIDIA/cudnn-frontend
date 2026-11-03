@@ -986,10 +986,10 @@ in ``cudnn.deepseek_sparse_attention`` (lazily exported) and compose with the to
 
 | API | Computes | Returns |
 |---|---|---|
-| ``pooled_keys_forward(keys, gates, ape, pool_size)`` | pooled keys ``(B, S_k // P, D)`` from ``keys (B, S_k, D)``, ``gates (B, S_k)``, ``ape (P,)`` | ``{'pooled'}`` |
+| ``pooled_keys_forward(keys, gates, ape, pool_size)`` | pooled keys ``(B, S_k // P, D)`` from bf16 ``keys (B, S_k, D)``, bf16 ``gates (B, S_k)``, fp32 ``ape (P, D)``; ``D`` is 128 | ``{'pooled'}`` |
 | ``unpool_backward(keys, gates, ape, d_pooled, pool_size)`` | gradients of ``pooled_keys_forward`` | ``{'d_keys', 'd_gates', 'd_ape'}`` |
 | ``pooled_indexer_select(index_q, pooled, weights, k_pools, pool_size, sm_scale)`` | top-``k_pools`` pools per query under the ratio-causal rule and their softmax | ``{'pool_ids' (B, S, K) INT32, 'predict' (B, S, K) FP32, 'logits'}`` |
-| ``pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k)`` | compact token expansion: valid pools' tokens, then the tail, then ``-1`` | ``{'token_ids' (B, S, K*P + P - 1), 'topk_length' (B, S)}`` |
+| ``pooled_expand_compact(pool_ids, positions, pool_size, seqlen_k)`` | compact token expansion: valid pools' tokens, then the tail, then ``-1`` | ``{'token_ids' (B, S, W), 'topk_length' (B, S)}`` with ``W = K*P + P - 1`` rounded up to a multiple of 64 |
 | ``pooled_sparse_attention_backward(q, kv, out, dout, lse, pool_ids, positions, pool_size)`` | sparse attention backward over the expanded tokens | ``{'dq', 'dkv', 'd_sink', 'token_ids', 'topk_length'}`` |
 | ``pooled_sparse_attention_backward_with_teacher(..., k_pools, ...)`` | the same backward, plus the pool-level teacher summed inside the kernel | ``{'dq', 'dkv', 'd_sink', 'target' (B, S, K) FP32, 'token_ids', 'topk_length'}`` |
 | ``pooled_teacher_recompute(q_attn, k_attn, lse, token_ids, topk_length, k_pools, pool_size)`` | pool-level teacher from the sparse attention score recompute | ``{'target' (B, S, K)}`` |
@@ -1003,7 +1003,7 @@ are excluded. ``pooled_indexer_backward`` consumes ``target`` in place and recom
 
 The underlying kernels take two options used by this composition: ``sparse_attn_score_recompute_wrapper(..., pool_size=P)`` emits the
 per-pool sums directly, and ``SparseAttentionBackward`` on SM100 accepts ``pool_target``/``pool_size`` to emit them from the backward's
-own probabilities. Supported on SM100-class GPUs with the generic single-CTA backward backend; ``pool_size`` 4 and 8 are tested.
+own probabilities. Supported on SM100-class GPUs with the generic single-CTA backward backend; ``pool_size`` 4 and 16 are supported.
 
 ## Limitations
 
