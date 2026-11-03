@@ -687,9 +687,9 @@ class Blk64Refinement:
     reads a row up to its count, as the blk64 metadata contract allows.
     """
 
-    block_index: Tensor  # [1, H, 2 * nQ, 2 * cap] int32
-    block_count: Tensor  # [1, H, 2 * nQ] int32
-    block_sizes: Tensor  # [2 * nKV] int32
+    block_index: Tensor  # [1, H, n_q64, 2 * cap] int32, n_q64 = ceil(seqlen_q / 64)
+    block_count: Tensor  # [1, H, n_q64] int32
+    block_sizes: Tensor  # [n_kv64] int32, n_kv64 = ceil(seqlen_k / 64)
 
 
 def refine_blk128_to_blk64(
@@ -706,8 +706,11 @@ def refine_blk128_to_blk64(
     batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
     assert batch == 1, "kpage runs a batch as independent heads; batch must be 1"
     dev = q2k_block_index.device
-    index64 = torch.empty((num_heads * n_q_blocks * 2, 2 * cap), dtype=torch.int32, device=dev)  # written up to each count
-    count64 = torch.empty((num_heads * n_q_blocks * 2,), dtype=torch.int32, device=dev)
+    half = BLOCK // 2
+    n_q64, n_kv64 = (seqlen_q + half - 1) // half, (seqlen_k + half - 1) // half
+    # Written in the final [heads, n_q64] row order: a half past the sequence is never written, so nothing is sliced or copied.
+    index64 = torch.empty((num_heads * n_q64, 2 * cap), dtype=torch.int32, device=dev)  # written up to each count
+    count64 = torch.empty((num_heads * n_q64,), dtype=torch.int32, device=dev)
     sizes64 = torch.empty((2 * kv_sizes.numel(),), dtype=torch.int32, device=dev)
     refine_cute(
         q2k_block_index.view(num_heads * n_q_blocks, cap),
@@ -719,13 +722,7 @@ def refine_blk128_to_blk64(
         sizes64,
         current_stream(),
     )
-    half = BLOCK // 2
-    index64 = index64.view(1, num_heads, 2 * n_q_blocks, 2 * cap)
-    count64 = count64.view(1, num_heads, 2 * n_q_blocks)
-    n_q64, n_kv64 = (seqlen_q + half - 1) // half, (seqlen_k + half - 1) // half
-    if n_q64 < 2 * n_q_blocks:  # the dropped half has no valid Q row (count 0)
-        index64, count64 = index64[:, :, :n_q64].contiguous(), count64[:, :, :n_q64].contiguous()
-    return Blk64Refinement(block_index=index64, block_count=count64, block_sizes=sizes64[:n_kv64].contiguous())
+    return Blk64Refinement(block_index=index64.view(1, num_heads, n_q64, 2 * cap), block_count=count64.view(1, num_heads, n_q64), block_sizes=sizes64[:n_kv64])
 
 
 # ---------------------------------------------------------------------------

@@ -913,8 +913,10 @@ class RefineBlk128ToBlk64:
 
     KV block ``j`` with ``s`` valid rows becomes half ``2j`` (``min(s, 64)`` rows) and half ``2j + 1`` (``s - 64``
     rows); a half without valid rows is dropped from the list.  Q half ``2i`` keeps the list when Q block ``i`` has
-    a valid row and half ``2i + 1`` when it has more than 64; otherwise the half gets count 0.  The half sizes are
-    written to ``mBlockSizes64``.
+    a valid row and half ``2i + 1`` when it has more than 64; otherwise the half gets count 0.  The halves are
+    written in the [heads, Q halves] row order of the blk64 metadata the kernels consume: ``mBlockCount64`` holds
+    ``n_q64`` halves per head, so with ``n_q64 = 2 * nQ - 1`` (a sequence ending 64 rows into its final block) the
+    last block's second half is not written at all.  The half sizes are written to ``mBlockSizes64``.
 
     One warp per walk: each lane takes one list entry per step, and two ballots place its halves after those of the
     lower lanes, so the halves keep the list order (``2j`` before ``2j + 1``).
@@ -930,8 +932,8 @@ class RefineBlk128ToBlk64:
         mBlockCount: cute.Tensor,  # [W]
         mQSizes: cute.Tensor,  # [nQ]
         mBlockSizes: cute.Tensor,  # [nKV]
-        mBlockIndex64: cute.Tensor,  # [2W, 2 * cap]; entries past a row's count are left unwritten
-        mBlockCount64: cute.Tensor,  # [2W]
+        mBlockIndex64: cute.Tensor,  # [heads * n_q64, 2 * cap]; entries past a row's count are left unwritten
+        mBlockCount64: cute.Tensor,  # [heads * n_q64], n_q64 = 2 * nQ or 2 * nQ - 1
         mBlockSizes64: cute.Tensor,  # [2 * nKV]
         stream: cuda.CUstream,
     ):
@@ -966,6 +968,12 @@ class RefineBlk128ToBlk64:
 
         walk = cute.arch.block_idx()[0] * self.num_warps + warp_idx
         if walk < n_walks:
+            n_q_blocks = mQSizes.shape[0]
+            head = walk // n_q_blocks
+            q_block = walk - head * n_q_blocks
+            n_q64 = mBlockCount64.shape[0] // (n_walks // n_q_blocks)
+            row = head * n_q64 + 2 * q_block  # first half's row; the second half follows unless it is past the sequence
+            has_second_row = 2 * q_block + 1 < n_q64
             # clamped: the metadata check is read back only after this kernel (on the walk-table sizing sync)
             edge_count = max(min(mBlockCount[walk], mBlockIndex.shape[1]), 0)
             lower_lanes = ~(Int32(-1) << lane_idx)
@@ -982,17 +990,20 @@ class RefineBlk128ToBlk64:
                 has_second = cute.arch.vote_ballot_sync(valid > BLOCK // 2)
                 pos = count + cute.arch.popc(has_first & lower_lanes) + cute.arch.popc(has_second & lower_lanes)
                 if valid > 0:
-                    mBlockIndex64[2 * walk, pos] = 2 * j
-                    mBlockIndex64[2 * walk + 1, pos] = 2 * j
+                    mBlockIndex64[row, pos] = 2 * j
+                    if has_second_row:
+                        mBlockIndex64[row + 1, pos] = 2 * j
                 if valid > BLOCK // 2:
-                    mBlockIndex64[2 * walk, pos + 1] = 2 * j + 1
-                    mBlockIndex64[2 * walk + 1, pos + 1] = 2 * j + 1
+                    mBlockIndex64[row, pos + 1] = 2 * j + 1
+                    if has_second_row:
+                        mBlockIndex64[row + 1, pos + 1] = 2 * j + 1
                 count += cute.arch.popc(has_first) + cute.arch.popc(has_second)
                 base += cute.arch.WARP_SIZE
             if lane_idx == 0:
-                q_valid = mQSizes[walk % mQSizes.shape[0]]
-                mBlockCount64[2 * walk] = count if q_valid > 0 else Int32(0)
-                mBlockCount64[2 * walk + 1] = count if q_valid > BLOCK // 2 else Int32(0)
+                q_valid = mQSizes[q_block]
+                mBlockCount64[row] = count if q_valid > 0 else Int32(0)
+                if has_second_row:
+                    mBlockCount64[row + 1] = count if q_valid > BLOCK // 2 else Int32(0)
 
 
 # Columns of ValidateMetadata's per-CTA result row.
