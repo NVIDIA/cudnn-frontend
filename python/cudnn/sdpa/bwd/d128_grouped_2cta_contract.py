@@ -110,7 +110,12 @@ CTA_PAIR_MIN_SEQ = {
     # GB300: the GB200 value carried with the cc 10.3 admission (2026-10-28); unmeasured on cc 10.3
     (10, 3): 8192,
     # Rubin: re-measured 2026-11-03 on a Rubin class node (212 SMs; A/B/A x3 x100, both build orders): the pair body wins the backward step
-    # over the one-CTA body by +7.9 % (8K), +9.9 % (16K), +12.3 % (32K) and is not a win at 4K -> the GB200 threshold holds
+    # over the one-CTA body by +7.9 % (8K), +9.9 % (16K), +12.3 % (32K) and is not a win at 4K -> the GB200 threshold holds.  The axes the
+    # rule ignores were measured there the same day and none moves the verdict at S >= 8K: the GQA ratio (hq / hkv 2, 4, 32: +8.0, +7.5,
+    # +7.6 % at 8K; +9.6, +9.4 % at 16K -- the per-kv-tile iteration count does not drive the margin, S does), the dense twin (a thinner win
+    # over its four-launch one-CTA base: +3.3 % at 8K, +6.5 % at 16K), non-causal (a larger one: +12.9 % at 8K, +11.8 % at 16K) and the
+    # varlen ramps (+8.1 % at 16K, +10.1 % at 32K).  Under-fill cells (batch 1 or eight heads: steps under 1 ms) resolve no sign at this
+    # protocol's resolution; the rule's choice there costs nothing measurable.
     (10, 7): 8192,
 }
 CTA_PAIR_CCS = tuple(CTA_PAIR_MIN_SEQ)

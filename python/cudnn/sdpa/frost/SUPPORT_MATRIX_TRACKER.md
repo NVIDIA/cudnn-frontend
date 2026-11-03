@@ -608,6 +608,7 @@ and group-fold launches are shared with the one-CTA chain, so the launch count s
 workspace contract is the grouped THD one with nine per-sequence tensor maps. The typed adapter
 field `cta_pair` selects the body: `auto` (the default) serves the pair when both declared
 `S_q` and `S_kv` reach `CTA_PAIR_MIN_SEQ[cc]` (8192 on cc 10.0 / 10.3 / 10.7 today) with a cluster of two admitted by
+(On cc 10.7 the axes the rule ignores were measured on 2026-11-03 and none moves the verdict at S >= 8K: GQA ratio 2 / 4 / 32, the dense twin, non-causal and the varlen ramps all keep the pair body ahead in both build orders; batch-1 / eight-head cells are too short for the protocol to resolve a sign.)
 the device's occupancy query, and the one-CTA body otherwise; `off` pins the one-CTA body; `on`
 pins the pair at any sequence length and declines by name (layout, cc, cluster, grouped heads) when
 a predicate fails.
