@@ -569,6 +569,43 @@ def test_fp8_sm120_multi_tile_long_seq():
     _check(*res)
 
 
+def _peaked_tail_qkv(S_q, S_kv, D):
+    """Anchor keys at both ends of the cache (logit 1 per unit attn_scale) over S_kv - 2 tail keys at logit 0;
+    V_anchor = e0, V_tail = e1.
+
+    An anchor sits in the first KV tile the kernel visits in either order, so every tail P is cast after the row
+    max reached the anchor. Every value is exact in e4m3, so O[..., 0] / O[..., 1] are the anchor / tail masses.
+    """
+    Qf = torch.zeros(1, 1, S_q, D, device="cuda")
+    Qf[..., 0] = 1.0
+    Kf = torch.zeros(1, 1, S_kv, D, device="cuda")
+    Vf = torch.zeros(1, 1, S_kv, D, device="cuda")
+    Vf[..., 1] = 1.0
+    for anchor in (0, S_kv - 1):
+        Kf[:, :, anchor, 0] = 1.0
+        Vf[:, :, anchor] = 0.0
+        Vf[:, :, anchor, 0] = 1.0
+    return Qf, Kf, Vf
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [128, 512], ids=["d128", "d512"])
+def test_fp8_sm120_peaked_row_keeps_its_tail(D):
+    """A peaked long row keeps the probability mass of keys far below its max.
+
+    attn_scale = 10 puts two anchors 10 nats above 32766 tail keys: each tail P is e^-10 = 4.5e-5 of the row
+    max, and together they carry 0.427 of the mass. P is cast to e4m3 with the kernel's P_CAST_LOG2_SCALE bias;
+    a bias that flushes 4.5e-5 to zero (2^4 does: 7.3e-4 is under half of e4m3's smallest subnormal) loses
+    O[..., 1], while 2^8 lands it on a subnormal within 1%. Unsplit: a split without an anchor would cast its
+    tail against its own max of 0 and hide the flush.
+    """
+    S_q, S_kv = 16, 32768
+    res = _run(1, 1, 1, S_q, S_kv, scale=10.0, sdpa_kwargs={}, D=D, split_kv=1, qkv=_peaked_tail_qkv(S_q, S_kv, D))
+    tail = 1.0 / (1.0 + 2.0 * math.exp(10.0) / (S_kv - 2))
+    assert abs(res.reference[..., 1].mean().item() - tail) < 1e-4, "the reference is the analytic tail mass"
+    _check(*res, tol_o=2e-2)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
