@@ -8,7 +8,7 @@ its declines.  The binding checks (:func:`check_binding`: dtype, device, shape, 
 ``rows``) run at compile time and again before EVERY launch -- the compile key pins the plan-time facts only, and a compiled DSL
 entry accepts a tensor of another dtype or footprint silently, so the host is a launch's only guard.
 
-Served geometry (declined otherwise, by name): the checkpoint constants of ``kernel/gdn_decode_fused_config.py`` -- the QKV slab
+Served geometry (declined otherwise, by name): the geometry constants of ``kernel/gdn_decode_fused_config.py`` -- the QKV slab
 ``x`` [rows, 10240] bf16 (a row-strided view is fine), the conv state ``cs`` [slots, 10240, 3] bf16 with channel-contiguous taps or
 tap-contiguous channels, the conv weight ``cw`` [10240, 4] bf16, ``A_log`` [48] fp32, ``dt_bias`` [48] bf16, the fp32 state
 ``[slots, 48, 128, 128]`` (slot-strided), the int32 slot indices, ``z`` [rows, 48, 128] bf16 (row-strided), the norm weight [128]

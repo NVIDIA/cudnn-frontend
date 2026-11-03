@@ -302,6 +302,10 @@ def test_norm_form_follows_the_reference_ctas_policy_and_resolves_per_requests()
         kcfg.resolve_cfg(kcfg.CFG, 0)
 
 
+def test_cudnn_level_export_resolves_to_the_entry():
+    assert cudnn.GdnVerifyFused is entry.GdnVerifyFused, "the lazy cudnn-level export (import cudnn; cudnn.GdnVerifyFused) is the entry class"
+
+
 def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
     k = entry.GdnVerifyFused("cpu", 1e-6)
     assert k.sm_count is None and not k.cfg_given

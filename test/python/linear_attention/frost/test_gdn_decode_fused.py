@@ -125,6 +125,10 @@ def test_default_form_switches_where_the_grid_outgrows_the_sms(sm_count):
         kcfg.default_cfg(1, 0)
 
 
+def test_cudnn_level_export_resolves_to_the_entry():
+    assert cudnn.GdnDecodeFused is entry.GdnDecodeFused, "the lazy cudnn-level export (import cudnn; cudnn.GdnDecodeFused) is the entry class"
+
+
 def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
     k = entry.GdnDecodeFused("cpu", 1e-6)
     assert k.sm_count is None and not k.cfg_given

@@ -30,15 +30,15 @@ import pytest
 torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 fi_api = pytest.importorskip("flashinfer.experimental.qwen_3_5_gdn_block.api", reason="FlashInfer with the experimental Qwen 3.5 GDN block is not installed")
+fi_block = pytest.importorskip("flashinfer.qwen_3_5_gdn_block", reason="FlashInfer's public qwen_3_5_gdn_block shim is not installed")
 
 from flashinfer.experimental.qwen_3_5_gdn_block import support as fi_support  # noqa: E402
-from flashinfer.qwen_3_5_gdn_block import (  # noqa: E402
-    Qwen35GdnGeometry,
-    prepare_qwen_3_5_gdn_block,
-    qwen_3_5_gdn_block_decode,
-    qwen_3_5_gdn_block_support,
-    qwen_3_5_gdn_block_verify,
-)
+
+Qwen35GdnGeometry = fi_block.Qwen35GdnGeometry
+prepare_qwen_3_5_gdn_block = fi_block.prepare_qwen_3_5_gdn_block
+qwen_3_5_gdn_block_decode = fi_block.qwen_3_5_gdn_block_decode
+qwen_3_5_gdn_block_support = fi_block.qwen_3_5_gdn_block_support
+qwen_3_5_gdn_block_verify = fi_block.qwen_3_5_gdn_block_verify
 
 from cudnn.linear_attention.frost import flashinfer_gdn_backend as backend  # noqa: E402  (the import registers "frost_fe")
 from cudnn.linear_attention.frost import gdn_decode_fused as entry  # noqa: E402
@@ -403,7 +403,9 @@ def _flashinfer_root():
 
 def _flashinfer_tests():
     """FlashInfer's own GDN block tests and torch reference (``ref``, ``dec``, ``ver``): importable from a source tree next to the
-    installed package only."""
+    installed package only.  The cells below call these modules' internals (their test functions, ``reference``, a plan's ``_runner``)
+    as FlashInfer PR #8131 laid them out -- a FlashInfer that reshapes its test package skips here rather than failing, and the cells
+    that read ``plan._runner`` are pinned to that layout."""
     _flashinfer_root()
     try:
         return types.SimpleNamespace(

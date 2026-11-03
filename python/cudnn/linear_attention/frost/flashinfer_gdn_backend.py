@@ -95,7 +95,7 @@ FLASHINFER_FLOOR = "FlashInfer main at or after PR #8131 (2026-10-31; no tagged 
 DECODE_MAX_ROWS = _decode.MAX_ROWS
 #: the verify launch is grid ``(48, requests, 1)``: the same cap, one grid row per request (``gdn_verify_fused.MAX_REQUESTS``)
 VERIFY_MAX_REQUESTS = _verify.MAX_REQUESTS
-#: the one geometry both kernels are written for, in FlashInfer's ``Qwen35GdnGeometry`` field names (the configs' checkpoint constants)
+#: the one geometry both kernels are written for, in FlashInfer's ``Qwen35GdnGeometry`` field names (the configs' geometry constants)
 GEOMETRY: Dict[str, int] = dict(d_model=HIDDEN, num_v_heads=V_HEADS, num_k_heads=K_HEADS, head_k_dim=HEAD_DIM, head_v_dim=HEAD_DIM, conv_kernel=CONV_WIDTH)
 _PARAM_DTYPE_NAMES = ("torch.float32", "torch.bfloat16", "torch.bfloat16")  # (A_log, dt_bias, norm_weight), the decode kernel's native dtypes
 _ENTRIES = {DECODE: _decode, VERIFY: _verify}

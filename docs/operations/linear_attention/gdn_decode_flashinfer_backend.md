@@ -52,8 +52,12 @@ python benchmarks/bench_qwen_3_5_gdn_block.py \
 `register_frost_fe(replace=False)` is the explicit entry: idempotent for this
 module's own registration, `replace=True` re-registers (and drops the backend's
 cached plans). Nothing here is imported at `import cudnn` time; the two entries are also
-reachable lazily as `cudnn.linear_attention.frost.GdnDecodeFused` / `GdnVerifyFused`
-(direct-call kernels with the block's argument contract; they are not graph engines).
+reachable lazily as `cudnn.GdnDecodeFused` / `cudnn.GdnVerifyFused` (and under
+`cudnn.linear_attention.frost`): direct-call kernels with the block's argument contract, not
+graph engines. Each entry validates the binding (dtype, device, shape, stride, 16-byte
+alignment, the step shape) at compile time and again before every launch -- the compile key
+pins the plan-time facts only, and a compiled CuTe DSL entry accepts a tensor of another dtype
+or footprint silently -- and declines a step of more than 65535 requests (one grid row each).
 
 ## Served and declined
 

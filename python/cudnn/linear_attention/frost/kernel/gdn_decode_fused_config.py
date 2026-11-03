@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Config of the fused Gated DeltaNet DECODE step kernel (``gdn_decode_fused_f16.py``): the fixed checkpoint geometry it serves and
+"""Config of the fused Gated DeltaNet DECODE step kernel (``gdn_decode_fused_f16.py``): the fixed model geometry it serves and
 the compile-time knobs of its one kernel body.  Importable without the CuTe DSL (the host entry validates a ``Cfg`` before the DSL
 version gate runs), so nothing here imports ``cutlass``.
 
@@ -82,7 +82,7 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 
 from dataclasses import dataclass, replace
 
-# --- the served geometry (checkpoint constants; the host entry declines everything else) ---
+# --- the served geometry (the model's constants; the host entry declines everything else) ---
 K_HEADS = 16
 V_HEADS = 48
 HEAD_DIM = 128
