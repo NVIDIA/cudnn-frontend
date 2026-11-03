@@ -14,7 +14,6 @@ request on a 148- / 152-SM part) against the one-CTA form at one request.  When 
 names a directory of saved operand sets with the reference verify kernel's outputs (``set_<tag>.pt`` / ``ref_<tag>.pt``), every set
 is replayed and compared BYTE for byte (fp8 output, bf16 output, every fp32 state slot, the conv pool, the reader tickets)."""
 
-import math
 import os
 from dataclasses import replace
 
@@ -719,7 +718,7 @@ REFERENCE_CELLS = [
 ]
 
 
-@pytest.mark.parametrize("requests, tokens, accepted, pad, skip", REFERENCE_CELLS, ids=lambda v: str(v))
+@pytest.mark.parametrize("requests, tokens, accepted, pad, skip", REFERENCE_CELLS, ids=str)
 def test_matches_the_torch_reference(requests, tokens, accepted, pad, skip):
     """The fused chain against the FP64 torch reference at the reference kernel's bars; random acceptance counts, a padding request,
     one skipped slot write per live request, non-monotone slots."""

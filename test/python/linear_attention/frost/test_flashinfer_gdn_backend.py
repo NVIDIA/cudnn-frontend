@@ -408,13 +408,14 @@ def _flashinfer_tests():
     that read ``plan._runner`` are pinned to that layout."""
     _flashinfer_root()
     try:
-        return types.SimpleNamespace(
+        modules = types.SimpleNamespace(
             ref=importlib.import_module("tests.experimental.qwen_3_5_gdn_block.reference"),
             dec=importlib.import_module("tests.experimental.qwen_3_5_gdn_block.test_frost_decode"),
             ver=importlib.import_module("tests.experimental.qwen_3_5_gdn_block.test_frost_verify"),
         )
     except ImportError as exc:
         pytest.skip(f"FlashInfer's test package did not import: {exc}")
+    return modules
 
 
 def _flashinfer_bench():
@@ -517,7 +518,7 @@ def _verify_device_or_skip(requests, tokens):
     return _device_or_skip("verify", requests=requests, tokens_per_request=tokens)
 
 
-@pytest.mark.parametrize("requests, tokens", VERIFY_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("requests, tokens", VERIFY_SHAPES, ids=str)
 def test_flashinfer_verify_reference_test_passes_against_frost_fe(monkeypatch, requests, tokens):
     """FlashInfer's ``test_verify_matches_reference`` under its device launch policy with its entry point bound to ``backend="frost_fe"``:
     its tolerances (the bf16 output within 2^-6 relative + 1e-3, > 99.9 % of the live fp8 bytes, the conv pool bitwise, written state
@@ -529,7 +530,7 @@ def test_flashinfer_verify_reference_test_passes_against_frost_fe(monkeypatch, r
 
 
 @pytest.mark.parametrize("policy", sorted(POLICY_SMS))
-@pytest.mark.parametrize("requests, tokens", VERIFY_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("requests, tokens", VERIFY_SHAPES, ids=str)
 def test_flashinfer_verify_reference_passes_under_the_sm_count_policies(requests, tokens, policy):
     """FlashInfer's verify reference with the entry's SM-count pick steered the way its own test steers the built-in backend (its ``b200``
     policy sets the wrapper's SM count before the first compile): the 148-SM policy (the cluster pair at one request, the one-CTA-per-SM

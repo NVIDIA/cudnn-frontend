@@ -661,7 +661,7 @@ def _ba_role(
         hx0 = [None] * (BA_CHUNKS * T)
         hx1 = [None] * (BA_CHUNKS * T)
         bd0, ad0, bd1, ad1 = [], [], [], []
-        for t in cutlass.range_constexpr(T):
+        for _t in cutlass.range_constexpr(T):
             bd0.append(FP32(0))
             ad0.append(FP32(0))
             bd1.append(FP32(0))
@@ -971,7 +971,6 @@ def _token_step_rolled(
         cute.arch.fence_view_async_shared()
     if t >= 1:
         if warp == NORM_WARP:
-            inv_prev = FP32(0)
             if cutlass.const_expr(TWO):
                 wait(mb_norm.subview(tm1 % 2), (tm1 >> 1) & 1)
                 inv_prev = _norm_inverse_pair(cfg, ss_prev, norm_recv_s[(tm1 % 2) * NORM_RECV_MAX_FLOATS + lane % NCH], r, lane, EPS)
@@ -1182,7 +1181,7 @@ def _tail_live(
         c_prev1 = []
         c_prev2 = []
         values = []  # every name the loop assigns exists before it with the same structure (the DSL's loop-carry rule)
-        for m in cutlass.range_constexpr(R):
+        for _m in cutlass.range_constexpr(R):
             c_prev1.append(FP32(0))
             c_prev2.append(FP32(0))
             values.append(FP32(0))

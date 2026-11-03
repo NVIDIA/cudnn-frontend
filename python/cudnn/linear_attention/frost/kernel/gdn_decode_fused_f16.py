@@ -738,7 +738,6 @@ def _role_body(
 ):
     R = cfg.R
     C = cfg.C
-    RG = cfg.RG
     BULK = cfg.BULK_STATE
     TWO = cfg.TWO_CTAS_PER_HEAD
     DO_BA = ROLE in (0, 2)

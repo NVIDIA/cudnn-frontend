@@ -249,18 +249,17 @@ def test_state_box_bank_map_is_conflict_free_at_every_tpr():
     """The 8 lanes of a 128-bit shared-memory phase read 8 distinct bank quads: bank = 4 rg + (128 / TPR) tpr + 4 c4 (mod 32)."""
     forms = [(256, tpr, False) for tpr in (2, 4, 8, 16)] + [(128, 1, False)] + [(256, tpr, True) for tpr in (4, 8, 16)] + [(128, 2, True)]
     for threads, tpr, two in forms:
-        if True:
-            c = kcfg.make_cfg(THREADS=threads, TPR=tpr, WARPGROUP_SPLIT=threads == 256, STATE_LOAD_PATH="bulk", TWO_CTAS_PER_HEAD=two)
-            pitch_words = c.STATE_BOX_PITCH_ELEMS
-            for c4 in range(c.C // 4):
-                for m in range(c.R):
-                    for phase in range(4):
-                        quads = set()
-                        for lane in range(8 * phase, 8 * phase + 8):
-                            tp, rg = lane // c.RG, lane % c.RG
-                            word = rg * pitch_words + (c.R * 0 + m) * 128 + tp * c.C + 4 * c4  # warp 0; the warp term is a multiple of 32
-                            quads.add((word % 32) // 4)
-                        assert len(quads) == 8, (threads, tpr, two, c4, m, phase, sorted(quads))
+        c = kcfg.make_cfg(THREADS=threads, TPR=tpr, WARPGROUP_SPLIT=threads == 256, STATE_LOAD_PATH="bulk", TWO_CTAS_PER_HEAD=two)
+        pitch_words = c.STATE_BOX_PITCH_ELEMS
+        for c4 in range(c.C // 4):
+            for m in range(c.R):
+                for phase in range(4):
+                    quads = set()
+                    for lane in range(8 * phase, 8 * phase + 8):
+                        tp, rg = lane // c.RG, lane % c.RG
+                        word = rg * pitch_words + (c.R * 0 + m) * 128 + tp * c.C + 4 * c4  # warp 0; the warp term is a multiple of 32
+                        quads.add((word % 32) // 4)
+                    assert len(quads) == 8, (threads, tpr, two, c4, m, phase, sorted(quads))
 
 
 @pytest.mark.parametrize(
