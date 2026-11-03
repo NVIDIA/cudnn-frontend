@@ -71,7 +71,6 @@ byte-identical. Hunk-symmetric with sm100/prefill_d128_fp8.py.
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key
-import os
 import sys
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
@@ -144,7 +143,7 @@ _SMEM_BYTES = (
     + CFG.STAGES_KV * (CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA) * CFG.BPE  # K ring
     + CFG.STAGES_KV * (CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA) * CFG.BPE  # V ring
     + CFG.TILES_Q * CFG.TILE_M * CFG.TILE_O * CFG.BPE_O  # O slabs
-    + (CFG.TILES_Q * CFG.TILE_M * 2 * 4 if os.environ.get("FROST_EXP_E11", "1") == "1" else 0)  # row stats
+    + CFG.TILES_Q * CFG.TILE_M * 2 * 4  # row stats
     + 2048  # barriers + scheduler + tmem-ptr slack (upper bound)
 )
 if _SMEM_BYTES > _GR100_SMEM_BUDGET:
@@ -280,8 +279,8 @@ qBufferElems = CFG.TILE_M * CFG.TILE_K
 kBufferElems = CFG.TILE_N * CFG.TILE_K // CFG.CTA_MMA
 vBufferElems = CFG.TILE_O * CFG.TILE_N // CFG.CTA_MMA
 oBufferElems = CFG.TILE_M * CFG.TILE_O
-_E11 = os.environ.get("FROST_EXP_E11", "1") == "1"
-_E14B = _E11 and os.environ.get("FROST_EXP_E14B", "1") == "1"
+_E11 = True
+_E14B = True
 
 qTmaTransactionBytes = qBufferElems * CFG.BPE * CFG.CTA_MMA
 kTmaTransactionBytes = kBufferElems * CFG.BPE * CFG.CTA_MMA
@@ -578,6 +577,12 @@ def _kernel(
     )
 
     bars = make_classic_bars(CFG)
+    mb_tile_go = MBarrier(
+        cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=1,
+        init_count=CFG.CORR_LANES + CFG.SOFTMAX_LANES,
+        producer=Producer.THREAD,
+    )
     if cutlass.const_expr(_E14B):
         sTileDec_raw = cutlass.Array(cutlass.Int32, CFG.SCHEDULER_STAGES * 16, alignment=16, space=cutlass.AddressSpace.smem)
         mb_tile_dec = MBarrier(
@@ -631,7 +636,8 @@ def _kernel(
                 bars.mb_bmm2_done[qs].init()
                 bars.mb_stat_full[qs].init()
                 bars.mb_stat_empty[qs].init()
-                bars.mb_stats_read[qs].init()
+                if cutlass.const_expr(not _E11):
+                    bars.mb_stats_read[qs].init()
                 bars.mb_o_full[qs].init()
                 bars.mb_o_empty[qs].init()
                 if cutlass.const_expr(_E11):
@@ -651,6 +657,7 @@ def _kernel(
                 for _ds in range(CFG.SCHEDULER_STAGES):
                     mb_tile_dec[_ds].init()
             bars.mb_empty_mainloop.init()
+            mb_tile_go.init()
 
     # All 32 lanes of warp 0 fill the ones tile (v4 stores, _ONES_ROWS // 4
     # iterations at 512 B per pass); the barrier below orders it before any
@@ -721,6 +728,7 @@ def _kernel(
             sStats_raw=sStats_raw,
             sTileDec_raw=sTileDec_raw,
             mb_tile_dec=mb_tile_dec,
+            mb_tile_go=mb_tile_go,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -747,6 +755,7 @@ def _kernel(
             sStats_raw=sStats_raw,
             sTileDec_raw=sTileDec_raw,
             mb_tile_dec=mb_tile_dec,
+            mb_tile_go=mb_tile_go,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -774,6 +783,7 @@ def _kernel(
             qh_per_kh=qh_per_kh,
             o_partial_f32=o_partial_f32,
             sStats_raw=sStats_raw,
+            mb_tile_go=mb_tile_go,
         )
 
     # cga2 non-leader runs quiet body (alloc+dealloc only); cga1 folds to full path.
@@ -1764,6 +1774,8 @@ def _mma_warp_group(
         stats_read_phase = stats_read_phase ^ 1
         if cutlass.const_expr(_E11):
             if kv_right > kv_left:
+                mb_s_read[0].wait(sf_phase, spin=SPIN_RING_WAITS)
+                mb_s_read[1].wait(sf_phase, spin=SPIN_RING_WAITS)
                 sf_phase = sf_phase ^ 1
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
@@ -1809,8 +1821,9 @@ def _mma_warp_group(
     # NEXT tile's prologue would have waited, i.e. exactly the phase the LAST
     # tile's correction arrives complete.  Leader only: the quiet (non-leader)
     # MMA arm never waits this ring.
-    for _qs in cutlass.range_constexpr(CFG.TILES_Q):
-        bars.mb_stats_read[_qs].wait(stats_read_phase)
+    if cutlass.const_expr(not _E11):
+        for _qs in cutlass.range_constexpr(CFG.TILES_Q):
+            bars.mb_stats_read[_qs].wait(stats_read_phase)
 
     bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
@@ -2060,6 +2073,7 @@ def _softmax_warp_group(
     sStats_raw=None,
     sTileDec_raw=None,
     mb_tile_dec=None,
+    mb_tile_go=None,
 ):
     """Softmax warp group: online softmax per kv iter, one lane per S_acc row.
 
@@ -2118,8 +2132,10 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        bars.mb_o_full[0].wait(epilogue_state)
+        mb_tile_go.wait(epilogue_state)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
+        if cutlass.const_expr(sub_tile_id == 1):
+            mb_tile_go.arrive()
 
         total_max = NEG_INF
         total_sum = cutlass.Vector.from_elements(
@@ -2362,6 +2378,7 @@ def _correction_warp_group(
     qh_per_kh,
     o_partial_f32=None,
     sStats_raw=None,
+    mb_tile_go=None,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
 
@@ -2584,7 +2601,8 @@ def _correction_warp_group(
             # final stats ride the slot HEAD and are now safely in registers
             # (tcgen05_wait LOAD above).  Cross-CTA arrive on the leader under
             # cga2 — the collective BMM1 writes both peers' TMEM.
-            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if cutlass.const_expr(not _E11):
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)  # pre-declare; computed in both branches
@@ -2802,6 +2820,8 @@ def _correction_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
 
             bars.mb_o_full[qs].arrive()
+            if cutlass.const_expr(qs == 0):
+                mb_tile_go.arrive()
 
         stat_full_phase = stat_full_phase ^ 1
         o_empty_phase = o_empty_phase ^ 1

@@ -70,7 +70,6 @@ this file as evidence that a V-SF builder is correct.
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key
-import os
 import sys
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
@@ -152,6 +151,8 @@ TMA_O_GRANU_ELEMS_HOST = CFG.O_SWZ_BYTES // CFG.BPE_O
 TMA_O_ITERS_HOST = (CFG.TILE_O * CFG.BPE_O) // CFG.O_SWZ_BYTES
 
 from cudnn.frost.tile_dsl.barrier import (
+    MBarrier,
+    Producer,
     PipelineState,
     advance,
     cga_arrive,
@@ -231,7 +232,7 @@ SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
 # call is written against -- the f32x2 op family's form differs and is not a proxy.  The stats
 # specialization keeps the shifted f32 scores for the exact LSE denominator and so never takes the fused arm.
 _FUSED_SHIFT_CVT = bool(SOFTMAX_F16 and SCALE_PREFOLDED and _softmax_f16.FUSED_SHIFT_CVT_AVAILABLE)
-_PSLOT = os.environ.get("FROST_EXP_PSLOT", "1") == "1"
+_PSLOT = True
 _P_ALIAS = CFG.CTA_MMA == 1
 _FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
 # The arms themselves (f16_exp_chunk / f16_exp_chunk_sum / fused_shift_f16_exp_chunk) live in
@@ -684,6 +685,12 @@ def _kernel(
     )
 
     bars = make_classic_bars(CFG)
+    mb_tile_go = MBarrier(
+        cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=1,
+        init_count=CFG.CORR_LANES + CFG.SOFTMAX_LANES,
+        producer=Producer.THREAD,
+    )
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -717,7 +724,8 @@ def _kernel(
                 # The final stats now ride the S_acc HEAD, so the MMA's
                 # next-tile prologue BMM1 has to wait for correction to have
                 # READ them.  init = CORR_LANES_TOTAL (make_classic_bars).
-                bars.mb_stats_read[qs].init()
+                if cutlass.const_expr(not _PSLOT):
+                    bars.mb_stats_read[qs].init()
                 bars.mb_o_full[qs].init()
                 bars.mb_o_empty[qs].init()
                 for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
@@ -732,6 +740,7 @@ def _kernel(
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
             bars.mb_tmem_dealloc.init()
             bars.mb_empty_mainloop.init()
+            mb_tile_go.init()
 
     # P_SF SMEM fill 0x7F (constant 1.0); MUST happen BEFORE cga_arrive so both peers see filled SMEM.
     SF_TOTAL_BYTES_P = SF_SMEM_SIZE_P * CFG.STAGES_KV
@@ -796,6 +805,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
             sStats_raw=sStats_raw,
+            mb_tile_go=mb_tile_go,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -819,6 +829,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             qh_per_kh=qh_per_kh,
             sStats_raw=sStats_raw,
+            mb_tile_go=mb_tile_go,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -844,6 +855,7 @@ def _kernel(
             cta_id_x=cta_id_x,
             qh_per_kh=qh_per_kh,
             sStats_raw=sStats_raw,
+            mb_tile_go=mb_tile_go,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -1956,8 +1968,9 @@ def _mma_warp_group(
     # NEXT tile's prologue would have waited, i.e. exactly the phase the LAST
     # tile's correction arrives complete.  Leader only: the quiet (non-leader)
     # MMA arm never waits this ring.
-    for _qs in cutlass.range_constexpr(CFG.TILES_Q):
-        bars.mb_stats_read[_qs].wait(stats_read_phase)
+    if cutlass.const_expr(not _PSLOT):
+        for _qs in cutlass.range_constexpr(CFG.TILES_Q):
+            bars.mb_stats_read[_qs].wait(stats_read_phase)
 
     bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
@@ -2244,6 +2257,7 @@ def _softmax_warp_group(
     cta_in_pair,
     qh_per_kh,
     sStats_raw=None,
+    mb_tile_go=None,
 ):
     """Softmax warp group — online softmax + α publish (LSE write owned by correction)."""
     # Wait on MMA's TMEM-publish named barrier BEFORE tmem_ptr_i32.load() — else stale base pointer.
@@ -2294,8 +2308,10 @@ def _softmax_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
-        bars.mb_o_full[0].wait(o_full_phase)
+        mb_tile_go.wait(o_full_phase)
         o_full_phase = o_full_phase ^ cutlass.Int32(1)
+        if cutlass.const_expr(sub_tile_id == 1):
+            mb_tile_go.arrive()
 
         total_max = NEG_INF
         total_sum = cutlass.Vector.from_elements(
@@ -2462,6 +2478,7 @@ def _correction_warp_group(
     cta_id_x,
     qh_per_kh,
     sStats_raw=None,
+    mb_tile_go=None,
 ):
     """Correction warp group — α-rescale O + epilogue cast/store + LSE.
 
@@ -2623,7 +2640,8 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             bars.mb_stat_empty[qs].arrive()
-            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if cutlass.const_expr(not _PSLOT):
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             total_max_scaled = stats_vec[0]
 
             # --- the denominator comes from the row-sum column, not stats word 1 ---
@@ -2803,6 +2821,8 @@ def _correction_warp_group(
             nvvm.fence_proxy("async.shared", space="cta")
 
             bars.mb_o_full[qs].arrive()
+            if cutlass.const_expr(qs == 0):
+                mb_tile_go.arrive()
 
         stat_full_phase = stat_full_phase ^ 1
         o_empty_phase = o_empty_phase ^ 1

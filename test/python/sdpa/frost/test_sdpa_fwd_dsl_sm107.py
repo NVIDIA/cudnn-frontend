@@ -230,9 +230,9 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("f16", (128, 128)): (True, 82, 22),
     ("fp8", (128, 128)): (
         False,
-        54,
+        56,
         12,
-    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait
+    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait; +2: the tile-end S-read credit waits
     ("mxfp8", (128, 128)): (
         True,
         38,
@@ -241,9 +241,9 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("fp8", (192, 128)): (
         True,
-        52,
+        54,
         13,
-    ),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait; the softmax tile-top wait is the idle mb_o_full[0] wait
+    ),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait; +2: the tile-end S-read credit waits; the softmax tile-top wait is the idle mb_o_full[0] wait
     ("mxfp8", (192, 128)): (True, 35, 14),  # +1 ring wait: the P-slot hand-over wait; the softmax tile-top wait is the idle mb_o_full[0] wait
     ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
     ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
