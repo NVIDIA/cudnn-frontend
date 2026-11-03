@@ -9,7 +9,11 @@ import torch
 from cudnn.deepseek_sparse_attention.pooled import backward as PB
 from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 from deepseek_sparse_attention.cutedsl import pooled_training_reference as R
-from deepseek_sparse_attention.cutedsl.dsa_reference import ref_sparse_attention_forward, ref_sparse_attn_score_recompute
+from deepseek_sparse_attention.cutedsl.dsa_reference import (
+    check_ref_dsa_sparse_attention_backward,
+    ref_sparse_attention_forward,
+    ref_sparse_attn_score_recompute,
+)
 
 pytestmark = [
     pytest.mark.L0,
@@ -121,7 +125,7 @@ def test_pooled_sparse_attention_backward_matches_compaction_route():
         q.reshape(s, h, d), kv.reshape(s, d), expanded["token_ids"].reshape(s, -1), topk_length=expanded["topk_length"].reshape(s), softmax_scale=softmax_scale
     )
     out, lse = fwd["out"].reshape(1, s, h, -1), fwd["lse"].reshape(1, s, h).float()
-    dout = torch.randn_like(out)
+    dout = torch.randn(out.shape, dtype=out.dtype, device=out.device, generator=torch.Generator(device="cuda").manual_seed(7))
     got = PB.pooled_sparse_attention_backward(q, kv, out, dout, lse, pool_ids, positions, pool_size, softmax_scale=softmax_scale)
     inference_ids = R.expand_pools_inference(pool_ids, positions, pool_size).reshape(s, -1)
     idx_c, len_c = R.argsort_compact_indices(inference_ids)
@@ -192,7 +196,7 @@ def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pool
             q.reshape(s, h, d), kv.reshape(s, d), None, token_ids.reshape(s, -1), topk_length=length.reshape(s), softmax_scale=softmax_scale
         )
         out, lse = out.reshape(1, s, h, -1).to(q.dtype), lse.reshape(1, s, h).float()
-    dout = torch.randn_like(out)
+    dout = torch.randn(out.shape, dtype=out.dtype, device=out.device, generator=torch.Generator(device="cuda").manual_seed(13 + attn_heads))
     plain = PB.pooled_sparse_attention_backward(
         q, kv, out, dout, lse, pool_ids, positions, pool_size, softmax_scale=softmax_scale, token_ids=token_ids, topk_length=length
     )
@@ -200,7 +204,25 @@ def test_attention_backward_with_teacher_matches_separate_kernels(seqlen, k_pool
         q, kv, out, dout, lse, pool_ids, positions, k_pools, pool_size, softmax_scale=softmax_scale, token_ids=token_ids, topk_length=length
     )
     assert _rel(fused["dq"], plain["dq"]) < 1e-5
-    assert _rel(fused["dkv"], plain["dkv"]) < 1e-4
+    assert _rel(fused["dkv"], plain["dkv"]) < 2e-3  # bf16 dkv rounds order-dependent fp32 atomics
+    no_sink = torch.full((h,), float("-inf"), dtype=torch.float32, device="cuda")
+    for route in (plain, fused):
+        check_ref_dsa_sparse_attention_backward(
+            q.reshape(s, h, d),
+            kv.reshape(s, d),
+            no_sink,
+            token_ids.reshape(s, -1),
+            out.reshape(s, h, -1),
+            dout.reshape(s, h, -1),
+            lse.reshape(s, h),
+            route["dq"].reshape(s, h, d),
+            route["dkv"].reshape(s, d),
+            route["d_sink"],
+            softmax_scale=softmax_scale,
+            topk_length=length.reshape(s),
+            atol=5e-2,
+            rtol=5e-2,
+        )
     token_target = ref_sparse_attn_score_recompute(q, kv, lse, token_ids, softmax_scale, topk_length=length)
     reference = PB.pooled_indexer_target(token_target, pool_ids, pool_size)["target"]
     assert fused["target"].shape == reference.shape and torch.isfinite(fused["target"]).all()
@@ -299,5 +321,7 @@ def test_indexer_chain_runs_on_the_requested_stream():
     side = _delayed_side_stream()
     got = PB.pooled_indexer_backward(*args, target.clone(), grad_loss, pool_size, 0.5, stream=side)
     torch.cuda.synchronize()
-    for name in ("d_index_q", "d_weights", "d_keys", "d_gates", "d_ape", "d_pooled"):
-        assert _rel(got[name], expected[name]) < 1e-4, name
+    for name in ("d_ape", "d_pooled"):
+        assert _rel(got[name], expected[name]) < 1e-5, name
+    for name in ("d_index_q", "d_weights", "d_keys", "d_gates"):
+        assert _rel(got[name], expected[name]) < 2e-3, name  # bf16 outputs of order-dependent fp32 atomics
