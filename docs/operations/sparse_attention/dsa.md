@@ -2,10 +2,13 @@
 
 **This is an experimental API and subject to change.**
 
-Torch-facing calls accept the ordinary default stream or a concrete
-`torch.cuda.Stream` / raw stream handle. The special `CUstream(2)` per-thread
-default sentinel is rejected by Torch interop: it cannot safely represent an
-allocator stream identity across host threads. Use a concrete stream instead.
+Stream parameter types are operation-specific. Sparse-attention forward uses
+the current PyTorch stream when its stream argument is `None`; an explicit
+stream must be a concrete `cuda.bindings.driver.CUstream`. Convert a
+`torch.cuda.Stream` with `cuda.bindings.driver.CUstream(stream.cuda_stream)`.
+The special `CUstream(2)` per-thread default sentinel is rejected by Torch
+interop: it cannot safely represent an allocator stream identity across host
+threads. Use a concrete stream instead.
 
 ## Overview
 
@@ -174,7 +177,8 @@ attention sink participates only in the output denominator, not in any stats.
 - **Layout and stream** — the convenience wrapper materializes non-contiguous
   or under-aligned inputs on the selected stream. Prepared SM90 `execute()`
   instead requires contiguous, adequately aligned tensors and raises before
-  launch if the contract is not met. An explicit `stream` must be a
+  launch if the contract is not met. An explicit `current_stream` for prepared
+  execution (or `stream` for the wrapper) must be a
   `cuda.bindings.driver.CUstream` belonging to `q.device`.
 
 For `D_qk=576`, QK uses all 576 dimensions while V/output uses only the first
