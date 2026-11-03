@@ -390,6 +390,26 @@ DSL satisfies your kernel.**
   the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
   `check_support` rejects that compiler before JIT compilation, and its tests
   exercise the rejection rather than crashing or silently skipping the gate.
+- **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
+  and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
+  and cu13 in separate environments/processes and empty, separate caches.
+  Cover the declared dependency floor and the newer supported DSL version
+  being qualified, when different, on every claimed architecture. Exercise
+  forward/backward paths, supported dtypes, and boundary/tail cases; check
+  finite outputs and the existing accuracy contract. Import-only or
+  compile-only success does not establish numerical correctness. Unsupported
+  compiler/architecture combinations must decline before JIT and have a test
+  for that rejection. Report unavailable lanes explicitly; do not loosen
+  tolerances or skip failing supported lanes to make this matrix pass.
+- Record the source revision, installed DSL distributions, loaded native
+  compiler path and `CUDA_VERSION.major` / `.minor`, GPU/driver, framework,
+  backend/NVRTC, and pass/fail/skip counts. With DSL 4.8, the default wheel
+  installs cu12; `[cu13]` adds another flavor and the loader can select it.
+  Verify the loaded flavor rather than assuming the install command selected
+  it. A cu12 DSL run with a CUDA 13 framework/backend isolates DSL compatibility;
+  it is not qualification of a deployment using CUDA 12 throughout. The
+  [integration skill](../../skills/cutedsl-kernel-integration/SKILL.md)
+  carries the test workflow.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
@@ -744,33 +764,55 @@ read by the family's analyzer under the spelling of EVERY op that takes it.**
 
 ## Frontend-only kernel package layout
 
-```
-python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
-├── __init__.py                      # exports the public functions via __all__
-├── api.py                           # <op>_<direction>() / <op>_<direction>_jax() functions
-└── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
+Organize kernels by operation, then backend, then GPU architecture where needed.
+Keep shared public functions in the operation's `api.py` and backend-independent
+operation contracts in `ops.py` (or an `ops/` package for multiple modules).
+
+```text
+python/cudnn/
+├── <op0>/
+│   ├── __init__.py                  # lazy public exports
+│   ├── api.py                      # shared public functions
+│   ├── ops.py                      # backend-independent operation contracts
+│   ├── <backend0>/
+│   │   ├── sm_x/                   # kernels for one architecture family
+│   │   └── sm_y/
+│   └── <backend1>/
+└── <op1>/
+    ├── __init__.py
+    ├── api.py
+    ├── ops.py
+    ├── <backend0>/
+    └── <backend1>/
 ```
 
-All GEMM fusions live under `gemm/`, grouped by how the operands are laid out:
+Use backend names such as `frost` and `cutedsl`, and architecture names such as
+`sm100` and `sm120`. Backend-specific API adapters and layout/fusion subpackages
+stay inside their backend.
 
-```
+For example, `gemm/frost/` and `gemm/cutedsl/` are sibling backends. `frost/` uses
+architecture subdirectories; `cutedsl/` groups fusions by operand layout:
+
+```text
 python/cudnn/gemm/
 ├── cutedsl/
-│   ├── dense/<fusion>/              # amax, dsrelu, proj_rope_mxfp8, srelu, swiglu
-│   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
-│   │                                #   quant, srelu, swiglu, unfused, wgrad
-│   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
-├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
-│   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
-│   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
-│   ├── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
-│   └── ln_prologue/                 #   the LayerNorm-prologue gated dual GEMM substrate: host (__init__.py) + ONE RENDERED body per arch (two arms: pairing=columns = TriMul K1, pairing=accumulators = TriMul K3)
-│                                    #   (sm107_dual_gemm.py; a rendering for one arch is not a registry template, so not under kernel_templates/)
-├── ops/                             # backend-independent torch custom-op contracts
-└── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
+│   ├── dense/<fusion>/
+│   ├── grouped/<fusion>/
+│   └── discrete_grouped/<fusion>/   # per-expert weight pointers
+├── frost/                          # JIT-fused matmul chains from cuDNN graphs
+│   ├── sm100/                      # compiler.py, epilogue_codegen.py, kernel_templates/
+│   ├── sm120/                      # same structure for the SM120 family
+│   ├── compiler.py                 # facade for the active family's compiler
+│   ├── epilogue_codegen.py          # facade for the active family's codegen
+│   ├── kernel_templates/           # template code shared by architecture families
+│   └── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+└── ops/                            # backend-independent torch custom-op contracts
 ```
 
-Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
+Keep helpers in the narrowest package shared by their users. For example,
+`gemm/cutedsl/grouped/moe_*.py` serves grouped CuTeDSL fusions, while
+`gemm/frost/kernel_templates/` serves multiple FROST architecture families.
+Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
 
@@ -1005,15 +1047,17 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   it cost the backward 13%.
 - Bound the inverse operand with the key magnitude as well as the gate prefix:
   unnormalized `k=5` overflows fp16 at a prefix of -13.75.
-- Sum individual token logs over the interval. Never subtract inclusive fp32 prefixes:
-  a -1e8 gate erases the following -1 gates from both.
+- Multiply individual token factors `exp2(g)` over the interval. Never subtract inclusive fp32 prefixes:
+  a -1e8 gate erases the following -1 gates from both. Factors are at most 1, so a product only underflows.
 - Reduce corrections in a fixed order, including when several channels are steep.
 - Use `encode_gate_exchange` for scan classification and exchange encoding. Keep stage selection and
-  barriers in each schedule. All six chunk schedules share gate conditioning, scans, row normalization
-  and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`. The rolled FP32
+  barriers in each schedule. All six GDN-2 chunk schedules share gate conditioning, scans, row normalization
+  and operand packing through the `@cute.jit` stages in `common/gdn2_operands.py`; the six KDA schedules
+  keep their inline operand code and call the same `common/steep_decay.py` stages. KDA's scalar beta sits
+  outside K decay and is already in the strict dM tile, so its corrections pass `beta_ptr=None`. The rolled FP32
   backward scan retains its local load/store schedule. Read exchange scales before releasing a raw
   stage; register-only packing may follow that release. `encode_gate_exchange` accepts log2 prefixes
-  only, and returns exponentials or exact token logs according to the channel ballot. The forward kernels
+  only, and returns exponentials or exact token factors according to the channel ballot. The forward kernels
   declare the steep scratch arrays from their cfg cosizes; the backward kernels carve it from the bank fill
   at cfg byte offsets and assert the capacity in `build_cfg`.
 - Range tests must vary state-gradient magnitude independently of gate magnitude. A large finite
@@ -1044,7 +1088,7 @@ with fp16 operands (`k * 2^-g` overflows). Both lie inside the documented gate r
   alias them later. A forward graph without a final-state output cannot overwrite its seeds;
   indexed input pools in such graphs need no snapshot.
 
-Detectors, all in the steep section of `linear_attention/test_la.py`: `test_steep_channel_decay_fwd_bwd`
+Detectors, all in the steep section of `linear_attention/test_la.py` and run for GDN-2 and KDA: `test_steep_channel_decay_fwd_bwd`
 (and `test_steep_channel_decay_fp16`), `test_steep_fp16_inverse_range_without_normalization`,
 `test_steep_multiple_channels_repeatable`, `test_steep_forward_state_alias_after_graph_warmup`,
 `test_steep_channel_decay_overwrite_initial_state`, `test_steep_channel_decay_backward_overwrite_initial_state`,

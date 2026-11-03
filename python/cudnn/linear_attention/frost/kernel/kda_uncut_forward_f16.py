@@ -30,6 +30,7 @@ from cutlass.cute.runtime import from_dlpack
 from cudnn.frost.compiled_cache import compile_cached
 
 from ..common.host import get_dtype
+from ..common.state_snapshot import snapshot_states
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
 
 uncut_forward_cache = {}
@@ -72,8 +73,14 @@ def uncut_forward_host(
     prep_words: Optional[cute.Tensor],
     prep_rows: Optional[cute.Tensor],
     prep_row_count: Optional[cute.Tensor],
+    state_snapshot: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
+    seed_state, seed_rows = state_in, seed_indices
+    if cutlass.const_expr(state_snapshot is not None):
+        # The prefill's final state overwrites the seeds its exact twin would reread: seed both from a copy.
+        snapshot_states(state_in, state_snapshot, seed_indices, stream)
+        seed_state, seed_rows = state_snapshot, None
     if cutlass.const_expr(prep):
         kda_prep_prefill_f16.prologue(
             io_dtype,
@@ -120,6 +127,7 @@ def uncut_forward_host(
             prep_diag,
             prep_rows,
             prep_row_count,
+            scheduler,
             stream,
         )
     else:
@@ -153,10 +161,10 @@ def uncut_forward_host(
         dt_bias,
         beta,
         cu_seqlens,
-        state_in,
+        seed_state,
         o,
         state_out,
-        seed_indices,
+        seed_rows,
         final_indices,
         work_items,
         work_count,
@@ -236,6 +244,7 @@ def build_uncut_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    state_snapshot=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the d_v split, state and checkpoint
     presence, device) the uncut forward launch over the buffers of one plan.  The placeholders repeat the marks of the
@@ -278,6 +287,7 @@ def build_uncut_forward(
         str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         int(tiles_per_head),
         bool(prep),
+        state_snapshot is not None,
     )
     if key not in uncut_forward_cache:
         prefill_cfg, prep_cfg = build_configs(
@@ -341,6 +351,7 @@ def build_uncut_forward(
             bool(prep),
             prep_cfg,
             *prep_placeholders,
+            from_dlpack(state_snapshot, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_snapshot is not None else None,
             cuda.CUstream(int(stream)),
             cache_key=repr((__name__, key)),
             symbol="frost_la_kda_uncut_forward_f16",
@@ -381,6 +392,7 @@ def run_uncut_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    state_snapshot=None,
 ) -> None:
     """Replay the uncut forward: one crossing into the DSL for the prologue and prefill launches.  The plan validated the
     contract at build, so nothing here raises."""
@@ -413,5 +425,6 @@ def run_uncut_forward(
         prep_words,
         prep_rows,
         prep_row_count,
+        state_snapshot,
         cuda.CUstream(int(stream)),
     )

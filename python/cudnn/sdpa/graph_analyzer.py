@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 import cudnn
 from cudnn._sdpa_tail import GateTail, match_gate_tail
+from cudnn.sdpa import band
 from cudnn.sdpa.layout import dense_layout_ok
 
 _LOG = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ _TORCH_FROM_CUDNN = {
     cudnn.data_type.FP8_E5M2: "float8_e5m2",
     cudnn.data_type.FLOAT: "float32",
     cudnn.data_type.INT32: "int32",
+    cudnn.data_type.INT64: "int64",
     # Block-scaled O of the per-tensor FP8 forward: two E2M1 per byte, and the
     # UE8M0 scale factors of its MXFP8 output.
     cudnn.data_type.FP4_E2M1: "float4_e2m1fn_x2",
@@ -470,6 +472,19 @@ class SdpaGraphFacts:
     # existing meaning for every other row and for backward.
     kv_dtype: Optional[Any] = None  # shared K/V dtype; None when they differ
     uniform_qo_dtype: bool = True  # actual O dtype equals Q
+    paged_pool_counts: tuple[int, int] = (0, 0)  # independent K/V physical page capacities
+
+    @property
+    def band(self) -> "band.BandFacts":
+        """This graph's mask band, in the canonical model (cudnn.sdpa.band).
+
+        A VIEW, not a second source: the raw resolved fields above stay the
+        facts every other consumer reads (heuristics, lowerings, configs) and
+        :meth:`cudnn.sdpa.band.BandFacts.from_sdpa_facts` is the one place they
+        are normalized into (left bound, right mode, anchor).  Engines decide
+        support by comparing this against their row's ``Capabilities.band``.
+        """
+        return band.BandFacts.from_sdpa_facts(self)
 
 
 _SDPA_NODE_TYPES = (
@@ -658,8 +673,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         _, h_kv, page_size, _ = k_dim
         if k_dim[3] != d_qk:
             return _invalid(f"paged K container head dim must equal Q's (q_dim={q_dim}, k_dim={k_dim})")
-        if v_dim[:3] != k_dim[:3]:
-            return _invalid(f"paged K/V containers must share [num_pages, H_kv, page_size] (k_dim={k_dim}, v_dim={v_dim})")
+        if v_dim[1:3] != k_dim[1:3] or k_dim[0] <= 0 or v_dim[0] <= 0:
+            return _invalid(f"paged K/V containers must share [H_kv, page_size] and have positive pool capacities (k_dim={k_dim}, v_dim={v_dim})")
         tables = [t for t in (table_k, table_v) if t is not None]
         for t in tables:
             td = tuple(t.get_dim())
@@ -990,6 +1005,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # flex-attention graphs and silently drop the user's score modifier.
         has_score_mod=any(rec.get(key) is not None for key in ("score_mod", "score_mod_bprop", "fn")),
         has_paged_kv=paged,
+        paged_pool_counts=(int(k_dim[0]), int(v_dim[0])) if paged else (0, 0),
         page_size=page_size,
         paged_k_table_t=table_k,
         paged_v_table_t=table_v,

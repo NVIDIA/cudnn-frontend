@@ -229,7 +229,8 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
 
 def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     """The default d256 backward row ranks ahead of the backend for d256 on cc 10.0 and behind it for D192x128, other parts,
-    unmeasured features and mask-free ragged THD past S_q 4096; the FROST opt-in keeps it first everywhere."""
+    unmeasured features and mask-free ragged THD past S_q 4096; on cc 10.3 the placement table decides bf16 THD graphs. The
+    FROST opt-in keeps it first everywhere."""
     from cudnn.engines.base import PlanConfig
     from cudnn.engines.heuristics import is_backend_block
     from cudnn.engines.manifest import MANIFEST
@@ -254,9 +255,21 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     assert order(thd=True, causal=False, max_total_seq_len_q=6 * 4096) == trail  # mask-free ragged past 4096
     assert order(thd=True, max_total_seq_len_q=6 * 4096) == lead  # causal ragged
     assert order(d_qk=192, d_v=128, h_kv=16) == trail
-    assert order(device_cc=(10, 3)) == trail
+    assert order(device_cc=(10, 3)) == trail  # dense on cc 10.3: no table entry, and the box is cc 10.0's
     for unmeasured in (dict(deterministic=True), dict(has_bias=True), dict(has_dropout=True), dict(window_left=1024), dict(has_sink=True)):
         assert order(**unmeasured) == trail, unmeasured
+    # cc 10.3 bf16 THD on the 128-key tile: the placement table's own entries (study sm103_d256_bwd_v2_20261031) decide
+    thd103 = dict(device_cc=(10, 3), thd=True, max_total_seq_len_q=8 * 4096)
+    assert order(**thd103) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=16, h_kv=16, s_q=1024, s_kv=1024, max_total_seq_len_q=1024) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=8, h_kv=8, s_q=256, s_kv=256, max_total_seq_len_q=256) == trail
+    for unmeasured in (dict(deterministic=True), dict(has_bias=True), dict(window_left=1024), dict(dtype=cudnn.data_type.HALF)):
+        assert order(**thd103, **unmeasured) == trail, unmeasured
+    # off the 128-key tile: the twin entries (study sm103_d256_bwd_thd_offtile_20261031)
+    assert order(device_cc=(10, 3), thd=True, s_q=4000, s_kv=4000, max_total_seq_len_q=8 * 4000) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=16, h_kv=16, s_q=3000, s_kv=3000, max_total_seq_len_q=3000) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=8, h_kv=8, s_q=1000, s_kv=1000, max_total_seq_len_q=1000) == trail
+    assert order(device_cc=(10, 3), s_q=4000, s_kv=4000) == trail  # dense off the tile: no entry
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order(d_qk=192, d_v=128, h_kv=16) == lead
 

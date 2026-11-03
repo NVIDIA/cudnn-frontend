@@ -192,7 +192,7 @@ navigation:
               - page: Grouped GEMM + WGrad (Unified)
                 path: ../../operations/gemm_fusions/grouped_gemm_wgrad.md
                 slug: grouped_gemm_wgrad
-              - page: DSv4.1 mHC Projection/RMS Backward (SM100)
+              - page: DSv4.1 mHC Projection/RMS Backward (SM100/SM103)
                 path: ../../operations/gemm_fusions/mhc_projection_bwd.md
                 slug: mhc_projection_bwd
           - page: Triangle Multiplicative Update
@@ -273,6 +273,9 @@ navigation:
           - page: Dynamic Shapes and Kernel Cache
             path: ../../utilities/dynamic-kernel-cache.md
             slug: dynamic-kernel-cache
+          - page: Limiting Execution Plan Shared Memory
+            path: ../../utilities/shared-memory-limit.md
+            slug: shared-memory-limit
           - page: 'Framework integration performance: getting the best per-call performance from cuDNN Frontend'
             path: ../../utilities/framework_integration_performance.md
             slug: framework_integration_performance

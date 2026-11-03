@@ -96,3 +96,34 @@ def test_graph_and_adapter_decline_unaligned_dense_port(cc, role, monkeypatch):
     spec = {(10, 0): engines._sm100_spec, (10, 7): engines._sm107_spec, (12, 0): engines._sm120_spec}[cc]()
     reason = engines.mismatch(spec.capabilities, facts)
     assert reason is not None and role in reason.lower() and "stride" in reason.lower()
+
+
+@pytest.mark.parametrize("heads,token_pitch", [(24, 13312), (32, 17408)])
+def test_fused_gate_slab_column_at_batch_one_token_is_declarable(heads, token_pitch):
+    """A gate sliced out of a fused projection slab at batch 1 x one query token keeps the slab's token pitch on both
+    singleton axes; canonicalized, the layout is BSHD-compact, so the graph row (``gate_layout_ok``) and the standalone
+    adapter (``epilogue_gate_layout_declarable``) must both admit it -- one rule, never a plan that dies at check_support."""
+    from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable
+    from cudnn.sdpa.graph_analyzer import gate_layout_ok
+
+    shape, strides = (1, heads, 1, 256), (token_pitch, 256, token_pitch, 1)
+    assert dense_bind_strides(shape, strides, 2) == (heads * 256, heads * 256, 256)
+    assert gate_layout_ok(shape, strides, 2) is True
+    assert epilogue_gate_layout_declarable(shape, strides, 2) is True
+
+
+@pytest.mark.parametrize(
+    "strides",
+    [(512 * 8 * 260, 260, 8 * 260, 1), (512 * 8 * 128, 128, 8 * 128, 1), (512 * 8 * 256, 256, 8 * 256, 2)],
+    ids=["unaligned-head-pitch", "overlapping-head-pitch", "strided-d"],
+)
+def test_fused_gate_layout_rule_still_declines_what_tma_cannot_express(strides):
+    """The gate has no copy fallback: an unaligned head pitch, an overlapping head pitch and a non-contiguous head dim stay
+    refused by both halves of the rule."""
+    from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable
+    from cudnn.sdpa.graph_analyzer import gate_layout_ok
+
+    shape = (1, 8, 512, 256)
+    assert dense_bind_strides(shape, strides, 2) is None
+    assert gate_layout_ok(shape, strides, 2) is False
+    assert epilogue_gate_layout_declarable(shape, strides, 2) is False

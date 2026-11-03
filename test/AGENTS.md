@@ -1,5 +1,14 @@
 # test — Agent Guide
 
+MXFP8 backward's element-count allowance needs the same magnitude cap as its
+row-count allowance: an isolated large error can preserve amax and still fit
+the element budget. `assert_close_mxfp8_grad` caps every extra mismatch;
+`sdpa/test_mxfp8_grad_budget.py` pins a non-maximum 0-to-8 rejection and bounded
+row acceptance. When emulating the backward exponent's FP32 FFMA, round the
+scalar multiplier and the separately formed Stats term before the final fused
+rounding. Keep the independent dS-policy recipe bitwise and pin the exponent
+before exp2 in `sdpa/test_mxfp8_ref_quantize_ds.py`.
+
 For deterministic DSA indexer backward, cover large TopK with more than twice
 as many query rows as producer planes, so persistent CTAs consume at least
 three rows. Restore score inputs and poison workspace/outputs before each run;
@@ -113,6 +122,7 @@ child-stage evidence.
   handle, and QSA's `test_entry_points_select_the_tensors_device_with_another_device_current`
   with delayed producer-stream fills.
 - A session-scoped autouse `cudnn_handle` fixture creates one handle bound to a dedicated stream; use it instead of creating handles per-test. Tests that rebind it must save `cudnn.get_stream(cudnn_handle)` before setup and restore that exact stream in `finally`, including setup failures/skips. Restoring `torch.cuda.current_stream()` instead leaks a different stream into later tests.
+  Eager graph calls using that handle also need producer-to-handle and handle-to-reference dependencies. Wrap its stream with `torch.cuda.ExternalStream`, wait for current-stream input updates before execution, then wait for its output before the current-stream reference. The SM80 `test_public_graph_geometry_rebind_replay` follows both edges; delaying the V update exposes the old unsynchronized eager call even when capture/replay itself is ordered correctly.
 - `pytest_configure` asserts `torch.cuda.is_available()` — there is no CPU-only mode.
 - Many custom CLI options exist (`--dryrun`, `--repro`, `--seed`, `--perf`, per-op dimension overrides like `--b/--s_q`, `--nsa-*`, `--dsa-*`); check `pytest_addoption` before adding new ones.
 - **Keep `sdpa/frost/` paths contiguous on the command line.** `sdpa/frost/conftest.py` sets `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` through an autouse fixture, because the FROST manifest rows are opt-in. Interleaving a top-level path between two `sdpa/frost/` paths — `pytest sdpa/frost/test_a.py test_dispatch.py sdpa/frost/test_b.py` — silently drops that fixture for everything after the top-level file: `_frost_opt_in` is absent from `item.fixturenames` and no FROST row is offered. Any top-level file does it, not just `test_dispatch.py`, and both contiguous orders are fine. Tests that *pin* an engine then fail loudly, but a test that `pytest.skip`s when it finds no python plan goes **falsely green**. Detector, as its own plugin so no test file changes:
@@ -972,6 +982,13 @@ the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
 
+When sharing a native backward ABI with another architecture, retain its registered
+`BwdLaunchSpec.name` or extend every name-based native guard. The fixed backward
+binder uses that name to enable gradient-overlap checks. Pin the public engine
+identity separately, verify the emitted target, and keep a real overlapping-gradient
+negative control with unchanged output/workspace sentinels. The SM120 THD cases
+in `test_sdpa_bwd_thd_sm120.py` exercise this boundary.
+
 Exercise the actual standalone adapter as well as the prepared binder. A lower-level
 frame test can miss an incompatible metadata container built by the adapter.
 `test_shared_standalone_adapter_uses_current_native_storage` calls that boundary
@@ -1183,3 +1200,15 @@ forbidding normalization and rejecting unsupported inner strides before launch.
 Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
 both packings classify the same element, but the token-major binder requires
 exact strides, so the wrapper must retain the head-major ABI for unused pitches.
+
+For JAX device-target admission, test zero-argument JIT closures that capture every
+operand as well as fully and partially traced inputs. Concrete captured arrays do
+not pin execution placement; detect the active trace independently of operand
+types. BSA's `test_fully_captured_public_call_refuses_mixed_arch_under_jit` checks
+that a modeled mixed-architecture host is rejected before the FFI factory.
+
+When a template-loader signature gains an optional target or part argument,
+update every monkeypatched loader spy to accept and forward it while retaining
+route assertions. Exercise the actual spy with both the legacy call and the new
+keyword; architecture-skipped GPU cases can otherwise hide a host-call failure
+until another lane runs, before any kernel executes.

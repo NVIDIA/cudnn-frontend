@@ -1441,3 +1441,28 @@ def test_cache_write_ring_arm_writes_the_last_cap_tokens_at_the_circular_slots(c
     assert bool(torch.isnan(ring[0].float()).all()), "the null block was written"
     n_live = sum(1 for x in slots if x >= 0)
     assert n_live == min(cap, kv_lens[0]) + min(cap, kv_lens[1]) and int((~torch.isnan(ring.float()).any(-1)).sum()) == n_live
+
+
+@requires_cuda
+def test_paged_kv_lens_at_the_int32_extremes_are_dead_in_both_kernels():
+    """The fused prepare launch's compress arm and the step form on ``kv_lens`` {INT_MIN, INT_MIN + 1, -1, 0} beside a ``4`` control (S_q 4, every
+    sequence on live pages and a live ring block): the ONE shared ``step_position`` derives the row-0 position from ``max(L, 0) - S_q``, so every
+    ``L <= 0`` sequence is DEAD in both kernels -- every slot ``-1``, not one ring or cache byte of it moved -- instead of the int32 wrap at ``INT_MIN``
+    landing its rows at a live positive position; the two kernels bitwise each other on every output, the control's row 3 completes block 0."""
+    ch = _Chain(_GEOM_SMALL, batch=5, rows=4, pos0=(0, 0, 0, 0, 0), paged=True, page=16, cap=8)
+    int_min = -(2**31)
+    ch.kv_lens = torch.tensor([int_min, int_min + 1, -1, 0, 4], dtype=torch.int32, device="cuda")
+    ch.compile_unfused()
+    ch.compile_fused()
+    ch.run_unfused()
+    ch.run_fused()
+    ch.assert_bitwise("kv_lens at the int32 extremes")
+    cs = ch.Bf["cslot"].tolist()
+    assert cs == [[-1] * 4] * 4 + [[-1, -1, -1, 0]], cs
+    assert _same(ch.Bf["ring"][:5], ch.ring0[:5]), "a dead sequence (kv_lens <= 0) wrote a ring row"
+    for b in range(4):
+        assert bool((ch.kbar_row(ch.Bf, b, 0).float() == ch.sent).all()), f"sequence {b} wrote its block 0"
+    assert bool((ch.kbar_row(ch.Bf, 4, 0).float() != ch.sent).any()), "the control did not write block 0"
+    raw = ch.cols(ch.slab0, ch.o_ik, 1, ch.d_i)
+    for j in range(4):
+        assert _same(ch.Bf["ring"][5, j % ch.ring_n, 0], raw[4 * 4 + j, 0]), j

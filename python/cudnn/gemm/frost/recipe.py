@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from math import prod
 
-from cudnn.frost.buffers import dtype_name, init_word, is_contiguous, strided_fill_plan
+from cudnn.frost.buffers import DeviceView, dtype_name, init_word, is_contiguous, strided_fill_plan
 
 from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
+from .layouts import fold_batch_layout
 
 # An operand's three axes, named by role rather than by position.
 AX_BATCH, AX_MN, AX_K = 0, 1, 2
@@ -97,10 +99,11 @@ class Operand:
     declared_layout: tuple  # the (dim, stride) that order comes with
     dc: int  # where stride 1 lands in the graph's order
     kc: int  # ... and in the caller's
+    graph_order: bool = False  # normalized operands always bind in original graph-input coordinates
 
     def axes(self, shape, stride, graph_order: bool) -> "tuple | None":
         """Which axis holds which role, or None when the layout is not the major."""
-        if graph_order or (tuple(shape), tuple(stride)) == self.declared_layout:
+        if self.graph_order or graph_order or (tuple(shape), tuple(stride)) == self.declared_layout:
             return self.declared if stride[self.dc] == 1 else None
         return KERNEL_AXES if stride[self.kc] == 1 else None
 
@@ -148,6 +151,7 @@ class Aux:
     align: int
     ref: Any  # TensorRef, for the fake-shape reshape
     mainloop_scale: PerKScaleRule | None = None
+    transposed: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,14 @@ class ScaleFactor:
     role: str
     is_a: bool
     operand_at: int  # the A or B operand this one scales, as an index into inputs
+
+
+def _batch_shape(shape, prefix):
+    """Pin each prepared batch axis while allowing dynamic matrix extents."""
+    shape = tuple(map(int, shape))
+    if len(shape) != len(prefix) + 2 or shape[:-2] != prefix:
+        raise ValueError(f"matrix batch view expected original batch axes {prefix}, got shape={shape}")
+    return (prod(prefix), *shape[-2:])
 
 
 @dataclass(frozen=True)
@@ -177,6 +189,8 @@ class GemmRecipe:
     stride_ins: tuple
     shared_layout: tuple
     seeds: tuple
+    matrix_views: tuple = ()
+    operand_reshapes: tuple = ()
 
     @property
     def a(self) -> Operand:
@@ -185,6 +199,64 @@ class GemmRecipe:
     @property
     def b(self) -> Operand:
         return self.inputs[self.b_at]
+
+    def operand_shape(self, index, shape):
+        """Project a caller shape using this recipe's prepared batch axes."""
+        for slot, view in self.operand_reshapes:
+            if slot == index:
+                return view.check_shape(shape)
+        for slot, prefix in self.matrix_views:
+            if slot == index:
+                return _batch_shape(shape, prefix)
+        return shape
+
+    def operand_views(self, operands, *, check_outputs=True):
+        """Apply prepared metadata views, without allocating or copying device storage.
+
+        Workspace sizing can omit write-layout validation; launch and diagnostic
+        paths validate every output before any kernel or seed write.
+        """
+        if not self.matrix_views and not self.operand_reshapes:
+            return operands
+        views = operands
+        for index, view in self.operand_reshapes:
+            value = views[index]
+            source_shape, source_stride = tuple(value.shape), tuple(value.stride())
+            shape, stride = view.layout(source_shape, source_stride)
+            if source_shape == shape and source_stride == stride:
+                continue
+            if hasattr(value, "metadata_view"):
+                value = value.metadata_view(shape, stride)
+            elif isinstance(value, DeviceView):
+                if not is_contiguous(shape, stride):
+                    raise ValueError("strided reshape/transpose execution requires a tensor or native variant pack")
+                value = value.reshape(shape)
+            elif hasattr(value, "as_strided"):
+                # Every intermediate index map was proved; inherit storage_offset
+                # and ownership, with one final view and no materializing reshape.
+                value = value.as_strided(shape, stride)
+            else:
+                raise ValueError("operand views require a tensor, DeviceView or native variant pack")
+            if views is operands:
+                views = list(operands)
+            views[index] = value
+        outputs = {o.index for o in self.outputs} if self.matrix_views and check_outputs else ()
+        for index, prefix in self.matrix_views:
+            value = views[index]
+            shape = _batch_shape(value.shape, prefix)
+            fold_batch_layout(value.shape, value.stride(), writable=index in outputs)
+            if tuple(value.shape) == shape:
+                continue  # identity view preserves singleton pitches too
+            if hasattr(value, "flatten_batch"):
+                value = value.flatten_batch()  # native strided metadata
+            elif isinstance(value, DeviceView):
+                value = value.reshape(shape)  # contiguous by contract
+            else:
+                value = value.view(shape)  # Torch view cannot copy
+            if views is operands:
+                views = list(operands)
+            views[index] = value
+        return views
 
     def problem(self, operands, graph_order=None) -> tuple:
         """``((M, N, K), axes-per-input)``, located rather than assumed."""
@@ -411,8 +483,30 @@ def _declared_layout(tensor) -> tuple:
         return (), ()
 
 
-def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool, declared_is_b: bool | None = None) -> Operand:
+def _operand(
+    index: int,
+    role: str,
+    tensor,
+    *,
+    major: str,
+    dtype: str,
+    batch: int,
+    is_b: bool,
+    declared_is_b: bool | None = None,
+    transposed=False,
+    graph_order=False,
+    matrix_batch=None,
+    operand_view=None,
+) -> Operand:
+    """Prepare one operand contract in the kernel ABI and original caller axes."""
     declared = _DECLARED_AXES["b" if (is_b if declared_is_b is None else declared_is_b) else "a"]
+    if transposed:
+        declared = (declared[0], declared[2], declared[1])
+    layout = _declared_layout(tensor)
+    if operand_view is not None:
+        layout = operand_view.layout(*layout)
+    if matrix_batch is not None:
+        layout = fold_batch_layout(*layout)
     contiguous = AX_K if major == "k" else AX_MN
     modulus, pack = contiguous_modulus(dtype, contiguous == AX_K)
     return Operand(
@@ -425,10 +519,11 @@ def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: in
         modulus=modulus,
         pack=pack,
         contiguous_role=contiguous,
-        declared_layout=_declared_layout(tensor),
+        declared_layout=layout,
         declared=declared,
         dc=declared[contiguous],
         kc=KERNEL_AXES[contiguous],
+        graph_order=graph_order,
     )
 
 
@@ -442,6 +537,8 @@ def build(compiled) -> GemmRecipe:
     for i, t in enumerate(binding.bound_tensors()):
         order.setdefault(id(t), i)
 
+    matrix_batches = {id(t): prefix for t, prefix in binding.matrix_batches}
+    operand_views = {id(t): view for t, view in binding.operand_views}
     inputs = [
         _operand(
             order[id(t)],
@@ -452,6 +549,10 @@ def build(compiled) -> GemmRecipe:
             batch=mm.a_batch,
             is_b=False,
             declared_is_b=swap_ab,
+            transposed=bool(binding.a_transposed and binding.a_transposed[i]),
+            graph_order=bool(binding.a_transposed),
+            matrix_batch=matrix_batches.get(id(t)),
+            operand_view=operand_views.get(id(t)),
         )
         for i, t in enumerate(binding.a_operands)
     ] + [
@@ -464,6 +565,10 @@ def build(compiled) -> GemmRecipe:
             batch=mm.b_batch,
             is_b=True,
             declared_is_b=not swap_ab,
+            transposed=bool(binding.b_transposed and binding.b_transposed[i]),
+            graph_order=bool(binding.b_transposed),
+            matrix_batch=matrix_batches.get(id(t)),
+            operand_view=operand_views.get(id(t)),
         )
         for i, t in enumerate(binding.b_operands)
     ]
@@ -489,7 +594,14 @@ def build(compiled) -> GemmRecipe:
         )
 
     aux = tuple(
-        Aux(index=order[id(t)], role=f"aux {compiled.aux_names[i]!r}", align=aux_reqs[compiled.aux_names[i]], ref=ref, mainloop_scale=_per_k_rule(ref, swap_ab))
+        Aux(
+            index=order[id(t)],
+            role=f"aux {compiled.aux_names[i]!r}",
+            align=aux_reqs[compiled.aux_names[i]],
+            ref=ref,
+            mainloop_scale=_per_k_rule(ref, swap_ab ^ bool(binding.aux_transposed and binding.aux_transposed[i])),
+            transposed=bool(binding.aux_transposed and binding.aux_transposed[i]),
+        )
         for i, (t, ref) in enumerate(zip(binding.aux, chain.aux_tensors))
     )
     na = len(binding.a_operands)
@@ -535,4 +647,6 @@ def build(compiled) -> GemmRecipe:
         stride_ins=stride_ins,
         shared_layout=shared_layout,
         seeds=tuple(seeds),
+        matrix_views=tuple((order[tid], prefix) for tid, prefix in matrix_batches.items() if tid in order and tid not in operand_views),
+        operand_reshapes=tuple((order[tid], view.folded() if tid in matrix_batches else view) for tid, view in operand_views.items() if tid in order),
     )

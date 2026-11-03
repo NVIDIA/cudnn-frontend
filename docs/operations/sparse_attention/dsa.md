@@ -269,28 +269,56 @@ combine those groups in fixed order.
 
 If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
 keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
-cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; longer
+cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; larger
 queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
 If that preferred layout's complete FP32-plane and packed-mask allocation would
 exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
 The long-query policy deliberately skips cluster-8: GB200 sweeps at 393K, 512K,
 and 768K KV found it slower than cluster-16 while retaining twice as many FP32
-planes. A setup kernel builds packed 16-bit, 8-bit, or 4-bit rank masks for every
-`(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
+planes. A setup kernel builds packed 4-, 8-, 16-, 32-, or 64-bit rank masks for
+every `(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
 ranks that actually update the same KV row, then publish that row with
-GPU-scope release/acquire ordering. Disjoint sparse rows continue in parallel;
-the fixed rank order handles both low- and high-overlap top-k rows without a
-global semaphore dependency on non-resident CTAs. The selected planes are
-folded in a fixed order. Duplicate top-k indices within one query row remain
-outside the deterministic contract, as in the bounded-wave path.
+GPU-scope release/acquire ordering. The participating reducer-thread CTA
+barrier carries the release/acquire causality, so no additional GPU-wide fence
+is needed. Rank zero skips the predecessor handoff, the last rank skips the
+successor publication, and the final release needs no second rendezvous.
+Disjoint sparse rows continue in parallel; the fixed rank order handles both
+low- and high-overlap top-k rows without a global semaphore dependency on
+non-resident CTAs. The selected 2, 4, 8, 16, or 32 planes are combined directly in
+the fixed-order conversion kernel, without an intermediate FP32 prefold.
+Duplicate top-k indices within one query row remain outside the deterministic
+contract, as in the bounded-wave path. This condition is not checked at
+runtime; callers that require bitwise repeatability must provide unique valid
+indices within each query's active top-k prefix.
+
+Callers that have profiled their exact SM100 workload may set
+`deterministic_relay_cluster_size` to `4`, `8`, `16`, `32`, or `64` to select
+that many CTAs per logical relay group instead of using the automatic policy.
+The corresponding number of FP32 relay planes is `32`, `16`, `8`, `4`, or
+`2`. Because SM100 hardware clusters contain at most 16 CTAs, the logical
+32- and 64-CTA groups run as two and four same-stream 16-CTA phases,
+respectively. Each kernel boundary completes the preceding physical phase
+before the next ranks reuse the same plane, avoiding cross-cluster residency
+dependencies. Cluster-64 uses a 64-bit packed row mask and is intended as an
+explicit emergency memory-first choice; the automatic policy never selects
+it because its lower per-phase parallelism regresses profiled workloads. This
+is a plan-time specialization: it is part of the compile/cache key, fixes the workspace size,
+and remains unchanged during `execute()` and CUDA Graph replay. The default
+`None` preserves automatic selection. Requests on non-deterministic plans,
+non-generic backends, or shapes that do not require the large-context relay are
+rejected rather than silently ignored. An explicit choice may exceed the
+automatic policy's 32 GiB memory-first budget, so callers should always allocate
+the exact value returned by `scratch_workspace_bytes()`.
 
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
 uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
-`relay_planes` is 8, 16, or 32, `relay_width` is 16, 8, or 4, and
+`relay_planes = 128 / relay_width`. The packed mask uses a 32-bit word for
+relay widths up to 32 and a 64-bit word for relay width 64. With
+`mask_word_bits` equal to 32 or 64, its FP32 storage rows are
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
-(K8 / (32 / relay_width)) / D8)`.
+ceil(K8 / (mask_word_bits / relay_width)) * (mask_word_bits / 32) / D8)`.
 One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
 authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
@@ -336,6 +364,23 @@ ordinary and two-CTA routes stay within 0.3%. Cluster-8 and cluster-4 trade
 at 512K KV, cluster-16 is 1.0% faster than upstream while using 93.1% less
 scratch.
 
+The follow-up relay scheduling pass was measured against merged commit
+`1dea4471a6e6c05e29d3bf281281fd156d345a84` on the same SM100 environment with
+PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0, BF16 H64, top-k 2048,
+five warm-ups, and 40 allocation-free calls. The automatic policy preserves
+the conservative eight-CTA layout below Q=8K because an earlier cluster-4
+crossover did not generalize across SM100 devices.
+
+| Dqk | Q | KV | Merged latency | Optimized latency | Speedup | Merged scratch | Optimized scratch |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 576 | 1024 | 65536 | 6.957 ms | 4.466 ms | 1.56x | 2.258 GiB | 2.258 GiB |
+| 576 | 8192 | 131072 | 31.677 ms | 24.142 ms | 1.31x | 9.129 GiB | 9.129 GiB |
+| 576 | 16384 | 262144 | 64.390 ms | 48.320 ms | 1.33x | 18.508 GiB | 18.508 GiB |
+| 576 | 16384 | 524288 | 101.409 ms | 64.426 ms | 1.57x | 10.008 GiB | 10.008 GiB |
+| 512 | 8192 | 131072 | 29.207 ms | 21.055 ms | 1.39x | 8.129 GiB | 8.129 GiB |
+| 512 | 16384 | 262144 | 60.060 ms | 42.305 ms | 1.42x | 16.508 GiB | 16.508 GiB |
+| 512 | 16384 | 524288 | 96.221 ms | 60.170 ms | 1.60x | 9.008 GiB | 9.008 GiB |
+
 For H64, a three-round, 20-call, reversed-order A/B measured prepared-plan
 eager execution at 104.579 ms and CUDA Graph replay at 104.225 ms (0.997x).
 Capture completed with PyTorch synchronization-debug error mode enabled. The
@@ -375,6 +420,7 @@ result = DSA.sparse_attention_backward_wrapper(
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
     deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
+    deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, 32, or 64 CTAs/group
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
@@ -536,9 +582,11 @@ which never microbatch, for one full launch.
 Paged K (`block_table` + `kv_lens`, the §3 contract) serves BSHD and THD
 queries with BF16 Q/K in one launch and returns local key ids
 (`topk_indices_global=False`), which is what serving engines consume before
-mapping ids to physical cache rows. THD capture preallocates through
-`compress_topk_cand_buffer_size_thd(cu_seqlens_q, None, ratio, q_causal_offsets)`,
-since a paged pool has no key prefix. No explicit microbatching and no MXFP8
+mapping ids to physical cache rows. Caller-owned candidate buffers are sized
+with `compress_topk_cand_buffer_size(..., paged=True)` for BSHD and
+`compress_topk_cand_buffer_size_thd(cu_seqlens_q, None, ratio, q_causal_offsets)`
+for THD: both return the single-launch size, and the THD call takes no key
+prefix because a paged pool has none. No explicit microbatching and no MXFP8
 yet.
 
 Global versus local ids is primarily an interoperability and allocation
@@ -599,9 +647,10 @@ with variable per-row effective length.
   the selected indices in CTA shared memory. The compiled specialization
   chooses between an index-bitmap scan and an in-place bitonic sort according
   to the target architecture and shape; on SM100, `top_k < 256` uses bitonic
-  ordering directly. Neither path adds a kernel, device allocation, or host
-  synchronization; the default specialization retains the existing selection
-  path.
+  ordering directly, and on SM103 bitonic ordering is used from 128K bucketed
+  columns at `top_k <= 128` (`<= 512` with more than 148 rows). Neither path
+  adds a kernel, device allocation, or host synchronization; the default
+  specialization retains the existing selection path.
 - **Constraints** — SM90+, `0 < top_k ≤ 2048`, nonzero row/column/batch
   extents, and `next_n > 0`. `seq_lens` is contiguous INT32 on the input CUDA
   device, and every entry must be in `[0, num_cols]`; the device-resident
@@ -779,11 +828,23 @@ indexer tower:
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
-3. In ordinary execution, a pure-torch dtype cast (kernel 3) converts
-   `dIndexK_f32` to a BF16 output. Deterministic execution instead uses the
-   fixed-order reduction below to write the requested output dtype directly.
+3. In ordinary execution with a BF16 `d_index_k`, a pure-torch copy (kernel 3)
+   casts `dIndexK_f32` to BF16; an fp32 `d_index_k` is the accumulator itself
+   and needs no kernel 3. On SM100-family GPUs that private BF16-path accumulator
+   is column-permuted, so kernel 2 can issue 16-byte reductions straight from
+   registers without SMEM staging; the same copy restores the natural order.
+   Deterministic execution instead uses the fixed-order reduction below to
+   write the requested output dtype directly.
 
-With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
+`IndexerBackward` / `indexer_backward_wrapper` run on SM90 and on SM100/SM103/SM107
+(SM107 needs a CuTe DSL with the `sm_107a` target).
+`check_support` admits `D == 128`, `block_I == 128`, a positive top-k that is a
+multiple of `block_I` (callers with other logical extents pad the top-k tensors
+with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103/SM107
+additionally require `H in {32, 64}` and SM90 requires `H == 64`. `d_index_q`
+and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
+
+With `deterministic=True` on SM100, SM103 or SM107, kernel 2 launches a fixed producer
 grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
 `deterministic_dk_planes` specialization selects 96, 128, or 148 producer
 planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
@@ -792,24 +853,23 @@ and dW stores remain single-writer.
 
 The plan owns no device memory. For non-deterministic execution, an fp32
 `d_index_k` is the accumulator itself (zeroed on the launch stream inside
-`execute`); a BF16 `d_index_k` accumulates into a `B * S_k * D` fp32 view carved
+`execute`: fused into the score-grad kernel on SM100, a memset on SM90; the
+BF16 scratch is cleared the same way, so callers never pre-zero); a BF16 `d_index_k` accumulates into a `B * S_k * D` fp32 view carved
 from the caller's workspace. `IndexerBackward.scratch_workspace_bytes()` reports
-that ordinary scratch size (0 for fp32 `d_index_k` on the default backend).
+that ordinary scratch size (0 for fp32 `d_index_k`).
 `execute(..., workspace=)` takes the uint8 buffer on `index_q.device`, and a
 missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 `indexer_backward_wrapper` allocates it per call on the launch stream and accepts
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100/SM103, `D == 128`,
-`block_I == 128`, and `topk % 128 == 0` for `128 <= topk <= 2048`. The default
-backend accepts `H in {32, 64}` while `sm100_v2` accepts `H == 64`. Each
-producer CTA owns one plane and processes the fixed row stripe `cta`,
-`cta + num_ctas`, ...; the v2 backend disables its ordinary dynamic ticket
-assignment for this path. The main GEMM therefore retains its existing Tensor
-Core math while dK has a fixed association order across launches. Scratch is
-exactly `ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for
-either backend. It is cleared on the launch stream at every execute, then
+`deterministic=True` is request-or-fail and supports SM100/SM103/SM107, `D == 128`,
+`block_I == 128`, `H in {32, 64}`, and `topk % 128 == 0` for
+`128 <= topk <= 2048`. Each producer CTA owns one plane and processes the fixed
+row stripe `cta`, `cta + num_ctas`, .... The main GEMM therefore retains its
+existing Tensor Core math while dK has a fixed association order across
+launches. Scratch is exactly
+`ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))`. It is cleared on the launch stream at every execute, then
 reduced once in fixed plane order. The live scratch byte range must not overlap
 any input or output; `execute` validates this before clearing the planes, while
 allowing disjoint views of the same allocation. A warmed plan with caller-owned
@@ -850,14 +910,13 @@ the singleton K head and add a batch dimension) together with global Top-K
 indices. FP8, MXFP8, and MXFP4 indexer backward are not currently supported
 because the backward wrapper requires BF16 Q/K/W inputs.
 
-For the default SM100 backend, `topk_indices_global` describes the input
-encoding; it is not a performance-tuning switch. When Gather4 is available,
-local ids are range-checked and converted to flat ids in registers before the
+On SM100, `topk_indices_global` describes the input
+encoding; it is not a performance-tuning switch. Local ids are range-checked and converted to flat ids in registers before the
 same optimized gather path. Do not add a separate `local_to_global_wrapper`
 launch only for Indexer Backward; preserve the producer's id convention and
 set `topk_indices_global` to match it.
 
-The default SM100 backend accepts compact H32 `index_q`, `weights`,
+On SM100, the kernel accepts compact H32 `index_q`, `weights`,
 `d_index_q`, and `d_weights` tensors directly. TCGEN05 still executes its
 minimum M64 tile internally: the upper Q rows and weights are zero-filled, and
 the dQ/dW stores are clipped to the logical H32 extent. Callers must not pad
@@ -870,107 +929,6 @@ counts retain their existing behavior.
 On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate
 conversion solely for Indexer Backward is unlikely to help.
-
-#### SM100-family sparse backward v2 (opt-in)
-
-`backend="sm100_v2"` on `IndexerBackward` / `indexer_backward_wrapper`
-selects an alternative kernel-2 (GEMM stage) implementation. `backend` is a
-string enum, one of `{"default", "sm100_v2"}` (default `"default"`; an
-unknown value raises `ValueError`). The semantics are
-**request-or-fail**: outside the envelope below the wrapper raises
-`ValueError` (or `RuntimeError` outside SM100/SM103) and never silently falls
-back to the default backend.
-
-Start with the default backend when throughput is the goal. Select `sm100_v2` for
-its two-term gradient representation, deterministic `d_weights`, or FP32
-output contract, not as an automatic performance-tuned alternative; benchmark
-the complete wrapper on the target shape when those properties are required.
-
-- **What it computes differently** — weights are upcast to fp32 in-register
-  (exact) and the fp32 per-slot gradient matrix is split into a two-term BF16
-  expansion (`hi + lo`) before the MMAs, so each individual product in the
-  dQ/dK contractions is exact in the fp32 accumulator when it is finite
-  there (~675x lower
-  gradient-matrix representation error than the default single-BF16 rounding,
-  measured as an aggregate over 1e6 random values; individual values gain
-  less when their `lo` term is small). `lo` is ~2^-9 of `hi`, so it starts to
-  underflow for gradient-matrix magnitudes below ~1e-35 (measured 518x at
-  1e-35, 63x at 1e-36, and no advantage left at 1e-38), and the FP32->BF16
-  conversion is non-saturating, so a magnitude at or above BF16's
-  round-to-nearest overflow threshold (`2^128 - 2^119` ~= 3.3962e38, itself
-  above BF16's 3.3895e38 maximum) becomes an infinity in `hi` and the opposite
-  infinity in `lo`, which sum to NaN rather than being clamped. `d_weights` is
-  reduced deterministically — `d_weights` and `d_index_q` are bitwise
-  run-to-run stable. Ordinarily, `d_index_k` stays in the same fp32-atomic
-  summation-order class as the default backend; `deterministic=True` routes
-  those atomics into fixed-owner planes and folds them in a fixed order,
-  making all three gradients bitwise reproducible.
-- **Output dtype selects output precision** — `d_weights` and `d_index_k`
-  accept FP32 buffers, which receive the fp32 accumulators directly; **the
-  headline accuracy gains require caller-supplied FP32 buffers.** The default
-  wrapper-allocated outputs keep the input dtypes (BF16), which rounds the
-  extra accuracy back to the BF16 representation floor (~1.7e-3 relative).
-  FP32 `d_index_k` is zeroed internally (no caller pre-zero contract).
-  `d_index_q` is always BF16.
-- **Envelope** (validated by `check_support` when a plan is created, and
-  re-validated against the real tensors on every execute -- cache hits
-  included -- before any buffer is mutated) —
-  SM100 (10, 0) or SM103 (10, 3); `H == 64`, `D == 128`, `block_I == 128`;
-  `topk % 128 == 0` with `128 <= topk <= 2048`; `sm_scale > 0`; contiguous
-  same-device tensors; `attn_score`/`index_score`/`topk_indices` shaped
-  `(B, S_q, topk)`. `sm_scale` folds into the gradient in kernel 2 while the
-  relu gate reads the *unscaled* score, which is equivalent for any positive
-  scale except at the underflow-to-zero boundary: for a slot whose scaled
-  score `sm_scale * S` rounds to zero the default backend drops the slot and
-  this backend keeps it, and because the gate is a step function that slot's
-  full dQ/dK contribution (`g' * w`, not scaled by `S`) is what differs. The
-  default backend's multiply preserves subnormals, so reaching it takes an
-  exact `sm_scale * S` below `2^-150` (~7.0e-46).
-- **Scratch / workspace behavior** — `attn_score` is consumed in place and left
-  holding kernel 1's `grad_signal`, while `index_score` is read-only and
-  preserved. `sm_scale` folds inside kernel 2 without touching either buffer.
-  The plan owns no workspace: `scratch_workspace_bytes()` is
-  `ws_align(8)` for the dynamic-ticket counter plus, for a BF16 `d_index_k`,
-  the `B * S_k * D` fp32 accumulator (2 MiB = 2,097,152 bytes at B=1,
-  S_k=4096, D=128, growing with `S_k`); both are carved from the buffer passed
-  to `execute(..., workspace=)` — counter first — and zeroed on the launch
-  stream at every execute, so a buffer another engine used in between is
-  fine. The wrapper allocates the workspace per call on the launch stream
-  unless you pass `workspace=`, and still allocates any output buffer you do
-  not pass in.
-  With `deterministic=True`, the dense accumulator and counter region are
-  replaced by `deterministic_dk_planes` FP32 planes regardless of the output
-  dtype; the accepted compile-time values are 96, 128, and 148, and
-  deterministic row ownership does not draw tickets.
-- **Concurrency** — executions that share one workspace buffer must not
-  overlap on the device (ordinary launches would interleave ticket draws;
-  deterministic launches would race on the same dK planes); a plan is bound
-  to no device and no stream, and
-  the workspace must live on `index_q.device` (rejected before `attn_score`
-  is overwritten otherwise). The wrapper's per-call workspace makes its calls
-  independent; it additionally keys its plan cache on the CUDA device and on
-  the **resolved** stream (`stream` when given, otherwise
-  `torch.cuda.current_stream()` at call time), so one cached plan's executes
-  are stream-ordered. `cudaStreamPerThread` is rejected; use a concrete
-  stream for each host thread. Users driving `IndexerBackward`
-  objects directly may share one object across streams and devices as long
-  as each in-flight execute has its own workspace.
-- **Local top-k ids** (`topk_indices_global=False`) are masked against the
-  per-batch `S_k` before the batch offset is applied, in-kernel: ids `< 0` or
-  `>= S_k` contribute nothing and can never alias a neighbouring batch.
-
-```python
-# fp32 output buffers unlock the full accuracy gain
-d_weights = torch.empty(B, S_q, H, dtype=torch.float32, device="cuda")
-d_index_k = torch.empty(B, S_k, D, dtype=torch.float32, device="cuda")
-result = DSA.indexer_backward_wrapper(
-    index_q, weights, index_k,
-    attn_score, index_score, topk_indices,
-    grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128,
-    backend="sm100_v2",
-    d_weights=d_weights, d_index_k=d_index_k,
-)
-```
 
 ### 10. Dense Indexer Backward
 
@@ -986,7 +944,9 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
   - `q_causal_offsets` (optional): same offsets used for the corresponding
     Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
-- **Constraints** — SM90 or SM100+, `H >= 64`, `ratio >= 1`
+- **Constraints** — SM90, SM100, SM103 or SM107, `H == 64`, `ratio >= 1`;
+  SM100-family GPUs accept `D in {64, 128}` and `block_I in {64, 128}`, SM90
+  `D == 128` and `block_I == 128`
 - **Scratch** — the dK reduction targets a pre-zeroed fp32 buffer: an fp32
   `d_index_k` in place, a BF16 `d_index_k` through an fp32 accumulator carved
   from the caller's workspace (`DenseIndexerBackward.scratch_workspace_bytes()`

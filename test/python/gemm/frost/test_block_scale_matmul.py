@@ -3705,11 +3705,10 @@ def test_sm120_fp4_rejects_non_k_major():
 
 
 _SM120_MXFP8 = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3)
+_SM100_BS_128 = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
-@requires_sm120
-@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
-def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+def _check_mxfp8_partial_scale_block_graph_is_declined(config_name, K, a_major, b_major):
     """MXFP8 scales whole 32-element K blocks, yet only the 16-byte TMA rule gated K: K % 16 for
     a K-major fp8 operand, nothing for M-major A with N-major B. A K ending inside a scale block
     planned, and the kernel -- whose F8_128x4 scale-factor view holds floor(K / 32) scales per row
@@ -3717,17 +3716,28 @@ def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
     (audit finding B01: at M = N = 256, K = 144, 54025 of 65536 outputs wrong)."""
     g = _build_nvfp4_graph(256, 256, K, a_major=a_major, b_major=b_major, **_SM120_MXFP8)
     with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
-        jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+        jit_from_cudnn_graph(g, **_kw(config_name))
 
 
 @requires_sm120
-def test_sm120_mxfp8_partial_scale_block_call_is_refused():
+@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
+def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+    _check_mxfp8_partial_scale_block_graph_is_declined(_SM120_BS_128, K, a_major, b_major)
+
+
+@requires_sm100
+@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
+def test_sm100_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+    _check_mxfp8_partial_scale_block_graph_is_declined(_SM100_BS_128, K, a_major, b_major)
+
+
+def _check_mxfp8_partial_scale_block_call_is_refused(config_name):
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
     inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
     M = N = 256
     g = _build_nvfp4_graph(M, N, 160, **_SM120_MXFP8)
     _, binding = analyze_with_binding(g)
-    compiled = jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
     torch.manual_seed(0)
 
     def call(K):
@@ -3758,6 +3768,16 @@ def test_sm120_mxfp8_partial_scale_block_call_is_refused():
     torch.cuda.synchronize()
     assert torch.all(c == 7.0)
     assert dict(compiled.deferrals) == {"partial scale block": 1}
+
+
+@requires_sm120
+def test_sm120_mxfp8_partial_scale_block_call_is_refused():
+    _check_mxfp8_partial_scale_block_call_is_refused(_SM120_BS_128)
+
+
+@requires_sm100
+def test_sm100_mxfp8_partial_scale_block_call_is_refused():
+    _check_mxfp8_partial_scale_block_call_is_refused(_SM100_BS_128)
 
 
 def test_sm120_analyze_graph_declines_signed_negative_scale():

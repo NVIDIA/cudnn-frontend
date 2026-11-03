@@ -37,6 +37,7 @@ from gemm_test_utils import (
     with_static_segmented_capacity as _with_static_segmented_capacity,
     plan_as_sm100,
 )
+from moe_block_scale_test_utils import _COMBOS, _build_graph
 
 from cudnn.gemm.frost.dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 from cudnn.gemm.frost import compiler as C
@@ -621,13 +622,6 @@ def _block_quant_q_atol(scale_dtype) -> float:
     return 1.0 / 512.0 if scale_dtype is torch.float8_e4m3fn else 0.0
 
 
-# combo -> (block_size, data dtype, SF dtype).
-_COMBOS = {
-    "nvfp4": (16, cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3),
-    "mxfp4": (32, cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E8M0),
-    "mxfp8": (32, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0),
-}
-
 _QUANT_CASES = [
     (
         "nvfp4_2cta_e4m3_out_e8m0_scale",
@@ -720,140 +714,6 @@ def _quant_scale_shape(S: int, N: int, reorder: bool) -> tuple[int, int, int]:
     if reorder:
         return (1, _ceil_div(S, 128) * 128, _ceil_div(N // 32, 4) * 4)
     return (1, S, N // 32)
-
-
-def _build_graph(
-    E,
-    S,
-    N,
-    K,
-    num_groups,
-    combo="nvfp4",
-    offset_dt=cudnn.data_type.INT32,
-    quant=False,
-    output_dt=cudnn.data_type.BFLOAT16,
-    reduction_mode=None,
-    reduction_dims=None,
-    reduction_stride=None,
-    reduction_dt=cudnn.data_type.FLOAT,
-    reduction_compute_dt=None,
-    quant_out_dt=cudnn.data_type.FP8_E4M3,
-    quant_scale_dt=cudnn.data_type.FP8_E8M0,
-    quant_scale_reorder=False,
-    quant_scale_dim=None,
-    quant_block_size=32,
-    quant_axis=None,
-    quant_group_offset=False,
-    weight_major="k",
-    a_dt_override=None,
-    b_dt_override=None,
-    dequant_a=True,
-    dequant_b=True,
-    epilogue_relu=False,
-    output_major="n",
-    offset_multiple=1,
-    scatter_top_k=None,
-    combine_top_k=None,
-    gather_rows=None,
-    scale_k=None,
-    negative_scale=(False, False),
-):
-    block_size, default_dt, sf_dt = _COMBOS[combo]
-    a_dt = default_dt if a_dt_override is None else a_dt_override
-    b_dt = default_dt if b_dt_override is None else b_dt_override
-    sf_k = K // block_size if scale_k is None else scale_k
-    g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K] if weight_major == "k" else [K * N, N, 1], data_type=b_dt)
-    sf_pitch = _ceil_div(sf_k, 16) * 16 if gather_rows is not None else sf_k
-    SFA = g.tensor(
-        name="SFA",
-        dim=[1, S, sf_k],
-        stride=[S * sf_pitch, sf_pitch, 1],
-        data_type=sf_dt,
-        reordering_type=cudnn.tensor_reordering.NONE if gather_rows is not None else cudnn.tensor_reordering.F8_128x4,
-    )
-    SFB = g.tensor(
-        name="SFB",
-        dim=[E, sf_k, N],
-        stride=[sf_k * N, 1, sf_k],
-        data_type=sf_dt,
-        reordering_type=cudnn.tensor_reordering.F8_128x4,
-    )
-    fto = g.tensor(
-        name="first_token_offset",
-        dim=[num_groups + 1, 1, 1],
-        stride=[1, 1, 1],
-        data_type=offset_dt,
-    )
-    fto.set_alignment_value(offset_multiple)
-    # ``negative_scale`` = (token side, weight side); None leaves is_negative_scale unset.
-    tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size], is_negative_scale=negative_scale[0] or None) if dequant_a else tok
-    w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1], is_negative_scale=negative_scale[1] or None) if dequant_b else w
-    routing = {}
-    mode = cudnn.moe_grouped_matmul_mode.NONE
-    if gather_rows is not None:
-        mode = cudnn.moe_grouped_matmul_mode.GATHER
-        routing["token_index"] = g.tensor(name="token_index", dim=[1, gather_rows, 1], stride=[gather_rows, 1, 1], data_type=cudnn.data_type.INT32)
-    if scatter_top_k is not None or combine_top_k is not None:
-        mode = cudnn.moe_grouped_matmul_mode.COMBINE if combine_top_k is not None else cudnn.moe_grouped_matmul_mode.SCATTER
-        routing = {
-            "token_index": g.tensor(name="token_index", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32),
-            "token_ks": g.tensor(name="token_ks", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32),
-            "top_k": combine_top_k if combine_top_k is not None else scatter_top_k,
-        }
-        if combine_top_k is not None:
-            count = S // combine_top_k
-            routing["top_k_scores"] = g.tensor(name="scores", dim=[1, count, combine_top_k], stride=[S, combine_top_k, 1], data_type=cudnn.data_type.FLOAT)
-    out = g.moe_grouped_matmul(
-        tok_d,
-        w_d,
-        fto,
-        mode=mode,
-        compute_data_type=cudnn.data_type.FLOAT,
-        name="moe",
-        **routing,
-    )
-    if epilogue_relu:
-        out = g.relu(input=out, name="relu")
-    if reduction_mode is not None:
-        red_kwargs = {}
-        if reduction_compute_dt is not None:
-            red_kwargs["compute_data_type"] = reduction_compute_dt
-        R = g.reduction(input=out, mode=reduction_mode, name="red", **red_kwargs)
-        assert reduction_dims is not None
-        stride = reduction_stride
-        if stride is None:
-            stride = (
-                reduction_dims[1] * reduction_dims[2],
-                reduction_dims[2],
-                1,
-            )
-        R.set_dim(list(reduction_dims)).set_stride(list(stride))
-        R.set_output(True).set_data_type(reduction_dt)
-    if quant:
-        quant_kwargs = {"input": out, "block_size": quant_block_size, "name": "q"}
-        if quant_axis is not None:
-            quant_kwargs["axis"] = quant_axis
-        if quant_group_offset:
-            quant_kwargs["group_offset"] = fto
-        q, q_scale = g.block_scale_quantize(**quant_kwargs)
-        q.set_data_type(quant_out_dt).set_output(True)
-        if quant_scale_dim is not None:
-            q_scale.set_dim(list(quant_scale_dim)).set_stride([quant_scale_dim[1] * quant_scale_dim[2], quant_scale_dim[2], 1])
-        q_scale.set_data_type(quant_scale_dt).set_output(True)
-        if quant_scale_reorder:
-            q_scale.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
-        return g
-    out.set_data_type(output_dt).set_output(True)
-    if output_major == "m":
-        ldm = _ceil_div(gather_rows if gather_rows is not None else S, 8) * 8  # Align BF16 column strides independently of S.
-        out.set_stride([ldm * N, 1, ldm])
-    return g
 
 
 # --------------------------------------------------------------------------- #
@@ -2843,6 +2703,7 @@ _SM120_BS_CFGS = [
     "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
 ]
 _SM120_BS_CFG = _SM120_BS_CFGS[0]
+_SM100_BS_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
 def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> None:
@@ -3099,6 +2960,7 @@ def test_sm120_moe_block_scale_declines_signed_negative_scale() -> None:
     engine.check_support(_build_graph(2, 512, 256, 512, num_groups=2, combo="mxfp4", negative_scale=(True, True)))
 
 
+@requires_sm120
 @pytest.mark.parametrize("public", [False, True], ids=["jit", "knob_replay"])
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["fwd", "swap_ab"])
 @pytest.mark.parametrize("config_name", [_SM120_BS_512x16, _SM120_BS_32x384], ids=["m512", "n384"])
@@ -3301,10 +3163,7 @@ def test_e2e_auto_config_sm120() -> None:
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
-@requires_sm120
-@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-@pytest.mark.parametrize("mode", ["none", "gather"])
-def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+def _check_moe_mxfp8_partial_scale_block_graph_is_declined(config_name, mode, swap_ab):
     """MXFP8 scales whole 32-element K blocks, but the token's 16-byte TMA rule only needs
     K % 16. Both orientations size the F8_128x4 scale-factor views from floor(K / 32) scales per
     row, so at K = 144 the last K tile read zero-filled scales and every 128-row SF block past the
@@ -3315,17 +3174,29 @@ def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) ->
     else:
         g = _build_graph(2, 256, 256, 144, 2, combo="mxfp8")
     with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
-        _plan(g, config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+        _plan(g, config=by_name(config_name), swap_ab=swap_ab)
 
 
 @requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+@pytest.mark.parametrize("mode", ["none", "gather"])
+def test_sm120_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_graph_is_declined(_SM120_BS_CFG, mode, swap_ab)
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+@pytest.mark.parametrize("mode", ["none", "gather"])
+def test_sm100_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_graph_is_declined(_SM100_BS_CFG, mode, swap_ab)
+
+
+def _check_moe_mxfp8_partial_scale_block_call_is_refused(config_name, swap_ab):
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
     inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
     E, S, N = 2, 256, 256
     offsets_list = [0, 128, S]
-    compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(_SM120_BS_CFG), swap_ab=swap_ab)
+    compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(config_name), swap_ab=swap_ab)
     torch.manual_seed(0)
 
     def call(K):
@@ -3355,3 +3226,15 @@ def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
         compiled(vp)
     torch.cuda.synchronize()
     assert torch.all(out == 7.0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM120_BS_CFG, swap_ab)
+
+
+@requires_sm100
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
+def test_sm100_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
+    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM100_BS_CFG, swap_ab)

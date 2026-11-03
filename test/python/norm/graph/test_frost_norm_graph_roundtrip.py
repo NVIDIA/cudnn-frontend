@@ -87,7 +87,7 @@ def _close(label, name, got, ref):
     _expect(ok, f"{label}: {name} matches PyTorch (rel {rel:.2e})")
 
 
-def _forward(handle, B, S, D, dtype):
+def _forward(handle, B, S, D, dtype, use_uids=False):
     label = f"LN fwd {B}x{S}x{D} {str(dtype).replace('torch.', '')}"
     print(f"\n=== {label} ===")
     torch.manual_seed(0)
@@ -97,7 +97,7 @@ def _forward(handle, B, S, D, dtype):
     eps_cpu = torch.full((1, 1, 1), 1e-5, device="cpu", dtype=torch.float32)
 
     g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
-    X = g.tensor(name="X", dim=x.size(), stride=x.stride(), data_type=x.dtype)
+    X = g.tensor(name="X", dim=x.size(), stride=x.stride(), data_type=x.dtype, uid=0)
     SC = g.tensor(name="scale", dim=sc.size(), stride=sc.stride(), data_type=sc.dtype)
     BI = g.tensor(name="bias", dim=bi.size(), stride=bi.stride(), data_type=bi.dtype)
     EP = g.tensor_like(eps_cpu, name="epsilon")
@@ -111,7 +111,8 @@ def _forward(handle, B, S, D, dtype):
         return
     y, mean, ivar = _nan((B, S, D), dtype), _nan(stats, torch.float32), _nan(stats, torch.float32)
     ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
-    g.execute({X: x, SC: sc, BI: bi, EP: eps_cpu, Y: y, MEAN: mean, IVAR: ivar}, ws, handle=handle)
+    bindings = {X: x, SC: sc, BI: bi, EP: eps_cpu, Y: y, MEAN: mean, IVAR: ivar}
+    g.execute({t.get_uid(): buf for t, buf in bindings.items()} if use_uids else bindings, ws, handle=handle)
     torch.cuda.synchronize()
 
     _check_written(label, y=y, mean=mean, inv_variance=ivar)
@@ -121,7 +122,7 @@ def _forward(handle, B, S, D, dtype):
     _close(label, "inv_variance", ivar, torch.rsqrt(x.float().var(-1, keepdim=True, correction=0) + 1e-5))
 
 
-def _backward(handle, B, S, D, dtype):
+def _backward(handle, B, S, D, dtype, use_uids=False):
     label = f"LN bwd {B}x{S}x{D} {str(dtype).replace('torch.', '')}"
     print(f"\n=== {label} ===")
     torch.manual_seed(0)
@@ -141,7 +142,7 @@ def _backward(handle, B, S, D, dtype):
     dy = torch.autograd.grad(loss, yv, retain_graph=True)[0].to(dtype)
 
     g = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
-    X = g.tensor(name="X", dim=x.size(), stride=x.stride(), data_type=x.dtype)
+    X = g.tensor(name="X", dim=x.size(), stride=x.stride(), data_type=x.dtype, uid=0)
     DY = g.tensor(name="grad", dim=dy.size(), stride=dy.stride(), data_type=dy.dtype)
     SC = g.tensor(name="scale", dim=sc.size(), stride=sc.stride(), data_type=sc.dtype)
     MN = g.tensor(name="mean", dim=mean.size(), stride=mean.stride(), data_type=mean.dtype)
@@ -155,7 +156,8 @@ def _backward(handle, B, S, D, dtype):
         return
     dx, ds, db = _nan((B, S, D), dtype), _nan((1, 1, D), torch.float32), _nan((1, 1, D), torch.float32)
     ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
-    g.execute({X: x, DY: dy, SC: sc, MN: mean, IV: ivar, DX: dx, DS: ds, DB: db}, ws, handle=handle)
+    bindings = {X: x, DY: dy, SC: sc, MN: mean, IV: ivar, DX: dx, DS: ds, DB: db}
+    g.execute({t.get_uid(): buf for t, buf in bindings.items()} if use_uids else bindings, ws, handle=handle)
     torch.cuda.synchronize()
 
     # DBias is the one that regressed: has_beta was read off the bias INPUT, which
@@ -168,13 +170,13 @@ def _backward(handle, B, S, D, dtype):
     _close(label, "dbias", db.reshape(-1), rdb)
 
 
-def main():
+def main(use_uids=False):
     assert torch.cuda.is_available(), "CUDA required"
     handle = cudnn.create_handle()
     cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
     for dtype in (torch.bfloat16, torch.float32):
-        _forward(handle, 8, 128, 1024, dtype)
-        _backward(handle, 8, 128, 1024, dtype)
+        _forward(handle, 8, 128, 1024, dtype, use_uids)
+        _backward(handle, 8, 128, 1024, dtype, use_uids)
     print("\n" + ("ALL PASS" if _OK else "SOME FAILED"))
     raise SystemExit(0 if _OK else 1)
 
@@ -184,13 +186,14 @@ if __name__ == "__main__":
 
 
 @pytest.mark.L0
-def test_frost_norm_graph_roundtrip():
-    """pytest entry point; this module also runs standalone via ``__main__``."""
+@pytest.mark.parametrize("use_uids", [False, True], ids=["tensor_keys", "uid_keys"])
+def test_frost_norm_graph_roundtrip(use_uids):
+    """UID zero binds the same buffers through tensor and integer keys."""
     from norm_test_utils import frost_norm_rows_offered_here
 
     if not torch.cuda.is_available() or not frost_norm_rows_offered_here():
         pytest.skip("no norm engine row on offer serves this device")
     try:
-        main()
+        main(use_uids)
     except SystemExit as exc:
         assert not exc.code, "checks failed -- see captured stdout"

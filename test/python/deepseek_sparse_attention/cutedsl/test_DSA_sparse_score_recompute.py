@@ -56,9 +56,9 @@ def _local_to_global_topk_indices(topk_indices: torch.Tensor, seqlen_k: int) -> 
 @pytest.mark.parametrize("has_topk_length", [False, True])
 @pytest.mark.parametrize("use_global", [False, True])
 def test_sparse_attn_sm100_tiles_match_reference(num_heads, head_dim, topk, has_topk_length, use_global):
-    from deepseek_sparse_attention.cutedsl.dsa_utils import _require_exact_sm100
+    from deepseek_sparse_attention.cutedsl.dsa_utils import _require_sm100_family
 
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn import DSA
 
     cfg = {"b": 2, "s_q": 32, "s_kv": 2048, "head_dim": head_dim, "qhead_per_kv_head": num_heads, "topk": topk}

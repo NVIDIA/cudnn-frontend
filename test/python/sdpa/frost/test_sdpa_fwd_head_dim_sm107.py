@@ -12,8 +12,8 @@ swizzle atoms, the TMA iteration counts, the TMEM O slot width, the BMM1 k-step 
 ``_validate_head_dim_tile``; the d128 rendering is byte-identical to the one-geometry file (``test_sdpa_fwd_score_stats.py``
 holds the cubin md5 records).
 
-D32 carries dense plans. D64 also carries nonpaged, unsplit THD and PackGQA.
-Split-KV and score side outputs use a larger flavor; a cga2 request at D <= 32
+D32 carries dense plans. D64 also carries nonpaged, unsplit THD, PackGQA and dense split-KV.
+Score side outputs use a larger flavor; a cga2 request at D <= 32
 uses the 64-wide tile. THD requires exact native dimensions, and paged D64 THD
 remains declined.
 
@@ -25,7 +25,7 @@ trace-compile of each new rendering keeps the register split (``USETMAXREG`` > 0
 the same mask arm; (3) GPU cells on a Rubin device -- the fp64 oracle over the degenerate-input matrix (the shared ``small_tile_cells``,
 one matrix for both arch lines) on the 32- and 64-wide tiles in bf16 with the fp16 member on the degenerate trio, one accept cell at
 D = 16 and at D = 56, the bitwise pin D = 8 / 24 vs an explicitly zero-padded D = 32 (40 / 48 vs 64: the zero-fill contract, one
-TMA mechanism), the d64 tile at cga2, the routed legs (split-KV and the score outputs at D = 24 / 64 on the d128 flavor, cga2 at
+TMA mechanism), the d64 tile at cga2, the routed legs (split-KV on D64 and score outputs on D128, cga2 at
 D = 24 / 32 on the 64-wide tile -- bitwise the zero-padded D = 64 cga2 run), optional and base-2 Stats.  A D = 24 cell that
 completes under the runner's timeout IS the expect_tx pin: a byte count short of the full box would hang the consumer on the
 first tile.  The d128 geometry of the same file is byte-pinned to its one-geometry past (``test_sdpa_fwd_score_stats.py``), so
@@ -167,8 +167,8 @@ def test_row_serves_the_dense_leg_on_the_small_tiles():
 # (a cga2 request at D <= 32 lands on the smallest covering tile validated at cga2); None = a typed decline that predates the
 # tiles (THD / paged KV are exact-shape legs, Rubin half PackGQA needs paged KV or a D128 packed split) -- the decline's words.
 _LEGS = (
-    ("split-KV", dict(), dict(split_kv=2), dict(split_kv=2), {8: 128, 24: 128, 32: 128, 48: 128, 64: 128, 128: 128}),
-    ("split-KV", dict(), dict(split_kv=2, cga=2), dict(split_kv=2, cga=2), {8: 128, 24: 128, 32: 128, 48: 128, 64: 128, 128: 128}),
+    ("split-KV", dict(), dict(split_kv=2), dict(split_kv=2), {8: 64, 24: 64, 32: 64, 48: 64, 64: 64, 128: 128}),
+    ("split-KV", dict(), dict(split_kv=2, cga=2), dict(split_kv=2, cga=2), {8: 64, 24: 64, 32: 64, 48: 64, 64: 64, 128: 128}),
     ("score side outputs", dict(has_score_max=True, has_score_sum_exp=True), None, dict(score=True), {8: 128, 24: 128, 32: 128, 48: 128, 64: 128, 128: 128}),
     (
         "score side outputs",
@@ -192,7 +192,7 @@ _DECLINE_WORDS = {"THD": "THD", "PackGQA": "PackGQA", None: "cga"}
 def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     """Graph, adapter and config agree on each tile's native feature domain.
 
-    D64 carries THD and PackGQA; split and score outputs use D128. Combined THD
+    D64 carries THD, PackGQA and dense splitting; score outputs use D128. Combined THD
     and paged requests remain declined, and D32 retains its dense-only domain.
     """
     from cudnn.sdpa.fwd import engines, heuristics
@@ -202,7 +202,7 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     caps = _caps()
     spec = {s.name: s for s in engines.ENGINE_SPECS}[_ROW]
     assert caps.dense_only_d_shapes == frozenset({(32, 32)})
-    assert dict(caps.native_legs_by_d_shape)[(64, 64)] == frozenset({"THD", "PackGQA"})
+    assert dict(caps.native_legs_by_d_shape)[(64, 64)] == frozenset({"THD", "PackGQA", "split-KV"})
     assert sm107_small_tile_leg() is None and sm107_small_tile_leg(split_kv=1, pack_gqa=False) is None
     for kw, name in (
         (dict(thd=True), "THD"),
@@ -248,9 +248,9 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     f24 = _facts(d_qk=24, d_v=24)
     assert engines.effective_cgas(caps, f24) == frozenset({1}), "the auto domain at D <= 32 is the 32-wide tile's"
     assert engines.effective_cgas(caps, f24, None, 2) == frozenset({1, 2}), "a cga2 request lands on the 64-wide tile"
-    # a split graph lands on the d128 flavor, whose two tiles both split on cc 10.7 (the shared decode tile at cga1 too)
-    assert engines.effective_cgas(caps, f24, 2) == frozenset({1, 2}), "a split graph lands on the d128 flavor"
-    assert heuristics._auto_sched_cga(spec, f24, split_kv=2, sched_policy=0) == (0, 2)
+    # A dense split graph uses native D64 with either CTA width.
+    assert engines.effective_cgas(caps, f24, 2) == frozenset({1, 2}), "a split graph lands on the native D64 flavor"
+    assert heuristics._auto_sched_cga(spec, f24, split_kv=2, sched_policy=0) == (0, 1)
     assert heuristics._auto_sched_cga(spec, _facts(d_qk=24, d_v=24, has_score_max=True, has_score_sum_exp=True), split_kv=1, sched_policy=0) == (0, 2)
     # a cga nobody serves is still a typed decline naming the domain of the flavor it would land on
     why = engines.mismatch(caps, f24, SdpaFwdKnobs(cga=3))
@@ -269,6 +269,29 @@ def test_partial_pack_checks_the_selected_native_tile(d_qk, d_v, cga):
     knobs = engines.SdpaFwdKnobs(pack_gqa=True, cga=cga)
     assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
     assert engines.mismatch(caps, facts, knobs) is None
+
+
+@requires_sm107_dsl
+@pytest.mark.parametrize("cga", [1, 2])
+@pytest.mark.parametrize("packed", [False, True])
+def test_native_d64_split_retains_thd_and_paged_boundaries(cga, packed):
+    from cudnn.sdpa.fwd import config_sm107 as cfg, engines
+
+    caps = _caps()
+    knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=8, pack_gqa=packed)
+    facts = _facts(d_qk=64, d_v=64, h_q=24, h_kv=2, has_sink=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
+    for changed in (dict(thd=True, padded=True), dict(has_paged_kv=True, page_size=16), dict(attn_scale_prefolded=True, thd=True, padded=True)):
+        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None
+    params = cfg.TemplateParams(dtype_qkv=2, d_flavor=64, cta_mma=cga, split_kv=8, pack_gqa=packed, qh_per_kh=12)
+    native, _ = cfg.make_cfg_d64(params)
+    assert native.SPLIT_KV == 8 and native.TILE_K == native.TILE_O == 64
+    api = _api(64, h=24, h_kv=2, cga=cga, split_kv=8, pack_gqa=packed)
+    assert api.check_support() and api._fp32_partial_split()
+    assert api._partial_torch_dtype() == torch.float32
+    with pytest.raises(ValueError, match="native THD split"):
+        cfg.make_cfg_d64(dataclasses.replace(params, thd_varlen=True, seq_kv_lens_present=True))
 
 
 def test_one_constant_feeds_the_row_the_adapter_and_the_factory():
@@ -377,7 +400,7 @@ def test_loader_binds_the_flavor_to_the_record():
         )
         assert mod.LAYOUT.TOTAL_COLS == 576 and mod.DESC_VERSION == 0 and mod.SPIN_RING_WAITS is True
         assert f"d{width}" in mod.__name__, mod.__name__
-        assert sorted(mod._MAKE_CFG) == [32, 64, 128]
+        assert sorted(mod._MAKE_CFG) == [32, 64, 128, 192]
 
 
 def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
@@ -462,7 +485,7 @@ def test_expect_tx_is_the_full_box_and_every_box_is_the_tile():
                         assert env["K_BOXES"] == env["V_BOXES"] == 1
     for bad in (r"TransactionBytes\s*=.*\bd_(qk|v)\b", r"box_[qkvo]\s*=.*\bd_(qk|v)\b", r"BufferElems\s*=.*\bd_(qk|v)\b"):
         assert not re.search(bad, code), bad
-    assert "_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}" in code
+    assert "_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192_paged}" in code
     assert "d128_family_tmem_layout(CFG)" in code and not re.search(r"^\s*(S1|O0|O1|STATS)_OFF: int = \d+\s*$", code, re.M), "no TMEM literal survives"
     assert re.search(r"CHUNK = CFG\.BMM2_CHUNK_SIZE", code) and not re.search(r"^\s*CHUNK = 64\s*$", code, re.M)
 
@@ -512,10 +535,10 @@ def test_adapter_check_support_twins_and_record():
     assert api.check_support() and api.template_params().cta_mma == 2
     api = _api(24, cga=2)
     assert api.check_support() and api.flavor == (64, 64) and api.template_params().cta_mma == 2 and api.template_params().d_flavor == 64
-    for kw in (dict(split_kv=2), dict(score=True), dict(split_kv=2, cga=2)):
+    for kw, width, cga in ((dict(split_kv=2), 64, 1), (dict(score=True), 128, 2), (dict(split_kv=2, cga=2), 64, 2)):
         api = _api(24, **kw)
-        assert api.check_support() and api.flavor == (128, 128), (kw, api.flavor)
-        assert api.template_params().d_flavor == 128 and api.template_params().cta_mma == 2, kw
+        assert api.check_support() and api.flavor == (width, width), (kw, api.flavor)
+        assert api.template_params().d_flavor == width and api.template_params().cta_mma == cga, kw
     with pytest.raises((ValueError, NotImplementedError), match="THD"):
         _api(24, thd=True).check_support()
     with pytest.raises((ValueError, NotImplementedError)):
@@ -627,12 +650,8 @@ _SPLIT_CELLS = [("dense_nkv2", 24), ("dense_nkv8_1024", 64)]
 
 @requires_rubin
 @pytest.mark.parametrize("case, d", _SPLIT_CELLS, ids=[f"{c}-{d}" for c, d in _SPLIT_CELLS])
-def test_split_kv_at_small_d_rides_the_d128_flavor(case, d):
-    """A split_kv = 2 request at D <= 64 -- the pre-tile autotune record {TILE_CGA_M: 2, SPLIT_KV: 2} -- is SERVED on the d128 flavor
-    the graph rode before the small tiles (only that flavor admits cga2 with a split at D <= 64; the small tiles carry the dense leg
-    only) and matches the oracle and the unsplit small-tile run.  Dense, sink-free, tile-multiple S: the split leg's own envelope
-    (padded / synthesized-tail graphs are its typed declines on every flavor).  The routing is the claim; the split body's own oracle
-    is the pre-existing d128 suite's."""
+def test_split_kv_at_small_d_rides_the_native_d64_flavor(case, d):
+    """Persisted small-D split knobs run native D64 and match the unsplit reference."""
     q, k, v, kw, ref = case_inputs(case, d, torch.bfloat16)
     out = _run(q, k, v, split_kv=2, cga=2, **kw)
     assert out["knobs"].split_kv == 2 and out["knobs"].cga == 2, out["knobs"]

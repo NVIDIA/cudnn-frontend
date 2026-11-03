@@ -18,19 +18,19 @@ def _require_half_arch():
         pytest.skip("SM100/SM103/SM107 half native stride path")
 
 
-def _case(d=128, dv=128, dtype=torch.bfloat16, padded_roles=("q", "k", "v", "o"), split=1, b=2):
+def _case(d=128, dv=128, dtype=torch.bfloat16, padded_roles=("q", "k", "v", "o"), split=1, b=2, q_seq=17):
     _require_half_arch()
     if torch.cuda.get_device_capability() == (10, 7) and split > 1:
         pytest.skip("SM107 half split-KV remains unsupported")
     torch.manual_seed(751)
     tensors, storage = {}, {}
-    for role, heads, seq, dim in (("q", 4, 17, d), ("k", 2, 128, d), ("v", 2, 128, dv), ("o", 4, 17, dv)):
+    for role, heads, seq, dim in (("q", 4, q_seq, d), ("k", 2, 128, d), ("v", 2, 128, dv), ("o", 4, q_seq, dv)):
         raw = (torch.randn(b, seq, heads, dim + 8 * (role in padded_roles), device="cuda") * 0.2).to(dtype)
         if role == "o":
             raw.fill_(11)
         storage[role] = raw
         tensors[role] = raw[..., :dim].transpose(1, 2)
-    tensors["lse"] = torch.empty((b, 4, 17), device="cuda")
+    tensors["lse"] = torch.empty((b, 4, q_seq), device="cuda")
     api = SdpaFwdDslSm100(**{"sample_" + n: t for n, t in tensors.items()}, split_kv=split)
     assert api.check_support()
     return api, tensors, storage
@@ -214,7 +214,7 @@ def test_half_native_physical_wide_stride(d, role, product):
 
 
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
-def test_half_native_artifact_reloads_without_jit(d, dv, tmp_path):
+def test_half_native_artifact_reloads_without_jit(d, dv, tmp_path, q_seq=17):
     _require_half_arch()  # Module pytestmarks do not follow re-exported test methods.
     import json
     import os
@@ -229,7 +229,7 @@ from pathlib import Path
 import torch, cudnn
 import cutlass.cute as cute
 from cudnn.frost import compiled_cache
-folder, package, d, dv, reload = sys.argv[1:]
+folder, package, d, dv, reload, q_seq = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [folder, str(Path(folder).parents[1])]
 from native_forward_half_cases import _case, _execute, _check
@@ -237,9 +237,11 @@ if reload == "1":
     def forbidden(*args, **kwargs):
         raise AssertionError("reloaded native artifact invoked JIT")
     cute.compile = forbidden
-api, tensors, storage = _case(int(d), int(dv))
+api, tensors, storage = _case(int(d), int(dv), q_seq=int(q_seq))
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 api.compile()
+if int(q_seq) > 32 and int(d) == 256:
+    assert Path(api._k_mod.__file__).name == "prefill_d256_f16.py", api._k_mod.__file__
 owner = api._dense_spec.owner
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")
@@ -263,7 +265,7 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     results = []
     for reload in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(d), str(dv), str(reload)],
+            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(d), str(dv), str(reload), str(q_seq)],
             env=env,
             cwd=tmp_path,
             capture_output=True,
@@ -276,6 +278,11 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     assert first["stats"]["misses"] > 0 and first["stats"]["hits"] == 0, first
     assert second["stats"]["misses"] == 0 and second["stats"]["hits"] > 0, second
     assert first["digest"] == second["digest"]
+
+
+def test_half_native_prefill_artifact_reloads_without_jit(tmp_path):
+    # The short-Q D256 fixture selects decode; cover the separate prefill host.
+    test_half_native_artifact_reloads_without_jit(256, 256, tmp_path, q_seq=129)
 
 
 @pytest.mark.parametrize("split", [1, 2])

@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import attention_backward_reference
+from block_sparse_attention.cutedsl.bsa_utils import require_arch
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -76,8 +77,7 @@ def _load_delayed_kernel(kernel, tmp_path, monkeypatch):
 
 @pytest.fixture(params=[False, True], ids=["normal", "first_read_delay"])
 def sm90_bsa(request, tmp_path, monkeypatch):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("shared-V lifetime regression is specific to SM90")
+    require_arch(families=(9,), reason="shared-V lifetime regression is specific to SM90")
     try:
         from cudnn import BSA
 

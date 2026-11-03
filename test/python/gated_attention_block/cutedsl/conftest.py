@@ -25,7 +25,7 @@ def _frost_opt_in(monkeypatch):
 
 def _dense_serving_ccs():
     """The parts the block's dense bf16 / f16 forms are served on -- ONE definition, the api's (``DENSE_SERVING_CCS``: cc 10.7 and, since
-    2026-10-29, cc 10.0); read lazily so collecting this directory never imports the package before a module asks for it."""
+    2026-10-29, cc 10.0, and since 2026-10-31, cc 10.3); read lazily so collecting this directory never imports the package before a module asks for it."""
     from cudnn.gated_attention_block import DENSE_SERVING_CCS
 
     return tuple(tuple(int(x) for x in cc) for cc in DENSE_SERVING_CCS)
@@ -40,7 +40,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "requires_blackwell: gated_attention_block ACCEPT test of the dense bf16 / f16 serving forms on a Blackwell-line part the block "
-        "admits (a cc of DENSE_SERVING_CCS other than SM107: cc 10.0 today); skipped everywhere else -- the cc 10.0 accept rows CI runs",
+        "admits (a cc of DENSE_SERVING_CCS other than SM107: cc 10.0 and cc 10.3); skipped everywhere else -- the SM100-line accept rows",
     )
     config.addinivalue_line(
         "markers",
@@ -52,7 +52,7 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     """The hoisted markers of this suite: ``@pytest.mark.requires_rubin`` on an accept test skips it wherever the device is
     not SM107; ``@pytest.mark.requires_blackwell`` (2026-10-29) skips wherever the device is not an admitted Blackwell-line part
-    of ``DENSE_SERVING_CCS`` (cc 10.0 today: the dense bf16 / f16 forms' accept rows there); ``@pytest.mark.requires_dense_part``
+    of ``DENSE_SERVING_CCS`` (cc 10.0 and cc 10.3: the dense bf16 / f16 forms' accept rows there); ``@pytest.mark.requires_dense_part``
     skips wherever the device is not in ``DENSE_SERVING_CCS`` at all (the cells both parts run).
 
     The older modules each re-define ``requires_rubin = pytest.mark.skipif(_cc() != _SM107, ...)`` at module

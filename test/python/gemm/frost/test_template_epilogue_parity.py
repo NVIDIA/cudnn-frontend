@@ -45,18 +45,26 @@ _BS_2 = [
     ("sm100_block_scale_matmul.py", 2),
     ("sm103_block_scale_matmul.py", 2),
 ]
-_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1)]
-_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2)]
+_MOE_PLAIN_1 = [("sm100_moe_grouped_matmul_fwd.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 1)]
+_MOE_PLAIN_2 = [("sm100_moe_grouped_matmul_fwd.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode.py", 2)]
 _MOE_BS_1 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 1),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 1),
 ]
 _MOE_BS_2 = [
     ("sm100_moe_grouped_block_scale_matmul_fwd.py", 2),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode.py", 2),
 ]
-_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1)]
-_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2)]
-_MOE_SWAP_1 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1)]
-_MOE_SWAP_2 = [("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2)]
+_MOE_PLAIN_SWAP_1 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 1), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 1)]
+_MOE_PLAIN_SWAP_2 = [("sm100_moe_grouped_matmul_fwd_swap_ab.py", 2), ("sm100_moe_grouped_matmul_fwd_gather_mode_swap_ab.py", 2)]
+_MOE_SWAP_1 = [
+    ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 1),
+]
+_MOE_SWAP_2 = [
+    ("sm100_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 2),
+    ("sm100_moe_grouped_block_scale_matmul_fwd_gather_mode_swap_ab.py", 2),
+]
 
 # sm120 is warp-scoped MMA: the accumulators are already in registers, so there
 # is no LDTM shape, no TMEM row base and no span list to share -- and its store
@@ -361,8 +369,9 @@ def test_l2_identity_fastpath_is_compile_time_and_used_by_every_mixed_cga_call()
                 offenders.append(f"{path.name}: MoE must keep its separate swizzle path")
             continue
 
-        # Dense block-scale's MMA warp tracks the raster for SFB sub-tiles too.
-        expected_count = 4 if path.name.startswith("sm103_") or path.name == "sm100_block_scale_matmul.py" else 3
+        # Dense block-scale's MMA warp tracks SFB sub-tiles; indexed mainloop
+        # transforms also track their own raster in addition to TMA/epilogue.
+        expected_count = 4 if path.name.startswith("sm103_") or path.name in {"sm100_block_scale_matmul.py", "sm100_matmul_mainloop.py"} else 3
         if len(calls) != expected_count:
             offenders.append(f"{path.name} (cta_group={cta_group}): expected {expected_count} L2-swizzle calls, found {len(calls)}")
         for call in calls:
@@ -728,6 +737,10 @@ def test_mixed_cga_uses_host_constant_masks_and_shifts_at_every_use_site():
                 if index < 2:
                     if target.startswith("init_"):
                         source = "bidx" if axis == "m" else "bidy"
+                    elif target.startswith("ml_"):
+                        # The mainloop consumes its own CLC response, not the
+                        # TMA/epilogue warps' m_idx/n_idx bindings.
+                        source = "_m_idx" if axis == "m" else "_n_idx"
                     else:
                         source = "m_idx" if axis == "m" else "n_idx"
                 else:

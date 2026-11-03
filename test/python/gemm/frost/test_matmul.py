@@ -2932,12 +2932,13 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
 
     from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
     from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.kernel_registry import TEMPLATES
     from cudnn.gemm.frost.tile_config import by_name
 
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
     files = template_files()
-    assert len(files) == 14, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    assert {p.name for p in files} == {template.file for template in TEMPLATES}
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
@@ -3624,6 +3625,7 @@ def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> N
     )
 
 
+@requires_sm120
 @pytest.mark.parametrize(
     "axis,swap_ab,build_m,call_m,call_n",
     [(-1, False, 256, 200, 256), (-1, False, 200, 256, 256), (1, False, 256, 224, 256), (-1, True, 256, 256, 224)],
@@ -3755,6 +3757,7 @@ def test_sm120_render_smoke() -> None:
                 assert f"b_is_n_major = {b_major == 'n'}" in src, combo
 
 
+@requires_sm120
 @pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
 def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     """An F8_128x4 quant-scale row holds roundup(blocks, 4) slots. A block-scaled

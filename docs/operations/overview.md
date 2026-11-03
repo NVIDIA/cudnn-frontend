@@ -30,7 +30,7 @@ The experimental API catalog includes:
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
-- [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) and write-through into a paged KV cache
+- [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) with the in-block indexer's decode and extend steps over the paged side caches, and write-through into a paged KV cache
 - [Triangle Multiplicative Update (SM100 / SM103 / SM107)](/operations/Matmul/triangle_multiplicative_update) — the AlphaFold-class outgoing / incoming triangle multiplication as three FROST launches behind cuEquivariance's `triangle_multiplicative_update` signature (bf16)
 - [Triangle Attention (SM107)](/operations/Attention/triangle_attention) — the AlphaFold-class attention with a pair bias and a key mask (right-padded lengths or a dense boolean mask) on the FROST SDPA engine behind cuEquivariance's `triangle_attention` signature (bf16 / fp16, D &lt;= 64)
 - [Tail RoPE + Microscaled QDQ](/operations/RoPE/rope-qdq)

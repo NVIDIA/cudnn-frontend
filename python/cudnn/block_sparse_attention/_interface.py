@@ -75,6 +75,7 @@ except ImportError as exc:
         ) from _SM100_BLK128_BWD_IMPORT_ERROR
 
 
+from cudnn.block_sparse_attention.csrc.bwd.sm90_blk64.bsa_bwd_sm90_paired import MixedKvBackwardSm90
 from cudnn.block_sparse_attention.csrc.bwd.sm90_blk64.bsa_bwd_sm90 import (
     BlockSparseAttnBackwardSm90Blk64,
     SM90_BWD_HEAD_DIM,
@@ -155,10 +156,10 @@ def _bshd_tma_compatible(t: torch.Tensor) -> bool:
 # The paired-KV backward rebuilds its pairing metadata on every call and splits each KV block's edges between two
 # kernels that share an FP32 dK/dV workspace. Below this many (batch, head, KV block) tasks that fixed cost is not
 # recovered (measured 1.33-1.38x slower on 4K/1K-token problems); production-scale masks start well above it.
-_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS = 1024
+_BLK64_PAIRED_KV_MIN_KV_TASKS = 1024
 
 
-def _sm100_blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Optional[torch.Tensor], num_kv_blocks: int, pair_bytes: int) -> bool:
+def _blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Optional[torch.Tensor], num_kv_blocks: int, pair_bytes: int) -> bool:
     """Paired KV needs variable-count metadata it can rewrite, and enough KV tasks to amortize building it."""
     batch, heads = q2k_block_index.shape[:2]
     return (
@@ -167,7 +168,7 @@ def _sm100_blk64_use_paired_kv(q2k_block_index: torch.Tensor, q2k_block_nums: Op
         and q2k_block_index.is_contiguous()
         and q2k_block_nums.is_contiguous()
         and pair_bytes <= 64 * 1024 * 1024
-        and batch * heads * num_kv_blocks >= _SM100_BLK64_PAIRED_KV_MIN_KV_TASKS
+        and batch * heads * num_kv_blocks >= _BLK64_PAIRED_KV_MIN_KV_TASKS
     )
 
 
@@ -312,6 +313,15 @@ def _sm100_blk64_requires_int64_kv_strides(
         if rank6_shape[5] > 1 and batch_stride >= coord_stride_limit:
             return True
     return False
+
+
+def _sm100_blk64_require_int32_sage_q_strides(q: torch.Tensor) -> None:
+    """Decline a Sage FP8 Q whose batch stride does not fit the Int32 stride leaf.
+
+    The Sage Q view takes Int32 strides (there is no Int64 variant like K/V's exact layout) and
+    `_validate_sm100_blk64_int32_bounds` skips stride(0), so a batch stride >= 2**31 elements would silently truncate.
+    """
+    _sm100_blk64_require_int32("sage_fp8 q.stride(0)", q.stride(0))
 
 
 def _sm100_blk64_has_partial_kv_tail(
@@ -712,19 +722,23 @@ def _sm90_blk64_auto_kv_splits(
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
 ) -> int:
-    """Choose SM90 blk64 splits so one split's K/V region of a head fits in L2.
+    """Choose SM90 blk64 splits from the K/V footprint of one head, gated by head count and list length.
 
     The non-split kernel walks each Q tile's list in lockstep only while a wave starts together; once CTAs
     retire and refill, the resident CTAs sit at random list positions and together touch the whole head's
-    K/V. When that exceeds L2 the kernel turns DRAM-bound (BF16 H100, 128K: L2 hit 40%, DRAM 85%). Lists are
-    ascending, so a split is a KV range, and the split grid orders all Q tiles of one split before the next:
-    the resident working set becomes kv_bytes_per_head / splits.
+    K/V. When that far exceeds L2 the kernel turns DRAM-bound. Lists are ascending, so a split is a KV
+    range, and the split grid orders all Q tiles of one split before the next: the resident working set
+    becomes kv_bytes_per_head / splits, at the cost of FP32 partials and a combine pass.
 
-    Measured on H100 BF16 MHA D128 with independent random indices, Sq == Sk, 12.5% density: 64 MB/head
-    -> 2 splits (+20%), 128 MB -> 4 (+70%), 256 MB -> 8 (+94%); more splits plateau. Dense lists (100%) lose
-    12%; 3% density gains 8% at 2 splits and loses at 4. This metadata-only policy cannot see shared or local
-    KV neighborhoods, which need explicitly benchmarked split counts. Unmeasured regimes return 1: GQA,
-    variable counts, Q tiles per head below the resident CTA count, density above 25%.
+    Measured on H100 (50 MiB L2) BF16 MHA D128 with fixed counts: independent random indices
+    (H 1-40, 32-256 MiB K/V per head, 128-1024 blocks per row) and video-generation top-k masks. Splitting pays only once a head's K/V clearly exceeds L2, and the
+    threshold rises as heads fall: 64 MiB gains with 16+ heads (+11-28%) but loses with 1-4 heads and is
+    mixed at 8 (a 61 MiB, 8-head video mask lost 7%); with 1-3 heads even 112-128 MiB loses or barely
+    gains. Above the threshold the best split keeps about L2 / 2 per split (128 MiB: 4-8, +27-67%;
+    256 MiB: 8-16, +9-86%; a 357 MiB video mask: 16, +78-84%) while a split still holds at least 32 blocks of
+    each row. 32 MiB per head never gained. This metadata-only policy cannot see shared or local KV
+    neighborhoods. Unmeasured regimes return 1: GQA, variable counts, Q tiles per head below the resident
+    CTA count, density above 25%.
     """
     if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
         return 1
@@ -740,8 +754,11 @@ def _sm90_blk64_auto_kv_splits(
     if l2_bytes <= 0 or _ceil_div_int(seqlen_q, 64) < 3 * props.multi_processor_count:
         return 1
     kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+    min_bytes = l2_bytes if heads >= 16 else (3 * l2_bytes // 2 if heads >= 4 else 4 * l2_bytes)
+    if kv_bytes_per_head <= min_bytes:
+        return 1
     splits = 1
-    while kv_bytes_per_head > splits * l2_bytes * 3 // 4 and splits < max_kv_splits and kv_blocks // (splits * 2) >= 16:
+    while kv_bytes_per_head > splits * l2_bytes // 2 and splits < max_kv_splits and kv_blocks // (splits * 2) >= 32:
         splits *= 2
     return splits
 
@@ -886,6 +903,8 @@ def _bsa_attn_fwd_sm90_blk64(
         else q2k_nums_cute
     )
 
+    # NaN takes the masking-safe nonpositive path as well (as on SM100).
+    nonpositive_scale = not (float(softmax_scale) > 0.0)
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     fwd_kernel = BlockSparseAttnForwardSm90Blk64(
         gqa_ratio=gqa_ratio,
@@ -898,6 +917,7 @@ def _bsa_attn_fwd_sm90_blk64(
         has_block_sizes=has_block_sizes,
         num_splits=kv_splits,
         allow_empty_block_nums=allow_empty_block_nums,
+        nonpositive_scale=nonpositive_scale,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -912,6 +932,7 @@ def _bsa_attn_fwd_sm90_blk64(
             has_block_sizes,
             kv_splits,
             allow_empty_block_nums,
+            nonpositive_scale,
         ),
         (
             q_t,
@@ -1246,7 +1267,9 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
     bucket = 256 if bucket is None else bucket
     if bucket <= 0:
         raise ValueError("bucket_size_blocks must be positive")
-    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts)
+    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
+        indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
+    )
     dq = torch.empty_like(q) if dq is None else dq
     dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv
@@ -1983,6 +2006,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     )
     if is_sage_fp8:
         assert q_bhsd.is_contiguous() and k_bhsd.is_contiguous() and v_bhsd.is_contiguous(), "Sage FP8 requires fully contiguous BHSD Q/K/V tensors"
+        _sm100_blk64_require_int32_sage_q_strides(q_bhsd)
     use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
     use_exact_kv_layout = use_int64_kv_strides or _sm100_blk64_has_partial_kv_tail(k_bhsd, v_bhsd)
 
@@ -3260,6 +3284,31 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
         block_sizes_sm90 = variable_block_sizes if has_block_sizes else None
 
+        pair_words = (num_q_blocks + 31) // 32
+        pair_count = (num_kv_blocks + 1) // 2
+        pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
+        # On SM90 fixed-count lists pair as well (measured faster on long video masks): a full per-row
+        # count describes the same edges, so build it whenever the task count could pass the gate.
+        pair_nums = q2k_block_nums
+        if pair_nums is None and batch_size * num_heads * num_kv_blocks >= _BLK64_PAIRED_KV_MIN_KV_TASKS:
+            pair_nums = torch.full((batch_size, num_heads, num_q_blocks), block_sparse_num, dtype=torch.int32, device=q.device)
+        use_paired_kv = _blk64_use_paired_kv(q2k_block_index, pair_nums, num_kv_blocks, pair_bytes)
+        pair_tensors = ()
+        if use_paired_kv:
+            pair_tensors = (
+                q2k_block_index,
+                pair_nums,
+                torch.empty((batch_size, num_heads, num_kv_blocks, pair_words), dtype=torch.int32, device=q.device),
+                torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device),
+                torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device),
+                torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device),
+            )
+        # NaN takes the masking-safe nonpositive path as well (as on SM100).
+        scale_nonpositive = not (softmax_scale > 0)
+        has_kv_tail = seqlen_k % sparse_block_size != 0
+        # A single Q bucket gives each CTA a whole dK/dV tile, which it then stores directly.
+        direct_kv = not use_paired_kv and num_q_groups == 1 and not has_kv_tail
+
         dtype = torch2cute_dtype_map[q.dtype]
         workspace = _empty_bwd_workspace_with_zeroed_accum(
             batch_size=batch_size,
@@ -3271,11 +3320,12 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             round_k_to=BlockSparseAttnBackwardSm90Blk64.tile_n,
             round_d_to=32,
             zero_dq_accum=False,
+            include_dkv_accum=not direct_kv,
             device=q.device,
         )
 
         current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
-        bwd_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
+        stage_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim, direct_kv=direct_kv, nonpositive_scale=scale_nonpositive)
         problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
         compile_key = _sm90_bwd_compile_key(
@@ -3284,14 +3334,16 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             head_dim,
             block_sizes_sm90 is not None,
             (
-                bwd_kernel.dQaccum_stage,
-                bwd_kernel.PdS_stage,
-                bwd_kernel.Q_stage,
+                stage_kernel.dQaccum_stage,
+                stage_kernel.PdS_stage,
+                stage_kernel.Q_stage,
             ),
             (dout, out, q, k, v, dq, dk, dv, lse),
-        )
+        ) + ((bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else (None, direct_kv, scale_nonpositive))
 
         if compile_key not in _bsa_attn_bwd_bucketed_k2q_csr.compile_cache:
+            # Building the paired kernel enumerates its matchings, so it happens only on a cache miss.
+            bwd_kernel = MixedKvBackwardSm90(dtype, head_dim, bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else stage_kernel
             _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
                 bwd_kernel,
                 problem_shape,
@@ -3309,6 +3361,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
                 (_to_sm90_bwd_cute_tensor(block_sizes_sm90, assumed_align=4) if block_sizes_sm90 is not None else None),
                 _to_sm90_bwd_cute_tensor(workspace),
                 Float32(softmax_scale),
+                *(_to_sm90_bwd_cute_tensor(t, assumed_align=4) for t in pair_tensors),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
                 options="--enable-tvm-ffi",
             )
@@ -3329,6 +3382,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             block_sizes_sm90,
             workspace,
             softmax_scale,
+            *pair_tensors,
             current_stream,
         )
 
@@ -3344,7 +3398,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     pair_words = (num_q_blocks + 31) // 32
     pair_count = (num_kv_blocks + 1) // 2
     pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
-    use_paired_kv = _sm100_blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
+    use_paired_kv = _blk64_use_paired_kv(q2k_block_index, q2k_block_nums, num_kv_blocks, pair_bytes)
     # Paired and residual tasks share dK/dV, so they still need FP32 accumulation.
     # One Q group in the regular path gives each KV block one unique CTA owner. For aligned
     # physical KV64 tiles, that owner can scale/convert dK and dV directly

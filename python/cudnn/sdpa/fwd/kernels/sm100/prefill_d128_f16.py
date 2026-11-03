@@ -3329,6 +3329,14 @@ def _correction_warp_group(
     # at 32, DSL regalloc spilled correction-warp regs to the stack.
     O_CHUNK = 16
     N_CHUNKS_O = CFG.TILE_O // O_CHUNK
+    # Keep alpha-rescale fragments at 16; its larger live range previously spilled.
+    # Final normalization has a different live set and may use a wider fragment.
+    O_CHUNK_EPI = (
+        32
+        if (CFG.TILE_K == 64 and CFG.TILE_O == 64 and CFG.CTA_MMA == 1 and STORAGE_DTYPE == cutlass.BFloat16 and SPLIT_KV == 1 and not CFG.THD_VARLEN)
+        else O_CHUNK
+    )
+    N_CHUNKS_O_EPI = CFG.TILE_O // O_CHUNK_EPI
     # Use O_SWZ_B (NOT V_SWZ_B): under cga2 V is split along d_v and may drop
     # to a narrower swizzle while O is full-row.  V-based stride here silently
     # produces correct TMEM but garbled SMEM → wrong O after TMA-STG.
@@ -3612,21 +3620,21 @@ def _correction_warp_group(
                     q_row_global,
                     row_head_idx,
                     CFG.TILE_O,
-                    O_CHUNK,
+                    O_CHUNK_EPI,
                 )
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
-                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O_EPI):
                     o_fp16 = cutlass.Vector.from_elements(
-                        tuple(STORAGE_DTYPE(0.0) for _ in range(O_CHUNK)),
+                        tuple(STORAGE_DTYPE(0.0) for _ in range(O_CHUNK_EPI)),
                         STORAGE_DTYPE,
                     )
                     if cutlass.const_expr(not MAY_BE_EMPTY) or (bounds.right > bounds.left):
-                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
+                        o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK_EPI)
                         o_chunk = nvvm.tcgen05_ld(
                             "32x32b",
                             nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                            num=O_CHUNK,
+                            num=O_CHUNK_EPI,
                         )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         o_scaled = o_chunk * inv_sum
@@ -3639,11 +3647,11 @@ def _correction_warp_group(
                             # row: total_sum == 0, the value a dead sub-tile's rows publish) rides the same select.  Without per-batch Q
                             # lengths a dead sub-tile's rows are all >= S_q, which the O descriptor clips and the Stats store guards, so the
                             # select is confined to this arm: every rendering without it is byte-identical.
-                            o_scaled = vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK)
+                            o_scaled = vec_select_zero(row_trim | row_dead, o_scaled, O_CHUNK_EPI)
                         o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
-                    col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
-                    block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
+                    col_offset_const = (chunk_idx * O_CHUNK_EPI) % D_BLOCK_SIZE
+                    block_idx_const = (chunk_idx * O_CHUNK_EPI) // D_BLOCK_SIZE
                     block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
                     smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
 

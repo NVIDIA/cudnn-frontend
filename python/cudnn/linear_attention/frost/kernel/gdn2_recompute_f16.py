@@ -53,7 +53,7 @@ the checkpoint buffer; sizes at DK = DV = 128, bf16 io, fp32 Gate):
   checkpoint staging              32768       2    <-- enable_checkpoints only (aliases V otherwise)
   scheduler ticket ring               4       8    <-- next-tile publish ring
   steep ballot words                 64       -    <-- STEEP_FAST / STEEP_EXACT only; one element per array under STEEP_OFF
-  steep last-token log2 gates      1024       -
+  steep last-token decay factors      1024       -
   steep k inverse norms             128       -
   steep tile words                   16       2
   steep correction tiles           2048       2
@@ -194,12 +194,11 @@ def make_bars(cfg) -> Gdn2RecomputeBars:
         mb_state_input_cg0_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG0_GROUP_WARPS, producer=Producer.THREAD),
         mb_y_input_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1_WARPS, producer=Producer.THREAD),
         mb_u_input_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1_WARPS + CG0_GROUP_WARPS, producer=Producer.THREAD),
-        # Exact correction rows use scalar stores; count every writer directly.
         mb_k_decay_inv_cg0_ready=MBarrier(
             alloc(cfg.smem_decay_stages),
             try_wait=True,
             stages=cfg.smem_decay_stages,
-            init_count=CG0_GROUP_WARPS if cfg.steep_mode != STEEP_EXACT else cfg.cg0_threads_per_group,
+            init_count=CG0_GROUP_WARPS,
             producer=Producer.THREAD,
         ),
         mb_decay_tcgen05_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=1, producer=Producer.MMA_COMMIT),
@@ -210,7 +209,7 @@ def make_bars(cfg) -> Gdn2RecomputeBars:
             alloc(cfg.qk_scale_ready_stages),
             try_wait=True,
             stages=cfg.qk_scale_ready_stages,
-            init_count=CG0_GROUP_WARPS if cfg.steep_mode != STEEP_EXACT else cfg.cg0_threads_per_group,
+            init_count=CG0_GROUP_WARPS,
             producer=Producer.THREAD,
         ),
         mb_t_inv_ready=MBarrier(
@@ -1021,7 +1020,9 @@ def compute0_warp_group(
                     (sSteepTile.data_ptr() + decay_stage * cfg.cg0_warps_per_group + cg0_local_warp).store((steep_scan_ptr + cg0_local_warp).load())
             if steep_any == 0:
                 nvvm.fence_proxy("async.shared", space="cta")
-                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT) or nvvm.elect_sync():
+                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+                if nvvm.elect_sync():
                     bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
 
             # ---- K restore operand store ---------------------------------------------
@@ -1072,10 +1073,14 @@ def compute0_warp_group(
                 # Each correction writer publishes its own stores below.
                 nvvm.barrier_cta_sync(cfg.cg0_group_sync_barrier_base_id + cg0_group_id, thread_count=cfg.cg0_threads_per_group)
                 nvvm.fence_proxy("async.shared", space="cta")
-                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT) or nvvm.elect_sync():
+                if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+                if nvvm.elect_sync():
                     bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
             nvvm.fence_proxy("async.shared", space="cta")
-            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT) or nvvm.elect_sync():
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+            if nvvm.elect_sync():
                 bars.mb_qk_scale_ready[qk_scale_ready_stage].arrive()
 
             # ---- state stage, left key half: pack, publish, fp32 decay ---------------
@@ -2276,7 +2281,7 @@ def frost_gdn2_recompute(
     bars = make_bars(cfg)
     tmem_base_holder = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=4)
     sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
-    # steep key channels (common/steep_decay.py): per CG0 group the scan's ballot words, last-token log2 gates and
+    # steep key channels (common/steep_decay.py): per CG0 group the scan's ballot words, last-token decay factors and
     # k inverse norms; per decay stage the tile's ballot words and the KK corrections
     sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scan_cosize, space=SMEM, alignment=16)
     sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_last_cosize, space=SMEM, alignment=16)

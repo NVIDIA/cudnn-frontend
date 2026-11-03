@@ -23,9 +23,9 @@ def test_native_d192_fp8_pack_rebind_replay(b, split, sched, sink, dtype, output
     seen = []
     load = api_dsl._load_kernel_template
 
-    def record(filename, params, tag):
+    def record(filename, params, tag, part=None):
         seen.append(filename)
-        return load(filename, params, tag)
+        return load(filename, params, tag, part=part)
 
     monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
     d, dv = 192, 128

@@ -146,7 +146,7 @@ gather, no conversion -- through ONE shared addressing helper per table (:func:`
 the fused prepare launch of ``qsa_prepare.py`` calls the same two) and derives every position in-kernel
 (:func:`step_position`)::
 
-    pos0[b]          = kv_lens[b] - S_q                             # kv_lens = the KV length AFTER the step
+    pos0[b]          = max(kv_lens[b], 0) - S_q                     # kv_lens = the KV length AFTER the step (clamped at 0 first: no int32 wrap)
     pos              = pos0[b] + j                                  # row j of sequence b
     ring row of pos  = (index_state_block_table[b, 0], pos % cap)   # == the slot  block * cap + pos % cap
     kbar row of blk  = (block_table[b, blk // (P / POOL)], blk % (P / POOL))
@@ -813,11 +813,17 @@ def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL, *, ring_write: b
 
 @cute.jit
 def step_position(mPos0: Optional[cute.Tensor], mKvLens: Optional[cute.Tensor], b: cutlass.Int32, s_q: cutlass.Int32) -> cutlass.Int32:
-    """The position of row 0 of sequence ``b``: ``kv_lens[b] - S_q`` from the KV length AFTER the step (the paged form -- a
-    negative value marks the rows below position 0 dead), or the ``pos0`` vector clamped at 0 (the dense form -- a negative
-    ``pos0`` is the first step of a sequence).  Exactly one of the two vectors is bound (the host checks)."""
+    """The position of row 0 of sequence ``b``: ``max(kv_lens[b], 0) - S_q`` from the KV length AFTER the step (the paged form -- a
+    negative value marks the rows below position 0 dead; the length is clamped at 0 FIRST, exactly as the kbar gather derives its
+    positions, so an int32 length within ``S_q`` of ``INT_MIN`` -- a stack bug -- reads as a dead sequence like every other ``L <= 0``
+    instead of wrapping to a live positive position; equal in value for every length that does not wrap: every ``L <= 0`` leaves every
+    row of the step dead either way), or the ``pos0`` vector clamped at 0 (the dense form -- a negative ``pos0`` is the first step of
+    a sequence).  Exactly one of the two vectors is bound (the host checks).  ONE helper for the step kernel and the fused prepare
+    launch's position sites."""
     if cutlass.const_expr(mKvLens is not None):
-        pos0 = ld_global(mKvLens.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32) - s_q
+        kv = ld_global(mKvLens.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
+        kv = kv if kv > cutlass.Int32(0) else cutlass.Int32(0)
+        pos0 = kv - s_q
     else:
         p0 = ld_global(mPos0.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
         pos0 = p0 if p0 > cutlass.Int32(0) else cutlass.Int32(0)

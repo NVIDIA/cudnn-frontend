@@ -122,8 +122,8 @@ def _operand_storage_bytes(operand) -> int:
 
 def _check_sm100():
     sm = buffers.current_sm()
-    if sm != 100:
-        raise NotImplementedError(f"frost_conv requires SM100, but found {sm}")
+    if sm not in (100, 103):  # the SM100-family kernels compile for the device's own target
+        raise NotImplementedError(f"frost_conv requires SM100 or SM103, but found {sm}")
 
 
 def _check_cutedsl(what: str, minimum_version: tuple[int, int]) -> None:
@@ -284,6 +284,8 @@ class _Sm100FrostConvPlan(CompiledPlan):
             and _tuple_param(node, "pre_padding", _ZERO) in ((0, 1, 1), (1, 1, 1), (2, 1, 1))
             and _tuple_param(node, "post_padding", _ZERO) == (0, 1, 1)
         )
+        if c96_causal and buffers.current_sm() != 100:
+            raise NotImplementedError("frost_conv: BF16 C96 causal convolution is qualified only on SM100")
         if image.dim[1] % input_channel_tile and not c96_causal:
             raise NotImplementedError(
                 f"frost_conv requires input channels to be a multiple of the {input_channel_tile}-element mainloop tile for {image_dtype}; got {image.dim[1]}"

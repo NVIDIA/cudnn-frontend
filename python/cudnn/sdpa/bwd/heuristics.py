@@ -85,7 +85,10 @@ def _leads(spec: EngineSpec, facts) -> bool:
     d256 GQA 16/2, 32/4 and MHA 16/16, D192x128 MHA 16-128 heads, S 1k-16k, causal / mask-free, BSHD and THD at equal and
     half-to-full lengths): d256 wins 0.73-0.98 -> ahead, except a mask-free ragged THD declaration (declared total below
     b * S_q) at S_q >= 4096 (0.95-1.10); D192x128 loses 1.08-1.91 everywhere -> behind. Only cc 10.0 was measured, and
-    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first.
+    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first. On cc 10.3 the d256
+    row's bf16 THD graphs are decided by the placement table (studies sm103_d256_bwd_v2_20261031 on the 128-key tile and
+    sm103_d256_bwd_thd_offtile_20261031 off it); its dense graphs, which lost on small-work holdout cases in two studies,
+    still trail the backend there.
 
     A measured entry in ``cudnn.sdpa.placement_table`` answers first; the rules above decide every graph without one."""
     from cudnn.sdpa import placement_table

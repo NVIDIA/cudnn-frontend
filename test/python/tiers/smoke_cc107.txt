@@ -242,6 +242,9 @@ gated_attention_block/cutedsl/test_sigmoid_gate_bwd.py::test_gate_bwd_fp8_og_is_
 gated_attention_block/cutedsl/test_elementwise.py::test_sigmoid_gate_matches_torch[37-4-128-dtype0]
 gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_prologue_is_bitwise_the_standalone_launches[1000-norm]
 gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_epilogue_is_bitwise_the_standalone_launches[amax-cast-only]
+# gated attention block, the FP8-projection + bf16-attention mode of the paged forms (2026-10-30; QuantSpec(attention_dtype=torch.bfloat16)): one DECODE + one EXTEND cell
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q[1-6]
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_fp8_proj_bf16_attention_extend_matrix_cell[hnd-16]
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]

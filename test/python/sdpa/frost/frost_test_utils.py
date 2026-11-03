@@ -316,6 +316,12 @@ def launch_f16(
         kv_mask_ptr=None,
         kv_mask_batch_stride=0,
         inv_scale_softmax=1.0,
+        # Direct template tests request split partials, leaving the optional
+        # in-kernel final-output reduction disabled.
+        final_o_ptr=None,
+        final_lse_ptr=None,
+        final_o_strides=(0, 0, 0),
+        final_lse_strides=(0, 0, 0),
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)

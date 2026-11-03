@@ -1999,7 +1999,8 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", *rel.split("/"))
     params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=cta_mma)
-    with pytest.raises(ValueError, match="paged_kv is not wired"):
+    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/prefill_d128_fp8.py" else "paged_kv is not wired"
+    with pytest.raises(ValueError, match=expected_error):
         load_template(path, params, tag=f"paged_unwired_probe_{rel.replace('/', '_')}")
 
 

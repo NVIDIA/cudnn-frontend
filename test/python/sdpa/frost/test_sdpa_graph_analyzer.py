@@ -11,6 +11,7 @@ import cudnn
 import pytest
 import torch
 
+from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as bwd_engines
 from cudnn.sdpa.fwd import engines
@@ -463,13 +464,15 @@ def test_d192_fp8_sink_dtype_support():
     assert engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E5M2, sink=True)) is None
 
 
-def test_probe_rejects_wrong_device_family(monkeypatch):
-    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+@pytest.mark.parametrize("device_cc, expected", [((7, 0), set()), ((8, 0), {"sdpa_fwd_prefill_sm80"})])
+def test_probe_rejects_wrong_device_family(monkeypatch, device_cc, expected):
+    monkeypatch.setattr(ga, "_device_cc", lambda: device_cc)
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
-    assert not _eligible(g)
+    # SM80 now supports this D512 graph; engines for other families must decline.
+    assert _eligible(g) == expected
 
 
 def test_probe_rejects_bias():
@@ -1062,7 +1065,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors. Native SM107 admits D64 and D512;
+    # exactly the adapter's flavors. Native SM107 admits D64, paged D192/V128 and D512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
     # requires whole groups. Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
@@ -1071,7 +1074,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
     assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
-    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (512, 512)})
+    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512)})
     others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
     assert all(v is None for v in others.values()), others
 
@@ -1198,12 +1201,36 @@ def test_capabilities_positional_prefix_is_append_only():
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the zero-scale and pre-folded-scale fields,
     # then the resident-bias / kv_mask fields of the Rubin small tiles and their per-shape TILE_N domain, then the PackGQA
-    # divisibility rule, last).
+    # divisibility rule). The canonical band set and independent-pool capability are appended in that order.
     first_appended = start + len(legacy_tail)
     assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
+    # Pin this historical segment while permitting future fields after it.
+    band_start = names.index("band")
+    band_segment = ["band", "independent_paged_pool_counts", "warp_spec_cfgs"]
+    assert names[band_start : band_start + len(band_segment)] == band_segment, names[band_start:]
+    assert caps.warp_spec_cfgs == frozenset({0})
+
+    # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
+    # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
+    # pre-band defaults, so its claim is unmasked-only.
+    pre_band_order = names[: names.index("band")]
+    pre_band = engines.Capabilities(*[legacy_value(n) for n in pre_band_order])
+    assert pre_band.sm_lo == 100 and pre_band.d_shapes == frozenset({(128, 128)})
+    assert pre_band.causal is False and pre_band.swa is False
+    assert pre_band.band == band.BandSupport.unmasked_only()
+
+    # ... and the row's claim is exactly the legacy flags' mapping (the normalization layer is one-directional: flags in,
+    # canonical set out).
+    assert pre_band.band == band.BandSupport.from_legacy_flags(
+        causal=pre_band.causal,
+        bottom_right=pre_band.bottom_right,
+        swa=pre_band.swa,
+        right_band_widening=pre_band.right_band_widening,
+    )
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-7:] == [
+    bwd_start = bwd_names.index("bottom_right_s_q_multiple")
+    assert bwd_names[bwd_start : bwd_start + 8] == [
         "bottom_right_s_q_multiple",
         "thd_head_stride",
         "zero_scale",
@@ -1211,7 +1238,9 @@ def test_capabilities_positional_prefix_is_append_only():
         "compact_bshd",
         "declaration_check",
         "independent_head_dims",
+        "band",
     ], bwd_names
+    assert bwd_names[bwd_start + 8 : bwd_start + 10] == ["thd_tile_ms", "thd_tile_ns"], bwd_names
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -1436,6 +1465,49 @@ def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
             if why is not None:
                 assert "tile_n" in why
     assert min(caps.tile_ns) == 128, "the heuristics' default width stays 128 (min of the row-wide floor)"
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("policy", [0, 1])
+def test_rubin_d192_unsplit_cta_does_not_require_split_workspace_bound(monkeypatch, dtype, policy):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    facts = ga.SdpaGraphFacts(
+        b=4096,
+        h_q=32,
+        h_kv=8,
+        s_q=128,
+        s_kv=65536,
+        d_qk=192,
+        d_v=128,
+        dtype=dtype,
+        dtype_o=dtype,
+        causal=True,
+        bottom_right=True,
+        padded=True,
+        thd=True,
+        device_cc=(10, 7),
+        shape_overrides=True,
+    )
+    unsplit = engines.SdpaFwdKnobs(cga=1, split_kv=1, tile_n=128, pack_gqa=False, sched_policy=policy)
+    assert engines.mismatch(caps, facts, unsplit) is None
+    assert engines.mismatch(caps, facts, replace(unsplit, cga=2)) is None
+    # No partial workspace is needed by the unsplit plan. Split plans still
+    # require the caller's bound, and unrelated unsupported features stay out.
+    assert not engines.thd_split_domain(caps, facts)
+    assert engines.mismatch(caps, facts, replace(unsplit, split_kv=2)) is not None
+    for unsupported in (
+        replace(facts, has_epilogue_gate=True),
+        replace(facts, stats_t=SimpleNamespace(ragged_offset=None)),
+    ):
+        assert engines.mismatch(caps, unsupported, unsplit) is not None
+    bounded = replace(facts, max_total_seq_len_q=128)
+    assert engines.thd_split_domain(caps, bounded)
+    assert engines.mismatch(caps, bounded, unsplit) is None
+    assert facts.max_total_seq_len_q is None and facts.shape_overrides
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
@@ -3568,3 +3640,20 @@ def test_native_d576_thd_split_scope(paged, sink):
     assert engines.mismatch(caps, facts, replace(knobs, cga=1)) is not None
     assert engines.mismatch(caps, replace(facts, has_epilogue_gate=True), knobs) is not None
     assert not engines.thd_split_domain(caps, replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q + 1))
+
+
+def test_paged_independent_pool_counts_are_capability_gated(monkeypatch):
+    graph = _mk_paged_graph()
+    original = _facts(graph)
+    for node in (original.q_t, original.o_t):
+        node.set_dim((B, H, 8, 128)).set_stride((8 * H * 128, 128, H * 128, 1))
+    dims = tuple(original.v_t.get_dim())
+    original.v_t.set_dim((dims[0] + 3, *dims[1:]))
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+    facts = _facts(graph)
+    assert engines.mismatch(engines._sm80_spec().capabilities, facts) is None
+    from dataclasses import replace
+
+    assert "equal K/V" in engines.mismatch(engines._sm100_spec().capabilities, replace(facts, device_cc=(10, 0)))
+    original.v_t.set_dim((dims[0], dims[1], dims[2] * 2, dims[3]))
+    assert ga.analyze(graph).invalid is not None

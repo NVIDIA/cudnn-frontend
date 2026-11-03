@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestNativeHalfRegisterRelease:
+    """Cross-compile the half kernel through the selected SM107 CI entry."""
+
+    from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
+
+    test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
@@ -829,6 +837,7 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     cfg.make_cfg_d256(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d256(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
     cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
@@ -2165,4 +2174,159 @@ class TestNativeD64Half:
     test_independent_origins = staticmethod(_checks.test_native_d64_independent_origins)
     test_ragged_replay = staticmethod(_checks.test_native_d64_ragged_replay)
     test_dense_pack_replay = staticmethod(_checks.test_native_d64_dense_pack_replay)
+    test_dense_split_replay = staticmethod(_checks.test_native_d64_dense_split_replay)
+    test_dense_unsplit_replay = staticmethod(_checks.test_native_d64_dense_unsplit_replay)
     test_standalone_compact_thd = staticmethod(_checks.test_native_d64_standalone_compact_thd)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD192PagedHalf:
+    """Half paged regressions collected by the SM107 CI entrypoint."""
+
+    import native_d192_paged_sm107_test_utils as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_independent_origins = staticmethod(_checks.test_independent_origins)
+
+
+@pytest.mark.L0
+@requires_rubin
+class TestNativeD256PrefillHalfSplit:
+    """Collect half D256 split regressions through the selected SM107 CI entry."""
+
+    from test_sdpa_d256_prefill_split_sm107 import (
+        test_native_d256_prefill_split_admission as _admission,
+        test_native_d256_prefill_partial_workspace_dtype as _workspace_dtype,
+        test_native_d256_prefill_split_replay as _replay,
+        test_native_d256_prefill_split_graph as _graph,
+    )
+
+    test_admission = staticmethod(_admission)
+    test_workspace_dtype = staticmethod(_workspace_dtype)
+    test_replay = staticmethod(_replay)
+    test_graph = staticmethod(_graph)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestD192Lpt:
+    """Native D192 work scheduling through retained dense and ragged replay."""
+
+    import sdpa_d192_lpt as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_ragged_replay = staticmethod(_checks.test_ragged_replay)
+    test_paged_independent_origins = staticmethod(_checks.test_paged_independent_origins)
+    test_paged_replay = staticmethod(_checks.test_paged_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeClusterSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_cluster_split_sm107 as _checks
+
+    test_cluster_split_standalone_rebind_and_retained_replay = staticmethod(_checks.test_cluster_split_standalone_rebind_and_retained_replay)
+    test_cluster_split_graph_contract = staticmethod(_checks.test_cluster_split_graph_contract)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestD192PhysicalOrigins:
+    """Independent Q/K/V/O/Stats offsets through the native CI entrypoint."""
+
+    import sdpa_d192_origins as _checks
+
+    test_independent_origins = staticmethod(_checks.test_independent_origins)
+    test_split_independent_origins = staticmethod(_checks.test_split_independent_origins)
+    test_split_origins_require_matching_extension = staticmethod(_checks.test_split_origins_require_matching_extension)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestD64ThdSplit:
+    """Nonpaged D64 split and physical origins through the native CI entrypoint."""
+
+    import sdpa_d64_thd_split as _checks
+
+    test_explicit_contract_and_template = staticmethod(_checks.test_explicit_contract_and_template)
+    test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
+    test_proper_divisor_pack_replay = staticmethod(_checks.test_proper_divisor_pack_replay)
+    test_standalone_compact_replay = staticmethod(_checks.test_standalone_compact_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeScalarTailSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_scalar_tail_split as _checks
+
+    test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
+    test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativePagedNarrow:
+    """Paged THD N64 admission and native lifecycle through the CI entry."""
+
+    import native_d128_paged_narrow_sm107_test_utils as _checks
+
+    test_admission_and_record = staticmethod(_checks.test_admission_and_record)
+    test_origins_rebind_and_replay = staticmethod(_checks.test_origins_rebind_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD256PhysicalOrigins:
+    """Exercise native unsplit physical origins from the architecture CI entry."""
+
+    from native_d256_origins_sm107_checks import test_native_d256_independent_origins
+
+    test_native_d256_independent_origins = staticmethod(test_native_d256_independent_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeSingleQ:
+    """Explicit one-Q configuration through the native CI entry."""
+
+    import native_single_q_sm107_checks as _checks
+
+    test_one_q_origins = staticmethod(_checks.test_one_q_origins)
+    test_one_q_public_identity_and_domain = staticmethod(_checks.test_one_q_public_identity_and_domain)
+    test_one_q_forced_rescale = staticmethod(_checks.test_one_q_forced_rescale)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeSingleQPaged:
+    """Exercise explicit paged one-Q topology from the architecture CI entry."""
+
+    from native_single_q_paged_sm107_checks import test_paged_one_q_origins
+
+    test_paged_one_q_origins = staticmethod(test_paged_one_q_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeCausalZeroTail:
+    """Run causal suffix and phase-reuse checks in the native CI entry."""
+
+    from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
+
+    test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)

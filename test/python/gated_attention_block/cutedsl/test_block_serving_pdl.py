@@ -67,7 +67,7 @@ requires_blackwell = pytest.mark.requires_blackwell  # the registered marker: an
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_pdl_probe import cuda_versions, delayed_write, retrace  # noqa: E402
-from test_block_serving_decode import _D, _D_MODEL, _DEV, _ROPE, _Case, _bits, _geom, _make_block, _written  # noqa: E402
+from test_block_serving_decode import _D, _D_MODEL, _DEV, _ROPE, _Case, _bits, _geom, _make_block, _pools, _written  # noqa: E402
 
 _LENS = (100, 384, 500, 0)  # the decode module's standard cell: a tail tile, ring depth 3 and 4, a PADDED entry
 _CASES = {}
@@ -208,6 +208,33 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     assert off(GatedAttentionBlockFwd(*qargs, quant=spec))
     with pytest.raises(NotImplementedError, match=decline):
         GatedAttentionBlockFwd(*qargs, quant=spec, use_pdl=True)
+    # the FP8-projection + bf16-attention mode (QuantSpec(attention_dtype=torch.bfloat16)) on the DECODE form: AUTO False (the quantize
+    # launch carries no griddepcontrol sites; the switched chain is unmeasured there), the explicit True the same decline, naming the mode
+    mode = QuantSpec.bf16_attention(0.01, 0.02, 0.03, 4.0)
+    kc, vc = _pools(8, 2, 16, _D, "hnd", torch.bfloat16)
+    geom_br = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)  # the paged forms' diagonal
+    mode_args = (
+        e4(4, 1, _D_MODEL),
+        e4(geom_br.n_qkvg, _D_MODEL),
+        mk(_D),
+        mk(_D),
+        mk(4, 1, _ROPE),
+        mk(4, 1, _ROPE),
+        e4(_D_MODEL, 8 * _D),
+        mk(4, 1, _D_MODEL),
+        geom_br,
+    )
+    mode_kw = dict(
+        paged_kv_page_size=16, kv_source="paged", sample_k_cache=kc, sample_v_cache=vc, sample_block_table=torch.zeros(4, 8, dtype=torch.int32, device=_DEV)
+    )
+    mode_blk = GatedAttentionBlockFwd(*mode_args, quant=mode, **mode_kw)
+    assert mode_blk.attention_bf16 and mode_blk.decode_route is not None and mode_blk.decode_route.pdl_capable and off(mode_blk)
+    assert mode_blk._sdpa.use_pdl is False and mode_blk._norm_rope.use_pdl is False
+    with pytest.raises(NotImplementedError, match=decline) as e:
+        GatedAttentionBlockFwd(*mode_args, quant=mode, use_pdl=True, **mode_kw)
+    assert "FP8-projection + bf16-attention mode" in str(e.value) and "None = auto reads False" in str(e.value)
+    env_mode = GatedAttentionBlockFwd.serving_envelope(geom_br, torch.float8_e4m3fn, _DEV, device_cc=(10, 7), quant=mode)
+    assert env_mode.decode.pdl_default is False
     # the block-sparse decode mode: a QsaSpec geometry under CALLER lists (with and without the indexer band) -- AUTO True on the measured
     # part (the sparse chain's own measured-parts tuple holds cc 10.7 since 2026-10-27: the switched block measured bitwise the plain one and
     # never slower over B 1 / 4 / 32), the explicit True SERVED the same way: the sparse core and its split combine carry the sites, so the

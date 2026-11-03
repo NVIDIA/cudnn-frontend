@@ -324,7 +324,11 @@ def test_graph_thd_execute_does_not_allocate_or_sync(monkeypatch):
         artifact, launch = compile_thd_host(*args, **kwargs)
 
         def launch_spy(*launch_args):
-            assert launch_args[-2] == (1, 1, 1)
+            import inspect
+
+            # Physical-origin operands append after the legacy stream slot.
+            aux_index = tuple(inspect.signature(inspect.unwrap(prepared_host.thd_host)).parameters).index("aux_strides")
+            assert launch_args[aux_index] == (1, 1, 1)
             launches.append(True)
             return launch(*launch_args)
 
@@ -670,12 +674,12 @@ def test_graph_thd_declines_overlapping_token_stride():
 @pytest.mark.parametrize("d,dv", [(48, 32), (64, 64), (64, 96), (96, 80), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("stats_layout", ["head_major_padded", "token_major"])
 @pytest.mark.parametrize("stats_carrier", ["canonical", "th1"])
-def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle):
+def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_carrier, cudnn_handle, dtype=None):
     """Declared pitches reach every address; padding and allocation tails stay untouched."""
     from test_sdpa_bwd_staged_sm80 import _assert_kernel_count
 
     lens_q, lens_kv = (33, 0, 17), (41, 3, 23)
-    dtype = torch.bfloat16 if d == 192 else torch.float16
+    dtype = dtype if dtype is not None else (torch.bfloat16 if d == 192 else torch.float16)
     graph, vp, nodes, _ = _make_graph(lens_q, lens_kv, h=4, hkv=2, d=d, dv=dv, dtype=dtype, stats_layout=stats_layout, cap_extra=5)
     q, k, v, o, stats = nodes
     stats_view = vp[stats]
@@ -686,6 +690,12 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
         vp[stats] = stats_view
         if stats_carrier == "th1":
             vp[stats] = stats_view.unsqueeze(-1) if stats_layout == "token_major" else stats_view[0, :, : sum(lens_q)].T.unsqueeze(-1)
+        elif stats_carrier == "flat":
+            vp[stats] = stats_view.view(-1)
+        elif stats_carrier == "capacity":
+            # Like the nightly's BSHD allocation: its logical axes are a
+            # carrier only. The graph's descriptor owns Stats packing.
+            vp[stats] = stats_view.view(2, -1, 4, 1).transpose(1, 2)
 
     bind_stats()
     storage = {}
@@ -700,10 +710,9 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
         if node is not o:
             view[:, :total].normal_()
         node.set_stride((7, head_stride, token_stride, 1))
-        for offset in vp:
-            if offset.get_name() == node.get_name() + "_ro":
-                # The graph still describes adjacent sequences; physical token pitches differ by port.
-                vp[offset].div_(node.get_dim()[1] * width, rounding_mode="floor").mul_(token_stride)
+        # Bind by declared tensor identity: an SDPA output need not be named "o".
+        offset = node.ragged_offset
+        vp[offset].div_(node.get_dim()[1] * width, rounding_mode="floor").mul_(token_stride)
         vp[node] = view
         storage[node] = backing
     output_padding = torch.ones_like(storage[o], dtype=torch.bool)
@@ -743,12 +752,9 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
     check(lens_q, lens_kv)
     if stats_carrier == "th1":
         good = vp[stats]
-        token_stride, head_stride, _ = good.stride()
-        for bad in (
-            good[:-1],
-            torch.empty_strided(good.shape, (token_stride + 1, head_stride, 1), dtype=good.dtype, device=good.device),
-            torch.empty_strided(good.shape, (token_stride, head_stride + 1, 1), dtype=good.dtype, device=good.device),
-        ):
+        # Graph buffers are raw storage: carrier strides cannot override the
+        # declared layout. A short exposed span must still fail before launch.
+        for bad in (good[:-1],):
             poison()
             vp[stats] = bad
             with pytest.raises(ValueError, match="SM80 THD .*Stats"):
@@ -785,7 +791,7 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
             elif name.endswith("_ro"):
                 lengths = new_kv if name in ("k_ro", "v_ro") else new_q
                 prefix = [0, lengths[0], lengths[0] + lengths[1], sum(lengths)]
-                data_node = next((n for n in (q, k, v, o) if n.get_name() + "_ro" == name), None)
+                data_node = next((n for n in (q, k, v, o) if n.ragged_offset is node), None)
                 pitch = data_node.get_stride()[2] if data_node is not None else (4 if stats_layout == "token_major" else 1)
                 vp[node].copy_(torch.tensor(prefix, dtype=torch.int64, device="cuda").view_as(vp[node]) * pitch)
         captured.replay()
@@ -793,6 +799,14 @@ def test_graph_thd_independent_pitches_rebind_replay(d, dv, stats_layout, stats_
         check(new_q, new_kv)
     finally:
         captured.reset()
+
+
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major_padded"])
+@pytest.mark.parametrize("stats_carrier", ["flat", "capacity"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_graph_thd_stats_storage_carriers(d, stats_layout, stats_carrier, dtype, cudnn_handle):
+    test_graph_thd_independent_pitches_rebind_replay(d, d, stats_layout, stats_carrier, cudnn_handle, dtype)
 
 
 def test_graph_thd_rejects_undersized_workspace():
