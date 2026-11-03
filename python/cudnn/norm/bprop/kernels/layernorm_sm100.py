@@ -26,7 +26,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, smem_capacity
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, smem_capacity, dsl_compile_lock
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     affine_gamma,
@@ -955,9 +955,12 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     key = ("pipe", params.io_dtype) + ce
     fn = _KPIPE.get(key)
     if fn is None:
-        fakes = _fakes(et, C, ("io", "io", "io", "g", "stat", "stat", "part", "part", "dg", "dg"))
-        fn = cute.compile(_ln_bwd_pipe_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
-        _KPIPE[key] = fn
+        with dsl_compile_lock():
+            fn = _KPIPE.get(key)
+            if fn is None:
+                fakes = _fakes(et, C, ("io", "io", "io", "g", "stat", "stat", "part", "part", "dg", "dg"))
+                fn = cute.compile(_ln_bwd_pipe_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
+                _KPIPE[key] = fn
     fn(ffi(dy2d), ffi(x2d), ffi(dx), ffi(gamma), ffi(mean), ffi(rstd), dgp, dbp, ffi(dgamma), ffi(dbeta), R, ctas, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)
 
@@ -1000,9 +1003,12 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg, out_dx=None, 
     key = ("tiled", params.io_dtype) + ce
     fn = _KTILED.get(key)
     if fn is None:
-        fakes = _fakes(et, C, ("io", "io", "io", "g", "stat", "part", "dg"))
-        fn = cute.compile(_ln_bwd_tiled_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
-        _KTILED[key] = fn
+        with dsl_compile_lock():
+            fn = _KTILED.get(key)
+            if fn is None:
+                fakes = _fakes(et, C, ("io", "io", "io", "g", "stat", "part", "dg"))
+                fn = cute.compile(_ln_bwd_tiled_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
+                _KTILED[key] = fn
     fn(ffi(dy2d), ffi(x2d), ffi(dx), ffi(gamma), ffi(rstd), dgp, ffi(dgamma), R, ctas, cur_stream())
     return dx, dgamma, None
 
@@ -1131,9 +1137,12 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
         key = ("slots", params.io_dtype) + ce
         fn = _KCACHE.get(key)
         if fn is None:
-            fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], M, ("io", "io", "g", "stat", "stat", "io", "part", "part", "dg", "dg"))
-            fn = cute.compile(_ln_bwd_slots_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
-            _KCACHE[key] = fn
+            with dsl_compile_lock():
+                fn = _KCACHE.get(key)
+                if fn is None:
+                    fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], M, ("io", "io", "g", "stat", "stat", "io", "part", "part", "dg", "dg"))
+                    fn = cute.compile(_ln_bwd_slots_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
+                    _KCACHE[key] = fn
         fn(ffi(dy2d), ffi(x2d), ffi(gamma), ffi(mean), ffi(rstd), ffi(dx), dgp, dbp, ffi(dgamma), ffi(dbeta), spec.R, cur_stream())
         return dx, dgamma, (dbeta if has_beta else None)
 
@@ -1141,8 +1150,11 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], spec.M, ("io", "io", "g", "stat", "stat", "io", "dg", "dg"))
-        fn = cute.compile(_ln_bwd_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], spec.M, ("io", "io", "g", "stat", "stat", "io", "dg", "dg"))
+                fn = cute.compile(_ln_bwd_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
+                _KCACHE[key] = fn
     fn(ffi(dy2d), ffi(x2d), ffi(gamma), ffi(mean), ffi(rstd), ffi(dx), ffi(dgamma), ffi(dbeta), spec.R, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)
