@@ -4405,12 +4405,9 @@ def test_DSA_sparse_attention_backward_check_support_declines_strided_inputs():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=385)
 def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(monkeypatch):
-    try:
-        from cudnn import DSA
-        from cuda.bindings import driver as cuda
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = _import_or_skip("cudnn").DSA
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+    _interface_sm90 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90")
 
     _require_sm90()
     device = torch.device("cuda")
@@ -5215,6 +5212,17 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
             head_dim,
             num_heads,
             deterministic=True,
+            deterministic_relay_cluster_size=8,
+        )
+        == expected_cluster8
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
             deterministic_relay_cluster_size=16,
         )
         == expected_cluster16
@@ -5267,6 +5275,17 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
             deterministic_relay_cluster_size=4,
         )
         == expected_large_cluster4
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_relay_cluster_size=8,
+        )
+        == expected_large_cluster8
     )
     assert (
         flash_attn_bwd_sm90_workspace_size(
@@ -5509,10 +5528,7 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
 )
 def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length, relay_cluster_size):
     """Hopper relay ranks, head phases, and query waves stay bitwise stable."""
-    try:
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
 
     _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
@@ -5572,11 +5588,8 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
 def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_runtime_extents(monkeypatch):
     """Packed Q/KV extents stay runtime values for all deterministic artifacts."""
     _require_sm90_deterministic_relay()
-    try:
-        from cuda.bindings import driver as cuda
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+    _interface_sm90 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90")
 
     launch = _interface_sm90.flash_attn_bwd_sm90
     monkeypatch.setattr(launch, "compile_cache_relay_masks", {})
@@ -5624,10 +5637,7 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_r
 @pytest.mark.parametrize("relay_cluster_size", [32, 64], ids=["cluster32", "cluster64"])
 def test_DSA_sparse_attention_backward_sm90_multiphase_relay_repeat100(relay_cluster_size):
     """Logical relays remain bitwise exact under 100 high-overlap repetitions."""
-    try:
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cuda-python not installed")
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
 
     _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
@@ -5688,10 +5698,7 @@ def test_DSA_sparse_attention_backward_sm90_multiphase_relay_repeat100(relay_clu
 )
 def test_DSA_sparse_attention_backward_sm90_relay_cuda_graph(relay_cluster_size):
     """C16/C32/C64 relays replay with poisoned storage and changed sparse inputs."""
-    try:
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cuda-python not installed")
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
 
     _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
