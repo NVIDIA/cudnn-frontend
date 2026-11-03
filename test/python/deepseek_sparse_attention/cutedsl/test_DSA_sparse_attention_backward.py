@@ -37,6 +37,20 @@ def _import_or_skip(module_name):
     return pytest.importorskip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed")
 
 
+def _require_sm90_relay_dsl():
+    """Skip feature tests when the deterministic SM90 relay cannot compile."""
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._sm90_relay import sm90_deterministic_relay_requirement_error
+
+    requirement_error = sm90_deterministic_relay_requirement_error()
+    if requirement_error is not None:
+        pytest.skip(requirement_error)
+
+
+def _require_sm90_deterministic_relay():
+    _require_sm90()
+    _require_sm90_relay_dsl()
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("sm_count,expected", [(132, 66), (148, 74), (152, 76), (160, 76)])
 def test_DSA_sparse_attention_backward_d576_deterministic_compact_slots(sm_count, expected):
@@ -5350,6 +5364,16 @@ def test_DSA_sparse_attention_backward_sm90_relay_cutedsl_version_gate(monkeypat
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_feature_tests_skip_old_cutedsl(monkeypatch):
+    """Feature tests skip, while the dedicated version-refusal test remains active."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.1")))
+    with pytest.raises(pytest.skip.Exception, match=r"requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.7\.1"):
+        _require_sm90_relay_dsl()
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
     """The largest valid signed-Int32 element offset is accepted exactly."""
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
@@ -5365,6 +5389,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
 @pytest.mark.parametrize("relay_cluster_size", [4, 8, 16, 32, 64])
 def test_DSA_sparse_attention_backward_sm90_relay_host_span_matches_workspace_layout(relay_cluster_size):
     """The support-check span calculation matches the execution workspace."""
+    _require_sm90_relay_dsl()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90, _sm90_relay
 
     planes, physical_plane_elems, *_ = _interface_sm90._deterministic_relay_layout(257, 1001, 576, 96, relay_cluster_size)
@@ -5374,7 +5399,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_host_span_matches_workspace_la
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm90_relay_rejects_oversized_accumulator_during_support_check(monkeypatch):
     """The prepared plan rejects unsafe dynamic offsets before compilation."""
-    _require_sm90()
+    _require_sm90_deterministic_relay()
     from cudnn import DSA
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
 
@@ -5420,6 +5445,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_rejects_old_cutedsl_before_com
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm90_kernels_have_public_symbol_prefix():
     """Every CuTeDSL kernel in the SM90 backward module uses the public prefix."""
+    _require_sm90_relay_dsl()
     module = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm90")
     source = inspect.getsource(module)
 
@@ -5457,7 +5483,7 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_sm90()
+    _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         96,
         576,
@@ -5514,13 +5540,13 @@ def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length,
 @torch_fork_set_rng(seed=94)
 def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_runtime_extents(monkeypatch):
     """Packed Q/KV extents stay runtime values for all deterministic artifacts."""
+    _require_sm90_deterministic_relay()
     try:
         from cuda.bindings import driver as cuda
         from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_sm90()
     launch = _interface_sm90.flash_attn_bwd_sm90
     monkeypatch.setattr(launch, "compile_cache_relay_masks", {})
     monkeypatch.setattr(launch, "compile_cache", {})
@@ -5572,7 +5598,7 @@ def test_DSA_sparse_attention_backward_sm90_multiphase_relay_repeat100(relay_clu
     except ImportError:
         pytest.skip("Environment not supported: cuda-python not installed")
 
-    _require_sm90()
+    _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         64,
         512,
@@ -5636,7 +5662,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_cuda_graph(relay_cluster_size)
     except ImportError:
         pytest.skip("Environment not supported: cuda-python not installed")
 
-    _require_sm90()
+    _require_sm90_deterministic_relay()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         96,
         576,
