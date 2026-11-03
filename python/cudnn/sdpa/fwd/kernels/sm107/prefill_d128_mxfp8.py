@@ -30,7 +30,6 @@ slab, at 167 KiB with a half-precision O.
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key
-import os
 import sys
 from functools import lru_cache
 from typing import Callable, Optional, Tuple
@@ -199,7 +198,7 @@ SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
 # call below is written against -- the f32x2 op family's form differs and is not a proxy.  The stats
 # specialization keeps the shifted f32 scores for the exact LSE denominator and so never takes the fused arm.
 _FUSED_SHIFT_CVT = bool(SOFTMAX_F16 and SCALE_PREFOLDED and _softmax_f16.FUSED_SHIFT_CVT_AVAILABLE)
-_PSLOT = os.environ.get("FROST_EXP_PSLOT", "1") == "1"
+_PSLOT = True
 _P_ALIAS = CFG.CTA_MMA == 1
 _FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
 # The arms themselves (f16_exp_chunk / f16_exp_chunk_sum / fused_shift_f16_exp_chunk) live in
@@ -742,7 +741,8 @@ def _kernel(
                 # The final stats now ride the S_acc HEAD, so the MMA's
                 # next-tile prologue BMM1 has to wait for correction to have
                 # READ them.  init = CORR_LANES_TOTAL (make_classic_bars).
-                bars.mb_stats_read[qs].init()
+                if cutlass.const_expr(not _PSLOT):
+                    bars.mb_stats_read[qs].init()
                 bars.mb_o_full[qs].init()
                 bars.mb_o_empty[qs].init()
                 for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
@@ -2001,8 +2001,9 @@ def _mma_warp_group(
     # NEXT tile's prologue would have waited, i.e. exactly the phase the LAST
     # tile's correction arrives complete.  Leader only: the quiet (non-leader)
     # MMA arm never waits this ring.
-    for _qs in cutlass.range_constexpr(CFG.TILES_Q):
-        bars.mb_stats_read[_qs].wait(stats_read_phase)
+    if cutlass.const_expr(not _PSLOT):
+        for _qs in cutlass.range_constexpr(CFG.TILES_Q):
+            bars.mb_stats_read[_qs].wait(stats_read_phase)
 
     bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
@@ -2699,7 +2700,8 @@ def _correction_warp_group(
             # leader under cga2 -- the collective BMM1 writes both peers' TMEM.
             # LEADER producer: all CFG.CORR_LANES correction lanes of each CTA
             # arrive, no pred= (MBarrier.arrive raises on pred for LEADER).
-            bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if cutlass.const_expr(not _PSLOT):
+                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             # Pre-declare inv_sum/lse_val — without it MLIR cf.if NameErrors the tracer post-branch.
             inv_sum = cutlass.Float32(0.0)
