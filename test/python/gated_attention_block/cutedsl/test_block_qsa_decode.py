@@ -15,10 +15,12 @@ performance knob; the LSE is served over the pools (the core writes it).
 
 Host cells (any device; the declaration cells even on the CPU): the declaration FACTS (the sparse stage in the paged form, the
 list form per ``S_q``, no dense route, where the gate runs, the split's default rule, ``seq_lens_present`` forced, the stage
-order); the typed declines (the packed form under ``QsaSpec`` over the pools -- the serving table's ``sparse`` row --, a block
-table sample that is not contiguous, a split past the item's tile count, ``max_kv_len`` past the table's reach, the bottom-right
+order); the typed declines (the serving table's ``sparse`` row through a record without the THD x paged composition claim -- the
+packed form under ``QsaSpec`` over the pools CONSTRUCTS since 2026-10-30: the packed sparse EXTEND form, ``test_block_qsa_packed_extend.py`` --,
+a block table sample that is not contiguous, a split past the item's tile count, ``max_kv_len`` past the table's reach, the bottom-right
 diagonal on the block's own K / V, the in-block indexer over the pools); the static ``serving_envelope`` (the DECODE form served
-on a Rubin reading with ``sparse_core``, the EXTEND form declined with the ``sparse`` row); the execute-time form checks on an
+on a Rubin reading with ``sparse_core``, the EXTEND form served too -- the packed sparse form with caller lists --, the ``sparse`` row
+through the declining record); the execute-time form checks on an
 UNCOMPILED block under ``set_sync_debug_mode("error")`` (the list form per declaration, ``seq_lens`` refused, the whole table
 required, ``kv_lens`` required); the split rule.
 
@@ -26,8 +28,9 @@ Rubin cells (``requires_rubin``; one compiled block per cell): the decode ladder
 reference over the WHOLE sequence gives the post-norm / post-RoPE Q, K, V and the pre-sigmoid gate; the prefix rows fill the
 pools (NaN everywhere else: a gathered unwritten row would poison O), the step's rows are the block's own write-through; the
 step rows' attention is the oracle's over ``qsa_visible_mask(..., pos0=)`` (shared) or per row (per-token), then the gate and
-the out projection -- ``cos(out) > 0.999``, the gated O (the workspace slot) and the LSE within ``atol 2e-2`` (the sparse
-end-to-end module's bars, never widened), a dead row (``kv_lens[b] = 0``; a row whose position is negative because the
+the out projection -- ``cos(out) > 0.999``, the gated O (the workspace slot) within the repo's bf16 / f16 OUTPUT bound
+(``gated_block_bounds.assert_output_close``: per element ``|d| <= 2^-7 max|ref| + 2^-6 |ref|`` and ``cos >= 0.999``; ``max|d|``
+printed beside the fraction of the bound), the LSE within ``atol 2e-2`` (the sparse end-to-end module's bars, never widened), a dead row (``kv_lens[b] = 0``; a row whose position is negative because the
 sequence is shorter than the step) EXACTLY ``out = 0`` / ``O = 0`` / ``LSE = -inf``, the pools' step rows BITWISE the slab's
 post-RoPE K / V bands, the prefix rows and the NULL block untouched, two launches bitwise.  The ladder: ``S_q`` 1 .. 4 (the
 shared list; B 1 / 2 / 4; ``kv_lens`` up to 20000 incl. 2052, a dead entry, a one-token sequence and a sequence shorter than
@@ -97,6 +100,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_census import cupti_kernels as _cupti_kernels  # noqa: E402
 from gated_block_qsa_reference import qsa_visible_mask, random_block_ids  # noqa: E402
+from gated_block_bounds import assert_output_close  # noqa: E402
 from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,7 +110,10 @@ D = 256
 ROPE = 64
 BS = 4  # tokens per selectable block
 COS_OUT = 0.999  # the end-to-end suite's bar on `out`
-ATOL = 2e-2  # the SDPA stage test's bar on O / LSE -- never widened here
+# The SDPA stage test's bar on the LSE (test_sdpa_stage_sm107.py asserts atol 2e-2 on the LSE; its O checks are cos > 0.999) -- never widened here.
+# The gated O is held to the repo's bf16 / f16 OUTPUT bound instead (gated_block_bounds.py: per element |d| <= 2^-7 max|ref| + 2^-6 |ref| and
+# cos >= 0.999, the block backward's calibrated convention); see test_block_qsa_end_to_end.py for the measurement that retired the absolute bar.
+ATOL = 2e-2
 SHARED_MAX_S_Q = 4  # the sparse core's shared-list cap (SparseCapabilities.index_shared_list_max_tokens)
 GEOM_SMALL = dict(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=ROPE)  # group 4, cheap projections
 GEOM_FLASH_NEXT = dict(d_model=2560, h_q=24, h_kv=2, d_head=D, rope_dim=ROPE)  # Qwen3.8-Flash-Next TP 1 (group 12)
@@ -237,58 +244,81 @@ def test_declaration_facts_of_the_sparse_decode_mode(s_q, fuse_gate):
     assert pinned.decode_split_kv == 3 == pinned._sdpa.split_kv and pinned.max_kv_len == 70 and pinned.return_lse and pinned._sdpa.want_lse
     # the serving declaration's capture-safe projections: set per stage iff the GEMM driver's "auto" resolver names a JIT tile for the
     # stage's own shape -- the forced tile where 256 divides N (this geometry's two projections), the small-M route's tile at T <= 128
-    # (the indexer band's 13952-column slab of the 24 / 2 geometry: its own cell below).  THIS small geometry's band slab (N 5120 + 640
-    # = 5760 = 45 x 128, off the 256 grid) is not that case on any served part: its 90 64-row tiles FIT one wave at 90 SMs and more,
-    # where the route keeps the driver's graph route (eager steps; a capture is the driver's typed refusal); a part with fewer SMs
-    # overflows the wave and takes the route's 128-row tile at T <= 128.  So the expectation is read off the live resolver, as the
+    # (the indexer band's 13952-column slab of the 24 / 2 geometry: its own cell below), the GEMM engine's own baseline pick past 128
+    # rows (the large-M rule, every 128-grid band slab).  THIS small geometry's band slab (N 5120 + 640 = 5760 = 45 x 128, off the 256
+    # grid) is not the small-M case on any served part: its 90 64-row tiles FIT one wave at 90 SMs and more, where the route keeps the
+    # driver's graph route up to 128 rows (eager steps; a capture is the driver's typed refusal); a part with fewer SMs overflows the
+    # wave and takes the route's 128-row tile at T <= 128.  Past 128 rows (S_q 64: T 256) the large-M rule names the baseline on every
+    # part (N 5760 is past the planner's bounds, K 512 too shallow to split).  So the expectation is read off the live resolver, as the
     # 13952 cell reads it, and the one-wave fact is asserted where the live part has it; the out projection (N 512, on the 256 grid)
     # is capture-safe throughout
-    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name, large_m_tile_config
     from cudnn.gemm.frost import arch_family
+    from cudnn.gemm.frost.tile_config import _sm_count, select_config
 
     assert blk._proj.capture_safe and blk._out_proj.capture_safe
     with _no_host_sync():
         band, baux = _declare(GEOM_SMALL, 4, s_q, n_pages=6, index_band=True)
     g = baux["geom"]
     assert g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0
-    name = _auto_tile_name(4 * s_q, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
+    t = 4 * s_q
+    name = _auto_tile_name(t, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
     resolves = name is not None
-    if _DEV == "cuda" and arch_family.active_family() == "sm100":
-        one_wave = -(-g.n_qkvg // 64) <= sm  # the slab's 90 64-row tiles fit one wave: every served part
-        assert resolves is (4 * s_q <= SMALL_M_MAX and not one_wave), (sm, name)
+    if arch_family.active_family() == "sm100":
+        sm_live = _sm_count()  # the resolver's SM count: the device's, or the helper's CPU-only default
+        if _DEV == "cuda":
+            assert sm_live == sm
+        if t <= SMALL_M_MAX:
+            one_wave = -(-g.n_qkvg // 64) <= sm_live  # the slab's 90 64-row tiles fit one wave: every served part
+            assert resolves is (not one_wave), (sm_live, name)
+        else:
+            # the large-M rule: the engine's own baseline pick at the live SM count (the kernel the graph route ran there), never swap-AB
+            expect = select_config(t, g.n_qkvg, 1, K=g.d_model, sm_count=sm_live).name
+            assert resolves and name == large_m_tile_config(t, g.n_qkvg, g.d_model, dtype=BF16) == expect and "swapAB" not in name, (sm_live, name)
     else:
         assert not resolves, name  # the sm120 family's forced-tile fallback has no tile off the 256 grid
     assert getattr(band._proj, "capture_safe", False) is resolves and band._proj.resolves_a_jit_tile() is resolves and band._out_proj.capture_safe
 
 
 @pytest.mark.parametrize(
-    "batch, s_q, jit", [(1, 1, True), (4, 1, True), (32, 4, True), (4, 64, False)], ids=["B1-Sq1-T1", "B4-Sq1-T4", "B32-Sq4-T128", "B4-Sq64-T256"]
+    "batch, s_q, small_m", [(1, 1, True), (4, 1, True), (32, 4, True), (4, 64, False)], ids=["B1-Sq1-T1", "B4-Sq1-T4", "B32-Sq4-T128", "B4-Sq64-T256"]
 )
-def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_decode_row_counts(batch, s_q, jit):
+def test_the_indexer_band_declaration_over_the_pools_is_capture_safe_at_every_row_count(batch, s_q, small_m):
     """The 24 / 2 geometry WITH the indexer band over the pools (N = 13312 + 640 = 13952, off the 256 grid): at decode row counts
     (``T = B x S_q <= 128``) the slab GEMM takes the small-M route's 128-row swap-AB tile (13952 = 109 x 128; its 218 64-row tiles
-    overflow a wave on every served part), so BOTH projection stages are declared capture-safe -- exactly where the driver's own
-    resolver names a tile (the predicate is read off it, never re-spelled); past 128 rows the band slab has no tile (256 does not
-    divide it) and keeps the graph route: the slab stage is not flagged (a capture is the driver's typed refusal), the out projection
-    (N 2560, on the 256 grid) is.  Declared on empty tensors with no host sync (any device)."""
-    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name
+    overflow a wave on every served part), past them (T 256) the GEMM engine's OWN baseline pick for the shape -- the kernel the graph
+    route ran there, named by the large-M rule so the slab rides the same JIT-only route -- so BOTH projection stages are declared
+    capture-safe at every row count, exactly where the driver's own resolver names a tile (the predicate is read off it, never
+    re-spelled); the out projection (N 2560, on the 256 grid) is capture-safe throughout.  Declared on empty tensors with no host sync
+    (any device)."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import SMALL_M_MAX, _auto_tile_name, large_m_tile_config
     from cudnn.gemm.frost import arch_family
-    from cudnn.gemm.frost.tile_config import _sm_count
+    from cudnn.gemm.frost.tile_config import _sm_count, select_config
 
     with _no_host_sync():
         blk, aux = _declare(GEOM_FLASH_NEXT, batch, s_q, n_pages=6, index_band=True)
     g = aux["geom"]
     t = batch * s_q
-    assert g.n_qkvg == 13952 and g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0 and (t <= SMALL_M_MAX) is jit
+    assert g.n_qkvg == 13952 and g.n_qkvg % 256 != 0 and g.n_qkvg % 128 == 0 and (t <= SMALL_M_MAX) is small_m
     # the resolver the block's predicate reads (its arch-family gate included), at the live part's SM count: on the sm100 family the
-    # small-M route's 128-row swap-AB tile below 218 SMs; the sm120 family keeps the forced-tile fallback, which has no tile off the 256 grid
+    # small-M route's 128-row swap-AB tile below 218 SMs up to 128 rows and the engine's baseline past them; the sm120 family keeps the
+    # forced-tile fallback, which has no tile off the 256 grid
     name = _auto_tile_name(t, g.n_qkvg, g.d_model, dtype=BF16, a_major="k", b_major="k", block_scale=False, alpha=False)
     resolves = name is not None
     if arch_family.active_family() == "sm100":
-        assert name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB"))
-        # the one-wave boundary the route reads off the live SM count: the slab's 218 64-row tiles overflow the wave of every served part
-        # (<= 212 SMs) -> the small-M tile at T <= 128; a part with 218 SMs or more holds them in one wave and keeps the graph route
-        assert resolves is (jit and _sm_count() < -(-g.n_qkvg // 64)), (_sm_count(), name)
+        if small_m:
+            assert name is None or (name.startswith("CONFIG_sm100_128x") and name.endswith("_swapAB"))
+            # the one-wave boundary the route reads off the live SM count: the slab's 218 64-row tiles overflow the wave of every served part
+            # (<= 212 SMs) -> the small-M tile at T <= 128; a part with 218 SMs or more holds them in one wave and keeps the graph route
+            assert resolves is (_sm_count() < -(-g.n_qkvg // 64)), (_sm_count(), name)
+        else:
+            # the large-M rule: the engine's baseline at the live SM count (a 2-CTA pair tile, never swap-AB), the name `select_config` spells;
+            # at 256 rows the pick's grid fills a wave on every served part, so the split guard admits it everywhere
+            expect = select_config(t, g.n_qkvg, 1, K=g.d_model, sm_count=_sm_count()).name
+            assert resolves and name == large_m_tile_config(t, g.n_qkvg, g.d_model, dtype=BF16) == expect, (_sm_count(), name, expect)
+            assert name.endswith("_2ctamma") and "swapAB" not in name and "splitK" not in name, name
+    else:
+        assert not resolves, name
     assert getattr(blk._proj, "capture_safe", False) is resolves and blk._out_proj.capture_safe is True
     assert blk._proj.resolves_a_jit_tile() is resolves and blk._out_proj.resolves_a_jit_tile() is True
 
@@ -401,18 +431,24 @@ def test_the_sparse_split_rule_over_the_measured_decode_cells(sm_count):
     assert _sparse_combine_decode_grid(4, h_q, 4, 6, cc) == _sparse_combine_decode_grid(4, h_q, 4, 7, cc) == split_combine.DECODE_GRID_OFF
 
 
-def test_typed_declines_of_the_sparse_decode_mode():
-    """Every request the mode cannot serve, declined at DECLARATION with the feature named: the PACKED form over the pools (the
-    serving table's ``sparse`` row -- the core serves THD and paged pools one at a time), a block-table sample that is not
-    contiguous (the sparse core binds the whole ``(B, max_pages)`` table), a split past the item's tile count, ``max_kv_len``
-    past the table's reach, the bottom-right diagonal on the block's OWN K / V (the decode mode is the paged one), the in-block
-    indexer over the pools, the prepare fusion over the pools."""
+def test_typed_declines_of_the_sparse_decode_mode(monkeypatch):
+    """Every request the mode cannot serve, declined at DECLARATION with the feature named: the serving table's ``sparse`` row through a
+    record WITHOUT the THD x paged composition claim (INVERTED 2026-10-30: with the claim the packed form over the pools CONSTRUCTS -- the
+    packed sparse EXTEND form with caller lists, stage (4) the sparse core with ``thd`` and ``paged``, unsplit, one list per row; its own
+    module is ``test_block_qsa_packed_extend.py``), a block-table sample that is not contiguous (the sparse core binds the whole ``(B,
+    max_pages)`` table), a split past the item's tile count, ``max_kv_len`` past the table's reach, the bottom-right diagonal on the block's
+    OWN K / V (the decode mode is the paged one), the in-block indexer over the pools, the prepare fusion over the pools."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd import sparse_gqa_sm107 as S
+
     name, exc, _pred, msg = _row("sparse")
     mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
     geom, _ = _geom(GEOM_SMALL)
     kc, vc = _pools(4, 2, 16, "hnd", BF16)
-    with pytest.raises(exc, match="thd=True") as e:
-        GatedAttentionBlockFwd(
+
+    def packed():
+        return GatedAttentionBlockFwd(
             mk(32, geom.d_model),
             mk(geom.n_qkvg, geom.d_model),
             mk(D),
@@ -432,7 +468,15 @@ def test_typed_declines_of_the_sparse_decode_mode():
             sample_v_cache=vc,
             sample_block_table=torch.zeros(2, 4, dtype=torch.int32, device=_DEV),
         )
-    assert str(e.value) == msg and "one at a time" in msg
+
+    blk = packed()  # the composition claimed: the packed sparse EXTEND form constructs
+    assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and blk._sdpa.paged and blk.sparse_decode and blk.decode_split_kv == 1
+    assert blk.qsa_list_form == "per_row" and not blk.qsa_shared_list and blk.sparse_tile == "sparse_d256_f16" and blk.decode_route is None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(S, "SPARSE_CAPABILITIES", dataclasses.replace(S.SPARSE_CAPABILITIES, thd_paged_kv=False))
+        with pytest.raises(exc, match="thd=True") as e:
+            packed()
+    assert str(e.value) == msg and "thd_paged_kv" in msg
     wide = torch.zeros(2, 9, dtype=torch.int32, device=_DEV)[:, :4]  # a row slice of a wider table: not contiguous
     with pytest.raises(ValueError, match="CONTIGUOUS under QsaSpec"):
         _declare(GEOM_SMALL, 2, 1, n_pages=4, table=wide)
@@ -533,27 +577,52 @@ def _declare_indexer(geom_kw=GEOM_FLASH_NEXT, batch=1, s_q=1, *, page=16, n_page
     )
 
 
-def test_the_envelope_serves_the_sparse_decode_mode_and_declines_the_packed_form(monkeypatch):
+def test_the_envelope_serves_the_sparse_decode_mode_and_the_packed_extend_form(monkeypatch):
     """The static record a serving stack reads: on a Rubin reading a QsaSpec geometry with the bottom-right diagonal SERVES the
-    DECODE form (``sparse_core`` names stage (4); the requires spell the shared list and the per-token form) and declines the
-    EXTEND form with the table's ``sparse`` row (the very message the packed declaration raises); the top-left QsaSpec geometry
-    meets the ``diagonal`` row like a dense one; on this device the verdict reads the part."""
+    DECODE form (``sparse_core`` names stage (4); the requires spell the shared list and the per-token form) AND, since 2026-10-30, the
+    EXTEND form -- the packed sparse form with caller lists (``extend.sparse_core``, ``index_sources`` / ``index_list_forms`` /
+    ``sparse_tiles`` on the appended tail, the LSE written, no PDL stage, the ``thd_paged_*`` rows beside the table's); the table's
+    ``sparse`` row keeps its text in the declines and becomes the EXTEND verdict through a record without the composition claim (the very
+    message the packed declaration then raises); the top-left QsaSpec geometry meets the ``diagonal`` row like a dense one on both forms;
+    on this device the verdict reads the part."""
+    import dataclasses
+
     from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import sparse_gqa_sm107 as S
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom, _ = _geom(GEOM_SMALL)
     env = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
     assert isinstance(env.decode, DecodeEnvelope) and env.decode.served and env.decode.sparse_core and env.decode.reason is None
-    assert env.forms == ("decode",) and not env.extend.served and env.extend.reason == _row("sparse")[3]
+    assert env.forms == ("extend", "decode") and env.extend.served and env.extend.reason is None and env.extend.sparse_core
+    assert env.extend.index_sources == ("caller",) and env.extend.index_list_forms == ("per_row",) and env.extend.sparse_tiles == ("sparse_d256_f16",)
+    assert env.extend.writes_lse and env.extend.pdl_stages == () and any("decode_split_kv None" in r for r in env.extend.requires)
     assert any("[B, top_k]" in r for r in env.decode.requires) and any("[B, S_q, top_k]" in r for r in env.decode.requires)
     assert env.decode.routes == () and "sparse" not in env.decode.declines and env.extend.declines["sparse"] == _row("sparse")[3]
+    assert {k for k in env.extend.declines if k.startswith("thd_paged_")} == {
+        "thd_paged_select_form",
+        "thd_paged_split",
+        "thd_paged_lean",
+        "thd_paged_shared_list",
+        "thd_paged_pdl",
+        "thd_paged_fuse_prepare",
+        "thd_paged_e4m3_pool",
+        "thd_paged_indexer",
+    }
     top_left = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec()), BF16, _DEV, device_cc=_SM107)
     assert not top_left.decode.served and top_left.decode.reason == _row("diagonal")[3] and top_left.decode.sparse_core  # a geometry fact, served or not
+    assert not top_left.extend.served and top_left.extend.reason == _row("diagonal")[3] and top_left.extend.sparse_core and top_left.forms == ()
     dense = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107)
     assert dense.decode.served and not dense.decode.sparse_core and dense.decode.routes
+    assert dense.extend.served and not dense.extend.sparse_core and dense.extend.index_sources == () and dense.extend.sparse_tiles == ()
+    assert not any(k.startswith("thd_paged_") for k in dense.extend.declines), "a dense geometry's record carries the table's rows alone"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(S, "SPARSE_CAPABILITIES", dataclasses.replace(S.SPARSE_CAPABILITIES, thd_paged_kv=False))
+        declined = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107)
+    assert declined.forms == ("decode",) and not declined.extend.served and declined.extend.reason == _row("sparse")[3] and declined.extend.sparse_core
     monkeypatch.undo()
     here = GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV)
-    assert here.decode.served is (_cc() == _SM107 and here.cutedsl_ok)
+    assert here.decode.served is (_cc() == _SM107 and here.cutedsl_ok) and here.extend.served is (_cc() == _SM107 and here.cutedsl_ok)
 
 
 def test_execute_form_checks_of_the_sparse_decode_mode():
@@ -841,7 +910,7 @@ class _CaseBase:
             d_lse = float((lse[~dead_bhs] - self.ref_lse[~dead_bhs]).abs().max()) if live.any() else 0.0
             assert d_lse <= ATOL, f"{what}: LSE off the oracle by {d_lse} (budget {ATOL})"
         assert c > COS_OUT, f"{what}: cos(out) {c} <= {COS_OUT}"
-        assert d_o <= ATOL, f"{what}: gated O off the oracle by {d_o} (budget {ATOL})"
+        ob = assert_output_close(o[live], self.ref_o_gated[live], f"{self.label()} {what}: gated O vs the oracle")
         # the write-through: the step's live rows are the slab's post-RoPE K / V rows, bitwise; nothing else moved
         slot = self.slot_mapping
         lv = slot >= 0
@@ -860,8 +929,10 @@ class _CaseBase:
             raw = index_k_raw_view(proj, self.geom, self.blk.batch, self.blk.seq_len)  # [B, S, 1, index_head_dim]
             assert torch.equal(_bits(self.index_cache[s_ // self.page, s_ % self.page, :]), _bits(raw.reshape(-1, raw.shape[-1])[lv]))
             assert (~torch.isnan(self.index_cache.float())).all(-1).sum().item() == int(lv.sum())
-        print(f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}")
-        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()))
+        print(
+            f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} ({ob['bound_ratio']:.3f} of the output bound) max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}"
+        )
+        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()), o_bound_ratio=ob["bound_ratio"], o_cos=ob["cos"])
 
 
 class _Case(_CaseBase):
@@ -1152,7 +1223,7 @@ def test_mtp_rows_share_the_step0_list_and_see_the_block_completed_after_step0(s
     print(
         f"\nmtp S_q={s_q} pos0 mod 4 = {r}: vs the pos0 oracle max|dO| {d_pos0:.3e}; vs the per-row-tail reading max|dO| {d_rowtail:.3e} max|dLSE| {lse_rowtail:.3e}; hidden row {hidden_row_exists}"
     )
-    assert d_pos0 <= ATOL
+    assert_output_close(o[live], case.ref_o_gated[live], f"mtp S_q={s_q} pos0 mod 4 = {r}: gated O vs the pos0 oracle")
     if hidden_row_exists:
         assert d_rowtail > d_pos0 and lse_rowtail > m["d_lse"], "the per-row-tail reading should be the farther one where a block completed after step 0"
     else:
@@ -1511,6 +1582,12 @@ _INDEXER_DECLINE_TOKENS = {  # the `indexer_e4m3_cache` row RETIRED 2026-10-21: 
     "indexer_shared_list": "selects per row",
     "shared_list_rows": "tail covers at most two blocks",
     "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
+    # the EXTEND step's rows (2026-10-29; their accept / reject cells live in test_block_qsa_extend.py)
+    "indexer_extend_fuse_prepare": "the T-row chunk's ring read and its tail write live in two launches",
+    "indexer_extend_ring_slots": "the extend step takes the stack's ring slots",
+    "indexer_extend_rope_tables_only": "the extend step is always unfused and its query norm reads the per-token",
+    "indexer_extend_ring_rows": "at least block_size - 1 = 3 ring rows",
+    "indexer_extend_chunk_rows": "a chunk longer than the table's reach",
 }
 
 
@@ -1653,9 +1730,11 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `device_cc`, the lean tile's rows
-        # being the last appended: `sparse_tiles` / `sparse_tile_lean_default` and the part the per-cell `sparse_tile(...)` reads)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-15:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after the EXTEND step's four fields --
+        # appended 2026-10-29 after `route_cc`, the part the dense routes were read for, itself after the lean tile's rows: `sparse_tiles` /
+        # `sparse_tile_lean_default` and the part the per-cell `sparse_tile(...)` reads; `quant_modes` appended after them 2026-10-30: the
+        # quant spellings the DENSE paged forms serve on the part -- the FP8-projection + bf16-attention mode; `()` on every QsaSpec geometry)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-21:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1671,7 +1750,15 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "sparse_tiles",
             "sparse_tile_lean_default",
             "device_cc",
+            "route_cc",
+            "index_select_forms",
+            "index_extend_ring_rows_min",
+            "index_extend_select_budget_bytes",
+            "index_compress_roundings",
+            "quant_modes",
         ]
+        assert d.index_select_forms == ("auto", "decode", "extend") and d.index_extend_ring_rows_min == 3 and d.index_compress_roundings == ("single", "hf")
+        assert d.quant_modes == (), "a QsaSpec geometry serves no quant spelling over the pools"
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
         assert f16.index_sources == ("caller",) and f16.index_cache_dtypes == () and f16.fuse_prepare_default is False
@@ -1703,7 +1790,9 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
     import re
 
     rows = {
-        "indexer_query_rows": lambda: _declare_indexer(GEOM_SMALL, 1, 17, cap=20),
+        "indexer_query_rows": lambda: _declare_indexer(
+            GEOM_SMALL, 1, 17, cap=20, index_select_form="decode"
+        ),  # the explicit pin: "auto" takes the EXTEND step past the envelope (2026-10-29)
         "indexer_page_size": lambda: _declare_indexer(GEOM_SMALL, 1, 1, page=48),
         "indexer_shared_list": lambda: _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=dict(index_list_form="shared")),
         "fuse_prepare_rope_tables_unfused": lambda: _declare_indexer(GEOM_SMALL, 1, 1, rope_position_tables_only=True, fuse_prepare=False),
@@ -1765,7 +1854,10 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
         # the query-row envelope at 8 heads: S_q 8 x 8 = 64 rows serves, 9 x 8 does not
         assert _declare_indexer(GEOM_SMALL, 1, 8, cap=11, qsa_over=dict(index_heads=8))._indexer_decode is not None
         with pytest.raises(NotImplementedError, match="at most 8 rows per sequence"):
-            _declare_indexer(GEOM_SMALL, 1, 9, cap=12, qsa_over=dict(index_heads=8))
+            _declare_indexer(GEOM_SMALL, 1, 9, cap=12, qsa_over=dict(index_heads=8), index_select_form="decode")
+        assert (
+            _declare_indexer(GEOM_SMALL, 1, 9, cap=12, qsa_over=dict(index_heads=8), index_state_slot_mapping_present=True)._indexer_extend is not None
+        )  # "auto": the EXTEND step
         # the ring rule, the commit flag, a missing sample, the side caches off their form, the flags' type
         with pytest.raises(ValueError, match=r"needs at least S_q \+ 4 - 1 = 7 rows"):
             _declare_indexer(GEOM_SMALL, 1, 4, cap=6)
@@ -1969,188 +2061,12 @@ def _set_vs_topk(in_set: torch.Tensor, scores: torch.Tensor, top_k: int, tol: fl
     return flips, int(differs.any(dim=-1).sum()), float(gap.max())
 
 
-class _IndexerCase(_CaseBase):
-    """One decode step of the IN-BLOCK INDEXER over the pools: ``_Case``'s batch of sequences (the whole-sequence inputs per entry, the
-    dense reference's Q / K / V / gate, the NaN pools holding the oracle's prefix K / V, the table, the slots) plus the indexer's state --
-    the band's raw keys of every position from the oracle's own projection, the PREFIX blocks compressed through the compress kernel
-    into the paged compressed-key cache (page 0 the null page, NaN everywhere unwritten), the ring primed with the last ``cap`` raw
-    keys below the step (block 0 the null block), the position tables over the table's whole reach -- and the block declared
-    ``QsaSpec(index_source="indexer")`` over them.  The oracle is formed AFTER the run from the KERNEL's own list per row (the
-    two-stage oracle's second stage); ``check_selection`` is its first stage."""
-
-    def __init__(
-        self,
-        geom_kw,
-        s_q,
-        kv_lens,
-        *,
-        page=16,
-        layout="hnd",
-        dtype=BF16,
-        seed=0,
-        top_k=512,
-        return_lse=False,
-        fuse_gate=False,
-        split=None,
-        n_pages=None,
-        fuse_prepare=None,
-        cap=None,
-        slot_form=False,
-        rope_tables_only=False,
-        outputs=True,
-        lens_out=True,
-        index_cache_dtype=None,
-        sparse_tile_form=None,  # the sparse core's BODY knob (None = the block's "auto"; "lean" / "tcgen05" explicit)
-        sparse_sub_tiles_per_cta=None,
-    ):
-        self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
-        self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
-        self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
-        self.sparse_tile_form, self.sparse_sub_tiles_per_cta = sparse_tile_form, sparse_sub_tiles_per_cta
-        self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
-        # the indexer CACHE dtype (QsaSpec.index_cache_dtype): the paged compressed-key cache, ix_q and the prefix priming in it (e4m3 = the e4m3
-        # indexer cache, 2026-10-21: the compress kernel's e4m3 store arm primes the prefix exactly as a prefill form's cast would); the ring bf16
-        self.index_cache_dtype = index_cache_dtype
-        self.cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
-        kw_g = dict(geom_kw, causal_bottom_right=True)
-        self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=index_cache_dtype))
-        self.ref_geom = RefGeometry(**kw_g)
-        geom, ref_geom = self.geom, self.ref_geom
-        h_q, h_kv, d_model, d_i, h_i = geom.h_q, geom.h_kv, geom.d_model, geom.qsa.index_head_dim, geom.qsa.index_heads
-        G = h_q // h_kv
-        B = len(self.kv_lens)
-        g = torch.Generator(device=_DEV).manual_seed(seed)
-        self.gen = g
-
-        def randn(*shape, std=0.02):
-            return (torch.randn(*shape, generator=g, device=_DEV, dtype=torch.float32) * std).to(dtype)
-
-        n_dense = sum(geom.qkvg_block_widths[:4])
-        w_qkvg = randn(geom.n_qkvg, d_model)
-        self.w = dict(
-            w_qkvg=w_qkvg,
-            w_q_norm=torch.ones(D, dtype=dtype, device=_DEV),
-            w_k_norm=torch.ones(D, dtype=dtype, device=_DEV),
-            w_o=randn(d_model, h_q * D),
-            w_iq_norm=(1.0 + 0.03 * randn(d_i, std=1.0).float()).to(dtype),
-            w_ik_norm=(1.0 + 0.02 * randn(d_i, std=1.0).float()).to(dtype),
-        )
-        self.w_band_k = w_qkvg[n_dense + h_i * d_i :]  # [d_i, d_model]: the band's raw-key head
-        L_max = max(max(self.kv_lens), s_q)
-        self.max_pages = max(-(-L_max // page), 1)
-        self.n_pos = self.max_pages * page  # the position tables cover the table's whole reach (the RoPE-table ceiling met with equality)
-        cos_t, sin_t = _rope_tables(self.n_pos, dtype, ref_geom)
-        self.cos_pos, self.sin_pos = cos_t, sin_t  # [1, n_pos, ROPE]
-        scale = geom.scale
-        self.scale, self.G = scale, G
-        self.h = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
-        self.cos = cos_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
-        self.sin = sin_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
-        self.ref_out = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
-        self.ref_o_gated = torch.zeros(B, s_q, h_q, D, dtype=dtype, device=_DEV)
-        self.ref_lse = torch.full((B, h_q, s_q), float("-inf"), dtype=torch.float32, device=_DEV)
-        self.ref_rows, self.refs, self.k_raw_full = {}, {}, {}
-        self.live_rows = torch.zeros(B, s_q, dtype=torch.bool, device=_DEV)
-        for b, L in enumerate(self.kv_lens):
-            pos = torch.arange(s_q, device=_DEV) + (L - s_q)
-            live = pos >= 0
-            self.live_rows[b] = live
-            if L == 0:
-                continue
-            h_full = randn(1, L, d_model, std=1.0)
-            ref = gated_attention_block_reference(
-                h_full, w_qkvg[:n_dense], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], ref_geom
-            )
-            self.refs[b] = ref
-            self.ref_rows[b] = (ref.k[0], ref.v[0])
-            # the band's raw key of every position: the oracle's own projection, ONE rounding (the prefix blocks and the ring are built from it)
-            self.k_raw_full[b] = (h_full[0].float() @ self.w_band_k.float().t()).to(dtype)  # [L, d_i]
-            p_live = pos[live]
-            self.h[b, live] = h_full[0, p_live]
-            self.cos[b, live] = cos_t[0, p_live]
-            self.sin[b, live] = sin_t[0, p_live]
-        # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages - 1; -1 past them
-        need = sum(-(-L // page) for L in self.kv_lens)
-        self.n_pages = n_pages if n_pages is not None else need + 1 + 2
-        assert self.n_pages >= need + 1, (self.n_pages, need)
-        perm = (torch.randperm(self.n_pages - 1, generator=g, device=_DEV) + 1).tolist()
-        self.block_table = torch.full((B, self.max_pages), -1, dtype=torch.int32, device=_DEV)
-        it = iter(perm)
-        slots = torch.full((B * s_q,), -1, dtype=torch.int32, device=_DEV)
-        self.k_cache, self.v_cache = _pools(self.n_pages, h_kv, page, layout, dtype)
-        self.index_cache = None  # the raw-key pool of the caller-list band form: nothing here (the raw key lives in the ring)
-        self.rpp = page // BS
-        self.cap = int(cap) if cap is not None else (4 if s_q == 1 else 8)  # the serving stacks' ring: 4 without speculative rows, 8 with 1 .. 4
-        self.index_kv_cache = torch.full((self.n_pages, self.rpp, 1, d_i), float("nan"), dtype=self.cache_dtype, device=_DEV)
-        self.index_state_cache = torch.full((B + 1, self.cap, 1, d_i), float("nan"), dtype=dtype, device=_DEV)
-        self.index_state_block_table = torch.zeros(B, 1, dtype=torch.int32, device=_DEV)
-        self.pages = {}
-        for b, L in enumerate(self.kv_lens):
-            if L == 0:
-                self.block_table[b] = 0  # the dead entry: the NULL block / the null ring block, slots -1
-                continue
-            pages = [next(it) for _ in range(-(-L // page))]
-            self.pages[b] = pages
-            self.block_table[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32, device=_DEV)
-            self.index_state_block_table[b, 0] = b + 1
-            k_rows, v_rows = self.ref_rows[b]
-            pos0 = L - s_q
-            for p in range(max(pos0, 0)):  # the PREFIX: the oracle's rows into the pools
-                pg, off = pages[p // page], p % page
-                self.k_cache[pg, :, off] = k_rows[p]
-                self.v_cache[pg, :, off] = v_rows[p]
-            for j in range(s_q):  # the step's live tokens: written through by the block
-                p = pos0 + j
-                if p >= 0:
-                    slots[b * s_q + j] = pages[p // page] * page + p % page
-            # the ring: the last `cap` raw keys below the step, position-indexed
-            for p in range(max(0, pos0 - self.cap), max(pos0, 0)):
-                self.index_state_cache[b + 1, p % self.cap, 0] = self.k_raw_full[b][p]
-        self.slot_mapping = slots
-        self.kv_lens_t = torch.tensor(self.kv_lens, dtype=torch.int32, device=_DEV)
-        self.prefix_bits = (_bits(self.k_cache).clone(), _bits(self.v_cache).clone())
-        # the ring's WRITE rows as the stack spells them (block x cap + pos % cap, -1 on a dead row), slot_mapping's dtype
-        pos_all = torch.tensor([[L - s_q + j for j in range(s_q)] for L in self.kv_lens], device=_DEV, dtype=torch.long)
-        blk_of = self.index_state_block_table.long()
-        self.ring_slots = (
-            torch.where((pos_all >= 0) & (blk_of > 0), blk_of * self.cap + pos_all % self.cap, torch.full_like(pos_all, -1)).reshape(-1).to(torch.int32)
-        )
-        self.block_ids_out = torch.full((B, s_q, top_k), _SENT_I32, dtype=torch.int32, device=_DEV) if outputs else None
-        self.block_lens_out = torch.full((B, s_q), _SENT_I32, dtype=torch.int32, device=_DEV) if lens_out else None
-        kw = dict(
-            paged_kv_page_size=page,
-            kv_source=KV_SOURCE_PAGED,
-            sample_k_cache=self.k_cache,
-            sample_v_cache=self.v_cache,
-            sample_block_table=self.block_table,
-            sample_index_kv_cache=self.index_kv_cache,
-            sample_index_state_cache=self.index_state_cache,
-            sample_index_state_block_table=self.index_state_block_table,
-            fuse_gate=fuse_gate,
-            return_lse=return_lse,
-            decode_split_kv=split,
-            fuse_prepare=fuse_prepare,
-            index_state_slot_mapping_present=self.slot_form,
-            rope_position_tables_only=self.rope_tables_only,
-        )
-        if sparse_tile_form is not None:
-            kw["sparse_tile_form"] = sparse_tile_form
-        if sparse_sub_tiles_per_cta is not None:
-            kw["sparse_sub_tiles_per_cta"] = sparse_sub_tiles_per_cta
-        self.blk_kw = kw
-        self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
-        self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
-        tables = (None, None) if self.rope_tables_only else (self.cos, self.sin)
-        self.blk = GatedAttentionBlockFwd(self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], *tables, self.w["w_o"], self.out, self.geom, **kw)
-        assert (
-            isinstance(self.blk._sdpa, _SparseSdpa)
-            and self.blk.indexer_decode
-            and not self.blk.qsa_shared_list
-            and isinstance(self.blk._indexer_decode, _IndexerDecode)
-        )
-        assert self.blk.index_cache_dtype == self.cache_dtype and self.blk._indexer_decode.cache_dtype == self.cache_dtype
-        self.ws = None
-        self._compress = {}
+class _IndexerCaseBase(_CaseBase):
+    """The in-block indexer's methods shared by its two step forms -- the decode step's ``_IndexerCase`` below and the extend module's
+    ``_IndexerExtendCase`` (a T-row chunk per sequence behind its prefix): the prefix priming through the compress kernel and the compress
+    helper, compile / execute / run over the declared block, the slab views, the two-stage oracle (``check_selection`` on the KERNEL's list,
+    the inherited ``check`` over it), the label and the e4m3 twin check.  No ``__init__`` -- ``_CaseBase``'s rule: each form's case builds its
+    own state (a different declaration, prefix and ring priming), so neither skips a base initializer."""
 
     def prime_prefix(self):
         """The PREFIX blocks of every live sequence (``j < floor(pos0 / 4)``) into the paged compressed-key cache through the compress kernel
@@ -2438,6 +2354,190 @@ class _IndexerCase(_CaseBase):
         return dict(agreement=agreement, rows=agree_rows, same_rows=same_rows, flips=flips, max_rel=max_rel)
 
 
+class _IndexerCase(_IndexerCaseBase):
+    """One decode step of the IN-BLOCK INDEXER over the pools: ``_Case``'s batch of sequences (the whole-sequence inputs per entry, the
+    dense reference's Q / K / V / gate, the NaN pools holding the oracle's prefix K / V, the table, the slots) plus the indexer's state --
+    the band's raw keys of every position from the oracle's own projection, the PREFIX blocks compressed through the compress kernel
+    into the paged compressed-key cache (page 0 the null page, NaN everywhere unwritten), the ring primed with the last ``cap`` raw
+    keys below the step (block 0 the null block), the position tables over the table's whole reach -- and the block declared
+    ``QsaSpec(index_source="indexer")`` over them.  The oracle is formed AFTER the run from the KERNEL's own list per row (the
+    two-stage oracle's second stage); ``check_selection`` is its first stage."""
+
+    def __init__(
+        self,
+        geom_kw,
+        s_q,
+        kv_lens,
+        *,
+        page=16,
+        layout="hnd",
+        dtype=BF16,
+        seed=0,
+        top_k=512,
+        return_lse=False,
+        fuse_gate=False,
+        split=None,
+        n_pages=None,
+        fuse_prepare=None,
+        cap=None,
+        slot_form=False,
+        rope_tables_only=False,
+        outputs=True,
+        lens_out=True,
+        index_cache_dtype=None,
+        sparse_tile_form=None,  # the sparse core's BODY knob (None = the block's "auto"; "lean" / "tcgen05" explicit)
+        sparse_sub_tiles_per_cta=None,
+    ):
+        self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
+        self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
+        self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
+        self.sparse_tile_form, self.sparse_sub_tiles_per_cta = sparse_tile_form, sparse_sub_tiles_per_cta
+        self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
+        # the indexer CACHE dtype (QsaSpec.index_cache_dtype): the paged compressed-key cache, ix_q and the prefix priming in it (e4m3 = the e4m3
+        # indexer cache, 2026-10-21: the compress kernel's e4m3 store arm primes the prefix exactly as a prefill form's cast would); the ring bf16
+        self.index_cache_dtype = index_cache_dtype
+        self.cache_dtype = dtype if index_cache_dtype is None else index_cache_dtype
+        kw_g = dict(geom_kw, causal_bottom_right=True)
+        self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True, index_cache_dtype=index_cache_dtype))
+        self.ref_geom = RefGeometry(**kw_g)
+        geom, ref_geom = self.geom, self.ref_geom
+        h_q, h_kv, d_model, d_i, h_i = geom.h_q, geom.h_kv, geom.d_model, geom.qsa.index_head_dim, geom.qsa.index_heads
+        G = h_q // h_kv
+        B = len(self.kv_lens)
+        g = torch.Generator(device=_DEV).manual_seed(seed)
+        self.gen = g
+
+        def randn(*shape, std=0.02):
+            return (torch.randn(*shape, generator=g, device=_DEV, dtype=torch.float32) * std).to(dtype)
+
+        n_dense = sum(geom.qkvg_block_widths[:4])
+        w_qkvg = randn(geom.n_qkvg, d_model)
+        self.w = dict(
+            w_qkvg=w_qkvg,
+            w_q_norm=torch.ones(D, dtype=dtype, device=_DEV),
+            w_k_norm=torch.ones(D, dtype=dtype, device=_DEV),
+            w_o=randn(d_model, h_q * D),
+            w_iq_norm=(1.0 + 0.03 * randn(d_i, std=1.0).float()).to(dtype),
+            w_ik_norm=(1.0 + 0.02 * randn(d_i, std=1.0).float()).to(dtype),
+        )
+        self.w_band_k = w_qkvg[n_dense + h_i * d_i :]  # [d_i, d_model]: the band's raw-key head
+        L_max = max(max(self.kv_lens), s_q)
+        self.max_pages = max(-(-L_max // page), 1)
+        self.n_pos = self.max_pages * page  # the position tables cover the table's whole reach (the RoPE-table ceiling met with equality)
+        cos_t, sin_t = _rope_tables(self.n_pos, dtype, ref_geom)
+        self.cos_pos, self.sin_pos = cos_t, sin_t  # [1, n_pos, ROPE]
+        scale = geom.scale
+        self.scale, self.G = scale, G
+        self.h = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.cos = cos_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
+        self.sin = sin_t[0, :1].expand(s_q, ROPE).clone()[None].expand(B, s_q, ROPE).clone()
+        self.ref_out = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.ref_o_gated = torch.zeros(B, s_q, h_q, D, dtype=dtype, device=_DEV)
+        self.ref_lse = torch.full((B, h_q, s_q), float("-inf"), dtype=torch.float32, device=_DEV)
+        self.ref_rows, self.refs, self.k_raw_full = {}, {}, {}
+        self.live_rows = torch.zeros(B, s_q, dtype=torch.bool, device=_DEV)
+        for b, L in enumerate(self.kv_lens):
+            pos = torch.arange(s_q, device=_DEV) + (L - s_q)
+            live = pos >= 0
+            self.live_rows[b] = live
+            if L == 0:
+                continue
+            h_full = randn(1, L, d_model, std=1.0)
+            ref = gated_attention_block_reference(
+                h_full, w_qkvg[:n_dense], self.w["w_q_norm"], self.w["w_k_norm"], cos_t[:, :L], sin_t[:, :L], self.w["w_o"], ref_geom
+            )
+            self.refs[b] = ref
+            self.ref_rows[b] = (ref.k[0], ref.v[0])
+            # the band's raw key of every position: the oracle's own projection, ONE rounding (the prefix blocks and the ring are built from it)
+            self.k_raw_full[b] = (h_full[0].float() @ self.w_band_k.float().t()).to(dtype)  # [L, d_i]
+            p_live = pos[live]
+            self.h[b, live] = h_full[0, p_live]
+            self.cos[b, live] = cos_t[0, p_live]
+            self.sin[b, live] = sin_t[0, p_live]
+        # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages - 1; -1 past them
+        need = sum(-(-L // page) for L in self.kv_lens)
+        self.n_pages = n_pages if n_pages is not None else need + 1 + 2
+        assert self.n_pages >= need + 1, (self.n_pages, need)
+        perm = (torch.randperm(self.n_pages - 1, generator=g, device=_DEV) + 1).tolist()
+        self.block_table = torch.full((B, self.max_pages), -1, dtype=torch.int32, device=_DEV)
+        it = iter(perm)
+        slots = torch.full((B * s_q,), -1, dtype=torch.int32, device=_DEV)
+        self.k_cache, self.v_cache = _pools(self.n_pages, h_kv, page, layout, dtype)
+        self.index_cache = None  # the raw-key pool of the caller-list band form: nothing here (the raw key lives in the ring)
+        self.rpp = page // BS
+        self.cap = int(cap) if cap is not None else (4 if s_q == 1 else 8)  # the serving stacks' ring: 4 without speculative rows, 8 with 1 .. 4
+        self.index_kv_cache = torch.full((self.n_pages, self.rpp, 1, d_i), float("nan"), dtype=self.cache_dtype, device=_DEV)
+        self.index_state_cache = torch.full((B + 1, self.cap, 1, d_i), float("nan"), dtype=dtype, device=_DEV)
+        self.index_state_block_table = torch.zeros(B, 1, dtype=torch.int32, device=_DEV)
+        self.pages = {}
+        for b, L in enumerate(self.kv_lens):
+            if L == 0:
+                self.block_table[b] = 0  # the dead entry: the NULL block / the null ring block, slots -1
+                continue
+            pages = [next(it) for _ in range(-(-L // page))]
+            self.pages[b] = pages
+            self.block_table[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32, device=_DEV)
+            self.index_state_block_table[b, 0] = b + 1
+            k_rows, v_rows = self.ref_rows[b]
+            pos0 = L - s_q
+            for p in range(max(pos0, 0)):  # the PREFIX: the oracle's rows into the pools
+                pg, off = pages[p // page], p % page
+                self.k_cache[pg, :, off] = k_rows[p]
+                self.v_cache[pg, :, off] = v_rows[p]
+            for j in range(s_q):  # the step's live tokens: written through by the block
+                p = pos0 + j
+                if p >= 0:
+                    slots[b * s_q + j] = pages[p // page] * page + p % page
+            # the ring: the last `cap` raw keys below the step, position-indexed
+            for p in range(max(0, pos0 - self.cap), max(pos0, 0)):
+                self.index_state_cache[b + 1, p % self.cap, 0] = self.k_raw_full[b][p]
+        self.slot_mapping = slots
+        self.kv_lens_t = torch.tensor(self.kv_lens, dtype=torch.int32, device=_DEV)
+        self.prefix_bits = (_bits(self.k_cache).clone(), _bits(self.v_cache).clone())
+        # the ring's WRITE rows as the stack spells them (block x cap + pos % cap, -1 on a dead row), slot_mapping's dtype
+        pos_all = torch.tensor([[L - s_q + j for j in range(s_q)] for L in self.kv_lens], device=_DEV, dtype=torch.long)
+        blk_of = self.index_state_block_table.long()
+        self.ring_slots = (
+            torch.where((pos_all >= 0) & (blk_of > 0), blk_of * self.cap + pos_all % self.cap, torch.full_like(pos_all, -1)).reshape(-1).to(torch.int32)
+        )
+        self.block_ids_out = torch.full((B, s_q, top_k), _SENT_I32, dtype=torch.int32, device=_DEV) if outputs else None
+        self.block_lens_out = torch.full((B, s_q), _SENT_I32, dtype=torch.int32, device=_DEV) if lens_out else None
+        kw = dict(
+            paged_kv_page_size=page,
+            kv_source=KV_SOURCE_PAGED,
+            sample_k_cache=self.k_cache,
+            sample_v_cache=self.v_cache,
+            sample_block_table=self.block_table,
+            sample_index_kv_cache=self.index_kv_cache,
+            sample_index_state_cache=self.index_state_cache,
+            sample_index_state_block_table=self.index_state_block_table,
+            fuse_gate=fuse_gate,
+            return_lse=return_lse,
+            decode_split_kv=split,
+            fuse_prepare=fuse_prepare,
+            index_state_slot_mapping_present=self.slot_form,
+            rope_position_tables_only=self.rope_tables_only,
+        )
+        if sparse_tile_form is not None:
+            kw["sparse_tile_form"] = sparse_tile_form
+        if sparse_sub_tiles_per_cta is not None:
+            kw["sparse_sub_tiles_per_cta"] = sparse_sub_tiles_per_cta
+        self.blk_kw = kw
+        self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
+        tables = (None, None) if self.rope_tables_only else (self.cos, self.sin)
+        self.blk = GatedAttentionBlockFwd(self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], *tables, self.w["w_o"], self.out, self.geom, **kw)
+        assert (
+            isinstance(self.blk._sdpa, _SparseSdpa)
+            and self.blk.indexer_decode
+            and not self.blk.qsa_shared_list
+            and isinstance(self.blk._indexer_decode, _IndexerDecode)
+        )
+        assert self.blk.index_cache_dtype == self.cache_dtype and self.blk._indexer_decode.cache_dtype == self.cache_dtype
+        self.ws = None
+        self._compress = {}
+
+
 def _two_launches_indexer(case: _IndexerCase, what: str):
     a = case.run().clone()
     ids_a, o_a = case.kernel_ids().clone(), case.slab_views()[4].clone()
@@ -2686,7 +2786,8 @@ def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwi
     nothing, the replay is BITWISE a fresh eager run (``out``, the LSE, the list, the ring, the cache), and a new step through the captured
     tensors (new lengths / tables / slots / ring state / cache / inputs) replays bitwise the eager run over them."""
     # the 24 / 2 band geometry: its slab (N 13952) rides the small-M route's 128-row tile at B x S_q <= 128 rows, capture-safe from the
-    # first execute (the band capture cell above); the 8 / 2 band slab (N 5760) takes the GEMM graph route, whose handle is created eagerly
+    # first execute (the band capture cell above); the 8 / 2 band slab (N 5760) takes the GEMM graph route at decode row counts (its 90
+    # 64-row tiles fit one wave), whose handle is created eagerly -- past 128 rows it rides the engine's baseline tile on the JIT route
     kw = dict(page=16, split=4, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare, index_cache_dtype=cache_dtype)
     case = _IndexerCase(GEOM_FLASH_NEXT, 2, (300, 0, 1000, 77), seed=141, **kw)
     case.prime_prefix()
@@ -3284,6 +3385,33 @@ def test_detector_turns_red_when_the_sparse_core_launches_with_the_attribute_but
 _TILE_LEAN, _TILE_TCGEN05 = "sparse_lean_d256_f16", "sparse_d256_f16"
 
 
+def test_on_a_cc_10_0_reading_the_explicit_lean_tile_through_the_block_is_a_typed_decline(monkeypatch):
+    """Closes the drift since the standalone sparse adapter admitted the EXPLICIT lean tile on cc 10.0 / 10.3: THROUGH THE BLOCK the
+    sparse forms stay Rubin-only (2026-10-29) -- the declaration still resolves the lean body (the adapter would serve it standalone),
+    ``check_support`` declines by name before any stage, the sparse stage itself declines before the adapter, and the envelope says not
+    served there (the AUTO / tcgen05 readings decline the same way: the part statement names the form, not the body)."""
+    from cudnn.gated_attention_block import api as _api
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+    with _no_host_sync():
+        blk, _ = _declare(GEOM_SMALL, 1, 1, sparse_tile_form="lean")
+        auto, _ = _declare(GEOM_SMALL, 1, 1)
+    assert blk.sparse_tile == _TILE_LEAN and blk.sparse_tile_form == "lean" and auto.sparse_tile == _TILE_TCGEN05
+    for b in (blk, auto):
+        with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only") as e:
+            b.check_support()
+        assert "explicit lean tile on cc 10.0 / 10.3" in str(e.value) and "found SM100" in str(e.value)
+        with pytest.raises(NotImplementedError, match=r"sparse forms .* served on cc 10\.7 \(Rubin\) only"):
+            b._sdpa.check_support()
+    env = GatedAttentionBlockFwd.serving_envelope(blk.geom, BF16, _DEV, device_cc=(10, 0)).decode
+    assert not env.served and "sparse forms" in env.reason and env.sparse_tile(1, 1, sparse_tile_form="lean") is None and env.sparse_tiles == ()
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    with _no_host_sync():
+        rubin, _ = _declare(GEOM_SMALL, 1, 1, sparse_tile_form="lean")
+    rubin._check_declaration()
+    rubin._check_part_support()  # the Rubin reading passes the part rows: the stages speak next
+
+
 def _lse_delta(a: torch.Tensor, b: torch.Tensor) -> float:
     """max |a - b| over the LIVE rows of two LSE tensors, after pinning that the two bodies agree on WHICH rows are dead (-inf on both: a dead
     entry's -inf minus -inf is NaN, not a difference)."""
@@ -3706,9 +3834,9 @@ _LEAN_BLOCK_CELLS = [
 def test_the_lean_route_matches_the_oracle_and_the_tcgen05_route_within_tolerance(
     geom_kw, s_q, kv_lens, page, layout, dtype, split, k, fuse_gate, return_lse, block_lens, seed
 ):
-    """The block on ``sparse_tile_form="lean"`` against the fp32 oracle (the module's bars: ``cos(out) > 0.999``, the gated O and the LSE within
-    2e-2, dead rows exact, two launches bitwise; the stage's ``kernel_template`` the lean tile's) and against the SAME block on
-    ``sparse_tile_form="tcgen05"``: ``out`` within the module's tolerance (cos), the gated O and the LSE within 2e-2, the list bitwise (the
+    """The block on ``sparse_tile_form="lean"`` against the fp32 oracle (the module's bars: ``cos(out) > 0.999``, the gated O within the output
+    bound, the LSE within 2e-2, dead rows exact, two launches bitwise; the stage's ``kernel_template`` the lean tile's) and against the SAME block on
+    ``sparse_tile_form="tcgen05"``: ``out`` within the module's tolerance (cos), the gated O within the output bound, the LSE within 2e-2, the list bitwise (the
     caller's list is the same tensor; the kernel-produced list is the indexer cell's) -- NOT bitwise across the bodies and never asserted so
     (a 4 x 64-d split-K sum in fixed order vs one 256-d MMA chain; recorded in the print), bitwise WITHIN each body (two launches)."""
     kw = dict(page=page, layout=layout, dtype=dtype, seed=seed, split=split, fuse_gate=fuse_gate, return_lse=return_lse, block_lens=block_lens)
@@ -3724,7 +3852,8 @@ def test_the_lean_route_matches_the_oracle_and_the_tcgen05_route_within_toleranc
     c = _cos(lean.out, tc.out)
     d_o = float((lean.slab_views()[4].float() - tc.slab_views()[4].float()).abs().max())
     d_lse = _lse_delta(lean.lse, tc.lse) if return_lse else 0.0
-    assert c > COS_OUT and d_o <= ATOL and d_lse <= ATOL, f"lean vs tcgen05: cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert c > COS_OUT and d_lse <= ATOL, f"lean vs tcgen05: cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert_output_close(lean.slab_views()[4], tc.slab_views()[4], "lean vs tcgen05: gated O")
     assert torch.equal(lean.block_ids, tc.block_ids), "the caller's list is one tensor: bitwise by construction"
     bitwise = bool(torch.equal(_bits(lean.out), _bits(tc.out)))
     print(
@@ -3768,8 +3897,8 @@ def test_the_lean_route_census_names_the_lean_kernel_and_matches_the_tcgen05_lau
 def test_the_indexer_decode_step_on_the_lean_route_lists_bitwise_and_attends_within_tolerance():
     """The in-block indexer's decode step (per-row lists, one row per sequence: the lean body serves it as the shared list) on
     ``sparse_tile_form="lean"`` against the SAME step on ``"tcgen05"``: the kernel-produced list, the counts, the side caches and the pools'
-    step rows BITWISE (the same prepare / scorer / top-k kernels run on both routes), ``out`` within the module's tolerance, the gated O and
-    the LSE within 2e-2; each route against its own two-stage oracle, two launches bitwise."""
+    step rows BITWISE (the same prepare / scorer / top-k kernels run on both routes), ``out`` within the module's tolerance, the gated O within
+    the output bound, the LSE within 2e-2; each route against its own two-stage oracle, two launches bitwise."""
     kw = dict(page=16, seed=221, split=None, fuse_gate=True, return_lse=True, fuse_prepare=True)
     lean = _IndexerCase(GEOM_SMALL, 1, (2052, 8192, 0, 4097), sparse_tile_form="lean", **kw)
     tc = _IndexerCase(GEOM_SMALL, 1, (2052, 8192, 0, 4097), sparse_tile_form="tcgen05", **kw)
@@ -3790,7 +3919,8 @@ def test_the_indexer_decode_step_on_the_lean_route_lists_bitwise_and_attends_wit
     c = _cos(lean.out, tc.out)
     d_o = float((lean.slab_views()[4].float() - tc.slab_views()[4].float()).abs().max())
     d_lse = _lse_delta(lean.lse, tc.lse)
-    assert c > COS_OUT and d_o <= ATOL and d_lse <= ATOL, f"lean vs tcgen05 (indexer step): cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert c > COS_OUT and d_lse <= ATOL, f"lean vs tcgen05 (indexer step): cos {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.3e}"
+    assert_output_close(lean.slab_views()[4], tc.slab_views()[4], "lean vs tcgen05 (indexer step): gated O")
     print(f"\nindexer step lean vs tcgen05: list bitwise, cos(out) {c:.6f} max|dO_gated| {d_o:.3e} max|dLSE| {d_lse:.2e}; lean {m_lean}; tcgen05 {m_tc}")
 
 

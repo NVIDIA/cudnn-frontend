@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.tensor_adapter import has_tcgen05
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_capability,
     maybe_contiguous,
@@ -37,8 +38,8 @@ from ._block_scaled import BLOCK_SCALED_PRECISION_NAMES
 def _check_score_arch(api: APIBase) -> None:
     major, _ = torch.cuda.get_device_capability()
     api._runtime_error_if(
-        major != 9 and major < 10,
-        f"{type(api).__name__} requires SM90 or SM100+ compute capability, found SM{major}",
+        major != 9 and not has_tcgen05(major),
+        f"{type(api).__name__} requires SM90 or SM100+ compute capability with tcgen05 (not cc 12.x), found SM{major}",
     )
 
 
@@ -336,7 +337,7 @@ def sparse_indexer_score_recompute_wrapper(
     omitted. All of it runs on ``stream``.
 
     ``topk_length`` does not replace the ``-1`` padding: slots at and past
-    ``topk_length[row]`` must still hold ``-1`` (docs/fe-oss-apis/dsa.md,
+    ``topk_length[row]`` must still hold ``-1`` (docs/operations/sparse_attention/dsa.md,
     "Compact vs. non-compact sparse indices").
     """
     with _torch_stream_context(stream):
@@ -520,7 +521,7 @@ def sparse_attn_score_recompute_wrapper(
     ``topk_length`` does not replace the ``-1`` padding: slots at and past
     ``topk_length[row]`` must still hold ``-1``, because the SM100 kernel may
     ignore ``topk_length`` and skip slots by index value (issue #1549; see
-    docs/fe-oss-apis/dsa.md, "Compact vs. non-compact sparse indices").
+    docs/operations/sparse_attention/dsa.md, "Compact vs. non-compact sparse indices").
     """
     with _torch_stream_context(stream):
         q_attn, k_attn, lse = (maybe_contiguous(t, stream) for t in (q_attn, k_attn, lse))

@@ -55,11 +55,20 @@ def validate_accumulation_scale(scale):
         raise ValueError("dense d128 accumulation requires scale and scale*log2(e) finite and positive in FP32") from None
 
 
-# Compute capabilities the accumulation chain (dense, THD and grouped) is qualified on.
-ACCUMULATION_CCS = ((10, 0), (10, 3))
+# The parts the accumulation chain (dense, THD and grouped) is admitted on, BY NAME: GB200 (cc 10.0, the measured part), GB300 (cc 10.3,
+# admitted 2026-10-28: the same tcgen05 / cta_group::2 / TMEM / CLC feature set) and Rubin (cc 10.7, admitted 2026-11-03: the same bodies,
+# unchanged).  The compile target follows the device in every prepared host (``--gpu-arch sm_{sm}a`` with ``sm = cc[0] * 10 + cc[1]``), so
+# admitting a part is this tuple plus the engine row's sm range -- never a copy of a kernel into another arch directory.
+ACCUMULATION_CCS = ((10, 0), (10, 3), (10, 7))
+# The text every decline off these parts carries (the graph row's declaration check and the THD / grouped standalone adapters pin ONE token).
+ACCUMULATION_PARTS = "SM100, SM103 or SM107 (cc 10.0 / 10.3 / 10.7)"
+# The dense MHA envelope of the ``sdpa_bwd_sm100_d128`` row (its ``Capabilities.sm_lo`` / ``sm_hi``, inclusive): the one-launch recompute body
+# serves every cc in it, the accumulation chain the ``ACCUMULATION_CCS`` parts only; cc 10.7 closes the range (SM108+ is declined by name
+# until a part is admitted).  Read by the engine spec and the dense adapter's ``check_support`` -- one place.
+DENSE_SM_RANGE = (100, 107)
 
 
-def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
+def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=128, d_v=128, input_bytes=2):
     """Choose from plan facts; recompute stays the fallback outside the accumulation envelope.
 
     The accumulation kernels round both sequence lengths up to whole 128-row
@@ -83,11 +92,19 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
     if batch > 65535 or heads > 65535 or batch * heads * q_tiles * 128 > 2**31 - 1 or batch * heads * k_tiles > 2**31 - 1:
         return RECOMPUTE
     # The causal scheduler divides Int32 tile ids by swizzle * num_k_tiles.
-    # Use the compiled host's fixed d128, 16-bit L2 grouping for either mask.
-    heads_per_l2 = (50 * 1024 * 1024) // (sq * (128 + 128) * 2)
+    # Match the compiled family's Q/dO footprint, including narrower FP8
+    # payloads: a smaller row produces a larger scheduler divisor.
+    heads_per_l2 = (50 * 1024 * 1024) // (sq * (d_qk + d_v) * input_bytes)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     if swizzle * k_tiles > 2**31 - 1:
         return RECOMPUTE
+    if input_bytes == 1:
+        # The separate FP8 dQ scheduler sizes its swizzle from K/V, then
+        # divides work ids by that swizzle times the number of Q tiles.
+        kv_heads_per_l2 = (50 * 1024 * 1024) // (skv * (d_qk + d_v) * input_bytes)
+        kv_swizzle = 1 << (kv_heads_per_l2.bit_length() - 1) if kv_heads_per_l2 > 0 else 1
+        if kv_swizzle * q_tiles > 2**31 - 1:
+            return RECOMPUTE
     if max(sq, skv) * heads * 128 * 2 >= 2**40:
         return RECOMPUTE
     try:
@@ -97,15 +114,15 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale):
     return ACCUMULATION
 
 
-def workspace_layout(batch, heads, sq):
+def workspace_layout(batch, heads, sq, d=128):
     """Return aligned-payload-relative regions and advertised allocation bytes."""
-    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)):
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)) or d not in (64, 128, 192):
         raise ValueError("dense d128 workspace dimensions must be positive integers")
     rounded = (sq + 127) // 128 * 128
-    dq_bytes = 4 * batch * rounded * heads * 128
+    dq_bytes = 4 * batch * rounded * heads * d
     delta_bytes = 4 * batch * heads * rounded
     regions = (
-        (0, (batch, rounded, heads, 128), (rounded * heads * 128, heads * 128, 128, 1)),
+        (0, (batch, rounded, heads, d), (rounded * heads * d, heads * d, d, 1)),
         (dq_bytes, (batch, heads, rounded), (heads * rounded, rounded, 1)),
     )
     total = dq_bytes + delta_bytes + WORKSPACE_SLACK

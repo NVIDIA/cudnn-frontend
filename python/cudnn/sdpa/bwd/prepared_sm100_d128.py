@@ -52,12 +52,12 @@ def compile_plan(api):
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     regions, required = (), 0
     if api._implementation == ACCUMULATION:
-        from .kernels.sm100.prepared_d128_accum_host import compile_host
+        from .kernels.sm100.prepared_d128_host import compile_host_accum as compile_host
 
-        regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max)
-        compile_args = (tuple(geometry), regions, dtype, api.is_causal, cc[0] * 10 + cc[1])
+        regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
+        compile_args = (tuple(geometry), regions, dtype, api.is_causal, cc[0] * 10 + cc[1], 0 if api.window_size_left is None else api.window_size_left + 1)
     else:
-        from .kernels.sm100.prepared_d128_host import compile_host
+        from .kernels.sm100.prepared_d128_host import compile_host_recompute as compile_host
 
         compile_args = (tuple(geometry), dtype, api.is_causal, cc[0] * 10 + cc[1], 0 if api.window_size_left is None else api.window_size_left + 1)
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.

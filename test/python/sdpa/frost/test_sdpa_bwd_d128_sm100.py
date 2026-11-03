@@ -10,11 +10,14 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import requires_bwd_engine_row, requires_dsl, select_engine
 from test_sdpa_bwd_dsl_sm107 import _TOL, _adapter, _bshd_empty, _build_graph, _causal_keep, _check, _half_bwd_graph, _reference64
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 _ENGINE = "sdpa_bwd_sm100_d128"
+# The GPU rows run on every part the row declares (its sm range: the SM100 line and, since the Rubin admission, cc 10.7 -- the bodies are
+# compiled per device, ``--gpu-arch sm_{cc}a``), read from the row; a pre-Rubin gate here would skip the one lane that proves the sm_107a body.
+requires_d128_part = requires_bwd_engine_row(_ENGINE)
 
 
 @contextmanager
@@ -162,8 +165,7 @@ def _case(
 ):
     """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
     None = leave the selection alone and expect recompute as the natural fallback (e.g. a negative scale).
-    ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance instead of demanding exact zeros
-    (the three-launch route rounds delta and dP separately, so a single-key dQ / dK is tiny but not bitwise zero)."""
+    ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def draw(s):
@@ -205,7 +207,7 @@ def _case(
     if check_build:
         assert torch.cuda.memory_allocated() == before
     rounded = (sq + 127) // 128 * 128  # the accumulation workspace covers whole dQ tiles
-    required = 4 * b * h * rounded * 129 + 240 if accumulation else 0
+    required = 4 * b * h * rounded * (d + 1) + 240 if accumulation else 0
     assert graph.get_workspace_size() == required
     refs.update(zip(("dq", "dk", "dv"), outputs))
     pack = {refs[n]: value for n, value in tensors.items()}
@@ -232,7 +234,7 @@ def _check_case(case, tensors=None, expected=None, allow_zero=False):
         _check(name, tensors[name], want, case.dt)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 @pytest.mark.parametrize(
     "dt,causal,sq,sk",
     [
@@ -251,7 +253,7 @@ def test_graph_matches_fp64(dt, causal, sq, sk):
     _case(dt=dt, causal=causal, sq=sq, sk=sk, b=b, h=h)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 def test_one_launch_without_workspace_allocation_or_sync():
     case = _case(check_build=True)
     torch.cuda.synchronize()
@@ -270,7 +272,7 @@ def test_one_launch_without_workspace_allocation_or_sync():
     _check_case(case)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 @pytest.mark.parametrize("dt,causal", [(torch.bfloat16, False), (torch.float16, True)], ids=["bf16-unmasked", "fp16-causal"])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_rebind_and_replay(dt, causal, deterministic):
@@ -313,7 +315,7 @@ def test_rebind_and_replay(dt, causal, deterministic):
         cudnn.destroy_handle(handle)
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 def test_replan_reloads_artifact_without_compilation(monkeypatch, tmp_path):
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache
@@ -344,7 +346,7 @@ def test_replan_reloads_artifact_without_compilation(monkeypatch, tmp_path):
         capture.reset()
 
 
-@requires_pre_rubin_blackwell
+@requires_d128_part
 @pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("sq,sk", [(257, 193), (1024, 1153)])

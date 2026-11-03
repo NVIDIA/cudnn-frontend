@@ -2013,67 +2013,92 @@ TEST_CASE("186 G08: repeated create/update/instantiate/destroy with growing loop
                             workspace_bytes,
                             __float2half(-1234.f));
 
+    // cudaMemGetInfo reports the whole device, so another process on the same GPU or a
+    // one-time pool / driver growth moves it as well. A leak that scales with the loop
+    // count loses memory on every pass, so each loop count gets up to kAttempts passes
+    // and passes only when one of them is clean: its delta stays within the slack in BOTH
+    // directions. A large gain is another process freeing memory in the window, which
+    // could cancel a leak, so it is retried like a large loss. This assumes the window
+    // is not contaminated by an amount that matches the leak; on a shared GPU the check
+    // stays best-effort.
+    int const kAttempts               = 3;
+    long long const kDeviceSlackBytes = 32LL * 1024LL * 1024LL;
+
     std::vector<int> loop_counts = {10, 50, 100, 200};
     for (auto loops : loop_counts) {
-        // Warm the allocator / driver caches before taking the baseline.
-        for (int i = 0; i < 5; ++i) {
-            cudaGraph_t warm = nullptr;
-            REQUIRE(cudaGraphCreate(&warm, 0) == cudaSuccess);
-            REQUIRE(populate_graph(graph, handle, first.variant_pack(), first.workspace_ptr(), warm).is_good());
-            cudaGraphExec_t warm_exec = nullptr;
-            REQUIRE(cudaGraphInstantiate(&warm_exec, warm, nullptr, nullptr, 0) == cudaSuccess);
-            REQUIRE(cudaGraphExecDestroy(warm_exec) == cudaSuccess);
-            REQUIRE(cudaGraphDestroy(warm) == cudaSuccess);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
+        bool clean_attempt = false;
+        for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+            // Warm the allocator / driver caches before taking the baseline.
+            for (int i = 0; i < 5; ++i) {
+                cudaGraph_t warm = nullptr;
+                REQUIRE(cudaGraphCreate(&warm, 0) == cudaSuccess);
+                REQUIRE(populate_graph(graph, handle, first.variant_pack(), first.workspace_ptr(), warm).is_good());
+                cudaGraphExec_t warm_exec = nullptr;
+                REQUIRE(cudaGraphInstantiate(&warm_exec, warm, nullptr, nullptr, 0) == cudaSuccess);
+                REQUIRE(cudaGraphExecDestroy(warm_exec) == cudaSuccess);
+                REQUIRE(cudaGraphDestroy(warm) == cudaSuccess);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-        size_t const rss_before  = host_rss_bytes();
-        auto const memory_before = device_memory();
-        auto const start         = std::chrono::steady_clock::now();
+            size_t const rss_before  = host_rss_bytes();
+            auto const memory_before = device_memory();
+            auto const start         = std::chrono::steady_clock::now();
 
-        size_t checksum_failures = 0;
-        for (int i = 0; i < loops; ++i) {
-            cudaGraph_t round_graph = nullptr;
-            REQUIRE(cudaGraphCreate(&round_graph, 0) == cudaSuccess);
-            REQUIRE(populate_graph(graph, handle, first.variant_pack(), first.workspace_ptr(), round_graph).is_good());
+            size_t checksum_failures = 0;
+            for (int i = 0; i < loops; ++i) {
+                cudaGraph_t round_graph = nullptr;
+                REQUIRE(cudaGraphCreate(&round_graph, 0) == cudaSuccess);
+                REQUIRE(
+                    populate_graph(graph, handle, first.variant_pack(), first.workspace_ptr(), round_graph).is_good());
 
-            cudaGraphExec_t round_exec = nullptr;
-            REQUIRE(cudaGraphInstantiate(&round_exec, round_graph, nullptr, nullptr, 0) == cudaSuccess);
-            REQUIRE(cudaGraphLaunch(round_exec, 0) == cudaSuccess);
-
-            REQUIRE(update_graph(graph, handle, second.variant_pack(), second.workspace_ptr(), round_graph).is_good());
-            cudaGraphExecUpdateResultInfo update_info{};
-            if (cudaGraphExecUpdate(round_exec, round_graph, &update_info) != cudaSuccess) {
-                REQUIRE(cudaGraphExecDestroy(round_exec) == cudaSuccess);
+                cudaGraphExec_t round_exec = nullptr;
                 REQUIRE(cudaGraphInstantiate(&round_exec, round_graph, nullptr, nullptr, 0) == cudaSuccess);
-            }
-            REQUIRE(cudaGraphLaunch(round_exec, 0) == cudaSuccess);
-            REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+                REQUIRE(cudaGraphLaunch(round_exec, 0) == cudaSuccess);
 
-            if (!second.output_all_equal(second.expected())) {
-                ++checksum_failures;
+                REQUIRE(
+                    update_graph(graph, handle, second.variant_pack(), second.workspace_ptr(), round_graph).is_good());
+                cudaGraphExecUpdateResultInfo update_info{};
+                if (cudaGraphExecUpdate(round_exec, round_graph, &update_info) != cudaSuccess) {
+                    REQUIRE(cudaGraphExecDestroy(round_exec) == cudaSuccess);
+                    REQUIRE(cudaGraphInstantiate(&round_exec, round_graph, nullptr, nullptr, 0) == cudaSuccess);
+                }
+                REQUIRE(cudaGraphLaunch(round_exec, 0) == cudaSuccess);
+                REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+                if (!second.output_all_equal(second.expected())) {
+                    ++checksum_failures;
+                }
+
+                REQUIRE(cudaGraphExecDestroy(round_exec) == cudaSuccess);
+                REQUIRE(cudaGraphDestroy(round_graph) == cudaSuccess);
             }
 
-            REQUIRE(cudaGraphExecDestroy(round_exec) == cudaSuccess);
-            REQUIRE(cudaGraphDestroy(round_graph) == cudaSuccess);
+            auto const stop         = std::chrono::steady_clock::now();
+            size_t const rss_after  = host_rss_bytes();
+            auto const memory_after = device_memory();
+            double const total_ms   = std::chrono::duration<double, std::milli>(stop - start).count();
+            long long const device_free_delta =
+                static_cast<long long>(memory_after.first) - static_cast<long long>(memory_before.first);
+
+            ev("[186][G08] loops=" + std::to_string(loops) + " attempt=" + std::to_string(attempt) + "/" +
+               std::to_string(kAttempts) + " checksum_failures=" + std::to_string(checksum_failures) +
+               " total_ms=" + fmt(total_ms) + " per_loop_us=" + fmt(total_ms * 1000.0 / static_cast<double>(loops)) +
+               " host_rss_delta_bytes=" +
+               std::to_string(static_cast<long long>(rss_after) - static_cast<long long>(rss_before)) +
+               " device_free_delta_bytes=" + std::to_string(device_free_delta));
+            REQUIRE(checksum_failures == 0);
+            // A failed cudaMemGetInfo reads {0, 0}; never take that as a measurement.
+            REQUIRE(memory_before.second != 0);
+            REQUIRE(memory_after.second != 0);
+
+            if (-kDeviceSlackBytes <= device_free_delta && device_free_delta <= kDeviceSlackBytes) {
+                clean_attempt = true;
+                break;
+            }
         }
-
-        auto const stop         = std::chrono::steady_clock::now();
-        size_t const rss_after  = host_rss_bytes();
-        auto const memory_after = device_memory();
-        double const total_ms   = std::chrono::duration<double, std::milli>(stop - start).count();
-
-        ev("[186][G08] loops=" + std::to_string(loops) + " checksum_failures=" + std::to_string(checksum_failures) +
-           " total_ms=" + fmt(total_ms) + " per_loop_us=" + fmt(total_ms * 1000.0 / static_cast<double>(loops)) +
-           " host_rss_delta_bytes=" +
-           std::to_string(static_cast<long long>(rss_after) - static_cast<long long>(rss_before)) +
-           " device_free_delta_bytes=" +
-           std::to_string(static_cast<long long>(memory_after.first) - static_cast<long long>(memory_before.first)));
-        REQUIRE(checksum_failures == 0);
-        // A leak that scales with the loop count would show up as device memory
-        // that never comes back. Allow a small driver-level slack only.
-        REQUIRE(static_cast<long long>(memory_after.first) >=
-                static_cast<long long>(memory_before.first) - 32LL * 1024LL * 1024LL);
+        // A leak that scales with the loop count would show up as device memory that never
+        // comes back on any pass. Allow a small driver-level slack only.
+        REQUIRE(clean_attempt);
     }
     ev("[186][G08] PASS, see the per-loop-count deltas above (host and device)");
 #endif

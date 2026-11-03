@@ -21,12 +21,14 @@ candidate match against its row below.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
 import cudnn
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
+from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
 
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
@@ -41,18 +43,28 @@ _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
 _SM100_D128 = "SdpaBwdDslSm100D128"
-_SM107_D128 = "SdpaBwdDslSm107D128"
+_SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
+_SM100_D192 = "SdpaBwdDslSm100D192"
+_SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
 
 
 def _adapter(name: str):
-    if name == _SM107_D128:
-        from cudnn.sdpa.bwd.api_dsl_sm107_d128 import SdpaBwdDslSm107D128
-
-        return SdpaBwdDslSm107D128
     if name == _SM100_D128:
         from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
         return SdpaBwdDslSm100D128
+    if name == _SM100_D128_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d128_fp8 import SdpaBwdDslSm100D128Fp8
+
+        return SdpaBwdDslSm100D128Fp8
+    if name == _SM100_D192:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
+
+        return SdpaBwdDslSm100D192
+    if name == _SM100_D192_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
+
+        return SdpaBwdDslSm100D192Fp8
     if name == _SM100_MXFP8:
         # Its own module: the MXFP8 lowering's imports stay out of the
         # half-precision adapters' way.
@@ -77,6 +89,30 @@ def _adapter(name: str):
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
+
+
+def _fp8_adapter(name: str):
+    if name == _SM100_D128_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d128_fp8 import SdpaBwdDslSm100D128Fp8
+
+        return SdpaBwdDslSm100D128Fp8
+    if name == _SM100_D192_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
+
+        return SdpaBwdDslSm100D192Fp8
+    from cudnn.sdpa.bwd import api_dsl_sm107
+
+    return getattr(api_dsl_sm107, name)
+
+
+def _mxfp8_adapter(name: str):
+    if name == _SM100_MXFP8:
+        from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
+
+        return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
+    from cudnn.sdpa.bwd import api_dsl_sm107
+
+    return getattr(api_dsl_sm107, name)
 
 
 def _cuda_driver():
@@ -194,6 +230,12 @@ class Capabilities:
 
     # optional features a backward graph may request
     gqa: bool = False  # h_q != h_kv
+    # The band axes a graph may request, in the PRE-MODEL declaration spelling
+    # (see cudnn.sdpa.band): causal (right bound 0), bottom-right anchor, sliding
+    # window (left bound), right-band widening (right bound > 0).  Mapped ONCE,
+    # in __post_init__ below, onto ``band`` -- the canonical set the probe
+    # decides with; a restricted row declares ``band`` instead, and declaring
+    # both is allowed only while they agree exactly.
     causal: bool = False
     bottom_right: bool = False
     deterministic: bool = False  # use_deterministic_algorithm=True
@@ -280,6 +322,57 @@ class Capabilities:
     # Appended for positional compatibility; no graph parsing, kernel imports,
     # allocation or compilation. The row supplies the verdict from pure facts.
     declaration_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
+    # Logical Q/K and V widths are independently masked within a covering
+    # flavor; neither equality nor D_QK >= D_V is required. Append-only.
+    independent_head_dims: bool = False
+
+    # The canonical band-support SET this row claims (cudnn.sdpa.band), the
+    # model the probe decides with.  APPENDED at the end for the append-only
+    # contract; ``None`` means "derive from the legacy flags above", and a row
+    # needing a restricted claim passes an explicit BandSupport (the MXFP8
+    # backward row: causal + swa with the window paired with the causal
+    # diagonal only, ``window_right``).  __post_init__
+    # resolves it, so ``capabilities.band`` is never None after construction,
+    # and a legacy flag that is SET outside an explicit claim is refused there.
+    band: Optional["band.BandSupport"] = None
+    # A packed implementation can have a narrower native tile domain than its
+    # dense sibling. Empty retains the row's existing dense domain.
+    thd_tile_ms: frozenset[int] = frozenset()
+    thd_tile_ns: frozenset[int] = frozenset()
+
+    def __post_init__(self) -> None:
+        """Single normalization layer: legacy mask flags -> canonical band set."""
+        if self.band is None:
+            object.__setattr__(
+                self,
+                "band",
+                band.BandSupport.from_legacy_flags(
+                    causal=self.causal,
+                    bottom_right=self.bottom_right,
+                    swa=self.swa,
+                    right_band_widening=self.right_band_widening,
+                ),
+            )
+            return
+        # A band-only declaration is the point of the model, so only the flags
+        # that are actually SET constrain the explicit claim: each of them must
+        # name an axis the declared band serves (the legacy spelling is then a
+        # redundant, narrower view of the same claim).  The all-default legacy
+        # block is the spelling of "nothing declared" and leaves the band alone.
+        legacy_axes = (
+            ("causal", self.causal, band.RIGHT_CAUSAL in self.band.right),
+            ("right_band_widening", self.right_band_widening, band.RIGHT_FINITE in self.band.right),
+            ("swa", self.swa, band.LEFT_WINDOW in self.band.left),
+            ("bottom_right", self.bottom_right, band.ANCHOR_BOTTOM_RIGHT in self.band.anchors),
+        )
+        conflicting = sorted(name for name, set_flag, served in legacy_axes if set_flag and not served)
+        if conflicting:
+            raise ValueError(
+                "Capabilities declares an explicit band support "
+                f"{self.band.as_dict()} that does not serve the legacy mask flags {conflicting} set with it; the two "
+                "spellings must state the same claim (clear the flags or widen the band) -- conflicting declarations "
+                "are never silently resolved"
+            )
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -294,8 +387,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if not isinstance(requested, SdpaBwdKnobs):
             return f"knob request is a {type(requested).__name__}, not SdpaBwdKnobs — wrong operation's vocabulary"
         for value, domain, label in (
-            (requested.tile_m, capabilities.tile_ms, "tile_m"),
-            (requested.tile_n, capabilities.tile_ns, "tile_n"),
+            (requested.tile_m, (capabilities.thd_tile_ms or capabilities.tile_ms) if facts.thd else capabilities.tile_ms, "tile_m"),
+            (requested.tile_n, (capabilities.thd_tile_ns or capabilities.tile_ns) if facts.thd else capabilities.tile_ns, "tile_n"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
@@ -325,10 +418,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             else "per-tensor FP8 (sdpa_fp8_backward)" if capabilities.is_fp8 else "half (fp16/bf16) sdpa_backward"
         )
         return f"this engine serves only {quant} graphs"
-    if capabilities.dqk_ge_dv:
+    if capabilities.dqk_ge_dv and not capabilities.independent_head_dims:
         if facts.d_qk < facts.d_v:
             return f"D_QK must be >= D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-    elif facts.d_qk != facts.d_v:
+    elif not capabilities.independent_head_dims and facts.d_qk != facts.d_v:
         return f"D_QK must equal D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if capabilities.d_envelope:
         if max(facts.d_qk, facts.d_v) > max(capabilities.d):
@@ -380,6 +473,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             if not compact:
                 return f"{name} must use compact BSHD storage; got stride {tuple(stride)}"
 
+    # The band decision goes through the canonical model (cudnn.sdpa.band):
+    # BandFacts is the graph's ask, ``capabilities.band`` the row's claim.  Built
+    # HERE, after the cheap arch/dtype/shape declines, so a probe that is going to
+    # reject the graph anyway does not pay for it; the checks are spliced in at the
+    # positions this probe has always used, so the first reported reason is
+    # unchanged.  BandSupport.decline() is the same decision in a single call.
+    band_facts = band.BandFacts.from_sdpa_facts(facts)
+    band_support = capabilities.band
     for fact, cap, label in (
         # Row-neutral reason: the sm120 / sm80 rows accumulate dQ through fp32 atomics, but the sm107 chains have no atomics at
         # all and simply have not claimed the two-run bitwise guarantee yet -- the old shared text was false for them.
@@ -399,8 +500,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
-        (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
-        (facts.window_left is not None, capabilities.swa, "sliding window"),
+        # Symmetric on every axis (see fwd/engines.py): the mode the graph asks
+        # for by leaving a flag unset is part of the row's claim too.
+        (True, band_support.serves_right_mode(band_facts.right_mode), band.LABEL_RIGHT[band_facts.right_mode]),
+        (True, band_support.serves_left_mode(band_facts.left_mode), band.LABEL_LEFT[band_facts.left_mode]),
         # A ragged graph always sets `padded` (its lengths ARE the mask), but a
         # row may serve the packed path without serving DENSE padding -- the
         # dense mask needs the per-batch length threaded into a kernel that
@@ -409,7 +512,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.thd, capabilities.thd, "THD / ragged"),
         (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
-        (facts.causal, capabilities.causal, "causal mask"),
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
@@ -467,10 +569,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return "dSink_token output requires a sink_token input"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the prefill kernels"
-    if facts.bottom_right and not (facts.causal or facts.right_band_widening):
-        return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
-    if facts.bottom_right and not capabilities.bottom_right:
-        return "graph uses bottom-right causal, which this engine does not support"
+    if band_facts.anchor == band.ANCHOR_BOTTOM_RIGHT and not band_facts.has_diagonal:
+        return band.REASON_ANCHOR_WITHOUT_DIAGONAL
+    if not band_support.serves_anchor(band_facts):
+        # The backward probe has always said "engine" here (the forward one says
+        # "kernel"); band.anchor_reason keeps both wordings in one definition.
+        return band.anchor_reason("engine", anchor=band_facts.anchor)
+    if not band_support.serves_window_with(band_facts):
+        return band.window_right_reason(band_support.window_right)
     m = capabilities.bottom_right_s_q_multiple
     if facts.bottom_right and m > 1 and facts.s_q % m != 0:
         return (
@@ -552,6 +658,8 @@ class EngineSpec:
 
 
 def _sm120_spec() -> EngineSpec:
+    from .sm120_thd_contract import graph_mismatch
+
     return EngineSpec(
         name="sdpa_bwd_sm120",
         capabilities=Capabilities(
@@ -576,6 +684,13 @@ def _sm120_spec() -> EngineSpec:
             layouts=frozenset({"bshd", "dense_flex"}),
             strided_stats=True,
             deterministic=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            thd_head_stride=True,
+            thd_tile_ms=frozenset({64}),
+            thd_tile_ns=frozenset({64}),
+            declaration_check=graph_mismatch,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
         ),
@@ -702,7 +817,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    adapter_cls = _adapter(api_type)
+    if api_type == _SM120 and thd:
+        from .api_dsl_sm120_thd import SdpaBwdDslSm120Thd
+
+        adapter_cls = SdpaBwdDslSm120Thd
+    else:
+        adapter_cls = _adapter(api_type)
     # Bound ragged offsets, read on device by rows that declare it: per port,
     # the IR tensor's offset tensor, dtype and multiplier.
     _ragged = {}
@@ -917,10 +1037,9 @@ def _sm80_spec() -> EngineSpec:
     """SM80 (A100) backward row: lowers through the shared ``lower_dsl_bwd``
     onto ``SdpaBwdDslSm80`` (``bwd/api_dsl.py``), which owns kernel-flavor selection
     (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
-    host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
-    kernel caching, and the dedicated plain-dense d=64 fast path.  The
-    CuTe-DSL JIT happens at compile(), except for that d=64 fast path, whose
-    module still self-caches on the first execute.  Knob domains are empty
+    native eight-aligned head-dim envelopes, declared data strides, per-shape
+    kernel caching, and the dedicated plain-dense d=64 fast path. The whole
+    chain is compiled at plan time. Knob domains are empty
     (no tunables wired).  sm80 exactly: the kernels assume the A100's 164 KiB
     opt-in SMEM, which the sm86/sm89 parts do not have.
 
@@ -937,6 +1056,8 @@ def _sm80_spec() -> EngineSpec:
     sequences (TE's ``cu_seqlens_padded``) is served; whole-token offsets are
     a supported-input precondition.
     """
+    from cudnn.sdpa.native_sm80 import graph_mismatch
+
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
@@ -944,8 +1065,10 @@ def _sm80_spec() -> EngineSpec:
             sm_lo=80,
             sm_hi=80,
             d=frozenset({256}),
-            d_envelope=True,  # flavor envelopes; host-side zero-padding
-            dqk_ge_dv=True,  # bprop kernel constraint relaxed to D_QK >= D_V
+            d_envelope=True,  # flavor envelopes; masked native loads
+            d_pad_multiple=8,
+            declaration_check=graph_mismatch,
+            independent_head_dims=True,  # logical widths inside covering MMA flavors
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
             causal=True,
@@ -976,6 +1099,23 @@ def _sm80_spec() -> EngineSpec:
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM80),
     )
+
+
+def _sm100_dense_layout_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """Use the standalone native TMA admission for each dense data port."""
+    if facts.thd:
+        return None
+    from types import SimpleNamespace
+    from .prepared_sm100 import native_io_layout
+
+    ports = {name.lower(): (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
+    for name in ("q", "k", "v", "o", "do", "dq", "dk", "dv"):
+        geometry = ports.get(name)
+        # Synthetic capability probes may omit descriptors. Real graphs carry
+        # every data port, and the analyzer already checks their dense cover.
+        if geometry is not None and not native_io_layout(SimpleNamespace(shape=geometry[0], stride=geometry[1])):
+            return f"{name} requires non-overlapping dense strides with D stride 1 and 16-byte outer pitches"
+    return None
 
 
 def _sm100_spec() -> EngineSpec:
@@ -1039,11 +1179,8 @@ def _sm100_spec() -> EngineSpec:
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             thd=True,
             thd_declared_totals=True,  # the blocked workspace is sized at build time
-            # Any dense layout: the adapter uses a BSHD-physical tensor in place
-            # (a permuted view, zero copy) and stages a non-conforming one
-            # through the workspace. That is not hypothetical -- a caller that
-            # builds dO as torch.randn(o.shape) instead of empty_like(o) loses
-            # o's memory format and hands over a BHSD-contiguous dO.
+            # Independent native B/H/S nesting and aligned padding; no layout copies.
+            declaration_check=_sm100_dense_layout_mismatch,
             layouts=frozenset({"bshd", "dense_flex"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100),
@@ -1107,7 +1244,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
 
     fp8, half = facts.dtype, facts.dtype_o
     stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
-    api = _adapter(api_type)(
+    api = _mxfp8_adapter(api_type)(
         sample_q=_port_desc("q", fp8, facts.q_t),
         sample_k=_port_desc("k", fp8, facts.k_t),
         sample_v=_port_desc("v", fp8, facts.v_t),
@@ -1188,41 +1325,69 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
     )
 
 
+_SM100_MXFP8_HEAD_PAIRS = ((64, 64), (128, 128), (192, 128), (256, 256))
+
+
+def _sm100_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    if (facts.d_qk, facts.d_v) not in _SM100_MXFP8_HEAD_PAIRS:
+        return f"the mxfp8 row serves (D_QK, D_V) in {_SM100_MXFP8_HEAD_PAIRS}; graph has ({facts.d_qk}, {facts.d_v})"
+    if facts.window_left is not None and facts.d_qk == 256:
+        return "the mxfp8 row serves a sliding window on the kernel pair route (D_QK 64, 128, 192) only"
+    # A window without the causal mask is the row's band claim (``window_right``), not a declaration check.
+    if facts.window_left is not None and facts.s_q > facts.s_kv + facts.window_left:
+        return "the mxfp8 row serves a sliding window while every query row keeps a key (S_q <= S_kv + left offset)"
+    if facts.d_qk != 256 and facts.scale is not None and not (math.isfinite(facts.scale) and facts.scale > 0):
+        return "the mxfp8 kernel pair (D_QK 64, 128, 192) requires a finite positive attn_scale"
+    return None
+
+
 def _sm100_mxfp8_spec() -> EngineSpec:
     """SM100 (Blackwell) d=256 block-scale MXFP8 backward row.
 
     Two kernels (dQ; fused dK/dV) ported from the ``fmha_mxfp8_large_head_dim``
     repo, preceded by a
     scale-factor repack into the kernels' 2-CTA slot layout (see
-    ``api_dsl_mxfp8_sm100`` for the Rule-2 exception this is). Exact d=256 only
-    -- the SF plumbing has no envelope story, as on the forward MXFP8 row.
+    ``api_dsl_mxfp8_sm100`` for the Rule-2 exception this is) at d=256; the
+    block-scale mode of the SM100 dK/dV + dQ kernel pair at (64, 64), (128, 128)
+    and (192, 128), with a left sliding window under the causal mask. Exact
+    (D_QK, D_V) pairs only -- the SF plumbing has no envelope story, as on the
+    forward MXFP8 row.
 
     Served: E4M3 payloads with fp16/bf16 half side, BSHD-physical layout, MHA /
     GQA / MQA, any fixed S_q / S_kv (tails are masked), dense and top-left
     causal, and ``deterministic`` (both kernels own their output tiles; nothing
     accumulates through atomics). dS is always quantized with an in-kernel
     per-block (online) E8M0 scale -- the upstream "fixed scale 1" mode is not
-    exposed. Declined: E5M2, bottom-right / band-widened / sliding-window
-    masks, padding, THD, bias / dBias, sink / dSink, amax_dQ/dK/dV outputs,
-    non-BSHD strides (the kernels derive their head/batch strides; no staging
-    copies).
+    exposed. Declined: E5M2, bottom-right / band-widened masks, a window at
+    d=256 or without the causal mask, padding, THD, bias / dBias, sink / dSink,
+    amax_dQ/dK/dV outputs, non-BSHD strides (the kernels derive their head/batch
+    strides; no staging copies).
     """
     return EngineSpec(
         name="sdpa_bwd_sm100_mxfp8",
         capabilities=Capabilities(
             sm_lo=100,
             sm_hi=106,  # no sm107 MXFP8 lowering (matches the forward MXFP8 row)
-            d=frozenset({256}),
+            d=frozenset({64, 128, 192, 256}),
+            dqk_ge_dv=True,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             is_mxfp8=True,
             causal=True,
+            swa=True,
             gqa=True,
             deterministic=True,
             layouts=frozenset({"bshd"}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
+            declaration_check=_sm100_mxfp8_declaration_mismatch,
+            # causal + swa, with the window served under the causal diagonal only
+            band=band.BandSupport(
+                right=frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}),
+                left=frozenset({band.LEFT_NONE, band.LEFT_WINDOW}),
+                window_right=frozenset({band.RIGHT_CAUSAL}),
+            ),
         ),
         lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_MXFP8),
     )
@@ -1340,7 +1505,7 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
     fp8, grad = facts.dtype, facts.dtype_o
     stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
     amaxes = dict(amax_dQ=facts.amax_dq_t, amax_dK=facts.amax_dk_t, amax_dV=facts.amax_dv_t, amax_dP=facts.amax_dp_t)
-    api = _adapter(api_type)(
+    api = _fp8_adapter(api_type)(
         sample_q=_desc(ports["q"], fp8, "q"),
         sample_k=_desc(ports["k"], fp8, "k"),
         sample_v=_desc(ports["v"], fp8, "v"),
@@ -1600,6 +1765,21 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     )
 
 
+def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts") -> bool:
+    from .d128_contract import ACCUMULATION_CCS
+
+    return (
+        (facts.d_qk, facts.d_v) == (192, 128)
+        and not facts.thd
+        and facts.h_q == facts.h_kv
+        and facts.window_left is None
+        and not facts.bottom_right
+        and not facts.deterministic
+        and facts.device_cc is not None
+        and tuple(facts.device_cc) in ACCUMULATION_CCS
+    )
+
+
 def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     pair = (facts.d_qk, facts.d_v)
     if pair == (256, 256):
@@ -1607,6 +1787,12 @@ def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
     if pair == (192, 128):
         return None
     return "D256 backward serves exact (256, 256) and (192, 128) head dimensions"
+
+
+def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    if _d192_accumulation_serves(facts):
+        return None
+    return "the d192 accumulation row serves dense MHA (192, 128) without windows on cc 10.0 / 10.3"
 
 
 def _sm100_d256_spec() -> EngineSpec:
@@ -1703,7 +1889,7 @@ def _sm107_d512_spec() -> EngineSpec:
     to 256 / 128 and masked), dense, top-left and bottom-right causal, right-band widening, sliding window (left), MHA / GQA /
     MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined on day one, each asserted by a test
     (``test_sdpa_bwd_d512_sm107.py``) and flipped only with a board-run accept + tracker line: THD / ragged (the SM100 row
-    serves it; the packed path has not run on cc 10.7), ``dense_flex`` staging layouts, dense padding masks, sink / dSink,
+    serves it; the packed path has not run on cc 10.7), graph ``dense_flex`` layouts, dense padding masks, sink / dSink,
     bias / dBias, deterministic, decode.
 
     Rule 7: the public DSL 4.7.0 lacks ``sm_107a``; the adapter's ``check_support`` declines through
@@ -1727,7 +1913,7 @@ def _sm107_d512_spec() -> EngineSpec:
             right_band_widening=True,
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             decode=False,  # prefill chain: a 256-row q cluster per stage-2 work item
-            layouts=frozenset({"bshd"}),  # dense_flex staging is the SM100 row's claim; unvalidated on cc 10.7
+            layouts=frozenset({"bshd"}),  # broader graph layouts remain unvalidated on cc 10.7
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM107_D512),
     )
@@ -1751,10 +1937,10 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
     label = "d128 grouped" if grouped else "d128 THD"
     import re
 
-    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+    from .d128_contract import ACCUMULATION_CCS, ACCUMULATION_PARTS, validate_accumulation_scale
 
     if facts.device_cc not in ACCUMULATION_CCS:
-        return f"{label} requires SM100 or SM103 (cc 10.0 / 10.3)"
+        return f"{label} requires {ACCUMULATION_PARTS}"
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
         return f"{label} requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
@@ -1830,15 +2016,21 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
 def _sm100_d128_spec() -> EngineSpec:
     """Dense and packed d128 with plan-time prepared implementation selection.
 
-    Dense MHA declarations retain the SM100-106 envelope. Packed or grouped
-    accumulation requires SM100 or SM103, DSL >= 4.8 and positive FP32 scale.
-    Grouped variants fold native per-Q-head dK/dV partials in FP32.
+    Dense MHA declarations take the ``d128_contract.DENSE_SM_RANGE`` envelope (SM100-107: the SM100 line and Rubin, the
+    one-launch recompute body compiled per device).  Packed or grouped accumulation requires one of the admitted parts
+    (``d128_contract.ACCUMULATION_CCS``: cc 10.0 / 10.3 / 10.7 -- the same bodies, ``--gpu-arch sm_{cc}a`` following the
+    device), DSL >= 4.8 and positive FP32 scale.  Grouped variants fold native per-Q-head dK/dV partials in FP32.  On cc
+    10.7 the DSL must carry the sm_107a target (``cutedsl_arch_requirement_error`` in :func:`mismatch`, Rule 7); the row's
+    placement there follows the cc 10.0 rule (``heuristics.D128_LEAD_CCS``: unwindowed d128 THD ahead of the backend, which
+    serves no such plan on cc 10.7; dense behind), measured 2026-11-03.
     """
+    from .d128_contract import DENSE_SM_RANGE
+
     return EngineSpec(
         name="sdpa_bwd_sm100_d128",
         capabilities=Capabilities(
-            sm_lo=100,
-            sm_hi=106,
+            sm_lo=DENSE_SM_RANGE[0],
+            sm_hi=DENSE_SM_RANGE[1],
             d=frozenset({64, 128}),
             causal=True,
             swa=True,
@@ -1854,36 +2046,117 @@ def _sm100_d128_spec() -> EngineSpec:
     )
 
 
-def _sm107_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    from .d128_sm107_contract import validate_declaration
-
-    if facts.max_total_seq_len_q is not None or facts.max_total_seq_len_kv is not None:
-        return "native SM107 D128 backward does not support THD capacities"
-    try:
-        validate_declaration(facts.device_cc, version, facts.b, facts.h_q, facts.s_q, facts.s_kv, 128**-0.5 if facts.scale is None else facts.scale)
-    except ValueError as error:
-        return str(error)
+def _sm100_d128_fp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    if facts.window_left is not None and facts.d_qk != 64:
+        return "the fp8 d128 row serves a sliding window at d64 only"
+    if facts.d_qk == 64 and facts.h_q != facts.h_kv and facts.dtype_o == cudnn.data_type.HALF:
+        return "FP16 gradients are not served on the grouped d64 route"
     return None
 
 
-def _sm107_d128_spec() -> EngineSpec:
-    """Native dense MHA only; FP32 dQ reduce-add is non-deterministic."""
+def _sm100_d128_fp8_spec() -> EngineSpec:
     return EngineSpec(
-        name="sdpa_bwd_sm107_d128",
+        name="sdpa_bwd_sm100_d128_fp8",
         capabilities=Capabilities(
-            sm_lo=107,
-            sm_hi=107,
-            d=frozenset({128}),
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({64, 128}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_fp8=True,
+            out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            amax_dgrad=True,
+            gqa=True,
             causal=True,
+            swa=True,
             compact_bshd=True,
-            decode=False,
-            declaration_check=_sm107_d128_declaration_mismatch,
+            layouts=frozenset({"bshd"}),
+            declaration_check=_sm100_d128_fp8_declaration_mismatch,
         ),
-        lower=partial(lower_dsl_bwd, api_type=_SM107_D128),
+        lower=partial(lower_dsl_bwd_fp8, api_type=_SM100_D128_FP8),
     )
 
 
-# Append-only: a row's position in this tuple is its rank in the ranked plan list, never its id (the manifest slot is).
+def _sm100_d192_half_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """The half THD extension does not widen the separate FP8 row."""
+    if not facts.thd:
+        return _sm100_d192_head_mismatch(facts, version)
+    import re
+
+    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+    from .d192_thd_contract import validate_bounds, validate_stats_span
+
+    if (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
+        return "d192 THD requires MHA with exact (192, 128) head dimensions"
+    if facts.device_cc not in ACCUMULATION_CCS:
+        return "d192 THD requires SM100 or SM103 (cc 10.0 / 10.3)"
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
+    if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
+        return f"d192 THD requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+    b, h, sq, sk = facts.b, facts.h_q, facts.s_q, facts.s_kv
+    tq, tk = facts.max_total_seq_len_q, facts.max_total_seq_len_kv
+    try:
+        validate_accumulation_scale(192**-0.5 if facts.scale is None else facts.scale)
+        if tq is None or tk is None:
+            return "d192 THD requires positive declared packed capacities"
+        validate_bounds(b, h, sq, sk, min(b * sq, tq), min(b * sk, tk), tq, tk)
+    except ValueError as error:
+        return str(error)
+    if facts.stats_t is not None and tuple(facts.stats_t.get_dim()) == (b, h, sq, 1):
+        stride = tuple(facts.stats_t.get_stride())
+        if len(stride) != 4:
+            return "d192 THD Stats strides must have rank 4"
+        packing = ga.thd_stats_packing(stride[1], stride[2], h)
+        if packing == "head_major" and stride[1] < tq:
+            return "d192 THD Stats head stride must cover the physical Q-token capacity"
+        if packing is not None:
+            try:
+                validate_stats_span(h, tq if packing == "token_major" else stride[1])
+            except ValueError as error:
+                return str(error)
+    return None
+
+
+def _sm100_d192_spec() -> EngineSpec:
+    return EngineSpec(
+        name="sdpa_bwd_sm100_d192",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({128, 192}),
+            dqk_ge_dv=True,
+            declaration_check=_sm100_d192_half_mismatch,
+            causal=True,
+            compact_bshd=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM100_D192),
+    )
+
+
+def _sm100_d192_fp8_spec() -> EngineSpec:
+    return EngineSpec(
+        name="sdpa_bwd_sm100_d192_fp8",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({128, 192}),
+            dqk_ge_dv=True,
+            declaration_check=_sm100_d192_head_mismatch,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_fp8=True,
+            out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            amax_dgrad=True,
+            causal=True,
+            compact_bshd=True,
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd_fp8, api_type=_SM100_D192_FP8),
+    )
+
+
 ENGINE_SPECS = (
     _sm120_spec(),
     _sm80_spec(),
@@ -1892,11 +2165,13 @@ ENGINE_SPECS = (
     _sm107_spec(),
     _sm107_fp8_spec(),
     _sm107_mxfp8_spec(),
+    _sm100_d192_spec(),
+    _sm100_d192_fp8_spec(),
     _sm100_d256_spec(),
     _sm107_d512_spec(),
     _sm100_d128_spec(),
     _sm107_d192_spec(),
-    _sm107_d128_spec(),
+    _sm100_d128_fp8_spec(),
 )
 
 __all__ = [

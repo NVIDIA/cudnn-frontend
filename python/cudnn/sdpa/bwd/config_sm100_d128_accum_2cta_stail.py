@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Grouped THD d128 accumulation geometry on the cta_group::2 datapath: the dQ image in S^T's dead tail with FAv4's rotated MMA order.
 
-Layout-only record for ``kernels/sm100/bprop_d128_accum_grouped_2cta_stail_f16.py`` (the pair body of the grouped THD route) on top of the
+Layout-only record for the pair body of ``kernels/sm100/bprop_d128_f16.py`` (``bprop_d128_accum_grouped_2cta_stail_kernel``, the grouped THD route's cta_group::2 implementation) on top of the
 base pair geometry ``config_sm100_d128_accum_2cta.Config``.  Every byte offset, TMEM column and ring depth derives from the geometry below
 and is re-derived by :func:`validate_config` at import; the barrier tables (``BAR_LAYOUT``, ``BAR_LAYOUT_XFA4``) are the barrier audit's
 tables, pasted, never re-derived.
@@ -13,6 +13,17 @@ What the body does against the base geometry:
   packed P^T does not reuse): ``DQ_COL = S_COL + PACK_COLS``; [192, 256) is DEAD.  Two alias edges on the S tail: the WRITE edge dQ(t-1) <-
   the softmax's read of S^T(t) (barrier ``s_read``) and the REUSE edge S^T(t+1) <- the epilogue's readout of dQ(t-1) (barrier
   ``s_tail_empty``); ``dp_empty`` keeps its count and waiter, its arrive sits at the dS^T readout.
+* TMEM MAP (the typed op-level field ``tmem_map``, PART-KEYED; kernel header sections 9 / 11): ``"s_tail"`` = the map above (THE default on the
+  512-column parts cc 10.0 / 10.3: ``TMEM_COLS`` 512, the dQ image in S^T's dead tail behind the two LEADER rows) | ``"dq_576"`` = the INDEPENDENT dQ
+  image at [DK_COL + DK_COLS, +DQ_COLS) = [512, 576) of the 576-column carve (``tmem_alloc(TMEM_COLS = 576, is_exclusive=True)`` on BOTH CTAs, the
+  SAME constant at the dealloc; selectable BY NAME on cc 10.7, declined BY NAME on the 512-column parts; NOT a default anywhere: a NEUTRAL structural
+  map -- the ceiling probe of its two rows (s_tail_wait_off) read +0.0 / +0.55 % at 16K and -0.3 / +0.27 % at 32K (step ms / main-kernel cycles), the combined s_tail + s_read probe -0.4 / -0.2 % (benchmarker, cc 10.7, A/B/A x 3 x 100 both build orders, 2026-11-03): inside noise, below the +2.0 % threshold -- kept as the base of the two-stage staging arm, whose own row decides a flip): the S tail has no
+  second tenant, so the rows ``s_read`` and ``s_tail_empty`` are DELETED with their five leader wait sites, the leader's state, the drain and the
+  two arrives (``BAR_LAYOUT_DQ576`` / ``BAR_LAYOUT_RING_DQ576`` = the audited table minus ``DELETED_BARRIERS_DQ576``, re-packed: 33 / 35 names);
+  the new REUSE edge dQ(t) readout -> dQ(t+1) write rides the epilogue's PROGRAM ORDER (its dq_done(t) wait + readout precede its next tile's dS
+  STS + ``ds_smem.arrive()``, the dQ issue's gate) -- pinned as a source assertion by the test module, voided by any staging-before-readout reorder
+  and by ``16w_fa4`` (which declines the map by name); SMEM, every slab and every other TMEM tenant unchanged; the three S-tail WAIT probes decline
+  by name under the map (their sites are the deleted rows).  Records: ``CFG_DQ576`` / ``CFG_RING_DQ576`` (``cfg_for_part`` resolves per cc).
 * ORDER: the leader issues FAv4's rotated stream per q tile: dP^T(t), dQ(t-1), dV(t), S^T(t+1), dK(t); the tail issues dQ(hi-1).
 * SMEM: Q1 one stage (FAv4's ``Q_stage = 1`` under 2-CTA; -16 KiB) funds a DEDICATED dQ fp32 staging ring ``sDQ`` of ``DQ_SLOTS`` = 2 x
   [64 q x 32 d] SW128 slices (the reduce-add box), two rounds per tile; no dQ staging alias on ds_own + XCHG (under the rotated order
@@ -23,7 +34,9 @@ What the body does against the base geometry:
 * DIAGNOSTIC PROBES + STAMPS: the ``diag_2cta`` values this body has code for (the code space ``config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES``)
   -- ``"dq_reduce_add_off"`` (the store warp's reduce-add issues skipped), ``"exchange_off"`` (the XCHG ship skipped and ds_recv_full armed
   with 0 tx bytes, EVERY wait kept = the SAFE exchange-family ceiling), ``"stats_one_chunk"`` (one LDS.128 stats / delta chunk per quarter
-  reused for all eight) and ``"sdq_sts_off"`` (the sDQ slice STS + its proxy fence skipped) -- and the typed bool field ``debug_clk`` (the
+  reused for all eight), ``"sdq_sts_off"`` (the sDQ slice STS + its proxy fence skipped), ``"s_tail_wait_off"`` (the leader's four
+  s_tail_empty WAIT sites skipped, every arrive kept), ``"s_read_wait_off"`` (the leader's s_read WAIT skipped, the arrive kept) and
+  ``"s_tail_and_s_read_wait_off"`` (both; the ceiling of the whole S-tail alias) -- and the typed bool field ``debug_clk`` (the
   STAMPS lever, the d512 bodies' ``debug_clk`` pattern): every mbarrier wait of ONE representative warp per role is bracketed by %clock64
   and accumulated per (role, barrier) into the Int32 words of the bar block's spare (``DBG_CLK``, below), with the epilogue's per-tile
   hand-off segments, dumped per CTA at exit into a workspace region the adapter carves only under the lever; output CORRECT, timing
@@ -46,7 +59,9 @@ from dataclasses import dataclass, replace
 
 from .config_sm100_d128_accum_2cta import CFG as CFG_BASE
 from .config_sm100_d128_accum_2cta import Config, resolve_diag_2cta
-from .d128_grouped_2cta_contract import STATS_KINDS, stats2_pad_total, stats2_shape_strides  # noqa: F401  (the tma_ring stats region: chain-level truth)
+
+# chain-level truth: the admitted parts (the TMEM map's part keys), the tma_ring stats region
+from .d128_grouped_2cta_contract import CTA_PAIR_CCS, STATS_KINDS, stats2_pad_total, stats2_shape_strides  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -62,7 +77,25 @@ class ConfigSTail(Config):
     # --- the softmax's MASK FORM: fsel (default; measured neutral against predicated) | predicated | diag_mask_off (diagnostic) ---
     MASK_FORM_DEFAULT: str = "fsel"
     MASK_WORD_COLS: int = 32  # columns per keep-word = tile_dsl.mask.MASK_WORD_COLS (the body asserts the two agree at import)
-    TMEM_MAP: str = "s_tail"  # the body's identity: the dQ image lives in S^T's dead tail (the resolution token `tmem_map=s_tail`, the record names)
+    # --- the TMEM MAP (the typed op-level field ``tmem_map``, PART-KEYED; the module docstring): "s_tail" = the dQ image in S^T's dead tail (this record
+    # and CFG_RING: the 512-column parts' rendering) | "dq_576" = the independent image past dK of the 576-column carve (CFG_DQ576 / CFG_RING_DQ576:
+    # TMEM_COLS 576, TMEM_IS_EXCLUSIVE; cc 10.7 only, selectable by name).  The record's own map is its identity (the resolution token, the record names). ---
+    TMEM_MAP: str = "s_tail"
+    TMEM_IS_EXCLUSIVE: bool = False  # the SKU's alloc form for a request past 512 columns (`tmem_alloc(..., is_exclusive=True)`); True iff TMEM_COLS > 512
+    # --- the SMEM MAP (the typed op-level field ``smem_map``, PART-KEYED; kernel header sections 5 / 8 / 11): "sm100" = this record's slab chain (the
+    # 232448-B opt-in cap of every part: THE default on every part, byte-identical) | "rubin_b2" = the 327 KiB oversized carveout of cc 10.7 ON the
+    # dq_576 TMEM map (CFG_RING_DQ576_B2; selectable BY NAME on cc 10.7, not a default anywhere until its A/B/A row): sQ1 x2, sDO1 x2, sDS x2 + sDS_xchg
+    # x2 (the TWO-STAGE dS / exchange staging ring: the epilogue stages dS(t) before it waits dQ(t-1), the leader gates every dQ issue on the NEW LEADER
+    # row dq_read_done) = 314368 B.  Every slab offset derives from the ring depths below; the SMEM cap is the part's (SMEM_CAP).  The record's own
+    # map is its identity (the resolution token). ---
+    SMEM_MAP: str = "sm100"
+    DO1_STAGES: int = 1  # the sDO1 ring's depth (the base chain's DO_STAGES keeps sDO2's single stage); 2 under rubin_b2
+    DS_STAGES: int = 1  # the sDS ring's depth (the dQ A operand: own half by STS, the peer's half by its ship); 2 under rubin_b2
+    XCHG_STAGES: int = 1  # the sDS_xchg ring's depth (the ship's source) == DS_STAGES (an sDS-only ring decouples nothing: the XCHG WAR has no local signal)
+    # dead bytes declared ABOVE the scaffold to the launcher only (the DIAGNOSTIC map sm100_oversized: the sm100 map itself, launched in the oversized
+    # carveout); every address of the map (slabs, bar block, TMEM handle, CLC payload) is the unpadded map's -- SMEM_BYTES alone grows
+    SMEM_PAD_BYTES: int = 0
+    SMEM_OVERSIZED_CAP: int = 334848  # cc 10.7's per-CTA oversized SMEM cap (the SKU card's attr 150 figure); the DSL launcher sets the mode from the slab size
     # --- the STAMPS lever (typed adapter field ``debug_clk``; header section 11): default OFF = the shipped rendering, byte-identical ---
     DEBUG_CLK_DEFAULT: bool = False
     # (the record's word count is DERIVED per (roles, stats_form) as the WHOLE bar-block spare (TMEM_HANDLE - BAR_LAYOUT_END) / 4: 96 under ldg
@@ -74,6 +107,12 @@ class ConfigSTail(Config):
     # --- the DIAGNOSTIC probes' constants (header section 11; OUTPUT WRONG BY DESIGN under a probe) ---
     DIAG_EXCHANGE_OFF_TX: int = 0  # exchange_off: ds_recv_full armed with ZERO tx bytes -> every phase completes at its own arm (no copy is ever in flight)
     DIAG_STATS_CHUNK: int = 0  # stats_one_chunk: the ONE 4-wide stats / delta chunk of each quarter that is loaded and reused for all GROUP_QUARTER // 4 chunks
+    # s_tail_wait_off / s_read_wait_off: the leader's WAIT sites the probe skips (header section 5 / 11; the barrier table is unchanged: every
+    # arrive and every PipelineState advance stays).  s_tail_empty: the prologue S^T(lo), the lookahead S^T(t+1), the tail dQ(hi-1), the P15
+    # drain = 4 static `_wait_tcgen` sites; s_read: slot 2 of every tile = 1 site.  The render census drops exactly these many try_wait /
+    # bar.warp.sync / tcgen05.fence::after_thread_sync.
+    DIAG_S_TAIL_WAIT_SITES: int = 4
+    DIAG_S_READ_WAIT_SITES: int = 1
     # --- the ROLE SHAPE: 16w (default = the shipped rendering) | 16w_fa4 (the alternate shape; module docstring) ---
     WARP_ROLES_DEFAULT: str = "16w"
     # XCHG_BARRIER lanes: SOFTMAX_LANES 256 under 16w_fa4, EPILOGUE_LANES 128 under 16w
@@ -114,7 +153,24 @@ class ConfigSTail(Config):
         #                                compute / waits unchanged (the byte-removal-only residual test of the SMEM-pipe reading; I1's ceiling)
         #   sdq_sts_off       (sdq_sts_off):      _dq_round skips the sDQ slice STS + its proxy fence (the UTMAREDG reads stale staging; -256 wavefronts;
         #                                the dq_empty waits and the dq_full arrive stay) = the second point of the wavefront -> time slope
-        return ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
+        #   s_tail_wait_off   (s_tail_wait_off):  the LEADER skips its DIAG_S_TAIL_WAIT_SITES s_tail_empty waits (D1 i / ii / iii + the P15 drain);
+        #                                the epilogue's pair-wide arrive and the leader's s_tail_state advance stay.  s_tail_empty is a LEADER
+        #                                relaxed thread-count row (256 bare arrives, no tx bytes): the phases flip unobserved, an arrive on a
+        #                                phase nobody waits is not an over-arrival.  S^T(t+1) / the tail dQ may overwrite an unread dQ(t-1):
+        #                                dQ WRONG BY DESIGN = the ceiling of the s_tail_empty edge (what an independent dQ image removes)
+        #   s_read_wait_off   (s_read_wait_off):  the LEADER skips its DIAG_S_READ_WAIT_SITES s_read wait (slot 2, every tile); the softmax's
+        #                                512-lane arrive and ready_state stay (the same relaxed-row argument).  dQ(t-1) may land under the
+        #                                softmax's S^T(t) read: S / dQ WRONG BY DESIGN = the ceiling of the s_read edge
+        #   s_tail_and_s_read_wait_off:  both guards at once in ONE rendering (no third code path) = the ceiling of the whole S-tail alias
+        return (
+            "dq_reduce_add_off",
+            "exchange_off",
+            "stats_one_chunk",
+            "sdq_sts_off",
+            "s_tail_wait_off",
+            "s_read_wait_off",
+            "s_tail_and_s_read_wait_off",
+        )
 
     # --- derived: the stats_one_chunk probe's counts (the softmax's stats / delta reads of header section 4: 4-wide chunks per q quarter, two quarters per group) ---
     @property
@@ -197,10 +253,84 @@ class ConfigSTail(Config):
         # dS STS from the 32 packed words = today's LDTM image; 4 own + 4 XCHG STS.128/lane
         return self.QUARTERS_PER_GROUP * self.DS_STS_VECS_PER_QUARTER  # 8 per softmax lane per tile = 64 warp-STS per CTA per tile (today's 4 x 16)
 
-    # --- derived: the slab chain gains the sDQ ring between XCHG and STATS (Q -16384, +DQ 16384: SLABS_END unchanged) ---
+    # --- derived: the slab chain gains the sDQ ring between XCHG and STATS (Q -16384, +DQ 16384: SLABS_END unchanged); the sDO1 / sDS / sDS_xchg
+    # rings have their OWN depths (the SMEM map): sm100 = one stage each (today's offsets), rubin_b2 = two stages each ---
+    @property
+    def DO2(self):
+        return self.DO1 + self.DO1_STAGES * self.DO1_BYTES  # the sDO1 ring's own depth (the base chain's DO_STAGES keeps sDO2's single stage)
+
+    @property
+    def XCHG(self):
+        return self.DS + self.DS_STAGES * self.DS_BYTES  # 196608 (sm100) / 262144 (rubin_b2: past the version-0 descriptor line; XCHG is no tcgen05 root)
+
+    @property
+    def ALIAS_BYTES(self):
+        return self.DQ - self.DS  # the dS / exchange region [DS, DQ): 48 KiB (sm100) / 96 KiB (rubin_b2); the dK staging tenants are its STAGE-0 bytes
+
     @property
     def DQ(self):
-        return self.XCHG + self.XCHG_BYTES  # 212992
+        return self.XCHG + self.XCHG_STAGES * self.XCHG_BYTES  # 212992 (sm100) / 294912 (rubin_b2)
+
+    # --- derived: the ring stages' byte bases (stage s of a ring; stage 0 = the base chain's single slab) ---
+    def q1_stage(self, stage):
+        return self.Q1 + stage * self.Q1_BYTES
+
+    def do1_stage(self, stage):
+        return self.DO1 + stage * self.DO1_BYTES
+
+    def ds_stage(self, stage):
+        return self.DS + stage * self.DS_BYTES
+
+    def xchg_stage(self, stage):
+        return self.XCHG + stage * self.XCHG_BYTES
+
+    def ds_own_stage(self, rank, stage):
+        """Own kv half of sDS stage ``stage`` (kv-global row order on both CTAs); ``ds_own(rank)`` = stage 0 (the dK staging's alias half)."""
+        return self.ds_stage(stage) + rank * self.DS_HALF_BYTES
+
+    def ds_recv_stage(self, rank, stage):
+        """The peer's kv half of sDS stage ``stage``: landed by the peer's ship of ITS tile on that stage, never written locally."""
+        return self.ds_stage(stage) + (1 - rank) * self.DS_HALF_BYTES
+
+    @property
+    def SMEM_MAPS(self):
+        return ("sm100", "rubin_b2", "sm100_oversized")  # the typed domain of ``smem_map`` (SMEM_MAP_CODES below is its kernel code space, in this order)
+
+    @property
+    def SMEM_CAP(self):
+        """The per-CTA SMEM cap the map's slab must fit (validate_config: SMEM_BYTES <= SMEM_CAP): the opt-in cap (sm100) | the oversized cap (rubin_b2)."""
+        if self.SMEM_MAP == "sm100":
+            return self.SMEM_OPT_IN_CAP
+        if self.SMEM_MAP in ("rubin_b2", "sm100_oversized"):
+            return self.SMEM_OVERSIZED_CAP
+        raise ValueError(f"SMEM_MAP must be one of {self.SMEM_MAPS}; got {self.SMEM_MAP!r}")
+
+    @property
+    def SMEM_BYTES(self):
+        """The dynamic SMEM the kernel declares (the launcher's size): the slab chain + the scaffold (+ SMEM_PAD_BYTES of dead space under the
+        DIAGNOSTIC map sm100_oversized: the launcher then takes the oversized carveout for the sm100 map itself)."""
+        return self.SLABS_END + self.SCAFFOLD_BYTES + self.SMEM_PAD_BYTES
+
+    @property
+    def SCHED_PAYLOAD(self):
+        # the CLC payload ends the SCAFFOLD, below the pad: every address of a padded map is the unpadded map's (the body renders byte-identical)
+        return self.SLABS_END + self.SCAFFOLD_BYTES - self.SCHED_PAYLOAD_BYTES
+
+    @property
+    def TCGEN05_V0_ADDR_LIMIT(self):
+        return (1 << 14) * 16  # 262144: the version-0 tcgen05 SMEM descriptor's 14-bit start-address field in 16-B units (a root at or past it needs v1)
+
+    def desc_roots(self):
+        """Every tcgen05 descriptor ROOT of the map in declaration order (the Q1 stages, Q2, the dO1 stages, dO2, K1, K2's two 128-row boxes, V, the dS
+        stages): validate_config keeps each below TCGEN05_V0_ADDR_LIMIT (the inherited DESC_VERSION 1 would cover more; sDS_xchg, sDQ and the stats ring
+        past the line are bulk-copy / UTMAREDG / LDS tenants, never roots)."""
+        return tuple(
+            [self.q1_stage(s) for s in range(self.Q1_STAGES)]
+            + [self.Q2]
+            + [self.do1_stage(s) for s in range(self.DO1_STAGES)]
+            + [self.DO2, self.K1, self.K2, self.K2 + self.K2_HALF_BYTES, self.V]
+            + [self.ds_stage(s) for s in range(self.DS_STAGES)]
+        )
 
     @property
     def DQ_BYTES(self):
@@ -260,15 +390,34 @@ class ConfigSTail(Config):
         """Round-2 slot ``index``: K2's two halves and the dS slab's first half (dK's slices 1..3)."""
         return (self.dv_store(0), self.dv_store(1), self.DS)[index]
 
-    # --- derived: TMEM column map -- the dQ image in S^T's dead tail ---
+    # --- derived: TMEM column map PER MAP (kernel header section 9) -- s_tail: the dQ image in S^T's dead tail; dq_576: the independent image past dK ---
+    @property
+    def TMEM_MAPS(self):
+        return ("s_tail", "dq_576")  # the typed domain of ``tmem_map`` (TMEM_MAP_CODES below is its kernel code space, in this order)
+
     @property
     def DQ_COL(self):
-        # dQ @64..128 = S^T dead tail: s_read gates dQ(t-1), s_tail_empty gates S^T(t+1)
-        return self.S_COL + self.PACK_COLS  # 64
+        if self.TMEM_MAP == "s_tail":
+            # dQ @64..128 = S^T dead tail: s_read gates dQ(t-1), s_tail_empty gates S^T(t+1)
+            return self.S_COL + self.PACK_COLS  # 64
+        if self.TMEM_MAP == "dq_576":
+            # dQ @512..576 = the 64 columns past dK of the 576-column carve: no second tenant, no alias edge, no row (the epilogue's program order)
+            return self.DK_COL + self.DK_COLS  # 512
+        raise ValueError(f"TMEM_MAP must be one of {self.TMEM_MAPS}; got {self.TMEM_MAP!r}")
+
+    @property
+    def TMEM_USED(self):
+        return max(self.DK_COL + self.DK_COLS, self.DQ_COL + self.DQ_COLS)  # 512 (s_tail: dK ends the map) / 576 (dq_576: the dQ image ends it)
 
     @property
     def TMEM_DEAD_COL(self):
-        return self.DS_COL + self.PACK_COLS  # 192: [TMEM_DEAD_COL, DV_COL) is DEAD (was the first body's dQ image)
+        return self.DS_COL + self.PACK_COLS  # 192: [TMEM_DEAD_COL, DV_COL) is DEAD under BOTH maps (was the first body's dQ image)
+
+    @property
+    def DIAG_2CTA_S_TAIL_PROBES(self):
+        # The probes whose wait sites ARE the two S-tail rows: defined on the s_tail map only (under dq_576 the rows do not exist, so the probe would
+        # render the default body = an identity arm; it declines BY NAME in validate_fields_for_roles and at the trace instead)
+        return ("s_tail_wait_off", "s_read_wait_off", "s_tail_and_s_read_wait_off")
 
     # --- the STATS FORM (header section 11): the typed domain, the stats ring's bytes and roots (the slab chain), the padded stats region ---
     @property
@@ -334,6 +483,28 @@ CFG = ConfigSTail()
 # The tma_ring geometry: the SAME record with the ring depth 2 -> SLABS_END 231424, SMEM_BYTES 232448 (== the cap), BARS / TMEM_HANDLE /
 # SCHED_PAYLOAD re-based +1024 by derivation; every other property equal (validate_config asserts the equality field by field).
 CFG_RING = replace(CFG, STATS_STAGES=2)
+# The Rubin TMEM map (kernel header sections 9 / 11; the resource plan's option A, the barrier skeleton R1 of 2026-11-03): the SAME geometry with the
+# dQ image moved out of S^T's tail into the 64 columns past dK of the 576-column carve -- one record per stats form; SMEM, every slab and every
+# other TMEM tenant unchanged (validate_config asserts the equality field by field).  TMEM_COLS_SM107 = the part's whole carve (the SKU card: 576
+# columns, allocated exclusive; == DK_COL + DK_COLS + DQ_COLS = exactly what the map uses), the ONE constant of the alloc AND the dealloc.
+TMEM_COLS_SM107 = 576
+CFG_DQ576 = replace(CFG, TMEM_COLS=TMEM_COLS_SM107, TMEM_IS_EXCLUSIVE=True, TMEM_MAP="dq_576")
+CFG_RING_DQ576 = replace(CFG_RING, TMEM_COLS=TMEM_COLS_SM107, TMEM_IS_EXCLUSIVE=True, TMEM_MAP="dq_576")
+# The Rubin SMEM map (kernel header sections 5 / 8 / 11; the resource plan's option B2, the barrier skeleton R2.c of 2026-11-03): the dq_576 ring
+# geometry with sQ1 / sDO1 / sDS / sDS_xchg at TWO stages each on the 327 KiB oversized carveout of cc 10.7 -- 314368 B (slack 20480 of 334848), every
+# tcgen05 root below 262144 (the last, sDS stage 1 @ 229376, ends exactly at the line), the bar block + the STAMPS record re-based by derivation.
+# Served ON the dq_576 map under the default role shape and stats form only (validate_fields_for_roles): the lagging epilogue order the ring pays for
+# voids the dq_576 map's program-order carrier, so the row dq_read_done (the B2 barrier table) carries the dQ image's reuse edge instead.
+CFG_RING_DQ576_B2 = replace(CFG_RING_DQ576, SMEM_MAP="rubin_b2", Q1_STAGES=2, DO1_STAGES=2, DS_STAGES=2, XCHG_STAGES=2)
+# The DIAGNOSTIC map "sm100_oversized" (2026-11-03; the follow-up question of the R2.c STAMPS -- the arm's loop is faster, the kernel slower; the SKU
+# card says the oversized carveout shrinks L1, so tensor-map / descriptor / CLC payload fetches may miss it): the sm100 map ITSELF (every slab base,
+# ring depth, barrier row and address identical: the kernel body renders byte-identical) with the DECLARED dynamic SMEM padded above the opt-in cap,
+# so the DSL launcher takes the oversized carveout for it.  Output CORRECT (it is the shipping map; --validate may run it); never a default; cc 10.7
+# only; the benchmarker's A/B/A against the part's default at 16K / 32K is its number (whether ANY oversized-SMEM arm can pay on this kernel).
+SMEM_OVERSIZED_PROBE_BYTES = 262144  # the padded declaration: above the 232448-B opt-in cap, below the 334848-B carveout; no tcgen05 root moves
+CFG_RING_OVS = replace(CFG_RING, SMEM_MAP="sm100_oversized", SMEM_PAD_BYTES=SMEM_OVERSIZED_PROBE_BYTES - CFG_RING.SMEM_BYTES)
+CFG_RING_DQ576_OVS = replace(CFG_RING_DQ576, SMEM_MAP="sm100_oversized", SMEM_PAD_BYTES=SMEM_OVERSIZED_PROBE_BYTES - CFG_RING_DQ576.SMEM_BYTES)
+SMEM_MAP_DIAGNOSTIC = ("sm100_oversized",)  # DIAGNOSTIC maps: selectable by name, never a part default (validate_config); output correct
 
 
 # The stats form's kernel code space (``Constexpr[int]`` ``stats_form_code``; the body names STATS_FORM_LDG / STATS_FORM_TMA_RING from these).
@@ -364,10 +535,158 @@ def stats_form_code(name=None, roles=None):
 
 
 def cfg_for_stats_form(name=None, roles=None):
-    """The geometry record a (resolved or ``None``) stats form renders with: ``CFG`` (ldg: one stats slab, the merged scaffold) or ``CFG_RING``
-    (tma_ring: the two-stage ring, the scaffold re-based +1024, SMEM_BYTES == the cap).  Every property the two records share is equal
-    (validate_config); the body reads the form-dependent ones (SMEM_BYTES, BARS, TMEM_HANDLE, SCHED_PAYLOAD, the ring bases) through this."""
+    """The geometry record a (resolved or ``None``) stats form renders with ON THE s_tail MAP: ``CFG`` (ldg: one stats slab, the merged scaffold) or
+    ``CFG_RING`` (tma_ring: the two-stage ring, the scaffold re-based +1024, SMEM_BYTES == the cap).  Every property the two records share is equal
+    (validate_config); the body reads the form-dependent ones (SMEM_BYTES, BARS, TMEM_HANDLE, SCHED_PAYLOAD, the ring bases) through this.  The
+    per-PART record (the TMEM map keyed by cc) is :func:`cfg_for_part`."""
     return CFG_RING if resolve_stats_form(name, roles) == "tma_ring" else CFG
+
+
+# The TMEM map's kernel code space (``Constexpr[int]`` ``tmem_map_code``; the body names TMEM_MAP_S_TAIL / TMEM_MAP_DQ576 from these).
+TMEM_MAP_CODES = {"s_tail": 0, "dq_576": 1}
+# PER PART (cc -> the maps SERVED and the map an UNSET field resolves to under the default role shape; the keys = the pair body's admitted parts,
+# ``CTA_PAIR_CCS``): "s_tail" is served everywhere (512 columns) and is THE default on every part; "dq_576" needs the 576-column carve = cc 10.7
+# only, where it is SELECTABLE BY NAME and not the default: the ceiling probe of its two rows (s_tail_wait_off) read +0.0 / +0.55 % at 16K and -0.3 / +0.27 % at 32K (step ms / main-kernel cycles), the combined s_tail + s_read probe -0.4 / -0.2 % (benchmarker, cc 10.7, A/B/A x 3 x 100 both build orders, 2026-11-03): inside noise, below the +2.0 % threshold -- a
+# NEUTRAL structural map (the SOL card's arm R1), kept as the base of the two-stage sDS + XCHG staging arm; the default flips only when that arm
+# lands on it with its own A/B/A row (recorded beside the entry below with its date).  Under "16w_fa4" the unset field resolves to "s_tail" on
+# every part (the shape has no program-order carrier for the independent image's reuse edge; a NAMED "dq_576" declines there).
+TMEM_MAP_PARTS = {"s_tail": CTA_PAIR_CCS, "dq_576": ((10, 7),)}
+TMEM_MAP_DEFAULT_BY_PART = {
+    # GB200 / GB300: the 512-column carve; the S-tail map is the only one served
+    (10, 0): "s_tail",
+    (10, 3): "s_tail",
+    # Rubin: the 576-column carve; "dq_576" selectable by name, NOT the default (its probe read inside noise, 2026-11-03: the comment above);
+    # flips to "dq_576" only with the two-stage staging arm's own A/B/A row on this part
+    (10, 7): "s_tail",
+}
+
+
+class TmemMapNotServed(ValueError):
+    """A map of ``CFG.TMEM_MAPS`` NAMED on a part that does not serve it (``TMEM_MAP_PARTS``): the engine's typed decline -- the prepared module
+    raises ``NotImplementedError`` with this text.  A name outside the domain is a plain ``ValueError`` (a bug of the caller, never a decline)."""
+
+
+def resolve_tmem_map(name=None, cc=None, roles=None):
+    """The pair body's TMEM MAP, typed and PART-KEYED: ``None`` -> the map the part renders when the field is unset (``TMEM_MAP_DEFAULT_BY_PART[cc]``
+    under the default role shape, "s_tail" under "16w_fa4"); a name outside ``CFG.TMEM_MAPS`` is a ``ValueError`` BY NAME; a map the part does not
+    serve is :class:`TmemMapNotServed` (a ``ValueError``) BY NAME; ``cc`` (the device's compute capability as a tuple -- the prepared module's read,
+    or ``compile_host``'s ``sm``) outside the admitted parts has NO default and declines by name.  Both maps compute the same function (bitwise dK /
+    dV: the same accumulation chain per GEMM; dQ by the fp64 gate)."""
+    cc = None if cc is None else tuple(cc)
+    if cc not in TMEM_MAP_DEFAULT_BY_PART:
+        raise ValueError(f"tmem_map: no TMEM map is defined for cc {cc}; the pair body is admitted on {tuple(TMEM_MAP_DEFAULT_BY_PART)}")
+    shape = resolve_warp_roles(roles)
+    if name is None:
+        form = TMEM_MAP_DEFAULT_BY_PART[cc] if shape == CFG.WARP_ROLES_DEFAULT else CFG.TMEM_MAP  # 16w_fa4: the s_tail map (the only one it serves)
+    else:
+        form = name
+    if type(form) is not str or form not in CFG.TMEM_MAPS:
+        raise ValueError(f"tmem_map must be one of {CFG.TMEM_MAPS}; got {form!r}")
+    if cc not in TMEM_MAP_PARTS[form]:
+        raise TmemMapNotServed(
+            f"tmem_map {form!r} is not served on cc {cc} (the {TMEM_COLS_SM107}-column TMEM carve it allocates exists on {TMEM_MAP_PARTS[form]}); "
+            f"choose tmem_map {TMEM_MAP_DEFAULT_BY_PART[cc]!r} or leave the field unset"
+        )
+    return form
+
+
+def tmem_map_code(name=None, cc=None, roles=None):
+    """The body's ``tmem_map_code`` Constexpr[int] for a (resolved) map name on part ``cc`` (``TMEM_MAP_CODES``; 0 = s_tail, 1 = dq_576); declines
+    exactly as :func:`resolve_tmem_map`."""
+    return TMEM_MAP_CODES[resolve_tmem_map(name, cc, roles)]
+
+
+# The SMEM map's kernel code space (``Constexpr[int]`` ``smem_map_code``; the body names SMEM_MAP_SM100 / SMEM_MAP_RUBIN_B2 from these).
+SMEM_MAP_CODES = {"sm100": 0, "rubin_b2": 1, "sm100_oversized": 2}
+# PER PART (cc -> the maps SERVED and the map an UNSET field resolves to): "sm100" is served everywhere (the opt-in cap) and is THE default on every
+# part; "rubin_b2" needs the oversized carveout = cc 10.7 only, where it is SELECTABLE BY NAME ON tmem_map "dq_576" (x 16w x tma_ring: the B2 tables'
+# seat; a NAMED "rubin_b2" under "s_tail", "16w_fa4" or "ldg" declines by name in validate_fields_for_roles) and NOT the default: the SOL card's arm
+# R2.c (2026-11-03) -- its ceiling probe exchange_off read +5.4 / +6.7 % step at 16K / 32K on rubin-perf-212, above the +2.0 % MAIN-cycle threshold, so the arm was
+# BUILT; the part default (together with tmem_map "dq_576") flips only with the built map's own A/B/A row against "sm100" on cc 10.7, recorded beside
+# the entry below with its date.
+SMEM_MAP_PARTS = {"sm100": CTA_PAIR_CCS, "rubin_b2": ((10, 7),), "sm100_oversized": ((10, 7),)}  # the DIAGNOSTIC map needs the carveout too
+SMEM_MAP_SLAB_BYTES = {"rubin_b2": CFG_RING_DQ576_B2.SMEM_BYTES, "sm100_oversized": SMEM_OVERSIZED_PROBE_BYTES}  # the declared size per oversized map
+SMEM_MAP_DEFAULT_BY_PART = {
+    (10, 0): "sm100",
+    (10, 3): "sm100",
+    # Rubin: the 327 KiB carveout; "rubin_b2" selectable by name ON dq_576, NOT the default: its A/B/A vs "sm100" on this part measured a LOSS
+    # (2026-11-03, a Rubin class node, both build orders: -2.5..-5.0 % step at 8K / 16K / 32K) -> below the +2.0 % MAIN-cycle threshold; no default flip
+    (10, 7): "sm100",
+}
+
+
+class SmemMapNotServed(ValueError):
+    """A map of ``CFG.SMEM_MAPS`` NAMED on a part that does not serve it (``SMEM_MAP_PARTS``): the engine's typed decline -- the prepared module
+    raises ``NotImplementedError`` with this text.  A name outside the domain is a plain ``ValueError`` (a bug of the caller, never a decline)."""
+
+
+def resolve_smem_map(name=None, cc=None, roles=None, stats_form=None, tmem_map=None):
+    """The pair body's SMEM MAP, typed and PART-KEYED: ``None`` -> the map the part renders when the field is unset (``SMEM_MAP_DEFAULT_BY_PART[cc]``:
+    "sm100" on every admitted part today); a name outside ``CFG.SMEM_MAPS`` is a ``ValueError`` BY NAME; a map the part does not serve is
+    :class:`SmemMapNotServed` (a ``ValueError``) BY NAME; ``cc`` outside the admitted parts has NO default and declines by name.  ``roles`` /
+    ``stats_form`` / ``tmem_map`` are resolved here only so a value outside its domain declines by name first; the cross-field rules of a NAMED
+    "rubin_b2" (built ON dq_576 x 16w x tma_ring only) are ``validate_fields_for_roles``'.  Both maps compute the same function (bitwise dK / dV: the
+    same accumulation chain per GEMM; dQ by the fp64 gate)."""
+    cc = None if cc is None else tuple(cc)
+    if cc not in SMEM_MAP_DEFAULT_BY_PART:
+        raise ValueError(f"smem_map: no SMEM map is defined for cc {cc}; the pair body is admitted on {tuple(SMEM_MAP_DEFAULT_BY_PART)}")
+    shape = resolve_warp_roles(roles)
+    resolve_stats_form(stats_form, shape)
+    resolve_tmem_map(tmem_map, cc, shape)
+    smap = SMEM_MAP_DEFAULT_BY_PART[cc] if name is None else name
+    if type(smap) is not str or smap not in CFG.SMEM_MAPS:
+        raise ValueError(f"smem_map must be one of {CFG.SMEM_MAPS}; got {smap!r}")
+    if cc not in SMEM_MAP_PARTS[smap]:
+        raise SmemMapNotServed(
+            f"smem_map {smap!r} is not served on cc {cc} (its {SMEM_MAP_SLAB_BYTES[smap]}-B slab needs the oversized SMEM carveout, which exists on "
+            f"{SMEM_MAP_PARTS[smap]}); choose smem_map {CFG.SMEM_MAP!r} or leave the field unset"
+        )
+    return smap
+
+
+def smem_map_code(name=None, cc=None, roles=None, stats_form=None, tmem_map=None):
+    """The body's ``smem_map_code`` Constexpr[int] for a (resolved) map name on part ``cc`` (``SMEM_MAP_CODES``; 0 = sm100, 1 = rubin_b2); declines
+    exactly as :func:`resolve_smem_map`."""
+    return SMEM_MAP_CODES[resolve_smem_map(name, cc, roles, stats_form, tmem_map)]
+
+
+# The five geometry records by (stats form, TMEM map, SMEM map): the body reads every form- / map-dependent number through the one it was handed
+# (SMEM_BYTES, BARS, TMEM_HANDLE, SCHED_PAYLOAD, the slab and ring bases, the ring depths; DQ_COL, TMEM_USED, TMEM_COLS, TMEM_IS_EXCLUSIVE).
+GEOMETRIES = {
+    ("ldg", "s_tail", "sm100"): CFG,
+    ("tma_ring", "s_tail", "sm100"): CFG_RING,
+    ("ldg", "dq_576", "sm100"): CFG_DQ576,
+    ("tma_ring", "dq_576", "sm100"): CFG_RING_DQ576,
+    ("tma_ring", "dq_576", "rubin_b2"): CFG_RING_DQ576_B2,
+    # the DIAGNOSTIC map: the two tma_ring records, padded (byte-identical bodies; the declared SMEM 262144)
+    ("tma_ring", "s_tail", "sm100_oversized"): CFG_RING_OVS,
+    ("tma_ring", "dq_576", "sm100_oversized"): CFG_RING_DQ576_OVS,
+}
+
+
+def cfg_for_geometry(stats_form, tmem_map, smem_map="sm100"):
+    """The geometry record of a RESOLVED (stats form, TMEM map, SMEM map) triple -- one of the five frozen records of ``GEOMETRIES``; a triple outside
+    the domains (or a combination the body does not build: "rubin_b2" off dq_576 x tma_ring) is a ``ValueError`` by name (the resolvers above are the
+    typed entry)."""
+    if (stats_form, tmem_map, smem_map) not in GEOMETRIES:
+        raise ValueError(
+            f"no geometry for stats_form {stats_form!r} x tmem_map {tmem_map!r} x smem_map {smem_map!r}: stats_form in {CFG.STATS_FORMS}, tmem_map in "
+            f"{CFG.TMEM_MAPS}, smem_map in {CFG.SMEM_MAPS} (rubin_b2 is built on tma_ring x dq_576 only; sm100_oversized on tma_ring)"
+        )
+    return GEOMETRIES[(stats_form, tmem_map, smem_map)]
+
+
+def cfg_for_part(cc, stats_form=None, roles=None, tmem_map=None, smem_map=None):
+    """The geometry record PART ``cc`` renders under the (resolved or ``None``) stats form, role shape, TMEM map and SMEM map: cc 10.0 / 10.3 -> the
+    s_tail records (the SAME objects :func:`cfg_for_stats_form` returns: the sm_100a / sm_103a renderings and their md5 records do not move); cc 10.7
+    -> the s_tail records too when the fields are unset (the part's defaults), the dq_576 records when "dq_576" is NAMED under the default role shape,
+    the dq_576 x rubin_b2 record when BOTH "dq_576" and "rubin_b2" are NAMED (x tma_ring x 16w).  Declines exactly as :func:`resolve_stats_form` /
+    :func:`resolve_tmem_map` / :func:`resolve_smem_map` / :func:`cfg_for_geometry` (``compile_host`` keys the artifact on every resolved name and
+    runs ``validate_fields_for_roles`` first, so an unbuilt combination declines by name before any trace)."""
+    shape = resolve_warp_roles(roles)
+    form = resolve_stats_form(stats_form, shape)
+    tmap = resolve_tmem_map(tmem_map, cc, shape)
+    return cfg_for_geometry(form, tmap, resolve_smem_map(smem_map, cc, shape, form, tmap))
 
 
 # The mask form's kernel code space (``Constexpr[int]`` ``mask_form_code``; the body names MASK_FORM_FSEL / _PREDICATED / _DIAG_OFF from these).
@@ -433,19 +752,63 @@ def warp_roles_code(name=None):
     return WARP_ROLES_CODES[resolve_warp_roles(name)]
 
 
-def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=None, stats_form=None):
+def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=None, stats_form=None, tmem_map=None, smem_map=None):
     """The field bundle a (resolved) role shape SERVES, typed BY NAME: under ``16w_fa4`` the STAMPS lever ``debug_clk`` (its record layout names
-    the 16w roles' waits), ``dkv_accum = "fp32_reduce"`` (its fp32 dK / dV staging rounds live in the 16w epilogue loop) and ``stats_form =
+    the 16w roles' waits), ``dkv_accum = "fp32_reduce"`` (its fp32 dK / dV staging rounds live in the 16w epilogue loop), ``stats_form =
     "tma_ring"`` NAMED (the stats ring's two rows are the 16w bundle's; the first build of the ring is sited under the 16w roles only -- an UNSET
-    ``stats_form`` resolves to "ldg" there) are not built and decline; every ``diag_2cta`` probe of ``CFG.DIAG_2CTA_NAMES`` serves both shapes;
-    ``stats_form = "tma_ring"`` x ``debug_clk`` is SERVED (the record derives its 88 words from the re-based spare and carries the two ring wait
-    words).  Called by ``compile_host`` before any trace; returns ``roles``."""
+    ``stats_form`` resolves to "ldg" there) and ``tmem_map = "dq_576"`` NAMED (the independent dQ image's reuse edge rides the 16w EPILOGUE's
+    program order into ds_smem; the reduce group of 16w_fa4 has no such carrier -- an UNSET ``tmem_map`` resolves to "s_tail" there) are not built
+    and decline; the three S-tail WAIT probes (``CFG.DIAG_2CTA_S_TAIL_PROBES``) decline BY NAME under ``tmem_map = "dq_576"`` on every shape (their
+    wait sites are the two rows the map deletes: the probe would render the default body); every other ``diag_2cta`` probe of
+    ``CFG.DIAG_2CTA_NAMES`` serves both shapes and both maps; ``stats_form = "tma_ring"`` x ``debug_clk`` is SERVED (the record derives its words
+    from the re-based spare and carries the two ring wait words; under dq_576 the four S-tail words are dead = 0).  ``tmem_map`` is the RESOLVED
+    map name (``resolve_tmem_map``: the caller knows the part); ``None`` = the s_tail map.  ``smem_map`` is the RESOLVED SMEM map name
+    (``resolve_smem_map``); ``None`` = the sm100 map: "rubin_b2" is built ON "dq_576" under the default role shape and stats form only -- NAMED under
+    "s_tail" (the ring's lagging epilogue order voids the S-tail map's carrier and its two rows have no seat in the B2 table), under "16w_fa4" (no
+    B2 table for the reduce group) or under "ldg" (the B2 tables and their rendering record are sited under tma_ring; the check that would admit ldg
+    is ONE host render + its record, not done 2026-11-03) it declines by name.  Called by ``compile_host`` before any trace; returns ``roles``."""
     if roles not in CFG.WARP_ROLES:
         raise ValueError(f"warp_roles must be one of {CFG.WARP_ROLES}; got {roles!r}")
-    resolve_diag_2cta(diag_2cta)
+    diag = resolve_diag_2cta(diag_2cta)
     form = resolve_stats_form(stats_form, roles)
+    tmap = CFG.TMEM_MAP if tmem_map is None else tmem_map
+    if type(tmap) is not str or tmap not in CFG.TMEM_MAPS:
+        raise ValueError(f"tmem_map must be one of {CFG.TMEM_MAPS}; got {tmap!r}")
+    smap = CFG.SMEM_MAP if smem_map is None else smem_map
+    if type(smap) is not str or smap not in CFG.SMEM_MAPS:
+        raise ValueError(f"smem_map must be one of {CFG.SMEM_MAPS}; got {smap!r}")
+    if smap != CFG.SMEM_MAP:
+        if smap == "rubin_b2" and tmap == CFG.TMEM_MAP:  # the lagging order of the two-stage ring needs the independent image's dq_read_done row
+            raise ValueError(
+                f"smem_map {smap!r} is not built under tmem_map {tmap!r} (the two-stage dS / exchange staging ring stages dS(t) before the dQ(t-1) readout, "
+                f"which voids the S-tail map's program-order carrier; the ring's barrier table is sited on the independent dQ image with the dq_read_done "
+                f"row); choose tmem_map {CFG.TMEM_MAPS[1]!r} or smem_map {CFG.SMEM_MAP!r}"
+            )
+        if roles != CFG.WARP_ROLES_DEFAULT:
+            raise ValueError(
+                f"smem_map {smap!r} is not built under warp_roles {roles!r} (the oversized-carveout maps render the 16w body: the two-stage dS / exchange "
+                f"ring and its dq_read_done row are sited in the 16w epilogue, the diagnostic sm100_oversized map has no 16w_fa4 record); choose warp_roles "
+                f"{CFG.WARP_ROLES_DEFAULT!r} or smem_map {CFG.SMEM_MAP!r}"
+            )
+        if form != CFG.STATS_FORM_DEFAULT:
+            raise ValueError(
+                f"smem_map {smap!r} is not built under stats_form {form!r} (the oversized-carveout maps' tables and rendering records are sited under stats_form "
+                f"{CFG.STATS_FORM_DEFAULT!r}; the ldg form under the map has no pinned record -- one host render + record admits it, not done 2026-11-03); "
+                f"choose stats_form {CFG.STATS_FORM_DEFAULT!r} or smem_map {CFG.SMEM_MAP!r}"
+            )
+    if tmap != CFG.TMEM_MAP and diag in CFG.DIAG_2CTA_S_TAIL_PROBES:
+        raise ValueError(
+            f"diag_2cta {diag!r} is not defined under tmem_map {tmap!r} (its wait sites are the s_read / s_tail_empty rows, which the independent dQ "
+            f"image deletes: the probe would render the default body); choose tmem_map {CFG.TMEM_MAP!r} or a probe outside {CFG.DIAG_2CTA_S_TAIL_PROBES}"
+        )
     if roles == CFG.WARP_ROLES_DEFAULT:
         return roles
+    if tmap != CFG.TMEM_MAP:  # the reduce group reads dQ out, the softmax stages dS: no program-order carrier between the readout and ds_smem(t+1)
+        raise ValueError(
+            f"tmem_map {tmap!r} is not built under warp_roles {roles!r} (the independent dQ image's reuse edge dQ(t) readout -> dQ(t+1) write rides "
+            f"the 16w epilogue's program order into ds_smem(t+1); the reduce group of {roles} has no such carrier and would need an explicit "
+            f"dq_read_done row); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r} or tmem_map {CFG.TMEM_MAP!r}"
+        )
     if debug_clk:  # the STAMPS record layout (DBG_CLK.ROLE_WAITS / WORD) is the 16w roles'
         raise ValueError(
             f"debug_clk is not defined under warp_roles {roles!r} (the STAMPS record layout names the 16w roles' waits: no words for the softmax's "
@@ -566,6 +929,94 @@ BAR_LAYOUT_STATUS = (
     "+ dvk_stage_empty (THREAD 32 store -> epilogue, fp32_reduce rounds only, init under dkv_fp32; audited with the role shape)"
 )
 BAR_KIND_COUNTS = {"tma_leader": 7, "mma": 9, "thread": 9, "leader": 6, "peer": 2, "tma_dsmem": 1, "tma": 1}
+# --- tmem_map = dq_576 (the barrier skeleton R1 2026-11-03 sections 1.1 / 1.2; PART-KEYED: cc 10.7): the rows the independent dQ image DELETES --
+# the WRITE edge s_read and the REUSE edge s_tail_empty of the S-tail alias have nothing left to guard once the dQ image is [512, 576); the new
+# reuse edge dQ(t) readout -> dQ(t+1) write rides ds_smem(t+1) / ds_pair_ready(t+1) through the epilogue's program order (the readout trio of
+# tile t precedes the dS STS + ds_smem.arrive() of tile t+1 in the SAME warps; pinned by the test module).  The tables = the audited rows minus the
+# two, re-packed from the geometry's BARS by the _rebase_layout form (16 B per row); under tma_ring the ring's two rows follow.  Every kept row keeps
+# its count, kind, waiter and cadence (validate_config asserts it row by row); no row is added under 16w.
+DELETED_BARRIERS_DQ576 = ("s_read", "s_tail_empty")
+
+
+def _filter_layout(layout, deleted):
+    return tuple(row for row in layout if row[0] not in deleted)
+
+
+BAR_LAYOUT_DQ576 = _rebase_layout(_filter_layout(BAR_LAYOUT, DELETED_BARRIERS_DQ576), CFG_DQ576.BARS)  # 16w x ldg: 33 names / 38 slots, END 230928
+BAR_LAYOUT_DQ576_END = CFG_DQ576.BARS + 16 * len(BAR_LAYOUT_DQ576)
+BAR_LAYOUT_RING_DQ576 = _ring_layout(_filter_layout(BAR_LAYOUT, DELETED_BARRIERS_DQ576), CFG_RING_DQ576.BARS)  # 16w x tma_ring: 35 names / 42 slots, END 231984
+BAR_LAYOUT_RING_DQ576_END = CFG_RING_DQ576.BARS + 16 * len(BAR_LAYOUT_RING_DQ576)
+BAR_LAYOUT_DQ576_STATUS = (
+    "SKELETON by the barrier audit (R1 2026-11-03, BARRIER-SKELETON-RUBIN sections 1.1-1.6): the audited table minus s_read (LEADER 512) and "
+    "s_tail_empty (LEADER 256), re-packed; 0 rows added under 16w (the reuse edge of the independent image rides the epilogue's program order into "
+    "ds_smem / ds_pair_ready); AUDIT of the committed body owed"
+)
+# --- smem_map = rubin_b2 (the barrier skeleton R2.c 2026-11-03 sections 2.2 / 2.3 / 2.5 b; PART-KEYED: cc 10.7 ON the dq_576 map): the table a geometry
+# renders is DERIVED from the audited rows -- the rows whose SLOT count follows a ring depth (RING_SLOT_ROWS: q1_full / q1_empty x Q1_STAGES, do1_full
+# x D_HALVES x DO1_STAGES, do1_empty x DO1_STAGES, ds_smem / ds_recv_full / ds_pair_ready x DS_STAGES; the init count per slot, the kind, the scope and
+# the waiter are the audited row's), the ONE row the two-stage ring ADDS (dq_read_done: LEADER relaxed, PAIR_EPILOGUE_LANES 256 = the four epilogue
+# warps of BOTH CTAs bare after each dQ readout's LDTM + tcgen05_wait(LOAD) + tcgen05_fence(BEFORE_THREAD_SYNC); waited by MMA(L) inside _dq_issue
+# before EVERY dQ issue on `dq_read_state` st(1) pre-armed, +1 per wait, ONE drain after the loop: the dQ TMEM image's REUSE edge under the LAGGING
+# epilogue order -- the epilogue stages dS(t) and arrives ds_smem(t) BEFORE it reads dQ(t-1) out, so the dq_576 map's program-order carrier is gone;
+# it takes the deleted s_tail_empty's seat after dp_empty: the same lanes, the same kind), and the re-pack with a CUMULATIVE walk (a row of up to two
+# 8-B slots takes 16 B, the 4-slot do1_full row 32 B -- `_rebase_layout`'s 16 B per row would overlap it).  validate_config asserts the derivation
+# reproduces every pasted table above (the ldg / ring / dq_576 / 16w_fa4 ones) and pins the B2 table's names, slots, counts, kinds and addresses.
+RING_SLOT_ROWS = {
+    "q1_full": ("Q1_STAGES",),
+    "q1_empty": ("Q1_STAGES",),
+    "do1_full": ("D_HALVES", "DO1_STAGES"),
+    "do1_empty": ("DO1_STAGES",),
+    "ds_smem": ("DS_STAGES",),
+    "ds_recv_full": ("DS_STAGES",),
+    "ds_pair_ready": ("DS_STAGES",),
+}
+ADDED_BARRIERS_B2 = ("dq_read_done",)
+DQ_READ_DONE_ROW = ("dq_read_done", 1, CFG.PAIR_EPILOGUE_LANES, "leader", "LEADER")
+DQ_READ_DONE_AFTER = "dp_empty"  # the row it follows in declaration order (the deleted s_tail_empty's seat)
+
+
+def _row_bytes(slots):
+    return 16 * ((slots * 8 + 15) // 16)  # the bar block's row granularity: 16 B per row of up to two 8-B slots, 32 B for three or four
+
+
+def _pack_layout(rows, base):
+    """``rows`` (name, _, slots, count, kind, scope) re-packed from ``base`` in order with the cumulative walk (16 B per <= 2 slots, 32 B per 4)."""
+    packed, off = [], base
+    for name, _off, slots, count, kind, scope in rows:
+        packed.append((name, off, slots, count, kind, scope))
+        off += _row_bytes(slots)
+    return tuple(packed)
+
+
+def layout_for_geometry(geo, roles="16w"):
+    """The barrier table geometry ``geo`` renders under role shape ``roles``: the audited base table (BAR_LAYOUT under 16w, BAR_LAYOUT_XFA4 under
+    16w_fa4) minus the rows the TMEM map deletes (dq_576: DELETED_BARRIERS_DQ576), the ring rows' slots from the geometry's depths (RING_SLOT_ROWS),
+    the dq_read_done row after DQ_READ_DONE_AFTER under a two-stage dS ring, re-packed from ``geo.BARS`` with the cumulative walk, then the stats ring's
+    rows under a two-stage stats ring (tma_ring).  Pure arithmetic over the pasted rows: the truth stays the audited tables."""
+    base = {"16w": BAR_LAYOUT, "16w_fa4": BAR_LAYOUT_XFA4}[roles]
+    rows = []
+    for name, off, slots, count, kind, scope in base:
+        if geo.TMEM_MAP != CFG.TMEM_MAP and name in DELETED_BARRIERS_DQ576:
+            continue
+        if name in RING_SLOT_ROWS:
+            slots = 1
+            for field_name in RING_SLOT_ROWS[name]:
+                slots *= getattr(geo, field_name)
+        rows.append((name, off, slots, count, kind, scope))
+        if name == DQ_READ_DONE_AFTER and geo.DS_STAGES > 1:
+            rows.append(DQ_READ_DONE_ROW[:1] + (0,) + DQ_READ_DONE_ROW[1:])  # (name, offset placeholder, slots, count, kind, scope): packed below
+    packed = _pack_layout(rows, geo.BARS)
+    if geo.STATS_STAGES > 1:
+        ring_rows = [(name, 0, slots, count, kind, scope) for name, slots, count, kind, scope in STATS_RING_ROWS]
+        packed = packed + _pack_layout(ring_rows, packed[-1][1] + _row_bytes(packed[-1][2]))
+    return packed
+
+
+def layout_end(layout):
+    return layout[-1][1] + _row_bytes(layout[-1][2])  # the next free byte past the table's last row
+
+
+# (BAR_LAYOUT_RING_DQ576_B2 and its STAMPS record are built below BAR_LAYOUT_XFA4: the derivation reads both base tables)
 
 # --- the STAMPS record (typed field ``debug_clk``; kernel header section 11): CFG.DBG_CLK_WORDS Int32 words per CTA in the bar block's spare
 # [BAR_LAYOUT_END, TMEM_HANDLE), written by ONE representative warp per role (softmax warp 0, the epilogue lead warp, the single service warps;
@@ -589,6 +1040,7 @@ DBG_CLK_ROLE_WAITS = {
         "ds_smem",
         "ds_recv_full",
         "ds_pair_ready",
+        "dq_read_done",  # smem_map rubin_b2 only (the dQ image's reuse edge inside _dq_issue, after the three dS gates); dead = 0 under sm100
         "p_ready",
         "do2_full",
         "q2_full",
@@ -696,12 +1148,37 @@ def _dbg_clk(layout_end, tmem_handle):
 DBG_CLK = _dbg_clk(BAR_LAYOUT_END, CFG.TMEM_HANDLE)  # ldg (16w): [230960, 231344) = 96 words, 82 used
 # RESOURCE-NOTE: STAMPS record = (TMEM_HANDLE - BAR_LAYOUT_END) / 4 = 88 words under tma_ring: derive it
 DBG_CLK_RING = _dbg_clk(BAR_LAYOUT_RING_END, CFG_RING.TMEM_HANDLE)  # tma_ring (16w): [232016, 232368) = 88 words, 84 used
+# tmem_map = dq_576: the SAME word map (every index unchanged: the kernel's `_W[...]` sites are one module-level map) over the spare the shorter bar
+# block leaves -- the four S-tail words (`dbg_clk_dead_words`) have no site under the map and read 0 (the record is still valid: magic, tiles, every
+# other wait); WORDS derived from the layout's END, never a literal.
+DBG_CLK_DQ576 = _dbg_clk(BAR_LAYOUT_DQ576_END, CFG_DQ576.TMEM_HANDLE)  # ldg x dq_576: [230928, 231344) = 104 words, 84 named (4 dead)
+DBG_CLK_RING_DQ576 = _dbg_clk(BAR_LAYOUT_RING_DQ576_END, CFG_RING_DQ576.TMEM_HANDLE)  # tma_ring x dq_576: [231984, 232368) = 96 words, 84 named (4 dead)
+# (DBG_CLK_RING_DQ576_B2 / DBG_CLK_BY_GEOMETRY are built below BAR_LAYOUT_XFA4, with the B2 table)
 
 
-def dbg_clk_for_stats_form(name=None, roles=None):
-    """The STAMPS record a (resolved or ``None``) stats form renders with: ``DBG_CLK`` (ldg) or ``DBG_CLK_RING`` (tma_ring; the same word map);
-    ``None`` resolves per role shape."""
-    return DBG_CLK_RING if resolve_stats_form(name, roles) == "tma_ring" else DBG_CLK
+def dbg_clk_dead_words(tmem_map, smem_map="sm100"):
+    """The STAMPS words with NO site under (``tmem_map``, ``smem_map``) (they read 0 in every record): the wait / blocked words of the rows the TMEM
+    map deletes (``DELETED_BARRIERS_DQ576`` under dq_576; none under s_tail) and of the row the SMEM map ADDS (``ADDED_BARRIERS_B2``: dq_read_done has
+    a site under rubin_b2 only).  The decoder and the dump test skip exactly these."""
+    if tmem_map not in CFG.TMEM_MAPS:
+        raise ValueError(f"tmem_map must be one of {CFG.TMEM_MAPS}; got {tmem_map!r}")
+    if smem_map not in CFG.SMEM_MAPS:
+        raise ValueError(f"smem_map must be one of {CFG.SMEM_MAPS}; got {smem_map!r}")
+    dead = (DELETED_BARRIERS_DQ576 if tmem_map == "dq_576" else ()) + (() if smem_map == "rubin_b2" else ADDED_BARRIERS_B2)
+    return tuple(f"{kind}:leader:{b}" for b in dead for kind in ("wait", "blocked"))
+
+
+def dbg_clk_for_stats_form(name=None, roles=None, tmem_map=None, smem_map=None):
+    """The STAMPS record a (resolved or ``None``) stats form renders with on a (resolved) TMEM map and SMEM map: ``DBG_CLK_BY_GEOMETRY`` (the same word
+    map everywhere); ``None`` stats form resolves per role shape; ``tmem_map`` ``None`` = the s_tail map's record, ``smem_map`` ``None`` = the sm100
+    map's (the per-part maps are the resolvers': the prepared module passes the resolved names)."""
+    tmap = CFG.TMEM_MAP if tmem_map is None else tmem_map
+    if tmap not in CFG.TMEM_MAPS:
+        raise ValueError(f"tmem_map must be one of {CFG.TMEM_MAPS}; got {tmap!r}")
+    smap = CFG.SMEM_MAP if smem_map is None else smem_map
+    if smap not in CFG.SMEM_MAPS:
+        raise ValueError(f"smem_map must be one of {CFG.SMEM_MAPS}; got {smap!r}")
+    return DBG_CLK_BY_GEOMETRY[(resolve_stats_form(name, roles), tmap, smap)]
 
 
 def dbg_clk_records(n_batch, nheads, max_skv):
@@ -714,8 +1191,8 @@ def dbg_clk_records(n_batch, nheads, max_skv):
     return max((max_skv + CFG.THD_UNIT_ROWS - 1) // CFG.THD_UNIT_ROWS, 1) * CFG.CGA_M * nheads * n_batch
 
 
-def dbg_clk_bytes(n_batch, nheads, max_skv, stats_form=None):
-    return dbg_clk_records(n_batch, nheads, max_skv) * dbg_clk_for_stats_form(stats_form).BYTES
+def dbg_clk_bytes(n_batch, nheads, max_skv, stats_form=None, tmem_map=None, smem_map=None):
+    return dbg_clk_records(n_batch, nheads, max_skv) * dbg_clk_for_stats_form(stats_form, None, tmem_map, smem_map).BYTES
 
 
 def dbg_clk_region_offset(regions_end):
@@ -811,27 +1288,77 @@ BAR_LAYOUT_XFA4_STATUS = (
 )
 
 
-def bar_layout_for_roles(roles, stats_form=None):
+BAR_LAYOUT_RING_DQ576_B2 = layout_for_geometry(CFG_RING_DQ576_B2)  # 16w x tma_ring x dq_576 x rubin_b2: 36 names / 51 slots / 592 B, END 313936
+BAR_LAYOUT_RING_DQ576_B2_END = layout_end(BAR_LAYOUT_RING_DQ576_B2)
+BAR_KIND_COUNTS_RING_DQ576_B2 = {"tma_leader": 7, "mma": 9, "thread": 10, "leader": 5, "peer": 2, "tma_dsmem": 1, "tma": 2}  # 36: dq_576's + dq_read_done
+BAR_LAYOUT_RING_DQ576_B2_STATUS = (
+    "SKELETON by the barrier audit (R2.c 2026-11-03, BARRIER-SKELETON-RUBIN sections 2.1-2.7 + 1.7): the dq_576 ring table with q1_full / q1_empty / "
+    "ds_smem / ds_recv_full / ds_pair_ready at 2 slots, do1_full at 4 and do1_empty at 2 (the same init per slot), + dq_read_done (LEADER 256, "
+    "pre-armed waiter inside _dq_issue, one drain), re-packed with the 32-B do1_full row; AUDIT of the committed body owed"
+)
+
+# smem_map = rubin_b2: the SAME word map over the spare its re-based bar block leaves (the leader's dq_read_done wait / blocked words are LIVE here only)
+DBG_CLK_RING_DQ576_B2 = _dbg_clk(
+    BAR_LAYOUT_RING_DQ576_B2_END, CFG_RING_DQ576_B2.TMEM_HANDLE
+)  # tma_ring x dq_576 x rubin_b2: [313936, 314288) = 88 words, 86 named
+DBG_CLK_BY_GEOMETRY = {
+    ("ldg", "s_tail", "sm100"): DBG_CLK,
+    ("tma_ring", "s_tail", "sm100"): DBG_CLK_RING,
+    ("ldg", "dq_576", "sm100"): DBG_CLK_DQ576,
+    ("tma_ring", "dq_576", "sm100"): DBG_CLK_RING_DQ576,
+    ("tma_ring", "dq_576", "rubin_b2"): DBG_CLK_RING_DQ576_B2,
+    ("tma_ring", "s_tail", "sm100_oversized"): DBG_CLK_RING,  # the DIAGNOSTIC map: the sm100 records (the same body)
+    ("tma_ring", "dq_576", "sm100_oversized"): DBG_CLK_RING_DQ576,
+}
+
+
+def bar_layout_for_roles(roles, stats_form=None, tmem_map=None, smem_map=None):
     """The barrier table a (resolved) role shape renders with under a stats form (``None`` = the form the shape renders when the field is unset:
-    tma_ring under 16w, ldg under 16w_fa4): the audited 35-row ``BAR_LAYOUT`` (``16w`` x ldg) or the audit's 33-row ``BAR_LAYOUT_XFA4``; under
-    ``tma_ring`` the rows re-based onto CFG_RING.BARS + the stats ring's two rows (the 16w_fa4 x tma_ring table is derived for completeness: the
-    combination declines by name in validate_fields_for_roles until the lift)."""
+    tma_ring under 16w, ldg under 16w_fa4) and a (resolved) TMEM map (``None`` = the s_tail map; the per-part map is resolve_tmem_map's): the
+    audited 35-row ``BAR_LAYOUT`` (``16w`` x ldg) or the audit's 33-row ``BAR_LAYOUT_XFA4``; under ``tma_ring`` the rows re-based onto CFG_RING.BARS
+    + the stats ring's two rows (the 16w_fa4 x tma_ring table is derived for completeness: the combination declines by name in
+    validate_fields_for_roles until the lift); under ``dq_576`` (16w only: the shape rule of validate_fields_for_roles) the s_read / s_tail_empty
+    rows are deleted and the rest re-packed (``BAR_LAYOUT_DQ576`` / ``BAR_LAYOUT_RING_DQ576``); under ``smem_map = "rubin_b2"`` (16w x tma_ring x
+    dq_576 only: the rule of validate_fields_for_roles) the ring rows gain their slots and dq_read_done joins (``BAR_LAYOUT_RING_DQ576_B2``)."""
+    tmap = CFG.TMEM_MAP if tmem_map is None else tmem_map
+    if tmap not in CFG.TMEM_MAPS:
+        raise ValueError(f"tmem_map must be one of {CFG.TMEM_MAPS}; got {tmap!r}")
+    smap = CFG.SMEM_MAP if smem_map is None else smem_map
+    if smap not in CFG.SMEM_MAPS:
+        raise ValueError(f"smem_map must be one of {CFG.SMEM_MAPS}; got {smap!r}")
     base = {"16w": BAR_LAYOUT, "16w_fa4": BAR_LAYOUT_XFA4}[roles]
-    if resolve_stats_form(stats_form, roles) == "ldg":  # the base tables are the ldg layouts (the merged rendering's)
-        return base
-    return BAR_LAYOUT_RING if roles == "16w" else _ring_layout(base, CFG_RING.BARS)
+    ldg = resolve_stats_form(stats_form, roles) == "ldg"  # the base tables are the ldg layouts (the merged rendering's)
+    if smap == "rubin_b2":
+        if tmap == CFG.TMEM_MAP or roles != CFG.WARP_ROLES_DEFAULT or ldg:
+            raise ValueError(
+                f"smem_map {smap!r} is built under warp_roles 16w x stats_form tma_ring x tmem_map dq_576 only (validate_fields_for_roles); no table exists for it"
+            )
+        return BAR_LAYOUT_RING_DQ576_B2
+    # smem_map "sm100_oversized" (DIAGNOSTIC) = the sm100 tables: the same rows at the same addresses
+    if tmap == CFG.TMEM_MAP:
+        if ldg:
+            return base
+        return BAR_LAYOUT_RING if roles == "16w" else _ring_layout(base, CFG_RING.BARS)
+    if roles != CFG.WARP_ROLES_DEFAULT:
+        raise ValueError(f"tmem_map {tmap!r} is not built under warp_roles {roles!r} (validate_fields_for_roles); no table exists for it")
+    return BAR_LAYOUT_DQ576 if ldg else BAR_LAYOUT_RING_DQ576
 
 
-def bar_layout_end_for_roles(roles, stats_form=None):
-    layout = bar_layout_for_roles(roles, stats_form)
-    return layout[-1][1] + 16
+def bar_layout_end_for_roles(roles, stats_form=None, tmem_map=None, smem_map=None):
+    return layout_end(bar_layout_for_roles(roles, stats_form, tmem_map, smem_map))
 
 
-def bar_kind_counts_for_roles(roles, stats_form=None):
+def bar_kind_counts_for_roles(roles, stats_form=None, tmem_map=None, smem_map=None):
     counts = dict({"16w": BAR_KIND_COUNTS, "16w_fa4": BAR_KIND_COUNTS_XFA4}[roles])
     if resolve_stats_form(stats_form, roles) != "ldg":
         for _name, _slots, _count, kind, _scope in STATS_RING_ROWS:
             counts[kind] = counts.get(kind, 0) + 1
+    if (CFG.TMEM_MAP if tmem_map is None else tmem_map) != CFG.TMEM_MAP:
+        kinds = {row[0]: row[4] for row in BAR_LAYOUT}
+        for name in DELETED_BARRIERS_DQ576:  # the two LEADER rows
+            counts[kinds[name]] -= 1
+    if (CFG.SMEM_MAP if smem_map is None else smem_map) == "rubin_b2":
+        counts[DQ_READ_DONE_ROW[3]] += 1  # the dq_read_done row (LEADER); sm100_oversized = the sm100 counts
     return counts
 
 
@@ -861,6 +1388,19 @@ def validate_config():
     assert c.Q1_STAGES * c.Q1_BYTES + c.Q2_STAGES * c.Q2_BYTES == 32768 and c.DQ == c.XCHG + c.XCHG_BYTES
     assert (c.ALIAS, c.ALIAS_BYTES) == (c.DS, 49152) and c.ALIAS + c.ALIAS_BYTES == c.DQ  # the alias region ends where the ring begins
     assert c.DVK_STORE_BYTES <= c.K2_BYTES and c.DVK_STORE_BYTES <= c.ALIAS_BYTES - c.DS_HALF_BYTES
+    assert (c.SMEM_MAP, c.DO1_STAGES, c.DS_STAGES, c.XCHG_STAGES, c.SMEM_CAP, c.SMEM_OPT_IN_CAP, c.SMEM_OVERSIZED_CAP) == (
+        "sm100",
+        1,
+        1,
+        1,
+        232448,
+        232448,
+        334848,
+    )
+    assert c.DO_STAGES == c.DO1_STAGES == 1 and c.DO2 == c.DO1 + c.DO1_BYTES and c.XCHG == c.DS + c.DS_BYTES and c.DQ == c.XCHG + c.XCHG_BYTES  # one stage each
+    assert [c.q1_stage(0), c.do1_stage(0), c.ds_stage(0), c.xchg_stage(0)] == [c.Q1, c.DO1, c.DS, c.XCHG]
+    assert all(c.ds_own_stage(rk, 0) == c.ds_own(rk) and c.ds_recv_stage(rk, 0) == c.ds_recv(rk) for rk in (0, 1))
+    assert c.desc_roots() == (0, 16384, 32768, 49152, 65536, 98304, 114688, 131072, 163840) and max(c.desc_roots()) < c.TCGEN05_V0_ADDR_LIMIT == 262144
     assert (c.SCAFFOLD_BYTES, c.SMEM_BYTES, c.BARS, c.TMEM_HANDLE, c.SCHED_PAYLOAD, c.BAR_BLOCK_BYTES) == (1024, 231424, 230400, 231344, 231360, 944)
     assert c.SMEM_BYTES == base.SMEM_BYTES and c.SLABS_END == base.SLABS_END  # the same bytes, re-partitioned
     # the dedicated ring: disjoint from every alias tenant, inside [DQ, STATS); slot s <-> the epilogue warp pair of d half s
@@ -902,9 +1442,49 @@ def validate_config():
     assert c.P_COL + c.PACK_COLS == c.DQ_COL and c.DQ_COL + c.DQ_COLS == c.S_COL + c.S_COLS  # the image fills exactly S^T's dead tail
     assert c.TMEM_DEAD_COL == c.DS_COL + c.PACK_COLS == 192 and c.TMEM_DEAD_COL <= c.DV_COL  # the first body's dQ columns are DEAD
     assert (c.DV_COL, c.DV_COLS, c.DK_COL, c.DK_COLS, c.TMEM_USED, c.TMEM_COLS) == (256, 128, 384, 128, 512, 512)
-    assert c.TMEM_USED <= c.TMEM_COLS and c.DQ_LANE_SPLIT == 64 and c.TMEM_COLS == base.TMEM_COLS
+    assert c.TMEM_USED <= c.TMEM_COLS and c.DQ_LANE_SPLIT == 64 and c.TMEM_COLS == base.TMEM_COLS and c.TMEM_IS_EXCLUSIVE is False
+    # tmem_map = dq_576 (the two Rubin records): the SAME map but the dQ image = the 64 columns past dK, TMEM_COLS = the whole 576-column carve
+    # (alloc == dealloc constant), exclusive; [192, 256) stays dead; the lane split and every other column unchanged; SMEM untouched
+    for g, s_tail_twin in ((CFG_DQ576, c), (CFG_RING_DQ576, CFG_RING)):
+        assert (
+            g.TMEM_MAP == "dq_576"
+            and g.TMEM_IS_EXCLUSIVE is True
+            and g.TMEM_COLS == TMEM_COLS_SM107 == 576
+            and g.TMEM_IS_EXCLUSIVE == (g.TMEM_COLS > base.TMEM_COLS)
+        )
+        assert g.DQ_COL == g.DK_COL + g.DK_COLS == 512 and g.DQ_COL + g.DQ_COLS == g.TMEM_USED == g.TMEM_COLS  # the image fills the carve past dK exactly
+        assert (g.S_COL, g.S_COLS, g.P_COL, g.PACK_COLS, g.DP_COL, g.DP_COLS, g.DS_COL, g.DQ_COLS) == (0, 128, 0, 64, 128, 128, 128, 64)
+        assert (g.DV_COL, g.DV_COLS, g.DK_COL, g.DK_COLS, g.TMEM_DEAD_COL, g.DQ_LANE_SPLIT) == (256, 128, 384, 128, 192, 64)
+        assert g.DQ_COL >= g.DK_COL + g.DK_COLS and g.TMEM_DEAD_COL + g.PACK_COLS <= g.DV_COL  # no 512-column tenant under the image; the dead half stays dead
+        assert (g.SMEM_BYTES, g.BARS, g.TMEM_HANDLE, g.SCHED_PAYLOAD, g.SLABS_END) == (
+            s_tail_twin.SMEM_BYTES,
+            s_tail_twin.BARS,
+            s_tail_twin.TMEM_HANDLE,
+            s_tail_twin.SCHED_PAYLOAD,
+            s_tail_twin.SLABS_END,
+        )  # SMEM is not the map's business
+    assert c.TMEM_MAPS == ("s_tail", "dq_576") == tuple(TMEM_MAP_CODES) and TMEM_MAP_CODES == {"s_tail": 0, "dq_576": 1} and c.TMEM_MAP == c.TMEM_MAPS[0]
+    assert c.DIAG_2CTA_S_TAIL_PROBES == ("s_tail_wait_off", "s_read_wait_off", "s_tail_and_s_read_wait_off") == c.DIAG_2CTA_NAMES_ON_MAP[4:]
+    try:
+        replace(c, TMEM_MAP="bogus").DQ_COL
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a record outside the map domain must decline at its first map-dependent property")
     # the probes (typed; the body has code for every name of the code space; the two probes of an earlier pair body are outside the domain)
-    assert c.DIAG_2CTA_NAMES_ON_MAP == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off") == c.DIAG_2CTA_NAMES
+    assert (
+        c.DIAG_2CTA_NAMES_ON_MAP
+        == (
+            "dq_reduce_add_off",
+            "exchange_off",
+            "stats_one_chunk",
+            "sdq_sts_off",
+            "s_tail_wait_off",
+            "s_read_wait_off",
+            "s_tail_and_s_read_wait_off",
+        )
+        == c.DIAG_2CTA_NAMES
+    )
     assert resolve_diag_2cta(None) is None and [resolve_diag_2cta(n) for n in c.DIAG_2CTA_NAMES_ON_MAP] == list(c.DIAG_2CTA_NAMES_ON_MAP)
     for bad_diag in ("dp_empty_wait_off", "ds_gates_off", "bogus", "", 1):
         try:
@@ -914,6 +1494,8 @@ def validate_config():
         else:
             raise AssertionError((bad_diag, "must decline by name"))
     assert (c.DIAG_EXCHANGE_OFF_TX, c.DIAG_STATS_CHUNK) == (0, 0) and 0 <= c.DIAG_STATS_CHUNK < c.DIAG_STATS_CHUNKS_PER_QUARTER == 8
+    # the S-tail wait probes: the leader's static wait sites per row (header section 5: prologue + lookahead + tail + drain; slot 2 every tile)
+    assert (c.DIAG_S_TAIL_WAIT_SITES, c.DIAG_S_READ_WAIT_SITES) == (4, 1)
     assert (c.DIAG_STATS_LDS_PER_LANE, c.DIAG_STATS_LDS_REMOVED_PER_LANE) == (32, 28) and c.DIAG_STATS_LDS_REMOVED_PER_LANE * c.SOFTMAX_WARPS == 224
     # the STAMPS lever: typed bool; the record fits the bar block's spare; the layout is unique, contiguous, and names real barriers
     assert c.DEBUG_CLK_DEFAULT is False and resolve_debug_clk(None) is False and resolve_debug_clk(True) is True and resolve_debug_clk(False) is False
@@ -929,16 +1511,18 @@ def validate_config():
     assert d.SMEM + d.BYTES == c.TMEM_HANDLE and d.BYTES == c.TMEM_HANDLE - BAR_LAYOUT_END  # the record IS the spare: no byte past it, none left
     assert len(d.WORD) <= d.WORDS and sorted(d.WORD.values()) == list(range(len(d.WORD))) and d.MAGIC == c.DBG_CLK_MAGIC != 0
     assert d.BLOCKED_THRESH == 128 and d.HIST_EDGES == (100, 400, 1600) == tuple(sorted(d.HIST_EDGES)) and d.RECORD_ALIGN == 256
-    bar_names = {row[0] for row in BAR_LAYOUT}
+    bar_names = {row[0] for row in BAR_LAYOUT} | set(ADDED_BARRIERS_B2)  # + the row the rubin_b2 table adds (its words are dead elsewhere)
     for role, waits in d.ROLE_WAITS.items():
         assert waits and len(set(waits)) == len(waits) and set(waits) <= bar_names, role
         assert all(f"wait:{role}:{b}" in d.WORD for b in waits), role
     for b in d.ROLE_WAITS["leader"]:
-        assert d.WORD[f"blocked:leader:{b}"] - d.WORD[f"wait:leader:{b}"] == d.LEADER_BLOCKED_STRIDE == 17, b
+        assert d.WORD[f"blocked:leader:{b}"] - d.WORD[f"wait:leader:{b}"] == d.LEADER_BLOCKED_STRIDE == 18, b
     assert [d.WORD[n] for n in d.HEADER] == list(range(len(d.HEADER))) and d.HEADER[0] == "magic" and len(d.SEGMENTS) == 18
-    assert set(d.ROLE_WAITS) == {"leader", "softmax", "epilogue", "follower", "loader", "store"} and len(d.WORD) == 84  # 82 ldg words + the 2 ring words
+    # 82 ldg words + the leader's dq_read_done wait / blocked pair (rubin_b2; dead = 0 elsewhere) + the 2 ring words
+    assert set(d.ROLE_WAITS) == {"leader", "softmax", "epilogue", "follower", "loader", "store"} and len(d.WORD) == 86
+    assert "dq_read_done" in d.ROLE_WAITS["leader"] and d.ROLE_WAITS["leader"].index("dq_read_done") == d.ROLE_WAITS["leader"].index("ds_pair_ready") + 1
     assert DBG_CLK_RING_WAITS == (("softmax", "stats_full"), ("loader", "stats_empty"))
-    assert [d.WORD[f"wait:{r}:{b}"] for r, b in DBG_CLK_RING_WAITS] == [82, 83]  # appended AFTER every ldg word: the ldg x debug_clk rendering is unchanged
+    assert [d.WORD[f"wait:{r}:{b}"] for r, b in DBG_CLK_RING_WAITS] == [84, 85]  # appended AFTER every leader / role word (the ring words close the record)
     assert (d.TAG_BACK_IN_TILE, d.TAG_BACK_TAIL, d.TAG_BACK_RELAY) == (2, 1, 1)  # the handshake's tag arithmetic (DbgClk's comment)
     assert (
         dbg_clk_records(1, 1, 1) == c.CGA_M == 2
@@ -1012,16 +1596,20 @@ def validate_config():
     assert [r.stats_lse(st) for st in range(r.STATS_STAGES)] == stages and [r.stats_delta(st) for st in range(r.STATS_STAGES)] == [st + 512 for st in stages]
     assert (r.stats_lse(0), r.stats_delta(0), c.stats_lse(0), c.stats_delta(0)) == (c.STATS, c.DELTA, c.STATS, c.DELTA)  # stage 0 = today's slab, both forms
     assert stages[-1] + r.STATS_STAGE_BYTES == r.SLABS_END == r.BARS  # the ring ends where the re-based bar block begins: no gap, no overlap
-    # every property but the ring depth and the scaffold chain is equal between the two geometries (the body reads them through CFG)
+    # every property but the ring depth and the scaffold chain is equal between the two stats geometries, and every property but the TMEM map's
+    # five between the two maps' geometries (the body reads them through the record it was handed)
     moved = {"STATS_STAGES", "STATS_RING_BYTES", "SLABS_END", "SMEM_BYTES", "BARS", "TMEM_HANDLE", "SCHED_PAYLOAD"}
+    moved_map = {"TMEM_MAP", "TMEM_COLS", "TMEM_IS_EXCLUSIVE", "DQ_COL", "TMEM_USED"}
     props = [n for n in dir(type(c)) if not n.startswith("_") and isinstance(getattr(type(c), n), property)]
-    assert moved <= set(props) | set(type(c).__dataclass_fields__), moved - (set(props) | set(type(c).__dataclass_fields__))
-    for n in props:
-        if n not in moved:
-            assert getattr(c, n) == getattr(r, n), n
-    for n in type(c).__dataclass_fields__:
-        if n not in moved:
-            assert getattr(c, n) == getattr(r, n), n
+    names_all = set(props) | set(type(c).__dataclass_fields__)
+    assert moved <= names_all and moved_map <= names_all, (moved | moved_map) - names_all
+    for a, b, skip in ((c, r, moved), (CFG_DQ576, CFG_RING_DQ576, moved), (c, CFG_DQ576, moved_map), (r, CFG_RING_DQ576, moved_map)):
+        for n in props:
+            if n not in skip:
+                assert getattr(a, n) == getattr(b, n), n
+        for n in type(c).__dataclass_fields__:
+            if n not in skip:
+                assert getattr(a, n) == getattr(b, n), n
     # the padded pre-scaled stats region (the contract's truth; one (head, q tile) record = one ring stage image)
     assert c.STATS_KINDS == STATS_KINDS == 2 and c.STATS_RECORD_BYTES == 2 * c.N * c.BPE_ACC == 1024 == c.STATS_STAGE_BYTES and c.STATS_PAD_GRAN == c.N == 128
     assert stats2_pad_total(4, 16384) == 16384 + 4 * 128 and stats2_pad_total(1, 128) == 256
@@ -1078,7 +1666,7 @@ def validate_config():
     )
     dr = DBG_CLK_RING
     assert dr.SMEM == BAR_LAYOUT_RING_END == 232016 and dr.WORDS == 88 and dr.BYTES == 352 and dr.SMEM + dr.BYTES == r.TMEM_HANDLE and dr.SMEM % 16 == 0
-    assert dr.WORD == DBG_CLK.WORD and len(dr.WORD) == 84 <= dr.WORDS and dr.MAGIC == DBG_CLK.MAGIC and dbg_clk_for_stats_form("tma_ring") is dr
+    assert dr.WORD == DBG_CLK.WORD and len(dr.WORD) == 86 <= dr.WORDS and dr.MAGIC == DBG_CLK.MAGIC and dbg_clk_for_stats_form("tma_ring") is dr
     assert dbg_clk_for_stats_form(None) is DBG_CLK_RING and dbg_clk_for_stats_form("ldg") is DBG_CLK is dbg_clk_for_stats_form(None, "16w_fa4")
     # BAR_LAYOUT: 34 names / 39 slots, 16-B rows, contiguous from BARS, disjoint, inside [BARS, TMEM_HANDLE); counts by kind; scope by kind
     assert BAR_LAYOUT_STATUS.startswith("FILLED") and len(BAR_LAYOUT) == 35 and sum(row[2] for row in BAR_LAYOUT) == 40
@@ -1217,6 +1805,435 @@ def validate_config():
     )
     assert (bar_layout_end_for_roles("16w", "ldg"), bar_layout_end_for_roles("16w_fa4")) == (BAR_LAYOUT_END, BAR_LAYOUT_XFA4_END)
     assert (bar_kind_counts_for_roles("16w", "ldg"), bar_kind_counts_for_roles("16w_fa4")) == (BAR_KIND_COUNTS, BAR_KIND_COUNTS_XFA4)
+    # --- the TMEM MAP (arm R1, PART-KEYED): the code space, the parts, the defaults, the resolver's declines, the four records, the filtered tables,
+    # the STAMPS records per map, the shape / probe rules ---
+    assert set(TMEM_MAP_DEFAULT_BY_PART) == set(CTA_PAIR_CCS) == set(TMEM_MAP_PARTS["s_tail"]) and TMEM_MAP_PARTS["dq_576"] == ((10, 7),)
+    assert TMEM_MAP_DEFAULT_BY_PART == {(10, 0): "s_tail", (10, 3): "s_tail", (10, 7): "s_tail"} and set(TMEM_MAP_PARTS) == set(c.TMEM_MAPS)
+    assert all(m == c.TMEM_MAP for m in TMEM_MAP_DEFAULT_BY_PART.values())  # dq_576 is selectable by name only (a neutral structural map: the comment)
+    assert all(cc in TMEM_MAP_PARTS[m] for cc, m in TMEM_MAP_DEFAULT_BY_PART.items())  # a part's default is a map it serves
+    assert (
+        resolve_tmem_map(None, (10, 0))
+        == "s_tail"
+        == resolve_tmem_map(None, (10, 3))
+        == resolve_tmem_map("s_tail", (10, 7))
+        == resolve_tmem_map(None, (10, 7), "16w_fa4")
+    )
+    assert resolve_tmem_map(None, (10, 7)) == "s_tail" == resolve_tmem_map(None, [10, 7]) == resolve_tmem_map(None, (10, 7), None)  # the part's default
+    assert resolve_tmem_map("dq_576", (10, 7)) == "dq_576" == resolve_tmem_map("dq_576", (10, 7), "16w")  # selectable by name on the 576-column part
+    assert (tmem_map_code(None, (10, 0)), tmem_map_code(None, (10, 7)), tmem_map_code("s_tail", (10, 7)), tmem_map_code("dq_576", (10, 7))) == (0, 0, 0, 1)
+    for bad_name, bad_cc, bad_roles in (("bogus", (10, 7), None), ("", (10, 7), None), (1, (10, 7), None), ("S_TAIL", (10, 0), None), (None, (10, 7), "20w")):
+        try:
+            resolve_tmem_map(bad_name, bad_cc, bad_roles)
+        except TmemMapNotServed:
+            raise AssertionError((bad_name, bad_cc, bad_roles, "a name outside the domain is a plain ValueError, never a decline"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((bad_name, bad_cc, bad_roles))
+    for bad_cc in (None, (9, 0), (12, 0), (10, 9), (10,)):
+        try:
+            resolve_tmem_map(None, bad_cc)
+        except TmemMapNotServed:
+            raise AssertionError((bad_cc, "an unadmitted part has no default: a plain ValueError"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_cc)
+    for bad_cc in ((10, 0), (10, 3)):  # the 576-column carve does not exist there: the typed decline (the prepared module's NotImplementedError)
+        try:
+            resolve_tmem_map("dq_576", bad_cc)
+        except TmemMapNotServed as error:
+            assert "tmem_map 'dq_576' is not served on cc" in str(error) and "576-column" in str(error), str(error)
+        else:
+            raise AssertionError(bad_cc)
+    assert cfg_for_part((10, 0)) is CFG_RING is cfg_for_part((10, 3)) is cfg_for_part((10, 7)) is cfg_for_part((10, 7), tmem_map="s_tail")
+    assert cfg_for_part((10, 0), "ldg") is CFG is cfg_for_part((10, 7), "ldg")
+    # cc 10.7: the dq_576 ring record when the TMEM map is NAMED (the SMEM map unset or NAMED "sm100": the SMEM-map block below)
+    assert cfg_for_part((10, 7), tmem_map="dq_576") is CFG_RING_DQ576 is cfg_for_part((10, 7), "tma_ring", "16w", "dq_576")
+    assert cfg_for_part((10, 7), tmem_map="dq_576", smem_map="sm100") is CFG_RING_DQ576 and cfg_for_part((10, 7), "ldg", tmem_map="dq_576") is CFG_DQ576
+    assert cfg_for_part((10, 7), roles="16w_fa4") is CFG and cfg_for_part((10, 7), roles="16w_fa4", stats_form="tma_ring") is CFG_RING  # the shape's unset map
+    assert cfg_for_geometry("tma_ring", "s_tail") is CFG_RING and {(f, m) for f, m, _s in GEOMETRIES} == {(f, m) for f in c.STATS_FORMS for m in c.TMEM_MAPS}
+    assert all(cfg_for_geometry(f, m, s).TMEM_MAP == m and cfg_for_geometry(f, m, s).STATS_STAGES == (2 if f == "tma_ring" else 1) for f, m, s in GEOMETRIES)
+    try:
+        cfg_for_geometry("tma_ring", "bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown map has no geometry")
+    # the shape / probe rules under the map
+    assert validate_fields_for_roles("16w", None, tmem_map="dq_576") == "16w" and validate_fields_for_roles("16w", None, tmem_map="s_tail") == "16w"
+    assert validate_fields_for_roles("16w", "exchange_off", debug_clk=True, dkv_accum="fp32_reduce", stats_form="tma_ring", tmem_map="dq_576") == "16w"
+    assert all(validate_fields_for_roles("16w", p, tmem_map="dq_576") == "16w" for p in c.DIAG_2CTA_NAMES_ON_MAP if p not in c.DIAG_2CTA_S_TAIL_PROBES)
+    for probe in c.DIAG_2CTA_S_TAIL_PROBES:
+        assert validate_fields_for_roles("16w", probe, tmem_map="s_tail") == "16w" and validate_fields_for_roles("16w", probe) == "16w"
+        try:
+            validate_fields_for_roles("16w", probe, tmem_map="dq_576")
+        except ValueError as error:
+            assert f"diag_2cta {probe!r} is not defined under tmem_map 'dq_576'" in str(error), str(error)
+        else:
+            raise AssertionError(probe)
+    try:
+        validate_fields_for_roles("16w_fa4", None, tmem_map="dq_576")
+    except ValueError as error:
+        assert "tmem_map 'dq_576' is not built under warp_roles '16w_fa4'" in str(error), str(error)
+    else:
+        raise AssertionError("dq_576 must decline by name under 16w_fa4")
+    assert validate_fields_for_roles("16w_fa4", None, tmem_map="s_tail") == "16w_fa4"
+    for bad_map in ("bogus", "", 1):
+        try:
+            validate_fields_for_roles("16w", None, tmem_map=bad_map)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_map)
+    # the filtered tables: the audited rows minus the two, re-packed from the geometry's BARS; every kept row identical in (slots, count, kind, scope)
+    assert DELETED_BARRIERS_DQ576 == ("s_read", "s_tail_empty") and all(n in {row[0] for row in BAR_LAYOUT} for n in DELETED_BARRIERS_DQ576)
+    assert len(BAR_LAYOUT_DQ576) == 33 and sum(row[2] for row in BAR_LAYOUT_DQ576) == 38 and BAR_LAYOUT_DQ576_END == c.BARS + 16 * 33 == 230928
+    assert len(BAR_LAYOUT_RING_DQ576) == 35 and sum(row[2] for row in BAR_LAYOUT_RING_DQ576) == 42 and BAR_LAYOUT_RING_DQ576_END == r.BARS + 16 * 35 == 231984
+    assert [row[0] for row in BAR_LAYOUT_DQ576] == [n for n in names if n not in DELETED_BARRIERS_DQ576]
+    assert [row[0] for row in BAR_LAYOUT_RING_DQ576] == [row[0] for row in BAR_LAYOUT_DQ576] + [row[0] for row in STATS_RING_ROWS]
+    audited = {row[0]: row[2:] for row in BAR_LAYOUT_RING}  # the s_tail ring table carries every row the two filtered tables keep
+    for layout, g in ((BAR_LAYOUT_DQ576, CFG_DQ576), (BAR_LAYOUT_RING_DQ576, CFG_RING_DQ576)):
+        prev_end, seen = g.BARS, set()
+        for name, offset, slots_n, count, kind, scope in layout:
+            assert (slots_n, count, kind, scope) == audited[name] and name not in DELETED_BARRIERS_DQ576, name
+            assert offset == prev_end and offset % 16 == 0, name
+            prev_end = offset + 16
+            for i in range(slots_n):
+                address = offset + i * 8
+                assert g.BARS <= address and address + 8 <= g.TMEM_HANDLE and address not in seen, name
+                seen.add(address)
+        assert prev_end == layout[-1][1] + 16 <= g.TMEM_HANDLE
+    assert BAR_LAYOUT_DQ576_STATUS.startswith("SKELETON")
+    assert bar_layout_for_roles("16w", "tma_ring", "dq_576") is BAR_LAYOUT_RING_DQ576 is bar_layout_for_roles("16w", None, "dq_576")
+    assert bar_layout_for_roles("16w", "ldg", "dq_576") is BAR_LAYOUT_DQ576 and bar_layout_for_roles("16w", "tma_ring", "s_tail") is BAR_LAYOUT_RING
+    assert bar_layout_for_roles("16w", "tma_ring", None) is BAR_LAYOUT_RING and bar_layout_for_roles("16w_fa4", None, "s_tail") is BAR_LAYOUT_XFA4
+    assert (bar_layout_end_for_roles("16w", "tma_ring", "dq_576"), bar_layout_end_for_roles("16w", "ldg", "dq_576")) == (231984, 230928)
+    counts_dq576 = bar_kind_counts_for_roles("16w", "tma_ring", "dq_576")
+    assert counts_dq576 == {"tma_leader": 7, "mma": 9, "thread": 10, "leader": 4, "peer": 2, "tma_dsmem": 1, "tma": 2} and sum(counts_dq576.values()) == 35
+    assert (
+        bar_kind_counts_for_roles("16w", "ldg", "dq_576") == dict(BAR_KIND_COUNTS, leader=4)
+        and bar_kind_counts_for_roles("16w", "tma_ring", "s_tail") == BAR_KIND_COUNTS_RING
+    )
+    for bad_call in (("16w_fa4", "ldg", "dq_576"), ("16w_fa4", None, "dq_576"), ("16w", None, "bogus")):
+        try:
+            bar_layout_for_roles(*bad_call)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_call)
+    # the STAMPS records per map: the same word map, the spare re-derived; the four S-tail words dead under dq_576
+    dd, drd = DBG_CLK_DQ576, DBG_CLK_RING_DQ576
+    assert (dd.SMEM, dd.WORDS, dd.BYTES) == (230928, 104, 416) and dd.SMEM + dd.BYTES == CFG_DQ576.TMEM_HANDLE == c.TMEM_HANDLE and dd.SMEM % 16 == 0
+    assert (drd.SMEM, drd.WORDS, drd.BYTES) == (231984, 96, 384) and drd.SMEM + drd.BYTES == CFG_RING_DQ576.TMEM_HANDLE == r.TMEM_HANDLE and drd.SMEM % 16 == 0
+    assert dd.WORD == drd.WORD == DBG_CLK.WORD and len(dd.WORD) == 86 <= drd.WORDS <= dd.WORDS and dd.MAGIC == drd.MAGIC == DBG_CLK.MAGIC
+    dead_b2 = ("wait:leader:dq_read_done", "blocked:leader:dq_read_done")  # the row has a site under rubin_b2 only
+    assert dbg_clk_dead_words("dq_576") == ("wait:leader:s_read", "blocked:leader:s_read", "wait:leader:s_tail_empty", "blocked:leader:s_tail_empty") + dead_b2
+    assert set(dbg_clk_dead_words("dq_576")) <= set(dd.WORD) and dbg_clk_dead_words("s_tail") == dead_b2 == dbg_clk_dead_words("s_tail", "sm100")
+    assert dbg_clk_dead_words("dq_576", "rubin_b2") == dbg_clk_dead_words("dq_576")[:4] and dbg_clk_dead_words("dq_576", "sm100") == dbg_clk_dead_words(
+        "dq_576"
+    )
+    assert (
+        dbg_clk_for_stats_form("tma_ring", None, "dq_576") is drd is dbg_clk_for_stats_form(None, None, "dq_576")
+        and dbg_clk_for_stats_form("ldg", None, "dq_576") is dd
+    )
+    assert (
+        dbg_clk_for_stats_form(None, None, "s_tail") is DBG_CLK_RING is dbg_clk_for_stats_form(None)
+        and dbg_clk_for_stats_form("ldg", "16w_fa4", "s_tail") is DBG_CLK
+    )
+    assert set(DBG_CLK_BY_GEOMETRY) == set(GEOMETRIES) and all(
+        DBG_CLK_BY_GEOMETRY[k].SMEM + DBG_CLK_BY_GEOMETRY[k].BYTES == GEOMETRIES[k].TMEM_HANDLE for k in GEOMETRIES
+    )
+    assert (
+        dbg_clk_bytes(1, 1, 256, "tma_ring", "dq_576") == 2 * 384
+        and dbg_clk_bytes(1, 1, 256, "ldg", "dq_576") == 2 * 416
+        and dbg_clk_bytes(1, 1, 256) == 2 * 352
+    )
+    for bad_map in ("bogus", None):
+        try:
+            dbg_clk_dead_words(bad_map)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_map)
+    # --- the SMEM MAP (arm R2.c, PART-KEYED; kernel header sections 5 / 8 / 11): the code space, the parts, the defaults, the resolver's declines, the
+    # B2 record's slab chain (every root below the version-0 line; the slab under the oversized cap), its barrier table (derived; names / slots / counts
+    # / kinds / addresses; SUM(issuing lanes) == init per row is the kernel header's ledger), its STAMPS record, the cross-field rules ---
+    b2 = CFG_RING_DQ576_B2
+    assert c.SMEM_MAPS == ("sm100", "rubin_b2", "sm100_oversized") == tuple(SMEM_MAP_CODES) and c.SMEM_MAP == c.SMEM_MAPS[0]
+    assert SMEM_MAP_CODES == {"sm100": 0, "rubin_b2": 1, "sm100_oversized": 2}
+    assert (b2.SMEM_MAP, b2.TMEM_MAP, b2.STATS_STAGES, b2.Q1_STAGES, b2.DO1_STAGES, b2.DS_STAGES, b2.XCHG_STAGES) == ("rubin_b2", "dq_576", 2, 2, 2, 2, 2)
+    assert b2.DS_STAGES == b2.XCHG_STAGES and b2.DO_STAGES == 1 and b2.DO1_STAGES == 2  # the base chain's DO_STAGES keeps sDO2 at one stage
+    order_b2 = (b2.Q1, b2.Q2, b2.DO1, b2.DO2, b2.K1, b2.K2, b2.V, b2.DS, b2.XCHG, b2.DQ, b2.STATS, b2.SLABS_END)
+    assert order_b2 == (0, 32768, 49152, 81920, 98304, 131072, 163840, 196608, 262144, 294912, 311296, 313344), order_b2
+    assert all(off % 1024 == 0 for off in order_b2)
+    assert (b2.SMEM_BYTES, b2.BARS, b2.TMEM_HANDLE, b2.SCHED_PAYLOAD, b2.BAR_BLOCK_BYTES, b2.SMEM_CAP) == (314368, 313344, 314288, 314304, 944, 334848)
+    assert c.SMEM_OPT_IN_CAP < b2.SMEM_BYTES <= b2.SMEM_CAP == c.SMEM_OVERSIZED_CAP  # the oversized mode is what the map buys; it fits the carveout
+    assert b2.SMEM_BYTES - r.SMEM_BYTES == c.Q1_BYTES + c.DO1_BYTES + c.DS_BYTES + c.XCHG_BYTES == 81920  # +16 +16 +32 +16 KiB: the four second stages
+    roots_b2 = b2.desc_roots()
+    assert roots_b2 == (0, 16384, 32768, 49152, 65536, 81920, 98304, 131072, 147456, 163840, 196608, 229376), roots_b2
+    assert max(roots_b2) < b2.TCGEN05_V0_ADDR_LIMIT and all(rt % 1024 == 0 for rt in roots_b2) and b2.DESC_VERSION == c.DESC_VERSION == 1
+    assert (
+        b2.ds_stage(1) + b2.DS_BYTES == b2.TCGEN05_V0_ADDR_LIMIT == b2.XCHG
+    )  # the last root ends exactly at the line; XCHG / sDQ / the stats ring are no roots
+    assert [b2.q1_stage(s) for s in range(2)] == [0, 16384] and [b2.do1_stage(s) for s in range(2)] == [49152, 65536]
+    assert [b2.ds_stage(s) for s in range(2)] == [196608, 229376] and [b2.xchg_stage(s) for s in range(2)] == [262144, 278528]
+    assert [b2.dq_slot(s) for s in range(b2.DQ_SLOTS)] == [294912, 303104] and [b2.stats_stage(s) for s in range(2)] == [311296, 312320]
+    assert (
+        b2.stats_stage(1) + b2.STATS_STAGE_BYTES == b2.SLABS_END == b2.BARS
+        and (b2.ALIAS, b2.ALIAS_BYTES) == (b2.DS, 98304)
+        and b2.ALIAS + b2.ALIAS_BYTES == b2.DQ
+    )
+    for rank in (0, 1):
+        assert {b2.dk_store(rank, 0), b2.dk_store(rank, 1)} == {b2.ds_own_stage(rank, 0), b2.xchg_stage(0)}  # the dK staging over the STAGE-0 bytes
+        assert b2.ds_own(rank) == b2.ds_own_stage(rank, 0) and b2.ds_recv(rank) == b2.ds_recv_stage(rank, 0)
+        for s in range(b2.DS_STAGES):
+            assert {b2.ds_own_stage(rank, s), b2.ds_recv_stage(rank, s)} == {b2.ds_stage(s), b2.ds_stage(s) + b2.DS_HALF_BYTES}
+            assert b2.ds_own_stage(rank, s) == b2.ds_recv_stage(1 - rank, s)  # our own half IS the peer's recv half of the same stage (kv-global order)
+    assert [b2.dkv_acc_r1_slot(i) for i in range(5)] == [b2.K2, b2.K2 + 16384, b2.DS, b2.DS + 16384, b2.XCHG]  # stage-0 bytes (dead from dq_done(hi-1))
+    assert (b2.dv_store(0), b2.dv_store(1)) == (b2.K2, b2.K2 + 16384) and all(
+        s >= b2.XCHG + b2.XCHG_STAGES * b2.XCHG_BYTES for s in [b2.dq_slot(0), b2.dq_slot(1)]
+    )
+    moved_smem = {  # the SMEM map's business and nothing else (the TMEM map's five, the lane counts, the boxes, the probes: equal)
+        "SMEM_MAP",
+        "Q1_STAGES",
+        "DO1_STAGES",
+        "DS_STAGES",
+        "XCHG_STAGES",
+        "Q2",
+        "DO1",
+        "DO2",
+        "K1",
+        "K2",
+        "V",
+        "DS",
+        "XCHG",
+        "ALIAS",
+        "ALIAS_BYTES",
+        "DQ",
+        "STATS",
+        "DELTA",
+        "STATS_RING",
+        "SLABS_END",
+        "SMEM_BYTES",
+        "BARS",
+        "TMEM_HANDLE",
+        "SCHED_PAYLOAD",
+        "SMEM_CAP",
+    }
+    assert moved_smem <= names_all, moved_smem - names_all
+    for n in props:
+        if n not in moved_smem:
+            assert getattr(CFG_RING_DQ576, n) == getattr(b2, n), n
+    for n in type(c).__dataclass_fields__:
+        if n not in moved_smem:
+            assert getattr(CFG_RING_DQ576, n) == getattr(b2, n), n
+    # the B2 barrier table (derived) and the derivation's fidelity to every pasted table
+    assert layout_for_geometry(c) == BAR_LAYOUT and layout_for_geometry(r) == BAR_LAYOUT_RING and layout_for_geometry(c, "16w_fa4") == BAR_LAYOUT_XFA4
+    assert layout_for_geometry(CFG_DQ576) == BAR_LAYOUT_DQ576 and layout_for_geometry(CFG_RING_DQ576) == BAR_LAYOUT_RING_DQ576
+    assert layout_for_geometry(r, "16w_fa4") == fa4_ring and [_row_bytes(s) for s in (1, 2, 3, 4)] == [16, 16, 32, 32]
+    t_b2 = BAR_LAYOUT_RING_DQ576_B2
+    names_b2 = [row[0] for row in t_b2]
+    kept = [n for n in names if n not in DELETED_BARRIERS_DQ576]
+    assert names_b2 == kept[: kept.index(DQ_READ_DONE_AFTER) + 1] + list(ADDED_BARRIERS_B2) + kept[kept.index(DQ_READ_DONE_AFTER) + 1 :] + [
+        row[0] for row in STATS_RING_ROWS
+    ]
+    assert len(t_b2) == 36 and sum(row[2] for row in t_b2) == 51 and BAR_LAYOUT_RING_DQ576_B2_END == 313936 == b2.BARS + 35 * 16 + 32
+    assert BAR_LAYOUT_RING_DQ576_B2_END == layout_end(t_b2) and layout_end(BAR_LAYOUT_RING) == BAR_LAYOUT_RING_END and layout_end(BAR_LAYOUT) == BAR_LAYOUT_END
+    slots_b2 = {row[0]: row[2] for row in t_b2}
+    grown = dict(q1_full=2, q1_empty=2, do1_full=4, do1_empty=2, ds_smem=2, ds_recv_full=2, ds_pair_ready=2)
+    assert slots_b2 == dict({row[0]: row[2] for row in BAR_LAYOUT_RING_DQ576}, dq_read_done=1, **grown), slots_b2
+    assert (
+        set(RING_SLOT_ROWS) == set(grown)
+        and DQ_READ_DONE_ROW == ("dq_read_done", 1, c.PAIR_EPILOGUE_LANES, "leader", "LEADER")
+        and c.PAIR_EPILOGUE_LANES == 256
+    )
+    row_b2 = {row[0]: row for row in t_b2}
+    for name, (slots_n, count, kind, scope) in audited.items():
+        if name not in DELETED_BARRIERS_DQ576:
+            assert row_b2[name][3:] == (count, kind, scope), name  # every kept row keeps its init per slot, kind and scope
+    assert row_b2["dq_read_done"][3:] == (c.PAIR_EPILOGUE_LANES, "leader", "LEADER") and names_b2.index("dq_read_done") == names_b2.index("dp_empty") + 1
+    prev_end, seen_b2, kinds_b2 = b2.BARS, set(), {}
+    for name, offset, slots_n, count, kind, scope in t_b2:
+        assert offset == prev_end and offset % 16 == 0 and scope == kind_scope[kind], name
+        prev_end = offset + _row_bytes(slots_n)
+        kinds_b2[kind] = kinds_b2.get(kind, 0) + 1
+        for i in range(slots_n):
+            address = offset + i * 8
+            assert b2.BARS <= address and address + 8 <= b2.TMEM_HANDLE and address not in seen_b2, name
+            seen_b2.add(address)
+    assert prev_end == BAR_LAYOUT_RING_DQ576_B2_END <= b2.TMEM_HANDLE and kinds_b2 == BAR_KIND_COUNTS_RING_DQ576_B2 and sum(kinds_b2.values()) == 36
+    assert row_b2["do1_full"][1] + 32 == row_b2["do1_empty"][1]  # the 4-slot row takes 32 B: the cumulative walk
+    assert BAR_LAYOUT_RING_DQ576_B2_STATUS.startswith("SKELETON")
+    assert bar_layout_for_roles("16w", "tma_ring", "dq_576", "rubin_b2") is BAR_LAYOUT_RING_DQ576_B2 is bar_layout_for_roles("16w", None, "dq_576", "rubin_b2")
+    assert bar_layout_for_roles("16w", "tma_ring", "dq_576", "sm100") is BAR_LAYOUT_RING_DQ576 is bar_layout_for_roles("16w", "tma_ring", "dq_576", None)
+    assert (
+        bar_layout_end_for_roles("16w", "tma_ring", "dq_576", "rubin_b2") == 313936
+        and bar_kind_counts_for_roles("16w", "tma_ring", "dq_576", "rubin_b2") == kinds_b2
+    )
+    for bad_call in (
+        ("16w", "tma_ring", "s_tail", "rubin_b2"),
+        ("16w_fa4", "ldg", "s_tail", "rubin_b2"),
+        ("16w", "ldg", "dq_576", "rubin_b2"),
+        ("16w", None, "dq_576", "bogus"),
+    ):
+        try:
+            bar_layout_for_roles(*bad_call)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_call)
+    # the resolvers, the defaults and the declines
+    assert set(SMEM_MAP_DEFAULT_BY_PART) == set(CTA_PAIR_CCS) == set(SMEM_MAP_PARTS["sm100"]) and SMEM_MAP_PARTS["rubin_b2"] == ((10, 7),)
+    assert SMEM_MAP_PARTS["sm100_oversized"] == ((10, 7),) and SMEM_MAP_SLAB_BYTES == {"rubin_b2": 314368, "sm100_oversized": 262144}
+    # --- the DIAGNOSTIC map sm100_oversized: the sm100 map itself (every address identical) with the padded declaration; never a default; cc 10.7 only ---
+    for ovs, ref, rec in ((CFG_RING_OVS, CFG_RING, DBG_CLK_RING), (CFG_RING_DQ576_OVS, CFG_RING_DQ576, DBG_CLK_RING_DQ576)):
+        assert ovs.SMEM_MAP == "sm100_oversized" and ref.SMEM_MAP == "sm100" and ovs.SMEM_PAD_BYTES == 29696 and ref.SMEM_PAD_BYTES == 0
+        assert ovs.SMEM_BYTES == SMEM_OVERSIZED_PROBE_BYTES == 262144 and c.SMEM_OPT_IN_CAP < ovs.SMEM_BYTES <= ovs.SMEM_CAP == c.SMEM_OVERSIZED_CAP
+        assert (ovs.BARS, ovs.TMEM_HANDLE, ovs.SCHED_PAYLOAD, ovs.SLABS_END) == (ref.BARS, ref.TMEM_HANDLE, ref.SCHED_PAYLOAD, ref.SLABS_END)
+        assert ovs.SCHED_PAYLOAD + c.SCHED_PAYLOAD_BYTES == ref.SMEM_BYTES == 232448  # the pad is dead space ABOVE every address of the map
+        assert ovs.desc_roots() == ref.desc_roots() and ovs.TMEM_MAP == ref.TMEM_MAP and ovs.STATS_STAGES == ref.STATS_STAGES == 2
+        assert (ovs.Q1_STAGES, ovs.DO1_STAGES, ovs.DS_STAGES, ovs.XCHG_STAGES) == (ref.Q1_STAGES, ref.DO1_STAGES, ref.DS_STAGES, ref.XCHG_STAGES)
+        assert (ovs.Q1, ovs.Q2, ovs.DO1, ovs.DO2, ovs.K1, ovs.K2, ovs.V, ovs.DS, ovs.XCHG, ovs.DQ, ovs.STATS, ovs.STATS_RING) == (
+            ref.Q1,
+            ref.Q2,
+            ref.DO1,
+            ref.DO2,
+            ref.K1,
+            ref.K2,
+            ref.V,
+            ref.DS,
+            ref.XCHG,
+            ref.DQ,
+            ref.STATS,
+            ref.STATS_RING,
+        )
+        assert bar_layout_for_roles("16w", "tma_ring", ref.TMEM_MAP, "sm100_oversized") is bar_layout_for_roles("16w", "tma_ring", ref.TMEM_MAP, "sm100")
+        assert bar_kind_counts_for_roles("16w", "tma_ring", ref.TMEM_MAP, "sm100_oversized") == bar_kind_counts_for_roles("16w", "tma_ring", ref.TMEM_MAP)
+        assert (
+            dbg_clk_for_stats_form("tma_ring", None, ref.TMEM_MAP, "sm100_oversized") is rec
+            and cfg_for_geometry("tma_ring", ref.TMEM_MAP, "sm100_oversized") is ovs
+        )
+    assert set(SMEM_MAP_DIAGNOSTIC) == {"sm100_oversized"} and not any(m in SMEM_MAP_DIAGNOSTIC for m in SMEM_MAP_DEFAULT_BY_PART.values())
+    assert resolve_smem_map("sm100_oversized", (10, 7)) == "sm100_oversized" and smem_map_code("sm100_oversized", (10, 7), "16w", "tma_ring", "s_tail") == 2
+    for cc in ((10, 0), (10, 3)):
+        try:
+            resolve_smem_map("sm100_oversized", cc)
+        except SmemMapNotServed:
+            pass
+        else:
+            raise AssertionError("sm100_oversized must decline by name off cc 10.7")
+    for bad in (dict(roles="16w_fa4", stats_form="ldg"), dict(roles="16w", stats_form="ldg")):
+        try:
+            validate_fields_for_roles(bad["roles"], None, stats_form=bad["stats_form"], tmem_map="s_tail", smem_map="sm100_oversized")
+        except ValueError as error:
+            assert "smem_map 'sm100_oversized' is not built under" in str(error), str(error)
+        else:
+            raise AssertionError("sm100_oversized x 16w_fa4 / x ldg must decline by name")
+    assert SMEM_MAP_DEFAULT_BY_PART == {(10, 0): "sm100", (10, 3): "sm100", (10, 7): "sm100"} and set(SMEM_MAP_PARTS) == set(c.SMEM_MAPS)
+    assert all(m == c.SMEM_MAP for m in SMEM_MAP_DEFAULT_BY_PART.values())  # rubin_b2 is selectable by name only (its A/B/A row flips the part default)
+    assert all(cc in SMEM_MAP_PARTS[m] for cc, m in SMEM_MAP_DEFAULT_BY_PART.items())
+    assert resolve_smem_map("rubin_b2", (10, 7)) == "rubin_b2" == resolve_smem_map("rubin_b2", [10, 7], "16w", "tma_ring", "dq_576")  # NAMED on cc 10.7
+    assert (
+        resolve_smem_map(None, (10, 0))
+        == "sm100"
+        == resolve_smem_map(None, (10, 3))
+        == resolve_smem_map(None, (10, 7))
+        == resolve_smem_map("sm100", (10, 7))
+        == resolve_smem_map(None, (10, 7), tmem_map="dq_576")
+        == resolve_smem_map(None, (10, 7), "16w_fa4")
+        == resolve_smem_map(None, (10, 7), stats_form="ldg")
+    )
+    assert (smem_map_code(None, (10, 0)), smem_map_code(None, (10, 7)), smem_map_code("sm100", (10, 7)), smem_map_code("rubin_b2", (10, 7))) == (0, 0, 0, 1)
+    for bad_name in ("bogus", "", 1, "RUBIN_B2", "b2"):
+        try:
+            resolve_smem_map(bad_name, (10, 7))
+        except SmemMapNotServed:
+            raise AssertionError((bad_name, "a name outside the domain is a plain ValueError, never a decline"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_name)
+    for bad_cc in (None, (9, 0), (12, 0), (10, 9)):
+        try:
+            resolve_smem_map(None, bad_cc)
+        except SmemMapNotServed:
+            raise AssertionError((bad_cc, "an unadmitted part has no default: a plain ValueError"))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_cc)
+    for bad_cc in ((10, 0), (10, 3)):
+        try:
+            resolve_smem_map("rubin_b2", bad_cc)
+        except SmemMapNotServed as error:
+            assert "smem_map 'rubin_b2' is not served on cc" in str(error) and "oversized" in str(error), str(error)
+        else:
+            raise AssertionError(bad_cc)
+    assert cfg_for_part((10, 7), tmem_map="dq_576", smem_map="rubin_b2") is b2 is cfg_for_part((10, 7), "tma_ring", "16w", "dq_576", "rubin_b2")  # BOTH named
+    assert cfg_for_part((10, 7), tmem_map="dq_576", smem_map="sm100") is CFG_RING_DQ576 is cfg_for_part((10, 7), tmem_map="dq_576")
+    assert cfg_for_part((10, 7)) is CFG_RING is cfg_for_part((10, 7), tmem_map="s_tail") is cfg_for_part((10, 0)) is cfg_for_part((10, 3))  # the defaults
+    assert cfg_for_part((10, 7), "ldg", tmem_map="dq_576") is CFG_DQ576 and cfg_for_part((10, 7), roles="16w_fa4") is CFG
+    assert cfg_for_geometry("tma_ring", "dq_576") is CFG_RING_DQ576 and cfg_for_geometry("tma_ring", "dq_576", "rubin_b2") is b2
+    for bad_part in (dict(smem_map="rubin_b2"), dict(tmem_map="s_tail", smem_map="rubin_b2"), dict(stats_form="ldg", tmem_map="dq_576", smem_map="rubin_b2")):
+        try:
+            cfg_for_part((10, 7), **bad_part)  # no geometry record exists off the B2 seat (validate_fields_for_roles names the rule first in compile_host)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_part)
+    assert set(GEOMETRIES) == {(f, m, "sm100") for f in c.STATS_FORMS for m in c.TMEM_MAPS} | {("tma_ring", "dq_576", "rubin_b2")} | {
+        ("tma_ring", m, "sm100_oversized") for m in c.TMEM_MAPS
+    }
+    assert all(cfg_for_geometry(*k).SMEM_MAP == k[2] and cfg_for_geometry(*k).TMEM_MAP == k[1] for k in GEOMETRIES)
+    for bad_geo in (("ldg", "dq_576", "rubin_b2"), ("tma_ring", "s_tail", "rubin_b2"), ("tma_ring", "dq_576", "bogus")):
+        try:
+            cfg_for_geometry(*bad_geo)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_geo)
+    assert validate_fields_for_roles("16w", None, tmem_map="dq_576", smem_map="rubin_b2") == "16w" == validate_fields_for_roles("16w", None, smem_map="sm100")
+    assert (
+        validate_fields_for_roles("16w", "exchange_off", debug_clk=True, dkv_accum="fp32_reduce", stats_form="tma_ring", tmem_map="dq_576", smem_map="rubin_b2")
+        == "16w"
+    )
+    for bad_kw, text in (
+        (dict(tmem_map="s_tail", smem_map="rubin_b2"), "smem_map 'rubin_b2' is not built under tmem_map 's_tail'"),
+        (dict(smem_map="rubin_b2"), "smem_map 'rubin_b2' is not built under tmem_map 's_tail'"),
+        (dict(stats_form="ldg", tmem_map="dq_576", smem_map="rubin_b2"), "smem_map 'rubin_b2' is not built under stats_form 'ldg'"),
+        (dict(smem_map="bogus"), "smem_map must be one of"),
+    ):
+        try:
+            validate_fields_for_roles("16w", None, **bad_kw)
+        except ValueError as error:
+            assert text in str(error), (bad_kw, str(error))
+        else:
+            raise AssertionError(bad_kw)
+    try:
+        validate_fields_for_roles("16w_fa4", None, tmem_map="dq_576", smem_map="rubin_b2")
+    except ValueError as error:
+        assert "is not built under warp_roles '16w_fa4'" in str(error), str(error)
+    else:
+        raise AssertionError("rubin_b2 must decline by name under 16w_fa4")
+    # the STAMPS record under the map: the same word map; the leader's dq_read_done pair live; the spare re-derived
+    db2 = DBG_CLK_RING_DQ576_B2
+    assert (db2.SMEM, db2.WORDS, db2.BYTES) == (313936, 88, 352) and db2.SMEM + db2.BYTES == b2.TMEM_HANDLE and db2.SMEM % 16 == 0
+    assert db2.WORD == DBG_CLK.WORD and len(db2.WORD) == 86 <= db2.WORDS and db2.MAGIC == DBG_CLK.MAGIC
+    assert dbg_clk_for_stats_form("tma_ring", None, "dq_576", "rubin_b2") is db2 is dbg_clk_for_stats_form(None, None, "dq_576", "rubin_b2")
+    assert dbg_clk_for_stats_form(None, None, "dq_576") is drd is dbg_clk_for_stats_form(None, None, "dq_576", "sm100")
+    assert set(DBG_CLK_BY_GEOMETRY) == set(GEOMETRIES) and all(
+        DBG_CLK_BY_GEOMETRY[k].SMEM + DBG_CLK_BY_GEOMETRY[k].BYTES == GEOMETRIES[k].TMEM_HANDLE and DBG_CLK_BY_GEOMETRY[k].WORDS >= len(DBG_CLK.WORD)
+        for k in GEOMETRIES
+    )
+    assert dbg_clk_bytes(1, 1, 256, "tma_ring", "dq_576", "rubin_b2") == 2 * 352 and dbg_clk_bytes(1, 1, 256, None, "dq_576") == 2 * 384
+    for bad_map in ("bogus", "", 1):  # None = the sm100 map (legal)
+        try:
+            dbg_clk_for_stats_form(None, None, "dq_576", bad_map)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad_map)
 
 
 validate_config()

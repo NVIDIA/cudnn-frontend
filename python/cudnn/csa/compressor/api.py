@@ -32,7 +32,7 @@ Validated envelope (``check_support``): compute capability major >= 10 (SM100+),
   by ``ratio`` transparently. NOTE: the numerics contracts differ per family — see
   below.
 
-Numerics contract (see the kernel modules and docs/fe-oss-apis/csa.md for details):
+Numerics contract (see the kernel modules and docs/operations/sparse_attention/csa.md for details):
 fp32 arithmetic with one final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX.
 Forward, ``dKV`` and ``dScore`` are bitwise run-to-run deterministic in BOTH families.
 At ``ratio in {2, 4}`` dKV/dScore are additionally bit-identical to the fp32-intermediate
@@ -386,7 +386,7 @@ class CSACompressorForward(_CSACompressorBase):
         # and cache pattern with the generic kernels (JIT cache keyed per
         # (ratio, head_dim, coff, device) plus the compile-time schedule); the
         # numerics contracts intentionally DIFFER per family — see the module
-        # docstring and docs/fe-oss-apis/csa.md.
+        # docstring and docs/operations/sparse_attention/csa.md.
         if self.ratio == 128:
             precompile_fwd_r128(self.ratio, self.head_dim, self.coff, self.target_device)
             run = run_fwd_r128

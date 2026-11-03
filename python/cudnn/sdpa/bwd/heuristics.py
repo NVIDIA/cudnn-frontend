@@ -79,13 +79,20 @@ def _leads(spec: EngineSpec, facts) -> bool:
     ``sdpa_bwd_sm100_d128`` (measured 2026-10-26 against cuDNN 9.28.0.38, 216 cases at 32k tokens: d64/d128, GQA
     32/8 16/2 and MHA, S 1k-16k, causal / mask-free / SWA1024, BSHD and THD at equal and half-to-full lengths): THD at
     d128 wins 0.79-0.95 (one 1.07) -> ahead; dense BSHD d128 is parity (0.93-1.27), a window loses ~2x and dense D64
-    loses 1.7-2.3x -> behind the backend.
+    loses 1.7-2.3x -> behind the backend.  Measured on cc 10.0; cc 10.3 runs the same rule (the sm103 admission,
+    2026-10-28); cc 10.7 (Rubin, admitted 2026-11-03 with the same bodies compiled for sm_107a) runs the same rule on the
+    evidence of 2026-11-03 (a Rubin class node, 212 SMs, A/B/A x3 x100 both build orders): the backend offers NO plan for
+    d128 THD backward on cc 10.7 with cuDNN 9.24.0.43 or 9.27.0.42, so the FROST row is the only candidate there; dense MHA d128 vs the backend's engine (9.27.0.42) is +1.6 % at 16K and inside noise at 8K = the parity band of
+    the cc 10.0 rule -> dense stays behind the backend there too.
 
     ``sdpa_bwd_sm100_d256`` (measured 2026-10-27 on a full-power B200 against cuDNN 9.28.0.38, 108 cases at 32k tokens:
     d256 GQA 16/2, 32/4 and MHA 16/16, D192x128 MHA 16-128 heads, S 1k-16k, causal / mask-free, BSHD and THD at equal and
     half-to-full lengths): d256 wins 0.73-0.98 -> ahead, except a mask-free ragged THD declaration (declared total below
     b * S_q) at S_q >= 4096 (0.95-1.10); D192x128 loses 1.08-1.91 everywhere -> behind. Only cc 10.0 was measured, and
-    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first.
+    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first. On cc 10.3 the d256
+    row's bf16 THD graphs are decided by the placement table (studies sm103_d256_bwd_v2_20261031 on the 128-key tile and
+    sm103_d256_bwd_thd_offtile_20261031 off it); its dense graphs, which lost on small-work holdout cases in two studies,
+    still trail the backend there.
 
     A measured entry in ``cudnn.sdpa.placement_table`` answers first; the rules above decide every graph without one."""
     from cudnn.sdpa import placement_table
@@ -94,15 +101,21 @@ def _leads(spec: EngineSpec, facts) -> bool:
     if measured is not None:
         return measured
     if spec.name == "sdpa_bwd_sm100_d128":
-        return facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
+        return facts.device_cc in D128_LEAD_CCS and facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
     if spec.name == "sdpa_bwd_sm100_d256":
         return _d256_leads(facts)
     return spec.name not in TRAIL_ONLY_ROWS
 
 
-TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512", "sdpa_bwd_sm107_d128"})
+TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
 """Default-offered rows with no measured lead shard: ranked after the backend's block, so they serve a graph only when the
 backend declines it (a correctness fallback, not a performance claim)."""
+
+D128_LEAD_CCS = ((10, 0), (10, 3), (10, 7))
+"""The parts where ``sdpa_bwd_sm100_d128``'s lead box (unwindowed d128 THD) applies: cc 10.0 measured (2026-10-26), cc 10.3
+carried with the sm103 admission, cc 10.7 measured 2026-11-03 on a Rubin class node -- the backend serves no d128 THD backward
+plan there (cuDNN 9.24.0.43 and 9.27.0.42), so the FROST row is the only candidate in the box; its dense d128 graphs read
+parity against the backend (+1.6 % at 16K, noise at 8K) and trail, as on cc 10.0."""
 
 
 SM100_D256_BWD_RAGGED_MASKFREE_MAX_S_Q = 4095  # mask-free ragged THD d256 past this length: 0.95-1.10 of the backend

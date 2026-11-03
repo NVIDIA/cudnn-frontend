@@ -41,7 +41,6 @@ _OFFERED = {
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
-    "sdpa_bwd_sm107_d128": 20611,
 }
 
 
@@ -139,13 +138,19 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6)])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7"])
 def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
+    """The d128 row (slot 9 -> 20609) lists one knob-less entry for a dense MHA graph on every cc of its sm range (the recompute body serves
+    the SM100-line envelope, cc 10.0-10.6, and Rubin, cc 10.7); the grouped (and THD) chains list on the accumulation parts ONLY -- the
+    family's cc tuple ``d128_contract.ACCUMULATION_CCS`` (cc 10.0 / 10.3 / 10.7), read from the contract, never a copy."""
+    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
+
     monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     facts = _facts(device_cc=cc)
     assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == [(20609, None)]
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc in ((10, 0), (10, 3)) else [])
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc in ACCUMULATION_CCS else [])
+    assert ((10, 7) in ACCUMULATION_CCS) and ((10, 6) not in ACCUMULATION_CCS)  # the admitted parts are named, the envelope's hypothetical ccs are not
     assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
 
@@ -159,16 +164,18 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
         ((10, 0), 512, [20602]),
         ((10, 3), 512, [20602]),
         ((10, 7), 256, [20604]),
-        ((10, 7), 128, []),
+        ((10, 7), 128, [20609]),  # d128 on cc 10.7: the admitted d128 family row (slot 9), never the d512 row
+        ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
         ((12, 0), 512, []),
     ],
-    ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm120-d512"],
+    ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
 )
 def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(cc, d, want):
     """The cc 10.7 d512 bf16 / fp16 backward row (slot 8 -> 20608) is fixed-geometry: on the Rubin line (cc 10.7-11.x) a
     d in (256, 512] graph lists exactly one entry with NO knobs (``{}`` is the complete record); the SM100 line keeps its
     own d512 row (20602); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
-    d = 128 and SM120 list no python row for the half d512 graph."""
+    d = 128 on cc 10.7 lists the admitted d128 family row (20609; the Rubin admission of 2026-11-03), past that row's range (cc 11.0)
+    and on SM120 no python row lists for these graphs."""
     assert any(s.name == "sdpa_bwd_sm107_d512" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_d512 is not registered"
     plans = recommend("A", _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
@@ -217,20 +224,27 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
     monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
 
     def order(**over):
-        plans = heuristics.propose("A", _facts(device_cc=(10, 0), **over), _OFFERED)
+        plans = heuristics.propose("A", _facts(**{"device_cc": (10, 0), **over}), _OFFERED)
         return ["backend" if is_backend_block(p) else "frost" for p in plans]
 
     assert order(thd=True) == ["frost"]
     assert order() == ["backend", "frost"]  # dense d128: parity
     assert order(thd=True, window_left=1024) == ["backend", "frost"]  # a window loses ~2x
     assert order(thd=True, d_qk=64, d_v=64) == ["backend", "frost"]
+    assert order(thd=True, device_cc=(10, 3)) == ["frost"]  # cc 10.3 runs the cc 10.0 rule (the sm103 precedent)
+    # cc 10.7 (Rubin, measured 2026-11-03): the backend serves no d128 THD backward plan there, so the row leads its box as on cc 10.0;
+    # dense d128 read parity (+1.6 % at 16K, noise at 8K) and trails (heuristics.D128_LEAD_CCS)
+    assert order(thd=True, device_cc=(10, 7)) == ["frost"]
+    assert order(device_cc=(10, 7)) == ["backend", "frost"]
+    assert order(thd=True, device_cc=(10, 7), window_left=1024) == ["backend", "frost"]
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order() == ["frost"]
 
 
 def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     """The default d256 backward row ranks ahead of the backend for d256 on cc 10.0 and behind it for D192x128, other parts,
-    unmeasured features and mask-free ragged THD past S_q 4096; the FROST opt-in keeps it first everywhere."""
+    unmeasured features and mask-free ragged THD past S_q 4096; on cc 10.3 the placement table decides bf16 THD graphs. The
+    FROST opt-in keeps it first everywhere."""
     from cudnn.engines.base import PlanConfig
     from cudnn.engines.heuristics import is_backend_block
     from cudnn.engines.manifest import MANIFEST
@@ -255,9 +269,21 @@ def test_sm100_d256_leads_the_backend_only_inside_its_measured_box(monkeypatch):
     assert order(thd=True, causal=False, max_total_seq_len_q=6 * 4096) == trail  # mask-free ragged past 4096
     assert order(thd=True, max_total_seq_len_q=6 * 4096) == lead  # causal ragged
     assert order(d_qk=192, d_v=128, h_kv=16) == trail
-    assert order(device_cc=(10, 3)) == trail
+    assert order(device_cc=(10, 3)) == trail  # dense on cc 10.3: no table entry, and the box is cc 10.0's
     for unmeasured in (dict(deterministic=True), dict(has_bias=True), dict(has_dropout=True), dict(window_left=1024), dict(has_sink=True)):
         assert order(**unmeasured) == trail, unmeasured
+    # cc 10.3 bf16 THD on the 128-key tile: the placement table's own entries (study sm103_d256_bwd_v2_20261031) decide
+    thd103 = dict(device_cc=(10, 3), thd=True, max_total_seq_len_q=8 * 4096)
+    assert order(**thd103) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=16, h_kv=16, s_q=1024, s_kv=1024, max_total_seq_len_q=1024) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=8, h_kv=8, s_q=256, s_kv=256, max_total_seq_len_q=256) == trail
+    for unmeasured in (dict(deterministic=True), dict(has_bias=True), dict(window_left=1024), dict(dtype=cudnn.data_type.HALF)):
+        assert order(**thd103, **unmeasured) == trail, unmeasured
+    # off the 128-key tile: the twin entries (study sm103_d256_bwd_thd_offtile_20261031)
+    assert order(device_cc=(10, 3), thd=True, s_q=4000, s_kv=4000, max_total_seq_len_q=8 * 4000) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=16, h_kv=16, s_q=3000, s_kv=3000, max_total_seq_len_q=3000) == lead
+    assert order(device_cc=(10, 3), thd=True, causal=False, b=1, h_q=8, h_kv=8, s_q=1000, s_kv=1000, max_total_seq_len_q=1000) == trail
+    assert order(device_cc=(10, 3), s_q=4000, s_kv=4000) == trail  # dense off the tile: no entry
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert order(d_qk=192, d_v=128, h_kv=16) == lead
 

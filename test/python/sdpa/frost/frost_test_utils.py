@@ -60,6 +60,23 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+
+
+def requires_bwd_engine_row(name):
+    """``skipif`` off the sm range the named FROST backward engine row DECLARES (``Capabilities.sm_lo`` / ``sm_hi`` in
+    sdpa/bwd/engines.py), read from the row at import -- never a per-file copy of the range.  For the rows whose bodies are
+    compiled per device (the ``sdpa_bwd_sm100_d128`` family: ``--gpu-arch sm_{cc}a`` from the device cc, cc 10.0 / 10.3 and,
+    since the Rubin admission, cc 10.7) a suite gated on ``requires_pre_rubin_blackwell`` would skip exactly the lane that
+    needs to run; this marker follows the row instead."""
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    caps = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+    return pytest.mark.skipif(
+        _SM is None or not (caps.sm_lo <= _SM <= caps.sm_hi),
+        reason=f"needs a GPU in the {name} row's range (SM{caps.sm_lo}-{caps.sm_hi}), have " + ("none" if _SM is None else f"sm_{_SM}"),
+    )
+
+
 # Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
 # sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
 # marker mirrors that range rather than pinning (10, 7)).
@@ -316,6 +333,12 @@ def launch_f16(
         kv_mask_ptr=None,
         kv_mask_batch_stride=0,
         inv_scale_softmax=1.0,
+        # Direct template tests request split partials, leaving the optional
+        # in-kernel final-output reduction disabled.
+        final_o_ptr=None,
+        final_lse_ptr=None,
+        final_o_strides=(0, 0, 0),
+        final_lse_strides=(0, 0, 0),
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)

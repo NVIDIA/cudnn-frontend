@@ -36,7 +36,10 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from cudnn.frost.device import device_context
+
 from .epilogue import get_epilogue_op
+from .._cutedsl import build_target
 from ..tile_config import ConvTileConfig, _get_config
 
 __all__ = ["compile"]
@@ -1689,7 +1692,6 @@ def _is_dense_selection_candidate(tile_config: ConvTileConfig, implicit_m: int, 
     )
 
 
-@lru_cache(maxsize=None)
 def compile(
     ncdhw: Tuple[int, int, int, int, int] = _DEFAULT_NCDHW,
     ktrs: Tuple[int, int, int, int] = _DEFAULT_KTRS,
@@ -1710,8 +1712,44 @@ def compile(
     specializations. Input/output storage dtypes and an explicitly supplied
     ``tile_config`` are specialized independently; when no config is supplied,
     the shared predicate-based selector chooses one from the implicit-GEMM
-    shape. The accumulator remains FP32.
+    shape. The accumulator remains FP32. Each build device compiles its own
+    artifact for its own target (``_cutedsl.build_target``).
     """
+    device, gpu_arch = build_target()
+    return _compile_cached(
+        ncdhw,
+        ktrs,
+        upper_padding_dhw,
+        lower_padding_dhw,
+        stride_dhw,
+        dilation_dhw,
+        epilogue,
+        epilogue_attrs,
+        ab_dtype,
+        c_dtype,
+        tile_config,
+        device=device,
+        gpu_arch=gpu_arch,
+    )
+
+
+@lru_cache(maxsize=None)
+def _compile_cached(
+    ncdhw: Tuple[int, int, int, int, int],
+    ktrs: Tuple[int, int, int, int],
+    upper_padding_dhw: Tuple[int, int, int],
+    lower_padding_dhw: Tuple[int, int, int],
+    stride_dhw: Tuple[int, int, int],
+    dilation_dhw: Tuple[int, int, int],
+    epilogue: str,
+    epilogue_attrs: tuple[tuple[str, float], ...],
+    ab_dtype: Type[Numeric],
+    c_dtype: Type[Numeric],
+    tile_config: ConvTileConfig | None,
+    *,
+    device: int,
+    gpu_arch: str,
+):
     acc_dtype = cutlass.Float32
     epilogue_op = get_epilogue_op(epilogue, epilogue_attrs)
 
@@ -1754,14 +1792,15 @@ def compile(
         )
 
     cluster_size = tile_config.cluster_shape_mn[0] * tile_config.cluster_shape_mn[1]
-    max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
-    return cute.compile(
-        fprop_op,
-        fake_a,
-        fake_b,
-        fake_c,
-        max_active_clusters,
-        make_fake_stream(),
-        epilogue_op,
-        options="--enable-tvm-ffi",
-    )
+    with device_context(device):
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        return cute.compile(
+            fprop_op,
+            fake_a,
+            fake_b,
+            fake_c,
+            max_active_clusters,
+            make_fake_stream(),
+            epilogue_op,
+            options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+        )

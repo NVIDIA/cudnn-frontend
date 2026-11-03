@@ -142,6 +142,8 @@ class EngineFamily:
 # ignored when classifying, so `matmul + pointwise` is a gemm graph. Names, not
 # enum members, so this file imports no engine code.
 _ANCHOR_NODE_TO_FAMILY = {
+    "ADALAYERNORM": "frost_norm_fwd",
+    "ADALAYERNORM_BWD": "frost_norm_bwd",
     "LAYERNORM": "frost_norm_fwd",
     "RMSNORM": "frost_norm_fwd",
     "INSTANCENORM": "frost_norm_fwd",
@@ -301,7 +303,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm107_d512": EngineSlot(8),
             "sdpa_bwd_sm100_d128": EngineSlot(9),
             "sdpa_bwd_sm107_d192": EngineSlot(10, opt_in=True),
-            "sdpa_bwd_sm107_d128": EngineSlot(11),
+            "sdpa_bwd_sm100_d128_fp8": EngineSlot(11, opt_in=True),
+            "sdpa_bwd_sm100_d192": EngineSlot(12, opt_in=True),
+            "sdpa_bwd_sm100_d192_fp8": EngineSlot(13, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -324,6 +328,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         # Slots are FIXED FOREVER; append the next free one, never reorder.
         slots={"norm_fprop_sm100": EngineSlot(0), "norm_fprop_sm90": EngineSlot(1, opt_in=True)},
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
+        validator=("cudnn.norm.affine", "validate_graph"),
     ),
     EngineFamily(
         FROST_NORM_BWD_ID_BASE,
@@ -332,6 +337,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "FrostNormBwdEngines",
         slots={"norm_bprop_sm100": EngineSlot(0), "norm_bprop_sm90": EngineSlot(1, opt_in=True)},
         analyzer=("cudnn.norm.graph_analyzer", "analyze"),
+        validator=("cudnn.norm.affine", "validate_graph"),
     ),
 )
 
