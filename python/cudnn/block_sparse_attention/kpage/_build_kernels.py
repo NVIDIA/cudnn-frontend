@@ -225,6 +225,12 @@ class WalkFill:
 
     With ``block == 64`` every Q block is an M64 tile: the M64 views are indexed
     by the Q block itself (no second half) and the M128 view is unused.
+
+    With ``block == 128`` every table is written one output word per thread,
+    consecutive threads on consecutive words: a chunk's page ids (at most
+    ``num_threads`` blocks of 8 pages) go to shared memory first and are copied
+    out in order, and each mask word is its own thread's.  A blk64 block has at
+    most 4 pages, and its direct writes were measured as fast (``staged``).
     """
 
     def __init__(self, block: int = BLOCK):
@@ -232,6 +238,7 @@ class WalkFill:
         self.pages_per_block = block // PAGE
         self.num_threads = 256
         self.num_warps = self.num_threads // cute.arch.WARP_SIZE
+        self.staged = block == 128
 
     @cute.jit
     def __call__(
@@ -253,6 +260,7 @@ class WalkFill:
         @cute.struct
         class SharedStorage:
             warp_pages: cute.struct.MemRange[Int32, self.num_warps]
+            stage: cute.struct.MemRange[Int32, self.num_threads * self.pages_per_block if self.staged else 1]
 
         self.kernel(
             mBlockIndex,
@@ -273,6 +281,25 @@ class WalkFill:
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
+
+    @cute.jit
+    def write_page(self, page_pos, page_id, allocated_pages, output_page_base, mPageTable: cute.Tensor):
+        """Write one page id at walk position ``page_pos`` when it is inside the allocation."""
+        if page_pos < allocated_pages:
+            flat_slot = output_page_base + page_pos
+            if flat_slot < mPageTable.shape[0] * 8:
+                mPageTable[flat_slot // 8, flat_slot % 8] = page_id
+
+    @cute.jit
+    def copy_out(self, stage: cute.Tensor, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable: cute.Tensor):
+        """Copy a chunk's staged page ids to walk positions ``page_base + i``, keeping those inside the allocation."""
+        idx = cute.arch.thread_idx()[0]
+        while idx < chunk_pages:
+            if page_base + idx < allocated_pages:
+                flat_slot = output_page_base + page_base + idx
+                if flat_slot < mPageTable.shape[0] * 8:
+                    mPageTable[flat_slot // 8, flat_slot % 8] = stage[idx]
+            idx += self.num_threads
 
     @cute.kernel
     def kernel(
@@ -319,6 +346,7 @@ class WalkFill:
         smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         warp_pages = storage.warp_pages.get_tensor(cute.make_layout(self.num_warps))
+        stage = storage.stage.get_tensor(cute.make_layout(self.num_threads * self.pages_per_block if self.staged else 1))
 
         # Keep every fully valid Page16 in one prefix. Partial Page16 tails
         # follow in stable edge order, then dummy pages fill the tile-aligned
@@ -350,13 +378,18 @@ class WalkFill:
             page_pos = page_rank - page_count
             first_page = block_idx * self.pages_per_block
             for page_idx in cutlass.range_constexpr(self.pages_per_block):
-                if page_count > page_idx and page_pos + page_idx < allocated_pages:
-                    flat_slot = output_page_base + page_pos + page_idx
-                    if flat_slot < mPageTable.shape[0] * 8:
-                        mPageTable[flat_slot // 8, flat_slot % 8] = first_page + page_idx
-
+                if page_count > page_idx:
+                    if cutlass.const_expr(self.staged):
+                        stage[page_pos - page_base + page_idx] = first_page + page_idx
+                    else:
+                        self.write_page(page_pos + page_idx, first_page + page_idx, allocated_pages, output_page_base, mPageTable)
+            chunk_pages = Int32(0)
             for idx in cutlass.range(self.num_warps):
-                page_base += warp_pages[idx]
+                chunk_pages += warp_pages[idx]
+            if cutlass.const_expr(self.staged):
+                cute.arch.sync_threads()
+                self.copy_out(stage, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable)
+            page_base += chunk_pages
             cute.arch.sync_threads()
 
         full_pages = page_base
@@ -386,13 +419,18 @@ class WalkFill:
             for idx in cutlass.range(warp_idx):
                 page_rank += warp_pages[idx]
             page_pos = page_rank - page_count
-            if page_count > 0 and page_pos < allocated_pages:
-                flat_slot = output_page_base + page_pos
-                if flat_slot < mPageTable.shape[0] * 8:
-                    mPageTable[flat_slot // 8, flat_slot % 8] = block_idx * self.pages_per_block + tail_page_idx
-
+            if page_count > 0:
+                if cutlass.const_expr(self.staged):
+                    stage[page_pos - page_base] = block_idx * self.pages_per_block + tail_page_idx
+                else:
+                    self.write_page(page_pos, block_idx * self.pages_per_block + tail_page_idx, allocated_pages, output_page_base, mPageTable)
+            chunk_pages = Int32(0)
             for idx in cutlass.range(self.num_warps):
-                page_base += warp_pages[idx]
+                chunk_pages += warp_pages[idx]
+            if cutlass.const_expr(self.staged):
+                cute.arch.sync_threads()
+                self.copy_out(stage, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable)
+            page_base += chunk_pages
             cute.arch.sync_threads()
 
         dummy_page = page_base + thread_idx
@@ -409,11 +447,13 @@ class WalkFill:
             first_mask_row = (valid_full_pages // (2 * FRAGS_PER_TILE)) * 2
 
         # One int32 word covers two adjacent Page16 entries. Only rows in a
-        # partial N128/N256 suffix are read by the forward kernels.
-        mask_row = first_mask_row + thread_idx
-        while mask_row < allocated_tiles:
-            global_row = offset_tiles + mask_row
-            for word_idx in cutlass.range_constexpr(4):
+        # partial N128/N256 suffix are read by the forward kernels.  Staged: one word per thread; else one row.
+        words_per_thread = 1 if self.staged else 4
+        mask_word = first_mask_row * 4 + thread_idx * words_per_thread
+        while mask_word < allocated_tiles * 4:
+            global_row = offset_tiles + mask_word // 4
+            for word_offset in cutlass.range_constexpr(words_per_thread):
+                word_idx = mask_word % 4 + word_offset
                 word_mask = Int32(0)
                 for half in cutlass.range_constexpr(2):
                     page_id = mPageTable[global_row, word_idx * 2 + half]
@@ -426,7 +466,7 @@ class WalkFill:
                     page_mask = (Int32(1) << valid_rows) - 1
                     word_mask = word_mask | (page_mask << (half * PAGE))
                 mMaskTable[global_row, word_idx] = word_mask
-            mask_row += self.num_threads
+            mask_word += self.num_threads * words_per_thread
 
         if thread_idx == 0:
             mTileOffsets[walk_idx] = offset_tiles
