@@ -1181,32 +1181,153 @@ class ValidateMetadata:
             cute.arch.atomic_or(col(VALIDATE_PARTIAL_KV), partial_kv, sem="relaxed", scope="cta")
 
 
-class BwdKvNoStraddlePack:
-    """Pack Page16 groups without allowing a group to cross a Page8 tile."""
+class BwdKvPackSlots:
+    """Page counts and the no-straddle packing of the K/V blocks into 8-page owner tiles, in one CTA.
+
+    Same layout as packing the blocks in stable order of ``page_count % 8`` (full blocks first, then partial
+    blocks from short to long) with next-fit that never lets a block cross a tile: full blocks take aligned
+    tiles, and inside a group of equal page counts ``c`` next-fit is periodic.  A block ranked ``j`` in its
+    group fills the tile the group starts in while ``j < r0 // c`` (``r0`` slots left there), then ``8 // c``
+    blocks per fresh tile.  So only each block's rank in its group is needed (ballots per chunk) plus the
+    groups' start states (a few scalar steps), not a sort.  Empty blocks sit where the full blocks before
+    them end.  Writes ``page_counts``, ``q_page_counts``, ``start_slots``, ``first_tiles``, ``tile_slots``
+    and the packed slot total.
+    """
+
+    num_threads = 1024
+    num_warps = num_threads // cute.arch.WARP_SIZE
 
     @cute.jit
     def __call__(
         self,
-        mPageCounts: cute.Tensor,
-        mStartSlots: cute.Tensor,
+        mKvSizes: cute.Tensor,  # [nKV]
+        mQSizes: cute.Tensor,  # [nQ]
+        mPageCounts: cute.Tensor,  # [nKV]
+        mQPageCounts: cute.Tensor,  # [nQ]
+        mStartSlots: cute.Tensor,  # [nKV]
+        mFirstTiles: cute.Tensor,  # [nKV]
+        mTileSlots: cute.Tensor,  # [nKV]
+        mTotalSlots: cute.Tensor,  # [1]
         stream: cuda.CUstream,
     ):
-        self.kernel(mPageCounts, mStartSlots).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+        @cute.struct
+        class SharedStorage:
+            warp_counts: cute.struct.MemRange[Int32, 8 * self.num_warps]
+
+        self.kernel(mKvSizes, mQSizes, mPageCounts, mQPageCounts, mStartSlots, mFirstTiles, mTileSlots, mTotalSlots, SharedStorage).launch(
+            grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream
+        )
+
+    @cute.jit
+    def page_count(self, size):
+        return min(max((size + PAGE - 1) // PAGE, 0), FRAGS_PER_TILE)
 
     @cute.kernel
-    def kernel(self, mPageCounts: cute.Tensor, mStartSlots: cute.Tensor):
-        start = Int32(0)
-        remaining = Int32(8)
-        for block_idx in cutlass.range(mPageCounts.shape[0]):
-            page_count = mPageCounts[block_idx]
-            if page_count > remaining:
-                start += remaining
-                remaining = Int32(8)
-            mStartSlots[block_idx] = start
-            start += page_count
-            remaining -= page_count
-            if remaining == 0:
-                remaining = Int32(8)
+    def kernel(
+        self,
+        mKvSizes: cute.Tensor,
+        mQSizes: cute.Tensor,
+        mPageCounts: cute.Tensor,
+        mQPageCounts: cute.Tensor,
+        mStartSlots: cute.Tensor,
+        mFirstTiles: cute.Tensor,
+        mTileSlots: cute.Tensor,
+        mTotalSlots: cute.Tensor,
+        SharedStorage: cutlass.Constexpr[Callable],
+    ):
+        thread_idx = cute.arch.thread_idx()[0]
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        n_kv = mKvSizes.shape[0]
+        n_q = mQSizes.shape[0]
+        smem = SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        warp_counts = storage.warp_counts.get_tensor(cute.make_layout((8, self.num_warps), stride=(self.num_warps, 1)))
+        lower_lanes = ~(Int32(-1) << lane_idx)
+
+        q = thread_idx
+        while q < n_q:
+            mQPageCounts[q] = self.page_count(mQSizes[q])
+            q += self.num_threads
+
+        # Rank of every block in its group: group 0 = full blocks (an empty block counts the full blocks before it),
+        # group c = blocks of c pages (1 <= c <= 7).  Group totals accumulate in ``base``.
+        base = cute.make_rmem_tensor((8,), Int32)
+        for g in cutlass.range_constexpr(8):
+            base[g] = Int32(0)
+        num_chunks = (n_kv + self.num_threads - 1) // self.num_threads
+        for chunk in cutlass.range(num_chunks):
+            block_idx = chunk * self.num_threads + thread_idx
+            count = Int32(-1)  # -1: past the end, in no group
+            if block_idx < n_kv:
+                count = self.page_count(mKvSizes[block_idx])
+            group = count & (FRAGS_PER_TILE - 1)  # 8 -> 0
+            rank = Int32(0)
+            for g in cutlass.range_constexpr(8):
+                ballot = cute.arch.vote_ballot_sync(count == (FRAGS_PER_TILE if g == 0 else g))
+                if lane_idx == 0:
+                    warp_counts[g, warp_idx] = cute.arch.popc(ballot)
+                if group == g:
+                    rank = cute.arch.popc(ballot & lower_lanes)
+            cute.arch.sync_threads()
+            if block_idx < n_kv:
+                for g in cutlass.range_constexpr(8):
+                    if group == g:
+                        rank += base[g]
+                        for w in cutlass.range(warp_idx):
+                            rank += warp_counts[g, w]
+                mPageCounts[block_idx] = count
+                mStartSlots[block_idx] = rank  # the rank for now; replaced by the slot below
+            for g in cutlass.range_constexpr(8):
+                for w in cutlass.range_constexpr(self.num_warps):
+                    base[g] += warp_counts[g, w]
+            cute.arch.sync_threads()
+
+        # Where each group starts: full blocks from slot 0, then groups 1..7 in turn (every thread, a few steps).
+        group_start = cute.make_rmem_tensor((8,), Int32)
+        group_room = cute.make_rmem_tensor((8,), Int32)
+        start = base[0] * FRAGS_PER_TILE
+        room = Int32(FRAGS_PER_TILE)
+        group_start[0] = Int32(0)
+        group_room[0] = room
+        for g in cutlass.range_constexpr(1, 8):
+            group_start[g] = start
+            group_room[g] = room
+            n = base[g]
+            if n > 0:
+                fit = room // g
+                per_tile = FRAGS_PER_TILE // g
+                if n <= fit:
+                    start += n * g
+                    room -= n * g
+                else:
+                    last = n - 1 - fit
+                    used = (last % per_tile + 1) * g
+                    start = group_start[g] + group_room[g] + (last // per_tile) * FRAGS_PER_TILE + used
+                    room = FRAGS_PER_TILE - used
+                if room == 0:
+                    room = Int32(FRAGS_PER_TILE)
+        if thread_idx == 0:
+            mTotalSlots[0] = start
+        cute.arch.sync_threads()  # the ranks above were written by other threads
+
+        block_idx = thread_idx
+        while block_idx < n_kv:
+            count = mPageCounts[block_idx]
+            rank = mStartSlots[block_idx]
+            slot = rank * FRAGS_PER_TILE  # full blocks, and empty blocks after the full ones before them
+            for g in cutlass.range_constexpr(1, 8):
+                if count == g:
+                    fit = group_room[g] // g
+                    if rank < fit:
+                        slot = group_start[g] + rank * g
+                    else:
+                        later = rank - fit
+                        slot = group_start[g] + group_room[g] + (later // (FRAGS_PER_TILE // g)) * FRAGS_PER_TILE + (later % (FRAGS_PER_TILE // g)) * g
+            mStartSlots[block_idx] = slot
+            mFirstTiles[block_idx] = slot // FRAGS_PER_TILE
+            mTileSlots[block_idx] = slot % FRAGS_PER_TILE
+            block_idx += self.num_threads
 
 
 class BwdKvPageTableFill:
@@ -1428,100 +1549,62 @@ class BwdKvBitmapStats:
                 mNnz[row_idx] = nnz_count
 
 
-class BwdKvCompactWork:
-    """Compact active backward rows while preserving their stable order."""
+class BwdKvScatterWork:
+    """Write each active backward row (``mActiveEnd``: inclusive prefix count of rows with steps) to its stable rank.
 
-    def __init__(self):
-        self.num_threads = 1024
-        self.num_warps = self.num_threads // cute.arch.WARP_SIZE
+    Multi-CTA: the rank comes from the prefix count, so no CTA waits on another (the former single-CTA compaction
+    walked every row in one block).
+    """
+
+    num_threads = 256
 
     @cute.jit
-    def __call__(
-        self,
-        mSteps: cute.Tensor,
-        mConfig: cute.Tensor,
-        mWork: cute.Tensor,
-        mWorkCount: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        @cute.struct
-        class SharedStorage:
-            warp_count: cute.struct.MemRange[Int32, self.num_warps]
-
-        self.kernel(
-            mSteps,
-            mConfig,
-            mWork,
-            mWorkCount,
-            SharedStorage,
-        ).launch(
-            grid=(1, 1, 1),
-            block=(self.num_threads, 1, 1),
-            stream=stream,
-        )
+    def __call__(self, mActiveEnd: cute.Tensor, mConfig: cute.Tensor, mWork: cute.Tensor, stream: cuda.CUstream):
+        grid = ((mActiveEnd.shape[0] + self.num_threads - 1) // self.num_threads, 1, 1)
+        self.kernel(mActiveEnd, mConfig, mWork).launch(grid=grid, block=(self.num_threads, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(
-        self,
-        mSteps: cute.Tensor,
-        mConfig: cute.Tensor,
-        mWork: cute.Tensor,
-        mWorkCount: cute.Tensor,
-        SharedStorage: cutlass.Constexpr[Callable],
-    ):
-        thread_idx = cute.arch.thread_idx()[0]
-        lane_idx = cute.arch.lane_idx()
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        num_rows = mSteps.shape[0]
-        n_kv_blocks = mConfig[4]
-        smem = SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        warp_count = storage.warp_count.get_tensor(cute.make_layout(self.num_warps))
+    def kernel(self, mActiveEnd: cute.Tensor, mConfig: cute.Tensor, mWork: cute.Tensor):
+        row = cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
+        if row < mActiveEnd.shape[0]:
+            end = mActiveEnd[row]
+            before = Int32(0)
+            if row > 0:
+                before = mActiveEnd[row - 1]
+            if end > before:
+                n_kv_blocks = mConfig[4]
+                head_group = row // n_kv_blocks
+                mWork[end - 1, 0] = head_group
+                mWork[end - 1, 1] = row - head_group * n_kv_blocks
 
-        local_active = Int32(0)
-        row_idx = thread_idx
-        while row_idx < num_rows:
-            local_active += Int32(mSteps[row_idx] > 0)
-            row_idx += self.num_threads
-        local_active = warp_reduce(local_active, lambda x, y: x + y)
-        if lane_idx == 0:
-            warp_count[warp_idx] = local_active
-        cute.arch.sync_threads()
-        active_total = Int32(0)
-        for idx in cutlass.range_constexpr(self.num_warps):
-            active_total += warp_count[idx]
-        if thread_idx == 0:
-            mWorkCount[0] = active_total
-        cute.arch.sync_threads()
 
-        active_base = Int32(0)
-        num_chunks = (num_rows + self.num_threads - 1) // self.num_threads
-        for chunk in cutlass.range(num_chunks):
-            row_idx = chunk * self.num_threads + thread_idx
-            step_count = mSteps[row_idx] if row_idx < num_rows else Int32(0)
-            is_active = Int32(step_count > 0)
+class StablePartitionScatter:
+    """``mWork[k]``: the ``k``-th index of a stable partition, selected indices first.
 
-            active_rank = is_active
-            for delta in (1, 2, 4, 8, 16):
-                other = cute.arch.shuffle_sync_up(active_rank, delta, mask_and_clamp=0)
-                if lane_idx >= delta:
-                    active_rank += other
-            if lane_idx == 31:
-                warp_count[warp_idx] = active_rank
-            cute.arch.sync_threads()
-            active_rank += active_base
-            for idx in cutlass.range(warp_idx):
-                active_rank += warp_count[idx]
-            chunk_active = Int32(0)
-            for idx in cutlass.range_constexpr(self.num_warps):
-                chunk_active += warp_count[idx]
-            cute.arch.sync_threads()
+    ``mSelectedEnd`` is the inclusive prefix count of selected indices; an unselected index ``i`` goes after all
+    selected ones, at ``total + i - mSelectedEnd[i]``.
+    """
 
-            if is_active != 0:
-                head_group = row_idx // n_kv_blocks
-                mWork[active_rank - 1, 0] = head_group
-                mWork[active_rank - 1, 1] = row_idx - head_group * n_kv_blocks
-            active_base += chunk_active
+    num_threads = 256
+
+    @cute.jit
+    def __call__(self, mSelectedEnd: cute.Tensor, mWork: cute.Tensor, stream: cuda.CUstream):
+        grid = ((mSelectedEnd.shape[0] + self.num_threads - 1) // self.num_threads, 1, 1)
+        self.kernel(mSelectedEnd, mWork).launch(grid=grid, block=(self.num_threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, mSelectedEnd: cute.Tensor, mWork: cute.Tensor):
+        idx = cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
+        n = mSelectedEnd.shape[0]
+        if idx < n:
+            end = mSelectedEnd[idx]
+            before = Int32(0)
+            if idx > 0:
+                before = mSelectedEnd[idx - 1]
+            if end > before:
+                mWork[end - 1] = idx
+            else:
+                mWork[mSelectedEnd[n - 1] + idx - end] = idx
 
 
 class BwdKvBitmapCompact:
@@ -2220,16 +2303,25 @@ def order_q_route_work(
 order_q_route_work.compile_cache = {}
 
 
-def bwd_kv_nostraddle_pack(page_counts: Tensor, start_slots: Tensor) -> None:
+def bwd_kv_pack_slots(
+    kv_sizes: Tensor,
+    q_sizes: Tensor,
+    page_counts: Tensor,
+    q_page_counts: Tensor,
+    start_slots: Tensor,
+    first_tiles: Tensor,
+    tile_slots: Tensor,
+    total_slots: Tensor,
+) -> None:
     _run_metadata_kernel(
-        "kpage_bwd_kv_nostraddle_pack",
-        BwdKvNoStraddlePack(),
-        (page_counts, start_slots),
-        bwd_kv_nostraddle_pack.compile_cache,
+        "kpage_bwd_kv_pack_slots",
+        BwdKvPackSlots(),
+        (kv_sizes, q_sizes, page_counts, q_page_counts, start_slots, first_tiles, tile_slots, total_slots),
+        bwd_kv_pack_slots.compile_cache,
     )
 
 
-bwd_kv_nostraddle_pack.compile_cache = {}
+bwd_kv_pack_slots.compile_cache = {}
 
 
 def bwd_kv_page_table_fill(start_slots: Tensor, page_counts: Tensor, block_sizes: Tensor, kv_page_table: Tensor, kv_valid: Tensor) -> None:
@@ -2292,31 +2384,18 @@ def bwd_kv_bitmap_stats(
 bwd_kv_bitmap_stats.compile_cache = {}
 
 
-def bwd_kv_compact_work(
-    steps: Tensor,
-    config: Tensor,
-    work: Tensor,
-    work_count: Tensor,
-) -> None:
-    name = "kpage_bwd_kv_compact_work"
-    tensors = (steps, config, work, work_count)
-    compile_key = make_compile_key(
-        name,
-        tuple(tensor.dtype for tensor in tensors),
-        tensors,
-    )
-    if compile_key not in bwd_kv_compact_work.compile_cache:
-        converted = _compile_tensors(tensors)
-        bwd_kv_compact_work.compile_cache[compile_key] = cute.compile(
-            BwdKvCompactWork(),
-            *converted,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-            options="--enable-tvm-ffi",
-        )
-    bwd_kv_compact_work.compile_cache[compile_key](*tensors, current_stream())
+def bwd_kv_scatter_work(active_end: Tensor, config: Tensor, work: Tensor) -> None:
+    _run_metadata_kernel("kpage_bwd_kv_scatter_work", BwdKvScatterWork(), (active_end, config, work), bwd_kv_scatter_work.compile_cache)
 
 
-bwd_kv_compact_work.compile_cache = {}
+bwd_kv_scatter_work.compile_cache = {}
+
+
+def stable_partition_scatter(selected_end: Tensor, work: Tensor) -> None:
+    _run_metadata_kernel("kpage_stable_partition_scatter", StablePartitionScatter(), (selected_end, work), stable_partition_scatter.compile_cache)
+
+
+stable_partition_scatter.compile_cache = {}
 
 
 def bwd_kv_bitmap_compact(

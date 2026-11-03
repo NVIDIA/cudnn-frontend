@@ -204,25 +204,21 @@ def _bwd_paged_kv_stats(
     num_groups = (num_q_blocks + blocks_per_group - 1) // blocks_per_group
     from ._build_kernels import (
         bwd_kv_bitmap_stats,
-        bwd_kv_compact_work,
         bwd_kv_edge_bitmap,
-        bwd_kv_nostraddle_pack,
+        bwd_kv_pack_slots,
         bwd_kv_page_table_fill,
+        bwd_kv_scatter_work,
     )
 
-    q_page_counts = ((q_sizes + (PAGE - 1)) // PAGE).clamp(0, FRAGS_PER_TILE)
-    page_counts = ((kv_sizes + (PAGE - 1)) // PAGE).clamp(0, FRAGS_PER_TILE)
     # Full blocks first (tile-aligned), then partial blocks from short to long;
     # packing similar sizes together keeps the union Q walks short.
-    pack_key = page_counts & (FRAGS_PER_TILE - 1)
-    order = torch.argsort(pack_key, stable=True)
-    ordered_page_counts = page_counts[order].contiguous()
-    ordered_start_slots = torch.empty_like(ordered_page_counts)
-    bwd_kv_nostraddle_pack(ordered_page_counts, ordered_start_slots)
-    start_slots = torch.empty_like(ordered_start_slots)
-    start_slots[order] = ordered_start_slots
-    first_tiles = start_slots // FRAGS_PER_TILE
-    tile_slots = start_slots - first_tiles * FRAGS_PER_TILE
+    page_counts = torch.empty(num_kv_blocks, dtype=torch.int32, device=device)
+    q_page_counts = torch.empty(num_q_blocks, dtype=torch.int32, device=device)
+    start_slots = torch.empty_like(page_counts)
+    first_tiles = torch.empty_like(page_counts)
+    tile_slots = torch.empty_like(page_counts)
+    total_slots = torch.empty(1, dtype=torch.int32, device=device)
+    bwd_kv_pack_slots(kv_sizes, q_sizes, page_counts, q_page_counts, start_slots, first_tiles, tile_slots, total_slots)
 
     # Allocate at the padded bound (one tile per KV block), then slice to num_kv_tiles * 8.
     kv_page_table = torch.full(
@@ -237,6 +233,7 @@ def _bwd_paged_kv_stats(
     # One bitmap byte per (walk row, Q block in its group).
     words_per_bitmap_row = (blocks_per_group + 3) // 4
     num_padded_rows = num_heads * num_groups * num_kv_blocks
+    # Pinned and non-blocking: a pageable host-to-device copy would synchronize the host with the stream.
     config = torch.tensor(
         (
             num_q_blocks,
@@ -246,8 +243,8 @@ def _bwd_paged_kv_stats(
             num_kv_blocks,
         ),
         dtype=torch.int32,
-        device=device,
-    )
+        pin_memory=True,
+    ).to(device, non_blocking=True)
     bitmap = torch.zeros(
         num_padded_rows * words_per_bitmap_row,
         dtype=torch.int32,
@@ -271,13 +268,8 @@ def _bwd_paged_kv_stats(
     entry_counts = torch.empty_like(step_counts)
     bwd_kv_bitmap_stats(bitmap, q_page_counts, step_counts, entry_counts, config)
     work_indices = torch.empty((num_padded_rows, 2), dtype=torch.int32, device=device)
-    active_count = torch.empty(1, dtype=torch.int32, device=device)
-    bwd_kv_compact_work(
-        step_counts,
-        config,
-        work_indices,
-        active_count,
-    )
+    active_end = torch.cumsum(step_counts > 0, 0, dtype=torch.int32)  # active rows in stable order
+    bwd_kv_scatter_work(active_end, config, work_indices)
     tile_offsets = torch.cumsum(step_counts, 0, dtype=torch.int64) - step_counts
     entry_offsets = torch.zeros(num_padded_rows + 1, dtype=torch.int32, device=device)
     torch.cumsum(entry_counts, 0, dtype=torch.int32, out=entry_offsets[1:])
@@ -295,8 +287,8 @@ def _bwd_paged_kv_stats(
         tile_offsets=tile_offsets,
         entry_offsets=entry_offsets,
         work_indices=work_indices,
-        active_count=active_count[0].to(torch.int64),
-        total_slots=(ordered_start_slots[-1] + ordered_page_counts[-1]).to(torch.int64),
+        active_count=active_end[-1].to(torch.int64),
+        total_slots=total_slots[0].to(torch.int64),
         total_steps=tile_offsets[-1] + step_counts[-1],
         total_entries=entry_offsets[-1].to(torch.int64),
     )
@@ -571,7 +563,7 @@ def build_walk_tables_blk64(
     halves of a 128-row block) and the M128 route is never used.  Q padding is not skipped, as in the base blk64
     kernel.  One readback sizes the tables; ``after_sizing`` runs right after it.
     """
-    from ._build_kernels import current_stream, walk_fill, walk_stats
+    from ._build_kernels import current_stream, stable_partition_scatter, walk_fill, walk_stats
 
     dev = kv_sizes.device
     batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
@@ -617,8 +609,9 @@ def build_walk_tables_blk64(
 
     # Every walk is queued, as on the blk128 route: an empty one (allow_empty_block_nums) takes the kernel's
     # empty-tile path and writes O = 0, LSE = -inf.  Long walks first, stable within each class.
-    heavy = iter_counts > _Q64_HEAVY_ITER_THRESHOLD
-    work_indices = torch.argsort(~heavy, stable=True).to(torch.int32).contiguous()
+    heavy_end = torch.cumsum(iter_counts > _Q64_HEAVY_ITER_THRESHOLD, 0, dtype=torch.int32)
+    work_indices = torch.empty_like(heavy_end)
+    stable_partition_scatter(heavy_end, work_indices)
     return Blk64ForwardTables(
         page_table=page_table,
         tile_offsets=tile_offsets.view(1, num_heads, n_q_blocks),
