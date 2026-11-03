@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""PyTorch references for pooled DSA training (GLM IndexPool indexer).
+"""PyTorch references for pooled DSA training.
 
 Layouts follow the DSA module: ``index_q`` (B, S, H, D), ``weights`` (B, S, H),
 ``keys``/``gates`` (B, S_k, D), ``ape`` (P, D), pool ids (B, S, K) INT32 with
@@ -117,8 +117,8 @@ def expand_pools_inference(pool_ids: torch.Tensor, positions: torch.Tensor, pool
     return torch.where(short, ascending, out).to(torch.int32)
 
 
-def xtuner_compact_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Argsort compaction used by the open-source cuDNN route (xtuner flash_mla_cudnn)."""
+def argsort_compact_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Argsort compaction of inference-style index rows into valid-first rows with lengths."""
     valid = indices != -1
     topk_length = valid.sum(dim=-1, dtype=torch.int32).contiguous()
     order = torch.argsort((~valid).to(torch.int32), dim=-1, stable=True)
@@ -182,7 +182,7 @@ def naive_pooled_indexer_backward(
     pool_size: int,
     chunk: int = 512,
 ):
-    """Open-source-style naive backward (Megatron-LM ``bwd_fused_indexer_loss_naive`` structure on pools).
+    """Dense naive reference backward on pools.
 
     Dense pooled scores over every pool, the teacher from a full attention
     recompute masked to the selected tokens, then chunked einsum gradients and
@@ -241,7 +241,7 @@ def naive_pooled_indexer_backward(
 
 
 def make_case(batch: int, seqlen: int, device, *, index_heads=32, index_dim=128, attn_heads=64, attn_dim=512, pool_size=4, topk_tokens=2048, seed=0):
-    """Random GLM-5.3-Flash-shaped pooled DSA layer inputs (NoPE MLA latent)."""
+    """Random pooled DSA layer inputs (NoPE MLA latent)."""
     gen = torch.Generator(device=device).manual_seed(seed)
     rn = lambda *shape, dtype=torch.bfloat16, scale=1.0: (torch.randn(*shape, device=device, generator=gen) * scale).to(dtype)
     index_q = rn(batch, seqlen, index_heads, index_dim, scale=index_dim**-0.5)

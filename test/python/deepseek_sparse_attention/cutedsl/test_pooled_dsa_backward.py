@@ -123,7 +123,7 @@ def test_pooled_sparse_attention_backward_matches_compaction_route():
     dout = torch.randn_like(out)
     got = PB.pooled_sparse_attention_backward(q, kv, out, dout, lse, pool_ids, positions, pool_size, softmax_scale=softmax_scale)
     inference_ids = R.expand_pools_inference(pool_ids, positions, pool_size).reshape(s, -1)
-    idx_c, len_c = R.xtuner_compact_indices(inference_ids)
+    idx_c, len_c = R.argsort_compact_indices(inference_ids)
     sink = torch.full((h,), float("-inf"), dtype=torch.float32, device="cuda")
     ref = sparse_attention_backward_wrapper(
         q.reshape(s, h, d),

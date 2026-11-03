@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pooled DSA backward at GLM-5.3-Flash shapes against the open-source formulations.
+"""Pooled DSA backward against reference formulations.
 
 Indexer side: the cuDNN chain (pooled keys, predict and teacher recompute,
 pool target, indexer backward, unpool) against the naive dense-score plus
-full-teacher backward (Megatron-LM ``bwd_fused_indexer_loss_naive`` structure).
+dense full-teacher reference backward.
 Attention side: compact expansion plus the SM100 sparse attention backward
 against the argsort compaction route plus the same kernel.
 
@@ -201,8 +201,8 @@ def attention_side(c, timer):
     res["expand_compact_us"] = timer(lambda: PB.pooled_expand_compact(c["pool_ids"], c["positions"], pool_size, seqlen_k=s, global_ids=True))
     # open-source route: inference-layout ids, argsort compaction, then the same kernel
     inference_ids = R.expand_pools_inference(c["pool_ids"], c["positions"], pool_size).reshape(s, -1)
-    res["argsort_compaction_us"] = timer(lambda: R.xtuner_compact_indices(inference_ids))
-    idx_c, len_c = R.xtuner_compact_indices(inference_ids)
+    res["argsort_compaction_us"] = timer(lambda: R.argsort_compact_indices(inference_ids))
+    idx_c, len_c = R.argsort_compact_indices(inference_ids)
 
     def kernel_open_source():
         return sparse_attention_backward_wrapper(
