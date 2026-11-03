@@ -12,22 +12,22 @@ allocator stream identity across host threads. Use a concrete stream instead.
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
 Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs. Sparse-attention
-forward and the combined compressed-logits + Top-K path are SM100-only;
-sparse-attention forward is limited to the mapped SM100-family capabilities
-10.0, 10.3, and 10.7. Dense Indexer Forward and standalone Indexer Top-K
-support both architectures. The kernels are delivered as Python classes /
+forward supports SM90 and the mapped SM100-family capabilities 10.0, 10.3,
+and 10.7; the combined compressed-logits + Top-K path remains SM100-only.
+Dense Indexer Forward and standalone Indexer Top-K support both architectures.
+The kernels are delivered as Python classes /
 wrappers that follow the same `APIBase` pattern as other cuDNN Frontend
 operations.
 
 **Scope:** this module ships CuTe-DSL kernels for sparse-attention forward and
 backward, indexer scores/top-K, sparse/dense score recompute, and sparse/dense
-indexer backward. Sparse forward covers regular H64 and small-top-k Prefill
-H128; it does not include the H128 decode/split-KV mode.
+indexer backward. On SM90, sparse forward covers H16/H32/H64/H96/H128 Prefill;
+on SM100 it covers regular H64 and small-top-k H128 Prefill. It does not
+include a decode or split-KV forward mode.
 
 The module packages the following operations:
 
-1. **Sparse Attention Forward** – sparse Prefill MQA for the supported SM100
-   H64/H128 shapes.
+1. **Sparse Attention Forward** – sparse Prefill MQA on SM90 and SM100.
 2. **Sparse Attention Backward** – DSA backward for flat MQA tensors on
    SM90/SM100.
 3. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
@@ -135,7 +135,7 @@ attention sink participates only in the output denominator, not in any stats.
   - `q`: `(total_S_q, H, D_qk)` FP16 or BF16
   - `kv`: `(total_S_kv, D_qk)`, with the same dtype as `q` (K = V latent; MQA)
   - `topk_idxs`: `(total_S_q, K)` INT32 global token ids; K may be any
-    nonnegative value and is padded internally to a multiple of 64
+    nonnegative value. SM100 pads a tail internally; SM90 masks it in place.
   - `attn_sink` (optional): `(H,)` FP32
   - `topk_length` (optional): `(total_S_q,)` INT32, clamped to `[0, K]`
   - `softmax_scale` (optional runtime float): defaults to `1 / sqrt(D_qk)`
@@ -146,21 +146,35 @@ attention sink participates only in the output denominator, not in any stats.
   - `lse`: `(total_S_q, H)` FP32, KV-only and excluding the sink
   - `lse_indexer`: `(total_S_q, H)` FP32, or `None` for `indexer_topk=0`
 - **Variants**
-  - H64: `D_qk in {512, 576}`, `indexer_topk in {0, 512, 1024, 2048}`
-  - H128 small-top-k Prefill: `D_qk=512`,
+  - SM90: `H in {16, 32, 64, 96, 128}`, `D_qk in {512, 576}`, and
+    `indexer_topk in {0, 512, 1024, 2048}`
+  - SM100 H64: `D_qk in {512, 576}`, `indexer_topk in {0, 512, 1024, 2048}`
+  - SM100 H128 small-top-k Prefill: `D_qk=512`,
     `indexer_topk in {0, 512, 1024}`
-- **Indexer prefix constraint** — `indexer_topk <= K`; when `topk_length` is
-  supplied and indexer LSE is enabled, every row must have
-  `topk_length >= indexer_topk`, matching the tile-boundary snapshot
-  contract.
+- **Indexer prefix constraint** — `indexer_topk <= K`. When `topk_length` is
+  present, a meaningful `lse_indexer` additionally requires
+  `topk_length >= indexer_topk` for that row. Shorter rows retain the SM100
+  source kernel's `+inf` sentinel; their `out`, `max_logits`, and full `lse`
+  outputs remain valid.
 - **Empty rows** — `out=0`, `max_logits=-inf`, `lse=+inf`; an enabled
   `lse_indexer` is also `+inf`.
-- **Compilation lifecycle** — `SparseAttentionForward.compile()` validates
-  and primes the API object, while the concrete CuTe kernel is JIT-compiled
-  on its first `execute()`/wrapper call because padding and live DLPack
-  layouts are runtime properties.
-- **Layout and stream** — non-contiguous or under-aligned Q/KV inputs are
-  materialized on the selected stream. An explicit `stream` must be a
+- **Compilation lifecycle** — on SM90, `SparseAttentionForward.compile()`
+  compiles a storage-free symbolic plan and `execute()` only launches it with
+  caller-owned outputs. The convenience wrapper allocates outputs and stages
+  layouts before calling the same plan. The existing SM100 direct path retains
+  its concrete-tensor cache and first-execute compilation.
+- **CUDA Graph and workspace** — the prepared SM90 `execute()` path is
+  allocation-free, performs no host read or JIT, and requires no workspace.
+  Compile before capture and provide preallocated outputs. Runtime `total_S_q`,
+  `total_S_kv`, and logical K may change per `execute()`. H, Dqk, dtypes, and
+  optional-operand presence must match the declaration; a plan for another
+  supported H reuses the same compiled kernel without a new specialization.
+- **Aliasing** — prepared SM90 outputs must be byte-range-disjoint from every
+  input and from one another. Empty tensors occupy no byte range.
+- **Layout and stream** — the convenience wrapper materializes non-contiguous
+  or under-aligned inputs on the selected stream. Prepared SM90 `execute()`
+  instead requires contiguous, adequately aligned tensors and raises before
+  launch if the contract is not met. An explicit `stream` must be a
   `cuda.bindings.driver.CUstream` belonging to `q.device`.
 
 For `D_qk=576`, QK uses all 576 dimensions while V/output uses only the first
@@ -979,23 +993,27 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ## Limitations
 
-- **CuTe DSL requirement** — install `nvidia-cutlass-dsl[cu13]>=4.5.0`.
+- **CuTe DSL requirement** — install `nvidia-cutlass-dsl[cu13]>=4.8.0`.
+  SM90 forward requires the loaded CUDA 13 DSL compiler flavor and rejects a
+  CUDA 12 compiler before JIT; the package version alone is not sufficient.
   Sparse Attention Forward emits the few SM100 instructions that are not yet
   exposed by the public CuTe facade through the MLIR LLVM inline-assembly
-  interface shared by CuTe DSL 4.5 and newer releases.
-- **Architecture support** — Sparse Attention Forward supports the mapped
-  SM100-family capabilities 10.0, 10.3, and 10.7 only.
+  interface available in the supported CuTe DSL builds.
+- **Architecture support** — Sparse Attention Forward supports SM90 and the
+  mapped SM100-family capabilities 10.0, 10.3, and 10.7.
   Sparse Attention Backward, Score Recompute, Indexer Forward, Indexer Top-K,
   and Indexer Backward support SM90 and SM100. Dense score recompute in the THD
   (`cu_seqlens`) layout is SM100+ only; SM90 serves BSHD. The combined
   compressed-logits + Top-K forward is SM100-only; the standalone Indexer Top-K
   remains SM90+.
-- **Forward scope** — only the 11 supported Prefill instances described above;
-  no SM90, regular H128, FP8 cache, decode, or split-KV forward path.
-- **Sparse gather path** — the public CuTe facade does not yet expose the TMA
-  `gather4` operation. Sparse Attention Forward therefore
-  uses a feature-local LLVM inline-assembly bridge with the compiler-owned TMA
-  descriptor; the issued data movement remains hardware TMA `gather4`.
+- **Forward scope** — Prefill only; no FP8 cache, decode, or split-KV forward
+  path. SM90 uses one CTA per query and 64-head tile, padding the last head tile
+  internally when H is not a multiple of 64.
+- **Sparse gather path** — SM90 uses predicated 16-byte `cp.async` gathers,
+  matching the Hopper C++ kernel. On SM100, the public CuTe facade does not yet
+  expose the TMA `gather4` operation, so the forward uses a feature-local LLVM
+  inline-assembly bridge with the compiler-owned descriptor; the issued data
+  movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
   `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16, MXFP8, and
   MXFP4 support `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}`. Both the dense and
