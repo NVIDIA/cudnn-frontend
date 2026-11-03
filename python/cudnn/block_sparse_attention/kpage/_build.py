@@ -622,6 +622,99 @@ def build_walk_tables_blk64(
     )
 
 
+@dataclass
+class Blk64PairForwardTables:
+    """Forward page walks for the SM90 Q-paired kernel: one walk per pair of 64-row Q blocks (2p, 2p + 1).
+
+    A walk covers the union of both KV lists, ordered first-only, common, second-only, as 8-page (128-row) tiles.
+    Compute WG0 (Q block 2p) runs tiles [0, ranges[..., 2]), WG1 (Q block 2p + 1) tiles [ranges[..., 3], ranges[..., 4]);
+    each masks its tiles with its own keep words (rows of its own blocks only, padding excluded).
+    """
+
+    page_table: Tensor  # [total_tiles, 8] int32 page ids; dummy ids >= num_kv_blocks * 4 load as zeros
+    keep: Tensor  # [total_tiles, 2, 4] int32 packed per-WG keep bits, two Page16 entries per word
+    ranges: Tensor  # [H, num_pairs, 5] int32: tile offset, tiles, WG0 end, WG1 begin, WG1 end
+
+
+def build_pair_walk_tables_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+) -> Blk64PairForwardTables:
+    """Q-pair page walks for sparse_block_size=64 metadata.  One readback sizes the tables."""
+    from ._build_kernels import current_stream, pair_walk_fill, pair_walk_stats
+
+    dev = kv_sizes.device
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage blk64 runs a batch as independent heads; batch must be 1"
+    assert q2k_block_index.dtype == torch.int32 and q2k_block_nums.dtype == torch.int32 and kv_sizes.dtype == torch.int32
+    n_pairs = (n_q_blocks + 1) // 2
+    words = (kv_sizes.numel() + 31) // 32
+
+    stream = current_stream()
+    bits = torch.zeros((num_heads * n_pairs, 2, words), dtype=torch.int32, device=dev)
+    class_pages = torch.empty((num_heads * n_pairs, 3), dtype=torch.int32, device=dev)
+    pair_walk_stats(q2k_block_index.view(num_heads, n_q_blocks, cap), q2k_block_nums.view(num_heads, n_q_blocks), kv_sizes, bits, class_pages, stream)
+    tiles = (class_pages.sum(dim=1, dtype=torch.int32) + FRAGS_PER_TILE - 1) // FRAGS_PER_TILE
+    tile_offsets = torch.cumsum(tiles, dim=0, dtype=torch.int32) - tiles
+    total_tiles = int((tile_offsets[-1] + tiles[-1]).cpu())
+
+    nt = max(total_tiles, 1)
+    page_table = torch.empty((nt, FRAGS_PER_TILE), dtype=torch.int32, device=dev)
+    keep = torch.empty((nt, 2, 4), dtype=torch.int32, device=dev)
+    ranges = torch.empty((num_heads * n_pairs, 5), dtype=torch.int32, device=dev)
+    pair_walk_fill(kv_sizes, bits, class_pages, tile_offsets, page_table, keep, ranges, stream)
+    return Blk64PairForwardTables(page_table=page_table, keep=keep, ranges=ranges.view(num_heads, n_pairs, 5))
+
+
+@dataclass
+class Blk64Refinement:
+    """blk128 metadata rewritten as the blk64 metadata of the same function (SM90 blk128 KPage).
+
+    Every 128-row block is split into its two 64-row halves; KV halves without valid rows are dropped from the lists
+    and Q halves without valid rows get count 0, so neither costs work in the blk64 forward and backward.
+    """
+
+    block_index: Tensor  # [1, H, 2 * nQ, 2 * cap] int32
+    block_count: Tensor  # [1, H, 2 * nQ] int32
+    block_sizes: Tensor  # [2 * nKV] int32
+
+
+def refine_blk128_to_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 128
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    q_sizes: Tensor,  # [nQ] int32 valid rows per 128-row Q block
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 128-row KV block
+    seqlen_q: int,
+    seqlen_k: int,
+) -> Blk64Refinement:
+    """The halves past a sequence that ends 64 rows into its final block are left out (as blk64 metadata of that length has them)."""
+    from ._build_kernels import current_stream, refine_blk128_to_blk64 as refine_cute
+
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage runs a batch as independent heads; batch must be 1"
+    dev = q2k_block_index.device
+    index64 = torch.zeros((num_heads * n_q_blocks * 2, 2 * cap), dtype=torch.int32, device=dev)
+    count64 = torch.empty((num_heads * n_q_blocks * 2,), dtype=torch.int32, device=dev)
+    refine_cute(
+        q2k_block_index.view(num_heads * n_q_blocks, cap),
+        q2k_block_nums.view(num_heads * n_q_blocks),
+        q_sizes,
+        kv_sizes,
+        index64,
+        count64,
+        current_stream(),
+    )
+    half = BLOCK // 2
+    sizes64 = torch.stack((kv_sizes.clamp(0, half), (kv_sizes.clamp(0, BLOCK) - half).clamp(min=0)), dim=-1).reshape(-1)
+    index64 = index64.view(1, num_heads, 2 * n_q_blocks, 2 * cap)
+    count64 = count64.view(1, num_heads, 2 * n_q_blocks)
+    n_q64, n_kv64 = (seqlen_q + half - 1) // half, (seqlen_k + half - 1) // half
+    if n_q64 < 2 * n_q_blocks:  # the dropped half has no valid Q row (count 0)
+        index64, count64 = index64[:, :, :n_q64].contiguous(), count64[:, :, :n_q64].contiguous()
+    return Blk64Refinement(block_index=index64, block_count=count64, block_sizes=sizes64[:n_kv64].contiguous())
+
+
 # ---------------------------------------------------------------------------
 # padding rows
 # ---------------------------------------------------------------------------
