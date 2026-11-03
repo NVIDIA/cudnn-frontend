@@ -418,7 +418,7 @@ def test_DSA_sparse_score_recompute_execute_requires_outputs(score_type, compile
 
 def _executes_allocate_nothing(plan, run, repeats=3):
     """R9: warm once, then no torch allocation and no host sync across ``repeats`` executes."""
-    run()  # warm: the score backend compiles on the first execute
+    run()
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     torch.cuda.set_sync_debug_mode("error")
@@ -444,8 +444,6 @@ def test_DSA_sparse_score_recompute_execute_allocates_nothing_and_never_synchron
     compile_allocates_nothing(plan)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     delta = _executes_allocate_nothing(plan, lambda: plan.execute(q, k, aux, topk_indices, out, topk_length=topk_length, current_stream=stream))
-    if torch.cuda.get_device_capability()[0] == 9 and delta != 0:
-        pytest.xfail("SM90 keeps the per-head (B,S,H)->(B,H,S) transpose copy (Rule 8 batch item D4, deferred)")
     assert delta == 0, f"{type(plan).__name__}.execute() made {delta} torch allocation(s) across 3 warm executes"
     check_ref_sparse_score_recompute(
         score_type,
@@ -457,6 +455,111 @@ def test_DSA_sparse_score_recompute_execute_allocates_nothing_and_never_synchron
         softmax_scale=q.shape[-1] ** -0.5,
         topk_length=topk_length,
     )
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+def test_DSA_sparse_score_recompute_sm90_symbolic_compile_cache_is_bounded(score_type, monkeypatch, compile_allocates_nothing):
+    """SM90 compile artifacts ignore B/Sq/Sk/exact-K and split only at the 128-slot capacity boundary."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 sparse score kernel")
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm90
+
+    monkeypatch.setattr(_interface_sm90.compile_sparse_score_recompute, "compile_cache", {})
+
+    def make_plan(b, s_q, s_k, topk):
+        cfg = {"b": b, "s_q": s_q, "s_kv": s_k, "head_dim": 128, "qhead_per_kv_head": 32, "topk": topk}
+        q, k, aux, indices, _ = _allocate(cfg, score_type, False)
+        out = torch.empty_like(indices, dtype=torch.float32)
+        return _sparse_plan(DSA, score_type, q, k, aux, indices, out)
+
+    same_bucket_a = make_plan(1, 3, 384, 129)
+    same_bucket_b = make_plan(2, 5, 512, 255)
+    next_bucket = make_plan(1, 7, 640, 257)
+    for plan in (same_bucket_a, same_bucket_b, next_bucket):
+        assert plan.check_support()
+        compile_allocates_nothing(plan)
+
+    assert same_bucket_a._compiled_kernel is same_bucket_b._compiled_kernel
+    assert next_bucket._compiled_kernel is not same_bucket_a._compiled_kernel
+    assert len(_interface_sm90.compile_sparse_score_recompute.compile_cache) == 2
+
+
+@pytest.mark.L0
+def test_DSA_sparse_score_recompute_sm90_topk_capacity_boundaries():
+    from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm90
+
+    assert _interface_sm90._sparse_topk_capacity(1) == 128
+    assert _interface_sm90._sparse_topk_capacity(128) == 128
+    assert _interface_sm90._sparse_topk_capacity(129) == 256
+    assert _interface_sm90._sparse_topk_capacity(2176) == 2176
+    for invalid in (0, 2177):
+        with pytest.raises(ValueError, match=r"must be in \[1, 2176\]"):
+            _interface_sm90._sparse_topk_capacity(invalid)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=9001)
+def test_DSA_sparse_score_recompute_sm90_prepared_graph_replay_is_bitwise(score_type, compile_allocates_nothing):
+    """A prepared SM90 plan captures without staging and every poisoned replay is bitwise stable."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 sparse score kernel")
+
+    DSA, q, k, aux, topk_indices, _, out = _sparse_case(score_type)
+    # Exercise a non-bucket-aligned physical width and short/partial/full rows.
+    q = q[:, :4]
+    aux = aux[:, :4]
+    topk_indices = torch.cat((topk_indices[:, :4], topk_indices[:, :4, :1]), dim=-1).contiguous()
+    out = torch.empty_like(topk_indices, dtype=torch.float32)
+    lengths = torch.tensor([[1, 2, 128, 129], [129, 65, 17, 3]], dtype=torch.int32, device="cuda")
+    positions = torch.arange(129, dtype=torch.int32, device="cuda").view(1, 1, -1)
+    topk_indices.masked_fill_(positions >= lengths.unsqueeze(-1), -1)
+    plan = _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out, lengths)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+
+    def launch():
+        plan.execute(q, k, aux, topk_indices, out, topk_length=lengths)
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            launch()
+        torch.cuda.synchronize()
+
+        # Change live inputs after capture and poison the caller-owned output;
+        # replay must read the captured pointers' new contents and overwrite every slot.
+        q.copy_(torch.randn_like(q))
+        k.copy_(torch.randn_like(k))
+        aux.copy_(torch.randn_like(aux))
+        out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = out.clone()
+        check_ref_sparse_score_recompute(
+            score_type,
+            q,
+            k if score_type == "indexer" else aux,
+            topk_indices,
+            expected,
+            aux=aux if score_type == "indexer" else k,
+            softmax_scale=q.shape[-1] ** -0.5,
+            topk_length=lengths,
+        )
+
+        for repeat in range(10):
+            out.fill_(float("nan"))
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8)), f"graph replay changed output bytes at repeat {repeat}"
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0

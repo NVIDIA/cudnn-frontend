@@ -6,8 +6,9 @@
 Wraps the SM100 and SM90 CuTe-DSL score kernels. Each backend provides
 indexer and attention score variants, giving four public classes.
 
-Tile / SMEM dispatch logic and compile caching live in the backend interface
-modules. This module adapts those entry points to the APIBase contract.
+Tile / SMEM dispatch logic lives in the backend interface modules. This module
+adapts those entry points to the APIBase contract and prepares symbolic SM90
+sparse-score artifacts at plan compile time.
 """
 
 from __future__ import annotations
@@ -119,9 +120,9 @@ def _wrapper_copy_back(stream, staged: torch.Tensor, user: Optional[torch.Tensor
 class _ScoreRecomputeBase(APIBase):
     """Common APIBase shell for score-recompute ops.
 
-    ``_interface.py`` owns compile caches keyed per-kernel; ``check_support``
-    and ``compile`` are thin markers that simply gate invocation. ``execute``
-    delegates to the relevant ``_iface`` entry point.
+    Dense and SM100 score backends retain their existing interface-owned lazy
+    compilation.  The SM90 sparse subclasses override ``compile`` so prepared
+    plans own a symbolic artifact before execution.
     """
 
     def __init__(self):
@@ -129,10 +130,9 @@ class _ScoreRecomputeBase(APIBase):
 
     def compile(self) -> None:
         self._ensure_support_checked()
-        # The score backends compile from the real execute-time tensors (their
-        # plan-time-only compile caches key on dtypes/tile params/flags), so
-        # this API validates eagerly and lets the backend compile on the first
-        # execute(); compile() itself launches and allocates nothing.
+        # Dense and SM100 score backends still compile from real execute-time
+        # tensors. The SM90 sparse subclasses override this method with their
+        # symbolic plan-time compilation path.
         self._compiled_kernel = True
 
 
@@ -224,6 +224,10 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
 
     Computes per-query ``softmax( sum_h ReLU(Q_h · K_topk^T) * W_h )`` over
     the top-K KV positions given by ``topk_indices``.
+
+    On SM90, ``compile()`` prepares a symbolic CuTeDSL artifact and
+    ``execute()`` requires that prepared plan; execution is allocation-free
+    and CUDA Graph capturable with caller-owned ``out``.
     """
 
     def __init__(
@@ -268,6 +272,25 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         self._is_supported = True
         return True
 
+    def compile(self) -> None:
+        self._ensure_support_checked()
+        if device_capability(self.q_desc.device)[0] != 9:
+            self._compiled_kernel = True
+            return
+        from . import _interface_sm90 as _iface_sm90
+
+        self._compiled_kernel = _iface_sm90.compile_sparse_score_recompute(
+            device=self.q_desc.device,
+            dtype=self.q_desc.dtype,
+            head_dim=self.q_desc.shape[3],
+            qhead_per_kvhead=self.q_desc.shape[2],
+            physical_topk=self.topk_desc.shape[2],
+            is_index_scores=True,
+            has_topk_length=self.topk_length_desc is not None,
+            output_log_probs=False,
+            topk_indices_global=self.topk_indices_global,
+        )
+
     def execute(
         self,
         q_indexer: torch.Tensor,
@@ -278,13 +301,14 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         topk_length: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        self._value_error_if(self._compiled_kernel is None, "SparseIndexerScoreRecompute plan not compiled; call compile() first")
         _require_live_tensor(self, q_indexer, self.q_desc, "q_indexer", contiguous=False)
         _require_live_tensor(self, k_indexer, self.k_desc, "k_indexer", contiguous=False)
         _require_live_tensor(self, weights, self.w_desc, "weights", contiguous=False)
         _require_live_tensor(self, topk_indices, self.topk_desc, "topk_indices", contiguous=True)
         _require_live_tensor(self, out, self.out_desc, "out", contiguous=True)
         _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
-        major, _ = device_capability()
+        major, _ = device_capability(q_indexer.device)
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -297,6 +321,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
                 topk_length=topk_length,
                 topk_indices_global=self.topk_indices_global,
                 current_stream=current_stream,
+                compiled_kernel=self._compiled_kernel,
             )
         return _iface_sm100.sparse_indexer_score_recompute(
             q_indexer,
@@ -399,6 +424,10 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
     Recovers per-head softmax from ``LSE``, sums across heads, and L1-normalizes
     over the top-K KV positions:
     ``target[b,q,i] = (sum_h exp(Q_h·K_topk^T·scale - LSE_h)) / sum_i(...)``.
+
+    On SM90, ``compile()`` prepares a symbolic CuTeDSL artifact and
+    ``execute()`` requires that prepared plan; execution is allocation-free
+    and CUDA Graph capturable with caller-owned ``out``.
     """
 
     def __init__(
@@ -445,6 +474,25 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         self._is_supported = True
         return True
 
+    def compile(self) -> None:
+        self._ensure_support_checked()
+        if device_capability(self.q_desc.device)[0] != 9:
+            self._compiled_kernel = True
+            return
+        from . import _interface_sm90 as _iface_sm90
+
+        self._compiled_kernel = _iface_sm90.compile_sparse_score_recompute(
+            device=self.q_desc.device,
+            dtype=self.q_desc.dtype,
+            head_dim=self.q_desc.shape[3],
+            qhead_per_kvhead=self.q_desc.shape[2],
+            physical_topk=self.topk_desc.shape[2],
+            is_index_scores=False,
+            has_topk_length=self.topk_length_desc is not None,
+            output_log_probs=False,
+            topk_indices_global=self.topk_indices_global,
+        )
+
     def execute(
         self,
         q_attn: torch.Tensor,
@@ -456,6 +504,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        self._value_error_if(self._compiled_kernel is None, "SparseAttnScoreRecompute plan not compiled; call compile() first")
         _require_live_tensor(self, q_attn, self.q_desc, "q_attn", contiguous=False)
         _require_live_tensor(self, k_attn, self.k_desc, "k_attn", contiguous=False)
         _require_live_tensor(self, lse, self.lse_desc, "lse", contiguous=False)
@@ -463,7 +512,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         _require_live_tensor(self, out, self.out_desc, "out", contiguous=True)
         _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
-        major, _ = device_capability()
+        major, _ = device_capability(q_attn.device)
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -477,6 +526,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
                 topk_length=topk_length,
                 topk_indices_global=self.topk_indices_global,
                 current_stream=current_stream,
+                compiled_kernel=self._compiled_kernel,
             )
         return _iface_sm100.sparse_attn_score_recompute(
             q_attn,
