@@ -576,6 +576,42 @@ def test_every_launch_re_checks_the_binding():
         k(**ops, rows=0)
 
 
+def test_binding_check_requires_every_operand_on_the_given_device():
+    """With the entry's device given (a concrete CUDA ordinal), every operand must live on exactly it, type AND index: CPU operands of
+    the served shapes and strides are a ``ValueError`` naming the operand and both devices -- host-only, no CUDA needed."""
+    ops = make_operands()
+    with pytest.raises(ValueError, match=r"one device, the entry's \(cuda:0\); qkv is on cpu"):
+        entry.check_binding(**ops, device=torch.device("cuda", 0))
+    entry.check_binding(**ops, device="cpu")  # the operands' own device passes
+    with pytest.raises(ValueError, match=r"the entry's \(cpu\); ssm_state is on meta"):
+        entry.check_binding(**dict(ops, ssm_state=ops["ssm_state"].to("meta")), device="cpu")
+    with pytest.raises(ValueError, match=r"qkv's \(cpu\); cu_seqlens is on meta"):
+        entry.check_binding(**dict(ops, cu_seqlens=ops["cu_seqlens"].to("meta")))  # without a device: qkv's
+
+
+def test_entry_device_is_a_concrete_ordinal_that_guards_a_warm_cache_too(monkeypatch):
+    """A CUDA entry resolves ``cuda`` to the current ordinal at construction, and a WARM entry (a kernel under the binding's compile key)
+    still runs the device check before the compiled callable is looked up: CPU operands of the same shapes, strides and dtypes (the key
+    matches) are a ``ValueError`` on the launch path and on the compile path, the planted kernel never invoked.  Host-only: the device
+    readers (the part's shared-memory readings, the SM count, the current ordinal) are stubbed."""
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: PART_READINGS[0])
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: 148)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    k = entry.GdnVerifyFused("cuda", 1e-6)
+    assert k.device == torch.device("cuda", 1) and k.sm_count == 148
+    assert entry.GdnVerifyFused("cuda:0", 1e-6).device == torch.device("cuda", 0)  # a given ordinal stays
+    assert entry.GdnVerifyFused("cpu", 1e-6).device == torch.device("cpu")  # a host entry: nothing to resolve
+    ops = make_operands(requests=2, tokens=4)
+    key = _key(k, ops)
+    calls = []
+    k.compiled[key] = lambda *args: calls.append(args)
+    with pytest.raises(ValueError, match=r"the entry's \(cuda:1\); qkv is on cpu"):
+        _run(k, ops)
+    with pytest.raises(ValueError, match=r"the entry's \(cuda:1\); qkv is on cpu"):
+        k.compile(**ops)
+    assert not calls, "the planted kernel was never invoked"
+
+
 def test_declines_a_dsl_below_the_floor_by_version(monkeypatch):
     """The kernel's 4.8.0 floor runs through the library's one version parser (cudnn.frost.buffers.cutedsl_too_old with the kernel's
     floor), so a prerelease of the floor compares as the floor and an internal build is never judged by the public numbering."""
@@ -703,6 +739,59 @@ def test_entry_reads_the_device_and_picks_the_form_per_requests():
     assert 2 * (one.smem_bytes(6) + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES  # one CTA per SM by shared memory (pair or not)
     two = k.cfg_for(k.sm_count // kcfg.V_HEADS + 1)  # the first requests count whose grid outgrows the SMs
     assert two.MIN_CTAS_PER_SM == 2 and 2 * (two.smem_bytes(6) + kcfg.SMEM_CTA_RESERVE_BYTES) <= two.SMEM_PER_SM_BYTES
+
+
+def test_warm_entry_rejects_cpu_operands_before_the_compiled_kernel_is_looked_up():
+    """After a real compile and launch, the same entry called with CPU operands of the same shapes, strides and dtypes (the compile key
+    matches: a cache hit) is a ``ValueError`` from the device check on the launch path and on the compile path, before the compiled
+    callable is looked up (swapped for a recorder: no call); the entry's device is a concrete ordinal, and it launches again afterwards."""
+    dev = _device_or_skip()
+    k = entry.GdnVerifyFused(dev, 1e-6)
+    assert k.device == torch.device("cuda", torch.cuda.current_device())
+    ops = make_operands(requests=2, tokens=4, device=dev)
+    _run(k, ops)
+    torch.cuda.synchronize()
+    key = _key(k, ops)
+    cpu = make_operands(requests=2, tokens=4)
+    assert _key(k, cpu) == key, "the same shapes, strides and dtypes: a warm key"
+    real, calls = k.compiled[key], []
+    k.compiled[key] = lambda *args: calls.append(args)
+    try:
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); qkv is on cpu"):
+            _run(k, cpu)
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); qkv is on cpu"):
+            k.compile(**cpu)
+    finally:
+        k.compiled[key] = real
+    assert not calls, "the compiled kernel was never invoked on CPU operands"
+    _run(k, ops)
+    torch.cuda.synchronize()
+
+
+def test_operands_on_another_cuda_device_are_rejected_before_any_launch():
+    """Operands on another CUDA device than the entry's (same shapes, strides and dtypes: the compile key matches) are a ``ValueError``
+    naming both ordinals, on the launch path and on the compile path, the compiled kernel never invoked.  Needs two CUDA devices."""
+    dev = _device_or_skip()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    k = entry.GdnVerifyFused(dev, 1e-6)
+    other = torch.device("cuda", (k.device.index + 1) % torch.cuda.device_count())
+    ops = make_operands(requests=2, tokens=4, device=dev)
+    _run(k, ops)
+    torch.cuda.synchronize()
+    key = _key(k, ops)
+    foreign = make_operands(requests=2, tokens=4, device=other)
+    assert _key(k, foreign) == key
+    real, calls = k.compiled[key], []
+    k.compiled[key] = lambda *args: calls.append(args)
+    try:
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); qkv is on {other}"):
+            _run(k, foreign)
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); qkv is on {other}"):
+            k.compile(**foreign)
+    finally:
+        k.compiled[key] = real
+    assert not calls, "the compiled kernel was never invoked on another device's operands"
 
 
 REFERENCE_CELLS = [

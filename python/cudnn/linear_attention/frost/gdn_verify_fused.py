@@ -5,8 +5,10 @@
 plan-time compile and the launch.  No DSL import at module level -- the CuTe DSL is imported inside :meth:`GdnVerifyFused.compile`
 after the version / architecture gate (python/cudnn/AGENTS.md Rule 7), so a host without it can still construct the entry and run
 its declines.  The binding checks (:func:`check_binding`: dtype, device, shape, stride and alignment of every operand against the step
-shape) run at compile time and again before EVERY launch -- the compile key pins the plan-time facts only, and a compiled DSL entry
-accepts a tensor of another dtype or footprint silently, so the host is a launch's only guard.
+shape) run before EVERY compile and EVERY launch, compile-cache hits included -- the compile key pins the plan-time facts only, and a
+compiled DSL entry accepts a tensor of another dtype, footprint or device silently, so the host is a launch's only guard.  The entry's
+device is resolved to a concrete CUDA ordinal at construction (:func:`resolve_device`) and every operand must live on exactly it (type
+AND index: a CPU tensor or one on another CUDA device is a ``ValueError`` naming the operand and both devices).
 
 The call contract is the FlashInfer Qwen 3.5 GDN block's verify form (its argument names and layouts), so an A/B against the
 reference kernel (FlashInfer's built-in ``frost`` verify backend) is a one-line swap: ``entry(qkv, z, hidden, ba_weight, A_log, dt_bias, ssm_state, state_indices,
@@ -151,6 +153,28 @@ def _check_aligned(name, t) -> None:
         raise ValueError(f"{NAME}: {name} must start at a 16-byte aligned address for its 128-bit copies, got data_ptr % 16 = {t.data_ptr() % 16}")
 
 
+def resolve_device(device):
+    """``device`` as a concrete ``torch.device``: a CUDA device given without an index is the CURRENT one (``torch.cuda.current_device()``),
+    so it compares with an operand's device (always indexed for a CUDA tensor) by type AND index; any other device is kept as given."""
+    import torch
+
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    return dev
+
+
+def _check_device(tensors, device, anchor) -> None:
+    """Every operand on ONE device: ``device`` (an entry's, resolved) when given, else the ``anchor`` operand's.  A ``torch.device``
+    compares by type AND index, so a CPU tensor or one on another CUDA device is a ``ValueError`` naming the operand and both devices
+    -- a compiled DSL entry would take either pointer silently on the entry's stream."""
+    want = resolve_device(device) if device is not None else tensors[anchor].device
+    whose = "the entry's" if device is not None else f"{anchor}'s"
+    for name, t in tensors.items():
+        if t.device != want:
+            raise ValueError(f"{NAME}: every operand must live on one device, {whose} ({want}); {name} is on {t.device}")
+
+
 def step_shape(state_indices) -> Tuple[int, int]:
     """``(requests, tokens per request)`` of a verify step: the two extents of the slot-index table."""
     if state_indices.dim() != 2:
@@ -177,12 +201,15 @@ def check_binding(
     out_bf16=None,
     cfg: Optional[Cfg] = None,
     rows: Optional[int] = None,
+    device=None,
 ) -> None:
-    """The binding checks, run at compile time AND before every launch: ``TypeError`` for a dtype (or a non-tensor), ``ValueError`` for
-    an inconsistent shape, stride, alignment or device, ``NotImplementedError`` for a geometry / layout / step shape this kernel does not
-    serve.  The compile key pins the plan-time facts only (the step shape, the strides the kernel is specialized on, the parameter
-    dtypes, the config), and a compiled DSL entry accepts a tensor of another dtype or footprint silently, so these checks are a launch's
-    only guard; host-only metadata arithmetic, no device work.  ``cfg`` (resolved) bounds the tokens per request by its shared-memory
+    """The binding checks, run before every compile AND every launch (compile-cache hits included): ``TypeError`` for a dtype (or a
+    non-tensor), ``ValueError`` for an inconsistent shape, stride, alignment or device, ``NotImplementedError`` for a geometry / layout /
+    step shape this kernel does not serve.  ``device`` (an entry's: a concrete CUDA ordinal) requires every operand on exactly that device,
+    type AND index; without it the operands must share ``qkv``'s.  The compile key pins the plan-time facts only (the step shape, the
+    strides the kernel is specialized on, the parameter dtypes, the config), and a compiled DSL entry accepts a tensor of another dtype,
+    footprint or device silently, so these checks are a launch's only guard; host-only metadata arithmetic, no device work.  ``cfg``
+    (resolved) bounds the tokens per request by its shared-memory
     budget; ``rows`` (the step's token rows, ``>= cu_seqlens[requests]`` by the caller's contract) bounds the row operands and the outputs
     for a ragged or padded step instead of ``requests x T``.  :func:`check_support` adds the architecture gate."""
     import torch
@@ -212,12 +239,10 @@ def check_binding(
         tensors["out"] = out
     if out_bf16 is not None:
         tensors["out_bf16"] = out_bf16
-    dev = qkv.device if isinstance(qkv, torch.Tensor) else None
     for name, t in tensors.items():
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"{NAME}: {name} must be a torch.Tensor, got {type(t).__name__}")
-        if t.device != dev:
-            raise ValueError(f"{NAME}: every operand must live on one device; {name} is on {t.device}, qkv on {dev}")
+    _check_device(tensors, device, "qkv")
     _check_dtype("qkv", qkv, torch.bfloat16)
     _check_dtype("z", z, torch.bfloat16)
     _check_dtype("hidden", hidden, torch.bfloat16)
@@ -330,9 +355,10 @@ def check_support(
     device_cc=None,
     cfg: Optional[Cfg] = None,
     rows: Optional[int] = None,
+    device=None,
 ) -> None:
-    """Typed declines, before any DSL import: the binding checks of :func:`check_binding` (``cfg`` / ``rows`` as there) plus the
-    architecture gate (``NotImplementedError`` for a part this kernel does not serve).  ``device_cc`` overrides the compute-capability
+    """Typed declines, before any DSL import: the binding checks of :func:`check_binding` (``cfg`` / ``rows`` / ``device`` as there) plus
+    the architecture gate (``NotImplementedError`` for a part this kernel does not serve).  ``device_cc`` overrides the compute-capability
     probe (tests)."""
     import torch
 
@@ -355,6 +381,7 @@ def check_support(
         out_bf16,
         cfg=cfg,
         rows=rows,
+        device=device,
     )
     dev = qkv.device
     if device_cc is None and dev.type != "cuda":
@@ -377,13 +404,14 @@ class GdnVerifyFused:
     tensors are launch arguments.  ``cfg`` overrides the config as a whole; without it the entry picks the form per requests
     (``default_cfg``: the cluster pair, two CTAs per V head, while the ``requests x 96`` CTAs have an SM each on this device, one CTA
     per SM while the ``requests x 48`` CTAs have one, two CTAs per SM past that).  An entry built for a non-CUDA device (host tests)
-    has no SM count to pick by and keeps the one-CTA form.  ``pdl`` /
-    ``pdl_release`` (None = the form's own fields) are the launch knobs on top of the form that serves."""
+    has no SM count to pick by and keeps the one-CTA form.  The device is resolved to a concrete CUDA ordinal at construction
+    (:func:`resolve_device`), and every operand of every compile / launch must live on exactly it.  ``pdl`` / ``pdl_release`` (None = the
+    form's own fields) are the launch knobs on top of the form that serves."""
 
     def __init__(self, device, eps: float, cfg: Optional[Cfg] = None, debug: bool = False, pdl: Optional[bool] = None, pdl_release: Optional[bool] = None):
         import torch
 
-        self.device = torch.device(device)
+        self.device = resolve_device(device)  # a CUDA device without an index is the current ordinal: the one every operand must match
         self.eps = float(eps)
         self.cfg_given = cfg is not None
         self.debug_flag = bool(debug)
@@ -548,11 +576,9 @@ class GdnVerifyFused:
         out_bf16=None,
         rows: Optional[int] = None,
     ) -> None:
-        """Validate (typed declines), gate the DSL, trace-compile the host entry for this (step shape, strides, dtypes) once.  ``rows``:
-        the step's token rows for a ragged / padded step (see :func:`check_support`); not a compile key (the kernel reads ``cu_seqlens``)."""
-        key = self.key(qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state)
-        if key in self.compiled:
-            return
+        """Validate (typed declines, on every call: every operand on this entry's device, a compile-cache hit included), gate the DSL,
+        trace-compile the host entry for this (step shape, strides, dtypes) once.  ``rows``: the step's token rows for a ragged / padded
+        step (see :func:`check_support`); not a compile key (the kernel reads ``cu_seqlens``)."""
         requests, tokens = step_shape(state_indices)
         check_support(
             qkv,
@@ -573,7 +599,11 @@ class GdnVerifyFused:
             out_bf16,
             cfg=self.cfg_for(requests),
             rows=rows,
+            device=self.device,
         )
+        key = self.key(qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state)
+        if key in self.compiled:
+            return
         import torch
 
         msg = _dsl_version_error()
@@ -645,7 +675,8 @@ class GdnVerifyFused:
         """Launch on torch's current stream; returns the fp8 output (``out`` when given, else the entry's buffer for this step
         shape; ``outputs(requests, tokens)`` holds the entry's buffers).  Compiles on first use for a new key (``rows`` as in
         :meth:`compile`).  Every launch re-runs the binding checks (:func:`check_binding`, against the form picked for this requests
-        count) before the compiled kernel sees the pointers: the key pins no dtype, shape or alignment, and the DSL checks none."""
+        count, every operand on this entry's device) before the compiled kernel is looked up: the key pins no dtype, shape, alignment or
+        device, and the DSL checks none."""
         import cuda.bindings.driver as cuda
         import torch
 
@@ -671,6 +702,7 @@ class GdnVerifyFused:
             out_bf16,
             cfg=cfg,
             rows=rows,
+            device=self.device,
         )
         key = self.key(qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state)
         if key not in self.compiled:

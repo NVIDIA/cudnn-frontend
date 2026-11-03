@@ -59,23 +59,13 @@ def make_operands(rows=ROWS, device="cpu", slots=SLOTS, seed=0, **overrides):
     return ops
 
 
+def _binding_args(ops):
+    """The entry's positional operands: ``(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw)``."""
+    return tuple(ops[name] for name in ("rows", "x", "cs", "cw", "al", "dt", "state", "idx", "z", "w", "scale", "hidden", "baw"))
+
+
 def call_check(ops, device_cc=(10, 0)):
-    return entry.check_support(
-        ops["rows"],
-        ops["x"],
-        ops["cs"],
-        ops["cw"],
-        ops["al"],
-        ops["dt"],
-        ops["state"],
-        ops["idx"],
-        ops["z"],
-        ops["w"],
-        ops["scale"],
-        ops["hidden"],
-        ops["baw"],
-        device_cc=device_cc,
-    )
+    return entry.check_support(*_binding_args(ops), device_cc=device_cc)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -341,6 +331,42 @@ def test_every_launch_re_checks_the_binding():
             _run(k, bad)
 
 
+def test_binding_check_requires_every_operand_on_the_given_device():
+    """With the entry's device given (a concrete CUDA ordinal), every operand must live on exactly it, type AND index: CPU operands of
+    the served shapes and strides are a ``ValueError`` naming the operand and both devices -- host-only, no CUDA needed."""
+    ops = make_operands()
+    with pytest.raises(ValueError, match=r"one device, the entry's \(cuda:0\); x is on cpu"):
+        entry.check_binding(*_binding_args(ops), device=torch.device("cuda", 0))
+    entry.check_binding(*_binding_args(ops), device="cpu")  # the operands' own device passes
+    with pytest.raises(ValueError, match=r"the entry's \(cpu\); state is on meta"):
+        entry.check_binding(*_binding_args(dict(ops, state=ops["state"].to("meta"))), device="cpu")
+    with pytest.raises(ValueError, match=r"x's \(cpu\); idx is on meta"):
+        entry.check_binding(*_binding_args(dict(ops, idx=ops["idx"].to("meta"))))  # without a device: x's
+
+
+def test_entry_device_is_a_concrete_ordinal_that_guards_a_warm_cache_too(monkeypatch):
+    """A CUDA entry resolves ``cuda`` to the current ordinal at construction, and a WARM entry (a kernel under the binding's compile key)
+    still runs the device check before the compiled callable is looked up: CPU operands of the same shapes and strides (the key matches)
+    are a ``ValueError`` on the launch path and on the compile path, the planted kernel never invoked.  Host-only: the device readers
+    (the part's shared-memory readings, the SM count, the current ordinal) are stubbed."""
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: PART_READINGS[0])
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: 148)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    k = entry.GdnDecodeFused("cuda", 1e-6)
+    assert k.device == torch.device("cuda", 1) and k.sm_count == 148
+    assert entry.GdnDecodeFused("cuda:0", 1e-6).device == torch.device("cuda", 0)  # a given ordinal stays
+    assert entry.GdnDecodeFused("cpu", 1e-6).device == torch.device("cpu")  # a host entry: nothing to resolve
+    ops = make_operands()
+    key = k.key(ROWS, ops["x"], ops["cs"], ops["state"], ops["z"])
+    calls = []
+    k.compiled[key] = lambda *args: calls.append(args)
+    with pytest.raises(ValueError, match=r"the entry's \(cuda:1\); x is on cpu"):
+        _run(k, ops)
+    with pytest.raises(ValueError, match=r"the entry's \(cuda:1\); x is on cpu"):
+        k.compile(*_binding_args(ops))
+    assert not calls, "the planted kernel was never invoked"
+
+
 def test_declines_a_dsl_below_the_floor_by_version(monkeypatch):
     """The kernel's 4.8.0 floor runs through the library's one version parser (cudnn.frost.buffers.cutedsl_too_old with the kernel's
     floor), so a prerelease of the floor compares as the floor and an internal build is never judged by the public numbering."""
@@ -419,9 +445,7 @@ def _device_or_skip():
 
 
 def _run(k, ops):
-    return k(
-        ops["rows"], ops["x"], ops["cs"], ops["cw"], ops["al"], ops["dt"], ops["state"], ops["idx"], ops["z"], ops["w"], ops["scale"], ops["hidden"], ops["baw"]
-    )
+    return k(*_binding_args(ops))
 
 
 def _reference(ops, eps=1e-6):
@@ -497,6 +521,59 @@ def test_entry_picks_the_form_per_rows_on_this_device():
     assert not one.TWO_CTAS_PER_HEAD and 2 * (one.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES  # one CTA per SM by shared memory
     two = k.cfg_for(sms // kcfg.V_HEADS + 1)  # the first rows count whose one-CTA grid outgrows the SMs
     assert two.MIN_CTAS_PER_SM == 2 and two.SMEM_PAD_BYTES == 0 and 2 * (two.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= two.SMEM_PER_SM_BYTES
+
+
+def test_warm_entry_rejects_cpu_operands_before_the_compiled_kernel_is_looked_up():
+    """After a real compile and launch, the same entry called with CPU operands of the same shapes and strides (the compile key matches:
+    a cache hit) is a ``ValueError`` from the device check on the launch path and on the compile path, before the compiled callable is
+    looked up (swapped for a recorder: no call); the entry's device is a concrete ordinal, and it launches again afterwards."""
+    dev = _device_or_skip()
+    k = entry.GdnDecodeFused(dev, 1e-6)
+    assert k.device == torch.device("cuda", torch.cuda.current_device())
+    ops = make_operands(device=dev)
+    _run(k, ops)
+    torch.cuda.synchronize()
+    key = k.key(ROWS, ops["x"], ops["cs"], ops["state"], ops["z"])
+    cpu = make_operands()
+    assert k.key(ROWS, cpu["x"], cpu["cs"], cpu["state"], cpu["z"]) == key, "the same shapes and strides: a warm key"
+    real, calls = k.compiled[key], []
+    k.compiled[key] = lambda *args: calls.append(args)
+    try:
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); x is on cpu"):
+            _run(k, cpu)
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); x is on cpu"):
+            k.compile(*_binding_args(cpu))
+    finally:
+        k.compiled[key] = real
+    assert not calls, "the compiled kernel was never invoked on CPU operands"
+    _run(k, ops)
+    torch.cuda.synchronize()
+
+
+def test_operands_on_another_cuda_device_are_rejected_before_any_launch():
+    """Operands on another CUDA device than the entry's (same shapes and strides: the compile key matches) are a ``ValueError`` naming
+    both ordinals, on the launch path and on the compile path, the compiled kernel never invoked.  Needs two CUDA devices."""
+    dev = _device_or_skip()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    k = entry.GdnDecodeFused(dev, 1e-6)
+    other = torch.device("cuda", (k.device.index + 1) % torch.cuda.device_count())
+    ops = make_operands(device=dev)
+    _run(k, ops)
+    torch.cuda.synchronize()
+    key = k.key(ROWS, ops["x"], ops["cs"], ops["state"], ops["z"])
+    foreign = make_operands(device=other)
+    assert k.key(ROWS, foreign["x"], foreign["cs"], foreign["state"], foreign["z"]) == key
+    real, calls = k.compiled[key], []
+    k.compiled[key] = lambda *args: calls.append(args)
+    try:
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); x is on {other}"):
+            _run(k, foreign)
+        with pytest.raises(ValueError, match=rf"the entry's \({k.device}\); x is on {other}"):
+            k.compile(*_binding_args(foreign))
+    finally:
+        k.compiled[key] = real
+    assert not calls, "the compiled kernel was never invoked on another device's operands"
 
 
 @pytest.mark.parametrize("form", ["one-cta", "two-ctas-per-head"])

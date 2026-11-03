@@ -54,10 +54,13 @@ module's own registration, `replace=True` re-registers (and drops the backend's
 cached plans). Nothing here is imported at `import cudnn` time; the two entries are also
 reachable lazily as `cudnn.GdnDecodeFused` / `cudnn.GdnVerifyFused` (and under
 `cudnn.linear_attention.frost`): direct-call kernels with the block's argument contract, not
-graph engines. Each entry validates the binding (dtype, device, shape, stride, 16-byte
-alignment, the step shape) at compile time and again before every launch -- the compile key
-pins the plan-time facts only, and a compiled CuTe DSL entry accepts a tensor of another dtype
-or footprint silently -- and declines a step of more than 65535 requests (one grid row each).
+graph engines. Each entry resolves its device to a concrete CUDA ordinal at construction and
+validates the binding (every operand on exactly that device, dtype, shape, stride, 16-byte
+alignment, the step shape) before every compile and every launch, compile-cache hits included
+-- the compile key pins the plan-time facts only, and a compiled CuTe DSL entry accepts a tensor
+of another dtype, footprint or device silently -- and declines a step of more than 65535
+requests (one grid row each). CPU operands or operands on another CUDA device are a
+`ValueError` naming the operand and both devices.
 
 ## Served and declined
 
