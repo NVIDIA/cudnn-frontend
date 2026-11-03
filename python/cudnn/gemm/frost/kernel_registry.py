@@ -968,6 +968,9 @@ def select_template(
     config: TileConfig,
 ) -> KernelTemplate:
     """The single template that renders (chain, config)."""
+    if chain.has_moe and chain.moe.uniform_group_rows:
+        if config.pipeline != "sm100" or config.swap_ab or isinstance(chain.moe, MoeSwapAbSpec):
+            raise NotImplementedError("row gather currently uses the non-swapped SM100 grouped loader")
     gt = classify_graph_type(chain)
     matches = [
         t

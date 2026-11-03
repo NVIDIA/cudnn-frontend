@@ -165,6 +165,24 @@ class OperandView:
         paths = tuple(dict.fromkeys((self.steps, *self.alternate_steps, other.steps, *other.alternate_steps)))
         return replace(self, alternate_steps=paths[1:])
 
+    def apply(self, value):
+        """One checked metadata view, without copying or owning device storage."""
+        from cudnn.frost.buffers import DeviceView, is_contiguous
+
+        source_shape, source_stride = tuple(value.shape), tuple(value.stride())
+        shape, stride = self.layout(source_shape, source_stride)
+        if source_shape == shape and source_stride == stride:
+            return value
+        if hasattr(value, "metadata_view"):
+            return value.metadata_view(shape, stride)
+        if isinstance(value, DeviceView):
+            if not is_contiguous(shape, stride):
+                raise ValueError("strided reshape/transpose execution requires a tensor or native variant pack")
+            return value.reshape(shape)
+        if hasattr(value, "as_strided"):
+            return value.as_strided(shape, stride)
+        raise ValueError("operand views require a tensor, DeviceView or native variant pack")
+
     def check_shape(self, shape):
         if tuple(shape) != self.source_shape:
             raise ValueError(f"reshape operand requires prepared source shape {self.source_shape}, got {tuple(shape)}")

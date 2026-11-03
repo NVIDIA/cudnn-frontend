@@ -469,6 +469,8 @@ def _swap_mn_view(t: object) -> object:
 
 def _offset_vector(t):
     """View ``[G+1,1,1]`` offsets as a vector."""
+    if t is None:
+        return None
     shape = tuple(t.shape)
     if len(shape) == 3 and shape[1:] == (1, 1):
         return t.reshape([shape[0]])
@@ -697,10 +699,32 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             # Keep the memo local for slot-only launchers.
             pass
 
+    views = {id(t): view for t, view in b.operand_views} if compiled.chain.moe.uniform_group_rows else {}
+
     def pull(t, role):
         if t is None or id(t) not in resolved:
             raise KeyError(f"variant pack is missing a buffer for {role}")
-        return resolved[id(t)]
+        value = resolved[id(t)]
+        if views:
+            declared_dtype = "int32" if t is b.token_index else compiled.chain.output_dtype if role == "output" else compiled.chain.matmul.a_dtype
+            expected_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32", "int32": "int32"}[declared_dtype]
+            if buffers.dtype_name(value) != expected_dtype:
+                raise ValueError(f"row gather {role} dtype does not match the prepared graph")
+            declared_device = getattr(value, "device", None)
+            if declared_device is not None and (
+                getattr(declared_device, "type", "cuda") != "cuda" or getattr(declared_device, "index", compiled.device) != compiled.device
+            ):
+                raise ValueError(f"row gather {role} is on a different device")
+            dlpack_device = getattr(value, "__dlpack_device__", None)
+            if dlpack_device is not None and tuple(dlpack_device()) != (2, compiled.device):
+                raise ValueError(f"row gather {role} is on a different device")
+            value = views[id(t)].apply(value)
+            if role == "output":
+                from .layouts import fold_batch_layout
+
+                fold_batch_layout(value.shape, value.stride(), writable=True)
+            return value
+        return value
 
     top_k_scores = None
     if compiled.chain.moe.mode == "combine":
@@ -750,7 +774,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             for spec, t in zip(compiled.chain.outputs, b.outputs)
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
-        fto = pull(b.first_token_offset, "first_token_offset")
+        fto = None if compiled.chain.moe.uniform_group_rows else pull(b.first_token_offset, "first_token_offset")
         sfa = [_kernel_order(pull(t, "SFA"), t, memo) for t in b.sfa_operands]
         sfb = [pull(t, "SFB") for t in b.sfb_operands]
         mm = compiled.chain.matmul
@@ -766,13 +790,25 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, (m, n, k)
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
+    b_bufs = [pull(t, "weight").permute(0, 2, 1) if views else _kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
-    fto = pull(b.first_token_offset, "first_token_offset")
+    fto = None if compiled.chain.moe.uniform_group_rows else pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "SFA") for t in b.sfa_operands]
     sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
+    if views:
+        # Gather inputs remain live throughout the tiled GEMM; output aliasing
+        # cannot be made safe by the order of graph nodes.
+        values = [*a_bufs, *b_bufs, *(pull(t, "indices") for t in (b.token_index,))]
+        for output in out_bufs:
+            olo = buffers.data_ptr(output)
+            ohi = olo + (1 + sum((d - 1) * s for d, s in zip(output.shape, output.stride()))) * output.element_size()
+            for value in values:
+                lo = buffers.data_ptr(value)
+                hi = lo + (1 + sum((d - 1) * s for d, s in zip(value.shape, value.stride()))) * value.element_size()
+                if olo < hi and lo < ohi:
+                    raise ValueError("row gather output must not overlap a source, weight, or index input")
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
     S = token_index.shape[0] if token_index is not None else a_bufs[0].shape[1]
@@ -1321,7 +1357,10 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             raise ValueError(
                 f"this MoE graph has {len(outputs_spec)} output(s) ({[o.source for o in outputs_spec]}); got {len(outputs)}. Pass outputs in slot order."
             )
-        for name, t, rank in (("token", token, 3), ("weight", weight, 3), ("first_token_offset", first_token_offset, 1)):
+        ranked = [("token", token, 3), ("weight", weight, 3)]
+        if not self.chain.moe.uniform_group_rows:
+            ranked.append(("first_token_offset", first_token_offset, 1))
+        for name, t, rank in ranked:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
@@ -1330,7 +1369,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                     f"MoE output {spec.source!r} must have shape {backend._expected_output_shape(spec, self.chain, (S, N, K), top_k_scores)}; got {tuple(t.shape)}"
                 )
         num_experts = int(weight.shape[0])
-        num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        num_groups = self.chain.moe.num_groups if self.chain.moe.uniform_group_rows else backend._moe_num_groups(first_token_offset, num_experts)
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]

@@ -754,6 +754,7 @@ def _render_tile_constants(
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        lines.append(f"gather_group_rows = {chain.moe.uniform_group_rows}")
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
         lines.append(f"mainloop_has_index = {any(op.index_expr is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}")
@@ -1582,6 +1583,7 @@ def _render_block_scale_tile_constants(
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        lines.append(f"gather_group_rows = {chain.moe.uniform_group_rows}")
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)

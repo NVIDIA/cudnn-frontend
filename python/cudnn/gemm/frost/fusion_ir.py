@@ -760,8 +760,11 @@ class MoeSpec:
     num_groups: int = 0
     offset_multiple: int = 1
     top_k: int = 1
+    uniform_group_rows: int = 0  # nonzero: fixed partition, no offset tensor
 
     def __post_init__(self) -> None:
+        if self.uniform_group_rows < 0 or (self.uniform_group_rows and self.mode != "gather"):
+            raise ValueError("uniform group rows are supported only by row-gather lowering")
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:

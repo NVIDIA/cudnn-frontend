@@ -142,6 +142,8 @@ class _RecordedOp:
     permutation: tuple[int, ...] = ()
     reshape_mode: str = "VIEW_ONLY"
     index_expr: IndexExpr | None = None
+    uniform_group_rows: int = 0
+    uniform_num_groups: int = 0
 
 
 @dataclass
@@ -387,6 +389,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
     node_type = node.node_type.name
     name = node.name
     compute = _map_dtype(node.compute_data_type)
+    if node_type == "GATHER":
+        inp, indices, out = node.inputs["input"], node.inputs["indices"], node.outputs["OUT_0"]
+        return _RecordedOp("gather", name, [id(inp), id(indices)], id(out), out, op_attrs=(("axis", node.params.get("axis", 0)),))
     if node_type == "MATMUL":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
@@ -1199,7 +1204,7 @@ def _output_layouts(dense_entries, quant_recs, meta):
     for _di in range(len(dense_entries)):
         _spec_i, _obj_i = dense_entries[_di]
         _m_i = meta.get(id(_obj_i))
-        if _m_i is not None and _m_i.matrix_batch is not None:
+        if _m_i is not None and (_m_i.matrix_batch is not None or _m_i.operand_view is not None):
             _d_i, _s_i = _m_i.dim, _m_i.stride
         else:
             _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
@@ -1304,8 +1309,8 @@ def _build_multi_moe_chain(
             raise ValueError("parallel MoE grouped matmuls must share the same " "first_token_offset tensor")
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
-    num_groups = int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0
-    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
+    num_groups = moe_ops[0].uniform_num_groups or (int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0)
+    offset_multiple = moe_ops[0].uniform_group_rows or (fto_meta.alignment_value if fto_meta is not None else 1)
 
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
 
@@ -1526,6 +1531,7 @@ def _build_multi_moe_chain(
             offset_dtype=offset_dtype,
             num_groups=num_groups,
             offset_multiple=offset_multiple,
+            uniform_group_rows=moe_ops[0].uniform_group_rows,
             top_k=moe_ops[0].top_k,
         ),
         block_scale=block_scale_spec,
@@ -1543,7 +1549,7 @@ def _build_multi_moe_chain(
         output_objs,
         aux_objs,
         block_scale_spec is not None,
-        first_token_offset=meta[fto_id].tensor,
+        first_token_offset=meta[fto_id].tensor if fto_meta is not None else None,
         token_index=index_meta.tensor if index_meta is not None else None,
         token_ks=ks_meta.tensor if ks_meta is not None else None,
         top_k_scores=scores_meta.tensor if scores_meta is not None else None,
@@ -2277,6 +2283,79 @@ def _build_multi_gemm_chain(
     return chain, binding
 
 
+def _build_row_gather_chain(ops, meta, io_dtype, intermediate_dtype, compute_dtype):
+    """Project a fixed row-gather matmul onto the existing grouped gather loader.
+
+    Logical gather remains distinct from zero-copy OperandView. Only the index
+    carrier, source matrix and final output receive metadata-only ABI views.
+    """
+    if len(ops) != 2 or [op.cudnn_name for op in ops] != ["gather", "matmul"]:
+        raise NotImplementedError("row gather requires one gather followed directly by one matmul")
+    gather, mm = ops
+    if mm.inputs[0] != gather.output:
+        raise NotImplementedError("row gather currently loads the matmul A operand")
+    source_id, index_id = gather.inputs
+    source, indices, weight, result = (meta[i] for i in (source_id, index_id, mm.inputs[1], mm.output))
+    if len(source.dim) != 2 or dict(gather.op_attrs)["axis"] not in (0, -2):
+        raise NotImplementedError("row gather loader requires an unbatched rank-2 source and axis=0")
+    if _is_output(meta, gather.output) or not source.is_input or not indices.is_input or not weight.is_input:
+        raise NotImplementedError("row gather source/indices/weight must be materialized; gathered intermediate must be virtual")
+    if source.dtype not in ("bf16", "fp16") or weight.dtype != source.dtype or meta[gather.output].dtype != source.dtype:
+        raise NotImplementedError("row gather loader requires matching FP16/BF16 operand dtypes; gather cannot cast")
+    if indices.dtype != "int32":
+        raise NotImplementedError("row gather loader requires INT32 indices")
+    t, k = source.dim
+    groups, rows = prod(indices.dim[:-1]), indices.dim[-1]
+    if max(t, k, groups * rows) >= 2**31:
+        raise NotImplementedError("row gather geometry must fit Int32")
+    if source.stride[-1] != 1 or source.stride[0] < k:
+        raise NotImplementedError("row gather source requires nonoverlapping K-major rows")
+    gathered_shape = (*indices.dim, k)
+    if meta[gather.output].dim != gathered_shape:
+        raise ValueError(f"gather output must have shape {gathered_shape}")
+    if len(weight.dim) < 2 or weight.dim[-2] != k:
+        raise ValueError("row gather matmul weight must have matching K")
+    n = weight.dim[-1]
+    if n >= 2**31:
+        raise NotImplementedError("row gather geometry must fit Int32")
+    batch = tuple(indices.dim[:-1])
+    wb = tuple(weight.dim[:-2])
+    padded_wb = (1,) * (len(batch) - len(wb)) + wb
+    if len(wb) > len(batch) or (padded_wb != batch and any(x != 1 for x in padded_wb)):
+        raise NotImplementedError("row gather weight batch must match index batch or broadcast as a whole")
+    expected = (*batch, rows, n)
+    if result.dim != expected:
+        raise ValueError(f"row gather matmul output must have shape {expected}")
+    if not _is_output(meta, mm.output):
+        raise NotImplementedError("row gather matmul requires a materialized output")
+
+    def project(tid, target):
+        m = meta[tid]
+        shape, stride = (m.operand_view.source_shape, m.operand_view.source_stride) if m.operand_view is not None else (m.dim, m.stride)
+        view = OperandView.prepare(shape, stride, (ViewStep("reshape", target),))
+        if m.operand_view is not None:
+            view = m.operand_view.merged(view)
+        if tid == mm.output:
+            fold_batch_layout(view.target_shape, view.target_stride, writable=True)
+        meta[tid] = replace(m, dim=view.target_shape, stride=view.target_stride, operand_view=view)
+
+    # Flatten only contiguous index/output batches; source row padding stays.
+    project(source_id, (1, t, k))
+    project(index_id, (1, groups * rows, 1))
+    project(mm.inputs[1], (prod(wb), k, n))
+    project(mm.output, (1, groups * rows, n))
+    routed = replace(
+        mm,
+        cudnn_name="moe_grouped_matmul",
+        inputs=[source_id, mm.inputs[1], -1],
+        moe_mode="gather",
+        token_index=index_id,
+        uniform_group_rows=rows,
+        uniform_num_groups=groups,
+    )
+    return _build_multi_moe_chain([routed], [routed], meta, io_dtype, intermediate_dtype, compute_dtype)
+
+
 def _build_chain(
     ops: list[_RecordedOp],
     meta: dict[int, _TensorMeta],
@@ -2308,6 +2387,8 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
     meta = dict(state["tensor_meta"])
+    if any(op.cudnn_name == "gather" for op in state["ops"]):
+        return _build_row_gather_chain(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"], state["compute_dtype"])
     ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
     return _build_chain(
         ops,

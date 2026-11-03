@@ -2986,6 +2986,12 @@ _install_pointwise_builders()
 # ---------------------------------------------------------------------------
 
 
+def _gather_dims(node):
+    from .nodes import gather_shape
+
+    return gather_shape(node.inputs["input"].dim, node.inputs["indices"].dim, node.params.get("axis", 0))
+
+
 def _like(port):  # output dims mirror an input port
     return lambda node: (node.inputs[port].dim if port in node.inputs else None)
 
@@ -3790,6 +3796,16 @@ _STRUCTURED_OPS = {
         push_output_dims=True,  # wgrad output (filter) dims are not inferable
     ),
     # ---- structural -----------------------------------------------------------
+    "gather": dict(
+        node_type=NodeType.GATHER,
+        inputs=("input", "indices"),
+        attrs=("axis",),
+        outputs=("OUT_0",),
+        infer={"OUT_0": _gather_dims},
+        dtype_like={"OUT_0": "input"},
+        no_cdt=True,
+        python_only=True,
+    ),
     "reshape": dict(
         node_type=NodeType.RESHAPE,
         inputs=("input",),
@@ -3943,6 +3959,8 @@ def _install_structured_builders() -> None:
         builder.__name__ = op
         builder.__qualname__ = f"pygraph.{op}"
         builder.__doc__ = f"{op}({', '.join(input_ports)}) -> ({', '.join(spec['outputs'])})."
+        if op == "gather":
+            builder.__doc__ += " axis=0; replaces that input axis with indices.shape. Negative/out-of-range indices load zero (no wrapping)."
         if spec.get("adaptive_op") or "adaptive" in attr_kws:
             builder.__doc__ += " adaptive=False; True uses per-sample affine parameters and parameter gradients."
         return builder
