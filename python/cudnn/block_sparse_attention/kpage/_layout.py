@@ -20,6 +20,7 @@ backward on them.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -83,6 +84,14 @@ class KPageLayout:
             self._tables.resolve_bwd_tables()
 
 
+_VALIDATE_CTAS_PER_SM = 4
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def _validate_metadata(
     q2k_block_index: Tensor, q2k_block_nums: Tensor, q_sizes: Tensor, kv_sizes: Tensor, allow_empty: bool, block: int = BLOCK
 ) -> Tuple[bool, bool]:
@@ -90,7 +99,43 @@ def _validate_metadata(
 
     ``allow_empty`` admits query blocks with no KV pages to attend to (count 0,
     or only zero-size blocks); they get O = 0, LSE = -inf and dQ = 0.
+
+    One CuTe DSL kernel reads only the listed slots of each walk.  On a violation,
+    ``_raise_metadata_error`` locates it for the error message.
     """
+    from . import _build_kernels as kernels
+
+    cap = q2k_block_index.shape[-1]
+    walks = q2k_block_index.numel() // cap
+    dev = q2k_block_index.device
+    num_ctas = max(1, min(walks, _VALIDATE_CTAS_PER_SM * _num_sms(dev.index)))
+    scratch = torch.zeros((num_ctas, (kv_sizes.numel() + 31) // 32), dtype=torch.int32, device=dev)
+    result = torch.empty((num_ctas, kernels.VALIDATE_NUM_FLAGS), dtype=torch.int32, device=dev)
+    kernels.validate_metadata(q2k_block_index.view(walks, cap), q2k_block_nums.view(walks), q_sizes, kv_sizes, scratch, result, block, kernels.current_stream())
+    result = result.cpu()
+    low, high = result.amin(dim=0).tolist(), result.amax(dim=0).tolist()
+    counts_min, counts_max = low[kernels.VALIDATE_COUNTS_MIN], high[kernels.VALIDATE_COUNTS_MAX]
+    sizes_min, sizes_max = low[kernels.VALIDATE_SIZES_MIN], high[kernels.VALIDATE_SIZES_MAX]
+    has_oob, has_dup, has_empty_row = (high[c] != 0 for c in (kernels.VALIDATE_HAS_OOB, kernels.VALIDATE_HAS_DUP, kernels.VALIDATE_HAS_EMPTY_ROW))
+    valid = (
+        counts_min >= (0 if allow_empty else 1)
+        and counts_max <= cap
+        and not has_oob
+        and not has_dup
+        and 0 <= sizes_min
+        and sizes_max <= block
+        and (allow_empty or not has_empty_row)
+    )
+    if not valid:
+        _raise_metadata_error(q2k_block_index, q2k_block_nums, q_sizes, kv_sizes, allow_empty, block)
+        raise RuntimeError(f"KPage metadata validation: the device check flagged a violation the reference check did not find ({result.tolist()})")
+    return high[kernels.VALIDATE_PARTIAL_Q] != 0, high[kernels.VALIDATE_PARTIAL_KV] != 0
+
+
+def _raise_metadata_error(
+    q2k_block_index: Tensor, q2k_block_nums: Tensor, q_sizes: Tensor, kv_sizes: Tensor, allow_empty: bool, block: int = BLOCK
+) -> Tuple[bool, bool]:
+    """The torch reference of ``_validate_metadata``: raises ``ValueError`` naming the first violation it finds."""
     dev = q2k_block_index.device
     cap = q2k_block_index.shape[-1]
     num_kv_blocks = kv_sizes.numel()

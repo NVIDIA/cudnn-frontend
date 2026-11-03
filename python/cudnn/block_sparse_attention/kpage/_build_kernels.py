@@ -879,6 +879,181 @@ class RefineBlk128ToBlk64:
             mBlockCount64[2 * walk + 1] = count if q_valid > BLOCK // 2 else Int32(0)
 
 
+# Columns of ValidateMetadata's per-CTA result row.
+(
+    VALIDATE_COUNTS_MIN,
+    VALIDATE_COUNTS_MAX,
+    VALIDATE_HAS_OOB,
+    VALIDATE_HAS_DUP,
+    VALIDATE_HAS_EMPTY_ROW,
+    VALIDATE_SIZES_MIN,
+    VALIDATE_SIZES_MAX,
+    VALIDATE_PARTIAL_Q,
+    VALIDATE_PARTIAL_KV,
+    VALIDATE_NUM_FLAGS,
+) = range(10)
+
+
+class ValidateMetadata:
+    """Check the KPage metadata contract in one pass over the listed KV blocks.
+
+    CTAs stride over the walks (rows of ``q2k_block_index``) and read only the first ``q2k_block_nums`` slots of each.
+    Duplicates are found with a per-CTA membership bitset in global scratch: ``atomic_or`` returns the previous word, so
+    a set bit means the id was already listed.  The CTA clears the words it touched before its next walk.  Every CTA
+    reduces its flags into its own row of ``mResult`` (columns ``VALIDATE_*``); the host reduces the rows.
+    """
+
+    num_threads = 256
+    num_warps = num_threads // cute.arch.WARP_SIZE
+    int32_max = 2**31 - 1
+    int32_min = -(2**31)
+
+    def __init__(self, block: int = BLOCK):
+        self.block = block
+
+    @cute.jit
+    def __call__(
+        self,
+        mBlockIndex: cute.Tensor,  # [W, cap] int32, W = heads * nQ
+        mBlockCount: cute.Tensor,  # [W]
+        mQSizes: cute.Tensor,  # [nQ]
+        mBlockSizes: cute.Tensor,  # [nKV]
+        mScratch: cute.Tensor,  # [G, ceil(nKV / 32)] int32, zeroed; G = number of CTAs
+        mResult: cute.Tensor,  # [G, VALIDATE_NUM_FLAGS] int32
+        stream: cuda.CUstream,
+    ):
+        @cute.struct
+        class SharedStorage:
+            row_has_valid: cute.struct.MemRange[Int32, 1]
+
+        self.kernel(mBlockIndex, mBlockCount, mQSizes, mBlockSizes, mScratch, mResult, SharedStorage).launch(
+            grid=(mScratch.shape[0], 1, 1),
+            block=(self.num_threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBlockIndex: cute.Tensor,
+        mBlockCount: cute.Tensor,
+        mQSizes: cute.Tensor,
+        mBlockSizes: cute.Tensor,
+        mScratch: cute.Tensor,
+        mResult: cute.Tensor,
+        SharedStorage: cutlass.Constexpr[Callable],
+    ):
+        cta = cute.arch.block_idx()[0]
+        thread_idx = cute.arch.thread_idx()[0]
+        lane_idx = cute.arch.lane_idx()
+        num_ctas = mScratch.shape[0]
+        num_walks = mBlockIndex.shape[0]
+        cap = mBlockIndex.shape[1]
+        n_q_blocks = mQSizes.shape[0]
+        n_blocks = mBlockSizes.shape[0]
+        smem = SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        row_has_valid = storage.row_has_valid.get_tensor(cute.make_layout(1))
+
+        if thread_idx == 0:
+            row_has_valid[0] = Int32(0)
+            mResult[cta, VALIDATE_COUNTS_MIN] = Int32(self.int32_max)
+            mResult[cta, VALIDATE_COUNTS_MAX] = Int32(self.int32_min)
+            mResult[cta, VALIDATE_SIZES_MIN] = Int32(self.int32_max)
+            mResult[cta, VALIDATE_SIZES_MAX] = Int32(self.int32_min)
+            for col in (VALIDATE_HAS_OOB, VALIDATE_HAS_DUP, VALIDATE_HAS_EMPTY_ROW, VALIDATE_PARTIAL_Q, VALIDATE_PARTIAL_KV):
+                mResult[cta, col] = Int32(0)
+        cute.arch.sync_threads()
+
+        counts_min = Int32(self.int32_max)
+        counts_max = Int32(self.int32_min)
+        has_oob = Int32(0)
+        has_dup = Int32(0)
+        has_empty_row = Int32(0)
+        walk = cta
+        while walk < num_walks:
+            count = mBlockCount[walk]
+            edge_count = max(min(count, cap), 0)
+            has_valid = Int32(0)
+            edge_idx = thread_idx
+            while edge_idx < edge_count:
+                block_idx = mBlockIndex[walk, edge_idx]
+                if block_idx >= 0 and block_idx < n_blocks:
+                    bit = Int32(1) << (block_idx % 32)
+                    ptr = mScratch.iterator + cute.crd2idx((cta, block_idx // 32), mScratch.layout)
+                    previous = cute.arch.atomic_or(ptr.llvm_ptr, bit, sem="relaxed", scope="gpu")
+                    if (previous & bit) != 0:
+                        has_dup = Int32(1)
+                    if mBlockSizes[block_idx] > 0:
+                        has_valid = Int32(1)
+                else:
+                    has_oob = Int32(1)
+                edge_idx += self.num_threads
+            if has_valid != 0:
+                row_has_valid[0] = Int32(1)
+            cute.arch.sync_threads()
+
+            if thread_idx == 0:
+                counts_min = min(counts_min, count)
+                counts_max = max(counts_max, count)
+                if row_has_valid[0] == 0:
+                    has_empty_row = Int32(1)
+                row_has_valid[0] = Int32(0)
+            edge_idx = thread_idx
+            while edge_idx < edge_count:  # clear the words this walk set, for the CTA's next walk
+                block_idx = mBlockIndex[walk, edge_idx]
+                if block_idx >= 0 and block_idx < n_blocks:
+                    mScratch[cta, block_idx // 32] = Int32(0)
+                edge_idx += self.num_threads
+            cute.arch.sync_threads()
+            walk += num_ctas
+
+        sizes_min = Int32(self.int32_max)
+        sizes_max = Int32(self.int32_min)
+        partial_q = Int32(0)
+        partial_kv = Int32(0)
+        idx = cta * self.num_threads + thread_idx
+        while idx < n_q_blocks:
+            size = mQSizes[idx]
+            sizes_min = min(sizes_min, size)
+            sizes_max = max(sizes_max, size)
+            if size < self.block:
+                partial_q = Int32(1)
+            idx += num_ctas * self.num_threads
+        idx = cta * self.num_threads + thread_idx
+        while idx < n_blocks:
+            size = mBlockSizes[idx]
+            sizes_min = min(sizes_min, size)
+            sizes_max = max(sizes_max, size)
+            if size < self.block:
+                partial_kv = Int32(1)
+            idx += num_ctas * self.num_threads
+
+        counts_min = warp_reduce(counts_min, lambda x, y: min(x, y))
+        counts_max = warp_reduce(counts_max, lambda x, y: max(x, y))
+        sizes_min = warp_reduce(sizes_min, lambda x, y: min(x, y))
+        sizes_max = warp_reduce(sizes_max, lambda x, y: max(x, y))
+        has_oob = warp_reduce(has_oob, lambda x, y: x | y)
+        has_dup = warp_reduce(has_dup, lambda x, y: x | y)
+        has_empty_row = warp_reduce(has_empty_row, lambda x, y: x | y)
+        partial_q = warp_reduce(partial_q, lambda x, y: x | y)
+        partial_kv = warp_reduce(partial_kv, lambda x, y: x | y)
+        if lane_idx == 0:
+
+            def col(c):
+                return (mResult.iterator + cute.crd2idx((cta, c), mResult.layout)).llvm_ptr
+
+            cute.arch.atomic_min(col(VALIDATE_COUNTS_MIN), counts_min, sem="relaxed", scope="cta")
+            cute.arch.atomic_max(col(VALIDATE_COUNTS_MAX), counts_max, sem="relaxed", scope="cta")
+            cute.arch.atomic_min(col(VALIDATE_SIZES_MIN), sizes_min, sem="relaxed", scope="cta")
+            cute.arch.atomic_max(col(VALIDATE_SIZES_MAX), sizes_max, sem="relaxed", scope="cta")
+            cute.arch.atomic_or(col(VALIDATE_HAS_OOB), has_oob, sem="relaxed", scope="cta")
+            cute.arch.atomic_or(col(VALIDATE_HAS_DUP), has_dup, sem="relaxed", scope="cta")
+            cute.arch.atomic_or(col(VALIDATE_HAS_EMPTY_ROW), has_empty_row, sem="relaxed", scope="cta")
+            cute.arch.atomic_or(col(VALIDATE_PARTIAL_Q), partial_q, sem="relaxed", scope="cta")
+            cute.arch.atomic_or(col(VALIDATE_PARTIAL_KV), partial_kv, sem="relaxed", scope="cta")
+
+
 class BwdKvNoStraddlePack:
     """Pack Page16 groups without allowing a group to cross a Page8 tile."""
 
@@ -1861,6 +2036,28 @@ def refine_blk128_to_blk64(
 
 
 refine_blk128_to_blk64.compile_cache = {}
+
+
+def validate_metadata(
+    block_index: Tensor,
+    block_count: Tensor,
+    q_sizes: Tensor,
+    block_sizes: Tensor,
+    scratch: Tensor,
+    result: Tensor,
+    block: int,
+    stream: cuda.CUstream = None,
+) -> None:
+    _run_metadata_kernel(
+        f"kpage_validate_metadata_blk{block}",
+        ValidateMetadata(block),
+        (block_index, block_count, q_sizes, block_sizes, scratch, result),
+        validate_metadata.compile_cache,
+        stream,
+    )
+
+
+validate_metadata.compile_cache = {}
 
 
 def order_q_route_work(
