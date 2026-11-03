@@ -19,6 +19,7 @@ _LAZY_EXPORTS = {
     "GdpSummaryFrostEngine": (".gdp_engine", "GdpSummaryFrostEngine"),
     "Mamba2FrostEngine": (".mamba2_engine", "Mamba2FrostEngine"),
     "Mamba2SummaryFrostEngine": (".mamba2_engine", "Mamba2SummaryFrostEngine"),
+    "GdnDecodeFused": (".gdn_decode_fused", "GdnDecodeFused"),
 }
 
 
@@ -47,4 +48,5 @@ __all__ = [
     "GdpSummaryFrostEngine",
     "Mamba2FrostEngine",
     "Mamba2SummaryFrostEngine",
+    "GdnDecodeFused",
 ]
