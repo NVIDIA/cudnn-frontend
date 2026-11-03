@@ -119,7 +119,7 @@ DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS = [
 
 DSA_INDEXER_BACKWARD_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
-    # IndexerBackward requires heads >= 64 (warp-specialized GEMM layout).
+    # H64 runs on both arches; the SM100-only compact H32 path has dedicated tests.
     pytest.mark.parametrize("qhead_per_kv_head", [64]),
     pytest.mark.parametrize("block_I", [128]),
 ]
