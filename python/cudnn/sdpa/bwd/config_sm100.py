@@ -379,12 +379,12 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
     if epi_mode not in STAGE3_EPI_MODES:
         raise ValueError(f"SDPA bwd stage 3: epi_mode must be one of {STAGE3_EPI_MODES} (EPI_NONE / EPI_DESCALE / EPI_QUANT); got {epi_mode}.")
     block_scale = bool(getattr(params, "block_scale", False))
+    if block_scale and tuple(params.cgrp_tile_mn) != STAGE3_FP8_CGRP_TILE:
+        raise ValueError(f"SDPA bwd stage 3: the block-scale arm is rendered at the {STAGE3_FP8_CGRP_TILE} row only; got cgrp_tile_mn={params.cgrp_tile_mn!r}.")
     if fp8 and tuple(params.cgrp_tile_mn) not in STAGE3_FP8_CGRP_TILES:
         raise ValueError(
             f"SDPA bwd stage 3: the fp8 arm (dtype_qkv=DTYPE_E4M3) is rendered at the {STAGE3_FP8_CGRP_TILES} rows only; got cgrp_tile_mn={params.cgrp_tile_mn!r}."
         )
-    if block_scale and tuple(params.cgrp_tile_mn) != STAGE3_FP8_CGRP_TILE:
-        raise ValueError(f"SDPA bwd stage 3: the block-scale arm is rendered at the {STAGE3_FP8_CGRP_TILE} row only; got cgrp_tile_mn={params.cgrp_tile_mn!r}.")
     if block_scale and not fp8:
         raise ValueError(
             f"SDPA bwd stage 3: block_scale is the MXFP8 arm of the fp8 rendering (dtype_qkv=DTYPE_E4M3: e4m3 payloads with an E8M0 scale per "
