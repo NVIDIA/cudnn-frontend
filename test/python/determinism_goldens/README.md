@@ -148,6 +148,73 @@ Replay, isolated batch checks, and all six goldens passed on GeForce RTX 4090
 (SM89), with PyTorch 2.12.1+cu130 and CuTe DSL 4.8.0. The goldens are in
 `c74756f44f441362/`.
 
+### Conv3D post-operations
+
+`conv/cutedsl/test_conv3d_postops_determinism.py` adds 27 L0 cases:
+
+| Checks | Cases | Coverage |
+| --- | ---: | --- |
+| Replay and batch invariance | 12 | One case per API family and dtype; N96/N160/N192/N256 tiles, C320 normalization and C1024 standalone reduction distributed across cases |
+| Small runtime-specific goldens | 12 | One case per API family and dtype, after replay and an independent numerical reference |
+| Persistent warm stress | 3 | Raw C192 TF32, prepared C192 BF16, and the separate BF16 C12 causal body |
+
+Replay uses fresh output allocations and concurrent GPU work. Batch checks keep
+inputs fixed while splitting, reordering, duplicating, inserting/removing
+sequences, and changing neighbors. T1/H7/W9 exercises partial M tiles and
+history/cache boundaries; the golden geometry uses T3/H5/W7. Stress uses
+T3/H97/W121 to reuse persistent workers and refill the shared-memory ring,
+with the shared helper's validated control and warm/poisoned launches.
+Output, padded output, cache, residual, and exposed stress workspaces are
+compared as raw bytes; inputs are checked for mutation. Caller-owned activated
+history is populated before comparing full fused outputs. Independent Torch
+references check numerical accuracy. These are forward-only APIs with batch
+size N >= 1.
+
+Measured on **2026-11-17, NVIDIA B200 (SM100, 148 SMs)** at source revision
+`3916c70f` plus this test/doc addition: Torch 2.13.0+cu132, CUDA driver 13040,
+cuDNN backend 9.20.0, CUTLASS DSL 4.9.0.dev1 (CUDA 13.4 compiler), and
+TVM-FFI 0.1.12.
+The representative selection passed **27/27 in 12.57 s**, including exact checks
+against all 12 records under `e236f71ed93bdd1c/`. The Conv3D L0/L1 correctness
+suite passed **92/92 in 12.69 s**, with one Torch synchronization-debug warning.
+Both runs had zero failures or skips. Correctness cases sample tile widths,
+K padding, reduction layouts, and dtype-specific paths; they also exercise
+dynamic geometry/history, graph replay, disk-cache reload, and stream lifetimes.
+
+The original selection on this runtime recorded **45/45 in 83.52 s**, checked
+**45/45 in 21.10 s** in a separate process, and passed correctness **158/158 in
+152.29 s**. That correctness run reported seven CUTLASS static-loop compile
+warnings and one Torch synchronization-debug warning. The golden inputs and
+records are unchanged; each passed an independent numerical reference before
+recording.
+
+Each of the three stress cases completed 3,000 warm and 3,000 poisoned launches
+with zero byte mismatches. The one-CTA and two-CTA positive
+controls each detected errors in 200/200 launches. The production persistent
+launch uses 148 thread blocks (one per SM); the controls use three blocks
+per SM. The prepared BF16 case refills 74 times and raw TF32 refills 156 times,
+and the causal BF16 body refills twice. Stress compares against cold-launch
+bytes; the independent numerical reference is checked separately before stress.
+
+Commands from `test/python` (record into a fresh directory, then check in a
+separate process):
+
+```bash
+python -c 'import cudnn; print(cudnn.__file__)'
+python -m pytest conv/cutedsl/test_conv3d_postops_determinism.py -m L0 --collect-only -q
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_TEST_NO_ISOLATION=1 OMP_NUM_THREADS=8
+CUDNN_DETERMINISM_RECORD=/tmp/conv3d-new-goldens python -m pytest \
+  conv/cutedsl/test_conv3d_postops_determinism.py -m L0 -q -rs -x
+CUDNN_DETERMINISM_GOLDENS=/tmp/conv3d-new-goldens python -m pytest \
+  conv/cutedsl/test_conv3d_postops_determinism.py -m L0 -q -rs -x
+# After reviewing and adding the records, check the repository baseline:
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  conv/cutedsl/test_conv3d_postops_determinism.py -m L0 -q -rs
+python -m pytest conv/cutedsl/test_conv3d_postops.py -m 'L0 or L1' -q -rs -x
+```
+
+See the [golden workflow](#golden-checks) for recording and reviewing new baselines.
+
 ### D256 nonpaged split physical origins (2026-11-16)
 
 `sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed
@@ -736,6 +803,7 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |

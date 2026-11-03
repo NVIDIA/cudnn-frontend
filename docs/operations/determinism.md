@@ -67,6 +67,8 @@ arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
+| `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
+| `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
@@ -307,6 +309,12 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+The Conv3D/post-op APIs provide deterministic inference by default. FP32
+convolution requires `allow_tf32=True`; standalone RMSNorm/SiLU preparation
+supports strict FP32. Callers populate the history interiors of fused prepared
+outputs. See the [Conv3D coverage report](../../test/python/determinism_goldens/README.md#conv3d-post-operations)
+for replay, batch-invariance, and stress-test results.
 
 - `grouped_gemm_glu_hadamard_wrapper_sm100` with `act_func="srelu"`: no deterministic
   mode is needed for replay. The qualified case sets `tanh_clamp_scale` and
