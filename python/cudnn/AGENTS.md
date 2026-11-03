@@ -121,6 +121,9 @@ unsupported input runnable.
   bind aligned covering B/H/S permutations directly. Graph and standalone
   admission share `config_sm100.dense_bind_strides`; each port uses its own
   storage element width. Unaligned outer strides decline before compilation.
+  The SM90 row does the same through `config_sm90.dense_bind_strides`
+  (`dense_flex` strides, a unit axis pinned to D), the layouts its adapter's
+  `check_support()` accepts.
   The prior compact-BSHD normalization exception has been removed; split
   partials and quantization scalars remain legitimate algorithmic scratch.
 - The flip side of declining: whatever `check_support()` ACCEPTS, the kernel

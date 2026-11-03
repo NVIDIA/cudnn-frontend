@@ -4850,6 +4850,11 @@ The SM107 fused epilogue gate port follows the same contract
 (`config_sm107.epilogue_gate_layout_declarable` is `dense_bind_strides`), so a
 batch-1, one-token gate sliced out of a projection slab, whose singleton axes
 carry the slab's token pitch, is declarable on the graph and the standalone path alike.
+The SM90 half row (D512 and D128) declines the same unaligned outer strides at
+the graph, through `config_sm90.dense_bind_strides` (`dense_flex` strides, a unit
+axis pinned to D), the predicate its prepared launch uses; its standalone adapter
+declines them in `check_support()`. Before, the row ranked such a graph and the
+adapter declined it at build.
 
 ### SM100/SM103 large-head backward native dense strides
 

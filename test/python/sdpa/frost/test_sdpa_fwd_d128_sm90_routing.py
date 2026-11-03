@@ -120,6 +120,65 @@ def test_row_and_picker_offer_the_128_tile_at_the_same_head_dims():
         assert (engines.mismatch(row, facts, d128) is None) == (c.pick_flavor(d_qk, d_v, c.FLAVORS) == c.D128_FLAVOR), (d_qk, d_v)
 
 
+# --- Outer-stride alignment on the row (the #2038 row check, with config_sm90.dense_bind_strides) -------
+
+
+class _Port:
+    """A half graph tensor as mismatch() reads one: dims, strides and data type, no graph needed."""
+
+    def __init__(self, dim, stride):
+        import cudnn
+
+        self._dim, self._stride, self._dtype = tuple(dim), tuple(stride), cudnn.data_type.HALF
+
+    def get_dim(self):
+        return list(self._dim)
+
+    def get_stride(self):
+        return list(self._stride)
+
+    def get_data_type(self):
+        return self._dtype
+
+
+def _bshd_ports(d, pitch=None, role=None, b=2, h=8, s=512):
+    """Q/K/V/O descriptors at (b, h, s, d), BSHD-physical; ``role`` gets a token pitch of ``pitch`` elements instead of d."""
+    ports = {}
+    for name in ("q", "k", "v", "o"):
+        p = pitch if name == role else d
+        ports[name + "_t"] = _Port((b, h, s, d), (s * h * p, p, h * p, 1))
+    return ports
+
+
+@pytest.mark.parametrize("d", [128, 512], ids=["d128", "d512"])
+@pytest.mark.parametrize("role", ["q", "k", "v", "o"])
+def test_the_row_declines_outer_strides_off_16_bytes(d, role):
+    """The SM90 adapter binds Q/K/V/O as TMA maps and refuses, in check_support, a dense pitch that is not a 16-byte
+    multiple. The row now declines it too, on both flavors, through the predicate the SM90 prepared launch uses
+    (config_sm90.dense_bind_strides), as the SM100, SM107 and SM120 rows do since #2038. An 8-byte pad (d + 4 half
+    elements) is declined by name; a 16-byte pad (d + 8) is served."""
+    from cudnn.sdpa.fwd import engines
+
+    reason = engines.mismatch(_caps(), _facts(d, **_bshd_ports(d, pitch=d + 4, role=role)))
+    assert (reason or "").startswith(
+        f"{role}: native dense forward requires contiguous D, non-overlapping B/H/S strides and 16-byte outer-stride alignment"
+    ), reason
+    assert engines.mismatch(_caps(), _facts(d, **_bshd_ports(d, pitch=d + 8, role=role))) is None
+
+
+def test_the_row_stride_check_reads_only_declared_dense_ports():
+    """Controls: a unit batch axis's stride is never stepped, so an odd one is served (config_sm90 pins it to D, as the
+    adapter does); a pure-fact probe with no descriptors is not judged; a THD graph keeps its own packed-layout checks."""
+    from cudnn.sdpa.fwd import engines
+
+    ports = _bshd_ports(128, b=1)
+    ports["q_t"] = _Port((1, 8, 512, 128), (12345, 128, 8 * 128, 1))
+    assert engines.mismatch(_caps(), _facts(128, b=1, **ports)) is None
+    assert engines.mismatch(_caps(), _facts(128)) is None
+    thd = _bshd_ports(512, pitch=516, role="q")
+    assert "16-byte outer-stride" not in (engines.mismatch(_caps(), _facts(512, thd=True, padded=True, **thd)) or "")
+
+
 # --- Tile domains per flavor (tile_ms_by_d_shape / tile_ns_by_d_shape) -------
 
 

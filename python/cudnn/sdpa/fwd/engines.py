@@ -2439,9 +2439,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     elif "bshd" in capabilities.layouts and not facts.bshd_layout:
         return "Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
 
-    if not facts.thd and capabilities.sm_lo in (100, 107, 120):
+    if not facts.thd and capabilities.sm_lo in (90, 100, 107, 120):
         from cudnn.graph_types import storage_geometry, storage_slot_bytes
-        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        if capabilities.sm_lo == 90:
+            # The SM90 adapter binds the same TMA maps and refuses the same pitches in check_support.
+            from cudnn.sdpa.fwd.config_sm90 import dense_bind_strides
+        else:
+            from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
         for role in ("q", "k", "v", "o"):
             if facts.has_paged_kv and role in ("k", "v"):
