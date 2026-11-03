@@ -3105,13 +3105,13 @@ def test_bwd_same_graph_two_streams(backend, variant, dtype, monkeypatch):
         execute_graph = module.execute_graph
         workspace_records = []
 
-        def record_workspace(graph_arg, variant_pack, workspace, handle):
+        def record_workspace(graph_arg, variant_pack, workspace, handle, context=None):
             """Record the launch stream and scratch address before real execution."""
             if graph_arg is graph:
                 # Retain both tensors until the paired launches complete, so
                 # allocator reuse cannot obscure whether they overlap.
                 workspace_records.append((int(torch.cuda.current_stream().cuda_stream), workspace))
-            return execute_graph(graph_arg, variant_pack, workspace, handle)
+            return execute_graph(graph_arg, variant_pack, workspace, handle, context)
 
         monkeypatch.setattr(module, "execute_graph", record_workspace)
 
