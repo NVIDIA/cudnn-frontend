@@ -666,7 +666,7 @@ causal, dense padding, deterministic requests, bias / dBias, sink / dSink.
 `test_sdpa_bwd_d192_accum_sm100.py` and `test_sdpa_bwd_d192_accum_thd_sm100.py`
 exercise the real graph/standalone routes and FP64 gradients. The default d256
 row retains its broader dense and THD D192x128 contract; this opt-in half row
-adds a low-workspace MHA choice. Per-tensor FP8 THD remains declined.
+adds a low-workspace MHA choice and lists after the d256 row on dense graphs. Per-tensor FP8 THD remains declined.
 
 The opt-in **per-tensor FP8 backward rows** (`sdpa_bwd_sm100_d128_fp8`, slot 11;
 `sdpa_bwd_sm100_d192_fp8`, slot 13) take E4M3 Q/K/V/O/dO with the per-tensor

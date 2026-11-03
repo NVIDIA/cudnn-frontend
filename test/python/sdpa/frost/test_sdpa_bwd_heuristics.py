@@ -138,6 +138,19 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
 
 
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["cc10.0", "cc10.3"])
+def test_sm100_d256_row_lists_ahead_of_the_d192_half_row_on_dense_graphs(monkeypatch, cc):
+    """With the opt-in d192 half row offered too, a half-precision (192, 128) MHA backward lists the d256 row (its native
+    192/128 geometry) before the d192 accumulation row on a dense graph, and the d192 THD row first on a packed one."""
+    monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    offered = {**_OFFERED, "sdpa_bwd_sm100_d192": 20612}
+    base = dict(d_qk=192, d_v=128, h_q=16, h_kv=16, dtype=cudnn.data_type.BFLOAT16, device_cc=cc)
+    thd = dict(thd=True, max_total_seq_len_q=2 * 256, max_total_seq_len_kv=2 * 256)
+    for causal in (False, True):
+        assert [p.engine_id for p in recommend("A", _facts(**base, causal=causal), offered)] == [20607, 20612], causal
+        assert [p.engine_id for p in recommend("A", _facts(**base, causal=causal, **thd), offered)] == [20612, 20607], causal
+
+
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7"])
 def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
     """The d128 row (slot 9 -> 20609) lists one knob-less entry for a dense MHA graph on every cc of its sm range (the recompute body serves
