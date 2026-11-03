@@ -4,7 +4,9 @@
 """Host entry of the fused Gated DeltaNet VERIFY step (``kernel/gdn_verify_fused_f16.py``): validation with typed declines, the
 plan-time compile and the launch.  No DSL import at module level -- the CuTe DSL is imported inside :meth:`GdnVerifyFused.compile`
 after the version / architecture gate (python/cudnn/AGENTS.md Rule 7), so a host without it can still construct the entry and run
-its declines.
+its declines.  The binding checks (:func:`check_binding`: dtype, device, shape, stride and alignment of every operand against the step
+shape) run at compile time and again before EVERY launch -- the compile key pins the plan-time facts only, and a compiled DSL entry
+accepts a tensor of another dtype or footprint silently, so the host is a launch's only guard.
 
 The call contract is the FlashInfer Qwen 3.5 GDN block's verify form (its argument names and layouts), so an A/B against the
 reference kernel (FlashInfer's built-in ``frost`` verify backend) is a one-line swap: ``entry(qkv, z, hidden, ba_weight, A_log, dt_bias, ssm_state, state_indices,
@@ -64,6 +66,8 @@ SUPPORTED_CC_MAJOR = 10  # SM100-class parts (compute capability 10.x); the DSL'
 SUPPORTED_CC_TEXT = "10.x"
 DSL_FLOOR = (4, 8, 0)
 NAME = "the fused GDN verify step"
+#: the launch is grid ``(48, requests, 1)`` (``kernel/gdn_verify_fused_f16.py``), one grid row per request: CUDA caps grid Y at 65535
+MAX_REQUESTS = 65535
 
 
 def cc_supported(cc) -> bool:
@@ -170,7 +174,7 @@ def step_shape(state_indices) -> Tuple[int, int]:
     return int(state_indices.shape[0]), int(state_indices.shape[1])
 
 
-def check_support(
+def check_binding(
     qkv,
     z,
     hidden,
@@ -187,15 +191,16 @@ def check_support(
     conv_weight,
     out=None,
     out_bf16=None,
-    device_cc=None,
     cfg: Optional[Cfg] = None,
     rows: Optional[int] = None,
 ) -> None:
-    """Typed declines, before any DSL import: ``NotImplementedError`` for a geometry / layout / architecture / step shape this kernel
-    does not serve, ``TypeError`` for a dtype, ``ValueError`` for an inconsistent shape, stride or alignment.  ``device_cc`` overrides
-    the compute-capability probe (tests); ``cfg`` (resolved) bounds the tokens per request by its shared-memory budget; ``rows`` (the
-    step's token rows, ``>= cu_seqlens[requests]`` by the caller's contract) bounds the row operands and the outputs for a ragged or padded
-    step instead of ``requests x T``."""
+    """The binding checks, run at compile time AND before every launch: ``TypeError`` for a dtype (or a non-tensor), ``ValueError`` for
+    an inconsistent shape, stride, alignment or device, ``NotImplementedError`` for a geometry / layout / step shape this kernel does not
+    serve.  The compile key pins the plan-time facts only (the step shape, the strides the kernel is specialized on, the parameter
+    dtypes, the config), and a compiled DSL entry accepts a tensor of another dtype or footprint silently, so these checks are a launch's
+    only guard; host-only metadata arithmetic, no device work.  ``cfg`` (resolved) bounds the tokens per request by its shared-memory
+    budget; ``rows`` (the step's token rows, ``>= cu_seqlens[requests]`` by the caller's contract) bounds the row operands and the outputs
+    for a ragged or padded step instead of ``requests x T``.  :func:`check_support` adds the architecture gate."""
     import torch
 
     tensors = dict(
@@ -251,6 +256,8 @@ def check_support(
     requests, tokens = step_shape(state_indices)
     if requests < 1:
         raise ValueError(f"{NAME}: state_indices must hold at least one request; got {tuple(state_indices.shape)}")
+    if requests > MAX_REQUESTS:
+        raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_REQUESTS} (CUDA's grid Y limit); got requests={requests}")
     if state_indices.stride(1) != 1:
         raise NotImplementedError(f"{NAME} needs the tokens of a request contiguous in state_indices; got strides {tuple(state_indices.stride())}")
     validate_tokens(cfg if cfg is not None else CFG, tokens)
@@ -317,6 +324,55 @@ def check_support(
     for name, t in tensors.items():
         if t.numel() > 1:  # every multi-element operand is declared 16-byte aligned to the kernel (_flat); a one-element scale is not
             _check_aligned(name, t)
+
+
+def check_support(
+    qkv,
+    z,
+    hidden,
+    ba_weight,
+    A_log,
+    dt_bias,
+    ssm_state,
+    state_indices,
+    cu_seqlens,
+    num_accepted_tokens,
+    norm_weight,
+    out_scale,
+    conv_state,
+    conv_weight,
+    out=None,
+    out_bf16=None,
+    device_cc=None,
+    cfg: Optional[Cfg] = None,
+    rows: Optional[int] = None,
+) -> None:
+    """Typed declines, before any DSL import: the binding checks of :func:`check_binding` (``cfg`` / ``rows`` as there) plus the
+    architecture gate (``NotImplementedError`` for a part this kernel does not serve).  ``device_cc`` overrides the compute-capability
+    probe (tests)."""
+    import torch
+
+    check_binding(
+        qkv,
+        z,
+        hidden,
+        ba_weight,
+        A_log,
+        dt_bias,
+        ssm_state,
+        state_indices,
+        cu_seqlens,
+        num_accepted_tokens,
+        norm_weight,
+        out_scale,
+        conv_state,
+        conv_weight,
+        out,
+        out_bf16,
+        cfg=cfg,
+        rows=rows,
+    )
+    dev = qkv.device
     if device_cc is None and dev.type != "cuda":
         raise NotImplementedError(f"{NAME} serves CUDA tensors only; the operands are on {dev}")
     cc = tuple(torch.cuda.get_device_capability(dev)) if device_cc is None else tuple(device_cc)
@@ -594,10 +650,34 @@ class GdnVerifyFused:
     ):
         """Launch on torch's current stream; returns the fp8 output (``out`` when given, else the entry's buffer for this step
         shape; ``outputs(requests, tokens)`` holds the entry's buffers).  Compiles on first use for a new key (``rows`` as in
-        :meth:`compile`)."""
+        :meth:`compile`).  Every launch re-runs the binding checks (:func:`check_binding`, against the form picked for this requests
+        count) before the compiled kernel sees the pointers: the key pins no dtype, shape or alignment, and the DSL checks none."""
         import cuda.bindings.driver as cuda
         import torch
 
+        cfg = None
+        if isinstance(state_indices, torch.Tensor) and state_indices.dim() == 2 and state_indices.shape[0] >= 1:
+            cfg = self.cfg_for(int(state_indices.shape[0]))  # the picked form bounds the tokens per request; a malformed table is check_binding's decline
+        check_binding(
+            qkv,
+            z,
+            hidden,
+            ba_weight,
+            A_log,
+            dt_bias,
+            ssm_state,
+            state_indices,
+            cu_seqlens,
+            num_accepted_tokens,
+            norm_weight,
+            out_scale,
+            conv_state,
+            conv_weight,
+            out,
+            out_bf16,
+            cfg=cfg,
+            rows=rows,
+        )
         key = self.key(qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state)
         if key not in self.compiled:
             self.compile(

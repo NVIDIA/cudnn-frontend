@@ -457,6 +457,7 @@ def test_state_box_bank_map_is_conflict_free_at_every_tpr():
         (lambda o: dict(state_indices=torch.ones(8, dtype=torch.int32)), NotImplementedError, "state_indices"),
         (lambda o: dict(state_indices=torch.ones(2, 4, dtype=torch.int64)), TypeError, "state_indices"),
         (lambda o: dict(state_indices=torch.ones(4, 2, dtype=torch.int32).T), NotImplementedError, "contiguous in state_indices"),
+        (lambda o: dict(state_indices=torch.ones(entry.MAX_REQUESTS + 1, 4, dtype=torch.int32)), NotImplementedError, "65535"),  # CUDA's grid Y limit
         (
             lambda o: dict(state_indices=torch.ones(2, 1, dtype=torch.int32), conv_state=torch.zeros(5, 3, 10240, dtype=torch.bfloat16).transpose(1, 2)),
             NotImplementedError,
@@ -539,6 +540,37 @@ def test_declines_an_unserved_compute_capability_by_name():
 def test_declines_cpu_operands_when_no_capability_is_given():
     with pytest.raises(NotImplementedError, match="CUDA tensors only"):
         call_check(make_operands(), device_cc=None)
+
+
+def test_every_launch_re_checks_the_binding():
+    """A compiled DSL entry accepts a tensor of another dtype or footprint silently, so the entry re-runs the binding checks on every
+    launch, before the compiled kernel sees the pointers: with a kernel planted under the binding's compile key (the step shape, the
+    strides, the parameter dtypes, the config -- none of these mutations changes it), a mismatched operand is a typed decline, never a
+    launch; the caller's output slots are checked too."""
+    k = entry.GdnVerifyFused("cpu", 1e-6)
+    ops = make_operands(requests=2, tokens=4)
+    key = _key(k, ops)
+
+    def launched(*args):
+        raise AssertionError("the planted kernel was launched on a mismatched binding")
+
+    k.compiled[key] = launched
+    for mutation, exc, token in (
+        (dict(hidden=ops["hidden"].to(torch.float16)), TypeError, "hidden"),  # a dtype the key does not carry
+        (dict(cu_seqlens=ops["cu_seqlens"][:2]), ValueError, "cu_seqlens"),  # fewer than requests + 1 offsets
+        (dict(conv_weight=torch.zeros(10240, 3, dtype=torch.bfloat16)), NotImplementedError, "conv_weight"),
+        (dict(norm_weight=torch.ones(136, dtype=torch.bfloat16)[1:129]), ValueError, "norm_weight"),  # the right shape at a 2-byte offset
+    ):
+        bad = dict(ops, **mutation)
+        assert _key(k, bad) == key, "the mutation keeps the compile key: only the launch check sees it"
+        with pytest.raises(exc, match=token):
+            _run(k, bad)
+    with pytest.raises(TypeError, match="out"):
+        _run(k, ops, out=torch.zeros(8, 48, 128, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="out_bf16"):
+        _run(k, ops, out_bf16=torch.zeros(4, 48, 128, dtype=torch.bfloat16))  # fewer rows than the step
+    with pytest.raises(ValueError, match="rows"):
+        k(**ops, rows=0)
 
 
 def test_declines_a_dsl_below_the_floor_by_version(monkeypatch):

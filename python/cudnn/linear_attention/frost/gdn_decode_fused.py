@@ -4,7 +4,9 @@
 """Host entry of the fused Gated DeltaNet DECODE step (``kernel/gdn_decode_fused_f16.py``): validation with typed declines, the
 plan-time compile and the launch.  No DSL import at module level -- the CuTe DSL is imported inside :meth:`GdnDecodeFused.compile`
 after the version / architecture gate (python/cudnn/AGENTS.md Rule 7), so a host without it can still construct the entry and run
-its declines.
+its declines.  The binding checks (:func:`check_binding`: dtype, device, shape, stride and alignment of every operand against
+``rows``) run at compile time and again before EVERY launch -- the compile key pins the plan-time facts only, and a compiled DSL
+entry accepts a tensor of another dtype or footprint silently, so the host is a launch's only guard.
 
 Served geometry (declined otherwise, by name): the checkpoint constants of ``kernel/gdn_decode_fused_config.py`` -- the QKV slab
 ``x`` [rows, 10240] bf16 (a row-strided view is fine), the conv state ``cs`` [slots, 10240, 3] bf16 with channel-contiguous taps or
@@ -51,6 +53,8 @@ SUPPORTED_CC_MAJOR = 10  # SM100-class parts (compute capability 10.x); the DSL'
 SUPPORTED_CC_TEXT = "10.x"
 DSL_FLOOR = (4, 8, 0)
 NAME = "the fused GDN decode step"
+#: the launch is grid ``(48, rows, 1)`` (``kernel/gdn_decode_fused_f16.py``), one grid row per request: CUDA caps grid Y at 65535
+MAX_ROWS = 65535
 
 
 def cc_supported(cc) -> bool:
@@ -133,16 +137,20 @@ def _check_aligned(name, t) -> None:
         raise ValueError(f"{NAME}: {name} must start at a 16-byte aligned address for its 128-bit loads, got data_ptr % 16 = {t.data_ptr() % 16}")
 
 
-def check_support(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw, device_cc=None) -> None:
-    """Typed declines, before any DSL import: ``NotImplementedError`` for a geometry / layout / architecture this kernel does not
-    serve, ``TypeError`` for a dtype, ``ValueError`` for an inconsistent shape, stride or alignment.  ``device_cc`` overrides the
-    compute-capability probe (tests)."""
+def check_binding(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw) -> None:
+    """The binding checks, run at compile time AND before every launch: ``TypeError`` for a dtype (or a non-tensor), ``ValueError`` for
+    an inconsistent shape, stride, alignment or device, ``NotImplementedError`` for a geometry / layout / rows count this kernel does not
+    serve.  The compile key pins the plan-time facts only (rows, the strides the kernel is specialized on, the config), and a compiled
+    DSL entry accepts a tensor of another dtype or footprint silently, so these checks are a launch's only guard; host-only metadata
+    arithmetic, no device work.  :func:`check_support` adds the architecture gate."""
     import torch
 
     if not isinstance(rows, int) or rows < 1:
         raise ValueError(f"{NAME}: rows must be a positive int, got {rows!r}")
+    if rows > MAX_ROWS:
+        raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_ROWS} (CUDA's grid Y limit); got rows={rows}")
     tensors = dict(x=x, cs=cs, cw=cw, al=al, dt=dt, state=state, idx=idx, z=z, w=w, scale=scale, hidden=hidden, baw=baw)
-    dev = x.device
+    dev = x.device if isinstance(x, torch.Tensor) else None
     for name, t in tensors.items():
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"{NAME}: {name} must be a torch.Tensor, got {type(t).__name__}")
@@ -201,6 +209,15 @@ def check_support(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw,
     for name, t in tensors.items():
         if t.numel() > 1:  # every multi-element operand is declared 16-byte aligned to the kernel (_flat); a one-element scale is not
             _check_aligned(name, t)
+
+
+def check_support(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw, device_cc=None) -> None:
+    """Typed declines, before any DSL import: the binding checks of :func:`check_binding` plus the architecture gate
+    (``NotImplementedError`` for a part this kernel does not serve).  ``device_cc`` overrides the compute-capability probe (tests)."""
+    import torch
+
+    check_binding(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw)
+    dev = x.device
     if device_cc is None and dev.type != "cuda":
         raise NotImplementedError(f"{NAME} serves CUDA tensors only; the operands are on {dev}")
     cc = tuple(torch.cuda.get_device_capability(dev)) if device_cc is None else tuple(device_cc)
@@ -359,10 +376,13 @@ class GdnDecodeFused:
 
     def __call__(self, rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw):
         """Launch on torch's current stream; returns the fp8 ``qout`` [rows, 48, 128] for the out projection (``outputs(rows)``
-        holds ``out`` and ``counts``).  Compiles on first use for a new (rows, strides)."""
+        holds ``out`` and ``counts``).  Compiles on first use for a new (rows, strides).  Every launch re-runs the binding checks
+        (:func:`check_binding`) before the compiled kernel sees the pointers: the key pins no dtype, shape or alignment, and the DSL
+        checks none."""
         import cuda.bindings.driver as cuda
         import torch
 
+        check_binding(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw)
         key = self.key(rows, x, cs, state, z)
         if key not in self.compiled:
             self.compile(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw)

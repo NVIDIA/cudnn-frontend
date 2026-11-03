@@ -290,6 +290,7 @@ def test_state_box_bank_map_is_conflict_free_at_every_tpr():
         (lambda o: dict(hidden=torch.zeros(ROWS, 4096, dtype=torch.bfloat16)), NotImplementedError, "hidden"),
         (lambda o: dict(baw=torch.zeros(96, 4096, dtype=torch.bfloat16)), NotImplementedError, "BA weight"),
         (lambda o: dict(rows=0), ValueError, "rows"),
+        (lambda o: dict(rows=entry.MAX_ROWS + 1), NotImplementedError, "65535"),  # one grid row per request: CUDA's grid Y limit
     ],
 )
 def test_typed_declines_name_the_operand(mutation, exc, token):
@@ -310,6 +311,31 @@ def test_declines_an_unserved_compute_capability_by_name():
 def test_declines_cpu_operands_when_no_capability_is_given():
     with pytest.raises(NotImplementedError, match="CUDA tensors only"):
         call_check(make_operands(), device_cc=None)
+
+
+def test_every_launch_re_checks_the_binding():
+    """A compiled DSL entry accepts a tensor of another dtype or footprint silently, so the entry re-runs the binding checks on every
+    launch, before the compiled kernel sees the pointers: with a kernel planted under the binding's compile key (rows, strides, the
+    config -- none of these mutations changes it), a mismatched operand is a typed decline, never a launch."""
+    k = entry.GdnDecodeFused("cpu", 1e-6)
+    ops = make_operands()
+    key = k.key(ROWS, ops["x"], ops["cs"], ops["state"], ops["z"])
+
+    def launched(*args):
+        raise AssertionError("the planted kernel was launched on a mismatched binding")
+
+    k.compiled[key] = launched
+    for mutation, exc, token in (
+        (dict(hidden=ops["hidden"].to(torch.float16)), TypeError, "hidden"),  # a dtype the key does not carry
+        (dict(idx=ops["idx"][:1]), ValueError, "idx"),  # fewer slots than rows
+        (dict(w=torch.ones(128 + 8, dtype=torch.bfloat16)[1:129]), ValueError, "w"),  # the right shape at a 2-byte offset: misaligned
+        (dict(cw=torch.zeros(10240, 3, dtype=torch.bfloat16)), NotImplementedError, "conv weight"),
+        (dict(state=ops["state"].cpu().to("meta")), ValueError, "one device"),
+    ):
+        bad = dict(ops, **mutation)
+        assert k.key(ROWS, bad["x"], bad["cs"], bad["state"], bad["z"]) == key, "the mutation keeps the compile key: only the launch check sees it"
+        with pytest.raises(exc, match=token):
+            _run(k, bad)
 
 
 def test_declines_a_dsl_below_the_floor_by_version(monkeypatch):

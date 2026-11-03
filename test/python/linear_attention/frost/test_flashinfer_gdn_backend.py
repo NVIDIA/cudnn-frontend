@@ -193,6 +193,7 @@ def test_dsl_gate_is_a_dsl_decline(monkeypatch, form):
 
 
 def test_row_envelope(as_sm100):
+    assert backend.DECODE_MAX_ROWS == entry.MAX_ROWS == 65535, "one source: the entry's own bound (its check_support declines past it)"
     assert _probe("cuda:0").served and _probe("cuda:0", requests=1).served
     assert _probe("cuda:0", requests=backend.DECODE_MAX_ROWS, tokens_per_request=1).served
     sup = _probe("cuda:0", requests=backend.DECODE_MAX_ROWS + 1)
@@ -225,6 +226,7 @@ def test_verify_step_shape_envelope(as_sm100):
         assert (sup.served, sup.kind) == (False, "shape") and token in sup.reason and f"tokens_per_request={tokens}" in sup.reason, (requests, tokens, sup)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=1)
     assert (sup.served, sup.kind) == (False, "shape") and "decode form" in sup.reason, sup
+    assert backend.VERIFY_MAX_REQUESTS == ventry.MAX_REQUESTS == 65535, "one source: the entry's own bound"
     sup = _probe("cuda:0", "verify", requests=backend.VERIFY_MAX_REQUESTS + 1, tokens_per_request=4)
     assert (sup.served, sup.kind) == (False, "shape") and str(backend.VERIFY_MAX_REQUESTS) in sup.reason, sup
     assert (
@@ -314,6 +316,32 @@ def test_verify_runner_maps_flashinfer_inputs_onto_the_entry_call_contract():
     assert runner.kernel.compiled is not backend._shared_compiled(_spec(rows=2))
     bf16 = fi_api.bind_inputs(spec, **dict(t, out_bf16=torch.empty(8, 48, 128, dtype=BF16)))
     assert runner._kwargs(bf16)["out_bf16"] is bf16.out_bf16
+
+
+def test_runner_launch_re_checks_the_binding():
+    """FlashInfer's ``bind_inputs`` checks dtypes and shapes; the entries re-check the whole binding (alignment and layout too) on every
+    launch, before the compiled kernel sees the pointers: with a kernel planted under the binding's compile key, a misaligned operand is a
+    typed decline at ``run``, never a launch -- on both runners."""
+
+    def launched(*args):
+        raise AssertionError("the planted kernel was launched on a mismatched binding")
+
+    spec = _spec(rows=2)
+    x = fi_api.bind_inputs(spec, **_tensors(2, CPU))
+    runner = backend.FrostFeDecodeRunner(spec)
+    args = runner._args(x)
+    runner.kernel.compiled[runner.kernel.key(args[0], args[1], args[2], args[6], args[8])] = launched
+    with pytest.raises(ValueError, match="norm weight|aligned"):
+        runner.run(replace(x, norm_weight=torch.ones(136, dtype=BF16)[1:129]))  # the right dtype and shape at a 2-byte offset
+    vspec = _spec(form="verify", rows=2, tokens=4)
+    vx = fi_api.bind_inputs(vspec, **_verify_tensors(2, 4, CPU))
+    vrunner = backend.FrostFeVerifyRunner(vspec)
+    kw = vrunner._kwargs(vx)
+    vrunner.kernel.compiled[
+        vrunner.kernel.key(kw["qkv"], kw["z"], kw["A_log"], kw["dt_bias"], kw["ssm_state"], kw["state_indices"], kw["norm_weight"], kw["conv_state"])
+    ] = launched
+    with pytest.raises(ValueError, match="norm_weight"):
+        vrunner.run(replace(vx, norm_weight=torch.ones(136, dtype=BF16)[1:129]))
 
 
 def test_support_probe_loads_no_kernel_module():

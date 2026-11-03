@@ -79,10 +79,11 @@ BACKEND = "frost_fe"
 DECODE = "decode"
 VERIFY = "verify"
 FORMS = (DECODE, VERIFY)
-#: the decode launch is grid ``(48, rows, 1)`` (``kernel/gdn_decode_fused_f16.py``): CUDA caps grid Y at 65535
-DECODE_MAX_ROWS = 65535
-#: the verify launch is grid ``(48, requests, 1)`` (``kernel/gdn_verify_fused_f16.py``): the same cap, one grid row per request
-VERIFY_MAX_REQUESTS = 65535
+#: the decode launch is grid ``(48, rows, 1)``: CUDA caps grid Y at 65535 -- the entry's own bound (``gdn_decode_fused.MAX_ROWS``; its
+#: ``check_support`` declines past it), so the probe and the direct entry answer alike
+DECODE_MAX_ROWS = _decode.MAX_ROWS
+#: the verify launch is grid ``(48, requests, 1)``: the same cap, one grid row per request (``gdn_verify_fused.MAX_REQUESTS``)
+VERIFY_MAX_REQUESTS = _verify.MAX_REQUESTS
 #: the one geometry both kernels are written for, in FlashInfer's ``Qwen35GdnGeometry`` field names (the configs' checkpoint constants)
 GEOMETRY: Dict[str, int] = dict(d_model=HIDDEN, num_v_heads=V_HEADS, num_k_heads=K_HEADS, head_k_dim=HEAD_DIM, head_v_dim=HEAD_DIM, conv_kernel=CONV_WIDTH)
 _PARAM_DTYPE_NAMES = ("torch.float32", "torch.bfloat16", "torch.bfloat16")  # (A_log, dt_bias, norm_weight), the decode kernel's native dtypes
