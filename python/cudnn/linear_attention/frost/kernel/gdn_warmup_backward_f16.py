@@ -94,6 +94,8 @@ def frost_gdn_regenerate_prologue(
     seed_span_chunks: cutlass.Int32,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Four-CTA prologue of the regenerate path, the recompute's and the bprop's prologues in one launch: block 0 the
     recompute's item phase (the interval items under ``coarse``, the LPT order under ``recompute_orders``), block 1 the
@@ -214,6 +216,8 @@ def frost_gdn_regenerate_prologue(
                 expand_num,
                 k_slots=k_slots,
                 v_slots=v_slots,
+                dk_slots=dk_slots,
+                dv_slots=dv_slots,
             )
         else:
             gdn_bprop_f16.build_descs_body(
@@ -244,6 +248,8 @@ def frost_gdn_regenerate_prologue(
                 expand_num,
                 k_slots=k_slots,
                 v_slots=v_slots,
+                dk_slots=dk_slots,
+                dv_slots=dv_slots,
             )
 
 
@@ -322,6 +328,8 @@ def warmup_backward_host(
     stream: cuda.CUstream,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     if cutlass.const_expr(tinv_pass):
         gdn_tinv_f16.host(tinv_cfg, True, k, tinv_words, gate, a_log, dt_bias, beta, cu_seqlens, tinv, tinv_rows, tinv_row_count, stream)
@@ -360,12 +368,41 @@ def warmup_backward_host(
         )
         if cutlass.const_expr(compact_qdo):
             base_q, base_k, base_v, base_do, base_checkpoint, base_dq, base_dk, base_dv = bprop.base_descriptors(
-                io_dtype, b_t, q, k, v, do, dq, dk, dv, checkpoints, expand_num=expand_num, k_slots=k_slots, v_slots=v_slots
+                io_dtype,
+                b_t,
+                q,
+                k,
+                v,
+                do,
+                dq,
+                dk,
+                dv,
+                checkpoints,
+                expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
+                dk_slots=dk_slots,
+                dv_slots=dv_slots,
             )
             base_tinv = base_k
         else:
             base_q, base_k, base_v, base_do, base_checkpoint, base_dq, base_dk, base_dv, base_tinv = bprop.base_descriptors(
-                io_dtype, b_t, q, k, v, do, dq, dk, dv, checkpoints, tinv, expand_num=expand_num, k_slots=k_slots, v_slots=v_slots
+                io_dtype,
+                b_t,
+                q,
+                k,
+                v,
+                do,
+                dq,
+                dk,
+                dv,
+                checkpoints,
+                tinv,
+                expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
+                dk_slots=dk_slots,
+                dv_slots=dv_slots,
             )
         frost_gdn_regenerate_prologue(
             compact_qdo,
@@ -416,6 +453,8 @@ def warmup_backward_host(
             seed_span_chunks,
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
         ).launch(grid=(4, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
         gdn_recompute_f16.host(
             recompute_cfg,
@@ -461,6 +500,8 @@ def warmup_backward_host(
             stream,
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
         )
     else:
         bprop.prologue(
@@ -487,6 +528,8 @@ def warmup_backward_host(
             stream,
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
         )
 
 
@@ -569,6 +612,8 @@ def build_warmup_backward(
     cu_align = 8 if str(cu_seqlens.dtype).endswith("int64") else 4
     k_slots = family_slots(k, expand_num, 3)
     v_slots = family_slots(v, expand_num, 3)
+    dk_slots = family_slots(dk, expand_num, 3)
+    dv_slots = family_slots(dv, expand_num, 3)
     beta_slots = family_slots(beta, expand_num, 2)
     key = (
         str(q.dtype),
@@ -603,6 +648,10 @@ def build_warmup_backward(
         k_slots,
         v_slots,
         beta_slots,
+        len(dk.shape),
+        len(dv.shape),
+        dk_slots,
+        dv_slots,
     )
     if key not in warmup_backward_cache:
         tinv_cfg = None
@@ -706,8 +755,8 @@ def build_warmup_backward(
             from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=len(dk.shape) - 1),
+            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=len(dv.shape) - 1),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             gate_table_placeholder,
             from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=len(beta.shape) - 1),
@@ -744,6 +793,8 @@ def build_warmup_backward(
             cuda.CUstream(int(stream)),
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return warmup_backward_cache[key], facts

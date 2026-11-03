@@ -40,7 +40,7 @@ from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
 from ..common.host import family_slots
-from ..common.thd import expanded_view
+from ..common.thd import expanded_view, family_descriptor
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
 from . import gdn_bprop_f16, gdn_bprop_summary_f16, gdn_prefill_f16, gdn_recompute_f16, gdn_summary_f16, gdn_tinv_f16, gdp_bprop_v64_f16
 
@@ -108,6 +108,8 @@ def frost_gdn_chain_prologue(
     tinv: Optional[cute.Tensor],
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -341,6 +343,8 @@ def frost_gdn_chain_prologue(
                     expand_num,
                     k_slots=k_slots,
                     v_slots=v_slots,
+                    dk_slots=dk_slots,
+                    dv_slots=dv_slots,
                 )
             else:
                 gdn_bprop_f16.build_descs_body(
@@ -371,6 +375,8 @@ def frost_gdn_chain_prologue(
                     expand_num,
                     k_slots=k_slots,
                     v_slots=v_slots,
+                    dk_slots=dk_slots,
+                    dv_slots=dv_slots,
                 )
 
 
@@ -422,6 +428,8 @@ def chain_prologue(
     stream: cuda.CUstream,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     swizzle_128b = tma.TensorMapSwizzle.s128b
     # K / V (token, slot, head, dim) views, base maps (dim, head, slot, token) with the full-token-run box; recompute reads K as V
@@ -499,15 +507,9 @@ def chain_prologue(
             dq_headed, box_dims=(128 // (dq.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
         )
     if cutlass.const_expr(dk is not None):
-        dk_headed = cute.make_tensor(dk.iterator, cute.make_layout((dk.shape[2], dk.shape[1], dk.shape[0]), stride=(1, dk.stride[1], dk.stride[0])))
-        base_dk = tma.create_tensor_map_tiled_from_view(
-            dk_headed, box_dims=(128 // (dk.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
-        )
+        base_dk = family_descriptor(dk, b_t, dk_slots, expand_num)
     if cutlass.const_expr(dv is not None):
-        dv_headed = cute.make_tensor(dv.iterator, cute.make_layout((dv.shape[2], dv.shape[1], dv.shape[0]), stride=(1, dv.stride[1], dv.stride[0])))
-        base_dv = tma.create_tensor_map_tiled_from_view(
-            dv_headed, box_dims=(128 // (dv.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
-        )
+        base_dv = family_descriptor(dv, b_t, dv_slots, expand_num)
     if cutlass.const_expr(summary_q is not None):
         if cutlass.const_expr(summary_q_step > 1):
             summary_q_headed = cute.make_tensor(
@@ -599,6 +601,8 @@ def chain_prologue(
         tinv,
         k_slots,
         v_slots,
+        dk_slots,
+        dv_slots,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -658,6 +662,8 @@ def run_chain_prologue(
     series_span_chunks = int(series_span_tokens) // int(b_t)
     k_slots = family_slots(k, expand_num, 3)
     v_slots = family_slots(v, expand_num, 3) if v is not None else 1
+    dk_slots = family_slots(dk, expand_num, 3) if dk is not None else 1
+    dv_slots = family_slots(dv, expand_num, 3) if dv is not None else 1
     if "compiled" not in cache:
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
@@ -709,14 +715,16 @@ def run_chain_prologue(
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if do is not None else None,
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dq is not None else None,
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dk is not None else None,
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dv is not None else None,
+            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=len(dk.shape) - 1) if dk is not None else None,
+            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=len(dv.shape) - 1) if dv is not None else None,
             from_dlpack(summary_q, assumed_align=16).mark_layout_dynamic(leading_dim=2) if summary_q is not None else None,
             from_dlpack(summary_do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if summary_do is not None else None,
             from_dlpack(tinv, assumed_align=128).mark_layout_dynamic(leading_dim=3) if tinv is not None else None,
             cu_stream,
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     cache["compiled"](

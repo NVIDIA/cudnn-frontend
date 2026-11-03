@@ -210,6 +210,13 @@ def check_tma_strides(op_name, name, t) -> None:
         raise ValueError(f"{op_name}: {name} needs 16-byte aligned outer strides and base, got strides {tuple(strides)} (elements of {t.element_size()} bytes)")
 
 
+def empty_kv_grad(t: torch.Tensor) -> torch.Tensor:
+    """Keep head-major channel storage for [T, n, H, D] projection views, without their token padding."""
+    if t.ndim == 4 and t.stride(1) == t.shape[3] and t.stride(2) == t.shape[1] * t.shape[3]:
+        return t.new_empty((t.shape[0], t.shape[2], t.shape[1], t.shape[3])).transpose(1, 2)
+    return t.new_empty(t.shape)
+
+
 # ---------------------------------------------------------------------------
 # Forward graph builder
 # ---------------------------------------------------------------------------
@@ -969,6 +976,8 @@ def gdp_bwd(
         if d_final_state.dtype != dstate_dtype:
             raise TypeError(f"gated_delta_product: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
     dstate_in = d_final_state if d_final_state is not None else None
+    dk = empty_kv_grad(k_in)
+    dv = empty_kv_grad(v_in)
 
     from ..frost.common.host import family_slots
 
@@ -1005,7 +1014,7 @@ def gdp_bwd(
         device,
         plan_name,
         tuple(beta.shape),
-    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2))
+    ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), family_slots(dk, n, 3), family_slots(dv, n, 3))
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
             total,
@@ -1045,8 +1054,6 @@ def gdp_bwd(
     HO = max(H, HV)
     expanded = total * n
     dq = torch.empty(total, H, K, dtype=q.dtype, device=device)
-    dk = torch.empty(expanded, HK, K, dtype=q.dtype, device=device)
-    dv = torch.empty(expanded, HV, V, dtype=q.dtype, device=device)
     dg = torch.empty(total, HO, dtype=g.dtype, device=device)
     dbeta = torch.empty(expanded, HO, dtype=beta.dtype, device=device)
     variant_pack = {
@@ -1086,8 +1093,7 @@ def gdp_bwd(
     execute_graph(graph, variant_pack, workspace, handle)
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
-    # dk / dv / dbeta are dense in the expanded row order; the token-major input's shape is a free view of them
-    return dq, dk.view(k_in.shape), dv.view(v_in.shape), dg, dbeta.view(beta_in.shape), dstate0, d_a_log, d_dt_bias
+    return dq, dk, dv, dg, dbeta.view(beta_in.shape), dstate0, d_a_log, d_dt_bias
 
 
 @gdp_bwd.register_fake
@@ -1123,8 +1129,8 @@ def gdp_bwd_fake(
     d_dt_bias = torch.empty_like(dt_bias) if dt_bias is not None else q.new_empty(0, dtype=torch.float32)
     return (
         q.new_empty(q.shape),
-        q.new_empty(k.shape),
-        q.new_empty(v.shape),
+        empty_kv_grad(k),
+        empty_kv_grad(v),
         g.new_empty(g.shape),
         beta.new_empty(beta.shape),
         dstate0,
@@ -1311,7 +1317,8 @@ def gated_delta_product(
     projection (``[T, n * H * D]`` viewed as ``[T, n, H, D]``) go in without a
     copy.  Strides are read as given (a stride-1 innermost dim, 16-byte
     aligned outer strides); ``dk`` / ``dv`` / ``dbeta`` come back in the
-    input's shape.
+    input's shape. Head-major k / v views (physical ``[T, H, n, D]``) receive
+    head-major gradients, so swapping the head/update axes back is a view.
 
     ``num_householder == 1`` is exactly ``gated_delta_net``.  Dtypes are
     kernel-native and strict (callers convert).  ``g`` is float32, bfloat16

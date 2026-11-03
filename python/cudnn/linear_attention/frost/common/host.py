@@ -24,7 +24,7 @@ def get_dtype(dtype):
 
 def tensormap_workspace_bytes(mod, B: int, expand_num: int = 1) -> int:
     """Runtime TMA-descriptor block for a kernel module, its per-batch arrays plus 128 alignment slack.  A module whose
-    sub-token operands (k / v) load through the (token, slot) descriptor family declares ``TENSORMAP_FAMILY_OPERANDS``;
+    sub-token operands load or store through the (token, slot) descriptor family declares ``TENSORMAP_FAMILY_OPERANDS``;
     each of those takes ``expand_num + 1`` arrays instead of one when ``expand_num`` does not divide the 64-row chunk."""
     arrays = mod.TENSORMAP_DESC_ARRAYS + getattr(mod, "TENSORMAP_FAMILY_OPERANDS", 0) * (0 if 64 % expand_num == 0 else expand_num)
     return TENSOR_MAP_QWORDS * 8 * arrays * B + 128

@@ -124,6 +124,8 @@ from ..common.thd import (
     expanded_view,
     slot_view,
     tma_load_family,
+    tma_store_family,
+    family_descriptor,
     TENSOR_MAP_QWORDS,
 )
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
@@ -468,12 +470,15 @@ def tmastg_warp(
         head_o = head_idx
         slot = batch_idx * desc_qwords
         desc_dq_slot = (desc_dq_base + slot).tospace(cutlass.AddressSpace.generic)
-        desc_dk_slot = (desc_dk_base + slot).tospace(cutlass.AddressSpace.generic)
-        desc_dv_slot = (desc_dv_base + slot).tospace(cutlass.AddressSpace.generic)
+        arr_words = (cu_seqlens.shape[0] - 1) * desc_qwords
+        desc_dk_family = desc_dk_base + slot
+        desc_dv_family = desc_dv_base + slot
         if elect_one:
             tma_tensormap_acquire(desc_dq_slot)
-            tma_tensormap_acquire(desc_dk_slot)
-            tma_tensormap_acquire(desc_dv_slot)
+            for s in cutlass.range_constexpr(1 if cfg.b_t % cfg.dk_slots == 0 else cfg.dk_slots + 1):
+                tma_tensormap_acquire((desc_dk_family + s * arr_words).tospace(cutlass.AddressSpace.generic))
+            for s in cutlass.range_constexpr(1 if cfg.b_t % cfg.dv_slots == 0 else cfg.dv_slots + 1):
+                tma_tensormap_acquire((desc_dv_family + s * arr_words).tospace(cutlass.AddressSpace.generic))
 
         for rev_idx in cutlass.range(compute_end - write_start):
             chunk_idx = compute_end - 1 - rev_idx
@@ -482,9 +487,8 @@ def tmastg_warp(
             dv_idx = dv_index.idx
             bars.mb_dv_tmastg_ready[dv_idx].wait(dv_index.phase)
             dv_index = advance(dv_index, cfg.smem_dv_stages)
-            dv_slice = tma_slice_runtime_desc(desc_dv_slot, cutlass.Int32(0), head_o, tok_coord)
             if chunk_idx < write_end:
-                tma_store_tile(sdV_tma[dv_idx], dv_slice, acquire=False)
+                tma_store_family(sdV_tma[dv_idx], desc_dv_family, arr_words, head_o, chunk_idx, cutlass.Int32(0), cfg.b_t, cfg.dv_slots)
                 tma_store_commit()
 
             dq_idx = dq_index.idx
@@ -498,9 +502,8 @@ def tmastg_warp(
             dk_idx = dk_index.idx
             bars.mb_dk_tmastg_ready[dk_idx].wait(dk_index.phase)
             dk_index = advance(dk_index, cfg.smem_dk_stages)
-            dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_o, tok_coord)
             if chunk_idx < write_end:
-                tma_store_tile(sdK_tma[dk_idx], dk_slice, acquire=False)
+                tma_store_family(sdK_tma[dk_idx], desc_dk_family, arr_words, head_o, chunk_idx, cutlass.Int32(0), cfg.b_t, cfg.dk_slots)
                 tma_store_commit()
 
             tma_store_wait(2)
@@ -3254,6 +3257,8 @@ def build_descs_body(
     expand_num: cutlass.Constexpr[int],
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp). Runs inside the
     prologue kernel after its order pass; warps past the array count fall
@@ -3266,9 +3271,9 @@ def build_descs_body(
     sub3 = cute.make_tensor(desc_workspace.iterator + (1 + 2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
     sub4 = cute.make_tensor(desc_workspace.iterator + (2 + 2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
     sub5 = cute.make_tensor(desc_workspace.iterator + (3 + 2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub6 = cute.make_tensor(desc_workspace.iterator + (4 + 2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub7 = cute.make_tensor(desc_workspace.iterator + (5 + 2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub8 = cute.make_tensor(desc_workspace.iterator + (6 + 2 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
+    sub6 = cute.make_tensor(desc_workspace.iterator + (4 + 2 * family_arrays) * arr_words, cute.make_layout((family_arrays * arr_words,), stride=(1,)))
+    sub7 = cute.make_tensor(desc_workspace.iterator + (4 + 3 * family_arrays) * arr_words, cute.make_layout((family_arrays * arr_words,), stride=(1,)))
+    sub8 = cute.make_tensor(desc_workspace.iterator + (4 + 4 * family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
         emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, expand_num, lanes=32)
@@ -3291,10 +3296,10 @@ def build_descs_body(
         emit_seq_descs(base_dq, sub5, cu_seqlens, dq, n_batch, 2, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 6:
-        emit_seq_descs(base_dk, sub6, cu_seqlens, dk, n_batch, 2, expand_num, lanes=32)
+        emit_family_descs(base_dk, sub6, cu_seqlens, dk, n_batch, b_t, dk_slots, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 7:
-        emit_seq_descs(base_dv, sub7, cu_seqlens, dv, n_batch, 2, expand_num, lanes=32)
+        emit_family_descs(base_dv, sub7, cu_seqlens, dv, n_batch, b_t, dv_slots, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
@@ -3332,6 +3337,8 @@ def frost_gdn_bprop_prologue(
     checkpoint_every_n: cutlass.Int32,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Two-CTA prologue. Under ``run_order`` this kernel is the first
     work-item-table consumer, so block 0 LPT-orders the table and zeroes both
@@ -3397,6 +3404,8 @@ def frost_gdn_bprop_prologue(
             expand_num,
             k_slots=k_slots,
             v_slots=v_slots,
+            dk_slots=dk_slots,
+            dv_slots=dv_slots,
         )
 
 
@@ -3416,6 +3425,8 @@ def base_descriptors(
     expand_num: cutlass.Constexpr[int] = 1,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ):
     """The whole-tensor TMA descriptors (Q, K, V, dO, checkpoints, dQ, dK, dV, the T-pass tiles) the prologue's per-batch
     arrays are built from; K and V as the (dim, head, slot, token) family base maps over their (token, slot, head, dim) views."""
@@ -3440,8 +3451,6 @@ def base_descriptors(
 
     do_headed = cute.make_tensor(do_.iterator, cute.make_layout((d_v, heads_out, seqlen), stride=(1, do_.stride[1], do_.stride[0])))
     dq_headed = cute.make_tensor(dq.iterator, cute.make_layout((dq.shape[2], heads_out, seqlen), stride=(1, dq.stride[1], dq.stride[0])))
-    dk_headed = cute.make_tensor(dk.iterator, cute.make_layout((dk.shape[2], heads_out, seqlen), stride=(1, dk.stride[1], dk.stride[0])))
-    dv_headed = cute.make_tensor(dv.iterator, cute.make_layout((d_v, heads_out, seqlen), stride=(1, dv.stride[1], dv.stride[0])))
     swizzle_128b = tma.TensorMapSwizzle.s128b
     base_desc_q = tma.create_tensor_map_tiled_from_view(q_headed, box_dims=(bt, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
     if cutlass.const_expr(k_slots == 1):
@@ -3466,8 +3475,8 @@ def base_descriptors(
         )
     base_desc_do = tma.create_tensor_map_tiled_from_view(do_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
     base_desc_dq = tma.create_tensor_map_tiled_from_view(dq_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
-    base_desc_dk = tma.create_tensor_map_tiled_from_view(dk_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
-    base_desc_dv = tma.create_tensor_map_tiled_from_view(dv_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
+    base_desc_dk = family_descriptor(dk, b_t, dk_slots, expand_num)
+    base_desc_dv = family_descriptor(dv, b_t, dv_slots, expand_num)
     checkpoint_view = cute.make_tensor(
         state_checkpoints.iterator,
         cute.make_layout(
@@ -3514,6 +3523,8 @@ def prologue(
     stream: cuda.CUstream,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    dk_slots: cutlass.Constexpr[int] = 1,
+    dv_slots: cutlass.Constexpr[int] = 1,
 ):
     """One-launch prologue: LPT-order the work items (with ``run_order``, when
     this kernel is the backward pair's first table consumer) and build the
@@ -3521,7 +3532,22 @@ def prologue(
     stores) into ``tensormap_workspace``."""
     batch_size = cu_seqlens.shape[0] - 1
     base_desc_q, base_desc_k, base_desc_v, base_desc_do, base_desc_checkpoint, base_desc_dq, base_desc_dk, base_desc_dv, base_desc_tinv = base_descriptors(
-        io_dtype, b_t, q, k, v, do_, dq, dk, dv, state_checkpoints, tinv, expand_num=expand_num, k_slots=k_slots, v_slots=v_slots
+        io_dtype,
+        b_t,
+        q,
+        k,
+        v,
+        do_,
+        dq,
+        dk,
+        dv,
+        state_checkpoints,
+        tinv,
+        expand_num=expand_num,
+        k_slots=k_slots,
+        v_slots=v_slots,
+        dk_slots=dk_slots,
+        dv_slots=dv_slots,
     )
     frost_gdn_bprop_prologue(
         run_order,
@@ -3556,6 +3582,8 @@ def prologue(
         cutlass.Int32(b_t),
         k_slots,
         v_slots,
+        dk_slots,
+        dv_slots,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -3748,8 +3776,8 @@ def frost_gdn_bprop(
     desc_checkpoint_base = desc_base_words + cutlass.Int32(2 + 2 * family_arrays) * arr_words
     desc_dq_base = desc_base_words + cutlass.Int32(3 + 2 * family_arrays) * arr_words
     desc_dk_base = desc_base_words + cutlass.Int32(4 + 2 * family_arrays) * arr_words
-    desc_dv_base = desc_base_words + cutlass.Int32(5 + 2 * family_arrays) * arr_words
-    desc_tinv_base = desc_base_words + cutlass.Int32(6 + 2 * family_arrays) * arr_words
+    desc_dv_base = desc_base_words + cutlass.Int32(4 + 3 * family_arrays) * arr_words
+    desc_tinv_base = desc_base_words + cutlass.Int32(4 + 4 * family_arrays) * arr_words
 
     SMEM = cutlass.AddressSpace.smem
     bars = make_bars(cfg)
@@ -4369,6 +4397,8 @@ class GdnBpropCfg:
     expand_num: int = 1
     k_slots: int = 1
     v_slots: int = 1
+    dk_slots: int = 1
+    dv_slots: int = 1
     beta_slots: int = 1
     compute_group_0_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
@@ -4463,6 +4493,8 @@ def build_cfg(
     k_slots: int = 1,
     v_slots: int = 1,
     beta_slots: int = 1,
+    dk_slots: int = 1,
+    dv_slots: int = 1,
 ) -> GdnBpropCfg:
     """Build the per-compile ``GdnBpropCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32).
     ``tinv_source`` "compute" inverts the strict-masked M_kk in compute group 0; "gmem" bulk-loads the tiles of
@@ -4488,6 +4520,8 @@ def build_cfg(
         k_slots=k_slots,
         v_slots=v_slots,
         beta_slots=beta_slots,
+        dk_slots=dk_slots,
+        dv_slots=dv_slots,
     )
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
@@ -4508,8 +4542,8 @@ def build_cfg(
     return cfg
 
 
-TENSORMAP_DESC_ARRAYS = 9  # per-batch runtime TMA descriptors: Q, K, V, dO, checkpoints, dQ, dK, dV, tinv (K and V as families)
-TENSORMAP_FAMILY_OPERANDS = 2  # K and V: expand_num + 1 descriptor arrays each when expand_num does not divide b_t
+TENSORMAP_DESC_ARRAYS = 9  # Q, K, V, dO, checkpoints, dQ, dK, dV, tinv; K/V/dK/dV may each use a family
+TENSORMAP_FAMILY_OPERANDS = 4  # K, V, dK and dV: expand_num + 1 arrays each when expand_num does not divide b_t
 
 
 # ---------------------------------------------------------------------------
@@ -4566,6 +4600,8 @@ def compile(
     k_slots: int = 1,
     v_slots: int = 1,
     beta_slots: int = 1,
+    dk_slots: int = 1,
+    dv_slots: int = 1,
     q_cute,
     k_cute,
     v_cute,
@@ -4611,6 +4647,8 @@ def compile(
         k_slots=k_slots,
         v_slots=v_slots,
         beta_slots=beta_slots,
+        dk_slots=dk_slots,
+        dv_slots=dv_slots,
     )
 
     return cute.compile(
@@ -4766,6 +4804,8 @@ def chunk_gdn_bwd(
     k_slots = family_slots(k, expand_num, 3)
     v_slots = family_slots(v, expand_num, 3)
     beta_slots = family_slots(beta, expand_num, 2)
+    dk_slots = family_slots(dk, expand_num, 3)
+    dv_slots = family_slots(dv, expand_num, 3)
     cache = get_compiled_cache(
         str(q.dtype),
         str(cu_seqlens.dtype),
@@ -4791,7 +4831,7 @@ def chunk_gdn_bwd(
         run_order,
         order_gen,
         tinv_source,
-        layout_key=(len(k.shape), len(v.shape), len(beta.shape), k_slots, v_slots, beta_slots),
+        layout_key=(len(k.shape), len(v.shape), len(beta.shape), k_slots, v_slots, beta_slots, len(dk.shape), len(dv.shape), dk_slots, dv_slots),
     )
 
     if "compiled" not in cache:
@@ -4831,6 +4871,8 @@ def chunk_gdn_bwd(
             k_slots=k_slots,
             v_slots=v_slots,
             beta_slots=beta_slots,
+            dk_slots=dk_slots,
+            dv_slots=dv_slots,
             q_cute=from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             k_cute=from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
             v_cute=from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
@@ -4842,8 +4884,8 @@ def chunk_gdn_bwd(
             dbeta_cute=from_dlpack(dbeta, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             do_cute=from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             dq_cute=from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            dk_cute=from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            dv_cute=from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            dk_cute=from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=len(dk.shape) - 1),
+            dv_cute=from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=len(dv.shape) - 1),
             cu_seqlens_cute=cu_seqlens_cute,
             dstate0_cute=dstate0_cute,
             dstate_in_cute=dstate_in_cute,
@@ -4887,8 +4929,8 @@ def chunk_gdn_bwd(
             from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=len(v.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=len(dk.shape) - 1),
+            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=len(dv.shape) - 1),
             checkpoints_placeholder,
             cu_placeholder,
             staging_placeholder,
@@ -4900,6 +4942,8 @@ def chunk_gdn_bwd(
             cu_stream,
             k_slots,
             v_slots,
+            dk_slots,
+            dv_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:

@@ -13,7 +13,7 @@
   per-sequence checkpoint offsets from the token ``cu_seqlens``.
 * The token-major (token, slot, head, dim) operands of the sub-token families (GDP's k / v, n = num_householder
   slots per token, any token stride): :func:`expanded_view`, :func:`slot_view`,
-  :func:`emit_family_descs`, :func:`tma_load_family`.
+  :func:`emit_family_descs`, :func:`tma_load_family`, :func:`tma_store_family`.
 """
 
 import cutlass
@@ -239,6 +239,27 @@ def expanded_view(t: cute.Tensor, slots: cutlass.Constexpr[int], expand_num: cut
 
 
 @cute.jit
+def family_descriptor(
+    tensor: cute.Tensor,
+    b_t: cutlass.Constexpr[int],
+    slots: cutlass.Constexpr[int],
+    expand_num: cutlass.Constexpr[int],
+):
+    """Base map shared by the output families; its coordinates match :func:`emit_family_descs`."""
+    tensor = expanded_view(tensor, slots, expand_num)
+    granule = 128 // (tensor.element_type.width // 8)
+    if cutlass.const_expr(slots == 1):
+        rows = cute.make_tensor(
+            tensor.iterator,
+            cute.make_layout((tensor.shape[0], tensor.shape[2], tensor.shape[3]), stride=(tensor.stride[0], tensor.stride[2], 1)),
+        )
+        return tma.create_tensor_map_tiled_from_view(rows, box_dims=(b_t, 1, granule), stride_order=(2, 1, 0), swizzle=tma.TensorMapSwizzle.s128b)
+    return tma.create_tensor_map_tiled_from_view(
+        tensor, box_dims=(b_t // slots, slots, 1, granule), stride_order=(3, 2, 1, 0), swizzle=tma.TensorMapSwizzle.s128b
+    )
+
+
+@cute.jit
 def slot_view(t: cute.Tensor, slots: cutlass.Constexpr[int], expand_num: cutlass.Constexpr[int]):
     """The (token, slot, head) view of a per-row scalar operand (beta) for ``slots`` slots per token: ``slots == 1`` the
     uniform rows as ``(row, 1, head)`` (expanded ``[token * n, head]`` or a dense token-major ``[token, n, head]``; at
@@ -388,3 +409,60 @@ def tma_load_family(
                             [d, head, cutlass.Int32(0), t_trail],
                             mbar,
                         )
+
+
+@cute.jit
+def tma_store_family(
+    smem_tile,
+    desc_family,
+    arr_words,
+    head,
+    chunk_idx,
+    d_offset,
+    b_t: cutlass.Constexpr[int],
+    slots: cutlass.Constexpr[int],
+) -> None:
+    """Store one expanded-row SMEM tile through the same boxes as :func:`tma_load_family`.
+
+    The issuing warp acquires every descriptor once per work item. All lead/full/trail boxes and column granules
+    stay in one bulk group: the caller commits once after this helper and retains its existing source-reuse waits.
+    Like ``tma_store_tile``, this warp-uniform store has no lane election. Sequence bounds clip tail stores in TMA.
+    """
+    granu = smem_tile.tma_granu_elems
+    sub_stride = smem_tile.tma_subtile_stride_elems
+    if cutlass.const_expr(slots == 1):
+        row = chunk_idx * cutlass.Int32(b_t)
+        desc = desc_family.tospace(cutlass.AddressSpace.generic)
+        for i in cutlass.range_constexpr(smem_tile.tma_loads_per_tile):
+            nvvm.cp_async_bulk_tensor_global_shared_cta(desc, smem_tile.base.subview(i * sub_stride), (d_offset + cutlass.Int32(i * granu), head, row))
+    elif cutlass.const_expr(b_t % slots == 0):
+        tok = chunk_idx * cutlass.Int32(b_t // slots)
+        desc = desc_family.tospace(cutlass.AddressSpace.generic)
+        for i in cutlass.range_constexpr(smem_tile.tma_loads_per_tile):
+            nvvm.cp_async_bulk_tensor_global_shared_cta(
+                desc, smem_tile.base.subview(i * sub_stride), (d_offset + cutlass.Int32(i * granu), head, cutlass.Int32(0), tok)
+            )
+    else:
+        n = cutlass.Int32(slots)
+        u = chunk_idx * cutlass.Int32(b_t)
+        t0 = u // n
+        p = u - t0 * n
+        lead = n - p if p > 0 else cutlass.Int32(0)
+        u_end = u + cutlass.Int32(b_t)
+        trail = u_end - (u_end // n) * n
+        full = (cutlass.Int32(b_t) - lead - trail) // n
+        full_slot = cutlass.Int32(0) if full == cutlass.Int32(b_t // slots) else cutlass.Int32(1)
+        t_full = t0 + (cutlass.Int32(1) if p > 0 else cutlass.Int32(0))
+        t_trail = t_full + full
+        desc_lead = (desc_family + (cutlass.Int32(1) + lead) * arr_words).tospace(cutlass.AddressSpace.generic)
+        desc_full = (desc_family + full_slot * arr_words).tospace(cutlass.AddressSpace.generic)
+        desc_trail = (desc_family + (cutlass.Int32(1) + trail) * arr_words).tospace(cutlass.AddressSpace.generic)
+        for i in cutlass.range_constexpr(smem_tile.tma_loads_per_tile):
+            d = d_offset + cutlass.Int32(i * granu)
+            if p > 0:
+                nvvm.cp_async_bulk_tensor_global_shared_cta(desc_lead, smem_tile.base.subview(i * sub_stride), (d, head, p, t0))
+            nvvm.cp_async_bulk_tensor_global_shared_cta(desc_full, smem_tile.base.subview(i * sub_stride + lead * granu), (d, head, cutlass.Int32(0), t_full))
+            if trail > 0:
+                nvvm.cp_async_bulk_tensor_global_shared_cta(
+                    desc_trail, smem_tile.base.subview(i * sub_stride + (cutlass.Int32(b_t) - trail) * granu), (d, head, cutlass.Int32(0), t_trail)
+                )
