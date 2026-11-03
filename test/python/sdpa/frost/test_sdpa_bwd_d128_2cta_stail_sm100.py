@@ -883,9 +883,9 @@ def _record_kernels(path, token, arch="sm_100a"):
     """(dsl line, {kernel: md5}) of a per-kernel record's ``default`` variant for ``arch`` (frost_test_utils.read_kernel_record): the
     installed DSL build's record where one CARRIES the token (the release record, then the dev-build record beside it); an unrecorded build,
     or a token the matching build's record lacks, still reaches the existing skip guard."""
-    from cudnn.frost.buffers import cutedsl_state
+    import cudnn.frost.buffers as buffers
 
-    _installed, version = cutedsl_state()
+    _installed, version = buffers.cutedsl_state()
     have = " ".join(version) if version else None
     paths = (path, _RECORD_DEV) if path == _RECORD else (path,)
     records = [read_kernel_record(candidate, token, arch) for candidate in paths]
@@ -920,9 +920,9 @@ def test_2cta_stail_record_selector_falls_back_to_the_release_record_for_tokens_
 def _skip_unless_record_dsl(dsl):
     """A record's PTX md5 holds for the DSL build that rendered it (its ``dsl=`` line): another installed build is a SKIP before the md5
     assertion -- never a widened or a conditional pin (PR 1943 review)."""
-    from cudnn.frost.buffers import cutedsl_state
+    import cudnn.frost.buffers as buffers
 
-    _installed, version = cutedsl_state()
+    _installed, version = buffers.cutedsl_state()
     have = " ".join(version) if version else None
     if have != dsl:
         pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")

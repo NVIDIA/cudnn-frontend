@@ -550,7 +550,6 @@ def _kv_full(owner_base, stream_base, sq, skv, causal: cutlass.Constexpr[bool], 
 def _kv_probability_p(
     s, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], col: cutlass.Constexpr[int], window_left: cutlass.Constexpr[int] = 0
 ):
-    tid = cute.arch.thread_idx()[0] % CFG_RECOMPUTE.TILE_M
     lse = cutlass.Vector.from_elements(tuple(stats.subview(col + i).load() for i in range(CFG_RECOMPUTE.POINTWISE_COLS)), cutlass.Float32)
     p = s
     if _kv_full(owner_base, stream_base, sq, skv, causal, window_left):
@@ -566,7 +565,6 @@ def _kv_probability_p(
 def _kv_probability_ds(
     dp, p, stats, owner_base, stream_base, sq, skv, scale, causal: cutlass.Constexpr[bool], col: cutlass.Constexpr[int], window_left: cutlass.Constexpr[int] = 0
 ):
-    tid = cute.arch.thread_idx()[0] % CFG_RECOMPUTE.TILE_M
     delta = cutlass.Vector.from_elements(
         tuple(stats.subview(CFG_RECOMPUTE.KV_STATS_DELTA + col + i).load() for i in range(CFG_RECOMPUTE.POINTWISE_COLS)), cutlass.Float32
     )
@@ -804,7 +802,6 @@ def _mma_q(slab, bars, tmem_base, lo, hi, dtype: cutlass.Constexpr):
     if hi > lo:
         bars.final_grad.arrive(cta_group=CFG_RECOMPUTE.CTA_MMA, pred=nvvm.elect_sync())
     _wait_service(bars.q_score_empty, empty_state)
-    empty_state = advance(empty_state, CFG_RECOMPUTE.SINGLE_STAGE)
 
 
 @cute.jit
@@ -952,7 +949,6 @@ def _compute_q(
         ds_state = advance(ds_state, CFG_RECOMPUTE.SINGLE_STAGE)
         ds_empty_state = advance(ds_empty_state, CFG_RECOMPUTE.SINGLE_STAGE)
     bars.q_ds_empty[ds_empty_state.idx].wait(ds_empty_state.phase)
-    ds_empty_state = advance(ds_empty_state, CFG_RECOMPUTE.SINGLE_STAGE)
     if hi > lo:
         bars.final_grad.wait(PipelineState.start().phase)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -993,7 +989,6 @@ def _tma_warp(slab, bars, stream0_desc, stream1_desc, o_desc, lo, hi, head, batc
         empty_state = advance(empty_state, CFG_RECOMPUTE.INPUT_STAGES)
     if cutlass.const_expr(not q_owner):
         _wait_service(bars.o_empty, o_empty_state)
-        o_empty_state = advance(o_empty_state, CFG_RECOMPUTE.SINGLE_STAGE)
 
 
 @cute.jit
@@ -1057,7 +1052,6 @@ def _stats_warps(slab, stats, bars, lse, owner_base, lo, hi, batch, head, sq, q_
             o_full_state = advance(o_full_state, CFG_RECOMPUTE.SINGLE_STAGE)
             o_empty_state = advance(o_empty_state, CFG_RECOMPUTE.SINGLE_STAGE)
         _wait_service(bars.stats_empty, empty_state)
-        empty_state = advance(empty_state, CFG_RECOMPUTE.SINGLE_STAGE)
 
 
 @cute.jit
@@ -1336,9 +1330,6 @@ def host_recompute(
     ).launch(grid=((q_tiles + kv_tiles) * q.shape[2] * q.shape[0], 1, 1), block=(CFG_RECOMPUTE.THREADS, 1, 1), stream=stream)
 
 
-_host = host_recompute
-
-
 # ======================================================================================================================
 # section 3: the dense MHA ACCUMULATION body (3-launch chain, fp32 dQ workspace)
 # (was kernels/sm100/bprop_d128_accum_f16.py)
@@ -1402,7 +1393,6 @@ def _bars_accum(slab):
 
 def _operand_accum(slab, offset, dtype, *, transpose=False, fp32=False):
     box = CFG_ACCUM.DQ_BOX if fp32 else CFG_ACCUM.HEAD_BOX
-    bpe = 4 if fp32 else CFG_ACCUM.BPE
     return SmemTile(
         base=_view(slab, offset, dtype, CFG_ACCUM.M * CFG_ACCUM.D, alignment=1024),
         elems_per_stage=CFG_ACCUM.M * CFG_ACCUM.D,
@@ -1733,7 +1723,7 @@ def _epilogue_loop_accum(
     while valid != 0:
         _credit_accum(bars.sched_empty[sched_state.idx])
         lo, hi = _bounds_accum(block, sq, causal, window)
-        for qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen_accum(bars.ds_ready, ds_state.phase)
             ds0 = _tmem_load(tmem_base + 128, 32, cutlass.Int32)
             ds1 = _tmem_load(tmem_base + 192, 32, cutlass.Int32)
@@ -2638,7 +2628,6 @@ def _bars_thd(slab):
 
 def _operand_thd(slab, offset, dtype, *, transpose=False, fp32=False):
     box = CFG_ACCUM_D128.DQ_BOX if fp32 else CFG_ACCUM_D128.HEAD_BOX
-    bpe = 4 if fp32 else CFG_ACCUM_D128.BPE
     return SmemTile(
         base=_view(slab, offset, dtype, CFG_ACCUM_D128.M * CFG_ACCUM_D128.D, alignment=1024),
         elems_per_stage=CFG_ACCUM_D128.M * CFG_ACCUM_D128.D,
@@ -2945,7 +2934,7 @@ def _epilogue_loop_thd(
     while valid != 0:
         _credit_thd(bars.sched_empty[sched_state.idx])
         lo, hi, seq_q, seq_k, q_start = _bounds_thd(block, meta, batch, n_batch, causal)
-        for qtile in cutlass.range(lo, hi, 1, unroll=1):
+        for _qtile in cutlass.range(lo, hi, 1, unroll=1):
             _wait_tcgen_thd(bars.ds_ready, ds_state.phase)
             ds0 = _tmem_load(tmem_base + 128, 32, cutlass.Int32)
             ds1 = _tmem_load(tmem_base + 192, 32, cutlass.Int32)

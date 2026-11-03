@@ -657,7 +657,7 @@ def host_grouped_2cta(
     tma_ring = stats_code == STATS_FORM_CODES["tma_ring"]  # the s_tail body's stats form (header section 11): the padded stats region replaces delta
     # the pair body's TMEM map (header section 9) and SMEM map (section 8), PART-KEYED: the workspace depends on neither, the STAMPS record on both
     dq576 = tmem_code == TMEM_MAP_CODES["dq_576"]
-    b2 = smem_code == SMEM_MAP_CODES["rubin_b2"]  # noqa: F841 (the map name below is the code space's)
+    # smem_code (SMEM_MAP_CODES, "rubin_b2" among them) does not enter the workspace: the SMEM map only changes the carveout (header section 8)
     rounded, rounded_k, delta_off, meta_off, origins_off, maps_off, dk_off, dv_off, regions_end, rowoff_off = grouped_2cta_thd_workspace_offsets(
         batch, heads, t_q, t_kv, tma_ring
     )

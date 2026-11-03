@@ -51,18 +51,20 @@ def compile_plan(api):
     cc = compute_capability(device)
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     regions, required = (), 0
+    sm = cc[0] * 10 + cc[1]
+    window = 0 if api.window_size_left is None else api.window_size_left + 1
+    # compile_cached owns device/context-aware reuse; no argument-only outer cache.
     if api._implementation == ACCUMULATION:
-        from .kernels.sm100.prepared_d128_host import compile_host_accum as compile_host
+        from .kernels.sm100.prepared_d128_host import compile_host_accum
 
         regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
-        compile_args = (tuple(geometry), regions, dtype, api.is_causal, cc[0] * 10 + cc[1], 0 if api.window_size_left is None else api.window_size_left + 1)
+        with torch.cuda.device(device):
+            entry = compile_host_accum(tuple(geometry), regions, dtype, api.is_causal, sm, window)
     else:
-        from .kernels.sm100.prepared_d128_host import compile_host_recompute as compile_host
+        from .kernels.sm100.prepared_d128_host import compile_host_recompute
 
-        compile_args = (tuple(geometry), dtype, api.is_causal, cc[0] * 10 + cc[1], 0 if api.window_size_left is None else api.window_size_left + 1)
-    # compile_cached owns device/context-aware reuse; no argument-only outer cache.
-    with torch.cuda.device(device):
-        entry = compile_host(*compile_args)
+        with torch.cuda.device(device):
+            entry = compile_host_recompute(tuple(geometry), dtype, api.is_causal, sm, window)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("sdpa_bwd_sm100_d128 requires a positional tvm-ffi entry")
