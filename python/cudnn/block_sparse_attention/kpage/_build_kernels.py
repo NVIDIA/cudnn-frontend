@@ -477,6 +477,15 @@ class _PairWalkBase:
         return pages
 
     @cute.jit
+    def lane_pages(self, bits, word, mBlockSizes: cute.Tensor):
+        """Page16 entries of block ``word * 32 + lane`` if its bit is set in ``bits``, else 0."""
+        lane_idx = cute.arch.lane_idx()
+        pages = Int32(0)
+        if ((bits >> lane_idx) & 1) != 0:
+            pages = (max(min(mBlockSizes[word * 32 + lane_idx], 64), 0) + PAGE - 1) // PAGE
+        return pages
+
+    @cute.jit
     def block_scan(self, value, warp_sums: cute.Tensor):
         """Exclusive prefix of ``value`` over the CTA, and the CTA total."""
         lane_idx = cute.arch.lane_idx()
@@ -576,7 +585,19 @@ class PairWalkStats(_PairWalkBase):
 
 
 class PairWalkFill(_PairWalkBase):
-    """Write each Q pair's Page16 walk, the per-WG packed keep words, and its tile ranges."""
+    """Write each Q pair's Page16 walk, the per-WG packed keep words, and its tile ranges.
+
+    Every table is written one output word per thread, consecutive threads on consecutive words, so each store
+    sector is written once.  For a chunk of bitset words, one thread per word counts its pages and one block scan
+    gives each word its first slot and each dense word (more than ``dense_bits`` blocks) its place in a compact
+    list.  The page ids go into a shared-memory window of ``stage_slots`` slots that the CTA then copies out in
+    order: a sparse word's thread writes them itself, a dense word is written by one warp, one lane per block and
+    each lane's slot from a warp scan (local patterns put a pair's blocks in a few dense words, which one thread
+    per word would serialize; scattered ones leave a few blocks per word, which a warp per word would waste).
+    """
+
+    stage_slots = 2048
+    dense_bits = 4
 
     @cute.jit
     def __call__(
@@ -593,6 +614,11 @@ class PairWalkFill(_PairWalkBase):
         @cute.struct
         class SharedStorage:
             warp_sums: cute.struct.MemRange[Int32, self.num_warps]
+            list_word: cute.struct.MemRange[Int32, self.num_threads]
+            list_bits: cute.struct.MemRange[Int32, self.num_threads]
+            list_start: cute.struct.MemRange[Int32, self.num_threads]
+            list_pages: cute.struct.MemRange[Int32, self.num_threads]
+            stage: cute.struct.MemRange[Int32, self.stage_slots]
 
         self.kernel(mBlockSizes, mBits, mClassPages, mTileEnds, mPageTable, mKeep, mRanges, SharedStorage).launch(
             grid=(mBits.shape[0], 1, 1),
@@ -619,6 +645,13 @@ class PairWalkFill(_PairWalkBase):
         smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         warp_sums = storage.warp_sums.get_tensor(cute.make_layout(self.num_warps))
+        list_word = storage.list_word.get_tensor(cute.make_layout(self.num_threads))
+        list_bits = storage.list_bits.get_tensor(cute.make_layout(self.num_threads))
+        list_start = storage.list_start.get_tensor(cute.make_layout(self.num_threads))
+        list_pages = storage.list_pages.get_tensor(cute.make_layout(self.num_threads))
+        stage = storage.stage.get_tensor(cute.make_layout(self.stage_slots))
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         first_pages = mClassPages[pair_idx, 0]
         common_pages = mClassPages[pair_idx, 1]
@@ -628,7 +661,7 @@ class PairWalkFill(_PairWalkBase):
         tile_offset = mTileEnds[pair_idx] - tiles
         slot_base = tile_offset * FRAGS_PER_TILE
 
-        # Pages in class order; within a class, chunks of one bitset word per thread keep ascending block ids.
+        # Pages in class order; within a class, ascending block ids (words in order, bits low to high).
         page_base = Int32(0)
         num_chunks = (words + self.num_threads - 1) // self.num_threads
         for cls in cutlass.range_constexpr(3):
@@ -637,16 +670,60 @@ class PairWalkFill(_PairWalkBase):
                 bits = Int32(0)
                 if word < words:
                     bits = self.class_bits(mBits, pair_idx, word, cls)
-                pos, total = self.block_scan(self.word_pages(bits, word, mBlockSizes), warp_sums)
-                slot = slot_base + page_base + pos
-                while bits != 0:
-                    low = bits & -bits
-                    block_idx = word * 32 + Int32(31) - Int32(cute.arch.clz(low))
-                    block_pages = (max(min(mBlockSizes[block_idx], 64), 0) + PAGE - 1) // PAGE
-                    for page_idx in cutlass.range(block_pages):
-                        mPageTable[slot // FRAGS_PER_TILE, slot % FRAGS_PER_TILE] = block_idx * self.pages_per_block + page_idx
-                        slot += 1
-                    bits = bits & (bits - 1)
+                pages = self.word_pages(bits, word, mBlockSizes)  # <= 32 * 4 per word, so a chunk's sum fits 16 bits
+                dense = Int32(1) if cute.arch.popc(bits) > self.dense_bits else Int32(0)
+                packed, packed_total = self.block_scan(pages | (dense << 16), warp_sums)
+                start = packed & 0xFFFF
+                total = packed_total & 0xFFFF
+                if dense != 0:
+                    entry = packed >> 16
+                    list_word[entry] = word
+                    list_bits[entry] = bits
+                    list_start[entry] = start
+                    list_pages[entry] = pages
+                cute.arch.sync_threads()
+                listed = packed_total >> 16
+
+                window = Int32(0)
+                while window < total:
+                    window_end = min(window + self.stage_slots, total)
+                    if dense == 0 and pages > 0 and start < window_end and start + pages > window:
+                        slot = start
+                        remaining = bits
+                        while remaining != 0:
+                            low = remaining & -remaining
+                            block_idx = word * 32 + Int32(31) - Int32(cute.arch.clz(low))
+                            block_pages = (max(min(mBlockSizes[block_idx], 64), 0) + PAGE - 1) // PAGE
+                            for page_idx in cutlass.range(block_pages):
+                                if slot >= window and slot < window_end:
+                                    stage[slot - window] = block_idx * self.pages_per_block + page_idx
+                                slot += 1
+                            remaining = remaining & (remaining - 1)
+                    entry = warp_idx
+                    while entry < listed:
+                        first = list_start[entry]
+                        if first < window_end and first + list_pages[entry] > window:
+                            dense_word = list_word[entry]
+                            lane_pages = self.lane_pages(list_bits[entry], dense_word, mBlockSizes)
+                            slot = lane_pages
+                            for delta in (1, 2, 4, 8, 16):
+                                other = cute.arch.shuffle_sync_up(slot, delta, mask_and_clamp=0)
+                                if lane_idx >= delta:
+                                    slot += other
+                            slot += first - lane_pages  # exclusive: this block's first page in the class walk
+                            for page_idx in cutlass.range(lane_pages):
+                                if slot >= window and slot < window_end:
+                                    stage[slot - window] = (dense_word * 32 + lane_idx) * self.pages_per_block + page_idx
+                                slot += 1
+                        entry += self.num_warps
+                    cute.arch.sync_threads()
+                    copied = thread_idx
+                    while copied < window_end - window:
+                        out = slot_base + page_base + window + copied
+                        mPageTable[out // FRAGS_PER_TILE, out % FRAGS_PER_TILE] = stage[copied]
+                        copied += self.num_threads
+                    cute.arch.sync_threads()  # the window is refilled next
+                    window = window_end
                 page_base += total
 
         # Dummy pages past seqlen_k pad the last tile; TMA loads them as zeros.
@@ -659,27 +736,30 @@ class PairWalkFill(_PairWalkBase):
         cute.arch.sync_threads()
 
         # One int32 keep word covers two adjacent Page16 entries; WG0 keeps the first block's rows, WG1 the second's.
-        row = thread_idx
-        while row < tiles:
-            global_row = tile_offset + row
-            for word_idx in cutlass.range_constexpr(4):
-                keep0 = Int32(0)
-                keep1 = Int32(0)
-                for half in cutlass.range_constexpr(2):
+        # A page's walk position gives its class (first-only, common, second-only), so membership needs no bitset.
+        # One thread per (tile, keep word), writing that word for both WGs.
+        common_end = first_pages + common_pages
+        entry = thread_idx
+        while entry < tiles * 4:
+            global_row = tile_offset + entry // 4
+            word_idx = entry % 4
+            keep0 = Int32(0)
+            keep1 = Int32(0)
+            for half in cutlass.range_constexpr(2):
+                page = (entry // 4) * FRAGS_PER_TILE + word_idx * 2 + half  # position in the pair's walk
+                if page < walk_pages:
                     page_id = mPageTable[global_row, word_idx * 2 + half]
-                    if page_id < zero_page:
-                        block_idx = page_id // self.pages_per_block
-                        page_idx = page_id - block_idx * self.pages_per_block
-                        valid_rows = max(min(max(min(mBlockSizes[block_idx], 64), 0) - page_idx * PAGE, PAGE), 0)
-                        page_mask = ((Int32(1) << valid_rows) - 1) << (half * PAGE)
-                        bit = Int32(1) << (block_idx % 32)
-                        if (mBits[pair_idx, 0, block_idx // 32] & bit) != 0:
-                            keep0 = keep0 | page_mask
-                        if (mBits[pair_idx, 1, block_idx // 32] & bit) != 0:
-                            keep1 = keep1 | page_mask
-                mKeep[global_row, 0, word_idx] = keep0
-                mKeep[global_row, 1, word_idx] = keep1
-            row += self.num_threads
+                    block_idx = page_id // self.pages_per_block
+                    page_idx = page_id - block_idx * self.pages_per_block
+                    valid_rows = max(min(max(min(mBlockSizes[block_idx], 64), 0) - page_idx * PAGE, PAGE), 0)
+                    page_mask = ((Int32(1) << valid_rows) - 1) << (half * PAGE)
+                    if page < common_end:
+                        keep0 = keep0 | page_mask
+                    if page >= first_pages:
+                        keep1 = keep1 | page_mask
+            mKeep[global_row, 0, word_idx] = keep0
+            mKeep[global_row, 1, word_idx] = keep1
+            entry += self.num_threads
 
         if thread_idx == 0:
             # WG0 computes the tiles holding first-only and common pages, WG1 those holding common and second-only.
