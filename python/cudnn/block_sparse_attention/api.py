@@ -216,6 +216,8 @@ def block_sparse_attention_forward(
     runs that kernel on the metadata's 64-row halves (padding halves dropped).
     Pass ``True`` to build the page layout from the metadata on this call, or
     a :class:`KPageLayout` from :func:`kpage_prepare_layout` to reuse one.
+    Building a layout synchronizes the host with the stream, so prefer one
+    layout built per sparse pattern and passed to every call that uses it.
     See "KPage" in ``docs/operations/sparse_attention/bsa.md`` for the contract.
     """
 

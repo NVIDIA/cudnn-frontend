@@ -457,6 +457,18 @@ layer of a diffusion step, every training step with a fixed packing) skip the
 metadata kernels. The layout depends on the metadata only, never on `q`, `k`,
 or `v`. Backward tables are built on the first backward call with that layout.
 
+Prefer a prebuilt layout. The walk tables are sized from counts computed on
+the device, so building a layout synchronizes the host with the current
+stream: the host waits until all previously queued GPU work has finished,
+kernels queued after the call start late, and the call cannot be captured into
+a CUDA graph. `kpage=True` builds a layout on every call (the forward and the
+backward each build their own), so it pays this on every layer. Calls that
+take a `KPageLayout` do not synchronize. Build one layout per sparse pattern
+outside the layer loop and pass it to the forward and backward of every layer
+that uses the pattern; on SM100/SM103 also pass `with_backward=True` so the
+backward tables are not built (with one more synchronization) on the first
+backward call. Keep `kpage=True` for one-off calls and experiments.
+
 `q_block_sizes` (int32, one entry per query block) is specific to this path:
 query rows at or past `q_block_sizes[i]` in block `i` are padding. They are
 not computed, which is where the M64 x N256 route and part of the speedup on
