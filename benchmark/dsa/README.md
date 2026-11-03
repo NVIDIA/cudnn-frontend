@@ -393,7 +393,7 @@ supported DSL.
 
 ##### SM90 deterministic relay scheduling (2026-11-02)
 
-Measured on NVIDIA L20X (SM90) with BF16 H64/Dqk576/Dv512, KV=65536,
+Measured on NVIDIA H200 (SM90) with BF16 H64/Dqk576/Dv512, KV=65536,
 top-k 2048, full runtime lengths, synthetic forward statistics, five warm-ups,
 and 20 allocation-free calls. The environment used PyTorch 2.12.1+cu130,
 CuTe DSL 4.8.1 (CUDA 13.4 lowering), and cuDNN 9.20.0. Each explicit relay
