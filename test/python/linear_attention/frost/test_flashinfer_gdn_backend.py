@@ -264,10 +264,10 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
     assert (sup.served, sup.kind) == (False, "device") and "cuDeviceGetAttribute failed" in sup.reason, sup
 
-    def broken(device, requests=None, norm_eps=1e-6):
+    def regressed(device, requests=None, norm_eps=1e-6):
         raise ValueError("a config regression")
 
-    monkeypatch.setattr(backend, "verify_form", broken)
+    monkeypatch.setattr(backend, "verify_form", regressed)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
     assert (sup.served, sup.kind) == (False, "backend") and "ValueError" in sup.reason, sup  # not a device decline: the raising probe is named by type
 
