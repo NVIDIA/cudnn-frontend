@@ -98,14 +98,14 @@ def _sm100_mqa_inputs(b, s_q, s_k, h_q=64, d=128):
 @torch_fork_set_rng(seed=2026)
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
 @pytest.mark.parametrize(
-    "s_q,s_k,ratio,offset",
+    "s_q,s_k,h_q,ratio,offset",
     [
-        pytest.param(17, 257, 1, 257, marks=pytest.mark.L0, id="partial-tiles"),
-        pytest.param(2049, 2053, 1, 2053, marks=pytest.mark.L1, id="persistent-reuse"),
-        pytest.param(17, 257, 4, 0, marks=pytest.mark.L0, id="empty-causal-tiles"),
+        pytest.param(17, 257, 32, 1, 257, marks=pytest.mark.L0, id="partial-tiles"),
+        pytest.param(2049, 2053, 32, 1, 2053, marks=pytest.mark.L1, id="persistent-reuse"),
+        pytest.param(17, 257, 64, 4, 0, marks=pytest.mark.L0, id="empty-causal-tiles"),
     ],
 )
-def test_DSA_indexer_forward_per_head_publication(s_q, s_k, ratio, offset, weight_dtype):
+def test_DSA_indexer_forward_per_head_publication(s_q, s_k, h_q, ratio, offset, weight_dtype):
     """Run under racecheck: numerical parity alone does not detect an unordered W handoff."""
     _require_sm100_family()
     try:
@@ -113,9 +113,9 @@ def test_DSA_indexer_forward_per_head_publication(s_q, s_k, ratio, offset, weigh
     except ImportError:
         return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    q = torch.randn(1, s_q, 32, 128, device="cuda", dtype=torch.bfloat16) / 128**0.5
+    q = torch.randn(1, s_q, h_q, 128, device="cuda", dtype=torch.bfloat16) / 128**0.5
     k = torch.randn(1, s_k, 1, 128, device="cuda", dtype=torch.bfloat16)
-    w = (torch.randn(1, s_q, 32, device="cuda", dtype=torch.float32) / 32**0.5).to(weight_dtype)
+    w = (torch.randn(1, s_q, h_q, device="cuda", dtype=torch.float32) / h_q**0.5).to(weight_dtype)
     offsets = torch.full((1,), offset, device="cuda", dtype=torch.int32)
 
     # Bound the FP64 oracle's [B, Q, H, K] intermediates independently of the

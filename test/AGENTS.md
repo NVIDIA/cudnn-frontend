@@ -521,6 +521,11 @@ completion before reuse. Run racecheck on both indexer and attention cases:
 ordering Q/K MMA alone does not publish every metadata lane's stores, and a
 max-to-sum reduction can overwrite shared scratch before all warps read it.
 
+Empty causal rows do not imply an empty score tile. At ratio 4 and offset 0,
+32 query heads put four queries in a tile, whose last row needs a K block.
+The per-head publication regression uses 64 heads (two queries per tile) to
+exercise a zero-K-block tile and its producer/consumer handoff.
+
 SM107 metadata/heuristic tests run on non-SM107 CI lanes too. Model compiler
 target availability explicitly when testing a synthetic Rubin capability row;
 do not require the worker's DSL wheel to expose `sm_107a`. Keep real installed
