@@ -249,7 +249,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
     """Rule 8 (R2 / R9): the fp32 dK accumulator behind a bf16 d_index_k is
     carved from the caller's workspace (``scratch_workspace_bytes()``), so
     three warm executes leave the torch caching allocator's allocation count
-    unchanged; the fe_api conftest arms ``set_sync_debug_mode("error")`` around
+    unchanged; the rule8_detector conftest hook arms ``set_sync_debug_mode("error")`` around
     every execute. An fp32 d_index_k declares zero scratch. Without a workspace
     the bf16 plan raises before either score buffer is mutated."""
     major = torch.cuda.get_device_capability()[0]
@@ -315,6 +315,67 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
     for name, t in (("d_index_q", d_index_q), ("d_weights", d_weights), ("d_index_k", d_index_k)):
         assert torch.isfinite(t.float()).all(), f"{name} contains NaN/Inf"
     check_ref_dense_indexer_backward(index_q, weights, index_k, attn_score, attn_l1norm, d_index_q, d_weights, d_index_k, grad_scale=1.0)
+
+
+_DENSE_ARCH_ERROR = (RuntimeError, "DenseIndexerBackward requires SM90 or capability in")
+_DENSE_HEADS_ERROR = (ValueError, "requires heads == 64")
+_DENSE_SM90_TILE_ERROR = (ValueError, "SM90 DenseIndexerBackward requires D=128 and block_I=128")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "capability,heads,head_dim,block_I,error",
+    [
+        pytest.param((11, 0), 64, 128, 128, _DENSE_ARCH_ERROR, id="sm110"),
+        pytest.param((12, 0), 64, 128, 128, _DENSE_ARCH_ERROR, id="sm120"),
+        pytest.param((10, 7), 64, 128, 128, (RuntimeError, "SM107 requires a CuTe DSL build supporting sm_107a"), id="sm107-no-sm107a-dsl"),
+        pytest.param((10, 0), 32, 128, 128, _DENSE_HEADS_ERROR, id="sm100-h32"),
+        pytest.param((10, 0), 128, 128, 128, _DENSE_HEADS_ERROR, id="sm100-h128"),
+        pytest.param((10, 0), 64, 96, 128, (ValueError, r"SM100 DenseIndexerBackward requires D in \(64, 128\)"), id="sm100-d96"),
+        pytest.param((10, 0), 64, 128, 256, (ValueError, r"SM100 DenseIndexerBackward requires block_I in \(64, 128\)"), id="sm100-block_i256"),
+        pytest.param((9, 0), 128, 128, 128, _DENSE_HEADS_ERROR, id="sm90-h128"),
+        pytest.param((9, 0), 64, 64, 128, _DENSE_SM90_TILE_ERROR, id="sm90-d64"),
+        pytest.param((9, 0), 64, 128, 64, _DENSE_SM90_TILE_ERROR, id="sm90-block_i64"),
+    ],
+)
+@torch_fork_set_rng(seed=0)
+def test_DSA_dense_indexer_backward_rejects_unsupported_plans(monkeypatch, capability, heads, head_dim, block_I, error):
+    """check_support admits SM90 and the validated SM100-family devices only (SM107
+    with a DSL that has the sm_107a target), and
+    only the tiles each dense kernel serves: H64 on both
+    arches (H96 is no legal TCGEN05 M and H128 exceeds the SM100 launch
+    resources; SM90 WGMMA M is 64), D and block_I in {64, 128} on SM100 (TCGEN05
+    M), and the validated D128 x I128 tile on SM90. Declines happen before any
+    score buffer moves."""
+    try:
+        from cudnn import DSA
+        import cudnn.frost.buffers as buffers
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to build DenseIndexerBackward tensor descriptors")
+
+    cfg = dict(b=1, s_q=8, s_kv=128, head_dim=head_dim, qhead_per_kv_head=heads)
+    index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None)
+    attn_before, index_before = attn_score.clone(), index_score.clone()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    # SM107 admission additionally needs a DSL with the sm_107a target (Rule 7);
+    # the SM107 case here checks the decline when that target is missing.
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    with pytest.raises(error[0], match=error[1]):
+        DSA.dense_indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
+            block_I=block_I,
+        )
+    assert torch.equal(attn_score, attn_before)
+    assert torch.equal(index_score, index_before)
 
 
 @pytest.mark.L0

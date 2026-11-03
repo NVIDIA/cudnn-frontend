@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from block_sparse_attention.cutedsl.bsa_utils import require_arch
 
 pytestmark = [pytest.mark.L1, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -12,8 +13,7 @@ pytestmark = [pytest.mark.L1, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 @pytest.mark.parametrize("kv_blocks", [17, 31, 32, 33, 35])
 @pytest.mark.parametrize("duplicates", [False, True])
 def test_refinement_rebinds_word_counts_and_preserves_pairs(kv_blocks, duplicates):
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("requires SM100/SM103")
+    require_arch(archs=(100, 103), reason="requires SM100/SM103")
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
 
