@@ -363,7 +363,7 @@ def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
 @pytest.mark.L0
 @pytest.mark.parametrize("arch", (90, 120))
 def test_bsa_fp8_blk128_dispatch_preserves_v_layout_and_metadata(monkeypatch, arch):
-    """The two native blk128 paths share an API but require different V storage."""
+    """Pin each blk128 path's V layout, K scaling and sparse metadata."""
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: arch)

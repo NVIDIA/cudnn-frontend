@@ -3930,8 +3930,8 @@ def test_sdpa_thd_head_major_batch_one_frost_L0(env_info, paged, with_sink, requ
 def _p2_fp8_pools_graph(form):
     """graph.sdpa_fp8 over paged K/V pools with a sink (per-tensor FP8 E4M3 in, bf16 O; d128 32/8, b 4, s_q 8, KV 4096, page
     16, bottom-right causal), queries packed ("thd": Q / O carry ragged offsets, the pools stay dense -- the paged THD form
-    sdpa.fp16 declares) or dense.  Declared here because the fp8 harness's builder cannot spell ragged Q over paged pools
-    (its paged and ragged branches both declare the per-batch length tensors); the operands follow it otherwise: BSHD
+    sdpa.fp16 declares) or dense. Declared directly to pin the sink/softmax capability boundary independently of the
+    shared fp8 harness's randomized data and output checks; the operands follow that harness: BSHD
     queries, [pages, H, page, D] pools, row-major (b, 1, pages, 1) block tables, scalar (de)scales, the FLOAT softmax."""
     b, h_q, h_kv, s_q, s_kv, d, page = 4, 32, 8, 8, 4096, 128, 16
     e4m3, f32, i32, i64 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FLOAT, cudnn.data_type.INT32, cudnn.data_type.INT64

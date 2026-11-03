@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from cudnn.gemm.frost.epilogue_codegen import _FragmentCoordinates, _emit_op, _render_index_expr
-from cudnn.gemm.frost.fusion_ir import Axis, FusionOp, IndexExpr
+from cudnn.gemm.frost.fusion_ir import Axis, FusionOp, IndexExpr, IndexMap
 from cudnn.gemm.frost.graph_analyzer import matrix_axis_index
 
 
@@ -46,7 +46,7 @@ def test_frost_logical_index_invalid_geometry(shape, axis):
     "op,value,operand",
     [
         ("unknown", 1, None),
-        ("axis", 1, None),
+        ("axis", -1, None),
         ("constant", -1, None),
         ("constant", 1 << 63, None),
         ("mod", 0, IndexExpr.coordinate(Axis.M)),
@@ -83,7 +83,7 @@ def test_frost_logical_index_composition_and_validation():
     with pytest.raises(ValueError, match="only gen_index"):
         FusionOp("relu", index_expr=m)
     with pytest.raises(ValueError, match="only batch"):
-        FusionOp("gen_index", index_expr=IndexExpr.coordinate(Axis.K))
+        FusionOp("gen_index", index_expr=IndexExpr.coordinate(Axis.GROUP))
 
 
 @pytest.mark.L0
@@ -274,3 +274,49 @@ compiled = cute.compile(entry, fake_aux, fake_output, options="--enable-tvm-ffi"
     output.fill_(float("nan"))
     module.compiled(aux, output)
     torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape,target", [((2, 3, 4), (2, 12)), ((2, 1, 3, 4), (4, 6)), ((1, 6), (2, 3))])
+def test_frost_index_map_reshape_and_composition(shape, target):
+    """Logical reshape is independent of physical stride and preserves flat order."""
+    mapping = IndexMap.reshape(shape, target)
+    permutation = tuple(reversed(range(len(target))))
+    permuted = IndexMap.permutation(target, permutation)
+    composed = mapping.compose(permuted)
+    for consumer in product(*(range(d) for d in target)):
+        flat = 0
+        for c, d in zip(consumer, target):
+            flat = flat * d + c
+        expected = []
+        for d in reversed(shape):
+            expected.append(flat % d)
+            flat //= d
+        actual = tuple(e.evaluate(dict(enumerate(consumer))) for e in mapping.coordinates)
+        assert actual == tuple(reversed(expected))
+        transposed = tuple(consumer[i] for i in permutation)
+        assert tuple(e.evaluate(dict(enumerate(transposed))) for e in composed.coordinates) == actual
+    assert mapping.compose(IndexMap.identity(target)) == mapping
+
+
+@pytest.mark.L0
+def test_frost_index_map_broadcast_and_arithmetic():
+    """Broadcast need not be invertible; constant arithmetic remains exact Int64."""
+    mapping = IndexMap.broadcast((1, 3), (2, 4, 3))
+    assert tuple(e.evaluate({0: 1, 1: 2, 2: 1}) for e in mapping.coordinates) == (0, 1)
+    x = IndexExpr.coordinate(0)
+    assert x.add(0) == x and x.multiply(1) == x and x.multiply(0) == IndexExpr.constant(0)
+    expr = x.multiply(3).add(2)
+    assert expr.evaluate({0: 7}) == 23
+    assert expr.substitute({0: IndexExpr.constant(7)}) == IndexExpr.constant(23)
+    for action in (
+        lambda: IndexMap.reshape((2, 3), (5,)),
+        lambda: IndexMap.identity((1 << 62, 4)),
+        lambda: IndexMap.permutation((2, 3), (0, 0)),
+        lambda: IndexMap.broadcast((2, 3), (4, 3)),
+        lambda: IndexMap.identity((2, 3)).compose(IndexMap.identity((6,))),
+        lambda: IndexMap((2,), (2,), (x.multiply(2),)),
+        lambda: IndexExpr.constant(1 << 62).multiply(4),
+    ):
+        with pytest.raises(ValueError, match="index"):
+            action()

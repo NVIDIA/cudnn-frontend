@@ -6135,10 +6135,21 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # on this arch, so there is no room to widen the O tile the way the
             # SM100 kernels do.
             #
-            # The half templates write sink-free partials and the combine folds
-            # the sink once; the FP8 epilogues still fold it per split.
+            # Half templates and qualified per-tensor FP8 lowering write
+            # sink-free partials; only the final combine folds the sink.
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
-            self._value_error_if(self.has_sink and self._fp8, "split_kv > 1 with an attention sink is served by the FP16/BF16 templates only")
+            self._value_error_if(
+                self.has_sink
+                and self._fp8
+                and not supports_quantized_split_sink(
+                    device_cc=self.compute_capability,
+                    pertensor=self._pertensor,
+                    thd=self.thd,
+                    d_shape=(int(d_q), int(d_v)),
+                    paged=self.paged,
+                ),
+                "SM120 split_kv > 1 with an attention sink requires exact D128 dense per-tensor FP8 or FP16/BF16",
+            )
             self._value_error_if(
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 "split_kv > 1 serves unpadded dense graphs only",
@@ -6205,7 +6216,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             bottom_right=self.causal_bottom_right,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
-            has_sink=self.has_sink,
+            # Quantized split partials exclude the sink; the prepared spec
+            # retains api.has_sink and folds it once in the final combine.
+            has_sink=self.has_sink and not (self._fp8 and self.split_kv > 1),
             stats_log2=self.stats_log2 and self.split_kv == 1,
             thd_varlen=self.thd,
             q_tile=self.q_tile,
