@@ -5170,6 +5170,7 @@ def test_DSA_sparse_attention_backward_rejects_unsupported_head_dim_runtime():
 @torch_fork_set_rng(seed=90)
 def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     """SM90 reports ordinary or deterministic FP32 scratch (R2)."""
+    _require_sm90_relay_dsl()
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90 import flash_attn_bwd_sm90_workspace_size
         from cudnn.api_base import ws_align
