@@ -488,9 +488,10 @@ class CSACompressorBackward(_CSACompressorBase):
         """Validate the common envelope plus deterministic workspace indexing."""
         super().check_support()
         self._is_supported = False
-        if self.ratio == 128:
+        if self.ratio == 128 and self.total_comp > 0:
             # The r128 schedule is sized against SM100's 227 KiB per-CTA ceiling; a device with less (cc 12.x has ~99 KiB)
-            # would reject the launch with CUDA_LAUNCH_INVALID_CONFIG, so decline here with the actual numbers.
+            # would reject the launch with CUDA_LAUNCH_INVALID_CONFIG, so decline here with the actual numbers. An empty
+            # output (every sequence shorter than the ratio) launches no kernel and stays supported.
             smem_bytes = bwd_smem_bytes_r128(self.ratio, self.head_dim, self.coff, self.total_comp)
             smem_limit = device_info(self.target_device.index).shared_memory_per_block_optin
             self._not_implemented_error_if(
