@@ -9,6 +9,7 @@ Gradients are generated via autograd on the gather-based forward reference.
 import ast
 import inspect
 import math
+import re
 import textwrap
 
 import pytest
@@ -32,13 +33,20 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
-def _import_or_skip(module_name):
+def _import_or_skip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed"):
     """Import an optional CuTeDSL module or skip when the environment lacks it."""
-    return pytest.importorskip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed")
+    return pytest.importorskip(module_name, reason=reason)
+
+
+def _require_sm90_relay_dependencies():
+    """Skip before the relay package import can load optional dependencies."""
+    _import_or_skip("cutlass")
+    _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
 
 
 def _require_sm90_relay_dsl():
     """Skip feature tests when the deterministic SM90 relay cannot compile."""
+    _require_sm90_relay_dependencies()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward._sm90_relay import sm90_deterministic_relay_requirement_error
 
     requirement_error = sm90_deterministic_relay_requirement_error()
@@ -5357,6 +5365,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_cluster_size_rejects_before_st
 )
 def test_DSA_sparse_attention_backward_sm90_relay_cutedsl_version_gate(monkeypatch, version, expected):
     """The SM90 relay names its 4.8 DSL floor without importing a kernel."""
+    _require_sm90_relay_dependencies()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
     from cudnn.frost import buffers
 
@@ -5367,6 +5376,7 @@ def test_DSA_sparse_attention_backward_sm90_relay_cutedsl_version_gate(monkeypat
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm90_relay_feature_tests_skip_old_cutedsl(monkeypatch):
     """Feature tests skip, while the dedicated version-refusal test remains active."""
+    _require_sm90_relay_dependencies()
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.1")))
@@ -5375,8 +5385,28 @@ def test_DSA_sparse_attention_backward_sm90_relay_feature_tests_skip_old_cutedsl
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("missing_dependency", ["cutlass", "cuda.bindings.driver"])
+def test_DSA_sparse_attention_backward_sm90_relay_dependencies_skip_before_package_import(monkeypatch, missing_dependency):
+    """A missing optional dependency skips before importing the relay package."""
+    attempted_imports = []
+
+    def import_or_skip(module_name, reason=None):
+        attempted_imports.append(module_name)
+        if module_name == missing_dependency:
+            pytest.skip(f"missing {module_name}")
+
+    monkeypatch.setitem(globals(), "_import_or_skip", import_or_skip)
+    with pytest.raises(pytest.skip.Exception, match=rf"missing {re.escape(missing_dependency)}"):
+        _require_sm90_relay_dsl()
+
+    expected_imports = ["cutlass"] if missing_dependency == "cutlass" else ["cutlass", "cuda.bindings.driver"]
+    assert attempted_imports == expected_imports
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
     """The largest valid signed-Int32 element offset is accepted exactly."""
+    _require_sm90_relay_dependencies()
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
 
     limit = 1 << 31
