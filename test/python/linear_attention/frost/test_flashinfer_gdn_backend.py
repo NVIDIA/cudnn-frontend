@@ -54,6 +54,7 @@ ROWS = [1, 2, 3, 4, 8, 16, 64]  # FlashInfer's decode rows (the last row a paddi
 VERIFY_SHAPES = [(1, 4), (1, 6), (2, 4), (2, 6), (4, 4), (4, 6)]  # FlashInfer's verify (requests, tokens per request)
 SM100_READINGS = dict(SMEM_PER_SM_BYTES=233472, SMEM_OPTIN_BYTES=232448)  # a cc 10.0 part: 228 KB per SM, 227 KB per-CTA opt-in
 SM100_SMS = 148
+POLICY_SMS = {"148 SMs": SM100_SMS, "two CTAs per SM": 47}  # the SM-count input of the entry's pick per launch policy
 
 
 def _probe(device, form="decode", **kw):
@@ -481,19 +482,21 @@ def test_flashinfer_verify_reference_test_passes_against_frost_fe(monkeypatch, r
     fi.ver.test_verify_matches_reference(dev, requests, tokens, "device")
 
 
-@pytest.mark.parametrize("policy", ["148 SMs", "two CTAs per SM"])
+@pytest.mark.parametrize("policy", sorted(POLICY_SMS))
 @pytest.mark.parametrize("requests, tokens", VERIFY_SHAPES, ids=lambda v: str(v))
 def test_flashinfer_verify_reference_passes_under_the_sm_count_policies(requests, tokens, policy):
     """FlashInfer's verify reference with the entry's SM-count pick steered the way its own test steers the built-in backend (its ``b200``
     policy sets the wrapper's SM count before the first compile): the 148-SM policy (the cluster pair at one request, the one-CTA-per-SM
-    form at 2 .. 3, two
-    CTAs per SM from 4) and, with an SM count below one request's grid, the two-CTAs-per-SM form at every shape."""
+    form at 2 .. 3, two CTAs per SM from 4) and, with an SM count below one request's grid, the two-CTAs-per-SM form at every shape.  The
+    expected form follows the SM-count rule itself (the pair while ``requests x 96`` CTAs have an SM each, streaming once ``requests x 48``
+    outgrow them), so a part with another SM count pins its own switch points."""
     dev = _verify_device_or_skip(requests, tokens)
     fi = _flashinfer_tests()
     plan = prepare_qwen_3_5_gdn_block("verify", geometry=GEOMETRY, device=dev, requests=requests, tokens_per_request=tokens, backend=backend.BACKEND)
-    plan._runner.kernel.sm_count = SM100_SMS if policy == "148 SMs" else 47  # the pick's SM-count input, before the first compile
+    sms = POLICY_SMS[policy]
+    plan._runner.kernel.sm_count = sms  # the pick's SM-count input, before the first compile
     form = plan._runner.kernel.cfg_for(requests)
-    assert form.STATE_STREAM == (policy == "two CTAs per SM" or requests * 48 > SM100_SMS), (policy, requests, form)
+    assert form.STATE_STREAM == (requests * 48 > sms) and form.TWO_CTAS_PER_HEAD == (requests * 96 <= sms), (policy, requests, form)
     case = fi.ver.make_case(requests, tokens, seed=100 * requests + tokens, device=dev, form="verify")
     ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
     q, out = fi.ver._outputs(requests * tokens, dev)

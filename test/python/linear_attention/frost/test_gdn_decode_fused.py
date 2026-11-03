@@ -114,7 +114,9 @@ def test_default_form_switches_where_the_grid_outgrows_the_sms(sm_count):
         assert kcfg.default_cfg(rows, sm_count) == kcfg.CFG, (rows, sm_count)
     for rows in (4, 8, 64):
         assert kcfg.default_cfg(rows, sm_count) == kcfg.CAPPED_CFG, (rows, sm_count)
+    pairs = sm_count // (2 * kcfg.V_HEADS)  # the last rows count whose cluster grid has an SM per CTA
     fits = sm_count // kcfg.V_HEADS  # the last rows count whose one-CTA grid fits
+    assert kcfg.default_cfg(pairs, sm_count) == kcfg.PAIR_CFG and kcfg.default_cfg(pairs + 1, sm_count) == kcfg.CFG
     assert kcfg.default_cfg(fits, sm_count) == kcfg.CFG and kcfg.default_cfg(fits + 1, sm_count) == kcfg.CAPPED_CFG
     assert kcfg.default_cfg(2, 192) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 192) == kcfg.CFG  # a 192-SM part would pair rows 2 too
     with pytest.raises(ValueError, match="rows"):
@@ -440,7 +442,7 @@ def test_entry_picks_the_form_per_rows_on_this_device():
         assert (got.SMEM_PER_SM_BYTES, got.SMEM_OPTIN_BYTES) == (k.cfg.SMEM_PER_SM_BYTES, k.cfg.SMEM_OPTIN_BYTES)  # the part's readings
     pair = k.cfg_for(1)
     assert pair.TWO_CTAS_PER_HEAD and pair.SMEM_PAD_BYTES == 0 and 2 * (pair.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= pair.SMEM_PER_SM_BYTES
-    one = k.cfg_for(2)
+    one = k.cfg_for(sms // (2 * kcfg.V_HEADS) + 1)  # the first rows count whose cluster grid outgrows the SMs (rows 2 on 148 / 152 SMs)
     assert not one.TWO_CTAS_PER_HEAD and 2 * (one.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES  # one CTA per SM by shared memory
     two = k.cfg_for(sms // kcfg.V_HEADS + 1)  # the first rows count whose one-CTA grid outgrows the SMs
     assert two.MIN_CTAS_PER_SM == 2 and two.SMEM_PAD_BYTES == 0 and 2 * (two.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= two.SMEM_PER_SM_BYTES

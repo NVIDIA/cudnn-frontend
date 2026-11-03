@@ -277,8 +277,10 @@ def test_default_cfg_picks_the_pair_then_the_one_cta_form_then_the_two_ctas_per_
             assert kcfg.default_cfg(requests, sm_count) == cfg, (requests, sm_count)  # 192 would not; 96 / 144 one-CTA CTAs do
         for requests in (4, 8, 16):
             assert kcfg.default_cfg(requests, sm_count) == two, (requests, sm_count)
-        fits = sm_count // kcfg.V_HEADS
-        assert kcfg.default_cfg(fits, sm_count) == cfg and kcfg.default_cfg(fits + 1, sm_count) == two
+        pairs = sm_count // (2 * kcfg.V_HEADS)  # the last requests count whose cluster grid has an SM per CTA
+        fits = sm_count // kcfg.V_HEADS  # the last requests count whose one-CTA grid fits
+        assert kcfg.default_cfg(pairs, sm_count) == pair and kcfg.default_cfg(pairs + 1, sm_count) == cfg, sm_count
+        assert kcfg.default_cfg(fits, sm_count) == cfg and kcfg.default_cfg(fits + 1, sm_count) == two, sm_count
     assert kcfg.default_cfg(2, 192) == pair and kcfg.default_cfg(3, 192) == cfg  # a 192-SM part would pair two requests too
     assert kcfg.default_cfg(1, 95) == cfg  # fewer SMs than the pair's 96 CTAs: the one-CTA form
     with pytest.raises(ValueError, match="requests"):
