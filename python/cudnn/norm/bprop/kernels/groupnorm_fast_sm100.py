@@ -416,9 +416,8 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     dyf, xf, dxf = dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1)
     args = (dyn(dyf), dyn(xf), dyn(dxf), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (M, V, CPG, SPAN, GPS, bt, it_ty, et, spec.has_mean, has_beta, smem_bytes, fgrid, fbt)
-    # dyn() specializes unit strides and keeps non-unit strides dynamic. The
-    # cache must distinguish these signatures for each read-only vector.
-    key = (params.io_dtype, ctas, gamma.stride(0) == 1, mean.stride(0) == 1, rstd.stride(0) == 1) + ce
+    # dyn() specializes strides 0 and 1; larger strides are dynamic.
+    key = (params.io_dtype, ctas, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_gn_bwd_fast_host, *args, *ce, fake_stream())
