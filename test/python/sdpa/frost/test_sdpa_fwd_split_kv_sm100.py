@@ -1600,9 +1600,8 @@ def test_quantized_split_reduces_in_half_not_in_the_output_type(out_dtype):
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        # Conversion O belongs to caller scratch now. Remove that separately
-        # sized final-output region when comparing the partial reservations.
-        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
+        # Native layout binding does not reserve a final-output copy.
+        return api.scratch_workspace_bytes()
 
     assert carved(out_dtype) == carved(torch.float16) > 0
 
@@ -1676,9 +1675,8 @@ def test_api_d256_quantized_split_reduces_in_half():
         o = torch.zeros(b, h, s_q, d, device=dev, dtype=o_dtype)
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=o_dtype, split_kv=4, pertensor_fp8=True)
         assert api.check_support()
-        # Conversion O belongs to caller scratch now. Remove that separately
-        # sized final-output region when comparing the partial reservations.
-        return api.scratch_workspace_bytes() - o.numel() * o.element_size()
+        # Native layout binding does not reserve a final-output copy.
+        return api.scratch_workspace_bytes()
 
     assert carved(torch.float8_e4m3fn) == carved(torch.float16) > 0
 
@@ -1752,8 +1750,7 @@ def test_split_workspace_is_sized_for_fp32_partials(split):
     over whatever the caller placed after the workspace."""
     b, h_q, s_q, d = 1, 8, 512, 128
     api, _got, _ref, wsb = _fp32_partials_api(split, b=b, h_q=h_q, s_q=s_q, d=d)
-    assert {region[0] for region in api._staged_spec.regions} == {"q", "o"}
-    wsb -= b * h_q * s_q * d * (1 + torch.float16.itemsize)  # gathered FP8 Q and final half O
+    assert api._dense_spec.native is not None and not hasattr(api, "_staged_spec")
     o_bytes = split * b * s_q * h_q * d * 4
     lse_bytes = split * b * h_q * s_q * 4
     assert wsb >= o_bytes + lse_bytes, f"workspace {wsb} cannot hold fp32 partials ({o_bytes} O + {lse_bytes} LSE)"
@@ -1785,9 +1782,9 @@ def test_fp32_partials_fold_off_without_a_split():
     fold away and leave the single-pass SMEM/TMA epilogue byte-identical."""
     api, _got, _ref, wsb = _fp32_partials_api(1)
     assert not api._fp32_partial_split()
-    assert api._staged_spec.core.combine is None
-    # Dense conversion still owns Q/O scratch and the core scalar dummies.
-    assert wsb == 1 * 8 * 512 * 128 * (1 + torch.float16.itemsize) + 128
+    assert api._dense_spec.combine is None
+    # No layout scratch: only the scalar identity reservation remains.
+    assert wsb == 128
 
 
 # --- narrow head dims under a split -----------------------------------------

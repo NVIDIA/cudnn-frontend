@@ -7,19 +7,19 @@ from types import SimpleNamespace
 
 
 @lru_cache(maxsize=128)
-def build_launch(module, device_index, h, h_kv, n_seq, swa_window, prefix_dtypes, sink_dtype):
+def build_launch(module, device_index, h, h_kv, n_seq, swa_window, prefix_dtypes, sink_dtype, dimensions=None):
     """Cache only the artifact and immutable host contract, never caller storage."""
     from cudnn import _pybind_module
     from .kernels.sm80.prepared_host import compile_thd_host
 
-    artifact, fn = compile_thd_host(module, h, h_kv, n_seq, swa_window, prefix_dtypes, sink_dtype)
+    artifact, fn = compile_thd_host(module, h, h_kv, n_seq, swa_window, prefix_dtypes, sink_dtype, dimensions=dimensions)
     params = module.PARAMS
     spec = SimpleNamespace(
         artifact=artifact,
         fn=fn,
         device_index=device_index,
         heads=(h, h_kv),
-        dimensions=(params.d_qk, params.d_v),
+        dimensions=(params.d_qk, params.d_v) if dimensions is None else tuple(dimensions),
         n_seq=n_seq,
         dtype="bfloat16" if params.io_bf16 else "float16",
         prefix_dtypes=tuple(t.removeprefix("torch.") for t in prefix_dtypes),

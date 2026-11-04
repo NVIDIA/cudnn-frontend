@@ -569,10 +569,13 @@ def cutedsl_state():
     return _DSL_STATE
 
 
-def cutedsl_too_old(version):
-    """``(distribution, version)`` is the public wheel, below the floor.
+def cutedsl_too_old(version, floor=CUTEDSL_MIN_VERSION):
+    """``(distribution, version)`` is the public wheel, below ``floor``.
 
-    Absent, unparsable, or an internal RC counts as NOT too old: internal builds
+    ``floor`` is the library floor ``CUTEDSL_MIN_VERSION`` unless a kernel passes
+    its own, higher one (Rule 7: every floor through this one parser, never a
+    second copy of it).  Absent, unparsable, or an internal RC counts as NOT too
+    old: internal builds
     carry their own numbering ("0.3.0+2026...") that the public floor cannot
     judge, and refusing on a string we failed to read would decline on a machine
     that works.
@@ -598,7 +601,7 @@ def cutedsl_too_old(version):
     # A short public version ("4.6") means the omitted components are zero
     # ("4.6.0"), so it compares against the floor instead of slipping past it.
     parts += [0] * (3 - len(parts))
-    return tuple(parts) < CUTEDSL_MIN_VERSION
+    return tuple(parts) < tuple(floor)
 
 
 @lru_cache(maxsize=1)
@@ -661,9 +664,10 @@ def cutedsl_primitives_error(what):
     )
 
 
-def cutedsl_requirement_error(what):
-    """Message naming the installed DSL version when it is below the floor, else None.
+def cutedsl_requirement_error(what, floor=CUTEDSL_MIN_VERSION):
+    """Message naming the installed DSL version when it is below ``floor``, else None.
 
+    ``floor`` is the library floor unless a kernel passes its own, higher one.
     Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
     version problem, not as a missing dependency, even when an environment
     bypasses the package dependency floor (see AGENTS.md Rule 7).
@@ -671,9 +675,9 @@ def cutedsl_requirement_error(what):
     installed, version = cutedsl_state()
     if not installed:
         return None
-    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
-    if cutedsl_too_old(version):
-        return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
+    floor_text = ".".join(str(x) for x in floor)
+    if cutedsl_too_old(version, floor):
+        return f"{what} requires nvidia-cutlass-dsl >= {floor_text}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor_text}'"
     return None
 
 

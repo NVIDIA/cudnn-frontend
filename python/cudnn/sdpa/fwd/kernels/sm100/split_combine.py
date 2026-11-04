@@ -151,6 +151,23 @@ scale on the decode-grid kernel for THIS entry only (``scale_o is None or quant_
 module's own forms as before).  ``quant_divisor`` is a trace-time constant on the four kernels behind ``_launch_combine``'s five forms
 (``_combine_packed_kernel`` is reached by the packed host entry only and never takes the fused store) and the two launchers, so every other
 entry's traced code is what it was.
+
+TWO ROUNDING CONVENTIONS of the fused store (``compile_ptr(out_rounding=)``; the trailing ``quant_rounding`` constexpr on the same four kernels
+and two launchers; on the adapter an OP ATTRIBUTE of the declaration, never a knob -- it changes the bytes).  ``"single"`` (the default) is the
+convention above: ONE rounding, of the fp32 gated value, FROST's own -- every existing entry traces the code it did.  ``"staged"`` reproduces a
+serving stack's gate-and-quantize launch byte for byte, ``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, s))``: the merged
+value rounded to bf16 as that stack's attention kernel stores it, the exact sigmoid as a DIVISION (``cute.math.exp`` at its default -- the
+precise lowering, never ``tanh.approx`` / a bare ``ex2`` -- and ``arith.divf`` = ``div.rn.f32``), the gated value rounded to bf16 once more, the
+fp32 multiply by the same ``div.rn(1, s)`` inverse, the saturating cvt -- spelled with the SAME DSL ops the stack's kernel spells
+(``_staged_gate_quad``), so the two agree bitwise on the arithmetic given the same (bf16 O, G, s); in a served chain the attention's own fp32
+accumulation order still flips a bf16 rounding of O on a small fraction of the elements.  Its purpose: a provider whose speculative verify is
+tuned on the stack's bytes can take the fused launch without moving the acceptance length -- the ~2-3 % of the elements one e4m3 code apart
+between the two conventions are enough to flip a near-tie greedy token.  The staged arm reads the same gate loads, keeps the dead-row SELECT
+per element AFTER the gate, then takes the single arm's ``* inv`` and store: the LSE, the dead rows (exactly 0), the PDL pair and every form
+(AUTO / ON / OFF / the lean group walk) are the single mode's.  bf16 gate dtype only (the convention is a bf16 chain's; the f16 analogue is
+refused by name, not defined); ``"staged"`` without ``gate_e4m3`` is refused by name.  The suite's boundary cell reads the mode: at a merged
+value of 1e-8, a zero gate and the scale 1e-10 the single mode stores 48 (fp32 50 ties to even), the staged mode 52 (bf16 1.0012e-8 halved to
+bf16 5.0059e-9, times 1e10 = 50.06).
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -162,6 +179,7 @@ from pathlib import Path
 
 from cudnn.sdpa.fwd.kernels._quantized import _unscale_amax_kernel
 from cudnn.sdpa.fwd.heuristics import DECODE_COMBINE_MAX_LEAN_BLOCKS as _DECODE_COMBINE_MAX_LEAN_BLOCKS
+from cudnn.sdpa.fwd.sparse_tile_rules import COMBINE_OUT_ROUNDING_SINGLE, COMBINE_OUT_ROUNDING_STAGED, COMBINE_OUT_ROUNDINGS
 from cudnn._cutlass_compat import SmemAllocator
 
 import cutlass
@@ -254,6 +272,13 @@ DECODE_GRID_LEAN_WALK = 3
 # kernel's per-chain slot count and the wide lean group's width (DECODE_SPLITS_PER_CHAIN == G_S == 16): the bitwise window of the forms.
 LEAN_WALK_G_S = 4
 LEAN_WALK_G_T = 16
+# The fused gated e4m3 store's ROUNDING CONVENTION (the trailing ``quant_rounding`` constexpr of the four kernels behind ``_launch_combine`` and
+# of the two launchers; ``compile_ptr(out_rounding=)`` maps heuristics.COMBINE_OUT_ROUNDINGS onto it; the module docstring).  SINGLE = one
+# rounding of the fp32 gated value (the default: every existing entry's traced code); STAGED = a serving stack's gate-and-quantize order
+# (``_staged_gate_quad``: bf16 of the merged value, the exact sigmoid as a division, bf16 of the gated value, then the shared ``* inv`` and
+# saturating cvt).  A third convention appends 2 (the DECODE_GRID_* pattern), never a new signature.
+QUANT_ROUNDING_SINGLE = 0
+QUANT_ROUNDING_STAGED = 1
 
 
 def lean_grid_blocks(b: int, h: int, s_q: int) -> int:
@@ -408,6 +433,34 @@ def _rcp_div_rn(s):
         read_only_args=[s],
     )
     return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
+
+
+def _staged_gate_elem(o32, g, all_dead, zero, one):
+    """One element of :func:`_staged_gate_quad`: ``bf16(bf16(o32) / (1 + exp(-g)))`` widened back to fp32, exactly 0 on a dead row -- a SELECT
+    after the gate (a NaN gate on a dead row never reaches the byte; ``0 * inv`` with a finite ``inv`` is the dead row's 0 as in the single mode).
+    The ops are the ones a serving stack's gate-and-quantize kernel spells in this DSL, in its order, at its default flags: ``arith.truncf`` to bf16
+    (round-to-nearest-even) and ``arith.extf`` back, ``cute.math.exp`` without ``fastmath`` (the precise lowering, never the approximate one),
+    ``arith.addf``, ``arith.divf`` (``div.rn.f32``) -- so the two agree bitwise given the same (bf16 O, G)."""
+    a = o32.to(cutlass.BFloat16).to(cutlass.Float32)
+    den = one + cute.math.exp(-g)
+    v = (a / den).to(cutlass.BFloat16).to(cutlass.Float32)
+    return cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), v.ir_value()))
+
+
+def _staged_gate_quad(o0, o1, o2, o3, g0, g1, g2, g3, all_dead):
+    """The STAGED rounding convention of the fused gated e4m3 store (``quant_rounding == QUANT_ROUNDING_STAGED``; the module docstring) on one
+    lane's four columns: the fp32 merged values ``o0 .. o3`` (``acc * inv_den``, the value the ungated half entry rounds to bf16 at its store) and
+    the fp32 gate values ``g0 .. g3`` -> the four fp32 values the caller multiplies by ``div.rn(1, s)`` and converts with ``cvt.rn.satfinite`` --
+    per element ``SELECT(all_dead, 0, bf16(bf16(o) / (1 + exp(-g))))`` (:func:`_staged_gate_elem`).  Per-lane register arithmetic under a
+    trace-time constant: no barrier, no SMEM, no new global read; the single arm's text is untouched."""
+    zero = cutlass.Float32(0.0)
+    one = cutlass.Float32(1.0)
+    return (
+        _staged_gate_elem(o0, g0, all_dead, zero, one),
+        _staged_gate_elem(o1, g1, all_dead, zero, one),
+        _staged_gate_elem(o2, g2, all_dead, zero, one),
+        _staged_gate_elem(o3, g3, all_dead, zero, one),
+    )
 
 
 def _st_e4m3x4(addr, v0, v1, v2, v3):
@@ -602,6 +655,11 @@ def _combine_kernel(
     # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
     # trace-time constant: the OFF arm's traced code is unchanged.
     quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
@@ -752,24 +810,29 @@ def _combine_kernel(
                             g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                         if d0 + cutlass.Int32(3) < d_v:
                             g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                        h0 = acc0 * inv_den_half
-                        h1 = acc1 * inv_den_half
-                        h2 = acc2 * inv_den_half
-                        h3 = acc3 * inv_den_half
-                        s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                        s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                        t0 = cute.math.tanh(s0, approx=True)
-                        t1 = cute.math.tanh(s1, approx=True)
-                        t2 = cute.math.tanh(s2, approx=True)
-                        t3 = cute.math.tanh(s3, approx=True)
-                        y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                        y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                        outs = (
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                        )
+                        if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                            # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value
+                            # rounded to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                            outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                        else:
+                            h0 = acc0 * inv_den_half
+                            h1 = acc1 * inv_den_half
+                            h2 = acc2 * inv_den_half
+                            h3 = acc3 * inv_den_half
+                            s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                            s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                            t0 = cute.math.tanh(s0, approx=True)
+                            t1 = cute.math.tanh(s1, approx=True)
+                            t2 = cute.math.tanh(s2, approx=True)
+                            t3 = cute.math.tanh(s3, approx=True)
+                            y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                            y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                            outs = (
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                            )
                     vals = []
                     for i in cutlass.range_constexpr(4):
                         o_val = outs[i]
@@ -950,24 +1013,29 @@ def _combine_kernel(
                             g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                         if d0 + cutlass.Int32(3) < d_v:
                             g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                        h0 = acc0 * inv_den_half
-                        h1 = acc1 * inv_den_half
-                        h2 = acc2 * inv_den_half
-                        h3 = acc3 * inv_den_half
-                        s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                        s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                        t0 = cute.math.tanh(s0, approx=True)
-                        t1 = cute.math.tanh(s1, approx=True)
-                        t2 = cute.math.tanh(s2, approx=True)
-                        t3 = cute.math.tanh(s3, approx=True)
-                        y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                        y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                        outs = (
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                        )
+                        if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                            # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value
+                            # rounded to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                            outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                        else:
+                            h0 = acc0 * inv_den_half
+                            h1 = acc1 * inv_den_half
+                            h2 = acc2 * inv_den_half
+                            h3 = acc3 * inv_den_half
+                            s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                            s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                            t0 = cute.math.tanh(s0, approx=True)
+                            t1 = cute.math.tanh(s1, approx=True)
+                            t2 = cute.math.tanh(s2, approx=True)
+                            t3 = cute.math.tanh(s3, approx=True)
+                            y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                            y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                            outs = (
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                            )
                     if cutlass.const_expr(quant_divisor):
                         # the fused gated e4m3 entry: the four scaled columns, then the packed / element store (no amax arm on this entry)
                         _store_e4m3_quad(
@@ -1071,6 +1139,11 @@ def _combine_decode_kernel(
     # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
     # trace-time constant: the OFF arm's traced code is unchanged.
     quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The decode form (S_q < 4): one block of four warps per row set.
 
@@ -1339,24 +1412,29 @@ def _combine_decode_kernel(
                         g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                     if d0 + cutlass.Int32(3) < d_v:
                         g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                h0 = acc0 * inv_den_half
-                h1 = acc1 * inv_den_half
-                h2 = acc2 * inv_den_half
-                h3 = acc3 * inv_den_half
-                s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                t0 = cute.math.tanh(s0, approx=True)
-                t1 = cute.math.tanh(s1, approx=True)
-                t2 = cute.math.tanh(s2, approx=True)
-                t3 = cute.math.tanh(s3, approx=True)
-                y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                outs = (
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                )
+                if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                    # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value rounded
+                    # to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                    outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                else:
+                    h0 = acc0 * inv_den_half
+                    h1 = acc1 * inv_den_half
+                    h2 = acc2 * inv_den_half
+                    h3 = acc3 * inv_den_half
+                    s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                    s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                    t0 = cute.math.tanh(s0, approx=True)
+                    t1 = cute.math.tanh(s1, approx=True)
+                    t2 = cute.math.tanh(s2, approx=True)
+                    t3 = cute.math.tanh(s3, approx=True)
+                    y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                    y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                    outs = (
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                    )
             if cutlass.const_expr(quant_divisor):
                 # the fused gated e4m3 entry: the four scaled columns, then the packed / element store (no amax arm on this entry)
                 _store_e4m3_quad(o_out, o_batch, o_tok, head, d0, d_v, outs[0] * q_scale, outs[1] * q_scale, outs[2] * q_scale, outs[3] * q_scale, row_live)
@@ -1434,6 +1512,11 @@ def _combine_decode_grid_kernel(
     # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
     # trace-time constant: the OFF arm's traced code is unchanged.
     quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The DECODE-GRID form of the lean fp32-partial combine (module constants ``DECODE_*``; the layout
     + barrier / SMEM notes are in the module docstring; the cc 10.7 adapter's form on a small split
@@ -1634,24 +1717,29 @@ def _combine_decode_grid_kernel(
                     g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                 if d0 + cutlass.Int32(3) < d_v:
                     g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-            hg0 = acc0 * inv_den_half
-            hg1 = acc1 * inv_den_half
-            hg2 = acc2 * inv_den_half
-            hg3 = acc3 * inv_den_half
-            s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-            s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-            t0 = cute.math.tanh(s0, approx=True)
-            t1 = cute.math.tanh(s1, approx=True)
-            t2 = cute.math.tanh(s2, approx=True)
-            t3 = cute.math.tanh(s3, approx=True)
-            y0, y1 = ffma2(t0, t1, hg0, hg1, hg0, hg1)
-            y2, y3 = ffma2(t2, t3, hg2, hg3, hg2, hg3)
-            outs = (
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-            )
+            if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value rounded to
+                # bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+            else:
+                hg0 = acc0 * inv_den_half
+                hg1 = acc1 * inv_den_half
+                hg2 = acc2 * inv_den_half
+                hg3 = acc3 * inv_den_half
+                s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                t0 = cute.math.tanh(s0, approx=True)
+                t1 = cute.math.tanh(s1, approx=True)
+                t2 = cute.math.tanh(s2, approx=True)
+                t3 = cute.math.tanh(s3, approx=True)
+                y0, y1 = ffma2(t0, t1, hg0, hg1, hg0, hg1)
+                y2, y3 = ffma2(t2, t3, hg2, hg3, hg2, hg3)
+                outs = (
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                    cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                )
         q_scale = cutlass.Float32(1.0)
         if cutlass.const_expr(scale_o is not None):
             q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
@@ -1941,6 +2029,11 @@ def _combine_lean_walk_kernel(
     # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
     # trace-time constant: the OFF arm's traced code is unchanged.
     quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The LEAN GROUP WALK: the module's former lean kernel, restored as the fifth form for the lean-grid-overflow launches of the cc 10.7
     line (the module docstring).  One warp per (q_row, head, batch), ROWS_PER_BLOCK rows per block, a lane owning four columns of every
@@ -2130,24 +2223,29 @@ def _combine_lean_walk_kernel(
                         g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
                     if d0 + cutlass.Int32(3) < d_v:
                         g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
-                    h0 = acc0 * inv_den_half
-                    h1 = acc1 * inv_den_half
-                    h2 = acc2 * inv_den_half
-                    h3 = acc3 * inv_den_half
-                    s0, s1 = fmul2(g0, g1, gate_half, gate_half)
-                    s2, s3 = fmul2(g2, g3, gate_half, gate_half)
-                    t0 = cute.math.tanh(s0, approx=True)
-                    t1 = cute.math.tanh(s1, approx=True)
-                    t2 = cute.math.tanh(s2, approx=True)
-                    t3 = cute.math.tanh(s3, approx=True)
-                    y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
-                    y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
-                    outs = (
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
-                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
-                    )
+                    if cutlass.const_expr(quant_rounding == QUANT_ROUNDING_STAGED):
+                        # The STAGED convention of the fused e4m3 store (the module docstring): the merged value and the gated value
+                        # rounded to bf16, the exact sigmoid as a division, the dead-row SELECT after the gate -- on the same gate loads.
+                        outs = _staged_gate_quad(outs[0], outs[1], outs[2], outs[3], g0, g1, g2, g3, all_dead)
+                    else:
+                        h0 = acc0 * inv_den_half
+                        h1 = acc1 * inv_den_half
+                        h2 = acc2 * inv_den_half
+                        h3 = acc3 * inv_den_half
+                        s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                        s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                        t0 = cute.math.tanh(s0, approx=True)
+                        t1 = cute.math.tanh(s1, approx=True)
+                        t2 = cute.math.tanh(s2, approx=True)
+                        t3 = cute.math.tanh(s3, approx=True)
+                        y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                        y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                        outs = (
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                            cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                        )
                 vals = []
                 for i in cutlass.range_constexpr(4):
                     o_val = outs[i]
@@ -2234,6 +2332,11 @@ def _launch_own_forms(
     # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
     # trace-time constant: the OFF arm's traced code is unchanged.
     quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """The module's own THREE-WAY rule -- what ``DECODE_GRID_OFF`` means, and what every launch that takes neither the
     decode-grid kernel nor the lean group walk runs: one of three kernels, chosen per launch from the runtime geometry
@@ -2277,7 +2380,7 @@ def _launch_own_forms(
     # S_q = 1, 2-8 splits: 3.4-4.4 us -> 2.1-2.9 us).
     if cutlass.Int32(SQ) <= cutlass.Int32(ROWS_PER_BLOCK // 2):
         if n_splits > cutlass.Int32(G_S):
-            _combine_decode_kernel(*args, use_pdl=use_pdl, quant_divisor=quant_divisor).launch(
+            _combine_decode_kernel(*args, use_pdl=use_pdl, quant_divisor=quant_divisor, quant_rounding=quant_rounding).launch(
                 grid=(1, H, B),
                 block=[THREADS, 1, 1],
                 smem=SMEM_BYTES,
@@ -2288,7 +2391,7 @@ def _launch_own_forms(
             # Each warp owns one row without a CTA barrier or cross-warp
             # exchange. Group heads so short-query batches use fewer blocks;
             # a head tail is guarded independently in the kernel.
-            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl, pack_heads=True, quant_divisor=quant_divisor).launch(
+            _combine_kernel(*args, lean_wide=True, use_pdl=use_pdl, pack_heads=True, quant_divisor=quant_divisor, quant_rounding=quant_rounding).launch(
                 grid=((H + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, SQ, B),
                 block=[cute.math.min(cutlass.Int32(H), cutlass.Int32(ROWS_PER_BLOCK)) * 32, 1, 1],
                 max_number_threads=[THREADS, 1, 1],
@@ -2296,7 +2399,7 @@ def _launch_own_forms(
                 use_pdl=use_pdl,
             )
     else:
-        _combine_kernel(*args, use_pdl=use_pdl, quant_divisor=quant_divisor).launch(
+        _combine_kernel(*args, use_pdl=use_pdl, quant_divisor=quant_divisor, quant_rounding=quant_rounding).launch(
             grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
             block=[THREADS, 1, 1],
             stream=stream,
@@ -2330,6 +2433,11 @@ def _launch_combine(
     # q_scale becomes div.rn.f32(1, scale_o[0]) -- and the e4m3 row is stored by _store_e4m3_quad (packed where the layout allows).  A
     # trace-time constant: the OFF arm's traced code is unchanged.
     quant_divisor: cutlass.Constexpr[bool] = False,
+    # The fused store's ROUNDING CONVENTION (compile_ptr(out_rounding=); the module docstring): QUANT_ROUNDING_SINGLE = one rounding of the
+    # fp32 gated value (the default), QUANT_ROUNDING_STAGED = a serving stack's gate-and-quantize order (_staged_gate_quad).  A trace-time
+    # constant read at the gate site only, meaningful with quant_divisor (compile_ptr refuses the other composition); the default arm's traced
+    # code is unchanged.
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """One launch for every ABI: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
@@ -2392,6 +2500,7 @@ def _launch_combine(
                 gate,
                 use_pdl,
                 quant_divisor,
+                quant_rounding,
             ).launch(
                 grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
                 block=[THREADS, 1, 1],
@@ -2420,6 +2529,7 @@ def _launch_combine(
                 q_lens,
                 use_pdl,
                 quant_divisor,
+                quant_rounding,
             )
     else:
         # The decode-grid kernel's geometry test is the lean path's own: lane l reads columns 4l..4l+3 of the compact fp32 partial
@@ -2467,6 +2577,7 @@ def _launch_combine(
                 gate,
                 use_pdl,
                 quant_divisor,
+                quant_rounding,
             ).launch(
                 grid=(cutlass.Int32(SQ) * n_chunks, H, B),
                 block=[DECODE_THREADS, 1, 1],
@@ -2495,6 +2606,7 @@ def _launch_combine(
                 q_lens,
                 use_pdl,
                 quant_divisor,
+                quant_rounding,
             )
 
 
@@ -2615,11 +2727,15 @@ def _host_ptr_gated_e4m3(
     decode_grid: cutlass.Constexpr[int],
     stream: _cuda_driver.CUstream = None,
     use_pdl: cutlass.Constexpr[bool] = False,
+    quant_rounding: cutlass.Constexpr[int] = QUANT_ROUNDING_SINGLE,
 ) -> None:
     """:func:`_host_ptr_gated` plus the 1-element fp32 static per-tensor DEQUANT scale ``scale_ptr`` (REQUIRED, right after the gate
     strides: no defaulted slot ahead of ``stream``) -- the FUSED gated e4m3 entry of the module docstring: the fp32 merged value gated, times
     ``div.rn(1, scale[0])`` on device, rounded ONCE to the e4m3 output (``cvt.rn.satfinite``), the dead rows 0, the LSE untouched.  Every form
-    (the decode-grid kernel under AUTO / ON where its geometry holds, the module's own forms otherwise) runs the same arithmetic."""
+    (the decode-grid kernel under AUTO / ON where its geometry holds, the module's own forms otherwise) runs the same arithmetic.
+    ``quant_rounding`` (appended after ``use_pdl``; a Constexpr, never a runtime slot, so the positional frame is unchanged) names the store's
+    rounding convention: ``QUANT_ROUNDING_SINGLE`` (the default, the one rounding above) or ``QUANT_ROUNDING_STAGED`` (``compile_ptr(out_rounding=
+    "staged")``: a serving stack's gate-and-quantize order, ``_staged_gate_quad``)."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
@@ -2648,6 +2764,7 @@ def _host_ptr_gated_e4m3(
         None,
         use_pdl,
         True,
+        quant_rounding,
     )
 
 
@@ -3137,6 +3254,7 @@ def compile_ptr(
     use_pdl: bool = False,
     ragged_q_lens: int = 0,
     gate_e4m3: bool = False,
+    out_rounding: str = COMBINE_OUT_ROUNDING_SINGLE,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -3194,6 +3312,13 @@ def compile_ptr(
     after the gate strides; it never composes with the quantized entries' ``quantized`` / ``has_amax`` / ``has_scale_o`` arms (its scale is
     a divisor, appended by the entry itself), takes the ``decode_grid`` selector and ``use_pdl`` like the gated half entry, and is the one
     FP8 output that does not require ``quantized=True``.
+    ``out_rounding`` (appended; ``"single"`` by default; in the key) names the fused e4m3 entry's ROUNDING CONVENTION (the module docstring):
+    ``"single"`` = ONE rounding of the fp32 gated value (every existing entry's code), ``"staged"`` = a serving stack's gate-and-quantize order
+    -- ``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, s))``, the exact sigmoid as a division and two bf16 roundings, spelled
+    with the DSL ops that stack's kernel spells -- so a provider can serve bytes identical to that chain; it is the trailing ``quant_rounding``
+    constexpr of the four kernels and the two launchers, read at the gate site only.  Declined by name: a value outside
+    ``heuristics.COMBINE_OUT_ROUNDINGS``, ``"staged"`` without ``gate_e4m3`` (the half and quantized entries round once at their store and take
+    no convention), ``"staged"`` with an f16 gate (the convention is a bf16 chain's; the f16 analogue is not wired).
     """
     if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
@@ -3206,6 +3331,26 @@ def compile_ptr(
     if gate_e4m3 and (quantized or has_amax or has_scale_o):
         raise ValueError(
             "gate_e4m3 appends its own scale (a DEQUANT divisor after the gate strides): the quantized entries' quantized / has_amax / has_scale_o arms do not compose with it"
+        )
+    if out_rounding not in COMBINE_OUT_ROUNDINGS:
+        raise ValueError(
+            f"out_rounding must be one of {COMBINE_OUT_ROUNDINGS} ('single' = one rounding of the fp32 gated value, 'staged' = a serving stack's "
+            f"gate-and-quantize order); got {out_rounding!r}"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and not gate_e4m3:
+        raise ValueError(
+            "out_rounding='staged' belongs to the fused gated e4m3 entry (gate_e4m3=True): the half and quantized entries round once at their store "
+            "and take no rounding convention"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and dtype_gate is None:
+        raise ValueError(
+            "out_rounding='staged' needs the gate dtype declared: pass dtype_gate='bf16' (the convention rounds the merged O and the gated value to "
+            "bf16, the serving chain's dtype)"
+        )
+    if out_rounding != COMBINE_OUT_ROUNDING_SINGLE and dtype_gate != "bf16":
+        raise ValueError(
+            "out_rounding='staged' is defined for the bf16 half dtype (the convention rounds the merged O and the gated value to bf16, the serving "
+            "chain's dtype); the f16 analogue is not wired -- got dtype_gate " + repr(dtype_gate)
         )
     if (has_amax or has_scale_o or dtype_o in ("e4m3", "e5m2")) and not (quantized or gate_e4m3):
         raise ValueError("FP8 outputs and scalar operands require the quantized pointer entry")
@@ -3306,4 +3451,7 @@ def compile_ptr(
         **({"q_lens_ptr": P(cutlass.Int32)} if (has_q_lens and quantized) else {}),
         **({"q_lens_ptr": P(cutlass.Int32), "q_lens_prefix": ragged_q_lens == 2} if ragged_q_lens else {}),
         **({"use_pdl": True} if use_pdl else {}),
+        # the fused entry's rounding convention: a Constexpr kwarg after use_pdl (the positional frame is unchanged); absent = SINGLE, the
+        # default arm, so every existing entry's call is what it was
+        **({"quant_rounding": QUANT_ROUNDING_STAGED} if out_rounding == COMBINE_OUT_ROUNDING_STAGED else {}),
     )

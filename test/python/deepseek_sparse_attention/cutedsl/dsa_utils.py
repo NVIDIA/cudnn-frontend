@@ -25,10 +25,10 @@ def _require_sm100():
         pytest.skip("SM100 GPU required")
 
 
-def _require_exact_sm100():
-    """Skip unless the device is exactly SM100 (capability ``(10, 0)``)."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("SM100 (10, 0) GPU required")
+def _require_sm100_family():
+    """Skip unless the device is an SM100-family part the DSA kernels compile for: SM100 or SM103 (``(10, 0)`` / ``(10, 3)``)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100 or SM103 GPU required")
 
 
 def _require_mxfp4_indexer():
@@ -119,7 +119,7 @@ DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS = [
 
 DSA_INDEXER_BACKWARD_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
-    # IndexerBackward requires heads >= 64 (warp-specialized GEMM layout).
+    # H64 runs on both arches; the SM100-only compact H32 path has dedicated tests.
     pytest.mark.parametrize("qhead_per_kv_head", [64]),
     pytest.mark.parametrize("block_I", [128]),
 ]
@@ -333,6 +333,11 @@ def dsa_init(
         required_major = min_compute_capability // 10
         required_minor = min_compute_capability % 10
         pytest.skip(f"DSA requires compute capability >= {required_major}.{required_minor}, " f"found SM{major}{minor}")
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if min_compute_capability >= 100 and not has_tcgen05(major):
+        # An SM100 floor means the SM100-family tcgen05 kernels; cc 12.x passes the threshold but has no tcgen05.
+        pytest.skip(f"DSA requires an SM100-family (tcgen05) device, found SM{major}{minor}")
 
     def opt(name: str, default):
         value = request.config.getoption(name, default=None)

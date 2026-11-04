@@ -786,10 +786,14 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
         device = torch.cuda.current_device()
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmDglu requires SM100+ compute capability, " f"but found SM{compute_capability} on device {device}")
+        if not has_tcgen05(major):
+            raise RuntimeError(
+                f"GroupedGemmDglu requires SM100+ compute capability with tcgen05 (not cc 12.x), " f"but found SM{compute_capability} on device {device}"
+            )
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

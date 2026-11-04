@@ -10,25 +10,20 @@ import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask
 from test_utils import torch_fork_set_rng
+from block_sparse_attention.cutedsl.bsa_utils import import_bsa, require_cutedsl
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 def _require_sm120(*, per_token=False):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
-        pytest.skip("native Sage FP8 tests require SM120")
-    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    ops = import_bsa(families=(12,), min_cutedsl=(4, 6, 1), feature="Sage FP8", reason="native Sage FP8 tests require SM120")
     from cudnn.frost.buffers import cutedsl_requirement_error
 
     error = cutedsl_requirement_error("SM120 FP8 BSA tests")
     if error is not None:
         pytest.skip(error)
-    if interface._cutlass_dsl_version() < (4, 6, 1):
-        pytest.skip("Sage FP8 requires CuTe DSL >= 4.6.1")
-    if per_token and interface._cutlass_dsl_version() < (4, 8, 0):
-        pytest.skip("Per-token SM120 FP8 BSA requires CuTe DSL >= 4.8.0")
-    from cudnn import ops
-
+    if per_token:
+        require_cutedsl((4, 8, 0), "Per-token SM120 FP8 BSA")
     return ops
 
 

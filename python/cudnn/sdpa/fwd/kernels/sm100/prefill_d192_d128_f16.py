@@ -37,8 +37,8 @@ SM100 resource layout:
      +1.9 % at S=8K dense, +2.6 % at S=2K, +3.1 % at S=32K, +1.75 % causal.
      ``PARAMS.exp2_fma_split`` (auto-set from the build device) folds it out on
      every other cc, where MUFU.EX2 runs at twice B200's rate and the same
-     split loses (``_E2E_ENABLED``); there the dense top-left causal arm keeps
-     its pre-existing tail emulation (``_exp2_mixed_late``).
+     split loses (``_E2E_ENABLED``); there every column takes the plain MUFU
+     exp2, the dense top-left causal arm included (``CFG.EXP2_TAIL_MIX`` = 0).
 
 Supported: FP16 / BF16 (``DTYPE_QKV in {2, 3}``); masks none / causal / SWA /
 padded and all pairwise combos (causal+swa, causal+padded, swa+padded);
@@ -139,17 +139,12 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_SWA,
 )
 
-from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
-
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
-# Dense top-left causal MHA: BMM1/BMM2 issue tweaks (an opaque K descriptor, one BMM2 issue election per
-# sub-tile, chunk 1's row-sum after its publish) plus -- with the cc 10.0 exp2 split OFF -- the pre-existing
-# causal-only tail emulation ``_exp2_mixed_late`` (the last 34 columns of chunk 1 on ex2_emulation_2's
-# degree-2 polynomial, PR #841).  With the split ON (``_E2E_ENABLED`` below) the module-wide ``_E2E_*``
-# pattern replaces that tail emulation on EVERY mask arm -- the exact form MEASURED on B200.  The tail
-# emulation itself is untouched and still traces wherever the split is off; it runs ungated on cc 10.3
-# today and its own arch gate is a separate follow-up.
-# The dense-causal tail emulation; CFG.EXP2_TAIL_MIX = 0 (the L2-prefetching cga1 loader) keeps the plain MUFU exp2 on that arm.
+# Dense top-left causal MHA with the exp2 split's spelling (``CFG.EXP2_TAIL_MIX``, set by make_cfg_d192 on a
+# build that claims ``PARAMS.exp2_fma_split`` and runs the develop loader): BMM1/BMM2 issue tweaks (an opaque
+# K descriptor, one BMM2 issue election per sub-tile) and chunk 1's row-sum after its publish, next to the
+# module-wide ``_E2E_*`` pattern on every mask arm.  Off (no split claim, or the L2-prefetching cga1 loader)
+# the arm keeps the default issue order and the plain MUFU exp2 on every column.
 _DENSE_CAUSAL_PUBLIC_EXP2_MIX = (
     bool(CFG.EXP2_TAIL_MIX) and not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 )
@@ -204,18 +199,6 @@ if 2 * sum(len(p) for p in _E2E_PAIRS) != _E2E_EMULATED_COLS:
     raise ValueError(f"{__name__}: exp2 emulation pairs cover {2 * sum(len(p) for p in _E2E_PAIRS)} columns, expected {_E2E_EMULATED_COLS}")
 
 
-def _exp2_mixed_late(vec):
-    values = []
-    for i in range(0, int(vec.shape[0]), 2):
-        if i >= 30:
-            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
-        else:
-            x = cute.math.exp2(vec[i], fastmath=True)
-            y = cute.math.exp2(vec[i + 1], fastmath=True)
-        values.extend((x, y))
-    return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
-
-
 # Only the common dense CLC path has a single scheduler publisher.
 # THD/predecode retains local schedulers and broadcast credits.
 if not CFG.THD_VARLEN:
@@ -250,6 +233,16 @@ else:
     # DTYPE_QKV in {2, 3}.
     raise ValueError(f"prefill_sdpa_d192_d128_f16_sm100: DTYPE_QKV={CFG.DTYPE_QKV} not supported (expected 2=BF16 or 3=FP16)")
 
+
+from cudnn.sdpa.fwd.kernels.thd_origins import (
+    COMPACT_MAP_SEQUENCE,
+    build_thd_origins,
+    origin_map_ptr,
+    origin_tensors,
+    origin_tma_slice,
+    thd_origins_compact_word,
+)
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     sdpa_operand_tensors,
@@ -735,6 +728,7 @@ def _kernel(
     # Paged KV: HND pool (row stride below head stride) -> descriptor dims
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
+    thd_origins: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -742,6 +736,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(thd_origins is not None):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
     # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.
@@ -965,6 +962,7 @@ def _kernel(
             cta_id_x=cta_id_x,
             qh_per_kh=qh_per_kh,
             o_partial_f32=o_partial_f32,
+            thd_origins=thd_origins,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -1041,6 +1039,7 @@ def _kernel(
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
+            thd_origins=thd_origins,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -1177,6 +1176,7 @@ def _tmaldg_warp_group(
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
+    thd_origins=None,
 ):
     """Unified TMA-LDG warp — cga1 / cga2 x MASK_NONE / PADDED / CAUSAL / SWA.
 
@@ -1199,8 +1199,24 @@ def _tmaldg_warp_group(
     # Both bootstrap consumer-side via q_empty_phase=1.
     mb_q_reload = bars.mb_q_o_alias if cutlass.const_expr(IS_QO_ALIAS) else bars.mb_q_empty
 
-    tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
+    if cutlass.const_expr(thd_origins is not None):
+        tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
+        # Setup records whether the load ports hold one map each (every live
+        # origin equals its compact prefix) or a map per sequence.
+        origins_word = thd_origins_compact_word(thd_origins, n_batch)
+        origins_single_map = origins_word != cutlass.Int64(0)
+        origins_per_sequence = origins_word == cutlass.Int64(0)
+        if origins_single_map:
+            # One map per load port, acquired once like the compact-prefix path.
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 1, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+    else:
+        tma_q = GmemTileTma(tma_q_desc)
+    if cutlass.const_expr(thd_origins is not None):
+        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)
+        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)
+    elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's packed-total-clamped runtime
         # descriptors (o_desc_words slots n_batch+1 / n_batch+2), so the last
         # sequence's tile-tail lands as exact zeros instead of reading the
@@ -1271,6 +1287,24 @@ def _tmaldg_warp_group(
     V_COL_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_O // CFG.CTA_MMA)
 
     while is_valid_tile > cutlass.Int32(0):
+        if cutlass.const_expr(thd_origins is not None):
+            if origins_per_sequence:
+                # Sequence-local maps have independent caller-port bases and clip
+                # every interior tail. Acquire again when a persistent unit changes.
+                stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+                base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
+                q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(q_map)
+                k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
+                v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(k_map)
+                tma_tensormap_acquire(v_map)
+            # Single maps keep the compact prefix offsets at batch coordinate 0;
+            # sequence-local maps carry the origin in their base and are
+            # selected by the batch coordinate.
+            q_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), q_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            kv_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), kv_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            tma_batch = cutlass.Int32(arith.select(origins_single_map.ir_value(), cutlass.Int32(0).ir_value(), batch_idx.ir_value()))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         # L2 prefetch only on tiles with at least _PF_MIN kv steps.
@@ -1399,6 +1433,7 @@ def _tmaldg_warp_group(
                 bars.mb_q_full[0].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=thd_origins is None,
             )
 
             _wait_mbarrier(mb_q_reload[1], q_empty_phase)
@@ -1419,6 +1454,7 @@ def _tmaldg_warp_group(
                 bars.mb_q_full[1].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=thd_origins is None,
             )
             q_empty_phase = q_empty_phase ^ 1
 
@@ -2419,15 +2455,11 @@ def _softmax_kv_body(
     p1_sum_pair = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        # Split ON: the module-wide pattern on every mask arm.  Split OFF: develop's spelling -- the dense
-        # top-left causal arm's tail emulation (_exp2_mixed_late), the plain MUFU exp2 everywhere else.
+        # Split ON: the module-wide pattern on every mask arm.  Split OFF: the plain MUFU exp2.
         if cutlass.const_expr(_E2E_ENABLED):
             deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         else:
-            if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
-                deferred_P_1 = _exp2_mixed_late(chunk_S_1)
-            else:
-                deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+            deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
         if cutlass.const_expr(not _DENSE_CAUSAL_PUBLIC_EXP2_MIX):
             p1_sum_pair = row_reduction_pair(deferred_P_1)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
@@ -2782,6 +2814,7 @@ def _correction_warp_group(
     cta_id_x,
     qh_per_kh,
     o_partial_f32=None,
+    thd_origins=None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -2973,18 +3006,19 @@ def _correction_warp_group(
                 _cu = cutlass.make_array_view(seq_kv_lens_tensor)
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                _stats_base = thd_port_origin(thd_origins, 4, batch_idx, _cu_q_b) if cutlass.const_expr(thd_origins is not None) else _cu_q_b
                 if q_row_global < _s_q_b:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
                         # token-major packed (T, H)
-                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
+                        lse_arr[_stats_base + q_row_global, head_idx] = lse_val
                     else:
                         # head-major packed (1, QH, head_stride)
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                             lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                         else:
-                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
+                            lse_arr[cutlass.Int32(0), head_idx, _stats_base + q_row_global] = lse_val
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -3127,6 +3161,8 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
@@ -3274,23 +3310,46 @@ def _host(
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.
-        _build_thd_meta_o_descs_kernel(
-            o_tensor,
-            tma_o_desc,
-            tma_k_desc,
-            tma_v_desc,
-            o_desc_words,
-            seq_kv_lens_tensor,
-            thd_q_lens_tensor,
-            thd_kv_lens_tensor,
-            thd_lens_form,
-            cutlass.Int32(QH // HEADS_PER_TILE),
-            cutlass.Int32(B),
-            cutlass.Int64(o_tensor.stride[1]),
-            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
-            n_thd_units,  # persistent cluster count; also seeds the claim counter
-            not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
-        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        if cutlass.const_expr(thd_origin_ptrs is not None):
+            o_desc_words, origins, offsets = origin_tensors(o_desc_ptr, thd_origin_ptrs, cutlass.Int32(B))
+            build_thd_origins(
+                (q_tensor, k_tensor, v_tensor, o_tensor),
+                tma_q_desc,
+                tma_k_desc,
+                tma_v_desc,
+                tma_o_desc,
+                o_desc_words,
+                origins,
+                offsets,
+                thd_origin_specs,
+                seq_kv_lens_tensor,
+                thd_q_lens_tensor,
+                thd_kv_lens_tensor,
+                thd_lens_form,
+                cutlass.Int32(B),
+                cutlass.Int32(QH // HEADS_PER_TILE),
+                cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
+                n_thd_units,
+                single_maps=True,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        else:
+            _build_thd_meta_o_descs_kernel(
+                o_tensor,
+                tma_o_desc,
+                tma_k_desc,
+                tma_v_desc,
+                o_desc_words,
+                seq_kv_lens_tensor,
+                thd_q_lens_tensor,
+                thd_kv_lens_tensor,
+                thd_lens_form,
+                cutlass.Int32(QH // HEADS_PER_TILE),
+                cutlass.Int32(B),
+                cutlass.Int64(o_tensor.stride[1]),
+                cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
+                n_thd_units,  # persistent cluster count; also seeds the claim counter
+                not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # Grid Python-folds on Cfg constant (avoids DSL if staging).
@@ -3323,6 +3382,7 @@ def _host(
         block_table_tensor,
         block_table_v_tensor,
         paged_hnd,
+        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -3342,6 +3402,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    thd_origin_specs=None,
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
@@ -3370,6 +3431,11 @@ def compile(  # noqa: A001
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
+    if thd_origin_specs is not None:
+        if not CFG.THD_VARLEN or SPLIT_KV != 1 or IS_TF32 or PAGED_KV:
+            raise ValueError("physical origins require nonpaged unsplit half THD")
+        if len(thd_origin_specs) != 5:
+            raise ValueError("physical origins require five Q/K/V/O/Stats specifications")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -3414,4 +3480,10 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd",
+        thd_origin_ptrs=(
+            tuple(P(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) if spec is not None else None for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        thd_origin_specs=thd_origin_specs,
     )
