@@ -32,10 +32,16 @@ its CTAs CAN share an SM (``Cfg.co_resident_ctas(tokens)`` >= 2 at the minimum t
 1,024) = 160,448 B > 102,400 B at T 2), so the 128-register cap buys nothing there and costs spills -- measured on sm_120a (``cuobjdump
 -res-usage``, 256 threads, T 6): ``TWO_CTA_CFG`` 128 registers + 56 B stack + 34 STL / LDL; the rolled register-resident forms ``PAIR_CFG``
 with NBUF 2 187 / 0, with NBUF 1 187 / 0, the one-CTA NBUF-1 form 183 / 0; the NBUF-1 pair under the cap 128 / 0 (spill-free: the one
-two-per-SM verify form of that part, at T <= 3: 2 x (50,112 + 1,024) = 102,272 B).  Every form is bitwise with the reference kernel --
-FlashInfer's built-in ``frost`` backend for the Qwen 3.5 GDN block, whose numerics these kernels reproduce.  ``PDL`` stays off in every
-form (it needs the caller's stream contract: its knob below).  A caller's ``Cfg`` overrides the pick as a whole; a ``NORM_FORM`` of
-``None`` is resolved from the requests count by the entry (``resolve_cfg``).
+two-per-SM verify form of that part, at T <= 3: 2 x (50,112 + 1,024) = 102,272 B).  Where the regime's primary form is not ADMISSIBLE on
+the part (``admissible``: its ring holds the minimum token count in the per-CTA opt-in and, under the register cap, two CTAs share an
+SM) the pick walks the regime's ladder (``PAIR_FORMS`` / ``ONE_CTA_FORMS`` / ``BEYOND_FORMS``: the primary, then the forms a smaller
+shared memory holds, deepest ring first) and is token-aware -- on the cc 12.0 reading ``PAIR_NBUF2_CFG`` at one request and
+``ONE_CTA_NBUF1_CFG`` at two and more for T <= 8, ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every requests count, and T >= 18 is the typed
+decline naming 17 (``max_tokens_served``, the bound FlashInfer's probe reads); where the primary is admissible (every cc 10.x part) the
+pick and its token bound are the measured ones above, whatever the step's token count.  Every form is bitwise with the reference
+kernel -- FlashInfer's built-in ``frost`` backend for the Qwen 3.5 GDN block, whose numerics these kernels reproduce: no knob moves an
+fp32 addition.  ``PDL`` stays off in every form (it needs the caller's stream contract: its knob below).  A caller's ``Cfg`` overrides
+the pick as a whole; a ``NORM_FORM`` of ``None`` is resolved from the requests count by the entry (``resolve_cfg``).
 
 Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 
@@ -486,19 +492,129 @@ PAIR_CFG = make_cfg(
 CFG = make_cfg(
     ROLLED_TOKENS=True
 )  # one CTA per SM: TPR 4, NBUF 3, register-resident, the token body traced once -- while the requests x 48 CTAs have an SM each
-TWO_CTA_CFG = make_cfg(TPR=4, NBUF=1, STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0, BA_PREFETCH_CHUNKS=1)  # two CTAs per SM, one wave
+TWO_CTA_CFG = make_cfg(
+    TPR=4, NBUF=1, STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0, BA_PREFETCH_CHUNKS=1
+)  # two CTAs per SM, one wave -- where the part's shared memory holds two (co_resident_ctas(TOKENS_MIN) >= 2: the cc 10.0 readings)
+
+# The forms a 99 KB per-CTA opt-in holds (the three picks above carry a 3-deep ring of 64 KB -- or 32 KB half -- slabs and hold no token
+# count there): the same kernel body under existing knobs, bitwise with the picks (no knob moves an fp32 addition; the sm_120a run of
+# record replayed every saved reference set byte for byte).  Footprint law: 6,464 + 3,536 T + ring (+ 144 on the pair), ring = NBUF x
+# 65,664 (one CTA) or NBUF x 32,896 (the pair).  What the ring depth buys: at NBUF 3 token t + 1's write-back waits only for the store of
+# t - 2, at NBUF 2 for the store of t - 1, at NBUF 1 the box read-out is exposed between the two passes of every token.
+PAIR_NBUF2_CFG = make_cfg(
+    TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=2
+)  # the half-slab pair with a 2-deep ring: 79,472 / 86,544 / 93,616 B at T 2 / 4 / 6, T <= 8 on the cc 12.0 reading (187 registers, 0 spills on sm_120a)
+PAIR_NBUF1_CFG = make_cfg(
+    TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=1
+)  # the half-slab pair, the landing slab only: 46,576 / 53,648 / 60,720 B, T <= 17 there (187 / 0; under MIN_CTAS_PER_SM 2: 128 / 0, two per SM at T <= 3)
+ONE_CTA_NBUF1_CFG = make_cfg(
+    ROLLED_TOKENS=True, NBUF=1
+)  # the whole slab, the landing slab only, no cluster: 79,200 / 86,272 / 93,344 B, T <= 8 there (183 / 0)
+
+# The ladder of each SM-count regime: the primary form (the measured cc 10.0 pick) first, then the forms a smaller shared memory still
+# holds, deepest ring first.  ``default_cfg`` returns the primary wherever it is admissible on the part (every cc 10.x part), so the picks
+# and the token envelopes there never move; on a part whose shared memory does not hold the primary it walks the rest, token-aware.
+PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
+ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
+BEYOND_FORMS = (TWO_CTA_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 
 
-def default_cfg(requests: int, sm_count: int) -> Cfg:
-    """The pick per requests: ``PAIR_CFG`` (two CTAs per head) while every CTA of the ``requests x 96`` cluster grid has an SM of its
-    own (one request on a 148- or 152-SM part), ``CFG`` (one CTA per SM) while every CTA of the ``requests x 48`` grid has one,
-    ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the device's SMs -- on a 148- or 152-SM part the switches are
-    between 1 request (96 cluster CTAs) and 2 (96 CTAs, 192 as a pair), and between 3 requests (144 CTAs) and 4 (192).  All are
-    plan-time facts (never a runtime value)."""
+def part_readings(smem_per_sm: int, smem_optin: int) -> dict:
+    """The ``Cfg`` fields of a part reading ``(shared memory per SM, per-CTA opt-in)`` in bytes, validated (positive, the opt-in no larger
+    than the SM) -- ``replace(form, **part_readings(...))`` is a form on that part."""
+    for name, value in (("smem_per_sm", smem_per_sm), ("smem_optin", smem_optin)):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"gdn_verify_fused: {name} must be a positive int (a device reading in bytes), got {value!r}")
+    if smem_optin > smem_per_sm:
+        raise ValueError(f"gdn_verify_fused: the per-CTA shared-memory opt-in ({smem_optin} B) cannot exceed the SM's ({smem_per_sm} B)")
+    return dict(SMEM_PER_SM_BYTES=smem_per_sm, SMEM_OPTIN_BYTES=smem_optin)
+
+
+def admissible(form: Cfg, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> bool:
+    """Whether ``form`` may serve on a part: its shared memory holds the minimum token count in the per-CTA opt-in, and a form that asks
+    ptxas for the two-CTA register cap (``MIN_CTAS_PER_SM`` 2) has two CTAs per SM to show for it (``co_resident_ctas(TOKENS_MIN)`` >= 2)
+    -- a cap on a part whose shared memory keeps the SM at one CTA buys nothing and spills (sm_120a: ``TWO_CTA_CFG`` 34 STL / LDL)."""
+    on = replace(form, **part_readings(smem_per_sm, smem_optin))
+    return on.max_tokens() >= TOKENS_MIN and (on.MIN_CTAS_PER_SM == 1 or on.co_resident_ctas(TOKENS_MIN) >= 2)
+
+
+def _no_form(forms, smem_per_sm: int, smem_optin: int) -> NotImplementedError:
+    """The typed decline of a part none of ``forms`` fits: it names the opt-in and the smallest footprint asked of it."""
+    need = min(form.natural_smem_bytes(TOKENS_MIN) for form in forms)
+    return NotImplementedError(
+        f"gdn_verify_fused: this part's {smem_optin}-byte shared-memory opt-in per CTA ({smem_per_sm} B per SM) holds no verify form at "
+        f"{TOKENS_MIN} tokens per request (the smallest form asks {need} B)"
+    )
+
+
+def first_fitting(forms, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> Cfg:
+    """The first of ``forms`` admissible on the part (the form an entry starts from: ``CFG`` on the cc 10.0 readings, ``ONE_CTA_NBUF1_CFG``
+    on the cc 12.0 ones for ``ONE_CTA_FORMS``), else the typed decline of a part none of them fits."""
+    for form in forms:
+        if admissible(form, smem_per_sm, smem_optin):
+            return form
+    raise _no_form(forms, smem_per_sm, smem_optin)
+
+
+def _ladder(requests: int, sm_count: int):
+    """The regime's ladder by the SM count: the pair forms while every CTA of the ``requests x 96`` cluster grid has an SM of its own, the
+    one-CTA forms while every CTA of the ``requests x 48`` grid has one, the beyond forms past that.  Plan-time facts, validated."""
     if not isinstance(requests, int) or requests < 1:
         raise ValueError(f"gdn_verify_fused: requests must be a positive int, got {requests!r}")
     if not isinstance(sm_count, int) or sm_count < 1:
         raise ValueError(f"gdn_verify_fused: the SM count must be a positive int, got {sm_count!r}")
     if requests * V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
-        return PAIR_CFG
-    return CFG if requests * V_HEADS <= sm_count else TWO_CTA_CFG
+        return PAIR_FORMS
+    return ONE_CTA_FORMS if requests * V_HEADS <= sm_count else BEYOND_FORMS
+
+
+def default_cfg(
+    requests: int,
+    sm_count: int,
+    smem_per_sm: int = SM100_SMEM_PER_SM_BYTES,
+    smem_optin: int = SM100_SMEM_OPTIN_BYTES,
+    tokens: Optional[int] = None,
+) -> Cfg:
+    """The pick per requests on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a two-argument
+    call is the measured cc 10.0 pick).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
+    the ``requests x 96`` cluster grid has an SM of its own (one request on a 148- or 152-SM part, two on a 212-SM one), ``CFG`` (one CTA
+    per SM) while every CTA of the ``requests x 48`` grid has one, ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the
+    device's SMs -- on a 148- or 152-SM part the switches are between 1 request (96 cluster CTAs) and 2 (192 as a pair; 96 one-CTA CTAs),
+    and between 3 requests (144 CTAs) and 4 (192).  The regime's primary form is returned wherever it is ``admissible`` on the readings
+    (every cc 10.x part), and ``tokens`` is then ignored: ``validate_tokens`` bounds the step by that form as before (35 / 8 / 45 on the cc
+    10.0 readings).  Where the primary is not admissible (a 99 KB opt-in holds none of the 3-deep rings; a 100 KB SM holds no two
+    ``TWO_CTA_CFG`` footprints) the first admissible form of the rest that holds ``tokens`` (the minimum token count when None) is
+    returned, else the admissible form with the largest token bound (so ``validate_tokens`` names the part's true bound), else the typed
+    decline of a part with no form.  On the cc 12.0 readings (170 / 188 SMs): one request ``PAIR_NBUF2_CFG`` for T <= 8 (96 cluster CTAs,
+    one wave), two and more ``ONE_CTA_NBUF1_CFG`` for T <= 8 (one wave to 3 requests, two from 4), ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every
+    requests count, T >= 18 the decline naming 17; ``TWO_CTA_CFG`` never (one CTA per SM there, 34 spills).  All are plan-time facts (never
+    a runtime value)."""
+    ladder = _ladder(requests, sm_count)
+    if tokens is not None and (not isinstance(tokens, int) or tokens < 1):
+        raise ValueError(f"gdn_verify_fused: tokens must be a positive int or None, got {tokens!r}")
+    want = max(TOKENS_MIN, tokens or TOKENS_MIN)
+    if admissible(ladder[0], smem_per_sm, smem_optin):
+        return ladder[0]
+    rest = [form for form in ladder[1:] if admissible(form, smem_per_sm, smem_optin)]
+    if not rest:
+        raise _no_form(ladder, smem_per_sm, smem_optin)
+    on = part_readings(smem_per_sm, smem_optin)
+    for form in rest:
+        if replace(form, **on).max_tokens() >= want:
+            return form
+    return max(rest, key=lambda form: replace(form, **on).max_tokens())
+
+
+def max_tokens_served(requests: int, sm_count: int, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> int:
+    """The largest tokens-per-request count ``default_cfg`` serves for ``requests`` on the part: the primary form's bound where it is
+    admissible (35 / 8 / 45 on the cc 10.0 readings by regime), else the largest bound over the admissible rest of the ladder (17 on the
+    cc 12.0 readings at every requests count); the typed decline of a part with no form.  The one bound the entry, its ``check_support``
+    and FlashInfer's probe answer alike."""
+    ladder = _ladder(requests, sm_count)
+    on = part_readings(smem_per_sm, smem_optin)
+    if admissible(ladder[0], smem_per_sm, smem_optin):
+        return replace(ladder[0], **on).max_tokens()
+    bounds = [replace(form, **on).max_tokens() for form in ladder[1:] if admissible(form, smem_per_sm, smem_optin)]
+    if not bounds:
+        raise _no_form(ladder, smem_per_sm, smem_optin)
+    return max(bounds)

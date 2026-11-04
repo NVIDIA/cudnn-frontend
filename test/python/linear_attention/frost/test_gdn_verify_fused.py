@@ -298,6 +298,86 @@ def test_default_cfg_picks_the_pair_then_the_one_cta_form_then_the_two_ctas_per_
         kcfg.default_cfg(1, 0)
 
 
+def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count():
+    """The cc 10.0 readings, explicit and as the defaults: the primary form of every regime is admissible there, so the pick is PAIR_CFG /
+    CFG / TWO_CTA_CFG by the SM-count rule alone at every requests count -- whatever the step's token count says -- and the served token
+    envelope is the published 35 / 8 / 45 (the byte-identity pin of the budget-aware pick with the measured cc 10.0 pick)."""
+    per_sm, optin = SM100_READING
+    envelope = {kcfg.PAIR_CFG: 35, kcfg.CFG: 8, kcfg.TWO_CTA_CFG: 45}
+    for sms in (84, 148, 152, 170, 188, 212):
+        for requests in range(1, 17):
+            want = kcfg.PAIR_CFG if requests * 96 <= sms else (kcfg.CFG if requests * 48 <= sms else kcfg.TWO_CTA_CFG)
+            assert kcfg.default_cfg(requests, sms) == want, (sms, requests)
+            for tokens in (None, 2, 6, 9, 17, 18, 40, 64):
+                assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) == want, (sms, requests, tokens)
+            assert kcfg.max_tokens_served(requests, sms) == kcfg.max_tokens_served(requests, sms, per_sm, optin) == envelope[want], (sms, requests)
+    assert kcfg.default_cfg(2, 212) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 212) == kcfg.CFG and kcfg.default_cfg(5, 212) == kcfg.TWO_CTA_CFG
+    assert kcfg.first_fitting(kcfg.ONE_CTA_FORMS) == kcfg.CFG and kcfg.first_fitting(kcfg.PAIR_FORMS, per_sm, optin) == kcfg.PAIR_CFG
+    assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.TWO_CTA_CFG
+    assert kcfg.admissible(kcfg.TWO_CTA_CFG) and kcfg.admissible(kcfg.CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
+    assert kcfg.PAIR_FORMS == (kcfg.PAIR_CFG, kcfg.PAIR_NBUF2_CFG, kcfg.PAIR_NBUF1_CFG)
+    assert kcfg.ONE_CTA_FORMS == (kcfg.CFG, kcfg.ONE_CTA_NBUF1_CFG, kcfg.PAIR_NBUF1_CFG)
+    assert kcfg.BEYOND_FORMS == (kcfg.TWO_CTA_CFG, kcfg.ONE_CTA_NBUF1_CFG, kcfg.PAIR_NBUF1_CFG)
+    assert kcfg.part_readings(per_sm, optin) == _on(SM100_READING)
+
+
+def test_default_cfg_on_the_cc120_reading_walks_the_ladders_token_aware():
+    """The cc 12.0 readings (100 KB per SM, 99 KB opt-in) on 84 / 170 / 188 SMs: no regime's primary form is admissible (the 3-deep rings
+    do not fit; two TWO_CTA_CFG footprints do not share the SM), so the pick walks the ladder, token-aware -- the pair with the 2-deep
+    ring at one request and the one-CTA landing-slab form at two and more for T <= 8, the landing-slab pair for T 9 .. 17 at every requests
+    count, T 18 the deepest form (so the typed decline names 17); never TWO_CTA_CFG / PAIR_CFG / CFG; ``max_tokens_served`` 17 everywhere;
+    a part with no form is the typed decline naming its opt-in."""
+    per_sm, optin = SM120_READING
+    on = _on(SM120_READING)
+    for sms in (84, 170, 188):
+        for requests in range(1, 17):
+            shallow = kcfg.PAIR_NBUF2_CFG if requests * 96 <= sms else kcfg.ONE_CTA_NBUF1_CFG
+            for tokens in (None, 2, 3, 4, 6, 8):
+                assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) == shallow, (sms, requests, tokens)
+            for tokens in range(9, 19):
+                assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) == kcfg.PAIR_NBUF1_CFG, (sms, requests, tokens)
+            assert kcfg.max_tokens_served(requests, sms, per_sm, optin) == 17, (sms, requests)
+            for tokens in (None, 2, 8, 17, 18, 64):
+                assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) not in (kcfg.TWO_CTA_CFG, kcfg.PAIR_CFG, kcfg.CFG), (sms, requests, tokens)
+    assert kcfg.default_cfg(1, 170, per_sm, optin) == kcfg.default_cfg(1, 170, per_sm, optin, 2) == kcfg.PAIR_NBUF2_CFG
+    assert kcfg.default_cfg(1, 84, per_sm, optin) == kcfg.ONE_CTA_NBUF1_CFG  # 84 SMs hold no 96-CTA cluster grid: the one-CTA ladder
+    assert kcfg.default_cfg(4, 170, per_sm, optin, 6) == kcfg.ONE_CTA_NBUF1_CFG  # 192 CTAs over 170 SMs: two waves, never the spilling cap
+    pick18 = replace(kcfg.default_cfg(1, 170, per_sm, optin, 18), **on)
+    kcfg.validate_tokens(pick18, 17)
+    with pytest.raises(NotImplementedError, match="at most 17 on this part"):
+        kcfg.validate_tokens(pick18, 18)
+    with pytest.raises(NotImplementedError, match="at most 8 on this part"):
+        kcfg.validate_tokens(replace(kcfg.default_cfg(2, 170, per_sm, optin, 8), **on), 9)  # the T-aware pick holds T 9; the T-8 pick does not
+    assert (
+        kcfg.first_fitting(kcfg.ONE_CTA_FORMS, per_sm, optin) == kcfg.ONE_CTA_NBUF1_CFG
+        and kcfg.first_fitting(kcfg.PAIR_FORMS, per_sm, optin) == kcfg.PAIR_NBUF2_CFG
+    )
+    assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.ONE_CTA_NBUF1_CFG
+    assert (
+        not kcfg.admissible(kcfg.TWO_CTA_CFG, per_sm, optin)
+        and not kcfg.admissible(kcfg.CFG, per_sm, optin)
+        and not kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
+    )
+    assert kcfg.admissible(kcfg.PAIR_NBUF1_CFG, per_sm, optin) and not kcfg.admissible(
+        replace(kcfg.ONE_CTA_NBUF1_CFG, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0), per_sm, optin
+    )
+    assert kcfg.admissible(replace(kcfg.PAIR_NBUF1_CFG, MIN_CTAS_PER_SM=2), per_sm, optin)  # the one capped form two of which share a 100 KB SM (T <= 3)
+    for call in (
+        lambda: kcfg.default_cfg(1, 170, 40960, 40000),
+        lambda: kcfg.default_cfg(4, 170, 40960, 40000, 6),
+        lambda: kcfg.max_tokens_served(4, 170, 40960, 40000),
+        lambda: kcfg.first_fitting(kcfg.ONE_CTA_FORMS, 40960, 40000),
+    ):
+        with pytest.raises(NotImplementedError, match="40000-byte shared-memory opt-in per CTA .* holds no verify form at 2 tokens per request"):
+            call()
+    with pytest.raises(ValueError, match="tokens must be a positive int"):
+        kcfg.default_cfg(1, 170, per_sm, optin, 0)
+    with pytest.raises(ValueError, match="cannot exceed the SM"):
+        kcfg.default_cfg(1, 170, 100000, 200000)
+    with pytest.raises(ValueError, match="smem_optin"):
+        kcfg.max_tokens_served(1, 170, per_sm, 0)
+
+
 def test_norm_form_follows_the_reference_ctas_policy_and_resolves_per_requests():
     assert kcfg.norm_form_for(1) == "ctas2" and kcfg.norm_form_for(2) == "ctas1" and kcfg.norm_form_for(16) == "ctas1"
     assert kcfg.norm_chain_rows("ctas2") == 4 and kcfg.norm_chain_rows("ctas1") == 8
@@ -451,9 +531,13 @@ def test_cc120_reading_footprints_and_co_residency():
     register cap the launch asks for -- and the three SM100 picks that do not hold even two tokens there."""
     per_sm, optin = SM120_READING
     assert SM120_READING == (102400, 101376) and SM100_READING == (233472, 232448)
-    pair_nbuf2 = kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=2, **_on(SM120_READING))
-    pair_nbuf1 = kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=1, **_on(SM120_READING))
-    one_nbuf1 = kcfg.make_cfg(ROLLED_TOKENS=True, NBUF=1, **_on(SM120_READING))
+    # the module forms a 99 KB opt-in holds: the pair with a 2-deep ring, the pair and the one-CTA form with the landing slab only
+    assert kcfg.PAIR_NBUF2_CFG == replace(kcfg.PAIR_CFG, NBUF=2) and kcfg.PAIR_NBUF1_CFG == replace(kcfg.PAIR_CFG, NBUF=1)
+    assert kcfg.ONE_CTA_NBUF1_CFG == replace(kcfg.CFG, NBUF=1) and kcfg.ONE_CTA_NBUF1_CFG.CTAS_PER_SM == 1 and not kcfg.ONE_CTA_NBUF1_CFG.TWO_CTAS_PER_HEAD
+    assert all(f.ROLLED_TOKENS and f.MIN_CTAS_PER_SM == 1 and f.PDL is False for f in (kcfg.PAIR_NBUF2_CFG, kcfg.PAIR_NBUF1_CFG, kcfg.ONE_CTA_NBUF1_CFG))
+    pair_nbuf2, pair_nbuf1, one_nbuf1 = (replace(f, **_on(SM120_READING)) for f in (kcfg.PAIR_NBUF2_CFG, kcfg.PAIR_NBUF1_CFG, kcfg.ONE_CTA_NBUF1_CFG))
+    for form in (pair_nbuf2, pair_nbuf1, one_nbuf1):
+        kcfg.validate_cfg(form)
     assert [pair_nbuf2.natural_smem_bytes(t) for t in (2, 4, 6)] == [79472, 86544, 93616] and pair_nbuf2.max_tokens() == 8
     assert [one_nbuf1.natural_smem_bytes(t) for t in (2, 4, 6)] == [79200, 86272, 93344] and one_nbuf1.max_tokens() == 8
     assert [pair_nbuf1.natural_smem_bytes(t) for t in (2, 3, 4, 6)] == [46576, 50112, 53648, 60720] and pair_nbuf1.max_tokens() == 17
