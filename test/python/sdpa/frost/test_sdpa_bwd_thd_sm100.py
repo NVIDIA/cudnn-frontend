@@ -854,7 +854,7 @@ def _thd_meta_words(case, h, chunk, seen):
 
 
 def _clusters():
-    from cudnn.sdpa.bwd.api_dsl import _sm100_device_clusters
+    from cudnn.sdpa.bwd.config_sm100 import _sm100_device_clusters
 
     return _sm100_device_clusters(torch.device("cuda"), 4)
 

@@ -4,7 +4,8 @@
 
 """Native packed QSA backward for Blackwell SM100/103.
 
-Each CTA reuses gathered K/V blocks across 12 or 24 query heads.
+Each CTA reuses gathered K/V blocks across the query's 6, 12 or 24 heads
+(one 16- or 24-column MMA tile; a 6-head group leaves the rest zero).
 The pipeline overlaps score, derivative, and gradient tensor-core work.
 """
 
@@ -19,6 +20,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cutlass.experimental import primitives as prims
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from .._contract import BLK_BITS, paired_queries
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
@@ -28,9 +30,9 @@ I64 = cutlass.Int64
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
-GQ = 12
 D = 256
 LOG2E = 1.4426950408889634
+BLK_MASK = (1 << BLK_BITS) - 1  # the block index of a batched-backward compact ID (owner bits above)
 
 NTHREADS = 512
 # Use whole 16-row dQ steps within the three operand stages.
@@ -130,6 +132,10 @@ def frost_qsa_bprop_sm100(
     if cutlass.const_expr(nonfinite is not None):
         if nonfinite[0] == 0:
             cute.arch.nvvm.exit()
+    GQ = HQ // HKV  # query heads per KV head: 6 (6/1) or 12 (12/1, 24/2)
+    # With the nonfinite flag this kernel is the per-query fallback of the batched backward and reads its compact IDs:
+    # one row per NQ consecutive queries (two at 12/1, four at 6/1), each block tagged with its owners' bits.
+    NQ = paired_queries(HQ, HKV)
     hint_ld = cutlass.Int64(L2_EVICT_FIRST)
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -214,9 +220,9 @@ def frost_qsa_bprop_sm100(
             nq = I32(0)
             for qq in cutlass.range(bid, T, nctas, unroll=1):
                 qi = qq
-                nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
+                nblk = (p_counts + (qi // NQ if cutlass.const_expr(nonfinite is not None) else qi)).load()
                 if nblk > 0:
-                    lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
+                    lrow = p_sparse_blocks + I64(qi // NQ if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                     nchunks = (nblk + (CHB - 1)) // CHB
                     _wait(b_qe, (nq & 1) ^ 1)
                     if prims.elect_sync():
@@ -252,7 +258,7 @@ def frost_qsa_bprop_sm100(
                         m = c * CHB + lane
                         blk = xcur
                         if cutlass.const_expr(nonfinite is not None):
-                            blk = blk & I32((1 << 28) - 1)
+                            blk = blk & I32(BLK_MASK)
                         ok = m < nblk
                         if lane >= CHB:
                             ok = False
@@ -291,9 +297,9 @@ def frost_qsa_bprop_sm100(
         if warp == 1:
             gc = I32(0)
             for qi in cutlass.range(bid, T, nctas, unroll=1):
-                nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
+                nblk = (p_counts + (qi // NQ if cutlass.const_expr(nonfinite is not None) else qi)).load()
                 if nblk > 0:
-                    lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
+                    lrow = p_sparse_blocks + I64(qi // NQ if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                     lower, upper = (p_lo + qi).load(), (p_hi + qi).load()
                     nchunks = (nblk + CHB - 1) // CHB
                     for c in cutlass.range(nchunks, unroll=1):
@@ -308,8 +314,8 @@ def frost_qsa_bprop_sm100(
                                 block = (lrow + c * CHB + lane).load()
                                 owned = True
                                 if cutlass.const_expr(nonfinite is not None):
-                                    owned = ((block >> (28 + qi % 2)) & 1) != 0
-                                    block = block & I32((1 << 28) - 1)
+                                    owned = ((block >> (BLK_BITS + qi % NQ)) & 1) != 0
+                                    block = block & I32(BLK_MASK)
                                 begin, end = (p_first + block).load(), (p_last + block).load()
                                 needs_mask = not (owned & (begin >= lower) & (begin + 3 <= upper) & (begin + 3 <= end) & (begin >= 0) & (begin + 3 < T))
                         if cute.arch.vote_ballot_sync(needs_mask) != 0:
@@ -319,8 +325,8 @@ def frost_qsa_bprop_sm100(
                                 if selected:
                                     block = (lrow + c * CHB + b).load()
                                     if cutlass.const_expr(nonfinite is not None):
-                                        selected = ((block >> (28 + qi % 2)) & 1) != 0
-                                        block = block & I32((1 << 28) - 1)
+                                        selected = ((block >> (BLK_BITS + qi % NQ)) & 1) != 0
+                                        block = block & I32(BLK_MASK)
                                     first, last = (p_first + block).load(), (p_last + block).load()
                                 for half in cutlass.range_constexpr(2):
                                     token = first + lane // 16 + half * 2
@@ -384,9 +390,9 @@ def frost_qsa_bprop_sm100(
             nq = I32(0)
             for qq in cutlass.range(bid, T, nctas, unroll=1):
                 qi = qq
-                nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
+                nblk = (p_counts + (qi // NQ if cutlass.const_expr(nonfinite is not None) else qi)).load()
                 if nblk > 0:
-                    lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
+                    lrow = p_sparse_blocks + I64(qi // NQ if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                     nchunks = (nblk + (CHB - 1)) // CHB
                     _wait(b_qf, nq & 1)
                     for c in cutlass.range(nchunks + 1, unroll=1):
@@ -488,14 +494,16 @@ def frost_qsa_bprop_sm100(
         ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
         for qq in cutlass.range(bid, T, nctas, unroll=1):
             qi = qq
-            nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
+            nblk = (p_counts + (qi // NQ if cutlass.const_expr(nonfinite is not None) else qi)).load()
             if nblk > 0:
-                lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
+                lrow = p_sparse_blocks + I64(qi // NQ if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                 nchunks = (nblk + (CHB - 1)) // CHB
                 lbase = qi * HQ + (hrow % HKV) * GQ
-                del_a = (p_delta + lbase).load(count=4, alignment=16)
-                del_b = (p_delta + lbase + 4).load(count=4, alignment=16)
-                del_c = (p_delta + lbase + 8).load(count=4, alignment=16)
+                # Twelve deltas are three 16-byte loads; a six-head row (24-byte pitch) is only 8-byte aligned.
+                DELTA_WIDTH = 4 if GQ % 4 == 0 else 2
+                deltas = []
+                for part in cutlass.range_constexpr(GQ // DELTA_WIDTH):
+                    deltas.append((p_delta + lbase + part * DELTA_WIDTH).load(count=DELTA_WIDTH, alignment=4 * DELTA_WIDTH))
                 for c in cutlass.range(nchunks, unroll=1):
                     cgc = gc + c
                     st = cgc & 1
@@ -516,20 +524,15 @@ def frost_qsa_bprop_sm100(
                         blk = (lrow + m).load()
                         owned = True
                         if cutlass.const_expr(nonfinite is not None):
-                            owned = ((blk >> (28 + qi % 2)) & 1) != 0
-                            blk = blk & I32((1 << 28) - 1)
+                            owned = ((blk >> (BLK_BITS + qi % NQ)) & 1) != 0
+                            blk = blk & I32(BLK_MASK)
                         token = (p_first + blk).load() + trow
                         valid = owned & (hrow < HKV) & (token >= (p_lo + qi).load()) & (token <= (p_hi + qi).load())
                         valid = valid & (token <= (p_last + blk).load()) & (token >= 0) & (token < T)
                     pw = []
                     dw = []
                     for j in cutlass.range_constexpr(GQ):
-                        if cutlass.const_expr(j < 4):
-                            ej = del_a[j]
-                        elif cutlass.const_expr(j < 8):
-                            ej = del_b[j - 4]
-                        else:
-                            ej = del_c[j - 8]
+                        ej = deltas[j // DELTA_WIDTH][j % DELTA_WIDTH]
                         lj = (p_lse + ((hrow % HKV) * GQ + j) * T + qi).load()
                         s0 = sv[j]
                         d0 = dpv[j]
@@ -621,9 +624,9 @@ def frost_qsa_bprop_sm100(
         gc = I32(0)
         for qq in cutlass.range(bid, T, nctas, unroll=1):
             qi = qq
-            nblk = (p_counts + (qi // 2 if cutlass.const_expr(nonfinite is not None) else qi)).load()
+            nblk = (p_counts + (qi // NQ if cutlass.const_expr(nonfinite is not None) else qi)).load()
             if nblk > 0:
-                lrow = p_sparse_blocks + I64(qi // 2 if cutlass.const_expr(nonfinite is not None) else qi) * capacity
+                lrow = p_sparse_blocks + I64(qi // NQ if cutlass.const_expr(nonfinite is not None) else qi) * capacity
                 nchunks = (nblk + (CHB - 1)) // CHB
                 # Prefetch the next chunk with in-bounds index loads.
                 nx = []
@@ -656,7 +659,7 @@ def frost_qsa_bprop_sm100(
                         m = c * CHB + qd * 4 + g
                         blk = cur[g]
                         if cutlass.const_expr(nonfinite is not None):
-                            blk = blk & I32((1 << 28) - 1)
+                            blk = blk & I32(BLK_MASK)
                         ok = m < nblk
                         if qd * 4 + g >= CHB:
                             ok = False
@@ -777,8 +780,8 @@ def compile_kernel(dtype, query_heads, kv_heads, arch):
     """Compile native THD geometry; tensor extents remain dynamic."""
     from .bprop_helpers import compile_helpers, fake
 
-    if dtype != BF16 or (query_heads, kv_heads) not in ((12, 1), (24, 2)):
-        raise ValueError("QSA backward requires BF16, D256, and head counts 12/1 or 24/2")
+    if dtype != BF16 or (query_heads, kv_heads) not in ((6, 1), (12, 1), (24, 2)):
+        raise ValueError("QSA backward requires BF16, D256, and head counts 6/1, 12/1 or 24/2")
     if arch not in (100, 103):
         raise ValueError(f"Blackwell QSA backward requires SM100 or SM103, got SM{arch}")
     key = template_key(globals(), {"query_heads": query_heads, "kv_heads": kv_heads, "arch": arch}, "compile_kernel")

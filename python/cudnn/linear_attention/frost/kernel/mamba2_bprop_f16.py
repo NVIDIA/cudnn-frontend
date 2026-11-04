@@ -1424,6 +1424,7 @@ def compute2_warp_group(
     sExit,
     sCumsumlog,
     mDstate_in,
+    mDcomposed,
     mDstate0,
     mExit,
     mSkipPart,
@@ -1491,14 +1492,24 @@ def compute2_warp_group(
             exit_base = cutlass.Int32(mExitBase[batch_idx])
         else:
             exit_base = batch_start // cutlass.Int32(cfg.b_t) + 2 * batch_idx
+        if cutlass.const_expr(cfg.has_composed_dstate):
+            gDcomposed = mDcomposed[None, None, head_o, cutlass.Int32(0)]
+            is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
         if n_local > 0:
             # ---- dS seed: d_final_state or zeros -> TMEM + bf16 SMEM ------------------------
             if cutlass.const_expr(cfg.use_dstate_in):
                 seed_values = []
                 seed_true = compute_end == batch_num_chunks
-                gDstate_in = mDstate_in[None, None, head_o, batch_idx]
+                if cutlass.const_expr(cfg.dstate_table):
+                    gDstate_in = mDstate_in[None, None, head_o, batch_idx]
                 for seed_p in cutlass.range_constexpr(cfg.d_v):
-                    seed_value = gDstate_in[seed_p + v_offset, cg2_tidx].to(cutlass.Float32)
+                    if cutlass.const_expr(cfg.dstate_table):
+                        seed_value = gDstate_in[seed_p + v_offset, cg2_tidx].to(cutlass.Float32)
+                    else:
+                        seed_value = zero
+                    if cutlass.const_expr(cfg.has_composed_dstate):
+                        composed_value = gDcomposed[seed_p + v_offset, cg2_tidx].to(cutlass.Float32)
+                        seed_value = composed_value if is_boundary else seed_value
                     seed_values.append(seed_value if seed_true else zero)
                 bars.mb_gate_ready[gate_index.idx].wait(gate_index.phase)
                 gamma_first = cute.math.exp2(sCumsumlog[cfg.b_t - 1, 0, gate_index.idx], fastmath=True)
@@ -1591,10 +1602,18 @@ def compute2_warp_group(
                 if cutlass.const_expr(cfg.use_dstate_in):
                     # ---- final-state dot of the final tile, ahead of the dS wait, the 64 seed loads in one burst ----
                     if final_tile:
-                        gDstate_final = mDstate_in[None, None, head_o, batch_idx]
+                        if cutlass.const_expr(cfg.dstate_table):
+                            gDstate_final = mDstate_in[None, None, head_o, batch_idx]
                         final_values = []
                         for p in cutlass.range_constexpr(cfg.d_v):
-                            final_values.append(gDstate_final[p + v_offset, cg2_tidx].to(cutlass.Float32))
+                            if cutlass.const_expr(cfg.dstate_table):
+                                final_value = gDstate_final[p + v_offset, cg2_tidx].to(cutlass.Float32)
+                            else:
+                                final_value = zero
+                            if cutlass.const_expr(cfg.has_composed_dstate):
+                                composed_value = gDcomposed[p + v_offset, cg2_tidx].to(cutlass.Float32)
+                                final_value = composed_value if is_boundary else final_value
+                            final_values.append(final_value)
                         final_lo = zero
                         final_hi = zero
                         for p in cutlass.range_constexpr(0, cfg.d_v, 2):
@@ -1714,9 +1733,17 @@ def compute2_warp_group(
             if dstate_destination >= 0:
                 gDstate0 = mDstate0[None, None, head_o, dstate_destination]
                 if cutlass.const_expr(cfg.use_dstate_in):
-                    gDstate_in = mDstate_in[None, None, head_o, batch_idx]
+                    if cutlass.const_expr(cfg.dstate_table):
+                        gDstate_in = mDstate_in[None, None, head_o, batch_idx]
                     for p in cutlass.range_constexpr(cfg.d_v):
-                        gDstate0[p + v_offset, cg2_tidx] = gDstate_in[p + v_offset, cg2_tidx].to(mDstate0.element_type)
+                        if cutlass.const_expr(cfg.dstate_table):
+                            seed_value = gDstate_in[p + v_offset, cg2_tidx].to(mDstate0.element_type)
+                        else:
+                            seed_value = cutlass.Float32(0.0).to(mDstate0.element_type)
+                        if cutlass.const_expr(cfg.has_composed_dstate):
+                            composed_value = gDcomposed[p + v_offset, cg2_tidx].to(mDstate0.element_type)
+                            seed_value = composed_value if is_boundary else seed_value
+                        gDstate0[p + v_offset, cg2_tidx] = seed_value
                 else:
                     for p in cutlass.range_constexpr(cfg.d_v):
                         gDstate0[p + v_offset, cg2_tidx] = cutlass.Float32(0.0).to(mDstate0.element_type)
@@ -1737,6 +1764,7 @@ def frost_mamba2_bprop(
     mD: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     mDstate_in: Optional[cute.Tensor],
+    mDcomposed: Optional[cute.Tensor],
     mDstate0: Optional[cute.Tensor],
     mExit: cute.Tensor,
     mSkipPart: Optional[cute.Tensor],
@@ -1973,6 +2001,7 @@ def frost_mamba2_bprop(
             sExit=sExit,
             sCumsumlog=sCumsumlog,
             mDstate_in=mDstate_in,
+            mDcomposed=mDcomposed,
             mDstate0=mDstate0,
             mExit=mExit,
             mSkipPart=mSkipPart,
@@ -2092,6 +2121,8 @@ class Mamba2BpropCfg:
     d_per_channel: bool = False
     skip_bwd_partials: bool = False
     tiles_per_head: int = 1
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -2167,6 +2198,8 @@ def build_cfg(
     skip_bwd_partials: bool = False,
     d_k: int,
     d_v: int,
+    dstate_table: Optional[bool] = None,
+    has_composed_dstate: bool = False,
 ) -> Mamba2BpropCfg:
     """Build the per-compile ``Mamba2BpropCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32)."""
     cfg = Mamba2BpropCfg(
@@ -2175,6 +2208,8 @@ def build_cfg(
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         use_dstate0=use_dstate0,
         dt_softplus=dt_softplus,
         has_d=has_d,
@@ -2482,6 +2517,7 @@ def host(
     exit_base: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
@@ -2512,6 +2548,14 @@ def host(
             cute.make_layout(
                 (dstate_in.shape[2], dstate_in.shape[3], dstate_in.shape[1], dstate_in.shape[0]),
                 stride=(dstate_in.stride[2], dstate_in.stride[3], dstate_in.stride[1], dstate_in.stride[0]),
+            ),
+        )
+    if cutlass.const_expr(dcomposed is not None):
+        dcomposed = cute.make_tensor(
+            dcomposed.iterator,
+            cute.make_layout(
+                (dcomposed.shape[2], dcomposed.shape[3], dcomposed.shape[1], dcomposed.shape[0]),
+                stride=(dcomposed.stride[2], dcomposed.stride[3], dcomposed.stride[1], dcomposed.stride[0]),
             ),
         )
     if cutlass.const_expr(dstate0 is not None):
@@ -2562,6 +2606,7 @@ def host(
         d,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         exit_dots,
         skip_bwd_part,

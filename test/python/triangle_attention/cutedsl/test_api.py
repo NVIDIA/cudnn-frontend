@@ -220,9 +220,9 @@ def _left_desc(b, n, h, s, d, dtype=torch.bfloat16, device="cuda"):
     return _desc((b, n, h, s, d), (n * s * h * d, s * h * d, d, h * d, 1), dtype, device)
 
 
-def _head_major_desc(b, n, h, s, d, dtype=torch.bfloat16, device="cuda"):
-    """cuEquivariance's contiguous (B, N, H, S, D): head-major -> not bindable without a copy."""
-    return _desc((b, n, h, s, d), (n * h * s * d, h * s * d, s * d, d, 1), dtype, device)
+def _strided_head_dim_desc(b, n, h, s, d, dtype=torch.bfloat16, device="cuda"):
+    """The "layout_left" (B, N, S, H, D) memory form with every second element of the head dim: not bindable without a copy."""
+    return _desc((b, n, h, s, d), (2 * n * s * h * d, 2 * s * h * d, 2 * d, 2 * h * d, 2), dtype, device)
 
 
 def _bias_desc(bb, h, s_q, s_kv, dtype=torch.bfloat16, device="cuda", row=None):
@@ -264,14 +264,14 @@ def test_declaration_declines_malformed_inputs_typed(kw, exc, match):
     [
         (dict(dtype=torch.float8_e4m3fn), NotImplementedError, "bf16 and fp16"),
         (dict(bias_dtype=torch.float32), NotImplementedError, "the activations' dtype"),
-        (dict(q=_head_major_desc(1, 256, 4, 256, 32)), NotImplementedError, "does not bind"),
+        (dict(q=_strided_head_dim_desc(1, 256, 4, 256, 32)), NotImplementedError, "does not bind"),
         (dict(bias=_bias_desc(1, 4, 217, 217), s=217), NotImplementedError, "16-byte"),
         (dict(bias=_bias_desc(1, 4, 256, 256, row=257)), NotImplementedError, "16-byte"),
     ],
 )
 def test_check_support_declines_unserved_declarations_before_any_device_work(kw, exc, match):
     """The envelope's typed declines fire on the declaration alone: the dtype, the fp32 bias (the function casts it, the class API does
-    not), a head-major activation layout, a compact bias at S_kv % 8 != 0 and an odd bias row stride (the TMA 16-byte rule)."""
+    not), an activation whose head dim is not contiguous, a compact bias at S_kv % 8 != 0 and an odd bias row stride (the TMA 16-byte rule)."""
     s = kw.pop("s", 256)
     dtype = kw.pop("dtype", torch.bfloat16)
     bias_dtype = kw.pop("bias_dtype", dtype)

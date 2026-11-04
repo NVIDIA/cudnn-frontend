@@ -272,7 +272,10 @@ def test_sparse_accepts_the_padding_and_stats_fields():
         (dict(lpt_head_group=2), "other kernels' specializations"),
         (dict(sched_policy=1), "sched_policy must be NATURAL"),
         (dict(paged_kv=True, page_size=6, seq_kv_lens_present=True), "multiple of 4"),
-        (dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True), "THD x paged is not served"),  # both arms wired, never together
+        (
+            dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True),
+            "THD x paged is not served",
+        ),  # the TOP-LEFT composition: no serving meaning (the triple with bottom_right builds -- the GREEN cell below)
         (dict(seq_q_lens_present=True), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
         (dict(qsa_block_topk=2), "multiple of 4 in"),
         (dict(qsa_block_topk=516), "multiple of 4 in"),
@@ -405,15 +408,46 @@ def test_sparse_accepts_the_decode_form_arms(split):
         (dict(split_kv=2, thd_varlen=True), "split_kv > 1 under THD"),
         (dict(qsa_list_per_sequence=True, bottom_right=True, thd_varlen=True), "list_per_sequence under THD"),
         (dict(qsa_list_per_sequence=True), "list_per_sequence requires BOTTOM_RIGHT"),
-        (dict(bottom_right=True, thd_varlen=True), "bottom_right under THD"),
+        (dict(bottom_right=True, thd_varlen=True), "bottom_right under THD"),  # on the DENSE packed form; over PAGED pools the triple builds (below)
     ],
 )
 def test_sparse_decode_form_arms_refuse_their_unserved_compositions(over, pattern):
     """The decode form's arms against each other at the factory (the adapter declines each by name first; this is the backstop):
-    a split past the item's tile count, the kernel's own gate under a split (the gate rides the combine), any of the three under
-    THD, the shared list without the bottom-right anchor."""
+    a split past the item's tile count, the kernel's own gate under a split (the gate rides the combine), the split and the shared list
+    under THD, bottom_right under THD on the DENSE packed form, the shared list without the bottom-right anchor."""
     with pytest.raises(ValueError, match=pattern):
         make_cfg_d256_sparse(_sparse(**over))
+
+
+@pytest.mark.parametrize("gate", [False, True], ids=["ungated", "gated"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_sparse_thd_paged_bottom_right_composition_builds(gate, page_size):
+    """THD x PAGED x BOTTOM_RIGHT (2026-10-30, the record's ``thd_paged_kv``): the packed EXTEND form over the pools -- the two pair
+    predicates admit exactly the TRIPLE (THD x paged on the top-left diagonal and bottom_right under THD on the dense packed form stay
+    refused above): the factory builds it, gated and ungated, with the per-sequence KV lengths forced, no split and no shared list, and
+    changes no other field of the record; the validator passes it, and turns RED again when either composing arm is dropped from the
+    built record."""
+    over = dict(thd_varlen=True, paged_kv=True, page_size=page_size, bottom_right=True, epilogue_gate=gate)
+    cfg, _ = make_cfg_d256_sparse(_sparse(**over))
+    assert (cfg.THD_VARLEN, cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.BOTTOM_RIGHT, cfg.SEQ_KV_LENS_PRESENT, cfg.SPLIT_KV, cfg.LIST_PER_SEQUENCE, cfg.EPILOGUE_GATE) == (
+        1,
+        1,
+        page_size,
+        1,
+        1,
+        1,
+        0,
+        int(gate),
+    )
+    dense, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=gate))
+    assert (
+        dataclasses.replace(cfg, THD_VARLEN=0, PAGED_KV=0, PAGE_SIZE=0, BOTTOM_RIGHT=0, SEQ_KV_LENS_PRESENT=0) == dense
+    ), "the composition changes no other field"
+    _validate_cfg_d256_sparse(cfg)
+    with pytest.raises(ValueError, match="THD x paged is not served"):
+        _validate_cfg_d256_sparse(dataclasses.replace(cfg, BOTTOM_RIGHT=0))
+    with pytest.raises(ValueError, match="bottom_right under THD is not served"):
+        _validate_cfg_d256_sparse(dataclasses.replace(cfg, PAGED_KV=0, PAGE_SIZE=0))
 
 
 # ---------------------------------------------------------------------------- the validator, predicate by predicate (RED on a replaced field)
@@ -500,7 +534,10 @@ _RED_ROWS = [
     (dict(LIST_PER_SEQUENCE=1), "list_per_sequence requires BOTTOM_RIGHT"),
     (dict(BOTTOM_RIGHT=1, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "bottom_right under THD is not served"),
     (dict(THD_VARLEN=1), "force SEQ_KV_LENS_PRESENT=1"),
-    (dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1), "THD x paged is not served"),  # both wired arms, never in one record
+    (
+        dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1),
+        "THD x paged is not served",
+    ),  # the TOP-LEFT composition; with BOTTOM_RIGHT=1 the record is the served triple
     (dict(SEQ_Q_LENS_PRESENT=1), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
     (dict(SCHEDULER_POLICY=1), "NATURAL in v1"),
 ]

@@ -93,6 +93,7 @@ _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
 _AB_STAGE_BYTES = (num_a_operands * cta_tile_mnk[0] + num_b_operands * cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
 if not stg_epi_prefunded:
     ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
+assert ab_stages >= 1, f"{__name__}: the epilogue staging left an empty AB ring"
 
 
 _PTX_AB_TAG = {

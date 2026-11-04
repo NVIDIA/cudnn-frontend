@@ -190,19 +190,20 @@ def test_d128_f16_folds_the_split_out_of_the_band_builds(band_kw, cta_mma, dtype
 
 @requires_dsl
 @pytest.mark.parametrize("enabled", [True, False], ids=["cc100_on", "cc103_off"])
-def test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate(enabled):
-    """The d192x128 f16 kernel's dense top-left causal arm carried a tail exp2 emulation BEFORE the split
-    (``_exp2_mixed_late``: the last 34 columns of chunk 1 on ``ex2_emulation_2``).  The measured form of the split
-    REPLACES it on every mask arm with the gate on; with the gate off the develop causal arm -- tail emulation
-    included -- must still be what the module traces (its own arch gate is a separate follow-up)."""
+def test_d192_f16_causal_arm_spelling_follows_the_split_claim(enabled):
+    """The d192x128 f16 kernel's dense top-left causal arm takes the exp2 split's spelling (``_DENSE_CAUSAL_PUBLIC_EXP2_MIX``
+    from ``CfgD192.EXP2_TAIL_MIX``: the BMM1/BMM2 issue tweaks and chunk 1's row-sum after its publish) only on a build
+    that claims the split; without the claim the arm traces the default issue order and the plain MUFU exp2 on every
+    column, and the module carries no causal-only tail emulation."""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
 
     params = TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=1, window_right=0, sched_policy=2, exp2_fma_split=enabled)
     mod = _load_sm100_kernel_module((192, 128), params, fp8=False, pertensor=False, rubin=False)
     assert mod._E2E_ENABLED is enabled
-    assert mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX is True, "this record is the dense top-left causal MHA arm"
-    assert callable(mod._exp2_mixed_late) and callable(mod.ex2_emulation_2), "the pre-existing tail emulation must stay importable for the gate-off arm"
-    assert mod._REUSE_BMM2_ISSUE_ELECTION is True, "the causal arm's BMM2 issue tweaks are independent of the split"
+    assert mod.CFG.EXP2_TAIL_MIX == int(enabled)
+    assert mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX is enabled, "this record is the dense top-left causal MHA arm"
+    assert mod._REUSE_BMM2_ISSUE_ELECTION is enabled, "the causal arm's BMM2 issue tweaks come with the split's spelling"
+    assert not hasattr(mod, "_exp2_mixed_late")
 
 
 @requires_dsl

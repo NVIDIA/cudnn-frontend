@@ -515,8 +515,8 @@ def test_canonical_jax_glu_hadamard_quant_delayed_act(monkeypatch):
     from cudnn.gemm.cutedsl.grouped.glu_hadamard_quant import api, jax_api
     from cudnn.gemm.cutedsl.grouped.glu_hadamard_quant import moe_blockscaled_grouped_gemm_glu_hadamard_quant as kernel_module
 
-    if get_compute_capability() != (10, 0):
-        pytest.skip("Exercises the SM100 epilogue barriers")
+    if get_compute_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Exercises the SM100-family epilogue barriers")
     original_sync = kernel_module._partial_cta_sync
 
     @dsl_user_op

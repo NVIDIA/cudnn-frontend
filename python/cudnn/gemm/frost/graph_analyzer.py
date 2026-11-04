@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field, replace
-from math import isfinite
+from functools import lru_cache
+from math import isfinite, prod
+from operator import index
 from typing import Any
 
 import cudnn
@@ -24,6 +26,9 @@ from .fusion_ir import (
     Dtype,
     FusionChain,
     FusionOp,
+    Axis,
+    IndexExpr,
+    IndexMap,
     MatmulSpec,
     ReductionSpec,
     TensorRef,
@@ -32,6 +37,8 @@ from .fusion_ir import (
 )
 
 # Dtype + op tables
+
+from .layouts import OperandView, ViewStep, fold_batch_layout
 
 from .dtypes import CUDNN_FROM_DTYPE as _CUDNN_FROM_DTYPE
 from .dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
@@ -132,6 +139,9 @@ class _RecordedOp:
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
     group_offset: int | None = None
+    permutation: tuple[int, ...] = ()
+    reshape_mode: str = "VIEW_ONLY"
+    index_expr: IndexExpr | None = None
 
 
 @dataclass
@@ -148,6 +158,9 @@ class _TensorMeta:
     output_index: int | None = None
     explicit_dtype: Any = None
     dim_override: tuple[int, ...] | None = None
+    mn_transposed: bool | None = None  # None for ordinary bindings; bool for a normalized caller-axis view
+    matrix_batch: tuple[int, ...] | None = None  # original leading axes before rank normalization
+    operand_view: OperandView | None = None  # fixed source shape and ordered zero-copy operations
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -167,6 +180,13 @@ class GemmBinding:
     token_index: Any = None
     token_ks: Any = None
     top_k_scores: Any = None
+    # Empty: historical graph/kernel-order binding. Nonempty: original graph axes,
+    # with the recorded M/N parity (including False when transposes cancel).
+    a_transposed: tuple[bool, ...] = ()
+    b_transposed: tuple[bool, ...] = ()
+    aux_transposed: tuple[bool, ...] = ()
+    matrix_batches: tuple[tuple[Any, tuple[int, ...]], ...] = ()
+    operand_views: tuple = ()
 
     def bound_tensors(self) -> list[Any]:
         """List tensors bound by this GEMM plan."""
@@ -186,7 +206,8 @@ class GemmBinding:
             ts.append(self.token_ks)
         if self.top_k_scores is not None:
             ts.append(self.top_k_scores)
-        return [t for t in ts if t is not None]
+        # A shared input can occupy different roles/views but has one caller binding.
+        return list({id(t): t for t in ts if t is not None}.values())
 
 
 def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
@@ -204,6 +225,11 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         token_index=binding.token_index,
         token_ks=binding.token_ks,
         top_k_scores=binding.top_k_scores,
+        a_transposed=binding.b_transposed,
+        b_transposed=binding.a_transposed,
+        aux_transposed=binding.aux_transposed,
+        matrix_batches=binding.matrix_batches,
+        operand_views=binding.operand_views,
     )
 
 
@@ -220,6 +246,7 @@ def _make_multi_binding(
     token_index=None,
     token_ks=None,
     top_k_scores=None,
+    aux_refs=(),
 ) -> GemmBinding:
     """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE):
     the cuDNN tensor per distinct A/B slot (+ its SF for block-scale) from ``meta``."""
@@ -232,6 +259,12 @@ def _make_multi_binding(
                 objs.append(meta[sid].tensor)
         return objs
 
+    def _transpose_flags(ids):
+        """Collect prepared transpose flags for bound tensors in caller coordinates."""
+        return tuple(bool(meta[i].mn_transposed) for i in ids) if any(meta[i].mn_transposed is not None for i in ids) else ()
+
+    views = {(m.name, id(m.tensor)): bool(m.mn_transposed) for m in meta.values() if m.mn_transposed is not None}
+    matrix_batches = {id(m.tensor): (m.tensor, m.matrix_batch) for m in meta.values() if m.matrix_batch is not None}
     return GemmBinding(
         a_operands=[meta[i].tensor for i in a_ids],
         b_operands=[meta[i].tensor for i in b_ids],
@@ -243,6 +276,11 @@ def _make_multi_binding(
         token_index=token_index,
         token_ks=token_ks,
         top_k_scores=top_k_scores,
+        a_transposed=_transpose_flags(a_ids),
+        b_transposed=_transpose_flags(b_ids),
+        aux_transposed=tuple(views.get((ref.name, id(tensor)), False) for ref, tensor in zip(aux_refs, aux_objs)) if views else (),
+        matrix_batches=tuple(matrix_batches.values()),
+        operand_views=tuple({id(m.tensor): (m.tensor, m.operand_view) for m in meta.values() if m.operand_view is not None}.values()),
     )
 
 
@@ -353,6 +391,14 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
         return _RecordedOp("matmul", name, [id(A), id(B)], id(out), out, compute_dtype=compute)
+    if node_type == "RESHAPE":
+        inp, out = node.inputs["input"], node.outputs["OUT_0"]
+        raw_mode = node.params.get("reshape_mode")
+        mode = "VIEW_ONLY" if raw_mode is None else getattr(raw_mode, "name", "unsupported")
+        return _RecordedOp("reshape", name, [id(inp)], id(out), out, reshape_mode=mode)
+    if node_type == "TRANSPOSE":
+        inp, out = node.inputs["input"], node.outputs["OUT_0"]
+        return _RecordedOp("transpose", name, [id(inp)], id(out), out, permutation=tuple(node.params.get("permutation") or ()))
     if node_type == "MOE_GROUPED_MATMUL":
         tok = node.inputs["token"]
         weight = node.inputs["weight"]
@@ -430,7 +476,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
         )
     if node_type == "POINTWISE":
         out = node.outputs["OUT_0"]
-        attrs = tuple(sorted((k, float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
+        attrs = tuple(sorted((k, int(v) if k == "axis" else float(v)) for k, v in node.params.items() if k in _POINTWISE_ATTR_KEYS and v is not None))
         return _RecordedOp(
             node.params.get("mode"),
             name,
@@ -991,9 +1037,11 @@ def _build_epilogue_dag(
     for next_op in ordered_ops:
         if next_op.cudnn_name in _UNARY_OP_MAP:
             (parent_id,) = next_op.inputs
-            if next_op.cudnn_name == "gen_index" and dict(next_op.op_attrs).get("axis") not in (1, 2):
+            if next_op.cudnn_name == "gen_index" and next_op.index_expr is None and dict(next_op.op_attrs).get("axis") not in (1, 2):
                 raise NotImplementedError(f"gen_index {next_op.op_name!r}: only axis 1 (M) or 2 (N) is supported " "in cudnn.gemm.frost")
-            fop = FusionOp(op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs)
+            fop = FusionOp(
+                op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs, index_expr=next_op.index_expr
+            )
         elif next_op.cudnn_name in _BINARY_OP_MAP:
             inp0, inp1 = next_op.inputs
             in0, in1 = _is_in_chain(inp0), _is_in_chain(inp1)
@@ -1150,8 +1198,12 @@ def _output_layouts(dense_entries, quant_recs, meta):
 
     for _di in range(len(dense_entries)):
         _spec_i, _obj_i = dense_entries[_di]
-        _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
-        _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
+        _m_i = meta.get(id(_obj_i))
+        if _m_i is not None and _m_i.matrix_batch is not None:
+            _d_i, _s_i = _m_i.dim, _m_i.stride
+        else:
+            _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
+            _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
         if (not _d_i or not _s_i) and _spec_i.quant_idx is not None:
             _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
             if _meta_i is not None:
@@ -1499,6 +1551,307 @@ def _build_multi_moe_chain(
     return chain, binding
 
 
+def matrix_axis_index(shape, axis):
+    """Map a logical rank-N matrix axis to folded (batch, M, N) coordinates.
+
+    Batch extents are prepared constants, matching the existing fixed-prefix
+    binding contract. Matrix coordinates remain dynamic; no M/N value is baked.
+    """
+    shape, axis = tuple(map(index, shape)), index(axis)
+    if len(shape) < 2 or any(d <= 0 for d in shape) or not 0 <= axis < len(shape):
+        raise ValueError(f"gen_index requires positive matrix dimensions and a valid logical axis; got shape={shape}, axis={axis}")
+    if max(prod(shape[:-2]), *shape) > (1 << 63) - 1:
+        raise ValueError("gen_index batch geometry exceeds Int64")
+    if axis == len(shape) - 2:
+        return IndexExpr.coordinate(Axis.M)
+    if axis == len(shape) - 1:
+        return IndexExpr.coordinate(Axis.N)
+    if shape[axis] == 1:
+        return IndexExpr.constant(0)
+    coordinate = IndexExpr.coordinate(Axis.BATCH).floor_div(prod(shape[axis + 1 : -2]))
+    # The leading batch axis has no higher digits to discard.
+    return coordinate if axis == 0 else coordinate.modulo(shape[axis])
+
+
+def _lower_matrix_indices(
+    ops: list[_RecordedOp], ranked_shapes: dict[int, tuple[int, ...]], producers: dict[int, _RecordedOp], matmul_output: int
+) -> list[_RecordedOp]:
+    """Lower graph index coordinates before matrix shapes are batch-folded.
+
+    This handles the plain pointwise/GEMM scope only: epilogue structural views
+    and reductions are excluded by the caller. Prepared batch extents are fixed,
+    while operands and GEMM descendants retain live matrix coordinates even
+    when prepared at extent one.
+    """
+
+    @lru_cache(maxsize=None)
+    def follows_matmul_shape(tid):
+        if tid == matmul_output:
+            return True
+        producer = producers.get(tid)
+        return producer is not None and any(follows_matmul_shape(i) for i in producer.inputs)
+
+    operand_nodes = set()
+
+    def collect_operands(tid):
+        if tid in operand_nodes:
+            return
+        operand_nodes.add(tid)
+        producer = producers.get(tid)
+        if producer is not None:
+            for source in producer.inputs:
+                collect_operands(source)
+
+    for source in producers[matmul_output].inputs:
+        collect_operands(source)
+    lowered = []
+    for op in ops:
+        if op.cudnn_name == "gen_index" and op.index_expr is None:
+            source = op.inputs[0]
+            dim = ranked_shapes[source]
+            axis = dict(op.op_attrs).get("axis")
+            expr = matrix_axis_index(dim, axis)
+            # Consumer matrix coordinates -> singleton producer coordinates.
+            # Auxiliary-only branches keep their unit extents when broadcast;
+            # compose before codegen/dtype rounding, not as a kernel fixup.
+            if op.output not in operand_nodes and not follows_matmul_shape(source):
+                coordinates = tuple(matrix_axis_index(dim, i) for i in range(len(dim)))
+                expr = IndexMap.broadcast(dim, dim).apply(coordinates)[index(axis)]
+            op = replace(op, index_expr=expr)
+        lowered.append(op)
+    return lowered
+
+
+def _operand_view_index_map(shape, steps):
+    """Compose logical consumer-to-producer views independently of index axes."""
+    mapping = IndexMap.identity(shape)
+    for step in steps:
+        view = (
+            IndexMap.reshape(mapping.consumer_shape, step.argument) if step.kind == "reshape" else IndexMap.permutation(mapping.consumer_shape, step.argument)
+        )
+        mapping = mapping.compose(view)
+    return mapping
+
+
+def _operand_index_expression(mapping, axis):
+    """Select a producer axis and bind it to folded matrix coordinates."""
+    axis = index(axis)
+    if not 0 <= axis < len(mapping.producer_shape):
+        raise ValueError("gen_index requires a valid logical producer axis")
+    coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
+    return mapping.apply(coordinates)[axis]
+
+
+def _normalize_operand_views(ops: list[_RecordedOp], meta: dict[int, _TensorMeta], io_dtype: Dtype, intermediate_dtype: Dtype) -> list[_RecordedOp]:
+    """Project ordered operand views through pointwise DAGs, then fold matrix rank.
+
+    One producer map and shape/dtype cache serve reshape and transpose. Geometry
+    lives in layouts; graph observability, broadcast and engine capability gates
+    stay here. Transpose-only bindings retain their dynamic-axis ABI.
+    """
+    structural = [op for op in ops if op.cudnn_name in ("reshape", "transpose")]
+    has_reshape = any(op.cudnn_name == "reshape" for op in structural)
+    matmuls = [op for op in ops if op.cudnn_name == "matmul"]
+    if len(matmuls) != 1 or any(op.cudnn_name in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops):
+        if structural:
+            raise ValueError("operand reshape/transpose fusion requires one plain matmul (no MoE or block-scale dequantize)")
+        return ops
+    fold_batches = all(op.cudnn_name in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "matmul", "reshape", "transpose") for op in ops)
+    if has_reshape and not fold_batches:
+        raise ValueError("operand reshape fusion requires one plain pointwise/GEMM graph")
+    if not structural and not fold_batches:
+        return ops
+    mm = matmuls[0]
+    producers = {op.output: op for op in ops}
+    used, projected_ops, input_views = set(), [], {}
+    names = {m.name for m in meta.values()}
+
+    @lru_cache(maxsize=None)
+    def shape(tid):
+        """Infer caller dimensions before structural projection or batch folding."""
+        m, op = meta[tid], producers.get(tid)
+        if op is None:
+            return m.dim
+        dims = [shape(i) for i in op.inputs]
+        if op.cudnn_name == "reshape":
+            if op.reshape_mode not in ("LOGICAL", "VIEW_ONLY") or not m.dim or any(d <= 0 for d in m.dim) or prod(dims[0]) != prod(m.dim):
+                raise ValueError("operand reshape requires explicit positive dimensions, equal element count and a supported mode")
+            return m.dim
+        if op.cudnn_name == "transpose":
+            dim = dims[0]
+            identity = tuple(range(len(dim)))
+            swap = (*identity[:-2], len(dim) - 1, len(dim) - 2)
+            if len(dim) < 2 or op.permutation not in (identity, swap):
+                raise ValueError(f"operand transpose {op.op_name!r}: only identity or last-two matrix axes may be permuted; batch axes must stay fixed")
+            expected = tuple(dim[i] for i in op.permutation)
+        elif op.cudnn_name == "matmul":
+            a, b = dims
+            if len(a) != len(b) or len(a) < 2 or a[-1] != b[-2]:
+                raise ValueError(f"matrix rank or contraction mismatch: A={a}, B={b}")
+            if any(x != y and x != 1 and y != 1 for x, y in zip(a[:-2], b[:-2])):
+                raise ValueError(f"matrix batch dimensions do not broadcast: A={a}, B={b}")
+            expected = (*map(max, zip(a[:-2], b[:-2])), a[-2], b[-1])
+        elif op.cudnn_name in (*_UNARY_OP_MAP, *_BINARY_OP_MAP):
+            rank = max(map(len, dims))
+            padded = [(1,) * (rank - len(d)) + d for d in dims]
+            if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*padded)):
+                raise ValueError(f"operand pointwise {op.op_name!r}: incompatible broadcast shapes {dims}")
+            expected = tuple(map(max, zip(*padded)))
+        else:
+            return m.dim
+        if m.dim and m.dim != expected:
+            raise ValueError(f"operand node {op.op_name!r}: expected output shape {expected}, got {m.dim}")
+        return expected
+
+    @lru_cache(maxsize=None)
+    def dtype(tid):
+        op, m = producers.get(tid), meta[tid]
+        if op is not None and op.cudnn_name in ("reshape", "transpose"):
+            expected = dtype(op.inputs[0])
+            declared = _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta) if m.dtype is not None else expected
+            if declared != expected:
+                raise ValueError(f"operand {op.cudnn_name} {op.op_name!r}: dtype changes are unsupported ({expected} -> {declared})")
+            return expected
+        return m.dtype if op is None else _resolve_out_dtype(tid, m.tensor, io_dtype, intermediate_dtype, meta)
+
+    def alias(tid, steps, parent=None):
+        """Prepare either a dynamic transpose binding or an ordered fixed-shape view."""
+        m, dim = meta[tid], shape(tid)
+        stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+        reshaped = any(step.kind == "reshape" for step in steps)
+        view = None
+        if parent is not None and has_reshape:
+            dim, stride, transposed = parent.dim, parent.stride, None
+        elif reshaped:
+            if m.is_input:
+                if dtype(tid) not in ("bf16", "fp16", "fp32"):
+                    raise ValueError("operand reshape currently supports BF16, FP16 and FP32 storage only")
+                view = OperandView.prepare(dim, stride, steps)
+                # Compare proved maps, not spelling: equivalent compositions share storage.
+                previous = input_views.get(id(m.tensor))
+                input_views[id(m.tensor)] = view if previous is None else previous.merged(view)
+                dim, stride = view.target_shape, view.target_stride
+            else:
+                dim, stride = parent.dim, parent.stride
+            transposed = False if m.is_input else None
+        else:
+            transposed = sum(step.argument != tuple(range(len(step.argument))) for step in steps) % 2 == 1
+            if transposed and len(dim) < 2:
+                if dim and all(d == 1 for d in dim):
+                    return tid
+                raise ValueError(f"operand transpose input {m.name!r}: expected matrix rank >= 2, got {dim}")
+            if transposed:
+                dim, stride = (*dim[:-2], dim[-1], dim[-2]), (*stride[:-2], stride[-1], stride[-2])
+        name = f"{m.name}_mn_view"
+        while name in names:
+            name += "_"
+        names.add(name)
+        result = replace(m, name=name, dim=dim, stride=stride, dtype=dtype(tid), mn_transposed=transposed, operand_view=view)
+        meta[id(result)] = result
+        return id(result)
+
+    @lru_cache(maxsize=None)
+    def operand_index_map(dim, steps):
+        # Analysis-local cache: axes on the same view chain share one map,
+        # without retaining graphs or geometry across compilation requests.
+        return _operand_view_index_map(dim, steps)
+
+    @lru_cache(maxsize=None)
+    def project(tid, steps=()):
+        op = producers.get(tid)
+        if op is None:
+            return alias(tid, steps)
+        if op.cudnn_name not in (*_UNARY_OP_MAP, *_BINARY_OP_MAP, "reshape", "transpose"):
+            raise ValueError(f"operand view path {op.op_name!r}: unsupported producer {op.cudnn_name!r}")
+        if meta[tid].output_index is not None:
+            raise ValueError(f"operand view path {op.op_name!r}: materialized intermediate outputs cannot be absorbed")
+        if op.cudnn_name in ("reshape", "transpose"):
+            shape(tid)
+            dtype(tid)
+            used.add(tid)
+            step = ViewStep("reshape", shape(tid), meta[tid].stride) if op.cudnn_name == "reshape" else ViewStep("transpose", op.permutation)
+            return project(op.inputs[0], (step, *steps))
+        reshaped = any(step.kind == "reshape" for step in steps)
+        primary = next((i for i in op.inputs if not all(d == 1 for d in shape(i))), op.inputs[0])
+        if reshaped:
+            if any(not all(d == 1 for d in shape(i)) and shape(i) != shape(primary) for i in op.inputs):
+                raise ValueError("reshape fusion supports equal-shaped pointwise operands or scalar auxiliaries, not partial broadcasts")
+        inputs = [i if reshaped and i != primary and all(d == 1 for d in shape(i)) else project(i, steps) for i in op.inputs]
+        output = alias(tid, steps, meta[inputs[op.inputs.index(primary)]])
+        expr = _operand_index_expression(operand_index_map(shape(tid), steps), dict(op.op_attrs).get("axis")) if op.cudnn_name == "gen_index" else op.index_expr
+        projected_ops.append(replace(op, inputs=inputs, output=output, index_expr=expr))
+        return output
+
+    if structural:
+        shape(mm.output)  # cache before pruning original operand metadata
+        inputs = [project(i) for i in mm.inputs]
+        if used != {op.output for op in structural}:
+            raise ValueError("reshape/transpose fusion is operand-only; epilogue or unrelated views are unsupported")
+        # Observable pre-view branches keep original pointwise nodes and shapes.
+        for op in structural:
+            if not meta[op.output].dim:
+                meta[op.output] = replace(meta[op.output], dim=shape(op.output))
+        ops = [replace(op, inputs=inputs) if op is mm else op for op in ops if op.cudnn_name not in ("reshape", "transpose")] + projected_ops
+        if has_reshape:
+            by_output = {op.output: op for op in ops}
+            live = set()
+
+            def visit(tid):
+                if tid in live:
+                    return
+                live.add(tid)
+                if tid in by_output:
+                    for i in by_output[tid].inputs:
+                        visit(i)
+
+            for tid in list(meta):
+                if _is_output(meta, tid):
+                    visit(tid)
+            visit(mm.output)
+            for tid in list(meta):
+                if tid not in live:
+                    del meta[tid]
+            for tid, m in list(meta.items()):
+                if m.is_input and id(m.tensor) in input_views:
+                    if m.operand_view is None:
+                        raise ValueError("shared reshape input has an observable branch in incompatible coordinates")
+                    meta[tid] = replace(m, operand_view=input_views[id(m.tensor)])
+            ops = [op for op in ops if op.output in live]
+    if fold_batches:
+        batch_shape = shape(mm.output)[:-2]
+        ranked_shapes = {tid: shape(tid) for tid in meta}
+        output_dim = ranked_shapes[mm.output]
+        # Ordered reshape views already prove their own layout. Do not put
+        # untouched rank-3 slots on the general batch-fold path.
+        matrix_views_required = (bool(structural) and not has_reshape) or output_dim != (prod(batch_shape), *output_dim[-2:])
+
+        ops = _lower_matrix_indices(ops, ranked_shapes, producers, mm.output)
+        for tid, m in list(meta.items()):
+            dim = ranked_shapes[tid]
+            if len(dim) < 2:
+                continue  # rank-one/scalar auxiliary ABI is already supported
+            prefix = dim[:-2]
+            width = max(len(prefix), len(batch_shape))
+            padded = (1,) * (width - len(prefix)) + prefix
+            expected_batch = (1,) * (width - len(batch_shape)) + batch_shape
+            if padded != expected_batch and any(d != 1 for d in padded):
+                raise ValueError(
+                    f"matrix input {m.name!r}: partial/crossed batch broadcasting cannot be represented by one batch stride; got {prefix}, output {batch_shape}"
+                )
+            stride = m.stride or tuple(prod(dim[i + 1 :]) for i in range(len(dim)))
+            layout_dim, layout_stride = fold_batch_layout(dim, stride, writable=_is_output(meta, tid), allow_identity_broadcast=not matrix_views_required)
+            meta[tid] = replace(
+                m,
+                dim=layout_dim,
+                stride=layout_stride,
+                # Identity geometry already binds through the existing ABI checks.
+                # Only prepare runtime views when the graph or this slot needs one.
+                matrix_batch=prefix if matrix_views_required or dim != layout_dim else None,
+                mn_transposed=False if m.is_input and m.mn_transposed is None and dim != layout_dim else m.mn_transposed,
+            )
+    return ops
+
+
 def _walk_mainloop_chain(
     operand_id: int,
     label: str,
@@ -1511,31 +1864,70 @@ def _walk_mainloop_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk backwards from a matmul operand through pointwise ops (unary, or binary with one SCALAR graph-input aux) to the root graph input."""
+    """Lower one same-carrier operand DAG, including indices and scalar/per-K auxiliaries."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
         return m is not None and m.is_input and len(m.dim) > 0 and all(d == 1 for d in m.dim)
 
-    # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
-    steps: list[tuple] = []
-    cur = operand_id
-    while cur in op_by_output:
-        producer = op_by_output[cur]
+    @lru_cache(maxsize=None)
+    def _pointwise_dim(tid: int) -> tuple[int, ...]:
+        m = meta.get(tid)
+        if m is not None and m.dim:
+            return m.dim
+        producer = op_by_output.get(tid)
+        if producer is None or (producer.cudnn_name not in _UNARY_OP_MAP and producer.cudnn_name not in _BINARY_OP_MAP):
+            return ()
+        dims = [_pointwise_dim(inp) for inp in producer.inputs]
+        if not dims or any(len(dim) != 3 for dim in dims):
+            return ()
+        if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*dims)):
+            return ()
+        return tuple(max(axis) for axis in zip(*dims))
+
+    def _is_per_k_input(tid: int, other: int) -> bool:
+        m = meta.get(tid)
+        k_axis = 2 if label == "A" else 1
+        if m is None or not m.is_input or len(m.dim) != 3 or m.dim[0] != 1 or m.dim[3 - k_axis] != 1:
+            return False
+        source_dim = _pointwise_dim(other)
+        if len(source_dim) != 3:
+            return False
+        expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
+        return m.dim == expected and source_dim[3 - k_axis] != 1
+
+    fops: list[FusionOp] = []
+
+    @lru_cache(maxsize=None)
+    def index_branch(tid):
+        producer = op_by_output.get(tid)
+        if producer is None:
+            return False
+        return producer.cudnn_name == "gen_index" or (producer.cudnn_name in _UNARY_OP_MAP and index_branch(producer.inputs[0]))
+
+    @lru_cache(maxsize=None)
+    def visit(tid):
+        producer = op_by_output.get(tid)
+        if producer is None:
+            return tid, -1
+        if _is_output(meta, tid):
+            raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: materialized intermediate outputs cannot be absorbed")
+        allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
         if producer.cudnn_name == "gen_index":
-            raise ValueError(
-                f"matmul {label} operand producer {producer.op_name!r}: gen_index is unsupported in mainloop fusion (requires logical operand coordinates)"
-            )
-        if producer.cudnn_name in _UNARY_OP_MAP or producer.cudnn_name in _BINARY_OP_MAP:
-            allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
-            for key, value in producer.op_attrs:
-                if key not in allowed_attrs:
-                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
-                if not isfinite(value):
-                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+            allowed_attrs = frozenset(("axis",))
+        for key, value in producer.op_attrs:
+            if key not in allowed_attrs:
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
+            if not isfinite(value):
+                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
+        expr = producer.index_expr
         if producer.cudnn_name in _UNARY_OP_MAP:
-            steps.append((producer.cudnn_name, False, None, True, producer))
-            (cur,) = producer.inputs
+            root, parent = visit(producer.inputs[0])
+            if producer.cudnn_name == "gen_index":
+                if expr is None:
+                    raise ValueError(f"matmul {label} gen_index requires normalized logical operand coordinates")
+                expr = expr.substitute({Axis.N if label == "A" else Axis.M: IndexExpr.coordinate(Axis.K)})
+            fop = FusionOp(op=_UNARY_OP_MAP[producer.cudnn_name], parent_idx=parent, index_expr=expr)
         elif producer.cudnn_name in _BINARY_OP_MAP:
             i0, i1 = producer.inputs
             s0, s1 = _is_scalar_input(i0), _is_scalar_input(i1)
@@ -1543,57 +1935,56 @@ def _walk_mainloop_chain(
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif s1 and not s0:
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i0, i1):
+                aux_id, chain_id, aux_on_rhs = i0, i1, False
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i1, i0):
+                aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif index_branch(i0) or index_branch(i1):
+                root, parent = visit(i0)
+                other_root, other = visit(i1)
+                if root != other_root:
+                    raise ValueError("mainloop index fan-in requires the same storage carrier on both branches")
+                fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], parent_idx=parent, parent_idx_b=other)
+                aux_id = None
             else:
                 raise ValueError(
-                    f"matmul {label} operand is produced by binary op "
-                    f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
-                    "fusion only supports a binary op with exactly one SCALAR "
-                    "graph-input aux (e.g. A * alpha); per-row/col/elem aux on an "
-                    "operand is out of POC scope (needs swizzle-aware indexing)"
+                    f"matmul {label} operand is produced by binary op {producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
+                    "fusion supports a binary op with exactly one SCALAR graph-input aux, per-K mul, or a same-carrier gen_index branch"
                 )
-            aux_meta = meta[aux_id]
-            if aux_id not in aux_seen:
-                aux_seen.add(aux_id)
-                aux_tensors.append(
-                    TensorRef(
-                        name=aux_meta.name,
-                        dim=aux_meta.dim,
-                        stride=aux_meta.stride,
-                        dtype=aux_meta.dtype,
-                        bcast_mode="scalar",
+            if aux_id is not None:
+                root, parent = visit(chain_id)
+                aux_meta = meta[aux_id]
+                if aux_id not in aux_seen:
+                    aux_seen.add(aux_id)
+                    scalar_aux = _is_scalar_input(aux_id)
+                    aux_tensors.append(
+                        TensorRef(
+                            name=aux_meta.name,
+                            dim=aux_meta.dim,
+                            stride=aux_meta.stride,
+                            dtype=aux_meta.dtype,
+                            bcast_mode="scalar" if scalar_aux else "per_k",
+                            reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
+                        )
                     )
-                )
-                aux_objs.append(aux_meta.tensor)
-            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs, producer))
-            cur = chain_id
+                    aux_objs.append(aux_meta.tensor)
+                fop = FusionOp(op=_BINARY_OP_MAP[producer.cudnn_name], aux=aux_meta.name, aux_on_rhs=aux_on_rhs, parent_idx=parent)
         else:
             raise ValueError(
-                f"matmul {label} operand is produced by op {producer.op_name!r} "
-                f"({producer.cudnn_name!r}) which is not a pointwise op — mainloop "
-                "fusion supports unary ops and scalar-aux binary ops in the POC"
+                f"matmul {label} operand is produced by op {producer.op_name!r} ({producer.cudnn_name!r}) which is not a pointwise op — mainloop fusion supports unary ops, scalar-aux binary ops and per-K mul"
             )
-    steps.reverse()
-    fops: list[FusionOp] = []
-    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs, producer) in enumerate(steps):
-        parent = idx - 1 if idx > 0 else -1
-        if is_binary:
-            fops.append(
-                FusionOp(
-                    op=_BINARY_OP_MAP[cudnn_name],
-                    aux=aux_name,
-                    aux_on_rhs=aux_on_rhs,
-                    parent_idx=parent,
-                )
+        fops.append(
+            replace(
+                fop,
+                attrs=producer.op_attrs,
+                compute_dtype=producer.compute_dtype or compute_dtype,
+                out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
             )
-        else:
-            fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
-        fops[-1] = replace(
-            fops[-1],
-            attrs=producer.op_attrs,
-            compute_dtype=producer.compute_dtype or compute_dtype,
-            out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
         )
-    return cur, fops
+        return root, len(fops) - 1
+
+    root, _ = visit(operand_id)
+    return root, fops
 
 
 def _build_multi_gemm_chain(
@@ -1881,6 +2272,7 @@ def _build_multi_gemm_chain(
         output_objs,
         aux_objs,
         block_scale_spec is not None,
+        aux_refs=aux_tensors,
     )
     return chain, binding
 
@@ -1915,9 +2307,11 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     """Lower one graph metadata snapshot."""
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
+    meta = dict(state["tensor_meta"])
+    ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"])
     return _build_chain(
-        state["ops"],
-        state["tensor_meta"],
+        ops,
+        meta,
         state["io_dtype"],
         state["intermediate_dtype"],
         state["compute_dtype"],
