@@ -123,7 +123,7 @@ checked_python_floating(py::handle value, char const* data_type_name) {
             }
             throw py::python_error();
         }
-        parsed = PyFloat_AS_DOUBLE(as_float.ptr());
+        parsed = PyFloat_AsDouble(as_float.ptr());
         // A wider type (for example numpy.longdouble) can hold a value that a double does not.
         if (!std::isnan(parsed)) {
             const int equal = PyObject_RichCompareBool(as_float.ptr(), value.ptr(), Py_EQ);
