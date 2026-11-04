@@ -75,6 +75,15 @@ tests and samples use this separation.
 
 ## Python tests (`test/python`)
 
+When changing direct CPython C API calls in the bindings, build with
+`CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` and import the resulting abi3 module.
+`PyFloat_AS_DOUBLE` is unavailable under `Py_LIMITED_API`; after successful
+`PyNumber_Float`, use the public `PyFloat_AsDouble` accessor. A small compile
+probe against the actual limited-API headers should fail with the old call and
+pass with the replacement. For build-flag qualification, inspect the compiler
+definitions: `CUDNN_FRONTEND_SKIP_JSON_LIB=ON` in a CMake cache alone does not
+prove that the Python module compiled with JSON disabled.
+
 When moving Python modules, build the validation wheel with fresh Python build
 output. Reusing `build/lib.*` can ship removed modules even when the source tree
 and its import tests are clean. Inspect the wheel's module paths, then run the
