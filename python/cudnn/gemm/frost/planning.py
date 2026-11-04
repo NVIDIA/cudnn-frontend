@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
+from .arch_family import family_for_arch
 from .dtypes import DTYPE_BITS
 from .fusion_ir import FusionChain, swap_ab
 from .tile_config import PLANNER_K_BOUNDS, PLANNER_MAX_BATCH, PLANNER_MN_BOUNDS, TileConfig, as_mma_tile_k, as_pipeline, by_name, select_config
@@ -285,12 +286,33 @@ def split_candidates(chain: FusionChain, config: TileConfig) -> range:
 _SMALL_M_BLOCK_SCALE_MAX_TOKENS = 32
 _SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES = 48
 
+# The narrow-token geometry of the sm120 (CC 12.x, warp-MMA) block-scale pipeline on a part no cost profile above names.  The sm120
+# catalog's smallest M tile is 32 rows, so one CTA row covers every decode batch of up to 32 tokens with the tokens left on M (no
+# swap); the 2x4 warp grid is the measured form.  Measured on an NVIDIA GeForce RTX 5090 (CC 12.0, 170 SMs, 96 MiB L2, GDDR7 pin
+# 1,575 GB/s; sweep run 20261104T024301Z, cold-L2 CUDA-graph timing, M in {1, 6, 24}) against the sm120 auto pick, which
+# `select_config` makes 128x128x128 for every block-scaled GEMM: NVFP4 (fp4_e2m1 x fp4_e2m1, e4m3 block-16 scales) K=5120 N=34816
+# M=1 93.5 -> 62.1 us (68 -> 103 % of the byte roofline), N=5120 K=17408 M=1 35.7 (split-K 4) -> 32.7 us (89 -> 98 %, split-K 4),
+# N=248320 K=5120 M=1 639 -> 426 us (71 -> 107 %); at M=6 and M=24 the same tile stays within 3 % of the best FlashInfer kernel
+# while the 128-row tile trails it by 12-33 %.  The split-K count follows the sm100 rule (one wave of CTAs over the weight tiles,
+# at most 16 slices): the measured N=5120 / K=17408 cell wants 4 slices, the two wide-N cells none.  MXFP8 (8-bit data) and the
+# calibrated parts were NOT measured and keep their picks.
+_SM120_SMALL_M_BLOCK_SCALE_GEOMETRY = "CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps2x4"
+
+
+def _calibrated(device: DeviceProperties) -> bool:
+    """Whether a cost profile above names this part (by its SM version and reported name)."""
+    return any(key[0] == device.arch and profile.device_name == device.name for key, profile in _PROFILES.items())
+
 
 def _small_m_block_scale_config(chain: FusionChain, baseline: TileConfig, device: DeviceProperties, shapes_fixed: bool) -> TileConfig | None:
-    """Swap decode tokens onto kernel N and split K within one CTA wave."""
+    """Swap decode tokens onto kernel N and split K within one CTA wave (sm100); on an uncalibrated CC 12.x part keep the tokens on M in
+    the family's 32-row tile (``_SM120_SMALL_M_BLOCK_SCALE_GEOMETRY``) with the same one-wave split-K rule."""
     mm = chain.matmul
-    if baseline.pipeline != "sm100" or not chain.has_block_scale or not _block_scale_supported(chain):
+    sm120 = baseline.pipeline == "sm120" and family_for_arch(device.arch) == "sm120" and not _calibrated(device)
+    if not (baseline.pipeline == "sm100" or sm120) or not chain.has_block_scale or not _block_scale_supported(chain):
         return None
+    if sm120 and not (DTYPE_BITS[mm.a_dtype] == DTYPE_BITS[mm.b_dtype] == 4):
+        return None  # only the fp4 x fp4 weight stream was measured on the sm120 family
     if chain.has_moe or chain.is_multi_gemm or chain.has_mainloop_fusion or chain.quants or chain.reductions or mm.batch != 1:
         return None
     if not 1 <= mm.M <= _SMALL_M_BLOCK_SCALE_MAX_TOKENS or mm.a_major != "k" or mm.b_major != "k" or mm.accum_dtype != "fp32":
@@ -302,10 +324,13 @@ def _small_m_block_scale_config(chain: FusionChain, baseline: TileConfig, device
         width = 64
     else:
         return None
-    config = by_name(f"CONFIG_sm100_128x{width}x{baseline.cta_tile_k_bytes}_128x{width}x{baseline.mma_tile_k_bytes}_cluster1x1_1ctamma")
+    if sm120:
+        config = by_name(_SM120_SMALL_M_BLOCK_SCALE_GEOMETRY)
+    else:
+        config = by_name(f"CONFIG_sm100_128x{width}x{baseline.cta_tile_k_bytes}_128x{width}x{baseline.mma_tile_k_bytes}_cluster1x1_1ctamma")
     max_slices = min(16, max(split_candidates(chain, config)), device.sm_count // weight_tiles)
     slices = 1 << (max(1, max_slices).bit_length() - 1)
-    return replace(config, split_k_slices=slices, swap_ab=True)
+    return replace(config, split_k_slices=slices, swap_ab=not sm120)
 
 
 def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DeviceProperties, profile: CostProfile) -> list[TileConfig]:
@@ -415,7 +440,9 @@ def select_strategies(
         except (NotImplementedError, ValueError):
             small_m = None
         else:
-            if device.arch == 100:
+            # The parts where the narrow-token plan is the measured first choice: B200 (the swap-AB form) and an uncalibrated CC 12.x
+            # part (the 32-row form); Rubin keeps its incumbent and is offered the candidate second (``include_small_m``).
+            if device.arch == 100 or small_m.pipeline == "sm120":
                 selected = [small_m]
                 if limit > 1 and baseline != small_m:
                     try:
