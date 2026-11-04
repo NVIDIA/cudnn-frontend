@@ -423,7 +423,8 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, 
         # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
         # change epsilon without rebuilding the graph (it is a pass-by-value operand),
         # and a key without it silently replays the kernel compiled for the old value.
-        key = (params.io_dtype,) + ce
+        # dyn() specializes unit strides; other strides use a dynamic signature.
+        key = (params.io_dtype, gamma.stride(0) == 1, beta.stride(0) == 1) + ce
         fn = _KCACHE.get(key)
         if fn is None:
             fn = cute.compile(_gn_fwd_nhwc_host, *args, *ce, fake_stream())

@@ -581,7 +581,8 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
             fr,
             fsmem,
         )
-        key = (params.io_dtype,) + ce
+        # dyn() specializes unit strides; other strides use a dynamic signature.
+        key = (params.io_dtype, gamma.stride(0) == 1, mean.stride(0) == 1, rstd.stride(0) == 1) + ce
         fn = _KCACHE.get(key)
         if fn is None:
             fn = cute.compile(_gn_bwd_nhwc_host, *args, *ce, fake_stream())
