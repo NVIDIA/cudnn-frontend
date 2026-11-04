@@ -3113,8 +3113,9 @@ def qsa_bwd_dense_pair_kernel(
                                     idesc_kv,
                                     acc0 | (kk > 0),
                                 )
-                            for part in cutlass.range_constexpr(DQ_PARTS):
-                                for kk in cutlass.range_constexpr(8):
+                            # the dQ^T MMAs of a K-step share their A operand K^T, which the collector keeps across the parts
+                            for kk in cutlass.range_constexpr(8):
+                                for part in cutlass.range_constexpr(DQ_PARTS):
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16,
                                         prims.CTAGroup.CTA_1,
@@ -3123,6 +3124,7 @@ def qsa_bwd_dense_pair_kernel(
                                         d_dsb.advance_start_address(part * DP_CM + kk * 1536),
                                         idesc_q,
                                         (part > 0) | (kk > 0),
+                                        collector_op=None if DQ_PARTS == 1 else "fill" if part == 0 else "lastuse" if part == DQ_PARTS - 1 else "use",
                                     )
                             prims.tcgen05_commit(b_pe.subview(xb), group=prims.CTAGroup.CTA_1)
                             prims.tcgen05_commit(b_le.subview(sl), group=prims.CTAGroup.CTA_1)
@@ -3145,8 +3147,8 @@ def qsa_bwd_dense_pair_kernel(
                             _wait(b_dqe, (kq - 1) & 1)
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                         if prims.elect_sync():
-                            for part in cutlass.range_constexpr(DQ_PARTS):
-                                for kk in cutlass.range_constexpr(8):
+                            for kk in cutlass.range_constexpr(8):
+                                for part in cutlass.range_constexpr(DQ_PARTS):
                                     prims.tcgen05_mma(
                                         prims.Tcgen05MMAKind.F16,
                                         prims.CTAGroup.CTA_1,
@@ -3155,6 +3157,7 @@ def qsa_bwd_dense_pair_kernel(
                                         d_x0.advance_start_address((xq * DQ_PARTS + part) * DP_CM + kk * 1536),
                                         idesc_q,
                                         (part > 0) | (kk > 0),
+                                        collector_op=None if DQ_PARTS == 1 else "fill" if part == 0 else "lastuse" if part == DQ_PARTS - 1 else "use",
                                     )
                             prims.tcgen05_commit(b_dqf, group=prims.CTAGroup.CTA_1)
                             prims.tcgen05_commit(b_xe.subview(xq), group=prims.CTAGroup.CTA_1)
