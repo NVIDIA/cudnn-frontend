@@ -151,6 +151,30 @@ def _reduction_partial_fold(red: ReductionSpec, dst: str, val: str) -> list[str]
     return [f"{dst} = cute.math.{op}({dst}, {val})"]
 
 
+def _reduction_skips_nan(red: ReductionSpec) -> bool:
+    """AMAX, MAX and MIN skip NaN elements, as the native cuDNN engines do."""
+    return red.compute_dtype != "int32" and red.mode in ("amax", "max", "min")
+
+
+def _nan_to_identity(red: ReductionSpec, value: str) -> str:
+    """``value``, or the reduction's identity where it is NaN (``x == x`` is false only for NaN).
+
+    AMAX / MAX / MIN contributions pass through this before any register fold or
+    atomic. The maxnumf folds alone do not skip NaN: the compiler can reduce the
+    first fold of a 0.0-seeded AMAX slot, ``max(0.0, |x|)``, to ``|x|``, so the slot
+    holds the NaN and loses the chunks folded after it; the float atomics keep or
+    drop a NaN depending on its sign bit."""
+    return f"cutlass.Float32(cutlass.select_({value} == {value}, {value}, {_reduction_partial_identity(red)}))"
+
+
+def _emit_reduction_chunk_combine(red_idx: int, red: ReductionSpec, src: str, vsize: int) -> tuple[list[str], str]:
+    """Fold one register vector (``_emit_reduction_local_combine``); an all-NaN AMAX / MAX / MIN chunk folds to the identity."""
+    lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
+    if _reduction_skips_nan(red):
+        lines.append(f"{acc} = {_nan_to_identity(red, acc)}")
+    return lines, acc
+
+
 def _emit_reduction_vector_atomic(tap_idx: int, red_idx: int, red: ReductionSpec, acc: str) -> list[str]:
     """One atomic of an N-reduced value ``acc`` (already folded over its vector)
     into the reduction's row/batch/group address. AVG reads ``_red_<k>_inv``."""
@@ -335,7 +359,7 @@ def _emit_lane_run_fold_chunk(red_idx: int, red: ReductionSpec, source_var: str,
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if fold.kind == "row":
-        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
+        combine_lines, acc = _emit_reduction_chunk_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
         slot = f"{fold.base} + mf * 2 + half"
         cur = f"_red_{red_idx}_fcur"
@@ -349,9 +373,10 @@ def _emit_lane_run_fold_chunk(red_idx: int, red: ReductionSpec, source_var: str,
     for i in range(vsize):
         slot = f"{fold.base} + grp * 8 + sv * {vsize} + {i}"
         cur = f"_red_{red_idx}_fc{i}"
+        elem = _nan_to_identity(red, f"{src}[{i}]") if _reduction_skips_nan(red) else f"{src}[{i}]"
         upd = [
             f"{cur} = {_reduction_partial_load(red, slot)}",
-            *_fold_combine(red, cur, cur, _fold_elem(red, f"{src}[{i}]")),
+            *_fold_combine(red, cur, cur, _fold_elem(red, elem)),
             _reduction_partial_store(red, slot, cur),
         ]
         if red.mode == "mul_no_zeros":
@@ -495,14 +520,14 @@ def _emit_reduction_atomic_body(
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if partial_slot is not None:
         # Fold into the thread's register slot; the flush applies AVG's 1/count once.
-        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
+        combine_lines, acc = _emit_reduction_chunk_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
         lines.extend(_reduction_partial_slot_fold(red_idx, red, partial_slot, acc))
         return lines
     if red.mode == "avg":
         lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain, token_extent=_MOE_USED_ROWS))
     if red.dim[2] == 1:
-        combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
+        combine_lines, acc = _emit_reduction_chunk_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
         lines.extend(_emit_reduction_vector_atomic(tap_idx, red_idx, red, acc))
         return lines
@@ -523,6 +548,8 @@ def _emit_reduction_atomic_body(
                 raise AssertionError(f"unhandled int32 reduction mode {red.mode!r}")
             lines.append(f'nvvm.atomicrmw("{op}", {ptr}, ' f'{val}, mem_order="relaxed", syncscope="gpu")')
             continue
+        if _reduction_skips_nan(red):
+            val = _nan_to_identity(red, val)
         if red.mode == "amax":
             lines.append(f"cute.arch.atomic_fmax({ptr}, " f'cute.math.abs({val}), sign_bit=False, sem="relaxed", scope="gpu")')
             continue
