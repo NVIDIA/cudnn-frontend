@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import math
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -416,6 +419,183 @@ def test_DSA_sparse_score_recompute_execute_requires_outputs(score_type, compile
         plan.execute(q, k, aux, topk_indices, out, topk_length=torch.ones(b, s_q, dtype=torch.int32, device="cuda"))
 
 
+@pytest.mark.L0
+def test_DSA_sparse_score_recompute_disjoint_check_ignores_empty_views():
+    """Empty and adjacent views remain legal even when they share the output's storage."""
+    from cudnn.deepseek_sparse_attention.score_recompute.api import _check_sparse_score_disjoint
+
+    storage = torch.empty(8, dtype=torch.float32, device="cuda")
+    _check_sparse_score_disjoint(storage[:4], (("empty", storage[:0]), ("adjacent", storage[4:])))
+
+
+@pytest.mark.L0
+def test_DSA_sparse_score_recompute_disjoint_binding_cache_tracks_metadata_without_retaining_storage():
+    """The hot-path cache hits only for the same live binding and owns no caller storage."""
+    from cudnn.deepseek_sparse_attention.score_recompute.api import _ScoreRecomputeBase
+
+    class ConcreteScoreRecompute(_ScoreRecomputeBase):
+        def check_support(self):
+            return True
+
+        def execute(self):
+            return None
+
+    out = torch.empty(8)
+    reader = torch.empty(8)
+    tensors = (("out", out), ("reader", reader))
+    binding = _ScoreRecomputeBase._make_sparse_score_disjoint_binding(tensors)
+    assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+
+    # A value-only mutation changes the version but preserves every byte-span
+    # field, so the second-level cache can refresh without a full overlap walk.
+    reader.fill_(0)
+    assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+    refreshed = _ScoreRecomputeBase._refresh_sparse_score_disjoint_binding(binding, tensors)
+    assert refreshed is not None
+    assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(refreshed, tensors)
+    binding = refreshed
+
+    # A distinct Tensor over the same address/storage (the allocator-reuse
+    # worst case) misses on tensor identity.
+    replacement = reader.view_as(reader)
+    assert replacement.data_ptr() == reader.data_ptr()
+    assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, (("out", out), ("reader", replacement)))
+
+    # set_ to a different storage, and same-storage offset / stride changes,
+    # each bump the mutation counter and invalidate the cached relation.
+    other = torch.empty(8)
+    reader.set_(other)
+    assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+
+    reader = torch.empty(8)
+    tensors = (("out", out), ("reader", reader))
+    binding = _ScoreRecomputeBase._make_sparse_score_disjoint_binding(tensors)
+    storage = reader.untyped_storage()
+    reader.set_(storage, 1, (7,), (1,))
+    assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+
+    reader.set_(storage, 0, (2, 4), (1, 2))
+    assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+
+    reader.set_(storage, 0, (8,), (1,))
+    binding = _ScoreRecomputeBase._make_sparse_score_disjoint_binding(tensors)
+    storage_ref = weakref.ref(storage)
+    storage.resize_(storage.nbytes() + 16)
+    assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+
+    tensor_ref = binding[1][0]
+    del reader, storage, tensors, binding
+    gc.collect()
+    assert tensor_ref() is None
+    assert storage_ref() is None
+
+    with torch.inference_mode():
+        inference_tensors = (("out", torch.empty(8)), ("reader", torch.empty(8)))
+        assert _ScoreRecomputeBase._make_sparse_score_disjoint_binding(inference_tensors) is None
+
+    # Restoring one storage to the same extent may move its base pointer, but
+    # cannot change the relative relation of two views of that same storage.
+    shared = torch.empty(16)
+    out, reader = shared[:8], shared[8:]
+    tensors = (("out", out), ("reader", reader))
+    binding = _ScoreRecomputeBase._make_sparse_score_disjoint_binding(tensors)
+    storage = shared.untyped_storage()
+    original_nbytes = storage.nbytes()
+    storage.resize_(original_nbytes // 2)
+    storage.resize_(original_nbytes)
+    assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+    ConcreteScoreRecompute()._check_sparse_score_disjoint_binding(out, (("reader", reader),))
+
+
+@pytest.mark.L0
+def test_DSA_sparse_score_recompute_disjoint_binding_cache_is_thread_safe():
+    """Concurrent new bindings each validate before one complete cache entry wins under the GIL."""
+    from cudnn.deepseek_sparse_attention.score_recompute.api import _ScoreRecomputeBase
+
+    class ConcreteScoreRecompute(_ScoreRecomputeBase):
+        def check_support(self):
+            return True
+
+        def execute(self):
+            return None
+
+    plan = ConcreteScoreRecompute()
+
+    def validate(_):
+        out = torch.empty(8)
+        reader = torch.empty(8)
+        readers = (("reader", reader),)
+        plan._check_sparse_score_disjoint_binding(out, readers)
+        return out, reader
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        bindings = list(pool.map(validate, range(16)))
+
+    assert (
+        sum(plan._sparse_score_disjoint_binding_matches(plan._sparse_score_disjoint_binding, (("out", out), ("reader", reader))) for out, reader in bindings)
+        == 1
+    )
+
+
+@pytest.mark.L0
+def test_DSA_sparse_score_recompute_wrapper_does_not_stage_invalid_aliases():
+    """An aliased output with an invalid dtype/shape still reaches the original class contract error."""
+    from cudnn import DSA
+
+    q, k, weights, indices, _ = _allocate(_SMALL_CFG, "indexer", False)
+    with pytest.raises(ValueError, match="out dtype"):
+        DSA.sparse_indexer_score_recompute_wrapper(q, k, weights, indices, out=indices)
+
+    wrong_shape = indices[..., :-1].view(torch.float32)
+    with pytest.raises(ValueError, match="out shape"):
+        DSA.sparse_indexer_score_recompute_wrapper(q, k, weights, indices, out=wrong_shape)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=81)
+def test_DSA_sparse_score_recompute_sm90_prepared_rejects_alias_but_wrapper_stages(score_type, compile_allocates_nothing):
+    """Prepared SM90 execution rejects input/output overlap; the allocating wrapper preserves convenience."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 sparse score kernel")
+    from cudnn import DSA
+
+    cfg = {"b": 1, "s_q": 2, "s_kv": 64, "head_dim": 128, "qhead_per_kv_head": 32, "topk": 32}
+    q, k, aux, indices, _ = _allocate(cfg, score_type, False)
+    if score_type == "indexer":
+        out = indices.view(torch.float32)
+        expected_aux = aux
+        expected_indices = indices.clone()
+    else:
+        out = aux
+        expected_aux = aux.clone()
+        expected_indices = indices
+
+    valid_out = torch.empty_like(indices, dtype=torch.float32)
+    plan = _sparse_plan(DSA, score_type, q, k, aux, indices, valid_out)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+    plan.execute(q, k, aux, indices, valid_out)
+    with pytest.raises(ValueError, match=r"out must not alias (topk_indices|lse)"):
+        plan.execute(q, k, aux, indices, out)
+
+    if score_type == "indexer":
+        actual = DSA.sparse_indexer_score_recompute_wrapper(q, k, aux, indices, out=out)["predict"]
+    else:
+        actual = DSA.sparse_attn_score_recompute_wrapper(q, k, aux, indices, q.shape[-1] ** -0.5, out=out)["target"]
+    torch.cuda.synchronize()
+    assert actual is out
+    check_ref_sparse_score_recompute(
+        score_type,
+        q,
+        expected_aux if score_type == "attention" else k,
+        expected_indices,
+        actual,
+        aux=k if score_type == "attention" else expected_aux,
+        softmax_scale=q.shape[-1] ** -0.5,
+    )
+
+
 def _executes_allocate_nothing(plan, run, repeats=3):
     """R9: warm once, then no torch allocation and no host sync across ``repeats`` executes."""
     run()
@@ -503,9 +683,10 @@ def test_DSA_sparse_score_recompute_sm90_topk_capacity_boundaries():
 @pytest.mark.parametrize("score_type", ["indexer", "attention"])
 @torch_fork_set_rng(seed=9001)
 def test_DSA_sparse_score_recompute_sm90_prepared_graph_replay_is_bitwise(score_type, compile_allocates_nothing):
-    """A prepared SM90 plan captures without staging and every poisoned replay is bitwise stable."""
+    """A prepared SM90 plan captures on an explicit non-default stream and poisoned replays stay bitwise stable."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("SM90 sparse score kernel")
+    from cuda.bindings import driver as cuda
 
     DSA, q, k, aux, topk_indices, _, out = _sparse_case(score_type)
     # Exercise a non-bucket-aligned physical width and short/partial/full rows.
@@ -520,44 +701,49 @@ def test_DSA_sparse_score_recompute_sm90_prepared_graph_replay_is_bitwise(score_
     assert plan.check_support()
     compile_allocates_nothing(plan)
 
-    def launch():
-        plan.execute(q, k, aux, topk_indices, out, topk_length=lengths)
+    capture_stream = torch.cuda.Stream()
+    cu_stream = cuda.CUstream(capture_stream.cuda_stream)
 
-    launch()
-    torch.cuda.synchronize()
+    def launch():
+        plan.execute(q, k, aux, topk_indices, out, topk_length=lengths, current_stream=cu_stream)
+
     graph = torch.cuda.CUDAGraph()
     try:
-        with torch.cuda.graph(graph):
+        with torch.cuda.stream(capture_stream):
             launch()
-        torch.cuda.synchronize()
+            capture_stream.synchronize()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                launch()
+            capture_stream.synchronize()
 
-        # Change live inputs after capture and poison the caller-owned output;
-        # replay must read the captured pointers' new contents and overwrite every slot.
-        q.copy_(torch.randn_like(q))
-        k.copy_(torch.randn_like(k))
-        aux.copy_(torch.randn_like(aux))
-        out.fill_(float("nan"))
-        torch.cuda.synchronize()
-        graph.replay()
-        torch.cuda.synchronize()
-        expected = out.clone()
-        check_ref_sparse_score_recompute(
-            score_type,
-            q,
-            k if score_type == "indexer" else aux,
-            topk_indices,
-            expected,
-            aux=aux if score_type == "indexer" else k,
-            softmax_scale=q.shape[-1] ** -0.5,
-            topk_length=lengths,
-        )
-
-        for repeat in range(10):
+        with torch.cuda.stream(capture_stream):
+            # Change live inputs after capture and poison the caller-owned output;
+            # replay must read the captured pointers' new contents and overwrite every slot.
+            q.copy_(torch.randn_like(q))
+            k.copy_(torch.randn_like(k))
+            aux.copy_(torch.randn_like(aux))
             out.fill_(float("nan"))
-            torch.cuda.synchronize()
+            capture_stream.synchronize()
             graph.replay()
-            torch.cuda.synchronize()
-            assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8)), f"graph replay changed output bytes at repeat {repeat}"
+            capture_stream.synchronize()
+            expected = out.clone()
+            check_ref_sparse_score_recompute(
+                score_type,
+                q,
+                k if score_type == "indexer" else aux,
+                topk_indices,
+                expected,
+                aux=aux if score_type == "indexer" else k,
+                softmax_scale=q.shape[-1] ** -0.5,
+                topk_length=lengths,
+            )
+
+            for repeat in range(10):
+                out.fill_(float("nan"))
+                capture_stream.synchronize()
+                graph.replay()
+                capture_stream.synchronize()
+                assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8)), f"graph replay changed output bytes at repeat {repeat}"
     finally:
         graph.reset()
 

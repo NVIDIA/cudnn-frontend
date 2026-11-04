@@ -817,9 +817,11 @@ Computes softmax over top-K entries of the indexer score:
   `topk_indices` / `topk_length` must be contiguous int32. `check_support()`
   declines anything else with `NotImplementedError` naming the tensor and its
   strides, and `execute()` re-validates the live tensors with `ValueError`;
-  nothing is copied, cast, or allocated on the execute path. The wrapper keeps
-  the convenience: it copies strided inputs contiguous, casts the index tensors
-  to int32, and allocates `out` when omitted, all on `stream`.
+  nothing is copied, cast, or allocated on the execute path. A prepared SM90
+  plan also rejects an `out` whose byte range overlaps any input. The wrapper
+  keeps the convenience: it copies strided inputs contiguous, casts the index
+  tensors to int32, allocates `out` when omitted, and stages an overlapping
+  SM90 output before copying it back, all on `stream`.
 - **Prepared SM90 plans** — `compile()` builds the CuTeDSL artifact from symbolic
   batch and sequence extents. Exact `B`, `S_q`, `S_k`, runtime scale, pointers,
   and stream do not specialize the artifact. Physical top-K widths in
@@ -849,8 +851,8 @@ L1-normalised head-summed softmax over top-K entries:
 - **Prepared SM90 plans** — the same symbolic compile and bounded Top-K buckets
   as §6 apply. `softmax_scale` is a runtime scalar rather than a compile key,
   and the kernel reads `(B, S_q, H)` LSE directly. A warmed class plan with its
-  caller-owned `out` is allocation-free, CUDA Graph capturable, and bitwise
-  deterministic for identical inputs.
+  caller-owned, disjoint `out` is allocation-free, CUDA Graph capturable on an
+  explicit non-default stream, and bitwise deterministic for identical inputs.
 
 ### 8. Dense Indexer / Dense Attn Score Recompute
 

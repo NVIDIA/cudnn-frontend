@@ -13,6 +13,7 @@ sparse-score artifacts at plan compile time.
 
 from __future__ import annotations
 
+import weakref
 from typing import Optional
 
 import torch
@@ -26,7 +27,8 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 )
 
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, record_streams
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import APIBase, TupleDict, check_buffers_disjoint, tensor_byte_span
+from cudnn.tensor_adapter import get_version
 
 from . import _interface_sm100 as _iface_sm100
 from ._block_scaled import BLOCK_SCALED_PRECISION_NAMES
@@ -110,6 +112,43 @@ def _wrapper_stage_output(t: Optional[torch.Tensor], shape, dtype: torch.dtype, 
     return torch.empty(shape, dtype=t.dtype, device=t.device), t
 
 
+def _score_tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """Exact span with a compact fast path for the score API's usual contiguous bindings."""
+    base = int(tensor.data_ptr())
+    nbytes = int(tensor.nbytes)
+    if nbytes == 0:
+        return base, base
+    if tensor.is_contiguous():
+        return base, base + nbytes
+    return tensor_byte_span(tensor)
+
+
+def _wrapper_stage_overlapping_output(
+    out: torch.Tensor,
+    out_user: Optional[torch.Tensor],
+    readers,
+    shape,
+    dtype: torch.dtype,
+    device,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Keep the allocating wrapper convenient when a valid user output aliases an input.
+
+    Prepared SM90 plans reject that alias before launch.  The wrapper instead
+    computes into a private contiguous tensor and copies back, matching its
+    existing treatment of a non-contiguous caller output.  Invalid outputs are
+    left for the class contract to reject rather than silently repaired.
+    """
+    if out_user is not None or tuple(out.shape) != tuple(shape) or out.dtype != dtype or out.device != device or not out.is_contiguous():
+        return out, out_user
+    out_lo, out_hi = _score_tensor_byte_span(out)
+    for _, reader in readers:
+        if reader is not None:
+            reader_lo, reader_hi = _score_tensor_byte_span(reader)
+            if out_lo < reader_hi and reader_lo < out_hi:
+                return torch.empty(shape, dtype=dtype, device=device), out
+    return out, out_user
+
+
 def _wrapper_copy_back(stream, staged: torch.Tensor, user: Optional[torch.Tensor]) -> torch.Tensor:
     if user is None:
         return staged
@@ -127,6 +166,14 @@ class _ScoreRecomputeBase(APIBase):
 
     def __init__(self):
         super().__init__()
+        # The live dtype/device/shape checks run on every execute.  Tensor
+        # identity plus PyTorch's mutation counter covers set_, storage-offset,
+        # and stride changes without re-walking storage metadata on every
+        # launch.  Weak references do not retain caller tensors or storage.
+        # Resizing a storage may move its base, but cannot make two distinct
+        # live storages overlap; same-storage views retain their relative spans.
+        self._sparse_score_disjoint_binding = None
+        self._is_prepared_sm90_sparse_score = False
 
     def compile(self) -> None:
         self._ensure_support_checked()
@@ -134,6 +181,91 @@ class _ScoreRecomputeBase(APIBase):
         # tensors. The SM90 sparse subclasses override this method with their
         # symbolic plan-time compilation path.
         self._compiled_kernel = True
+
+    @staticmethod
+    def _make_sparse_score_disjoint_binding(tensors):
+        binding = []
+        for _, tensor in tensors:
+            if tensor is None:
+                binding.append(None)
+                continue
+            # Inference tensors intentionally have no mutation counter, so an
+            # exact span check is required for each execute using one.
+            if tensor.is_inference():
+                return None
+            binding.append(
+                (
+                    weakref.ref(tensor),
+                    get_version(tensor),
+                    int(tensor.data_ptr()),
+                    int(tensor.storage_offset()),
+                    tuple(tensor.stride()),
+                )
+            )
+        return tuple(binding)
+
+    @staticmethod
+    def _sparse_score_disjoint_binding_matches(binding, tensors) -> bool:
+        if binding is None or len(binding) != len(tensors):
+            return False
+        for cached, (_, tensor) in zip(binding, tensors):
+            if tensor is None:
+                if cached is not None:
+                    return False
+                continue
+            if cached is None:
+                return False
+            if cached[0]() is not tensor or cached[1] != get_version(tensor):
+                return False
+        return True
+
+    @staticmethod
+    def _refresh_sparse_score_disjoint_binding(binding, tensors):
+        """Refresh value-only version bumps, inspecting metadata only for changed tensors."""
+        if binding is None or len(binding) != len(tensors):
+            return None
+        refreshed = list(binding)
+        for index, (cached, (_, tensor)) in enumerate(zip(binding, tensors)):
+            if tensor is None:
+                if cached is not None:
+                    return None
+                continue
+            if cached is None or cached[0]() is not tensor:
+                return None
+            version = get_version(tensor)
+            if cached[1] == version:
+                continue
+            updated = (
+                cached[0],
+                version,
+                int(tensor.data_ptr()),
+                int(tensor.storage_offset()),
+                tuple(tensor.stride()),
+            )
+            if cached[2:] != updated[2:]:
+                return None
+            refreshed[index] = updated
+        return tuple(refreshed)
+
+    def _check_sparse_score_disjoint_binding(self, out: torch.Tensor, readers) -> None:
+        tensors = (("out", out), *readers)
+        if self._sparse_score_disjoint_binding_matches(self._sparse_score_disjoint_binding, tensors):
+            return
+        refreshed = self._refresh_sparse_score_disjoint_binding(self._sparse_score_disjoint_binding, tensors)
+        if refreshed is not None:
+            self._sparse_score_disjoint_binding = refreshed
+            return
+        _check_sparse_score_disjoint(out, readers)
+        self._sparse_score_disjoint_binding = self._make_sparse_score_disjoint_binding(tensors)
+
+
+def _check_sparse_score_disjoint(out: torch.Tensor, readers) -> None:
+    """Reject a prepared SM90 output that overlaps an operand still being read."""
+    check_buffers_disjoint(
+        [("out", out)],
+        readers,
+        what="the prepared SM90 sparse score kernel",
+    )
 
 
 def _check_sparse_score_shapes(
@@ -274,7 +406,8 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
 
     def compile(self) -> None:
         self._ensure_support_checked()
-        if device_capability(self.q_desc.device)[0] != 9:
+        self._is_prepared_sm90_sparse_score = device_capability(self.q_desc.device)[0] == 9
+        if not self._is_prepared_sm90_sparse_score:
             self._compiled_kernel = True
             return
         from . import _interface_sm90 as _iface_sm90
@@ -312,6 +445,16 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
+            self._check_sparse_score_disjoint_binding(
+                out,
+                (
+                    ("q_indexer", q_indexer),
+                    ("k_indexer", k_indexer),
+                    ("weights", weights),
+                    ("topk_indices", topk_indices),
+                    ("topk_length", topk_length),
+                ),
+            )
             return _iface_sm90.sparse_indexer_score_recompute(
                 q_indexer,
                 k_indexer,
@@ -401,6 +544,27 @@ def sparse_indexer_score_recompute_wrapper(
         obj.compile()
         _cache_of_SparseIndexerScoreRecomputeObjects[key] = obj
 
+    if obj._is_prepared_sm90_sparse_score:
+        readers = (
+            ("q_indexer", q_indexer),
+            ("k_indexer", k_indexer),
+            ("weights", weights),
+            ("topk_indices", topk_indices),
+            ("topk_length", topk_length),
+        )
+        try:
+            obj._check_sparse_score_disjoint_binding(out, readers)
+        except ValueError:
+            with _torch_stream_context(stream):
+                out, out_user = _wrapper_stage_overlapping_output(
+                    out,
+                    out_user,
+                    readers,
+                    (q_indexer.shape[0], q_indexer.shape[1], topk_indices.shape[-1]),
+                    torch.float32,
+                    q_indexer.device,
+                )
+
     predict = obj.execute(
         q_indexer,
         k_indexer,
@@ -476,7 +640,8 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
 
     def compile(self) -> None:
         self._ensure_support_checked()
-        if device_capability(self.q_desc.device)[0] != 9:
+        self._is_prepared_sm90_sparse_score = device_capability(self.q_desc.device)[0] == 9
+        if not self._is_prepared_sm90_sparse_score:
             self._compiled_kernel = True
             return
         from . import _interface_sm90 as _iface_sm90
@@ -516,6 +681,16 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
+            self._check_sparse_score_disjoint_binding(
+                out,
+                (
+                    ("q_attn", q_attn),
+                    ("k_attn", k_attn),
+                    ("lse", lse),
+                    ("topk_indices", topk_indices),
+                    ("topk_length", topk_length),
+                ),
+            )
             return _iface_sm90.sparse_attn_score_recompute(
                 q_attn,
                 k_attn,
@@ -610,6 +785,27 @@ def sparse_attn_score_recompute_wrapper(
         assert obj.check_support()
         obj.compile()
         _cache_of_SparseAttnScoreRecomputeObjects[key] = obj
+
+    if obj._is_prepared_sm90_sparse_score:
+        readers = (
+            ("q_attn", q_attn),
+            ("k_attn", k_attn),
+            ("lse", lse),
+            ("topk_indices", topk_indices),
+            ("topk_length", topk_length),
+        )
+        try:
+            obj._check_sparse_score_disjoint_binding(out, readers)
+        except ValueError:
+            with _torch_stream_context(stream):
+                out, out_user = _wrapper_stage_overlapping_output(
+                    out,
+                    out_user,
+                    readers,
+                    (q_attn.shape[0], q_attn.shape[1], topk_indices.shape[-1]),
+                    torch.float32,
+                    q_attn.device,
+                )
 
     target = obj.execute(
         q_attn,
