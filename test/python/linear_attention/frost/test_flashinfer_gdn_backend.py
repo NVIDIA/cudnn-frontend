@@ -407,6 +407,7 @@ def _flashinfer_tests():
     as FlashInfer PR #8131 laid them out -- a FlashInfer that reshapes its test package skips here rather than failing, and the cells
     that read ``plan._runner`` are pinned to that layout."""
     _flashinfer_root()
+    modules = None  # assigned in the try below; pytest.skip() in the except never returns
     try:
         modules = types.SimpleNamespace(
             ref=importlib.import_module("tests.experimental.qwen_3_5_gdn_block.reference"),
