@@ -81,6 +81,9 @@ def test_frost_forward_reloads_in_a_fresh_process(tmp_path, variant):
         results.append(json.loads(path.read_text()))
         listings.append(_cache_listing(tmp_path / "cache"))
     print(json.dumps({"variant": variant, "cold": results[0], "warm": results[1], "cache_files": len(listings[0])}))
-    assert listings[0], "the cold process left no compiled artifacts in the cache directory"
+    names = {name for name, _, _ in listings[0]}
+    objects = [name for name in names if name.endswith("kernel.o")]
+    assert objects, "the cold process stored no compiled kernel object (kernel.o) in the cache directory"
+    assert all(name[: -len("kernel.o")] + "entry.json" in names for name in objects), "a stored kernel object lacks its entry.json commit marker"
     assert listings[1] == listings[0], "the warm process rewrote or added cache artifacts instead of reusing them"
     assert results[1]["outputs"] == results[0]["outputs"], "the warm process computed different outputs from the cached artifacts"

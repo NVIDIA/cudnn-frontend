@@ -690,6 +690,9 @@ class CompiledMamba2Bwd:
         o_pre = views[self.index_o_pre] if self.index_o_pre is not None else None
         dq = views[self.index_dq]
         dk = views[self.index_dk]
+        for port, grad, fold in (("dQ", dq, self.fold_dq), ("dK", dk, self.fold_dk)):
+            if fold and any(s % 2 for s in tuple(grad.stride())[:-1]):
+                raise ValueError(f"{self.plan_name}: buffer for {port!r} must have even outer strides (grouped B / C fold), got {tuple(grad.stride())}")
         dv = views[self.index_dv]
         dg = views[self.index_dg]
         da = views[self.index_da]

@@ -574,6 +574,8 @@ else:
         raise ValueError(f"--d_skip and --d_per_channel are the Mamba-2 skip connection; {args.variant} has no D")
     if args.z_gate and (args.variant != "mamba2" or args.la_backend != "cudnn"):
         raise ValueError("--z_gate is the Mamba-2 output gate of the cudnn backend")
+    if args.z_gate and not args.skip_ref:
+        raise ValueError("--z_gate has no fla reference (chunk_simple_gla has no output gate); pass --skip_ref")
     if args.la_backend == "flash_qla":
         if num_q_heads > num_kv_heads:
             raise ValueError("flash_qla does not support GQA (num_q_heads > num_kv_heads)")
@@ -1123,6 +1125,7 @@ else:
         k_bytes = tokens * num_householder * num_q_heads * head_dim_qk * io_bytes
         v_bytes = tokens * num_householder * num_kv_heads * head_dim_vo * io_bytes
         o_bytes = tokens * num_o_heads * head_dim_vo * io_bytes
+        z_bytes = v_bytes if args.z_gate else 0  # the Mamba-2 output gate, shaped like x: read in both passes, dz written in the backward
         if args.variant in ("gdn", "gdp"):
             gate_bytes = tokens * num_o_heads * (g_bytes + num_householder * b_bytes)
         elif args.variant == "mamba2":
@@ -1140,9 +1143,9 @@ else:
         final_bytes = state_elems * int(output_final_state) * final_state_dtype.itemsize
         dfinal_bytes = state_elems * int(args.initial_state) * final_state_dtype.itemsize
         if mode == "fwd":
-            return qkv_bytes + gate_bytes + o_bytes + state0_bytes + final_bytes
+            return qkv_bytes + gate_bytes + z_bytes + o_bytes + state0_bytes + final_bytes
         recompute_bytes = k_bytes + v_bytes + gate_bytes + h_bytes
-        return recompute_bytes + 2 * (qkv_bytes + gate_bytes) + o_bytes + h_bytes + 2 * state0_bytes + dfinal_bytes
+        return recompute_bytes + 2 * (qkv_bytes + gate_bytes + z_bytes) + o_bytes + h_bytes + 2 * state0_bytes + dfinal_bytes
 
     def tb_per_sec(
         batch_size,
