@@ -648,13 +648,14 @@ def test_sm90_persistent_cta_count_is_the_sm_count_and_ignores_the_thd_overrides
 
 def test_d128_ships_persistence_over_the_overlap_loop():
     """The shipped D128 switches, api_dsl's constants as committed: intra-warpgroup overlap and, over it, persistence,
-    which check_support writes into dense plans only, causal plans staying one tile per CTA
-    (test_d128_ships_the_persistent_loop_on_dense_plans_only in test_sdpa_fwd_d128_sm90.py runs both masks on an SM90
+    which check_support writes into every non-causal plan and, as the paired walk (D128_PERSISTENT_CAUSAL_WALK 2), into
+    every causal plan the route keeps (test_d128_route_ships_on_with_its_cutoffs pins the route;
+    test_d128_ships_the_persistent_loop_and_the_causal_route in test_sdpa_fwd_d128_sm90.py runs both masks on an SM90
     GPU). The measurements behind the defaults are D128_PERSISTENT's and D128_PERSISTENT_CAUSAL_WALK's comments;
     changing any value changes this test."""
     from cudnn.sdpa.fwd import api_dsl
 
-    assert (api_dsl.D128_INTRA_WG_OVERLAP, api_dsl.D128_PERSISTENT, api_dsl.D128_PERSISTENT_CAUSAL_WALK) == (True, True, 0)
+    assert (api_dsl.D128_INTRA_WG_OVERLAP, api_dsl.D128_PERSISTENT, api_dsl.D128_PERSISTENT_CAUSAL_WALK) == (True, True, 2)
 
 
 def test_d128_causal_plans_take_the_walk_the_constant_names(monkeypatch):

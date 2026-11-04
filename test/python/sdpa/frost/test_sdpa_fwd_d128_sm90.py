@@ -1165,22 +1165,30 @@ def test_d128_adapter_passes_the_cta_count_exactly_when_persistent(monkeypatch):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_d128_ships_the_persistent_loop_on_dense_plans_only():
+def test_d128_ships_the_persistent_loop_and_the_causal_route():
     """The shipped record (api_dsl's constants as committed, nothing patched): a dense plan compiles the persistent loop
-    over the overlap loop, at the device's SM count, and computes the one-tile overlap kernel's O and Stats bit for bit;
-    a causal plan compiles the one-tile-per-CTA overlap kernel (api_dsl.D128_PERSISTENT: a stride by the grid ran long
-    causal shapes slower)."""
-    q, k, v = _inputs(2, 4, 2, 300, 700, torch.bfloat16)
-    for causal in (False, True):
-        mask = dict(is_causal=True) if causal else {}
+    over the overlap loop, at the device's SM count; a causal plan the route keeps compiles the paired walk
+    (D128_PERSISTENT_CAUSAL_WALK 2), and one it routes the one-tile-per-CTA overlap kernel (D128_CAUSAL_WALK_ROUTE).
+    Each computes the one-tile overlap kernel's O and Stats bit for bit. The two causal plans take the same decision on
+    any SM90 GPU (at most 132 SMs): bottom-right b3 h32/16 S_q 384 S_kv 6272 has 288 items (3 Q tiles of 32 heads in 3
+    batches) at L 48.0 (its mean KV tiles per Q tile), at the walk cutoff and past the stride cutoffs, and more than
+    twice as many items as CTAs at any count up to 143, so the route sends it one tile per CTA without running the walk's
+    planner; b4 h16/4 S 512 has 256 items, more than an SM90 GPU has SMs, at L 2.5, below every cutoff, so the route
+    keeps it."""
+    for shape, mask, want in [
+        ((2, 4, 2, 300, 700), {}, (True, True, 0)),
+        ((3, 32, 16, 384, 6272), dict(is_causal=True, causal_bottom_right=True), (True, False, 0)),
+        ((4, 16, 4, 512, 512), dict(is_causal=True), (True, True, 1)),
+    ]:
+        q, k, v = _inputs(*shape, torch.bfloat16)
         api, o, lse = _plan(q, k, v, stats=True, **mask)
-        assert (api._k_mod.INTRA_WG_OVERLAP, api._k_mod.PERSISTENT, api._k_mod.CAUSAL_WALK) == (True, not causal, 0), causal
-        if not causal:
+        assert (api._k_mod.INTRA_WG_OVERLAP, api._k_mod.PERSISTENT, api._k_mod.CAUSAL_WALK) == want, (shape, mask)
+        if want[1]:
             assert api._persistent_ctas(q.device) == torch.cuda.get_device_properties(q.device).multi_processor_count
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
         torch.cuda.synchronize()
         base = _run(q, k, v, stats=True, variant="ov", **mask)
-        _assert_bitwise("the shipped record", "causal" if causal else "dense", (o, lse), base, "ov")
+        _assert_bitwise("the shipped record", f"{'causal' if mask else 'dense'} {shape} {mask}", (o, lse), base, "ov")
 
 
 # --- Tight numerics against FP64 -------
@@ -1390,9 +1398,10 @@ _SASS_PROBE = textwrap.dedent(r"""
 # 13.4 V13.4.92, CuTe DSL 4.8.0); the test holds every new compile to that, within SPILL_TOLERANCE.
 _SPILL_PIN = {"STL": 0, "LDL": 0}
 # The SASS cases: (variant, causal body). Today's two on the causal body, plus the persistent record on the dense body,
-# the only one the adapter ships it on (one step instance: the masked phases fold away), and the paired walk on the
-# causal body (pairs alone at 64 CTAs: four pairs per group, one unit per CTA) and on its one-Q-tile twin (S_q 100,
-# S_kv 300 at 3 CTAs: middle tiles only, two groups to a unit), the branch whose Q tile walk_item writes as a division
+# which the adapter ships on non-causal plans (one step instance: the masked phases fold away), and the paired walk,
+# which it ships on the causal plans the route keeps (ov is the record of those it routes), on the causal body (pairs
+# alone at 64 CTAs: four pairs per group, one unit per CTA) and on its one-Q-tile twin (S_q 100, S_kv 300 at 3 CTAs:
+# middle tiles only, two groups to a unit), the branch whose Q tile walk_item writes as a division
 # so that the item's loop bounds stay run-time values (as a trace-time constant it spilled; walk_item's comment), and
 # the stride on that one-Q-tile body (NATURAL, 3 CTAs), whose Q tile work_of writes the same way (work_of's comment).
 # The last two are both walks on a chunked prefill body with two Q tiles (b8 h24/8 S_q 256 S_kv 2048 bottom-right,

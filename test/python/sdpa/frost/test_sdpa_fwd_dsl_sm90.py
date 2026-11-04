@@ -444,14 +444,18 @@ class _TemplateNamed(Exception):
     """Raised by the loader spy: the adapter named its template, and the test stops there (no JIT)."""
 
 
-def _spy_template_loads(monkeypatch):
-    """Record the (file, tag) each compile() asks for, and stop before anything is traced."""
+def _spy_template_loads(monkeypatch, *, load=False):
+    """Record the (file, tag) of each template load. By default stop there, before anything is traced; with ``load``
+    hand it to the real loader, a module load with nothing traced, as check_support's causal route needs (it reads the
+    D128 template's plan-time rule)."""
     from cudnn.sdpa.fwd import api_dsl
 
-    loads = []
+    loads, real = [], api_dsl._load_kernel_template
 
     def spy(filename, params, tag="template", part=None):
         loads.append((filename, tag))
+        if load:
+            return real(filename, params, tag, part=part)
         raise _TemplateNamed(filename)
 
     monkeypatch.setattr(api_dsl, "_load_kernel_template", spy)
@@ -500,10 +504,14 @@ _FLAVOR_CASES = [
 
 @pytest.mark.parametrize("d, declared, expected", _FLAVOR_CASES)
 def test_sm90_adapter_picks_d128_for_what_it_serves(monkeypatch, d, declared, expected):
-    """The flavor is decided once, in check_support, and compile() loads exactly that file under its tag."""
-    loads = _spy_template_loads(monkeypatch)
+    """The flavor is decided once, in check_support, and compile() loads exactly that file under its tag. check_support
+    loads a template only for the causal route, which the shipped switches run on every causal D128 plan
+    (api_dsl.D128_PERSISTENT_CAUSAL_WALK 2, D128_CAUSAL_WALK_ROUTE on): that plan's own file, under its tag."""
+    checked = _spy_template_loads(monkeypatch, load=True)
     api = _api_at(d, **declared)
     assert api.check_support() and api.flavor == ((128, 128) if expected == _D128_FILE else (512, 512))
+    assert checked == ([expected] if expected == _D128_FILE and declared.get("is_causal") else []), checked
+    loads = _spy_template_loads(monkeypatch)
     with pytest.raises(_TemplateNamed):
         api.compile()
     assert loads == [expected], loads

@@ -222,13 +222,14 @@ class TemplateParams:
     intra_wg_overlap: bool = False
     # Persistent switch of the D128 template, appended after the overlap one so every earlier specialization keeps its
     # default (False: one work tile per CTA). persistent launches min(work items, persistent_ctas) CTAs that each loop
-    # over work items, striding by the grid, with the pipeline states carried across items, so the producer loads the
-    # next item's first K tile and Q while the current item finishes (persistent_ctas is a compile() argument the adapter
+    # over work items, striding by the grid (on a paired walk, causal_walk 1, min(walk units, persistent_ctas) CTAs,
+    # each walking its dealt units), with the pipeline states carried across items, so the producer loads the next
+    # item's first K tile and Q while the current item finishes (persistent_ctas is a compile() argument the adapter
     # sizes to the SM count). It requires intra_wg_overlap, so the v1 loop stays the non-persistent reference, and it
     # computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90 sets the shipped value
     # (api_dsl.D128_PERSISTENT) on non-causal D128 plans, and on causal ones only as api_dsl.D128_PERSISTENT_CAUSAL_WALK
-    # says, less the plans api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA (causal_walk below; at its default, 0,
-    # causal plans stay one tile per CTA). D512 refuses it.
+    # says, less the plans api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA (causal_walk below; at that constant's
+    # default, 2, every causal plan the route keeps is persistent). D512 refuses it.
     persistent: bool = False
     # Causal walk of the D128 persistent loop, appended after the persistent switch so every earlier specialization
     # keeps its default (0: the stride by the grid over the sched_policy order). 1 is the paired walk: of each (head,
@@ -237,10 +238,11 @@ class TemplateParams:
     # light_rows - 1 down to 0 one at a time, in rounds dealt to the CTAs in alternating directions, with light_rows set
     # at compile time from the declared shape and CTA count (or the stride, where it balances better). It requires
     # persistent and causal, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90
-    # sets it from api_dsl.D128_PERSISTENT_CAUSAL_WALK on causal D128 plans only, and clears it (with persistent) on a
-    # plan api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA: a plan of at most one item per CTA, a paired walk of
-    # 48 or more KV tiles per Q tile on average unless it deals pairs alone, and the stride above 15 KV tiles per Q tile
-    # on a GQA or MQA plan or at 10 or more on an MHA plan, from 161 timings of 132 causal shapes. D512 refuses it.
+    # sets it from api_dsl.D128_PERSISTENT_CAUSAL_WALK on causal D128 plans only (1 at that constant's default, 2), and
+    # clears it (with persistent) on a plan api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA: a plan of at most
+    # one item per CTA, a paired walk of 48 or more KV tiles per Q tile on average unless it deals pairs alone, and the
+    # stride above 15 KV tiles per Q tile on a GQA or MQA plan or at 10 or more on an MHA plan, from 161 timings of 132
+    # causal shapes. D512 refuses it.
     causal_walk: int = 0
 
 

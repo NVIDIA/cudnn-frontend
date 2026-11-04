@@ -259,8 +259,9 @@ D128_INTRA_WG_OVERLAP: bool = True
 # The SM90 D128 template's persistent-loop switch (config_sm90.TemplateParams.persistent). A CALL-TIME module constant
 # like D128_INTRA_WG_OVERLAP above, written into a D128 plan's record by check_support; a D512 plan never carries it.
 # Persistence rides the overlap loop (validate_params), so a plan is persistent only while D128_INTRA_WG_OVERLAP is on
-# as well, and only a non-causal plan: its items all walk the same KV tiles, so a stride by the grid balances them, and
-# it keeps a zero workspace. Either value computes the same O and Stats bit for bit
+# as well. A non-causal plan's items all walk the same KV tiles, so a stride by the grid balances them; a causal plan's
+# items differ in length, and the end of this comment says when a causal plan is persistent. The loop keeps a zero
+# workspace. Either value computes the same O and Stats bit for bit
 # (test_sdpa_fwd_d128_sm90.py::test_d128_persistent_is_bitwise_ov), so this is a speed choice. Measured on one H100 SXM
 # (132 SMs) on 2026-10-20 against the one-tile-per-CTA overlap kernel and cuDNN 9.27 (bf16, 22 non-causal shapes, 9
 # interleaved rounds, 15 on the six s512 and s1024 shapes the default was chosen on, the decision shapes; CuTe DSL 4.8.0
@@ -274,12 +275,12 @@ D128_INTRA_WG_OVERLAP: bool = True
 # over these shapes (0.02-0.24) against the one-tile kernel and 0.14 (0.02-0.31) against cuDNN. No shape ran below 1x
 # against either; 10 shapes, the six decision shapes among them, ran above 1 plus their band against the one-tile
 # kernel, and 3 against cuDNN. The weakest against the one-tile kernel, b1 h16/4 s1024 at 1.006x (host-bound, 0.025 ms
-# a call), has a band of 0.10. Causal plans stay one tile per CTA because of an earlier measurement (this one timed
-# non-causal shapes only): the same day, on another H100 SXM, a development copy of this loop, which this loop matched
-# within the copy's band on the six decision shapes, ran three long causal shapes at 0.889-0.922x the one-tile kernel
-# with a stride by the grid (b4 h8/8 s8192, b1 h16/4 s8192, b2 h32/32 s4096; only the first by more than its band).
-# D128_PERSISTENT_CAUSAL_WALK below can put causal plans on the persistent loop as well; at its default, 0, they stay
-# one tile per CTA.
+# a call), has a band of 0.10. A causal plan is persistent only as D128_PERSISTENT_CAUSAL_WALK below says, because of an
+# earlier measurement (this one timed non-causal shapes only): the same day, on another H100 SXM, a development copy of
+# this loop, which this loop matched within the copy's band on the six decision shapes, ran three long causal shapes at
+# 0.889-0.922x the one-tile kernel with a stride by the grid (b4 h8/8 s8192, b1 h16/4 s8192, b2 h32/32 s4096; only the
+# first by more than its band). At that constant's default, 2, a causal plan runs the paired walk unless
+# D128_CAUSAL_WALK_ROUTE sends it one tile per CTA.
 D128_PERSISTENT: bool = True
 # Causal D128 plans on the persistent loop (config_sm90.TemplateParams.causal_walk). A CALL-TIME module constant like
 # D128_PERSISTENT above, read by check_support (_sm90_d128_persistence) for causal D128 plans only, and only while
@@ -287,10 +288,21 @@ D128_PERSISTENT: bool = True
 # loop with the stride by the grid (causal_walk 0), 2 on the paired walk (causal_walk 1). An int, not a bool, so that
 # either walk can be selected. Every value computes the one-tile kernel's O and Stats bit for bit
 # (test_sdpa_fwd_d128_sm90.py: test_d128_persistent_is_bitwise_ov runs the stride on causal cases,
-# test_d128_paired_walk_is_bitwise_ov the paired walk at each of its branches), so this is a speed choice. 0 until
-# both walks are measured against the one-tile kernel on causal shapes: the stride ran three long causal shapes at
-# 0.889-0.922x it (D128_PERSISTENT's comment).
-D128_PERSISTENT_CAUSAL_WALK: int = 0
+# test_d128_paired_walk_is_bitwise_ov the paired walk at each of its branches), so this is a speed choice. 2, with
+# D128_CAUSAL_WALK_ROUTE below sending the plans its rule picks one tile per CTA: the stride by the grid alone ran three
+# long causal shapes at 0.889-0.922x the one-tile kernel (D128_PERSISTENT's comment), and the route's comment gives the
+# 161 timings its three cutoffs come from. Measured on one H100 SXM (132 SMs) on 2026-11-03, on nine causal shapes, each
+# in the record the route gives it (#1159's harness, which runs the graph route; bf16, O and Stats, 5 rounds, CuTe DSL
+# 4.8.0; every ratio a median of per-round ratios, the band the larger of 1% and the A/A twin gap): against the one-tile
+# kernel, 1.026x to 1.380x on the eight plans the route keeps, each above its band (paired walks of b66 h4/1 S 512, b2
+# h32/8 S 8192, b2 h32/32 S 4096 and b8 h32/8 S_q 2048 S_kv 6144; the strides of b5 h64/64 S_q 768 S_kv 1536, b4 h64/32
+# S_q 2176 S_kv 2304, b41 h64/8 S_q 1024 S_kv 1792 and b8 h32/8 S_q 2176 S_kv 2432, at L 9.5, 10.0, 10.5 and 11.0), and
+# 1.0005x, inside the band, on the one it routes, b8 h32/8 S_q 2048 S_kv 16384, which compiles the one-tile record and
+# on which the paired walk ran 1.2% slower than the one-tile kernel; against cuDNN 9.27 in the same rounds, 0.905x to
+# 1.101x, below 1 beyond its band on one, the MHA stride b5 h64/64 S_q 768 S_kv 1536 at 0.905x. The strides at L 10.5
+# and 11.0 are timed in that run's arm of the walk's plan without the route, the record the route keeps for them; its
+# arm of the shipped records ran an earlier draft of the route, which sent them one tile per CTA.
+D128_PERSISTENT_CAUSAL_WALK: int = 2
 # Causal D128 plans of the paired walk that _sm90_d128_causal_route picks go one tile per CTA: a plan of at most one
 # item per CTA, a paired walk of 48 or more KV tiles per Q tile on average unless it deals pairs alone, and the stride
 # of more than 15 on a plan with more than one Q head per KV head (GQA or MQA) or of 10 or more on an MHA plan. A

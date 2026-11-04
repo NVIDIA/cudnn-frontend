@@ -634,11 +634,18 @@ rings, so the producer loads KV tile j+1 while tile j is in use: 196,704 B of
 SMEM, one CTA per SM. A non-causal plan's grid is persistent: at most one CTA
 per SM (the SM count is a compile argument), each walking its work items by a
 stride of the grid, so the producer loads the next item's first K tile, Q and
-first V tile while the current item finishes. A causal plan runs one work item
-per CTA: its items differ in length, and a stride by the grid ran three long
-causal shapes at 0.889-0.922x the one-item-per-CTA kernel on an H100 (an
-earlier run on 2026-10-20 that timed a development build of the loop; the
-measurement below is non-causal only). The online
+first V tile while the current item finishes. A causal plan's items differ in
+length, and a stride by the grid ran three long causal shapes at 0.889-0.922x
+the one-item-per-CTA kernel on an H100 (an earlier run on 2026-10-20 that timed
+a development build of the loop), so a causal plan's persistent grid deals a
+paired walk instead: each (head, batch)'s heavy and light Q tiles go out in
+pairs of equal KV work. A plan-time route (`_sm90_d128_causal_route`) runs a
+causal plan one work item per CTA instead when it has at most one item per CTA,
+when it is a paired walk of 48 or more KV tiles per Q tile on average (unless
+each CTA gets at most one pair), or when the walk's own rule keeps the stride
+by the grid at more than 15 KV tiles per Q tile with more than one Q head per KV
+head, or at 10 or more on MHA; its cutoffs come from 161 timings of 132 causal
+shapes on H100 SXM GPUs (`api_dsl.D128_CAUSAL_WALK_ROUTE`). The online
 softmax, the sign-aware row anchor, the FP64 path for extreme scales and the
 reverse KV walk are D512's arithmetic (shared helpers in
 `sm90/_common_hopper.py`). Dense only: a direct caller's
@@ -655,7 +662,12 @@ s4k-16k; medians of per-round ratios), where one work item per CTA ran at
 0.821-1.140x. The persistent kernel's lead is larger than the run-to-run noise
 band on 3 of the 22 shapes (per shape, the worst per-round gap between the
 persistent kernel and an independently compiled copy of it, or between two
-timings of the same cuDNN call, whichever is larger; median 0.14). Placement
+timings of the same cuDNN call, whichever is larger; median 0.14). Causal
+plans as shipped, on one H100 SXM (2026-11-03, #1159's harness, bf16, O + Stats,
+9 causal shapes, 5 rounds): 1.026-1.380x the one-item-per-CTA kernel on the
+eight plans the route keeps and 1.0005x on the one it routes (both kernels then
+run the same record), and 0.905-1.101x cuDNN's speed, below 1 beyond the noise
+band on one (b5 h64/64 S_q 768 S_kv 1536, an MHA stride, at 0.905x). Placement
 keeps it behind the backend with the row's other non-D512 shapes.
 
 ---
