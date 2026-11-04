@@ -1451,6 +1451,11 @@ def gated_delta_net_v2(
     dtype.  ``initial_state`` is float32 or bfloat16 and ``final_state`` and
     the state gradients follow it.
 
+    FROST BF16 paths form the Y operand ``W .* V - K_decay @ S`` in FP32 and
+    round it once; the backward's Y regeneration follows the same rule. The
+    MMA operands, the chunk inverse and the checkpoint storage are unchanged,
+    and FP16 keeps its packed residual arithmetic.
+
     Args:
         g: per-key-channel decay: log-space by default (``alpha = exp(g)``),
             the linear decay ``alpha`` itself when ``gate_domain="linear"``,
@@ -2264,6 +2269,9 @@ def gated_delta_net_v2_summary(
     M_buf + X_H`` and ``X_dh0 = X_dht @ M_buf^T + X_G``.  Both outputs are non-differentiable.  THD layout and gate
     semantics match :func:`gated_delta_net_v2` (k ``[total_tokens, HK, K]``, v ``[total_tokens, HV, V]``, g/beta
     ``[total_tokens, HO, K]`` per-key-channel gates, w ``[total_tokens, HO, V]``, cu_seqlens ``[N+1]``); ``initial_state`` is float32.
+
+    FROST BF16 H paths form ``W .* V - K_decay @ S`` in FP32 before rounding the Y operand; the M chain (``0 - K_decay @ M``)
+    rounds once as before, and FP16 keeps its packed arithmetic.
 
     Args:
         safe_gate: ``g`` is read as ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``; ``a_log`` ``[HO]`` and

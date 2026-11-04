@@ -88,7 +88,7 @@ from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import sigmoid, opaque_f32_zero, opaque_i32, fmul2, fp32_to_fp16
 
-from ..common.kda_residual import residual_operand
+from ..common.residual import residual_operand
 
 USE_PDL = True
 

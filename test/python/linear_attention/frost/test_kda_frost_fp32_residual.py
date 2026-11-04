@@ -1,55 +1,48 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FROST cancellation regressions for BF16 KDA residuals and recompute."""
+"""FROST cancellation regressions for BF16 KDA residuals, forward and backward."""
 
 import pytest
 import torch
 
-from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.linear_attention.ops import kimi_delta_attention, kimi_delta_attention_summary
 
-requirement_error = cutedsl_requirement_error("KDA residual tests")
+from linear_attention.test_la import frost_la_unavailable
+
+requirement_error = frost_la_unavailable()
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
-
-from cudnn.linear_attention.ops.kda import kimi_delta_attention, kimi_delta_attention_summary
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
-@pytest.fixture(autouse=True)
-def frost_device():
-    """Match the production FROST LA eligibility gate on other CI devices."""
-    from cudnn.frost.buffers import current_sm
-
-    sm = current_sm()
-    if sm is None or not (100 <= sm <= 103 or sm == 107):
-        pytest.skip("requires SM100 / SM103 / SM107 FROST KDA")
-
-
-def cancellation_inputs(dim_k, dim_v, active):
+def cancellation_inputs(dim_k, dim_v, active, lead_seqs=0):
     """Exactly representable inputs whose FP32 projection is a BF16 midpoint.
 
     P = 1 + 1/256 rounds to BF16 1, so the old packed subtraction incorrectly
     produced zero. beta * (V - P) = -1/512 is exactly representable in BF16.
     Only one token has a nonzero key, isolating initial/steady-state Y staging
-    from inverse approximation and preceding state-rounding errors.
+    from inverse approximation and preceding state-rounding errors.  ``lead_seqs``
+    zero-key sequences of 128 tokens precede the 129-token active sequence: two of
+    them make a three-sequence, 385-token batch of one head.
     """
-    tokens = 33
+    lead = 128 * lead_seqs
+    tokens = lead + (129 if lead_seqs else 33)
     q = torch.zeros(tokens, 1, dim_k, dtype=torch.bfloat16, device="cuda")
     q[..., 0] = 1
     k = torch.zeros_like(q)
-    k[active, :, 0], k[active, :, 1] = 1, 1 / 256
+    k[lead + active, :, 0], k[lead + active, :, 1] = 1, 1 / 256
     v = torch.zeros(tokens, 1, dim_v, dtype=torch.bfloat16, device="cuda")
-    v[active] = 1
+    v[lead + active] = 1
     gate = torch.zeros(tokens, 1, dim_k, dtype=torch.float32, device="cuda")
     beta = torch.full((tokens, 1), 0.5, dtype=torch.bfloat16, device="cuda")
-    cu = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
-    seed = torch.zeros(1, 1, dim_v, dim_k, device="cuda")
+    cu = torch.tensor([*range(0, lead + 1, 128), tokens], dtype=torch.int32, device="cuda")
+    seed = torch.zeros(lead_seqs + 1, 1, dim_v, dim_k, device="cuda")
     seed[..., :2] = 1
     expected = seed.double().clone()
-    expected[..., 0] -= 1 / 512
-    expected[..., 1] -= 1 / 131072
+    expected[-1, ..., 0] -= 1 / 512
+    expected[-1, ..., 1] -= 1 / 131072
     return (q, k, v, gate, beta, cu), seed, expected
 
 
@@ -87,23 +80,12 @@ def test_projection_residual_retains_cancellation(dims, active, path, beta_dtype
 @pytest.mark.L1
 @pytest.mark.parametrize("dim_k", [64, 128])
 @pytest.mark.parametrize("active", [0, 16], ids=["initial", "steady"])
-def test_prep_projection_residual_retains_cancellation(monkeypatch, dim_k, active):
-    """Exercise prep-fed Y staging explicitly, independent of heuristic ranking."""
-    from cudnn.linear_attention.frost.common import piece_chain
-    from cudnn.linear_attention.frost import kda_engine
-    from cudnn.linear_attention.ops.kda import fprop_cache
-
-    fprop_cache.clear()
-    choose = piece_chain.choose_pieces
-    monkeypatch.setattr(piece_chain, "choose_pieces", lambda **kw: (0, choose(**kw)[1]))
-    monkeypatch.setattr(piece_chain, "is_dv_split", lambda **kw: True)
-    monkeypatch.setattr(kda_engine, "PREP_TILE_FRACTION", 1.0)
-    args, seed, expected = cancellation_inputs(dim_k, 128, active)
-    try:
-        _, actual = kimi_delta_attention(*args, initial_state=seed, output_final_state=True, plan_name="kda_frost")
-        torch.testing.assert_close(actual.double()[..., :2], expected[..., :2], rtol=0, atol=1e-7)
-    finally:
-        fprop_cache.clear()
+def test_three_sequence_projection_residual_retains_cancellation(dim_k, active):
+    """Three one-head sequences of 385 tokens at V = 128."""
+    args, seed, expected = cancellation_inputs(dim_k, 128, active, lead_seqs=2)
+    _, actual = kimi_delta_attention(*args, initial_state=seed, output_final_state=True, plan_name="kda_frost")
+    torch.testing.assert_close(actual.double()[..., :2], expected[..., :2], rtol=0, atol=1e-7)
+    assert torch.count_nonzero(actual[..., 2:]) == 0
 
 
 @pytest.mark.L1
@@ -139,4 +121,4 @@ def test_backward_saved_checkpoints_and_recompute_agree(dtype, safe_gate):
     torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
     for name, got, expected in zip(("q", "k", "v", "gate", "beta"), results[0][1], results[1][1]):
         relative_l2 = (got.double() - expected.double()).norm() / expected.double().norm().clamp_min(1e-20)
-        assert relative_l2 < 0.003, f"{name}: checkpoint/recompute relative L2 {relative_l2}"
+        assert relative_l2 < 0.003, f"{name}: checkpoint / no-checkpoint relative L2 {relative_l2}"
