@@ -31,6 +31,8 @@ from gemm_test_utils import (
     brev_bfind_types,
     FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
     plan_as_sm100,
+    INT8_STORE_VALUES,
+    int8_store_ref,
 )
 
 from cudnn.gemm.frost.compiler import force_stg_epi, jit_from_cudnn_graph
@@ -2046,7 +2048,7 @@ def test_gather_numerics_sm120(cfg_name, m_major, activation, swiglu):
     _run_gather_numerics(C120, by_name(cfg_name), m_major=m_major, activation=activation, swiglu=swiglu)
 
 
-@requires_matmul_gpu
+@requires_sm120
 @pytest.mark.parametrize(
     "gather,swap_ab,call_n",
     [(False, False, 256), (False, True, 224), (True, False, 256), (True, True, 224)],
@@ -2109,7 +2111,7 @@ def _f8_128x4_logical(blob: torch.Tensor, cols: int) -> torch.Tensor:
     return logical.view(-1, cols)
 
 
-@requires_matmul_gpu
+@requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
 @pytest.mark.parametrize("axis", [-1, 1], ids=["feature_axis", "token_axis"])
 def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
@@ -2151,6 +2153,35 @@ def test_moe_quant_scale_k_padding_is_zeroed_sm120(axis, swap_ab):
     expected[:, :blocks] = s_ref[0].view(torch.uint8)
     torch.testing.assert_close(_f8_128x4_logical(scale_buf, dims[2])[:rows], expected, atol=0, rtol=0)
     torch.testing.assert_close(q_buf.float(), (q_ref.transpose(1, 2) if axis == 1 else q_ref).float(), atol=0, rtol=0)
+
+
+@requires_matmul_gpu
+# The normal template also runs on SM10.x, like the GATHER / SCATTER SM120 tests above; the
+# swap-AB case is SM120-only, like every other SM120 swap-AB test.
+@pytest.mark.parametrize(
+    "swap_ab,out_dt", [pytest.param(False, torch.int8, id="int8"), pytest.param(True, torch.uint8, id="swap_ab-uint8", marks=requires_sm120)]
+)
+def test_moe_int8_output_rounds_to_nearest_even_and_saturates_sm120(swap_ab, out_dt):
+    """A bf16 MoE GEMM stored straight to INT8 / UINT8 rounds half to even,
+    saturates and stores NaN as 0, as cuDNN's native engines do. The epilogue's
+    bare .to() rounded toward zero and kept the low byte (2.75 -> 2, 300 -> 44).
+    Token row s is x_s exactly: one nonzero K term against unit weights."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K = 2, 256, 128, 128
+    output_dt = cudnn.data_type.UINT8 if out_dt is torch.uint8 else cudnn.data_type.INT8
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K, output_dt=output_dt), config=replace(by_name(_SM120_CFG), swap_ab=swap_ab))
+    x = torch.tensor(INT8_STORE_VALUES, dtype=torch.bfloat16).repeat(-(-S // len(INT8_STORE_VALUES)))[:S].cuda()
+    token = torch.zeros(1, S, K, dtype=torch.bfloat16, device="cuda")
+    token[0, :, 0] = x
+    weight = torch.zeros(E, N, K, dtype=torch.bfloat16, device="cuda")
+    weight[:, :, 0] = 1.0
+    out = torch.full((1, S, N), 0x5A, dtype=out_dt, device="cuda")
+    compiled(_vp_moe(compiled, token, weight, _offsets([128, 128], S), out))
+    torch.cuda.synchronize()
+    ref = int8_store_ref(x, out_dt).view(1, S, 1).expand(1, S, N)
+    bad = (out != ref).any(dim=2)[0].nonzero().flatten().tolist()
+    assert not bad, "x -> got (expected): " + ", ".join(f"{float(x[s])} -> {int(out[0, s, 0])} ({int(ref[0, s, 0])})" for s in bad[:8])
 
 
 @requires_sm120
@@ -2231,6 +2262,97 @@ def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
     m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
     params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]
     assert params == ["problem_size", "first_token_offset", "a_tma_workspace", *(["token_index"] if gather else []), "a_0", "b_0", "c_tap_0", "stream"], params
+
+
+_SM120_MOE_TEMPLATES = (
+    "sm120_moe_grouped_matmul_fwd.py",
+    "sm120_moe_grouped_matmul_fwd_swap_ab.py",
+    "sm120_moe_grouped_block_scale_matmul_fwd.py",
+    "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+)
+
+
+@pytest.mark.parametrize("template", _SM120_MOE_TEMPLATES)
+def test_sm120_moe_external_counter_reset_states_its_contract(template: str) -> None:
+    """Rendering ``external_counter_reset = True`` drops the host's counter-zeroing
+    launch, and the kernel never writes the counter back. The comment at the guard
+    is the only statement of what such a runtime owes (a zero before every launch,
+    visible to the kernel's griddepcontrol.wait), so pin it together with the kernel
+    facts it rests on: one atomic add per claim and no other use of the counter."""
+    import ast
+
+    from cudnn.gemm.frost.kernel_registry import template_path
+
+    src = template_path(template).read_text()
+    lines = src.splitlines()
+    (guard,) = [i for i, line in enumerate(lines) if line.strip() == "if cutlass.const_expr(not external_counter_reset):"]
+    assert "_dynamic_scheduler_counter_initialization(" in lines[guard + 1]
+    assert lines[guard - 1].strip().startswith("counter_qword = ")
+    top = guard - 1
+    while lines[top - 1].lstrip().startswith("#"):
+        top -= 1
+    contract = " ".join(line.strip().lstrip("#").strip() for line in lines[top : guard - 1])
+    for fact in ("+ grid_num_clusters", "before every launch", "griddepcontrol.wait"):
+        assert fact in contract, f"{template}: the external_counter_reset comment must state {fact!r}; got {contract!r}"
+    tree = ast.parse(src)
+    names = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "sched_counter_ptr"]
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and any(isinstance(a, ast.Name) and a.id == "sched_counter_ptr" for a in node.args)]
+    assert len(names) == 2 and len(calls) == 1, f"{template}: the scheduler counter has a new use; revisit the external_counter_reset comment"
+    assert ast.unparse(calls[0].func) == "nvvm.atomicrmw" and ast.literal_eval(calls[0].args[0]) == "add"
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("external_reset", [False, True], ids=["host_reset", "external_reset"])
+def test_sm120_moe_scheduler_counter_needs_a_zero_before_every_launch(external_reset: bool, monkeypatch) -> None:
+    """FC1 then FC2 on one workspace, so both launches use one counter word, as in FlashInfer's
+    MoE adapters (two compiled kernels, FC1 and FC2, that share one ``desc`` scratch; one
+    compiled kernel stands in for both here). Each launch leaves the counter at its tile
+    count + grid_num_clusters. The default host zeroes it before every launch, so a stale
+    count is harmless; with ``external_counter_reset`` rendered True and one zero for both
+    launches (a per-layer reset), FC2 starts at FC1's final count and skips the tiles below
+    it without an error."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    cfg = by_name(_SM120_CFG)  # 128 x 128 CTA tiles
+    grid = C120._grid_num_clusters(cfg)
+    m_tiles = grid // 2 + 10  # FC2's 2 * m_tiles tiles outnumber FC1's 2 + grid
+    E, S, N, K = 4, 128 * m_tiles, 256, 128
+    if external_reset:
+        render = C120._render_template
+
+        def render_external_reset(*args, **kwargs):
+            src = render(*args, **kwargs)
+            assert src.count("\nexternal_counter_reset = False\n") == 1
+            return src.replace("\nexternal_counter_reset = False\n", "\nexternal_counter_reset = True\n")
+
+        monkeypatch.setattr(C120, "_render_template", render_external_reset)
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=cfg)
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    counter = workspace.view(torch.int32)[:1]  # moe_desc_slots = 0: the workspace is the counter
+    counter.fill_(0 if external_reset else 1 << 30)  # the runtime's one zero / a stale count
+
+    def launch(starts):
+        offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
+        out = torch.full((1, S, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+        compiled(_vp_moe(compiled, token, weight, offsets, out), workspace=workspace)
+        tiles = sum(_ceil_div(end - begin, 128) * (N // 128) for begin, end in zip(starts, starts[1:]))
+        assert counter.item() == tiles + grid  # every CTA stops at its first claim past the last tile
+        return out, _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), tiles
+
+    out, ref, fc1_tiles = launch([0, 128, 128, 128, 128])  # trailing rows unused
+    torch.testing.assert_close(out[0, :128], ref[:128], atol=1e-1, rtol=1e-2)
+    half = 128 * (m_tiles // 2)
+    out, ref, _ = launch([0, half, half, S - 128, S])
+    unwritten = out[0].isnan()
+    assert int(unwritten.sum()) == ((fc1_tiles + grid) * 128 * 128 if external_reset else 0)
+    torch.testing.assert_close(out[0][~unwritten], ref[~unwritten], atol=1e-1, rtol=1e-2)
+    if external_reset:  # zeroed before FC2 too, as the template comment asks
+        counter.zero_()
+        out, ref, _ = launch([0, half, half, S - 128, S])
+        torch.testing.assert_close(out[0], ref, atol=1e-1, rtol=1e-2)
 
 
 @requires_sm100
@@ -2427,7 +2549,7 @@ def test_moe_swap_ab_plain_graph_coordinates_and_public_replay(aligned):
 def test_moe_templates_follow_internal_operation(block_scale, monkeypatch):
     from cudnn.gemm.frost import fusion_ir, kernel_registry as R
     from cudnn.gemm.frost.sm100 import compiler as C
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     graph = (build_bs if block_scale else _build_graph)(2, 176, 256, 256, num_groups=4)
     chain = analyze(graph)
@@ -2530,7 +2652,7 @@ def test_moe_swap_ab_sweep_includes_geometry_rejected_by_original_graph(monkeypa
 @pytest.mark.parametrize("swap", [False, True])
 def test_moe_norm2_is_refused_at_probe_and_jit(block_scale, swap):
     from cudnn.gemm.frost.sm100 import compiler
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     graph = (build_bs if block_scale else _build_graph)(
         2,
@@ -2554,7 +2676,7 @@ def _run_moe_swap_ab_quant(case, *, block_scale=False):
     from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
     from cudnn.gemm.frost.sm100 import compiler as C
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     col = case in ("col", "col_grouped", "multi")
     grouped = case in ("row_grouped", "col_grouped")
@@ -2689,7 +2811,7 @@ def test_moe_swap_ab_quant(case):
 @pytest.mark.parametrize("grouped", [False, True])
 def test_moe_swap_ab_token_quant_requires_aligned_groups(block_scale, grouped, monkeypatch):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     C = plan_as_sm100(monkeypatch)
     graph = (build_bs if block_scale else _build_graph)(2, 256, 128, 256, num_groups=4)
@@ -2728,7 +2850,7 @@ def _run_moe_swap_ab_reductions(axis, *, block_scale=False, reduction_kind="basi
     from contextlib import nullcontext
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
     from cudnn.gemm.frost.sm100 import compiler as C
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     avg = reduction_kind == "avg"
     products = reduction_kind == "products"
@@ -2933,13 +3055,7 @@ def test_moe_avg_fp32(grouped, axis):
     )
 
 
-@requires_sm120
-@pytest.mark.parametrize(
-    "block_scale,swap,gather",
-    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
-    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
-)
-def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
+def _check_moe_avg_divides_by_used_rows(compiler, config_name, block_scale, swap, gather):
     """An ungrouped AVG over the token axis averages the rows the groups cover,
     first_token_offset[G], not the routed capacity (Token.shape[1], or
     len(token_index) under GATHER): trailing routed rows are unused, and ADD/MAX and
@@ -2947,16 +3063,16 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
     the per-feature AVG adds per chunk."""
     from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
-    from cudnn.gemm.frost.sm120 import compiler as C120
-    from test_moe_grouped_block_scale_matmul_fwd import _build_graph as build_bs
+    from moe_block_scale_test_utils import _build_graph as build_bs
 
     E, S, N, K, G = 2, 192, 128, 128, 4
     rows = 64 if gather else S  # token rows; under GATHER, S is the routed capacity len(token_index)
     F = cudnn.data_type.FLOAT
     if block_scale:
-        graph = build_bs(E, S, N, K, G, combo="nvfp4", output_dt=F, offset_multiple=8)
+        graph = build_bs(E, rows, N, K, G, combo="nvfp4", output_dt=F, offset_multiple=8, gather_rows=S if gather else None)
         _, binding = analyze_with_binding(graph)
         token_t, weight_t, fto_t, out_t = binding.a_operands[0], binding.b_operands[0], binding.first_token_offset, binding.outputs[0]
+        index_t = binding.token_index
     else:
         graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=F, compute_data_type=F)
         token_t = graph.tensor(name="token", dim=[1, rows, K], stride=[rows * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
@@ -2974,7 +3090,7 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
         red = graph.reduction(input=out_t, mode=cudnn.reduction_mode.AVG, name=name, compute_data_type=F)
         red.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_data_type(F).set_output(True)
         reductions.append(red)
-    compiled = C120.jit_from_cudnn_graph(graph, config=replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap))
+    compiled = compiler.jit_from_cudnn_graph(graph, config=replace(by_name(config_name), swap_ab=swap))
 
     # Exact integer products that do not cancel across features: out[s, n] = K * x[s] * w[g % E, n].
     x = (torch.arange(rows, device="cuda") % 3 + 1).float()
@@ -2983,10 +3099,13 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
     vp = {}
     if block_scale:
         codes = torch.tensor([0, 2, 4, 5], device="cuda", dtype=torch.uint8)  # E2M1 codes of 0, 1, 2, 3
-        vp[token_t] = (codes[x.long()] * 17).view(1, S, 1).expand(1, S, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
+        vp[token_t] = (codes[x.long()] * 17).view(1, rows, 1).expand(1, rows, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
         w_codes = codes[w.abs().long()] + (w < 0).to(torch.uint8) * 8
         vp[weight_t] = (w_codes * 17)[:, :, None].expand(E, N, K // 2).contiguous().view(torch.float4_e2m1fn_x2)
-        vp[binding.sfa_operands[0]] = torch.ones((1, segmented_row_scale_capacity_rows(S, G), K // 16), device="cuda").to(torch.float8_e4m3fn)
+        if gather:
+            vp[binding.sfa_operands[0]] = torch.ones((1, rows, 16), device="cuda").to(torch.float8_e4m3fn)[:, :, : K // 16]
+        else:
+            vp[binding.sfa_operands[0]] = torch.ones((1, segmented_row_scale_capacity_rows(S, G), K // 16), device="cuda").to(torch.float8_e4m3fn)
         vp[binding.sfb_operands[0]] = torch.ones((E, N, K // 16), device="cuda").to(torch.float8_e4m3fn)
     else:
         vp[token_t] = x.view(1, rows, 1).expand(1, rows, K).to(torch.bfloat16).contiguous()
@@ -3019,6 +3138,48 @@ def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
         expected_feature = ref[:used].mean(0) if used else torch.zeros(N, device="cuda")
         torch.testing.assert_close(avg_scalar, expected_scalar.view(1, 1, 1), atol=1e-3, rtol=1e-5, msg=lambda m: f"scalar AVG, offsets {starts}: {m}")
         torch.testing.assert_close(avg_feature, expected_feature.view(1, 1, N), atol=1e-3, rtol=1e-5, msg=lambda m: f"per-feature AVG, offsets {starts}: {m}")
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "block_scale,swap,gather",
+    [(False, False, False), (False, True, False), (False, False, True), (True, False, False), (True, True, False)],
+    ids=["plain", "plain_swap_ab", "plain_gather", "block_scale", "block_scale_swap_ab"],
+)
+def test_moe_avg_divides_by_used_rows_sm120(block_scale, swap, gather):
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    _check_moe_avg_divides_by_used_rows(C120, "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", block_scale, swap, gather)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "block_scale,swap,gather",
+    [
+        (False, False, False),
+        (False, True, False),
+        (False, False, True),
+        (False, True, True),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+        (True, True, True),
+    ],
+    ids=[
+        "plain",
+        "plain_swap_ab",
+        "plain_gather",
+        "plain_gather_swap_ab",
+        "block_scale",
+        "block_scale_swap_ab",
+        "block_scale_gather",
+        "block_scale_gather_swap_ab",
+    ],
+)
+def test_moe_avg_divides_by_used_rows_sm100(block_scale, swap, gather):
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
+    _check_moe_avg_divides_by_used_rows(C100, "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", block_scale, swap, gather)
 
 
 def test_moe_reduction_initialization_validates_all_outputs_before_writing():
@@ -3057,7 +3218,7 @@ def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
     from cudnn.gemm.frost.graph_analyzer import analyze_with_binding, swap_ab_binding
 
     if block_scale:
-        from test_moe_grouped_block_scale_matmul_fwd import _build_graph as bs_graph
+        from moe_block_scale_test_utils import _build_graph as bs_graph
 
         graph = bs_graph(2, 128, 128, 128, 2)
     else:

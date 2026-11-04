@@ -579,9 +579,10 @@ TEST_CASE("Matmul with restricted shared memory", "[matmul][graph]") {
     auto handle     = *handle_ptr;
 
     REQUIRE(graph.build_operation_graph(handle).is_good());
-    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
-
+    // Set the limit before querying plans so supported backends can use it to
+    // select pipeline stages. The post-query engine-config filter remains active.
     graph.deselect_shared_mem_greater_than(256 * 1024);
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
     REQUIRE(graph.check_support().is_good());
 
     REQUIRE(graph.build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());

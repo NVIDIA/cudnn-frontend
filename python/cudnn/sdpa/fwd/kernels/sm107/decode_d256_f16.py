@@ -993,6 +993,8 @@ def _kernel(
     # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag): each role waits on the
     # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
     use_pdl: cutlass.Constexpr[bool] = False,
+    final_o_tensor: Optional[cute.Tensor] = None,
+    final_lse_tensor: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1164,6 +1166,43 @@ def _kernel(
             use_pdl=use_pdl,
         )
 
+    # Publish split-major global partials before any CTA reads a peer. Every
+    # role participates in the ordered cluster barrier; relaxed arrival does
+    # not publish these stores. Each CTA then owns disjoint final elements.
+    if cutlass.const_expr(final_o_tensor is not None):
+        nvvm.barrier_cluster_arrive_aligned()
+        nvvm.barrier_cluster_wait_aligned()
+        parts = cutlass.make_array_view(o_tensor)
+        part_lse = cutlass.make_array_view(lse_tensor)
+        final_o = cutlass.make_array_view(final_o_tensor)
+        if cutlass.const_expr(final_lse_tensor is not None):
+            final_lse = cutlass.make_array_view(final_lse_tensor)
+        for item in cutlass.range_constexpr((Q_BOX_ROWS * CFG.TILE_O + SPLIT_KV * CFG.THREADS_PER_CTA - 1) // (SPLIT_KV * CFG.THREADS_PER_CTA)):
+            flat = split_idx * cutlass.Int32(CFG.THREADS_PER_CTA) + tidx + cutlass.Int32(item * SPLIT_KV * CFG.THREADS_PER_CTA)
+            row = flat // cutlass.Int32(CFG.TILE_O)
+            col = flat % cutlass.Int32(CFG.TILE_O)
+            tok = tok0 + row // cutlass.Int32(HEADS_PER_TILE)
+            head = head_idx * cutlass.Int32(HEADS_PER_TILE) + row % cutlass.Int32(HEADS_PER_TILE)
+            if (row < cutlass.Int32(Q_BOX_ROWS)) & (tok < seqlen_q):
+                maxima = cutlass.Float32(float("-inf"))
+                for part in cutlass.range_constexpr(SPLIT_KV):
+                    maxima = cute.math.max(maxima, part_lse[batch_idx + cutlass.Int32(part) * n_batch, head, tok])
+                dead = maxima == cutlass.Float32(float("-inf"))
+                anchor = _select_f32(dead, cutlass.Float32(0.0), maxima)
+                denominator = cutlass.Float32(0.0)
+                numerator = cutlass.Float32(0.0)
+                for part in cutlass.range_constexpr(SPLIT_KV):
+                    pp = batch_idx + cutlass.Int32(part) * n_batch
+                    weight = cute.math.exp(part_lse[pp, head, tok] - anchor, fastmath=True)
+                    value = _select_f32(weight == cutlass.Float32(0.0), cutlass.Float32(0.0), parts[pp, tok, head, col])
+                    denominator = denominator + weight
+                    numerator = numerator + weight * value
+                final_o[batch_idx, tok, head, col] = (numerator / cute.math.max(denominator, cutlass.Float32(1e-30))).to(final_o_tensor.element_type)
+                if cutlass.const_expr(final_lse_tensor is not None):
+                    if col == cutlass.Int32(0):
+                        result_lse = anchor + cute.math.log(cute.math.max(denominator, cutlass.Float32(1e-30)), fastmath=True)
+                        final_lse[batch_idx, head, tok] = _select_f32(dead, cutlass.Float32(float("-inf")), result_lse)
+
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
@@ -1201,6 +1240,10 @@ def _host(
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool] = False,
+    final_o_ptr: Optional[cute.Pointer] = None,
+    final_lse_ptr: Optional[cute.Pointer] = None,
+    final_o_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64]] = None,
+    final_lse_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64]] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
@@ -1288,6 +1331,13 @@ def _host(
     n_tok_units = (cutlass.Int32(SQ) + cutlass.Int32(Q_BOX_TOKENS - 1)) // cutlass.Int32(Q_BOX_TOKENS)
     grid_shape = ((QH // HEADS_PER_TILE) * n_tok_units, B, SPLIT_KV)
 
+    final_o_tensor = None
+    final_lse_tensor = None
+    if cutlass.const_expr(final_o_ptr is not None):
+        final_o_tensor = cute.make_tensor(final_o_ptr, cute.make_layout((B, SQ, QH, d_v), stride=(*final_o_strides, 1)))
+        if cutlass.const_expr(final_lse_ptr is not None):
+            final_lse_tensor = cute.make_tensor(final_lse_ptr, cute.make_layout((B, QH, SQ), stride=final_lse_strides))
+
     kernel_args = (
         tma_q_desc,
         tma_k_desc,
@@ -1302,16 +1352,19 @@ def _host(
         scale_softmax_log2,
         seq_q_lens_addr,
         n_tok_units,
+        final_o_tensor,
+        final_lse_tensor,
     )
 
     # `pdl` is an explicit argument of both helpers (like `hnd`): the DSL refuses a closure capture inside a staged `if`.
     def launch(args, k_table, v_table, hnd, pdl, grid, current_stream):
         # pdl: the programmatic-stream-serialization launch attribute, paired with the kernel's griddepcontrol sites.
-        _kernel(*args, k_table, v_table, hnd, pdl).launch(
+        _kernel(*args[:-2], k_table, v_table, hnd, pdl, *args[-2:]).launch(
             grid=grid,
             block=[CFG.THREADS_PER_CTA, 1, 1],
             stream=current_stream,
             use_pdl=pdl,
+            cluster=(1, 1, SPLIT_KV) if args[-2] is not None else None,
         )
 
     def launch_tables(args, kt, vt, kp, vp, strides, batch, kv_extent, hnd, pdl, grid, current_stream):
@@ -1358,6 +1411,25 @@ EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument l
 LSE_KINDS = ("dense",)  # the decode tile never serves THD
 
 
+def cluster_combine_supported(d_qk: int, d_v: int) -> bool:
+    """The measured native cluster form; this does not select a split count."""
+    return bool(
+        SPLIT_KV == 8
+        and CFG.PACK_GQA
+        and CFG.QH_PER_KH == 16
+        and N_Q == 16
+        and d_qk == d_v == 256
+        and CFG.DTYPE_QKV == 2
+        and CFG.DTYPE_O == 2
+        and not PAGED_KV
+        and not CFG.HAS_SINK
+        and not CFG.MASK_FLAGS
+        and not CFG.STATS_LOG2
+        and not CFG.SEQ_Q_LENS_PRESENT
+        and not CFG.SEQ_KV_LENS_PRESENT
+    )
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     d_qk: int = CFG.TILE_K,
@@ -1366,6 +1438,8 @@ def compile(  # noqa: A001
     lse_kind: str = "dense",
     paged_hnd: bool = False,
     use_pdl: bool = False,
+    cluster_combine: bool = False,
+    has_final_lse: bool = True,
 ) -> Callable:
     """Compile the shared pointer ABI for dense or paged decode. Shapes and strides
     are runtime arguments; head-dim envelopes, Stats presence and pool layout
@@ -1383,6 +1457,8 @@ def compile(  # noqa: A001
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if paged_hnd and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
+    if cluster_combine and (not cluster_combine_supported(d_qk, d_v) or use_pdl or not has_lse):
+        raise ValueError("cluster combine requires dense unmasked BF16 D256 G16 split8 with partial LSE and no PDL")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -1423,6 +1499,10 @@ def compile(  # noqa: A001
         lse_kind,
         paged_hnd,
         bool(use_pdl),
+        P(STORAGE_DTYPE, 2) if cluster_combine else None,
+        P(cutlass.Float32, 4) if cluster_combine and has_final_lse else None,
+        i64_3,
+        i64_3,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

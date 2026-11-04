@@ -53,6 +53,7 @@ _FLAG = "CUDNN_FRONTEND_ENABLE_FROST_ENGINES"
 _SM107 = (10, 7)
 
 requires_rubin = pytest.mark.requires_rubin  # registered by this directory's conftest: skipped wherever the device is not SM107
+requires_dense_part = pytest.mark.requires_dense_part  # registered: any served part of DENSE_SERVING_CCS (cc 10.7, and cc 10.0 since 2026-10-29)
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device (a stream to capture)")
 
 # The block geometry the capture cells run: every projection on the forced tile (n_qkvg = (2*8 + 2*2) * 256 = 5120, h_q*d_head
@@ -308,7 +309,7 @@ def _assert_jit_only(plan, seen):
         assert not any(n == "frost_gemm" or n.startswith("frost_gemm[") for n in names), names
 
 
-@requires_rubin
+@requires_dense_part
 @pytest.mark.parametrize("h_q, h_kv, d_model", _SERVED_GEOMETRIES)
 def test_dense_bf16_projections_compile_and_run_without_the_flag_at_every_served_geometry(monkeypatch, h_q, h_kv, d_model):
     """Both projection GEMMs of every served geometry, built with the flag UNSET: the ``jit-only`` route at the tile the driver resolves
@@ -335,7 +336,7 @@ def test_dense_bf16_projections_compile_and_run_without_the_flag_at_every_served
     assert dict(proj_gemm._GRAPH_HANDLES) == handles_before, "the jit-only route created a cuDNN handle"
 
 
-@requires_rubin
+@requires_dense_part
 @pytest.mark.parametrize("h_q, h_kv, d_model", _SERVED_GEOMETRIES)
 def test_bf16_block_compiles_without_the_flag_at_every_served_geometry(monkeypatch, h_q, h_kv, d_model):
     """The whole bf16 block at each served geometry (B=1, S=128), declared and compiled with the flag UNSET: both projections on the
@@ -354,7 +355,7 @@ def test_bf16_block_compiles_without_the_flag_at_every_served_geometry(monkeypat
     assert torch.isfinite(out.float()).all()
 
 
-@requires_rubin
+@requires_dense_part
 @pytest.mark.parametrize("flag", ["set", "unset"])
 def test_capture_safe_plan_never_enters_the_ranked_list_whatever_the_flag(monkeypatch, flag):
     """The serving declaration with the opt-in flag SET (the suite's default) and UNSET: the plan's graph holds NO ranked list
@@ -385,7 +386,7 @@ def test_capture_safe_plan_never_enters_the_ranked_list_whatever_the_flag(monkey
     assert dict(proj_gemm._GRAPH_HANDLES) == handles_before, "the capture_safe plan created a cuDNN handle"
 
 
-@requires_rubin
+@requires_dense_part
 def test_first_execute_captured_with_zero_warmups_replays_bitwise_eager(monkeypatch):
     """vLLM's defaults: a FRESH bf16 declaration, compiled with the opt-in flag UNSET (the serving stack's configuration: both
     projections on the ``jit-only`` route -- on the tree before this route that compile is the ``_NoFrostPlan`` decline), and its
@@ -441,7 +442,7 @@ def test_first_execute_captured_with_zero_warmups_replays_bitwise_eager(monkeypa
         graph.reset()
 
 
-@requires_rubin
+@requires_dense_part
 def test_graph_route_first_execute_under_capture_is_refused_typed_and_creates_no_handle(monkeypatch):
     """The forced tile disabled (``_forced_tile_config`` -> None): both projections run the GRAPH route, whose first execute per
     stream creates a cuDNN handle.  Captured on a NEW stream with no warm-up, the first execute is a typed ``RuntimeError`` naming
@@ -470,7 +471,7 @@ def test_graph_route_first_execute_under_capture_is_refused_typed_and_creates_no
     assert key in proj_gemm._GRAPH_HANDLES and torch.isfinite(out.float()).all()
 
 
-@requires_rubin
+@requires_dense_part
 def test_block_compile_under_capture_is_refused_typed():
     """``GatedAttentionBlockFwd.compile()`` inside a capture on a fresh stream: the first stage to build a GEMM plan refuses typed
     (the compile route, the remedy), before any cuDNN graph exists."""

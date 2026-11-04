@@ -43,8 +43,6 @@ Grid: (seqlen, batch, 1). Each CTA handles one query position.
 from __future__ import annotations
 
 import math
-from functools import partial
-from typing import Optional
 
 import cuda.bindings.driver as cuda
 import torch
@@ -66,10 +64,9 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
 )
 from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_info
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import (
     gemm,
-    gemm_zero_init,
     make_smem_layout,
 )
 from cudnn.deepseek_sparse_attention.utils.sm90.primitives import transpose_view
@@ -127,7 +124,7 @@ class IndexerBackwardSm90:
         # Public forward/topk returns global KV ids by default. Sparse mode
         # decodes them to local per-batch ids before indexing K/dK views.
         self.topk_indices_global = topk_indices_global
-        assert heads >= 64
+        assert heads == 64, "the warpgroup GEMMs use the head count as WGMMA M, which must be 64"
         assert is_dense or topk % block_I == 0
         self.num_topk_blocks = (topk + block_I - 1) // block_I
         self.grad_signal_smem_size = self.block_I if is_dense else self.topk
@@ -740,8 +737,6 @@ class IndexerBackwardSm90:
         tDQrKt_s1 = thr_mma3.make_fragment_B(thr_mma3.partition_B(sKt_s1_half))
         tDQrKt_s2 = thr_mma3.make_fragment_B(thr_mma3.partition_B(sKt_s2_half))
         dq_acc_shape = tmma3.partition_shape_C(self.gemm3_tiler_half)
-        cDQ_half = cute.make_identity_tensor(self.gemm3_tiler_half)
-        tCcDQ_half = thr_mma3.partition_C(cDQ_half)
 
         sdS_view = cute.composition(sdS, cute.make_layout((self.heads_padded, self.block_I)))
 
@@ -772,8 +767,6 @@ class IndexerBackwardSm90:
                 sDwPartial[idx] = Float32(0.0)
         cute.arch.fence_view_async_shared()
         self.compute_sync_barrier.arrive_and_wait()
-
-        n_offset = compute_wg_idx * self.half_block_I
 
         # shared-mem store dK staging: partition sdK_staging using GEMM2's MMA layout
         sdK_staging_half = cute.local_tile(sdK_staging, (64, self.block_I), (compute_wg_idx, 0))
@@ -1397,11 +1390,7 @@ def indexer_backward_sm90(
     # single compiled kernel serves every shape. Keying them would force
     # recompiles under varlen / changing batch.
     #
-    # Use probability-domain score input (predict) to match SM100 convention.
-    # The kernel implements both modes behind const_expr(index_is_log); the
-    # unified predict path keeps the SM90 and SM100 dispatcher data flows
-    # identical. ``score_input_is_log`` is const_expr-branched, so it IS keyed.
-    score_input_is_log = False
+    # The score input is the probability-domain predict, matching SM100.
     return _build_cute_dsl_kernel(
         seqlen,
         seqlen_k,
@@ -1410,7 +1399,6 @@ def indexer_backward_sm90(
         topk,
         sm_scale,
         block_I,
-        score_input_is_log=score_input_is_log,
         topk_indices_global=topk_indices_global,
     )
 
@@ -1420,9 +1408,8 @@ class ScoreGradSm90:
 
     THREADS_PER_CTA = 128
 
-    def __init__(self, topk: int, index_is_log: bool):
+    def __init__(self, topk: int):
         self.topk = topk
-        self.index_is_log = index_is_log
 
     @cute.jit
     def __call__(
@@ -1472,12 +1459,8 @@ class ScoreGradSm90:
             if pos < self.topk:
                 target = Float32(mAttnScore[seq_idx, pos, batch_idx])
                 target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-                if const_expr(self.index_is_log):
-                    log_predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    log_clip_mask = Float32(1.0) if log_predict >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                else:
-                    predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
+                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 local_sum += -target_eff * log_clip_mask * grad_scale_f32
 
         thread_sums[tidx] = local_sum
@@ -1496,15 +1479,25 @@ class ScoreGradSm90:
             if pos < self.topk:
                 target = Float32(mAttnScore[seq_idx, pos, batch_idx])
                 target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
-                if const_expr(self.index_is_log):
-                    log_predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    predict = cute.math.exp(log_predict, fastmath=True)
-                    log_clip_mask = Float32(1.0) if log_predict >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                else:
-                    predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
+                predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
+                log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 g_i = -target_eff * log_clip_mask * grad_scale_f32
                 mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
+
+
+def _compile_score_grad(topk: int):
+    """Compile (or reuse) kernel 1 for one top-k width, from fake operands (R11)."""
+    if topk not in _score_grad_cute_cache:
+        _score_grad_cute_cache[topk] = cute.compile(
+            ScoreGradSm90(topk=topk),
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(cutlass.Float32, 3),
+            fake_cute_tensor(cutlass.Float32, 1),
+            cutlass.Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options(),
+        )
+    return _score_grad_cute_cache[topk]
 
 
 def _score_grad_inplace_cute(
@@ -1512,7 +1505,6 @@ def _score_grad_inplace_cute(
     IndexScore,
     GradLoss,
     grad_scale,
-    index_is_log: bool = False,
     current_stream=None,
 ):
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D; defend direct
@@ -1521,24 +1513,9 @@ def _score_grad_inplace_cute(
         GradLoss = GradLoss.reshape(1)
 
     _, _, topk = AttnScore.shape
-    compile_key = (topk, bool(index_is_log))
+    compiled = _compile_score_grad(topk)
     s = _resolve_stream(current_stream)
-    if compile_key not in _score_grad_cute_cache:
-        kernel_obj = ScoreGradSm90(
-            topk=topk,
-            index_is_log=bool(index_is_log),
-        )
-        _score_grad_cute_cache[compile_key] = cute.compile(
-            kernel_obj,
-            to_cute_tensor(AttnScore),
-            to_cute_tensor(IndexScore),
-            to_cute_tensor(GradLoss),
-            cutlass.Float32(float(grad_scale)),
-            s,
-            options=compile_options(),
-        )
-
-    _score_grad_cute_cache[compile_key](
+    compiled(
         AttnScore,
         IndexScore,
         GradLoss,
@@ -1552,7 +1529,6 @@ def _score_grad_inplace(
     IndexScore,
     GradLoss,
     grad_scale,
-    index_is_log: bool = False,
     current_stream=None,
 ):
     """Kernel 1: Compute clipped-log KL grad_signal from target/predict.
@@ -1586,7 +1562,6 @@ def _score_grad_inplace(
         IndexScore,
         GradLoss,
         grad_scale,
-        index_is_log=index_is_log,
         current_stream=current_stream,
     )
 
@@ -1599,7 +1574,6 @@ def _build_cute_dsl_kernel(
     topk,
     sm_scale,
     block_I,
-    score_input_is_log=True,
     topk_indices_global: bool = True,
 ):
     cap = torch.cuda.get_device_capability()[0]
@@ -1620,36 +1594,17 @@ def _build_cute_dsl_kernel(
     # ``seqlen``/``seqlen_k``/``sm_scale`` are NOT keyed: they're forwarded as
     # runtime ``cutlass.Int32``/``Float32`` args below (seqlen* unused on the
     # sparse path).
-    compile_key = (heads, dim, topk, block_I, score_input_is_log, topk_indices_global)
+    compile_key = (heads, dim, topk, block_I, topk_indices_global)
 
-    def _ensure_compiled(
-        IndexQ,
-        Weights,
-        IndexK,
-        dIndexQ,
-        dWeights,
-        dIndexK_f32,
-        GradSignal,
-        TopkIndices,
-        current_stream=None,
-    ):
-        """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
-        s = _resolve_stream(current_stream)
+    def _ensure_compiled():
+        """Compile (or reuse) the GEMM (kernel 2) from fake operands (R11).
+
+        Operands: Q/dQ (B, S_q, H, D), W/dW (B, S_q, H) and K (B, S_k, D) in
+        BF16; the FP32 dK accumulator (B, S_k, D) and grad_signal
+        (B, S_q, topk); INT32 top-k (B, S_q, topk).
+        """
         if compile_key not in _compile_cache:
-            cute_args = [
-                to_cute_tensor(t)
-                for t in [
-                    IndexQ,
-                    Weights,
-                    IndexK,
-                    dIndexQ,
-                    dWeights,
-                    dIndexK_f32,
-                    GradSignal,
-                    TopkIndices,
-                ]
-            ]
-
+            bf16, f32 = cutlass.BFloat16, cutlass.Float32
             # Pass dummy Int32 values for max_seqlen_q/k: the kernel's __call__
             # signature declares these as ``Int32 = None`` and the JIT cannot
             # cast ``None`` to ``Int32`` (raises DSLRuntimeError). They are
@@ -1657,9 +1612,16 @@ def _build_cute_dsl_kernel(
             # values here are unused but must be valid Int32.
             _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
-                *cute_args,
+                fake_cute_tensor(bf16, 4),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(bf16, 4),
+                fake_cute_tensor(bf16, 3),
+                fake_cute_tensor(f32, 3),
+                fake_cute_tensor(f32, 3),
+                fake_cute_tensor(cutlass.Int32, 3),
                 cutlass.Float32(sm_scale),
-                s,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
                 None,
                 None,
                 cutlass.Int32(seqlen),
@@ -1680,17 +1642,7 @@ def _build_cute_dsl_kernel(
     ):
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
         s = _resolve_stream(current_stream)
-        _ensure_compiled(
-            IndexQ,
-            Weights,
-            IndexK,
-            dIndexQ,
-            dWeights,
-            dIndexK_f32,
-            GradSignal,
-            TopkIndices,
-            current_stream=current_stream,
-        )
+        _ensure_compiled()
         _compile_cache[compile_key](
             IndexQ,
             Weights,
@@ -1744,7 +1696,6 @@ def _build_cute_dsl_kernel(
             IndexScore,
             GradLoss,
             grad_scale,
-            index_is_log=score_input_is_log,
             current_stream=current_stream,
         )
         _run_gemm_only(
@@ -1762,8 +1713,12 @@ def _build_cute_dsl_kernel(
             with _torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
-    _run.score_grad = partial(_score_grad_inplace, index_is_log=score_input_is_log)
+    def _precompile(d_index_k_dtype: torch.dtype):
+        """Compile every kernel ``_run`` launches; dK always accumulates in FP32."""
+        _compile_score_grad(topk)
+        _ensure_compiled()
+
     _run.gemm_only = _run_gemm_only
-    _run.score_input_is_log = score_input_is_log
+    _run.precompile = _precompile
 
     return _run

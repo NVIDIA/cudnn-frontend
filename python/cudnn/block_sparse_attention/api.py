@@ -209,11 +209,15 @@ def block_sparse_attention_forward(
     Callers must satisfy the "Sparse metadata" value ranges in
     ``docs/operations/sparse_attention/bsa.md``.
 
-    ``kpage`` selects the SM100/SM103 KPage kernels, which gather the
-    valid 16-row pages of partially occupied K/V blocks into full MMA tiles
-    (blk128, or blk64 for the forward).
+    ``kpage`` selects the KPage kernels, which gather the valid 16-row pages
+    of partially occupied K/V blocks into full MMA tiles: SM100/SM103 blk128,
+    or blk64 for the forward; SM90 blk64 forward, where adjacent query blocks
+    also share each K/V tile of their common KV blocks, and SM90 blk128, which
+    runs that kernel on the metadata's 64-row halves (padding halves dropped).
     Pass ``True`` to build the page layout from the metadata on this call, or
     a :class:`KPageLayout` from :func:`kpage_prepare_layout` to reuse one.
+    Building a layout synchronizes the host with the stream, so prefer one
+    layout built per sparse pattern and passed to every call that uses it.
     See "KPage" in ``docs/operations/sparse_attention/bsa.md`` for the contract.
     """
 
@@ -649,14 +653,18 @@ def kpage_prepare_layout(
     multiples of 128 (the rows past them become padding of the final block,
     as on the base path) or when ``block_sizes`` is omitted and the key
     sequence is not as long as the query sequence.  ``validate=False`` skips
-    the metadata contract check (one extra device readback);
+    the metadata contract check (it is read back with the table sizes, so the
+    build synchronizes the host once either way);
     ``allow_empty_block_nums`` has the forward meaning (query blocks with
     ``q2k_block_nums == 0`` get ``O = 0``, ``LSE = -inf`` and ``dQ = 0``).
     ``with_backward=True`` builds the backward tables here instead of on the
-    first backward call.  ``bwd_kv_groups`` overrides the number of Q groups
-    the backward walk of each K/V tile is split into.  With
+    first backward call.  ``bwd_kv_groups`` (SM100/SM103 only) overrides the
+    number of Q groups the backward walk of each K/V tile is split into.  On
+    SM90 a blk128 layout holds the metadata rewritten as 64-row halves, with
+    halves that hold no valid row dropped, for the blk64 kernels.  With
     ``sparse_block_size=64`` the layout serves the forward only and takes no
-    ``q_block_sizes``, ``with_backward`` or ``bwd_kv_groups``.
+    ``q_block_sizes``, ``with_backward`` or ``bwd_kv_groups``; it is built for
+    the architecture of the metadata's device (SM90 or SM100/SM103).
     """
     from . import _kpage_api
 
