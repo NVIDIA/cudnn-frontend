@@ -454,6 +454,7 @@ def build_walk_tables(
     n_walks = idx.shape[0]
 
     shared_counts = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    full_pages = torch.empty(n_walks, dtype=torch.int32, device=dev)
     from ._build_kernels import current_stream, walk_stats
 
     stream = current_stream()
@@ -463,6 +464,7 @@ def build_walk_tables(
         q_sizes,
         kv_sizes,
         shared_counts,
+        full_pages,
         stream,
     )
 
@@ -506,6 +508,7 @@ def build_walk_tables(
         kv_sizes,
         tile_off,
         shared_counts,
+        full_pages,
         full_tile_counts,
         tile_offsets_q64,
         iter_counts_q64,
@@ -575,7 +578,8 @@ def build_walk_tables_blk64(
 
     stream = current_stream()
     iter_tiles = torch.empty(n_walks, dtype=torch.int32, device=dev)
-    walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, stream, block=_BLOCK64)
+    full_pages = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, full_pages, stream, block=_BLOCK64)
     # Inclusive tile ends; WalkFill turns each into its walk's first tile in place.
     tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32)
     total_tiles = int(tile_off[-1].cpu())
@@ -598,6 +602,7 @@ def build_walk_tables_blk64(
         kv_sizes,
         tile_off,
         iter_tiles,
+        full_pages,
         full_tile_counts,
         tile_offsets,
         iter_counts,

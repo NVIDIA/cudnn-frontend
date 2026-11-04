@@ -23,7 +23,7 @@ from cudnn.block_sparse_attention.kpage._compile import compile_key as make_comp
 
 
 class WalkStats:
-    """Count the Page16 rows required by each forward walk."""
+    """Count the Page16 rows required by each forward walk, and its fully valid pages (``mFullPages``)."""
 
     def __init__(self, block: int = BLOCK):
         self.block = block
@@ -38,11 +38,13 @@ class WalkStats:
         mQSizes: cute.Tensor,
         mBlockSizes: cute.Tensor,
         mSharedCount: cute.Tensor,
+        mFullPages: cute.Tensor,
         stream: cuda.CUstream,
     ):
         @cute.struct
         class SharedStorage:
             warp_pages: cute.struct.MemRange[Int32, self.num_warps]
+            warp_full: cute.struct.MemRange[Int32, self.num_warps]
 
         self.kernel(
             mBlockIndex,
@@ -50,6 +52,7 @@ class WalkStats:
             mQSizes,
             mBlockSizes,
             mSharedCount,
+            mFullPages,
             SharedStorage,
         ).launch(
             grid=(mBlockIndex.shape[0], 1, 1),
@@ -65,6 +68,7 @@ class WalkStats:
         mQSizes: cute.Tensor,
         mBlockSizes: cute.Tensor,
         mSharedCount: cute.Tensor,
+        mFullPages: cute.Tensor,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
         walk_idx = cute.arch.block_idx()[0]
@@ -77,26 +81,34 @@ class WalkStats:
         edge_count = max(min(mBlockCount[walk_idx], cap), 0)
 
         page_count = Int32(0)
+        full_count = Int32(0)
         edge_idx = thread_idx
         while edge_idx < edge_count:
             block_idx = max(min(mBlockIndex[walk_idx, edge_idx], n_blocks - 1), 0)
             block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
             page_count += (block_rows + PAGE - 1) // PAGE
+            full_count += block_rows // PAGE
             edge_idx += self.num_threads
 
         page_count = warp_reduce(page_count, lambda x, y: x + y)
+        full_count = warp_reduce(full_count, lambda x, y: x + y)
 
         smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         warp_pages = storage.warp_pages.get_tensor(cute.make_layout(self.num_warps))
+        warp_full = storage.warp_full.get_tensor(cute.make_layout(self.num_warps))
         if lane_idx == 0:
             warp_pages[warp_idx] = page_count
+            warp_full[warp_idx] = full_count
         cute.arch.sync_threads()
 
         if warp_idx == 0:
             page_count = warp_pages[lane_idx] if lane_idx < self.num_warps else Int32(0)
             page_count = warp_reduce(page_count, lambda x, y: x + y)
+            full_count = warp_full[lane_idx] if lane_idx < self.num_warps else Int32(0)
+            full_count = warp_reduce(full_count, lambda x, y: x + y)
             if lane_idx == 0:
+                mFullPages[walk_idx] = full_count
                 q_size = Int32(64)  # blk64: every Q block is one full M64 tile (mQSizes is not read)
                 if cutlass.const_expr(self.block != 64):
                     q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
@@ -251,6 +263,7 @@ class WalkFill:
         mBlockSizes: cute.Tensor,
         mTileOffsets: cute.Tensor,
         mTileCounts: cute.Tensor,
+        mFullPages: cute.Tensor,  # [walks] fully valid pages of each walk (WalkStats)
         mFullTiles: cute.Tensor,
         mQ64Offsets: cute.Tensor,
         mQ64IterCounts: cute.Tensor,
@@ -263,7 +276,7 @@ class WalkFill:
         @cute.struct
         class SharedStorage:
             warp_pages: cute.struct.MemRange[Int32, self.num_warps]
-            stage: cute.struct.MemRange[Int32, self.num_threads * self.pages_per_block if self.staged else 1]
+            stage: cute.struct.MemRange[Int32, self.num_threads * (self.pages_per_block + 1) if self.staged else 1]
 
         self.kernel(
             mBlockIndex,
@@ -272,6 +285,7 @@ class WalkFill:
             mBlockSizes,
             mTileOffsets,
             mTileCounts,
+            mFullPages,
             mFullTiles,
             mQ64Offsets,
             mQ64IterCounts,
@@ -295,14 +309,14 @@ class WalkFill:
                 mPageTable[flat_slot // 8, flat_slot % 8] = page_id
 
     @cute.jit
-    def copy_out(self, stage: cute.Tensor, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable: cute.Tensor):
-        """Copy a chunk's staged page ids to walk positions ``page_base + i``, keeping those inside the allocation."""
+    def copy_out(self, stage: cute.Tensor, stage_base, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable: cute.Tensor):
+        """Copy ``chunk_pages`` staged page ids from ``stage_base`` to walk positions ``page_base + i`` inside the allocation."""
         idx = cute.arch.thread_idx()[0]
         while idx < chunk_pages:
             if page_base + idx < allocated_pages:
                 flat_slot = output_page_base + page_base + idx
                 if flat_slot < mPageTable.shape[0] * 8:
-                    mPageTable[flat_slot // 8, flat_slot % 8] = stage[idx]
+                    mPageTable[flat_slot // 8, flat_slot % 8] = stage[stage_base + idx]
             idx += self.num_threads
 
     @cute.kernel
@@ -314,6 +328,7 @@ class WalkFill:
         mBlockSizes: cute.Tensor,
         mTileOffsets: cute.Tensor,
         mTileCounts: cute.Tensor,
+        mFullPages: cute.Tensor,  # [walks] fully valid pages of each walk (WalkStats)
         mFullTiles: cute.Tensor,
         mQ64Offsets: cute.Tensor,
         mQ64IterCounts: cute.Tensor,
@@ -353,92 +368,67 @@ class WalkFill:
         smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         warp_pages = storage.warp_pages.get_tensor(cute.make_layout(self.num_warps))
-        stage = storage.stage.get_tensor(cute.make_layout(self.num_threads * self.pages_per_block if self.staged else 1))
+        stage = storage.stage.get_tensor(cute.make_layout(self.num_threads * (self.pages_per_block + 1) if self.staged else 1))
 
         # Keep every fully valid Page16 in one prefix. Partial Page16 tails
         # follow in stable edge order, then dummy pages fill the tile-aligned
         # suffix. This gives the attention kernel a contiguous unmasked phase.
-        page_base = Int32(0)
+        # One pass: the walk's full-page total (WalkStats) places the tails, and one scan
+        # ranks both (full pages in the low 16 bits, at most num_threads * 8 per chunk).
+        full_pages = mFullPages[walk_idx]
+        tail_stage = self.num_threads * self.pages_per_block
+        full_base = Int32(0)
+        tail_base = Int32(0)
         num_chunks = (edge_count + self.num_threads - 1) // self.num_threads
         for chunk in cutlass.range(num_chunks):
             edge_idx = chunk * self.num_threads + thread_idx
-            page_count = Int32(0)
+            full_count = Int32(0)
+            tail_count = Int32(0)
             block_idx = Int32(0)
             if edge_idx < edge_count:
                 block_idx = max(min(mBlockIndex[walk_idx, edge_idx], n_blocks - 1), 0)
                 block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
-                page_count = block_rows // PAGE
+                full_count = block_rows // PAGE
+                if block_rows - full_count * PAGE > 0:
+                    tail_count = Int32(1)
+            packed = full_count | (tail_count << 16)
 
-            page_rank = page_count
+            rank = packed
             for delta in (1, 2, 4, 8, 16):
-                other = cute.arch.shuffle_sync_up(page_rank, delta, mask_and_clamp=0)
+                other = cute.arch.shuffle_sync_up(rank, delta, mask_and_clamp=0)
                 if lane_idx >= delta:
-                    page_rank += other
-
+                    rank += other
             if lane_idx == 31:
-                warp_pages[warp_idx] = page_rank
+                warp_pages[warp_idx] = rank
             cute.arch.sync_threads()
-
-            page_rank += page_base
             for idx in cutlass.range(warp_idx):
-                page_rank += warp_pages[idx]
-            page_pos = page_rank - page_count
+                rank += warp_pages[idx]
+            before = rank - packed
+            full_rank = before & 0xFFFF
+            tail_rank = before >> 16
             first_page = block_idx * self.pages_per_block
             for page_idx in cutlass.range_constexpr(self.pages_per_block):
-                if page_count > page_idx:
+                if full_count > page_idx:
                     if cutlass.const_expr(self.staged):
-                        stage[page_pos - page_base + page_idx] = first_page + page_idx
+                        stage[full_rank + page_idx] = first_page + page_idx
                     else:
-                        self.write_page(page_pos + page_idx, first_page + page_idx, allocated_pages, output_page_base, mPageTable)
-            chunk_pages = Int32(0)
-            for idx in cutlass.range(self.num_warps):
-                chunk_pages += warp_pages[idx]
-            if cutlass.const_expr(self.staged):
-                cute.arch.sync_threads()
-                self.copy_out(stage, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable)
-            page_base += chunk_pages
-            cute.arch.sync_threads()
-
-        full_pages = page_base
-        for chunk in cutlass.range(num_chunks):
-            edge_idx = chunk * self.num_threads + thread_idx
-            page_count = Int32(0)
-            block_idx = Int32(0)
-            tail_page_idx = Int32(0)
-            if edge_idx < edge_count:
-                block_idx = max(min(mBlockIndex[walk_idx, edge_idx], n_blocks - 1), 0)
-                block_rows = max(min(mBlockSizes[block_idx], self.block), 0)
-                tail_page_idx = block_rows // PAGE
-                if block_rows - tail_page_idx * PAGE > 0:
-                    page_count = Int32(1)
-
-            page_rank = page_count
-            for delta in (1, 2, 4, 8, 16):
-                other = cute.arch.shuffle_sync_up(page_rank, delta, mask_and_clamp=0)
-                if lane_idx >= delta:
-                    page_rank += other
-
-            if lane_idx == 31:
-                warp_pages[warp_idx] = page_rank
-            cute.arch.sync_threads()
-
-            page_rank += page_base
-            for idx in cutlass.range(warp_idx):
-                page_rank += warp_pages[idx]
-            page_pos = page_rank - page_count
-            if page_count > 0:
+                        self.write_page(full_base + full_rank + page_idx, first_page + page_idx, allocated_pages, output_page_base, mPageTable)
+            if tail_count > 0:
                 if cutlass.const_expr(self.staged):
-                    stage[page_pos - page_base] = block_idx * self.pages_per_block + tail_page_idx
+                    stage[tail_stage + tail_rank] = first_page + full_count
                 else:
-                    self.write_page(page_pos, block_idx * self.pages_per_block + tail_page_idx, allocated_pages, output_page_base, mPageTable)
-            chunk_pages = Int32(0)
+                    self.write_page(full_pages + tail_base + tail_rank, first_page + full_count, allocated_pages, output_page_base, mPageTable)
+            chunk_packed = Int32(0)
             for idx in cutlass.range(self.num_warps):
-                chunk_pages += warp_pages[idx]
+                chunk_packed += warp_pages[idx]
             if cutlass.const_expr(self.staged):
                 cute.arch.sync_threads()
-                self.copy_out(stage, chunk_pages, page_base, allocated_pages, output_page_base, mPageTable)
-            page_base += chunk_pages
+                self.copy_out(stage, 0, chunk_packed & 0xFFFF, full_base, allocated_pages, output_page_base, mPageTable)
+                self.copy_out(stage, tail_stage, chunk_packed >> 16, full_pages + tail_base, allocated_pages, output_page_base, mPageTable)
+            full_base += chunk_packed & 0xFFFF
+            tail_base += chunk_packed >> 16
             cute.arch.sync_threads()
+        page_base = full_pages + tail_base
 
         dummy_page = page_base + thread_idx
         zero_page = n_blocks * self.pages_per_block
@@ -2176,13 +2166,14 @@ def walk_stats(
     q_sizes: Tensor,
     block_sizes: Tensor,
     shared_count: Tensor,
+    full_pages: Tensor,
     stream: cuda.CUstream = None,
     block: int = BLOCK,
 ) -> None:
     _run_metadata_kernel(
         f"kpage_walk_stats_blk{block}",
         WalkStats(block),
-        (block_index, block_count, q_sizes, block_sizes, shared_count),
+        (block_index, block_count, q_sizes, block_sizes, shared_count, full_pages),
         walk_stats.compile_cache,
         stream,
     )
@@ -2226,6 +2217,7 @@ def walk_fill(
     block_sizes: Tensor,
     tile_offsets: Tensor,
     tile_counts: Tensor,
+    full_pages: Tensor,
     full_tiles: Tensor,
     q64_offsets: Tensor,
     q64_iter_counts: Tensor,
@@ -2247,6 +2239,7 @@ def walk_fill(
             block_sizes,
             tile_offsets,
             tile_counts,
+            full_pages,
             full_tiles,
             q64_offsets,
             q64_iter_counts,
