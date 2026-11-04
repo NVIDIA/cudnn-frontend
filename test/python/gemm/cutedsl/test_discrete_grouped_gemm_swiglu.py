@@ -466,7 +466,9 @@ def test_discrete_vs_contiguous_match(ab_dtype, d_dtype, sf_vec_size, sf_dtype, 
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     major, _ = torch.cuda.get_device_capability()
-    if major < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Requires SM100+, found SM{major}0")
 
     from core.cutedsl.test_fe_api_utils import create_and_permute_tensor, create_scale_factor_tensor
