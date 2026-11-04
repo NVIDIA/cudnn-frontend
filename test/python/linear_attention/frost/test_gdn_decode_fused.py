@@ -123,6 +123,53 @@ def test_default_form_switches_where_the_grid_outgrows_the_sms(sm_count):
         kcfg.default_cfg(1, 0)
 
 
+def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count():
+    """The cc 10.0 readings, explicit and as the defaults: the capped form IS two per SM there (three footprints by shared memory, two by
+    the cap), so the pick is PAIR_CFG / CFG / CAPPED_CFG by the SM-count rule alone at every rows count -- the byte-identity pin of the
+    budget-aware pick with the measured cc 10.0 pick, over six SM counts."""
+    per_sm, optin = SM100_READING
+    for sms in (84, 148, 152, 170, 188, 212):
+        for rows in range(1, 17):
+            want = kcfg.PAIR_CFG if rows * 96 <= sms else (kcfg.CFG if rows * 48 <= sms else kcfg.CAPPED_CFG)
+            assert kcfg.default_cfg(rows, sms) == kcfg.default_cfg(rows, sms, per_sm, optin) == want, (sms, rows)
+    assert kcfg.default_cfg(2, 212) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 212) == kcfg.CFG and kcfg.default_cfg(5, 212) == kcfg.CAPPED_CFG
+    assert kcfg.default_cfg(1, 84) == kcfg.CFG and kcfg.default_cfg(2, 84) == kcfg.CAPPED_CFG  # 84 SMs hold no 96-CTA cluster grid
+    assert kcfg.first_fitting(kcfg.ONE_CTA_FORMS) == kcfg.CFG and kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.CAPPED_CFG
+    assert kcfg.admissible(kcfg.CAPPED_CFG) and kcfg.admissible(kcfg.STREAMED_CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
+    assert (kcfg.PAIR_FORMS, kcfg.ONE_CTA_FORMS, kcfg.BEYOND_FORMS) == ((kcfg.PAIR_CFG,), (kcfg.CFG,), (kcfg.CAPPED_CFG, kcfg.CFG))
+    assert kcfg.part_readings(per_sm, optin) == _on(SM100_READING)
+
+
+def test_default_cfg_on_the_cc120_reading_never_picks_a_cap_the_part_cannot_use():
+    """The cc 12.0 readings (100 KB per SM, 99 KB opt-in) on 170 / 188 SMs: rows 1 the pair, rows 2 and up the one-CTA form -- two waves
+    from rows 4 rather than CAPPED_CFG / STREAMED_CFG, whose cap keeps nothing co-resident on a 100 KB SM and spills; on 84 SMs the
+    one-CTA form at every rows count; a part no form fits is the typed decline naming its opt-in."""
+    per_sm, optin = SM120_READING
+    for sms in (170, 188):
+        assert kcfg.default_cfg(1, sms, per_sm, optin) == kcfg.PAIR_CFG
+        for rows in range(2, 65):
+            assert kcfg.default_cfg(rows, sms, per_sm, optin) == kcfg.CFG, (sms, rows)
+    for rows in range(1, 17):
+        assert kcfg.default_cfg(rows, 84, per_sm, optin) == kcfg.CFG, rows
+    assert not kcfg.admissible(kcfg.CAPPED_CFG, per_sm, optin) and not kcfg.admissible(kcfg.STREAMED_CFG, per_sm, optin)
+    assert kcfg.admissible(kcfg.CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
+    assert kcfg.admissible(
+        kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2), per_sm, optin
+    ), "the one capped form two of which share a 100 KB SM"
+    assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.CFG
+    for call in (
+        lambda: kcfg.default_cfg(1, 170, 40960, 40000),
+        lambda: kcfg.default_cfg(4, 170, 40960, 40000),
+        lambda: kcfg.first_fitting(kcfg.ONE_CTA_FORMS, 40960, 40000),
+    ):
+        with pytest.raises(NotImplementedError, match="40000-byte shared-memory opt-in per CTA .* holds no decode form"):
+            call()
+    with pytest.raises(ValueError, match="cannot exceed the SM"):
+        kcfg.default_cfg(1, 170, 100000, 200000)
+    with pytest.raises(ValueError, match="smem_optin"):
+        kcfg.default_cfg(1, 170, per_sm, 0)
+
+
 def test_cudnn_level_export_resolves_to_the_entry():
     assert cudnn.GdnDecodeFused is entry.GdnDecodeFused, "the lazy cudnn-level export (import cudnn; cudnn.GdnDecodeFused) is the entry class"
 
