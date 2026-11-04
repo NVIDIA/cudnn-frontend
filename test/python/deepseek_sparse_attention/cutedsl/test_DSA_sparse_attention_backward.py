@@ -3196,7 +3196,9 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("sink-normalization regression test targets the SM100 kernel")
     if num_heads == 128 and (major, minor) not in _TWO_CTA_CAPABILITIES:
         # The H128 case covers the D576 two-CTA route; elsewhere H128/D576 runs
@@ -3292,7 +3294,9 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
     if not torch.cuda.is_available():
         pytest.skip("SM90+ GPU required")
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 90:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if major != 9 and not has_tcgen05(major):
         pytest.skip("sparse attention backward requires SM90+")
     if num_heads == 128 and head_dim == 512:
         _require_sm100_family()
@@ -4255,7 +4259,9 @@ def test_DSA_sparse_attention_backward_sm100_partial_max_topk(num_heads, s_kv, t
     if not torch.cuda.is_available():
         pytest.skip("SM100 GPU required")
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("dedicated H16/H32 regression test targets the SM100 kernel")
 
     try:
@@ -4480,7 +4486,9 @@ def test_DSA_sparse_attention_backward_staged_store():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("staged-store regression test targets the SM100 kernel")
 
     s_q = s_kv = 512
