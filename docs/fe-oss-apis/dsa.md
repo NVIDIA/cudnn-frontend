@@ -247,6 +247,46 @@ with a helper kernel. With the default `deterministic=False`, short query
 batches split each query's top-k range across otherwise idle two-SM clusters;
 the split count is fixed when the plan is compiled.
 
+On SM90, `deterministic=True` uses a row-aware relay with logical cluster size
+`C in {4, 8, 16, 32, 64}` for H16/H32/H64/H96/H128. The public
+`deterministic_relay_cluster_size` argument selects `C` and defaults to 16.
+Each 128-query wave gives one FP32 dKV plane to every logical relay group. C4,
+C8, and C16 launch one physical cluster per group; C32 and C64 run each group
+as two or four same-stream physical C16 phases. Kernel completion orders phase
+reuse without making a CTA wait for a nonresident cluster. A setup kernel builds
+packed `C`-bit rank masks for every referenced
+`(query wave, M64 head tile, KV row)`. A relay CTA waits only for lower logical
+ranks that actually update the same row; a 128-thread WG1
+barrier carries the acquired visibility to every reducer lane, and the matching
+barrier publishes all relaxed FP32 reductions before one lane release-clears
+that rank's ownership bit at GPU scope when a successor exists. Head tiles and
+later query waves are stream-ordered, while disjoint sparse rows within a
+cluster can progress independently. The postprocess kernel combines the
+`128 / C` planes in fixed order, and one warp per head computes `d_sink` with a
+fixed strided-lane/tree reduction order. Duplicate valid top-k indices within
+one query row remain outside this deterministic contract.
+
+The SM90 deterministic dKV allocation is
+`(128 / C) * (K64 + mask_rows) * D32 * sizeof(float)`, where
+`K64 = round_up(total_S_kv, 64)`, `D32 = round_up(D, 32)`, and
+`mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
+(K64 / (mask_bits / C)) * (mask_bits / 32) / D32)`, where `mask_bits` is
+64 for C64 and 32 otherwise.
+The caller-owned workspace is cleared and the masks are rebuilt on every
+execution, so changing `topk_idxs` or `topk_length` between launches is safe.
+After one eager execution populates the SM90 concrete-tensor compile caches,
+the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
+the declared tensor shapes and addresses fixed while allowing tensor contents,
+including `topk_idxs` and `topk_length`, to change.
+On the target H200 sweep (BF16 H64 D576/Dv512, KV=65536, top-k 2048), C16
+measured 1.47--1.54x the non-deterministic latency with 1.13--1.26 GiB of
+workspace and remains the conservative default. C32 measured 1.34--1.37x
+with 0.57--0.70 GiB, the best time/memory point in that workload. C64 reduced
+workspace further to 0.29--0.41 GiB, but four sequential physical phases
+raised latency to 2.30--2.37x non-deterministic. C32 and C64 are therefore
+explicit workload-specific choices rather than the automatic default; the
+full table and environment are recorded in `benchmark/dsa/README.md`.
+
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
 same-stream waves of at most 74 query tokens, with one two-CTA pair per query.
@@ -393,8 +433,10 @@ declared tensor shapes and storage addresses while their contents may change.
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
 requirement on every backend: the SM100 FP32 statistics and dKV-accumulator
 planes, and on SM90 the FP32 dPsum and log2-scaled LSE vectors plus the dKV
-accumulator (`2 * align128(round64(total_S_q) * H * 4) +
-align128(round64(total_S_kv) * round32(D) * 4)` bytes). Pass a contiguous CUDA
+accumulator. The ordinary SM90 dKV term is
+`align128(round64(total_S_kv) * round32(D) * 4)` bytes; deterministic SM90 uses
+the selected relay term above. Both add
+`2 * align128(round64(total_S_q) * H * 4)` bytes of statistics. Pass a contiguous CUDA
 `uint8` tensor of at least this size to `execute(..., workspace=workspace)` and
 reuse it across calls; the launch sequence re-initializes the accumulators on
 every execution (in-kernel on SM100, and with one stream-ordered memset for the
@@ -419,7 +461,7 @@ result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
-    deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
+    deterministic=True,  # optional; SM90/SM100 H16/H32/H64/H96/H128
     deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, 32, or 64 CTAs/group
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
