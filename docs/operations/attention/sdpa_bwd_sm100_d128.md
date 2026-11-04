@@ -1,4 +1,4 @@
-# SDPA backward, d = 64 or 128 (SM100)
+# SDPA backward, d = 64 or 128 (SM100 line and Rubin)
 
 The opt-in `sdpa_bwd_sm100_d128` engine serves dense multi-head attention with
 BF16 or FP16 inputs and gradients, compact BSHD physical storage, and
@@ -7,8 +7,9 @@ unmasked or top-left causal attention, and a left sliding window, including
 rectangular query and key/value lengths allowed by the shared graph contract.
 Packed THD MHA supports both dtypes at D128. Dense and THD GQA/MQA support
 BF16 at D128, without sliding windows. Packed
-and grouped paths require SM100 or SM103 (cc 10.0 or 10.3), CuTeDSL 4.8 or newer and
-positive FP32 attention scale. Grouped dense lengths must be multiples of 128;
+and grouped paths require SM100, SM103 or SM107 (cc 10.0, 10.3 or 10.7), CuTeDSL 4.8 or newer (a build with the
+`sm_107a` target on cc 10.7) and positive FP32 attention scale. The same kernels serve every admitted part; the compile
+target follows the device. Grouped dense lengths must be multiples of 128;
 packed grouped lengths may have tails or empty actual sequences. Other masks,
 bias, sinks and dropout are declined. Dense MHA supports deterministic requests;
 the packed and grouped paths still decline them.
@@ -22,7 +23,7 @@ graph.execute(variant_pack, workspace)
 ```
 
 Plan construction selects the implementation from declarations and the build
-device. On SM100 or SM103 with public CuTeDSL 4.8 or newer and a positive attention
+device. On SM100, SM103 or SM107 with public CuTeDSL 4.8 or newer and a positive attention
 scale and no deterministic request, the D64 and D128 MHA three-kernel chain (D128 without a sliding window, D64 with or without one) computes the row delta while initializing FP32 dQ
 scratch, accumulates dQ and writes dK/dV, then converts dQ to the output type.
 Sequence lengths need not be multiples of 128: the tail tiles' loads are zero-filled,
@@ -70,8 +71,8 @@ initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
 atomic accumulation does not promise bitwise repeatability.
 
-The three-kernel implementation is selected for D64, and for D128 without a window, on SM100 and SM103 when determinism is not requested. Existing support
-on other pre-Rubin Blackwell devices retains the previous implementation.
+The three-kernel implementation is selected for D64, and for D128 without a window, on SM100, SM103 and SM107 when determinism is not requested. Existing support
+on other Blackwell devices in the row's range retains the previous implementation.
 The engine remains opt-in while performance qualification proceeds.
 
 For packed THD, declare positive `max_total_seq_len_q` and
@@ -90,7 +91,7 @@ workspace size. Execution reads lengths and offsets on the device and
 performs no allocation, tensor conversion or host read of metadata. Gradient
 outputs and workspace must also be disjoint from all metadata operands.
 Declared capacities must be positive even when every actual sequence is
-empty. This path requires cc 10.0 or 10.3 and both scale and scale*log2(e)
+empty. This path requires cc 10.0, 10.3 or 10.7 and both scale and scale*log2(e)
 finite and positive in FP32.
 
 GQA/MQA requires `Hq > Hkv > 0` and an integral `Hq/Hkv`; ratios need not
@@ -107,6 +108,23 @@ writes each dK/dV port at its independent declared origin. Dense grouped
 execution has four launches; packed grouped execution has five. Their dQ
 scratch, device metadata, alias checks, rebinding and capture contract match
 the corresponding MHA plan. Always query workspace size from the plan.
+
+Grouped BF16 GQA/MQA at long sequence lengths on cc 10.0 / 10.3 / 10.7 (SM100 / SM103 / SM107)
+may be served by a two-CTA pair implementation (one cluster of two CTAs per 256-row
+KV block) instead of the one-CTA grouped body, on packed THD and on dense compact
+BSHD declarations alike. The op-level field `cta_pair` on the adapter selects it:
+`auto` (the default) uses the pair when both declared `S_q` and `S_kv` are at least
+8192 and the device admits a cluster of two, `off` always uses the one-CTA body, and
+`on` uses the pair at any sequence length and raises a typed error naming the
+failing predicate (layout, compute capability, cluster admission, grouped heads)
+otherwise. The pair implementations (`accumulation_grouped_thd_2cta` on packed THD,
+`accumulation_grouped_dense_2cta` on dense compact BSHD) keep the grouped contract:
+the same inputs, outputs and declaration requirements as the one-CTA grouped body of
+the layout (dense: compact BSHD storage, contiguous FP32 Stats, lengths that are
+multiples of 128, BF16), a workspace sized like the packed grouped chain (the dense
+twin's packed capacities are `B * S_q` and `B * S_kv`), five launches, and dQ accumulated
+in FP32 without ordering guarantees. Always query the plan's workspace size. The dense
+twin's dK/dV are bitwise the packed chain's for the same per-sequence data.
 
 Grouped support and packed support do not imply performance parity with
 another backend; that qualification is a separate step.
