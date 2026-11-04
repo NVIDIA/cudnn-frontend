@@ -77,6 +77,7 @@ def _build_nvfp4_graph(
     b_major="k",
     reorder=True,
     out_major="n",
+    negative_scale=(False, False),
 ):
     sf_k = K // block_size
     sf_m, sf_n = M, N
@@ -111,8 +112,9 @@ def _build_nvfp4_graph(
         data_type=sf_dt,
         **sf_kw,
     )
-    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, block_size])
-    Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[block_size, 1])
+    # ``negative_scale`` = (A side, B side); None leaves is_negative_scale unset.
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, block_size], is_negative_scale=negative_scale[0] or None)
+    Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[block_size, 1], is_negative_scale=negative_scale[1] or None)
     C = g.matmul(A=Ad, B=Bd, name="mm")
     if out_major == "m":
         C.set_stride([M * N, 1, M])
@@ -3703,11 +3705,10 @@ def test_sm120_fp4_rejects_non_k_major():
 
 
 _SM120_MXFP8 = dict(block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3)
+_SM100_BS_128 = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
 
 
-@requires_sm120
-@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
-def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+def _check_mxfp8_partial_scale_block_graph_is_declined(config_name, K, a_major, b_major):
     """MXFP8 scales whole 32-element K blocks, yet only the 16-byte TMA rule gated K: K % 16 for
     a K-major fp8 operand, nothing for M-major A with N-major B. A K ending inside a scale block
     planned, and the kernel -- whose F8_128x4 scale-factor view holds floor(K / 32) scales per row
@@ -3715,17 +3716,28 @@ def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
     (audit finding B01: at M = N = 256, K = 144, 54025 of 65536 outputs wrong)."""
     g = _build_nvfp4_graph(256, 256, K, a_major=a_major, b_major=b_major, **_SM120_MXFP8)
     with pytest.raises(NotImplementedError, match="not a multiple of the scale block size 32"):
-        jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+        jit_from_cudnn_graph(g, **_kw(config_name))
 
 
 @requires_sm120
-def test_sm120_mxfp8_partial_scale_block_call_is_refused():
+@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
+def test_sm120_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+    _check_mxfp8_partial_scale_block_graph_is_declined(_SM120_BS_128, K, a_major, b_major)
+
+
+@requires_sm100
+@pytest.mark.parametrize("K,a_major,b_major", [(144, "k", "k"), (130, "m", "n")], ids=["k_major", "mn_major"])
+def test_sm100_mxfp8_partial_scale_block_graph_is_declined(K, a_major, b_major):
+    _check_mxfp8_partial_scale_block_graph_is_declined(_SM100_BS_128, K, a_major, b_major)
+
+
+def _check_mxfp8_partial_scale_block_call_is_refused(config_name):
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
     inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
     M = N = 256
     g = _build_nvfp4_graph(M, N, 160, **_SM120_MXFP8)
     _, binding = analyze_with_binding(g)
-    compiled = jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
     torch.manual_seed(0)
 
     def call(K):
@@ -3756,3 +3768,55 @@ def test_sm120_mxfp8_partial_scale_block_call_is_refused():
     torch.cuda.synchronize()
     assert torch.all(c == 7.0)
     assert dict(compiled.deferrals) == {"partial scale block": 1}
+
+
+@requires_sm120
+def test_sm120_mxfp8_partial_scale_block_call_is_refused():
+    _check_mxfp8_partial_scale_block_call_is_refused(_SM120_BS_128)
+
+
+@requires_sm100
+def test_sm100_mxfp8_partial_scale_block_call_is_refused():
+    _check_mxfp8_partial_scale_block_call_is_refused(_SM100_BS_128)
+
+
+def test_sm120_analyze_graph_declines_signed_negative_scale():
+    """Host-only, so every lane runs it: the sm120 tree's ``_analyze_graph`` declines
+    ``is_negative_scale=True`` on either operand's E4M3 scales before any architecture-dependent
+    step. The same graph without it, and a flagged E8M0 graph (no sign bit), pass the analysis."""
+    for side in ("SFA", "SFB"):
+        flagged = _build_nvfp4_graph(256, 256, 512, negative_scale=(side == "SFA", side == "SFB"))
+        with pytest.raises(NotImplementedError, match=f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"):
+            C120._analyze_graph(flagged)
+    C120._analyze_graph(_build_nvfp4_graph(256, 256, 512))
+    C120._analyze_graph(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
+
+
+@requires_sm120
+def test_sm120_block_scale_declines_signed_negative_scale():
+    """``is_negative_scale=True`` asks for ``x * s`` with signed E4M3 scales, but the sm120 block-scale
+    MMA reads every scale as unsigned ``.ue4m3`` and ignores the sign bit: the plan ran and returned
+    ``x * |s|``. The FROST engine and the direct JIT decline the attribute on either operand's E4M3
+    scales, and the front door offers the graph no frost_gemm plan; the same graph without it, and a
+    flagged E8M0 graph (no sign bit), keep their plans."""
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+
+    engine = FrostGemmEngine()
+    for side in ("SFA", "SFB"):
+        flagged = _build_nvfp4_graph(256, 256, 512, negative_scale=(side == "SFA", side == "SFB"))
+        match = f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"
+        with pytest.raises(NotImplementedError, match=match):
+            engine.check_support(flagged)
+        with pytest.raises(NotImplementedError, match=match):
+            jit_from_cudnn_graph(flagged, **_kw(_SM120_BS_128))
+    engine.check_support(_build_nvfp4_graph(256, 256, 512))
+    engine.check_support(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
+    g = _build_nvfp4_graph(256, 256, 512, negative_scale=(True, True))
+    g.validate()
+    g.build_operation_graph()
+    try:
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError as exc:  # no backend plan either: the error names the decline
+        assert "is_negative_scale=True" in str(exc)
+    else:
+        assert not any(g.get_plan_name_at_index(i).startswith("frost_gemm") for i in range(g.get_execution_plan_count()))

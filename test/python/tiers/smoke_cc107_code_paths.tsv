@@ -85,7 +85,7 @@ sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_dense_en
 sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Mxfp8::test_sm107_mxfp8_rebind[output_dtype0-128-128-dtype0-False-False]	prepared mxfp8 rebind
 sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Mxfp8::test_sm107_mxfp8_capture[dtype0-128-128]	prepared mxfp8 capture
 sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedBlockOutput::test_rebind_and_replay[False-False-dtype0-16-False-True]	prepared block-scaled output replay
-sdpa/frost/test_sdpa_fp8_sm107.py::TestStagedSm107Mxfp8::test_fp8_output[1-128-128]	staged mxfp8 fp8 output
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeSm107Mxfp8Strides::test_fp8_output[1-128-128]	native strided mxfp8 fp8 output
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[none-e4m3]	mxfp8 fwd d128 dense
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[causal-e5m2]	mxfp8 fwd d128 causal e5m2
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[swa-e4m3]	mxfp8 SWA
@@ -240,6 +240,8 @@ gated_attention_block/cutedsl/test_sigmoid_gate_bwd.py::test_gate_bwd_fp8_og_is_
 gated_attention_block/cutedsl/test_elementwise.py::test_sigmoid_gate_matches_torch[37-4-128-dtype0]	elementwise gate
 gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_prologue_is_bitwise_the_standalone_launches[1000-norm]	fused fp8 bwd prologue
 gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_epilogue_is_bitwise_the_standalone_launches[amax-cast-only]	fused fp8 bwd epilogue
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q[1-6]	gated block DECODE form, the FP8-projection + bf16-attention mode | FP8 forced-tile GEMMs with the alpha epilogue | the bf16 decode tile packed + the gate in the split combine | quantize_o | the write-through fold
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_fp8_proj_bf16_attention_extend_matrix_cell[hnd-16]	gated block EXTEND form, the FP8-projection + bf16-attention mode | FP8 forced-tile GEMMs | the bf16 paged THD body | the separate gate | quantize_o | the separate cache write
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]	graph suite fwd (FROST-routed where claimed)
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]	graph suite bwd
 sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]	graph suite decode
@@ -315,7 +317,7 @@ sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_contiguous_shapes_and_dea
 sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_native_graph_rebind_and_replay[bfloat16-128-1-False]	rule: first L0 cell of test_sink_native_graph_rebind_and_replay
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_envelopes_fresh_storage_and_replay[bfloat16-1-128-128]	rule: first L0 cell of test_sm120_native_graph_envelopes_fresh_storage_and_replay
 sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_sinks[248-256]	rule: first L0 cell of test_sm120_native_graph_sinks
-sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125-False--0.5-0-False-bfloat16]	rule: first L0 cell of test_sm80_actual_host_frame_matches_python
+sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125--0.5-0-False-bfloat16]	rule: first L0 cell of test_sm80_actual_host_frame_matches_python
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_dense_permutation_frames_match_python[False-permutation0-bfloat16]	rule: first L0 cell of test_dense_permutation_frames_match_python
 sdpa/frost/test_sdpa_native_sm90_binding.py::test_thd_fixed_batch_and_tensor_map_alignment	rule: first L0 cell of test_thd_fixed_batch_and_tensor_map_alignment
 sdpa/frost/test_sdpa_native_split_binding.py::test_native_split_frames_match_python_and_rebind[2-128-1-False-False-False-False-bfloat16]	rule: first L0 cell of test_native_split_frames_match_python_and_rebind
@@ -337,11 +339,11 @@ sdpa/frost/test_sdpa_prepared_thd.py::test_dense_layout_rule_covers_every_tma_gl
 sdpa/frost/test_sdpa_python_validate.py::test_alibi_requires_causal	rule: first L0 cell of test_alibi_requires_causal
 sdpa/frost/test_sdpa_python_validate.py::test_bottom_right_causal_with_bias	rule: first L0 cell of test_bottom_right_causal_with_bias
 sdpa/frost/test_sdpa_sm80_packed_init.py::test_initializer_rebinds_counts_and_preserves_guards[2]	rule: first L0 cell of test_initializer_rebinds_counts_and_preserves_guards
-sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_block_output_matches_native_graph[dtype0-16]	rule: first L0 cell of test_staged_block_output_matches_native_graph
-sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_paged_qo_preserves_kv_pool_views[1-False]	rule: first L0 cell of test_staged_paged_qo_preserves_kv_pool_views
-sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_has_no_execute_allocations_and_replays_current_storage[1-dtype0-128-128]	rule: first L0 cell of test_half_staged_has_no_execute_allocations_and_replays_current_storage
-sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_preserves_native_operands_and_split_output[1-converted0]	rule: first L0 cell of test_half_staged_preserves_native_operands_and_split_output
-sdpa/frost/test_sdpa_staged_forward_mxfp8.py::test_mxfp8_staged_block_output_matches_native_graph[dtype0-16]	rule: first L0 cell of test_mxfp8_staged_block_output_matches_native_graph
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeFp8Strides::test_native_block_output_matches_native_graph[dtype0-16]	native stride regression
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeFp8Strides::test_native_paged_qo_preserves_kv_pool_views[1-False]	native stride regression
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeHalfStrides::test_current_storage[1-dtype0-128-128]	native stride regression
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeHalfStrides::test_mixed_layout[1-padded_roles0]	native stride regression
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeSm107Mxfp8Strides::test_block_output[dtype0-16]	native stride regression
 sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_quantized_thd_tensormaps_rebind_and_replay[e4m3-d128_fp8]	rule: first L0 cell of test_quantized_thd_tensormaps_rebind_and_replay
 sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_thd_tensormaps_rebind_and_replay[bf16-d128_cga2]	rule: first L0 cell of test_thd_tensormaps_rebind_and_replay
 sdpa/frost/test_sdpa_torch_varlen_metadata.py::test_frost_torch_auxiliary_metadata_rebind_and_replay[False-lengths]	rule: first L0 cell of test_frost_torch_auxiliary_metadata_rebind_and_replay

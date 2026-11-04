@@ -282,7 +282,15 @@ b7643bd54521f563b839b98289b5cd048c062ba2:
 - python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head64.py
 - python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head128_small_topk.py
 
-The derived kernel files retain the upstream copyright notice.
+The SM90 sparse-prefill CuTe DSL kernel is adapted primarily from FlashMLA's
+Hopper sparse-prefill implementation, pinned to commit
+4f38f29ef6793c228363e4af5be66d44e81167ba:
+
+- python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm90.py
+
+The derived kernel files retain the upstream copyright notice. The SM90 port
+adds wider H coverage, arbitrary logical K boundary handling, bounded symbolic
+compilation, and an allocation-free CUDA Graph prepared-execution contract.
 
 License: MIT License
 

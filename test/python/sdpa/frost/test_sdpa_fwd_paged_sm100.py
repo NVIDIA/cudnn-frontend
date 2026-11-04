@@ -1999,7 +1999,8 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", *rel.split("/"))
     params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=cta_mma)
-    with pytest.raises(ValueError, match="paged_kv is not wired"):
+    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/prefill_d128_fp8.py" else "paged_kv is not wired"
+    with pytest.raises(ValueError, match=expected_error):
         load_template(path, params, tag=f"paged_unwired_probe_{rel.replace('/', '_')}")
 
 
@@ -2919,7 +2920,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"
     assert not _offers(_plans(128, d_qk=64, d_v=64)), "MXFP8 is exact-native: no d64 envelope"
-    assert not _offers(_plans(128, q_bhsd=True, s_q=4)), "the MXFP8 row serves BSHD-physical Q/O only (at s_q == 1 the layouts coincide)"
+    assert _offers(_plans(128, q_bhsd=True, s_q=4)), "BHSD Q/O bind natively when s_q > 1 too"
     assert _offers(_plans(128, mixed_layout=True)), "K and V layout kinds are independent"
 
 

@@ -122,6 +122,11 @@ def _emit_reduction_atomic(
     return lines
 
 
+# The MoE templates bind the routed rows their groups cover (the final first_token_offset, at most
+# the routed capacity) under this name; an ungrouped AVG over the token axis divides by it.
+_MOE_USED_ROWS = "moe_used_rows"
+
+
 def _emit_reduction_atomic_body(
     tap_idx: int,
     red_idx: int,
@@ -136,7 +141,7 @@ def _emit_reduction_atomic_body(
     src = f"_red_{red_idx}_src"
     lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     if red.mode == "avg":
-        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain))
+        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain, token_extent=_MOE_USED_ROWS))
     if red.dim[2] == 1:
         combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)

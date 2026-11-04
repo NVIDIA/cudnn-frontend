@@ -391,6 +391,23 @@ def assert_block_scale_reduction_close(actual, expected, mode):
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
 
 
+# --- integer output reference ------------------------------------------------
+
+# Ties, fractions, both int8 / uint8 range edges, values past the int16 range and non-finite values, all exact in bf16.
+INT8_STORE_VALUES = (0.5, -0.5, 1.5, 2.5, -2.5, 2.75, -2.75, 126.5, 127.5, -127.5, 128.0, -129.0, 200.0, 255.0, 256.0, 300.0, -300.0, 40960.0, -40960.0) + (
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+)
+
+
+def int8_store_ref(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """What cuDNN's native engines store for an int8 / uint8 output (cvt.rni.sat):
+    round half to even, saturate to the dtype's range (inf included), NaN -> 0."""
+    info = torch.iinfo(out_dtype)
+    return torch.nan_to_num(x.float(), nan=0.0).round().clamp(info.min, info.max).to(out_dtype)
+
+
 # --- shared MoE fixtures -----------------------------------------------------
 
 # Explicit boundaries for 36 groups (BxE > E) shared by the MoE grouped tests.

@@ -363,7 +363,7 @@ def make_parser(description: str, default_shape: str, configs_help: str) -> argp
     parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_implementation", choices=("frost", "cudnn"), help=argparse.SUPPRESS)
     parser.add_argument("--_tile-config", help=argparse.SUPPRESS)
-    parser.add_argument("-v", "--verbose", action="store_true", help="If enabled, print more debug messages")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print worker output, kernel timings, and full failure diagnostics")
     return parser
 
 
@@ -401,6 +401,8 @@ def run_sweep(
     except RuntimeError as exc:
         if not allow_missing_cudnn:
             raise
+        if args.verbose:
+            print(str(exc), file=sys.stderr, flush=True)
         lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
         message = lines[-1] if lines else type(exc).__name__
         print(f"  [native cuDNN baseline unavailable: {message[:160]}]", flush=True)
@@ -415,6 +417,8 @@ def run_sweep(
             if args.verbose:
                 print_kernel_breakdown(config_name, stats, args.iters)
         except RuntimeError as exc:
+            if args.verbose:
+                print(str(exc), file=sys.stderr, flush=True)
             lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
             message = lines[-1] if lines else type(exc).__name__
             result = BenchmarkResult(config_name, float("inf"), error=message[:160])

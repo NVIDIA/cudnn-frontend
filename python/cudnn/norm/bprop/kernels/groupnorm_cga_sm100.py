@@ -42,7 +42,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, sm_count, smem_capacity
+from cudnn.norm.utils import ws_bytes, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, sm_count, smem_capacity
 
 from .groupnorm_fast_sm100 import _gn_bwd_finalize_kernel, _vec_for, red_scratch_len
 
@@ -115,6 +115,25 @@ def cga_cfg(spec, eb):
     per = (NVS + cga - 1) // cga
     ks = min(per, max(1, _STAGE_CAP // (2 * bt * V * eb)))
     return V, bt, cga, ncta_rows, per, ks, NVS
+
+
+def _ffi_fakes(et):
+    """Compile-time placeholders of (dy, x, dx, gamma, mean, rstd, dgamma partials, dbeta partials, dgamma, dbeta): flat
+    operands whose lengths are dynamic symbols, so the tvm-ffi entry binds any row count."""
+    io, stat, part, g = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
+    f32 = cutlass.Float32
+    return (
+        fake_rows(et, rows=io),
+        fake_rows(et, rows=io),
+        fake_rows(et, rows=io),
+        fake_rows(et, rows=g),
+        fake_rows(f32, rows=stat),
+        fake_rows(f32, rows=stat),
+        fake_rows(f32, rows=part),
+        fake_rows(f32, rows=part),
+        fake_rows(f32, rows=g),
+        fake_rows(f32, rows=g),
+    )
 
 
 def eligible(spec, eb):
@@ -424,26 +443,12 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     fbt = 128
     fgrid = (GPS * CPG + fbt - 1) // fbt
 
-    args = (
-        dyn(dy2d.reshape(-1)),
-        dyn(x2d.reshape(-1)),
-        dyn(dx.reshape(-1)),
-        dyn(gamma),
-        dyn(mean),
-        dyn(rstd),
-        dyn(dgp),
-        dyn(dbp),
-        dyn(dgamma),
-        dyn(dbeta),
-        cutlass.Int32(R),
-        cutlass.Int32(ncta_rows),
-        cutlass.Int32(nparts),
-    )
     ce = (M, V, CPG, SPAN, GPS, bt, CGA, PER, KS, NVS, it_ty, et, bool(spec.has_mean), has_beta, nparts, smem_bytes, fbt, fgrid)
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_cga_host, *args, *ce, fake_stream())
+        fn = cute.compile(_gn_bwd_cga_host, *_ffi_fakes(et), *(cutlass.Int32(0),) * 3, *ce, fake_stream(), options="--enable-tvm-ffi")
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    operands = (dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1), gamma, mean, rstd, dgp, dbp, dgamma, dbeta)
+    fn(*(ffi(t) for t in operands), R, ncta_rows, nparts, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

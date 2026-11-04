@@ -149,6 +149,23 @@ def store_fragment(words: cutlass.Vector, region: cutlass.Array, tid):
 
 
 @cute.jit
+def zero_v_tail_rows(region: cutlass.Array, row_lo, tid, dtype: cutlass.Constexpr):
+    """Zero rows ``[row_lo, 64)`` of one 64-row V half before PV reads it.
+
+    ``region`` is the half's four SW128 slabs (4096 elements each, row ``r`` at
+    ``64 * r``). SW128 permutes 16-byte chunks only within a 128-byte row, so whole rows
+    are cleared without the swizzle. All 128 lanes take 16 of the 2048 16-byte stores.
+    The caller owns the async-proxy fence and the warpgroup barrier before WGMMA.
+    """
+    zero = cutlass.Vector.from_elements(tuple(dtype(0.0) for _ in range(8)), dtype)
+    for step in cutlass.range_constexpr(16):
+        index = step * cute.arch.THREADS_PER_WARPGROUP + tid
+        row = (index // 8) % 64
+        if row >= row_lo:
+            (region.data_ptr() + (index // 512) * 4096 + row * 64 + (index % 8) * 8).store(zero, alignment=16)
+
+
+@cute.jit
 def normalize_row(anchor, scale, scale_log2, total, scale_mode: cutlass.Constexpr):
     """Return inverse row sum and LSE without sink mass; empty rows return ``(0, -inf)``.
 

@@ -2033,14 +2033,30 @@ def test_dsl_sm120_wide_stats(head_dim, stats_use_log2):
 
 
 # Keep the convenience-wrapper regression in the explicit SM120 CI entry.
-import test_sdpa_staged_forward_sm120 as _staged_forward_checks
+import native_forward_sm120_cases as _native_forward_checks
 
 
 @pytest.mark.L0
 @requires_dsl
-class TestStagedSm120Wrapper:
-    test_compiled_workspace_budget = staticmethod(_staged_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
-    test_conversion_workspace = staticmethod(_staged_forward_checks.test_sm120_wrapper_supplies_conversion_workspace)
+class TestNativeSm120Strides:
+    test_native_forward_uses_pointer_host = staticmethod(_native_forward_checks.test_native_forward_uses_pointer_host)
+    test_native_typed_workspace_uses_current_view_origin = staticmethod(_native_forward_checks.test_native_typed_workspace_uses_current_view_origin)
+    test_native_first_capture_rebinds_current_storage_and_stream = staticmethod(
+        _native_forward_checks.test_native_first_capture_rebinds_current_storage_and_stream
+    )
+    test_native_default_stream_is_resolved_for_q_device = staticmethod(_native_forward_checks.test_native_default_stream_is_resolved_for_q_device)
+    test_native_default_stream_with_another_device_current = staticmethod(_native_forward_checks.test_native_default_stream_with_another_device_current)
+    test_native_invalid_operand_is_rejected_before_any_launch = staticmethod(_native_forward_checks.test_native_invalid_operand_is_rejected_before_any_launch)
+    test_native_rejects_mxfp8_input_scales = staticmethod(_native_forward_checks.test_native_rejects_mxfp8_input_scales)
+    test_native_amax_alias_checks_original_operand = staticmethod(_native_forward_checks.test_native_amax_alias_checks_original_operand)
+    test_native_sf_alias_checks_original_operand = staticmethod(_native_forward_checks.test_native_sf_alias_checks_original_operand)
+    test_native_physical_wide_batch_stride = staticmethod(_native_forward_checks.test_native_physical_wide_batch_stride)
+    test_native_artifact_reloads_without_jit = staticmethod(_native_forward_checks.test_native_artifact_reloads_without_jit)
+    test_native_block_output_matches_native_graph = staticmethod(_native_forward_checks.test_native_block_output_matches_native_graph)
+    test_sm120_wrapper_supplies_workspace = staticmethod(_native_forward_checks.test_sm120_wrapper_supplies_workspace)
+    test_compiled_workspace_query_uses_prepared_budget = staticmethod(_native_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
+    test_native_rejects_runtime_element_stride_and_broadcast = staticmethod(_native_forward_checks.test_native_rejects_runtime_element_stride_and_broadcast)
+    test_native_explicit_stream_with_another_device_current = staticmethod(_native_forward_checks.test_native_explicit_stream_with_another_device_current)
 
 
 @pytest.mark.L0
@@ -2114,3 +2130,13 @@ def test_dsl_sm120_execute_scale_sign_must_match_the_plan():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=2 * planned)
         torch.cuda.synchronize()
         torch.testing.assert_close(o.float(), _ref_sdpa_full(q, k, v, scale=2 * planned), atol=0.1, rtol=5e-2)
+
+
+# Keep native stride coverage in the architecture-specific CI entry.
+from native_forward_stride_cases import check_native_dense_permutations as _native_dense_permutations
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeDenseStrides:
+    test_permutations = staticmethod(_native_dense_permutations)

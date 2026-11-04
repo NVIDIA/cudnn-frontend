@@ -33,6 +33,8 @@ from gemm_test_utils import (
     e5m3_quant_ref as _e5m3_quant_ref,
     e5m3_to_float as _e5m3_to_float,
     requires_sm107,
+    INT8_STORE_VALUES as _INT8_STORE_VALUES,
+    int8_store_ref as _int8_store_ref,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
@@ -2281,6 +2283,55 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     assert diff == 0.0, f"{config_name} -> {out_dt}: max|diff|={diff} (expected bit-exact)"
 
 
+@pytest.mark.parametrize("compute,out_dt,out_major", [("fp32", "int8", "n"), ("fp32", "uint8", "m"), ("int32", "int8", "m"), ("int32", "uint8", "n")])
+def test_sm120_int8_output_rounds_to_nearest_even_and_saturates(compute: str, out_dt: str, out_major: str) -> None:
+    """GEMM -> mul(scale) -> INT8 / UINT8 output, in FLOAT and in INT32 compute.
+    The epilogue narrowed with a bare .to(): fptosi rounded toward zero and kept
+    the low byte (2.75 -> 2, 128 -> -128, 300 -> 44), and trunci wrapped the
+    INT32 chain the same way. Row m of the GEMM is x_m exactly (one nonzero K term)."""
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    _skip_unless_active(cfg)
+    M = N = K = 64
+    int_chain = compute == "int32"
+    io = cudnn.data_type.INT8 if int_chain else _BF16
+    comp = cudnn.data_type.INT32 if int_chain else cudnn.data_type.FLOAT
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=comp, compute_data_type=comp)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"), data_type=io)
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"), data_type=io)
+    scale = g.tensor(name="scale", dim=[1, 1, 1], stride=[1, 1, 1], data_type=comp)
+    C = g.matmul(A=A, B=B, compute_data_type=comp, name="mm")
+    C.set_data_type(comp)
+    Y = g.mul(a=C, b=scale, compute_data_type=comp, name="requant")
+    Y.set_output(True).set_data_type(cudnn.data_type.UINT8 if out_dt == "uint8" else cudnn.data_type.INT8)
+    if out_major == "m":
+        Y.set_stride([M * N, 1, M])
+    compiled = _plan(g, config=cfg)
+    assert [(op.op, op.compute_dtype, op.out_dtype) for op in compiled.chain.ops] == [("mul", compute, out_dt)]
+
+    if int_chain:
+        # 3 * int8 spans [-381, 381]: in range, and past both edges of int8 and uint8.
+        col = torch.tensor([100, -100, 50, -43, 42, 43, 85, -86, 127, -127, 1, -1, 0, 90, -90, 60], dtype=torch.int8)
+        b_val, s_val = 3, torch.ones(1, 1, 1, dtype=torch.int32, device="cuda")
+    else:
+        col = torch.tensor(_INT8_STORE_VALUES, dtype=torch.bfloat16)
+        b_val, s_val = 1, torch.ones(1, 1, 1, dtype=torch.float32, device="cuda")
+    col = col.repeat(-(-M // len(col)))[:M]
+    a = torch.zeros(1, M, K, dtype=col.dtype, device="cuda")
+    a[0, :, 0] = col.cuda()
+    b = torch.zeros(1, N, K, dtype=col.dtype, device="cuda")
+    b[0, :, 0] = b_val
+    torch_dt = torch.uint8 if out_dt == "uint8" else torch.int8
+    c = torch.full((1, N, M) if out_major == "m" else (1, M, N), 0x5A, dtype=torch_dt, device="cuda")
+    c = c.transpose(1, 2) if out_major == "m" else c
+    compiled(_vp(compiled, a, b, c, s_val))
+    torch.cuda.synchronize()
+
+    x = col.float().cuda() * b_val
+    ref = _int8_store_ref(x, torch_dt).view(1, M, 1).expand(1, M, N)
+    bad = (c != ref).any(dim=2)[0].nonzero().flatten().tolist()
+    assert not bad, "x -> got (expected): " + ", ".join(f"{float(x[m])} -> {int(c[0, m, 0])} ({int(ref[0, m, 0])})" for m in bad[:8])
+
+
 # M-major batched output. The 32B store-alignment rule moves from N to M
 # (out_major="m"), so M-OOB menu shapes SKIP here.
 
@@ -2881,12 +2932,13 @@ def test_no_template_hardcodes_the_staging_alignment() -> None:
 
     from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
     from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.kernel_registry import TEMPLATES
     from cudnn.gemm.frost.tile_config import by_name
 
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
     files = template_files()
-    assert len(files) == 14, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    assert {p.name for p in files} == {template.file for template in TEMPLATES}
     for path in files:
         src = path.read_text()
         assert "alignment=64" not in src, path.name
@@ -3479,6 +3531,70 @@ def test_sm120_epi_vec_clamp_and_stg_only() -> None:
     assert _epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")) == 8
 
 
+# (graph builder, torch reference) for the activations whose emitters use max/min. relu with both negative_slope and
+# lower_clip has no reference: only its NaN positions are compared, so the test does not depend on how that
+# combination's finite values are lowered.
+_NAN_ACTIVATIONS = {
+    "relu": (lambda g, C: g.relu(input=C, name="act"), torch.relu),
+    "relu_clip": (lambda g, C: g.relu(input=C, lower_clip=-1.5, upper_clip=6.0, name="act"), lambda x: torch.clamp(x, -1.5, 6.0)),
+    "relu_slope_upper": (
+        lambda g, C: g.relu(input=C, negative_slope=0.1, upper_clip=6.0, name="act"),
+        lambda x: torch.clamp(torch.nn.functional.leaky_relu(x, 0.1), max=6.0),
+    ),
+    "relu_slope_lower": (lambda g, C: g.relu(input=C, negative_slope=0.1, lower_clip=-1.0, upper_clip=6.0, name="act"), None),
+    "leaky_relu": (lambda g, C: g.leaky_relu(input=C, negative_slope=0.01, name="act"), lambda x: torch.nn.functional.leaky_relu(x, 0.01)),
+    "elu": (lambda g, C: g.elu(input=C, name="act"), torch.nn.functional.elu),
+}
+
+# One dense config per arch tree: both render these ops with the shared emitters. A process renders only its own
+# tree, so the other tree's cases skip.
+_NAN_CONFIGS = {
+    "sm100": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "sm120": "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+}
+
+
+@pytest.mark.parametrize("act", list(_NAN_ACTIVATIONS))
+@pytest.mark.parametrize("family", list(_NAN_CONFIGS))
+def test_relu_family_propagates_nan(family: str, act: str) -> None:
+    """relu (plain, clipped, sloped), leaky_relu and elu keep a NaN accumulator
+    NaN, as torch does and as the frontend requests for RELU_FWD
+    (CUDNN_PROPAGATE_NAN). Their max/min used to return the non-NaN operand, so
+    NaN came out as 0 or lower_clip. +-inf accumulators pin the unchanged
+    non-finite results."""
+    cfg = _resolve(_NAN_CONFIGS[family])
+    M = N = K = 128
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
+    if not ok:
+        pytest.skip(reason)
+    build, ref_fn = _NAN_ACTIVATIONS[act]
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    build(g, g.matmul(A=A, B=B, name="mm")).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _plan(g, config=cfg)
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    a[0, 0, 3] = float("nan")  # row 0: NaN in every column
+    a[0, 1, 4], a[0, 1, 5] = float("inf"), float("-inf")  # row 1: inf - inf
+    b[0, :, 4] = b[0, :, 5] = 1.0
+    a[0, 2, 6] = float("inf")  # row 2: 0 * inf, then +inf, then -inf
+    b[0, :64, 6], b[0, 64:96, 6], b[0, 96:, 6] = 0.0, 1.0, -1.0
+    acc = torch.einsum("bmk,bnk->bmn", a.double(), b.double()).float()
+    nan = torch.isnan(acc)
+    assert int(nan.sum()) == 320 and int(torch.isinf(acc).sum()) == 64
+
+    out = torch.full((1, M, N), 12345.0, device="cuda")  # finite, so an unwritten NaN cell cannot pass
+    compiled(_vp(compiled, a, b, out))
+    torch.cuda.synchronize()
+    lost = int((~torch.isnan(out[nan])).sum())
+    assert lost == 0, f"{act}: {lost} of {int(nan.sum())} NaN accumulators came out finite, values {torch.unique(out[nan]).tolist()[:4]}"
+    if ref_fn is None:
+        assert not torch.isnan(out[~nan]).any(), f"{act}: a non-NaN accumulator came out NaN"
+    else:
+        torch.testing.assert_close(out, ref_fn(acc), atol=1e-5, rtol=1e-5, equal_nan=True)
+
+
 @pytest.mark.parametrize(
     "a_major,b_major,out_major",
     [(a, b, o) for a in ("k", "m") for b in ("k", "n") for o in ("n", "m")],
@@ -3509,6 +3625,7 @@ def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> N
     )
 
 
+@requires_sm120
 @pytest.mark.parametrize(
     "axis,swap_ab,build_m,call_m,call_n",
     [(-1, False, 256, 200, 256), (-1, False, 200, 256, 256), (1, False, 256, 224, 256), (-1, True, 256, 256, 224)],
@@ -3640,6 +3757,7 @@ def test_sm120_render_smoke() -> None:
                 assert f"b_is_n_major = {b_major == 'n'}" in src, combo
 
 
+@requires_sm120
 @pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
 def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     """An F8_128x4 quant-scale row holds roundup(blocks, 4) slots. A block-scaled
