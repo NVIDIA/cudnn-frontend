@@ -11,8 +11,9 @@ pytest.importorskip("cudnn.norm", reason="Frost norm engines require a built fro
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("variant", ["layer", "rms"])
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
-def test_nontrailing_layernorm_axes_use_backend(cudnn_handle, monkeypatch, backward):
+def test_nontrailing_norm_axes_use_backend(cudnn_handle, monkeypatch, backward, variant):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     cc = torch.cuda.get_device_capability()
     if cc not in ((9, 0), (10, 0), (10, 3)):
@@ -25,7 +26,8 @@ def test_nontrailing_layernorm_axes_use_backend(cudnn_handle, monkeypatch, backw
     beta = torch.randn_like(gamma)
     eps = torch.full((1, 1, 1), 1e-5, dtype=torch.float32)
     mean = x.mean(dim=1, keepdim=True).contiguous()
-    rstd = torch.rsqrt(x.var(dim=1, correction=0, keepdim=True) + 1e-5).contiguous()
+    variance = x.var(dim=1, correction=0, keepdim=True) if variant == "layer" else x.square().mean(dim=1, keepdim=True)
+    rstd = torch.rsqrt(variance + 1e-5).contiguous()
     saved_stream = cudnn.get_stream(cudnn_handle)
     cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
     try:
@@ -35,22 +37,35 @@ def test_nontrailing_layernorm_axes_use_backend(cudnn_handle, monkeypatch, backw
         if backward:
             dy = torch.randn_like(x)
             DY = graph.tensor(name="DY", dim=dy.shape, stride=dy.stride(), data_type=dy.dtype)
-            MN = graph.tensor(name="mean", dim=mean.shape, stride=mean.stride(), data_type=mean.dtype)
             RS = graph.tensor(name="rstd", dim=rstd.shape, stride=rstd.stride(), data_type=rstd.dtype)
-            DX, DS, DB = graph.layernorm_backward(grad=DY, input=X, scale=S, mean=MN, inv_variance=RS)
+            if variant == "layer":
+                MN = graph.tensor(name="mean", dim=mean.shape, stride=mean.stride(), data_type=mean.dtype)
+                DX, DS, DB = graph.layernorm_backward(grad=DY, input=X, scale=S, mean=MN, inv_variance=RS)
+            else:
+                DX, DS, DB = graph.rmsnorm_backward(grad=DY, input=X, scale=S, inv_variance=RS, has_dbias=True)
             DX.set_output(True).set_data_type(torch.float32)
             DS.set_output(True).set_data_type(torch.float32)
             DB.set_output(True).set_data_type(torch.float32)
             dx, ds, db = torch.empty_like(x), torch.empty_like(gamma), torch.empty_like(beta)
-            bindings = {X: x, S: gamma, DY: dy, MN: mean, RS: rstd, DX: dx, DS: ds, DB: db}
+            bindings = {X: x, S: gamma, DY: dy, RS: rstd, DX: dx, DS: ds, DB: db}
+            if variant == "layer":
+                bindings[MN] = mean
         else:
             B = graph.tensor(name="bias", dim=beta.shape, stride=beta.stride(), data_type=beta.dtype)
             E = graph.tensor_like(eps, name="epsilon")
-            Y, MN, RS = graph.layernorm(norm_forward_phase=cudnn.norm_forward_phase.TRAINING, input=X, scale=S, bias=B, epsilon=E)
-            for t in (Y, MN, RS):
+            kw = dict(norm_forward_phase=cudnn.norm_forward_phase.TRAINING, input=X, scale=S, bias=B, epsilon=E)
+            if variant == "layer":
+                Y, MN, RS = graph.layernorm(**kw)
+            else:
+                Y, RS = graph.rmsnorm(**kw)
+            for t in (Y, RS):
                 t.set_output(True).set_data_type(torch.float32)
-            y, mean_out, rstd_out = torch.empty_like(x), torch.empty_like(mean), torch.empty_like(rstd)
-            bindings = {X: x, S: gamma, B: beta, E: eps, Y: y, MN: mean_out, RS: rstd_out}
+            y, rstd_out = torch.empty_like(x), torch.empty_like(rstd)
+            bindings = {X: x, S: gamma, B: beta, E: eps, Y: y, RS: rstd_out}
+            if variant == "layer":
+                mean_out = torch.empty_like(mean)
+                MN.set_output(True).set_data_type(torch.float32)
+                bindings[MN] = mean_out
 
         graph.validate()
         graph.build_operation_graph()
@@ -65,9 +80,10 @@ def test_nontrailing_layernorm_axes_use_backend(cudnn_handle, monkeypatch, backw
         xr = x.detach().requires_grad_(True)
         gr = gamma.detach().requires_grad_(True)
         br = beta.detach().requires_grad_(True)
-        refmean = xr.mean(dim=1, keepdim=True)
-        refrstd = torch.rsqrt(xr.var(dim=1, correction=0, keepdim=True) + 1e-5)
-        ref = (xr - refmean) * refrstd * gr + br
+        refmean = xr.mean(dim=1, keepdim=True) if variant == "layer" else 0
+        centered = xr - refmean
+        refrstd = torch.rsqrt(centered.square().mean(dim=1, keepdim=True) + 1e-5)
+        ref = centered * refrstd * gr + br
         if backward:
             refdx, refds, refdb = torch.autograd.grad(ref, (xr, gr, br), dy)
             torch.testing.assert_close(dx, refdx, atol=2e-5, rtol=2e-5)
@@ -75,7 +91,8 @@ def test_nontrailing_layernorm_axes_use_backend(cudnn_handle, monkeypatch, backw
             torch.testing.assert_close(db, refdb, atol=2e-5, rtol=2e-5)
         else:
             torch.testing.assert_close(y, ref, atol=2e-5, rtol=2e-5)
-            torch.testing.assert_close(mean_out, refmean, atol=2e-5, rtol=2e-5)
+            if variant == "layer":
+                torch.testing.assert_close(mean_out, refmean, atol=2e-5, rtol=2e-5)
             torch.testing.assert_close(rstd_out, refrstd, atol=2e-5, rtol=2e-5)
     finally:
         cudnn.set_stream(handle=cudnn_handle, stream=saved_stream)
