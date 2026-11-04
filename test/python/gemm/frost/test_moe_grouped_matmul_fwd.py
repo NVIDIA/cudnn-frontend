@@ -19,6 +19,7 @@ from gemm_test_utils import (
     requires_sm100,
     requires_sm120,
     requires_matmul_gpu,
+    assert_quant_scale_blob_guard as _assert_quant_scale_blob_guard,
     Plan as _plan,
     ceil_div as _ceil_div,
     to_blocked as _to_blocked,
@@ -2183,6 +2184,41 @@ def test_moe_int8_output_rounds_to_nearest_even_and_saturates_sm120(swap_ab, out
     assert not bad, "x -> got (expected): " + ", ".join(f"{float(x[s])} -> {int(out[0, s, 0])} ({int(ref[0, s, 0])})" for s in bad[:8])
 
 
+@requires_sm120
+@pytest.mark.parametrize("relu,swap", [(False, False), (True, False), (False, True)], ids=["one_gemm", "epilogue_op", "swap_ab"])
+def test_moe_quant_scale_output_must_be_a_packed_blob_sm120(relu, swap):
+    """All three plain MoE launchers (one GEMM, the multi-GEMM path an epilogue op takes, and
+    swap-AB) decline an F8_128x4 quant-scale binding the blob would spill out of, before any
+    write. S = 512 gives the [1, 512, 8] scale a row-aliasing view whose span equals its
+    element count, which the swap-AB launcher's whole-blob check alone accepts."""
+    from cudnn.gemm.frost.fusion_ir import MoeSwapAbSpec
+
+    E, K, N, bs = 4, 128, 256, 32
+    group_sizes = [128, 0, 288, 96]
+    S = sum(group_sizes)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    y = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    if relu:
+        y = g.relu(input=y, name="relu")
+    q, sf = g.block_scale_quantize(input=y, block_size=bs, name="q")
+    q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    sf.set_dim([1, S, N // bs]).set_stride([S * N // bs, N // bs, 1]).set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
+    sf.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap)
+    assert bool(compiled.chain.ops) == relu
+    assert isinstance(compiled.chain.moe, MoeSwapAbSpec) == swap
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = _offsets(group_sizes, S)
+    out = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+    _assert_quant_scale_blob_guard(
+        lambda view: compiled(_vp_moe(compiled, token, weight, offsets, [out, view])), (1, S, N // bs), torch.float8_e8m0fnu, others=[out.view(torch.uint8)]
+    )
+
+
 @pytest.mark.parametrize("weight_major", ["k", "n"])
 @pytest.mark.parametrize("gather", [False, True])
 def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
@@ -2226,6 +2262,69 @@ def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
     m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
     params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]
     assert params == ["problem_size", "first_token_offset", "a_tma_workspace", *(["token_index"] if gather else []), "a_0", "b_0", "c_tap_0", "stream"], params
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_offsets_outside_the_contract_stay_in_bounds_sm120(swap_ab):
+    """first_token_offset is device data the host never checks. A table that breaks the
+    contract (a boundary past S, or below zero) is clamped into the S routed rows: rows
+    it no longer covers keep their contents, and nothing is stored outside the output."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K, guard, sentinel = 2, 256, 256, 128, 128, 123.0
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=replace(by_name(_SM120_CFG), swap_ab=swap_ab))
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    per_expert = [(token[0].float() @ weight[e].float().T).to(torch.bfloat16) for e in range(E)]
+    # The exactly shaped [1, S, N] output between two guard regions.
+    backing = torch.empty(guard + S + guard, N, dtype=torch.bfloat16, device="cuda")
+    out = backing[guard : guard + S].unsqueeze(0)
+    # Each table with the rows every group computes once it is clamped into [0, S].
+    for table, rows in (
+        ([0, 128, 256], [(0, 128), (128, 256)]),
+        ([0, 128, 384], [(0, 128), (128, 256)]),
+        ([0, -64, 128], [(0, 0), (0, 128)]),
+    ):
+        backing.fill_(sentinel)
+        compiled(_vp_moe(compiled, token, weight, torch.tensor(table, dtype=torch.int32, device="cuda"), out))
+        torch.cuda.synchronize()
+        assert torch.all(backing[:guard] == sentinel) and torch.all(backing[guard + S :] == sentinel), f"offsets {table} stored outside the output"
+        expected = torch.full((S, N), sentinel, dtype=torch.bfloat16, device="cuda")
+        for group, (begin, end) in enumerate(rows):
+            expected[begin:end] = per_expert[group % E][begin:end]
+        torch.testing.assert_close(out[0], expected, atol=0.125, rtol=0.01)
+
+
+@requires_matmul_gpu
+def test_gather_offsets_outside_the_contract_stay_in_bounds_sm120():
+    """A GATHER table whose last boundary passes the R routed rows reads token_index and
+    stores output rows below R only: its last group is clamped to R."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    g, x, weights, offsets, indices, y = _build_gather_graph()
+    compiled = C120.jit_from_cudnn_graph(g, config=by_name(_SM120_CFG))
+    source_rows, R, n, guard, sentinel = 137, 257, 96, 64, 123.0
+    torch.manual_seed(123)
+    token = torch.randn(1, source_rows, 96, device="cuda", dtype=torch.bfloat16)
+    wbuf = torch.randn(3, n, 96, device="cuda", dtype=torch.bfloat16) * 0.1
+    # The index entries past R name a real source row, so a read past R would also feed a store.
+    index_backing = torch.full((R + guard,), 5, dtype=torch.int32, device="cuda")
+    index_backing[:R] = torch.randint(source_rows, (R,), device="cuda", dtype=torch.int32)
+    index = index_backing[:R].view(1, R, 1)
+    backing = torch.full((R + guard, n), sentinel, dtype=torch.bfloat16, device="cuda")
+    out = backing[:R].unsqueeze(0)
+    starts = [0, 65, 65, 68, 197, 198, R + 40]
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int32).view(7, 1, 1)
+    compiled({x: token, offsets: fto, indices: index, y: out, weights[0]: wbuf})
+    torch.cuda.synchronize()
+    assert torch.all(backing[R:] == sentinel), "a row past R was stored"
+    ref = torch.empty(R, n, device="cuda", dtype=torch.float32)
+    for group in range(6):
+        begin, end = starts[group], min(starts[group + 1], R)
+        ref[begin:end] = token[0, index.flatten()[begin:end].long()].float() @ wbuf[group % 3].float().T
+    torch.testing.assert_close(out[0].float(), ref.to(torch.bfloat16).float(), atol=0.03, rtol=0.02)
 
 
 _SM120_MOE_TEMPLATES = (
@@ -3002,6 +3101,65 @@ def test_moe_swap_ab_reduction_runtime_token_tail(mode):
         torch.testing.assert_close(red, torch.full_like(red, expected), atol=1e-4, rtol=1e-5)
 
 
+@requires_sm120
+@pytest.mark.parametrize("align", [1, 8], ids=["align1", "align8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_reductions_skip_nan_sm120(swap_ab, align):
+    """AMAX, MAX and MIN skip NaN elements in both SM120 MoE orientations, as the
+    native cuDNN engines do. ``fusion_ir.swap_ab`` transposes each reduction, so a
+    per-token or per-feature reduction moves between per-element atomics and
+    per-chunk folds with the orientation; the swap-AB plan's chunks are as many
+    tokens wide as the declared ``first_token_offset`` alignment (1 or 8 here). The
+    scalar and per-expert ones fold through register partials. The NaN token used
+    to make every per-feature AMAX NaN on the normal plan and on the swap-AB plan at
+    alignment 1, but none on the swap-AB plan at alignment 8."""
+    from cudnn.gemm.frost.recipe import REDUCTION_INIT_VALUE
+
+    E, S, N, K = 2, 64, 64, 64
+    starts = [0, 24, S]
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto.set_alignment_value(align)
+    C = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    reds = []
+    for src_name, src in (("c", C), ("neg", g.neg(input=C, name="neg"))):
+        for mode in ("amax", "max", "min"):
+            for dims in ((1, 1, 1), (1, S, 1), (1, 1, N), (E, 1, 1)):
+                kw = {"group_offset": fto} if dims[0] == E else {}
+                r = g.reduction(input=src, mode=getattr(cudnn.reduction_mode, mode.upper()), name=f"{src_name}_{mode}_{'x'.join(map(str, dims))}", **kw)
+                r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+                reds.append((src_name, mode, dims, r))
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap_ab)
+
+    torch.manual_seed(0)
+    token = torch.randint(-3, 4, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-3, 4, (E, N, K), device="cuda").to(torch.bfloat16)
+    token[0, 5, 3] = float("nan")  # token 5 (expert 0) is NaN in every feature
+    weight[1, 9, 3] = float("nan")  # feature 9 is NaN for every token of expert 1
+    offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
+    outs = [torch.full(dims, 12345.0, device="cuda") for _s, _m, dims, _r in reds]
+    compiled({tok: token, w: weight.transpose(1, 2), fto: offsets, **{r: out for (_s, _m, _d, r), out in zip(reds, outs)}})
+    torch.cuda.synchronize()
+
+    c = _ref_f32(token, weight, offsets, S, N, E)
+    bad = []
+    for (src_name, mode, dims, _r), out in zip(reds, outs):
+        x = c if src_name == "c" else -c
+        x = torch.where(torch.isnan(x), REDUCTION_INIT_VALUE["fp32"][mode], x)  # a NaN element contributes nothing
+        x = x.abs() if mode == "amax" else x
+        fold = torch.amin if mode == "min" else torch.amax
+        if dims[0] == E:
+            want = torch.stack([fold(x[starts[e] : starts[e + 1]]) for e in range(E)])
+        else:
+            want = fold(x, dim=tuple(i for i, extent in enumerate(dims[1:]) if extent == 1))
+        want = want.reshape(dims)
+        if not torch.equal(out, want):
+            bad.append(f"{src_name} {mode} {dims}: {int(torch.isnan(out).sum())} NaN cells, {int((~torch.isnan(out) & (out != want)).sum())} other mismatches")
+    assert not bad, "\n".join(bad)
+
+
 @requires_sm100
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("axis", ["scalar", "feature", "token"])
@@ -3269,6 +3427,32 @@ def test_moe_workspace_failure_preserves_reduction_outputs(family, block_scale, 
         compiled(vp, workspace=workspace)
     assert calls == []
     torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_moe_operand_rejections_name_graph_roles(family, block_scale, swap):
+    """Name a misaligned or missing operand by its graph role; swap-AB puts the weight in kernel A."""
+    from gemm_test_utils import graph_binding
+
+    compiled, vp, _, calls, _ = _recorded_moe_plan(family, block_scale, False, False, swap)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    bd = graph_binding(compiled)
+    roles = [("token", bd.a_operands[0]), ("weight", bd.b_operands[0])]
+    if block_scale:
+        roles += [("token SF", bd.sfa_operands[0]), ("weight SF", bd.sfb_operands[0])]
+    for role, tensor in roles:
+        good = vp[tensor]
+        storage = torch.empty(good.numel() * good.element_size() + 8, device="cuda", dtype=torch.uint8)
+        misaligned = storage[8:].view(good.dtype).view(good.shape)
+        with pytest.raises(ValueError, match=f"requirement: {role}: alignment 8B < required 16B"):
+            compiled({**vp, tensor: misaligned}, workspace=workspace)
+        # str(KeyError) quotes its message; the closing quote pins the exact role.
+        with pytest.raises(KeyError, match=f"missing a buffer for {role}'"):
+            compiled({key: buf for key, buf in vp.items() if key is not tensor}, workspace=workspace)
+    assert calls == []
 
 
 @pytest.mark.parametrize("family", ["sm100", "sm120"])

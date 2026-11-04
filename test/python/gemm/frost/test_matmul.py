@@ -35,6 +35,7 @@ from gemm_test_utils import (
     requires_sm107,
     INT8_STORE_VALUES as _INT8_STORE_VALUES,
     int8_store_ref as _int8_store_ref,
+    assert_quant_scale_blob_guard as _assert_quant_scale_blob_guard,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
@@ -1801,6 +1802,51 @@ def test_dense_amax_only_no_dense_output() -> None:
 
     ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32)))
     torch.testing.assert_close(out_am.flatten()[0], ref.abs().amax(), atol=1e-3, rtol=1e-3)
+
+
+@requires_sm120
+@pytest.mark.parametrize("split_k", [1, 2], ids=["no_split", "split_k2"])
+def test_sm120_reductions_skip_nan(split_k: int) -> None:
+    """AMAX, MAX and MIN skip NaN elements on every dense SM120 reduction path,
+    as the native cuDNN engines do. Without split-K the drain folds them (per-CTA
+    partials for the scalar, lane-run slots for rows and columns); the split-K
+    reducer issues per-chunk atomics (scalar, rows) and per-element atomics
+    (columns). These paths used to keep a NaN, drop it, or decide by its sign bit,
+    and a lane-run slot whose first chunk was all NaN lost the chunks after it, so
+    one graph gave NaN, the NaN-free result or neither, depending on the plan. A
+    set whose elements are all NaN yields the output's seed."""
+    from cudnn.gemm.frost.recipe import REDUCTION_INIT_VALUE
+
+    M, N, K = 128, 128, 256
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    reds = []
+    for src_name, src in (("c", C), ("neg", g.neg(input=C, name="neg"))):
+        for mode in ("amax", "max", "min"):
+            for dims in ((1, 1, 1), (1, M, 1), (1, 1, N)):
+                r = g.reduction(input=src, mode=getattr(cudnn.reduction_mode, mode.upper()), name=f"{src_name}_{mode}_{dims[1]}x{dims[2]}")
+                r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+                reds.append((src_name, mode, dims, r))
+    compiled = _jit_splitk(g, split_k, base_cfg=by_name(_SM120_SPLITK_CFG))
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    a[0, 5, 7] = float("nan")  # row 5 of C is NaN
+    b[0, :8, 9] = float("nan")  # columns 0..7 of C are NaN: the first lane-run chunk of every row
+    outs = [torch.full(dims, 12345.0, device="cuda") for _s, _m, dims, _r in reds]
+    _run_splitk(compiled, {A: a, B: b, **{r: out for (_s, _m, _d, r), out in zip(reds, outs)}})
+
+    c = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+    bad = []
+    for (src_name, mode, dims, _r), out in zip(reds, outs):
+        x = c if src_name == "c" else -c
+        x = torch.where(torch.isnan(x), REDUCTION_INIT_VALUE["fp32"][mode], x)  # a NaN element contributes nothing
+        axes = tuple(i for i in (1, 2) if dims[i] == 1)
+        want = x.abs().amax(axes, keepdim=True) if mode == "amax" else x.amax(axes, keepdim=True) if mode == "max" else x.amin(axes, keepdim=True)
+        if not torch.equal(out, want):
+            bad.append(f"{src_name} {mode} {dims}: {int(torch.isnan(out).sum())} NaN cells, {int((~torch.isnan(out) & (out != want)).sum())} other mismatches")
+    assert not bad, "\n".join(bad)
 
 
 @pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
@@ -3728,6 +3774,28 @@ def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
     )
 
 
+@requires_sm120
+def test_sm120_quant_scale_output_must_be_a_packed_blob() -> None:
+    """The F8_128x4 quant epilogue writes the scale blob from each batch plane's base and
+    applies only the batch stride. A binding it cannot address is declined before the launch:
+    a row pitch or an element stride (the blob would spill out of the view), and interleaved
+    or overlapping batch planes (they would overwrite each other). Dense permuted planes and
+    a padded batch pitch get exactly the compact blob's bytes."""
+    L, M, N, K, bs = 2, 256, 256, 128, 32
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[L, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[L, K, N], stride=[K * N, 1, K])
+    Q, SF = g.block_scale_quantize(input=g.matmul(A=A, B=B, name="mm"), block_size=bs, axis=-1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    SF.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    SF.set_dim([L, M, N // bs]).set_stride([M * N // bs, N // bs, 1]).set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    compiled = _plan(g, config=_resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
+    a, b, _ = _mkbatched_data(L, M, N, K, "bf16", "bf16")
+    q = torch.empty(L, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    _assert_quant_scale_blob_guard(lambda sf: compiled({A: a, B: b, Q: q, SF: sf}), (L, M, N // bs), torch.float8_e8m0fnu, others=[q.view(torch.uint8)])
+    assert dict(compiled._compiled.deferrals) == {"quant scale blob": 4}
+
+
 def test_sm120_render_smoke() -> None:
     """Render the sm120 template end-to-end (real tile constants + epilogue
     snippets) on whatever GPU is active — no cute.compile, and through the
@@ -3804,6 +3872,59 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
     for Q, QS, q_ref, addr, expected in checks:
         torch.testing.assert_close(vp[QS].view(torch.uint8).flatten()[addr], expected, atol=0, rtol=0)
         torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0)
+
+
+# (graph builder, torch reference) for the activations whose closed forms cancel near a limit.
+_SERIES_ACTIVATIONS = {
+    "tanh": (lambda g, x: g.tanh(input=x, name="act"), torch.tanh),
+    "elu": (lambda g, x: g.elu(input=x, name="act"), torch.nn.functional.elu),
+    "softplus": (lambda g, x: g.softplus(input=x, name="act"), torch.nn.functional.softplus),
+}
+
+# One dense config per arch tree: both render these ops with the shared emitters. A process renders only its own
+# tree, so the other tree's cases skip.
+_SERIES_CONFIGS = {
+    "sm100": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "sm120": "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+}
+
+
+@pytest.mark.parametrize("act", list(_SERIES_ACTIVATIONS))
+@pytest.mark.parametrize("family", list(_SERIES_CONFIGS))
+def test_tanh_elu_softplus_relative_precision(family: str, act: str) -> None:
+    """tanh and elu near 0, and softplus of a very negative input, keep fp32
+    relative precision. The emitted forms cancelled there: tanh(1e-6) as
+    1 - 2/(e^2x + 1) came out 4.6% low, elu as (max(x, 0) + e^min(x, 0)) - 1
+    returned 0 for a positive input below 2^-24, and softplus(-20) as
+    log(1 + e^x) came out 0. A and B are 0, so the activation sees exactly the
+    fp32 aux X; inputs up to 10 in magnitude and +-inf pin the closed forms
+    that are kept."""
+    cfg = _resolve(_SERIES_CONFIGS[family])
+    M = N = K = 128
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
+    if not ok:
+        pytest.skip(reason)
+    build, ref_fn = _SERIES_ACTIVATIONS[act]
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    X = g.tensor(name="X", dim=[1, M, N], stride=[M * N, N, 1], data_type=cudnn.data_type.FLOAT)
+    build(g, g.add(a=g.matmul(A=A, B=B, name="mm"), b=X, name="x")).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _plan(g, config=cfg)
+
+    gen = torch.Generator().manual_seed(0)
+    mag = 10.0 ** (-30.0 + 31.0 * torch.rand(6000, generator=gen, dtype=torch.float64))  # 1e-30 .. 10, both signs
+    # Not below -80: under about -87.3, e^x is subnormal and exp2 (ex2.approx.ftz) flushes it, so softplus returns 0
+    # there, which an rtol-only check would reject.
+    negative = -2.0 - 78.0 * torch.rand(M * N - 2 * mag.numel() - 2, generator=gen, dtype=torch.float64)  # softplus: e^x < 0.14
+    x = torch.cat([mag, -mag, negative, torch.tensor([float("inf"), float("-inf")], dtype=torch.float64)]).float()
+    x = x.view(1, M, N).cuda()
+    a = torch.zeros(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(1, N, K, dtype=torch.bfloat16, device="cuda")
+    out = torch.full((1, M, N), float("nan"), device="cuda")
+    compiled(_vp(compiled, a, b, out, x))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref_fn(x.double()).float(), atol=0, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -4335,6 +4456,108 @@ def test_sm120_splitk_batched_aux_and_row_sum():
     ref = mm * rows * elems
     assert torch.equal(y, ref), f"{(y != ref).sum().item()}/{y.numel()} elements differ"
     assert torch.equal(s, ref.sum(dim=2, keepdim=True))
+
+
+def _frost_listed(g) -> bool:
+    """Whether the graph API offers a FROST plan, i.e. its check_support accepted the graph."""
+    from cudnn.engines import is_python_engine
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    return any(is_python_engine(p.engine_id) for p in g.plans)
+
+
+@requires_sm120
+def test_sm120_batch_past_grid_z_is_declined():
+    # The sm120 dense launch is (ceil(M / tile_m), ceil(N / tile_n), batch * S). With S = 1 a batch
+    # past 65535 used to plan, then fail every launch with cudaErrorInvalidValue and no fallback.
+    # Declined, the graph builds on the backend, which must run it exactly.
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+
+    batch, M, N, K = 65536, 32, 32, 64
+    assert _frost_listed(_splitk_graph(batch - 1, M, N, K)[0])
+    g, A, Bt, C = _splitk_graph(batch, M, N, K)
+    assert not _frost_listed(g)
+    with pytest.raises(NotImplementedError, match=r"grid\.z = batch=65536 \* split_k_slices=1 = 65536"):
+        jit_from_cudnn_graph(_splitk_graph(batch, M, N, K)[0], by_name(_SM120_SPLITK_CFG))
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine is None  # the backend serves the graph
+    a = torch.randint(-2, 2, (batch, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 2, (batch, N, K), device="cuda").to(torch.bfloat16)
+    c = torch.full((batch, M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    g.execute({A: a, Bt: b.transpose(1, 2), C: c}, torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    assert torch.equal(c, (a.float() @ b.float().transpose(1, 2)).to(torch.bfloat16))
+
+
+@requires_sm120
+def test_sm120_n_past_grid_y_is_refused():
+    # grid.y = ceil(N / tile_n) has the same cap, and N is symbolic: a plan built at a legal N
+    # refuses a call that needs more N tiles before it writes anything, and explain() agrees.
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+    from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
+
+    cfg = by_name("CONFIG_sm120_128x16x128_16x16x32_cluster1x1_warps8x1")
+    M, K, n_max = 32, 64, 65535 * 16
+    g, A, Bt, C = _splitk_graph(1, M, n_max, K)
+    plan = jit_from_cudnn_graph(g, cfg)
+    a = torch.randint(-2, 2, (1, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 2, (1, n_max + 16, K), device="cuda").to(torch.bfloat16)
+    c = torch.full((1, M, n_max), float("nan"), dtype=torch.bfloat16, device="cuda")
+    plan({A: a, Bt: b[:, :n_max], C: c})  # grid.y = 65535 still launches
+    torch.cuda.synchronize()
+    assert torch.equal(c, (a.float() @ b[:, :n_max].float().transpose(1, 2)).to(torch.bfloat16))
+
+    c = torch.full((1, M, n_max + 16), -123.0, dtype=torch.bfloat16, device="cuda")
+    resolved = resolve_variant_pack({A: a, Bt: b, C: c}, plan.binding)
+    operands = [resolved[id(t)] for t in plan.binding.bound_tensors()]
+    messages = []
+    for call in (lambda: plan.lowered(operands), lambda: plan.explain(operands)):
+        with pytest.raises(ValueError, match=r"^cudnn\.frost gemm: .*grid\.y = ceil\(N=1048576 / 16\) = 65536.* rebuild for this shape$") as refused:
+            call()
+        messages.append(str(refused.value))
+    assert messages[0] == messages[1]
+    torch.cuda.synchronize()
+    assert torch.all(c == -123)
+    with pytest.raises(NotImplementedError, match=r"grid\.y = ceil\(N=1048576 / 16\) = 65536"):
+        jit_from_cudnn_graph(_splitk_graph(1, M, n_max + 16, K)[0], cfg)
+
+
+@requires_sm120
+def test_sm120_auto_pick_fits_grid_y():
+    # The automatic pick for a wide N is a 128-column tile; past 65535 such tiles it must move to a
+    # wider one rather than plan a launch CUDA rejects.
+    from cudnn.gemm.frost.compiler import plan_config
+
+    n = 65536 * 128
+    cfg = plan_config(analyze(_splitk_graph(1, 32, n, 64)[0]), shapes_fixed=True)
+    assert -(-n // cfg.cta_tile_n) <= 65535, cfg.name
+
+
+@requires_sm120
+def test_sm120_splitk_reducer_grid_y_is_declined():
+    # The split-K reducer's grid.y = ceil(N / reducer tile) can overflow while the main grid fits:
+    # a reducer CTA covers 16 columns at S >= 9 when N % 4 == 2.
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.compiler import probe_chain
+
+    probe_chain(analyze(_splitk_graph(1, 32, 65535 * 16 - 2, 1024)[0]), replace(by_name(_SM120_SPLITK_CFG), split_k_slices=16))
+    g, *_ = _splitk_graph(1, 32, 65535 * 16 + 2, 1024)
+    with pytest.raises(NotImplementedError, match=r"split-K reducer grid\.y = ceil\(N=1048562 / 16\) = 65536"):
+        _jit_splitk(g, 16)
+
+
+def test_sm120_reducer_tile_restates_the_reducer_kernel():
+    # The sm120 grid gate restates the reducer's tile width without importing CuTe DSL.
+    from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import splitk_reduce_tile_n
+    from cudnn.gemm.frost.sm120 import compiler as sm120
+
+    for slices in range(2, 33):
+        for elems in (1, 2, 4):
+            assert sm120._splitk_reduce_tile_n(slices, elems) == splitk_reduce_tile_n(slices, elems)
 
 
 def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):

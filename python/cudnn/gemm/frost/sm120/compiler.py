@@ -279,6 +279,16 @@ def _splitk_reduce_elems(chain: FusionChain) -> int:
     return elems
 
 
+def _splitk_reduce_tile_n(split_k_slices: int, reduce_elems: int) -> int:
+    """Output columns per split-K reducer CTA: the reducer kernel's ``splitk_reduce_tile_n``,
+    restated here because that module imports CuTe DSL, which the support probe does not load
+    (a test pins the two together)."""
+    groups = 1
+    while groups < 4 and split_k_slices > 4 * groups:
+        groups *= 2
+    return 32 // groups * reduce_elems
+
+
 def _out_vec_bytes(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
     """The vector width for the output stores."""
     if config.split_k_slices > 1:
@@ -1237,12 +1247,54 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
+def _quant_scale_plane_reject(buf) -> "str | None":
+    """Why an F8_128x4 quant-scale output binding cannot take the blob its epilogue writes, or None.
+
+    The epilogue writes the 128x4-atom stream at compact offsets from a batch plane's base
+    (``tile_l * quant_scale_stride_l``) and never applies the M/N strides. Each batch plane
+    must therefore be one dense byte run, and the batch stride must not let planes overlap.
+    A dense permuted view qualifies (the blob is read back as raw bytes). A pitched or
+    element-strided view would get the blob written into its gaps, outside the view;
+    interleaved or overlapping planes would overwrite each other."""
+    shape, strides = tuple(buf.shape), tuple(buf.stride())
+    plane = 1
+    for stride, extent in sorted((st, s) for s, st in zip(shape[1:], strides[1:]) if s > 1):
+        if stride != plane:
+            return "a batch plane is not a dense byte run"
+        plane *= extent
+    if shape[0] > 1 and strides[0] < plane:
+        return f"its {plane}-byte batch planes overlap"
+    return None
+
+
+def _quant_scale_blob_reject(chain: FusionChain, outputs) -> "str | None":
+    """Check each F8_128x4 quant-scale output with ``_quant_scale_plane_reject``."""
+    bad = []
+    for spec, buf in zip(chain.outputs, outputs):
+        if not spec.is_quant_scale:
+            continue
+        qi = int(spec.source.rsplit("_", 1)[1])
+        if chain.quants[qi].scale_reorder != "F8_128x4":
+            continue
+        reason = _quant_scale_plane_reject(buf)
+        if reason is not None:
+            bad.append(f"quant scale output[{qi}] shape {tuple(buf.shape)} stride {tuple(buf.stride())}: {reason}")
+    if bad:
+        return (
+            "F8_128x4 quant scale outputs must be packed blobs (the epilogue writes each batch plane at compact offsets "
+            "from its base and does not apply the M/N strides): " + "; ".join(bad)
+        )
+    return None
+
+
 class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
+    _validate_quant_scale_blobs = True
     _validate_whole_scale_blocks = True
+    _validate_launch_grid = True
 
     def _lower(self):
         """The shared launch closure; a dense block-scale plan first checks its declared scale factors against the
@@ -2185,6 +2237,9 @@ def _precheck_plain(
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(select_template(chain, config))
+    _grid_reason = _launch_grid_reason(chain, config, chain.matmul.N)
+    if _grid_reason is not None:
+        raise NotImplementedError(_grid_reason)
 
 
 def _check_moe_output_dtypes(chain: FusionChain, tmpl) -> None:
@@ -2414,6 +2469,9 @@ def _precheck_block_scale(
     _check_own_family(select_template(chain, config))
     _check_block_scale_geometry(chain, config)
     _check_registry_funnel(_tmpl, chain, config)
+    _grid_reason = _launch_grid_reason(chain, config, chain.matmul.N)
+    if _grid_reason is not None:
+        raise NotImplementedError(_grid_reason)
 
 
 def _precheck_moe_block_scale(
@@ -2665,6 +2723,33 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     return None
 
 
+def _launch_grid_reason(chain: FusionChain, config: TileConfig, n: int) -> "str | None":
+    """Why the dense templates cannot launch this plan at kernel-frame N = ``n``, or None.
+
+    sm120_matmul.py and sm120_block_scale_matmul.py launch one CTA per output tile on a
+    (ceil(M / cta_tile_m), ceil(N / cta_tile_n), batch * split_k_slices) grid, and the split-K
+    reducer on a (ceil(M / 4), ceil(N / reducer tile), batch) grid. CUDA caps grid.y and grid.z
+    at 65535 (grid.x at 2**31 - 1, out of reach of any M an SM120 part can hold). Batch and the
+    slice count are fixed per plan; N is checked at plan time and again on every call, which
+    can grow it.
+    """
+    batch, slices = chain.matmul.batch, config.split_k_slices
+    over = []
+    if batch * slices > 65535:
+        over.append(f"grid.z = batch={batch} * split_k_slices={slices} = {batch * slices}")
+    tile_n = config.cga_tile_mn[1]
+    if -(-n // tile_n) > 65535:
+        over.append(f"grid.y = ceil(N={n} / {tile_n}) = {-(-n // tile_n)}")
+    if config.workspace_split_k:
+        reduce_n = _splitk_reduce_tile_n(slices, _splitk_reduce_elems(chain))
+        if -(-n // reduce_n) > 65535:
+            over.append(f"split-K reducer grid.y = ceil(N={n} / {reduce_n}) = {-(-n // reduce_n)}")
+    if not over:
+        return None
+    swapped = " (N is the graph's M: this swap-AB plan runs the GEMM transposed)" if config.swap_ab else ""
+    return f"the {config.name} launch grid exceeds CUDA's 65535 limit on grid.y and grid.z: {'; '.join(over)}{swapped}"
+
+
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
@@ -2846,6 +2931,7 @@ class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _validate_quant_scale_blobs = True
 
 
 def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> None:
@@ -2899,6 +2985,9 @@ def _launch_moe_swap_ab(
     scale_blob_reason = _grouped_row_quant_scale_blob_reject(chain, outputs, m, n, g)
     if scale_blob_reason is not None:
         raise ValueError(scale_blob_reason)
+    # The whole-blob _sf_blob_reject in the loop above accepts an aliasing view whose span
+    # equals its element count (e.g. a stride-0 row axis); the per-plane rule does not.
+    compiled._check_quant_scale_blobs(outputs)
     for i, spec in enumerate(chain.output_specs):
         if i in compiled.tma_slots and spec.major == "n" and n * DTYPE_BYTES[spec.dtype] % 16:
             raise ValueError("MoE weight-by-token runtime S violates the TMA token boundary alignment")
@@ -3020,6 +3109,7 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _validate_quant_scale_blobs = True
     _check_padded_operands = True
     _check_all_operands = True
     _validate_whole_scale_blocks = True
