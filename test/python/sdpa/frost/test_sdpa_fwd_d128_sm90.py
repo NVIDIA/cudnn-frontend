@@ -1045,28 +1045,92 @@ def test_d128_turns_and_rings_complete_in_a_watchdogged_child(variant):
 def test_d128_adapter_applies_the_shipped_switches(monkeypatch):
     """check_support writes api_dsl's D128 switch constants into a D128 plan's record at call time: persistence only
     under overlap, on a dense plan always and on a causal plan as D128_PERSISTENT_CAUSAL_WALK says (0 one tile per CTA,
-    1 the stride by the grid, 2 the paired walk). A D512 plan (tile 64/64 pinned) never carries a switch."""
+    1 the stride by the grid, 2 the paired walk), the paired walk's plan going one tile per CTA where
+    D128_CAUSAL_WALK_ROUTE routes it, as it routes this two-item plan (at most one item per CTA). A D512 plan (tile 64/64
+    pinned) never carries a switch."""
     import itertools
 
     from cudnn.sdpa.fwd import api_dsl
 
     q, k, v = _inputs(1, 2, 2, 64, 128, torch.float16)
     o = torch.empty_like(q)
-    for overlap, persistent, walk, causal in itertools.product((False, True), (False, True), (0, 1, 2), (False, True)):
+    for overlap, persistent, walk, causal, route in itertools.product((False, True), (False, True), (0, 1, 2), (False, True), (False, True)):
         monkeypatch.setattr(api_dsl, "D128_INTRA_WG_OVERLAP", overlap)
         monkeypatch.setattr(api_dsl, "D128_PERSISTENT", persistent)
         monkeypatch.setattr(api_dsl, "D128_PERSISTENT_CAUSAL_WALK", walk)
+        monkeypatch.setattr(api_dsl, "D128_CAUSAL_WALK_ROUTE", route)
         mask = dict(is_causal=True) if causal else {}
         api = api_dsl.SdpaFwdDslSm90(q, k, v, o, **mask)
         assert api.check_support() and api.flavor == (128, 128), api.flavor
         on = overlap and persistent and (not causal or walk > 0)
+        paired = on and causal and walk == 2
         got = {name: getattr(api.params, name) for name in _SWITCHES}
-        assert got == dict(intra_wg_overlap=overlap, persistent=on, causal_walk=int(on and causal and walk == 2)), (causal, walk, got)
+        want = dict(intra_wg_overlap=overlap, persistent=on and not (paired and route), causal_walk=int(paired and not route))
+        assert got == want, (causal, walk, route, got)
         d512 = api_dsl.SdpaFwdDslSm90(q, k, v, o, tile_m=64, tile_n=64, **mask)
         assert d512.check_support() and d512.flavor == (512, 512), d512.flavor
         assert not any(getattr(d512.params, name) for name in _SWITCHES), d512.params
 
 
+@pytest.mark.L0
+def test_d128_adapter_routes_causal_plans_one_tile_per_cta(monkeypatch):
+    """check_support with the paired walk picked (D128_PERSISTENT_CAUSAL_WALK 2), at 132 CTAs (an H100 SXM's SM count,
+    patched so that the decision does not move with the board): with D128_CAUSAL_WALK_ROUTE on, a causal plan the route
+    sends carries the record D128_PERSISTENT_CAUSAL_WALK 0 gives it, field for field, and every other plan the paired
+    walk's record; with the route off every plan carries the paired walk's. L is a plan's mean KV tiles per Q tile, and
+    every plan but the last is bottom-right. Routed: paired walks of b8 h32/8 at S_q 2048 S_kv 16384 (L 120.5, the
+    one-tile kernel won) and S_q 1920 S_kv 7040 (L 48.0, the walk's cutoff); strides the walk's rule keeps at b3 h8/8
+    S_q 2048 S_kv 10240 (MHA, L 72.5, the one-tile kernel won), b8 h24/8 S_q 256 S_kv 2176 (GQA ratio 3, L 16.5) and b3
+    h32/16 S_q 384 S_kv 6272 (GQA ratio 2, L 48.0); and at the stride cutoffs, the MHA strides b13 h16/16 S_q 1152 S_kv
+    1792 (L 10.0, the MHA cutoff) and b9 h16/16 S_q 1664 S_kv 2688 (L 15.0) and the GQA ratio 2 stride b12 h16/8 S_q
+    1280 S_kv 2560 (L 15.5, half a KV tile past the GQA cutoff). Kept: paired walks of b8 h16/4 S 1024 (L 4.5) and b8
+    h32/8 S_q 2048 S_kv 7040 (L 47.5); strides of b6 h32/32 S_q 256 S_kv 512 (MHA, L 3.5) and, at the stride cutoffs, b5
+    h64/64 S_q 768 S_kv 1536 (MHA, L 9.5), b8 h32/8 S_q 2176 S_kv 2304 (GQA ratio 4, L 10.0), b8 h32/16 S_q 2304 S_kv
+    2432 (GQA ratio 2, L 10.5) and b17 h32/4 S_q 384 S_kv 2048 (GQA ratio 8, L 15.0, the GQA cutoff); pairs alone at b3
+    h8/8 S_q 768 S_kv 4864 (72 pairs on 72 CTAs); and b8 h32/8 S_q 2048 S_kv 16384 under the top-left mask (a paired
+    walk at L 8.5, the first plan's top-left twin: check_support gives the route the record's alignment). These are the
+    host suite's decisions in test_sdpa_fwd_d128_sm90_routing.py (test_d128_route_on_the_measured_timings,
+    test_d128_route_walk_cutoff_at_its_boundary, test_d128_route_stride_cutoffs_at_their_boundaries,
+    test_d128_route_splits_strides_by_head_layout and test_d128_route_reads_the_mask_alignment)."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setattr(api_dsl.SdpaFwdDslSm90, "_persistent_ctas", lambda self, device: 132)
+
+    def record(q, k, v, bottom_right, walk, route):
+        monkeypatch.setattr(api_dsl, "D128_PERSISTENT_CAUSAL_WALK", walk)
+        monkeypatch.setattr(api_dsl, "D128_CAUSAL_WALK_ROUTE", route)
+        api = api_dsl.SdpaFwdDslSm90(q, k, v, torch.empty_like(q), is_causal=True, causal_bottom_right=bottom_right)
+        assert api.check_support() and api.flavor == (128, 128), api.flavor
+        return api.params
+
+    for shape, bottom_right, routed in [
+        ((8, 32, 8, 2048, 16384), True, True),
+        ((8, 32, 8, 1920, 7040), True, True),
+        ((3, 8, 8, 2048, 10240), True, True),
+        ((8, 24, 8, 256, 2176), True, True),
+        ((3, 32, 16, 384, 6272), True, True),
+        ((13, 16, 16, 1152, 1792), True, True),
+        ((9, 16, 16, 1664, 2688), True, True),
+        ((12, 16, 8, 1280, 2560), True, True),
+        ((8, 16, 4, 1024, 1024), True, False),
+        ((8, 32, 8, 2048, 7040), True, False),
+        ((6, 32, 32, 256, 512), True, False),
+        ((5, 64, 64, 768, 1536), True, False),
+        ((8, 32, 8, 2176, 2304), True, False),
+        ((8, 32, 16, 2304, 2432), True, False),
+        ((17, 32, 4, 384, 2048), True, False),
+        ((3, 8, 8, 768, 4864), True, False),
+        ((8, 32, 8, 2048, 16384), False, False),
+    ]:
+        routed = api_dsl._sm90_d128_causal_route(shape, bottom_right, 132)
+        q, k, v = _inputs(*shape, torch.bfloat16)
+        paired = record(q, k, v, bottom_right, 2, False)
+        assert (paired.persistent, paired.causal_walk) == (True, 1), (shape, bottom_right, paired)
+        assert record(q, k, v, bottom_right, 2, True) == (record(q, k, v, bottom_right, 0, True) if routed else paired), (shape, bottom_right)
+        del q, k, v
+
+
+@pytest.mark.L0
 def test_d128_adapter_passes_the_cta_count_exactly_when_persistent(monkeypatch):
     """compile() passes the SM count (SdpaFwdDslSm90._persistent_ctas) to a persistent D128 record and nothing to any
     other plan, so a non-persistent key never names a device."""

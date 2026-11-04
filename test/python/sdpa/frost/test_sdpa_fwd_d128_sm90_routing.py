@@ -1133,6 +1133,497 @@ def test_causal_walk_record_carries_the_rule():
         make((1, 2, 2, 256, 256), persistent=True, persistent_ctas=2, causal_walk=1)
 
 
+# --- The route: causal plans of the paired walk go one tile per CTA by L (host-only) -------
+#
+# api_dsl._sm90_d128_causal_route, run on the paired walk's own template: check_support gives a causal plan of the
+# paired walk the one-tile record where it returns True (D128_CAUSAL_WALK_ROUTE); the cc 9.0 suite's
+# test_d128_adapter_routes_causal_plans_one_tile_per_cta runs it through check_support.
+
+
+def _route(shape, ctas=132):
+    """Whether the route sends a causal bottom-right bf16 plan of ``shape``, under the adapter's causal order, one tile
+    per CTA at ``ctas`` CTAs (132: an H100 SXM's SM count)."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    _, h_q, h_kv, _, s_kv = shape
+    sched = api_dsl._causal_sched_policy(s_kv, 128, 128, 2)
+    return api_dsl._sm90_d128_causal_route(_walk_module(), shape, True, sched, h_q // h_kv, ctas, 2)
+
+
+def _plan(shape, ctas=132):
+    """``(kind, L)`` of the same plan, from the template's planner: "one item per CTA" (at most ``ctas`` items), "pairs"
+    (the walk's rule deals pairs alone, at most one unit per CTA), "walk" (any other paired walk) or "stride" (the
+    walk's rule keeps the stride), and L, the mean KV tiles per Q tile."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    mod = _walk_module()
+    b, h_q, h_kv, _, s_kv = shape
+    kv_tiles = mod.causal_kv_tiles(shape, True)
+    mean = sum(kv_tiles) / len(kv_tiles)
+    if len(kv_tiles) * h_q * b <= ctas:
+        return "one item per CTA", mean
+    walk = mod.causal_walk_plan(shape, True, api_dsl._causal_sched_policy(s_kv, 128, 128, 2), h_q // h_kv, ctas, 2)
+    return ("stride" if walk is None else "pairs" if walk.units <= ctas else "walk"), mean
+
+
+# The 161 timings of D128_CAUSAL_WALK_ROUTE's comment (132 causal shapes on H100 SXM GPUs, #1159's harness, bf16, ten
+# sessions from 2026-10-21 to 2026-11-04, each on its own machine), by the kind of plan and L: (session, (b, h_q, h_kv,
+# S_q, S_kv) with the diagonal bottom-right (the top-left mask where S_q equals S_kv), L, t(one tile) / t(the walk's
+# plan) as a median of per-round ratios, its band, the larger of 1% and the A/A twin gap (1% alone on the 26 timings of
+# 2026-10-21, which ran no twin), and whether the route sends the plan one tile per CTA at 132 CTAs). Below 1 minus the
+# band the one-tile kernel won, above 1 plus the band the walk's plan did. A shape timed in more than one session has a
+# row per session. Paired walks stay below L 48 (_D128_ROUTE_WALK_MAX_L) whatever the head layout; strides stay up to L
+# 15 inclusive with more than one Q head per KV head (_D128_ROUTE_STRIDE_MAX_L_GQA) and below L 10 on MHA
+# (_D128_ROUTE_STRIDE_MAX_L_MHA); pairs alone stay at any L, and a plan of at most one item per CTA is routed at any L.
+_ROUTE_MEASURED = {
+    "walk": [
+        ("s13", (8, 24, 8, 256, 256), 1.5, 1.2785, 0.0196, False),
+        ("s11", (16, 16, 4, 512, 512), 2.5, 1.3000, 0.0100, False),
+        ("s11", (33, 8, 8, 512, 512), 2.5, 1.2605, 0.0100, False),
+        ("s11", (66, 4, 1, 512, 512), 2.5, 1.3806, 0.0100, False),
+        ("s13", (8, 24, 8, 256, 384), 2.5, 1.2440, 0.0136, False),
+        ("s14", (16, 16, 4, 512, 512), 2.5, 1.2983, 0.0100, False),
+        ("s14", (29, 8, 1, 512, 512), 2.5, 1.3053, 0.0146, False),
+        ("s14", (33, 8, 8, 512, 512), 2.5, 1.2662, 0.0100, False),
+        ("s14", (66, 4, 1, 512, 512), 2.5, 1.3771, 0.0100, False),
+        ("s19", (66, 4, 1, 512, 512), 2.5, 1.3895, 0.0198, False),
+        ("s12", (4, 8, 8, 640, 640), 3.0, 1.0406, 0.0345, False),
+        ("s11", (8, 16, 4, 1024, 1024), 4.5, 1.1955, 0.0100, False),
+        ("s11", (17, 2, 2, 1024, 1024), 4.5, 1.1669, 0.0100, False),
+        ("s11", (23, 6, 6, 1024, 1024), 4.5, 1.1275, 0.0100, False),
+        ("s11", (32, 16, 4, 1024, 1024), 4.5, 1.2785, 0.0100, False),
+        ("s11", (33, 4, 1, 1024, 1024), 4.5, 1.2854, 0.0100, False),
+        ("s11", (33, 4, 4, 1024, 1024), 4.5, 1.1976, 0.0100, False),
+        ("s11", (33, 16, 4, 1024, 1024), 4.5, 1.3316, 0.0100, False),
+        ("s12", (17, 2, 2, 1024, 1024), 4.5, 1.1587, 0.0118, False),
+        ("s13", (17, 2, 2, 1024, 1024), 4.5, 1.1706, 0.0224, False),
+        ("s14", (8, 16, 4, 1024, 1024), 4.5, 1.1999, 0.0100, False),
+        ("s14", (24, 128, 8, 1024, 1024), 4.5, 1.2941, 0.0100, False),
+        ("s14", (32, 128, 8, 512, 768), 4.5, 1.7587, 0.0100, False),
+        ("s14", (33, 4, 1, 1024, 1024), 4.5, 1.2986, 0.0100, False),
+        ("s14", (33, 4, 4, 1024, 1024), 4.5, 1.2017, 0.0100, False),
+        ("s12", (4, 16, 4, 1152, 1152), 5.0, 1.2390, 0.0100, False),
+        ("s13", (4, 16, 4, 1152, 1152), 5.0, 1.2428, 0.0100, False),
+        ("s12", (4, 16, 4, 1000, 1100), 5.5, 1.0780, 0.0193, False),
+        ("s11", (2, 32, 8, 2048, 2048), 8.5, 1.1091, 0.0100, False),
+        ("s11", (33, 2, 2, 2048, 2048), 8.5, 1.1221, 0.0100, False),
+        ("s17", (12, 64, 8, 2048, 2048), 8.5, 1.1517, 0.0100, False),
+        ("s13", (8, 24, 8, 256, 1280), 9.5, 1.2237, 0.0104, False),
+        ("s12", (1, 6, 6, 3000, 3000), 12.5, 1.0437, 0.0219, False),
+        ("s11", (1, 32, 8, 4096, 4096), 16.5, 1.0563, 0.0100, False),
+        ("s11", (2, 32, 8, 4096, 4096), 16.5, 1.0708, 0.0100, False),
+        ("s11", (2, 32, 32, 4096, 4096), 16.5, 1.0412, 0.0100, False),
+        ("s11", (8, 32, 8, 4096, 4096), 16.5, 1.0607, 0.0100, False),
+        ("s11", (33, 1, 1, 4096, 4096), 16.5, 1.0705, 0.0100, False),
+        ("s19", (2, 32, 32, 4096, 4096), 16.5, 1.0438, 0.0100, False),
+        ("s11", (1, 16, 4, 8192, 8192), 32.5, 1.0144, 0.0100, False),
+        ("s11", (2, 32, 8, 8192, 8192), 32.5, 1.0269, 0.0100, False),
+        ("s11", (4, 8, 8, 8192, 8192), 32.5, 1.0211, 0.0100, False),
+        ("s11", (33, 1, 1, 8192, 8192), 32.5, 1.0307, 0.0100, False),
+        ("s14", (1, 16, 4, 8192, 8192), 32.5, 1.0194, 0.0100, False),
+        ("s14", (4, 32, 32, 4096, 6144), 32.5, 1.0251, 0.0100, False),
+        ("s14", (4, 32, 32, 8192, 8192), 32.5, 1.0103, 0.0100, False),
+        ("s14", (6, 32, 32, 4096, 6144), 32.5, 1.0247, 0.0100, False),
+        ("s19", (2, 32, 8, 8192, 8192), 32.5, 1.0257, 0.0100, False),
+        ("s14", (8, 32, 8, 2048, 6144), 40.5, 1.0680, 0.0100, False),
+        ("s15", (8, 32, 8, 2048, 6144), 40.5, 1.0689, 0.0100, False),
+        ("s16", (8, 32, 8, 2048, 6144), 40.5, 1.0440, 0.0100, False),
+        ("s17", (8, 32, 8, 2048, 6144), 40.5, 1.0681, 0.0100, False),
+        ("s18", (8, 32, 8, 2048, 6144), 40.5, 1.0661, 0.0100, False),
+        ("s19", (8, 32, 8, 2048, 6144), 40.5, 1.0638, 0.0100, False),
+        ("s17", (8, 8, 8, 4096, 7680), 44.5, 0.9976, 0.0100, False),
+        ("s17", (1, 64, 8, 11776, 11776), 46.5, 1.0327, 0.0100, False),
+        ("s17", (6, 16, 16, 4096, 8064), 47.5, 0.9980, 0.0100, False),
+        ("s17", (16, 32, 8, 1024, 6528), 47.5, 1.0099, 0.0100, False),
+        ("s14", (4, 32, 32, 4096, 8192), 48.5, 1.0011, 0.0100, True),
+        ("s15", (6, 32, 32, 4096, 8192), 48.5, 1.0000, 0.0100, True),
+        ("s17", (16, 32, 8, 1024, 6656), 48.5, 1.0098, 0.0100, True),
+        ("s17", (2, 64, 64, 4096, 8448), 50.5, 1.0027, 0.0100, True),
+        ("s17", (2, 16, 4, 13312, 13312), 52.5, 1.0118, 0.0100, True),
+        ("s17", (4, 32, 4, 2048, 8192), 56.5, 1.0258, 0.0100, True),
+        ("s11", (1, 64, 8, 16384, 16384), 64.5, 1.0118, 0.0100, True),
+        ("s11", (2, 16, 4, 16384, 16384), 64.5, 1.0082, 0.0100, True),
+        ("s11", (2, 32, 8, 16384, 16384), 64.5, 1.0088, 0.0100, True),
+        ("s15", (3, 32, 32, 4096, 10240), 64.5, 1.0081, 0.0100, True),
+        ("s15", (4, 32, 32, 4096, 10240), 64.5, 1.0062, 0.0100, True),
+        ("s14", (8, 32, 8, 2048, 10240), 72.5, 1.0225, 0.0100, True),
+        ("s15", (3, 32, 32, 4096, 12288), 80.5, 1.0157, 0.0100, True),
+        ("s15", (8, 32, 8, 2048, 12288), 88.5, 1.0200, 0.0100, True),
+        ("s16", (3, 32, 32, 4096, 13312), 88.5, 0.9805, 0.0100, True),
+        ("s15", (8, 32, 8, 2048, 13312), 96.5, 0.9840, 0.0100, True),
+        ("s16", (16, 32, 8, 1024, 13312), 100.5, 0.9770, 0.0100, True),
+        ("s16", (2, 32, 32, 4096, 15360), 104.5, 0.9856, 0.0100, True),
+        ("s16", (2, 32, 32, 4096, 16384), 112.5, 0.9872, 0.0100, True),
+        ("s12", (4, 32, 8, 2048, 16384), 120.5, 0.9932, 0.0100, True),
+        ("s12", (8, 32, 8, 2048, 16384), 120.5, 0.9857, 0.0100, True),
+        ("s13", (4, 32, 8, 2048, 16384), 120.5, 0.9909, 0.0100, True),
+        ("s13", (8, 32, 8, 2048, 16384), 120.5, 0.9834, 0.0100, True),
+        ("s14", (8, 32, 8, 2048, 16384), 120.5, 0.9899, 0.0100, True),
+        ("s15", (8, 32, 8, 2048, 16384), 120.5, 0.9889, 0.0100, True),
+        ("s16", (8, 32, 8, 2048, 16384), 120.5, 0.9773, 0.0100, True),
+        ("s17", (8, 32, 8, 2048, 16384), 120.5, 0.9911, 0.0100, True),
+        ("s18", (8, 32, 8, 2048, 16384), 120.5, 0.9900, 0.0100, True),
+        ("s19", (8, 32, 8, 2048, 16384), 120.5, 0.9884, 0.0100, True),
+        ("s14", (3, 32, 32, 4096, 20480), 144.5, 0.9964, 0.0100, True),
+        ("s17", (4, 64, 8, 1024, 20480), 156.5, 1.0021, 0.0100, True),
+        ("s16", (16, 16, 4, 2048, 24576), 184.5, 0.9902, 0.0100, True),
+        ("s16", (5, 32, 8, 2048, 26624), 200.5, 0.9818, 0.0100, True),
+        ("s16", (4, 64, 8, 2048, 32768), 248.5, 0.9731, 0.0409, True),
+        ("s14", (8, 32, 8, 2048, 34816), 264.5, 0.9778, 0.0443, True),
+        ("s14", (8, 32, 8, 2048, 67584), 520.5, 0.9890, 0.0724, True),
+    ],
+    "stride": [
+        ("s18", (24, 32, 32, 768, 896), 4.5, 1.2083, 0.0100, False),
+        ("s17", (16, 32, 32, 2048, 2048), 8.5, 1.0238, 0.0100, False),
+        ("s18", (41, 64, 8, 1024, 1536), 8.5, 1.1346, 0.0100, False),
+        ("s19", (5, 64, 64, 768, 1536), 9.5, 1.0598, 0.0137, False),
+        ("s18", (8, 32, 8, 2176, 2304), 10.0, 1.0979, 0.0100, False),
+        ("s19", (4, 64, 32, 2176, 2304), 10.0, 1.1137, 0.0100, False),
+        ("s20", (4, 64, 32, 2176, 2304), 10.0, 1.1235, 0.0100, False),
+        ("s20", (9, 16, 16, 1664, 2048), 10.0, 1.0179, 0.0123, True),
+        ("s20", (13, 16, 16, 1152, 1792), 10.0, 0.9610, 0.0100, True),
+        ("s20", (15, 16, 8, 1152, 1792), 10.0, 1.0970, 0.0119, False),
+        ("s19", (41, 64, 8, 1024, 1792), 10.5, 1.0703, 0.0100, False),
+        ("s19", (8, 32, 8, 2176, 2432), 11.0, 1.0909, 0.0100, False),
+        ("s20", (8, 32, 8, 2176, 2432), 11.0, 1.0976, 0.0100, False),
+        ("s20", (13, 16, 16, 1152, 1920), 11.0, 0.9549, 0.0100, True),
+        ("s20", (15, 16, 8, 1152, 1920), 11.0, 1.0821, 0.0100, False),
+        ("s20", (2, 64, 64, 1664, 2304), 12.0, 1.0481, 0.0188, True),
+        ("s20", (25, 64, 8, 384, 1664), 12.0, 1.0848, 0.0100, False),
+        ("s20", (4, 32, 32, 1408, 2304), 13.0, 1.0376, 0.0191, True),
+        ("s20", (17, 32, 8, 896, 2048), 13.0, 1.0718, 0.0100, False),
+        ("s20", (3, 64, 64, 896, 2176), 14.0, 1.0280, 0.0189, True),
+        ("s20", (7, 32, 16, 1408, 2432), 14.0, 1.0682, 0.0100, False),
+        ("s20", (4, 32, 32, 2176, 2944), 15.0, 0.9811, 0.0156, True),
+        ("s20", (9, 16, 16, 1664, 2688), 15.0, 0.9576, 0.0100, True),
+        ("s20", (17, 32, 4, 384, 2048), 15.0, 1.0779, 0.0100, False),
+        ("s20", (30, 24, 8, 384, 2048), 15.0, 1.0623, 0.0100, False),
+        ("s13", (8, 24, 8, 256, 1956), 15.5, 1.0264, 0.0131, True),
+        ("s13", (8, 24, 8, 256, 2048), 15.5, 1.0108, 0.0100, True),
+        ("s17", (10, 16, 16, 1536, 2688), 15.5, 0.9322, 0.0114, True),
+        ("s17", (16, 32, 32, 2048, 2944), 15.5, 0.9851, 0.0100, True),
+        ("s18", (12, 16, 8, 1280, 2560), 15.5, 1.0277, 0.0100, True),
+        ("s13", (8, 24, 8, 384, 2176), 16.0, 1.0287, 0.0100, True),
+        ("s17", (8, 32, 32, 4096, 4096), 16.5, 0.9669, 0.0108, True),
+        ("s17", (12, 16, 16, 3072, 4352), 22.5, 0.9573, 0.0100, True),
+        ("s17", (16, 32, 8, 2048, 3840), 22.5, 1.0207, 0.0100, True),
+        ("s18", (8, 64, 64, 2048, 3840), 22.5, 0.9172, 0.0100, True),
+        ("s18", (12, 16, 8, 3072, 4352), 22.5, 1.0146, 0.0100, True),
+        ("s17", (16, 24, 8, 2048, 4096), 24.5, 1.0308, 0.0100, True),
+        ("s12", (4, 24, 8, 512, 4096), 30.5, 1.0273, 0.0100, True),
+        ("s13", (4, 24, 8, 512, 4096), 30.5, 1.0231, 0.0100, True),
+        ("s16", (8, 32, 32, 4096, 6144), 32.5, 0.9586, 0.0100, True),
+        ("s18", (3, 16, 8, 3072, 6528), 39.5, 0.9438, 0.0100, True),
+        ("s15", (3, 8, 8, 2048, 6144), 40.5, 1.0110, 0.0100, True),
+        ("s15", (3, 8, 8, 2048, 7168), 48.5, 0.9202, 0.0100, True),
+        ("s16", (6, 32, 8, 4096, 8192), 48.5, 1.0048, 0.0100, True),
+        ("s12", (8, 64, 8, 2048, 8192), 56.5, 0.9959, 0.0100, True),
+        ("s16", (16, 32, 8, 2048, 8192), 56.5, 1.0095, 0.0100, True),
+        ("s15", (6, 32, 32, 4096, 10240), 64.5, 0.9148, 0.0100, True),
+        ("s16", (5, 32, 32, 4096, 10240), 64.5, 0.9488, 0.0100, True),
+        ("s18", (6, 32, 16, 4096, 10240), 64.5, 0.9645, 0.0100, True),
+        ("s14", (3, 8, 8, 2048, 10240), 72.5, 0.9335, 0.0100, True),
+        ("s16", (12, 32, 8, 2048, 11264), 80.5, 1.0117, 0.0100, True),
+        ("s12", (8, 64, 8, 2048, 16384), 120.5, 1.0084, 0.0358, True),
+        ("s14", (6, 32, 32, 4096, 20480), 144.5, 0.9092, 0.0474, True),
+        ("s18", (3, 32, 8, 2560, 20480), 150.5, 0.9977, 0.0100, True),
+        ("s18", (1, 64, 8, 2176, 28672), 216.0, 0.9902, 0.0100, True),
+    ],
+    "pairs": [
+        ("s11", (11, 3, 3, 1024, 1024), 4.5, 1.1238, 0.0100, False),
+        ("s13", (8, 24, 8, 128, 1920), 15.0, 1.0084, 0.0113, False),
+        ("s13", (4, 24, 8, 256, 2048), 15.5, 1.0453, 0.0105, False),
+        ("s15", (3, 8, 8, 768, 3840), 27.5, 0.9993, 0.0111, False),
+        ("s14", (3, 8, 8, 768, 4864), 35.5, 1.0128, 0.0100, False),
+        ("s14", (3, 8, 8, 1024, 5120), 36.5, 1.0161, 0.0100, False),
+        ("s15", (3, 8, 8, 768, 5888), 43.5, 1.0133, 0.0114, False),
+        ("s15", (2, 8, 8, 1152, 7296), 53.0, 0.9946, 0.0107, False),
+        ("s16", (3, 4, 1, 1536, 34304), 262.5, 1.0177, 0.0109, False),
+    ],
+    "one item per CTA": [
+        ("s11", (1, 16, 4, 1024, 1024), 4.5, 0.9947, 0.0100, True),
+        ("s12", (1, 4, 1, 2048, 16384), 120.5, 0.9960, 0.0100, True),
+        ("s14", (1, 4, 1, 4096, 135168), 1040.5, 0.9934, 0.0100, True),
+    ],
+}
+# The wins the rule gives up, (session, shape): paired walks at L 52.5 to 88.5 that won by 1.2% to 2.6%, MHA strides at
+# L 10 to 14 that won by 1.8% to 4.8%, and strides at L 15.5 to 80.5 that won by 1.1% to 3.1%.
+_ROUTE_WINS_GIVEN_UP = {
+    ("s17", (2, 16, 4, 13312, 13312)),
+    ("s17", (4, 32, 4, 2048, 8192)),
+    ("s11", (1, 64, 8, 16384, 16384)),
+    ("s14", (8, 32, 8, 2048, 10240)),
+    ("s15", (3, 32, 32, 4096, 12288)),
+    ("s15", (8, 32, 8, 2048, 12288)),
+    ("s20", (9, 16, 16, 1664, 2048)),
+    ("s20", (2, 64, 64, 1664, 2304)),
+    ("s20", (4, 32, 32, 1408, 2304)),
+    ("s20", (3, 64, 64, 896, 2176)),
+    ("s13", (8, 24, 8, 256, 1956)),
+    ("s13", (8, 24, 8, 256, 2048)),
+    ("s18", (12, 16, 8, 1280, 2560)),
+    ("s13", (8, 24, 8, 384, 2176)),
+    ("s17", (16, 32, 8, 2048, 3840)),
+    ("s18", (12, 16, 8, 3072, 4352)),
+    ("s17", (16, 24, 8, 2048, 4096)),
+    ("s12", (4, 24, 8, 512, 4096)),
+    ("s13", (4, 24, 8, 512, 4096)),
+    ("s15", (3, 8, 8, 2048, 6144)),
+    ("s16", (12, 32, 8, 2048, 11264)),
+}
+
+
+def test_d128_route_on_the_measured_timings():
+    """The route's decision at 132 CTAs on each of the 161 timings (_ROUTE_MEASURED), with its plan's kind and L: it
+    routes all 29 on which the one-tile kernel won beyond the band and 27 of the 33 ties, keeps 78 of the 99 the walk's
+    plan won, and gives up the other 21 (_ROUTE_WINS_GIVEN_UP), none by more than 4.81%. The 55 strides split by head
+    layout: of the 32 with more than one Q head per KV head (GQA ratios 2, 3, 4 and 8), the 14 at L 15 or less all won
+    and are kept, and the 18 above (ten won, six tied, two lost) are routed; of the 23 MHA strides, the three below L 10
+    won and are kept, and the 20 from L 10 up (five won, 15 lost) are routed."""
+    rows = [(kind, *row) for kind, kind_rows in _ROUTE_MEASURED.items() for row in kind_rows]
+    assert len(rows) == 161 and len({shape for _, _, shape, *_ in rows}) == 132
+    for kind, session, shape, mean, _, _, routed in rows:
+        assert _plan(shape) == (kind, mean), (session, shape, _plan(shape))
+        assert _route(shape) is routed, (session, shape, routed)
+    lost = [row for row in rows if row[4] < 1 - row[5]]
+    won = [row for row in rows if row[4] > 1 + row[5]]
+    tied = [row for row in rows if row not in lost and row not in won]
+    assert len(lost) == 29 and all(row[6] for row in lost), [row[1:3] for row in lost if not row[6]]
+    given_up = [row for row in won if row[6]]
+    assert len(won) == 99 and {row[1:3] for row in given_up} == _ROUTE_WINS_GIVEN_UP, sorted(row[1:3] for row in given_up)
+    assert max(row[4] for row in given_up) == 1.0481
+    assert len(tied) == 33 and sum(row[6] for row in tied) == 27
+    gqa = [row for row in rows if row[0] == "stride" and row[2][1] > row[2][2]]
+    mha = [row for row in rows if row[0] == "stride" and row[2][1] == row[2][2]]
+    assert (len(gqa), len(mha)) == (32, 23)
+    short_gqa, long_gqa = [row for row in gqa if row[3] <= 15], [row for row in gqa if row[3] > 15]
+    assert len(short_gqa) == 14 and sorted({row[2][1] // row[2][2] for row in short_gqa}) == [2, 3, 4, 8]
+    assert all(row in won and not row[6] for row in short_gqa)
+    assert [sum(row in calls for row in long_gqa) for calls in (won, tied, lost)] == [10, 6, 2] and all(row[6] for row in long_gqa)
+    short_mha, long_mha = [row for row in mha if row[3] < 10], [row for row in mha if row[3] >= 10]
+    assert len(short_mha) == 3 and all(row in won and not row[6] for row in short_mha)
+    assert [sum(row in calls for row in long_mha) for calls in (won, tied, lost)] == [5, 0, 15] and all(row[6] for row in long_mha)
+
+
+def test_d128_route_walk_cutoff_at_its_boundary():
+    """The walk cutoff on real paired walks of b8 h32/8 at 132 CTAs, at it and half a KV tile on either side (L moves in
+    half KV tiles here): S_q 2048 S_kv 7040 (L 47.5) stays, S_q 1920 S_kv 7040 (L 48.0, the cutoff) and S_q 2048 S_kv
+    7168 (L 48.5) go one tile per CTA."""
+    for shape, mean, routed in [((8, 32, 8, 2048, 7040), 47.5, False), ((8, 32, 8, 1920, 7040), 48.0, True), ((8, 32, 8, 2048, 7168), 48.5, True)]:
+        assert _plan(shape) == ("walk", mean) and _route(shape) is routed, (shape, _plan(shape), routed)
+
+
+def test_d128_route_stride_cutoffs_at_their_boundaries():
+    """Each stride cutoff on real strides at 132 CTAs, at its edge (L moves in half KV tiles here). MHA, below L 10: the
+    strides of b5 h64/64 S_q 768 S_kv 1536 (which the stride won by 6.0%) and b17 h8/8 S_q 256 S_kv 1280 at L 9.5 stay,
+    and those of b8 h32/32 S_q 2176 S_kv 2304 and b13 h16/16 S_q 1152 S_kv 1792 (which the one-tile kernel won by 3.9%)
+    at L 10.0 go one tile per CTA. More than one Q head per KV head, up to L 15 inclusive: the strides at L 15.0 of GQA
+    ratio 2 (b17 h16/8 S_q 128 S_kv 1920), 3 (b30 h24/8 S_q 384 S_kv 2048, won by 6.2%), 4 (b17 h16/4 S_q 128 S_kv
+    1920), 8 (b17 h32/4 S_q 384 S_kv 2048, won by 7.8%) and 32, MQA (b41 h32/1 S_q 1920 S_kv 2816), stay, and those at
+    L 15.5 of ratio 2 (b12 h16/8 S_q 1280 S_kv 2560, won by 2.8%), 3 (b8 h24/8 S_q 256 S_kv 2048, won by 1.1%), 4 (b6
+    h32/8 S_q 256 S_kv 2048), 8 (b41 h64/8 S_q 768 S_kv 2304) and 32 (b41 h32/1 S_q 1792 S_kv 2816) go. Each cutoff
+    reads its own layout only: the GQA strides of b8 h32/16 and h32/8 S_q 2176 S_kv 2304 at L 10.0 stay (h32/8 won by
+    9.8%), the MHA stride b9 h16/16 S_q 1664 S_kv 2688 at L 15.0 goes (the one-tile kernel won it by 4.2%), and the
+    paired walks of b8 h32/8 S_q 2304 S_kv 2432 (L 10.5) and b9 h16/8 S_q 1664 S_kv 2688 (L 15.0) stay."""
+    for shape, kind, mean, routed in [
+        ((5, 64, 64, 768, 1536), "stride", 9.5, False),
+        ((17, 8, 8, 256, 1280), "stride", 9.5, False),
+        ((8, 32, 32, 2176, 2304), "stride", 10.0, True),
+        ((13, 16, 16, 1152, 1792), "stride", 10.0, True),
+        ((17, 16, 8, 128, 1920), "stride", 15.0, False),
+        ((30, 24, 8, 384, 2048), "stride", 15.0, False),
+        ((17, 16, 4, 128, 1920), "stride", 15.0, False),
+        ((17, 32, 4, 384, 2048), "stride", 15.0, False),
+        ((41, 32, 1, 1920, 2816), "stride", 15.0, False),
+        ((12, 16, 8, 1280, 2560), "stride", 15.5, True),
+        ((8, 24, 8, 256, 2048), "stride", 15.5, True),
+        ((6, 32, 8, 256, 2048), "stride", 15.5, True),
+        ((41, 64, 8, 768, 2304), "stride", 15.5, True),
+        ((41, 32, 1, 1792, 2816), "stride", 15.5, True),
+        ((8, 32, 16, 2176, 2304), "stride", 10.0, False),
+        ((8, 32, 8, 2176, 2304), "stride", 10.0, False),
+        ((9, 16, 16, 1664, 2688), "stride", 15.0, True),
+        ((8, 32, 8, 2304, 2432), "walk", 10.5, False),
+        ((9, 16, 8, 1664, 2688), "walk", 15.0, False),
+    ]:
+        assert _plan(shape) == (kind, mean) and _route(shape) is routed, (shape, _plan(shape), routed)
+
+
+def test_d128_route_splits_strides_by_head_layout():
+    """A stride the walk's rule keeps goes by L and by whether its plan has more than one Q head per KV head, and by
+    nothing else of the layout: at 132 CTAs, the strides of b8 S_q 2176 S_kv 2560 (L 12.0, between the two stride
+    cutoffs) go one tile per CTA at h32/32 (MHA) and stay at h32/16 and h32/8 (GQA ratios 2 and 4), and the MQA stride
+    b41 h32/1 S_q 1920 S_kv 2432 (L 12.0) stays; the strides of h32/32, h32/16, h24/8, h32/8 and h32/4 at b8 S_q 2176
+    S_kv 3328 (L 18.0, past both stride cutoffs) and b6 S_q 4096 S_kv 20480 (L 144.5, past every cutoff; h32/32 there is
+    a measured stride loss of 9.1%) all go; and of the strides of the cc 9.0 suite's
+    test_d128_adapter_routes_causal_plans_one_tile_per_cta away from the cutoffs, b6 h32/32 S_q 256 S_kv 512 (MHA, L
+    3.5) stays, and b8 h24/8 S_q 256 S_kv 2176 (GQA ratio 3, L 16.5) and b3 h32/16 S_q 384 S_kv 6272 (GQA ratio 2, L
+    48.0) go (its fourth, b3 h8/8 S_q 2048 S_kv 10240, is among the measured timings)."""
+    for shape, routed in [((8, 32, 32, 2176, 2560), True), ((8, 32, 16, 2176, 2560), False), ((8, 32, 8, 2176, 2560), False), ((41, 32, 1, 1920, 2432), False)]:
+        assert _plan(shape) == ("stride", 12.0) and _route(shape) is routed, (shape, _plan(shape), routed)
+    for (b, s_q, s_kv), mean in [((8, 2176, 3328), 18.0), ((6, 4096, 20480), 144.5)]:
+        for h_q, h_kv in ((32, 32), (32, 16), (24, 8), (32, 8), (32, 4)):
+            shape = (b, h_q, h_kv, s_q, s_kv)
+            assert _plan(shape) == ("stride", mean) and _route(shape), (shape, _plan(shape))
+    for shape, mean, routed in [((6, 32, 32, 256, 512), 3.5, False), ((8, 24, 8, 256, 2176), 16.5, True), ((3, 32, 16, 384, 6272), 48.0, True)]:
+        assert _plan(shape) == ("stride", mean) and _route(shape) is routed, (shape, _plan(shape))
+
+
+def test_d128_route_reads_each_cutoff_on_its_own_kind():
+    """_D128_ROUTE_WALK_MAX_L decides paired walks only, _D128_ROUTE_STRIDE_MAX_L_GQA strides with more than one Q head
+    per KV head only and _D128_ROUTE_STRIDE_MAX_L_MHA MHA strides only: at 0 every plan a cutoff decides goes and past
+    every L every such plan stays, and every other plan keeps its decision. The paired walks b8 h32/8 S_q 2048 at S_kv
+    16384 (L 120.5, routed) and S_kv 6144 (L 40.5, kept); the GQA strides b3 h16/8 S_q 3072 S_kv 6528 (L 39.5, routed)
+    and b8 h32/8 S_q 2176 S_kv 2304 (L 10.0, kept); the MHA strides b3 h8/8 S_q 2048 S_kv 10240 (L 72.5, routed) and
+    b16 h32/32 S 2048 (L 8.5, kept); the plan of at most one item per CTA b1 h4/1 S_q 4096 S_kv 135168 (routed); pairs
+    alone b3 h4/1 S_q 1536 S_kv 34304 (L 262.5) and b11 h3/3 S_q 1024 S_kv 6656 (L 48.5), kept."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    walks = {(8, 32, 8, 2048, 16384): True, (8, 32, 8, 2048, 6144): False}
+    gqa = {(3, 16, 8, 3072, 6528): True, (8, 32, 8, 2176, 2304): False}
+    mha = {(3, 8, 8, 2048, 10240): True, (16, 32, 32, 2048, 2048): False}
+    others = {(1, 4, 1, 4096, 135168): True, (3, 4, 1, 1536, 34304): False, (11, 3, 3, 1024, 6656): False}
+    shipped = {**walks, **gqa, **mha, **others}
+    assert {shape: _route(shape) for shape in shipped} == shipped
+    for name, own in [("_D128_ROUTE_WALK_MAX_L", walks), ("_D128_ROUTE_STRIDE_MAX_L_GQA", gqa), ("_D128_ROUTE_STRIDE_MAX_L_MHA", mha)]:
+        for cutoff, own_go in [(0, True), (10**6, False)]:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(api_dsl, name, cutoff)
+                want = {**shipped, **{shape: own_go for shape in own}}
+                assert {shape: _route(shape) for shape in want} == want, (name, cutoff)
+
+
+def test_d128_route_keeps_pairs_alone_and_routes_one_item_per_cta():
+    """Two kinds of plan skip L. Pairs alone (at most one unit per CTA over more items than CTAs) stay at any L: at 132
+    CTAs b3 h4/1 S_q 1536 S_kv 34304 (72 pairs on 72 CTAs, L 262.5, a measured win), b2 h8/8 S_q 1152 S_kv 7296 (L 53.0,
+    a measured tie) and b11 h3/3 S_q 1024 S_kv 6656 (132 pairs on 132 CTAs, L 48.5); one batch more (b12, 288 items) is
+    no longer pairs alone, the walk's rule keeps the stride, at L 48.5, and the route sends it. A plan of at most one item
+    per CTA goes at any L: b1 h16/4 S 1024 (128 items, L 4.5), b1 h4/1 S_q 4096 S_kv 135168 (128 items, L 1040.5) and b1
+    h4/1 S 4224 (132 items, L 17.0), and at 7 CTAs b1 h7/7 S_q 128 (7 items); one Q tile more than the last at 132 (b1
+    h4/1 S 4352, 136 items) is a paired walk at L 17.5 and stays."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+
+    for shape, mean in [((3, 4, 1, 1536, 34304), 262.5), ((2, 8, 8, 1152, 7296), 53.0), ((11, 3, 3, 1024, 6656), 48.5)]:
+        assert _plan(shape) == ("pairs", mean) and not _route(shape), (shape, _plan(shape))
+    assert _walk_module().causal_walk_plan((11, 3, 3, 1024, 6656), True, SCHED_LPT_L2, 1, 132, 2).units == 132
+    assert _plan((12, 3, 3, 1024, 6656)) == ("stride", 48.5) and _route((12, 3, 3, 1024, 6656))
+    for shape, mean in [((1, 16, 4, 1024, 1024), 4.5), ((1, 4, 1, 4096, 135168), 1040.5), ((1, 4, 1, 4224, 4224), 17.0)]:
+        assert _plan(shape) == ("one item per CTA", mean) and _route(shape), (shape, _plan(shape))
+    assert _plan((1, 7, 7, 128, 1024), ctas=7) == ("one item per CTA", 8.0) and _route((1, 7, 7, 128, 1024), ctas=7)
+    assert _plan((1, 4, 1, 4352, 4352)) == ("walk", 17.5) and not _route((1, 4, 1, 4352, 4352))
+
+
+def test_d128_route_stays_cheap_on_large_plans():
+    """The route runs once per causal plan of the paired walk, in check_support, and runs the walk's rule only where the
+    plan's kind can change its answer: never where the plan's stride cutoff keeps a stride (top-left b8 h32/8 S_q 2048
+    S_kv 16384 at L 8.5, and top-left b2 h16/4 S_q 4096 S_kv 2048 at L 12.25, a GQA plan) or at or past the walk cutoff
+    on a plan of more than 2 * ctas items (b1 h128/1 S 262144 at L 1024.5, where the rule alone takes about 7.6 s on a
+    laptop, b1 h128/128 S 262144, and the walk rule's other large plans past L 48), always between the plan's stride
+    cutoff and the walk cutoff (top-left b2 h16/16 S_q 4096 S_kv 2048 at L 12.25, an MHA plan, and b32 h128/8 S 8192 and
+    b32 h128/128 S 8192 at L 32.5). On these plans it stays far below a compile's seconds: at most 0.3 s each on a
+    laptop (Python 3.14); the bound leaves room for a slow host. Not timed here: top-left b1 h128/1 S_q 262144 S_kv 4096,
+    a paired walk at L 31.8 between the cutoffs, where the rule runs and takes about 5.6 s on a laptop."""
+    import time
+    import types
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+    from cudnn.sdpa.fwd import api_dsl
+
+    mod, calls = _walk_module(), []
+
+    def walk_plan(*args, **kwargs):
+        calls.append(args[0])
+        return mod.causal_walk_plan(*args, **kwargs)
+
+    spy = types.SimpleNamespace(causal_kv_tiles=mod.causal_kv_tiles, causal_walk_plan=walk_plan)
+    for shape, bottom_right, rule_runs in [
+        ((32, 32, 8, 32000, 32020), True, False),
+        ((8, 64, 8, 65536, 32768), False, False),
+        ((16, 32, 8, 16000, 16010), True, False),
+        ((2, 16, 4, 4096, 2048), False, False),
+        ((2, 16, 16, 4096, 2048), False, True),
+        ((32, 128, 8, 16384, 16384), True, False),
+        ((1, 128, 1, 262144, 262144), True, False),
+        ((1, 128, 128, 262144, 262144), True, False),
+        ((8, 32, 8, 2048, 16384), False, False),
+        ((32, 128, 8, 8192, 8192), True, True),
+        ((32, 128, 128, 8192, 8192), True, True),
+    ]:
+        calls.clear()
+        start = time.perf_counter()
+        api_dsl._sm90_d128_causal_route(spy, shape, bottom_right, SCHED_LPT_L2, shape[1] // shape[2], 132, 2)
+        assert time.perf_counter() - start < 3.0, shape
+        assert calls == ([shape] if rule_runs else []), (shape, calls)
+
+
+def test_d128_route_reads_the_mask_alignment():
+    """The route reads L under the alignment it is given: b8 h32/8 S_q 2048 S_kv 16384 is a paired walk at L 120.5 under
+    the bottom-right mask (routed, a measured loss of the walk's plan) and at L 8.5 under the top-left one (kept), where
+    each Q tile walks its own tile count from KV tile 0. check_support passes the record's alignment (the cc 9.0 suite's
+    test_d128_adapter_routes_causal_plans_one_tile_per_cta runs both through it)."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+    from cudnn.sdpa.fwd import api_dsl
+
+    mod, shape = _walk_module(), (8, 32, 8, 2048, 16384)
+    for bottom_right, mean, routed in [(True, 120.5, True), (False, 8.5, False)]:
+        kv_tiles = mod.causal_kv_tiles(shape, bottom_right)
+        assert sum(kv_tiles) / len(kv_tiles) == mean and mod.causal_walk_plan(shape, bottom_right, SCHED_LPT_L2, 4, 132, 2).units > 132
+        assert api_dsl._sm90_d128_causal_route(mod, shape, bottom_right, SCHED_LPT_L2, 4, 132, 2) is routed, bottom_right
+
+
+def test_d128_route_runs_only_under_its_switch():
+    """check_support calls the route at one place, under ``if causal_walk and D128_CAUSAL_WALK_ROUTE:``, so with the
+    switch False no plan is routed and every causal plan of the paired walk keeps its record; where the route returns
+    True the record becomes D128_PERSISTENT_CAUSAL_WALK 0's (persistent and causal_walk cleared) and nothing else
+    changes. The route is given what compile() gives causal_walk_plan: the record's template, alignment, scheduler and
+    head ratio, the device's SM count and the storage width, so it plans the walk the kernel would run. The head ratio is
+    the expression the record's qh_per_kh is built from, so the route's MHA (a ratio of 1) is the kernel's (Q head h
+    reads KV head h // qh_per_kh); a PackGQA declaration never reaches the D128 template (the per-flavor tests above).
+    The cc 9.0 suite's test_d128_adapter_routes_causal_plans_one_tile_per_cta runs both settings through check_support,
+    at 132 CTAs and under LPT_L2 only, so these arguments are pinned here."""
+    import ast
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    with open(api_dsl.__file__, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_sm90_d128_causal_route"]
+    assert len(calls) == 1, [call.lineno for call in calls]
+    inner = parents[calls[0]]
+    assert isinstance(inner, ast.If) and inner.test is calls[0] and not inner.orelse, ast.unparse(inner)
+    assert [ast.unparse(node) for node in inner.body] == ["self.params = replace(self.params, persistent=False, causal_walk=0)"]
+    outer = parents[inner]
+    assert isinstance(outer, ast.If) and outer.body == [inner] and not outer.orelse, ast.unparse(outer)
+    assert ast.unparse(outer.test) == "causal_walk and D128_CAUSAL_WALK_ROUTE"
+    assert not calls[0].keywords and [ast.unparse(arg) for arg in calls[0].args] == [
+        "_load_sm90_kernel_module(self.flavor, self.params)",
+        "(b, h_q, h_kv, s_q, s_kv)",
+        "self.params.causal if self.params.bottom_right is None else self.params.bottom_right",
+        "sched",
+        "h_q // h_kv",
+        "self._persistent_ctas(self.q_desc.device)",
+        "self.q_desc.dtype.itemsize",
+    ], ast.unparse(calls[0])
+    records = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Sm90TemplateParams"]
+    assert [ast.unparse(kw.value) for record in records for kw in record.keywords if kw.arg == "qh_per_kh"] == ["h_q // h_kv"]
+
+
+def test_d128_route_ships_on_with_its_cutoffs():
+    """The shipped route and its three cutoffs as committed (D128_CAUSAL_WALK_ROUTE's and the cutoffs' comments give the
+    measurements): a paired walk stays below L 48, a stride up to L 15 inclusive with more than one Q head per KV head
+    and below L 10 on MHA. Changing any value or adding a cutoff changes this test and the decisions above."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    assert api_dsl.D128_CAUSAL_WALK_ROUTE is True
+    assert (api_dsl._D128_ROUTE_WALK_MAX_L, api_dsl._D128_ROUTE_STRIDE_MAX_L_GQA, api_dsl._D128_ROUTE_STRIDE_MAX_L_MHA) == (48, 15, 10)
+    assert sorted(name for name in vars(api_dsl) if name.startswith("_D128_ROUTE_")) == [
+        "_D128_ROUTE_STRIDE_MAX_L_GQA",
+        "_D128_ROUTE_STRIDE_MAX_L_MHA",
+        "_D128_ROUTE_WALK_MAX_L",
+    ]
+
+
 # --- The paired walk: the kernel's decode on plain ints (host-only, no trace) -------
 #
 # walk_unit, walk_live, walk_next and walk_item are the functions both roles of the kernel trace in place; here they run

@@ -291,6 +291,33 @@ D128_PERSISTENT: bool = True
 # both walks are measured against the one-tile kernel on causal shapes: the stride ran three long causal shapes at
 # 0.889-0.922x it (D128_PERSISTENT's comment).
 D128_PERSISTENT_CAUSAL_WALK: int = 0
+# Causal D128 plans of the paired walk that _sm90_d128_causal_route picks go one tile per CTA: a plan of at most one
+# item per CTA, a paired walk of 48 or more KV tiles per Q tile on average unless it deals pairs alone, and the stride
+# of more than 15 on a plan with more than one Q head per KV head (GQA or MQA) or of 10 or more on an MHA plan. A
+# CALL-TIME module constant like D128_PERSISTENT_CAUSAL_WALK above, read by check_support only while that constant picks
+# the paired walk (2): True gives each causal plan the rule routes the record D128_PERSISTENT_CAUSAL_WALK 0 gives it,
+# one tile per CTA under overlap, and leaves every other plan's record as it was; False keeps every causal plan on the
+# paired walk (or on the stride the walk's own rule keeps). Every record computes the one-tile kernel's O and Stats bit
+# for bit, so this is a speed choice. The paired walk and the stride deal their items to the CTAs before the launch and
+# cannot even out the last round, where the one-tile grid's block scheduler can, and the longer the items the less the
+# persistent loop's saving per item covers that. On H100 SXM GPUs (132 SMs; #1159's harness, bf16, 132 causal shapes,
+# 161 timings in ten sessions from 2026-10-21 to 2026-11-04, each session on its own machine, every ratio a median of
+# per-round ratios, the band the larger of 1% and the A/A twin gap, if one ran) the comments of _D128_ROUTE_WALK_MAX_L
+# and of _D128_ROUTE_STRIDE_MAX_L_GQA and _D128_ROUTE_STRIDE_MAX_L_MHA give each kind's timings by L, the mean KV tiles
+# per Q tile. On those timings the rule routes all 29 on which the one-tile kernel won beyond the band (12 paired walks,
+# 17 strides) and 27 of the 33 ties, keeps 78 of the 99 the walk's plan won, and gives up 21 wins of 1.1% to 4.8%. The
+# stride cutoffs were chosen from all 161 timings and the walk cutoff from the first 135; each of the five paired walks
+# timed since went the way it decides. Three earlier rules predicted a margin in KV tiles from fitted terms, and each
+# was wrong on the shapes timed after it: the first two routed walk wins (seven of 25, then one of 12), and the third
+# kept four of 13 that the one-tile kernel won, by 1.4% to 4.1%. Three more decided the stride otherwise and were wrong
+# on the strides timed after them: one kept it up to L 16 and kept two MHA strides at L 15.5 that the one-tile kernel
+# won, by 1.5% and 6.8%; the next kept it on GQA plans and routed it on MHA plans at any L, and kept two strides of GQA
+# ratio 2, at L 39.5 and 64.5, that the one-tile kernel won by 5.6% and 3.5%, and routed an MHA stride at L 4.5 that the
+# stride won by 20.8%; the last kept it up to L 10 whatever the head layout, and routed nine timings of GQA strides at L
+# 10.5 to 15 that the stride won by 6.2% to 9.8% and kept an MHA stride at L 10 that the one-tile kernel won by 3.9%. A
+# shape timed in several sessions moves by more than the 1% band (b8 h32/8 S_q 2048 S_kv 6144 ran at 1.044x to 1.069x in
+# six sessions, at S_kv 16384 at 0.977x to 0.991x in eight), so the rule has no fitted terms, only its three cutoffs.
+D128_CAUSAL_WALK_ROUTE: bool = True
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -526,6 +553,72 @@ def _sm90_d128_persistence(flavor: tuple[int, int], causal: bool) -> tuple[bool,
         raise ValueError(f"api_dsl.D128_PERSISTENT_CAUSAL_WALK must be 0, 1 or 2; got {walk!r}")
     persistent = flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP and D128_PERSISTENT and (not causal or walk > 0)
     return persistent, int(persistent and causal and walk == 2)
+
+
+# The cutoffs of D128_CAUSAL_WALK_ROUTE's rule (_sm90_d128_causal_route), on L, a plan's mean KV tiles per Q tile
+# (causal_kv_tiles), from the 161 timings of that constant's comment. A paired walk stays below L 48 whatever its head
+# layout: it beat the one-tile kernel on all 54 timings at L 40.5 or less (by 1.0% to 76%), and from L 44.5 to 47.5 won
+# one (by 3.3%) and tied three; from L 48.5 to 80.5 it won five (by 1.2% to 2.6%) and tied eight, and from L 88.5 up the
+# one-tile kernel won 12 of 23 (by 1.0% to 2.3%), ten tied and the walk won one (by 2.0%).
+_D128_ROUTE_WALK_MAX_L = 48
+# The stride the walk's rule keeps stays up to L 15, inclusive, on a plan with more than one Q head per KV head
+# (qh_per_kh above 1: GQA and MQA; _D128_ROUTE_STRIDE_MAX_L_GQA) and below L 10 on an MHA plan (qh_per_kh 1;
+# _D128_ROUTE_STRIDE_MAX_L_MHA). Of the 55 strides among the 161 timings (52 shapes; 17 timed on 2026-11-04 at L 10 to
+# 15 for these cutoffs), the rule routes the 17 that the one-tile kernel won beyond the band and the six ties, keeps 17
+# of the 32 the stride won and gives up 15. qh_per_kh above 1 (32 timings, all of GQA ratio 2, 3, 4 or 8; no stride of
+# the 161 is MQA or of a ratio above 8): the 14 at L 15 or less (L 8.5 to 15) all won, by 6.2% to 13.5%; of the 18
+# above, the stride won ten, by 1.1% to 3.1%, six tied, and the one-tile kernel won two of ratio 2, at L 39.5 and 64.5,
+# by 5.6% and 3.5%. MHA (23 timings): the three below L 10 won, b24 h32/32 S_q 768 S_kv 896 (L 4.5) by 20.8%, b16 h32/32
+# S 2048 (L 8.5) by 2.4% and b5 h64/64 S_q 768 S_kv 1536 (L 9.5) by 6.0%; of the eight at L 10 to 15 the one-tile kernel
+# won four, by 1.9% to 4.5% (b13 h16/16 S_q 1152 at S_kv 1792 and 1920, L 10 and 11, and two at L 15), and the stride
+# won four, by 1.8% to 4.8%; above L 15 the one-tile kernel won 11 of 12, by 1.5% to 9.1%, and the stride won one, at L
+# 40.5, by 1.1%. A reading of why the head layout matters, not a tested cause: in the adapter's causal order (work_of,
+# under the L2 budget) the items that read one budget's worth of KV heads are qh_per_kh times as many on a GQA plan as
+# on an MHA plan. The stride's CTAs walk their pre-dealt items at different speeds, so the items in flight spread along
+# that order, and on an MHA plan the same spread reaches past the budget's KV heads sooner. Nsight Compute on the twelve
+# strides at L 11 to 15 fits that reading: the stride's L2 hit rate trailed the one-tile kernel's by 0.7 to 5.6 points
+# on the six GQA plans, which all won, and by 4.2 to 19.5 on the six MHA plans, 13.1 to 19.5 on the three that lost. The
+# hit rate does not decide a stride alone: the ratio 2 stride at L 64.5 lost with 63.5% against the one-tile kernel's
+# 78.0%, and the MHA strides at L 4.5 and 8.5 won with 47.1% against 54.8% and 52.0% against 67.9%.
+_D128_ROUTE_STRIDE_MAX_L_GQA = 15
+_D128_ROUTE_STRIDE_MAX_L_MHA = 10
+
+
+def _sm90_d128_causal_route(template, shape, bottom_right: bool, sched_policy: int, qh_per_kh: int, ctas: int, storage_bytes: int) -> bool:
+    """Whether check_support gives a causal D128 plan of the paired walk the one-tile record (D128_CAUSAL_WALK_ROUTE).
+    The inputs are causal_walk_plan's, every one a compile-key value, and ``template`` is the D128 template module.
+
+    A plan with at most ``ctas`` items runs one item per CTA in both kernels: routed. A paired walk of at most one unit
+    per CTA stays: each CTA runs one pair, while the one-tile grid runs a full wave and part of a second (nine timings,
+    six wins and three ties, at L 4.5 to 262.5). Any other plan goes by L, its mean KV tiles per Q tile: a paired walk
+    stays below _D128_ROUTE_WALK_MAX_L whatever its head layout, and the stride causal_walk_plan keeps (walk None) stays
+    up to _D128_ROUTE_STRIDE_MAX_L_GQA, inclusive, where ``qh_per_kh`` is above 1 (GQA and MQA) and below
+    _D128_ROUTE_STRIDE_MAX_L_MHA where it is 1 (MHA). ``qh_per_kh`` is the record's head ratio, h_q // h_kv, the one the
+    kernel addresses KV heads by (Q head h reads KV head h // qh_per_kh); the D128 template serves no PackGQA plan.
+
+    causal_walk_plan, which names the kind, runs only where the kind can change the answer: where the plan's stride
+    cutoff keeps a stride every plan stays, and at or past the walk cutoff every plan of more than 2 * ``ctas`` items
+    goes, as a unit holds at most two items and so such a plan is never pairs alone; such a plan is routed without the
+    walk's search, which takes seconds on a long plan with one KV head (b1 h128/1 S 262144: 7.6 s on a laptop). Between
+    the plan's stride cutoff and the walk cutoff it runs on every plan: top-left b1 h128/1 S_q 262144 S_kv 4096 (L 31.8,
+    a paired walk, kept) takes 5.6 s, and the compile of a kept plan runs it again in the template.
+    """
+    b, h_q, _, _, _ = shape
+    kv_tiles = template.causal_kv_tiles(shape, bottom_right)
+    items = len(kv_tiles) * h_q * b
+    if items <= ctas:
+        return True
+    mean = sum(kv_tiles) / len(kv_tiles)
+    walk_goes = mean >= _D128_ROUTE_WALK_MAX_L
+    stride_goes = mean > _D128_ROUTE_STRIDE_MAX_L_GQA if qh_per_kh > 1 else mean >= _D128_ROUTE_STRIDE_MAX_L_MHA
+    if not walk_goes and not stride_goes:
+        return False
+    if walk_goes and stride_goes and items > 2 * ctas:
+        return True
+    walk = template.causal_walk_plan(shape, bottom_right, sched_policy, qh_per_kh, ctas, storage_bytes)
+    if walk is None:
+        return stride_goes
+    return walk.units > ctas and walk_goes
 
 
 class WorkspaceCarver:
@@ -5919,6 +6012,19 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # The standalone adapter already serves these richer declarations
             # on the D512 envelope; only select D64 inside its native subset.
             self._native_d64 = why is None
+        if causal_walk and D128_CAUSAL_WALK_ROUTE:
+            # A causal plan the rule routes takes the one-tile record (D128_CAUSAL_WALK_ROUTE), the rule run on the
+            # walk's own template with the alignment and CTA count compile() gives it.
+            if _sm90_d128_causal_route(
+                _load_sm90_kernel_module(self.flavor, self.params),
+                (b, h_q, h_kv, s_q, s_kv),
+                self.params.causal if self.params.bottom_right is None else self.params.bottom_right,
+                sched,
+                h_q // h_kv,
+                self._persistent_ctas(self.q_desc.device),
+                self.q_desc.dtype.itemsize,
+            ):
+                self.params = replace(self.params, persistent=False, causal_walk=0)
         self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max = b, h_q, h_kv, s_q, s_kv
         self.head_dim_qk, self.head_dim_v = d_qk, d_v
         self.dtype = self.q_desc.dtype
