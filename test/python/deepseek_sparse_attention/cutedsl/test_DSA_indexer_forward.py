@@ -1148,7 +1148,7 @@ def test_DSA_indexer_forward_mxfp4_two_mmas_per_k_chunk(monkeypatch, ratio):
     class WideKChunk(IndexerScoreUnifiedSm100Mxfp4):
         def __init__(self, *args, **kwargs):
             constructed.append(kwargs)
-            super().__init__(*args, **{**kwargs, "k_block_size": 128, "kv_stage": 12})
+            super().__init__(*args, **{**kwargs, "k_block_size": 128})
 
     monkeypatch.setitem(_block_scaled.BLOCK_SCALED_FORMATS, "mxfp4", dataclasses.replace(_block_scaled.BLOCK_SCALED_FORMATS["mxfp4"], kernel_cls=WideKChunk))
     monkeypatch.setattr(_interface, "_compile_cache", {})

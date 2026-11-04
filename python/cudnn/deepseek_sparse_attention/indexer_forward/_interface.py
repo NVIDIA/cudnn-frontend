@@ -607,7 +607,6 @@ def _indexer_fwd_bound(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=64,
-                kv_stage=24,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,

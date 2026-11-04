@@ -984,9 +984,8 @@ def _dense_indexer_score_recompute(
         if n_block_size != 128:
             raise ValueError(f"precision={precision!r} dense indexer requires n_block_size=128")
         m_block_size = 128
-        # k_block_size is locked to 64 (the D128 two-chunk plan): kv_stage is
-        # hardcoded to 24 below, which keeps K-SMEM within the SM100 budget only
-        # at k_block=64 (k_block>64 overflows SMEM; k_block<64 under-pipelines).
+        # k_block_size is locked to 64 (the D128 two-chunk plan the kernel's
+        # SMEM rings are sized for).
         k_block_size = 64 if k_block_size is None else k_block_size
         if k_block_size != 64:
             raise ValueError(f"precision={precision!r} dense indexer requires k_block_size=64; got {k_block_size}")
@@ -1018,11 +1017,8 @@ def _dense_indexer_score_recompute(
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
         k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
-    kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
-    if is_block_scaled:
-        # K-SMEM = n_block * k_block_size(=64) * kv_stage at <= 1 byte per element;
-        # 24 fits the SM100 SMEM budget, and k_block is locked to 64 above.
-        kv_stage = 24
+    # The block-scaled kernels size their own SMEM rings from the split schedule.
+    kv_stage = None if is_block_scaled else _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
@@ -1045,7 +1041,6 @@ def _dense_indexer_score_recompute(
             n_block_size,
             k_block_size,
             head_dim_padded // k_block_size,
-            kv_stage,
             ratio,
             is_varlen,
             q_causal_offsets is not None,
@@ -1090,7 +1085,6 @@ def _dense_indexer_score_recompute(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=k_block_size,
-                kv_stage=kv_stage,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,

@@ -23,7 +23,7 @@ import torch
 SUPPORTED_QHEAD_PER_KV_HEAD_BF16 = (4, 8, 16, 32, 64)
 # The MXFP8 kernel keeps its 128-row tile for every group (its scale atom is 128 packed rows, so the
 # scale packing ``packed_m = token * group + head`` does not depend on the group): a small group packs
-# ``128 // group`` tokens per tile, split between the two epilogue warpgroups. Same set as BF16; a
+# ``128 // group`` tokens per tile, split across the math warpgroups. Same set as BF16; a
 # plain-e4m3 scorer is the MXFP8 kernel with all-ones E8M0 scale blobs.
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (4, 8, 16, 32, 64)
 # The MXFP4 kernel differs from the MXFP8 one only in its MMA, so it serves the same groups.
