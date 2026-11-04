@@ -25,31 +25,37 @@ import collections
 import json
 import math
 import sys
-from types import SimpleNamespace
 
 import cudnn
 from cudnn.sdpa import placement_table as pt
+from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 _DTYPES = {"bf16": cudnn.data_type.BFLOAT16, "f16": cudnn.data_type.HALF}
 
 
 def _facts_inference(c, s):
-    """Inference harness (generation phase): q tokens per request, dense or paged KV (case field, else the study default)."""
-    return SimpleNamespace(
+    """Inference harness: q tokens per request, dense or paged KV, head pair and mask (case fields, else the study default).
+    ``mask`` "none" is a non-causal context; any other value is the harness's causal band, bottom-right (a square reads the
+    same from either corner)."""
+    paged = c.get("layout", s.get("layout", "dense")) == "paged"
+    causal = c.get("mask", "causal") != "none"
+    return SdpaGraphFacts(
         b=c["b"],
         h_q=c["hq"],
         h_kv=c.get("hkv", 1),
         s_q=c["q"],
         s_kv=c["kv"],
-        d_qk=s["d_qk"],
-        d_v=s["d_v"],
+        d_qk=c.get("d_qk", s.get("d_qk")),
+        d_v=c.get("d_v", s.get("d_v")),
         dtype=_DTYPES[s["dtype"]],
-        causal=True,
-        bottom_right=True,
+        causal=causal,
+        bottom_right=causal,
         window_left=c.get("window"),
         has_sink=bool(c.get("sink")),
-        has_paged_kv=c.get("layout", s.get("layout", "dense")) == "paged",
-        thd=False,
+        has_paged_kv=paged,
+        page_size=c.get("page", 64) if paged else 0,
+        padded=paged,
+        thd=bool(c.get("thd", False)),
         max_total_seq_len_q=None,
         device_cc=tuple(s["device_cc"]),
         has_bias=False,
@@ -62,7 +68,7 @@ def _facts_training(c, s):
     """Training harness: s_q == s_kv == s; THD at fill < 1 declares its live total (ragged)."""
     thd = c["layout"] == "thd"
     total = c["b"] * c["s"] if c.get("fill", 1.0) >= 1.0 else int(c["b"] * c["s"] * (1 + c["fill"]) / 2)
-    return SimpleNamespace(
+    return SdpaGraphFacts(
         b=c["b"],
         h_q=c["hq"],
         h_kv=c["hkv"],
@@ -112,8 +118,21 @@ def fit(points, margin):
     # The threshold sits halfway (in log2 work) between the last loss and the first win past it, rounded away from the
     # loss so the emitted value never re-admits it.
     if len(above) >= len(below):
-        return "ge", math.ceil((top + min(above)) / 2 * 1000) / 1000
-    return "le", math.floor((bottom + max(below)) / 2 * 1000) / 1000
+        split = "ge", math.ceil((top + min(above)) / 2 * 1000) / 1000
+    else:
+        split = "le", math.floor((bottom + max(below)) / 2 * 1000) / 1000
+
+    # A threshold also gives up the wins on its far side. "always" / "never" replace it when every loss they accept is
+    # marginal (within twice the neutral margin) and their worst cell, then their geomean, is lower.
+    def regret(rule):
+        direction, t = rule
+        regs = [
+            max(r, 1.0) if direction == "always" or (direction == "ge" and w >= t) or (direction == "le" and w <= t) else max(1 / r, 1.0) for w, r in points
+        ]
+        return max(regs), sum(map(math.log, regs))
+
+    flat = [rule for rule in (("always", None), ("never", None)) if regret(rule)[0] <= 1 + 2 * margin]
+    return min([split, *flat], key=regret)
 
 
 def main():

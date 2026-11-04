@@ -2,15 +2,18 @@
 # default), rendered from the tree BEFORE the hardware upper-bound form landed (host trace-compile; the probe body is test_sdpa_bias_max_form_sm107.py's).
 # Lines: dsl=<distribution> <version>; fwd_d128_file sm_107a <arm> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
 # Re-recorded on the tree with origin/develop 2bcdd1bb4 merged in: develop's d128 f16 kernel edits between the previous record and that tree (the dense tile-scheduler path) move the rendering of the arm(s) updated here; the other arms are unchanged. Control: the same probe against origin/develop f64afb7a6 itself reads the updated md5 exactly where the arm exists there (the compiled-out form is develop's kernel byte for byte), and the merge of 2bcdd1bb4 leaves every md5 of this file where it was.
+# Re-recorded for the common service-warpgroup register release. Same-toolchain parent
+# renders reproduce all prior records under public DSL 4.8.0 / CUDA 13.4; the four
+# role-local release sites become one common site, with unchanged register budgets.
 dsl=nvidia-cutlass-dsl 4.8.0
-fwd_d128_file sm_107a d32_bias_res_one rc=0 cubin_md5=6a65bec101f4675f9571bc2684de0d6d
-fwd_d128_file sm_107a d32_bias_mask_padded rc=0 cubin_md5=3023b5026e18503777e809309c4c1a32
-fwd_d128_file sm_107a d32_mask_only rc=0 cubin_md5=4cf00785a02f537b9f99cb484ca9dc8b
-fwd_d128_file sm_107a d32_mask_only_t64 rc=0 cubin_md5=f18f3f73f2b66d2d6f335163c2f3d652
-fwd_d128_file sm_107a d32_bias_pair_n4 rc=0 cubin_md5=848fe763552fb3cff5de7246e703d1be
-fwd_d128_file sm_107a d32_bias_ring_st2 rc=0 cubin_md5=b61c46186e8353b1cc83014d8d021c41
-fwd_d128_file sm_107a d32_both_pair_n4_t64 rc=0 cubin_md5=41e14b11c1d2b138d7881f1ce92512ed
-fwd_d128_file sm_107a d32_both_ring_st2_t64 rc=0 cubin_md5=2016bee97c39bd12da6a3ca80c12dc9a
-fwd_d128_file sm_107a d64_bias_mask_cga2_padded rc=0 cubin_md5=425ca6e4c01847e1cdd6a0347997744a
-fwd_d128_file sm_107a d32_maskadd_only rc=0 cubin_md5=41f9515c60f3e5b26f1b7a60de8a5ebe
-fwd_d128_file sm_107a d32_bias_f16_res_one rc=0 cubin_md5=a6f6651ec13cf1ed26e9523f2dbb3764
+fwd_d128_file sm_107a d32_bias_res_one rc=0 cubin_md5=6242c3dd4b360d3dc631f4ed3847b7f1
+fwd_d128_file sm_107a d32_bias_mask_padded rc=0 cubin_md5=e4e5ed600116bcfa06760d003b4ce507
+fwd_d128_file sm_107a d32_mask_only rc=0 cubin_md5=787d63340005d9af1b8b57df8b4ce831
+fwd_d128_file sm_107a d32_mask_only_t64 rc=0 cubin_md5=470cafebc6f20ed37e6b849a216d95cc
+fwd_d128_file sm_107a d32_bias_pair_n4 rc=0 cubin_md5=9639c034237702bcfdb948b5fabd8c5d
+fwd_d128_file sm_107a d32_bias_ring_st2 rc=0 cubin_md5=21c5e5734e6f959dfd5430a969f0a5d2
+fwd_d128_file sm_107a d32_both_pair_n4_t64 rc=0 cubin_md5=c930e9410c853128a29dd9173d57c55e
+fwd_d128_file sm_107a d32_both_ring_st2_t64 rc=0 cubin_md5=9d2385572751a62d16145c697b527318
+fwd_d128_file sm_107a d64_bias_mask_cga2_padded rc=0 cubin_md5=2474f0ffb722182f37104768600d8f09
+fwd_d128_file sm_107a d32_maskadd_only rc=0 cubin_md5=24ed1d68b9db7ed17bdf1f049a2f06be
+fwd_d128_file sm_107a d32_bias_f16_res_one rc=0 cubin_md5=7ceec78d30e6e17776c10ae4756abfb2

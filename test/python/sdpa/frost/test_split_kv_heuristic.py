@@ -257,7 +257,7 @@ def _facts():
 def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     """A ragged S_kv on a skv_tail_via_padding row is served through the
     kernel's KV-tail mask (kv_tail_mask, #1425). Outside the qualified
-    exact-D128 architectures this remains declined before plan build."""
+    native architectures this remains declined before plan build."""
     from cudnn.sdpa import graph_analyzer as ga
 
     caps = Capabilities(
@@ -298,8 +298,8 @@ def test_explicit_scalar_tail_split_admission(device_cc, fp8):
     assert "split_kv" not in (mismatch(caps, facts, knobs) or "")
     for other in (
         replace(facts, device_cc=(10, 8)),
-        replace(facts, d_qk=112),
-        replace(facts, d_qk=192),
+        *([replace(facts, d_qk=112)] if fp8 else []),
+        replace(facts, d_qk=576),
         replace(facts, is_fp8=False, is_mxfp8=True),
     ):
         assert "split_kv" in (mismatch(caps, other, knobs) or "")

@@ -1,6 +1,6 @@
 # DSv4.1 mHC projection/RMS backward
 
-This experimental SM100 API computes the input and projection-weight gradients
+This experimental SM100/SM103 API computes the input and projection-weight gradients
 of the projection/RMS stage in DSv4.1 mHC. It expects the upstream projection
 and RMS gradients after the gate and normalization derivatives:
 
@@ -23,7 +23,7 @@ remain the caller's responsibility.
 
 ## Requirements and tensor contract
 
-Use a Blackwell SM100 GPU, PyTorch, `cuda-tile>=1.5`, a compatible system
+Use a Blackwell SM100 or SM103 GPU, PyTorch, `cuda-tile>=1.5`, a compatible system
 `tileiras` compiler and the Frontend `cutile,triton` optional dependencies:
 
 ```bash

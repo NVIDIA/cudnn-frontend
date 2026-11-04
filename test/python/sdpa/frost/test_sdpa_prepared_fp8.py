@@ -514,27 +514,30 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
 
 @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("padding", [8, 16])
-def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype, padding, monkeypatch):
-    """One-byte O needs 16-element TMA alignment; other pitches retain conversion."""
+def test_fp8_output_pitch_requires_native_byte_alignment(output_dtype, padding, monkeypatch):
+    """One-byte O needs 16-element TMA alignment; unsupported pitches decline."""
+    if padding == 8:
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="o: native dense forward.*16-byte outer-stride alignment"):
+            _case(output_dtype=output_dtype, output_padding=padding)
+        return
     g, vp, ws, bufs, _ = _case(output_dtype=output_dtype, output_padding=padding)
     plan = g._compiled_plans[g._plan_index]
-    assert (plan._prepared is not None) == (padding == 16)
+    assert plan._prepared is not None
     prepared_calls = []
-    if padding == 16:
-        execute = plan._prepared.execute
+    execute = plan._prepared.execute
 
-        def record(*args, **kwargs):
-            prepared_calls.append(True)
-            return execute(*args, **kwargs)
+    def record(*args, **kwargs):
+        prepared_calls.append(True)
+        return execute(*args, **kwargs)
 
-        monkeypatch.setattr(plan._prepared, "execute", record)
+    monkeypatch.setattr(plan._prepared, "execute", record)
     g.execute(vp, ws)
-    assert len(prepared_calls) == (1 if padding == 16 else 0)
+    assert len(prepared_calls) == 1
     _check(bufs, thd=False)
     with _cuda_graph() as captured:
         with torch.cuda.graph(captured):
             g.execute(vp, ws)
-        assert len(prepared_calls) == (2 if padding == 16 else 0)
+        assert len(prepared_calls) == 2
         bufs["descale_v"].mul_(0.5)
         bufs["o"].fill_(float("nan"))
         captured.replay()

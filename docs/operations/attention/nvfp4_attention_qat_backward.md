@@ -35,8 +35,8 @@ fully masked tiles while retaining the elementwise mask on the diagonal.
 The local-scale conversion uses precise division so exact E2M1 midpoints
 preserve round-to-nearest-even; no tolerance relaxation is required.
 The production
-non-causal SM100 configuration uses 64 by 64 tiles; other supported Blackwell
-configurations use 32 by 32 tiles.
+non-causal SM100 and SM103 configurations use 64 by 64 tiles; other supported
+Blackwell configurations use 32 by 32 tiles.
 
 ## Installation
 
@@ -141,9 +141,9 @@ dependency used by `APIBase`. An installed DSL below FROST's 4.7.0 floor (for
 example 4.6.2) selects Triton without importing the FROST kernel; this does
 not promise the API works with the base `cutlass` package completely absent.
 
-## FROST backend (SM100)
+## FROST backend (SM100/SM103)
 
-The FROST backend requires **CuTe DSL >= 4.7.0**, SM100, BF16, D128,
+The FROST backend requires **CuTe DSL >= 4.7.0**, SM100 or SM103, BF16, D128,
 B=1, equal query/KV head counts, noncausal attention, and equal positive
 sequence lengths divisible by 256. With `auto`, unsupported FROST declarations
 select Triton, which has wider support including tails. Neither route adds

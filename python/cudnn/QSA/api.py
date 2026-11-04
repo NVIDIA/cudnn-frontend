@@ -13,10 +13,10 @@ from torch import Tensor
 
 from cudnn._device import device_info
 
-from ._contract import check_inputs, check_tensor
+from ._contract import BLK_BITS, check_inputs, check_tensor, paired_backward, paired_queries
 
 
-def _implementation(q, direction):
+def _implementation(q, k, direction):
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
@@ -30,8 +30,13 @@ def _implementation(q, direction):
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
     family = 107 if arch == 107 else 100
-    if direction == "bprop" and q.shape[1] == 12:
-        family = 100
+    if direction == "bprop":
+        # The batched backward (12:1 pairs, 6:1 quads) is one SM100 module compiled for every architecture; 24:2 runs
+        # the single-query backward, which has a Rubin copy.
+        if paired_backward(q.shape[1], k.shape[1]):
+            family = 100
+        elif family == 100:
+            family = "100_base"
     return importlib.import_module(f".kernels.{direction}_sm{family}", __package__), arch
 
 
@@ -44,18 +49,18 @@ def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
     return ids, counts
 
 
-def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, kv_heads):
-    if kv_heads == 1:
+def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv):
+    if paired_backward(hq, hkv):
         from ._metadata import compile_group_kernel
-        from .kernels.bprop_sm100 import NQ, BLK_BITS
 
+        nq = paired_queries(hq, hkv)
         total, blocks = sel_blocks.shape
         if blocks > 1 << BLK_BITS:
-            raise NotImplementedError(f"Paired QSA requires NB <= {1 << BLK_BITS} for block-owner encoding")
-        groups = (total + NQ - 1) // NQ
+            raise NotImplementedError(f"Batched QSA backward requires NB <= {1 << BLK_BITS} for block-owner encoding")
+        groups = (total + nq - 1) // nq
         ids = torch.empty((groups, blocks), dtype=torch.int32, device=sel_blocks.device)
         counts = torch.empty(groups, dtype=torch.int32, device=sel_blocks.device)
-        compile_group_kernel(arch, NQ, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
+        compile_group_kernel(arch, nq, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
         return ids, counts
     return _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
 
@@ -91,7 +96,7 @@ def qsa_forward(
     """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     with torch.cuda.device(q.device):
-        impl, arch = _implementation(q, "fprop")
+        impl, arch = _implementation(q, k, "fprop")
         cuda, TupleDict, raw_stream, _forward = _forward_runtime()
         stream = cuda.CUstream(raw_stream(torch)(q.device.index))
         out, out_fp32 = torch.empty_like(q), torch.empty_like(q, dtype=torch.float32)
@@ -123,7 +128,7 @@ def qsa_backward(
     check_tensor("out_fp32", out_fp32, q.shape, torch.float32, q.device, 16)
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     with torch.cuda.device(q.device):
-        impl, arch = _implementation(q, "bprop")
+        impl, arch = _implementation(q, k, "bprop")
         import cutlass
         from cuda.bindings import driver as cuda
         from cudnn.api_base import TupleDict
@@ -137,7 +142,7 @@ def qsa_backward(
             "dk_acc": torch.empty_like(k, dtype=torch.float32),
             "dv_acc": torch.empty_like(v, dtype=torch.float32),
         }
-        ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hkv)
+        ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv)
         num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         impl.launch(
             compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, block_first, block_last, dq, dk, dv, scratch, float(scale), stream, num_sms

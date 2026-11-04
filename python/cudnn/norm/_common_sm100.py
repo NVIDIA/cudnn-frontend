@@ -146,3 +146,12 @@ def shifted_stats(s1, s2, kshift, Nf, eps, centered: cutlass.Constexpr):
 def red_scratch_len(block_threads: int) -> int:
     """Length of the fp32 reduction scratch for :func:`block_reduce_sum2`."""
     return 2 * (block_threads // 32)
+
+
+@cute.jit
+def affine_gamma(value, affine: cutlass.Constexpr):
+    """Honor the declared output dtype of the gamma + 1 prologue."""
+    g = value.to(cutlass.Float32)
+    if cutlass.const_expr(affine is not None and affine[2] is not None):
+        g = (g + cutlass.Float32(1.0)).to(affine[2]).to(cutlass.Float32)
+    return g
