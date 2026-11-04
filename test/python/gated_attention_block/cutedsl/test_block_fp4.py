@@ -301,7 +301,9 @@ def test_check_declaration_is_the_pre_stage_half_of_check_support():
     if _cc() == mx_suite._SM107:
         assert blk.check_support() is True and blk._is_supported
     else:
-        with pytest.raises(NotImplementedError, match="SM107"):
+        # off Rubin the SDPA stage's own arch gate ("SM107"), or -- on a served part other than Rubin, cc 10.0 since 2026-10-29 -- the
+        # block's quant part row, which precedes every stage
+        with pytest.raises(NotImplementedError, match=mx_suite._QUANT_PART_ROW if mx_suite._quant_part_row_first() else "SM107"):
             blk.check_support()
         assert not getattr(blk, "_is_supported", False)
 
@@ -982,6 +984,8 @@ _COMMON = dict(
     ix_logits=-1,
     ix_counts=-1,
     ix_cslot=-1,
+    ix_qpos=-1,  # the indexer's EXTEND step's two (appended 2026-10-29: the select pieces' first positions, the per-sequence report)
+    ix_seqrep=-1,
 )
 _SNAPSHOT = {
     ("test", "bf16_inplace"): dict(

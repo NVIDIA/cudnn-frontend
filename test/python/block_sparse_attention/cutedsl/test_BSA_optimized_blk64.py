@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Numerical and layout regressions for the SM100/SM103 blk64 path."""
+"""Numerical and layout regressions for the SM100/SM103 blk64 path and the SM90/SM100 paired-KV backward."""
 
 import importlib
 
@@ -9,16 +9,9 @@ import pytest
 import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask
+from block_sparse_attention.cutedsl.bsa_utils import import_bsa
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
-
-
-def _bsa():
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("requires SM100/SM103")
-    from cudnn import BSA
-
-    return BSA
 
 
 def _force_paired_kv(monkeypatch):
@@ -28,16 +21,17 @@ def _force_paired_kv(monkeypatch):
     without reading compile-cache key positions.
     """
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
-    monkeypatch.setattr(interface, "_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
+    monkeypatch.setattr(interface, "_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
     builds = []
-    paired_cls = interface.MixedKvBackwardSm100
+    name = "MixedKvBackwardSm90" if torch.cuda.get_device_capability()[0] == 9 else "MixedKvBackwardSm100"
+    paired_cls = getattr(interface, name)
 
     class RecordingMixedKvBackward(paired_cls):
         def __init__(self, *args, **kwargs):
             builds.append(args)
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(interface, "MixedKvBackwardSm100", RecordingMixedKvBackward)
+    monkeypatch.setattr(interface, name, RecordingMixedKvBackward)
     return builds
 
 
@@ -57,7 +51,7 @@ def test_large_bucket_policy_is_a_valid_choice(num_q_blocks):
 @pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["q", "k", "v"])
 @pytest.mark.parametrize("splits", [1, 2])
 def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     torch.manual_seed(20260911)
     torch.backends.cuda.matmul.allow_tf32 = False
     inputs = [torch.randn((2, 64, 3, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
@@ -82,7 +76,7 @@ def test_bshd_sliced_inputs(misalignment, tensor_index, splits):
 @pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
 @pytest.mark.parametrize("seqlen", [193, 1089])
 def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     torch.manual_seed(19000 + seqlen)
     torch.backends.cuda.matmul.allow_tf32 = False
     q, k, v = [torch.randn((1, 2, seqlen, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
@@ -110,28 +104,36 @@ def test_forward_empty_rows_and_partial_tiles(clc, splits, seqlen):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("clc,splits", [(False, 1), (True, 1), (True, 2)])
+@pytest.mark.parametrize("clc,splits", [(False, 1), (False, 2), (True, 1), (True, 2)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, variable):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
+    sm90 = torch.cuda.get_device_capability()[0] == 9
+    if sm90 and clc:
+        pytest.skip("CLC scheduling is SM100-only")
     if variable:
         _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface.bsa_attn_fwd_blk64_cutedsl, "compile_cache", {})
+    monkeypatch.setattr(interface.bsa_attn_fwd, "compile_cache", {})
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
     torch.manual_seed(27191)
-    q = torch.randn((1, 2, 193, 128), device="cuda", dtype=torch.bfloat16)
+    # The SM90 forward needs whole query blocks; the backward partial-query tail is covered elsewhere.
+    seqlen_q = 256 if sm90 else 193
+    q = torch.randn((1, 2, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 2, 129, 128), device="cuda", dtype=torch.bfloat16)
     v, do = torch.randn_like(k), torch.randn_like(q)
     indices = torch.arange(3, device="cuda", dtype=torch.int32).view(1, 1, 1, 3).expand(1, 2, 4, 3).contiguous()
     counts = torch.tensor([3, 0, 1, 2], device="cuda", dtype=torch.int32).view(1, 1, 4).expand(1, 2, 4).contiguous() if variable else None
     sizes = torch.tensor([64, 37, 1], device="cuda", dtype=torch.int32)
-    mask = block_sparse_mask(indices, 3, sizes, 193, 129, 64, counts)
+    mask = block_sparse_mask(indices, 3, sizes, seqlen_q, 129, 64, counts)
     nonempty = torch.isfinite(mask).any(-1, keepdim=True)
     kwargs = dict(block_sparse_num=3, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64)
     cache_sizes = []
-    # Changing the sign never recompiles the backward; the forward compiles one extra, separately specialized
-    # nonpositive-scale kernel so the positive-scale softmax loop stays free of the masking-order branch.
+    # The forward compiles one extra, separately specialized nonpositive-scale kernel so the positive-scale
+    # softmax loop stays free of the masking-order branch. Changing the sign never recompiles the SM100
+    # backward; SM90 specializes its backward the same way as its forward.
+    clc_kwargs = {} if sm90 else dict(use_clc=clc)
     for scale in (128**-0.5, 0.0, -(128**-0.5), 128**-0.5):
         qr, kr, vr = [t.double().detach().requires_grad_() for t in (q, k, v)]
         scores = (qr @ kr.transpose(-1, -2)) * scale + mask
@@ -139,16 +141,21 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
         expected = probabilities @ vr
         expected.backward(do.double())
         output, lse = bsa.block_sparse_attention_forward(
-            q, k, v, indices, **kwargs, softmax_scale=scale, use_clc=clc, kv_splits=splits, allow_empty_block_nums=True
+            q, k, v, indices, **kwargs, softmax_scale=scale, **clc_kwargs, kv_splits=splits, allow_empty_block_nums=True
         )
         gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, softmax_scale=scale, bucket_size_blocks=3)
         torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.03, rtol=0.03)
         for got, ref in zip((output, *gradients), (expected, qr.grad, kr.grad, vr.grad)):
             torch.testing.assert_close(got.double(), ref, atol=0.03, rtol=0.03)
-        cache_sizes.append((len(interface.bsa_attn_fwd_blk64_cutedsl.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)))
+        forward_cache = interface.bsa_attn_fwd if sm90 else interface.bsa_attn_fwd_blk64_cutedsl
+        cache_sizes.append((len(forward_cache.compile_cache), len(interface._bsa_attn_bwd_bucketed_k2q_csr.compile_cache)))
     forward_sizes, backward_sizes = zip(*cache_sizes)
-    assert set(backward_sizes) == {backward_sizes[0]}
-    assert forward_sizes == (forward_sizes[0], forward_sizes[0] + 1, forward_sizes[0] + 1, forward_sizes[0] + 1)
+    specialized = (forward_sizes[0], forward_sizes[0] + 1, forward_sizes[0] + 1, forward_sizes[0] + 1)
+    assert forward_sizes == specialized
+    if sm90:
+        assert backward_sizes == (backward_sizes[0], backward_sizes[0] + 1, backward_sizes[0] + 1, backward_sizes[0] + 1)
+    else:
+        assert set(backward_sizes) == {backward_sizes[0]}
 
 
 @pytest.mark.L1
@@ -156,7 +163,7 @@ def test_signed_scale_forward_backward_and_cache(monkeypatch, clc, splits, varia
 @pytest.mark.parametrize("sq,sk", [(193, 129), (248, 2177), (320, 1088), (513, 1025)])
 @pytest.mark.parametrize("variable", [False, True])
 def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable, monkeypatch):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     if variable:
         _force_paired_kv(monkeypatch)
     torch.manual_seed(27000 + sq)
@@ -214,7 +221,7 @@ def test_backward_partial_tiles_and_buckets(layout, sq, sk, variable, monkeypatc
 def test_sage_fp8_rejects_nonpositive_softmax_scale(scale):
     """Sage FP8 folds the softmax scale into its Q*K dequantization scales; a nonpositive scale would turn fully
     masked groups into NaN/+inf, so the public entry point rejects it instead of returning non-finite output."""
-    bsa = _bsa()
+    bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     q, k, v = [torch.randn((1, 2, 128, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
     indices = torch.zeros((1, 2, 2, 1), device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="softmax_scale must be positive"):
@@ -225,7 +232,7 @@ def test_sage_fp8_rejects_nonpositive_softmax_scale(scale):
 @pytest.mark.parametrize("duplicates", [False, True])
 @pytest.mark.parametrize("kv_blocks", [17, 35])
 def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
@@ -278,8 +285,52 @@ def test_paired_multiset_and_graph_replay(monkeypatch, duplicates, kv_blocks):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("sq,sk", [(1024, 1025), (1088, 2177), (2048, 2048)])
+def test_paired_partial_blocks_and_buckets(layout, sq, sk, monkeypatch):
+    """Local KV windows give matched pairs real common edges; partial blocks, a KV tail and empty rows mask both halves."""
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
+    paired_builds = _force_paired_kv(monkeypatch)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    torch.manual_seed(28000 + sk)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    q = torch.randn((2, 2, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 2, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    nq, nk = sq // 64, (sk + 63) // 64
+    width = 6
+    centers = (torch.arange(nq, device="cuda") * nk // nq).clamp(max=nk - width)
+    window = centers[:, None] + torch.arange(width, device="cuda")
+    indices = window.expand(2, 2, nq, width).int().contiguous()
+    counts = torch.randint(width - 2, width + 1, (2, 2, nq), device="cuda", dtype=torch.int32)
+    counts[:, :, ::7] = 0
+    sizes = torch.randint(1, 65, (nk,), device="cuda", dtype=torch.int32)
+    sizes[::3] = 64
+    sizes[-1].clamp_(max=sk - (nk - 1) * 64)
+    mask = block_sparse_mask(indices, width, sizes, sq, sk, 64, counts)
+    qr, kr, vr = [t.float().detach().requires_grad_() for t in (q, k, v)]
+    scores = qr @ kr.transpose(-1, -2) / 128**0.5 + mask
+    nonempty = torch.isfinite(mask).any(-1, keepdim=True)
+    probabilities = torch.where(nonempty, scores, 0).softmax(-1).masked_fill(~torch.isfinite(mask), 0)
+    (probabilities @ vr).backward(do.float())
+    tensors = (q, k, v, do)
+    if layout == "bshd":
+        tensors = tuple(t.transpose(1, 2).contiguous() for t in tensors)
+    q, k, v, do = tensors
+    kwargs = dict(block_sparse_num=width, block_sizes=sizes, q2k_block_nums=counts, sparse_block_size=64, layout=layout)
+    output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
+    for bucket_size in (3, nq):
+        gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=bucket_size)
+        for got, ref in zip(gradients, (qr.grad, kr.grad, vr.grad)):
+            got = got.transpose(1, 2) if layout == "bshd" else got
+            torch.testing.assert_close(got.float(), ref, atol=0.03, rtol=0.03)
+    assert paired_builds, "the dispatcher did not build the paired-KV kernel"
+
+
+@pytest.mark.L1
 def test_paired_cache_rebinds_bitset_lengths(monkeypatch):
-    bsa = _bsa()
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
     paired_builds = _force_paired_kv(monkeypatch)
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})

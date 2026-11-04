@@ -385,6 +385,12 @@ def _run_causal_conv1d_bulk_backend(
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Run the current backend without exporting its lifecycle or result type."""
 
+    from cudnn.causal_conv1d_bulk_sm100.autograd import row_major_view
+
+    # The route admits any contiguous [B, T, D] view; the backend checks exact row-major strides (T == 1 or D == 1 leaves one free).
+    x_btd = row_major_view(x_btd)
+    if initial_state is not None:
+        initial_state = row_major_view(initial_state)
     if _causal_conv1d_native_route(x_btd, weight, bias, initial_state) == "native-autograd":
         backend = _get_causal_conv1d_training_backend(
             x_btd,

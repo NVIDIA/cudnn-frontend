@@ -445,7 +445,7 @@ def test_adalayernorm_forward_without_bias(phase, cudnn_handle):
     y = torch.full_like(x, float("nan"))
     stats = _execute(graph, cudnn_handle, x, {X: x, Sc: scale, eps: torch.full((1, 1, 1), 1e-5), Y: y}, (mean, inv_var))
     y_expected, mean_expected, inv_variance_expected = _manual_layernorm(x, scale, None, 1e-5)
-    torch.testing.assert_close(y, y_expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(y, y_expected, check_dtype=False)
     if phase == cudnn.norm_forward_phase.TRAINING:
-        torch.testing.assert_close(stats[mean].view(B, S, 1), mean_expected, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(stats[inv_var].view(B, S, 1), inv_variance_expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(stats[mean].view(B, S, 1), mean_expected, check_dtype=False)
+        torch.testing.assert_close(stats[inv_var].view(B, S, 1), inv_variance_expected, check_dtype=False)

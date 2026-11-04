@@ -857,7 +857,7 @@ class LeanRun:
         o = torch.full((B, SQ, H, D), _SENTINEL if dtype == torch.bfloat16 else 6.0e4, device=dev, dtype=dtype)
         lse = torch.full((B, H, SQ), _SENTINEL, device=dev, dtype=torch.float32)
         cc = torch.cuda.get_device_capability(dev)
-        form = _sparse_combine_decode_grid(B, H, SQ, self.split, cc)
+        form = _sparse_combine_decode_grid(B, H, SQ, self.split, cc, lean=True)  # the lean route's reading (the cc 10.0 rule follows cc 10.7's shape)
         tag = "bf16" if dtype == torch.bfloat16 else "f16"
         compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
         owner = compile_combine(dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=False, dtype_gate=None, decode_grid=form, use_pdl=False)
@@ -1816,6 +1816,58 @@ def test_split_bound_and_workspace_per_form():
     assert fresh_auto.scratch_workspace_bytes() == slab_bytes(1, 1, 24, 65) and fresh_auto.tile_form == "lean"
     fresh_core = _route_adapter(tile_form="tcgen05")  # the unsplit core still reports 0 before and after
     assert fresh_core.scratch_workspace_bytes() == 0 and fresh_core.check_support() and fresh_core.scratch_workspace_bytes() == 0
+
+
+def test_explicit_lean_is_admitted_on_the_blackwell_parts_for_measurement():
+    """cc 10.0 / 10.3 (``SPARSE_LEAN_TILE_EXPLICIT_CCS``: B200 / GB200, B300) serve the EXPLICIT ``tile_form="lean"`` only -- the lean body is
+    SM100-legal instruction for instruction and its config pins no Rubin-only size, so the admission is a host rule (2026-10-28, admitted for
+    the B200 measurement): the route resolves the lean tile at the lean split (65, k 1), the slab is the 65-partial one and the combine form
+    is the decode-grid kernel on cc 10.0 (``DECODE_GRID_AUTO``: the cc 10.7 split-aware rule's shape, measured there 2026-10-28 --
+    ``SPARSE_LEAN_COMBINE_RULE_CCS``) and the module's own on cc 10.3 (``DECODE_GRID_OFF``, unmeasured); the 24 / 4 geometry (G 6) at S_q 4 builds the
+    lean record with the step rows (N_MT 2).  ``"auto"`` / ``"tcgen05"`` there resolve the tcgen05 core and are declined by name ('EXPLICIT lean
+    tile only', ending with the former statement's spelling), the AUTO pin and the placement rule stay cc 10.7's, the lean body's own declines
+    still apply, a part outside both sets keeps the former decline whatever the form, and the gather4 floor still answers first below cc 10.0."""
+    from cudnn.sdpa.fwd import sparse_tile_rules as H
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as sc
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SPARSE_CAPABILITIES
+
+    assert H.SPARSE_LEAN_TILE_EXPLICIT_CCS == ((10, 0), (10, 3)) and H.SPARSE_LEAN_TILE_DEFAULT_CCS == ((10, 7),) and H._SPARSE_LEAN_TILE_RULE_CC == (10, 7)
+    assert (
+        SPARSE_CAPABILITIES.lean_explicit_ccs == H.SPARSE_LEAN_TILE_EXPLICIT_CCS
+    ), "the record's copy of the explicit part set (the one the adapter hands the statement) is the rules constant"
+    rubin = _route_adapter(tile_form="lean")
+    assert rubin.check_support() and rubin.combine_form() == sc.DECODE_GRID_AUTO  # the measured part: the decode-grid kernel at split 65
+    for cc in H.SPARSE_LEAN_TILE_EXPLICIT_CCS:
+        a = _route_adapter(cc=cc, tile_form="lean")
+        assert a.check_support() and a.tile_form == "lean" and a.kernel_template == H.SPARSE_TILE_LEAN and (a.split_kv, a.sub_tiles_per_cta) == (65, 1), cc
+        want_form = (
+            sc.DECODE_GRID_AUTO if cc in H.SPARSE_LEAN_COMBINE_RULE_CCS else sc.DECODE_GRID_OFF
+        )  # cc 10.0 measured (the rules module's table), cc 10.3 not
+        assert a.combine_form() == want_form and a.scratch_workspace_bytes() == rubin.scratch_workspace_bytes(), cc
+        g6 = _route_adapter(cc=cc, tile_form="lean", H=24, KH=4, SQ=4)  # 24 q / 4 kv heads (G 6), the shared list at S_q 4: N_MT = ceil(24 / 16) = 2
+        assert g6.check_support() and g6.tile_form == "lean" and g6.template_params().decode_seqlen_q == 4 and g6.template_params().qh_per_kh == 6, cc
+        assert not H.sparse_decode_lean_tile_selected(batch=1, h_kv=2, s_q=1, top_k=512, device_cc=cc)
+        assert H.sparse_tile_form_auto(batch=1, h_kv=2, s_q=1, top_k=512, device_cc=cc, admissible=True) == "tcgen05"
+        for form in ("auto", "tcgen05"):
+            with pytest.raises(NotImplementedError, match=rf"EXPLICIT lean tile only .* Rubin-line GPU \(cc 10\.7 \.\. 11\.9\); got cc {cc[0]}\.{cc[1]}"):
+                _route_adapter(cc=cc, tile_form=form).check_support()
+        with pytest.raises(NotImplementedError, match="below 8"):  # the lean body's own declines still apply on these parts
+            _route_adapter(cc=cc, tile_form="lean", top_k=4).check_support()
+    with pytest.raises(NotImplementedError, match=r"needs a Rubin-line GPU \(cc 10\.7 \.\. 11\.9\); got cc 12\.0"):
+        _route_adapter(cc=(12, 0), tile_form="lean").check_support()  # outside both sets: the former decline, lean or not
+    with pytest.raises(NotImplementedError, match="requires a cc 10.0\\+ part"):
+        _route_adapter(cc=(9, 0), tile_form="lean").check_support()  # the gather4 part floor answers first
+    # the rule's statement is ONE function, readable without a declaration (the block hears it through the adapter)
+    part = lambda cc, form: H.sparse_tile_part_decline(device_cc=cc, tile_form_requested=form, sm_lo=107, sm_hi=119)  # noqa: E731
+    assert part((10, 7), "auto") is None and part((11, 0), "lean") is None and part((10, 0), "lean") is None and part((10, 3), "lean") is None
+    assert "EXPLICIT lean tile only" in part((10, 3), "auto") and "got cc 10.3" in part((10, 3), "tcgen05") and part(None, "auto") is None
+    assert part((12, 0), "lean") == "needs a Rubin-line GPU (cc 10.7 .. 11.9); got cc 12.0"
+    # the statement reads the caller's RECORD copy of the part set (an appended keyword; None = the rules constant): an empty set is the former decline
+    assert (
+        H.sparse_tile_part_decline(device_cc=(10, 0), tile_form_requested="lean", sm_lo=107, sm_hi=119, explicit_lean_ccs=())
+        == "needs a Rubin-line GPU (cc 10.7 .. 11.9); got cc 10.0"
+    )
+    assert H.sparse_tile_part_decline(device_cc=(10, 0), tile_form_requested="lean", sm_lo=107, sm_hi=119, explicit_lean_ccs=((10, 0),)) is None
 
 
 def test_lean_kernel_carries_its_census_name_and_the_tcgen05_core_keeps_its_own():
