@@ -145,6 +145,7 @@ def test_DSA_indexer_forward_per_head_publication(s_q, s_k, h_q, ratio, offset, 
     changed = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=offsets)["scores"]
     expected = torch.where(torch.isneginf(expected), expected, -expected)
     torch.testing.assert_close(changed, expected, atol=5e-5, rtol=2e-5)
+    return None
 
 
 def _allocation_count() -> int:
