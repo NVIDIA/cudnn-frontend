@@ -26,9 +26,12 @@ per-CTA opt-in) every whole-slab form is one CTA per SM by shared memory alone, 
 never picked there (it would only spill); the decode step runs the one-CTA form in two waves
 past the one-CTA grid, and the verify step -- whose cc 10.0 forms carry a 3-deep ring of 64 KB
 state slabs that a 99 KB opt-in cannot hold -- serves the same kernel body with shallower rings:
-the two-CTAs-per-head pair with a 2-deep ring at one request and the one-CTA landing-slab
-(`NBUF` 1) form at two and more, up to 8 tokens per request, and the landing-slab pair for 9 to
-17 tokens per request at every requests count. The verify step traces its token loop once
+the two-CTAs-per-head pair with a 2-deep ring at one request and again past the one-CTA grid
+(four and more requests on 170- / 188-SM parts: its one-per-SM cluster CTAs fill the waves the
+one-CTA form's nearly empty second wave would leave -- measured +4 to +9 % at four requests on a
+170-SM cc 12.0 part), the one-CTA landing-slab (`NBUF` 1) form at two and three requests, each
+up to 8 tokens per request, and the landing-slab pair for 9 to 17 tokens per request at every
+requests count. The verify step traces its token loop once
 (`ROLLED_TOKENS`) in the forms that keep the state in registers. Every knob is a compile-time
 axis of one kernel body and bitwise with the default pick (no knob moves an fp32 addition), and
 the outputs reproduce FlashInfer's built-in `frost` backend byte for byte.
@@ -82,7 +85,7 @@ requests (one grid row each). CPU operands or operands on another CUDA device ar
 | CuTe DSL | `nvidia-cutlass-dsl >= 4.8.0` (kind `dsl`, naming the installed version) |
 | FlashInfer | the experimental Qwen 3.5 GDN block with its backend registry (`flashinfer.experimental.qwen_3_5_gdn_block.api.register_backend`): FlashInfer main at or after PR #8131 (2026-10-31); no tagged release carried it at the time of writing, and FlashInfer marks the block experimental (it may change or be removed without deprecation). Importing the backend module without it raises `ImportError` naming the requirement |
 | decode rows | up to 65535 requests per call, one grid row each (kind `shape`) |
-| verify step shape | up to 65535 requests per call, one grid row each; `tokens_per_request` from 2 up to the shared-memory budget of the forms the entry picks for that requests count on the device (`verify_max_tokens(device, requests)`, the bound of the pick's whole ladder): the cluster pair while the `requests x 96` CTAs have an SM each, the one-CTA-per-SM form while the `requests x 48` CTAs have one, the two-CTAs-per-SM form past that -- on a cc 10.0 part 35, 8 and 45 tokens per request; on a cc 12.0 part (99 KB per-CTA opt-in) the regime's shallower-ring forms of the same kernel: 8 tokens per request with the picked form at every requests count (the 2-deep-ring pair at one request, the one-CTA landing-slab form from two) and up to 17 through the landing-slab pair, the pick moving with the step's token count (kind `shape`, naming the deepest form and its bound) |
+| verify step shape | up to 65535 requests per call, one grid row each; `tokens_per_request` from 2 up to the shared-memory budget of the forms the entry picks for that requests count on the device (`verify_max_tokens(device, requests)`, the bound of the pick's whole ladder): the cluster pair while the `requests x 96` CTAs have an SM each, the one-CTA-per-SM form while the `requests x 48` CTAs have one, the two-CTAs-per-SM form past that -- on a cc 10.0 part 35, 8 and 45 tokens per request; on a cc 12.0 part (99 KB per-CTA opt-in) the regime's shallower-ring forms of the same kernel: 8 tokens per request with the picked form at every requests count (the 2-deep-ring pair at one request and past the one-CTA grid, the one-CTA landing-slab form at two and three) and up to 17 through the landing-slab pair, the pick moving with the step's token count (kind `shape`, naming the deepest form and its bound) |
 | parameter dtypes | decode: `A_log` fp32, `dt_bias` and `norm_weight` bf16 (FlashInfer's default `param_dtypes`; the kernel-native dtypes). Not part of FlashInfer's support question, so a decode plan built for other dtypes is declined at `prepare_qwen_3_5_gdn_block` time with a `NotImplementedError` naming them. Verify: each of the three in fp32 or bf16, compiled per dtype set. |
 | conv pool, decode | the `[num_slots, C, K - 1]` view in either layout: channel-innermost storage (`[num_slots, K - 1, C]` transposed) or dim-first (`[num_slots, C, K - 1]` contiguous) |
 | conv pool, verify | the `[num_slots, C, T + 2]` view of a channel-innermost pool (`[num_slots, T + 2, C]` transposed) only; the dim-first pool FlashInfer admits is a typed decline at plan time (`NotImplementedError` naming the layout), as with FlashInfer's built-in backend |

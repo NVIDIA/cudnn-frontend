@@ -320,21 +320,23 @@ def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count
     assert kcfg.admissible(kcfg.TWO_CTA_CFG) and kcfg.admissible(kcfg.CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
     assert kcfg.PAIR_FORMS == (kcfg.PAIR_CFG, kcfg.PAIR_NBUF2_CFG, kcfg.PAIR_NBUF1_CFG)
     assert kcfg.ONE_CTA_FORMS == (kcfg.CFG, kcfg.ONE_CTA_NBUF1_CFG, kcfg.PAIR_NBUF1_CFG)
-    assert kcfg.BEYOND_FORMS == (kcfg.TWO_CTA_CFG, kcfg.ONE_CTA_NBUF1_CFG, kcfg.PAIR_NBUF1_CFG)
+    assert kcfg.BEYOND_FORMS == (kcfg.TWO_CTA_CFG, kcfg.PAIR_NBUF2_CFG, kcfg.ONE_CTA_NBUF1_CFG, kcfg.PAIR_NBUF1_CFG)
+    assert kcfg.BEYOND_FORMS == (kcfg.TWO_CTA_CFG,) + kcfg.BEYOND_SMALL_SMEM_ORDER  # the cc 10.0 primary first: byte-identical there
     assert kcfg.part_readings(per_sm, optin) == _on(SM100_READING)
 
 
 def test_default_cfg_on_the_cc120_reading_walks_the_ladders_token_aware():
     """The cc 12.0 readings (100 KB per SM, 99 KB opt-in) on 84 / 170 / 188 SMs: no regime's primary form is admissible (the 3-deep rings
     do not fit; two TWO_CTA_CFG footprints do not share the SM), so the pick walks the ladder, token-aware -- the pair with the 2-deep
-    ring at one request and the one-CTA landing-slab form at two and more for T <= 8, the landing-slab pair for T 9 .. 17 at every requests
-    count, T 18 the deepest form (so the typed decline names 17); never TWO_CTA_CFG / PAIR_CFG / CFG; ``max_tokens_served`` 17 everywhere;
-    a part with no form is the typed decline naming its opt-in."""
+    ring at one request AND past the one-CTA grid (the measured wave-quantization exception, ``BEYOND_SMALL_SMEM_ORDER``), the one-CTA
+    landing-slab form while the ``requests x 48`` grid has an SM per CTA, all for T <= 8 (T 8 itself lands on the 2-deep-ring pair, which
+    holds it), the landing-slab pair for T 9 .. 17 at every requests count, T 18 the deepest form (so the typed decline names 17); never
+    TWO_CTA_CFG / PAIR_CFG / CFG; ``max_tokens_served`` 17 everywhere; a part with no form is the typed decline naming its opt-in."""
     per_sm, optin = SM120_READING
     on = _on(SM120_READING)
     for sms in (84, 170, 188):
         for requests in range(1, 17):
-            shallow = kcfg.PAIR_NBUF2_CFG if requests * 96 <= sms else kcfg.ONE_CTA_NBUF1_CFG
+            shallow = kcfg.PAIR_NBUF2_CFG if (requests * 96 <= sms or requests * 48 > sms) else kcfg.ONE_CTA_NBUF1_CFG
             for tokens in (None, 2, 3, 4, 6, 8):
                 assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) == shallow, (sms, requests, tokens)
             for tokens in range(9, 19):
@@ -344,7 +346,15 @@ def test_default_cfg_on_the_cc120_reading_walks_the_ladders_token_aware():
                 assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) not in (kcfg.TWO_CTA_CFG, kcfg.PAIR_CFG, kcfg.CFG), (sms, requests, tokens)
     assert kcfg.default_cfg(1, 170, per_sm, optin) == kcfg.default_cfg(1, 170, per_sm, optin, 2) == kcfg.PAIR_NBUF2_CFG
     assert kcfg.default_cfg(1, 84, per_sm, optin) == kcfg.ONE_CTA_NBUF1_CFG  # 84 SMs hold no 96-CTA cluster grid: the one-CTA ladder
-    assert kcfg.default_cfg(4, 170, per_sm, optin, 6) == kcfg.ONE_CTA_NBUF1_CFG  # 192 CTAs over 170 SMs: two waves, never the spilling cap
+    assert kcfg.default_cfg(2, 84, per_sm, optin, 6) == kcfg.PAIR_NBUF2_CFG  # 96 one-CTA CTAs outgrow 84 SMs: past the grid, the pair again
+    # past the one-CTA grid on 170 / 188 SMs: the 2-deep-ring pair for T 2 .. 8 (T 8 fits: 100,688 B), never the spilling cap, and never the
+    # one-CTA form's nearly empty second wave (192 CTAs over 170 SMs); the one-CTA form stays the pick while its grid is one wave (R 2 / 3)
+    for sms in (170, 188):
+        for tokens in (None, 2, 4, 6, 8):
+            assert kcfg.default_cfg(4, sms, per_sm, optin, tokens) == kcfg.default_cfg(8, sms, per_sm, optin, tokens) == kcfg.PAIR_NBUF2_CFG, (sms, tokens)
+            assert kcfg.default_cfg(2, sms, per_sm, optin, tokens) == kcfg.default_cfg(3, sms, per_sm, optin, tokens) == kcfg.ONE_CTA_NBUF1_CFG, (sms, tokens)
+        assert kcfg.default_cfg(4, sms, per_sm, optin, 9) == kcfg.default_cfg(2, sms, per_sm, optin, 9) == kcfg.PAIR_NBUF1_CFG, sms
+    assert replace(kcfg.PAIR_NBUF2_CFG, **on).max_tokens() == 8 and replace(kcfg.default_cfg(4, 170, per_sm, optin, 8), **on).max_tokens() == 8
     pick18 = replace(kcfg.default_cfg(1, 170, per_sm, optin, 18), **on)
     kcfg.validate_tokens(pick18, 17)
     with pytest.raises(NotImplementedError, match="at most 17 on this part"):
@@ -355,7 +365,7 @@ def test_default_cfg_on_the_cc120_reading_walks_the_ladders_token_aware():
         kcfg.first_fitting(kcfg.ONE_CTA_FORMS, per_sm, optin) == kcfg.ONE_CTA_NBUF1_CFG
         and kcfg.first_fitting(kcfg.PAIR_FORMS, per_sm, optin) == kcfg.PAIR_NBUF2_CFG
     )
-    assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.ONE_CTA_NBUF1_CFG
+    assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.first_fitting(kcfg.BEYOND_SMALL_SMEM_ORDER, per_sm, optin) == kcfg.PAIR_NBUF2_CFG
     assert (
         not kcfg.admissible(kcfg.TWO_CTA_CFG, per_sm, optin)
         and not kcfg.admissible(kcfg.CFG, per_sm, optin)
@@ -433,7 +443,8 @@ def test_entry_on_a_99kb_part_starts_from_the_fitting_one_cta_form_and_picks_per
 
     assert strip(k.cfg_for(1)) == strip(k.cfg_for(1, 2)) == strip(k.cfg_for(1, 6)) == strip(k.cfg_for(1, 8)) == kcfg.PAIR_NBUF2_CFG
     assert strip(k.cfg_for(1, 9)) == strip(k.cfg_for(1, 17)) == strip(k.cfg_for(4, 12)) == strip(k.cfg_for(16, 17)) == kcfg.PAIR_NBUF1_CFG
-    assert strip(k.cfg_for(2)) == strip(k.cfg_for(2, 8)) == strip(k.cfg_for(3, 6)) == strip(k.cfg_for(4, 6)) == strip(k.cfg_for(16)) == kcfg.ONE_CTA_NBUF1_CFG
+    assert strip(k.cfg_for(2)) == strip(k.cfg_for(2, 8)) == strip(k.cfg_for(3, 6)) == kcfg.ONE_CTA_NBUF1_CFG  # the one-CTA grid in one wave
+    assert strip(k.cfg_for(4)) == strip(k.cfg_for(4, 6)) == strip(k.cfg_for(4, 8)) == strip(k.cfg_for(16)) == kcfg.PAIR_NBUF2_CFG  # past it: the pair
     assert k.cfg_for(1).NORM_FORM == k.cfg_for(1, 12).NORM_FORM == "ctas2" and k.cfg_for(4, 12).NORM_FORM == "ctas1"
     assert k.cfg_for(1, 9) is k.cfg_for(1, 12), "one resolved form per (module form, requests): the forms cache"
     assert k.cfg_for(1, 18) == k.cfg_for(1, 17), "beyond the ladder the deepest form answers, so the decline names its bound"
@@ -1011,9 +1022,10 @@ def test_entry_reads_the_device_and_picks_the_form_per_requests():
         assert (
             beyond.co_resident_ctas(kcfg.TOKENS_MIN) == 2 and 2 * (beyond.smem_bytes(kcfg.TOKENS_MIN) + kcfg.SMEM_CTA_RESERVE_BYTES) <= beyond.SMEM_PER_SM_BYTES
         )
-    else:  # the part keeps every whole-slab form at one CTA per SM, so the cap left the pick (a 99 KB opt-in)
+    else:  # the part keeps every whole-slab form at one CTA per SM, so the cap left the pick (a 99 KB opt-in): the 2-deep-ring pair serves
         assert beyond.co_resident_ctas(kcfg.TOKENS_MIN) == 1 and replace(kcfg.TWO_CTA_CFG, **k.part).co_resident_ctas(kcfg.TOKENS_MIN) == 1
-        assert not kcfg.admissible(kcfg.TWO_CTA_CFG, *k.readings) and beyond.NBUF == 1
+        assert not kcfg.admissible(kcfg.TWO_CTA_CFG, *k.readings) and beyond.TWO_CTAS_PER_HEAD and beyond.NBUF == 2
+        assert replace(beyond, NORM_FORM=None, **_on(SM100_READING)) == kcfg.first_fitting(kcfg.BEYOND_SMALL_SMEM_ORDER, *k.readings)
 
 
 def test_warm_entry_rejects_cpu_operands_before_the_compiled_kernel_is_looked_up():
@@ -1114,8 +1126,8 @@ def test_parameter_dtypes_are_keys_and_match_the_reference(param_dtypes):
 @pytest.mark.parametrize("requests", [8, 16])
 def test_pick_beyond_the_reference_kernel_envelope_matches_the_torch_reference(requests):
     """8 and 16 requests (the reference verify kernel declines them): the pick past the one-CTA grid -- the two-CTAs-per-SM form on a cc
-    10.0 part, the one-CTA landing-slab form in two waves on a 99 KB opt-in -- against the torch reference, the same bars; the gated-norm
-    association is the reference's one-CTA-per-head chain order (ctas1)."""
+    10.0 part, the 2-deep-ring pair on a 99 KB opt-in (768 / 1,536 cluster CTAs over the SMs) -- against the torch reference, the same bars;
+    the gated-norm association is the reference's one-CTA-per-head chain order (ctas1)."""
     dev = _device_or_skip()
     ops = make_operands(requests, 6, dev, seed=800 + requests, pad="last", skip="mid")
     condition_conv_inputs(ops)
@@ -1152,8 +1164,8 @@ def test_long_steps_on_the_landing_slab_pair_match_the_torch_reference(requests,
 
 @pytest.mark.parametrize("form", ["pick", "pair"])
 def test_padding_and_skipped_slots_touch_nothing_else(form):
-    """The entry's pick at 4 requests (the two-CTAs-per-SM form on a 148- / 152-SM part; the one-CTA landing-slab form on a 99 KB opt-in)
-    and the two-CTAs-per-head pair this part holds forced: a padding request (both CTAs of a pair null together: the cluster wait pairs
+    """The entry's pick at 4 requests (the two-CTAs-per-SM form on a 148- / 152-SM part; the 2-deep-ring pair on a 99 KB opt-in) and the
+    two-CTAs-per-head pair this part holds forced: a padding request (both CTAs of a pair null together: the cluster wait pairs
     the entry arrive, nothing shipped) zeroes its rows and touches nothing else; a skipped slot stays."""
     dev = _device_or_skip()
     ops = make_operands(4, 6, dev, seed=5, accepted="random", pad="mid", skip="last")

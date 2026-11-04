@@ -12,7 +12,7 @@ a subprocess proof that the probe loads no kernel, and the per-row trip of the d
 tests -- the torch reference at decode rows 1 .. 64 and at verify requests 1 / 2 / 4 x tokens 4 / 6, the CUDA-graph replays, the
 dim-first conv pool (served by decode, a typed decline for verify) -- run against ``frost_fe`` (FlashInfer's checks, the cuDNN Frontend backend), the verify
 reference under the 148-SM launch policy and with the SM count held below one request's grid (the regime's budget-fitting form at every
-shape: the two-CTAs-per-SM form on a cc 10.0 part, the one-CTA landing-slab form on a 99 KB opt-in), the fp32-parameter decode decline at
+shape: the two-CTAs-per-SM form on a cc 10.0 part, the 2-deep-ring pair on a 99 KB opt-in), the fp32-parameter decode decline at
 plan time, the capture guards, and bitwise agreement with FlashInfer's built-in ``frost`` backend where that one is served (cc 10.0):
 decode on its reference cases, verify on the benchmark's own input sets at requests 1 / 2 / 4 x 6 tokens (all accepted, and random
 acceptance with a padding request).  The FlashInfer tests and benchmark are imported from the source tree next to the installed
@@ -294,6 +294,9 @@ def test_verify_step_shape_envelope_on_a_99kb_part(as_sm120):
         (1, 6, kvcfg.PAIR_NBUF2_CFG),
         (1, 12, kvcfg.PAIR_NBUF1_CFG),
         (2, 6, kvcfg.ONE_CTA_NBUF1_CFG),
+        (2, 8, kvcfg.ONE_CTA_NBUF1_CFG),
+        (4, 6, kvcfg.PAIR_NBUF2_CFG),  # past the one-CTA grid the 2-deep-ring pair again (the measured wave-quantization order)
+        (4, 8, kvcfg.PAIR_NBUF2_CFG),
         (4, 17, kvcfg.PAIR_NBUF1_CFG),
     ):
         got = backend.verify_form("cuda:0", requests, GEOMETRY.norm_eps, tokens)
@@ -713,7 +716,7 @@ def test_flashinfer_verify_reference_passes_under_the_sm_count_policies(requests
     policy sets the wrapper's SM count before the first compile): the 148-SM policy (on a cc 10.0 part the cluster pair at one request,
     the one-CTA-per-SM form at 2 .. 3, two CTAs per SM from 4) and, with an SM count below one request's grid, the beyond-the-grid form at
     every shape.  The expected form is the module pick on that SM count and THIS part's readings (the budget decides which form of the
-    regime's ladder serves: the streamed two-CTAs-per-SM form on a cc 10.0 part, the one-CTA landing-slab form on a 99 KB opt-in), so a
+    regime's ladder serves: the streamed two-CTAs-per-SM form on a cc 10.0 part, the 2-deep-ring pair on a 99 KB opt-in), so a
     part with another SM count or budget pins its own switch points."""
     dev = _verify_device_or_skip(requests, tokens)
     fi = _flashinfer_tests()
@@ -728,11 +731,15 @@ def test_flashinfer_verify_reference_passes_under_the_sm_count_policies(requests
     # admissible form of every ladder, so the pick is that form
     ladder = kvcfg.PAIR_FORMS if requests * 96 <= sms else (kvcfg.ONE_CTA_FORMS if requests * 48 <= sms else kvcfg.BEYOND_FORMS)
     assert want == kvcfg.first_fitting(ladder, *readings), (policy, requests, want)
-    assert form.TWO_CTAS_PER_HEAD == (requests * 96 <= sms), (policy, requests, form)  # the cluster pair exactly in the pair regime, on every part
-    if kvcfg.admissible(ladder[0], *readings):  # a cc 10.x part: the SM100 policy itself -- 3-deep rings, streaming once the grid outgrows the SMs
-        assert form.STATE_STREAM == (requests * 48 > sms) and form.NBUF == (1 if form.STATE_STREAM else 3), (policy, requests, form)
-    else:  # a 99 KB opt-in: the shallower rings of the same ladder, never the streamed cap (one CTA per SM there, and it spills)
-        assert not form.STATE_STREAM and form.MIN_CTAS_PER_SM == 1 and form.NBUF == (2 if form.TWO_CTAS_PER_HEAD else 1), (policy, requests, form)
+    pair_regime, beyond_grid = requests * 96 <= sms, requests * 48 > sms
+    if kvcfg.admissible(ladder[0], *readings):  # a cc 10.x part: the SM100 policy itself -- the pair in its regime, 3-deep rings, streaming past the grid
+        assert form.TWO_CTAS_PER_HEAD == pair_regime and form.STATE_STREAM == beyond_grid, (policy, requests, form)
+        assert form.NBUF == (1 if form.STATE_STREAM else 3), (policy, requests, form)
+    else:  # a 99 KB opt-in: the shallower rings of the same ladder -- the 2-deep-ring pair in the pair regime AND past the grid (the measured
+        # wave-quantization order), the one-CTA landing-slab form while the one-CTA grid is one wave, never the streamed cap (one CTA per SM
+        # there, and it spills)
+        assert form.TWO_CTAS_PER_HEAD == (pair_regime or beyond_grid) and not form.STATE_STREAM and form.MIN_CTAS_PER_SM == 1, (policy, requests, form)
+        assert form.NBUF == (2 if form.TWO_CTAS_PER_HEAD else 1), (policy, requests, form)
     case = fi.ver.make_case(requests, tokens, seed=100 * requests + tokens, device=dev, form="verify")
     ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
     q, out = fi.ver._outputs(requests * tokens, dev)

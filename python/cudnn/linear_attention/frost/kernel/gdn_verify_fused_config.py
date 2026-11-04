@@ -35,8 +35,9 @@ with NBUF 2 187 / 0, with NBUF 1 187 / 0, the one-CTA NBUF-1 form 183 / 0; the N
 two-per-SM verify form of that part, at T <= 3: 2 x (50,112 + 1,024) = 102,272 B).  Where the regime's primary form is not ADMISSIBLE on
 the part (``admissible``: its ring holds the minimum token count in the per-CTA opt-in and, under the register cap, two CTAs share an
 SM) the pick walks the regime's ladder (``PAIR_FORMS`` / ``ONE_CTA_FORMS`` / ``BEYOND_FORMS``: the primary, then the forms a smaller
-shared memory holds, deepest ring first) and is token-aware -- on the cc 12.0 reading ``PAIR_NBUF2_CFG`` at one request and
-``ONE_CTA_NBUF1_CFG`` at two and more for T <= 8, ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every requests count, and T >= 18 is the typed
+shared memory holds, deepest ring first) and is token-aware -- on the cc 12.0 reading ``PAIR_NBUF2_CFG`` at one request and past the
+one-CTA grid (four and more requests on 170 / 188 SMs: ``BEYOND_SMALL_SMEM_ORDER``), ``ONE_CTA_NBUF1_CFG`` at two and three, all for
+T <= 8, ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every requests count, and T >= 18 is the typed
 decline naming 17 (``max_tokens_served``, the bound FlashInfer's probe reads); where the primary is admissible (every cc 10.x part) the
 pick and its token bound are the measured ones above, whatever the step's token count.  Every form is bitwise with the reference
 kernel -- FlashInfer's built-in ``frost`` backend for the Qwen 3.5 GDN block, whose numerics these kernels reproduce: no knob moves an
@@ -514,9 +515,16 @@ ONE_CTA_NBUF1_CFG = make_cfg(
 # The ladder of each SM-count regime: the primary form (the measured cc 10.0 pick) first, then the forms a smaller shared memory still
 # holds, deepest ring first.  ``default_cfg`` returns the primary wherever it is admissible on the part (every cc 10.x part), so the picks
 # and the token envelopes there never move; on a part whose shared memory does not hold the primary it walks the rest, token-aware.
+# Past the one-CTA grid the fall-through order is a MEASURED exception to "deepest ring first" (BEYOND_SMALL_SMEM_ORDER): on a 170-SM
+# cc 12.0 part (three interleaved boost-clock rounds, every arm bitwise with the pick) the 2-deep-ring pair beat the one-CTA landing-slab
+# form by +4 .. +9 % at four requests (T 4 and T 6; cold-swept, warm and in situ alike) -- the pair's one-per-SM cluster CTAs fill 2.26
+# waves where the one-CTA form's 192 CTAs leave a nearly empty second wave -- while at two requests the one-CTA form's 96 CTAs are one
+# wave and win by 11 .. 21 %, so ONE_CTA_FORMS keeps its order.  Where the pair does not hold the token count (T 9 .. 17) the walk falls
+# through to the one-CTA form and the landing-slab pair as before.
 PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
 ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
-BEYOND_FORMS = (TWO_CTA_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
+BEYOND_SMALL_SMEM_ORDER = (PAIR_NBUF2_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
+BEYOND_FORMS = (TWO_CTA_CFG,) + BEYOND_SMALL_SMEM_ORDER
 
 
 def part_readings(smem_per_sm: int, smem_optin: int) -> dict:
@@ -586,9 +594,10 @@ def default_cfg(
     ``TWO_CTA_CFG`` footprints) the first admissible form of the rest that holds ``tokens`` (the minimum token count when None) is
     returned, else the admissible form with the largest token bound (so ``validate_tokens`` names the part's true bound), else the typed
     decline of a part with no form.  On the cc 12.0 readings (170 / 188 SMs): one request ``PAIR_NBUF2_CFG`` for T <= 8 (96 cluster CTAs,
-    one wave), two and more ``ONE_CTA_NBUF1_CFG`` for T <= 8 (one wave to 3 requests, two from 4), ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every
-    requests count, T >= 18 the decline naming 17; ``TWO_CTA_CFG`` never (one CTA per SM there, 34 spills).  All are plan-time facts (never
-    a runtime value)."""
+    one wave); two and three requests ``ONE_CTA_NBUF1_CFG`` for T <= 8 (96 / 144 CTAs, one wave); four and more requests ``PAIR_NBUF2_CFG``
+    again for T <= 8 (``BEYOND_SMALL_SMEM_ORDER``: its one-per-SM cluster CTAs fill the waves the one-CTA form's nearly empty second wave
+    would leave, +4 .. +9 % measured at four requests); ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every requests count; T >= 18 the decline naming
+    17; ``TWO_CTA_CFG`` never (one CTA per SM there, 34 spills).  All are plan-time facts (never a runtime value)."""
     ladder = _ladder(requests, sm_count)
     if tokens is not None and (not isinstance(tokens, int) or tokens < 1):
         raise ValueError(f"gdn_verify_fused: tokens must be a positive int or None, got {tokens!r}")
