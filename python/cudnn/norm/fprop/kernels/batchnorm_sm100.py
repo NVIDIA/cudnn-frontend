@@ -181,8 +181,8 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean=Non
         cutlass.Float32(momentum),
     )
     ce = (cfg.block_threads, has_beta, bool(training), update_running)
-    # dyn() specializes unit strides; non-unit strides remain dynamic.
-    key = (params.io_dtype, gamma.stride(0) == 1, beta.stride(0) == 1, running_mean.stride(0) == 1, running_var.stride(0) == 1) + ce
+    # dyn() specializes strides 0 and 1; larger strides are dynamic.
+    key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(running_mean.stride(0), 2), min(running_var.stride(0), 2)) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_bn_fwd_host, *args, *ce, fake_stream())

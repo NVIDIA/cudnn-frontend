@@ -407,8 +407,8 @@ def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     smem_bytes = _smem_bytes(BT, V, CPC, KS, eb)
 
     ce = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, it_ty, et, float(M), has_beta, smem_bytes, mbpm)
-    # dyn() specializes unit strides; non-unit strides remain dynamic.
-    key = (params.io_dtype, gamma.stride(0) == 1, saved_mean.stride(0) == 1, saved_rstd.stride(0) == 1) + ce
+    # dyn() specializes strides 0 and 1; larger strides are dynamic.
+    key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
     okey = key + (M,)
     occ0 = _OCC.get(okey, 2 if mbpm != 1 else 1)
     can2 = smem_bytes * 2 <= smem_budget(224 * 1024)
