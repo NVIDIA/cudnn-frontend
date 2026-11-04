@@ -186,7 +186,8 @@ def test_ragged_wide_token_table_strides_and_per_port_divisors():
         facts[role] = f._replace(strides=(2**33, 1), span=3 * 2**33 + 8)
     s.ragged_divs = (*token_strides, s.qh)
     s.native = cudnn._pybind_module._SdpaDenseBinder(s)
-    partial, combined = _equal(s, facts)
+    # Wide synthetic spans must not cover the synthetic split workspace.
+    partial, combined = _equal(s, facts, workspace=1 << 48)
     assert partial[s.index["q_strides"]][0] == 2**33
     assert combined[6][1] == 2**33 + 1 and combined[11] == s.ragged_divs
 

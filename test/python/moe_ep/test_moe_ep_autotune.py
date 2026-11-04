@@ -79,11 +79,11 @@ def test_autotune_core_contracts(monkeypatch):
         max_candidates=2,
     ) == (baseline, candidate)
     ds3_default = MoeEpTuningConfig(
-        dgrad_optimization="ds3_ep4_v1",
+        dgrad_optimization="ds3_ep4_pattern",
     )
     ds3_explicit = MoeEpTuningConfig(
         epi_flag_batch=(4, 2),
-        dgrad_optimization="ds3_ep4_v1",
+        dgrad_optimization="ds3_ep4_pattern",
     )
     assert normalize(
         baseline,

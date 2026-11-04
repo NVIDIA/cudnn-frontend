@@ -35,14 +35,10 @@ Same kernel shape as the C++ source: pipeline, TMEM/SMEM layout,
 barrier inventory + init counts, scheduler, warp dispatch, register
 split match.  Canonical reference port; reaches ~0.99x C++ TFLOPS.
 
-THD / varlen is **NOT** ported.  The pre-upstream body carried a packed-varlen
-entry point (``CFG.THD_VARLEN=1``: packed ``[1,T,H,D]`` + ``cu_seqlens`` coord
-offset, per-batch O TMA-descriptor array, packed ``[1,QH,T]`` LSE), but its
-setup-kernel call site still speaks the pre-upstream 7-arg contract against a
-14-arg helper and the metadata layout differs (3B+2 vs 4B+4).  ``compile()``
-raises on ``CFG.THD_VARLEN`` rather than half-serving it, ``config_sm107``
-rejects THD for f16/bf16, and no engine row advertises it.  Only the dense
-``[B,S,H,D]`` path is served.
+Dense and THD / varlen use the same native body. THD uses sequence-local
+TMA maps and a device-bounded persistent scheduler; all warp roles decode
+the same work order for NATURAL and LPT. The adapter binds current runtime
+capacity before choosing the initial worker waves.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -197,6 +193,16 @@ else:
 SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
 
 
+from cudnn.sdpa.fwd.kernels.thd_origins import (
+    COMPACT_MAP_SEQUENCE,
+    build_thd_origins,
+    origin_map_ptr,
+    origin_tensors,
+    origin_tma_slice,
+    thd_origins_compact_word,
+)
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
+
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     sdpa_operand_tensors,
     Bars,
@@ -211,6 +217,11 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
 )
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
+# The THD scheduler claims compact work from a device counter after setup.
+THD_PERSISTENT = True
+# Small runtime workloads keep up to two initial waves; broad declarations
+# are tightened again by the shared binder using current storage capacity.
+THD_INITIAL_WAVES = 2
 
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_2 if CFG.CTA_MMA == 2 else nvvm.CTAGroup.CTA_1
 
@@ -357,6 +368,7 @@ def _kernel(
     scale_softmax_log2: cutlass.Float32,
     seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
+    thd_origins: Optional[cute.Tensor] = None,
 ) -> None:
 
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -365,6 +377,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(thd_origins is not None):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     # SMEM allocations in natural Q/K/V/O order — Tcgen05SmemDesc.build truncates
     # start_address past ~256 KiB so this order keeps the data buffers in low SMEM.
@@ -562,6 +577,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             o_partial_f32=o_partial_f32,
+            thd_origins=thd_origins,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -633,6 +649,7 @@ def _kernel(
             is_leader=is_leader,
             cta_in_pair=cta_in_pair,
             tma_mcast_mask=tma_mcast_mask,
+            thd_origins=thd_origins,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -716,6 +733,7 @@ def _tmaldg_warp_group(
     is_leader,
     cta_in_pair,
     tma_mcast_mask,
+    thd_origins=None,
 ):
     """Unified TMA-LDG warp — cga1 / cga2 x MASK_NONE / PADDED / CAUSAL / SWA.
 
@@ -732,8 +750,24 @@ def _tmaldg_warp_group(
     # Both bootstrap consumer-side via q_empty_phase=1.
     mb_q_reload = bars.mb_q_o_alias if cutlass.const_expr(IS_QO_ALIAS) else bars.mb_q_empty
 
-    tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN):
+    if cutlass.const_expr(thd_origins is not None):
+        tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
+        # Setup records whether the load ports hold one map each (every live
+        # origin equals its compact prefix) or a map per sequence.
+        origins_word = thd_origins_compact_word(thd_origins, n_batch)
+        origins_single_map = origins_word != cutlass.Int64(0)
+        origins_per_sequence = origins_word == cutlass.Int64(0)
+        if origins_single_map:
+            # One map per load port, acquired once like the compact-prefix path.
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 1, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+    else:
+        tma_q = GmemTileTma(tma_q_desc)
+    if cutlass.const_expr(thd_origins is not None):
+        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)
+        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)
+    elif cutlass.const_expr(CFG.THD_VARLEN):
         # THD: K/V ride the setup kernel's RUNTIME descriptors (o_desc_words
         # slots n_batch+1 / n_batch+2), whose seq extent is CLAMPED to the
         # packed KV total cu_k[B].  The plan-time descriptors describe the
@@ -787,6 +821,24 @@ def _tmaldg_warp_group(
     V_COL_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_O // CFG.CTA_MMA)
 
     while is_valid_tile > cutlass.Int32(0):
+        if cutlass.const_expr(thd_origins is not None):
+            if origins_per_sequence:
+                # Sequence-local maps have independent caller-port bases and clip
+                # every interior tail. Acquire again when a persistent unit changes.
+                stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)
+                base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)
+                q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(q_map)
+                k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
+                v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(k_map)
+                tma_tensormap_acquire(v_map)
+            # Single maps keep the compact prefix offsets at batch coordinate 0;
+            # sequence-local maps carry the origin in their base and are
+            # selected by the batch coordinate.
+            q_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), q_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            kv_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), kv_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            tma_batch = cutlass.Int32(arith.select(origins_single_map.ir_value(), cutlass.Int32(0).ir_value(), batch_idx.ir_value()))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -807,6 +859,7 @@ def _tmaldg_warp_group(
                 bars.mb_q_full[0].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=thd_origins is None,
             )
 
             bars.mb_k_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -840,6 +893,7 @@ def _tmaldg_warp_group(
                 bars.mb_q_full[1].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=thd_origins is None,
             )
             q_empty_phase = q_empty_phase ^ 1
 
@@ -1770,6 +1824,7 @@ def _correction_warp_group(
     cta_in_pair,
     cta_id_x,
     o_partial_f32: Optional[cute.Tensor],
+    thd_origins=None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -1980,6 +2035,7 @@ def _correction_warp_group(
                 _cu = cutlass.make_array_view(seq_kv_lens_tensor)
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                _stats_base = thd_port_origin(thd_origins, 4, batch_idx, _cu_q_b) if cutlass.const_expr(thd_origins is not None) else _cu_q_b
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < _s_q_b:
                         lse_arr = cutlass.make_array_view(lse_tensor)
@@ -1991,13 +2047,13 @@ def _correction_warp_group(
                         # [1, QH, head_stride].  Serving only the rank-3 arm
                         # would silently transpose every LSE on the common path.
                         if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                            lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
+                            lse_arr[_stats_base + q_row_global, head_idx] = lse_val
                         else:
                             if cutlass.const_expr(len(lse_tensor.shape) == 4):
                                 # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                                 lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                             else:
-                                lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
+                                lse_arr[cutlass.Int32(0), head_idx, _stats_base + q_row_global] = lse_val
             else:
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < seqlen_q:
@@ -2126,6 +2182,8 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
@@ -2257,22 +2315,45 @@ def _host(
         #
         # Per-token element stride of packed O is o_tensor.stride[1] (= QH*d_v),
         # NOT CFG.TILE_O -- those coincide only at QH == 1.
-        _build_o_descs_kernel(
-            o_tensor,
-            tma_o_desc,
-            tma_k_desc,
-            tma_v_desc,
-            o_desc_words,
-            seq_kv_lens_tensor,
-            thd_q_lens_tensor,
-            thd_kv_lens_tensor,
-            thd_lens_form,
-            cutlass.Int32(QH),
-            cutlass.Int32(B),
-            cutlass.Int64(o_tensor.stride[1]),
-            cutlass.Int32(CGA_TILE_M),
-            n_thd_units,
-        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        if cutlass.const_expr(thd_origin_ptrs is not None):
+            o_desc_words, origins, offsets = origin_tensors(o_desc_ptr, thd_origin_ptrs, cutlass.Int32(B))
+            build_thd_origins(
+                (q_tensor, k_tensor, v_tensor, o_tensor),
+                tma_q_desc,
+                tma_k_desc,
+                tma_v_desc,
+                tma_o_desc,
+                o_desc_words,
+                origins,
+                offsets,
+                thd_origin_specs,
+                seq_kv_lens_tensor,
+                thd_q_lens_tensor,
+                thd_kv_lens_tensor,
+                thd_lens_form,
+                cutlass.Int32(B),
+                cutlass.Int32(QH),
+                cutlass.Int32(CGA_TILE_M),
+                n_thd_units,
+                single_maps=True,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        else:
+            _build_o_descs_kernel(
+                o_tensor,
+                tma_o_desc,
+                tma_k_desc,
+                tma_v_desc,
+                o_desc_words,
+                seq_kv_lens_tensor,
+                thd_q_lens_tensor,
+                thd_kv_lens_tensor,
+                thd_lens_form,
+                cutlass.Int32(QH),
+                cutlass.Int32(B),
+                cutlass.Int64(o_tensor.stride[1]),
+                cutlass.Int32(CGA_TILE_M),
+                n_thd_units,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # Grid Python-folds on Cfg constant (avoids DSL if-staging).
@@ -2297,6 +2378,7 @@ def _host(
         scale_softmax_log2,
         seq_q_lens_addr,
         o_partial_f32,
+        thd_origins=origins if cutlass.const_expr(thd_origin_ptrs is not None) else None,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2316,6 +2398,7 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    thd_origin_specs=None,
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
@@ -2344,6 +2427,11 @@ def compile(  # noqa: A001
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd:
         raise ValueError("paged_hnd is a paged-KV specialization")
+    if thd_origin_specs is not None:
+        if not CFG.THD_VARLEN or SPLIT_KV != 1 or IS_TF32:
+            raise ValueError("physical origins require nonpaged unsplit half THD")
+        if len(thd_origin_specs) != 5:
+            raise ValueError("physical origins require five Q/K/V/O/Stats specifications")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -2388,4 +2476,10 @@ def compile(  # noqa: A001
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd",
+        thd_origin_ptrs=(
+            tuple(P(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) if spec is not None else None for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        thd_origin_specs=thd_origin_specs,
     )

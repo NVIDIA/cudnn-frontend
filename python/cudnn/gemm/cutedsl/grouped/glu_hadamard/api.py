@@ -328,10 +328,12 @@ class GroupedGemmGluHadamardSm100(APIBase):
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmGluHadamardSm100 requires SM100+, found SM{compute_capability}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"GroupedGemmGluHadamardSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         if not self._kernel.can_implement(
             _convert_to_cutlass_data_type(self.ab_dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2),

@@ -112,6 +112,10 @@ class TemplateParams:
     sched_policy: int = _SCHED_NATURAL
     # L2 budget (MiB) that sizes the LPT_L2 head groups (mirrors fwd).
     sched_l2_mib: int = 16
+    # Native mma.sync reuse on devices with a smaller shared-memory budget.
+    # Zero/None retain the established per-head-dimension SM80 choices.
+    qo_stages: int = 0
+    dq_smem_coalesce: bool | None = None
 
 
 def validate_bwd_params(p: TemplateParams) -> None:
@@ -135,6 +139,8 @@ def validate_bwd_params(p: TemplateParams) -> None:
         raise ValueError(f"sm80 bwd: sched_policy must be SCHED_NATURAL, SCHED_LPT or SCHED_LPT_L2; got {p.sched_policy}")
     if p.sched_l2_mib <= 0:
         raise ValueError(f"sm80 bwd: sched_l2_mib must be > 0; got {p.sched_l2_mib}")
+    if p.qo_stages not in (0, 1, 2):
+        raise ValueError(f"native mma.sync bwd: qo_stages must be 0, 1 or 2; got {p.qo_stages}")
     if p.deterministic and p.sched_policy != _SCHED_NATURAL:
         raise ValueError("sm80 bwd: deterministic dQ requires SCHED_NATURAL (the kv-ordered semaphore relay)")
     if p.causal_bottom_right and not (p.is_causal or p.has_swa):

@@ -48,8 +48,8 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
     scale = dim**-0.5 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("softmax_scale must be finite and positive")
-    if not q.is_cuda or torch.cuda.get_device_capability(q.device) != (10, 0):
-        raise NotImplementedError("native sparse attention training currently requires SM100")
+    if not q.is_cuda or torch.cuda.get_device_capability(q.device) not in ((10, 0), (10, 3)):
+        raise NotImplementedError("native sparse attention training currently requires SM100 or SM103")
     from cudnn.frost.buffers import cutedsl_requirement_error
 
     error = cutedsl_requirement_error("native DSA training")

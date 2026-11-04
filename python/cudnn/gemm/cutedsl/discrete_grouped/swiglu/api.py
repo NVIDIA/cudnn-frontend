@@ -38,6 +38,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     framework_dtype,
     get_compute_capability,
+    has_tcgen05,
     get_data_ptr,
     get_shape,
     get_strides,
@@ -507,8 +508,8 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"DiscreteGroupedGemmSwiglu requires SM100+, but found SM{compute_capability}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"DiscreteGroupedGemmSwiglu requires SM100+ with tcgen05 (not cc 12.x), but found SM{compute_capability}")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

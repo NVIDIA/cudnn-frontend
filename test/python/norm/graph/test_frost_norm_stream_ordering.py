@@ -102,9 +102,13 @@ def test_execute_is_ordered_against_the_handle_stream():
 
     ref = torch.nn.functional.layer_norm(fresh, [D], scale.reshape(-1), bias.reshape(-1), 1e-5)
     err = (y - ref).abs().max().item()
-    assert err < 1e-4, (
-        f"execute ran ahead of a producer queued on the handle's stream (max err {err:.5f}); "
-        "the kernels and output copies are not following ExecutionContext.stream"
+    torch.testing.assert_close(
+        y,
+        ref,
+        check_dtype=False,
+        msg=lambda detail: f"execute ran ahead of a producer queued on the handle's stream (max err {err:.5f}); the kernels and output copies are not following ExecutionContext.stream"
+        + ": "
+        + detail,
     )
 
 
@@ -144,7 +148,9 @@ def test_execute_output_copies_follow_the_handle_stream():
 
     ref = torch.nn.functional.layer_norm(x, [D], scale.reshape(-1), bias.reshape(-1), 1e-5)
     err = (seen - ref).abs().max().item()
-    assert err < 1e-4, f"a consumer on the handle's stream did not see the output copies (max err {err:.5f})"
+    torch.testing.assert_close(
+        seen, ref, check_dtype=False, msg=lambda detail: f"a consumer on the handle's stream did not see the output copies (max err {err:.5f})" + ": " + detail
+    )
 
 
 @pytest.mark.L0
@@ -192,7 +198,7 @@ def test_cuda_graph_replay_recomputes_from_changed_inputs():
         cuda_graph.replay()
         torch.cuda.synchronize()
         err = (y - ref).abs().max().item()
-        assert err < 1e-4, f"replay {i} returned stale normalization (max err {err:.5f})"
+        torch.testing.assert_close(y, ref, check_dtype=False, msg=lambda detail: f"replay {i} returned stale normalization (max err {err:.5f})" + ": " + detail)
 
 
 @pytest.mark.L0
@@ -246,7 +252,11 @@ def test_explicitly_requested_default_stream_is_entered():
 
     ref = torch.nn.functional.layer_norm(fresh, [D], scale.reshape(-1), bias.reshape(-1), 1e-5)
     err = (y - ref).abs().max().item()
-    assert err < 1e-4, (
-        f"execute stayed on the ambient side stream instead of the requested default one "
-        f"(max err {err:.5f}); handle 0 is being read as 'no stream requested'"
+    torch.testing.assert_close(
+        y,
+        ref,
+        check_dtype=False,
+        msg=lambda detail: f"execute stayed on the ambient side stream instead of the requested default one (max err {err:.5f}); handle 0 is being read as 'no stream requested'"
+        + ": "
+        + detail,
     )

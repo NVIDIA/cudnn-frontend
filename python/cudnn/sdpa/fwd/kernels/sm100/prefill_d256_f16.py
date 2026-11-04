@@ -1981,6 +1981,11 @@ def _correction_warp_group(
                 bars.mb_stat_empty.arrive()
                 stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
+                # Prepare P1 while the preceding PV may still be in flight.
+                # Keep its TMEM store after the existing reuse/rescale handshake.
+                scaled = RegTile(raw_hi, size=64) * scale_log2 - max_safe
+                high_p = cute.math.exp2(scaled.vec, fastmath=True)
+
                 if kv_loop != bounds.left:
                     all_alpha_one = vote_sync(0xFFFFFFFF, alpha == cutlass.Float32(1.0), VoteSync.ALL)
                     previous_phase = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
@@ -1998,8 +2003,6 @@ def _correction_warp_group(
                 _fused_before_sync()
                 bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-                scaled = RegTile(raw_hi, size=64) * scale_log2 - max_safe
-                high_p = cute.math.exp2(scaled.vec, fastmath=True)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(tmem_base_iter + p_off + cutlass.Int32(32), cutlass.Float32), high_p.to(STORAGE_DTYPE))
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 _fused_before_sync()
