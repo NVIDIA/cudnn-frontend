@@ -63,6 +63,14 @@ def _decline_unless_contiguous(api: APIBase, desc, name: str) -> None:
     )
 
 
+def _check_sm90_sparse_topk_capacity(device, topk_desc) -> None:
+    """Keep public admission aligned with the prepared SM90 compiler without narrowing SM100."""
+    if device_capability(device)[0] == 9:
+        from . import _interface_sm90 as _iface_sm90
+
+        _iface_sm90._sparse_topk_capacity(topk_desc.shape[2])
+
+
 def _require_live_tensor(api: APIBase, t: Optional[torch.Tensor], desc, name: str, *, contiguous: bool) -> None:
     """Rule 1: execute re-validates the live tensor against its plan descriptor and raises, never converts."""
     cls = type(api).__name__
@@ -359,7 +367,8 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
 
     On SM90, ``compile()`` prepares a symbolic CuTeDSL artifact and
     ``execute()`` requires that prepared plan; execution is allocation-free
-    and CUDA Graph capturable with caller-owned ``out``.
+    and CUDA Graph capturable with caller-owned ``out``. The physical top-K
+    width must be in ``[1, 2176]`` on SM90; the SM100 contract is unchanged.
     """
 
     def __init__(
@@ -401,6 +410,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
             "W",
             self.qhead_per_kv_head,
         )
+        _check_sm90_sparse_topk_capacity(self.q_desc.device, self.topk_desc)
         self._is_supported = True
         return True
 
@@ -591,7 +601,8 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
 
     On SM90, ``compile()`` prepares a symbolic CuTeDSL artifact and
     ``execute()`` requires that prepared plan; execution is allocation-free
-    and CUDA Graph capturable with caller-owned ``out``.
+    and CUDA Graph capturable with caller-owned ``out``. The physical top-K
+    width must be in ``[1, 2176]`` on SM90; the SM100 contract is unchanged.
     """
 
     def __init__(
@@ -635,6 +646,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
             "LSE",
             self.qhead_per_kv_head,
         )
+        _check_sm90_sparse_topk_capacity(self.q_desc.device, self.topk_desc)
         self._is_supported = True
         return True
 

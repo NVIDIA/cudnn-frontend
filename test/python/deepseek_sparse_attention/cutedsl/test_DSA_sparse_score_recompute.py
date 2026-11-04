@@ -698,6 +698,45 @@ def test_DSA_sparse_score_recompute_sm90_topk_capacity_boundaries():
             _interface_sm90._sparse_topk_capacity(invalid)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@pytest.mark.parametrize("physical_topk", [0, 2177])
+def test_DSA_sparse_score_recompute_public_support_rejects_sm90_topk_boundaries(score_type, physical_topk, monkeypatch):
+    """The public support query rejects widths that the prepared SM90 compiler cannot serve."""
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.score_recompute import api as score_api
+
+    monkeypatch.setattr(score_api, "device_capability", lambda _device: (9, 0))
+    q = torch.empty((1, 1, 32, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
+    aux_dtype = torch.bfloat16 if score_type == "indexer" else torch.float32
+    aux = torch.empty((1, 1, 32), dtype=aux_dtype, device="cuda")
+    topk_indices = torch.empty((1, 1, physical_topk), dtype=torch.int32, device="cuda")
+    out = torch.empty((1, 1, physical_topk), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match=r"SM90 sparse score topk must be in \[1, 2176\]"):
+        _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@pytest.mark.parametrize("physical_topk", [0, 2177])
+def test_DSA_sparse_score_recompute_public_support_preserves_sm100_topk_contract(score_type, physical_topk, monkeypatch):
+    """The SM90 capacity gate does not narrow the existing SM100 public support query."""
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.score_recompute import api as score_api
+
+    monkeypatch.setattr(score_api, "device_capability", lambda _device: (10, 0))
+    q = torch.empty((1, 1, 32, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
+    aux_dtype = torch.bfloat16 if score_type == "indexer" else torch.float32
+    aux = torch.empty((1, 1, 32), dtype=aux_dtype, device="cuda")
+    topk_indices = torch.empty((1, 1, physical_topk), dtype=torch.int32, device="cuda")
+    out = torch.empty((1, 1, physical_topk), dtype=torch.float32, device="cuda")
+
+    assert _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out).check_support()
+
+
 @pytest.mark.L1
 @pytest.mark.parametrize("score_type", ["indexer", "attention"])
 @torch_fork_set_rng(seed=9001)
