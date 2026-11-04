@@ -219,14 +219,14 @@ def _bench_shape(name, lens, d, ratio, coff, args):
     result = {
         "shape": name,
         "workspace_mib": workspace_bytes / (1024 * 1024),
-        "atomic_rows_per_cta": plans[False]._rows_per_cta,
+        "atomic_rows_per_cta": getattr(plans[False], "_rows_per_cta", None),
         "atomic_kernel_us": statistics.median(kernel[False]),
         "atomic_operation_us": statistics.median(operation[False]),
         **accuracy,
     }
     if True in plans:
         result.update(
-            deterministic_rows_per_cta=plans[True]._rows_per_cta,
+            deterministic_rows_per_cta=getattr(plans[True], "_rows_per_cta", None),
             deterministic_kernel_us=statistics.median(kernel[True]),
             deterministic_operation_us=statistics.median(operation[True]),
         )
