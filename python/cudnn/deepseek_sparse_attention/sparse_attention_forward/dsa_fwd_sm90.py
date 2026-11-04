@@ -171,8 +171,12 @@ class SparseAttentionForwardSm90:
                 col1 = col0 + 1
                 valid0 = sValid[col0] != cutlass.Uint8(0)
                 valid1 = sValid[col1] != cutlass.Uint8(0)
-                s0 = scores[score_off] if valid0 else neg_inf
-                s1 = scores[score_off + 1] if valid1 else neg_inf
+                # Scale before masking.  Scaling a masked -inf would produce
+                # NaN for a zero scale and +inf for a negative scale.
+                scaled0 = scores[score_off] * scale_log2
+                scaled1 = scores[score_off + 1] * scale_log2
+                s0 = scaled0 if valid0 else neg_inf
+                s1 = scaled1 if valid1 else neg_inf
                 pairs.append((s0, s1))
                 if cutlass.const_expr(k_frag < 2):
                     chains += [s0, s1]
@@ -182,7 +186,7 @@ class SparseAttentionForwardSm90:
                     chains[chain + 1] = cute.arch.fmax(chains[chain + 1], s1)
 
             old_mi = mi[row_half]
-            current = cute.arch.fmax(cute.arch.fmax(chains[0], chains[1]), cute.arch.fmax(chains[2], chains[3])) * scale_log2
+            current = cute.arch.fmax(cute.arch.fmax(chains[0], chains[1]), cute.arch.fmax(chains[2], chains[3]))
             floor_mi = floor_mi0 if cutlass.const_expr(row_half == 0) else floor_mi1
             current = cute.arch.fmax(current, floor_mi)
             current = quad_reduce(current, "max")
@@ -193,12 +197,12 @@ class SparseAttentionForwardSm90:
             total = li[row_half] * old_scale
             for k_frag in cutlass.range_constexpr(self.QK_SLOTS // 4):
                 s0, s1 = pairs[k_frag]
-                # The mask already replaced invalid scores with -inf, so the
-                # unconditional exp2 below produces exact zero.  A finite
+                # The post-scale mask replaced invalid scores with -inf, so
+                # the unconditional exp2 below produces exact zero.  A finite
                 # MAX_INIT keeps an all-invalid row away from inf - inf, as in
                 # FlashMLA's Hopper implementation.
-                p0 = cute.math.exp2(cute.math.fma(s0, scale_log2, -current), fastmath=True)
-                p1 = cute.math.exp2(cute.math.fma(s1, scale_log2, -current), fastmath=True)
+                p0 = cute.math.exp2(s0 - current, fastmath=True)
+                p1 = cute.math.exp2(s1 - current, fastmath=True)
                 total = total + p0 + p1
                 scores[k_frag * 4 + row_half * 2] = p0
                 scores[k_frag * 4 + row_half * 2 + 1] = p1

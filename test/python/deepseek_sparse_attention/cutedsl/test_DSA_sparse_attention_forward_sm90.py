@@ -79,6 +79,48 @@ def test_DSA_sparse_attention_forward_sm90_matches_reference(num_heads, head_dim
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("head_dim", [512, 576])
+@pytest.mark.parametrize("scale", [0.0, -0.125], ids=["zero", "negative"])
+def test_DSA_sparse_attention_forward_sm90_nonpositive_scale_tail(head_dim, scale):
+    """Scale valid logits before masking padded and invalid sparse slots."""
+    _require_sm90()
+    from cudnn import DSA
+
+    torch.manual_seed(9724 + head_dim)
+    total_s_q, total_s_kv, num_heads, logical_topk = 2, 73, 16, 65
+    q = torch.randn(total_s_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda") * 0.05
+    kv = torch.randn(total_s_kv, head_dim, dtype=torch.bfloat16, device="cuda") * 0.05
+    indices = torch.randint(0, total_s_kv, (total_s_q, logical_topk), dtype=torch.int32, device="cuda")
+    indices[0, -1] = -1
+    indices[1, 1:] = total_s_kv
+    lengths = torch.tensor([logical_topk, 1], dtype=torch.int32, device="cuda")
+
+    result = DSA.sparse_attention_forward_wrapper(
+        q,
+        kv,
+        indices,
+        topk_length=lengths,
+        softmax_scale=scale,
+    )
+    reference = ref_sparse_attention_forward(
+        q,
+        kv,
+        None,
+        indices,
+        topk_length=lengths,
+        softmax_scale=scale,
+        return_full=True,
+    )
+
+    torch.testing.assert_close(result["out"].float(), reference[0].float(), atol=8e-3, rtol=3.01 / 128)
+    torch.testing.assert_close(result["max_logits"], reference[1], atol=2e-5, rtol=2.01 / 65536)
+    torch.testing.assert_close(result["lse"], reference[2], atol=2e-5, rtol=2.01 / 65536)
+    assert torch.isfinite(result["out"]).all()
+    assert torch.isfinite(result["max_logits"]).all()
+    assert torch.isfinite(result["lse"]).all()
+
+
+@pytest.mark.L1
 def test_DSA_sparse_attention_forward_sm90_compile_is_symbolic_and_execute_does_not_jit(monkeypatch):
     """Reuse one symbolic artifact across runtime sequence and head extents."""
     _require_sm90()
