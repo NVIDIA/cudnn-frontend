@@ -68,16 +68,17 @@ def attention_backward_reference(
     mask: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ):
-    """Return FP32 reference output/LSE and gradients for MHA."""
+    """Return FP32 reference output/LSE and gradients (MHA, or GQA/MQA with dK/dV summed over each head group)."""
 
     softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    group_size = q.shape[1] // k.shape[1]
     q_ref = q.float().detach().requires_grad_()
     k_ref = k.float().detach().requires_grad_()
     v_ref = v.float().detach().requires_grad_()
-    scores = torch.einsum("bhqd,bhkd->bhqk", q_ref * softmax_scale, k_ref)
+    scores = torch.einsum("bhqd,bhkd->bhqk", q_ref * softmax_scale, k_ref.repeat_interleave(group_size, dim=1))
     scores = scores + mask
     probabilities = torch.softmax(scores, dim=-1)
-    output = torch.einsum("bhqk,bhkd->bhqd", probabilities, v_ref)
+    output = torch.einsum("bhqk,bhkd->bhqd", probabilities, v_ref.repeat_interleave(group_size, dim=1))
     lse = torch.logsumexp(scores, dim=-1)
     output.backward(do.float())
     return output.detach(), lse.detach(), q_ref.grad, k_ref.grad, v_ref.grad

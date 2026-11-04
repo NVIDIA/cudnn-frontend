@@ -1222,7 +1222,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                     if nq0 + r_loc >= seqlen_q:
                                         val = cutlass.Float32(float("inf"))
                                 lse_r[row_blk * 2 + hf] = val * cutlass.Float32(_LOG2E)
-                    dq_accum_base = ((batch * S_Q_R + q_row0) * H_Q + q_head) * D_QK
+                    dq_accum_base = ((wide_index(batch, dq_accum) * S_Q_R + q_row0) * H_Q + q_head) * D_QK
                     if cutlass.const_expr(self.deterministic):
                         _bwd_relay_wait(relay_sem, q_block, relay_turn, warp)
                     _bwd_dq_scatter(
@@ -1271,7 +1271,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                     if nq0 + r_loc >= seqlen_q:
                                         val = cutlass.Float32(float("inf"))
                                 lse_r[row_blk * 2 + hf] = val * cutlass.Float32(_LOG2E)
-                    dq_accum_base = ((batch * S_Q_R + q_row0) * H_Q + q_head) * D_QK
+                    dq_accum_base = ((wide_index(batch, dq_accum) * S_Q_R + q_row0) * H_Q + q_head) * D_QK
                     if cutlass.const_expr(self.deterministic):
                         _bwd_relay_wait(relay_sem, q_block, relay_turn, warp)
                     _bwd_dq_scatter(
@@ -1353,7 +1353,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 chunks_per_row = D_QK // _COPY_ELEMS
                 total = KV_TILE * chunks_per_row
                 # workspace's head-dim base offset
-                whd_base = (batch * S_KV + kv_base) * qk_row_stride + q_head * D_QK
+                whd_base = (wide_index(batch, dk_ws) * S_KV + kv_base) * qk_row_stride + q_head * D_QK
                 for i in cutlass.range_constexpr(total // 256):
                     chunk = i * 256 + math_tidx
                     row = chunk // chunks_per_row

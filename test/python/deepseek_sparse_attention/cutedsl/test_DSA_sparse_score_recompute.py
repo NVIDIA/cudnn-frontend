@@ -56,9 +56,9 @@ def _local_to_global_topk_indices(topk_indices: torch.Tensor, seqlen_k: int) -> 
 @pytest.mark.parametrize("has_topk_length", [False, True])
 @pytest.mark.parametrize("use_global", [False, True])
 def test_sparse_attn_sm100_tiles_match_reference(num_heads, head_dim, topk, has_topk_length, use_global):
-    from deepseek_sparse_attention.cutedsl.dsa_utils import _require_exact_sm100
+    from deepseek_sparse_attention.cutedsl.dsa_utils import _require_sm100_family
 
-    _require_exact_sm100()
+    _require_sm100_family()
     from cudnn import DSA
 
     cfg = {"b": 2, "s_q": 32, "s_kv": 2048, "head_dim": head_dim, "qhead_per_kv_head": num_heads, "topk": topk}
@@ -352,7 +352,9 @@ def _sparse_plan(DSA, score_type, q, k, aux, topk_indices, out, topk_length=None
 def _sparse_case(score_type, has_topk_length=False):
     from cudnn import DSA
 
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Sparse score recompute requires SM90+")
     q, k, aux, topk_indices, topk_length = _allocate(_SMALL_CFG, score_type, has_topk_length)
     out = torch.empty(topk_indices.shape, dtype=torch.float32, device="cuda")
@@ -462,7 +464,9 @@ def test_DSA_sparse_score_recompute_execute_allocates_nothing_and_never_synchron
 @torch_fork_set_rng(seed=8)
 def test_DSA_sparse_score_recompute_sm100_topk_length_none_compiles_out(score_type, monkeypatch):
     """R3: without topk_length the SM100 mTopkLength slot is None at compile and launch (no (1,1) placeholder), keyed have_topk_length=False."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100 sparse score kernel")
     from cuda.bindings import driver as cuda
     from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm100

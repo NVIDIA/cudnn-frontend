@@ -71,7 +71,7 @@ def rubin_host(crashing_backend, monkeypatch):
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
 
 
-def _mxfp8_graph(b=4, hq=8, hk=2, sq=1, skv=2048, d=128, dv=128, bshd=True, stats=False, sink=False):
+def _mxfp8_graph(b=4, hq=8, hk=2, sq=1, skv=2048, d=128, dv=128, bshd=True, stats=False, sink=False, unaligned_k=False):
     """A dense graph.sdpa_mxfp8 forward declared as test/python/sdpa/mxfp8.py declares it (BSHD or BHSD strides)."""
     ceil_div = lambda a, m: -(-a // m)  # noqa: E731
     itype = cudnn.data_type.FP8_E4M3
@@ -92,6 +92,8 @@ def _mxfp8_graph(b=4, hq=8, hk=2, sq=1, skv=2048, d=128, dv=128, bshd=True, stat
     q_stride = (sq * hq * d, d, hq * d, 1) if bshd else (hq * sq * d, sq * d, d, 1)
     o_stride = (sq * hq * dv, dv, hq * dv, 1) if bshd else (hq * sq * dv, sq * dv, dv, 1)
     k_stride = (skv * hk * d, d, hk * d, 1) if bshd else (hk * skv * d, skv * d, d, 1)
+    if unaligned_k:
+        k_stride = (hk * skv * (d + 1), skv * (d + 1), d + 1, 1)
     v_stride = (skv * hk * dv, dv, hk * dv, 1) if bshd else (hk * skv * dv, skv * dv, dv, 1)
     q = g.tensor(dim=(b, hq, sq, d), stride=q_stride, data_type=itype, name="q")
     k = g.tensor(dim=(b, hk, skv, d), stride=k_stride, data_type=itype, name="k")
@@ -204,11 +206,12 @@ def test_manifest_declares_the_guard_for_the_sdpa_forward_family():
 # --- the planning sequence on real graphs (host-only: nothing is built) ---------------------------------------------
 
 
-def test_bshd_single_query_graph_plans_on_the_row_without_lowering_the_backend(rubin_host, monkeypatch):
+@pytest.mark.parametrize("bshd", [False, True])
+def test_native_single_query_graph_plans_on_the_row_without_lowering_the_backend(rubin_host, monkeypatch, bshd):
     """The guarded graph plans on the FROST row alone: no C++ lowering happens (the tripwire would fail the test), the
     plan list holds the row's python plans only, and the guard's text is recorded as the backend's decline."""
     monkeypatch.setattr(pygraph, "_lower_backend_graph", lambda self: pytest.fail("the backend must not be lowered for a guarded graph"))
-    g = _mxfp8_graph()
+    g = _mxfp8_graph(bshd=bshd)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -219,18 +222,18 @@ def test_bshd_single_query_graph_plans_on_the_row_without_lowering_the_backend(r
     assert _GUARD in str(g._backend_declined) and _TAIL in str(g._backend_declined)
 
 
-def test_bhsd_single_query_graph_declines_with_the_guard_text(rubin_host, monkeypatch):
-    """A graph the row does not serve (BHSD) and the guarded backend is not asked about: a typed decline whose text
+def test_unaligned_single_query_graph_declines_with_the_guard_text(rubin_host, monkeypatch):
+    """A graph the row does not serve (unaligned K) and the guarded backend is not asked about: a typed decline whose text
     carries the guard's reason, with no C++ lowering on the way."""
     monkeypatch.setattr(pygraph, "_lower_backend_graph", lambda self: pytest.fail("the backend must not be lowered for a guarded graph"))
-    g = _mxfp8_graph(bshd=False)
+    g = _mxfp8_graph(bshd=False, unaligned_k=True)
     g.validate()
     g.build_operation_graph()
     with pytest.raises(cudnn.cudnnGraphNotSupportedError) as exc:
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     assert _GUARD in str(exc.value) and _TAIL in str(exc.value), str(exc.value)
     # ... and the row's own reason, both sides in one message.
-    assert "python engines declined:" in str(exc.value) and f"{_ROW}: Q/K/V/O must be BSHD-physical" in str(exc.value), str(exc.value)
+    assert "python engines declined:" in str(exc.value) and f"{_ROW}: k: native dense forward" in str(exc.value), str(exc.value)
     assert g._lowered_graph is None
 
 

@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 from .dtypes import DTYPE_BITS
 from .fusion_ir import FusionChain, swap_ab
-from .tile_config import TileConfig, as_mma_tile_k, as_pipeline, by_name, select_config
+from .tile_config import PLANNER_K_BOUNDS, PLANNER_MAX_BATCH, PLANNER_MN_BOUNDS, TileConfig, as_mma_tile_k, as_pipeline, by_name, select_config
 
 MAX_PLAN_CONFIGS = 8
 
@@ -58,9 +58,11 @@ class CostProfile:
     switch_margin: float = 0.05
     tie_margin: float = 0.01
     diversity_margin: float = 0.5
-    mn_bounds: tuple[int, int] = (32, 4096)
-    k_bounds: tuple[int, int] = (1024, 16384)
-    max_batch: int = 8
+    # the shape envelope this profile claims; the defaults are the engine-wide planner envelope `tile_config` publishes (a host-side
+    # resolver reads it there without importing this module), and every profile stays inside it (`test_tile_select_analytic.py` pins that)
+    mn_bounds: tuple[int, int] = PLANNER_MN_BOUNDS
+    k_bounds: tuple[int, int] = PLANNER_K_BOUNDS
+    max_batch: int = PLANNER_MAX_BATCH
     b_n_major_ok: bool = False
     scalar_scale_epilogue_ok: bool = False
 

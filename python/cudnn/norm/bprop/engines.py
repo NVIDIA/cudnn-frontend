@@ -46,6 +46,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
     """First reason this engine cannot serve these facts, or None if it can."""
     if facts.invalid:
         return facts.invalid
+    if facts.extended_affine:
+        from cudnn.norm.affine import mismatch as affine_mismatch
+
+        reason = affine_mismatch(facts)
+        if reason is not None:
+            return reason
     if requested is not None and not isinstance(requested, NormBwdKnobs):
         return f"knob request is a {type(requested).__name__}, not NormBwdKnobs — wrong operation's vocabulary"
     if facts.phase != capabilities.phase:
@@ -56,7 +62,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.NormGraphFacts", requested: 
         return f"requires {' or '.join(f'SM{a}{b}' for a, b in sorted(capabilities.archs))}; current device is {facts.device_cc}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
-    if not facts.uniform_dtype:
+    if not facts.uniform_dtype and not facts.extended_affine:
         return "DY dtype must match X"
     return None
 
@@ -107,6 +113,11 @@ def lower_norm_bprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     """Default lowering: resolve buffers at execute time and call
     :func:`cudnn.norm.bprop.api.norm_bprop` (dispatches by ``facts.variant``);
     outputs are copied into the graph's DX / Dscale / Dbias buffers."""
+    if facts.extended_affine:
+        from cudnn.norm.affine import lower
+
+        return lower(facts)
+
     from cudnn.norm.bprop.api import bprop_workspace_bytes, norm_bprop
 
     binding = ga.NormBinding(

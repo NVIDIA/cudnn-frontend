@@ -12,10 +12,12 @@ public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel modul
 version problem, never as a ``KeyError`` from inside the DSL), then every field of the record as a typed decline.  Every
 arm the body does not carry yet (a sink, a band, Q-length trimming of a dense batch, log2 stats, a pure caller list) is declined
 BY NAME; a later commit that lands an arm flips the record field, the config's wired-arm set and the support-matrix tracker in
-the same change.  THD (packed sequences) and paged K / V pools are carried --
-ONE of the two per declaration (``thd=True`` with ``paged_kv=True`` is a typed decline: the packed sequence's K / V row offset
-composes with a dense tensor only, never with a page pool) -- and so is the fused epilogue gate, which composes with either
-(it touches the item's Q^T slot ring and the epilogue only); see the contracts below.
+the same change.  THD (packed sequences) and paged K / V pools are carried, and so is their COMPOSITION on the bottom-right
+diagonal (``thd=True`` + ``paged_kv=True`` + ``bottom_right=True``, served since 2026-10-30: the packed EXTEND form over a cached
+prefix -- every sequence's K / V rows through its row of the page table, its rows' positions from the per-sequence KV lengths; the
+record's ``thd_paged_kv`` field); THD x paged on the TOP-LEFT diagonal is a typed decline (a packed self-attention over a page pool
+has no serving meaning).  The fused epilogue gate composes with every arm (it touches the item's Q^T slot ring and the epilogue
+only); see the contracts below.
 
 The fused epilogue gate (``epilogue_gate=`` the gate OPERAND, O's ``(B, S, H_q, D)`` shape in Q's dtype at its own (batch,
 seq, head) strides -- a slab column slice binds with no copy; the packed ``[1, T_q, H_q, D]`` form under THD) is served: the
@@ -72,6 +74,45 @@ statement of the fact that the gated attention block's declaration-time decline 
 metadata above every role wait (the pre-dispatch dead-CTA exit, the claim-counter scheduler), so a dependent launch of it would read
 what the setup launch has not written yet; the switch's scope is the dense BSHD and paged decode chain.
 
+THE FUSED GATED e4m3 STORE (appended 2026-10-29; an OP ATTRIBUTE of the declaration, never a knob -- it changes the numerics): ``o``
+declared ``float8_e4m3fn`` + ``out_scale`` (a 1-element fp32 CUDA tensor or descriptor: the consumer's static per-tensor DEQUANT scale,
+the o_proj input scale) + ``epilogue_gate``, on a SPLIT plan (the lean tile always splits; the tcgen05 core needs ``split_kv >= 2``):
+the split combine's fused entry (``sm100/split_combine.compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")``) stores
+``e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale))`` -- ONE rounding of the fp32 gated value, the inverse computed on device
+-- in place of the half O and the consumer's gate + quant launch; a dead row stores 0, the LSE is untouched.  Against the unfused
+chain (the half O, then ``e4m3(half(O) * inv)``) it differs by at most one e4m3 ulp at the larger magnitude, never bitwise, WHEREVER the
+half twin does not underflow before the scale: below the half dtype's smallest normal the twin loses digits and then flushes to zero (f16
+from 2^-25 down) while the fused path keeps the fp32 magnitude -- the single rounding is the contract, the twin is not a general bound
+(the gate suite's boundary cell records 48 on every form against the f16 twin's 0 and the bf16 twin's 52: a merged value of 1e-8, a zero
+gate, the scale 1e-10).  ``out_scale``
+is a POSITIVE NORMAL fp32 by contract: its VALUE is never read on the host (a device word; the shape / dtype / contiguity are), and a zero /
+subnormal scale makes the on-device inverse +inf -- a dead row's ``0 * inf`` is then the e4m3 NaN byte and every live element +-448 (or NaN
+where it is exactly 0), so no kernel-side select makes a zero scale meaningful.  Declines by name: ``NotImplementedError`` (the typed decline
+that advances a build walk) for an UNWIRED form -- an e4m3 ``o`` without the gate / unsplit / under THD, any other output dtype than Q's or
+e4m3 --, ``ValueError`` for a MALFORMED declaration, like the adapter's other operand-shape errors -- an e4m3 ``o`` without ``out_scale``,
+``out_scale`` with a half ``o``, a scale that is not ONE contiguous fp32 element.  :attr:`SparseGqaFwdDslSm107.fused_e4m3` reads the
+resolved arm back after ``check_support``.  On the Blackwell explicit-lean parts the lean route's combine FORM follows the cc 10.7
+split-aware rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` = cc 10.0, measured on the GB200 class 2026-10-28; cc 10.3 keeps the
+module's own forms) -- :func:`_sparse_combine_decode_grid`.
+
+THE FUSED STORE's ROUNDING CONVENTION (``out_rounding``, appended last; an OP ATTRIBUTE of the declaration, never a knob -- it changes the bytes;
+the vocabulary is ``heuristics.COMBINE_OUT_ROUNDINGS``, validated by name at construction): ``"single"`` (the default) is the convention above, ONE
+rounding of the fp32 gated value (FROST's own); ``"staged"`` reproduces a serving stack's gate-and-quantize launch byte for byte,
+``e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1, scale))`` -- the merged O rounded to bf16 as that stack's attention kernel
+stores it, the exact sigmoid as a division, the gated value rounded to bf16, the fp32 multiply by the same inverse, the saturating cvt -- spelled
+with the DSL ops that stack's kernel spells (``split_combine.compile_ptr(out_rounding="staged")``), so a provider whose speculative verify is
+tuned on the stack's bytes can take the fused launch without moving the acceptance length (the two conventions differ by one e4m3 code on a
+few percent of the elements, enough to flip a near-tie greedy token).  The LSE, the dead rows (0), the PDL arm and the combine FORM are the single
+mode's; the attribute is compiled into the combine entry (no new runtime slot).  Declines by name: ``"staged"`` with a half ``o`` (no fused store
+to apply it to) is a ``ValueError`` (a malformed declaration, like ``out_scale`` with a half ``o``); ``"staged"`` with f16 operands is a
+``NotImplementedError`` (the typed decline: the convention is a bf16 chain's -- refused by name rather than defined for f16, which has no
+consumer, no ground truth and a narrower range below which the two conventions part); a value outside the vocabulary is a ``ValueError`` at
+construction.  :attr:`SparseGqaFwdDslSm107.out_rounding` reads the attribute back.
+The per-form COST of ``"staged"`` is a PERFORMANCE fact of the attribute, not a numerics change, recorded in the tracker's "Measured cost
+of the staged convention" note (``python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md``; 2026-10-30, the Rubin 212-SM class): a tie inside
+the noise on the served decode-grid combine at one token per sequence, 0.13-0.30 us per layer at four, 1.2-1.5 us per layer (-6.7..-8.5 %)
+where the combine resolves to the module's own forms -- prefer ``"single"`` on such a declaration until the staged arithmetic is rescheduled.
+
 TWO BODIES, ONE FUNCTION (``tile_form``, appended; a PERFORMANCE knob): the tcgen05 core (``kernels/sm107/sparse_d256_f16.py``, the
 module above, ``kernel_template`` ``"sparse_d256_f16"``) and the LEAN decode tile (``kernels/sm107/sparse_lean_d256_f16.py``: ``mma.sync``
 m16n8k16 + ``cp.async``, one 128-thread CTA per (sequence, KV head, chunk of ``sub_tiles_per_cta`` 32-key sub-tiles), no TMEM / TMA / CLC,
@@ -92,7 +133,11 @@ split-major partial slab the tcgen05 core's split store writes, so the combine, 
 (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table) the placement rule
 ``heuristics.sparse_decode_lean_tile_selected`` (``B x H_kv <= LEAN_SPARSE_MAX_UNITS`` = 4 CTAs per chunk -- the lean grid's own unit: the
 step's S_q rows ride inside the CTA, so B 1 and B 2 on two KV heads take the lean body at every served S_q 1..4), the tcgen05 core on every
-other part; an explicit ``"lean"`` is honoured where the body serves the declaration and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
+other part; an explicit ``"lean"`` is honoured where the body serves the declaration -- on the core's parts and, FOR MEASUREMENT, on the
+Blackwell parts of ``heuristics.SPARSE_LEAN_TILE_EXPLICIT_CCS`` (cc 10.0 / 10.3, outside the record's ``sm_lo .. sm_hi`` and stated by its
+``lean_explicit_ccs`` field: the lean body is
+SM100-legal and its config pins no Rubin-only size; UNMEASURED there, the AUTO reading unchanged, ``"auto"`` / ``"tcgen05"`` declined by name
+through ``heuristics.sparse_tile_part_decline``) -- and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
 THD, a prefill / top-left form, no ``seq_kv_lens``, ``S_q`` past the served rows, per-row lists past one row, a group past 16, ``top_k`` below
 8, a non-default ``softmax_groups``), never a silent fallback; ``sub_tiles_per_cta`` is the lean body's pin and is refused by name where the
 resolved body is the tcgen05 core.  :attr:`SparseGqaFwdDslSm107.tile_form` / :attr:`kernel_template` read the resolved body back after
@@ -130,6 +175,18 @@ metadata the setup launch writes.  Semantics per sequence ``b`` with Q length ``
 sees ``n_vis = min(pos + 1, S_kv_b)`` tokens (top-left causal); ``S_kv_b = 0`` makes every row of the sequence dead (``O = 0``,
 ``LSE = -inf`` stored); ``S_q_b = 0`` contributes no work; a one-sequence packing computes the dense ``B = 1`` function.
 Lengths are device values (Rule 3): the host validates the tensors' FORM only.
+
+THD x PAGED contract (``thd=True`` + ``paged_kv=True`` + ``bottom_right=True``; the packed EXTEND form over the pools, 2026-10-30; the
+record's ``thd_paged_kv``): Q / O ``[1, T_q, H, D]`` packed as above; K / V are the page POOLS of the paged contract, addressed through
+``block_table`` ``(B, max_pages)`` int32 with ``B`` = the SEQUENCE count (one table row per sequence of the packing, in the packing's
+order -- never Q's batch extent, which is 1); ``seq_kv_lens`` is the ``[B]`` per-sequence LOGICAL KV length AFTER the step (the serving
+stack's ``kv_lens``; the lengths form only -- ``cu_seq_kv_lens=True`` is declined by name --; ``0`` = a dead sequence: every one of its
+rows stores ``O = 0`` / ``LSE = -inf``), ``seq_q_lens`` the Q lengths in either form; row ``j`` of sequence ``b`` (``q_len_b = cu_q[b + 1] -
+cu_q[b]`` rows) sits at position ``kv_len_b - q_len_b + j`` (a negative position is a dead row, stored); ``block_ids`` one row per packed
+token with ids RELATIVE TO ITS SEQUENCE; any sequence order; the metadata workspace as under THD (the setup launch stores ``meta[b] =
+seq_kv_lens[b]`` and the K / V prefix sums, which the paged gather never reads: the gather row is ``page x rows_per_page + ...`` with the
+page from table row ``b``).  Refused by name on this form: the top-left diagonal, the split, the shared per-sequence list, the lean
+tile, ``use_pdl``, the e4m3 store, a prefix-form KV length.
 """
 
 from __future__ import annotations
@@ -140,6 +197,11 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cudnn
+from cudnn.sdpa.fwd.sparse_tile_rules import (  # DSL-free (no cutlass / torch / tile_dsl import): importable before the DSL gate, as a declaration's construction must be
+    COMBINE_OUT_ROUNDING_SINGLE,
+    COMBINE_OUT_ROUNDINGS,
+    SPARSE_LEAN_TILE_EXPLICIT_CCS,
+)
 
 KERNEL_FILE = "sm107/sparse_d256_f16.py"
 KERNEL_FILE_LEAN = "sm107/sparse_lean_d256_f16.py"  # the second body (tile_form="lean"); the vocabulary and the kernel_template names are the heuristics'
@@ -155,7 +217,7 @@ class SparseCapabilities:
     """What the sparse core serves -- the adapter-owned claims record (no engine row: see the module docstring).  Field names
     follow ``engines.Capabilities`` where the meaning matches; the index-list fields are this record's own."""
 
-    sm_lo: int = 107
+    sm_lo: int = 107  # the CORE's parts (both bodies); the EXPLICIT lean tile is admitted on `lean_explicit_ccs` (below) too: cc 10.0 / 10.3, unmeasured
     sm_hi: int = 119
     phase: str = "forward"
     d_shapes: frozenset = frozenset({(_D, _D)})
@@ -163,13 +225,15 @@ class SparseCapabilities:
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # the paged pools' dtype = Q's (reached through paged_kv)
     causal: bool = True  # the in-block mask: key <= the token's position (top-left, or bottom-right)
-    bottom_right: bool = True  # pos = kv_len_b - S_q + row: the decode / verify rows at the END of the sequence; dense BSHD or paged, never THD
+    bottom_right: bool = (
+        True  # pos = kv_len_b - S_q + row: the decode / verify rows at the END of the sequence; dense BSHD or paged -- and under THD over paged pools (thd_paged_kv, below)
+    )
     swa: bool = False
     sink: bool = False
     padded: bool = False  # per-batch Q lengths (the dense padding mask) are not carried ...
     kv_lens: bool = True  # ... per-batch KV lengths are (seq_kv_lens: the tail follows the visible range, a 0 length is a dead row)
-    # thd and paged_kv are served ONE AT A TIME -- a declaration with both is a typed decline (check_support by name, the config validator's
-    # predicate, the tracker's gaps row): the two fields below read as two arms, never as their composition.
+    # thd and paged_kv are two arms; their COMPOSITION is its own claim, `thd_paged_kv` (appended, below): served with bottom_right (the
+    # packed EXTEND form over the pools), declined by name on the top-left diagonal (check_support, the config validator's predicate).
     thd: bool = True  # packed sequences: cu_seqlens / per-sequence lengths, sequence-relative block ids, the persistent claim counter
     cu_seq_len: bool = True  # ... the lengths as [B + 1] prefix sums (cu_seq_q_lens / cu_seq_kv_lens, normalised on device) -- reached through thd
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
@@ -195,6 +259,18 @@ class SparseCapabilities:
     )
     index_shared_list_max_tokens: int = 4  # S_q cap under list_per_sequence: the shared list's tail covers at most two blocks for S_q <= 4 (the MTP cap)
     cutedsl_min_version: Tuple[int, int, int] = (4, 8, 0)
+    lean_explicit_ccs: Tuple[Tuple[int, int], ...] = (
+        SPARSE_LEAN_TILE_EXPLICIT_CCS  # appended 2026-10-28: the parts OUTSIDE sm_lo .. sm_hi (cc 10.0 / 10.3: B200 / GB200, B300) on which the EXPLICIT tile_form="lean" is admitted for measurement (unmeasured there; "auto" / "tcgen05" resolve the core and are declined by name) -- the copy sparse_tile_part_decline reads, pinned equal to sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS by the suite
+    )
+    gated_e4m3_out: bool = (
+        True  # appended 2026-10-29: O stored as float8_e4m3fn at a static per-tensor DEQUANT scale (out_scale, a positive normal fp32 by contract) through the GATED split combine's fused entry -- a split plan with the gate, dense or paged, never THD
+    )
+    gated_e4m3_out_roundings: Tuple[str, ...] = (
+        COMBINE_OUT_ROUNDINGS  # appended 2026-10-29: the fused store's rounding conventions (the `out_rounding` attribute: "single" = one rounding of the fp32 gated value, the default; "staged" = a serving stack's gate-and-quantize order, bf16 operands only) -- pinned equal to heuristics.COMBINE_OUT_ROUNDINGS by the suite
+    )
+    thd_paged_kv: bool = (
+        True  # appended 2026-10-30: the COMPOSITION of thd and paged_kv on the bottom-right diagonal -- the packed EXTEND form over the pools (THD x PAGED x BOTTOM_RIGHT: a sequence's K / V rows through its own table row, its rows' positions from the per-sequence KV lengths); the top-left composition stays declined; the conjunction flag the adapter's check_support, the config validator's predicate and the gated attention block's serving table read (a record without it declines the packed form by name)
+    )
 
 
 SPARSE_CAPABILITIES = SparseCapabilities()
@@ -325,7 +401,7 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
     return s_page, s_tok, col_head, rows_per_page, rows_per_head
 
 
-def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_cc) -> int:
+def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_cc, *, lean: bool = False) -> int:
     """The split combine entry's kernel FORM for a sparse plan (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
     ``DECODE_GRID_LEAN_WALK``): a plan-time specialization on the sparse grid ``(B, H_q, S_q)`` -- the REAL query-head count, the
     rows the combine reduces --, the split and the plan's DEVICE, never a runtime value.  The dense adapter's rule
@@ -336,14 +412,21 @@ def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_c
     split-aware rule pins the module's own forms where the two disagree (``decode_combine_force_lean``: a split below 8, or a mid-sized
     grid below 32 -- B 4 x S_q 4 at split 7), a deeper split past the bound keeps the AUTO entry (= the module's own forms there by
     construction).  Off cc 10.7 (the Blackwell line keeps the module's own three-way rule, measured on B200 / B300; a line the rules
-    were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound."""
+    were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound -- EXCEPT a LEAN plan
+    (``lean``, appended 2026-10-29: the body is the lean tile) on a part of ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0),
+    whose combine follows the cc 10.7 split-aware rule's SHAPE (``sparse_lean_combine_rule_cc``): the lean grids' two combine forms were
+    MEASURED there (the GB200 152-SM class, the table in the rules module: the decode-grid kernel 3.0-3.8 us against the module's
+    own 6.8-16.3 on the 24-96-row grids at the lean splits 17-65, the own forms ahead only on the 384-row grid below split 32), never the
+    walk (a cc 10.7 form; the lean splits are >= 9 anyway).  The tcgen05 body and every other part read as before; a caller of the former
+    five-argument form (``lean`` unset) reads as before."""
     from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean, decode_combine_lean_walk_selected
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    from cudnn.sdpa.fwd.sparse_tile_rules import sparse_lean_combine_rule_cc
 
     cc = (int(device_cc[0]), int(device_cc[1]))
-    if decode_combine_lean_walk_selected(b, h_q, s_q, split, device_cc=cc):
+    if decode_combine_lean_walk_selected(b, h_q, s_q, split, device_cc=cc):  # the walk: the plan's own line only (cc 10.7)
         return split_combine.DECODE_GRID_LEAN_WALK
-    if decode_combine_force_lean(b, h_q, s_q, split, device_cc=cc):
+    if decode_combine_force_lean(b, h_q, s_q, split, device_cc=sparse_lean_combine_rule_cc(cc, lean=lean)):
         return split_combine.DECODE_GRID_OFF
     return split_combine.DECODE_GRID_AUTO
 
@@ -418,6 +501,8 @@ class SparseGqaFwdDslSm107:
         use_pdl: bool = False,
         tile_form: str = "auto",
         sub_tiles_per_cta: Optional[int] = None,
+        out_scale=None,
+        out_rounding: str = COMBINE_OUT_ROUNDING_SINGLE,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         # The TILE FORM (appended; a PERFORMANCE knob of the two bodies, the module docstring): "auto" / "lean" / "tcgen05" -- the
@@ -454,6 +539,24 @@ class SparseGqaFwdDslSm107:
         # The fused epilogue gate's OPERAND (a tensor or a SparseOperandDesc; None = the ungated specialization): O's shape in
         # Q's dtype at its own (batch, seq, head) strides -- validated in check_support, compiled in as TemplateParams.epilogue_gate.
         self.gate = epilogue_gate
+        # The FUSED gated e4m3 STORE (appended 2026-10-29; an OP ATTRIBUTE of the declaration, never a knob -- it changes the numerics): `o`
+        # declared float8_e4m3fn + `out_scale` = the 1-element fp32 per-tensor DEQUANT scale (a POSITIVE NORMAL value by contract, never read
+        # on the host; the o_proj input scale: the stored byte is e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale)), ONE rounding of the
+        # fp32 gated value) + the epilogue gate, on a split plan (the store rides the split combine's fused entry, compile_ptr(gate_e4m3=True));
+        # resolved by check_support into `fused_e4m3`.
+        self.out_scale = out_scale
+        self.fused_e4m3 = False
+        # The fused store's ROUNDING CONVENTION (appended 2026-10-29; an OP ATTRIBUTE, never a knob -- it changes the bytes): "single" (the
+        # default) = the one rounding above, "staged" = a serving stack's gate-and-quantize order (bf16 of the merged O, the exact sigmoid as a
+        # division, bf16 of the gated value, then the same inverse and saturating cvt; compile_ptr(out_rounding="staged")).  The vocabulary is
+        # validated here by name (heuristics.COMBINE_OUT_ROUNDINGS, like tile_form's); its composition (the fused store, bf16 operands) in
+        # check_support once the dtypes are known.  Compiled into the combine entry: no runtime slot.
+        if not isinstance(out_rounding, str) or out_rounding not in COMBINE_OUT_ROUNDINGS:
+            raise ValueError(
+                f"sparse d256 forward (sm107): out_rounding must be one of {COMBINE_OUT_ROUNDINGS} ('single' = one rounding of the fp32 gated value, "
+                f"'staged' = a serving stack's gate-and-quantize order on the fused e4m3 store); got {out_rounding!r}"
+            )
+        self.out_rounding = out_rounding
         self.top_k, self.block_size = int(top_k), int(block_size)
         # The softmax scale is handed to the kernel SIGNED (as scale x log2 e): the body multiplies every raw score by it BEFORE the
         # column max, so a negative attn_scale is served as is -- the dense line's TemplateParams.negate_scores (BMM1 negates Q and
@@ -468,7 +571,8 @@ class SparseGqaFwdDslSm107:
         # THD (packed sequences): the Q lengths ride ``seq_q_lens`` (REQUIRED there; a dense batch's Q-length trimming is the
         # unserved ``seq_q_lens`` arm below), the KV lengths ``seq_kv_lens``; each as per-sequence lengths [B] or cumulative
         # [B + 1] per its ``cu_seq_*_lens`` flag; the metadata lives in the caller's ``workspace``.  THD together with the paged
-        # read is a typed decline in check_support (one of the two arms per declaration).
+        # read is served with ``bottom_right`` (the record's ``thd_paged_kv``: the KV lengths are then the [B] serving lengths, never a
+        # prefix) and declined by name on the top-left diagonal (check_support).
         self.thd = bool(thd)
         self.seq_q_lens = seq_q_lens
         self.cu_seq_q_lens, self.cu_seq_kv_lens = bool(cu_seq_q_lens), bool(cu_seq_kv_lens)
@@ -527,9 +631,21 @@ class SparseGqaFwdDslSm107:
         msg = tma_gather4_requirement_error(cc)
         if msg is not None:
             raise NotImplementedError(f"sparse d256 forward (sm107): {msg}")
-        cc_code = cc[0] * 10 + cc[1]
-        if not (SPARSE_CAPABILITIES.sm_lo <= cc_code <= SPARSE_CAPABILITIES.sm_hi):
-            raise NotImplementedError(f"sparse d256 forward (sm107): needs a Rubin-line GPU (cc 10.7 .. 11.9); got cc {cc[0]}.{cc[1]}")
+        # the PART: the core's record (cc 10.7 .. 11.9: both bodies); the Blackwell parts of the record's lean_explicit_ccs
+        # (= sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS: cc 10.0 / 10.3) serve the EXPLICIT lean tile only, for measurement -- "auto" /
+        # "tcgen05" there resolve the core and are declined by name (the ONE statement, sparse_tile_part_decline; its text ends with the former
+        # Rubin-line spelling)
+        from cudnn.sdpa.fwd.sparse_tile_rules import sparse_tile_part_decline
+
+        part = sparse_tile_part_decline(
+            device_cc=cc,
+            tile_form_requested=self.tile_form_requested,
+            sm_lo=SPARSE_CAPABILITIES.sm_lo,
+            sm_hi=SPARSE_CAPABILITIES.sm_hi,
+            explicit_lean_ccs=SPARSE_CAPABILITIES.lean_explicit_ccs,
+        )
+        if part is not None:
+            raise NotImplementedError(f"sparse d256 forward (sm107): {part}")
         device = self._device_index
         for name, t in (
             ("q", self.q),
@@ -543,6 +659,7 @@ class SparseGqaFwdDslSm107:
             ("block_table", self.block_table),
             ("seq_q_lens", self.seq_q_lens),
             ("gate", self.gate),
+            ("out_scale", self.out_scale),
             ("workspace", self.workspace),
         ):
             device = _require_cuda_device(name, t, device, allow_unbound=True)
@@ -571,12 +688,19 @@ class SparseGqaFwdDslSm107:
             # `pdl_decline_reason`'s: ONE statement for this site and for the gated attention block's declaration-time decline.
             raise NotImplementedError(f"sparse d256 forward (sm107): {pdl_decline_reason(thd=True)}")
         if self.thd:
-            for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence), ("bottom_right", self.bottom_right)):
+            for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence)):
                 if requested:
                     raise NotImplementedError(
-                        f"sparse d256 forward (sm107): {name} with thd=True is not served -- the packed form keeps top-left positions, one list row per "
-                        "packed token and the claim-counter scheduler (no split axis); the decode form takes dense BSHD operands or paged pools"
+                        f"sparse d256 forward (sm107): {name} with thd=True is not served -- the packed form keeps one list row per packed token and "
+                        "the claim-counter scheduler (no split axis); the decode form's shared list and split take dense BSHD operands or paged pools"
                     )
+            if self.bottom_right and not self.paged_kv:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): bottom_right with thd=True is not served on the block's own dense K / V -- the packed self-attention "
+                    "form keeps top-left positions (the token's offset in its sequence); the composition is served over PAGED pools (thd=True + "
+                    "paged_kv=True + bottom_right=True: the packed EXTEND form over a cached prefix, the position kv_len_b - q_len_b + j from the "
+                    "per-sequence KV lengths)"
+                )
         if self.list_per_sequence and not self.bottom_right:
             raise NotImplementedError(
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
@@ -599,9 +723,26 @@ class SparseGqaFwdDslSm107:
         dt = str(self.q.dtype)
         if dt not in _DTYPE_CODE:
             raise NotImplementedError(f"sparse d256 forward (sm107): Q must be bf16 or f16; got {dt}")
-        for name, t in (("K", self.k), ("V", self.v), ("O", self.o)):
+        for name, t in (("K", self.k), ("V", self.v)):
             if str(t.dtype) != dt:
                 raise ValueError(f"sparse d256 forward (sm107): {name} dtype {t.dtype} must equal Q's {dt}")
+        # O: Q's dtype (the half store), or float8_e4m3fn with out_scale + the gate (the FUSED store; its split requirement is checked
+        # once the body and the split are resolved below)
+        self.fused_e4m3 = self._resolve_fused_store(dt)
+        if self.out_rounding != COMBINE_OUT_ROUNDING_SINGLE:
+            # the staged convention is a property of the FUSED store (no half store takes a convention: it rounds once at its own cast) and of a
+            # bf16 chain (the f16 analogue is refused by name, not defined: no consumer, no ground truth, a narrower underflow range)
+            if not self.fused_e4m3:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): out_rounding={self.out_rounding!r} belongs to the fused e4m3 store -- declare O as float8_e4m3fn with "
+                    "out_scale and the epilogue gate; a half O rounds once at its own store and takes no rounding convention"
+                )
+            if dt != "torch.bfloat16":
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): out_rounding={self.out_rounding!r} is served with bf16 operands only (the convention is a bf16 serving "
+                    f"chain's: the merged O and the gated value are rounded to bf16); the f16 analogue is not wired -- got Q {dt}; declare bf16 operands or "
+                    "out_rounding='single'"
+                )
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
         if self.gate is not None:
@@ -622,15 +763,29 @@ class SparseGqaFwdDslSm107:
                     f"sparse d256 forward (sm107): the epilogue gate (batch, seq, head) strides must be multiples of 8 elements (TMA's 16-byte rule); got {gst}"
                 )
 
-        # the two wired arms are served ONE AT A TIME: under THD the gather row is the sequence's packed row cu_k[b] + 4 blk + r
-        # on a dense [1, T_kv, H_kv, D] tensor, under the paged read the pool row page x rows_per_page + ...; nothing composes
-        # a sequence's row offset with a page pool, so the combination is declined by name until a serving stack asks for it
+        # THD x PAGED (the record's thd_paged_kv; the module docstring's THD x PAGED contract): under THD the dense arm's gather row is the
+        # sequence's packed row cu_k[b] + 4 blk + r, under the paged read the pool row page x rows_per_page + ... with the page from the table
+        # row of the sequence the THD decode found -- the two compose on the BOTTOM-RIGHT diagonal (the packed EXTEND form over a cached
+        # prefix); the top-left composition (a packed self-attention over a page pool) has no serving meaning, and the KV lengths must be
+        # the [B] serving lengths (the setup launch stores them as the per-sequence KV length; a prefix form is not wired)
         if self.thd and self.paged_kv:
-            raise NotImplementedError(
-                "sparse d256 forward (sm107): thd=True with paged_kv=True is not served -- the packed sequence's K / V row offset (cu_k[b]) composes "
-                "with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool; declare one of the two (the combination lands with its own "
-                "accept cells when a serving stack asks for it)"
-            )
+            if not SPARSE_CAPABILITIES.thd_paged_kv:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): thd=True with paged_kv=True -- the record declines the composition (thd_paged_kv=False: the kernel "
+                    "body does not carry the packed EXTEND form over the pools); declare one of the two"
+                )
+            if not self.bottom_right:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): thd=True with paged_kv=True is served on the bottom-right diagonal only (bottom_right=True: the packed "
+                    "EXTEND form over a cached prefix -- row j of sequence b at position kv_len_b - q_len_b + j); a top-left packed self-attention "
+                    "over a page pool has no serving meaning -- declare bottom_right=True, or the dense [1, T_kv, H_kv, D] K / V"
+                )
+            if self.cu_seq_kv_lens:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): thd=True with paged_kv=True takes seq_kv_lens as the [B] per-sequence LOGICAL KV lengths (the serving "
+                    "stack's kv_lens after the step; 0 = a dead sequence), never a prefix -- cu_seq_kv_lens=True is not served on this form; hand "
+                    "the lengths (cu_seq_kv_lens=False)"
+                )
 
         # the paged read's FORM: page_size a positive multiple of the block (the kernel's one-lookup-per-block premise), the
         # table and the KV lengths present; both appended arguments refused on a dense declaration (the mirror image)
@@ -644,8 +799,9 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): paged_kv needs block_table (int32 (B, max_pages): the sequence's pages in order)")
             if self.seq_kv_lens is None:
                 raise ValueError(
-                    "sparse d256 forward (sm107): paged_kv needs seq_kv_lens (int32 [B], the per-batch logical KV length): a page pool has no dense "
-                    "extent, so the visible range and the unwritten rows of a partially filled last page can only be bounded by it"
+                    "sparse d256 forward (sm107): paged_kv needs seq_kv_lens (int32 [B] -- B the batch, or the SEQUENCE count under thd=True -- the "
+                    "per-sequence logical KV length): a page pool has no dense extent, so the visible range and the unwritten rows of a partially "
+                    "filled last page can only be bounded by it"
                 )
         else:
             if self.block_table is not None:
@@ -668,6 +824,18 @@ class SparseGqaFwdDslSm107:
             raise ValueError(f"sparse d256 forward (sm107): V shape {vs} must equal K shape {ks}")
         if os_ != qs:
             raise ValueError(f"sparse d256 forward (sm107): O shape {os_} must equal Q shape {qs}")
+        # THD FIRST (the check ORDER matters): the packed operands' batch extent is 1 and the SEQUENCE count is the length tensors' --
+        # the paged checks below compare the table's rows and size the metadata against THAT count, never against Q's batch (a
+        # [n_seq, max_pages] table would otherwise be refused, and a [1, max_pages] one accepted with every sequence reading row 0)
+        n_seq = B
+        if self.thd:
+            if B != 1:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): thd=True takes PACKED operands with batch extent 1 -- Q / O [1, T_q, H, D], K / V [1, T_kv, H_kv, D] "
+                    f"(or the page pools); got Q {qs}, K {ks}"
+                )
+            n_seq = self._check_thd_lens_form()
+        rows, rows_label = (n_seq, "num_sequences") if self.thd else (B, "B")
         if self.paged_kv:
             num_pages, KH, Pk, _ = ks
             if Pk != self.page_size:
@@ -676,25 +844,21 @@ class SparseGqaFwdDslSm107:
             if str(bt.dtype) != "torch.int32":
                 raise ValueError(f"sparse d256 forward (sm107): block_table must be int32; got {bt.dtype}")
             bts = _shape(bt)
-            if len(bts) != 2 or bts[0] != B or bts[1] < 1 or not bt.is_contiguous():
-                raise ValueError(f"sparse d256 forward (sm107): block_table must be a contiguous int32 (B, max_pages) = ({B}, >= 1); got {bt.dtype} {bts}")
+            if len(bts) != 2 or bts[0] != rows or bts[1] < 1 or not bt.is_contiguous():
+                raise ValueError(
+                    f"sparse d256 forward (sm107): block_table must be a contiguous int32 ({rows_label}, max_pages) = ({rows}, >= 1) -- one row per "
+                    f"{'sequence of the packing (the length tensors count them)' if self.thd else 'batch entry'}; got {bt.dtype} {bts}"
+                )
             max_pages = bts[1]
-            SKV = max_pages * self.page_size  # the table's capacity; the visible range per batch is seq_kv_lens
+            SKV = max_pages * self.page_size  # the table's capacity; the visible range per batch / sequence is seq_kv_lens
         else:
             Bk, SKV, KH, _ = ks
             if Bk != B:
                 raise ValueError(f"sparse d256 forward (sm107): batch mismatch: Q {qs}, K {ks}")
-        n_seq = B
-        if self.thd:
-            if B != 1:
-                raise ValueError(
-                    f"sparse d256 forward (sm107): thd=True takes PACKED operands with batch extent 1 -- Q / O [1, T_q, H, D], K / V [1, T_kv, H_kv, D]; got Q {qs}, K {ks}"
-                )
-            if SQ < 1 or SKV < 1:
-                raise ValueError(
-                    f"sparse d256 forward (sm107): thd=True needs packed capacities T_q, T_kv >= 1 (a zero-extent tensor map is invalid, not empty); got T_q {SQ}, T_kv {SKV}"
-                )
-            n_seq = self._check_thd_lens_form()
+        if self.thd and (SQ < 1 or SKV < 1):
+            raise ValueError(
+                f"sparse d256 forward (sm107): thd=True needs packed capacities T_q, T_kv >= 1 (a zero-extent tensor map is invalid, not empty); got T_q {SQ}, T_kv {SKV}"
+            )
         if self.list_per_sequence and SQ > SPARSE_CAPABILITIES.index_shared_list_max_tokens:
             raise NotImplementedError(
                 f"sparse d256 forward (sm107): list_per_sequence serves S_q <= {SPARSE_CAPABILITIES.index_shared_list_max_tokens} rows per sequence (the "
@@ -709,6 +873,12 @@ class SparseGqaFwdDslSm107:
             )
         # THE TILE FORM and the split, per body (the module docstring): resolved here, once the geometry is known
         self._resolve_tile_form(B, SQ, KH, G, cc, max_tiles)
+        if self.fused_e4m3 and self.split_kv <= 1:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): the e4m3 store rides the SPLIT combine (the fused gated entry, compile_ptr(gate_e4m3=True)); this plan is "
+                f"unsplit (split_kv {self.split_kv} on the {self.tile_form} body) -- declare a split (the lean tile always splits; split_kv >= 2 on the tcgen05 "
+                "core) or a half O"
+            )
         if self.lse is not None and _shape(self.lse) != (B, H, SQ):
             raise ValueError(f"sparse d256 forward (sm107): LSE must be (B, H_q, S_q) = {(B, H, SQ)}; got {_shape(self.lse)}")
         if B * SKV > _INT32_MAX or B * SQ * self.top_k > _INT32_MAX:
@@ -769,6 +939,50 @@ class SparseGqaFwdDslSm107:
         self._B, self._SQ, self._SKV, self._H, self._KH, self._G = B, SQ, SKV, H, KH, G
         self._NSEQ = n_seq
         self._dtype_code = _DTYPE_CODE[dt]
+        return True
+
+    def _resolve_fused_store(self, dt: str) -> bool:
+        """Whether this declaration takes the FUSED gated static-scale e4m3 store (the module docstring): ``o`` float8_e4m3fn with ``out_scale``
+        and the epilogue gate -- True --, or Q's dtype without ``out_scale`` -- False; every other combination is a decline naming the arm:
+        ``NotImplementedError`` (the typed decline) for an unwired form -- an e4m3 ``o`` without the gate or under THD, any other output dtype
+        --, ``ValueError`` for a malformed declaration, like the other operand-shape errors of ``check_support`` -- an e4m3 ``o`` without
+        ``out_scale``, ``out_scale`` with a half ``o``, a scale that is not ONE contiguous fp32 element (the split requirement is checked by
+        ``check_support`` once the body is resolved).  The scale's VALUE is not read (a device word): it is a positive normal fp32 by contract --
+        a zero / subnormal scale makes the on-device inverse +inf, a dead row's ``0 * inf`` the e4m3 NaN byte.  ``dt`` is Q's dtype string."""
+        o_dt = str(self.o.dtype)
+        if o_dt == dt:
+            if self.out_scale is not None:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): out_scale given but O is {o_dt}, not torch.float8_e4m3fn -- the static per-tensor scale belongs to the "
+                    "fused e4m3 store (declare O as float8_e4m3fn with the epilogue gate), a half O takes no scale"
+                )
+            return False
+        if o_dt != "torch.float8_e4m3fn":
+            raise NotImplementedError(
+                f"sparse d256 forward (sm107): O dtype {o_dt} must equal Q's {dt} or be torch.float8_e4m3fn with out_scale (the fused gated static-scale "
+                "store); no other output dtype is wired"
+            )
+        if self.out_scale is None:
+            raise ValueError(
+                "sparse d256 forward (sm107): an e4m3 O needs out_scale (the 1-element fp32 per-tensor DEQUANT scale: the stored byte is "
+                "e4m3(O * sigmoid(G) * div.rn(1, out_scale)))"
+            )
+        if self.gate is None:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): an e4m3 O is served with the epilogue_gate only (the fused store is the GATED split combine's: "
+                "O32 * sigmoid(G) * div.rn(1, out_scale) rounded once); an ungated e4m3 store is not wired -- declare epilogue_gate or a half O"
+            )
+        if self.thd:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): thd=True has no split combine (the packed form stores O in its epilogue): the e4m3 store needs the dense "
+                "BSHD or paged decode chain -- declare a half O under THD"
+            )
+        sc = self.out_scale
+        if str(sc.dtype) != "torch.float32" or _shape(sc) != (1,) or not sc.is_contiguous():
+            raise ValueError(
+                f"sparse d256 forward (sm107): out_scale must be a contiguous float32 tensor of ONE element (the per-tensor dequant scale); got {sc.dtype} "
+                f"{_shape(sc)}"
+            )
         return True
 
     def _sm_count_for_rule(self) -> int:
@@ -1019,14 +1233,15 @@ class SparseGqaFwdDslSm107:
     def combine_form(self) -> int:
         """The split combine entry's kernel FORM this plan compiles (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
         ``DECODE_GRID_LEAN_WALK``): :func:`_sparse_combine_decode_grid` on the declared ``(B, H_q, S_q)``, the split and the device --
-        a plan-time fact, read after ``check_support`` (which it runs when needed); ``DECODE_GRID_OFF`` unsplit (no combine launch)."""
+        a plan-time fact, read after ``check_support`` (which it runs when needed); ``DECODE_GRID_OFF`` unsplit (no combine launch).  A LEAN
+        plan on cc 10.0 follows the cc 10.7 rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS``, measured there)."""
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
         if not self._G:
             self.check_support()
         if self.split_kv <= 1:
             return split_combine.DECODE_GRID_OFF
-        return _sparse_combine_decode_grid(self._B, self._H, self._SQ, self.split_kv, self._device_cc())
+        return _sparse_combine_decode_grid(self._B, self._H, self._SQ, self.split_kv, self._device_cc(), lean=self.lean)
 
     def compile(self, has_block_lens: Optional[bool] = None):
         """Load the template for this specialization and compile its pointer ABI (one artifact per (dtype, group, top_k,
@@ -1083,8 +1298,11 @@ class SparseGqaFwdDslSm107:
             tag = "bf16" if self._dtype_code == 2 else "f16"
             form = self.combine_form()
             compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
+            # the FUSED gated e4m3 store (fused_e4m3): the gated entry's frame plus the static DEQUANT scale, the e4m3 output rounded once --
+            # or, under out_rounding="staged" (check_support admits it with the fused store and bf16 operands only), a serving stack's
+            # gate-and-quantize order; the convention is compiled into the entry (in its cache key), never a runtime slot
             owner = compile_combine(
-                dtype_o=tag,
+                dtype_o="e4m3" if self.fused_e4m3 else tag,
                 dtype_partial="f32",
                 has_lse=True,
                 stats_log2=False,
@@ -1092,6 +1310,8 @@ class SparseGqaFwdDslSm107:
                 dtype_gate=tag if self.gate is not None else None,
                 decode_grid=form,
                 use_pdl=self.use_pdl,
+                gate_e4m3=self.fused_e4m3,
+                out_rounding=self.out_rounding,
             )
             entry = positional_entry(owner)
             if entry is None:
@@ -1136,6 +1356,7 @@ class SparseGqaFwdDslSm107:
         seq_q_lens=None,
         workspace=None,
         gate=None,
+        out_scale=None,
     ):
         """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
 
@@ -1147,7 +1368,7 @@ class SparseGqaFwdDslSm107:
         variant, ``None`` -> the kernel's derived default count -- the variant must have been compiled (:meth:`compile`), never
         compiled here.  THD: ``seq_q_lens`` binds like the others and ``workspace`` (the metadata buffer,
         :meth:`scratch_workspace_bytes`, 16-byte aligned) is the one operand that need not match a declaration -- any buffer of
-        at least the size serves."""
+        at least the size serves.  ``out_scale`` (appended) binds like the others on a fused e4m3 declaration (its presence is compiled in)."""
         if not self._G:
             self.check_support()
         q = self._bind("q", q, self.q, required=True)
@@ -1166,6 +1387,7 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
             self._check_workspace(ws, self._NSEQ)
         gate = self._bind("gate", gate, self.gate, required=self.gate is not None)
+        out_scale = self._bind("out_scale", out_scale, self.out_scale, required=self.fused_e4m3)
         # every pointer handed to the kernel with assumed_align=16 starts on a 16-byte boundary (a storage-offset view is refused by name)
         for name, t in (("Q", q), ("K", k), ("V", v), ("O", o), ("block_ids", ids), ("the epilogue gate", gate)):
             _require_16b_base(name, t)
@@ -1198,6 +1420,7 @@ class SparseGqaFwdDslSm107:
             ("block_table", table),
             ("seq_q_lens", seq_q_lens),
             ("gate", gate),
+            ("out_scale", out_scale),
             ("workspace", ws),
         ):
             _require_cuda_device(name, t, device)
@@ -1210,9 +1433,9 @@ class SparseGqaFwdDslSm107:
         import torch
 
         with torch.cuda.device(device):
-            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream)
+            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream, out_scale)
 
-    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream):
+    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream, out_scale=None):
         import torch
         import cutlass
         import cuda.bindings.driver as cuda_driver
@@ -1309,4 +1532,6 @@ class SparseGqaFwdDslSm107:
             args = [base + o_off, base + lse_off, int(o.data_ptr()), lse_final, (B, H, SQ, _D), S, tuple(_strides(o)[:4]), lse_final_strides]
             if gate is not None:
                 args += [int(gate.data_ptr()), tuple(_strides(gate)[:4])]
+            if self.fused_e4m3:
+                args.append(int(out_scale.data_ptr()))  # the fused entry's static DEQUANT scale, right after the gate strides
             self._combine(*args, int(stream))
