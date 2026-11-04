@@ -32,7 +32,6 @@ from cudnn.norm.utils import (
     ws_zeros,
     cur_stream,
     fake_rows,
-    fake_strided_vector,
     is_aligned_contiguous_vector,
     fake_stream,
     ffi,
@@ -40,6 +39,7 @@ from cudnn.norm.utils import (
     dsl_compile_lock,
 )
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
+from cudnn.norm.strided import fake_strided_vector
 from cudnn.norm._common_sm100 import (
     affine_gamma,
     STAGE_BULK,

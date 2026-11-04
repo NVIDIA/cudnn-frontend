@@ -25,7 +25,8 @@ import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, fake_rows, fake_strided_vector, fake_stream, ffi, dsl_compile_lock
+from cudnn.norm.strided import fake_strided_vector
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, dsl_compile_lock
 from cudnn.norm._common_sm100 import (
     affine_gamma,
     STAGE_BULK,
