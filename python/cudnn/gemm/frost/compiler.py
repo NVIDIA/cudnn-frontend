@@ -896,6 +896,8 @@ def _import_kernel(src: str) -> object:
 class _CompiledRuntime:
     _compiler: ClassVar[Any]
     _validate_runtime_quant: ClassVar[bool] = False
+    # _CompiledFusedGemm's lowered()/explain() check each aux against the layout the family's epilogue compiled in (``_aux_layout_check``).
+    _validate_aux_layout: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
     _validate_quant_scale_blobs: ClassVar[bool] = False
     # Per call: refuse a block-scale K that ends inside a scale block (_partial_scale_block_reject).
@@ -1141,6 +1143,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_chain, quant_cfg = (self.chain, self.config)
         check_grid = self._check_launch_grid if self._validate_launch_grid else None
         zero_extent = backend._zero_extent_problem if self._check_zero_extents else None
+        aux_layouts = tuple(((x.index, backend._aux_layout_check(x.ref, swap_ab)) for x in r.aux)) if self._validate_aux_layout else ()
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
@@ -1209,6 +1212,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     scale_rule.check(v, k)
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
+                    return refuse(original_operands, graph_order)
+            for idx, aux_layout_reason in aux_layouts:
+                if aux_layout_reason(operands[idx], m, n) is not None:
+                    gave_up["aux layout"] += 1
                     return refuse(original_operands, graph_order)
             if sfs:
                 if whole_scale_blocks and k % block_size:
@@ -1332,6 +1339,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     f"{exc} [in the kernel frame of this swap-AB plan, which runs the graph transposed: its M = {m} and N = {n} are the graph's N and M, and its row / col quant axes the graph's col / row]"
                 ) from exc
         self._check_quant_scale_blobs([operands[o.index] for o in recipe.outputs])
+        if self._validate_aux_layout:
+            backend._check_aux_layout(recipe, operands, int(mnk[0]), int(mnk[1]), self.config.swap_ab)
         raise RuntimeError(
             f"cudnn.frost gemm: the launch path refused this call and no rule explains why -- its per-call guards and the diagnostics here have drifted apart. Guards that fired: {dict(self.deferrals)}."
         )
@@ -1830,6 +1839,7 @@ _SHARED_EXPORTS = {
     "_CTAMMA_SUFFIX": _CTAMMA_SUFFIX,
     "_INJECT_MARKER_LINE": _INJECT_MARKER_LINE,
     "_aux_fake_shape_code": _aux_fake_shape_code,
+    "_aux_kernel_shape": _aux_kernel_shape,
     "_aux_can_use_explicit_fake_stride": _aux_can_use_explicit_fake_stride,
     "_aux_fake_block": _aux_fake_block,
     "_aux_signature_block": _aux_signature_block,
