@@ -53,16 +53,16 @@ def _require_mxfp4_indexer():
         pytest.skip(str(exc))
 
 
-def _require_block_scaled_indexer(precision: str):
-    """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("mxfp8" or "mxfp4") indexer."""
+def _require_sm100_indexer(precision: str):
+    """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("bf16", "mxfp8" or "mxfp4") indexer."""
     if precision == "mxfp4":
         _require_mxfp4_indexer()
         return
     from cudnn.tensor_adapter import has_tcgen05
 
     if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
-        pytest.skip("MXFP8 indexer requires an SM100-family GPU")
-    if getattr(torch, "float8_e8m0fnu", None) is None:
+        pytest.skip(f"{precision.upper()} indexer requires an SM100-family GPU")
+    if precision == "mxfp8" and getattr(torch, "float8_e8m0fnu", None) is None:
         pytest.skip("MXFP8 indexer requires torch.float8_e8m0fnu")
 
 
@@ -288,14 +288,20 @@ def make_random_mxfp8(
     return data, data.float() * expand_mxfp8_scale(scale, shape[-1]), scale
 
 
-def make_random_block_scaled(
+def make_random_indexer_input(
     precision: str,
     shape: Tuple[int, ...],
     *,
     device: torch.device | str,
     seed: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Random ``precision`` ("mxfp8" / "mxfp4") data, its dequantized FP32 value and its logical E8M0 scales."""
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Random indexer Q / K of ``precision`` ("bf16", "mxfp8" or "mxfp4"): ``(data, FP32 value, logical E8M0 scales)``,
+    the scales ``None`` for BF16."""
+    if precision == "bf16":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        data = torch.randn(shape, device=device, generator=generator).bfloat16()
+        return data, data.float(), None
     make = {"mxfp8": make_random_mxfp8, "mxfp4": make_random_mxfp4}[precision]
     return make(shape, device=device, seed=seed)
 

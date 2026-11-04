@@ -21,9 +21,9 @@ import torch
 @pytest.mark.parametrize(
     "case",
     [
-        pytest.param("test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference[qh4_b3_key_tail-mxfp8]", id="mxfp8-h4-key-tail"),
-        pytest.param("test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference[qh4_b3_key_tail-mxfp4]", id="mxfp4-h4-empty-tail"),
-        pytest.param("test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference[qh64_ratio4_persistent_mixed_blocks-mxfp4]", id="mxfp4-h64-persistent"),
+        pytest.param("test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh4_b3_key_tail-mxfp8]", id="mxfp8-h4-key-tail"),
+        pytest.param("test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh4_b3_key_tail-mxfp4]", id="mxfp4-h4-empty-tail"),
+        pytest.param("test_DSA_indexer_forward_wrapper_matches_dequant_reference[qh64_ratio4_persistent_mixed_blocks-mxfp4]", id="mxfp4-h64-persistent"),
     ],
 )
 def test_indexer_forward_sm100_blockscaled_sanitizer(case, tool):

@@ -10,13 +10,13 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
-    _require_block_scaled_indexer,
+    _require_sm100_indexer,
     _require_mxfp4_indexer,
     _require_sm90,
     _require_sm100 as _require_sm100_family,
     dsa_init,
     expand_mxfp8_scale,
-    make_random_block_scaled,
+    make_random_indexer_input,
     make_random_mxfp4,
     pack_mxfp8_scales_thd,
     quantize_e2m1,
@@ -387,7 +387,10 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_sm90()  # return_lse=True: the SM100 dense path does not expose LSE
+    major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    if major not in (9, 10):
+        pytest.skip("Requires Hopper or Blackwell")
+    sm90 = major == 9  # return_lse: only the SM90 dense path exposes LSE
     device = torch.device("cuda")
     b, s_q, s_k, h_q, h_kv, d = 1, 8, 128, 16, 1, 128
     ratio = 4
@@ -403,7 +406,7 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
         ratio=ratio,
         qhead_per_kv_head=h_q,
         q_causal_offsets=q_causal_offsets,
-        return_lse=True,
+        return_lse=sm90,
     )
     scores = result["scores"]
     torch.cuda.synchronize()
@@ -422,6 +425,8 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
         ratio,
         q_causal_offsets=q_causal_offsets,
     )
+    if not sm90:
+        return
     scores_ref = ref_indexer_forward(
         q,
         k,
@@ -439,42 +444,52 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=5)
-def test_DSA_indexer_forward_wrapper_zero_key_query_tail_returns_empty_scores():
-    """The geometry the trailing-query rule admits at its edge: a query shorter than one compressed block (S_q 3 at ratio 4) has NO
-    compressed key yet (S_k 0).  The dense wrapper returns the empty (B, S_q, 0) scores -- nothing to score, nothing compiled or launched,
-    the empty buffer has no row stride to hold to the 16-byte rule -- the compressed top-k wrapper returns its padded result (-1 indices,
-    -inf logits) for the same input, and one query token more (S_q 4 = a complete block with no key) is still refused by name."""
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the SM100-family dense indexer forward")
-    device = torch.device("cuda")
-    b, s_q, s_k, h_q, h_kv, d, ratio = 1, 3, 0, 4, 1, 128, 4
-    q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
-    k = torch.empty(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
-    w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device)
+@pytest.mark.parametrize("h_q", [4, 64], ids=["qh4", "qh64"])
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4"])
+def test_DSA_indexer_forward_wrapper_zero_key_query_tail(precision, h_q):
+    """The geometry the trailing-query rule admits at its edge: a query shorter than one compressed block (S_q 3 at ratio 4)
+    has NO compressed key yet (S_k 0). The dense wrapper returns the empty (B, S_q, 0) scores -- nothing to score, nothing
+    compiled or launched, the empty buffer has no row stride to hold to the 16-byte rule -- the compressed top-k wrapper
+    returns its padded result (-1 indices, -inf logits) for the same input, and one query token more (S_q 4 = a complete
+    block with no key) is still refused by name."""
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
+    _require_sm100_indexer(precision)
+    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
-    scores = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, qhead_per_kv_head=h_q)["scores"]
+    device = "cuda"
+    b, s_q, s_k, d, ratio, top_k = 1, 3, 0, 128, 4, 8
+
+    def inputs(s, seed):
+        q, _, q_scale_logical = make_random_indexer_input(precision, (b, s, h_q, d), device=device, seed=seed)
+        w = torch.rand(b, s, h_q, dtype=torch.bfloat16, device=device)
+        kwargs = {} if precision == "bf16" else dict(q_scale=scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q))
+        return q, w, kwargs
+
+    k_full, _, _ = make_random_indexer_input(precision, (b, 1, 1, d), device=device, seed=7)
+    k = k_full[:, :s_k].contiguous()
+    common = dict(ratio=ratio, qhead_per_kv_head=h_q, precision=precision)
+    if precision != "bf16":
+        common["k_scale"] = torch.empty((b, s_k, d // 32), dtype=torch.float8_e8m0fnu, device=device)
+
+    q, w, q_kwargs = inputs(s_q, 11)
+    scores = DSA.indexer_forward_wrapper(q, k, w, **common, **q_kwargs)["scores"]
     torch.cuda.synchronize()
-    assert tuple(scores.shape) == (b, s_q, 0), tuple(scores.shape)
+    assert tuple(scores.shape) == (b, s_q, 0)
     assert scores.dtype == torch.float32 and scores.is_cuda
 
-    topk = DSA.indexer_forward_top_k_wrapper(q, k, w, top_k=8, ratio=ratio, qhead_per_kv_head=h_q, return_softmax=False)
+    topk = DSA.indexer_forward_top_k_wrapper(q, k, w, top_k=top_k, return_softmax=False, **common, **q_kwargs)
     torch.cuda.synchronize()
-    assert tuple(topk["indices"].shape) == (b, s_q, 8), tuple(topk["indices"].shape)
+    assert tuple(topk["indices"].shape) == (b, s_q, top_k)
     assert bool((topk["indices"] == -1).all()) and bool(torch.isneginf(topk["logits"]).all())
 
-    q4 = torch.randn(b, ratio, h_q, d, dtype=torch.bfloat16, device=device)
-    w4 = torch.randn(b, ratio, h_q, dtype=torch.bfloat16, device=device)
+    q4, w4, q4_kwargs = inputs(ratio, 13)
     with pytest.raises(ValueError, match=r"must be <= seqlen_k \* ratio \+ \(ratio - 1\)"):
-        DSA.indexer_forward_wrapper(q4, k, w4, ratio=ratio, qhead_per_kv_head=h_q)
+        DSA.indexer_forward_wrapper(q4, k, w4, **common, **q4_kwargs)
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=14)
-@pytest.mark.parametrize("h_q", [16, 32, 64])
+@pytest.mark.parametrize("h_q", [4, 8, 16, 32, 64])
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize(
     "recompute,weight_dtype",
@@ -491,6 +506,8 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute, wei
         pytest.skip("Requires Hopper or Blackwell")
     if recompute and torch.cuda.get_device_capability()[0] == 9:
         pytest.skip("Dense score recompute declines THD on SM90 (BSHD-native kernel); see test_DSA_dense_score_recompute.py")
+    if h_q < 16 and torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("the SM90 indexer forward serves qhead_per_kv_head 16 / 32 / 64")
     device = torch.device("cuda")
     shapes = [(1, 1), (3, 7), (7, 67), (11, 70)]
     h_kv, d = 1, 128
@@ -627,7 +644,7 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
 
 
 @torch_fork_set_rng(seed=21)
-@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize(
     "qhead_per_kv_head,b_default,s_q_default,s_kv_default,ratio,offsets",
     [
@@ -651,7 +668,7 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
         pytest.param(16, 1, 64, 96, 2, (128,), marks=pytest.mark.L1, id="qh16_ratio2"),
     ],
 )
-def test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference(
+def test_DSA_indexer_forward_wrapper_matches_dequant_reference(
     request,
     precision,
     qhead_per_kv_head,
@@ -661,10 +678,12 @@ def test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference(
     ratio,
     offsets,
 ):
-    """Dense and compressed MXFP8 / MXFP4 scores match an FP32 reference on the dequantized inputs."""
+    """SM100 dense and compressed BF16 / MXFP8 / MXFP4 scores match an FP32 reference on the (dequantized) inputs, across
+    the tile geometries of the case table (query / key tails, full and partial KV splits, persistent multi-tile CTAs,
+    small head groups)."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
-    _require_block_scaled_indexer(precision)
+    _require_sm100_indexer(precision)
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
@@ -688,11 +707,9 @@ def test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference(
     h_q = h_kv * qhpkv
     device = "cuda"
 
-    q, q_deq, q_scale_logical = make_random_block_scaled(precision, (b, s_q, h_q, d), device=device, seed=201)
-    k, k_deq, k_scale_logical = make_random_block_scaled(precision, (b, s_k, h_kv, d), device=device, seed=203)
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (b, s_q, h_q, d), device=device, seed=201)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (b, s_k, h_kv, d), device=device, seed=203)
     w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
-    q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=qhpkv)
-    k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
     q_causal_offsets = torch.tensor([offsets[i % len(offsets)] for i in range(b)], dtype=torch.int32, device=device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     common = dict(
@@ -700,10 +717,13 @@ def test_DSA_indexer_forward_wrapper_block_scaled_matches_dequant_reference(
         qhead_per_kv_head=qhpkv,
         q_causal_offsets=q_causal_offsets,
         precision=precision,
-        q_scale=q_scale,
-        k_scale=k_scale,
         stream=stream,
     )
+    if precision != "bf16":
+        common.update(
+            q_scale=scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=qhpkv),
+            k_scale=scale_utils.pack_k_scale_bshd(k_scale_logical),
+        )
 
     result = DSA.indexer_forward_wrapper(q, k, w, **common)
     torch.cuda.synchronize()
@@ -745,7 +765,7 @@ def test_DSA_indexer_forward_wrapper_thd_block_scaled_compact_padded_scales(prec
     """THD MXFP8 / MXFP4 scores with 256-token padded scale spans match an FP32 reference on the dequantized inputs."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
-    _require_block_scaled_indexer(precision)
+    _require_sm100_indexer(precision)
 
     device = torch.device("cuda")
     shapes = [(127, 32), (129, 64)]
@@ -757,8 +777,8 @@ def test_DSA_indexer_forward_wrapper_thd_block_scaled_compact_padded_scales(prec
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
     max_q, max_k = max(q_lengths), max(k_lengths)
 
-    q, q_deq, q_scale_logical = make_random_block_scaled(precision, (total_q, h_q, d), device=device, seed=207)
-    k, k_deq, k_scale_logical = make_random_block_scaled(precision, (total_k, h_kv, d), device=device, seed=209)
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (total_q, h_q, d), device=device, seed=207)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (total_k, h_kv, d), device=device, seed=209)
     w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
     q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(
         q_scale_logical,
@@ -1014,43 +1034,6 @@ def test_DSA_indexer_forward_wrapper_rejects_mismatched_qk_last_dim():
     cu_k = torch.tensor([0, 32], dtype=torch.int32, device=device)
     with pytest.raises(ValueError, match=r"q last dim \(128\) != k last dim \(64\)"):
         DSA.indexer_forward_wrapper(q[0], k[0], w[0], ratio=4, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=8, max_seqlen_k=32)
-
-
-@pytest.mark.L0
-@torch_fork_set_rng(seed=7)
-@pytest.mark.parametrize("h_q", [64, 32], ids=["qh64", "qh32"])
-def test_DSA_indexer_forward_wrapper_mxfp4_zero_key_query_tail(h_q):
-    """With no compressed key (S_q 3 at ratio 4, S_k 0), MXFP4 dense scores are empty and top-k is all padding
-    (-1 indices, -inf logits); S_q 4 is refused."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
-    _require_mxfp4_indexer()
-
-    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
-
-    device = "cuda"
-    b, s_q, s_k, d, ratio, top_k = 1, 3, 0, 128, 4, 8
-    q, _, q_scale_logical = make_random_mxfp4((b, s_q, h_q, d), device=device, seed=11)
-    k = torch.empty((b, s_k, 1, d // 2), dtype=torch.uint8, device=device).view(torch.float4_e2m1fn_x2)
-    w = torch.rand(b, s_q, h_q, dtype=torch.bfloat16, device=device)
-    q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q)
-    k_scale = torch.empty((b, s_k, d // 32), dtype=torch.float8_e8m0fnu, device=device)
-    common = dict(ratio=ratio, precision="mxfp4", q_scale=q_scale, k_scale=k_scale)
-
-    scores = DSA.indexer_forward_wrapper(q, k, w, **common)["scores"]
-    torch.cuda.synchronize()
-    assert tuple(scores.shape) == (b, s_q, 0)
-    assert scores.dtype == torch.float32 and scores.is_cuda
-
-    topk = DSA.indexer_forward_top_k_wrapper(q, k, w, top_k=top_k, return_softmax=False, **common)
-    torch.cuda.synchronize()
-    assert tuple(topk["indices"].shape) == (b, s_q, top_k)
-    assert bool((topk["indices"] == -1).all()) and bool(torch.isneginf(topk["logits"]).all())
-
-    q4, _, q4_scale_logical = make_random_mxfp4((b, ratio, h_q, d), device=device, seed=13)
-    w4 = torch.rand(b, ratio, h_q, dtype=torch.bfloat16, device=device)
-    q4_scale = scale_utils.pack_q_scale_bshd(q4_scale_logical, qhead_per_kv_head=h_q)
-    with pytest.raises(ValueError, match=r"must be <= seqlen_k \* ratio \+ \(ratio - 1\)"):
-        DSA.indexer_forward_wrapper(q4, k, w4, **{**common, "q_scale": q4_scale})
 
 
 @pytest.mark.L0

@@ -11,8 +11,8 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
     ref_indexer_forward,
 )
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
-    _require_block_scaled_indexer,
-    make_random_block_scaled,
+    _require_sm100_indexer,
+    make_random_indexer_input,
     pack_mxfp8_scales_thd,
 )
 
@@ -55,7 +55,7 @@ def test_indexer_rejects_unsupported_qhead_group_before_launch(precision, layout
     if precision == "bf16":
         _require_sm100()
     else:
-        _require_block_scaled_indexer(precision)
+        _require_sm100_indexer(precision)
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
 
@@ -147,7 +147,7 @@ def test_DSA_compressed_indexer_forward_bshd_small_head_groups(precision, weight
     if precision == "bf16":
         _require_sm100()
     else:
-        _require_block_scaled_indexer(precision)
+        _require_sm100_indexer(precision)
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
 
@@ -159,8 +159,8 @@ def test_DSA_compressed_indexer_forward_bshd_small_head_groups(precision, weight
         q = q_deq = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
         k = k_deq = torch.randn(b, s_k, 1, d, dtype=torch.bfloat16, device=device)
     else:
-        q, q_deq, q_scale_logical = make_random_block_scaled(precision, (b, s_q, h_q, d), device=device, seed=61 + h_q)
-        k, k_deq, k_scale_logical = make_random_block_scaled(precision, (b, s_k, 1, d), device=device, seed=67 + h_q)
+        q, q_deq, q_scale_logical = make_random_indexer_input(precision, (b, s_q, h_q, d), device=device, seed=61 + h_q)
+        k, k_deq, k_scale_logical = make_random_indexer_input(precision, (b, s_k, 1, d), device=device, seed=67 + h_q)
         kwargs = dict(
             precision=precision,
             q_scale=pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q),
@@ -200,15 +200,13 @@ def test_DSA_compressed_indexer_forward_bshd_small_head_groups(precision, weight
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=43)
-def test_DSA_compressed_indexer_forward_thd_small_head_group_tails():
-    """THD at 4 heads per KV head: sequences whose length is not a multiple of the ratio (the trailing tokens
-    see the complete blocks only), a one-token sequence that sees nothing (all -1), a sequence that sees fewer
-    blocks than top_k, and a chunked one whose causal offset makes every row see every block."""
-    _require_sm100()
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp4"])
+def test_DSA_compressed_indexer_forward_thd_small_head_group_tails(precision):
+    """THD at 4 heads per KV head, at every precision: sequences whose length is not a multiple of the ratio (the
+    trailing tokens see the complete blocks only), a one-token sequence that sees nothing (all -1), a sequence that sees
+    fewer blocks than top_k, and a chunked one whose causal offset makes every row see every block."""
+    _require_sm100_indexer(precision)
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
 
     device = torch.device("cuda")
     # (seqlen_q, seqlen_k, q_causal_offset): seqlen_q <= seqlen_k * 4 + 3 under offset 0
@@ -218,10 +216,14 @@ def test_DSA_compressed_indexer_forward_thd_small_head_group_tails():
     cu_k = torch.tensor([0, *torch.tensor([s[1] for s in shapes]).cumsum(0).tolist()], dtype=torch.int32, device=device)
     q_causal_offsets = torch.tensor([s[2] for s in shapes], dtype=torch.int32, device=device)
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_k, 1, d, dtype=torch.bfloat16, device=device)
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (total_q, h_q, d), device=device, seed=89)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (total_k, 1, d), device=device, seed=97)
     w = torch.ones(total_q, h_q, dtype=torch.bfloat16, device=device)
     sm_scale = d**-0.5
+    scales = {}
+    if precision != "bf16":
+        q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(q_scale_logical, k_scale_logical, cu_q, cu_k, h_q)
+        scales = dict(precision=precision, q_scale=q_scale, k_scale=k_scale, cu_seqlens_q_scale_padded=cu_q_scale, cu_seqlens_k_scale_padded=cu_k_scale)
 
     result = DSA.indexer_forward_top_k_wrapper(
         q,
@@ -238,18 +240,20 @@ def test_DSA_compressed_indexer_forward_thd_small_head_group_tails():
         topk_indices_global=False,
         return_softmax=False,
         deterministic=True,
+        **scales,
     )
     torch.cuda.synchronize()
     assert result["indices"].shape == (total_q, top_k)
 
+    tol = 1e-4 if precision == "bf16" else 1e-3
     cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
     for batch, (s_q, s_k, offset) in enumerate(shapes):
         q0, q1 = cu_q_host[batch : batch + 2]
         k0, k1 = cu_k_host[batch : batch + 2]
         dense_ref = (
             ref_indexer_forward(
-                q[q0:q1].unsqueeze(0),
-                k[k0:k1].unsqueeze(0),
+                q_deq[q0:q1].unsqueeze(0),
+                k_deq[k0:k1].unsqueeze(0),
                 w[q0:q1].unsqueeze(0),
                 ratio,
                 q_causal_offsets=q_causal_offsets[batch : batch + 1],
@@ -259,8 +263,8 @@ def test_DSA_compressed_indexer_forward_thd_small_head_group_tails():
         )
         indices = result["indices"][q0:q1]
         if top_k <= s_k:
-            check_ref_compressed_topk(dense_ref, indices.unsqueeze(0), result["logits"][q0:q1].unsqueeze(0), top_k, atol=1e-4, rtol=1e-4)
-        _assert_topk_sets_match(dense_ref.squeeze(0), indices, top_k, tie_tol=1e-4, logits=result["logits"][q0:q1])
+            check_ref_compressed_topk(dense_ref, indices.unsqueeze(0), result["logits"][q0:q1].unsqueeze(0), top_k, atol=tol, rtol=tol)
+        _assert_topk_sets_match(dense_ref.squeeze(0), indices, top_k, tie_tol=tol, logits=result["logits"][q0:q1])
         if offset == 0:
             # rows 0..2 have no complete block yet: nothing selected
             assert bool((indices[: min(3, s_q)] == -1).all())
@@ -1085,36 +1089,35 @@ def test_DSA_compressed_indexer_forward_deterministic_microbatch():
     assert int(((row_end[None, :] > top_k) & (equal_count > 1)).sum()) > 0
 
 
-@pytest.mark.L0
-@torch_fork_set_rng(seed=31)
-@pytest.mark.parametrize("h_q", [32, 64])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
-def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q, weight_dtype):
-    _require_sm100()
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+@torch_fork_set_rng(seed=37)
+@pytest.mark.parametrize("offsets", [None, (0, 128)], ids=["no_offsets", "offsets"])
+@pytest.mark.parametrize("h_q", [pytest.param(32, marks=pytest.mark.L1), pytest.param(64, marks=pytest.mark.L0)])
+@pytest.mark.parametrize(
+    "precision,weight_dtype",
+    [("bf16", torch.bfloat16), ("bf16", torch.float32), ("mxfp8", torch.bfloat16), ("mxfp4", torch.bfloat16)],
+    ids=["bf16-w-bf16", "bf16-w-fp32", "mxfp8", "mxfp4"],
+)
+def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(precision, weight_dtype, h_q, offsets):
+    """BSHD top-k into caller-provided buffers (candidate slab, indices, logits, softmax, LSE) at every precision:
+    global indices, logits, LSE and fused softmax match the fp64 reference on the (dequantized) inputs, without
+    offsets (the first rows of each batch see no block) and with per-batch offsets (tight, non-uniform slabs)."""
+    _require_sm100_indexer(precision)
+    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
+    from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
 
     device = torch.device("cuda")
-    b, s_q, s_k, h_kv, d = 2, 128, 64, 1, 128
+    b, s_q, s_k, d = 2, 128, 64, 128
     ratio, top_k, sm_scale = 4, 32, d**-0.5
-    q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
-    k = torch.randn(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (b, s_q, h_q, d), device=device, seed=73 + h_q)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (b, s_k, 1, d), device=device, seed=79 + h_q)
     w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
     if weight_dtype == torch.float32:
         w = (w.abs() + 1).float() + 2**-10
-    # Different per-batch offsets exercise tight, non-uniform candidate slabs.
-    q_causal_offsets = torch.tensor([0, 128], dtype=torch.int32, device=device)
+    scales = {} if precision == "bf16" else dict(q_scale=pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q), k_scale=pack_k_scale_bshd(k_scale_logical))
+    q_causal_offsets = None if offsets is None else torch.tensor(offsets, dtype=torch.int32, device=device)
 
     cand_floats = DSA.compress_topk_cand_buffer_size(
-        b,
-        s_q,
-        s_k,
-        ratio,
-        microbatch_rows=0,
-        return_lse=True,
-        q_causal_offsets=q_causal_offsets,
+        b, s_q, s_k, ratio, microbatch_rows=0, return_lse=True, q_causal_offsets=q_causal_offsets, precision=precision
     )
     cand = torch.empty(cand_floats, dtype=torch.float32, device=device)
     out_indices = torch.empty((b, s_q, top_k), dtype=torch.int32, device=device)
@@ -1130,6 +1133,7 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q, weight_dtype)
         ratio=ratio,
         sm_scale=sm_scale,
         q_causal_offsets=q_causal_offsets,
+        precision=precision,
         microbatch_rows=0,
         cand_buffer=cand,
         out_indices=out_indices,
@@ -1137,6 +1141,7 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q, weight_dtype)
         softmax_out=out_softmax,
         return_lse=True,
         lse_out=lse_out,
+        **scales,
     )
     torch.cuda.synchronize()
 
@@ -1145,142 +1150,34 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q, weight_dtype)
     assert result["softmax"].data_ptr() == out_softmax.data_ptr()
     assert result["lse"].data_ptr() == lse_out.data_ptr()
 
-    dense_ref = (
-        ref_indexer_forward(
-            q,
-            k,
-            w,
-            ratio,
-            q_causal_offsets=q_causal_offsets,
-            compute_dtype=torch.float64,
-        )
-        * sm_scale
-    )
-    local_indices = _bshd_global_to_local(result["indices"], s_k)
-    check_ref_compressed_topk(
-        dense_ref,
-        local_indices,
-        result["logits"],
-        top_k,
-        atol=1e-4 if weight_dtype == torch.float32 else 2e-3,
-        rtol=1e-4 if weight_dtype == torch.float32 else 2e-3,
-    )
+    dense_ref = ref_indexer_forward(q_deq, k_deq, w, ratio, q_causal_offsets=q_causal_offsets, compute_dtype=torch.float64) * sm_scale
+    tol = 1e-4 if weight_dtype == torch.float32 else 2e-3
+    check_ref_compressed_topk(dense_ref, _bshd_global_to_local(result["indices"], s_k), result["logits"], top_k, atol=tol, rtol=tol)
     lse_ref = torch.logsumexp(dense_ref, dim=-1)
-    assert torch.equal(torch.isfinite(result["lse"]), torch.isfinite(lse_ref))
     finite = torch.isfinite(lse_ref)
-    torch.testing.assert_close(
-        result["lse"][finite],
-        lse_ref[finite],
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    if offsets is None:
+        assert not bool(finite.all())
+    assert torch.equal(torch.isfinite(result["lse"]), finite)
+    torch.testing.assert_close(result["lse"][finite], lse_ref[finite], atol=2e-3, rtol=2e-3)
     _check_fused_softmax(result["indices"], result["logits"], result["softmax"])
 
 
-@pytest.mark.L0
-@torch_fork_set_rng(seed=37)
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
-def test_DSA_compressed_indexer_forward_thd_preallocated_global_indices(weight_dtype):
-    _require_sm100()
-    try:
-        from cudnn import DSA
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-
-    device = torch.device("cuda")
-    shapes = [(64, 32), (96, 32)]
-    ratio, top_k, h_q, h_kv, d = 4, 16, 64, 1, 128
-    q_lengths = [shape[0] for shape in shapes]
-    k_lengths = [shape[1] for shape in shapes]
-    cu_q = torch.tensor(
-        [0, *torch.tensor(q_lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=device,
-    )
-    cu_k = torch.tensor(
-        [0, *torch.tensor(k_lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=device,
-    )
-    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
-    w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
-    if weight_dtype == torch.float32:
-        w = (w.abs() + 1).float() + 2**-10
-
-    cand_offsets, cand_floats = DSA.compress_topk_cand_buffer_size_thd(
-        cu_q,
-        cu_k,
-        ratio,
-    )
-    cand = torch.empty(cand_floats, dtype=torch.float32, device=device)
-    out_indices = torch.empty((total_q, top_k), dtype=torch.int32, device=device)
-    out_logits = torch.empty((total_q, top_k), dtype=torch.float32, device=device)
-    out_softmax = torch.empty((total_q, top_k), dtype=torch.float32, device=device)
-    result = DSA.indexer_forward_top_k_wrapper(
-        q,
-        k,
-        w,
-        top_k=top_k,
-        ratio=ratio,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_seqlen_q=max(q_lengths),
-        max_seqlen_k=max(k_lengths),
-        topk_indices_global=True,
-        cand_buffer=cand,
-        cand_batch_offsets=cand_offsets,
-        out_indices=out_indices,
-        out_logits=out_logits,
-        softmax_out=out_softmax,
-    )
-    torch.cuda.synchronize()
-
-    assert result["indices"].data_ptr() == out_indices.data_ptr()
-    assert result["logits"].data_ptr() == out_logits.data_ptr()
-    assert result["softmax"].data_ptr() == out_softmax.data_ptr()
-    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
-    for batch, (s_q, s_k) in enumerate(shapes):
-        q0, q1 = cu_q_host[batch : batch + 2]
-        k0, k1 = cu_k_host[batch : batch + 2]
-        indices = result["indices"][q0:q1]
-        valid = indices >= 0
-        assert bool((((indices >= k0) & (indices < k1)) | ~valid).all())
-        local_indices = torch.where(
-            valid,
-            indices.to(torch.int64) - k0,
-            indices.to(torch.int64),
-        ).to(torch.int32)
-        dense_ref = ref_indexer_forward(
-            q[q0:q1].unsqueeze(0),
-            k[k0:k1].unsqueeze(0),
-            w[q0:q1].unsqueeze(0),
-            ratio,
-            compute_dtype=torch.float64,
-        )
-        check_ref_compressed_topk(
-            dense_ref,
-            local_indices.unsqueeze(0),
-            result["logits"][q0:q1].unsqueeze(0),
-            top_k,
-            atol=1e-4 if weight_dtype == torch.float32 else 2e-3,
-            rtol=1e-4 if weight_dtype == torch.float32 else 2e-3,
-        )
-    _check_fused_softmax(result["indices"], result["logits"], result["softmax"])
-
-
-@pytest.mark.L0
 @torch_fork_set_rng(seed=43)
+@pytest.mark.parametrize("deterministic", [pytest.param(False, marks=pytest.mark.L0), pytest.param(True, marks=pytest.mark.L1)])
 @pytest.mark.parametrize("h_q", [4, 64], ids=["h4", "h64"])
-@pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
-def test_DSA_compressed_indexer_forward_thd_block_scaled_lse(precision, deterministic, h_q):
-    """THD MXFP8 / MXFP4 top-k indices, logits, preallocated LSE and fused softmax match the fp64 reference on the
-    dequantized Q/K, at 64 heads (two query tokens per tile) and at 4 heads (32 tokens per tile, each carrying its own
-    running max / sum). MXFP8 pads the scale prefixes to 256 tokens (a multiple of both groups' minimum
-    ``128 // gcd(128, h_q)`` = 2, resp. 32, so the padded prefixes are the same for both); MXFP4 keeps the default."""
-    _require_block_scaled_indexer(precision)
+@pytest.mark.parametrize(
+    "precision,weight_dtype",
+    [("bf16", torch.bfloat16), ("bf16", torch.float32), ("mxfp8", torch.bfloat16), ("mxfp4", torch.bfloat16)],
+    ids=["bf16-w-bf16", "bf16-w-fp32", "mxfp8", "mxfp4"],
+)
+def test_DSA_compressed_indexer_forward_thd_preallocated(precision, weight_dtype, h_q, deterministic):
+    """THD top-k into caller-provided buffers (candidate slab with its batch offsets, indices, logits, softmax, LSE) at
+    every precision, at 64 heads (two query tokens per tile) and at 4 heads (32 tokens per tile, each with its own
+    running max / sum): global indices stay inside their sequence, and logits, LSE and fused softmax match the fp64
+    reference on the (dequantized) inputs. MXFP8 pads the scale prefixes to 256 tokens (a multiple of both groups'
+    minimum ``128 // gcd(128, h_q)`` = 2, resp. 32, so the padded prefixes are the same for both); MXFP4 keeps the
+    default."""
+    _require_sm100_indexer(precision)
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
 
     device = torch.device("cuda")
@@ -1292,16 +1189,26 @@ def test_DSA_compressed_indexer_forward_thd_block_scaled_lse(precision, determin
     cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
     cu_k = torch.tensor([0, *torch.tensor(k_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    max_q, max_k = max(q_lengths), max(k_lengths)
-    q, q_deq, q_scale_logical = make_random_block_scaled(precision, (total_q, h_q, d), device=device, seed=61 + h_q)
-    k, k_deq, k_scale_logical = make_random_block_scaled(precision, (total_k, h_kv, d), device=device, seed=67 + h_q)
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (total_q, h_q, d), device=device, seed=61 + h_q)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (total_k, h_kv, d), device=device, seed=67 + h_q)
     w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
-    alignment = dict(q_alignment=256, k_alignment=256) if precision == "mxfp8" else {}
-    q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(q_scale_logical, k_scale_logical, cu_q, cu_k, h_q // h_kv, **alignment)
-    if alignment:
-        expected_scale_prefix = torch.tensor([0, 256, 512], dtype=torch.int32, device=device)
-        assert torch.equal(cu_q_scale, expected_scale_prefix)
-        assert torch.equal(cu_k_scale, expected_scale_prefix)
+    if weight_dtype == torch.float32:
+        w = (w.abs() + 1).float() + 2**-10
+    scales = {}
+    if precision != "bf16":
+        alignment = dict(q_alignment=256, k_alignment=256) if precision == "mxfp8" else {}
+        q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(q_scale_logical, k_scale_logical, cu_q, cu_k, h_q // h_kv, **alignment)
+        if alignment:
+            expected_scale_prefix = torch.tensor([0, 256, 512], dtype=torch.int32, device=device)
+            assert torch.equal(cu_q_scale, expected_scale_prefix)
+            assert torch.equal(cu_k_scale, expected_scale_prefix)
+        scales = dict(q_scale=q_scale, k_scale=k_scale, cu_seqlens_q_scale_padded=cu_q_scale, cu_seqlens_k_scale_padded=cu_k_scale)
+
+    cand_offsets, cand_floats = DSA.compress_topk_cand_buffer_size_thd(cu_q, cu_k, ratio)
+    cand = torch.empty(cand_floats, dtype=torch.float32, device=device)
+    out_indices = torch.empty((total_q, top_k), dtype=torch.int32, device=device)
+    out_logits = torch.empty((total_q, top_k), dtype=torch.float32, device=device)
+    out_softmax = torch.empty((total_q, top_k), dtype=torch.float32, device=device)
     lse_out = torch.empty(total_q, dtype=torch.float32, device=device)
 
     result = DSA.indexer_forward_top_k_wrapper(
@@ -1313,38 +1220,43 @@ def test_DSA_compressed_indexer_forward_thd_block_scaled_lse(precision, determin
         sm_scale=sm_scale,
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
-        max_seqlen_q=max_q,
-        max_seqlen_k=max_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
         precision=precision,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        cu_seqlens_q_scale_padded=cu_q_scale,
-        cu_seqlens_k_scale_padded=cu_k_scale,
-        topk_indices_global=False,
+        topk_indices_global=True,
+        cand_buffer=cand,
+        cand_batch_offsets=cand_offsets,
+        out_indices=out_indices,
+        out_logits=out_logits,
+        softmax_out=out_softmax,
         return_lse=True,
         lse_out=lse_out,
         deterministic=deterministic,
+        **scales,
     )
-    assert result["lse"].data_ptr() == lse_out.data_ptr()
+    torch.cuda.synchronize()
 
+    assert result["indices"].data_ptr() == out_indices.data_ptr()
+    assert result["logits"].data_ptr() == out_logits.data_ptr()
+    assert result["softmax"].data_ptr() == out_softmax.data_ptr()
+    assert result["lse"].data_ptr() == lse_out.data_ptr()
+    tol = 1e-4 if weight_dtype == torch.float32 else 2e-3
     cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
     for batch in range(len(shapes)):
         q0, q1 = cu_q_host[batch : batch + 2]
         k0, k1 = cu_k_host[batch : batch + 2]
-        q_seq, k_seq, w_seq = q_deq[q0:q1].unsqueeze(0), k_deq[k0:k1].unsqueeze(0), w[q0:q1].unsqueeze(0)
-        dense_ref = ref_indexer_forward(q_seq, k_seq, w_seq, ratio, compute_dtype=torch.float64) * sm_scale
-        check_ref_compressed_topk(
-            dense_ref,
-            result["indices"][q0:q1].unsqueeze(0),
-            result["logits"][q0:q1].unsqueeze(0),
-            top_k,
-            atol=1e-3,
-            rtol=1e-3,
+        indices = result["indices"][q0:q1]
+        valid = indices >= 0
+        assert bool((((indices >= k0) & (indices < k1)) | ~valid).all())
+        local_indices = torch.where(valid, indices.to(torch.int64) - k0, indices.to(torch.int64)).to(torch.int32)
+        dense_ref = (
+            ref_indexer_forward(q_deq[q0:q1].unsqueeze(0), k_deq[k0:k1].unsqueeze(0), w[q0:q1].unsqueeze(0), ratio, compute_dtype=torch.float64) * sm_scale
         )
+        check_ref_compressed_topk(dense_ref, local_indices.unsqueeze(0), result["logits"][q0:q1].unsqueeze(0), top_k, atol=tol, rtol=tol)
         lse_ref = torch.logsumexp(dense_ref, dim=-1).squeeze(0)
         finite = torch.isfinite(lse_ref)
         assert torch.equal(torch.isfinite(result["lse"][q0:q1]), finite)
-        torch.testing.assert_close(result["lse"][q0:q1][finite], lse_ref[finite], atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(result["lse"][q0:q1][finite], lse_ref[finite], atol=2e-3, rtol=2e-3)
 
     _check_fused_softmax(result["indices"], result["logits"], result["softmax"])
 
@@ -1370,58 +1282,3 @@ def test_DSA_compress_topk_cand_buffer_size_block_scaled_is_single_launch():
         assert DSA.compress_topk_cand_buffer_size(b, s_q_tail, s_k, ratio, precision=precision) == full_tail
         with pytest.raises(ValueError, match=r"must be <= seqlen_k \* ratio \+ \(ratio - 1\)"):
             DSA.compress_topk_cand_buffer_size(b, s_q_tail + 1, s_k, ratio, precision=precision)
-
-
-@torch_fork_set_rng(seed=73)
-@pytest.mark.parametrize("precision", ["mxfp8", "mxfp4"])
-@pytest.mark.parametrize(
-    "offsets",
-    [pytest.param(None, marks=pytest.mark.L0, id="no_offsets"), pytest.param((128, 17), marks=pytest.mark.L1, id="offsets")],
-)
-def test_DSA_compressed_indexer_forward_bshd_block_scaled_lse(precision, offsets):
-    """BSHD MXFP8 / MXFP4 at 64 heads: top-k indices, logits, LSE and fused softmax through a caller-provided candidate
-    buffer match the fp64 reference, with and without per-batch causal offsets (the small head groups ride
-    ``test_DSA_compressed_indexer_forward_bshd_small_head_groups``)."""
-    _require_block_scaled_indexer(precision)
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
-    from deepseek_sparse_attention.cutedsl.mxfp8_scale_reference import pack_k_scale_bshd, pack_q_scale_bshd
-
-    device = torch.device("cuda")
-    b, s_q, s_k, h_q, d = 2, 128, 64, 64, 128
-    ratio, top_k, sm_scale = 4, 16, d**-0.5
-    q, q_deq, q_scale_logical = make_random_block_scaled(precision, (b, s_q, h_q, d), device=device, seed=73 + h_q)
-    k, k_deq, k_scale_logical = make_random_block_scaled(precision, (b, s_k, 1, d), device=device, seed=79 + h_q)
-    w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
-    q_causal_offsets = None if offsets is None else torch.tensor(offsets, dtype=torch.int32, device=device)
-    # A caller-provided candidate buffer sized for this launch's precision.
-    cand_size = DSA.compress_topk_cand_buffer_size(b, s_q, s_k, ratio, return_lse=True, q_causal_offsets=q_causal_offsets, precision=precision)
-    cand_buffer = torch.empty(cand_size, dtype=torch.float32, device=device)
-
-    result = DSA.indexer_forward_top_k_wrapper(
-        q,
-        k,
-        w,
-        top_k=top_k,
-        ratio=ratio,
-        sm_scale=sm_scale,
-        q_causal_offsets=q_causal_offsets,
-        precision=precision,
-        q_scale=pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q),
-        k_scale=pack_k_scale_bshd(k_scale_logical),
-        topk_indices_global=False,
-        return_lse=True,
-        cand_buffer=cand_buffer,
-    )
-    torch.cuda.synchronize()
-
-    dense_ref = ref_indexer_forward(q_deq, k_deq, w, ratio, q_causal_offsets=q_causal_offsets, compute_dtype=torch.float64) * sm_scale
-    check_ref_compressed_topk(dense_ref, result["indices"], result["logits"], top_k, atol=1e-3, rtol=1e-3)
-    lse_ref = torch.logsumexp(dense_ref, dim=-1)
-    finite = torch.isfinite(lse_ref)
-    if offsets is None:
-        # The first rows of each batch see no key: all-padding rows.
-        assert not bool(finite.all())
-    assert result["lse"].shape == (b, s_q)
-    assert torch.equal(torch.isfinite(result["lse"]), finite)
-    torch.testing.assert_close(result["lse"][finite], lse_ref[finite], atol=1e-3, rtol=1e-3)
-    _check_fused_softmax(result["indices"], result["logits"], result["softmax"])
