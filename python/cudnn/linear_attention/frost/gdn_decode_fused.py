@@ -16,10 +16,13 @@ tap-contiguous channels, the conv weight ``cw`` [10240, 4] bf16, ``A_log`` [48] 
 ``[slots, 48, 128, 128]`` (slot-strided), the int32 slot indices, ``z`` [rows, 48, 128] bf16 (row-strided), the norm weight [128]
 bf16, the static FP8 scale (fp32, one element), ``hidden`` [rows, 5120] bf16 and the BA weight [96, 5120] bf16; every operand 16-byte
 aligned; an SM100-class part (compute capability 10.x) and a CuTe DSL >= 4.8.0.  The config is the caller's ``cfg`` as a whole or, without
-one, the measured pick per rows (``default_cfg``: a cluster of two CTAs per head while the ``rows x 96`` CTAs have an SM each on THIS
-device, one CTA per SM while the ``rows x 48`` CTAs have one, the register-resident two-CTAs-per-SM form past that); the device's SM
-count, its shared memory per SM and its per-CTA opt-in maximum (the occupancy knob's pad) are read at construction (every shared-memory
-figure in this file's docstrings is a cc 10.0 reading; another part is served on its own readings).  The launch knobs ``pdl`` /
+one, the measured pick per rows on THIS part (``default_cfg`` on the device's SM count and shared-memory readings: a cluster of two CTAs
+per head while the ``rows x 96`` CTAs have an SM each, one CTA per SM while the ``rows x 48`` CTAs have one, and past that the
+register-resident two-CTAs-per-SM form where two of its CTAs share an SM on the part -- its third plan-time fact, ``co_resident_ctas``
+-- else the one-CTA form in two waves); the device's SM count, its shared memory per SM and its per-CTA opt-in maximum (the occupancy
+knob's pad and the pick's budget) are read at construction, and the entry starts from the one-CTA form the part holds (a part that holds
+none is a typed ``NotImplementedError`` there; every shared-memory figure in this file's docstrings is a cc 10.0 reading, another part is
+served on its own readings).  The launch knobs ``pdl`` /
 ``pdl_release`` set the config's ``PDL`` / ``PDL_RELEASE`` on top of whatever form serves (the pick or a given ``cfg``): under ``pdl=True``
 every launch carries the programmatic-stream-serialization attribute, the kernel waits for its predecessor (``griddepcontrol.wait``)
 only right before it reads the QKVZ projection's rows and the normed hidden (the slot, the parameters, the BA weight rows, the state
@@ -43,11 +46,15 @@ from .kernel.gdn_decode_fused_config import (
     CONV_WIDTH,
     HEAD_DIM,
     HIDDEN,
+    ONE_CTA_FORMS,
     QKV_CHANNELS,
+    SM100_SMEM_OPTIN_BYTES,
+    SM100_SMEM_PER_SM_BYTES,
     TICKET_STRIDE,
     V_HEADS,
     Cfg,
     default_cfg,
+    first_fitting,
     validate_cfg,
 )
 
@@ -104,7 +111,7 @@ def device_shared_memory(device) -> Tuple[int, int]:
 
 def device_multiprocessor_count(device) -> int:
     """The SM count of a CUDA device (``cudaDevAttrMultiProcessorCount``), the second plan-time fact of the default pick
-    (``default_cfg``: one CTA per SM while the ``rows x 48`` CTAs have an SM each)."""
+    (``default_cfg``: one CTA per SM while the ``rows x 48`` CTAs have an SM each; the shared-memory readings are the third)."""
     import torch
 
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
@@ -243,12 +250,14 @@ def _flat(t):
 
 class GdnDecodeFused:
     """Compiled per (rows, strides, cfg) and shared by every GDN layer: all per-layer tensors are launch arguments.  ``cfg`` overrides
-    the config as a whole; without it the entry picks the measured form per rows (``default_cfg``: ``PAIR_CFG`` = two CTAs per head
-    while the ``rows x 96`` CTAs have an SM each on this device, ``CFG`` = one CTA per SM while the ``rows x 48`` CTAs have one,
-    ``CAPPED_CFG`` = two CTAs per SM past that).  An entry built for a non-CUDA device (host tests) has no SM count to pick by and
-    keeps ``CFG``.  The device is resolved to a concrete CUDA ordinal at construction (:func:`resolve_device`), and every operand of every
-    compile / launch must live on exactly it.  ``pdl`` / ``pdl_release`` (None = the form's own fields) are the launch knobs on top of the
-    form that serves."""
+    the config as a whole; without it the entry picks the measured form per rows on this part (``default_cfg`` on the device's SM count
+    and shared-memory readings: ``PAIR_CFG`` = two CTAs per head while the ``rows x 96`` CTAs have an SM each, ``CFG`` = one CTA per SM
+    while the ``rows x 48`` CTAs have one, ``CAPPED_CFG`` = two CTAs per SM past that where the part's shared memory holds two of its
+    CTAs, else ``CFG`` in two waves).  The entry starts from the one-CTA form the part holds (a part holding none is a typed
+    ``NotImplementedError`` at construction).  An entry built for a non-CUDA device (host tests) has no SM count to pick by and keeps
+    ``CFG`` on the cc 10.0 readings.  The device is resolved to a concrete CUDA ordinal at construction (:func:`resolve_device`), and every
+    operand of every compile / launch must live on exactly it.  ``pdl`` / ``pdl_release`` (None = the form's own fields) are the launch
+    knobs on top of the form that serves."""
 
     def __init__(self, device, eps: float, cfg: Optional[Cfg] = None, debug: bool = False, pdl: Optional[bool] = None, pdl_release: Optional[bool] = None):
         import torch
@@ -261,13 +270,18 @@ class GdnDecodeFused:
         self.pdl: Optional[bool] = None if pdl is None else bool(pdl)
         self.pdl_release: Optional[bool] = None if pdl_release is None else bool(pdl_release)
         self.sm_count: Optional[int] = None
-        self.part: Dict[str, int] = {}  # THIS part's readings every form takes: shared memory per SM and per-CTA opt-in (the pad)
+        # THIS part's readings, (shared memory per SM, per-CTA opt-in): the pick's budget and every form's pad; the cc 10.0 readings
+        # until a CUDA device replaces them -- never a constant carried across an architecture line
+        self.readings: Tuple[int, int] = (SM100_SMEM_PER_SM_BYTES, SM100_SMEM_OPTIN_BYTES)
+        self.part: Dict[str, int] = {}  # the readings as Cfg fields, stamped into every form on a CUDA device (empty on a host entry)
         if self.device.type == "cuda":
-            # the occupancy pad is derived from THIS part's shared memory per SM and per-CTA opt-in, never from a carried constant
-            per_sm, optin = device_shared_memory(self.device)
-            self.part = dict(SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin)
+            self.readings = device_shared_memory(self.device)
+            self.part = dict(SMEM_PER_SM_BYTES=self.readings[0], SMEM_OPTIN_BYTES=self.readings[1])
             self.sm_count = device_multiprocessor_count(self.device)
-        self.cfg = self._on_this_part(cfg if cfg is not None else CFG)  # the override, or the one-CTA form the pick starts from
+        # the override, or the one-CTA form the pick starts from -- the one this part holds (CFG on every served part; a part that holds
+        # none is the typed decline here, before any form is stamped)
+        start = cfg if cfg is not None else (first_fitting(ONE_CTA_FORMS, *self.readings) if self.part else CFG)
+        self.cfg = self._on_this_part(start)
         self.forms: Dict[Cfg, Cfg] = {}  # the picked forms on this part, by their module form
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[int, Dict[str, Any]] = {}
@@ -291,10 +305,11 @@ class GdnDecodeFused:
 
     def cfg_for(self, rows: int) -> Cfg:
         """The config a plan for ``rows`` compiles with: the caller's ``cfg`` when one was given, else the measured pick per rows
-        (``default_cfg`` with this device's SM count; ``CFG`` when there is no CUDA device to pick by)."""
+        (``default_cfg`` on this device's SM count and shared-memory readings -- the capped two-CTAs-per-SM form only where two of its
+        CTAs share an SM on this part; ``CFG`` when there is no CUDA device to pick by)."""
         if self.cfg_given or self.sm_count is None:
             return self.cfg
-        form = default_cfg(rows, self.sm_count)
+        form = default_cfg(rows, self.sm_count, *self.readings)
         if form not in self.forms:
             self.forms[form] = self._on_this_part(form)
         return self.forms[form]
