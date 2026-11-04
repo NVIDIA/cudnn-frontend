@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM80 serves accepted declarations natively, or declines before compilation."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -50,7 +51,12 @@ def _api(direction, descs, **kwargs):
 
 def _facts(direction, descs, *, thd=False):
     def ref(desc):
-        return SimpleNamespace(get_dim=lambda: desc.shape, get_stride=lambda: desc.stride, get_data_type=lambda: cudnn.data_type.BFLOAT16)
+        return SimpleNamespace(
+            get_dim=lambda: desc.shape,
+            get_stride=lambda: desc.stride,
+            get_data_type=lambda: cudnn.data_type.BFLOAT16,
+            ragged_offset=SimpleNamespace() if thd else None,
+        )
 
     q, k, v = (descs[n] for n in ("q", "k", "v"))
     return ga.SdpaGraphFacts(
@@ -77,6 +83,32 @@ def _facts(direction, descs, *, thd=False):
 def _mismatch(direction, facts):
     module = backward if direction == "bwd" else forward
     return module.mismatch(module._sm80_spec().capabilities, facts)
+
+
+@pytest.mark.parametrize("d,dv", [(512, 512), (576, 512), (288, 384), (520, 504)])
+@pytest.mark.parametrize("thd", [False, True])
+def test_wide_forward_admission_keeps_backward_boundary(d, dv, thd):
+    descs, facts = _forward_thd_case(d, dv) if thd else (_descs(d, dv), _facts("fwd", _descs(d, dv)))
+    api = _api("fwd", descs, thd=thd, seq_kv_lens_present=thd, max_total_seq_len_q=64 if thd else None)
+    assert api.check_support()
+    assert (api.kernel_tile_m, api.kernel_tile_n, api.kernel_num_warps) == (32, 16, 4)
+    assert _mismatch("fwd", facts) is None
+    assert _mismatch("bwd", _facts("bwd", descs, thd=thd)) is not None
+
+
+@pytest.mark.parametrize("tile_m,tile_n", [(64, None), (128, None), (None, 32), (None, 64)])
+def test_wide_forward_declines_unbounded_explicit_geometry(tile_m, tile_n):
+    api = _api("fwd", _descs(576, 512), tile_m=tile_m, tile_n=tile_n)
+    with pytest.raises(ValueError, match="wide heads require"):
+        api.check_support()
+
+
+@pytest.mark.parametrize("d,dv", [(584, 512), (512, 520)])
+def test_wide_forward_declines_outside_native_envelope(d, dv):
+    api = _api("fwd", _descs(d, dv))
+    with pytest.raises(ValueError, match="exceeds supported envelope"):
+        api.check_support()
+    assert _mismatch("fwd", _facts("fwd", _descs(d, dv))) is not None
 
 
 @pytest.mark.parametrize("direction,role", [("fwd", n) for n in DATA_ROLES[:4]] + [("bwd", n) for n in DATA_ROLES])
@@ -114,7 +146,7 @@ def test_rope_declines_before_compile(direction):
 
 
 @pytest.mark.parametrize("direction", ["fwd", "bwd"])
-@pytest.mark.parametrize("d,dv", [(48, 32), (96, 80), (128, 128), (160, 112), (192, 128), (224, 208), (256, 256)])
+@pytest.mark.parametrize("d,dv", [(16, 256), (48, 32), (64, 96), (96, 80), (128, 128), (160, 112), (192, 128), (224, 208), (256, 256)])
 @pytest.mark.parametrize("singleton", [False, True])
 def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
     descs = _descs(d, dv, singleton=singleton)
@@ -122,16 +154,47 @@ def test_aligned_native_envelopes_remain_supported(direction, d, dv, singleton):
     assert api.check_support()
     assert _mismatch(direction, _facts(direction, descs)) is None
     if direction == "bwd":
-        assert api._native_pointer and api._staged_layout is None
+        assert api._native_pointer
 
 
-@pytest.mark.parametrize("d,dv", [(96, 80), (192, 128)])
+@pytest.mark.parametrize("d,dv", [(16, 256), (64, 96), (96, 80), (192, 128)])
 def test_backward_thd_ignores_unused_batch_stride(d, dv):
     descs = _descs(d, dv, thd=True)
     api = _api("bwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64)
     assert api.check_support()
-    assert api._native_pointer and api._staged_layout is None
+    assert api._native_pointer
     assert _mismatch("bwd", _facts("bwd", descs, thd=True)) is None
+
+
+def _forward_thd_case(d, dv, *, singleton=False):
+    descs = _descs(d, dv, thd=True, singleton=singleton)
+    b, h, s, _ = descs["q"].shape
+    descs["stats"] = TensorDesc(dtype=torch.float32, shape=(b, h, s), stride=(7, 64, 1), stride_order=(2, 1, 0), device=torch.device("cuda:0"), name="stats")
+    facts = replace(_facts("fwd", descs, thd=True), seq_q_t=SimpleNamespace(), seq_kv_t=SimpleNamespace())
+    return descs, facts
+
+
+@pytest.mark.parametrize("d,dv", [(48, 32), (64, 64), (64, 96), (96, 80), (128, 128), (192, 112), (192, 128), (224, 208), (256, 256)])
+@pytest.mark.parametrize("singleton", [False, True])
+def test_forward_thd_native_pitches(d, dv, singleton):
+    descs, facts = _forward_thd_case(d, dv, singleton=singleton)
+    api = _api("fwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64, seq_kv_lens_present=True)
+    assert api.check_support()
+    assert _mismatch("fwd", facts) is None
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o"])
+@pytest.mark.parametrize("bad_stride", [(7, 128, 128, 1), (7, 120, 544, 1), (7, 136, 561, 1), (7, 136, 560, 2)])
+def test_forward_thd_invalid_pitches_decline(role, bad_stride):
+    descs, _ = _forward_thd_case(128, 128)
+    descs[role] = TensorDesc(
+        dtype=torch.bfloat16, shape=descs[role].shape, stride=bad_stride, stride_order=(3, 1, 2, 0), device=torch.device("cuda:0"), name=role
+    )
+    facts = replace(_facts("fwd", descs, thd=True), seq_q_t=SimpleNamespace(), seq_kv_t=SimpleNamespace())
+    with pytest.raises(NotImplementedError, match=rf"(?i){role}.*stride"):
+        _api("fwd", descs, thd=True, max_total_seq_len_q=64, max_total_seq_len_kv=64, seq_kv_lens_present=True).check_support()
+    reason = _mismatch("fwd", facts)
+    assert reason is not None and role.lower() in reason.lower() and "stride" in reason.lower()
 
 
 @pytest.mark.parametrize("missing", ["bias", "dbias", "dsink"])
@@ -150,3 +213,12 @@ def test_backward_incomplete_auxiliary_declarations_decline(missing):
     kwargs = {"sample_" + n: desc for n, desc in aux.items() if n != missing}
     with pytest.raises(NotImplementedError, match=missing):
         _api("bwd", descs, has_bias=True, bias_is_fp32=True, **kwargs).check_support()
+
+
+def test_forward_thd_dense_port_keeps_batch_stride():
+    descs, facts = _forward_thd_case(128, 128)
+    facts.o_t.ragged_offset = None
+    assert "o" in _mismatch("fwd", facts)
+    dense_o = _descs(128, 128)["o"]
+    facts.o_t.get_stride = lambda: dense_o.stride
+    assert _mismatch("fwd", facts) is None

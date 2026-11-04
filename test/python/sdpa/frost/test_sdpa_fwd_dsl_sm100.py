@@ -717,14 +717,17 @@ def test_dsl_sm100_band_right_uncovered_tail_via_padding():
     + [(dt, dt, 4, 2) for dt in (torch.float8_e4m3fn, torch.float8_e5m2)],
 )
 @torch_fork_set_rng(seed=0)
-def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, output_dtype, monkeypatch, splits, cga):
+def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
+    input_dtype, output_dtype, monkeypatch, splits, cga, d_shape=(128, 128), stats_output=True, knob_overrides=None, query_length=64
+):
     """A mask-free S_kv off the KV tile compiles the padded mask against the scalar S_kv (#1425): no lengths buffer,
     the native prepared launch, and execute-time S_kv overrides on and off the tile within the declared envelope."""
     _require_dsl()
     import cudnn
     from cudnn.sdpa.fwd import prepared as prep
 
-    b, hq, hk, s_q, d, declared = 2, 4, 2, 64, 128, 257
+    b, hq, hk, s_q, declared = 2, 4, 2, query_length, 257
+    d, dv = d_shape
     fp8 = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     dtype_enum = {
         torch.float16: cudnn.data_type.HALF,
@@ -734,19 +737,19 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
     }
     io = dtype_enum[input_dtype]
 
-    def make(h, s):
+    def make(h, s, width=d):
         # Poison backing storage beyond the live logical tensor extent. TMA
         # must zero-fill it; masking logits alone cannot remove NaNs from PV.
-        x = torch.randn(b, s + 16, h, d, device="cuda")
+        x = torch.randn(b, s + 16, h, width, device="cuda")
         x[:, s:] = torch.nan
         x = x.to(input_dtype)
         return x[:, :s].transpose(1, 2)
 
-    def bshd_stride(h, s):
-        return [(s + 16) * h * d, d, h * d, 1]
+    def bshd_stride(h, s, width=d):
+        return [(s + 16) * h * width, width, h * width, 1]
 
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
-    q0, k0, v0 = make(hq, s_q), make(hk, declared), make(hk, declared)
+    q0, k0, v0 = make(hq, s_q), make(hk, declared), make(hk, declared, dv)
     qd, kd, vd = (g.tensor_like(t) for t in (q0, k0, v0))
     pack = {}
     if fp8:
@@ -762,24 +765,25 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
             scale_s=scales[4],
             scale_o=scales[5],
             attn_scale=d**-0.5,
-            generate_stats=True,
+            generate_stats=stats_output,
         )
         ad.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
         pack.update({t: torch.full((1, 1, 1, 1), val, device="cuda") for t, val in zip(scales, (2.0, 0.5, 0.25, 1.0, 1.0, 2.0))})
         pack[ad] = torch.zeros(1, 1, 1, 1, device="cuda")
     else:
-        od, stats = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=True)
-    o = torch.empty(b, s_q, hq, d, device="cuda", dtype=output_dtype).transpose(1, 2)
+        od, stats = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=stats_output)
+    o = torch.empty(b, s_q, hq, dv, device="cuda", dtype=output_dtype).transpose(1, 2)
     od.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride())).set_data_type(dtype_enum[output_dtype])
-    lse = torch.empty(b, hq, s_q, 1, device="cuda")
-    stats.set_output(True).set_dim(list(lse.shape)).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
-    pack[stats] = lse
+    lse = torch.full((b, hq, s_q, 1), 77.0, device="cuda")
+    if stats_output:
+        stats.set_output(True).set_dim(list(lse.shape)).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
+        pack[stats] = lse
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     _select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8))
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga})
+    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})})
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
@@ -793,7 +797,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
     forbid_python_forward_binding(monkeypatch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     for s_kv in (declared, 1, 127, 128, 129, 255):
-        q, k, v = q0, make(hk, s_kv), make(hk, s_kv)
+        q, k, v = q0, make(hk, s_kv), make(hk, s_kv, dv)
         o.zero_()
 
         def run():
@@ -801,8 +805,8 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
                 {**pack, qd: q, kd: k, vd: v, od: o},
                 ws,
                 override_uids=[kd.get_uid(), vd.get_uid()],
-                override_shapes=[[b, hk, s_kv, d]] * 2,
-                override_strides=[bshd_stride(hk, s_kv)] * 2,
+                override_shapes=[[b, hk, s_kv, d], [b, hk, s_kv, dv]],
+                override_strides=[bshd_stride(hk, s_kv), bshd_stride(hk, s_kv, dv)],
             )
 
         run()
@@ -815,7 +819,10 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
             torch.cuda.synchronize()
             qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
             o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
-            torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
+            if stats_output:
+                torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
+            else:
+                assert (lse == 77).all()
             if fp8:
                 torch.testing.assert_close(pack[ad].flatten()[0], o_ref.abs().max() * 0.25, atol=0.03, rtol=0.03)
                 o_ref = o_ref * 0.25 * 2.0  # descale_v, then scale_o; Amax excludes scale_o
@@ -3248,10 +3255,9 @@ def test_dsl_sm100_combo(flavor, dtype, heads, sink, layout, mask):
 # test (O to the bf16 rounding, the fp32 row-sum moves by ~1e-5) and worth +1.9 % at S=8K dense / +1.75 % causal on the
 # DSv3 chart layer on B200, so its only tripwire is the SASS.  Two arms per specialization, one per cc the sm100 rows
 # serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True) and sm_103a with the cc 10.3 record
-# (exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate, so the split is folded OUT and the kernel is
-# develop's -- INCLUDING develop's pre-existing causal-only tail emulation, `_exp2_mixed_late`, which the split replaces
-# only where it is on; the gate-off cubin is md5-identical to develop's on both archs).  Compiled here for the target
-# arch (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
+# (exp2_fma_split=False: the split is folded OUT and every softmax column takes the plain MUFU exp2 -- the dense top-left
+# causal arm too, whose exp2-split spelling (CfgD192.EXP2_TAIL_MIX) follows the claim).  Compiled here for the target arch
+# (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
 _SM100_D192_F16_SASS_PROBE = sass_probe_source("""
     # The PRODUCTION geometry of the DSv3 chart layer the split was measured on (B200, B=1 H=128/128 d_qk=192 d_v=128
     # bf16 S=8K, Stats, cga2 = the adapter's default for an f16 build); the per-arch field (exp2_fma_split) and the causal
@@ -3259,14 +3265,11 @@ _SM100_D192_F16_SASS_PROBE = sass_probe_source("""
     params = TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=1, **params_kw)
     mod = _load_sm100_kernel_module((192, 128), params, fp8=False, pertensor=False, rubin=False)
     # MUFU.EX2 the kernel must carry: per traced softmax body one alpha exp2 plus the non-emulated columns; the body is
-    # traced once per softmax warpgroup and, on a masked specialization, once more for the masked arm.  With the split
-    # OFF the dense top-left causal arm still emulates its last 34 columns of chunk 1 (`_exp2_mixed_late`: pairs from
-    # index 30 of the 64-wide chunk, PR #841) -- develop's spelling, which the gate-off build must reproduce.
+    # traced once per softmax warpgroup and, on a masked specialization, once more for the masked arm.
     n_bodies = (2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1) * (2 if mod.CFG.MASK_FLAGS else 1)
-    tail_cols = 0 if mod._E2E_ENABLED or not mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX else mod._SOFTMAX_CHUNK - 30  # `_exp2_mixed_late`: `if i >= 30`
-    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS - tail_cols + 1))
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
-    print("TAIL_EMULATED_COLS", tail_cols)
+    print("CAUSAL_SPLIT_SPELLING", int(mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX))
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
     mod.compile(d_qk=192, d_v=128, has_lse=True)
     """)
@@ -3277,8 +3280,9 @@ _D192_F16_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 2}
 # +2.64 % S=2K, +3.07 % S=32K, +1.75 % S=8K causal).  Gate ON (sm_100a): dense MUFU.EX2 258 -> 194 (2 x 97), FFMA2
 # 130 -> 226, FADD2 126 -> 222 (+3 each per emulated pair), STL / LDL 14 / 14 unchanged; causal (masked + unmasked arm x 2
 # warpgroups) MUFU.EX2 380 -> 388 (4 x 97: the split emulates 32 columns per row where develop's tail emulation did 34),
-# FFMA2 396 -> 452, FADD2 456 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a, cubin md5-identical to develop's): develop's
-# counts exactly -- dense 2 x 129 = 258, causal 4 x (129 - 34) = 380 with STL / LDL 12 / 12.  The MUFU count is pinned
+# FFMA2 396 -> 452, FADD2 456 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a): every column on MUFU -- dense 2 x 129 = 258,
+# causal 4 x 129 = 516 (the causal arm's exp2-split spelling goes with the claim; its FFMA2 / FADD2 / STL / LDL are the
+# counts of that build on this toolchain).  The MUFU count is pinned
 # EXACTLY (derived from the module); slack 16 on the packed-FMA counts tolerates unrelated ptxas drift and still catches
 # one emulated pair falling back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.  The STL / LDL entries
 # are the counts of THIS toolchain (cutlass-dsl 4.8.0.dev0 + CUDA 13.5 ptxas) and are bounds, not literals: the causal cubins
@@ -3290,7 +3294,7 @@ _D192_F16_ON_PINS = {
 }
 _D192_F16_OFF_PINS = {
     "dense": {"MUFU_EX2": 258, "FFMA2": 130, "FADD2": 126, "STL": 14, "LDL": 14},
-    "causal": {"MUFU_EX2": 380, "FFMA2": 396, "FADD2": 456, "STL": 12, "LDL": 12},
+    "causal": {"MUFU_EX2": 516, "FFMA2": 260, "FADD2": 252, "STL": 0, "LDL": 0},
 }
 
 
@@ -3311,7 +3315,7 @@ def test_sm100_d192_f16_exp2_split_sass_pins(tmp_path, spec):
     pins = _D192_F16_ON_PINS[spec]
     assert probe.expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
     assert probe.expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {probe.expect['EMULATED_COLS']}"
-    assert probe.expect["TAIL_EMULATED_COLS"] == 0, "with the split on, the module-wide pattern replaces the causal tail emulation"
+    assert probe.expect["CAUSAL_SPLIT_SPELLING"] == (1 if spec == "causal" else 0), "the dense top-left causal arm takes the split's spelling with the claim"
     assert (
         probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
     ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
@@ -3324,11 +3328,10 @@ def test_sm100_d192_f16_exp2_split_sass_pins(tmp_path, spec):
 @requires_dsl
 @pytest.mark.parametrize("spec", sorted(_D192_F16_SPECS))
 def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
-    """cc 10.3 record (exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300, where MUFU.EX2 runs at
-    Rubin's 32/clk/SM and the same split MEASURED -9..-10 %): the kernel issues develop's MUFU.EX2 count exactly (dense
-    2 x 129 = 258; causal 4 x (129 - 34) = 380, develop's tail emulation intact), with no `exp2_emul_pair` left behind
-    (FFMA2 / FADD2 at or below develop's plus slack) and no spill beyond develop's.  Compiled for sm_103a; skips where
-    this cutlass-dsl has no sm_103a."""
+    """cc 10.3 record (exp2_fma_split=False, what api_dsl.template_params() builds for cc 10.3): every softmax column
+    takes the plain MUFU exp2 -- MUFU.EX2 == 2 x 129 = 258 (dense) / 4 x 129 = 516 (causal) exactly, the causal arm's
+    exp2-split spelling folded out with the claim -- with no `exp2_emul_pair` left behind (FFMA2 / FADD2 at or below the
+    recorded counts plus slack) and no new spill.  Compiled for sm_103a; skips where this cutlass-dsl has no sm_103a."""
     from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
 
     assert _exp2_fma_split_for((10, 3), kind="f16", flavor=(192, 128)) is False, "the cc 10.3 record must fold the split OUT"
@@ -3338,7 +3341,7 @@ def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
     pins = _D192_F16_OFF_PINS[spec]
     assert probe.expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
     assert probe.expect["EMULATED_COLS"] == 0, f"no column may be emulated by the split with the gate off, the module says {probe.expect['EMULATED_COLS']}"
-    assert probe.expect["TAIL_EMULATED_COLS"] == (34 if spec == "causal" else 0), "develop's causal tail emulation must survive the gate-off build untouched"
+    assert probe.expect["CAUSAL_SPLIT_SPELLING"] == 0, "the causal arm's exp2-split spelling must fold out with the claim"
     assert (
         probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
     ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
@@ -3350,17 +3353,78 @@ def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
 
 
 # The CI arch targets select this module explicitly; imported tests need L0.
-import test_sdpa_staged_forward_half as _staged_half_checks
+import native_forward_half_cases as _native_half_checks
 
 
 @pytest.mark.L0
 @requires_dsl
-class TestStagedHalf:
-    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
-    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
-    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
-    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
-    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
-    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
-    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
-    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+class TestNativeHalfStrides:
+    test_current_storage = staticmethod(_native_half_checks.test_half_native_has_no_execute_allocations_and_replays_current_storage)
+    test_mixed_layout = staticmethod(_native_half_checks.test_half_native_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_native_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_native_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_native_half_checks.test_half_native_rejects_invalid_bindings_before_launch)
+    test_physical_wide_stride = staticmethod(_native_half_checks.test_half_native_physical_wide_stride)
+    test_artifact_reload = staticmethod(_native_half_checks.test_half_native_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_native_half_checks.test_half_native_follows_launch_stream)
+
+
+# Keep native stride coverage in the architecture-specific CI entry.
+from native_forward_stride_cases import check_native_dense_permutations as _native_dense_permutations
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeDenseStrides:
+    test_permutations = staticmethod(_native_dense_permutations)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D192 LPT on SM100/SM103; native SM107 has its own CI entry")
+class TestD192Lpt:
+    """D192 work scheduling through retained dense and ragged replay."""
+
+    import sdpa_d192_lpt as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_ragged_replay = staticmethod(_checks.test_ragged_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D192 origins on SM100/SM103; SM107 has its own CI entry")
+class TestD192PhysicalOrigins:
+    """Independent Q/K/V/O/Stats offsets through the native CI entrypoint."""
+
+    import sdpa_d192_origins as _checks
+
+    test_independent_origins = staticmethod(_checks.test_independent_origins)
+    test_split_independent_origins = staticmethod(_checks.test_split_independent_origins)
+    test_split_origins_require_matching_extension = staticmethod(_checks.test_split_origins_require_matching_extension)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64 THD split on SM100/SM103; SM107 has its own CI entry")
+class TestD64ThdSplit:
+    """Nonpaged D64 split and physical origins through the native CI entrypoint."""
+
+    import sdpa_d64_thd_split as _checks
+
+    test_explicit_contract_and_template = staticmethod(_checks.test_explicit_contract_and_template)
+    test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
+    test_proper_divisor_pack_replay = staticmethod(_checks.test_proper_divisor_pack_replay)
+    test_standalone_compact_replay = staticmethod(_checks.test_standalone_compact_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="native SM100/SM103; SM107 has its own CI entry")
+class TestNativeScalarTailSplit:
+    """Run native regression coverage from the architecture CI entrypoint."""
+
+    import sdpa_scalar_tail_split as _checks
+
+    test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
+    test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)

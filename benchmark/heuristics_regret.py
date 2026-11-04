@@ -13,6 +13,11 @@ the same plan as the faster leg (``backend_detail``), the case is not a misrank 
 spread is run-to-run noise, reported as the noise floor the threshold has to clear.
 
     python -m benchmark.heuristics_regret <results dir or CSV> [...] [--threshold 1.05] [--top 30] [--fail]
+
+``--baseline <an earlier run's dir or CSV> [...]`` adds the run-to-run view: each case's ``cudnn_auto`` time against the
+same case there (matched on the configuration columns both runs record). A case slower by more than ``--regress`` is
+listed under "plan changed" when its default plan differs between the runs (a dispatch change) and under "same plan"
+otherwise (a kernel, backend or measurement change); cases whose default stopped running are listed apart.
 """
 
 import argparse
@@ -57,6 +62,7 @@ def _csvs(paths):
 def _load(paths):
     cases = defaultdict(dict)
     for f in _csvs(paths):
+        found = defaultdict(dict)
         with open(f, newline="") as fh:
             for row in csv.DictReader(fh):
                 leg = row.get("backend")
@@ -68,9 +74,12 @@ def _load(paths):
                     t = float(row["time_ms"]) if ok else None
                 except (TypeError, ValueError):
                     t = None
-                if leg in cases[key]:
-                    raise SystemExit(f"{f}: two {leg} rows for one case; cannot tell which measurement to compare")
-                cases[key][leg] = (t if t and t > 0 else None, row.get("backend_detail") or "")
+                if leg in found[key]:
+                    print(f"skipping {f}: two {leg} rows for one case; cannot tell which measurement to compare", file=sys.stderr)
+                    break
+                found[key][leg] = (t if t and t > 0 else None, row.get("backend_detail") or "")
+            else:
+                cases.update(found)
     return cases
 
 
@@ -88,13 +97,93 @@ def _label(key):
     return f"{key[0]}: {head} {shape}"
 
 
+def _defaults(paths):
+    """{configuration columns: (time, detail)} of every cudnn_auto row; a case two files both record is dropped."""
+    out, seen = {}, set()
+    for key, legs in _load(paths).items():
+        if "cudnn_auto" not in legs:
+            continue
+        case = key[1:]
+        if case in seen:
+            out.pop(case, None)
+            continue
+        seen.add(case)
+        out[case] = legs["cudnn_auto"]
+    return out
+
+
+def _pairs(now, then):
+    """(case, now, baseline) for every case of `now` with exactly one counterpart in `then`. Two cases are counterparts when
+    one row's columns include the other's (a run that added a column still pairs with its predecessor) and they agree on
+    the shared ones; a case with several counterparts is dropped as ambiguous."""
+    schema = lambda case: frozenset(k for k, _ in case)
+    by_schema = defaultdict(dict)
+    for case, v in then.items():
+        by_schema[schema(case)][case] = v
+    groups = defaultdict(list)
+    for case in now:
+        groups[schema(case)].append(case)
+    for s_now, cases in groups.items():
+        found = defaultdict(list)
+        for s_then, prev in by_schema.items():
+            if not (s_then <= s_now or s_now <= s_then):
+                continue
+            cols = s_now & s_then
+            index = defaultdict(list)
+            for c, v in prev.items():
+                index[tuple(kv for kv in c if kv[0] in cols)].append(v)
+            for case in cases:
+                found[case] += index.get(tuple(kv for kv in case if kv[0] in cols), [])
+        for case in cases:
+            if len(found[case]) == 1:
+                yield case, now[case], found[case][0]
+
+
+def _report_baseline(paths, baseline, regress, top):
+    ratios, changed, same, lost = [], [], [], []
+    for case, (t, detail), prev in _pairs(_defaults(paths), _defaults(baseline)):
+        if t is None:
+            if prev[0] is not None:
+                lost.append((case, prev))
+            continue
+        if prev[0] is None:
+            continue
+        r = t / prev[0]
+        ratios.append(r)
+        if r > regress:
+            (changed if _plan(detail) != _plan(prev[1]) else same).append((r, case, prev, (t, detail)))
+    if not ratios and not lost:
+        print("## Run to run: no cudnn_auto case matched the baseline\n")
+        return False
+    gm = math.exp(sum(map(math.log, ratios)) / len(ratios)) if ratios else float("nan")
+    print("## Run to run (cudnn_auto time now / baseline, same case)\n")
+    print(f"- matched cases: {len(ratios)}; geomean {gm:.3f}; slower than {regress:.2f}x: {len(changed)} with a new default plan, {len(same)} on the same plan")
+    print(f"- default stopped running: {len(lost)}\n")
+    for title, rows in (("new default plan", changed), ("same default plan", same)):
+        if rows:
+            print(f"| now/baseline ({title}) | case | baseline plan (ms) | plan now (ms) |\n|---|---|---|---|")
+            for r, case, prev, cur in sorted(rows, key=lambda x: -x[0])[:top]:
+                print(f"| {r:.2f} | {_label(('',) + case)} | {_plan(prev[1])} {prev[0]:.4f} | {_plan(cur[1])} {cur[0]:.4f} |")
+            print()
+    if lost:
+        print("| default stopped running | baseline plan (ms) |\n|---|---|")
+        for case, prev in lost[:top]:
+            print(f"| {_label(('',) + case)} | {_plan(prev[1])} {prev[0]:.4f} |")
+        print()
+    return bool(changed or lost)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--threshold", type=float, default=1.05)
     ap.add_argument("--top", type=int, default=30)
-    ap.add_argument("--fail", action="store_true", help="exit 1 when any misrank or coverage loss is found")
+    ap.add_argument("--fail", action="store_true", help="exit 1 when any misrank or coverage loss is found (or, with --baseline, a slower new default plan)")
+    ap.add_argument("--baseline", nargs="+", default=None, help="an earlier run's results dir or CSV: report cudnn_auto cases slower than there")
+    ap.add_argument("--regress", type=float, default=1.2, help="--baseline: now/baseline ratio reported as slower")
     a = ap.parse_args()
+
+    regressed = _report_baseline(a.paths, a.baseline, a.regress, a.top) if a.baseline else False
 
     cases = _load(a.paths)
     regrets, misranks, losses, same_plan = [], [], [], []
@@ -118,7 +207,7 @@ def main():
 
     if not regrets and not losses:
         print("no case has a cudnn_auto row next to a cudnn / cudnn_oss row")
-        return 0
+        return 1 if a.fail and regressed else 0
     gm = math.exp(sum(math.log(r) for r in regrets) / len(regrets)) if regrets else float("nan")
     print(f"## Heuristics regret (cudnn_auto vs the faster of cudnn / cudnn_oss, same data type)\n")
     print(f"- compared cases: {len(regrets)}; geomean regret {gm:.3f}; worst {max(regrets, default=float('nan')):.3f}")
@@ -135,7 +224,7 @@ def main():
         print("| coverage loss | faster leg (ms) |\n|---|---|")
         for key, best_leg, tb in losses[: a.top]:
             print(f"| {_label(key)} | {best_leg} {tb:.4f} |")
-    return 1 if a.fail and (misranks or losses) else 0
+    return 1 if a.fail and (misranks or losses or regressed) else 0
 
 
 if __name__ == "__main__":

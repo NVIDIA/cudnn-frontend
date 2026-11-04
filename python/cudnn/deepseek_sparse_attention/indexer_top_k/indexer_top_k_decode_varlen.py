@@ -26,7 +26,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .block_scan import block_prefix_sum_kernel
-from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen, atomicAdd, resolve_deterministic_ordering
+from .indexer_top_k_varlen_util import DETERMINISTIC_BITMAP_MAX_NUM_COLS, IndexerTopKKernelVarlen, atomicAdd, resolve_deterministic_ordering
 
 
 class ComputeDynamicCTAOffsets:
@@ -626,6 +626,20 @@ def _sm100_deterministic_bitmap_max_cols(dtype, top_k: int, large_occupancy: boo
     return 65536 if top_k <= 512 else 131072
 
 
+def _sm103_deterministic_bitmap(bucketed_num_cols: int, top_k: int, large_occupancy: bool) -> bool:
+    """Whether bitmap ordering is the auto choice on SM103 (B300).
+
+    Measured with captured graphs on a B300 (fp32 / bf16, 1-1024 rows, 4k-256k columns, top_k 32-2048). Bitmap wins at
+    narrow rows at every top_k, unlike the SM100 rule above. Bitonic wins from 128k columns at top_k <= 128, and with
+    large occupancy at top_k <= 512, by 4-12%. Past the bitmap limit, bitonic is the only choice.
+    """
+    if bucketed_num_cols > DETERMINISTIC_BITMAP_MAX_NUM_COLS:
+        return False
+    if bucketed_num_cols >= 131072 and (top_k <= 128 or (large_occupancy and top_k <= 512)):
+        return False
+    return True
+
+
 def _bucket_num_cols(num_cols: int) -> int:
     """Bucket num_cols to the next power of 2 for compilation caching.
 
@@ -682,6 +696,8 @@ def compile_topk_kernel(
     if deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 0):
         bitmap_limit = _sm100_deterministic_bitmap_max_cols(dtype, top_k, large_occupancy)
         deterministic_ordering = "bitmap" if bucketed_num_cols <= bitmap_limit else "bitonic"
+    elif deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 3):
+        deterministic_ordering = "bitmap" if _sm103_deterministic_bitmap(bucketed_num_cols, top_k, large_occupancy) else "bitonic"
     deterministic_ordering = resolve_deterministic_ordering(bucketed_num_cols, deterministic, deterministic_ordering)
     assert not load_balance
 

@@ -37,7 +37,7 @@ from .tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
-from .named_barrier import EPILOGUE_BARRIER_BASE, TMEM_POINTER_BARRIER, TMEM_RELEASE_BARRIER
+from .named_barrier import EPILOGUE_BARRIER_BASE, TMEM_POINTER_BARRIER, TMEM_RELEASE_BARRIER, sync_unaligned
 from .block_sparsity import (
     HSTUBlockSparseTensors,
     get_q2k_block_for_reverse_slot,
@@ -3102,10 +3102,7 @@ class HSTUAttentionForwardSm100:
         if const_expr(self.use_tma_O):
             if tidx < cute.arch.WARP_SIZE:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
-            cute.arch.barrier(
-                barrier_id=EPILOGUE_BARRIER_BASE + stage,
-                number_of_threads=(cute.arch.WARP_SIZE * len(self.silu1_warp_ids)),
-            )
+            sync_unaligned(EPILOGUE_BARRIER_BASE + stage, cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
     @cute.jit
     def _silu_step_q1_m64(
@@ -3418,13 +3415,14 @@ class HSTUAttentionForwardSm100:
         pipeline_o: Optional[cutlass.pipeline.PipelineUmmaAsync] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
+        # With q_stage=1, SiLU group 1 stores the single O accumulator (stage 0).
+        # Select the barrier by the owning warp group, not the accumulator stage:
+        # group 0's scheduler tail uses barrier 1 and can run concurrently.
+        epilogue_barrier_id = EPILOGUE_BARRIER_BASE + (stage if const_expr(self.q_stage == 2) else 1)
         if const_expr(self.use_tma_O):
             if tidx < cute.arch.WARP_SIZE:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
-            cute.arch.barrier(
-                barrier_id=EPILOGUE_BARRIER_BASE + stage,
-                number_of_threads=(cute.arch.WARP_SIZE * len(self.silu1_warp_ids)),
-            )
+            sync_unaligned(epilogue_barrier_id, cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
         offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
         offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
         if const_expr(self.use_2cta_instrs):
@@ -3512,7 +3510,7 @@ class HSTUAttentionForwardSm100:
         if const_expr(self.use_tma_O):
             # Publish regular SMEM writes before the async proxy reads sO for the TMA store.
             cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.barrier(barrier_id=EPILOGUE_BARRIER_BASE + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
+        sync_unaligned(epilogue_barrier_id, cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
         if const_expr(self.q1_split_kv > 1):
             self._atomic_add_q1_split_O(head_idx, stage, seqlen, mO, sO)

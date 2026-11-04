@@ -47,6 +47,15 @@ two launches bitwise:
   all-empty one -- the CTAs at or past the live total exit at entry), a one-sequence packing BITWISE the dense ``B = 1, S = T`` run, the
   cumulative length forms (a prefix sliced from a larger one included) bitwise the lengths form, and on every sequence the
   missed-coordinate signature of a THD port (``LSE == log(n_vis)`` -- an all-zero K operand) ruled out;
+* THD x PAGED x BOTTOM_RIGHT (``thd=True, paged_kv=True, bottom_right=True`` -- the record's ``thd_paged_kv``, 2026-10-30: the packed
+  EXTEND form of a serving step over the pools, row ``j`` of sequence ``b`` at ``kv_len_b - q_len_b + j``, one list per packed row,
+  unsplit): the accept cells at every page size / pool layout / sequence count / Q-length form with the metadata sized by the SEQUENCE
+  count, the typed declines (the top-left composition, a prefix-form KV length, the split, the shared list, PDL, the lean tile, a table
+  whose row count is not the sequence count), and on Rubin every sequence of a packing BITWISE the dense ``[1, q_len_b]`` paged
+  bottom-right per-row run over the same table row / pools / lists and within the budget vs the oracle at the per-row positions; the
+  degenerate rows (a dead sequence with rows, an empty sequence, a sequence shorter than its chunk, the identity bound, a one-token
+  sequence, prefix 0, an id past the table, stale finite pool rows, the gate), the carried states over mixed 1- / 17-tile item sequences,
+  the capture replayed over a new packing;
 * the DECODE form (``bottom_right=True``, ``list_per_sequence=True``, ``split_kv=S``): the ``S_q = 1`` ladder, the dead-sequence
   partials, the paged open block, the gate on the epilogue / in the combine, and the MTP MATRIX of the shared list -- ``S_q`` in
   {1, 2, 3, 4} x every residue of the step-0 position ``pos_0 = kv_len - S_q`` mod 4 x B in {1, 4}: per row the step-0 anchor's
@@ -71,6 +80,7 @@ import pytest
 import torch
 
 from frost_test_utils import requires_dsl, requires_rubin
+from sparse_item_sequences import CARRIED_STATE_SEQUENCES, count_for_tiles
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -141,6 +151,9 @@ def test_claims_record_agrees_with_the_config_wired_arms():
     assert (C.index_top_k_min, C.index_top_k_max, C.index_gqa_group_max) == (4, 512, 16)
     # the decode form: the shared list (bottom-right anchored, S_q <= 4) and the split are the record's decode claim
     assert C.decode == (C.index_list_per_sequence and C.bottom_right and C.split_kv) and C.index_shared_list_max_tokens == 4
+    # THD x PAGED (2026-10-30): the appended composition claim is the conjunction of its three arms (frost-engine-contract section 1), and the
+    # config factory admits exactly that triple (the config module's own cells pin the two refused pairs)
+    assert C.thd_paged_kv == (C.thd and C.paged_kv and C.bottom_right)
     assert C.cutedsl_min_version == (4, 8, 0) and (C.sm_lo, C.sm_hi) == (107, 119)
 
 
@@ -536,7 +549,8 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed(sm10
             lambda o: o.update(**_paged_operands(), thd=True, seq_q_lens=_T((1,), (1,), "torch.int32")),
             NotImplementedError,
             "thd=True with paged_kv=True",
-        ),  # the two wired arms are served one at a time: the packed sequence's K / V row offset composes with a dense tensor only
+        ),  # the TOP-LEFT composition (no bottom_right): a packed self-attention over a page pool has no serving meaning; the composition is
+        # served on the bottom-right diagonal (2026-10-30: the packed EXTEND form, its own cells below)
         # the fused epilogue gate is SERVED (the record claims it); a malformed gate operand is a ValueError naming the gate
         (lambda o: o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D, 1), "torch.float32")), ValueError, "epilogue gate dtype"),
         (lambda o: o.update(epilogue_gate=_T((1, 8, 12, D), (8 * 12 * D, 12 * D, D, 1), "torch.bfloat16")), ValueError, "O-shaped"),
@@ -572,7 +586,8 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed(sm10
             lambda o: o.update(thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"), bottom_right=True),
             NotImplementedError,
             "bottom_right with thd=True is not served",
-        ),
+        ),  # on the block's own DENSE K / V (no paged_kv): the packed form's position is the token's offset in its sequence; the bottom-right
+        # position lives on the paged composition (2026-10-30)
         (
             lambda o: o.update(
                 thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"), list_per_sequence=True, bottom_right=True
@@ -847,7 +862,8 @@ def test_sparse_kernel_thd_arm_source_pins():
     claim counter vs the CLC loop); a CTA past the live total exits at entry BEFORE any mbarrier init; ONE decode helper
     turns every payload (the first item included) into the item in every role; the three load sites take their coordinates
     from it and nothing else (the ids bulk copy ``item_row``, the Q box ``(out_tok, out_batch)``, the gather rows
-    ``kv_row_base`` on the dense arm -- the paged arm's pool row never composes with it: THD x paged is a typed decline) -- no
+    ``kv_row_base`` on the dense arm, the pool row through the table row of the sequence the decode found on the paged arm: the
+    THD x PAGED composition, 2026-10-30) -- no
     dense ``batch x S`` coordinate survives outside the decode; the metadata offsets come from
     ``tile_dsl.thd``'s names, never re-literalled; the setup launch precedes the main launch."""
     code = _code(_kernel_source())
@@ -3504,3 +3520,506 @@ def test_prefill_form_pdl_arm_is_bitwise_the_plain_arm(dtype):
     max_o, max_lse = _check([outs[True]], ref_o, ref_lse)
     _assert_bitwise(outs[True], outs[False], f"prefill {dtype} use_pdl vs plain")
     print(f"\nprefill pdl arm {dtype}: bitwise the plain arm; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+# ============================================================================ THD x PAGED x BOTTOM_RIGHT (2026-10-30): the packed EXTEND form over the pools
+# The composition the record claims as ``thd_paged_kv``: the packed Q of a serving step ([1, T, H, D] -- decode rows beside prefill chunks of
+# any length, in any order) against K / V read from a PAGED pool through a [n_seq, max_pages] table on the BOTTOM-RIGHT diagonal (row j of
+# sequence b at position kv_len_b - q_len_b + j; kv_len_b the serving stack's logical length AFTER the step), one list per packed row
+# (sequence-relative ids), unsplit, the THD metadata in the workspace.  Host: the record / config agreement (the claims test above), the accept
+# cells at every page size / pool layout / sequence count / Q-length form, the typed declines by name.  Rubin: every sequence's rows BITWISE
+# the dense [1, q_len_b] paged bottom-right per-row run over the same table row / pools / lists (the same items, the same tiles in the same
+# order: only the item decode and the metadata differ between the two renderings) and within the budget vs the fp32 oracle at the per-row
+# positions; the degenerate rows; the carried states over mixed item sequences; the capture replayed over a new packing.
+
+
+def _thd_paged_operands(n_seq=3, T_q=600, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=512, hnd=True, max_pages=8, cu_q=False, extra_pages=2):
+    """The THD x PAGED x BOTTOM_RIGHT stand-ins: packed Q / O ``[1, T_q, H, D]``, pools of ``n_seq x max_pages + extra_pages`` pages, a
+    ``[n_seq, max_pages]`` table, the ``[n_seq]`` KV lengths, the ``[n_seq (+ 1)]`` Q lengths (``cu_q``: the prefix-sum form)."""
+    o = _paged_operands(B=1, S=T_q, H=H, KH=KH, P=P, dtype=dtype, top_k=top_k, hnd=hnd, max_pages=max_pages, extra_pages=extra_pages)
+    pool = _T((n_seq * max_pages + extra_pages, KH, P, D), _pool_strides(KH, P, hnd), dtype)
+    o.update(
+        k=pool,
+        v=pool,
+        block_table=_T((n_seq, max_pages), (max_pages, 1), "torch.int32"),
+        seq_kv_lens=_T((n_seq,), (1,), "torch.int32"),
+        thd=True,
+        seq_q_lens=_T((n_seq + int(cu_q),), (1,), "torch.int32"),
+        cu_seq_q_lens=cu_q,
+        bottom_right=True,
+    )
+    return o
+
+
+@pytest.mark.parametrize("P", [16, 32, 64, 128])
+@pytest.mark.parametrize("hnd", [True, False], ids=["HND", "NHD"])
+@pytest.mark.parametrize("n_seq", [1, 3, 8])
+@pytest.mark.parametrize("cu_q", [False, True], ids=["lens", "cu"])
+@pytest.mark.parametrize("dtype", ["torch.bfloat16", "torch.float16"], ids=["bf16", "f16"])
+def test_adapter_accepts_the_packed_paged_bottom_right_composition_and_sizes_its_workspace(P, hnd, n_seq, cu_q, dtype, sm107_host_target):
+    """``thd=True`` x ``paged_kv=True`` x ``bottom_right=True`` (the record's ``thd_paged_kv``): a ``[n_seq, max_pages]`` table and ``[n_seq]``
+    KV lengths are ACCEPTED at every page size / pool layout / sequence count / Q-length form; the template record carries the three arms with
+    the lengths present, the per-row list and no split; the workspace is the THD metadata sized by the SEQUENCE count (``4 n_seq + 4`` int32
+    words, 16-byte rounded -- never by Q's batch extent of 1); the config factory builds the composed record and its validator passes it."""
+    from cudnn.sdpa.fwd.config_sm107 import _validate_cfg_d256_sparse, make_cfg_d256_sparse
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    a = SparseGqaFwdDslSm107(**_thd_paged_operands(n_seq=n_seq, P=P, hnd=hnd, dtype=dtype, cu_q=cu_q))
+    assert a.check_support() is True
+    tp = a.template_params()
+    assert (tp.thd_varlen, tp.paged_kv, tp.page_size, tp.bottom_right, tp.seq_kv_lens_present, tp.qsa_list_per_sequence, tp.split_kv) == (
+        True,
+        True,
+        P,
+        True,
+        True,
+        False,
+        1,
+    )
+    assert a._NSEQ == n_seq and a._B == 1 and a._paged[1] == 8 and a._SKV == 8 * P
+    assert a.scratch_workspace_bytes() == -(-((4 * n_seq + 4) * 4) // 16) * 16, "the THD metadata, sized by the sequence count"
+    cfg, _ = make_cfg_d256_sparse(tp)
+    assert (cfg.THD_VARLEN, cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.BOTTOM_RIGHT, cfg.SEQ_KV_LENS_PRESENT, cfg.SPLIT_KV, cfg.LIST_PER_SEQUENCE) == (
+        1,
+        1,
+        P,
+        1,
+        1,
+        1,
+        0,
+    )
+    _validate_cfg_d256_sparse(cfg)
+
+
+def test_adapter_declines_the_packed_paged_compositions_the_body_does_not_carry_by_name(sm107_host_target, monkeypatch):
+    """The reject half of ``thd_paged_kv`` (frost-engine-contract section 9): the top-left composition, a prefix-form KV length, the split, the
+    shared list, PDL and the lean tile under THD x paged -- each a typed decline naming the feature; a table whose row count is Q's batch
+    extent (1) or any count other than the SEQUENCE count is a ``ValueError`` naming the sequence count (a ``[1, max_pages]`` table would
+    otherwise read row 0 for every sequence); a KV-length tensor of another count is the THD form check's; a record without the claim
+    declines the composition by its field name."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd import sparse_gqa_sm107 as S
+
+    assert S.SparseGqaFwdDslSm107(**_thd_paged_operands()).check_support() is True  # the accept half every row below is measured against
+    i32 = "torch.int32"
+    rows = [
+        (dict(bottom_right=False), NotImplementedError, "served on the bottom-right diagonal only"),
+        (dict(cu_seq_kv_lens=True, seq_kv_lens=_T((4,), (1,), i32)), NotImplementedError, "cu_seq_kv_lens=True is not served"),
+        (dict(split_kv=2), NotImplementedError, "split_kv with thd=True is not served"),
+        (dict(list_per_sequence=True), NotImplementedError, "list_per_sequence with thd=True is not served"),
+        (dict(use_pdl=True), NotImplementedError, "thd=True with use_pdl=True is not served"),
+        (dict(tile_form="lean"), NotImplementedError, "the lean tile has no claim-counter form"),
+        (dict(block_table=_T((1, 8), (8, 1), i32)), ValueError, "(num_sequences, max_pages) = (3, >= 1)"),  # Q's batch extent, never the row count
+        (dict(block_table=_T((4, 8), (8, 1), i32)), ValueError, "(num_sequences, max_pages) = (3, >= 1)"),
+        (dict(seq_kv_lens=_T((4,), (1,), i32)), ValueError, "same B"),
+    ]
+    for over, exc, word in rows:
+        o = _thd_paged_operands()
+        o.update(over)
+        with pytest.raises(exc, match=re.escape(word)):
+            S.SparseGqaFwdDslSm107(**o).check_support()
+    monkeypatch.setattr(S, "SPARSE_CAPABILITIES", dataclasses.replace(S.SPARSE_CAPABILITIES, thd_paged_kv=False))
+    with pytest.raises(NotImplementedError, match="thd_paged_kv=False"):
+        S.SparseGqaFwdDslSm107(**_thd_paged_operands()).check_support()
+
+
+def _thd_paged_inputs(lens_q, lens_kv, H, KH, dtype, P, hnd, *, top_k=512, list_kind="shuffled", seed=0, extra_cap=0, extra_pages=3, L_cap=None):
+    """A packed serving step over the pools: the packed ``Q [1, T_q + extra_cap, H, D]``; per sequence ``b`` a dense K / V history of
+    ``kv_len_b`` rows (``k_full / v_full [n_seq, L_cap, KH, D]``, the rows past a sequence's length unused), paginated into ONE pool pair
+    through a shuffled ``[n_seq, max_pages]`` table (``-1`` past the live pages, NaN on every row no sequence wrote: a gathered unwritten row
+    would poison O); the per-row lists at the BOTTOM-RIGHT positions ``kv_len_b - q_len_b + j`` from the oracle's builders with the
+    sequence's own KV length (sequence-relative ids; a row the sequence is too short for gets an empty list), the rows past the packed
+    total ``-1`` / 0.  ``L_cap`` (default the longest sequence) fixes the table's width across packings (the capture cell)."""
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    n_seq, T_q = len(lens_q), sum(lens_q)
+    L_cap = max(max(lens_kv), 1) if L_cap is None else int(L_cap)
+    q = torch.randn(1, T_q + extra_cap, H, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    k_full = torch.randn(n_seq, L_cap, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    v_full = torch.randn(n_seq, L_cap, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    k_pool, v_pool, table = _paginate(k_full, v_full, lens_kv, P, hnd, "nan", g, extra_pages=extra_pages)
+    ids = torch.full((T_q + extra_cap, top_k), -1, dtype=torch.int32, device=dev)
+    lens = torch.zeros(T_q + extra_cap, dtype=torch.int32, device=dev)
+    oracle = _oracle()
+    cu_q = _cu(lens_q)
+    for b, (sq, L) in enumerate(zip(lens_q, lens_kv)):
+        if sq == 0:
+            continue
+        pos = (torch.arange(sq, device=dev) + (int(L) - sq))[None]
+        kvl = torch.tensor([int(L)], device=dev, dtype=torch.long)[:, None]
+        if list_kind == "full":
+            ids_b, lens_b = oracle.full_block_ids(pos, top_k, BS, kv_lens=kvl)
+        else:
+            ids_b, lens_b = oracle.random_block_ids(pos, top_k, BS, generator=g, kv_lens=kvl, shuffle=True)
+        ids[cu_q[b] : cu_q[b + 1]] = ids_b[0]
+        lens[cu_q[b] : cu_q[b + 1]] = lens_b[0]
+    return dict(q=q, k_full=k_full, v_full=v_full, k_pool=k_pool, v_pool=v_pool, table=table, ids=ids.contiguous(), lens=lens.contiguous(), cu_q=cu_q)
+
+
+def _bottom_right_reference(q_rows, k_seq, v_seq, ids_rows, lens_rows, pos, L, scale, top_k):
+    """The fp32 oracle of ``S`` packed rows of ONE sequence at the bottom-right positions ``pos`` (``[S]``; negative on a row the sequence is
+    too short for) over its ``L`` keys ``k_seq`` / ``v_seq`` ``[L, KH, D]`` through the oracle's visible mask (natural-log LSE; a dead row
+    ``O = 0``, ``LSE = -inf``) -> ``(O [S, H, D] fp32, LSE [H, S] fp32)``."""
+    oracle = _oracle()
+    S, H, _ = q_rows.shape
+    KH = k_seq.shape[1]
+    G = H // KH
+    dev = q_rows.device
+    o = torch.zeros(S, H, D, device=dev, dtype=torch.float32)
+    lse = torch.full((H, S), float("-inf"), device=dev, dtype=torch.float32)
+    if L <= 0:
+        return o, lse
+    allowed = oracle.qsa_visible_mask(ids_rows, lens_rows, pos, L, L, BS, top_k=top_k)
+    for h in range(H):
+        kk, vv = k_seq[:, h // G].float(), v_seq[:, h // G].float()
+        sc = (q_rows[:, h].float() @ kk.t()) * scale
+        sc = sc.masked_fill(~allowed, float("-inf"))
+        rmax = sc.amax(dim=-1)
+        dead = torch.isinf(rmax) & (rmax < 0)
+        safe = torch.where(dead, torch.zeros_like(rmax), rmax)
+        p = torch.where(allowed, torch.exp(sc - safe[:, None]), torch.zeros_like(sc))
+        den = p.sum(dim=-1)
+        oc = (p @ vv) / torch.where(dead, torch.ones_like(den), den)[:, None]
+        o[:, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+        lse[h] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
+    return o, lse
+
+
+def _thd_paged_reference(inp, lens_q, lens_kv, scale, top_k, *, lens_present=True):
+    """The per-sequence oracle of a packed step assembled on the packed axis: ``(O [1, T_q, H, D], LSE [1, H, T_q])`` over the live rows,
+    a sequence with no key or a row at a negative position exact (0 / -inf)."""
+    q, cu_q = inp["q"], inp["cu_q"]
+    T_q, H = cu_q[-1], q.shape[2]
+    ref_o = torch.zeros(1, T_q, H, D, device=q.device, dtype=torch.float32)
+    ref_lse = torch.full((1, H, T_q), float("-inf"), device=q.device, dtype=torch.float32)
+    for b, (sq, L) in enumerate(zip(lens_q, lens_kv)):
+        if sq == 0:
+            continue
+        lo, hi = cu_q[b], cu_q[b + 1]
+        pos = torch.arange(sq, device=q.device) + (int(L) - sq)
+        o_b, lse_b = _bottom_right_reference(
+            q[0, lo:hi],
+            inp["k_full"][b, : int(L)],
+            inp["v_full"][b, : int(L)],
+            inp["ids"][lo:hi],
+            inp["lens"][lo:hi] if lens_present else None,
+            pos,
+            int(L),
+            scale,
+            top_k,
+        )
+        ref_o[0, lo:hi] = o_b
+        ref_lse[0, :, lo:hi] = lse_b
+    return ref_o, ref_lse
+
+
+def _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P, *, cu_q=False, launches=2, gate=None, lens_present=True, pools=None, adapters=None):
+    """Sentinel-filled packed ``O [1, T_cap, H, D]`` / ``LSE [1, H, T_cap]`` per launch through the adapter's THD x PAGED x BOTTOM_RIGHT form:
+    the ``[n_seq (+ 1)]`` Q lengths (``cu_q`` the prefix-sum form), the ``[n_seq]`` KV lengths, the whole table, the per-row lists, the
+    metadata workspace POISONED before every launch (the setup launch writes every word the core reads).  ``pools`` overrides the pool pair
+    (the stale-finite twin); ``adapters`` (a list) collects the adapter objects (the capture cell)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q = inp["q"]
+    dev = q.device
+    _, T_cap, H, _ = q.shape
+    k_pool, v_pool = (inp["k_pool"], inp["v_pool"]) if pools is None else pools
+    seq_q = _lens_tensor(lens_q, cu_q)
+    seq_kv = torch.tensor([int(x) for x in lens_kv], device=dev, dtype=torch.int32)
+    sent = _sentinel(q.dtype)
+    outs = []
+    for _ in range(launches):
+        o = torch.full((1, T_cap, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((1, H, T_cap), sent, device=dev, dtype=torch.float32)
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=k_pool,
+            v=v_pool,
+            o=o,
+            lse=lse,
+            block_ids=inp["ids"],
+            block_lens=inp["lens"] if lens_present else None,
+            seq_kv_lens=seq_kv,
+            top_k=top_k,
+            scale=scale,
+            thd=True,
+            seq_q_lens=seq_q,
+            cu_seq_q_lens=cu_q,
+            paged_kv=True,
+            page_size=P,
+            block_table=inp["table"],
+            bottom_right=True,
+            epilogue_gate=gate,
+        )
+        assert a.check_support()
+        tp = a.template_params()
+        assert tp.thd_varlen and tp.paged_kv and tp.bottom_right and tp.split_kv == 1 and not tp.qsa_list_per_sequence
+        a.compile()  # plan time: the adapter never compiles on the execute path
+        ws = torch.full((a.scratch_workspace_bytes() // 4,), -7, device=dev, dtype=torch.int32)
+        a.execute(stream=_stream(), workspace=ws)
+        torch.cuda.synchronize()
+        outs.append((o, lse))
+        if adapters is not None:
+            adapters.append((a, ws))
+    return outs
+
+
+def _dense_paged_rows(inp, b, lo, hi, L, top_k, scale, P, *, lens_present=True):
+    """The CONTROL of one sequence: the dense paged BOTTOM-RIGHT per-row run of its ``q_len_b`` rows -- ``Q [1, q_len_b, H, D]`` the packed rows
+    (a view at the packed strides), the same pools, the sequence's table row as a contiguous ``[1, max_pages]`` table, its own lists and KV
+    length; sentinel-filled O / LSE ``[1, q_len_b, H, D]`` / ``[1, H, q_len_b]``.  The tcgen05 core pinned by name (``tile_form="tcgen05"``,
+    this module's convention): under ``"auto"`` the measured part takes the LEAN tile at one row per sequence, whose split would need the
+    partials workspace -- and the lean body is another arithmetic, never the bitwise control of the core's packed rendering."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q = inp["q"][:, lo:hi]
+    dev = q.device
+    S, H = hi - lo, q.shape[2]
+    sent = _sentinel(q.dtype)
+    o = torch.full((1, S, H, D), sent, device=dev, dtype=q.dtype)
+    lse = torch.full((1, H, S), sent, device=dev, dtype=torch.float32)
+    a = SparseGqaFwdDslSm107(
+        q=q,
+        k=inp["k_pool"],
+        v=inp["v_pool"],
+        o=o,
+        lse=lse,
+        block_ids=inp["ids"][lo:hi],
+        block_lens=inp["lens"][lo:hi] if lens_present else None,
+        seq_kv_lens=torch.tensor([int(L)], device=dev, dtype=torch.int32),
+        top_k=top_k,
+        scale=scale,
+        paged_kv=True,
+        page_size=P,
+        block_table=inp["table"][b : b + 1].contiguous(),
+        bottom_right=True,
+        tile_form="tcgen05",
+    )
+    assert a.check_support() and not a.template_params().thd_varlen and a.tile_form == "tcgen05" and a.split_kv == 1
+    a.compile()
+    a.execute(stream=_stream())
+    torch.cuda.synchronize()
+    return o, lse
+
+
+def _check_thd_paged(outs, ref_o, ref_lse, T_q):
+    """The standard per-cell assertions over the packed rows (finite, no sentinel on a live row, dead rows exact, within the budget, two
+    launches bitwise) and the capacity tail past the packed total untouched on every launch.  Returns ``(max|dO|, max|dLSE|)``."""
+    sent, sent_o = _sentinel(outs[0][0].dtype), _stored_sentinel(outs[0][0].dtype)
+    for o, lse in outs:
+        assert (o[0, T_q:].float() == sent_o).all() and (lse[0, :, T_q:] == sent).all(), "the capacity tail past the packed Q total was written"
+    return _check([(o[:, :T_q], lse[:, :, :T_q]) for o, lse in outs], ref_o, ref_lse)
+
+
+def _per_sequence_bitwise(inp, outs, lens_q, lens_kv, top_k, scale, P, what, *, lens_present=True):
+    """Every non-empty sequence's packed rows BITWISE its dense paged bottom-right per-row control (O and LSE)."""
+    o, lse = outs[0]
+    cu_q = inp["cu_q"]
+    for b, (sq, L) in enumerate(zip(lens_q, lens_kv)):
+        if sq == 0:
+            continue
+        lo, hi = cu_q[b], cu_q[b + 1]
+        c_o, c_lse = _dense_paged_rows(inp, b, lo, hi, L, top_k, scale, P, lens_present=lens_present)
+        _assert_bitwise((o[:, lo:hi], lse[:, :, lo:hi]), (c_o, c_lse), f"{what}: sequence {b} (q {sq}, kv {L})")
+
+
+# (lens_q, the PREFIX per sequence -- kv_len = prefix + q_len --, the capacity tail): decode rows beside chunks of every residue, the identity
+# bound (2052), a chunk past 2052 behind a short prefix, an empty prefix, an empty sequence
+_THD_PAGED_PACKINGS = {
+    "mixed-step": dict(lens_q=[1, 300, 4, 17, 128, 3, 1, 2], prefix=[8191, 2051, 4094, 2, 6144, 0, 0, 2050], extra_cap=37),
+    "one-sequence": dict(lens_q=[300], prefix=[2052], extra_cap=0),
+    "ragged-small": dict(lens_q=[5, 0, 64, 1, 7], prefix=[0, 0, 3, 2051, 1], extra_cap=11),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "name, P, hnd, dtype",
+    [
+        pytest.param("mixed-step", 16, True, torch.bfloat16, id="mixed-step-p16-HND-bf16"),
+        pytest.param("mixed-step", 64, False, torch.bfloat16, id="mixed-step-p64-NHD-bf16"),
+        pytest.param("mixed-step", 16, True, torch.float16, id="mixed-step-p16-HND-f16"),
+        pytest.param("one-sequence", 48, True, torch.bfloat16, id="one-sequence-p48-HND-bf16"),
+        pytest.param("ragged-small", 16, True, torch.bfloat16, id="ragged-small-p16-HND-bf16"),
+        pytest.param("ragged-small", 32, False, torch.float16, id="ragged-small-p32-NHD-f16"),
+    ],
+)
+def test_thd_paged_composition_is_bitwise_the_dense_paged_per_row_form_per_sequence(name, P, hnd, dtype):
+    """THD x PAGED x BOTTOM_RIGHT: a packed serving step -- decode rows beside chunks of 2 .. 300 rows behind prefixes of every residue, the
+    identity bound, an empty prefix, an empty sequence, a capacity tail -- in ONE launch: every sequence's rows BITWISE the dense ``[1, q_len_b]``
+    paged bottom-right per-row run over the same table row / pools / lists (the same items, tiles and order; only the item decode and the
+    metadata differ), within the budget vs the fp32 oracle at the per-row positions, two launches bitwise, the capacity tail untouched; the
+    cumulative Q-length form bitwise the lengths form; ``block_lens`` absent bitwise its own control."""
+    spec = _THD_PAGED_PACKINGS[name]
+    lens_q, extra_cap = spec["lens_q"], spec["extra_cap"]
+    lens_kv = [p + q for p, q in zip(spec["prefix"], lens_q)]
+    H, KH, top_k = 24, 2, 512
+    scale = 1.0 / math.sqrt(D)
+    inp = _thd_paged_inputs(lens_q, lens_kv, H, KH, dtype, P, hnd, top_k=top_k, seed=31, extra_cap=extra_cap)
+    T_q = sum(lens_q)
+    outs = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P)
+    ref_o, ref_lse = _thd_paged_reference(inp, lens_q, lens_kv, scale, top_k)
+    max_o, max_lse = _check_thd_paged(outs, ref_o, ref_lse, T_q)
+    _per_sequence_bitwise(inp, outs, lens_q, lens_kv, top_k, scale, P, f"{name} p{P} {'HND' if hnd else 'NHD'} {dtype}")
+    cu = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P, cu_q=True, launches=1)
+    _assert_bitwise(cu[0], outs[0], f"{name}: the cumulative Q-length form vs the lengths form")
+    if name == "ragged-small":
+        no_lens = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P, launches=1, lens_present=False)
+        ref_o2, ref_lse2 = _thd_paged_reference(inp, lens_q, lens_kv, scale, top_k, lens_present=False)
+        _check_thd_paged(no_lens, ref_o2, ref_lse2, T_q)
+        _per_sequence_bitwise(inp, no_lens, lens_q, lens_kv, top_k, scale, P, f"{name}: block_lens absent", lens_present=False)
+    print(
+        f"\nthd x paged {name} p{P} {'HND' if hnd else 'NHD'} {dtype}: q {lens_q} kv {lens_kv} tail {extra_cap}: every sequence bitwise its dense "
+        f"paged per-row control; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; dead rows {int(torch.isinf(ref_lse).sum())}"
+    )
+
+
+@requires_rubin
+def test_thd_paged_degenerate_rows():
+    """The composed degenerate rows (the kernel header's THD x PAGED paragraph): a dead sequence WITH rows (``kv_len 0``: ``O = 0`` / ``LSE =
+    -inf`` stored), an empty sequence (no unit), a sequence shorter than its chunk (the negative-position rows dead, the rest live), the
+    identity bound at 17 tiles, a one-token sequence (no complete block: the tail alone), prefix 0 (a packed self-attention over the pool),
+    the MTP step shape, a listed id past the table (a zero row, the keys masked by the length), the capacity tail; stale FINITE pool rows
+    past every sequence's length (the zero-filled twin) bitwise the NaN-filled pools -- never gathered; every sequence bitwise its dense
+    paged control and within the budget vs the oracle; the fused epilogue gate within one rounding of the ungated run x sigmoid."""
+    lens_q = [5, 0, 8, 3, 1, 37, 4, 2]
+    lens_kv = [0, 100, 5, 2052, 1, 37, 300, 70]
+    H, KH, top_k, P, dtype = 24, 2, 512, 16, torch.bfloat16
+    scale = 1.0 / math.sqrt(D)
+    inp = _thd_paged_inputs(lens_q, lens_kv, H, KH, dtype, P, True, top_k=top_k, list_kind="full", seed=47, extra_cap=37)
+    cu_q = inp["cu_q"]
+    # the last sequence (q 2 at kv 70: 17 complete blocks): plant an id PAST the table's reach inside the count (the kernel reads row -1 for it:
+    # a zero row whose keys the length masks; the oracle's multiplicity reference ignores it the same way)
+    n_blocks_total = -(-int(inp["table"].shape[1]) * P // BS)
+    inp["ids"][cu_q[-2], 0] = n_blocks_total + 5
+    T_q = sum(lens_q)
+    outs = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P)
+    ref_o, ref_lse = _thd_paged_reference(inp, lens_q, lens_kv, scale, top_k)
+    assert torch.isinf(ref_lse[0, :, cu_q[0] : cu_q[1]]).all(), "the dead sequence's rows"
+    assert torch.isinf(ref_lse[0, :, cu_q[2] : cu_q[2] + 3]).all() and torch.isfinite(ref_lse[0, :, cu_q[2] + 3 : cu_q[3]]).all(), "the short sequence"
+    max_o, max_lse = _check_thd_paged(outs, ref_o, ref_lse, T_q)
+    _per_sequence_bitwise(inp, outs, lens_q, lens_kv, top_k, scale, P, "degenerate rows")
+    # stale FINITE rows: the NaN-filled pools' unwritten rows set to 0 (the written rows untouched) -- bitwise: the core never gathers them
+    zero_pools = (torch.nan_to_num(inp["k_pool"], nan=0.0), torch.nan_to_num(inp["v_pool"], nan=0.0))
+    assert torch.isfinite(zero_pools[0].float()).all() and torch.isnan(inp["k_pool"].float()).any()
+    stale = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P, launches=1, pools=zero_pools)
+    _assert_bitwise(stale[0], outs[0], "stale finite pool rows vs NaN-filled pools")
+    # the fused epilogue gate on the packed form over the pools: within one rounding of the ungated O x sigmoid(G) on the live rows
+    g = torch.Generator(device="cuda").manual_seed(48)
+    gate = (torch.randn(inp["q"].shape, device="cuda", dtype=torch.float32, generator=g) * 2.0).to(dtype)
+    gated = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P, launches=1, gate=gate)
+    expect = _elementwise_gate(outs[0][0], gate)
+    live = ~torch.isinf(ref_lse[0, 0])  # [T_q]
+    d = (gated[0][0][0, :T_q].float() - expect[0, :T_q].float()).abs()
+    budget = _ulp_of(expect[0, :T_q].float(), dtype).to(d.device)
+    assert (d[live] <= budget[live]).all(), f"the fused gate is off the unfused-then-gated form by more than one rounding: max {float(d[live].max()):.3e}"
+    assert (gated[0][0][0, :T_q][~live] == 0).all() and torch.equal(gated[0][1], outs[0][1]), "dead rows 0 and the LSE untouched by the gate"
+    print(f"\nthd x paged degenerate rows: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; dead rows {int(torch.isinf(ref_lse).sum())}; gate within one rounding")
+
+
+@requires_rubin
+def test_thd_paged_one_cta_and_group_sixteen():
+    """One CTA in the whole grid (``T_q x KH = 1``: one query row, one KV head, G = 16 -- the group at the record's cap) on the composed
+    rendering: the persistent scheduler's single claim, bitwise the dense paged control, within the budget."""
+    lens_q, lens_kv = [1], [2052]
+    H, KH, top_k, P, dtype = 16, 1, 512, 16, torch.bfloat16
+    scale = 1.0 / math.sqrt(D)
+    inp = _thd_paged_inputs(lens_q, lens_kv, H, KH, dtype, P, True, top_k=top_k, list_kind="full", seed=49)
+    outs = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P)
+    ref_o, ref_lse = _thd_paged_reference(inp, lens_q, lens_kv, scale, top_k)
+    max_o, max_lse = _check_thd_paged(outs, ref_o, ref_lse, 1)
+    _per_sequence_bitwise(inp, outs, lens_q, lens_kv, top_k, scale, P, "one CTA, G 16")
+    print(f"\nthd x paged one CTA (G 16): max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("seq", CARRIED_STATE_SEQUENCES, ids=lambda s: "t" + "-".join(str(x) for x in s))
+def test_thd_paged_carried_states_over_mixed_item_sequences(seq):
+    """The carried-state stress on the COMPOSED rendering (the standalone sequences module's shapes): one sequence of ``R`` = the device's SM
+    count rows per wave, the wave's items held to ``n_tiles`` tiles through ``block_lens`` (``32 n - 1`` entries: ``n`` tiles with or without an
+    open block; 17 = the full list, 16 or 17 per the row's open block), a 0 a DEAD sequence of ``R`` rows (``kv_len 0``: dead items between
+    live ones), every live sequence behind a prefix past the identity bound so every row's count holds; the persistent scheduler hands each
+    CTA the waves in order, so a CTA sees the item sequence ``seq`` -- a 1-tile item right after a 17-tile one and the reverse, dead items
+    interleaved: two launches bitwise, no sentinel survives, dead rows exact, every sequence within the budget vs its oracle and bitwise its
+    dense paged control."""
+    R = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    H, KH, top_k, P, dtype = 24, 2, 512, 16, torch.bfloat16
+    scale = 1.0 / math.sqrt(D)
+    lens_q = [R] * len(seq)
+    lens_kv = [R + 2300 if n else 0 for n in seq]
+    inp = _thd_paged_inputs(lens_q, lens_kv, H, KH, dtype, P, True, top_k=top_k, list_kind="full", seed=51, extra_cap=5)
+    cu_q = inp["cu_q"]
+    for b, n in enumerate(seq):
+        if n:
+            count = count_for_tiles(n, 1, top_k)  # 32 n - 1 (n < 17), 512 at 17: the item runs n tiles (16 or 17 at the full list per the open block)
+            inp["ids"][cu_q[b] : cu_q[b + 1]] = -1
+            inp["ids"][cu_q[b] : cu_q[b + 1], :count] = torch.arange(count, device="cuda", dtype=torch.int32)[None]
+            inp["lens"][cu_q[b] : cu_q[b + 1]] = count
+    T_q = sum(lens_q)
+    outs = _launch_thd_paged(inp, lens_q, lens_kv, top_k, scale, P)
+    ref_o, ref_lse = _thd_paged_reference(inp, lens_q, lens_kv, scale, top_k)
+    max_o, max_lse = _check_thd_paged(outs, ref_o, ref_lse, T_q)
+    _per_sequence_bitwise(inp, outs, lens_q, lens_kv, top_k, scale, P, f"carried states {seq}")
+    print(f"\nthd x paged carried states {seq} (R {R}): max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; dead rows {int(torch.isinf(ref_lse).sum())}")
+
+
+@requires_rubin
+def test_thd_paged_capture_replays_over_a_new_packing_bitwise_its_eager_twin():
+    """CUDA-graph capture of the composed rendering (the setup launch + the core) after one eager run on the capture stream: the replay bitwise
+    the eager run; a NEW packing of the same shapes (other Q lengths, KV lengths, table, lists, pools and Q) copied through the captured
+    tensors replays bitwise a fresh eager run over it -- the lengths, the table and the lists are device data."""
+    H, KH, top_k, P, dtype = 24, 2, 512, 16, torch.bfloat16
+    scale = 1.0 / math.sqrt(D)
+    a_q, a_prefix = [64, 100, 36], [300, 0, 2000]
+    b_q, b_prefix = [100, 36, 64], [77, 2052, 5]
+    a_kv = [p + q for p, q in zip(a_prefix, a_q)]
+    b_kv = [p + q for p, q in zip(b_prefix, b_q)]
+    L_cap = max(max(a_kv), max(b_kv))
+    A = _thd_paged_inputs(a_q, a_kv, H, KH, dtype, P, True, top_k=top_k, seed=61, L_cap=L_cap)
+    B = _thd_paged_inputs(b_q, b_kv, H, KH, dtype, P, True, top_k=top_k, seed=63, L_cap=L_cap)
+    assert A["table"].shape == B["table"].shape and A["k_pool"].shape == B["k_pool"].shape and A["q"].shape == B["q"].shape
+    T_q = sum(a_q)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        held = []
+        outs = _launch_thd_paged(A, a_q, a_kv, top_k, scale, P, launches=1, adapters=held)  # the eager warm-up ON the capture stream
+    (adapter, ws), (o, lse) = held[0], outs[0]
+    eager_o, eager_lse = o.clone(), lse.clone()
+    seq_q = adapter.seq_q_lens
+    seq_kv = adapter.seq_kv_lens
+    o.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            import cuda.bindings.driver as cuda
+
+            adapter.execute(stream=cuda.CUstream(int(stream.cuda_stream)), workspace=ws)
+        torch.cuda.synchronize()
+        assert torch.isnan(o).all(), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(o, eager_o) and torch.equal(lse, eager_lse), "the replay differs from the eager run"
+        # the new packing through the captured tensors
+        A["q"].copy_(B["q"])
+        A["k_pool"].copy_(B["k_pool"])
+        A["v_pool"].copy_(B["v_pool"])
+        A["table"].copy_(B["table"])
+        A["ids"].copy_(B["ids"])
+        A["lens"].copy_(B["lens"])
+        seq_q.copy_(torch.tensor(b_q, device="cuda", dtype=torch.int32))
+        seq_kv.copy_(torch.tensor(b_kv, device="cuda", dtype=torch.int32))
+        o.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        twin = _launch_thd_paged(B, b_q, b_kv, top_k, scale, P, launches=1)
+        assert torch.equal(o, twin[0][0]) and torch.equal(lse, twin[0][1]), "the replay over the new packing differs from its eager twin"
+        ref_o, ref_lse = _thd_paged_reference(B, b_q, b_kv, scale, top_k)
+        _check_thd_paged([(o, lse)], ref_o, ref_lse, T_q)
+    finally:
+        graph.reset()
+    print("\nthd x paged capture: the replay bitwise eager; the replay over a new packing bitwise its eager twin")
