@@ -97,7 +97,9 @@ class WalkStats:
             page_count = warp_pages[lane_idx] if lane_idx < self.num_warps else Int32(0)
             page_count = warp_reduce(page_count, lambda x, y: x + y)
             if lane_idx == 0:
-                q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
+                q_size = Int32(64)  # blk64: every Q block is one full M64 tile (mQSizes is not read)
+                if cutlass.const_expr(self.block != 64):
+                    q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
                 shared_count = Int32(0)
                 if q_size > 0:
                     if q_size <= 64:
@@ -216,8 +218,7 @@ class CompactQRoutes:
         if thread_idx == 0:
             mRouteCounts[0] = small_base
             mRouteCounts[1] = large_base
-            last_walk = mTileCounts.shape[0] - 1
-            mRouteCounts[2] = mTileOffsets[last_walk] + mTileCounts[last_walk]
+            mRouteCounts[2] = mTileOffsets[mTileCounts.shape[0] - 1]  # inclusive tile ends: the last is the total
 
 
 class WalkFill:
@@ -233,8 +234,9 @@ class WalkFill:
     most 4 pages, and its direct writes were measured as fast (``staged``).
     """
 
-    def __init__(self, block: int = BLOCK):
+    def __init__(self, block: int = BLOCK, heavy_threshold: int = 0):
         self.block = block
+        self.heavy_threshold = heavy_threshold  # blk64: a walk with more N256 iterations is flagged heavy
         self.pages_per_block = block // PAGE
         self.num_threads = 256
         self.num_warps = self.num_threads // cute.arch.WARP_SIZE
@@ -255,6 +257,7 @@ class WalkFill:
         mQ64FullIters: cute.Tensor,
         mPageTable: cute.Tensor,
         mMaskTable: cute.Tensor,
+        mHeavy: cute.Tensor,  # blk64: [walks] 1 for walks over heavy_threshold iterations (unused for blk128)
         stream: cuda.CUstream,
     ):
         @cute.struct
@@ -275,6 +278,7 @@ class WalkFill:
             mQ64FullIters,
             mPageTable,
             mMaskTable,
+            mHeavy,
             SharedStorage,
         ).launch(
             grid=(mBlockIndex.shape[0], 1, 1),
@@ -316,6 +320,7 @@ class WalkFill:
         mQ64FullIters: cute.Tensor,
         mPageTable: cute.Tensor,
         mMaskTable: cute.Tensor,
+        mHeavy: cute.Tensor,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
         walk_idx = cute.arch.block_idx()[0]
@@ -326,14 +331,16 @@ class WalkFill:
         n_q_blocks = mQSizes.shape[0]
         n_blocks = mBlockSizes.shape[0]
         edge_count = max(min(mBlockCount[walk_idx], cap), 0)
-        q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
+        q_size = Int32(64)  # blk64: every Q block is one full M64 tile (mQSizes is not read)
+        if cutlass.const_expr(self.block != 64):
+            q_size = max(min(mQSizes[walk_idx % n_q_blocks], self.block), 0)
         is_small = Int32(0)
         if q_size > 0:
             if q_size <= 64:
                 is_small = Int32(1)
         requested_tiles = mTileCounts[walk_idx]
         tile_capacity = mPageTable.shape[0]
-        offset_tiles = min(mTileOffsets[walk_idx], tile_capacity)
+        offset_tiles = min(mTileOffsets[walk_idx] - requested_tiles, tile_capacity)  # input: inclusive tile ends
         room = max(tile_capacity - offset_tiles, 0)
         if is_small != 0:
             room = room & -4
@@ -476,6 +483,8 @@ class WalkFill:
             mQ64Offsets[q64_idx] = offset_tiles
             mQ64IterCounts[q64_idx] = allocated_tiles // 2 if is_small != 0 else 0
             mQ64FullIters[q64_idx] = valid_full_pages // (2 * FRAGS_PER_TILE) if is_small != 0 else 0
+            if cutlass.const_expr(self.block == 64):
+                mHeavy[walk_idx] = Int32(1) if allocated_tiles // 2 > self.heavy_threshold else Int32(0)
             if cutlass.const_expr(self.block != 64):
                 mQ64Offsets[q64_idx + 1] = 0
                 mQ64IterCounts[q64_idx + 1] = 0
@@ -813,28 +822,36 @@ class PairWalkFill(_PairWalkBase):
 
 
 class OrderQRouteWork:
-    """Expand one Q route and stable-partition long walks first."""
+    """Expand the M128 and M64 Q routes into work queues, long walks first, in one launch.
 
-    def __init__(self, heavy_threshold: int, is_q64: bool):
-        self.heavy_threshold = heavy_threshold
-        self.is_q64 = is_q64
+    CTA 0 orders the M128 route and CTA 1 the M64 route, each a stable partition of its walks by cost.  Route
+    lengths come from ``mRouteCounts`` (M64, M128), so an empty route needs no special launch.
+    """
+
+    def __init__(self, large_threshold: int, small_threshold: int):
+        self.large_threshold = large_threshold
+        self.small_threshold = small_threshold
         self.num_threads = 1024
         self.num_warps = self.num_threads // cute.arch.WARP_SIZE
 
     @cute.jit
     def __call__(
         self,
-        mQRoute: cute.Tensor,
-        mCost: cute.Tensor,
-        mWork: cute.Tensor,
+        mRouteCounts: cute.Tensor,  # [3] M64 count, M128 count, total tiles
+        mLargeQ: cute.Tensor,  # [nQ] M128 route, first mRouteCounts[1] entries
+        mLargeCost: cute.Tensor,  # [H * nQ]
+        mLargeWork: cute.Tensor,  # [>= H * mRouteCounts[1]]
+        mSmallQ: cute.Tensor,  # [nQ] M64 route, first mRouteCounts[0] entries
+        mSmallCost: cute.Tensor,  # [H * 2 * nQ]
+        mSmallWork: cute.Tensor,  # [>= H * mRouteCounts[0]]
         stream: cuda.CUstream,
     ):
         @cute.struct
         class SharedStorage:
             warp_count: cute.struct.MemRange[Int32, self.num_warps]
 
-        self.kernel(mQRoute, mCost, mWork, SharedStorage).launch(
-            grid=(1, 1, 1),
+        self.kernel(mRouteCounts, mLargeQ, mLargeCost, mLargeWork, mSmallQ, mSmallCost, mSmallWork, SharedStorage).launch(
+            grid=(2, 1, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
         )
@@ -842,24 +859,42 @@ class OrderQRouteWork:
     @cute.kernel
     def kernel(
         self,
+        mRouteCounts: cute.Tensor,
+        mLargeQ: cute.Tensor,
+        mLargeCost: cute.Tensor,
+        mLargeWork: cute.Tensor,
+        mSmallQ: cute.Tensor,
+        mSmallCost: cute.Tensor,
+        mSmallWork: cute.Tensor,
+        SharedStorage: cutlass.Constexpr[Callable],
+    ):
+        smem = SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        warp_count = storage.warp_count.get_tensor(cute.make_layout(self.num_warps))
+        if cute.arch.block_idx()[0] == 0:
+            self.order(mLargeQ, mRouteCounts[1], mLargeCost, mLargeWork, warp_count, self.large_threshold, False)
+        else:
+            self.order(mSmallQ, mRouteCounts[0], mSmallCost, mSmallWork, warp_count, self.small_threshold, True)
+
+    @cute.jit
+    def order(
+        self,
         mQRoute: cute.Tensor,
+        n_route_q,
         mCost: cute.Tensor,
         mWork: cute.Tensor,
-        SharedStorage: cutlass.Constexpr[Callable],
+        warp_count: cute.Tensor,
+        heavy_threshold: cutlass.Constexpr[int],
+        is_q64: cutlass.Constexpr[bool],
     ):
         thread_idx = cute.arch.thread_idx()[0]
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        n_route_q = mQRoute.shape[0]
-        n_work = mWork.shape[0]
-        num_heads = n_work // n_route_q
-        n_q_blocks = mCost.shape[0] // num_heads
-        if cutlass.const_expr(self.is_q64):
-            n_q_blocks = n_q_blocks // 2
-
-        smem = SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        warp_count = storage.warp_count.get_tensor(cute.make_layout(self.num_warps))
+        n_q_blocks = mQRoute.shape[0]
+        num_heads = mCost.shape[0] // n_q_blocks
+        if cutlass.const_expr(is_q64):
+            num_heads = num_heads // 2
+        n_work = num_heads * n_route_q
 
         local_heavy = Int32(0)
         work_idx = thread_idx
@@ -867,14 +902,14 @@ class OrderQRouteWork:
             head_idx = work_idx // n_route_q
             rank = work_idx - head_idx * n_route_q
             q_rank = rank
-            if cutlass.const_expr(not self.is_q64):
+            if cutlass.const_expr(not is_q64):
                 q_rank = n_route_q - 1 - rank
             q_block = mQRoute[q_rank]
-            if cutlass.const_expr(self.is_q64):
+            if cutlass.const_expr(is_q64):
                 work = head_idx * (2 * n_q_blocks) + 2 * q_block
             else:
                 work = head_idx * n_q_blocks + q_block
-            if mCost[work] > self.heavy_threshold:
+            if mCost[work] > heavy_threshold:
                 local_heavy += 1
             work_idx += self.num_threads
 
@@ -898,14 +933,14 @@ class OrderQRouteWork:
                 head_idx = work_idx // n_route_q
                 rank = work_idx - head_idx * n_route_q
                 q_rank = rank
-                if cutlass.const_expr(not self.is_q64):
+                if cutlass.const_expr(not is_q64):
                     q_rank = n_route_q - 1 - rank
                 q_block = mQRoute[q_rank]
-                if cutlass.const_expr(self.is_q64):
+                if cutlass.const_expr(is_q64):
                     work = head_idx * (2 * n_q_blocks) + 2 * q_block
                 else:
                     work = head_idx * n_q_blocks + q_block
-                if mCost[work] > self.heavy_threshold:
+                if mCost[work] > heavy_threshold:
                     is_heavy = Int32(1)
             is_normal = Int32(work_idx < n_work) - is_heavy
 
@@ -2197,12 +2232,14 @@ def walk_fill(
     q64_full_iters: Tensor,
     page_table: Tensor,
     mask_table: Tensor,
+    heavy: Tensor,
     stream: cuda.CUstream = None,
     block: int = BLOCK,
+    heavy_threshold: int = 0,
 ) -> None:
     _run_metadata_kernel(
-        f"kpage_walk_fill_blk{block}",
-        WalkFill(block),
+        f"kpage_walk_fill_blk{block}_heavy{heavy_threshold}",
+        WalkFill(block, heavy_threshold),
         (
             block_index,
             block_count,
@@ -2216,6 +2253,7 @@ def walk_fill(
             q64_full_iters,
             page_table,
             mask_table,
+            heavy,
         ),
         walk_fill.compile_cache,
         stream,
@@ -2313,31 +2351,25 @@ validate_metadata.compile_cache = {}
 
 
 def order_q_route_work(
-    q_route: Tensor,
-    cost: Tensor,
-    work: Tensor,
+    route_counts: Tensor,
+    large_q: Tensor,
+    large_cost: Tensor,
+    large_work: Tensor,
+    small_q: Tensor,
+    small_cost: Tensor,
+    small_work: Tensor,
     *,
-    heavy_threshold: int,
-    is_q64: bool,
+    large_threshold: int,
+    small_threshold: int,
     stream: cuda.CUstream = None,
 ) -> None:
-    name = f"kpage_order_q_route_work_q{64 if is_q64 else 128}"
-    compile_key = make_compile_key(
-        name,
-        (heavy_threshold, is_q64, *(tensor.dtype for tensor in (q_route, cost, work))),
-        (q_route, cost, work),
+    _run_metadata_kernel(
+        f"kpage_order_q_route_work_{large_threshold}_{small_threshold}",
+        OrderQRouteWork(large_threshold, small_threshold),
+        (route_counts, large_q, large_cost, large_work, small_q, small_cost, small_work),
+        order_q_route_work.compile_cache,
+        stream,
     )
-    if compile_key not in order_q_route_work.compile_cache:
-        converted = _compile_tensors((q_route, cost, work))
-        order_q_route_work.compile_cache[compile_key] = cute.compile(
-            OrderQRouteWork(heavy_threshold, is_q64),
-            *converted,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-            options="--enable-tvm-ffi",
-        )
-    if stream is None:
-        stream = current_stream()
-    order_q_route_work.compile_cache[compile_key](q_route, cost, work, stream)
 
 
 order_q_route_work.compile_cache = {}

@@ -87,34 +87,30 @@ def _build_q_work_queues(
     small_costs: Tensor,
     small_q: Tensor,
     large_q: Tensor,
+    route_counts: Tensor,
     n_small_q: int,
     n_large_q: int,
     stream,
 ) -> Tuple[Tensor, Tensor]:
-    """Expand per-Q route templates into exact M128 and M64 queues."""
-    small_work = torch.empty(num_heads * n_small_q, dtype=torch.int32, device=device)
-    large_work = torch.empty(num_heads * n_large_q, dtype=torch.int32, device=device)
+    """Expand per-Q route templates into exact M128 and M64 queues (one launch orders both)."""
+    small_work = torch.empty(max(num_heads * n_small_q, 1), dtype=torch.int32, device=device)
+    large_work = torch.empty(max(num_heads * n_large_q, 1), dtype=torch.int32, device=device)
     from ._build_kernels import order_q_route_work
 
-    if large_work.numel() > 0:
+    if n_small_q + n_large_q > 0:
         order_q_route_work(
-            large_q[:n_large_q],
+            route_counts,
+            large_q,
             large_costs,
             large_work,
-            heavy_threshold=_Q128_HEAVY_ITER_THRESHOLD,
-            is_q64=False,
-            stream=stream,
-        )
-    if small_work.numel() > 0:
-        order_q_route_work(
-            small_q[:n_small_q],
+            small_q,
             small_costs,
             small_work,
-            heavy_threshold=_Q64_HEAVY_ITER_THRESHOLD,
-            is_q64=True,
+            large_threshold=_Q128_HEAVY_ITER_THRESHOLD,
+            small_threshold=_Q64_HEAVY_ITER_THRESHOLD,
             stream=stream,
         )
-    return large_work, small_work
+    return large_work[: num_heads * n_large_q], small_work[: num_heads * n_small_q]
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +467,8 @@ def build_walk_tables(
     )
 
     n_q_blocks = q_sizes.numel()
-    tile_off = torch.cumsum(shared_counts, dim=0, dtype=torch.int32) - shared_counts
+    # Inclusive tile ends; WalkFill turns each into its walk's first tile in place.
+    tile_off = torch.cumsum(shared_counts, dim=0, dtype=torch.int32)
     q_route_state = _prepare_q_route_templates(
         q_sizes,
         shared_counts,
@@ -515,6 +512,7 @@ def build_walk_tables(
         full_iter_counts_q64,
         page_table,
         mask_table,
+        mask_table,  # heavy flags: blk64 only, not written here
         stream,
     )
 
@@ -525,6 +523,7 @@ def build_walk_tables(
         iter_counts_q64,
         q_route_state[0],
         q_route_state[1],
+        q_route_state[2],
         n_small_q,
         n_large_q,
         stream,
@@ -572,13 +571,14 @@ def build_walk_tables_blk64(
     cnt = q2k_block_nums.view(-1)  # [H*nQ]
     assert idx.dtype == torch.int32 and cnt.dtype == torch.int32 and kv_sizes.dtype == torch.int32
     n_walks = idx.shape[0]
-    q_sizes = torch.full((n_q_blocks,), _BLOCK64, dtype=torch.int32, device=dev)
+    q_sizes = kv_sizes  # placeholder: with block 64 the walk kernels treat every Q block as 64 rows and do not read it
 
     stream = current_stream()
     iter_tiles = torch.empty(n_walks, dtype=torch.int32, device=dev)
     walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, stream, block=_BLOCK64)
-    tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32) - iter_tiles
-    total_tiles = int((tile_off[-1] + iter_tiles[-1]).cpu())
+    # Inclusive tile ends; WalkFill turns each into its walk's first tile in place.
+    tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32)
+    total_tiles = int(tile_off[-1].cpu())
     if after_sizing is not None:
         after_sizing()
 
@@ -590,6 +590,7 @@ def build_walk_tables_blk64(
     tile_offsets = torch.empty(n_walks, dtype=torch.int32, device=dev)
     iter_counts = torch.empty_like(tile_offsets)
     full_iter_counts = torch.empty_like(tile_offsets)
+    heavy = torch.empty_like(tile_offsets)
     walk_fill(
         idx,
         cnt,
@@ -603,13 +604,15 @@ def build_walk_tables_blk64(
         full_iter_counts,
         page_table,
         mask_table,
+        heavy,
         stream,
         block=_BLOCK64,
+        heavy_threshold=_Q64_HEAVY_ITER_THRESHOLD,
     )
 
     # Every walk is queued, as on the blk128 route: an empty one (allow_empty_block_nums) takes the kernel's
     # empty-tile path and writes O = 0, LSE = -inf.  Long walks first, stable within each class.
-    heavy_end = torch.cumsum(iter_counts > _Q64_HEAVY_ITER_THRESHOLD, 0, dtype=torch.int32)
+    heavy_end = torch.cumsum(heavy, 0, dtype=torch.int32)
     work_indices = torch.empty_like(heavy_end)
     stable_partition_scatter(heavy_end, work_indices)
     return Blk64ForwardTables(
