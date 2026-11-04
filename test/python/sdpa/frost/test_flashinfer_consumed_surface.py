@@ -149,7 +149,10 @@ def test_unified_implementation_graph_helpers_and_decline_type_resolve():
 def test_dsl_gate_names_resolve_as_spelled():
     assert buffers.CUTEDSL_MIN_VERSION == (4, 7, 0)
     assert list(inspect.signature(buffers.cutedsl_state).parameters) == []
-    assert list(inspect.signature(buffers.cutedsl_too_old).parameters) == ["version", "floor"]  # `floor` appended (a kernel's own DSL floor); FlashInfer passes `version` positionally
+    assert list(inspect.signature(buffers.cutedsl_too_old).parameters) == [
+        "version",
+        "floor",
+    ]  # `floor` appended (a kernel's own DSL floor); FlashInfer passes `version` positionally
     assert list(inspect.signature(buffers.cutedsl_arch_requirement_error).parameters) == ["device_cc"]
     assert list(inspect.signature(buffers.cutedsl_requirement_error).parameters) == ["what", "floor"]  # `floor` appended, same contract
     installed, version = buffers.cutedsl_state()
