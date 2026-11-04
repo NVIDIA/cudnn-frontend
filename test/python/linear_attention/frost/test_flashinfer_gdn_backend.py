@@ -712,9 +712,18 @@ def test_flashinfer_verify_reference_passes_under_the_sm_count_policies(requests
     sms = POLICY_SMS[policy]
     plan._runner.kernel.sm_count = sms  # the pick's SM-count input, before the first compile
     form = plan._runner.kernel.cfg_for(requests, tokens)
-    want = kvcfg.default_cfg(requests, sms, *plan._runner.kernel.readings, tokens)
+    readings = plan._runner.kernel.readings
+    want = kvcfg.default_cfg(requests, sms, *readings, tokens)
     assert replace(form, NORM_FORM=None, **SM100_READINGS) == want, (policy, requests, form)
-    assert form.TWO_CTAS_PER_HEAD == (requests * 96 <= sms) and (form.STATE_STREAM or form.NBUF == 1) == (requests * 48 > sms), (policy, requests, form)
+    # the regime by SM count selects the ladder, the part's budget the form within it -- one rule on every part; T 4 / 6 fit the first
+    # admissible form of every ladder, so the pick is that form
+    ladder = kvcfg.PAIR_FORMS if requests * 96 <= sms else (kvcfg.ONE_CTA_FORMS if requests * 48 <= sms else kvcfg.BEYOND_FORMS)
+    assert want == kvcfg.first_fitting(ladder, *readings), (policy, requests, want)
+    assert form.TWO_CTAS_PER_HEAD == (requests * 96 <= sms), (policy, requests, form)  # the cluster pair exactly in the pair regime, on every part
+    if kvcfg.admissible(ladder[0], *readings):  # a cc 10.x part: the SM100 policy itself -- 3-deep rings, streaming once the grid outgrows the SMs
+        assert form.STATE_STREAM == (requests * 48 > sms) and form.NBUF == (1 if form.STATE_STREAM else 3), (policy, requests, form)
+    else:  # a 99 KB opt-in: the shallower rings of the same ladder, never the streamed cap (one CTA per SM there, and it spills)
+        assert not form.STATE_STREAM and form.MIN_CTAS_PER_SM == 1 and form.NBUF == (2 if form.TWO_CTAS_PER_HEAD else 1), (policy, requests, form)
     case = fi.ver.make_case(requests, tokens, seed=100 * requests + tokens, device=dev, form="verify")
     ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
     q, out = fi.ver._outputs(requests * tokens, dev)
