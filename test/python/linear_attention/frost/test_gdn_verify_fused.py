@@ -407,6 +407,65 @@ def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
     k8 = entry.GdnVerifyFused("cpu", 1e-6, cfg=given)
     k8.sm_count = 148
     assert k8.cfg_given and replace(k8.cfg_for(1), NORM_FORM=None) == replace(k8.cfg_for(8), NORM_FORM=None) == given
+    # a host entry keeps the cc 10.0 readings; its bound follows the pick once an SM count is set (148 here), a given cfg's its own
+    assert k.readings == k8.readings == SM100_READING and (k.max_tokens_for(1), k.max_tokens_for(3), k.max_tokens_for(4)) == (35, 8, 45)
+    assert k8.max_tokens_for(1) == k8.max_tokens_for(8) == given.max_tokens() and entry.GdnVerifyFused("cpu", 1e-6).max_tokens_for(1) == 8
+
+
+def test_entry_on_a_99kb_part_starts_from_the_fitting_one_cta_form_and_picks_per_step_shape(monkeypatch):
+    """Host-only, the device readers stubbed to the cc 12.0 readings and 170 SMs: the entry constructs (its start form is the one-CTA
+    landing-slab form, not CFG, whose 3-deep ring the part does not hold), ``cfg_for`` is token-aware (the 2-deep-ring pair at one request
+    for T <= 8, the one-CTA landing-slab form at two and more, the landing-slab pair for T 9 .. 17 at every requests count),
+    ``max_tokens_for`` is 17, the compile key carries the T-aware form, and the step shape is bounded by that form -- while a host caller
+    of ``check_support`` without a form keeps the module's one-CTA bound.  On the cc 10.0 readings the start form is CFG and the picks
+    are the measured ones, tokens ignored; a part holding no form is the typed decline at construction."""
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: SM120_READING)
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: 170)
+    k = entry.GdnVerifyFused("cuda:0", 1e-6)
+    assert (k.readings, k.sm_count, k.cfg.SMEM_PER_SM_BYTES, k.cfg.SMEM_OPTIN_BYTES) == (SM120_READING, 170, 102400, 101376)
+    assert replace(k.cfg, **_on(SM100_READING)) == kcfg.ONE_CTA_NBUF1_CFG and (k.cfg.NBUF, k.cfg.TWO_CTAS_PER_HEAD, k.cfg.ROLLED_TOKENS) == (1, False, True)
+
+    def strip(c):
+        return replace(c, NORM_FORM=None, **_on(SM100_READING))
+
+    assert strip(k.cfg_for(1)) == strip(k.cfg_for(1, 2)) == strip(k.cfg_for(1, 6)) == strip(k.cfg_for(1, 8)) == kcfg.PAIR_NBUF2_CFG
+    assert strip(k.cfg_for(1, 9)) == strip(k.cfg_for(1, 17)) == strip(k.cfg_for(4, 12)) == strip(k.cfg_for(16, 17)) == kcfg.PAIR_NBUF1_CFG
+    assert strip(k.cfg_for(2)) == strip(k.cfg_for(2, 8)) == strip(k.cfg_for(3, 6)) == strip(k.cfg_for(4, 6)) == strip(k.cfg_for(16)) == kcfg.ONE_CTA_NBUF1_CFG
+    assert k.cfg_for(1).NORM_FORM == k.cfg_for(1, 12).NORM_FORM == "ctas2" and k.cfg_for(4, 12).NORM_FORM == "ctas1"
+    assert k.cfg_for(1, 9) is k.cfg_for(1, 12), "one resolved form per (module form, requests): the forms cache"
+    assert k.cfg_for(1, 18) == k.cfg_for(1, 17), "beyond the ladder the deepest form answers, so the decline names its bound"
+    assert all(k.max_tokens_for(requests) == 17 for requests in (1, 2, 3, 4, 8, 16))
+    assert (k.cfg_for(1, 9).SMEM_PER_SM_BYTES, k.cfg_for(1, 9).SMEM_OPTIN_BYTES) == SM120_READING, "every pick carries the part's readings"
+    ops = make_operands(requests=1, tokens=12)
+    assert _key(k, ops)[2] == k.cfg_for(1, 12) and _key(k, ops) != _key(k, make_operands(requests=1, tokens=6))
+    # the step is bounded by the T-aware pick: T 12 at one request passes the host checks with it, T 18 is the typed decline naming 17,
+    # and a host caller without a form keeps the module's one-CTA bound (8), as documented
+    entry.check_support(**ops, device_cc=(10, 0), cfg=k.cfg_for(1, 12))
+    with pytest.raises(NotImplementedError, match="at most 17 on this part"):
+        entry.check_support(**make_operands(requests=1, tokens=18), device_cc=(10, 0), cfg=k.cfg_for(1, 18))
+    with pytest.raises(NotImplementedError, match="at most 8 on this part"):
+        call_check(ops)
+    # the launch path resolves the pick from the table's shape: a planted kernel under the T-aware key is reached only after the
+    # binding checks (CPU operands against a CUDA entry: the device check declines first, the token bound never did)
+    calls = []
+    k.compiled[_key(k, ops)] = lambda *args: calls.append(args)
+    with pytest.raises(ValueError, match=r"the entry's \(cuda:0\); qkv is on cpu"):
+        _run(k, ops)
+    assert not calls
+    # the cc 10.0 readings: the start form is CFG, the picks the measured ones whatever the token count, the envelope 35 / 8 / 45
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: SM100_READING)
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: 148)
+    k100 = entry.GdnVerifyFused("cuda:0", 1e-6)
+    assert k100.cfg == kcfg.CFG and k100.readings == SM100_READING
+    assert replace(k100.cfg_for(1, 30), NORM_FORM=None) == kcfg.PAIR_CFG and replace(k100.cfg_for(2, 8), NORM_FORM=None) == kcfg.CFG
+    assert replace(k100.cfg_for(4, 6), NORM_FORM=None) == replace(k100.cfg_for(4, 40), NORM_FORM=None) == kcfg.TWO_CTA_CFG
+    assert (k100.max_tokens_for(1), k100.max_tokens_for(2), k100.max_tokens_for(3), k100.max_tokens_for(4)) == (35, 8, 8, 45)
+    # a part that holds no form: the typed decline at construction; a caller's explicit form is validated as given (its own typed error)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (40960, 40000))
+    with pytest.raises(NotImplementedError, match="40000-byte shared-memory opt-in per CTA .* holds no verify form"):
+        entry.GdnVerifyFused("cuda:0", 1e-6)
+    with pytest.raises(ValueError, match="does not fit 2 tokens per request on a 40000-byte opt-in"):
+        entry.GdnVerifyFused("cuda:0", 1e-6, cfg=kcfg.PAIR_NBUF1_CFG)
 
 
 def test_pdl_launch_knobs_apply_on_top_of_the_pick_and_of_a_given_cfg():
@@ -842,6 +901,31 @@ def _run(k, ops, out=None, out_bf16=None):
     return k(**ops, out=out, out_bf16=out_bf16)
 
 
+def _part_form(dev, forms):
+    """The first of ``forms`` this device's shared memory holds (``PAIR_CFG`` / ``CFG`` on a cc 10.0 part; the 2-deep-ring pair / the
+    landing-slab one-CTA form on a 99 KB opt-in): the explicit form a cell compares the pick against on THIS part."""
+    return kcfg.first_fitting(forms, *entry.device_shared_memory(dev))
+
+
+def _fits_or_declines(dev, cfg, tokens):
+    """``cfg`` stamped with this part's readings when it holds ``tokens`` per request; else the typed decline is asserted (a form whose
+    shared memory the part does not hold at the minimum token count is validate_cfg's ValueError at construction, one that holds too few
+    tokens is validate_tokens' NotImplementedError at the call) and None is returned -- a knob arm is never a skip, on any part."""
+    on_part = replace(cfg, **_on(entry.device_shared_memory(dev)))
+    try:
+        kcfg.validate_cfg(on_part)
+    except ValueError as exc:
+        assert "does not fit" in str(exc), exc
+        with pytest.raises(ValueError, match="does not fit"):
+            entry.GdnVerifyFused(dev, 1e-6, cfg=cfg)
+        return None
+    if tokens > on_part.max_tokens():
+        with pytest.raises(NotImplementedError, match=f"at most {on_part.max_tokens()} on this part"):
+            kcfg.validate_tokens(on_part, tokens)
+        return None
+    return on_part
+
+
 def _snapshot(k, ops):
     """Run once; the bytes of every output (the fp8 / bf16 outputs, the state and conv pools, the tickets back at zero)."""
     rows = ops["qkv"].shape[0]
@@ -870,15 +954,28 @@ def test_entry_reads_the_device_and_picks_the_form_per_requests():
     props = torch.cuda.get_device_properties(dev)
     assert k.cfg.SMEM_PER_SM_BYTES == props.shared_memory_per_multiprocessor and k.cfg.SMEM_OPTIN_BYTES == props.shared_memory_per_block_optin
     assert k.sm_count == props.multi_processor_count and not k.cfg_given
+    assert k.readings == (props.shared_memory_per_multiprocessor, props.shared_memory_per_block_optin)
+    assert k.cfg == replace(kcfg.first_fitting(kcfg.ONE_CTA_FORMS, *k.readings), **k.part), "the start form: the first one-CTA form this part holds"
     for requests in (1, 2, 3, 4, 8, 16):
-        want, got = kcfg.default_cfg(requests, k.sm_count), k.cfg_for(requests)
-        assert replace(got, NORM_FORM=None, SMEM_PER_SM_BYTES=want.SMEM_PER_SM_BYTES, SMEM_OPTIN_BYTES=want.SMEM_OPTIN_BYTES) == want, requests
-        assert got.NORM_FORM == kcfg.norm_form_for(requests) and got.PDL is False
+        for tokens in (None, 2, 6, 12):
+            want, got = kcfg.default_cfg(requests, k.sm_count, *k.readings, tokens), k.cfg_for(requests, tokens)
+            assert replace(got, NORM_FORM=None, **_on(SM100_READING)) == want, (requests, tokens)
+            assert got.NORM_FORM == kcfg.norm_form_for(requests) and got.PDL is False
+            assert (got.SMEM_PER_SM_BYTES, got.SMEM_OPTIN_BYTES) == k.readings
+        assert k.max_tokens_for(requests) == kcfg.max_tokens_served(requests, k.sm_count, *k.readings)
     one = k.cfg_for(1)
     assert one.TWO_CTAS_PER_HEAD == (kcfg.V_HEADS * 2 <= k.sm_count)  # the pair while its 96 cluster CTAs have an SM each
-    assert 2 * (one.smem_bytes(6) + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES  # one CTA per SM by shared memory (pair or not)
-    two = k.cfg_for(k.sm_count // kcfg.V_HEADS + 1)  # the first requests count whose grid outgrows the SMs
-    assert two.MIN_CTAS_PER_SM == 2 and 2 * (two.smem_bytes(6) + kcfg.SMEM_CTA_RESERVE_BYTES) <= two.SMEM_PER_SM_BYTES
+    assert (
+        one.co_resident_ctas(6) == 1 and 2 * (one.smem_bytes(6) + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES
+    )  # one CTA per SM by shared memory at T 6
+    beyond = k.cfg_for(k.sm_count // kcfg.V_HEADS + 1)  # the first requests count whose grid outgrows the SMs
+    if beyond.MIN_CTAS_PER_SM == 2:  # the capped form: the part's shared memory holds two of its CTAs per SM (the cc 10.0 readings)
+        assert (
+            beyond.co_resident_ctas(kcfg.TOKENS_MIN) == 2 and 2 * (beyond.smem_bytes(kcfg.TOKENS_MIN) + kcfg.SMEM_CTA_RESERVE_BYTES) <= beyond.SMEM_PER_SM_BYTES
+        )
+    else:  # the part keeps every whole-slab form at one CTA per SM, so the cap left the pick (a 99 KB opt-in)
+        assert beyond.co_resident_ctas(kcfg.TOKENS_MIN) == 1 and replace(kcfg.TWO_CTA_CFG, **k.part).co_resident_ctas(kcfg.TOKENS_MIN) == 1
+        assert not kcfg.admissible(kcfg.TWO_CTA_CFG, *k.readings) and beyond.NBUF == 1
 
 
 def test_warm_entry_rejects_cpu_operands_before_the_compiled_kernel_is_looked_up():
@@ -977,31 +1074,54 @@ def test_parameter_dtypes_are_keys_and_match_the_reference(param_dtypes):
 
 
 @pytest.mark.parametrize("requests", [8, 16])
-def test_two_cta_form_beyond_the_reference_kernel_envelope_matches_the_torch_reference(requests):
-    """8 and 16 requests (the reference verify kernel declines them): the two-CTAs-per-SM form against the torch reference, the
-    same bars; the gated-norm association is the reference's one-CTA-per-head chain order (ctas1)."""
+def test_pick_beyond_the_reference_kernel_envelope_matches_the_torch_reference(requests):
+    """8 and 16 requests (the reference verify kernel declines them): the pick past the one-CTA grid -- the two-CTAs-per-SM form on a cc
+    10.0 part, the one-CTA landing-slab form in two waves on a 99 KB opt-in -- against the torch reference, the same bars; the gated-norm
+    association is the reference's one-CTA-per-head chain order (ctas1)."""
     dev = _device_or_skip()
     ops = make_operands(requests, 6, dev, seed=800 + requests, pad="last", skip="mid")
     condition_conv_inputs(ops)
     ssm0, conv0 = pools_before(ops)
     k = entry.GdnVerifyFused(dev, 1e-6)
-    assert k.cfg_for(requests).MIN_CTAS_PER_SM == 2 or requests * kcfg.V_HEADS <= k.sm_count
+    assert replace(k.cfg_for(requests, 6), NORM_FORM=None, **_on(SM100_READING)) == kcfg.default_cfg(requests, k.sm_count, *k.readings, 6)
+    assert k.cfg_for(requests, 6).NORM_FORM == "ctas1" and requests * kcfg.V_HEADS > k.sm_count
     outb = torch.empty(requests * 6, kcfg.V_HEADS, kcfg.HEAD_DIM, dtype=torch.bfloat16, device=dev)
     q = _run(k, ops, out_bf16=outb)
     torch.cuda.synchronize()
     check_against_reference(ops, q, outb, ssm0, conv0)
 
 
+@pytest.mark.parametrize("requests, tokens", [(1, 10), (2, 12), (4, 17)], ids=str)
+def test_long_steps_on_the_landing_slab_pair_match_the_torch_reference(requests, tokens):
+    """Steps of 10 .. 17 tokens per request against the torch reference: where this part's pick holds them (a 99 KB opt-in: the
+    landing-slab pair, the T 9 .. 17 fall-through at every requests count; a cc 10.0 part: the 3-deep pair at one request, the
+    two-CTAs-per-SM form from four) the pick serves; where it does not (a cc 10.0 part at two requests holds 8) the landing-slab pair is
+    forced as an explicit form -- so the fall-through form of the 99 KB parts runs on every part, never a skip."""
+    dev = _device_or_skip()
+    k = entry.GdnVerifyFused(dev, 1e-6)
+    if tokens > k.max_tokens_for(requests):
+        k = entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.PAIR_NBUF1_CFG)
+        assert k.cfg_for(requests, tokens).max_tokens() >= tokens
+    ops = make_operands(requests, tokens, dev, seed=900 + 10 * requests + tokens, accepted="random", pad="last" if requests > 1 else "none", skip="mid")
+    condition_conv_inputs(ops)
+    ssm0, conv0 = pools_before(ops)
+    outb = torch.empty(requests * tokens, kcfg.V_HEADS, kcfg.HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    q = _run(k, ops, out_bf16=outb)
+    torch.cuda.synchronize()
+    assert not k.outputs(requests, tokens)["counts"].any()
+    check_against_reference(ops, q, outb, ssm0, conv0)
+
+
 @pytest.mark.parametrize("form", ["pick", "pair"])
 def test_padding_and_skipped_slots_touch_nothing_else(form):
-    """The entry's pick at 4 requests (the two-CTAs-per-SM form on a 148- / 152-SM part) and the two-CTAs-per-head pair forced: a
-    padding request (both CTAs of a pair null together: the cluster wait pairs the entry arrive, nothing shipped) zeroes its rows and
-    touches nothing else; a skipped slot stays."""
+    """The entry's pick at 4 requests (the two-CTAs-per-SM form on a 148- / 152-SM part; the one-CTA landing-slab form on a 99 KB opt-in)
+    and the two-CTAs-per-head pair this part holds forced: a padding request (both CTAs of a pair null together: the cluster wait pairs
+    the entry arrive, nothing shipped) zeroes its rows and touches nothing else; a skipped slot stays."""
     dev = _device_or_skip()
     ops = make_operands(4, 6, dev, seed=5, accepted="random", pad="mid", skip="last")
     idx = ops["state_indices"]
     ssm0, conv0 = ops["ssm_state"].clone(), ops["conv_state"].contiguous().clone()
-    k = entry.GdnVerifyFused(dev, 1e-6, cfg=None if form == "pick" else kcfg.PAIR_CFG)
+    k = entry.GdnVerifyFused(dev, 1e-6, cfg=None if form == "pick" else _part_form(dev, kcfg.PAIR_FORMS))
     bufs = k.outputs(4, 6)
     bufs["qout"].view(torch.uint8).fill_(0xAB)
     outb = torch.full((24, kcfg.V_HEADS, kcfg.HEAD_DIM), float("nan"), dtype=torch.bfloat16, device=dev)
@@ -1111,10 +1231,15 @@ def _default_snapshot(dev, seed=31):
     ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "one-cta-form",
 )
 def test_knob_arms_are_bitwise_with_the_default_pick(arm):
+    """Every knob arm this part's shared memory holds at T 6 writes the bytes of the entry's pick; an arm it does not hold (the 3-deep
+    rings and the two-slab pads on a 99 KB opt-in) is the typed decline (``_fits_or_declines``), never a skip and never a launch."""
     dev = _device_or_skip()
+    cfg = kcfg.make_cfg(**arm)
+    if _fits_or_declines(dev, cfg, 6) is None:
+        return
     base = _default_snapshot(dev)
     ops = make_operands(4, 6, dev, seed=31, accepted="random", pad="last", skip="mid")
-    got = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.make_cfg(**arm)), ops)
+    got = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=cfg), ops)
     _assert_bitwise(base, got, str(arm))
     assert not got["qout"][18:24].any() and got["qout"][:18].any(), "the padding request is zero, the live rows written"
 
@@ -1141,19 +1266,21 @@ def test_pdl_launch_knob_entry_is_bitwise_with_the_plain_pick(requests):
 
 @pytest.mark.parametrize("tokens", [6, 2])
 def test_pair_and_one_cta_forms_are_bitwise_at_one_request(tokens):
-    """One request = the pair's own regime (the pick on a 148- / 152-SM part; the ctas2 norm association on both forms): the pair (rolled =
-    PAIR_CFG, and unrolled), the one-CTA form and the entry's pick agree byte for byte on the fp8 / bf16 outputs, every state slot and the conv pool."""
+    """One request = the pair's own regime (the pick on a 148- / 152-SM part; the ctas2 norm association on both forms): the pair this
+    part holds (rolled = PAIR_CFG, or the 2-deep-ring pair on a 99 KB opt-in; and unrolled), the one-CTA form it holds (CFG, or the
+    landing-slab form) and the entry's pick agree byte for byte on the fp8 / bf16 outputs, every state slot and the conv pool."""
     dev = _device_or_skip()
+    pair_form, one_form = _part_form(dev, kcfg.PAIR_FORMS), _part_form(dev, kcfg.ONE_CTA_FORMS)
     ops = [make_operands(1, tokens, dev, seed=41, accepted="random", skip="last") for _ in range(3)]
     pick = entry.GdnVerifyFused(dev, 1e-6)
-    assert pick.cfg_for(1).TWO_CTAS_PER_HEAD == (2 * kcfg.V_HEADS <= pick.sm_count)
+    assert pick.cfg_for(1, tokens).TWO_CTAS_PER_HEAD == (2 * kcfg.V_HEADS <= pick.sm_count)
     got_pick = _snapshot(pick, ops[0])
-    got_pair = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.PAIR_CFG), ops[1])
-    got_one = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.CFG), ops[2])
+    got_pair = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=pair_form), ops[1])
+    got_one = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=one_form), ops[2])
     _assert_bitwise(got_one, got_pair, "the pair vs the one-CTA form at one request")
     _assert_bitwise(got_one, got_pick, "the pick vs the one-CTA form at one request")
     ops_u = make_operands(1, tokens, dev, seed=41, accepted="random", skip="last")
-    got_unrolled = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=replace(kcfg.PAIR_CFG, ROLLED_TOKENS=False)), ops_u)
+    got_unrolled = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=replace(pair_form, ROLLED_TOKENS=False)), ops_u)
     _assert_bitwise(got_one, got_unrolled, "the unrolled pair vs the one-CTA form at one request")
 
 

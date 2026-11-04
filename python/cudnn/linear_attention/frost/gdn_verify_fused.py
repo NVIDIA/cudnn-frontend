@@ -31,10 +31,13 @@ the conv-history columns past ``ntok`` as they were; such a step's operands hold
 step's row count with ``rows`` (``>= cu_seqlens[requests]``, its own guarantee -- the host cannot read ``cu_seqlens`` without a sync) and
 ``check_support`` bounds the operands and outputs by it instead of ``requests x T`` (the FlashInfer contract, every request exactly ``T``
 tokens, needs no ``rows``).  The config is the caller's ``cfg`` as a whole or,
-without one, the pick per requests (``default_cfg``: the cluster pair, two CTAs per V head, while the ``requests x 96`` CTAs have an SM
-each on THIS device, one CTA per SM while the ``requests x 48`` CTAs have one, the two-CTAs-per-SM form past that); the device's SM
-count, its shared memory per SM and its per-CTA opt-in maximum are read at
-construction.  The launch knobs ``pdl`` / ``pdl_release`` set the config's ``PDL`` / ``PDL_RELEASE`` on top of whatever form serves (the
+without one, the budget-derived pick per step shape (``default_cfg`` on THIS device's SM count and shared-memory readings: the cluster
+pair, two CTAs per V head, while the ``requests x 96`` CTAs have an SM each, one CTA per SM while the ``requests x 48`` CTAs have one, the
+two-CTAs-per-SM form past that -- each where the part's shared memory holds that form; where it does not, the regime's ladder of
+shallower-ring forms, token-aware, so a 99 KB opt-in serves T <= 8 with the 2-deep-ring pair or the one-CTA landing-slab form and T 9 ..
+17 with the landing-slab pair, ``max_tokens_for`` naming the bound); the device's SM count, its shared memory per SM and its per-CTA opt-in
+maximum are read at construction, and the entry starts from the first one-CTA form the part holds (a part that holds none is a typed
+``NotImplementedError`` there).  The launch knobs ``pdl`` / ``pdl_release`` set the config's ``PDL`` / ``PDL_RELEASE`` on top of whatever form serves (the
 pick or a given ``cfg``): under ``pdl=True`` every launch carries the programmatic-stream-serialization attribute, the kernel waits for
 its predecessor (``griddepcontrol.wait``) only right before it reads the QKVZ projection's rows and the normed hidden (the slot chain,
 the parameters, the BA weight rows, the state slab, the conv weights and history load ahead of the wait) and, with ``pdl_release``
@@ -54,11 +57,16 @@ from .kernel.gdn_verify_fused_config import (
     CONV_WIDTH,
     HEAD_DIM,
     HIDDEN,
+    ONE_CTA_FORMS,
     QKV_CHANNELS,
+    SM100_SMEM_OPTIN_BYTES,
+    SM100_SMEM_PER_SM_BYTES,
     TICKET_STRIDE,
     V_HEADS,
     Cfg,
     default_cfg,
+    first_fitting,
+    max_tokens_served,
     resolve_cfg,
     validate_cfg,
     validate_tokens,
@@ -209,9 +217,11 @@ def check_binding(
     type AND index; without it the operands must share ``qkv``'s.  The compile key pins the plan-time facts only (the step shape, the
     strides the kernel is specialized on, the parameter dtypes, the config), and a compiled DSL entry accepts a tensor of another dtype,
     footprint or device silently, so these checks are a launch's only guard; host-only metadata arithmetic, no device work.  ``cfg``
-    (resolved) bounds the tokens per request by its shared-memory
-    budget; ``rows`` (the step's token rows, ``>= cu_seqlens[requests]`` by the caller's contract) bounds the row operands and the outputs
-    for a ragged or padded step instead of ``requests x T``.  :func:`check_support` adds the architecture gate."""
+    (resolved) bounds the tokens per request by its shared-memory budget -- an entry passes the form it picked for the step
+    (:meth:`GdnVerifyFused.cfg_for`, token-aware on this part); without one the module's one-CTA form ``CFG`` bounds it (8 tokens on the
+    cc 10.0 readings), the bound of a host caller that names no device and no form; ``rows`` (the step's token rows, ``>=
+    cu_seqlens[requests]`` by the caller's contract) bounds the row operands and the outputs for a ragged or padded step instead of
+    ``requests x T``.  :func:`check_support` adds the architecture gate."""
     import torch
 
     tensors = dict(
@@ -401,10 +411,13 @@ def _flat(t):
 
 class GdnVerifyFused:
     """Compiled per (requests, tokens per request, strides, parameter dtypes, config) and shared by every GDN layer: all per-layer
-    tensors are launch arguments.  ``cfg`` overrides the config as a whole; without it the entry picks the form per requests
-    (``default_cfg``: the cluster pair, two CTAs per V head, while the ``requests x 96`` CTAs have an SM each on this device, one CTA
-    per SM while the ``requests x 48`` CTAs have one, two CTAs per SM past that).  An entry built for a non-CUDA device (host tests)
-    has no SM count to pick by and keeps the one-CTA form.  The device is resolved to a concrete CUDA ordinal at construction
+    tensors are launch arguments.  ``cfg`` overrides the config as a whole; without it the entry picks the form per step shape
+    (``default_cfg`` on this device's SM count and shared-memory readings: the cluster pair, two CTAs per V head, while the ``requests x
+    96`` CTAs have an SM each, one CTA per SM while the ``requests x 48`` CTAs have one, two CTAs per SM past that -- each where the part
+    holds it, else the regime's ladder of shallower-ring forms, token-aware; :meth:`max_tokens_for` is the served bound).  The entry starts
+    from the first one-CTA form this part holds (``CFG`` on the cc 10.0 readings, the landing-slab form on a 99 KB opt-in; a part holding
+    none is a typed ``NotImplementedError`` at construction).  An entry built for a non-CUDA device (host tests) has no SM count to pick
+    by and keeps the one-CTA form ``CFG`` on the cc 10.0 readings.  The device is resolved to a concrete CUDA ordinal at construction
     (:func:`resolve_device`), and every operand of every compile / launch must live on exactly it.  ``pdl`` / ``pdl_release`` (None = the
     form's own fields) are the launch knobs on top of the form that serves."""
 
@@ -419,12 +432,18 @@ class GdnVerifyFused:
         self.pdl: Optional[bool] = None if pdl is None else bool(pdl)
         self.pdl_release: Optional[bool] = None if pdl_release is None else bool(pdl_release)
         self.sm_count: Optional[int] = None
-        self.part: Dict[str, int] = {}  # THIS part's readings every form takes: shared memory per SM and per-CTA opt-in (the pad)
+        # THIS part's readings, (shared memory per SM, per-CTA opt-in): the pick's budget and every form's pad; the cc 10.0 readings
+        # until a CUDA device replaces them
+        self.readings: Tuple[int, int] = (SM100_SMEM_PER_SM_BYTES, SM100_SMEM_OPTIN_BYTES)
+        self.part: Dict[str, int] = {}  # the readings as Cfg fields, stamped into every form on a CUDA device (empty on a host entry)
         if self.device.type == "cuda":
-            per_sm, optin = device_shared_memory(self.device)
-            self.part = dict(SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin)
+            self.readings = device_shared_memory(self.device)
+            self.part = dict(SMEM_PER_SM_BYTES=self.readings[0], SMEM_OPTIN_BYTES=self.readings[1])
             self.sm_count = device_multiprocessor_count(self.device)
-        self.cfg = self._on_this_part(cfg if cfg is not None else CFG)  # the override, or the one-CTA form the pick starts from
+        # the override, or the first one-CTA form this part holds (CFG on the cc 10.0 readings and on a host without a device; the
+        # landing-slab form on a 99 KB opt-in) -- a part that holds none is the typed decline here, before any form is stamped
+        start = cfg if cfg is not None else (first_fitting(ONE_CTA_FORMS, *self.readings) if self.part else CFG)
+        self.cfg = self._on_this_part(start)
         self.forms: Dict[Tuple[Cfg, int], Cfg] = {}  # the resolved forms on this part, by (module form, requests)
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -446,14 +465,25 @@ class GdnVerifyFused:
         release = (pdl if self.pdl is not None else cfg.PDL_RELEASE) if self.pdl_release is None else self.pdl_release
         return dict(PDL=pdl, PDL_RELEASE=release)
 
-    def cfg_for(self, requests: int) -> Cfg:
-        """The config a plan for ``requests`` compiles with (its ``NORM_FORM`` resolved): the caller's ``cfg`` when one was given,
-        else the pick per requests (``default_cfg`` with this device's SM count; the one-CTA form without a CUDA device)."""
-        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count)
+    def cfg_for(self, requests: int, tokens: Optional[int] = None) -> Cfg:
+        """The config a plan for ``requests`` (and ``tokens`` per request; None = the minimum) compiles with, its ``NORM_FORM`` resolved:
+        the caller's ``cfg`` when one was given, else the pick (``default_cfg`` on this device's SM count and shared-memory readings; the
+        one-CTA form without a CUDA device).  ``tokens`` moves the pick only on a part whose shared memory does not hold the regime's
+        primary form (a 99 KB opt-in: T 9 .. 17 fall through to the landing-slab pair); past the ladder's bound the deepest form is
+        returned, so ``validate_tokens`` on it names the part's true bound.  One resolved form per (module form, requests)."""
+        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count, *self.readings, tokens)
         key = (form, requests)
         if key not in self.forms:
             self.forms[key] = resolve_cfg(self._on_this_part(form), requests)
         return self.forms[key]
+
+    def max_tokens_for(self, requests: int) -> int:
+        """The largest tokens-per-request count a plan for ``requests`` can hold on this part: the served bound of the pick over the
+        regime's whole ladder (``max_tokens_served``: 35 / 8 / 45 by regime on the cc 10.0 readings, 17 at every requests count on a 99 KB
+        opt-in), or a given ``cfg``'s own bound -- the one bound ``check_support`` and FlashInfer's probe answer alike."""
+        if self.cfg_given or self.sm_count is None:
+            return self.cfg.max_tokens()
+        return max_tokens_served(requests, self.sm_count, *self.readings)
 
     @property
     def debug(self) -> bool:
@@ -492,12 +522,12 @@ class GdnVerifyFused:
         return [_flat(b["raw"]), _flat(b["convout"]), _flat(b["baout"])] if self.debug else [None, None, None]
 
     def key(self, qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state):
-        """The compile key: plan-time facts only (the step shape, strides, parameter dtypes, the config of this requests count)."""
+        """The compile key: plan-time facts only (the step shape, strides, parameter dtypes, the config picked for this step shape)."""
         requests, tokens = step_shape(state_indices)
         return (
             requests,
             tokens,
-            self.cfg_for(requests),
+            self.cfg_for(requests, tokens),
             int(qkv.stride(0)),
             int(z.stride(0)),
             int(ssm_state.stride(0)),
@@ -597,7 +627,7 @@ class GdnVerifyFused:
             conv_weight,
             out,
             out_bf16,
-            cfg=self.cfg_for(requests),
+            cfg=self.cfg_for(requests, tokens),
             rows=rows,
             device=self.device,
         )
@@ -638,7 +668,7 @@ class GdnVerifyFused:
         with torch.cuda.device(self.device):
             self.compiled[key] = cute.compile(
                 mod.launch,
-                self.cfg_for(requests),
+                self.cfg_for(requests, tokens),
                 *args,
                 requests,
                 int(qkv.stride(0)),
@@ -674,15 +704,16 @@ class GdnVerifyFused:
     ):
         """Launch on torch's current stream; returns the fp8 output (``out`` when given, else the entry's buffer for this step
         shape; ``outputs(requests, tokens)`` holds the entry's buffers).  Compiles on first use for a new key (``rows`` as in
-        :meth:`compile`).  Every launch re-runs the binding checks (:func:`check_binding`, against the form picked for this requests
-        count, every operand on this entry's device) before the compiled kernel is looked up: the key pins no dtype, shape, alignment or
+        :meth:`compile`).  Every launch re-runs the binding checks (:func:`check_binding`, against the form picked for this step shape,
+        every operand on this entry's device) before the compiled kernel is looked up: the key pins no dtype, shape, alignment or
         device, and the DSL checks none."""
         import cuda.bindings.driver as cuda
         import torch
 
         cfg = None
         if isinstance(state_indices, torch.Tensor) and state_indices.dim() == 2 and state_indices.shape[0] >= 1:
-            cfg = self.cfg_for(int(state_indices.shape[0]))  # the picked form bounds the tokens per request; a malformed table is check_binding's decline
+            # the form picked for this step shape bounds the tokens per request; a malformed table is check_binding's decline
+            cfg = self.cfg_for(int(state_indices.shape[0]), int(state_indices.shape[1]))
         check_binding(
             qkv,
             z,
