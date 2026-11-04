@@ -635,10 +635,9 @@ def test_sm100_blk64_empty_rows_and_partial_tiles(clc, splits, seqlen):
     torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize("misalignment", ["stride", "address", "aligned_stride"])
 @pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["q", "k", "v"])
-@pytest.mark.parametrize("splits", [1, 2])
+@pytest.mark.parametrize("splits", [pytest.param(1, marks=pytest.mark.L1), pytest.param(2, marks=pytest.mark.L0)])
 def test_sm100_blk64_bshd_sliced_inputs(misalignment, tensor_index, splits):
     """BSHD q/k/v views with a padded row stride or a misaligned start address."""
     bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")

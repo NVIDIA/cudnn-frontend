@@ -80,19 +80,25 @@ def test_sm90_quantized_forward_and_centered_lse(block, batch, heads, q_blocks, 
     _sm90_assert_reference(block, tensors, _sm90_ids(batch, heads, q_blocks * block, k_blocks * block, block), count, beta)
 
 
-@pytest.mark.L0
 @with_block
-@pytest.mark.parametrize("beta", [128**-0.5, 0.0, -0.125])
-@pytest.mark.parametrize("count", [1, 2, 3, 5, 8, 17, 33, 65, 256])
+@pytest.mark.parametrize(
+    "count, beta",
+    [
+        pytest.param(count, beta, id=f"{count}-{name}", marks=pytest.mark.L0 if name == "default" and count in (1, 2, 17, 256) else pytest.mark.L1)
+        for name, beta in (("default", 128**-0.5), ("zero", 0.0), ("negative", -0.125))
+        for count in (1, 2, 3, 5, 8, 17, 33, 65, 256)
+    ],
+)
 def test_sm90_pipeline_lengths_and_scales(block, count, beta):
     require_sm90_fp8(block)
     sk = (count + 2) * block
     _sm90_assert_reference(block, _sm90_quantized(sq=block, sk=sk), _sm90_ids(1, 1, block, sk, block), count, beta)
 
 
-@pytest.mark.L0
 @with_block
-@pytest.mark.parametrize("count", [2, 31, 32, 33, 63, 64, 65, 97])
+@pytest.mark.parametrize(
+    "count", [pytest.param(count, marks=pytest.mark.L0 if count in (32, 33, 64, 65) else pytest.mark.L1) for count in (2, 31, 32, 33, 63, 64, 65, 97)]
+)
 def test_sm90_pipeline_stage_wrap(block, count):
     require_sm90_fp8(block)
     sk = (count + 3) * block
@@ -794,11 +800,22 @@ def test_sm100_blk128_scale_views_and_graph_stream(flatten):
         assert torch.equal(captured, expected)
 
 
-@pytest.mark.L0
 @pytest.mark.usefixtures("require_sm100")
-@pytest.mark.parametrize("kv_splits", [1, 2, 4, 8])
-@pytest.mark.parametrize("sizes_mode", [0, 1, 2, 3])
-@pytest.mark.parametrize("variable", [False, True])
+@pytest.mark.parametrize(
+    "kv_splits, sizes_mode, variable",
+    [
+        # L0 keeps a diagonal that takes every split count, block_sizes rank and count mode once.
+        pytest.param(
+            kv_splits,
+            sizes_mode,
+            variable,
+            marks=pytest.mark.L0 if (kv_splits, sizes_mode, variable) in ((1, 0, False), (2, 1, True), (4, 2, False), (8, 3, True)) else pytest.mark.L1,
+        )
+        for kv_splits in (1, 2, 4, 8)
+        for sizes_mode in (0, 1, 2, 3)
+        for variable in (False, True)
+    ],
+)
 def test_sm100_blk128_split_dynamic_metadata(kv_splits, sizes_mode, variable):
     torch.manual_seed(3700 + sizes_mode)
     # Change every dynamic extent while reusing the compiled variant. Include
