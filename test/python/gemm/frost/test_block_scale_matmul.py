@@ -3835,6 +3835,38 @@ def test_sm120_block_scale_declines_signed_negative_scale():
         assert not any(g.get_plan_name_at_index(i).startswith("frost_gemm") for i in range(g.get_execution_plan_count()))
 
 
+def test_sm100_analyze_graph_declines_signed_negative_scale():
+    """Host-only: the sm100 tree's ``_analyze_graph`` declines ``is_negative_scale=True`` on either
+    operand's E4M3 scales, as the sm120 tree does. The same graph without it, and a flagged E8M0
+    graph (no sign bit), pass the analysis."""
+    for side in ("SFA", "SFB"):
+        flagged = _build_nvfp4_graph(256, 256, 512, negative_scale=(side == "SFA", side == "SFB"))
+        with pytest.raises(NotImplementedError, match=f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"):
+            C100._analyze_graph(flagged)
+    C100._analyze_graph(_build_nvfp4_graph(256, 256, 512))
+    C100._analyze_graph(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
+
+
+@requires_sm100
+def test_sm100_block_scale_declines_signed_negative_scale():
+    """``is_negative_scale=True`` asks for ``x * s`` with signed E4M3 scales, but the tcgen05
+    block-scale MMA reads every scale as unsigned ``.ue4m3``: the plan ran and ignored the sign. The
+    FROST engine and the sm100 JIT decline the attribute on either operand's E4M3 scales; the same
+    graph without it, and a flagged E8M0 graph, keep their plans."""
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+
+    engine = FrostGemmEngine()
+    for side in ("SFA", "SFB"):
+        flagged = _build_nvfp4_graph(256, 256, 512, negative_scale=(side == "SFA", side == "SFB"))
+        match = f"is_negative_scale=True on its fp8_e4m3 scale factors '{side}'"
+        with pytest.raises(NotImplementedError, match=match):
+            engine.check_support(flagged)
+        with pytest.raises(NotImplementedError, match=match):
+            C100.jit_from_cudnn_graph(flagged, **_kw(_SM100_BS_128))
+    engine.check_support(_build_nvfp4_graph(256, 256, 512))
+    engine.check_support(_build_nvfp4_graph(256, 256, 512, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, negative_scale=(True, True)))
+
+
 @requires_sm120
 def test_sm120_block_scale_n_past_grid_y_is_refused():
     """The block-scale template launches one CTA per output tile like the dense one, so N tiles
