@@ -4,7 +4,8 @@
 
 """Native packed QSA backward for Rubin SM107.
 
-Each CTA reuses gathered K/V blocks across 12 or 24 query heads.
+Each CTA reuses gathered K/V blocks across the query's 6, 12 or 24 heads
+(one 16- or 24-column MMA tile; a 6-head group leaves the rest zero).
 The pipeline overlaps score, derivative, and gradient tensor-core work.
 """
 
@@ -28,7 +29,6 @@ I64 = cutlass.Int64
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
-GQ = 12
 D = 256
 LOG2E = 1.4426950408889634
 
@@ -126,6 +126,7 @@ def frost_qsa_bprop_sm107(
     HQ: cutlass.Constexpr[int],
     HKV: cutlass.Constexpr[int],
 ):
+    GQ = HQ // HKV  # query heads per KV head: 6 (6/1) or 12 (12/1, 24/2)
     hint_ld = cutlass.Int64(L2_EVICT_FIRST)
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -480,9 +481,11 @@ def frost_qsa_bprop_sm107(
                 lrow = p_sparse_blocks + I64(qi) * capacity
                 nchunks = (nblk + (CHB - 1)) // CHB
                 lbase = qi * HQ + (hrow % HKV) * GQ
-                del_a = (p_delta + lbase).load(count=4, alignment=16)
-                del_b = (p_delta + lbase + 4).load(count=4, alignment=16)
-                del_c = (p_delta + lbase + 8).load(count=4, alignment=16)
+                # Twelve deltas are three 16-byte loads; a six-head row (24-byte pitch) is only 8-byte aligned.
+                DELTA_WIDTH = 4 if GQ % 4 == 0 else 2
+                deltas = []
+                for part in cutlass.range_constexpr(GQ // DELTA_WIDTH):
+                    deltas.append((p_delta + lbase + part * DELTA_WIDTH).load(count=DELTA_WIDTH, alignment=4 * DELTA_WIDTH))
                 for c in cutlass.range(nchunks, unroll=1):
                     cgc = gc + c
                     st = cgc & 1
@@ -507,12 +510,7 @@ def frost_qsa_bprop_sm107(
                     pw = []
                     dw = []
                     for j in cutlass.range_constexpr(GQ):
-                        if cutlass.const_expr(j < 4):
-                            ej = del_a[j]
-                        elif cutlass.const_expr(j < 8):
-                            ej = del_b[j - 4]
-                        else:
-                            ej = del_c[j - 8]
+                        ej = deltas[j // DELTA_WIDTH][j % DELTA_WIDTH]
                         lj = (p_lse + ((hrow % HKV) * GQ + j) * T + qi).load()
                         s0 = sv[j]
                         d0 = dpv[j]
@@ -756,8 +754,8 @@ def compile_kernel(dtype, query_heads, kv_heads, arch):
     """Compile native THD geometry; tensor extents remain dynamic."""
     from .bprop_helpers import compile_helpers, fake
 
-    if dtype != BF16 or (query_heads, kv_heads) not in ((12, 1), (24, 2)):
-        raise ValueError("QSA backward requires BF16, D256, and head counts 12/1 or 24/2")
+    if dtype != BF16 or (query_heads, kv_heads) not in ((6, 1), (12, 1), (24, 2)):
+        raise ValueError("QSA backward requires BF16, D256, and head counts 6/1, 12/1 or 24/2")
     if arch != 107:
         raise ValueError(f"Rubin QSA backward requires SM107, got SM{arch}")
     key = template_key(globals(), {"query_heads": query_heads, "kv_heads": kv_heads, "arch": arch}, "compile_kernel")

@@ -62,7 +62,7 @@ class Mxfp8KernelConfig:
     dgrad_optimization: Literal[
         "baseline",
         "rolling",
-        "ds3_ep4_v1",
+        "ds3_ep4_pattern",
     ] = "baseline"
 
     def __post_init__(self) -> None:
@@ -79,16 +79,16 @@ class Mxfp8KernelConfig:
         if self.dgrad_optimization not in (
             "baseline",
             "rolling",
-            "ds3_ep4_v1",
+            "ds3_ep4_pattern",
         ):
-            raise ValueError("dgrad_optimization must be 'baseline', 'rolling', or " f"'ds3_ep4_v1', got {self.dgrad_optimization!r}")
+            raise ValueError("dgrad_optimization must be 'baseline', 'rolling', or " f"'ds3_ep4_pattern', got {self.dgrad_optimization!r}")
         if self.col_quant_num_ctas == -1:
-            if self.dgrad_optimization != "ds3_ep4_v1" or not self.enable_grad_y2_col_quant:
-                raise ValueError("col_quant_num_ctas=-1 requires ds3_ep4_v1 backward " "grad-y2 column quantization")
+            if self.dgrad_optimization != "ds3_ep4_pattern" or not self.enable_grad_y2_col_quant:
+                raise ValueError("col_quant_num_ctas=-1 requires ds3_ep4_pattern backward " "grad-y2 column quantization")
         elif self.col_quant_num_ctas <= 0:
             raise ValueError("col_quant_num_ctas must be positive")
-        if self.dgrad_optimization == "ds3_ep4_v1" and self.col_quant_num_ctas != -1:
-            raise ValueError("dgrad_optimization='ds3_ep4_v1' requires " "col_quant_num_ctas=-1")
+        if self.dgrad_optimization == "ds3_ep4_pattern" and self.col_quant_num_ctas != -1:
+            raise ValueError("dgrad_optimization='ds3_ep4_pattern' requires " "col_quant_num_ctas=-1")
         if self.weight_storage_mode not in ("contiguous", "discrete"):
             raise ValueError("weight_storage_mode must be 'contiguous' or 'discrete', " f"got {self.weight_storage_mode!r}")
 
@@ -135,7 +135,7 @@ class Mxfp8KernelConfig:
             logical_route_limit = receive_capacity.training_logical_route_capacity
         else:
             logical_route_limit = receive_capacity.inference_logical_route_capacity
-        ds3 = dgrad_optimization == "ds3_ep4_v1"
+        ds3 = dgrad_optimization == "ds3_ep4_pattern"
         return cls(
             num_experts=topology.experts_per_rank,
             world_size=topology.ep_size,
@@ -166,7 +166,7 @@ class Mxfp8KernelConfig:
             weight_storage_mode=weight_storage_mode,
             launch_cluster_count=launch_cluster_count,
             col_quant_num_ctas=(-1 if ds3 else 2368),
-            load_balance_mode=("atomic_counter" if dgrad_optimization in ("rolling", "ds3_ep4_v1") else "static"),
+            load_balance_mode=("atomic_counter" if dgrad_optimization in ("rolling", "ds3_ep4_pattern") else "static"),
             num_sched_stages=(2 if ds3 else None),
             dgrad_optimization=dgrad_optimization,
         )

@@ -12,8 +12,18 @@ import pytest
 import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import attention_backward_reference
+from block_sparse_attention.cutedsl.bsa_utils import require_arch
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+
+
+def _disable_tf32_matmul(request):
+    """Turn off TF32 torch matmuls for the reference and restore the flag at teardown. monkeypatch.setattr cannot
+    do this since pytest 9.2: torch.backends.cuda.matmul serves allow_tf32 through __getattr__/__setattr__, so
+    monkeypatch finds no instance value to restore and its teardown deletes the attribute, raising AttributeError."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    request.addfinalizer(lambda: setattr(torch.backends.cuda.matmul, "allow_tf32", previous))
 
 
 _DELAY_HELPER = """
@@ -76,8 +86,7 @@ def _load_delayed_kernel(kernel, tmp_path, monkeypatch):
 
 @pytest.fixture(params=[False, True], ids=["normal", "first_read_delay"])
 def sm90_bsa(request, tmp_path, monkeypatch):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("shared-V lifetime regression is specific to SM90")
+    require_arch(families=(9,), reason="shared-V lifetime regression is specific to SM90")
     try:
         from cudnn import BSA
 
@@ -86,7 +95,7 @@ def sm90_bsa(request, tmp_path, monkeypatch):
     except (ImportError, OSError) as error:
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    _disable_tf32_matmul(request)
     # The public wrapper's key does not distinguish the test-only kernel class.
     # Restore both the original cache and class binding after each test.
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})

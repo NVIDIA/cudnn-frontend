@@ -114,9 +114,9 @@ def _row_strides(shape5: Tuple[int, ...], stride5: Tuple[int, ...]) -> Tuple[Tup
 
 def activation_binds_zero_copy(shape4: Tuple[int, ...], stride4: Tuple[int, ...]) -> bool:
     """Whether a logical ``(N, H, S, D)`` activation binds to the kernel's TMA descriptors without a copy -- the engine row's own
-    predicate (``config_sm100.dense_bind_strides``): the head dim contiguous, the token / head / batch strides 16-byte multiples,
-    the nest token-major (``stride(S) >= H * stride(H)``) -- the "layout_left" ``(B, N, S, H, D)`` memory form, compact or padded.
-    A torch-contiguous ``(B, N, H, S, D)`` tensor is head-major and returns False."""
+    predicate (``config_sm100.dense_bind_strides``): the head dim contiguous and the token / head / batch strides 16-byte multiples,
+    nested in any order.  The "layout_left" ``(B, N, S, H, D)`` memory form (compact or padded) and a torch-contiguous head-major
+    ``(B, N, H, S, D)`` tensor both bind; a head dim that is not contiguous does not."""
     global _dense_bind_strides
     if _dense_bind_strides is None:
         from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
@@ -466,8 +466,7 @@ class TriangleAttentionFwd(APIBase):
             if not activation_binds_zero_copy(shape4, stride4):
                 raise NotImplementedError(
                     f"{name}'s layout (per-entry shape {shape4}, strides {stride4}) does not bind to the kernel without a copy: the head dim must be "
-                    "contiguous, the token / head / entry strides 16-byte multiples and the nest token-major (stride(S) >= H * stride(H); the "
-                    "(B, N, S, H, D) memory form).  The drop-in function repacks such a tensor with a counted copy."
+                    "contiguous and the token / head / entry strides 16-byte multiples.  The drop-in function repacks such a tensor with a counted copy."
                 )
         if not bias_binds_zero_copy(*self.bias4):
             raise NotImplementedError(

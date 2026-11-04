@@ -84,6 +84,7 @@ def warmup_backward_host(
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
@@ -167,6 +168,7 @@ def warmup_backward_host(
         None,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,
@@ -197,6 +199,7 @@ def build_warmup_backward(
     skip_bwd_part,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -254,6 +257,7 @@ def build_warmup_backward(
         bool(split),
         bool(dt_softplus),
         dstate_in is not None,
+        dcomposed is not None,
         dstate0 is not None,
         transition is not None,
         skip_bwd_part is not None,
@@ -263,7 +267,9 @@ def build_warmup_backward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_dstate_in=dstate_in is not None,
+            use_dstate_in=dstate_in is not None or dcomposed is not None,
+            dstate_table=dstate_in is not None,
+            has_composed_dstate=dcomposed is not None,
             use_dstate0=dstate0 is not None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
@@ -300,6 +306,9 @@ def build_warmup_backward(
         dstate_in_placeholder = None
         if dstate_in is not None:
             dstate_in_placeholder = from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_placeholder = None
+        if dcomposed is not None:
+            dcomposed_placeholder = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         dstate0_placeholder = None
         if dstate0 is not None:
             dstate0_placeholder = from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3)
@@ -345,6 +354,7 @@ def build_warmup_backward(
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             dstate_in_placeholder,
+            dcomposed_placeholder,
             dstate0_placeholder,
             work_items_placeholder,
             work_items_table_placeholder,
@@ -384,6 +394,7 @@ def run_warmup_backward(
     skip_bwd_part,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -428,6 +439,7 @@ def run_warmup_backward(
         cu_seqlens,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_items,
@@ -604,7 +616,9 @@ def regenerate_backward_host(
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
@@ -711,6 +725,7 @@ def regenerate_backward_host(
         dt_bias,
         cu_seqlens,
         seed_checkpoints if coarse else state_in,
+        composed,
         None,
         None,
         None,
@@ -744,6 +759,7 @@ def regenerate_backward_host(
         None,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,
@@ -774,7 +790,9 @@ def build_regenerate_backward(
     skip_bwd_part,
     cu_seqlens,
     state_in,
+    composed=None,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -836,6 +854,7 @@ def build_regenerate_backward(
         str(cu_seqlens.dtype),
         str(state_source.dtype) if state_source is not None else "none",
         bool(coarse),
+        composed is not None,
         str(dstate_source.dtype) if dstate_source is not None else "none",
         str(series.dtype),
         int(device),
@@ -846,6 +865,7 @@ def build_regenerate_backward(
         bool(split),
         bool(dt_softplus),
         dstate_in is not None,
+        dcomposed is not None,
         dstate0 is not None,
         transition is not None,
         skip_bwd_part is not None,
@@ -855,7 +875,9 @@ def build_regenerate_backward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_initial_state=state_source is not None,
+            use_initial_state=state_source is not None or composed is not None,
+            state_table=state_source is not None,
+            has_composed=composed is not None,
             store_final_state=False,
             enable_checkpoints=True,
             dt_softplus=dt_softplus,
@@ -867,7 +889,9 @@ def build_regenerate_backward(
             io_dtype,
             dstate_dtype,
             max_active_clusters=num_sm,
-            use_dstate_in=dstate_in is not None,
+            use_dstate_in=dstate_in is not None or dcomposed is not None,
+            dstate_table=dstate_in is not None,
+            has_composed_dstate=dcomposed is not None,
             use_dstate0=dstate0 is not None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
@@ -903,6 +927,9 @@ def build_regenerate_backward(
         state_in_placeholder = None
         if state_in is not None:
             state_in_placeholder = from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_placeholder = None
+        if composed is not None:
+            composed_placeholder = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         seed_checkpoints_placeholder = None
         series_items_placeholder = None
         if coarse:
@@ -912,6 +939,9 @@ def build_regenerate_backward(
         dstate_in_placeholder = None
         if dstate_in is not None:
             dstate_in_placeholder = from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_placeholder = None
+        if dcomposed is not None:
+            dcomposed_placeholder = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         dstate0_placeholder = None
         if dstate0 is not None:
             dstate0_placeholder = from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3)
@@ -959,7 +989,9 @@ def build_regenerate_backward(
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             state_in_placeholder,
+            composed_placeholder,
             dstate_in_placeholder,
+            dcomposed_placeholder,
             dstate0_placeholder,
             work_items_placeholder,
             work_items_table_placeholder,
@@ -1005,7 +1037,9 @@ def run_regenerate_backward(
     skip_bwd_part,
     cu_seqlens,
     state_in,
+    composed=None,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -1057,7 +1091,9 @@ def run_regenerate_backward(
         cu_seqlens,
         cu_seqlens,
         state_in,
+        composed,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_items,
@@ -1095,6 +1131,7 @@ def summary_backward_host(
     dt_bias: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: cute.Tensor,
     work_items: cute.Tensor,
     work_count: cute.Tensor,
@@ -1130,6 +1167,7 @@ def summary_backward_host(
         dt_bias,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,
@@ -1151,6 +1189,7 @@ def build_summary_backward(
     dt_bias,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -1185,6 +1224,7 @@ def build_summary_backward(
         int(b_t),
         bool(dt_softplus),
         dstate_in is not None,
+        dcomposed is not None,
         str(transition.dtype) if transition is not None else "none",
     )
     if key not in summary_backward_cache:
@@ -1192,7 +1232,9 @@ def build_summary_backward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_dstate_in=dstate_in is not None,
+            use_dstate_in=dstate_in is not None or dcomposed is not None,
+            dstate_table=dstate_in is not None,
+            has_composed_dstate=dcomposed is not None,
             dt_softplus=dt_softplus,
             d_k=DK,
             d_v=DV,
@@ -1213,6 +1255,7 @@ def build_summary_backward(
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate_in is not None else None,
+            from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dcomposed is not None else None,
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             work_items_placeholder,
             from_dlpack(work_count, assumed_align=4).mark_layout_dynamic(),
@@ -1235,6 +1278,7 @@ def run_summary_backward(
     dt_bias,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -1256,6 +1300,7 @@ def run_summary_backward(
         dt_bias,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,

@@ -85,7 +85,10 @@ def _leads(spec: EngineSpec, facts) -> bool:
     d256 GQA 16/2, 32/4 and MHA 16/16, D192x128 MHA 16-128 heads, S 1k-16k, causal / mask-free, BSHD and THD at equal and
     half-to-full lengths): d256 wins 0.73-0.98 -> ahead, except a mask-free ragged THD declaration (declared total below
     b * S_q) at S_q >= 4096 (0.95-1.10); D192x128 loses 1.08-1.91 everywhere -> behind. Only cc 10.0 was measured, and
-    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first.
+    deterministic / bias / dropout / window / sink graphs were not. Every other row keeps ours-first. On cc 10.3 the d256
+    row's bf16 THD graphs are decided by the placement table (studies sm103_d256_bwd_v2_20261031 on the 128-key tile and
+    sm103_d256_bwd_thd_offtile_20261031 off it); its dense graphs, which lost on small-work holdout cases in two studies,
+    still trail the backend there.
 
     A measured entry in ``cudnn.sdpa.placement_table`` answers first; the rules above decide every graph without one."""
     from cudnn.sdpa import placement_table
@@ -137,12 +140,19 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     return lead + [BACKEND] + trail if trail else lead
 
 
+def _lists_last(spec: EngineSpec, facts) -> bool:
+    """Rows listed after the other eligible rows: the d192 half row on a dense graph, where the d256 row's native
+    192/128 geometry serves the same declaration."""
+    return spec.name == "sdpa_bwd_sm100_d192" and not facts.thd
+
+
 def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
-    """One complete entry per eligible row, in ``ENGINE_SPECS`` order; ``kind``
+    """One complete entry per eligible row, in ``ENGINE_SPECS`` order except for :func:`_lists_last`; ``kind``
     does not change the answer (no runner-up candidates to thin out)."""
-    out: List[PlanConfig] = []
+    out: List[Tuple[EngineSpec, PlanConfig]] = []
     for engine_id, spec in _eligible(facts, offered):
         knobs = default_knobs(spec, facts)
         if knobs is None or mismatch(spec.capabilities, facts, knobs) is None:
-            out.append(PlanConfig(engine_id, knobs))
-    return out
+            out.append((spec, PlanConfig(engine_id, knobs)))
+    out.sort(key=lambda entry: _lists_last(entry[0], facts))
+    return [plan for _, plan in out]
