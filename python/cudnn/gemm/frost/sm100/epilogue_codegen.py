@@ -401,7 +401,8 @@ def _emit_block_quant_col(
         if row_pred is None:
             lines.append(_st)
         else:
-            col_pred = f"{p}_n{k} < {col_bound}" if swapped else f"col_j + {vsize} <= N"
+            # Each lane owns a column, including in a partial final vector.
+            col_pred = f"{p}_n{k} < {col_bound}"
             lines.append(f"if ({row_pred}) & ({col_pred}):")
             lines.append(f"    {_st}")
     return lines

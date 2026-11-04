@@ -1266,7 +1266,8 @@ def _emit_block_quant_row(
         if row_pred is None:
             lines.append(_st)
         else:
-            width = (k + 1) * bs if swapped else vsize
+            # A reused plan can end N inside this vector but after this block.
+            width = (k + 1) * bs
             lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
             lines.append(f"    {_st}")
     if vector_scales:

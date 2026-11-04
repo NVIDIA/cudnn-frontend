@@ -3757,6 +3757,93 @@ def test_sm120_render_smoke() -> None:
                 assert f"b_is_n_major = {b_major == 'n'}" in src, combo
 
 
+def _check_quant_reused_partial_scale_rows(config_name, axes, shapes) -> None:
+    """Check active scale bytes and quantized output while one plan changes N."""
+    cfg = _resolve(config_name)
+    K, bs = 128, 32
+    M0, N0 = shapes[0]
+
+    def scale_dims(axis, M, N):
+        rows, blocks = (M, N // bs) if axis == -1 else (N, M // bs)
+        return rows, blocks, [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M0, K], stride=_a_stride_batched(M0, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N0], stride=_b_stride_batched(N0, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    taps = []
+    for qi, axis in enumerate(axes):
+        Q, QS = g.block_scale_quantize(input=C, block_size=bs, axis=axis, name=f"q{qi}")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        dims = scale_dims(axis, M0, N0)[2]
+        QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+        taps.append((axis, Q, QS, dims))
+    compiled = _plan(g, config=cfg)
+    assert [q.axis == 1 for q in compiled.chain.quants] == [axis == 1 for axis in axes]
+
+    for M, N in shapes:
+        a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+        vp, checks = {A: a, B: b}, []
+        for axis, Q, QS, dims0 in taps:
+            rows, blocks, dims = scale_dims(axis, M, N)
+            assert dims == dims0, "the shapes of one compile share a padded scale extent"
+            vp[Q] = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+            backing = torch.full((dims[1] * dims[2] + 256,), 0xA5, dtype=torch.uint8, device="cuda")
+            raw = backing[128:-128].view(dims)
+            raw.fill_(0xFF)
+            vp[QS] = raw.view(torch.float8_e8m0fnu)
+            addr = _f8_row_scale_addr(M, dims[2] * bs, bs) if axis == -1 else _f8_col_scale_addr(dims[2] * bs, N, bs)
+            checks.append((axis, Q, QS, backing, addr, blocks))
+
+        def check():
+            mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+            for axis, Q, QS, backing, addr, blocks in checks:
+                if axis == -1:
+                    q_ref, s_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+                else:
+                    q_ref, s_ref = _col_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+                    s_ref = s_ref.transpose(1, 2)
+                got = vp[QS].view(torch.uint8).flatten()[addr][:, :blocks]
+                torch.testing.assert_close(got, s_ref[0].view(torch.uint8), atol=0, rtol=0, msg=lambda m: f"M={M} N={N}: {m}")
+                torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0, msg=lambda m: f"M={M} N={N}: {m}")
+                assert (backing[:128] == 0xA5).all() and (backing[-128:] == 0xA5).all()
+
+        compiled(vp)
+        torch.cuda.synchronize()
+        check()
+        if N == 352:
+            capture, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+            workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda") if compiled.workspace_bytes else None
+            try:
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.graph(capture, stream=stream):
+                    compiled._compiled(vp, workspace=workspace, stream=stream.cuda_stream)
+                torch.cuda.current_stream().wait_stream(stream)
+                a.mul_(2)
+                for _, Q, QS, _, _, _ in checks:
+                    vp[Q].zero_()
+                    vp[QS].view(torch.uint8).fill_(0xFF)
+                capture.replay()
+                torch.cuda.synchronize()
+                check()
+            finally:
+                capture.reset()
+
+
+@requires_sm100
+@pytest.mark.parametrize("axes", [(-1,), (-1, 1)], ids=["row", "row_col"])
+def test_sm100_reused_quant_plan_writes_partial_scale_rows(axes) -> None:
+    _check_quant_reused_partial_scale_rows("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", axes, [(256, n) for n in (384, 352, 320, 288)])
+
+
+@requires_sm120
+@pytest.mark.parametrize("axes", [(-1,), (-1, 1)], ids=["row", "row_col"])
+def test_sm120_reused_quant_plan_writes_partial_scale_rows(axes) -> None:
+    _check_quant_reused_partial_scale_rows("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", axes, [(256, n) for n in (384, 352, 320, 288)])
+
+
 @requires_sm120
 @pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
 def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
