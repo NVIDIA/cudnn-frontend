@@ -1,6 +1,6 @@
 ## DSA module
 
-- **Sparse Attention Forward**: SM100 sparse-prefill CuTe-DSL kernels for H64/D512 or D576 and H128/D512 small-top-k Prefill MQA shapes. Supports arbitrary logical K, invalid/OOB and duplicate indices, per-query lengths, attention sinks, and indexer LSE.
+- **Sparse Attention Forward**: SM90/SM100 sparse-prefill CuTe-DSL kernels. SM90 serves H16/H32/H64/H96/H128 with D512/D576; SM100 serves H64/D512 or D576 and H128/D512 small-top-k Prefill MQA shapes. Supports arbitrary logical K, invalid/OOB and duplicate indices, per-query lengths, attention sinks, and indexer LSE.
 - **Indexer Forward**: `indexer_forward_wrapper` materializes dense scores on SM90/SM100; `indexer_forward_top_k_wrapper` is the separate SM100 compact-logits path that runs radix Top-K and its fused softmax without materializing the dense score tensor (BSHD/THD BF16, MXFP8, and MXFP4, with optional LSE).
 - **Indexer Top-K**: SM90+ CuTe-DSL radix top-K kernel with per-row ``seq_lens``.
 - **Sparse Attention Backward**: DSA backward for flat MQA tensors on SM90/SM100; consumes the forward wrapper's `out` and KV-only `lse`.
@@ -11,4 +11,10 @@
 
 ## Acknowledgements
 
-The DSA/CSA kernels were a collaborative effort, jointly developed by: Hongxiao Bai, Jiayu Sun, Jerry Chen, Jie Fang, Qi Zhang, Bin Chai and Yue Weng
+The DSA/CSA kernels were a collaborative effort, jointly developed by: Hongxiao Bai, Jiayu Sun, Jerry Chen, Jie Fang, Qi Zhang, Bin Chai and Yue Weng.
+
+The SM90 sparse-attention forward schedule and pipeline are adapted primarily
+from [FlashMLA's MIT-licensed Hopper implementation](https://github.com/deepseek-ai/FlashMLA/tree/4f38f29ef6793c228363e4af5be66d44e81167ba/csrc/kernels/sm90/prefill/sparse).
+The cuDNN Frontend port adds wider H coverage, arbitrary logical K boundary
+handling, bounded symbolic compilation, and an allocation-free CUDA Graph
+prepared-execution contract.

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental, single-device SM100 blk128 JAX block sparse attention."""
+"""Experimental, single-device SM100/SM103 blk128 JAX block sparse attention."""
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
@@ -44,14 +44,19 @@ class Config:
     allow_empty: bool
     scale: float
     bucket_size: int
+    gpu_arch: str
 
     @property
     def bhsd(self):
         return self.qshape if self.layout == "bhsd" else (self.qshape[0], self.qshape[2], self.qshape[1], self.qshape[3])
 
 
+# The blk128 kernels compile for the device's own arch-specific target: an sm_100a cubin does not load on cc 10.3.
+_SM100_FAMILY = {"10.0": "sm_100a", "10.3": "sm_103a"}
+
+
 def is_sm100(device):
-    return device.platform == "gpu" and str(getattr(device, "compute_capability", "")) == "10.0"
+    return device.platform == "gpu" and str(getattr(device, "compute_capability", "")) in _SM100_FAMILY
 
 
 def require_array(x, name, shape=None, dtype=None):
@@ -111,9 +116,32 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
     placed = {d for x in (q_tensor, k_tensor, v_tensor, indices, nums) if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for d in x.devices()}
     if len(placed) > 1:
         raise ValueError("all BSA arrays must be on the same GPU")
-    # Traced arrays carry no device, so under jit only require that some local GPU can run the kernel.
-    if jax.process_count() != 1 or not any(is_sm100(d) for d in placed or jax.local_devices()):
-        raise ValueError("JAX BSA currently requires a single process and arrays on an SM100 (compute capability 10.0) GPU")
+    # Captured concrete arrays do not pin a zero-argument jit's execution device.
+    # Compare opaque trace states against an explicit eager context without
+    # materializing a tensor or depending on operand Tracer types.
+    from jax.extend import core as jax_extend_core
+
+    trace_state = getattr(jax_extend_core, "get_opaque_trace_state", None)
+    if trace_state is None:  # JAX 0.9.x exports this through jax.core.
+        trace_state = jax.core.get_opaque_trace_state
+    current_trace = trace_state()
+    with jax.core.eval_context():
+        tracing = current_trace != trace_state()
+    if placed and not tracing:
+        # Committed arrays: compile for the device they are on.
+        gpu_arch = {_SM100_FAMILY[str(d.compute_capability)] for d in placed if is_sm100(d)}
+    else:
+        # Under tracing -- including when all inputs are captured concrete arrays -- or with no committed array to
+        # read, the device XLA runs the call on is not visible here: read the target off the local SM100-family GPUs, and refuse a
+        # host that exposes both architectures rather than compile for the wrong one.
+        gpu_arch = {_SM100_FAMILY[str(d.compute_capability)] for d in jax.local_devices() if is_sm100(d)}
+        if len(gpu_arch) > 1:
+            raise ValueError(
+                "JAX BSA cannot tell SM100 from SM103 when both are visible and no committed array names the device (a traced "
+                "call): call it eagerly on committed arrays, or make GPUs of one architecture visible (CUDA_VISIBLE_DEVICES)"
+            )
+    if jax.process_count() != 1 or len(gpu_arch) != 1:
+        raise ValueError("JAX BSA currently requires a single process and arrays on an SM100 or SM103 (compute capability 10.0 or 10.3) GPU")
     return Config(
         tuple(q_tensor.shape),
         tuple(k_tensor.shape),
@@ -124,6 +152,7 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
         allow_empty,
         float(scale),
         bucket_size,
+        gpu_arch.pop(),
     )
 
 
@@ -136,7 +165,7 @@ def forward_call(c):
         output_shape_dtype=(jax.ShapeDtypeStruct(c.qshape, jnp.bfloat16), jax.ShapeDtypeStruct((b, h, sq), jnp.float32)),
         input_spec=(spec,) * 3 + (None, None),
         output_spec=(spec, None),
-        compile_options="--gpu-arch=sm_100a",
+        compile_options=f"--gpu-arch={c.gpu_arch}",
     )
 
 
@@ -166,7 +195,7 @@ def backward_call(c):
         input_spec=(spec,) * 5 + (None,) * 3,
         output_spec=(spec,) * 3 + (None,) * 11,
         initialized_outputs=initialized,
-        compile_options="--gpu-arch=sm_100a",
+        compile_options=f"--gpu-arch={c.gpu_arch}",
     )
 
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Packed 12:1 QSA from four-token groups, without a quadratic bitmap."""
+"""Packed 12:1 and 6:1 QSA from four-token groups, without a quadratic bitmap."""
 
 from functools import lru_cache
 import importlib
@@ -12,16 +12,18 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn._torch_stream import stream_context
-from cudnn.QSA._contract import check_tensor
+from cudnn.QSA._contract import check_tensor, paired_backward, paired_queries
+
+QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
 
 
 def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None):
     if not isinstance(q, torch.Tensor) or not q.is_cuda or q.ndim != 3:
-        raise ValueError("q must be a CUDA tensor with shape [T, 12, 256]")
-    total = q.shape[0]
-    if total < 1 or q.shape[1:] != (12, 256) or q.numel() > 2**31 - 1:
-        raise NotImplementedError("Indexed QSA requires T > 0, 12Q/1KV, D256 and T * 12 * 256 <= INT32_MAX")
-    for name, tensor, heads in (("q", q, 12), ("k", k, 1), ("v", v, 1)):
+        raise ValueError("q must be a CUDA tensor with shape [T, Hq, 256]")
+    total, hq = q.shape[0], q.shape[1]
+    if total < 1 or hq not in QUERY_HEADS or q.shape[2] != 256 or q.numel() > 2**31 - 1:
+        raise NotImplementedError("Indexed QSA requires T > 0, 12Q/1KV or 6Q/1KV, D256 and T * Hq * 256 <= INT32_MAX")
+    for name, tensor, heads in (("q", q, hq), ("k", k, 1), ("v", v, 1)):
         check_tensor(name, tensor, (total, heads, 256), torch.bfloat16, q.device, 16)
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
         raise ValueError("scale must be a finite host scalar")
@@ -34,18 +36,20 @@ def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None):
     if grad is not None:
         check_tensor("grad_out", grad, q.shape, torch.bfloat16, q.device, 16)
         check_tensor("out_fp32", out32, q.shape, torch.float32, q.device, 16)
-        check_tensor("lse", lse, (12, total), torch.float32, q.device)
+        check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     return total, width
 
 
 class _QsaIndexedPlan(APIBase):
     """Immutable geometry and compiled kernels; execute uses caller storage only."""
 
-    def __init__(self, total, width, device, direction):
+    def __init__(self, total, width, device, direction, hq=12):
         with torch.cuda.device(device):
             super().__init__()
-        self.total, self.width, self.device, self.direction = total, width, device, direction
-        self.nq = 1 if direction == "fprop" else 2
+        self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
+        # The backward batches consecutive queries (two at 12:1, four at 6:1) with owner bits in the compact IDs.
+        self.paired = direction == "bprop" and paired_backward(hq, 1)
+        self.nq = paired_queries(hq, 1) if self.paired else 1
         groups = (total + self.nq - 1) // self.nq
         self.layouts = [
             ("ids", (groups, self.nq * (width // 4)), torch.int32),
@@ -55,13 +59,14 @@ class _QsaIndexedPlan(APIBase):
         if direction == "bprop":
             self.layouts.extend(
                 [
-                    ("delta", (total, 12), torch.float32),
-                    ("dq_acc", (total, 12, 256), torch.float32),
+                    ("delta", (total, hq), torch.float32),
+                    ("dq_acc", (total, hq, 256), torch.float32),
                     ("dk_acc", (total, 1, 256), torch.float32),
                     ("dv_acc", (total, 1, 256), torch.float32),
-                    ("flags", (((total * 256 + 1023) // 1024) * 4 + 1,), torch.int32),
                 ]
             )
+            if self.paired:
+                self.layouts.append(("flags", (((total * 256 + 1023) // 1024) * 4 + 1,), torch.int32))
         self.workspace_bytes = sum(ws_align(math.prod(shape) * dtype.itemsize) for _, shape, dtype in self.layouts)
 
     def check_support(self):
@@ -92,10 +97,12 @@ class _QsaIndexedPlan(APIBase):
 
         with torch.cuda.device(self.device):
             module = f"{self.direction}_sm100"
-            if self.direction == "fprop" and self.arch == 107 and self.total >= 32768:
-                module = "fprop_n64_sm107"
+            if self.direction == "fprop" and self.arch == 107 and self.total >= 32768 and self.hq == 12:
+                module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
+            elif self.direction == "bprop" and not self.paired:
+                module = "bprop_sm107" if self.arch == 107 else "bprop_sm100_base"
             self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
-            self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, 12, 1, self.arch)
+            self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
             self._metadata = _metadata.compile_metadata(self.arch, self.nq, self.width // 4)
 
     def scratch_workspace_bytes(self):
@@ -109,12 +116,12 @@ class _QsaIndexedPlan(APIBase):
         if self.direction == "fprop" and any(value is not None for value in (grad, out32, lse)):
             raise ValueError("forward does not accept backward saved state")
         total, width = _validate(q, k, v, indices, scale, grad, out32, lse)
-        if (total, width, q.device) != (self.total, self.width, self.device):
-            raise ValueError("Inputs must match the compiled token count, index width and device")
+        if (total, width, q.shape[1], q.device) != (self.total, self.width, self.hq, self.device):
+            raise ValueError("Inputs must match the compiled token count, index width, query heads and device")
         if len(outputs) != 3:
             raise ValueError("Indexed QSA requires three preallocated outputs")
         specifications = (
-            ((q.shape, q.dtype), (q.shape, torch.float32), ((12, total), torch.float32))
+            ((q.shape, q.dtype), (q.shape, torch.float32), ((self.hq, total), torch.float32))
             if self.direction == "fprop"
             else ((q.shape, q.dtype), (k.shape, k.dtype), (v.shape, v.dtype))
         )
@@ -140,6 +147,8 @@ class _QsaIndexedPlan(APIBase):
             self._metadata(indices, *metadata, stream)
             if self.direction == "fprop":
                 self.impl.launch(self._compiled_kernel, q, k, v, *outputs, *metadata, float(scale), stream)
+            elif not self.paired:
+                self.impl.launch(self._compiled_kernel, grad, q, k, v, out32, lse, *metadata, *outputs, scratch, float(scale), stream, self.sms)
             else:
                 self._compiled_kernel["dispatch"](
                     q,
@@ -163,8 +172,8 @@ class _QsaIndexedPlan(APIBase):
 
 
 @lru_cache(maxsize=32)
-def _plan(total, width, device, direction):
-    plan = _QsaIndexedPlan(total, width, device, direction)
+def _plan(total, width, device, direction, hq=12):
+    plan = _QsaIndexedPlan(total, width, device, direction, hq)
     plan.check_support()
     plan.compile()
     return plan
@@ -173,9 +182,9 @@ def _plan(total, width, device, direction):
 def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     """Return ``(out, out_fp32, lse)`` from complete four-token groups and a tail."""
     total, width = _validate(q, k, v, indices, scale)
-    plan = _plan(total, width, q.device, "fprop")
+    plan = _plan(total, width, q.device, "fprop", q.shape[1])
     with torch.cuda.device(q.device):
-        outputs = (torch.empty_like(q), torch.empty_like(q, dtype=torch.float32), torch.empty((12, total), dtype=torch.float32, device=q.device))
+        outputs = (torch.empty_like(q), torch.empty_like(q, dtype=torch.float32), torch.empty((q.shape[1], total), dtype=torch.float32, device=q.device))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
         plan.execute(q, k, v, indices, outputs, scale, workspace)
     return TupleDict(zip(("out", "out_fp32", "lse"), outputs))
@@ -198,6 +207,8 @@ def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16
         raise ValueError("grad_out is required")
     total, width = _validate(q, k, v, indices, scale, grad_out, out_fp32, lse)
     if selection_mode == "causal_topk":
+        if q.shape[1] != 12:
+            raise NotImplementedError("causal_topk requires 12Q/1KV; 6Q/1KV uses selection_mode='general'")
         if width != 2052 or scale != 1 / 16:
             raise NotImplementedError("causal_topk requires index width 2052 and scale=1/16")
         if max_seq_len is not None and (type(max_seq_len) is not int or not 1 <= max_seq_len <= total):
@@ -214,7 +225,7 @@ def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16
 
         with torch.cuda.device(q.device):
             return _backward(q, k, v, out_fp32, grad_out, lse, indices, softmax_scale=scale, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
-    plan = _plan(total, width, q.device, "bprop")
+    plan = _plan(total, width, q.device, "bprop", q.shape[1])
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)

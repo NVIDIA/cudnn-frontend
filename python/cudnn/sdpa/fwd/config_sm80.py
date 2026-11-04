@@ -43,6 +43,38 @@ GPTOSS_CFG = Cfg(D_QK=64, D_V=64, TILE_M=128, TILE_N=64, NUM_WARPS=4)
 LLAMA_CFG = Cfg(D_QK=128, D_V=128, TILE_M=128, TILE_N=64, NUM_WARPS=8)
 DSV3_CFG = Cfg(D_QK=192, D_V=128, TILE_M=128, TILE_N=64, NUM_WARPS=8)
 QWEN_CFG = Cfg(D_QK=256, D_V=256, TILE_M=128, TILE_N=64, NUM_WARPS=8)
+WIDE512_CFG = Cfg(D_QK=512, D_V=512, TILE_M=32, TILE_N=16, NUM_WARPS=4)
+MLA576_CFG = Cfg(D_QK=576, D_V=512, TILE_M=32, TILE_N=16, NUM_WARPS=4)
+
+FLAVOR_CFGS = {
+    "gptoss": GPTOSS_CFG,
+    "llama": LLAMA_CFG,
+    "dsv3": DSV3_CFG,
+    "qwen": QWEN_CFG,
+    "wide512": WIDE512_CFG,
+    "mla576": MLA576_CFG,
+}
+
+
+def pick_flavor(d_qk: int, d_v: int) -> str:
+    """Smallest native envelope, shared by graph admission and lowering."""
+    for name, cfg in FLAVOR_CFGS.items():
+        if d_qk <= cfg.D_QK and d_v <= cfg.D_V:
+            return name
+    dims = {name: (cfg.D_QK, cfg.D_V) for name, cfg in FLAVOR_CFGS.items()}
+    raise ValueError(f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  Supported envelopes: {dims}.")
+
+
+def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[int]]:
+    """Explicit graph tuning domain; this does not prescribe default tiles.
+
+    The 256-wide double K/V buffers at N128 need 256 KiB, exceeding
+    A100's 164 KiB limit. Wide heads use the fixed column-partition tile.
+    """
+    cfg = FLAVOR_CFGS[pick_flavor(d_qk, d_v)]
+    if cfg.D_QK > 256 or cfg.D_V > 256:
+        return frozenset({32}), frozenset({16})
+    return frozenset({64, 128}), frozenset({32, 64} if cfg == QWEN_CFG else {64, 128})
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +142,8 @@ class TemplateParams:
     sink_natural: bool = False
     # Sign of attn_scale: the kernel negates (-1) or zeroes (0) the raw scores and runs at kernel_scale() (#1435).
     score_sign: int = 1
+    # Zero retains contiguous K/V; positive values select device page tables.
+    paged_page_size: int = 0
 
 
 def score_sign(scale: float) -> int:
@@ -124,22 +158,29 @@ def kernel_scale(scale: float) -> float:
 def validate_params(p: TemplateParams) -> None:
     """Raising validator — a failure here means the capability row or the
     adapter lied about what this template can serve (README Rule 2)."""
-    if p.tile_n not in _SM80_SEQ_TILES_N:
-        raise ValueError(f"sm80: tile_n must be one of {_SM80_SEQ_TILES_N}; got {p.tile_n}")
+    wide = p.d_qk > 256 or p.d_v > 256
+    tile_ns = (16,) if wide else (32, *_SM80_SEQ_TILES_N) if (p.d_qk, p.d_v) == (256, 256) else _SM80_SEQ_TILES_N
+    if p.tile_n not in tile_ns:
+        raise ValueError(f"sm80: tile_n must be one of {tile_ns}; got {p.tile_n}")
     if p.num_warps not in (4, 8):
         raise ValueError(f"sm80: num_warps must be 4 or 8; got {p.num_warps}")
-    if p.tile_m % (p.num_warps * 16) != 0:
-        raise ValueError(f"sm80: tile_m ({p.tile_m}) must be a multiple of num_warps*16 ({p.num_warps * 16})")
+    row_warps = p.num_warps // (2 if wide else 1)
+    if p.tile_m % (row_warps * 16) != 0:
+        raise ValueError(f"sm80: tile_m ({p.tile_m}) must be a multiple of row_warps*16 ({row_warps * 16})")
+    if wide and (p.tile_m, p.tile_n, p.num_warps) != (32, 16, 4):
+        raise ValueError("sm80: wide heads require the 32-query, 16-key, four-warp tile")
     if p.d_qk % 16 != 0 or p.d_qk <= 0:
         raise ValueError(f"sm80: template d_qk must be a positive multiple of 16 (m16n8k16 K); got {p.d_qk}")
     if p.d_v % 16 != 0 or p.d_v <= 0:
         raise ValueError(f"sm80: template d_v must be a positive multiple of 16 (cp.async + STG.128 epilogue); got {p.d_v}")
-    if (p.d_qk, p.d_v) not in {(cfg.D_QK, cfg.D_V) for cfg in (GPTOSS_CFG, LLAMA_CFG, DSV3_CFG, QWEN_CFG)}:
-        raise ValueError(f"sm80: (d_qk, d_v) = ({p.d_qk}, {p.d_v}) is not a swept flavor envelope")
+    if (p.d_qk, p.d_v) not in {(cfg.D_QK, cfg.D_V) for cfg in (GPTOSS_CFG, LLAMA_CFG, DSV3_CFG, QWEN_CFG, WIDE512_CFG, MLA576_CFG)}:
+        raise ValueError(f"sm80: (d_qk, d_v) = ({p.d_qk}, {p.d_v}) is not a supported flavor envelope")
     if p.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"sm80: sched_policy must be a tile_dsl SCHED_* value; got {p.sched_policy}")
     if p.score_sign not in (-1, 0, 1):
         raise ValueError(f"sm80: score_sign must be -1, 0 or 1; got {p.score_sign}")
+    if p.paged_page_size < 0:
+        raise ValueError("sm80: paged_page_size must be nonnegative")
     if p.sched_l2_mib <= 0:
         raise ValueError(f"sm80: sched_l2_mib must be > 0; got {p.sched_l2_mib}")
     if p.causal_bottom_right and not (p.is_causal or p.has_swa):
@@ -149,8 +190,8 @@ def validate_params(p: TemplateParams) -> None:
 
 
 def params_for_flavor(flavor: str, **overrides) -> TemplateParams:
-    """A TemplateParams seeded from one swept flavor's Cfg row."""
-    cfg = {"gptoss": GPTOSS_CFG, "llama": LLAMA_CFG, "dsv3": DSV3_CFG, "qwen": QWEN_CFG}[flavor]
+    """A TemplateParams seeded from one native flavor's Cfg row."""
+    cfg = FLAVOR_CFGS[flavor]
     base = dict(d_qk=cfg.D_QK, d_v=cfg.D_V, tile_m=cfg.TILE_M, num_warps=cfg.NUM_WARPS, tile_n=cfg.TILE_N)
     base.update(overrides)
     p = TemplateParams(**base)

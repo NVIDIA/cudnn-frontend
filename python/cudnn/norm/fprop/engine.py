@@ -77,7 +77,7 @@ class FrostNormFwdEngine(BaseEngine):
             # a unit gamma would allocate inside execute (Rule 1). Let an engine that
             # serves it natively have the graph.
             return "a norm without a scale input is not served"
-        if not facts.uniform_dtype:
+        if not facts.uniform_dtype and not facts.extended_affine:
             # These kernels read scale/bias/DY at the I/O dtype; a mixed-precision
             # graph would be read wrong rather than merely be slow.
             return "scale/bias/DY must share the input dtype; mixed-precision parameters are not supported"

@@ -556,11 +556,11 @@ def test_dgrad_optimization_public_contract_and_phase_scope():
     assert baseline.dgrad_optimization == "baseline"
 
     ds3_default = MoeEpTuningConfig(
-        dgrad_optimization="ds3_ep4_v1",
+        dgrad_optimization="ds3_ep4_pattern",
     )
     ds3_explicit = MoeEpTuningConfig(
         epi_flag_batch=(4, 2),
-        dgrad_optimization="ds3_ep4_v1",
+        dgrad_optimization="ds3_ep4_pattern",
     )
     assert ds3_default == ds3_explicit
     assert ds3_default.epi_flag_batch == (4, 2)
@@ -576,9 +576,9 @@ def test_dgrad_optimization_public_contract_and_phase_scope():
         {"reduce_topk_in_kernel": True},
     )
     for overrides in invalid_ds3:
-        with pytest.raises(ValueError, match="ds3_ep4_v1"):
+        with pytest.raises(ValueError, match="ds3_ep4_pattern"):
             MoeEpTuningConfig(
-                dgrad_optimization="ds3_ep4_v1",
+                dgrad_optimization="ds3_ep4_pattern",
                 **overrides,
             )
 

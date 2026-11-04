@@ -38,7 +38,9 @@ def forward_adapter_mismatch(api):
         return "SM80 RoPE forward requires staging and is not supported by the native adapter"
     for role in ("q", "k", "v", "o"):
         desc = getattr(api, role + "_desc")
-        reason = forward_thd_layout_mismatch(role, desc.shape, desc.stride) if api.thd else data_layout_mismatch(role, desc.shape, desc.stride)
+        index = ("q", "k", "v", "o").index(role)
+        thd = api.thd and not (api.paged and role in ("k", "v")) and getattr(api, "_thd_origin_batch_strides", (None,) * 5)[index] is None
+        reason = forward_thd_layout_mismatch(role, desc.shape, desc.stride) if thd else data_layout_mismatch(role, desc.shape, desc.stride)
         if reason is not None:
             return reason
     return None
@@ -58,7 +60,10 @@ def graph_mismatch(facts, _version=None):
         )
     )
     for name, shape, stride in ports:
-        reason = data_layout_mismatch(name, shape, stride, thd=facts.thd)
+        packed = facts.thd
+        if not facts.is_backward:
+            packed = packed and getattr(getattr(facts, name + "_t"), "ragged_offset", None) is not None
+        reason = data_layout_mismatch(name, shape, stride, thd=packed)
         if reason is not None:
             return reason
     if facts.is_backward:

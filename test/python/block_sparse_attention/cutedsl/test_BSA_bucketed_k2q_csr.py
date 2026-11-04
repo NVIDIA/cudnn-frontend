@@ -8,13 +8,13 @@ from functools import partial
 
 import pytest
 import torch
+from block_sparse_attention.cutedsl.bsa_utils import require_arch
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 def _csr_module():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in {9, 10, 11}:
-        pytest.skip("requires an architecture supported by BSA backward")
+    require_arch(families=(9, 10, 11), reason="requires an architecture supported by BSA backward")
     return importlib.import_module("cudnn.block_sparse_attention.csrc.bwd.bucketed_k2q_csr")
 
 
