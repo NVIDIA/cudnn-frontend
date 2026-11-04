@@ -25,10 +25,17 @@ serving regime pays for: every layer's launch finds its code and data evicted); 
 (with the L2 swept before every launch the rolled forms are the fastest at one and at two requests on a cc 10.0 part; warm, with the
 code resident, the unrolled pair is marginally faster at one request -- the cold figure decides); while every CTA of the ``requests x
 48`` grid has an SM of its own (``requests * 48 <= SM count``) the one-CTA-per-SM form ``CFG`` serves (TPR 4, the 3-deep ring); past that
-the two-CTAs-per-SM form ``TWO_CTA_CFG`` serves (the register-capped form that lets two CTAs share an SM so the grid runs in one wave).
-Every form is bitwise with the reference kernel -- FlashInfer's built-in ``frost`` backend for the Qwen 3.5 GDN block, whose numerics
-these kernels reproduce.  ``PDL`` stays off in every form (it needs the caller's stream contract: its knob below).  A caller's ``Cfg``
-overrides the pick as a whole; a ``NORM_FORM`` of ``None`` is resolved from the requests count by the entry (``resolve_cfg``).
+the two-CTAs-per-SM form ``TWO_CTA_CFG`` serves (the register-capped streamed form, so the grid runs in one wave) -- on a part where two of
+its CTAs CAN share an SM (``Cfg.co_resident_ctas(tokens)`` >= 2 at the minimum token count: the cc 10.0 part's 228 KB per SM holds two
+80 KB footprints, the register cap two CTAs of 256 threads).  Two CTAs per SM is a PER-PART premise, read from ``co_resident_ctas``: on a
+100 KB part (cc 12.0: 102,400 B per SM, 101,376 B opt-in) every whole-slab form is one CTA per SM by shared memory alone (2 x (79,200 +
+1,024) = 160,448 B > 102,400 B at T 2), so the 128-register cap buys nothing there and costs spills -- measured on sm_120a (``cuobjdump
+-res-usage``, 256 threads, T 6): ``TWO_CTA_CFG`` 128 registers + 56 B stack + 34 STL / LDL; the rolled register-resident forms ``PAIR_CFG``
+with NBUF 2 187 / 0, with NBUF 1 187 / 0, the one-CTA NBUF-1 form 183 / 0; the NBUF-1 pair under the cap 128 / 0 (spill-free: the one
+two-per-SM verify form of that part, at T <= 3: 2 x (50,112 + 1,024) = 102,272 B).  Every form is bitwise with the reference kernel --
+FlashInfer's built-in ``frost`` backend for the Qwen 3.5 GDN block, whose numerics these kernels reproduce.  ``PDL`` stays off in every
+form (it needs the caller's stream contract: its knob below).  A caller's ``Cfg`` overrides the pick as a whole; a ``NORM_FORM`` of
+``None`` is resolved from the requests count by the entry (``resolve_cfg``).
 
 Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 
@@ -43,9 +50,11 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
   ``wait_group.read 0`` between the token's two passes).
 * ``STATE_STREAM``: the state lives in the shared-memory boxes, not in registers: pass 1 reads each row and drops it, pass 2
   re-reads it, recomputes ``h = S * decay`` (bit-identical) and writes the updated row to the next box -- the <= 128-register form
-  that lets two CTAs share an SM (``NBUF`` 1 or 2 there).
+  that lets two CTAs share an SM where the part's shared memory holds two of its footprints (``NBUF`` 1 or 2 there).
 * ``MIN_CTAS_PER_SM``: the launch's ``min_blocks_per_mp`` = ptxas's register cap (1 -> 255, 2 -> 128 registers per thread); the SASS
-  gate (no ``STL`` / ``LDL``) decides whether a form may use it.
+  gate (no ``STL`` / ``LDL``) decides whether a form may use it, and ``Cfg.co_resident_ctas(tokens)`` (the CTAs per SM the part's shared
+  memory and the cap guarantee together) whether it buys anything on the part: a cap on a form whose footprint already keeps the SM at
+  one CTA is pure cost (sm_120a: ``TWO_CTA_CFG`` spills 34).
 * ``CTAS_PER_SM``: 0 = natural shared memory, 1 / 2 = a dummy pad that caps the co-resident CTAs per SM at one / two, derived from
   ``SMEM_PER_SM_BYTES`` -- the DEVICE's shared memory per SM, which the host entry reads from the part.
 * ``BA_PREFETCH_CHUNKS``: how many of the three 2048-element chunks of the BA projection's ``hidden`` rows (all ``T`` tokens) are in
@@ -160,6 +169,10 @@ NORM_RECV_MAX_FLOATS = 16
 # part it does not describe.
 SM100_SMEM_PER_SM_BYTES = 228 * 1024
 SM100_SMEM_OPTIN_BYTES = 227 * 1024
+# The cc 12.0 part's readings (100 KB per SM, 99 KB per-CTA opt-in, the same 1 KB reserve; a 170-SM RTX 5090-class part): documentation
+# and tests only, never a default -- the host entry reads the part.
+SM120_SMEM_PER_SM_BYTES = 100 * 1024
+SM120_SMEM_OPTIN_BYTES = 99 * 1024
 SMEM_CTA_RESERVE_BYTES = 1024
 SMEM_PAD_MARGIN_BYTES = 4096  # keeps the cap robust to the allocation granularity
 
@@ -361,6 +374,17 @@ class Cfg:
 
     def smem_bytes(self, tokens: int) -> int:
         return self.natural_smem_bytes(tokens) + self.smem_pad_bytes(tokens)
+
+    def co_resident_ctas(self, tokens: int) -> int:
+        """The CTAs of this form that share one SM on the part at ``tokens`` per request, as the host can GUARANTEE them from the two
+        budgets it knows: by shared memory, how many launch footprints plus the driver's per-CTA reserve fit ``SMEM_PER_SM_BYTES``; by
+        registers, ``MIN_CTAS_PER_SM`` (the cap the launch asks ptxas for -- 2 = 128 registers, two CTAs of 256 threads in the 64 K file;
+        an uncapped form may take up to 255, so the host counts one) -- the smaller of the two.  The ONE predicate the default pick, its
+        docs and its tests read: a ``MIN_CTAS_PER_SM`` 2 form is worth its cap only where this is 2 at the minimum token count (the cc
+        10.0 readings: ``TWO_CTA_CFG`` 2; the cc 12.0 readings: 1, 2 x (79,200 + 1,024) B > 102,400 B), and the NBUF-1 pair under the cap
+        is two per SM on the cc 12.0 readings at T <= 3 (2 x (50,112 + 1,024) = 102,272 B) and one from T 4 (53,648 B)."""
+        by_smem = self.SMEM_PER_SM_BYTES // (self.smem_bytes(tokens) + SMEM_CTA_RESERVE_BYTES)
+        return min(by_smem, self.MIN_CTAS_PER_SM)
 
     def max_tokens(self) -> int:
         """The largest tokens-per-request count whose footprint fits this part's per-CTA opt-in (and, with a pad, the SM)."""

@@ -18,9 +18,15 @@ While the ``rows x 96`` CTAs of the two-CTAs-per-head form have an SM each (``ro
 ``PAIR_CFG`` serves -- ``TWO_CTAS_PER_HEAD``, ``CTAS_PER_SM`` 0 -- because the pair buys a second SM's bulk-copy path per head (the
 fastest form at rows 1; the pair loses once it has to share an SM).  While every CTA of the ``rows x 48`` grid has an SM of its own
 (``rows * 48 <= SM count``) the one-CTA-per-SM form ``CFG`` serves.  Past that the register-resident form under the 128-register cap
-``CAPPED_CFG`` serves -- ``MIN_CTAS_PER_SM`` 2, ``CTAS_PER_SM`` 0, spill-free with one tail -- so two CTAs share an SM and the grid runs
-in ONE wave (slightly ahead of the streamed form ``STREAMED_CFG``).  ``PDL`` stays off in every form: it needs the caller's stream
-contract (its knob below).  A caller's ``Cfg`` overrides the pick as a whole.
+``CAPPED_CFG`` serves -- ``MIN_CTAS_PER_SM`` 2, ``CTAS_PER_SM`` 0 -- so two CTAs share an SM and the grid runs in ONE wave (slightly ahead
+of the streamed form ``STREAMED_CFG``) -- on a part where two of its CTAs CAN share an SM (``Cfg.co_resident_ctas`` >= 2: the cc 10.0
+part's 228 KB per SM holds three 75 KB footprints, the register cap two CTAs of 256 threads; spill-free there with one tail).  Two CTAs per
+SM is a PER-PART premise, read from ``co_resident_ctas``: on a 100 KB part (cc 12.0: 102,400 B per SM, 101,376 B opt-in) the whole-slab
+form is one CTA per SM by shared memory alone (2 x (74,848 + 1,024) = 151,744 B > 102,400 B), so the 128-register cap buys nothing there
+and costs spills -- measured on sm_120a (``cuobjdump -res-usage``, 256 threads): ``CAPPED_CFG`` 128 registers + 16 B stack + 7 STL / LDL,
+``STREAMED_CFG`` 128 / 0, ``CFG`` 145 / 0, ``PAIR_CFG`` 111 / 0, ``PAIR_CFG`` with ``MIN_CTAS_PER_SM`` 2 109 / 0 (the cap a no-op: the pair
+is two per SM by registers without it, and 2 x (42,112 + 1,024) = 86,272 B fit the 100 KB SM).  ``PDL`` stays off in every form: it needs
+the caller's stream contract (its knob below).  A caller's ``Cfg`` overrides the pick as a whole.
 
 Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 
@@ -42,7 +48,9 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 * ``STATE_STREAM`` (bulk only): pass 2 re-reads each row from shared memory and recomputes ``h = S * decay`` (bit-identical) instead of
   keeping the 64 updated values live across the two passes -- the <= 128-register form that lets two CTAs share an SM.
 * ``MIN_CTAS_PER_SM``: the launch's ``min_blocks_per_mp`` = ptxas's register cap (1 -> 255, 2 -> 128 registers per thread at 256 threads);
-  the SASS gate (no ``STL`` / ``LDL``) decides whether a form may use it.
+  the SASS gate (no ``STL`` / ``LDL``) decides whether a form may use it, and ``Cfg.co_resident_ctas`` (the CTAs per SM the part's shared
+  memory and the cap guarantee together) whether it buys anything on the part: a cap on a form whose footprint already keeps the SM at
+  one CTA is pure cost (sm_120a: ``CAPPED_CFG`` spills 7).
 * ``PDL`` / ``PDL_RELEASE``: ``griddepcontrol.wait`` AFTER the predecessor-independent loads (slot, parameters, BA weight rows, the state
   slab, the conv weights and history) and BEFORE ``z``, ``hidden``, the ``x`` copies and every global write (the pre-wait prefetch order
   of the reference verify kernel); ``griddepcontrol.launch_dependents`` at entry; the launch carries the programmatic-stream-
@@ -124,6 +132,10 @@ STATE_LOAD_PATHS = ("ldg128", "bulk")
 # so a hardcoded size never decides an occupancy pad on a part it does not describe.
 SM100_SMEM_PER_SM_BYTES = 228 * 1024
 SM100_SMEM_OPTIN_BYTES = 227 * 1024
+# The cc 12.0 part's readings (100 KB per SM, 99 KB per-CTA opt-in, the same 1 KB reserve; a 170-SM RTX 5090-class part): documentation
+# and tests only, never a default -- the host entry reads the part.
+SM120_SMEM_PER_SM_BYTES = 100 * 1024
+SM120_SMEM_OPTIN_BYTES = 99 * 1024
 SMEM_CTA_RESERVE_BYTES = 1024
 SMEM_PAD_MARGIN_BYTES = 4096  # keeps the cap robust to the allocation granularity
 
@@ -275,6 +287,17 @@ class Cfg:
     @property
     def SMEM_BYTES(self) -> int:
         return self.NATURAL_SMEM_BYTES + self.SMEM_PAD_BYTES
+
+    @property
+    def co_resident_ctas(self) -> int:
+        """The CTAs of this form that share one SM on the part, as the host can GUARANTEE them from the two budgets it knows: by shared
+        memory, how many launch footprints plus the driver's per-CTA reserve fit ``SMEM_PER_SM_BYTES``; by registers, ``MIN_CTAS_PER_SM``
+        (the cap the launch asks ptxas for -- 2 = 128 registers, two CTAs of 256 threads in the 64 K file; an uncapped form may take up to
+        255, so the host counts one) -- the smaller of the two.  The ONE predicate the default pick, its docs and its tests read: a
+        ``MIN_CTAS_PER_SM`` 2 form is worth its cap only where this is 2 (the cc 10.0 readings: ``CAPPED_CFG`` 2; the cc 12.0 readings: 1,
+        2 x (74,848 + 1,024) B > 102,400 B), and the half-slab pair under the cap is two per SM on both (42,112 B)."""
+        by_smem = self.SMEM_PER_SM_BYTES // (self.SMEM_BYTES + SMEM_CTA_RESERVE_BYTES)
+        return min(by_smem, self.MIN_CTAS_PER_SM)
 
 
 def validate_cfg(cfg: Cfg) -> None:

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The fused GDN decode step (``cudnn.linear_attention.frost.gdn_decode_fused``): the typed declines of its host entry (host-only,
-CPU tensors), the plan-time-only compile key, the config knob validation (the occupancy pad on both part readings), the DSL-floor
+CPU tensors), the plan-time-only compile key, the config knob validation (the occupancy pad and the co-residency on every part reading), the DSL-floor
 decline, and -- on a cc 10.x device -- the null-slot contract, the reader tickets, determinism, CUDA-graph replay over distinct
 layers, a loose torch reference of the fused math, and the bitwise agreement of every knob arm (the shared-memory state path, the
 streamed two-CTAs-per-SM form, the PDL order, the TPR mappings, the 128-thread form, the tap-contiguous conv-state layout) with the
@@ -25,9 +25,17 @@ pytestmark = [pytest.mark.L0]
 
 ROWS = 2
 SLOTS = ROWS + 1
-# the cc 10.0 part reading (228 KB per SM, 227 KB opt-in) and a hypothetical larger part (336 KiB per SM, 335 KiB opt-in): the pad must do
-# what it claims on both
-PART_READINGS = [(233472, 232448), (344064, 343040)]
+# the cc 10.0 part reading (228 KB per SM, 227 KB opt-in), a hypothetical larger part (336 KiB per SM, 335 KiB opt-in) and the cc 12.0 part
+# reading (100 KB per SM, 99 KB opt-in): the pad must do what it claims on each, and a form two of which cannot share the SM is a typed
+# decline where the caller asks for two
+SM100_READING = (kcfg.SM100_SMEM_PER_SM_BYTES, kcfg.SM100_SMEM_OPTIN_BYTES)  # 233,472 / 232,448
+SM120_READING = (kcfg.SM120_SMEM_PER_SM_BYTES, kcfg.SM120_SMEM_OPTIN_BYTES)  # 102,400 / 101,376
+PART_READINGS = [SM100_READING, (344064, 343040), SM120_READING]
+
+
+def _on(reading):
+    """The ``Cfg`` fields of a part reading ``(shared memory per SM, per-CTA opt-in)``."""
+    return dict(SMEM_PER_SM_BYTES=reading[0], SMEM_OPTIN_BYTES=reading[1])
 
 
 def make_operands(rows=ROWS, device="cpu", slots=SLOTS, seed=0, **overrides):
@@ -225,14 +233,57 @@ def test_cfg_knobs_validate():
 
 @pytest.mark.parametrize("per_sm, optin", PART_READINGS)
 @pytest.mark.parametrize("path", kcfg.STATE_LOAD_PATHS)
-def test_occupancy_pad_caps_the_ctas_per_sm_on_both_part_readings(per_sm, optin, path):
+def test_occupancy_pad_caps_the_ctas_per_sm_on_every_part_reading(per_sm, optin, path):
+    """``CTAS_PER_SM`` n pads the footprint so that n + 1 CTAs exceed the SM while n fit it; where even the NATURAL footprints of n CTAs do
+    not fit (the whole-slab bulk form at n = 2 on the cc 12.0 reading: 2 x (74,848 + 1,024) B > 102,400 B) the knob is a typed decline,
+    never a silent one-per-SM launch."""
     for n in (1, 2):
+        natural = kcfg.make_cfg(CTAS_PER_SM=0, STATE_LOAD_PATH=path, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin).NATURAL_SMEM_BYTES
+        if n * (natural + kcfg.SMEM_CTA_RESERVE_BYTES) > per_sm:
+            with pytest.raises(ValueError, match="do not fit the SM"):
+                kcfg.make_cfg(CTAS_PER_SM=n, STATE_LOAD_PATH=path, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin)
+            continue
         c = kcfg.make_cfg(CTAS_PER_SM=n, STATE_LOAD_PATH=path, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin)
         per_cta = c.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES
         assert (n + 1) * per_cta > per_sm, "one CTA more than allowed does not fit the SM"
         assert n * per_cta <= per_sm, "the allowed count does"
         assert c.SMEM_BYTES <= optin
         assert c.SMEM_PAD_BYTES % 16 == 0
+        assert per_sm // per_cta == n and c.co_resident_ctas == 1, "the pad admits exactly n by shared memory; an uncapped form guarantees one by registers"
+
+
+def test_cc120_reading_footprints_and_co_residency():
+    """The cc 12.0 readings (100 KB per SM, 99 KB per-CTA opt-in) through the module's own arithmetic: the launch footprints of the forms
+    (no pad fits beside a slab there: the natural footprints launch), which of them two can share an SM -- ``co_resident_ctas`` reads BOTH
+    budgets, the part's shared memory and the register cap the launch asks for -- and the knob arms that cannot be asked for two."""
+    per_sm, optin = SM120_READING
+    assert SM120_READING == (102400, 101376) and SM100_READING == (233472, 232448)
+    pair, cfg, capped, streamed = (replace(f, **_on(SM120_READING)) for f in (kcfg.PAIR_CFG, kcfg.CFG, kcfg.CAPPED_CFG, kcfg.STREAMED_CFG))
+    assert (pair.SMEM_BYTES, cfg.SMEM_BYTES, capped.SMEM_BYTES, streamed.SMEM_BYTES) == (42112, 74848, 74848, 74848)
+    assert (pair.SMEM_PAD_BYTES, cfg.SMEM_PAD_BYTES, capped.SMEM_PAD_BYTES) == (0, 0, 0)
+    for form in (pair, cfg, capped, streamed):
+        kcfg.validate_cfg(form)  # every form fits the 99 KB opt-in at one CTA per SM
+    # the whole-slab forms are one per SM by shared memory alone (2 x 75,872 B > 102,400 B), cap or no cap; the uncapped pair guarantees one
+    assert (pair.co_resident_ctas, cfg.co_resident_ctas, capped.co_resident_ctas, streamed.co_resident_ctas) == (1, 1, 1, 1)
+    assert 2 * (capped.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) == 151744 > per_sm
+    pair2 = kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2, **_on(SM120_READING))
+    assert pair2.co_resident_ctas == 2 and 2 * (pair2.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) == 86272 <= per_sm < 3 * (
+        pair2.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES
+    )
+    ldg2 = kcfg.make_cfg(STATE_LOAD_PATH="ldg128", TPR=16, CTAS_PER_SM=2, MIN_CTAS_PER_SM=2, **_on(SM120_READING))
+    assert (ldg2.NATURAL_SMEM_BYTES, ldg2.SMEM_PAD_BYTES, ldg2.SMEM_BYTES, ldg2.co_resident_ctas) == (9392, 27824, 37216, 2)
+    assert kcfg.make_cfg(STATE_LOAD_PATH="ldg128", **_on(SM120_READING)).SMEM_BYTES == 54272  # CTAS_PER_SM 1: padded to one per SM
+    for arm in (
+        dict(MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+        dict(STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+        dict(TPR=8, MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+    ):
+        with pytest.raises(ValueError, match="do not fit the SM"):
+            kcfg.make_cfg(**arm, **_on(SM120_READING))  # two whole slabs asked for by the pad: the typed decline
+    # the cc 10.0 readings: the capped whole-slab forms ARE two per SM (three by shared memory, two by the cap); the uncapped forms one
+    assert replace(kcfg.CAPPED_CFG, **_on(SM100_READING)).co_resident_ctas == replace(kcfg.STREAMED_CFG, **_on(SM100_READING)).co_resident_ctas == 2
+    assert replace(kcfg.CFG, **_on(SM100_READING)).co_resident_ctas == replace(kcfg.PAIR_CFG, **_on(SM100_READING)).co_resident_ctas == 1
+    assert kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2, **_on(SM100_READING)).co_resident_ctas == 2
 
 
 def test_state_box_bank_map_is_conflict_free_at_every_tpr():

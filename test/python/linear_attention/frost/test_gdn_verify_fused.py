@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The fused GDN verify step (``cudnn.linear_attention.frost.gdn_verify_fused``): the typed declines of its host entry (host-only,
-CPU tensors), the plan-time-only compile key, the config knob validation and the per-T shared-memory budget (the occupancy pad on
-both part readings), the DSL-floor decline, and -- on a cc 10.x device -- the semantics against a pure-torch reference of the fused
+CPU tensors), the plan-time-only compile key, the config knob validation and the per-T shared-memory budget (the occupancy pad and the
+co-residency on every part reading), the DSL-floor decline, and -- on a cc 10.x device -- the semantics against a pure-torch reference of the fused
 chain (the FP64 recurrence with the chain's rounding points; its tolerances are the ones the reference verify kernel was validated
 with: the bf16 output within 2^-6 relative + 1e-3, fp8 bytes equal on > 99.9 % of the live outputs and bitwise equal to the static
 quantization of the kernel's own bf16 output, the conv pool bitwise, written state slots within 1e-4, untouched slots untouched,
@@ -27,10 +27,20 @@ from cudnn.linear_attention.frost.kernel import gdn_verify_fused_config as kcfg 
 
 pytestmark = [pytest.mark.L0]
 
-# the cc 10.0 / 10.3 part reading (228 KB per SM, 227 KB opt-in) and a hypothetical larger part (336 KiB per SM, 335 KiB opt-in): the pad
-# must do what it claims on both
-PART_READINGS = [(233472, 232448), (344064, 343040)]
+# the cc 10.0 / 10.3 part reading (228 KB per SM, 227 KB opt-in), a hypothetical larger part (336 KiB per SM, 335 KiB opt-in) and the cc
+# 12.0 part reading (100 KB per SM, 99 KB opt-in): the pad must do what it claims on each, and a form two of which cannot share the SM is
+# a typed decline where the caller asks for two
+SM100_READING = (kcfg.SM100_SMEM_PER_SM_BYTES, kcfg.SM100_SMEM_OPTIN_BYTES)  # 233,472 / 232,448
+SM120_READING = (kcfg.SM120_SMEM_PER_SM_BYTES, kcfg.SM120_SMEM_OPTIN_BYTES)  # 102,400 / 101,376
+PART_READINGS = [SM100_READING, (344064, 343040), SM120_READING]
 REFERENCE_DIR_ENV = "CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR"
+
+
+def _on(reading):
+    """The ``Cfg`` fields of a part reading ``(shared memory per SM, per-CTA opt-in)``."""
+    return dict(SMEM_PER_SM_BYTES=reading[0], SMEM_OPTIN_BYTES=reading[1])
+
+
 FP8_MAX = 448.0
 AMBIGUOUS_REL = 2.0**-16
 
@@ -416,13 +426,59 @@ def test_cfg_knobs_validate_and_the_smem_budget_follows_the_tokens():
 
 @pytest.mark.parametrize("per_sm, optin", PART_READINGS)
 @pytest.mark.parametrize("tokens", (2, 6))
-def test_occupancy_pad_caps_the_ctas_per_sm_on_both_part_readings(per_sm, optin, tokens):
+def test_occupancy_pad_caps_the_ctas_per_sm_on_every_part_reading(per_sm, optin, tokens):
+    """``CTAS_PER_SM`` n pads the footprint so that n + 1 CTAs exceed the SM while n fit it; where even the NATURAL footprints of n CTAs do
+    not fit at the minimum token count (the streamed whole-slab form at n = 2 on the cc 12.0 reading: 2 x (79,200 + 1,024) B > 102,400 B)
+    the knob is a typed decline, never a silent one-per-SM launch."""
     for n, base in ((1, dict(NBUF=1)), (2, dict(NBUF=1, STATE_STREAM=True, MIN_CTAS_PER_SM=2))):
+        natural = kcfg.make_cfg(CTAS_PER_SM=0, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin, **base).natural_smem_bytes(kcfg.TOKENS_MIN)
+        if n * (natural + kcfg.SMEM_CTA_RESERVE_BYTES) > per_sm:
+            with pytest.raises(ValueError, match="does not fit"):
+                kcfg.make_cfg(CTAS_PER_SM=n, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin, **base)
+            continue
         c = kcfg.make_cfg(CTAS_PER_SM=n, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin, **base)
         per_cta = c.smem_bytes(tokens) + kcfg.SMEM_CTA_RESERVE_BYTES
         assert (n + 1) * per_cta > per_sm, "one CTA more than allowed does not fit the SM"
         assert n * per_cta <= per_sm, "the allowed count does"
         assert c.smem_bytes(tokens) <= optin and c.smem_pad_bytes(tokens) % 16 == 0
+        assert per_sm // per_cta == n and c.co_resident_ctas(tokens) == min(n, c.MIN_CTAS_PER_SM), "the pad admits exactly n by shared memory"
+
+
+def test_cc120_reading_footprints_and_co_residency():
+    """The cc 12.0 readings (100 KB per SM, 99 KB per-CTA opt-in) through the module's own arithmetic: the footprint law ``6,464 + 3,536 T
+    + ring (+ 144 on the pair)`` with ``ring = NBUF x 65,664`` (one CTA) or ``NBUF x 32,896`` (the pair), the token bounds of the forms a
+    99 KB opt-in holds, which of them two can share an SM -- ``co_resident_ctas`` reads BOTH budgets, the part's shared memory and the
+    register cap the launch asks for -- and the three SM100 picks that do not hold even two tokens there."""
+    per_sm, optin = SM120_READING
+    assert SM120_READING == (102400, 101376) and SM100_READING == (233472, 232448)
+    pair_nbuf2 = kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=2, **_on(SM120_READING))
+    pair_nbuf1 = kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=1, **_on(SM120_READING))
+    one_nbuf1 = kcfg.make_cfg(ROLLED_TOKENS=True, NBUF=1, **_on(SM120_READING))
+    assert [pair_nbuf2.natural_smem_bytes(t) for t in (2, 4, 6)] == [79472, 86544, 93616] and pair_nbuf2.max_tokens() == 8
+    assert [one_nbuf1.natural_smem_bytes(t) for t in (2, 4, 6)] == [79200, 86272, 93344] and one_nbuf1.max_tokens() == 8
+    assert [pair_nbuf1.natural_smem_bytes(t) for t in (2, 3, 4, 6)] == [46576, 50112, 53648, 60720] and pair_nbuf1.max_tokens() == 17
+    assert pair_nbuf1.natural_smem_bytes(17) == 99616 <= optin < pair_nbuf1.natural_smem_bytes(18) == 103152
+    assert pair_nbuf2.natural_smem_bytes(9) == 104224 > optin and one_nbuf1.natural_smem_bytes(9) == 103952 > optin
+    assert all(f.smem_pad_bytes(t) == 0 for f in (pair_nbuf2, pair_nbuf1, one_nbuf1) for t in (2, 6)), "no pad fits beside a slab on this part"
+    for t in (2, 4, 6):
+        assert one_nbuf1.natural_smem_bytes(t) == 6464 + 3536 * t + 65664 and pair_nbuf1.natural_smem_bytes(t) == 6464 + 3536 * t + 144 + 32896
+        assert pair_nbuf2.natural_smem_bytes(t) == 6464 + 3536 * t + 144 + 2 * 32896
+    # co-residency: every whole-slab form is one per SM by shared memory alone; the NBUF-1 pair is two by shared memory at T <= 3 and one
+    # from T 4 -- and the host guarantees two only under the register cap (the uncapped pair measured 187 registers on sm_120a)
+    two = replace(kcfg.TWO_CTA_CFG, **_on(SM120_READING))
+    assert two.max_tokens() == 8 and two.co_resident_ctas(2) == 1 and 2 * (two.smem_bytes(2) + kcfg.SMEM_CTA_RESERVE_BYTES) == 160448 > per_sm
+    assert [pair_nbuf2.co_resident_ctas(t) for t in (2, 6)] == [1, 1] and [one_nbuf1.co_resident_ctas(t) for t in (2, 6)] == [1, 1]
+    assert [pair_nbuf1.co_resident_ctas(t) for t in (2, 3, 4)] == [1, 1, 1]
+    capped = replace(pair_nbuf1, MIN_CTAS_PER_SM=2)
+    assert [capped.co_resident_ctas(t) for t in (2, 3, 4, 6)] == [2, 2, 1, 1] and 2 * (capped.smem_bytes(3) + kcfg.SMEM_CTA_RESERVE_BYTES) == 102272
+    for form in (kcfg.PAIR_CFG, kcfg.CFG):  # the 3-deep rings: 112,368 / 210,528 B at T 2 -- typed declines, by the opt-in
+        assert replace(form, **_on(SM120_READING)).max_tokens() == 0
+        with pytest.raises(ValueError, match="does not fit 2 tokens per request on a 101376-byte opt-in"):
+            kcfg.validate_cfg(replace(form, **_on(SM120_READING)))
+    # the cc 10.0 readings: TWO_CTA_CFG is two per SM to T 12 (two by shared memory, two by the cap); the uncapped picks guarantee one
+    two100 = replace(kcfg.TWO_CTA_CFG, **_on(SM100_READING))
+    assert (two100.co_resident_ctas(2), two100.co_resident_ctas(12), two100.co_resident_ctas(13), two100.max_tokens()) == (2, 2, 1, 45)
+    assert replace(kcfg.CFG, **_on(SM100_READING)).co_resident_ctas(2) == replace(kcfg.PAIR_CFG, **_on(SM100_READING)).co_resident_ctas(2) == 1
 
 
 def test_state_box_bank_map_is_conflict_free_at_every_tpr():
