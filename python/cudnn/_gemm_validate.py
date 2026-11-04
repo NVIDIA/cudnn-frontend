@@ -42,6 +42,8 @@ COVERED_NODE_TYPES = frozenset(
         NodeType.BLOCK_SCALE_QUANTIZE,
         NodeType.POINTWISE,
         NodeType.REDUCTION,
+        NodeType.TRANSPOSE,
+        NodeType.RESHAPE,
     }
 )
 
@@ -64,6 +66,9 @@ def validate_graph(graph) -> bool:
     nodes = list(graph._nodes)
     if not nodes or any(n.node_type not in COVERED_NODE_TYPES for n in nodes):
         return False
+    # Unspecified reshape targets retain the classic scalar/default inference.
+    if any(n.node_type == NodeType.RESHAPE and not _dims(n.outputs.get("OUT_0")) for n in nodes):
+        return False
     for node in nodes:
         validate_node(node)
     return True
@@ -73,6 +78,10 @@ def validate_node(node) -> None:
     """Dispatch one GEMM-family node to its rules."""
     if node.node_type == NodeType.MATMUL:
         _validate_matmul(node)
+    elif node.node_type == NodeType.RESHAPE:
+        _validate_reshape(node)
+    elif node.node_type == NodeType.TRANSPOSE:
+        _validate_transpose(node)
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
         _validate_moe_offsets(node)
@@ -114,6 +123,27 @@ def validate_node(node) -> None:
             dim = _dims(tensor)
             if dim and out and (len(dim) > len(out) or any(x != 1 and x != y for x, y in zip(reversed(dim), reversed(out)))):
                 raise _not_supported("Pointwise inputs do not broadcast to the output shape")
+
+
+def _validate_transpose(node) -> None:
+    """Version-independent transpose semantics; FROST's narrower scope is a support gate."""
+    _validate_required(node, "Transpose", ("input",), ("OUT_0",))
+    dim = _dims(node.inputs["input"]) or []
+    permutation = node.params.get("permutation")
+    if not permutation:
+        raise ValueError("Permutation must be set for transpose operation.")
+    if len(permutation) != len(dim):
+        raise ValueError("Permutation size must match input tensor dimensionality.")
+    if any(not isinstance(i, int) or i < 0 or i >= len(dim) for i in permutation):
+        raise ValueError("Permutation indices must be in range [0, n-1].")
+    if len(set(permutation)) != len(permutation):
+        raise ValueError("Permutation indices must be unique.")
+    source, output = node.inputs["input"], node.outputs["OUT_0"]
+    if source.get_data_type() != output.get_data_type():
+        raise ValueError("Output and input tensor data types must match for transpose operation.")
+    expected = [dim[i] for i in permutation]
+    if _dims(output) != expected:
+        raise _not_supported(f"Transpose output dims must match the permuted input dims {expected}")
 
 
 def _validate_moe_combine(node) -> None:
@@ -194,3 +224,22 @@ def _validate_moe_offsets(node) -> None:
     experts = _dims(expert_tensor)
     if offsets and experts:
         moe_offset_mode(offsets[0], experts[0])
+
+
+def _validate_reshape(node) -> None:
+    """Validate logical shape facts without requiring a backend reshape descriptor."""
+    from math import prod
+
+    _validate_required(node, "Reshape", ("input",), ("OUT_0",))
+    source, output = node.inputs["input"], node.outputs["OUT_0"]
+    dim, target = _dims(source), _dims(output)
+    if not target or any(d <= 0 for d in target):
+        raise ValueError("Reshape requires an explicit positive output shape")
+    raw_mode = node.params.get("reshape_mode")
+    mode = "VIEW_ONLY" if raw_mode is None else getattr(raw_mode, "name", None)
+    if mode not in ("LOGICAL", "VIEW_ONLY"):
+        raise ValueError("Unsupported reshape mode")
+    if mode == "LOGICAL" and dim and prod(dim) != prod(target):
+        raise ValueError("LOGICAL reshape input and output element counts must match")
+    if mode == "LOGICAL" and source.get_data_type() != output.get_data_type():
+        raise ValueError("Output and input tensor data types must match for LOGICAL reshape operation.")

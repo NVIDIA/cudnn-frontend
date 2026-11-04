@@ -28,9 +28,10 @@ The experimental API catalog includes:
 - [Causal Conv1d](/operations/CausalConv1d/causal_conv1d) and [Decode Update](/operations/CausalConv1d/causal_conv1d_update)
 - [FLA Integration Shims](/operations/LinearAttention/fla)
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
+- [Fused GDN Decode / Verify Steps as a FlashInfer Backend (SM100)](/operations/LinearAttention/gdn_decode_flashinfer_backend) — the fused Gated DeltaNet decode step and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer as one FROST launch each, registered as the `frost_fe` backend of FlashInfer's experimental Qwen 3.5 GDN block (bf16 operands, fp32 state, FP8 output)
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
-- [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) and write-through into a paged KV cache
+- [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) with the in-block indexer's decode and extend steps over the paged side caches, and write-through into a paged KV cache
 - [Triangle Multiplicative Update (SM100 / SM103 / SM107)](/operations/Matmul/triangle_multiplicative_update) — the AlphaFold-class outgoing / incoming triangle multiplication as three FROST launches behind cuEquivariance's `triangle_multiplicative_update` signature (bf16)
 - [Triangle Attention (SM107)](/operations/Attention/triangle_attention) — the AlphaFold-class attention with a pair bias and a key mask (right-padded lengths or a dense boolean mask) on the FROST SDPA engine behind cuEquivariance's `triangle_attention` signature (bf16 / fp16, D &lt;= 64)
 - [Tail RoPE + Microscaled QDQ](/operations/RoPE/rope-qdq)

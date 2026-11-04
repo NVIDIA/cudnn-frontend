@@ -167,6 +167,7 @@ def make_launcher(plan, names):
                 dstate0=ports.get("d_initial_state"),
                 gate_main=g if not log_gate and not safe_gate else None,
                 seed_checkpoints=ports.get("state_checkpoints") if coarse else None,
+                dstate_scratch=w["dstate_scratch"],
             )
         if chain:
             args.update(
@@ -235,6 +236,7 @@ def make_launcher(plan, names):
                     scheduler_bwd=w["scheduler_bwd"],
                     recompute_words=w.get("recompute_tensormaps"),
                     bprop_words=w["bwd_tensormaps"],
+                    dstate_snapshot=w.get("dstate_snapshot"),
                 )
             else:
                 args.update(
@@ -253,6 +255,7 @@ def make_launcher(plan, names):
                     prep_words=w.get("prep_tensormaps"),
                     prep_rows=w.get("prep_rows"),
                     prep_row_count=w.get("prep_row_count"),
+                    state_snapshot=w.get("state_snapshot"),
                 )
         for name, dtype in scalar_types.items():
             args[name] = dtype(args[name])

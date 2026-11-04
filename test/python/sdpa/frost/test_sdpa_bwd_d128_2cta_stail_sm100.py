@@ -51,6 +51,7 @@ _BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_grouped_2cta_stail
 _BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/bprop_d128_accum_grouped_2cta_stail_f16.py")
 _TREE = pathlib.Path(__file__).resolve().parents[4]  # test/python/sdpa/frost/<file> -> the checkout
 _RECORD = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt"
+_RECORD_DEV = _RECORD.with_name("md5_d128_accum_grouped_2cta_stail_default_sm_100a_dsl_4_9_dev_20261028.txt")
 _RECORD_TOKEN = "d128_accum_grouped_2cta_stail"
 _RECORD_TOKEN_LDG = "d128_accum_grouped_2cta_stail_ldg"  # the stats_form = "ldg" rendering's rows (the previous default), beside the default's in the same file
 # The kernels the pair chain OWNS under the DEFAULT form (tma_ring: the delta-and-stats launch; one record row each; the group fold
@@ -104,7 +105,8 @@ _STATS_FORMS = ("ldg", "tma_ring")
 _STATS_CENSUS = {
     "bar_sync_1_256": r"bar\.sync\s+1,\s*256",
     "st_shared_b32": r"st\.shared\.b32",
-    "bulk_g2s_plain": r"cp\.async\.bulk\.shared::cluster\.global\.mbarrier",
+    # Non-multicast copies use either destination spelling, depending on the DSL build.
+    "bulk_g2s_plain": r"cp\.async\.bulk\.shared::(?:cta|cluster)\.global\.mbarrier",
     "mbarrier_init": r"mbarrier\.init",
     "ld_global": r"ld\.global",
     "fence_proxy_async": r"fence\.proxy\.async",
@@ -465,8 +467,14 @@ def _render_kernels(tmp_path, form_kw, extra_census=None):
 
 
 def _record_kernels(path, token):
-    """(dsl line, {kernel: md5}) of a per-kernel record's ``default`` variant (frost_test_utils.read_kernel_record)."""
-    dsl, want = read_kernel_record(path, token)
+    """Select the installed DSL build's record; an unrecorded build still reaches the existing skip guard."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    paths = (path, _RECORD_DEV) if path == _RECORD else (path,)
+    records = [read_kernel_record(candidate, token) for candidate in paths]
+    dsl, want = next((record for record in records if record[0] == have), records[0])
     return dsl, want.get("default", {})
 
 
@@ -669,7 +677,9 @@ def test_2cta_stail_host_renders_stats_forms_for_sm_100a(tmp_path):
     # the ldg chain's five launches: the compact delta launch; the main kernel and the setup kernel (no padded row-offset pass) render differently
     # from the default's, the dQ cast is the same kernel; the shared fold is rendered and excluded from the pin
     assert set(kernels_l) == set(_OWN_KERNELS_LDG) | set(D128_THD_SHARED_KERNELS), kernels_l
-    assert kernels_l[_OWN_KERNELS[2]] != kernels_d[_OWN_KERNELS[2]] and kernels_l[_OWN_KERNELS[3]] == kernels_d[_OWN_KERNELS[3]], (kernels_d, kernels_l)
+    assert kernels_l[_OWN_KERNELS[2]] != kernels_d[_OWN_KERNELS[2]], (kernels_d, kernels_l)
+    # Pin the cast independently in each form: its entry-region hash also includes the following kernel's .globl annotation,
+    # which can differ between forms even when the cast instructions are identical.
     _assert_record(kernels_l, _RECORD, _RECORD_TOKEN_LDG, "the ldg rendering")
     md5_c, census_c, regs_c = _render(tmp_path, {"debug_clk": True}, _STATS_CENSUS)
     assert census_c["clock64"] > 0 and md5_c != md5_d and regs_c == regs_d

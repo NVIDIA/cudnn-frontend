@@ -57,6 +57,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         has_block_sizes: bool = True,
         num_splits: cutlass.Constexpr[int] = 1,
         allow_empty_block_nums: bool = False,
+        nonpositive_scale: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -88,6 +89,9 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         # Compile-time specialization: only the empty-enabled variant pays for the
         # empty-safe finalizer. The non-split kernel's num_n_tiles > 0 guard is unconditional.
         self.allow_empty_block_nums = allow_empty_block_nums
+        # softmax_scale <= 0 (or NaN): max(scale * S) is not scale * max(S), and a masked -inf times the
+        # scale is not -inf. The scale then multiplies the scores before the masks and the softmax uses 1.
+        self.nonpositive_scale = nonpositive_scale
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -120,6 +124,9 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         O_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
     ):
+        score_scale = scale_softmax_log2e
+        if cutlass.const_expr(self.nonpositive_scale):
+            scale_softmax_log2e = cutlass.Float32(1.0)
         # Single-stage Q/K, double-buffered V: overlap QK[j] with PV[j-1].
         # Reuse K after wait_group(1); reuse V and update P/O after wait_group(0).
         # Reuse Q storage for O only after the final drain.
@@ -250,6 +257,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 max_m=max_m,
                 sum_m=sum_m,
                 scale_softmax_log2e=scale_softmax_log2e,
+                score_scale=score_scale,
             )
         else:
             # Empty row: Q was still loaded. Let it land before its SMEM is reused for O staging or the
@@ -331,6 +339,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         max_m: cute.Tensor,
         sum_m: cute.Tensor,
         scale_softmax_log2e: cutlass.Float32,
+        score_scale: cutlass.Float32,
     ):
         """QK[j] and PV[j-1] in flight together; wait_group(1) retires QK[j] before softmax[j]."""
         # Every PV accumulates into O (zero-initialized): set once, so no MMA atom is loop-carried.
@@ -355,6 +364,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
             cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
+        self.prescale(tSrS, score_scale)
         # Full KV tiles need no mask; the CTA-uniform branch skips per-element selects.
         if varblk < self.tile_size:
             mask(tiled_mma_qk, tSrS, tScS, varblk)
@@ -397,6 +407,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
                 cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
+            self.prescale(tSrS, score_scale)
             if varblk < self.tile_size:
                 mask(tiled_mma_qk, tSrS, tScS, varblk)
             prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
@@ -415,6 +426,11 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV[None, None, None, last % 2], tOrO)
         cute.nvgpu.warpgroup.commit_group()
         cute.nvgpu.warpgroup.wait_group(0)
+
+    @cute.jit
+    def prescale(self, tSrS: cute.Tensor, score_scale: cutlass.Float32):
+        if cutlass.const_expr(self.nonpositive_scale):
+            tSrS.store(tSrS.load() * score_scale)
 
     @cute.jit
     def block_len(self, n_tile_idx, gBSZ: cute.Tensor, seqlen, num_compute_tiles):
@@ -448,6 +464,9 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         V_smem_layout: cute.ComposedLayout,
         scale_softmax_log2e: cutlass.Float32,
     ):
+        score_scale = scale_softmax_log2e
+        if cutlass.const_expr(self.nonpositive_scale):
+            scale_softmax_log2e = cutlass.Float32(1.0)
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -576,6 +595,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                     K_barrier[0].arrive_and_expect_tx(index=0, tx_count=cute.size_in_bytes(self.K_dtype, K_smem_layout))
                     cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
+                self.prescale(tSrS, score_scale)
                 if varblk < self.tile_size:
                     mask(tiled_mma_qk, tSrS, tScS, varblk)
                 prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)

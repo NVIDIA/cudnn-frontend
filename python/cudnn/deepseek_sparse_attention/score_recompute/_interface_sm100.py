@@ -35,7 +35,7 @@ from ._block_scaled import (
     validate_indexer_precision,
     validate_sf_vec_size,
 )
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options, gpu_arch_flag
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
     device_major as _get_device_capability,
@@ -291,6 +291,7 @@ def _sparse_indexer_score_recompute(
         # decode of topk ids).
         compile_key = (
             "indexer",
+            gpu_arch_flag(),
             q_indexer.dtype,
             head_dim,
             qhead_per_kv_head,
@@ -432,10 +433,15 @@ def _sparse_attn_score_recompute(
     n_block_size: int = 64,
     k_block_size: Optional[int] = None,
     topk_indices_global: bool = True,
+    pool_size: int = 0,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> torch.Tensor:
     """
     Compute sparse attention target (L1-normalized head-summed softmax) for backward.
+
+    ``pool_size`` > 0 sums each group of ``pool_size`` consecutive slots and writes
+    the pool-level target ``(bs, seqlen_q, out.shape[2])``; ``topk_length`` must then
+    be a multiple of ``pool_size`` and ``n_block_size`` 64.
 
     Args:
         q_attn: (bs, seqlen_q, n_heads_q, head_dim) [BF16], unit innermost stride
@@ -472,7 +478,14 @@ def _sparse_attn_score_recompute(
     have_topk_length = topk_length is not None
     if have_topk_length:
         _require_int32_contiguous(topk_length, "topk_length")
-    _require_fp32_output(out, "out", (bs, seqlen_q, topk))
+    if pool_size:
+        if not have_topk_length or n_block_size != 64 or pool_size not in (4, 16):
+            raise ValueError("pool_size needs topk_length, n_block_size=64 and pool_size in (4, 16)")
+        if out.dim() != 3 or out.shape[2] * pool_size > topk:
+            raise ValueError(f"pooled out must be (bs, seqlen_q, k_pools) with k_pools * {pool_size} <= {topk}, got {tuple(out.shape)}")
+        _require_fp32_output(out, "out", (bs, seqlen_q, out.shape[2]))
+    else:
+        _require_fp32_output(out, "out", (bs, seqlen_q, topk))
 
     # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
@@ -503,6 +516,7 @@ def _sparse_attn_score_recompute(
     if compute_capability >= 10:
         compile_key = (
             "attention",
+            gpu_arch_flag(),
             q_attn.dtype,
             head_dim,
             qhead_per_kv_head,
@@ -511,11 +525,11 @@ def _sparse_attn_score_recompute(
             n_block_size,
             k_block_size,
             kv_stage,
+            pool_size,
             have_topk_length,
             topk_in_smem,
             topk_indices_global,
         )
-
         if compile_key not in _sparse_attn_score_recompute.compile_cache:
             q_cute = to_cute_tensor(q_attn)
             k_cute = to_cute_tensor(k_attn)
@@ -537,8 +551,8 @@ def _sparse_attn_score_recompute(
                 have_topk_length=have_topk_length,
                 topk_in_smem=topk_in_smem,
                 topk_indices_global=topk_indices_global,
+                pool_size=pool_size,
             )
-
             _sparse_attn_score_recompute.compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 q_cute,
@@ -1018,6 +1032,7 @@ def _dense_indexer_score_recompute(
         assert q_scale is not None and k_scale is not None
         compile_key = (
             "dense_indexer",
+            gpu_arch_flag(),
             precision,
             q.dtype,
             k.dtype,
@@ -1038,6 +1053,7 @@ def _dense_indexer_score_recompute(
         )
     else:
         base_compile_key = (
+            gpu_arch_flag(),
             q.dtype,
             head_dim,
             qhead_per_kv_head,
@@ -1341,6 +1357,7 @@ def _dense_attn_score_recompute(
         assert q_scale is not None and k_scale is not None
         compile_key = (
             "dense_attention",
+            gpu_arch_flag(),
             "mxfp8",
             q.dtype,
             k.dtype,
@@ -1362,6 +1379,7 @@ def _dense_attn_score_recompute(
     else:
         compile_key = (
             "dense_attention",
+            gpu_arch_flag(),
             q.dtype,
             head_dim,
             qhead_per_kv_head,

@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from .config_types import BenchmarkResult, InferenceBenchmarkConfig, ModelPreset
+from .config_types import BenchmarkResult, InferenceBenchmarkConfig, ModelPreset, attn_mask
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -178,6 +178,8 @@ class InferenceBenchmarkRunner:
             num_iterations=config.num_iterations,
             kv_layout=case.get("kv_layout", "dense"),
             kv_min_fill=case.get("kv_min_fill", 1.0),
+            attn_mask=attn_mask(case["phase"], config.context_causal, case["q_tokens"], case["kv_len"], model.sliding_window_size),
+            has_sink=model.has_sink,
         )
 
         skip = backend_supported(case["backend"], model, case["phase"], cc)

@@ -8,20 +8,9 @@ import torch
 
 from test_utils import torch_fork_set_rng
 from block_sparse_attention.cutedsl.bsa_reference import attention_backward_reference, block_sparse_mask
-from block_sparse_attention.cutedsl.bsa_utils import make_fixed_metadata, supported_block_size
+from block_sparse_attention.cutedsl.bsa_utils import import_bsa, make_fixed_metadata, require_arch, supported_block_size
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
-
-
-def _import_bsa():
-    try:
-        from cudnn import ops
-
-        importlib.import_module("cudnn.block_sparse_attention._interface")
-
-        return ops
-    except (ImportError, OSError) as error:
-        pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
 
 @pytest.mark.L0
@@ -30,8 +19,7 @@ def _import_bsa():
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_bsa_sm100_blk64_sum_odo_fp32_product(seqlen, layout):
     """Casting after O*dO has already lost BF16 product bits needed by dS."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in {10, 11}:
-        pytest.skip("blk64 backward is specific to SM100/SM110")
+    require_arch(families=(10, 11), reason="blk64 backward is specific to SM100/SM110")
 
     from cudnn.frost.buffers import cutedsl_requirement_error
 
@@ -39,7 +27,7 @@ def test_bsa_sm100_blk64_sum_odo_fp32_product(seqlen, layout):
     if requirement_error is not None:
         pytest.skip(requirement_error)
 
-    _import_bsa()
+    import_bsa()
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
@@ -94,7 +82,7 @@ def test_bsa_sm100_blk64_sum_odo_fp32_product(seqlen, layout):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_bsa_attention_backward_fixed_blocks():
-    ops = _import_bsa()
+    ops = import_bsa()
     block_size = supported_block_size(backward=True)
     batch, heads, seqlen_q, seqlen_k, dim = 1, 2, 2 * block_size, 4 * block_size, 128
     q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
@@ -183,7 +171,7 @@ def test_bsa_attention_backward_fixed_blocks():
     ],
 )
 @pytest.mark.parametrize("variable_counts", [False, True])
-def test_bsa_attention_backward_sm100_blk64(
+def test_bsa_attention_backward_blk64(
     bucket_size_blocks,
     seqlen_k,
     softmax_scale,
@@ -192,15 +180,12 @@ def test_bsa_attention_backward_sm100_blk64(
 ):
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
+    ops = import_bsa(families=(9, 10, 11), reason="blk64 backward test is specific to SM90/SM100/SM110")
     major, _ = torch.cuda.get_device_capability()
-    if major not in {10, 11}:
-        pytest.skip("blk64 backward test is specific to SM100/SM110")
-
-    ops = _import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     if variable_counts:
         # Keep this small case on the paired-KV path, whose shared dK/dV needs the FP32 workspace.
-        monkeypatch.setattr(interface, "_SM100_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
+        monkeypatch.setattr(interface, "_BLK64_PAIRED_KV_MIN_KV_TASKS", 0)
     workspace_modes = []
     allocate_workspace = interface._empty_bwd_workspace_with_zeroed_accum
 
@@ -246,7 +231,7 @@ def test_bsa_attention_backward_sm100_blk64(
         block_sizes,
         sparse_block_size=64,
         softmax_scale=softmax_scale,
-        use_clc=False,
+        **({} if major == 9 else {"use_clc": False}),
         q2k_block_nums=counts,
     )
     backward = ops.block_sparse_attention_backward(
@@ -290,11 +275,7 @@ def test_bsa_attention_backward_blk128_dk_zero_init_accumulate_transition(num_q_
     """
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
-    major, _ = torch.cuda.get_device_capability()
-    if major not in {10, 11}:
-        pytest.skip("blk128 backward is specific to SM100/SM110")
-
-    ops = _import_bsa()
+    ops = import_bsa(families=(10, 11), reason="blk128 backward is specific to SM100/SM110")
     block_size = 128
     batch, heads, dim = 1, 1, 128
     seqlen_q = num_q_blocks * block_size

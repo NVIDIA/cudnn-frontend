@@ -20,6 +20,7 @@ import cuda.bindings.driver as cuda
 from cudnn.api_base import APIBase, TupleDict
 
 from cudnn.deepseek_sparse_attention.utils.runtime import device_major
+from cudnn.tensor_adapter import has_tcgen05
 
 from ._interface import TMA_ALIGN_ELEMS, _indexer_fwd_bound, indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
@@ -147,8 +148,8 @@ class IndexerForward(APIBase):
 
         major = device_major()
         self._runtime_error_if(
-            major < 10,
-            f"IndexerForward requires SM100+ compute capability, found SM{major}",
+            not has_tcgen05(major),
+            f"IndexerForward requires SM100+ compute capability with tcgen05 (not cc 12.x), found SM{major}",
         )
 
         self.batch_size = b

@@ -67,8 +67,8 @@ class DsaBenchmarkRunner:
         for model, (q_seqlen, kv_seqlen), backend, data_type, profile_pass in itertools.product(
             config.models, config.seqlens, config.backends, config.data_types, passes
         ):
-            # deterministic_bwd is a backward-only knob: fwd emits one row.
-            det_values = [False] if profile_pass == "fwd" else list(config.deterministic_bwd)
+            # deterministic_bwd is a backward-only DSA knob: fwd and QSA emit one row.
+            det_values = [False] if profile_pass == "fwd" or model.kind != "dsa" else list(config.deterministic_bwd)
             for det_bwd in det_values:
                 yield {
                     "config": config,
@@ -85,9 +85,11 @@ class DsaBenchmarkRunner:
     def _case_label(case: Dict[str, Any]) -> str:
         m: ModelPreset = case["model"]
         det = " | det" if case["deterministic_bwd"] else ""
+        heads = f"H{m.num_q_heads}" if m.kind == "dsa" else f"H{m.num_q_heads}/{m.num_kv_heads}"
+        topk = f"K={m.topk}" if m.block_size == 1 else f"K={m.topk}x{m.block_size}"
         return (
-            f"{m.name} | seq={case['q_seqlen']}x{case['kv_seqlen']} | H{m.num_q_heads} d={m.head_dim_qk}/{m.head_dim_vo} "
-            f"K={m.topk} | {case['backend']} | {case['data_type']} | {case['profile_pass']}{det}"
+            f"{m.name} | seq={case['q_seqlen']}x{case['kv_seqlen']} | {heads} d={m.head_dim_qk}/{m.head_dim_vo} "
+            f"{topk} | {case['backend']} | {case['data_type']} | {case['profile_pass']}{det}"
         )
 
     def run_single(self, case: Dict[str, Any]) -> BenchmarkResult:
@@ -106,14 +108,19 @@ class DsaBenchmarkRunner:
             topk=model.topk,
             indexer_topk=model.indexer_topk,
             has_sink=model.has_sink,
-            use_topk_length=config.use_topk_length,
+            use_topk_length=config.use_topk_length if model.kind == "dsa" else False,
             profile_pass=case["profile_pass"],
             deterministic_bwd=case["deterministic_bwd"],
             num_iterations=config.num_iterations,
+            kind=model.kind,
+            num_kv_heads=model.num_kv_heads,
+            block_size=model.block_size,
         )
         failed = dict(time_ms=float("inf"), tflops=0.0, success=False)
 
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_single_dsa.py")
+        # One worker per kind; both speak the same RESULT, / UNSUPPORTED, protocol.
+        worker = "benchmark_single_qsa.py" if model.kind == "qsa" else "benchmark_single_dsa.py"
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), worker)
         cmd = [
             sys.executable,
             script,
@@ -133,8 +140,6 @@ class DsaBenchmarkRunner:
             str(model.head_dim_vo),
             "--topk",
             str(model.topk),
-            "--indexer_topk",
-            str(model.indexer_topk),
             "--data_type",
             case["data_type"],
             "--num_iterations",
@@ -142,12 +147,16 @@ class DsaBenchmarkRunner:
             "--num_warmup_iterations",
             str(config.num_warmup_iterations),
         ]
-        if model.has_sink:
-            cmd.append("--has_sink")
-        if config.use_topk_length:
-            cmd.append("--use_topk_length")
-        if case["deterministic_bwd"]:
-            cmd.append("--deterministic")
+        if model.kind == "qsa":
+            cmd += ["--num_kv_heads", str(model.num_kv_heads), "--block_size", str(model.block_size)]
+        else:
+            cmd += ["--indexer_topk", str(model.indexer_topk)]
+            if model.has_sink:
+                cmd.append("--has_sink")
+            if config.use_topk_length:
+                cmd.append("--use_topk_length")
+            if case["deterministic_bwd"]:
+                cmd.append("--deterministic")
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)

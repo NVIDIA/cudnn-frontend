@@ -19,12 +19,28 @@ def data_layout_mismatch(name, shape, stride, *, thd=False):
     return None
 
 
+def forward_thd_layout_mismatch(name, shape, stride):
+    """Packed token-major rows may have independent head and token padding."""
+    reason = data_layout_mismatch(name, shape, stride, thd=True)
+    if reason is not None:
+        return reason
+    _, heads, _, width = map(int, shape)
+    _, head_stride, token_stride, inner_stride = map(int, stride)
+    # Batch is never stepped. A singleton head's pitch is also unread.
+    row_span = (heads - 1) * head_stride + width
+    if inner_stride != 1 or (heads > 1 and head_stride < width) or token_stride < row_span:
+        return f"SM80 THD {name}: native packed rows require non-overlapping token/head strides and contiguous head dimension; got stride {tuple(stride)}"
+    return None
+
+
 def forward_adapter_mismatch(api):
     if api._rope_max_s:
         return "SM80 RoPE forward requires staging and is not supported by the native adapter"
     for role in ("q", "k", "v", "o"):
         desc = getattr(api, role + "_desc")
-        reason = data_layout_mismatch(role, desc.shape, desc.stride, thd=api.thd)
+        index = ("q", "k", "v", "o").index(role)
+        thd = api.thd and not (api.paged and role in ("k", "v")) and getattr(api, "_thd_origin_batch_strides", (None,) * 5)[index] is None
+        reason = forward_thd_layout_mismatch(role, desc.shape, desc.stride) if thd else data_layout_mismatch(role, desc.shape, desc.stride)
         if reason is not None:
             return reason
     return None
@@ -44,7 +60,10 @@ def graph_mismatch(facts, _version=None):
         )
     )
     for name, shape, stride in ports:
-        reason = data_layout_mismatch(name, shape, stride, thd=facts.thd)
+        packed = facts.thd
+        if not facts.is_backward:
+            packed = packed and getattr(getattr(facts, name + "_t"), "ragged_offset", None) is not None
+        reason = data_layout_mismatch(name, shape, stride, thd=packed)
         if reason is not None:
             return reason
     if facts.is_backward:
