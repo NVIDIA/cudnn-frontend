@@ -108,8 +108,11 @@ def test_csr_parallel_offsets_warp_tails_and_cache(monkeypatch, metadata):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("kv_blocks", [17, 31, 32, 33, 35])
-@pytest.mark.parametrize("duplicates", [False, True])
+@pytest.mark.parametrize(
+    "kv_blocks, duplicates",
+    # Duplicate slots only unpair the first 32-KV group: one partial and one full-plus-tail group count suffice.
+    [(kv_blocks, False) for kv_blocks in (17, 31, 32, 33, 35)] + [(17, True), (33, True)],
+)
 def test_pair_refinement_rebinds_word_counts_and_preserves_pairs(kv_blocks, duplicates):
     """One compiled refiner honors the shared-tile and cost-limit word counts, pairs each 32-KV group exactly once and
     leaves groups with duplicate slots unpaired."""

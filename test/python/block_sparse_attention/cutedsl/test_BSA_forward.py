@@ -463,12 +463,25 @@ def test_sm90_blk128_partial_prologue(scale, variable):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("use_clc", (False, True))
-@pytest.mark.parametrize("layout", ("bhsd", "bshd"))
-@pytest.mark.parametrize("variable_counts", (False, True), ids=("fixed", "variable_with_empty"))
-@pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
+@pytest.mark.parametrize(
+    "use_clc, variable_counts, with_block_sizes, layout",
+    # The layout only changes the strides of q/k/v, independently of the scheduler and the metadata: it alternates
+    # over the full scheduler x metadata grid, so that every value of each sees both layouts.
+    [
+        pytest.param(
+            clc,
+            variable,
+            sizes,
+            "bshd" if (clc + variable + sizes) % 2 else "bhsd",
+            id=f"clc{int(clc)}-{'variable_with_empty' if variable else 'fixed'}-{'partial' if sizes else 'full'}_blocks",
+        )
+        for clc in (False, True)
+        for variable in (False, True)
+        for sizes in (False, True)
+    ],
+)
 @torch_fork_set_rng(seed=4593)
-def test_sm100_blk64_persistent_query_replay(use_clc, layout, variable_counts, with_block_sizes):
+def test_sm100_blk64_persistent_query_replay(use_clc, variable_counts, with_block_sizes, layout):
     """Multiple persistent waves exercise KV-ring rotation, empty queries and changed-input replay.
 
     Repeat distinct query tiles to bound the independent dense reference while
@@ -639,9 +652,17 @@ def test_sm100_blk64_empty_rows_and_partial_tiles(clc, splits, seqlen):
     torch.testing.assert_close(lse, expected_lse, atol=0.03, rtol=0.03)
 
 
-@pytest.mark.parametrize("misalignment", ["stride", "address", "aligned_stride"])
-@pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["q", "k", "v"])
-@pytest.mark.parametrize("splits", [pytest.param(1, marks=pytest.mark.L1), pytest.param(2, marks=pytest.mark.L0)])
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "misalignment, tensor_index, splits",
+    # Whether a view can feed TMA is decided per tensor on the host, before and independently of kv_splits: splits
+    # alternates so that every misalignment and every tensor sees both.
+    [
+        pytest.param(misalignment, index, 1 + (m + index) % 2, id=f"{misalignment}-{name}-splits{1 + (m + index) % 2}")
+        for m, misalignment in enumerate(("stride", "address", "aligned_stride"))
+        for index, name in enumerate("qkv")
+    ],
+)
 def test_sm100_blk64_bshd_sliced_inputs(misalignment, tensor_index, splits):
     """BSHD q/k/v views with a padded row stride or a misaligned start address."""
     bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")

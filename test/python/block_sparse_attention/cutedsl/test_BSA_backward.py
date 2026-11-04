@@ -664,10 +664,17 @@ def test_sm100_blk64_sum_odo_fp32_product(seqlen, layout):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
-@pytest.mark.parametrize("sq,sk", [(193, 129), (248, 2177), (320, 1088), (513, 1025)])
-@pytest.mark.parametrize("variable", [False, True])
-def test_sm100_blk64_partial_tiles_and_buckets(layout, sq, sk, variable, monkeypatch):
+@pytest.mark.parametrize(
+    "sq, sk, variable, layout",
+    # The layout only changes the strides, independently of the tails and the count mode: it alternates over the
+    # shape x count-mode grid, so that every shape and both count modes see both layouts.
+    [
+        (sq, sk, variable, "bshd" if (i + variable) % 2 else "bhsd")
+        for i, (sq, sk) in enumerate([(193, 129), (248, 2177), (320, 1088), (513, 1025)])
+        for variable in (False, True)
+    ],
+)
+def test_sm100_blk64_partial_tiles_and_buckets(sq, sk, variable, layout, monkeypatch):
     """Random partial KV blocks, partial Q/KV tails and (paired-KV) empty rows over 1, 3 and all-Q buckets."""
     bsa = import_bsa(archs=(100, 103), reason="requires SM100/SM103")
     if variable:
@@ -758,9 +765,12 @@ def test_sm100_blk128_dk_zero_init_accumulate_transition(num_q_blocks):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("bucket", [1, 128])
-@pytest.mark.parametrize("sq,sk,dim,layout", [(512, 512, 128, "bshd"), (389, 517, 128, "bhsd"), (257, 257, 64, "bshd")])
-def test_sm100_blk128_partial_blocks_and_buckets(bucket, sq, sk, dim, layout):
+@pytest.mark.parametrize(
+    "sq, sk, dim, layout, bucket",
+    # The Q bucket only regroups the backward, independently of the tails and head_dim: one shape takes both buckets.
+    [(512, 512, 128, "bshd", 1), (389, 517, 128, "bhsd", 1), (389, 517, 128, "bhsd", 128), (257, 257, 64, "bshd", 1)],
+)
+def test_sm100_blk128_partial_blocks_and_buckets(sq, sk, dim, layout, bucket):
     """Partial KV blocks (strided block_sizes), empty rows, Q/KV tails and head_dim 64 over Q buckets of 1 and 128."""
     BSA = import_bsa(archs=(100, 103), reason="blk128 backward block_sizes are SM100/SM103 only")
     torch.manual_seed(13)

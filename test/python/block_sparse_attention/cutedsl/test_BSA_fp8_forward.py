@@ -591,34 +591,10 @@ def assert_accuracy(out, ref, *, relative=0.029, absolute=0.15):
 
 @pytest.mark.L0
 @pytest.mark.usefixtures("require_sm100")
-@pytest.mark.parametrize("sizes_mode", [0, 1, 2, 3])
-@pytest.mark.parametrize("variable", [False, True])
-def test_sm100_blk128_native_tails_and_metadata(sizes_mode, variable):
-    torch.manual_seed(2100 + sizes_mode)
-    # Alternate all dynamic extents in one process, including one-token tails,
-    # odd topk, topk=1, and batch/head strides that are not multiples of 16.
-    for batch, heads, sq, sk, topk in [
-        (1, 1, 1, 1, 1),
-        (2, 3, 129, 641, 5),
-        (1, 5, 257, 259, 3),
-        (3, 1, 63, 145, 1),
-    ]:
-        q, k, v = make_inputs(batch, heads, sq, sk, gain=0.5)
-        index, nums, sizes = make_metadata(batch, heads, sq, sk, topk, variable=variable, sizes_mode=sizes_mode)
-        quantized = list(quantize_sage_bhsd(q, k, v))
-        # Flattened scales are part of the blk64 API contract too.
-        quantized[3:] = [t.flatten() for t in quantized[3:]]
-        out = bsa_fp8_fwd(*quantized, index, topk, sparse_block_size=128, block_sizes=sizes, q2k_block_nums=nums)
-        ref = sparse_reference(*dequantize(quantized), index, topk, nums, sizes)
-        assert_accuracy(out, ref)
-
-
-@pytest.mark.L0
-@pytest.mark.usefixtures("require_sm100")
-@pytest.mark.parametrize("sizes_mode", [1, 2, 3])
-@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize("sizes_mode, topk", [(1, 1), (2, 2), (3, 1)])
 def test_sm100_blk128_provided_extent_respects_physical_tail(sizes_mode, topk):
-    """Provided extents cannot make padded tokens participate in softmax."""
+    """Provided extents cannot make padded tokens participate in softmax.  The block_sizes rank only changes how the
+    extent is indexed, independently of the list length, so topk alternates."""
     q = torch.zeros(1, 1, 64, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.zeros(1, 1, 129, 128, device="cuda", dtype=torch.bfloat16)
     v = torch.ones_like(k)
@@ -797,34 +773,39 @@ def test_sm100_blk128_scale_views_and_graph_stream(flatten):
         assert torch.equal(captured, expected)
 
 
+_SPLITS = (1, 2, 4, 8)
+_L0_SPLIT_CASES = ((1, 0), (2, 2), (4, 1), (8, 3))  # every split count and block_sizes rank once, both count modes
+
+
 @pytest.mark.usefixtures("require_sm100")
 @pytest.mark.parametrize(
     "kv_splits, sizes_mode, variable",
     [
-        # L0 keeps a diagonal that takes every split count, block_sizes rank and count mode once.
-        pytest.param(
-            kv_splits,
-            sizes_mode,
-            variable,
-            marks=pytest.mark.L0 if (kv_splits, sizes_mode, variable) in ((1, 0, False), (2, 1, True), (4, 2, False), (8, 3, True)) else pytest.mark.L1,
-        )
-        for kv_splits in (1, 2, 4, 8)
+        # block_sizes rank and the count mode are independent of the split count: all split x rank pairs, the count
+        # mode alternating so that every split count and every rank sees both.
+        pytest.param(kv_splits, sizes_mode, (i + sizes_mode) % 2 == 1, marks=pytest.mark.L0 if (kv_splits, sizes_mode) in _L0_SPLIT_CASES else pytest.mark.L1)
+        for i, kv_splits in enumerate(_SPLITS)
         for sizes_mode in (0, 1, 2, 3)
-        for variable in (False, True)
     ],
 )
-def test_sm100_blk128_split_dynamic_metadata(kv_splits, sizes_mode, variable):
+def test_sm100_blk128_dynamic_metadata_and_splits(kv_splits, sizes_mode, variable):
+    """One compiled variant per (splits, block_sizes rank, count mode) serves every dynamic extent: one-token tails, odd
+    and unit topk, batch/head strides that are not multiples of 16, empty splits and rows, and poisoned inactive
+    indices.  Scales are passed flattened for half of the split counts (the blk64 API contract)."""
     torch.manual_seed(3700 + sizes_mode)
-    # Change every dynamic extent while reusing the compiled variant. Include
-    # empty splits, odd counts, physical tails, and poisoned inactive indices.
     for batch, heads, sq, sk, topk in [
         (1, 1, 1, 1, 1),
+        (2, 3, 129, 641, 5),
+        (1, 5, 257, 259, 3),
+        (3, 1, 63, 145, 1),
         (2, 3, 257, 913, 7),
         (1, 2, 389, 1153, 9),
     ]:
         q, k, v = make_inputs(batch, heads, sq, sk, gain=0.5)
         index, nums, sizes = make_metadata(batch, heads, sq, sk, topk, variable=variable, sizes_mode=sizes_mode)
-        quantized = quantize_sage_bhsd(q, k, v)
+        quantized = list(quantize_sage_bhsd(q, k, v))
+        if kv_splits in (1, 4):
+            quantized[3:] = [t.flatten() for t in quantized[3:]]
         kwargs = dict(
             sparse_block_size=128,
             kv_splits=kv_splits,

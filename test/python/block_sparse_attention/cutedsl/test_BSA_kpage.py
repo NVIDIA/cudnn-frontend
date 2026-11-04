@@ -410,7 +410,6 @@ def test_rejects_unsupported_configurations():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=11)
-@pytest.mark.parametrize("pad_fill", [0.0, 1000.0])
 @pytest.mark.parametrize(
     "block_sizes",
     [
@@ -419,8 +418,10 @@ def test_rejects_unsupported_configurations():
         [5, 9, 16, 48, 64, 64, 65, 127],  # mostly small blocks, several per K/V tile
     ],
 )
-def test_q_padding_matches_reference(block_sizes, pad_fill):
-    """q_block_sizes=block_sizes: padding rows of q/k/v/do may hold any finite value; valid rows are exact, padding rows zero."""
+def test_q_padding_matches_reference(block_sizes):
+    """q_block_sizes=block_sizes: padding rows of q/k/v/do may hold any finite value (here a large one); valid rows are
+    exact, padding rows zero."""
+    pad_fill = 1000.0
     BSA = import_kpage_bsa(KPAGE)
     heads = 2
     bs = torch.tensor(block_sizes, dtype=torch.int32, device="cuda")
