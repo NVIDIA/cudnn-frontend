@@ -54,6 +54,22 @@ def test_indexed_packed_reference(supported_gpu, lengths):
     check_case(inputs, indices_for(inputs))
 
 
+@pytest.mark.parametrize("lengths", [(3, 5, 7), (129, 133)])
+def test_indexed_six_query_heads(supported_gpu, lengths):
+    """6Q/1KV shares the kernels; its backward batches four queries per compact-ID row (12Q/1KV batches two)."""
+    inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
+    indices = indices_for(inputs)
+    check_case(inputs, indices)
+    plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 6)
+    assert plan.paired and plan.nq == 4 and "flags" in {name for name, _, _ in plan.layouts}
+    assert dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == ((inputs["q"].shape[0] + 3) // 4, indices.shape[1])
+    paired = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop")
+    assert paired.paired and paired.nq == 2
+    out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], indices)
+    with pytest.raises(NotImplementedError, match="causal_topk requires 12Q/1KV"):
+        qsa_indexed_backward(inputs["q"], inputs["q"], inputs["k"], inputs["v"], out["out_fp32"], out["lse"], indices, selection_mode="causal_topk")
+
+
 def test_indexed_changed_values_replay(supported_gpu):
     inputs = make_inputs((3, 65), 12, 1, all_selected=True)
     indices = indices_for(inputs)

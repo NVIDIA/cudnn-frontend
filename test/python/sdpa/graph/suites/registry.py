@@ -50,11 +50,9 @@ def _model_post(phase):
     if phase == "generation":
 
         def _post(cfg, rng, request):
-            # Paged + ragged (packed THD Q/O against a paged KV cache) is a
-            # valid serving combo but deferred — harness support only existed
-            # for f16; tracked as a suite-wide extension (f16 + fp8) in the
-            # issue tracker. Until then only non-THD draws get paged.
-            cfg.is_paged = rng.random() < 0.5 and not cfg.is_ragged
+            # Paging is independent of the Q/O layout: page pools stay dense
+            # when the queries and outputs use packed THD buffers.
+            cfg.is_paged = rng.random() < 0.5
 
         return _post
     if phase == "bprop":

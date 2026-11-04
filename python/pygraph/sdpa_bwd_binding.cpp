@@ -26,7 +26,7 @@ class SdpaBwdBinder : private FixedSdpaOperands {
         bool contiguous = false;
         int length_bit  = -1;
     };
-    // SM80 writes gradients directly. Their declared address sets must be
+    // Native SM80 and large-head chains write gradients directly. Their declared address sets must be
     // disjoint, including after rebinding raw graph pointers. Bounding spans
     // alone cannot distinguish legal interleaved Q/K/V gradient storage.
     struct Output {
@@ -140,8 +140,8 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             add_operand(roles[i], value, declared[i]);
             if (!value.is_none() && py::cast<int64_t>(value.attr("itemsize")) != operands_.back().bits / 8)
                 invalid("operand dtype and element width disagree");
-            if (name_ == "sdpa_bwd_sm80" && !value.is_none() &&
-                (roles[i] == "dq" || roles[i] == "dk" || roles[i] == "dv")) {
+            if ((name_ == "sdpa_bwd_sm80" || name_ == "sdpa_bwd_sm100" || name_ == "sdpa_bwd_sm107_d512") &&
+                !value.is_none() && (roles[i] == "dq" || roles[i] == "dk" || roles[i] == "dv")) {
                 auto shape   = py::cast<std::vector<int64_t>>(value.attr("shape"));
                 auto strides = py::cast<std::vector<int64_t>>(value.attr("strides"));
                 if (shape.size() > 4 || shape.size() != strides.size()) invalid("invalid gradient geometry");
