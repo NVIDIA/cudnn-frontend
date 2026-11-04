@@ -53,6 +53,19 @@ def _require_mxfp4_indexer():
         pytest.skip(str(exc))
 
 
+def _require_block_scaled_indexer(precision: str):
+    """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("mxfp8" or "mxfp4") indexer."""
+    if precision == "mxfp4":
+        _require_mxfp4_indexer()
+        return
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip("MXFP8 indexer requires an SM100-family GPU")
+    if getattr(torch, "float8_e8m0fnu", None) is None:
+        pytest.skip("MXFP8 indexer requires torch.float8_e8m0fnu")
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
@@ -258,6 +271,33 @@ def make_random_mxfp4(
     values = torch.randn(shape, device=device, generator=generator)
     packed, dequantized = quantize_e2m1(values * expand_mxfp8_scale(scale, shape[-1]), scale)
     return packed, dequantized, scale
+
+
+def make_random_mxfp8(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MXFP8 counterpart of :func:`make_random_mxfp4`: ``(e4m3 data, dequantized FP32 value, logical E8M0 scales)``."""
+    scale = make_random_mxfp8_scale((*shape[:-1], shape[-1] // 32), device=device, seed=seed, exponent_min=-2, exponent_max=3)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + 1)
+    values = torch.randn(shape, device=device, generator=generator)
+    data = quantize_mxfp8(values * expand_mxfp8_scale(scale, shape[-1]), scale)
+    return data, data.float() * expand_mxfp8_scale(scale, shape[-1]), scale
+
+
+def make_random_block_scaled(
+    precision: str,
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random ``precision`` ("mxfp8" / "mxfp4") data, its dequantized FP32 value and its logical E8M0 scales."""
+    make = {"mxfp8": make_random_mxfp8, "mxfp4": make_random_mxfp4}[precision]
+    return make(shape, device=device, seed=seed)
 
 
 def pack_mxfp8_scales_thd(
