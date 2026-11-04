@@ -37,6 +37,14 @@ SHAPES = (
     ("r128-c2-d512-3x8192", [8192] * 3, 512, 128, 2),
 )
 
+GENERIC_SHAPES = (
+    ("r2-c2-d128-1x8192", [8192], 128, 2, 2),
+    ("r2-c2-d128-3x8192", [8192] * 3, 128, 2, 2),
+    ("r2-c2-d512-1x8192", [8192], 512, 2, 2),
+    ("r2-c2-d512-3x8192", [8192] * 3, 512, 2, 2),
+    *SHAPES[:4],
+)
+
 LONG_CONTEXT_SHAPES = (
     (
         "r4-c1-d128-packed256k-cp32-or64",
@@ -211,12 +219,14 @@ def _bench_shape(name, lens, d, ratio, coff, args):
     result = {
         "shape": name,
         "workspace_mib": workspace_bytes / (1024 * 1024),
+        "atomic_rows_per_cta": plans[False]._rows_per_cta,
         "atomic_kernel_us": statistics.median(kernel[False]),
         "atomic_operation_us": statistics.median(operation[False]),
         **accuracy,
     }
     if True in plans:
         result.update(
+            deterministic_rows_per_cta=plans[True]._rows_per_cta,
             deterministic_kernel_us=statistics.median(kernel[True]),
             deterministic_operation_us=statistics.median(operation[True]),
         )
@@ -235,6 +245,11 @@ def main():
     shape_group = parser.add_mutually_exclusive_group()
     shape_group.add_argument("--quick", action="store_true", help="Run one generic and one ratio=128 shape")
     shape_group.add_argument(
+        "--generic-only",
+        action="store_true",
+        help="Run the ratio-2/4 d128/d512 1x/3x8192 matrix (supported on SM90)",
+    )
+    shape_group.add_argument(
         "--long-context",
         action="store_true",
         help="Run the unequal packed 256K/CP32-or-64 and 1M/CP64 production shapes",
@@ -249,6 +264,8 @@ def main():
         shapes = LONG_CONTEXT_SHAPES
     elif args.packed_metadata:
         shapes = PACKED_METADATA_SHAPES
+    elif args.generic_only:
+        shapes = GENERIC_SHAPES
     else:
         shapes = SHAPES[::4] if args.quick else SHAPES
     results = [_bench_shape(*shape, args) for shape in shapes]

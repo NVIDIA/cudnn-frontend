@@ -848,6 +848,148 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "deterministic,d,threshold,upper",
+    [
+        (False, 128, 8192, None),
+        (False, 512, 4096, 5121),
+        (True, 128, 4096, None),
+        (True, 512, 2048, None),
+    ],
+)
+def test_sm90_ratio2_backward_schedule_boundaries(monkeypatch, deterministic, d, threshold, upper):
+    """SM90 ratio-2 plans select only the measured 8/16-row capacity buckets."""
+    _require_csa_device(2)
+    compressor = _import_compressor()
+    from cudnn.csa.compressor import api as compressor_api
+    from cudnn.csa.compressor.compressor_sm100 import _bwd_rows, _validate_bwd_rows, bwd_dape_workspace_bytes
+
+    assert _bwd_rows(2, deterministic, threshold - 1, d, coff=2, is_sm90=True) == 8
+    assert _bwd_rows(2, deterministic, threshold, d, coff=2, is_sm90=True) == 16
+    assert _bwd_rows(2, deterministic, threshold * 4, d, coff=2, is_sm90=True) == (8 if upper else 16)
+    if upper is not None:
+        assert _bwd_rows(2, deterministic, upper - 1, d, coff=2, is_sm90=True) == 16
+        assert _bwd_rows(2, deterministic, upper, d, coff=2, is_sm90=True) == 8
+    assert _bwd_rows(2, deterministic, 0, d, coff=2, is_sm90=True) == 8
+    # The tuning is deliberately SM90-only and restricted to measured coff/head dims.
+    assert _bwd_rows(2, deterministic, threshold, d, coff=2, is_sm90=False) == 8
+    assert _bwd_rows(2, deterministic, threshold, 256, coff=2, is_sm90=True) == 8
+    assert _bwd_rows(2, deterministic, threshold, d, coff=1, is_sm90=True) == 8
+    with pytest.raises(ValueError, match="rows_per_cta must be one of"):
+        _validate_bwd_rows(12)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    below = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=threshold - 1, d=d, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert below.check_support()
+    assert below._rows_per_cta == 8
+    plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=threshold, d=d, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._rows_per_cta == 16
+    compiled_rows = []
+    launched_rows = []
+    monkeypatch.setattr(compressor_api, "precompile_bwd", lambda *args, **kwargs: compiled_rows.append(kwargs["rows_per_cta"]))
+    monkeypatch.setattr(compressor_api, "run_bwd", lambda *args, **kwargs: launched_rows.append(kwargs["rows_per_cta"]))
+    kv = torch.empty(2, 2 * d, dtype=torch.bfloat16, device="cuda")
+    score = torch.empty_like(kv)
+    ape = torch.empty(2, 2 * d, dtype=torch.float32, device="cuda")
+    cu = torch.zeros(3, dtype=torch.int32, device="cuda")
+    cuc = torch.zeros_like(cu)
+    grad_out = torch.empty(threshold, d, dtype=torch.bfloat16, device="cuda")
+    grad_kv = torch.empty_like(kv)
+    grad_score = torch.empty_like(score)
+    grad_ape = torch.empty_like(ape)
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if deterministic else None
+
+    def capability_must_not_be_queried(*args, **kwargs):
+        raise AssertionError("prepared compile/execute must use the plan-bound schedule")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_must_not_be_queried)
+    plan.compile()
+    assert compiled_rows == [16]
+    plan.execute(kv, score, ape, cu, cuc, grad_out, grad_kv, grad_score, grad_ape, workspace=workspace)
+    assert launched_rows == [16]
+    if deterministic:
+        assert plan.scratch_workspace_bytes() == bwd_dape_workspace_bytes(threshold, 2, d, 2, rows_per_cta=16)
+    else:
+        assert plan.scratch_workspace_bytes() == 0
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    sm100_plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=threshold, d=d, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert sm100_plan.check_support()
+    assert sm100_plan._rows_per_cta == 8
+
+    if upper is not None:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+        below_upper = compressor.CSACompressorBackward(
+            **_meta_samples(total=2, total_comp=upper - 1, d=d, ratio=2, coff=2),
+            ratio=2,
+            coff=2,
+            deterministic=deterministic,
+        )
+        assert below_upper.check_support()
+        assert below_upper._rows_per_cta == 16
+        at_upper = compressor.CSACompressorBackward(
+            **_meta_samples(total=2, total_comp=upper, d=d, ratio=2, coff=2),
+            ratio=2,
+            coff=2,
+            deterministic=deterministic,
+        )
+        assert at_upper.check_support()
+        assert at_upper._rows_per_cta == 8
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_sm90_ratio2_empty_plan_keeps_base_schedule(monkeypatch, deterministic):
+    """An empty prepared capacity keeps the base schedule and needs no workspace."""
+    _require_csa_device(2)
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=0, d=128, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._rows_per_cta == 8
+    assert plan.scratch_workspace_bytes() == 0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("d,coff", [(256, 2), (128, 1)], ids=["d256", "coff1"])
+def test_sm90_ratio2_unmeasured_plan_keeps_base_schedule(monkeypatch, deterministic, d, coff):
+    """Unmeasured head-dimension/coff plans never inherit the tuned artifact."""
+    _require_csa_device(2)
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=16384, d=d, ratio=2, coff=coff),
+        ratio=2,
+        coff=coff,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._rows_per_cta == 8
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("nb_total,expected_rows", [(65535, 8), (65536, 24)])
 def test_ratio4_deterministic_workspace_includes_hierarchical_stage(nb_total, expected_rows):
     """Ratio 4 reserves disjoint producer and stage-1 planes."""
@@ -1732,7 +1874,7 @@ def test_check_support_rejects_unsupported_compute_capability(monkeypatch, capab
 @pytest.mark.L0
 @pytest.mark.parametrize("cls_name", ["CSACompressorForward", "CSACompressorBackward"])
 def test_check_support_rejects_ratio128_on_sm90(monkeypatch, cls_name):
-    """Keep the B200-tuned ratio-128 family closed on SM90 until separately gated."""
+    """Keep the SM100-tuned ratio-128 family closed on SM90 until separately gated."""
     compressor = _import_compressor()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
     cls = getattr(compressor, cls_name)

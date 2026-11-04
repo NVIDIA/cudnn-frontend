@@ -71,6 +71,7 @@ from cudnn.api_base import APIBase, TupleDict
 from .compressor_sm100 import (
     CU_ALIGN_BYTES,
     PTR_ALIGN_BYTES,
+    _bwd_rows,
     bwd_dape_workspace_bytes,
     precompile_bwd,
     precompile_fwd,
@@ -192,6 +193,7 @@ class _CSACompressorBase(APIBase):
         self.head_dim = None
         self.n_seg = None
         self.target_device: Optional[torch.device] = None
+        self._compute_capability = None
 
     def check_support(self) -> bool:
         """Validate the configuration against the kernels' validated envelope.
@@ -337,6 +339,7 @@ class _CSACompressorBase(APIBase):
         self.head_dim = head_dim
         self.n_seg = self.cu_desc.shape[0] - 1
         self.target_device = target
+        self._compute_capability = capability
         self._is_supported = True
         return True
 
@@ -481,6 +484,7 @@ class CSACompressorBackward(_CSACompressorBase):
         """Capture descriptors and choose atomic or deterministic dAPE reduction."""
         self.deterministic = bool(deterministic)
         self._scratch_bytes: Optional[int] = None
+        self._rows_per_cta: Optional[int] = None
         super().__init__(
             sample_kv,
             sample_score,
@@ -496,6 +500,15 @@ class CSACompressorBackward(_CSACompressorBase):
         """Validate the common envelope plus deterministic workspace indexing."""
         super().check_support()
         self._is_supported = False
+        if self.ratio != 128:
+            self._rows_per_cta = _bwd_rows(
+                self.ratio,
+                self.deterministic,
+                self.total_comp,
+                self.head_dim,
+                self.coff,
+                self._compute_capability == _SM90_CAPABILITY,
+            )
         if self.deterministic:
             if self.ratio == 128:
                 self._scratch_bytes = bwd_dape_workspace_bytes_r128(
@@ -506,7 +519,13 @@ class CSACompressorBackward(_CSACompressorBase):
                     self.target_device.index,
                 )
             else:
-                self._scratch_bytes = bwd_dape_workspace_bytes(self.total_comp, self.ratio, self.head_dim, self.coff)
+                self._scratch_bytes = bwd_dape_workspace_bytes(
+                    self.total_comp,
+                    self.ratio,
+                    self.head_dim,
+                    self.coff,
+                    rows_per_cta=self._rows_per_cta,
+                )
             workspace_elems = self._scratch_bytes // 4
             self._value_error_if(
                 workspace_elems >= _INT32_LIMIT,
@@ -567,31 +586,59 @@ class CSACompressorBackward(_CSACompressorBase):
                 self.target_device,
                 deterministic=self.deterministic,
                 nb_total=self.total_comp,
+                rows_per_cta=self._rows_per_cta,
             )
             run = run_bwd
 
         ratio, head_dim, coff, deterministic = self.ratio, self.head_dim, self.coff, self.deterministic
+        rows_per_cta = self._rows_per_cta
 
-        def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, stream_handle):
-            """Per-config closure: invoke the routed backward with the bound ``(ratio, head_dim, coff)``."""
-            run(
-                kv,
-                score,
-                ape,
-                cu_seqlens,
-                cu_seqlens_comp,
-                grad_out,
-                grad_kv,
-                grad_score,
-                grad_ape,
-                grad_out.shape[0],
-                ratio,
-                head_dim,
-                coff,
-                stream_handle=stream_handle,
-                deterministic=deterministic,
-                workspace=workspace,
-            )
+        if rows_per_cta is None:
+
+            def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, stream_handle):
+                """Invoke the ratio-128 backward with its internally selected schedule."""
+                run(
+                    kv,
+                    score,
+                    ape,
+                    cu_seqlens,
+                    cu_seqlens_comp,
+                    grad_out,
+                    grad_kv,
+                    grad_score,
+                    grad_ape,
+                    grad_out.shape[0],
+                    ratio,
+                    head_dim,
+                    coff,
+                    stream_handle=stream_handle,
+                    deterministic=deterministic,
+                    workspace=workspace,
+                )
+
+        else:
+
+            def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, stream_handle):
+                """Invoke generic backward with its plan-bound capacity schedule."""
+                run(
+                    kv,
+                    score,
+                    ape,
+                    cu_seqlens,
+                    cu_seqlens_comp,
+                    grad_out,
+                    grad_kv,
+                    grad_score,
+                    grad_ape,
+                    grad_out.shape[0],
+                    ratio,
+                    head_dim,
+                    coff,
+                    stream_handle=stream_handle,
+                    deterministic=deterministic,
+                    workspace=workspace,
+                    rows_per_cta=rows_per_cta,
+                )
 
         self._compiled_kernel = tensor_api
         self._logger.debug("Kernel compiled successfully")
