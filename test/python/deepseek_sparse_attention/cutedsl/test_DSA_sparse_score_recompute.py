@@ -540,9 +540,7 @@ def test_DSA_sparse_score_recompute_disjoint_binding_cache_is_thread_safe():
 @pytest.mark.L0
 def test_DSA_sparse_score_recompute_wrapper_does_not_stage_invalid_aliases():
     """An aliased output with an invalid dtype/shape still reaches the original class contract error."""
-    from cudnn import DSA
-
-    q, k, weights, indices, _ = _allocate(_SMALL_CFG, "indexer", False)
+    DSA, q, k, weights, indices, _, _ = _sparse_case("indexer", False)
     with pytest.raises(ValueError, match="out dtype"):
         DSA.sparse_indexer_score_recompute_wrapper(q, k, weights, indices, out=indices)
 

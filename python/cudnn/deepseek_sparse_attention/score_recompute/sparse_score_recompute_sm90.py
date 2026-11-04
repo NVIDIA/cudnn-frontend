@@ -342,8 +342,6 @@ class SparseScoreRecomputeSm90:
         sKV_1 = sKV_staged[None, None, 1]
 
         sWeights = storage.sWeights.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
-        if tidx == 0:
-            sWeights.fill(0.0)
 
         # Sparse path: one float per topk position, consumed by softmax_l1norm_parallel.
         sTopk_reduced = storage.sTopk_reduced.get_tensor(cute.make_layout((self.topk_max,), stride=(1,)))
@@ -409,14 +407,13 @@ class SparseScoreRecomputeSm90:
         tidx: Int32,
     ):
         """Load one packed query/head tile from a native ``(S_q, H_q)`` view."""
-        rows_per_thread = cute.ceil_div(self.tile_m, cute.arch.WARP_SIZE)
-        for i in cutlass.range_constexpr(rows_per_thread):
-            row = i * cute.arch.WARP_SIZE + tidx
-            if row < self.tile_m:
-                idx = m_block * self.tile_m + row
-                m_idx = idx // self.qhead_per_kvhead
-                h_idx = idx - m_idx * self.qhead_per_kvhead
-                sAux[row] = mAux_cur[m_idx, h_idx]
+        # tile_m <= 64 < 128 producer threads: one row per thread, no overlap.
+        row = tidx
+        if row < self.tile_m:
+            idx = m_block * self.tile_m + row
+            m_idx = idx // self.qhead_per_kvhead
+            h_idx = idx - m_idx * self.qhead_per_kvhead
+            sAux[row] = mAux_cur[m_idx, h_idx]
 
     @cute.jit
     def producer_wg0(
