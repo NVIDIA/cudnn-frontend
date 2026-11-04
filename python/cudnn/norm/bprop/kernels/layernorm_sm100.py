@@ -26,7 +26,19 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, fake_rows, fake_stream, ffi, smem_capacity, dsl_compile_lock
+from cudnn.norm.utils import (
+    ws_bytes,
+    ws_empty,
+    ws_zeros,
+    cur_stream,
+    fake_rows,
+    fake_strided_vector,
+    is_aligned_contiguous_vector,
+    fake_stream,
+    ffi,
+    smem_capacity,
+    dsl_compile_lock,
+)
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     affine_gamma,
@@ -1033,7 +1045,8 @@ def _fakes(et, C, roles):
     make = {
         "io": lambda: fake_rows(et, C, rows=rows),
         "g": lambda: fake_rows(et, rows=C),
-        "stat": lambda: fake_rows(cutlass.Float32, rows=rows),
+        "g_strided": lambda: fake_strided_vector(et, rows=C),
+        "stat": lambda: fake_strided_vector(cutlass.Float32, rows=rows),
         "part": lambda: fake_rows(cutlass.Float32, rows=parts),
         "dg": lambda: fake_rows(cutlass.Float32, rows=C),
     }
@@ -1071,18 +1084,16 @@ def _plain_scratch_bytes(spec, has_beta):
 def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
     """Upper bound on the workspace this backward may carve.
 
-    Mirrors ``backward``'s own dispatch rather than taking a blanket max over
-    the three routes: the plain route carves partials only past its slot threshold, and the tiled
-    route's grid cap (sm*12) is far above the pipelined one's, so a blanket max
-    reported 58 MB where the chosen route used 9.7. The conditions live a dozen
-    lines below in this same file, so they cannot drift the way a cross-module
-    guess would.
+    Shape-only sizing cannot know whether gamma will require the plain fallback.
+    Reserve the larger of that fallback and the shape-selected optimized route;
+    do not reserve the unrelated optimized route for the same shape.
     """
     eb = DTYPE_BYTES[params.io_dtype]
     C, R = spec.M, spec.R
+    plain = _plain_scratch_bytes(spec, has_beta)
     wcfg = _bwd_pipe_cfg(C, eb)
     if wcfg is None:
-        return _plain_scratch_bytes(spec, has_beta)
+        return plain
     _tpr, wn, ldgs, V = wcfg
     if wn == 1 and V >= 2 and not spec.has_mean and (R % 2 == 0) and not has_beta:
         RPT = 1
@@ -1091,19 +1102,20 @@ def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
                 RPT = r
                 break
         ctas = min(R // RPT, _sm_count() * 12)
-        return ws_bytes((ctas * C, 4), (2 * spec.gamma_len, 4))
+        return max(plain, ws_bytes((ctas * C, 4), (2 * spec.gamma_len, 4)))
     if _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
         ctas = _pipe_bwd_cap(R, wn, C, _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb), eb)
         parts = [(ctas * C, 4)] * (2 if has_beta else 1)
-        return ws_bytes(*parts, (2 * spec.gamma_len, 4))
-    return _plain_scratch_bytes(spec, has_beta)
+        return max(plain, ws_bytes(*parts, (2 * spec.gamma_len, 4)))
+    return plain
 
 
 def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_dx=None, out_dgamma=None, out_dbeta=None, ws=None):
     """Launch LayerNorm/RMSNorm backward. Returns ``(dx, dgamma, dbeta)``."""
     import torch
 
-    wcfg = _bwd_pipe_cfg(spec.M, DTYPE_BYTES[params.io_dtype])
+    # The pipelined paths bulk-copy gamma as a contiguous, 16-byte-aligned vector.
+    wcfg = _bwd_pipe_cfg(spec.M, DTYPE_BYTES[params.io_dtype]) if is_aligned_contiguous_vector(gamma) else None
     if wcfg is not None and wcfg[1] == 1 and wcfg[3] >= 2 and not spec.has_mean and (spec.R % 2 == 0) and not has_beta:
         # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline.
         # V >= 2 because this route stages through ``load_ext`` too, whose count must
@@ -1140,7 +1152,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
             with dsl_compile_lock():
                 fn = _KCACHE.get(key)
                 if fn is None:
-                    fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], M, ("io", "io", "g", "stat", "stat", "io", "part", "part", "dg", "dg"))
+                    fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], M, ("io", "io", "g_strided", "stat", "stat", "io", "part", "part", "dg", "dg"))
                     fn = cute.compile(_ln_bwd_slots_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
                     _KCACHE[key] = fn
         fn(ffi(dy2d), ffi(x2d), ffi(gamma), ffi(mean), ffi(rstd), ffi(dx), dgp, dbp, ffi(dgamma), ffi(dbeta), spec.R, cur_stream())
@@ -1153,7 +1165,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
         with dsl_compile_lock():
             fn = _KCACHE.get(key)
             if fn is None:
-                fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], spec.M, ("io", "io", "g", "stat", "stat", "io", "dg", "dg"))
+                fakes = _fakes(DTYPE_TO_CUTLASS[params.io_dtype], spec.M, ("io", "io", "g_strided", "stat", "stat", "io", "dg", "dg"))
                 fn = cute.compile(_ln_bwd_host, *fakes, cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
                 _KCACHE[key] = fn
     fn(ffi(dy2d), ffi(x2d), ffi(gamma), ffi(mean), ffi(rstd), ffi(dx), ffi(dgamma), ffi(dbeta), spec.R, cur_stream())
