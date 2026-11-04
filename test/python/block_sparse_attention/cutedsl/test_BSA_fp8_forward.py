@@ -82,17 +82,14 @@ def test_sm90_quantized_forward_and_centered_lse(block, batch, heads, q_blocks, 
 
 @with_block
 @pytest.mark.parametrize(
-    "count, beta",
-    [
-        pytest.param(count, beta, id=f"{count}-{name}", marks=pytest.mark.L0 if name == "default" and count in (1, 2, 17, 256) else pytest.mark.L1)
-        for name, beta in (("default", 128**-0.5), ("zero", 0.0), ("negative", -0.125))
-        for count in (1, 2, 3, 5, 8, 17, 33, 65, 256)
-    ],
+    "count", [pytest.param(count, marks=pytest.mark.L0 if count in (1, 2, 17, 256) else pytest.mark.L1) for count in (1, 2, 3, 5, 8, 17, 33, 65, 256)]
 )
-def test_sm90_pipeline_lengths_and_scales(block, count, beta):
+def test_sm90_pipeline_lengths(block, count):
+    """List lengths across the pipeline prologue, steady state and drain.  The softmax-scale sign does not depend on the
+    length; test_sm90_quantized_forward_and_centered_lse covers zero and negative scales."""
     require_sm90_fp8(block)
     sk = (count + 2) * block
-    _sm90_assert_reference(block, _sm90_quantized(sq=block, sk=sk), _sm90_ids(1, 1, block, sk, block), count, beta)
+    _sm90_assert_reference(block, _sm90_quantized(sq=block, sk=sk), _sm90_ids(1, 1, block, sk, block), count)
 
 
 @with_block

@@ -339,13 +339,17 @@ def test_sm90_blk64_ring_head_dims(dtype, head_dim, value_dim, with_block_sizes)
 
 @pytest.mark.L1
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("head_dim", (64, 96, 128))
 @pytest.mark.parametrize("value_dim", (64, 96, 128))
 @pytest.mark.parametrize("with_block_sizes", (False, True))
 @torch_fork_set_rng(seed=29)
-def test_sm90_blk64_rescale_row_slots(dtype, head_dim, value_dim, with_block_sizes):
-    """Cover unchanged/increasing maxima, different row slots, and mixed rows within a warp vote."""
+def test_sm90_blk64_rescale_row_slots(dtype, value_dim, with_block_sizes):
+    """Cover unchanged/increasing maxima, different row slots, and mixed rows within a warp vote.
+
+    The rescale acts on the O accumulator, so value_dim varies; head_dim only sizes the QK reduction (its dispatch is
+    covered by test_sm90_blk64_ring_head_dims).
+    """
     ops = import_bsa(families=(9,), reason="the blk64 forward kernel under test is specific to SM90")
+    head_dim = 128
     seqlen_q, seqlen_k = 5 * 64, 16 * 64 - 17
     q = torch.zeros((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
     row = torch.arange(64, device="cuda")

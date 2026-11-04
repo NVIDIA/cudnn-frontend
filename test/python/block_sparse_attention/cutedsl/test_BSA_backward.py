@@ -490,10 +490,15 @@ def test_sm90_blk128_tails(sq, sk, variable):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
 @pytest.mark.parametrize("size", [1, 63, 64, 65, 127, 128])
-@pytest.mark.parametrize("bucket", [1, 192])
-def test_sm90_blk128_partial_boundary_scale(scale, size, bucket):
+@pytest.mark.parametrize(
+    "scale, bucket",
+    # The Q bucket only regroups the backward, independently of the KV boundary and the scale sign.
+    [(0.0, 1), (-0.125, 1), (0.125, 1), (0.125, 192)],
+    ids=["zero-bucket1", "negative-bucket1", "positive-bucket1", "positive-bucket192"],
+)
+def test_sm90_blk128_partial_boundary_scale(size, scale, bucket):
+    """Every partial-KV boundary of the 64-row MMA halves, with zero, negative and positive softmax scales."""
     require_arch(families=(9,), reason=SM90_BLK128)
     check_blk128(sq=129, sk=257, sizes_rank=2, valid_size=size, scale=scale, splits=2, layout="bshd", bucket=bucket)
 

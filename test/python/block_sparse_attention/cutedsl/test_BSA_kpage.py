@@ -96,11 +96,11 @@ def test_matches_base_kernel_and_reference(block, num_q_blocks, kv_block_sizes, 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=13)
 @with_block
-@pytest.mark.parametrize("softmax_scale", [None, 0.2])
 @pytest.mark.parametrize("block_sparse_num", [2, 3])
-def test_fixed_count_matches_base_kernel(block, softmax_scale, block_sparse_num):
+def test_fixed_count_matches_base_kernel(block, block_sparse_num):
     """A fixed count with block_sizes=None is the plain problem; KPage takes odd counts, which the SM100/SM110 blk128
-    base kernel does not."""
+    base kernel does not.  The scale is passed through (its sign is covered by test_softmax_scale_sign_with_partial_blocks)."""
+    softmax_scale = 0.2
     BSA = import_kpage_bsa(KPAGE)
     heads, num_blocks = 2, 4
     seqlen = num_blocks * block
