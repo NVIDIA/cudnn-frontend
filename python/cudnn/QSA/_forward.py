@@ -85,7 +85,7 @@ def _launch(
         ids = cute.make_tensor(scratch.iterator, cute.make_layout((total, blocks), stride=(blocks, 1)))
         counts_offset = cute.ceil_div(total * blocks, 4) * 4
         counts = cute.make_tensor(scratch.iterator + counts_offset, cute.make_layout((total,)))
-        _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream, arch == 107)
+        _metadata._compact_host(sel, lo, hi, first, last, ids, counts, stream)
         if cutlass.const_expr(n64):
             from .kernels import fprop_n64_sm107
 

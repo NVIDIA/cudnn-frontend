@@ -230,7 +230,7 @@ The public functions select one of two architecture families internally:
 | Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine with its SM107 dense pair, query-major and key-major kernels) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
-Rubin compaction scans 16 selection bytes per lane and preserves block order.
+Selection rows are compacted 16 bytes per lane on every architecture, preserving block order.
 CuTeDSL 4.7 or newer is
 required; Rubin also requires a build with the `sm_107a` target. On SM107 the
 backward runs Rubin flavors of the dense pair, query-major and key-major kernels,

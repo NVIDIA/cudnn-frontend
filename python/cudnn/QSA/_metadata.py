@@ -9,7 +9,7 @@ from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Int32, Int64, Uint32
+from cutlass import Boolean, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cuda.bindings import driver as cuda
 
@@ -71,27 +71,12 @@ def _compact_row(
     counts: cute.Tensor,
     row: Int64,
     lane: Int32,
-    vectorized: cutlass.Constexpr = False,
 ):
-    low, high = lo[row], hi[row]
     count = Int32(0)
-    if cutlass.const_expr(vectorized):
-        bulk = (Int32(sel.shape[1]) // 512) * 512
-        for start in cutlass.range(0, bulk, 512, unroll=1):
-            count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, start + lane * 16, count, True)
-        count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, bulk + lane * 16, count, False)
-    else:
-        lower_lanes = (Uint32(1) << Uint32(lane)) - Uint32(1)
-        for start in cutlass.range(0, Int32(sel.shape[1]), 32, unroll=1):
-            block = start + lane
-            selected = Boolean(False)
-            if block < sel.shape[1]:
-                selected = (sel[Int64(row), Int64(block)] != 0) & (last[block] >= low) & (first[block] <= high) & (low <= high)
-            ballot = Uint32(cute.arch.vote_ballot_sync(selected))
-            if selected:
-                offset = count + Int32(cute.arch.popc(ballot & lower_lanes))
-                ids[Int64(row), Int64(offset)] = block
-            count = count + Int32(cute.arch.popc(ballot))
+    bulk = (Int32(sel.shape[1]) // 512) * 512
+    for start in cutlass.range(0, bulk, 512, unroll=1):
+        count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, start + lane * 16, count, True)
+    count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, bulk + lane * 16, count, False)
     if lane == 0:
         counts[row] = count
 
@@ -106,7 +91,6 @@ def frost_qsa_compact(
     ids: cute.Tensor,
     counts: cute.Tensor,
     mode,
-    vectorized: cutlass.Constexpr = False,
 ):
     tid = cute.arch.thread_idx()[0]
     rows_per_warp = cutlass.const_expr(8 if mode is not None else 1)
@@ -120,34 +104,25 @@ def frost_qsa_compact(
         for step in cutlass.range(rows_per_warp, unroll=1):
             row = row0 + step * 4
             if row < sel.shape[0]:
-                _compact_row(sel, lo, hi, first, last, ids, counts, Int64(row), Int32(lane), vectorized)
+                _compact_row(sel, lo, hi, first, last, ids, counts, Int64(row), Int32(lane))
 
 
 frost_qsa_compact.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _compact_host(sel, lo, hi, first, last, ids, counts, stream: cuda.CUstream, vectorized: cutlass.Constexpr = False):
-    if cutlass.const_expr(vectorized):
-        # The bit scan is tuned for long sparse rows. Preserve short-row dispatch.
-        use_fast = (sel.shape[1] >= 8192) & (sel.shape[1] % 16 == 0) & (sel.iterator.toint() % 16 == 0)
-        if use_fast:
-            _metadata_fast.frost_qsa_fast_compact_host(sel, lo, hi, first, last, ids, counts, stream)
-        else:
-            frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None, vectorized).launch(
-                grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
-            )
+def _compact_host(sel, lo, hi, first, last, ids, counts, stream: cuda.CUstream):
+    # The bit scan is tuned for long sparse rows. Preserve short-row dispatch.
+    use_fast = (sel.shape[1] >= 8192) & (sel.shape[1] % 16 == 0) & (sel.iterator.toint() % 16 == 0)
+    if use_fast:
+        _metadata_fast.frost_qsa_fast_compact_host(sel, lo, hi, first, last, ids, counts, stream)
     else:
-        frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None, vectorized).launch(
-            grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream
-        )
+        frost_qsa_compact(sel, lo, hi, first, last, ids, counts, None).launch(grid=(cute.ceil_div(sel.shape[0], 4), 1, 1), block=(128, 1, 1), stream=stream)
 
 
 @cute.jit
-def _compact_gated_host(sel, lo, hi, first, last, ids, counts, mode, stream: cuda.CUstream, vectorized: cutlass.Constexpr = False):
-    frost_qsa_compact(sel, lo, hi, first, last, ids, counts, mode, vectorized).launch(
-        grid=(cute.ceil_div(sel.shape[0], 32), 1, 1), block=(128, 1, 1), stream=stream
-    )
+def _compact_gated_host(sel, lo, hi, first, last, ids, counts, mode, stream: cuda.CUstream):
+    frost_qsa_compact(sel, lo, hi, first, last, ids, counts, mode).launch(grid=(cute.ceil_div(sel.shape[0], 32), 1, 1), block=(128, 1, 1), stream=stream)
 
 
 @lru_cache(maxsize=None)
@@ -172,7 +147,6 @@ def compile_kernel(arch, gated=False):
     return compile_cached(
         _compact_gated_host if gated else _compact_host,
         *_compile_args(gated),
-        arch == 107,
         options=f"--enable-tvm-ffi --gpu-arch=sm_{arch}a",
         cache_key=key,
         symbol="qsa_compact",
