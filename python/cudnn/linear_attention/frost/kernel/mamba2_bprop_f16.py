@@ -1170,12 +1170,12 @@ def compute0_warp_group(
                     (sDa_base + swizzle_offset).store(cutlass.Vector.from_elements(tuple(words), cutlass.Int32).bitcast(cfg.io_dtype), alignment=16)
                 if cutlass.const_expr(piece + 1 < num_dq_pieces):
                     acc_vector = acc_next
+            nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_q_cg0_done[0].arrive()
+            bars.mb_dq_tmastg_ready[0].arrive()
             token = batch_start + chunk_idx * cutlass.Int32(cfg.b_t) + cg0_tidx
             if chunk_idx < write_end and token < batch_end:
                 mDotQ[token, head_o] = dot_lo + dot_hi
-            nvvm.fence_proxy("async.shared", space="cta")
-            bars.mb_dq_tmastg_ready[0].arrive()
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
     bars.mb_tmem_done[0].arrive()
@@ -1430,12 +1430,12 @@ def compute1_warp_group(
                     (sdK_base + swizzle_offset).store(cutlass.Vector.from_elements(tuple(words), cutlass.Int32).bitcast(cfg.io_dtype), alignment=16)
                 if cutlass.const_expr(piece + 1 < num_dk_pieces):
                     acc_vector = acc_next
+            nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_k_cg1_done[0].arrive()
+            bars.mb_dk_tmastg_ready[0].arrive()
             token = batch_start + chunk_idx * cutlass.Int32(cfg.b_t) + cg1_tidx
             if chunk_idx < write_end and token < batch_end:
                 mDotK[token, head_o] = dot_lo + dot_hi
-            nvvm.fence_proxy("async.shared", space="cta")
-            bars.mb_dk_tmastg_ready[0].arrive()
             bars.mb_gate_done[gate_idx].arrive()
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1578,8 +1578,7 @@ def compute2_warp_group(
                 gate_index = advance(gate_index, cfg.smem_gate_stages)
                 g_last = sCumsumlog[cfg.b_t - 1, 0, gate_idx]
 
-                # ---- D-skip partials: per head the warp's 32 diagonal entries of dA^T = V dO^T (the per-token <x_j, dO_j>),
-                # per channel the raw-row dots of the warp's 32 tokens, one channel pair per lane; one row per warp per slot ----
+                # ---- D-skip partials ----
                 if cutlass.const_expr(cfg.skip_bwd_partials):
                     skip_row = (exit_base + chunk_idx) * 4 + warp_in_group
                     if cutlass.const_expr(cfg.d_per_channel):
@@ -1603,6 +1602,7 @@ def compute2_warp_group(
                             x_lo, x_hi = f16x2_to_f32(x_word[0], dtype=cfg.io_dtype)
                             do_lo, do_hi = f16x2_to_f32(do_word[0], dtype=cfg.io_dtype)
                             skip_lo, skip_hi = ffma2(do_lo, do_hi, x_lo, x_hi, skip_lo, skip_hi)
+                        nvvm.fence_proxy("async.shared", space="cta")
                         bars.mb_v_cg1_done[0].arrive()
                         bars.mb_do_skip_done[do_buffer].arrive()
                         if chunk_idx < write_end:

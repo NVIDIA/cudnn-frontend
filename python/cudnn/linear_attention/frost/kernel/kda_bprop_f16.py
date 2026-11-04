@@ -3224,6 +3224,7 @@ def compute2_warp_group(
             bars.mb_da_diag_done[da_diag_stage].arrive()
             if cutlass.const_expr((not cfg.l2norm or split_channels) and cfg.steep_mode == STEEP_EXACT):
                 if steep_any != 0:
+                    nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_raw_done[raw_stage].arrive()
 
             # ---- dGate finalize ------------------------------------------------------

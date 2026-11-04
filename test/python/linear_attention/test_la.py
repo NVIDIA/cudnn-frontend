@@ -3341,7 +3341,7 @@ def test_execute_from_a_thread_with_no_cuda_context(backend, variant):
             o, _ = pinned_op(backend, variant)(*args, *op_tail(case), batch_invariant=True)
             seen["o"] = o.detach().clone()
             seen["grads"] = torch.autograd.grad([o], leaves, [dO])
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             seen["exc"] = exc
         seen["after"] = int(drv.cuCtxGetCurrent()[1])
 
@@ -3699,12 +3699,12 @@ def test_gdp_long_bwd_compact_summary(backend, l2norm, n):
     assert_long_grads_close(grads, grads_inv)
 
 
-def token_major_views(case, pad=24, return_buffers=False):
+def token_major_views(case, pad=24):
     """The case's expanded k / v / beta as the per-token column slices of a joint projection buffer: ``[T, pad | n*HV*V |
     n*HK*K | H*K | pad]`` viewed ``[T, n, HV, V]`` / ``[T, n, HK, K]`` with the joint token stride, beta from a ``[T, pad |
     n*HO | pad]`` buffer viewed ``[T, n, HO]``.  Same bytes as the expanded leaves, a different row convention.
-    ``return_buffers`` adds the two joint buffers and the column slices of v, k and beta (to differentiate through the
-    buffers: a clone of a strided view is contiguous, so a leaf must be the buffer itself)."""
+    Also returns the two joint buffers and the column slices of v, k and beta (to differentiate through the buffers: a
+    clone of a strided view is contiguous, so a leaf must be the buffer itself)."""
     tokens, n = case.T * case.B, case.n
     k, v, beta = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"])
     widths = (n * case.HV * case.V, n * case.HK * case.K, case.H * case.K)
@@ -3720,9 +3720,7 @@ def token_major_views(case, pad=24, return_buffers=False):
     beta_tm = beta_joint[:, beta_cols].view(tokens, n, case.HO)
     beta_tm.copy_(beta.view(tokens, n, case.HO))
     assert not (k_tm.is_contiguous() or v_tm.is_contiguous() or beta_tm.is_contiguous())
-    if return_buffers:
-        return k_tm, v_tm, beta_tm, joint, beta_joint, k_cols, v_cols, beta_cols
-    return k_tm, v_tm, beta_tm
+    return k_tm, v_tm, beta_tm, joint, beta_joint, k_cols, v_cols, beta_cols
 
 
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
@@ -3741,7 +3739,7 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
     tokens = case.T * case.B
     q_e, g_e = to_thd(case.q), to_thd(case.gates["g"])
     k_e, v_e, beta_e = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"])
-    _, _, _, joint, beta_joint, k_cols, v_cols, beta_cols = token_major_views(case, return_buffers=True)
+    _, _, _, joint, beta_joint, k_cols, v_cols, beta_cols = token_major_views(case)
     set_seed(SEED + 2)
     dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
     dFS = torch.randn(case.N, case.HO, case.V, case.K, device="cuda") * 0.1
@@ -3818,7 +3816,7 @@ def test_gdp_token_major_bitwise(backend, n, V, l2norm):
 def test_gdp_summary_token_major_bitwise(backend, n):
     """The GDP summaries (H, M and the backward G) read token-major k / v / beta bitwise like the expanded rows."""
     case = make_case("gdp", torch.bfloat16, seq_lens=[100, 333, 64], n=n)
-    k_tm, v_tm, beta_tm = token_major_views(case)
+    k_tm, v_tm, beta_tm, *_ = token_major_views(case)
     k, v, beta, g, q = to_thd(case.k), to_thd(case.v), to_thd(case.gates["beta"]), to_thd(case.gates["g"]), to_thd(case.q)
     set_seed(SEED + 2)
     dO = torch.randn(case.T, case.HO, case.V, device="cuda").to(case.dtype)
@@ -3840,7 +3838,7 @@ def test_gdp_token_major_rejects_misaligned_and_malformed(backend):
     a token-major tensor whose sub-token count is not num_householder."""
     case = make_case("gdp", torch.bfloat16, T=128, n=3)
     args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
-    k_tm, v_tm, beta_tm = token_major_views(case, pad=3)
+    k_tm, v_tm, beta_tm, *_ = token_major_views(case, pad=3)
     with pytest.raises(ValueError, match="16-byte aligned"):
         pinned_op(backend, "gdp")(args[0], k_tm, args[2], args[3], args[4], case.cu, 3)
     with pytest.raises(ValueError, match="token-major k must be"):
@@ -3938,7 +3936,7 @@ def run_frost(case, **kw):
     try:
         return op(case.variant)(*op_args(case), **kw)
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost engine declined: {e}")
 
 
 def m_twin(case):
@@ -3957,7 +3955,7 @@ def run_summary(case, *, initial_state=None, **kw):
     try:
         return fn(*op_args(case)[1:], initial_state=initial_state, **kw)
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost summary engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost summary engine declined: {e}")
 
 
 def kernel_m(case, producer="prefill", **kw):
@@ -4070,7 +4068,7 @@ def grads_via_port(case, d_o, d_final, *, seed=SEED + 11, **op_kw):
             **op_kw,
         )
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost engine declined: {e}")
     outputs, grad_outputs = [o], [d_o]
     if d_final is not None:
         outputs.append(fs)
@@ -4957,7 +4955,7 @@ def run_summary_bwd(case, d_o, *, d_final_state=None, **kw):
     try:
         return fn(args[0], args[1], args[3], args[4], d_o, *tail, d_final_state=d_final_state, **kw)
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost summary engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost summary engine declined: {e}")
 
 
 @pytest.mark.L0
@@ -5477,7 +5475,7 @@ def family_forward_backward(case, s0, d_o, d_final):
     try:
         o, fs = op(case.variant)(*leaves.values(), *op_tail(case), initial_state=seed, output_final_state=True, plan_name=f"{case.variant}_frost")
     except cudnn.cudnnGraphNotSupportedError as e:
-        pytest.skip(f"{case.variant} frost engine declined: {e}")
+        raise pytest.skip.Exception(f"{case.variant} frost engine declined: {e}")
     grads = torch.autograd.grad([o, fs], list(leaves.values()) + [seed], [d_o, d_final])
     named = dict(zip(list(leaves) + ["initial_state"], grads))
     return o.detach(), fs.detach(), named
