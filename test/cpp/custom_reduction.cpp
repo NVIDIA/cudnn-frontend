@@ -137,9 +137,13 @@ from_bits(U bits) {
 // first.
 void
 skip_below_cudnn_9_29() {
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Custom reduction requires cuDNN v9.29.0");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Custom reduction requires cuDNN v9.29.0");
     }
+#endif
 }
 
 json
@@ -1037,9 +1041,11 @@ TEST_CASE("Custom reduction refuses null inputs and reducers", "[custom_reductio
 }
 
 TEST_CASE("Custom reduction refuses a cuDNN backend older than 9.29", "[custom_reduction][version]") {
-    if (CUDNN_VERSION >= 92900 && fe::detail::get_backend_version() >= 92900) {
+#if (CUDNN_VERSION >= 92900)
+    if (fe::detail::get_backend_version() >= 92900) {
         SKIP("Test requires cuDNN headers or a cuDNN backend older than 9.29.0");
     }
+#endif
     auto calls           = std::make_shared<int>(0);
     auto counted_reducer = [calls, add = make_reducer(fe::PointwiseMode_t::ADD)](
                                Custom_attributes::Graph_t graph, std::vector<Tensor_t> lhs, std::vector<Tensor_t> rhs) {

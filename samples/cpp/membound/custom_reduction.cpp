@@ -25,8 +25,10 @@ char const*
 custom_reduction_runtime_skip_reason() {
 #if CUDART_VERSION < 13010
     return "Test requires cuda toolkit 13.1 or above";
+#elif CUDNN_VERSION < 92900
+    return "Custom reduction requires cuDNN v9.29.0";
 #else
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+    if (fe::detail::get_backend_version() < 92900) {
         return "Custom reduction requires cuDNN v9.29.0";
     }
     if (!is_blackwell_computing_arch()) {
@@ -72,9 +74,13 @@ TEST_CASE("Custom reduction F32 sum helper matches built-in reduction and replay
     return;
 #endif
 
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Custom reduction requires cuDNN v9.29.0");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Custom reduction requires cuDNN v9.29.0");
     }
+#endif
     if (!is_blackwell_computing_arch()) {
         SKIP("Custom reduction requires the TensorIR MemBound engine on data-center Blackwell");
     }

@@ -28,9 +28,13 @@ require_runtime() {
 #if CUDART_VERSION < 13010
     SKIP("Requires CUDA 13.1 or newer");
 #endif
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Requires cuDNN 9.29 or newer");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Requires cuDNN 9.29 or newer");
     }
+#endif
     int device = 0;
     cudaDeviceProp properties{};
     REQUIRE(cudaGetDevice(&device) == cudaSuccess);

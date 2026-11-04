@@ -413,8 +413,10 @@ char const*
 custom_reduction_runtime_skip_reason() {
 #if CUDART_VERSION < 13010
     return "Test requires cuda toolkit 13.1 or above";
+#elif CUDNN_VERSION < 92900
+    return "Custom reduction requires cuDNN v9.29.0";
 #else
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+    if (fe::detail::get_backend_version() < 92900) {
         return "Custom reduction requires cuDNN v9.29.0";
     }
     if (!is_blackwell_computing_arch() || !is_arch_supported_by_cudnn()) {

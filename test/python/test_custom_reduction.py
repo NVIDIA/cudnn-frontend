@@ -251,6 +251,7 @@ def test_custom_reduction_executes_float_relu_body_with_default_upper_clip(cudnn
     x_gpu = x_cpu.cuda()
     y_gpu = torch.full(list(expected.shape), float("nan"), dtype=torch.float32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    torch.cuda.synchronize()  # The fixture handle uses a separate nonblocking stream.
     graph.execute({x: x_gpu, y: y_gpu}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     assert torch.equal(y_gpu.cpu(), expected)
@@ -637,9 +638,11 @@ def test_custom_reduction_modifiers_execute(cudnn_handle):
         graph.build([cudnn.heur_mode.A])
         assert _custom_node(graph)["reducer_semantic_key"] == f"cudnn_frontend.reduction_modifiers.{helper_name}.v1"
 
+        x_gpu = x_cpu.cuda()
         y_gpu = torch.full(list(expected.shape), float("nan"), dtype=torch.float32, device="cuda")
         workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-        graph.execute({x: x_cpu.cuda(), y: y_gpu}, workspace, handle=cudnn_handle)
+        torch.cuda.synchronize()
+        graph.execute({x: x_gpu, y: y_gpu}, workspace, handle=cudnn_handle)
         torch.cuda.synchronize()
         assert torch.equal(y_gpu.cpu(), expected), helper_name
 
@@ -674,9 +677,11 @@ def test_custom_reduction_docs_argmax_executes(cudnn_handle):
     index.set_output(True)
     graph.build([cudnn.heur_mode.A])
 
+    x_gpu, idx_gpu = x_cpu.cuda(), idx_cpu.cuda()
     index_gpu = torch.full(list(expected.shape), -1, dtype=torch.int32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-    graph.execute({x: x_cpu.cuda(), idx: idx_cpu.cuda(), index: index_gpu}, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+    graph.execute({x: x_gpu, idx: idx_gpu, index: index_gpu}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     assert torch.equal(index_gpu.cpu(), expected)
 
@@ -721,6 +726,7 @@ def test_custom_reduction_plan_serialize_roundtrip(cudnn_handle):
     x_gpu, idx_gpu = x_cpu.cuda(), idx_cpu.cuda()
     original = torch.full(list(expected.shape), -1, dtype=torch.int32, device="cuda")
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    torch.cuda.synchronize()
     graph.execute({x: x_gpu, idx: idx_gpu, index: original}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
     assert torch.equal(original.cpu(), expected)
@@ -735,6 +741,7 @@ def test_custom_reduction_plan_serialize_roundtrip(cudnn_handle):
         restored_graph.deserialize(restored_handle, data, enforce_precompiled=True)
         restored = torch.full(list(expected.shape), -1, dtype=torch.int32, device="cuda")
         restored_workspace = torch.empty(restored_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+        torch.cuda.synchronize()
         restored_graph.execute({x: x_gpu, idx: idx_gpu, index: restored}, restored_workspace, handle=restored_handle)
         torch.cuda.synchronize()
     finally:
@@ -797,6 +804,7 @@ def test_custom_reduction_keeps_an_assigned_output_stride_after_shape_inference(
         storage = torch.full([15], -777.0, dtype=torch.float32, device="cuda")
         y_gpu = storage.as_strided([2, 1, 3], [10, 6, 2])
         workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+        torch.cuda.synchronize()
         if raw_pointers:
             graph.execute({x: x_gpu.data_ptr(), y: y_gpu.data_ptr()}, workspace.data_ptr(), handle=cudnn_handle)
         else:

@@ -9,6 +9,7 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <tuple>
@@ -269,6 +270,48 @@ parse(json const &j) {
             require(json(tensor->get_data_type()) == info.at("data_type"), "Serialized tensor data type is unknown");
             require(json(tensor->get_reordering_type()) == info.at("reordering_type"),
                     "Serialized tensor reordering type is unknown");
+            require(result.tensors.emplace(key, std::move(tensor)).second, "Serialized tensor UID is repeated");
+        }
+
+        // Tensor JSON stores a ragged offset as a UID-only placeholder. Resolve
+        // every reference against the complete record table, regardless of row
+        // order. Detect cycles before linking shared_ptrs so a rejected blob
+        // cannot retain a cycle of tensor descriptors.
+        std::unordered_map<uid_t, uid_t> ragged_edges;
+        for (auto const &[key, tensor] : result.tensors) {
+            auto const placeholder = tensor->get_ragged_offset();
+            if (placeholder == nullptr) {
+                continue;
+            }
+            auto const target = placeholder->get_uid();
+            auto const owner  = result.tensors.find(target);
+            require(owner != result.tensors.end(), "Serialized ragged offset UID has no tensor record");
+            ragged_edges.emplace(key, target);
+        }
+        std::unordered_map<uid_t, uint8_t> marks;
+        for (auto const &[key, tensor] : result.tensors) {
+            (void)tensor;
+            std::vector<uid_t> path;
+            auto current = key;
+            while (marks[current] == 0) {
+                marks[current] = 1;
+                path.push_back(current);
+                auto const edge = ragged_edges.find(current);
+                if (edge == ragged_edges.end()) {
+                    break;
+                }
+                current = edge->second;
+                require(marks[current] != 1, "Serialized ragged offset chain is cyclic");
+            }
+            for (auto const visited : path) {
+                marks[visited] = 2;
+            }
+        }
+        for (auto const &[source, target] : ragged_edges) {
+            result.tensors.at(source)->set_ragged_offset(result.tensors.at(target));
+        }
+
+        for (auto const &[key, tensor] : result.tensors) {
             require(tensor->validate().is_good(), "Serialized tensor has inconsistent attributes");
             auto const alignment = tensor->get_alignment();
             require(alignment > 0 && (alignment & (alignment - 1)) == 0,
@@ -308,7 +351,6 @@ parse(json const &j) {
                     aligned->second.second == static_cast<int64_t>(detail::get_data_type_size(tensor->get_data_type())),
                     "Serialized aligned element width disagrees with tensor storage");
             }
-            require(result.tensors.emplace(key, std::move(tensor)).second, "Serialized tensor UID is repeated");
         }
     }
 

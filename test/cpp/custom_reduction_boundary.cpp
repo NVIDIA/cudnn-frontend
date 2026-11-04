@@ -190,9 +190,13 @@ TEST_CASE("Ragged offset cycles are rejected before creation", "[custom_reductio
 
 TEST_CASE("Custom reduction direct builds reject malformed ranks and operands",
           "[custom_reduction][boundary][direct_build]") {
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Requires cuDNN9.29");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Requires cuDNN9.29");
     }
+#endif
     using Attributes = fe::graph::Custom_reduction_attributes;
     for (bool null_input : {false, true}) {
         fe::graph::Graph graph;
@@ -223,9 +227,13 @@ TEST_CASE("Custom reduction direct builds reject malformed ranks and operands",
 }
 
 TEST_CASE("Reducer bodies reject surplus pointwise operands", "[custom_reduction][boundary][arity_body]") {
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Requires cuDNN9.29");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Requires cuDNN9.29");
     }
+#endif
     using Attributes = fe::graph::Custom_reduction_attributes;
     for (auto mode : {fe::PointwiseMode_t::ADD, fe::PointwiseMode_t::IDENTITY}) {
         DYNAMIC_SECTION("mode " << static_cast<int64_t>(mode)) {
@@ -334,9 +342,13 @@ TEST_CASE("Custom reduction validates intermediate ragged inputs", "[custom_redu
 
 TEST_CASE("Throwing reducers are contained and retry with FE exceptions disabled too",
           "[custom_reduction][boundary][callback_flag]") {
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Requires cuDNN9.29");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Requires cuDNN9.29");
     }
+#endif
     using Attributes = fe::graph::Custom_reduction_attributes;
     for (bool nonstandard : {false, true}) {
         DYNAMIC_SECTION("nonstandard " << nonstandard) {
@@ -414,9 +426,13 @@ TEST_CASE("Owned scalar storage covers the declared backend read width", "[custo
 
 TEST_CASE("Reducer rejects a narrow owned constant before committing its body",
           "[custom_reduction][boundary][scalar_width_body]") {
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Requires cuDNN9.29");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Requires cuDNN9.29");
     }
+#endif
     using Attributes = fe::graph::Custom_reduction_attributes;
     ExpandingGraph graph;
     graph.set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);

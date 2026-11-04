@@ -248,6 +248,99 @@ TEST_CASE("Plan metadata validates sibling UID and workspace representations", "
     REQUIRE_THROWS_AS(md::parse(duplicate), std::exception);
 }
 
+TEST_CASE("Plan metadata resolves ragged offset records before validation", "[serialize][plan_metadata][ragged]") {
+    namespace fe = cudnn_frontend;
+    namespace md = fe::graph::plan_serialization_detail;
+    using Tensor = fe::graph::Tensor_attributes;
+    auto owner   = std::make_shared<Tensor>(
+        Tensor().set_uid(2).set_name("offset").set_dim({3}).set_stride({1}).set_data_type(fe::DataType_t::INT32));
+    auto input = Tensor()
+                     .set_uid(1)
+                     .set_name("input")
+                     .set_dim({2, 4})
+                     .set_stride({4, 1})
+                     .set_data_type(fe::DataType_t::FLOAT)
+                     .set_ragged_offset(owner);
+    json base{{"json_version", "2.0"},
+              {"cudnn_backend_data", "opaque"},
+              {"variant_pack_uids", json::array({1, 2})},
+              {"fe_workspace_size", 0},
+              {"variant_pack_replacements", json::array()},
+              {"behavior_notes", json::array({json::array()})},
+              {"gid", 1},
+              {"nodes", json::array()},
+              {"tensors", json::array()}};
+    for (bool offset_first : {false, true}) {
+        auto j = base;
+        j["tensors"] =
+            offset_first ? json::array({json(*owner), json(input)}) : json::array({json(input), json(*owner)});
+        md::PlanMetadata metadata;
+        REQUIRE_NOTHROW(metadata = md::parse(j));
+        REQUIRE(metadata.tensors.at(1)->get_ragged_offset() == metadata.tensors.at(2));
+        REQUIRE(metadata.tensors.at(1)->validate().is_good());
+    }
+
+    auto shared = base;
+    auto second = input;
+    second.set_uid(3).set_name("second");
+    shared["tensors"] = json::array({json(second), json(*owner), json(input)});
+    md::PlanMetadata shared_metadata;
+    REQUIRE_NOTHROW(shared_metadata = md::parse(shared));
+    REQUIRE(shared_metadata.tensors.at(1)->get_ragged_offset() == shared_metadata.tensors.at(3)->get_ragged_offset());
+
+    auto deep = base;
+    auto next = std::make_shared<Tensor>(*owner);
+    deep["tensors"].push_back(json(*next));
+    for (int64_t key = 4; key < 68; ++key) {
+        auto current = std::make_shared<Tensor>(Tensor()
+                                                    .set_uid(key)
+                                                    .set_dim({3})
+                                                    .set_stride({1})
+                                                    .set_data_type(fe::DataType_t::INT32)
+                                                    .set_ragged_offset(next));
+        deep["tensors"].push_back(json(*current));
+        next = std::move(current);
+    }
+    auto chain_head = input;
+    chain_head.set_ragged_offset(next);
+    deep["tensors"].push_back(json(chain_head));
+    md::PlanMetadata deep_metadata;
+    REQUIRE_NOTHROW(deep_metadata = md::parse(deep));
+    REQUIRE(deep_metadata.tensors.at(1)->validate().is_good());
+
+    auto stale_name                                = base;
+    stale_name["tensors"]                          = json::array({json(input), json(*owner)});
+    stale_name["tensors"][0]["ragged_offset_name"] = "historical name hint";
+    md::PlanMetadata stale_metadata;
+    REQUIRE_NOTHROW(stale_metadata = md::parse(stale_name));
+    REQUIRE(stale_metadata.tensors.at(1)->get_ragged_offset() == stale_metadata.tensors.at(2));
+    stale_name["tensors"][0].erase("ragged_offset_name");
+    REQUIRE_NOTHROW(stale_metadata = md::parse(stale_name));
+    REQUIRE(stale_metadata.tensors.at(1)->get_ragged_offset() == stale_metadata.tensors.at(2));
+
+    auto bad                               = base;
+    bad["tensors"]                         = json::array({json(input), json(*owner)});
+    bad["tensors"][0]["ragged_offset_uid"] = 99;
+    REQUIRE_THROWS_AS(md::parse(bad), std::exception);
+    fe::graph::Graph graph;
+    fe::error_t status;
+    REQUIRE_NOTHROW(status = graph.deserialize(static_cast<cudnnHandle_t>(nullptr), bad, false, false));
+    REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
+
+    bad            = base;
+    bad["tensors"] = json::array({json(input), json(*owner), json(*owner)});
+    REQUIRE_THROWS_AS(md::parse(bad), std::exception);
+    bad                                    = base;
+    bad["tensors"]                         = json::array({json(input), json(*owner)});
+    bad["tensors"][0]["ragged_offset_uid"] = 1;
+    REQUIRE_THROWS_AS(md::parse(bad), std::exception);
+    bad["tensors"][0]["ragged_offset_uid"] = 2;
+    bad["tensors"][1]["ragged_offset_uid"] = 1;
+    REQUIRE_THROWS_AS(md::parse(bad), std::exception);
+    bad["tensors"][1]["ragged_offset_uid"] = 1.5;
+    REQUIRE_THROWS_AS(md::parse(bad), std::exception);
+}
+
 TEST_CASE(
     "Plan metadata preserves virtual predicates and bounds owned aliases "
     "and dumps",
@@ -403,9 +496,13 @@ TEST_CASE("Plan metadata separates scalar reads empty shapes aliases and dumps",
 TEST_CASE("Reduction plan warmup omits fake dumps and preserves execution dumps",
           "[serialize][custom_reduction][warmup_dumps]") {
     namespace fe = cudnn_frontend;
-    if (CUDNN_VERSION < 92900 || fe::detail::get_backend_version() < 92900) {
+#if (CUDNN_VERSION < 92900)
+    SKIP("Requires cuDNN9.29 headers");
+#else
+    if (fe::detail::get_backend_version() < 92900) {
         SKIP("Requires cuDNN9.29");
     }
+#endif
     fe::graph::Graph graph;
     graph.set_io_data_type(fe::DataType_t::FLOAT)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
@@ -1578,6 +1675,100 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
     cudnnDestroy(handle);
 }
 
+TEST_CASE("Ragged SDPA plan reloads with structural tensor metadata", "[graph][serialize][ragged]") {
+    namespace fe        = cudnn_frontend;
+    constexpr int64_t b = 2, h = 2, s = 128, d = 64;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto q_offset   = graph.tensor(fe::graph::Tensor_attributes()
+                                     .set_name("Q_ragged_offset")
+                                     .set_uid(11)
+                                     .set_dim({b + 1, 1, 1, 1})
+                                     .set_stride({1, 1, 1, 1})
+                                     .set_data_type(fe::DataType_t::INT64));
+    auto Q          = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("Q")
+                              .set_uid(1)
+                              .set_dim({b, h, s, d})
+                              .set_stride({s * h * d, d, h * d, 1})
+                              .set_ragged_offset(q_offset));
+    auto K          = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("K")
+                              .set_uid(2)
+                              .set_dim({b, h, s, d})
+                              .set_stride({s * h * d, d, h * d, 1}));
+    auto V          = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("V")
+                              .set_uid(3)
+                              .set_dim({b, h, s, d})
+                              .set_stride({s * h * d, d, h * d, 1}));
+    auto seq_q      = graph.tensor(fe::graph::Tensor_attributes()
+                                  .set_name("seq_q")
+                                  .set_uid(12)
+                                  .set_dim({b, 1, 1, 1})
+                                  .set_stride({1, 1, 1, 1})
+                                  .set_data_type(fe::DataType_t::INT32));
+    auto seq_kv     = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("seq_kv")
+                                   .set_uid(13)
+                                   .set_dim({b, 1, 1, 1})
+                                   .set_stride({1, 1, 1, 1})
+                                   .set_data_type(fe::DataType_t::INT32));
+    auto [O, stats] = graph.sdpa(Q,
+                                 K,
+                                 V,
+                                 fe::graph::SDPA_attributes()
+                                     .set_name("ragged_sdpa")
+                                     .set_generate_stats(false)
+                                     .set_attn_scale(0.125f)
+                                     .set_padding_mask(true)
+                                     .set_seq_len_q(seq_q)
+                                     .set_seq_len_kv(seq_kv));
+    O->set_output(true).set_uid(4).set_dim({b, h, s, d}).set_stride({s * h * d, d, h * d, 1});
+    auto o_offset = graph.tensor(fe::graph::Tensor_attributes()
+                                     .set_name("O_ragged_offset")
+                                     .set_uid(14)
+                                     .set_dim({b + 1, 1, 1, 1})
+                                     .set_stride({1, 1, 1, 1})
+                                     .set_data_type(fe::DataType_t::INT64));
+    O->set_ragged_offset(o_offset);
+    (void)stats;
+
+    struct Handle {
+        cudnnHandle_t value = nullptr;
+        ~Handle() {
+            if (value != nullptr) cudnnDestroy(value);
+        }
+    } handle;
+    REQUIRE(cudnnCreate(&handle.value) == CUDNN_STATUS_SUCCESS);
+    auto built = graph.build(handle.value, {fe::HeurMode_t::A});
+    INFO(built.get_message());
+    REQUIRE(built.is_good());
+
+    std::vector<uint8_t> structural, plan_only;
+    REQUIRE(graph.serialize(structural).is_good());
+    REQUIRE(graph.serialize(plan_only, /*serialize_structure=*/false).is_good());
+    json const with_structure = json::from_ubjson(structural);
+    REQUIRE(with_structure.at("tensors").is_array());
+    REQUIRE(with_structure.at("tensors").size() > 0);
+    REQUIRE_FALSE(json::from_ubjson(plan_only).contains("tensors"));
+
+    for (auto const &blob : {plan_only, structural}) {
+        fe::graph::Graph reloaded;
+        auto status = reloaded.deserialize(handle.value,
+                                           blob,
+                                           /*enforce_precompiled=*/false,
+                                           /*run_warmup=*/false);
+        INFO(status.get_message());
+        REQUIRE(status.is_good());
+        REQUIRE(reloaded.get_variant_pack_uids_sorted() == graph.get_variant_pack_uids_sorted());
+    }
+}
+
 // A graph loaded via deserialize(handle, ...) might have no node subtree,
 // so serialize() must source its pass-by-value and workspace modifications from the
 // cached members instead of walking the (now empty) subtree.
@@ -1648,6 +1839,17 @@ TEST_CASE("Plan round trip keeps a compile-time constant with a mismatched type"
     namespace fe = cudnn_frontend;
 
     auto const check_round_trip = [](fe::DataType_t tensor_type, bool int32_constant) {
+        // This mixed constant/INT32 pointwise plan is offered by the TensorIR
+        // MemBound engine on data-center Blackwell, not the SM80/SM90 lanes.
+        if (tensor_type == fe::DataType_t::INT32) {
+            int device = 0;
+            cudaDeviceProp properties{};
+            REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+            REQUIRE(cudaGetDeviceProperties(&properties, device) == cudaSuccess);
+            if (properties.major < 10) {
+                SKIP("FLOAT constant on INT32 tensor requires the Blackwell TensorIR MemBound engine");
+            }
+        }
         constexpr int64_t N = 1, C = 8, H = 16, W = 16;
         constexpr int64_t count = N * C * H * W;
         constexpr size_t bytes  = static_cast<size_t>(count) * 4;
@@ -1668,9 +1870,19 @@ TEST_CASE("Plan round trip keeps a compile-time constant with a mismatched type"
             fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD).set_compute_data_type(tensor_type));
         Y->set_output(true).set_data_type(tensor_type);
 
-        cudnnHandle_t handle;
-        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
-        REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
+        struct Resources {
+            cudnnHandle_t handle = nullptr;
+            void *x_dev = nullptr, *y_dev = nullptr, *restored_y_dev = nullptr, *workspace = nullptr;
+            ~Resources() {
+                if (workspace) cudaFree(workspace);
+                if (restored_y_dev) cudaFree(restored_y_dev);
+                if (y_dev) cudaFree(y_dev);
+                if (x_dev) cudaFree(x_dev);
+                if (handle) cudnnDestroy(handle);
+            }
+        } resources;
+        REQUIRE(cudnnCreate(&resources.handle) == CUDNN_STATUS_SUCCESS);
+        REQUIRE(graph.build(resources.handle, {fe::HeurMode_t::A}).is_good());
 
         // Both tensor types are 4 bytes; the input holds the integers 0 .. count-1 in the tensor type.
         std::vector<uint8_t> input(bytes);
@@ -1683,44 +1895,39 @@ TEST_CASE("Plan round trip keeps a compile-time constant with a mismatched type"
                 std::memcpy(input.data() + static_cast<size_t>(i) * 4, &value, 4);
             }
         }
-        void *x_dev = nullptr, *y_dev = nullptr, *restored_y_dev = nullptr, *workspace = nullptr;
-        REQUIRE(cudaMalloc(&x_dev, bytes) == cudaSuccess);
-        REQUIRE(cudaMalloc(&y_dev, bytes) == cudaSuccess);
-        REQUIRE(cudaMalloc(&restored_y_dev, bytes) == cudaSuccess);
-        REQUIRE(cudaMemcpy(x_dev, input.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess);
+        REQUIRE(cudaMalloc(&resources.x_dev, bytes) == cudaSuccess);
+        REQUIRE(cudaMalloc(&resources.y_dev, bytes) == cudaSuccess);
+        REQUIRE(cudaMalloc(&resources.restored_y_dev, bytes) == cudaSuccess);
+        REQUIRE(cudaMemcpy(resources.x_dev, input.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess);
         // Different fill bytes: equal outputs then show that both executions wrote every element.
-        REQUIRE(cudaMemset(y_dev, 0xAB, bytes) == cudaSuccess);
-        REQUIRE(cudaMemset(restored_y_dev, 0xCD, bytes) == cudaSuccess);
+        REQUIRE(cudaMemset(resources.y_dev, 0xAB, bytes) == cudaSuccess);
+        REQUIRE(cudaMemset(resources.restored_y_dev, 0xCD, bytes) == cudaSuccess);
         int64_t workspace_size = 0;
         REQUIRE(graph.get_workspace_size(workspace_size).is_good());
         if (workspace_size > 0) {
-            REQUIRE(cudaMalloc(&workspace, static_cast<size_t>(workspace_size)) == cudaSuccess);
+            REQUIRE(cudaMalloc(&resources.workspace, static_cast<size_t>(workspace_size)) == cudaSuccess);
         }
 
-        std::unordered_map<int64_t, void *> variant_pack = {{X->get_uid(), x_dev}, {Y->get_uid(), y_dev}};
-        REQUIRE(graph.execute(handle, variant_pack, workspace).is_good());
+        std::unordered_map<int64_t, void *> variant_pack = {{X->get_uid(), resources.x_dev},
+                                                            {Y->get_uid(), resources.y_dev}};
+        REQUIRE(graph.execute(resources.handle, variant_pack, resources.workspace).is_good());
 
         std::vector<uint8_t> data;
         REQUIRE(graph.serialize(data).is_good());
         fe::graph::Graph restored;
-        auto status = restored.deserialize(handle, data, /*enforce_precompiled=*/true, /*run_warmup=*/false);
+        auto status = restored.deserialize(resources.handle, data, /*enforce_precompiled=*/true, /*run_warmup=*/false);
         INFO(status.get_message());
         REQUIRE(status.is_good());
-        std::unordered_map<int64_t, void *> restored_variant_pack = {{X->get_uid(), x_dev},
-                                                                     {Y->get_uid(), restored_y_dev}};
-        REQUIRE(restored.execute(handle, restored_variant_pack, workspace).is_good());
+        std::unordered_map<int64_t, void *> restored_variant_pack = {{X->get_uid(), resources.x_dev},
+                                                                     {Y->get_uid(), resources.restored_y_dev}};
+        REQUIRE(restored.execute(resources.handle, restored_variant_pack, resources.workspace).is_good());
         REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
         std::vector<uint8_t> output(bytes), restored_output(bytes);
-        REQUIRE(cudaMemcpy(output.data(), y_dev, bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
-        REQUIRE(cudaMemcpy(restored_output.data(), restored_y_dev, bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
+        REQUIRE(cudaMemcpy(output.data(), resources.y_dev, bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
+        REQUIRE(cudaMemcpy(restored_output.data(), resources.restored_y_dev, bytes, cudaMemcpyDeviceToHost) ==
+                cudaSuccess);
         REQUIRE(restored_output == output);
-
-        cudaFree(workspace);
-        cudaFree(restored_y_dev);
-        cudaFree(y_dev);
-        cudaFree(x_dev);
-        cudnnDestroy(handle);
     };
 
     SECTION("INT32 constant on a FLOAT tensor") { check_round_trip(fe::DataType_t::FLOAT, true); }
