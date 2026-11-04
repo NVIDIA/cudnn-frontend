@@ -73,6 +73,31 @@ GAP12 = Q_BYTES  # dO sits between stages 1 and 2
 DS_BYTES = 2 * CHB * 384  # one bf16 part of dS^T
 
 
+def _bf16_parts(x, n, parts):
+    """The n fp32 lanes of x as `parts` bf16 vectors that sum to x. After the round-to-nearest part 0 the residual fits
+    16 bits, so the other parts are exact truncations and a pair costs one cvt."""
+    words = []
+    res = x
+    for part in range(parts):
+        if part == 0 or parts == 2:
+            bp = res.to(BF16)
+            words.append(bp.bitcast(I32))
+            if part + 1 < parts:
+                res = res - bp.to(F32)
+        else:
+            hw = res.bitcast(I32)
+            hs = []
+            for i in range(n):
+                hs.append(hw[i] & I32(-65536))
+            pk = []
+            for i in range(n // 2):
+                pk.append(prims.prmt(hs[2 * i], 0x7632, prims.PermuteMode.DEFAULT, hi=hs[2 * i + 1]))
+            words.append(cutlass.Vector.from_elements(pk, I32))
+            if part + 1 < parts:
+                res = res - cutlass.Vector.from_elements(hs, I32).bitcast(F32)
+    return words
+
+
 def _query_layout(parts):
     # K stages and the dO, Q, V and dS offsets of the query-major kernel for the number of dS^T parts
     nks = 3 if parts == 1 else 2
@@ -761,12 +786,9 @@ def qsa_bwd_sparse_query_kernel(
                         # dS^T for the dQ MMA in DQ_PARTS bf16 parts of its fp32 value (three keep the cancellation of
                         # nearly equal rows). The record keeps the first.
                         dvecs = []
-                        res = ds_v
+                        bpws = _bf16_parts(ds_v, GQ, DQ_PARTS)
                         for part in cutlass.range_constexpr(DQ_PARTS):
-                            bp = res.to(BF16)
-                            if cutlass.const_expr(part + 1 < DQ_PARTS):
-                                res = res - bp.to(F32)
-                            bpw = bp.bitcast(I32)
+                            bpw = bpws[part]
                             dwords = []
                             for n in cutlass.range_constexpr(16):
                                 dv_ = I32(0)
@@ -3394,13 +3416,7 @@ def qsa_bwd_dense_pair_kernel(
                             dpk.append(d0)
                             dpk.append(d1)
                     # dS^T for the dQ^T MMAs in DQ_PARTS bf16 parts of its fp32 value. dK takes the first.
-                    dparts = []
-                    res = cutlass.Vector.from_elements(dpk, F32)
-                    for part in cutlass.range_constexpr(DQ_PARTS):
-                        bp = res.to(BF16)
-                        if cutlass.const_expr(part + 1 < DQ_PARTS):
-                            res = res - bp.to(F32)
-                        dparts.append(bp.bitcast(I32))
+                    dparts = _bf16_parts(cutlass.Vector.from_elements(dpk, F32), len(dpk), DQ_PARTS)
                     dvec = dparts[0]
                     if k >= 1:
                         # dK / dQ^T(k-1) have read the TMEM dS^T slot and the SMEM parts. The copy of dS(k - R0) has landed
