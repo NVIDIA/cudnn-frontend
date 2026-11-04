@@ -15,7 +15,7 @@ Served geometry (declined otherwise, by name): the geometry constants of ``kerne
 tap-contiguous channels, the conv weight ``cw`` [10240, 4] bf16, ``A_log`` [48] fp32, ``dt_bias`` [48] bf16, the fp32 state
 ``[slots, 48, 128, 128]`` (slot-strided), the int32 slot indices, ``z`` [rows, 48, 128] bf16 (row-strided), the norm weight [128]
 bf16, the static FP8 scale (fp32, one element), ``hidden`` [rows, 5120] bf16 and the BA weight [96, 5120] bf16; every operand 16-byte
-aligned; an SM100-class part (compute capability 10.x) and a CuTe DSL >= 4.8.0.  The config is the caller's ``cfg`` as a whole or, without
+aligned; an SM100-class (compute capability 10.x) or SM120-class (12.x) part and a CuTe DSL >= 4.8.0.  The config is the caller's ``cfg`` as a whole or, without
 one, the measured pick per rows on THIS part (``default_cfg`` on the device's SM count and shared-memory readings: a cluster of two CTAs
 per head while the ``rows x 96`` CTAs have an SM each, one CTA per SM while the ``rows x 48`` CTAs have one, and past that the
 register-resident two-CTAs-per-SM form where two of its CTAs share an SM on the part -- its third plan-time fact, ``co_resident_ctas``
@@ -58,8 +58,12 @@ from .kernel.gdn_decode_fused_config import (
     validate_cfg,
 )
 
-SUPPORTED_CC_MAJOR = 10  # SM100-class parts (compute capability 10.x); the DSL's target gate (cutedsl_arch_requirement_error) decides per part
-SUPPORTED_CC_TEXT = "10.x"
+#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts (cc 10.x; validated on cc 10.0, 10.3 and
+#: 10.7) and SM120-class parts (cc 12.x; validated on cc 12.0 -- 100 KB of shared memory per SM, 99 KB per-CTA opt-in, 170 SMs -- the
+#: same kernel body on the budget-derived picks; cc 12.1 shares the family admission on those picks).  cc 11.x has never run these
+#: kernels and stays declined by name; the DSL's target gate (``cutedsl_arch_requirement_error``) decides per part on top.
+SUPPORTED_CC_RANGES = ((100, 109), (120, 129))
+SUPPORTED_CC_TEXT = "10.x (SM100-class) or 12.x (SM120-class)"
 DSL_FLOOR = (4, 8, 0)
 DSL_FLOOR_TEXT = ".".join(str(x) for x in DSL_FLOOR)
 NAME = "the fused GDN decode step"
@@ -68,8 +72,12 @@ MAX_ROWS = 65535
 
 
 def cc_supported(cc) -> bool:
-    """Whether a ``(major, minor)`` compute capability is one this kernel serves: every SM100-class part (10.x)."""
-    return cc is not None and int(cc[0]) == SUPPORTED_CC_MAJOR
+    """Whether a ``(major, minor)`` compute capability is one this kernel serves: inside one of ``SUPPORTED_CC_RANGES`` (SM100-class 10.x,
+    SM120-class 12.x); ``None`` (no CUDA device) is not."""
+    if cc is None:
+        return False
+    code = 10 * int(cc[0]) + int(cc[1])
+    return any(lo <= code <= hi for lo, hi in SUPPORTED_CC_RANGES)
 
 
 def _dsl_version_error() -> Optional[str]:
@@ -237,7 +245,7 @@ def check_support(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw,
         raise NotImplementedError(f"{NAME} serves CUDA tensors only; the operands are on {dev}")
     cc = tuple(torch.cuda.get_device_capability(dev)) if device_cc is None else tuple(device_cc)
     if not cc_supported(cc):
-        raise NotImplementedError(f"{NAME} serves compute capability {SUPPORTED_CC_TEXT} (SM100-class parts); this device is {cc[0]}.{cc[1]}")
+        raise NotImplementedError(f"{NAME} serves compute capability {SUPPORTED_CC_TEXT}; this device is {cc[0]}.{cc[1]}")
 
 
 def _flat(t):

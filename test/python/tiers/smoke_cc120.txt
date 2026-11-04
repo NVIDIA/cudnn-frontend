@@ -1,0 +1,18 @@
+# SMOKE tier, cc 12.0 (SM120-class: RTX 5090 / RTX PRO 6000 class, 170 / 188 SMs, 100 KB of shared memory per SM): one cell per code path at the
+# smallest shape -- the rules are in README.md; the code path each id stands for is in smoke_cc120_code_paths.tsv.  conftest.py marks
+# these ids `smoke`:   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= @tiers/smoke_cc120.txt)
+# Only the fused GDN decode / verify steps are listed so far (their picks on this part: the decode pair at rows 1 and the one-CTA form
+# past it, the verify 2-deep-ring pair / one-CTA landing-slab form to 8 tokens and the landing-slab pair to 17); the FROST SDPA sm120
+# modules have no list yet.
+linear_attention/frost/test_gdn_decode_fused.py::test_graph_replay_over_distinct_layers_matches_eager
+linear_attention/frost/test_gdn_decode_fused.py::test_deterministic_and_matches_the_torch_model
+linear_attention/frost/test_gdn_decode_fused.py::test_null_slot_rows_are_zero_and_leave_the_state_and_conv_state_untouched[two-ctas-per-head]
+linear_attention/frost/test_gdn_decode_fused.py::test_pdl_launch_knob_entry_is_bitwise_with_the_plain_pick[4]
+linear_attention/frost/test_gdn_verify_fused.py::test_matches_the_torch_reference[1-2-full-none-none]
+linear_attention/frost/test_gdn_verify_fused.py::test_matches_the_torch_reference[2-2-one-last-first]
+linear_attention/frost/test_gdn_verify_fused.py::test_matches_the_torch_reference[4-6-random-last-mid]
+linear_attention/frost/test_gdn_verify_fused.py::test_long_steps_on_the_landing_slab_pair_match_the_torch_reference[1-10]
+linear_attention/frost/test_gdn_verify_fused.py::test_long_steps_on_the_landing_slab_pair_match_the_torch_reference[2-12]
+linear_attention/frost/test_gdn_verify_fused.py::test_pick_beyond_the_reference_kernel_envelope_matches_the_torch_reference[8]
+linear_attention/frost/test_gdn_verify_fused.py::test_padding_and_skipped_slots_touch_nothing_else[pair]
+linear_attention/frost/test_gdn_verify_fused.py::test_pdl_launch_knob_entry_is_bitwise_with_the_plain_pick[1]

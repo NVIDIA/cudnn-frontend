@@ -7,7 +7,8 @@ declines through FlashInfer's own probe (form, geometry by field, device by comp
 the verify step-shape envelope: tokens per request against the pick's shared-memory budget on a cc 10.0 reading and on a 99 KB one, a
 part whose shared memory holds no verify form), the build-time
 dtype / device declines, both runners' argument mapping onto their entry's call contract and their refusal of an unprepared binding, and
-a subprocess proof that the probe loads no kernel.  Device (an SM100-class part, cc 10.x, with a serving DSL): FlashInfer's OWN decode and verify
+a subprocess proof that the probe loads no kernel, and the per-row trip of the docs page's served / declined table through both twins
+(the probe and the entries' own ``check_support``).  Device (an SM100- or SM120-class part, cc 10.x / 12.x, with a serving DSL): FlashInfer's OWN decode and verify
 tests -- the torch reference at decode rows 1 .. 64 and at verify requests 1 / 2 / 4 x tokens 4 / 6, the CUDA-graph replays, the
 dim-first conv pool (served by decode, a typed decline for verify) -- run against ``frost_fe`` (FlashInfer's checks, the cuDNN Frontend backend), the verify
 reference under the 148-SM launch policy and with the two-CTAs-per-SM form forced at every shape, the fp32-parameter decode decline at
@@ -60,6 +61,7 @@ SM120_READINGS = dict(
 )  # a cc 12.0 part: 100 KB per SM, 99 KB opt-in
 SM120_SMS = 170
 POLICY_SMS = {"148 SMs": SM100_SMS, "two CTAs per SM": 47}  # the SM-count input of the entry's pick per launch policy
+_REAL_VERIFY_FORM = backend.verify_form  # the unpatched probe path, for cells that patch it to a host twin and back
 
 
 def _probe(device, form="decode", **kw):
@@ -176,12 +178,11 @@ def as_sm100(monkeypatch):
 
 
 @pytest.fixture
-def as_99kb_part(monkeypatch):
-    """The support question as it reads on a 99 KB-opt-in part with 170 SMs (the cc 12.0 readings) with a serving DSL: the DSL gates
-    patched, the verify entry's DEVICE READERS patched to that part (the real ``verify_form`` / ``verify_max_tokens`` run on the host,
-    picking through the real entry), the compute-capability fact at a served value.  The cc 12.0 admission itself is the gate commit's
-    (``as_sm120`` there); the budget path is the same."""
-    monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
+def as_sm120(monkeypatch):
+    """The support question as it reads on a cc 12.0 part (170 SMs, 100 KB of shared memory per SM, 99 KB per-CTA opt-in) with a serving
+    DSL: the device fact FlashInfer's helper reads, the DSL gates, and the verify entry's DEVICE READERS patched to that part -- the real
+    ``verify_form`` / ``verify_max_tokens`` run on the host, picking through the real entry."""
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (12, 0))
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "device_shared_memory", lambda device: (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"]))
@@ -208,12 +209,13 @@ def test_devices_are_declined_by_compute_capability(monkeypatch, form):
     kw = dict(tokens_per_request=6) if form == "verify" else {}
     sup = _probe(CPU, form, **kw)  # the real probe on a CPU device
     assert (sup.served, sup.kind) == (False, "device") and "no CUDA device" in sup.reason and form in sup.reason, sup
-    for cc, token in (((8, 0), "SM80"), ((9, 0), "SM90"), ((12, 0), "SM120")):
+    for cc, token in (((8, 0), "SM80"), ((9, 0), "SM90"), ((11, 0), "SM110"), ((13, 0), "SM130")):
         monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
         sup = _probe("cuda:0", form, **kw)
-        assert (sup.served, sup.kind) == (False, "device") and token in sup.reason and "10.x" in sup.reason, sup
-    assert entry.SUPPORTED_CC_MAJOR == ventry.SUPPORTED_CC_MAJOR == 10
-    for cc in ((10, 0), (10, 3)):
+        assert (sup.served, sup.kind) == (False, "device") and token in sup.reason and "10.x" in sup.reason and "12.x" in sup.reason, sup
+    assert entry.SUPPORTED_CC_RANGES == ventry.SUPPORTED_CC_RANGES == ((100, 109), (120, 129))
+    assert entry.SUPPORTED_CC_TEXT == ventry.SUPPORTED_CC_TEXT and not hasattr(entry, "SUPPORTED_CC_MAJOR") and not hasattr(ventry, "SUPPORTED_CC_MAJOR")
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
         monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
         assert _probe("cuda:0", form, **kw).served, cc
 
@@ -273,7 +275,7 @@ def test_verify_step_shape_envelope(as_sm100):
     )
 
 
-def test_verify_step_shape_envelope_on_a_99kb_part(as_99kb_part):
+def test_verify_step_shape_envelope_on_a_99kb_part(as_sm120):
     """The verify form on a 99 KB-opt-in part with 170 SMs (the cc 12.0 readings) through the REAL probe path (the entry's device readers
     patched): the pick is token-aware -- the 2-deep-ring pair at one request and the one-CTA landing-slab form at two and more hold 8
     tokens, the landing-slab pair holds 17 at every requests count -- so the served envelope is 2 .. 17 tokens per request everywhere,
@@ -305,6 +307,83 @@ def test_verify_step_shape_envelope_on_a_99kb_part(as_99kb_part):
         assert (sup.served, sup.kind) == (False, "shape"), (requests, sup)
         assert "two CTAs per head" in sup.reason and "at most 17" in sup.reason and "tokens_per_request=18" in sup.reason and "101376 B" in sup.reason, sup
     assert _probe("cuda:0", "decode").served and _probe("cuda:0", "decode", requests=64).served
+
+
+DOCS_PAGE = Path(__file__).resolve().parents[4] / "docs" / "operations" / "linear_attention" / "gdn_decode_flashinfer_backend.md"  # <repo>/docs/...
+
+
+def _docs_table_rows():
+    """The docs page's served / declined table as ``{question: answer}`` (the GDN support matrix, maintained by hand)."""
+    rows = {}
+    for line in DOCS_PAGE.read_text().splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")] if line.startswith("| ") else []
+        if len(cells) == 2 and cells[0] not in ("question", "---"):
+            rows[cells[0]] = cells[1]
+    return rows
+
+
+def test_docs_served_and_declined_rows_are_reachable_with_the_published_bounds(monkeypatch):
+    """The docs page's served / declined table is the GDN support matrix: its ``device`` and ``verify step shape`` rows name exactly the
+    compute capabilities and the per-part token bounds the code computes, and every decline those rows publish is reachable through BOTH
+    twins -- FlashInfer's probe (``support``) and the entries' own ``check_support`` -- with the published tokens in its text (a row no
+    code path reaches, or a bound the page misquotes, fails here)."""
+    rows = _docs_table_rows()
+    assert {"device", "verify step shape", "decode rows"} <= set(rows), sorted(rows)
+    device_row, shape_row = rows["device"], rows["verify step shape"]
+    for token in ("10.x", "12.x", "cc 10.0", "cc 12.0", "kind `device`"):
+        assert token in device_row, (token, device_row)
+    assert entry.SUPPORTED_CC_TEXT == ventry.SUPPORTED_CC_TEXT == "10.x (SM100-class) or 12.x (SM120-class)"
+    assert entry.SUPPORTED_CC_RANGES == ventry.SUPPORTED_CC_RANGES == ((100, 109), (120, 129))
+    for token in ("35, 8 and 45", "17", "kind `shape`", "`verify_max_tokens(device, requests)`"):
+        assert token in shape_row, (token, shape_row)
+    assert [kvcfg.max_tokens_served(r, SM100_SMS) for r in (1, 2, 3, 4)] == [35, 8, 8, 45]
+    sm120 = (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"])
+    assert all(kvcfg.max_tokens_served(r, SM120_SMS, *sm120) == 17 for r in (1, 2, 3, 4, 8, 16))
+    assert all(replace(kvcfg.default_cfg(r, SM120_SMS, *sm120, 8), **SM120_READINGS).max_tokens() == 8 for r in (1, 2, 4))  # "8 with the picked form"
+    # the device row through both twins: every declined capability by name, every served one through
+    monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
+    dspec, vspec = _spec(rows=2), _spec(form="verify", rows=1, tokens=4)
+    dargs = backend.FrostFeDecodeRunner(dspec)._args(fi_api.bind_inputs(dspec, **_tensors(2, CPU)))
+    vkw = backend.FrostFeVerifyRunner(vspec)._kwargs(fi_api.bind_inputs(vspec, **_verify_tensors(1, 4, CPU)))
+    for cc, name in (((9, 0), "SM90"), ((11, 0), "SM110"), ((13, 0), "SM130")):
+        monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
+        for form, kw in (("decode", {}), ("verify", dict(requests=1, tokens_per_request=4))):
+            sup = _probe("cuda:0", form, **kw)
+            assert (sup.served, sup.kind) == (False, "device") and name in sup.reason and "10.x" in sup.reason and "12.x" in sup.reason, sup
+        with pytest.raises(NotImplementedError, match=rf"10\.x .*12\.x.*{cc[0]}\.{cc[1]}"):
+            entry.check_support(*dargs, device_cc=cc)
+        with pytest.raises(NotImplementedError, match=rf"10\.x .*12\.x.*{cc[0]}\.{cc[1]}"):
+            ventry.check_support(**vkw, device_cc=cc)
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
+        monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
+        assert _probe("cuda:0", "decode").served and _probe("cuda:0", "verify", requests=1, tokens_per_request=4).served, cc
+        entry.check_support(*dargs, device_cc=cc)
+        ventry.check_support(**vkw, device_cc=cc)
+    # the verify step-shape row through both twins: the cc 10.0 bound at one request (35) and the 99 KB bound (17)
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
+    sup = _probe("cuda:0", "verify", requests=1, tokens_per_request=36)
+    assert (sup.served, sup.kind) == (False, "shape") and "at most 35" in sup.reason and "two CTAs per head" in sup.reason, sup
+    vkw36 = backend.FrostFeVerifyRunner(_spec(form="verify", rows=1, tokens=36))._kwargs(
+        fi_api.bind_inputs(_spec(form="verify", rows=1, tokens=36), **_verify_tensors(1, 36, CPU))
+    )
+    with pytest.raises(NotImplementedError, match="at most 35 on this part"):
+        ventry.check_support(**vkw36, device_cc=(10, 0), cfg=_sm100_verify_form("cuda:0", 1))
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (12, 0))
+    monkeypatch.setattr(ventry, "device_shared_memory", lambda device: sm120)
+    monkeypatch.setattr(ventry, "device_multiprocessor_count", lambda device: SM120_SMS)
+    monkeypatch.setattr(backend, "verify_form", _REAL_VERIFY_FORM)  # the real probe path again, now reading the 99 KB part
+    sup = _probe("cuda:0", "verify", requests=1, tokens_per_request=18)
+    assert (sup.served, sup.kind) == (False, "shape") and "at most 17" in sup.reason and "two CTAs per head" in sup.reason, sup
+    assert _probe("cuda:0", "verify", requests=4, tokens_per_request=17).served
+    vkw18 = backend.FrostFeVerifyRunner(_spec(form="verify", rows=1, tokens=18))._kwargs(
+        fi_api.bind_inputs(_spec(form="verify", rows=1, tokens=18), **_verify_tensors(1, 18, CPU))
+    )
+    k120 = ventry.GdnVerifyFused("cuda:0", GEOMETRY.norm_eps)
+    with pytest.raises(NotImplementedError, match="at most 17 on this part"):
+        ventry.check_support(**vkw18, device_cc=(12, 0), cfg=k120.cfg_for(1, 18))
+    ventry.check_support(**vkw, device_cc=(12, 0), cfg=k120.cfg_for(1, 4))
 
 
 def test_verify_probe_declines_a_part_whose_shared_memory_holds_no_form_by_kind_device(monkeypatch):

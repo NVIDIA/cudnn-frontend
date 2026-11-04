@@ -3,7 +3,8 @@
 **Experimental.** `cudnn.linear_attention.frost.gdn_decode_fused` and
 `cudnn.linear_attention.frost.gdn_verify_fused` are the fused Gated DeltaNet (GDN) decode step
 and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer, one CuTe DSL launch
-each, for SM100-class parts. `cudnn.linear_attention.frost.flashinfer_gdn_backend` registers
+each, for SM100-class (compute capability 10.x) and SM120-class (12.x) parts -- validated on
+cc 10.0 (GB200) and cc 12.0 (RTX 5090). `cudnn.linear_attention.frost.flashinfer_gdn_backend` registers
 them as the backend `"frost_fe"` of FlashInfer's experimental Qwen 3.5 GDN block
 (`flashinfer.experimental.qwen_3_5_gdn_block`), so the block's plans, plan cache, CUDA-graph
 rules, reference tests and benchmark run the cuDNN Frontend kernels unchanged.
@@ -14,14 +15,23 @@ conv + SiLU over the slot's history, the Q / K RMS scales, the gated delta-rule 
 state written to its own slot), the gated RMSNorm, the static per-tensor FP8 output quantization
 and the conv-history shift. One CTA per (request, V head) with 256 threads; the 128 x 128 fp32
 state rows are register-resident and travel through padded shared-memory boxes by
-`cp.async.bulk`. The default form follows two plan-time facts, the request count and the
-device's SM count: a cluster of two CTAs per head (half the state rows each) while the
-`requests x 96` cluster grid has an SM per CTA (one request on 148- / 152-SM parts), one CTA per
-SM while the `requests x 48` grid has one, and a register-capped two-CTAs-per-SM form past that
-so the grid runs in one wave. The verify step traces its token loop once (`ROLLED_TOKENS`) in
-the forms that keep the state in registers. Every knob is a compile-time axis of one kernel body
-and bitwise with the default pick, and the outputs reproduce FlashInfer's built-in `frost`
-backend byte for byte.
+`cp.async.bulk`. The default form follows three plan-time facts, the request count, the
+device's SM count and the device's shared-memory readings (per SM and the per-CTA opt-in): a
+cluster of two CTAs per head (half the state rows each) while the `requests x 96` cluster grid
+has an SM per CTA (one request on 148- / 152- / 170-SM parts), one CTA per SM while the
+`requests x 48` grid has one, and past that a register-capped two-CTAs-per-SM form so the grid
+runs in one wave -- where two of its CTAs can share an SM, i.e. `2 x (footprint + 1 KB)` fits
+the SM's shared memory (228 KB on cc 10.0 parts). On a 100 KB-per-SM part (cc 12.0: 99 KB
+per-CTA opt-in) every whole-slab form is one CTA per SM by shared memory alone, so the cap is
+never picked there (it would only spill); the decode step runs the one-CTA form in two waves
+past the one-CTA grid, and the verify step -- whose cc 10.0 forms carry a 3-deep ring of 64 KB
+state slabs that a 99 KB opt-in cannot hold -- serves the same kernel body with shallower rings:
+the two-CTAs-per-head pair with a 2-deep ring at one request and the one-CTA landing-slab
+(`NBUF` 1) form at two and more, up to 8 tokens per request, and the landing-slab pair for 9 to
+17 tokens per request at every requests count. The verify step traces its token loop once
+(`ROLLED_TOKENS`) in the forms that keep the state in registers. Every knob is a compile-time
+axis of one kernel body and bitwise with the default pick (no knob moves an fp32 addition), and
+the outputs reproduce FlashInfer's built-in `frost` backend byte for byte.
 
 ## Register
 
@@ -68,11 +78,11 @@ requests (one grid row each). CPU operands or operands on another CUDA device ar
 |---|---|
 | form | `decode` and `verify` (kind `form` otherwise) |
 | geometry | the block's dense-27B geometry at tensor-parallel rank 1: `d_model` 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4 (kind `geometry`, naming the fields otherwise); any `norm_eps` |
-| device | an SM100-class part, compute capability 10.x (kind `device` otherwise); validated on cc 10.0 |
+| device | an SM100-class part (compute capability 10.x) or an SM120-class part (12.x) (kind `device` otherwise, naming both served families; cc 11.x has never run these kernels and is declined); validated on cc 10.0 (GB200: 152 SMs, 228 KB of shared memory per SM, 227 KB per-CTA opt-in) and cc 12.0 (RTX 5090: 170 SMs, 100 KB per SM, 99 KB opt-in); cc 12.1 is admitted on the same budget-derived picks without a run of its own; a device whose shared memory holds no verify form is kind `device` too, naming its opt-in |
 | CuTe DSL | `nvidia-cutlass-dsl >= 4.8.0` (kind `dsl`, naming the installed version) |
 | FlashInfer | the experimental Qwen 3.5 GDN block with its backend registry (`flashinfer.experimental.qwen_3_5_gdn_block.api.register_backend`): FlashInfer main at or after PR #8131 (2026-10-31); no tagged release carried it at the time of writing, and FlashInfer marks the block experimental (it may change or be removed without deprecation). Importing the backend module without it raises `ImportError` naming the requirement |
 | decode rows | up to 65535 requests per call, one grid row each (kind `shape`) |
-| verify step shape | up to 65535 requests per call, one grid row each; `tokens_per_request` from 2 up to the shared-memory budget of the form the entry picks for that requests count on the device (`verify_max_tokens(device, requests)`): the cluster pair while the `requests x 96` CTAs have an SM each, the one-CTA-per-SM form while the `requests x 48` CTAs have one, the two-CTAs-per-SM form past that -- on a cc 10.0 part 35, 8 and 45 tokens per request (kind `shape`, naming the form and its bound) |
+| verify step shape | up to 65535 requests per call, one grid row each; `tokens_per_request` from 2 up to the shared-memory budget of the forms the entry picks for that requests count on the device (`verify_max_tokens(device, requests)`, the bound of the pick's whole ladder): the cluster pair while the `requests x 96` CTAs have an SM each, the one-CTA-per-SM form while the `requests x 48` CTAs have one, the two-CTAs-per-SM form past that -- on a cc 10.0 part 35, 8 and 45 tokens per request; on a cc 12.0 part (99 KB per-CTA opt-in) the regime's shallower-ring forms of the same kernel: 8 tokens per request with the picked form at every requests count (the 2-deep-ring pair at one request, the one-CTA landing-slab form from two) and up to 17 through the landing-slab pair, the pick moving with the step's token count (kind `shape`, naming the deepest form and its bound) |
 | parameter dtypes | decode: `A_log` fp32, `dt_bias` and `norm_weight` bf16 (FlashInfer's default `param_dtypes`; the kernel-native dtypes). Not part of FlashInfer's support question, so a decode plan built for other dtypes is declined at `prepare_qwen_3_5_gdn_block` time with a `NotImplementedError` naming them. Verify: each of the three in fp32 or bf16, compiled per dtype set. |
 | conv pool, decode | the `[num_slots, C, K - 1]` view in either layout: channel-innermost storage (`[num_slots, K - 1, C]` transposed) or dim-first (`[num_slots, C, K - 1]` contiguous) |
 | conv pool, verify | the `[num_slots, C, T + 2]` view of a channel-innermost pool (`[num_slots, T + 2, C]` transposed) only; the dim-first pool FlashInfer admits is a typed decline at plan time (`NotImplementedError` naming the layout), as with FlashInfer's built-in backend |
@@ -99,7 +109,8 @@ conv state or slot indices. The default forms keep PDL off.
 
 `test/python/linear_attention/frost/test_gdn_decode_fused.py` and `test_gdn_verify_fused.py`
 cover the host entries (typed declines, the plan-time compile key, the knob validation, the
-shared-memory budget per tokens count, the DSL and architecture gates) and, on an SM100-class
+shared-memory budget per tokens count on the cc 10.0 and cc 12.0 readings, the budget-derived
+pick tables of both parts, the DSL and architecture gates) and, on an SM100-class or SM120-class
 device, the null-slot and padding contracts, determinism, CUDA-graph replay over distinct
 layers, a torch reference of the fused chain and the bitwise agreement of every knob arm with
 the default pick. When `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR` names a directory of saved verify
@@ -117,7 +128,9 @@ tokens (every token accepted, and random acceptance with a padding request).
 
 ## Performance
 
-One GPU class, GB200 (1200 W, 152 SMs, SM clock locked at 1830 MHz, one exclusive GPU), CUPTI
+One GPU class so far, GB200 (1200 W, 152 SMs, SM clock locked at 1830 MHz, one exclusive GPU) -- the cc 12.0
+admission ships with its functional validation only; a GeForce board allows no clock lock, so an RTX 5090 table
+will be a separate table with its own (boost-clock, interleaved) protocol stated beside it. CUPTI
 kernel-duration medians inside a serving step at batch 1 (cold code and data, as every layer's
 launch finds them), speed-ups positive = faster (`baseline / new - 1`):
 

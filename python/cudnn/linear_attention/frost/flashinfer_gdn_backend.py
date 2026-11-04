@@ -16,8 +16,8 @@ when this module was written (:data:`FLASHINFER_FLOOR`; importing this module wi
 and FlashInfer marks the block experimental: it may change or be removed without deprecation.
 
 Served (:func:`support`, the registry's ``support_fn``: cheap, imports no kernel): both forms at the block's dense-27B geometry at
-tensor-parallel rank 1 (d_model 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4) on SM100-class parts (compute capability
-10.x) with a CuTe DSL >= 4.8.0.  The
+tensor-parallel rank 1 (d_model 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4) on SM100-class (compute capability 10.x) and
+SM120-class (12.x) parts with a CuTe DSL >= 4.8.0.  The
 ``decode`` form takes up to 65535 rows (one grid row per request).  The ``verify`` form takes up to 65535 requests (one grid row each) of
 ``tokens_per_request`` >= 2 tokens, bounded above by the shared-memory budget of the forms the entry picks for that requests count on
 THIS device (:func:`verify_max_tokens` = the entry's ``max_tokens_for``, the bound of the pick's whole ladder: the cluster pair, two CTAs
@@ -148,9 +148,7 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
     cc = device_cc(device)
     if not entry.cc_supported(cc):
         found = "no CUDA device" if cc is None else f"SM{cc[0]}{cc[1]}"
-        return Qwen35GdnDecline(
-            "device", f"the cuDNN Frontend GDN {form} kernel serves compute capability {entry.SUPPORTED_CC_TEXT} (SM100-class parts); found {found}"
-        )
+        return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN {form} kernel serves compute capability {entry.SUPPORTED_CC_TEXT}; found {found}")
     msg = entry._dsl_version_error()
     if msg is not None:
         return Qwen35GdnDecline("dsl", msg)

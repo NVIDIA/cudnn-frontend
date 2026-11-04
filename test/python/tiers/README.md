@@ -67,7 +67,8 @@ NIGHTLY-only -- a cell leaves FULL only with a named twin that keeps its arm (`n
 
 Counts at the time of writing: SMOKE cc 10.7 = 358 cells (266 hand-picked + 92 rule-added), cc 10.0 = 267 (135 + 132),
 cc 10.3 = 252 (the cc 10.0 cells that run on cc 10.3; the list's header names the 24 left out);
-NIGHTLY-only = 120 (96 codegen pins + 24 B / H / seed twins). Lists for other capabilities are added as they are reviewed.
+NIGHTLY-only = 120 (96 codegen pins + 24 B / H / seed twins); SMOKE cc 12.0 = 12 cells (the fused GDN decode / verify steps only -- the
+FROST SDPA sm120 modules have no list yet). Lists for other capabilities are added as they are reviewed.
 
 ## Running
 

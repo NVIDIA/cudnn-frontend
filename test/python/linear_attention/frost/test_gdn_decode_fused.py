@@ -425,11 +425,18 @@ def test_typed_declines_name_the_operand(mutation, exc, token):
 
 
 def test_declines_an_unserved_compute_capability_by_name():
-    with pytest.raises(NotImplementedError, match=r"9\.0"):
-        call_check(make_operands(), device_cc=(9, 0))
-    with pytest.raises(NotImplementedError, match=r"12\.0"):
-        call_check(make_operands(), device_cc=(12, 0))
-    assert entry.cc_supported((10, 0)) and entry.cc_supported((10, 3)) and not entry.cc_supported((9, 0)) and not entry.cc_supported(None)
+    """The admission is two closed ranges of ``10 * major + minor``: SM100-class (cc 10.x) and SM120-class (cc 12.x) -- cc 12.0 is served,
+    cc 12.1 structurally with it, while cc 9.x, 11.x (these kernels never ran there) and 13.x are declined by name, the decline naming
+    both served families and the device's capability; the single-major constant is gone (the ranges are the one source)."""
+    for cc in ((9, 0), (8, 0), (11, 0), (13, 0)):
+        with pytest.raises(NotImplementedError, match=rf"10\.x .*12\.x.*{cc[0]}\.{cc[1]}"):
+            call_check(make_operands(), device_cc=cc)
+        assert not entry.cc_supported(cc), cc
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
+        call_check(make_operands(), device_cc=cc)
+        assert entry.cc_supported(cc), cc
+    assert entry.SUPPORTED_CC_RANGES == ((100, 109), (120, 129)) and "10.x" in entry.SUPPORTED_CC_TEXT and "12.x" in entry.SUPPORTED_CC_TEXT
+    assert not entry.cc_supported(None) and not hasattr(entry, "SUPPORTED_CC_MAJOR")
 
 
 def test_declines_cpu_operands_when_no_capability_is_given():
@@ -568,7 +575,7 @@ def _device_or_skip():
         pytest.skip("needs a CUDA device")
     cc = tuple(torch.cuda.get_device_capability())
     if not entry.cc_supported(cc):
-        pytest.skip(f"the fused GDN decode step serves SM100-class parts (cc 10.x), this device is {cc}")
+        pytest.skip(f"the fused GDN decode step serves compute capability {entry.SUPPORTED_CC_TEXT}, this device is {cc}")
     msg = entry._dsl_version_error()
     if msg:
         pytest.skip(msg)
