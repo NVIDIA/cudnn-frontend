@@ -184,6 +184,15 @@ attention sink participates only in the output denominator, not in any stats.
 For `D_qk=576`, QK uses all 576 dimensions while V/output uses only the first
 512 KV dimensions. `attn_sink=None` is equivalent to an all-`-inf` sink.
 
+#### Credits and cuDNN Frontend extensions
+
+The SM90 kernel schedule and pipeline are adapted primarily from
+[FlashMLA's MIT-licensed Hopper sparse-prefill implementation](https://github.com/deepseek-ai/FlashMLA/tree/4f38f29ef6793c228363e4af5be66d44e81167ba/csrc/kernels/sm90/prefill/sparse).
+The cuDNN Frontend port extends that foundation with H16/H32/H64/H96/H128
+coverage, arbitrary logical K tails and boundary handling, a bounded symbolic
+compile cache, and an allocation-free prepared-execution contract for CUDA
+Graph capture and replay.
+
 ```python
 import math
 

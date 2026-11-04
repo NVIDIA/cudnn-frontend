@@ -11,4 +11,10 @@
 
 ## Acknowledgements
 
-The DSA/CSA kernels were a collaborative effort, jointly developed by: Hongxiao Bai, Jiayu Sun, Jerry Chen, Jie Fang, Qi Zhang, Bin Chai and Yue Weng
+The DSA/CSA kernels were a collaborative effort, jointly developed by: Hongxiao Bai, Jiayu Sun, Jerry Chen, Jie Fang, Qi Zhang, Bin Chai and Yue Weng.
+
+The SM90 sparse-attention forward schedule and pipeline are adapted primarily
+from [FlashMLA's MIT-licensed Hopper implementation](https://github.com/deepseek-ai/FlashMLA/tree/4f38f29ef6793c228363e4af5be66d44e81167ba/csrc/kernels/sm90/prefill/sparse).
+The cuDNN Frontend port adds wider H coverage, arbitrary logical K boundary
+handling, bounded symbolic compilation, and an allocation-free CUDA Graph
+prepared-execution contract.

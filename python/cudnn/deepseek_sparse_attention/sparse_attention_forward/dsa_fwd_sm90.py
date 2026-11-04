@@ -1,5 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 DeepSeek
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 """Hopper sparse-prefill forward for DeepSeek latent attention.
 
@@ -12,6 +16,13 @@ tiles.  The latent value is ``KV[..., :512]``.
 The implementation intentionally keeps sequence and physical top-k extents
 dynamic.  Only Dqk, element dtype, optional operands, and the optional indexer
 prefix change generated code.
+
+The SM90 schedule and pipeline are adapted primarily from FlashMLA's
+MIT-licensed Hopper sparse-prefill implementation, pinned to commit
+4f38f29ef6793c228363e4af5be66d44e81167ba.  The cuDNN Frontend port adds
+support for H16/H32/H64/H96/H128, arbitrary logical K tails, bounded symbolic
+compilation, and an allocation-free prepared-execution contract for CUDA Graph
+capture.
 """
 
 import math
