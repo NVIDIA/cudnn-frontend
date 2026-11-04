@@ -100,6 +100,10 @@ def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
 
 _PARTIAL_REDUCTION_MODES = frozenset({"add", "avg", "norm1", "norm2", "amax", "max", "min"})
 
+# The MoE templates bind the routed rows their groups cover (the final first_token_offset, at most
+# the routed capacity) under this name; an ungrouped AVG over the token axis divides by it.
+_MOE_USED_ROWS = "moe_used_rows"
+
 
 def _reduction_uses_partial(red: ReductionSpec) -> bool:
     return red.dim[1] == 1 and red.dim[2] == 1 and red.mode in _PARTIAL_REDUCTION_MODES
@@ -202,7 +206,7 @@ def _emit_reduction_partial_flush(tap_idx: int, red_idx: int, red: ReductionSpec
         sh = f"_red_{red_idx}_sh{off}"
         lines.append(f"{sh} = cute.arch.shuffle_sync_bfly({tot}, offset={off})")
         lines.extend(_reduction_partial_fold(red, tot, sh))
-    body = _emit_reduction_avg_inverse(red_idx, red, chain) if red.mode == "avg" else []
+    body = _emit_reduction_avg_inverse(red_idx, red, chain, token_extent=_MOE_USED_ROWS) if red.mode == "avg" else []
     body += _emit_reduction_vector_atomic(tap_idx, red_idx, red, tot)
     lines.append("if lane == 0:")
     lines.extend(f"    {ln}" for ln in body)
@@ -218,7 +222,7 @@ def _emit_red_part_module(chain: FusionChain, parts: list, folds: "list | None" 
     lines = [f"red_part_slots = {max(1, len(parts), fold_slots)}", "", "", "@cute.jit", "def red_part_seed(_red_part):"]
     seed = [_reduction_partial_store(red, slot, _reduction_partial_identity(red)) for _ri, slot, red, _t in parts]
     lines += [f"    {ln}" for ln in (seed or ["pass"])]
-    ctx = "group_idx, group_begin, group_end" if chain.has_moe else "tile_l,"
+    ctx = f"group_idx, group_begin, group_end, {_MOE_USED_ROWS}" if chain.has_moe else "tile_l,"
     args = ", ".join(f"gC_tap_{tap}_ptr, red_stride_m_{ri}, red_stride_n_{ri}, red_stride_l_{ri}" for ri, tap in _red_part_arg_refs(parts, folds))
     for name, per_cta in (("red_part_flush_tile", False), ("red_part_flush_cta", True)):
         lines += ["", "", "@cute.jit", f"def {name}(_red_part, lane, M, N, _red_part_ctx, _red_part_args):"]
@@ -409,7 +413,7 @@ def _emit_lane_run_fold_flush(chain: FusionChain, folds: list, lane_run_tile: "t
             lines += [f"{t} = cute.arch.shuffle_sync_bfly({o}, offset={off})", f"if {t} > {o}:", f"    {o} = {t}"]
     for ri, red, tap, fold in folds:
         o = f"_fold_o_{fold.kind}"
-        avg = _emit_reduction_avg_inverse(ri, red, chain) if red.mode == "avg" else []
+        avg = _emit_reduction_avg_inverse(ri, red, chain, token_extent=_MOE_USED_ROWS) if red.mode == "avg" else []
         if fold.kind == "row":
             vals = []
             for s in range(2 * m_frags):
@@ -496,7 +500,7 @@ def _emit_reduction_atomic_body(
         lines.extend(_reduction_partial_slot_fold(red_idx, red, partial_slot, acc))
         return lines
     if red.mode == "avg":
-        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain))
+        lines.extend(_emit_reduction_avg_inverse(red_idx, red, chain, token_extent=_MOE_USED_ROWS))
     if red.dim[2] == 1:
         combine_lines, acc = _emit_reduction_local_combine(red_idx, red, src, vsize)
         lines.extend(combine_lines)
@@ -581,6 +585,32 @@ def _warp_amax_u32(value: str, mask: str) -> str:
     )
 
 
+def _f8_128x4_k_padding(quant: BlockQuantizeSpec, swapped: bool) -> bool:
+    """Whether an F8_128x4 scale row can end in K padding slots.
+
+    A blob row holds ``roundup(blocks, 4)`` scale slots. Grouped token-axis
+    segments hold none: their groups start at multiples of ``4 * block_size``."""
+    token_axis = (quant.axis == 1) != swapped
+    return quant.scale_reorder == "F8_128x4" and not (quant.grouped_by_moe and token_axis)
+
+
+def _emit_f8_128x4_k_pad_zero(quant: BlockQuantizeSpec, block: str, num_blocks: str, sidx: str, scale_tap_idx: int) -> list[str]:
+    """Zero the padding slots after a scale row's last real block.
+
+    A consumer whose K is the quantized axis multiplies them against its zero-filled
+    K tail, so a stale NaN encoding (E8M0 0xFF, E4M3 0x7F/0xFF) poisons its whole output
+    row. They share the last block's 4-byte quad, so the lane storing that block
+    writes them. Rows that pad the blob to a whole 128-row atom stay unwritten: only
+    consumer rows that are never stored read them."""
+    store_dtype = _scale_store_dtype(quant.scale_dtype)
+    zero = "cutlass.Int8(0)" if store_dtype == "cutlass.Int8" else f"cutlass.Int8(0).bitcast({store_dtype})"
+    lines = [f"if {block} + 1 == {num_blocks}:"]
+    for slot in range(1, 4):
+        lines.append(f"    if {block} % 4 < {4 - slot}:")
+        lines.append(f"        (gC_tap_{scale_tap_idx}_ptr + {sidx} + {slot}).store({zero}, alignment=1)")
+    return lines
+
+
 def _emit_block_quant_col(
     quant: BlockQuantizeSpec,
     quant_idx: int,
@@ -597,6 +627,7 @@ def _emit_block_quant_col(
     p = f"_q{quant_idx}"
     swapped = isinstance(chain.moe, MoeSwapAbSpec)
     col_bound = "group_end" if swapped else "N"
+    k_padding = _f8_128x4_k_padding(quant, swapped)
     scale_dtype = _scale_store_dtype(quant.scale_dtype)
     G = 16 if quant.block_size == 16 else 32
     if vsize % G != 0:
@@ -719,13 +750,15 @@ def _emit_block_quant_col(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + "
                 f"{p}_mb * quant_scale_stride_m_{quant_idx} + {p}_n{k} * quant_scale_stride_n_{quant_idx}"
             )
-        _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"
+        stores = [f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale_mine[{k}], alignment=1)"]
+        if k_padding:
+            stores.extend(_emit_f8_128x4_k_pad_zero(quant, f"{p}_mb", f"(M // {quant.block_size})", f"{p}_sidx{k}", scale_tap_idx))
         if row_pred is None:
-            lines.append(_st)
+            lines.extend(stores)
         else:
             col_pred = f"{p}_n{k} < {col_bound}" if swapped else f"col_j + {vsize} <= N"
             lines.append(f"if ({row_pred}) & ({col_pred}):")
-            lines.append(f"    {_st}")
+            lines.extend(f"    {line}" for line in stores)
     return lines
 
 
@@ -744,7 +777,21 @@ def _emit_block_quant(
     """Generate block-quantized data and scale stores."""
     if quant.axis == 1:
         return _emit_block_quant_col(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
-    return _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
+    lines = _emit_block_quant_row(quant, quant_idx, source_var, output_dtype, out_var, scale_tap_idx, chain, batch_index_expr, vsize, row_pred)
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    if not _f8_128x4_k_padding(quant, swapped):
+        return lines
+    # The shared row emitter stores only real blocks; pad behind its scale stores, under their predicate.
+    p, bs = f"_q{quant_idx}", quant.block_size
+    for k in range(vsize // bs):
+        pad = _emit_f8_128x4_k_pad_zero(quant, f"{p}_scol{k}", f"(N // {bs})", f"{p}_sidx{k}", scale_tap_idx)
+        if row_pred is None:
+            lines.extend(pad)
+        else:
+            width, col_bound = ((k + 1) * bs, "group_end") if swapped else (vsize, "N")
+            lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
+            lines.extend(f"    {line}" for line in pad)
+    return lines
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
@@ -762,11 +809,11 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
             chain.matmul.M,
             chain.matmul.N // q.block_size,
         )
-        logical_n = chain.matmul.N // q.block_size
-        m_expr = "1" if m == 1 else ("sym_m" if m == chain.matmul.M else str(m))
-        n_expr = "1" if n == 1 else (f"(sym_n // {q.block_size})" if n == logical_n else str(n))
-        l_expr = "1" if b == 1 else ("sym_l" if b == chain.matmul.batch else str(b))
-        return f"({m_expr}, {n_expr}, {l_expr})"
+        # Fresh symbols, never the kernel's sym_m / sym_n / sym_l: the blob's extents are plan constants the host
+        # checks (recipe._output_rule) and the kernel only takes its raw pointer, but one SymInt is one tvm-ffi Var,
+        # so sym_m held the padded F8_128x4 rows to the kernel's runtime M (S for MoE, the graph's N under swap-AB)
+        # and refused calls that _check_runtime_quant admits.
+        return "(" + ", ".join("1" if d == 1 else "cute.sym_int64()" for d in (m, n, b)) + ")"
     if tap.dim is None:
         l_expr = "1" if (chain is not None and chain.has_moe) else "sym_l"
         if tap.dtype == "fp4_e2m1":

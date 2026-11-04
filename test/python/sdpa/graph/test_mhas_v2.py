@@ -3645,19 +3645,20 @@ def _p2_frost(cfg, request, cudnn_handle, *, cga=None, pin=None):
     anyway) keeps the graph on the python engines as the sibling cc 10.7 sweeps do, so a FROST decline is the
     failure text instead of a backend fallback; _exec_sdpa_on_frost pins the row and the shared paged template;
     _must_run turns a WAIVED skip into a failure.  ``pin`` appends + selects one explicit knob set
-    (ExecConfig.plan_pin); the cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  Returns the
-    served plan's knobs (asserted unsplit, never a winner)."""
+    (ExecConfig.plan_pin); without one, SPLIT_KV=1 is pinned over the row's first set: a sink graph without a window
+    may split by default on cc 10.7, and this route covers the unsplit shared paged body (the default twin runs the
+    split).  The cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  Returns the served plan's
+    knobs (asserted unsplit, never a winner)."""
     engine = _cc107_engine("half")
     cfg.softmax_precision = cudnn.data_type.FLOAT
-    if pin is not None:
-        cfg.plan_pin = {"engine": engine, "knobs": pin}
+    cfg.plan_pin = {"engine": engine, "knobs": pin if pin is not None else {"SPLIT_KV": 1}}
     with _must_run(request):
         _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=cga, template=_P2_TEMPLATE[cfg.d_qk], tensor_checker=_p2_exact_keyless_checker(cfg))
     if request.config.option.dryrun:
         return None
     served, knobs = frost_routing.LAST_PLAN
     assert served == engine and knobs is not None, frost_routing.LAST_PLAN
-    assert knobs.split_kv in (None, 1), f"sink x split-KV is declined on every row, yet the served plan was {knobs}"
+    assert knobs.split_kv in (None, 1), f"this route pins an unsplit plan, yet the served plan was {knobs}"
     print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy}")
     return knobs
 
@@ -3686,7 +3687,8 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     head-major (single-request head-major batches included, #1482: test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0);
     HND / NHD pools; dead pool pages
     NaN-poisoned; f16:bf16 1:2.  The sink-free half is the control (served before this change); every case is strict
-    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph is unsplit."""
+    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph under a left window is unsplit
+    (without one the heuristics may split it)."""
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     geom_seed = abs(hash(test_no))
@@ -3724,7 +3726,7 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     test.showConfig(test_no, request)
     with _must_run(request):
         _exec_cc107(test, request, cudnn_handle, "half")
-    if cfg.with_sink_token and not request.config.option.dryrun:
+    if cfg.with_sink_token and cfg.left_bound is not None and not request.config.option.dryrun:
         assert frost_routing.LAST_PLAN[1].split_kv in (None, 1), frost_routing.LAST_PLAN
 
 
@@ -3928,8 +3930,8 @@ def test_sdpa_thd_head_major_batch_one_frost_L0(env_info, paged, with_sink, requ
 def _p2_fp8_pools_graph(form):
     """graph.sdpa_fp8 over paged K/V pools with a sink (per-tensor FP8 E4M3 in, bf16 O; d128 32/8, b 4, s_q 8, KV 4096, page
     16, bottom-right causal), queries packed ("thd": Q / O carry ragged offsets, the pools stay dense -- the paged THD form
-    sdpa.fp16 declares) or dense.  Declared here because the fp8 harness's builder cannot spell ragged Q over paged pools
-    (its paged and ragged branches both declare the per-batch length tensors); the operands follow it otherwise: BSHD
+    sdpa.fp16 declares) or dense. Declared directly to pin the sink/softmax capability boundary independently of the
+    shared fp8 harness's randomized data and output checks; the operands follow that harness: BSHD
     queries, [pages, H, page, D] pools, row-major (b, 1, pages, 1) block tables, scalar (de)scales, the FLOAT softmax."""
     b, h_q, h_kv, s_q, s_kv, d, page = 4, 32, 8, 8, 4096, 128, 16
     e4m3, f32, i32, i64 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FLOAT, cudnn.data_type.INT32, cudnn.data_type.INT64
@@ -4314,7 +4316,7 @@ _P6A_DECLINES = {
     "d512_pools": (dict(d=512, d_v=512), "d128, d256 kernel flavors only"),
     "sf_o_over_pools": (dict(sf_o=True), "block-scaled O"),
     "d64": (dict(d=64), "exact native shapes"),  # control: green before and after
-    "bhsd_queries": (dict(bhsd_q=True, s_q=4), "BSHD"),  # control
+    "bhsd_queries": (dict(bhsd_q=True, s_q=4), None),  # native-layout positive control
     "prefolded_scale": (dict(prefolded=True), "paged-KV kernel bodies"),  # control
 }
 
@@ -4346,6 +4348,15 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
         mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
         spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
         reason = engines.analyze_for(spec, g)[1]
+        if expected is None:
+            assert reason is None, (case, reason)
+            g.validate()
+            g.build_operation_graph()
+            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
+            assert any(n == engine or n.startswith(engine + "[") for n in names), names
+            assert _p6a_declaration_snapshot(decl) == before
+            return
         assert reason is not None and expected in reason, (case, reason)
         g.validate()
         g.build_operation_graph()
@@ -4755,8 +4766,8 @@ def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudn
 
 
 _P3_ENVELOPE_CASES = {
-    # GPT-OSS uses the native SM107 d64 tile; pin its unpacked cga1 plan.
-    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="prefill_d128_f16"),
+    # GPT-OSS uses the native D64 single-Q body on SM107; pin its unpacked cga1 plan.
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin="u1n", cga=None, knobs=None, template="decode_d128_f16"),
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
@@ -5180,7 +5191,7 @@ _P1_FP8_DTYPES = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _P1_O_DTYPES = {"bf16": "BFLOAT16", "f16": "HALF", "e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 
 
-def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bshd=True, thd=False, stats=True, sink=False, dtype_in="e4m3", o_dtype="bf16", causal=None):
+def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bshd=True, thd=False, stats=True, sink=False, dtype_in="e4m3", o_dtype="bf16", causal=None, unaligned_k=False):
     """One graph.sdpa_mxfp8 graph declared the way test/python/sdpa/mxfp8.py declares it -- dense BSHD / BHSD, paged
     pools behind (b, 1, table, 1) block tables under a padding mask, or the THD twin (ragged offsets on Q/K/V/O/Stats,
     (b, 1, 1, 1) INT32 lengths, dense-capacity SF tensors, token-major packed Stats) -- and the dict of every tensor it
@@ -5230,6 +5241,8 @@ def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bs
         q_stride = (sq * hq * d, d, hq * d, 1) if bshd else (hq * sq * d, sq * d, d, 1)
         stride_o = (sq * hq * dv, dv, hq * dv, 1) if bshd else (hq * sq * dv, sq * dv, dv, 1)
         k_stride = (skv * hk * d, d, hk * d, 1) if (bshd and not page) else (hk * s_rows * d, s_rows * d, d, 1)
+        if unaligned_k:
+            k_stride = (hk * s_rows * (d + 1), s_rows * (d + 1), d + 1, 1)
         v_stride = (skv * hk * dv, dv, hk * dv, 1) if (bshd and not page) else (hk * s_rows * dv, s_rows * dv, dv, 1)
         T["q"] = g.tensor(dim=(b, hq, sq, d), stride=q_stride, data_type=itype, name="q")
         T["k"] = g.tensor(dim=(b_kv, hk, s_rows, d), stride=k_stride, data_type=itype, name="k")
@@ -5270,7 +5283,7 @@ def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bs
 
 _P1_ROW_PAGE = "paged MXFP8 KV needs page_size to be a multiple of 128"  # the row's page-size clause (P6a): pools page in whole 128-row F8_128x4 SF atoms
 _P1_ROW_EXACT = "serves exact native shapes"
-_P1_ROW_BSHD = "Q/K/V/O must be BSHD-physical"
+_P1_ROW_LAYOUT = "k: native dense forward"
 # Since #1488 the row claims THD at d256 only (thd_d_shapes): a THD graph at another head dim is declined by the generic
 # THD-shape clause, which sits ahead of the row's own cc 10.7 clause in engines.mismatch.
 _P1_ROW_THD_LEG = "THD (ragged) rides the packed native-tile leg on this engine"
@@ -5283,7 +5296,8 @@ _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unr
     "thd":           (dict(thd=True),                      "frost_absent", _P1_ROW_THD_LEG),  # d128 THD: the THD-shape clause (d256 only since #1488); the backend may plan it and NaNs / hangs at execute, so never executed
     "d64":           (dict(d=64, dv=64),                   "frost_absent", _P1_ROW_EXACT),
     "d200":          (dict(d=200, dv=200),                 "frost_absent", _P1_ROW_EXACT),
-    "sq1_bhsd":      (dict(sq=1, bshd=False, stats=False), "guard",        _P1_ROW_BSHD),  # the crash domain; LAST so the other cells report first in one run
+    "sq1_bhsd":      (dict(sq=1, bshd=False, stats=False), "frost",        None),  # native layout, backend remains guarded
+    "sq1_unaligned_k": (dict(sq=1, stats=False, unaligned_k=True), "guard", _P1_ROW_LAYOUT),  # both native row and guarded backend decline
 }
 
 

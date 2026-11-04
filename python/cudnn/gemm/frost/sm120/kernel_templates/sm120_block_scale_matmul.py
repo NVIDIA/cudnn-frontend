@@ -520,6 +520,14 @@ def _kernel(
         sf_lane_row = lane_div4 + 8 * (lane % 2)
         sfa_lane_sel = (lane // 2) % 2
         sfb_lane_sel = lane_mod4
+        # A row's ceil(K / block_size) K-scales end in its F8_128x4 word sf_tail_word. Unless that count is
+        # a multiple of 4, the word's last 1-3 bytes are blob padding: the SF box still loads them (TMA
+        # zero-fills only the words past rest_k), and the MMAs of the zero-filled K blocks behind them use
+        # them as scales, so a NaN pad (UE8M0 0xFF, UE4M3 0x7F) would make a whole output row or column
+        # NaN. sf_tail_keep is the AND mask that keeps only that word's live bytes.
+        sf_last = cutlass.Int32((k + (block_size - 1)) // block_size) - 1
+        sf_tail_word = sf_last >> 2
+        sf_tail_keep = ~(cutlass.Int32(-256) << ((sf_last & 3) * 8))
 
         acc = cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16)
 
@@ -583,17 +591,22 @@ def _kernel(
                 sSFA_ptr = smem_sfa_list[0].subview(_SFA_STAGE_WORDS * stage).data_ptr()
                 sSFB_ptr = smem_sfb_list[0].subview(_SFB_STAGE_WORDS * stage).data_ptr()
 
+                # sf_tail_keep on the word that holds a row's last K-scale, all ones on every other word.
+                _sf_keep = [
+                    cutlass.Int32(cutlass.select_(cutlass.Int32(k_tile_idx) * _SF_WORDS + w == sf_tail_word, sf_tail_keep, cutlass.Int32(-1)))
+                    for w in range(_SF_WORDS)
+                ]
                 sfa_words = []
                 for g in cutlass.range_constexpr(_SFA_GROUPS):
                     _ws = []
                     for w in cutlass.range_constexpr(_SF_WORDS):
-                        _ws.append((sSFA_ptr + sfa_word_off[g] + w * _SF_ATOM_WORDS).load())
+                        _ws.append((sSFA_ptr + sfa_word_off[g] + w * _SF_ATOM_WORDS).load() & _sf_keep[w])
                     sfa_words.append(_ws)
                 sfb_words = []
                 for g in cutlass.range_constexpr(_SFB_GROUPS):
                     _ws = []
                     for w in cutlass.range_constexpr(_SF_WORDS):
-                        _ws.append((sSFB_ptr + sfb_word_off[g] + w * _SF_ATOM_WORDS).load())
+                        _ws.append((sSFB_ptr + sfb_word_off[g] + w * _SF_ATOM_WORDS).load() & _sf_keep[w])
                     sfb_words.append(_ws)
 
                 for k_blk in cutlass.range_constexpr(_NUM_K_BLOCKS):

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _allowed_vsize, dense_output_layout
-from .fusion_ir import BlockQuantizeSpec, Dtype, FusionChain, FusionOp, MoeSwapAbSpec, ReductionSpec, TensorRef, gemm_index, is_gemm_source
+from .fusion_ir import Axis, BlockQuantizeSpec, Dtype, FusionChain, FusionOp, IndexExpr, MoeSwapAbSpec, ReductionSpec, TensorRef, gemm_index, is_gemm_source
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,61 @@ def _compute_literal(dtype: Dtype, value: float | int) -> str:
 def _elem_coord(e: int) -> tuple[str, str]:
     """Return an epilogue element coordinate."""
     return ("row", f"col_j + {e}")
+
+
+def _render_index_expr(expr: IndexExpr, coordinates: dict[Axis, str]) -> str:
+    """Lower integer IR through a caller-owned coordinate map, not IR symbol names."""
+    if expr.op == "axis":
+        return f"cutlass.Int64({coordinates[expr.value]})"
+    if expr.op == "constant":
+        return str(expr.value)
+    operand = _render_index_expr(expr.operand, coordinates)
+    if expr.rhs is not None:
+        rhs = _render_index_expr(expr.rhs, coordinates)
+        return f"({operand} {'+' if expr.op == 'add' else '*'} {rhs})"
+    return f"({operand} {'//' if expr.op == 'floor_div' else '%'} {expr.value})"
+
+
+@dataclass(frozen=True)
+class _FragmentCoordinates:
+    """Per-element axis expressions for one register vector, supplied at codegen.
+
+    This is a coordinate table, not a storage/thread layout system. Equality of
+    supplied expressions conservatively proves an axis invariant in the vector;
+    no particular axis is inherently uniform or varying.
+    """
+
+    coordinates: tuple[tuple[Axis, tuple[str, ...]], ...]
+
+    def __post_init__(self):
+        if not self.coordinates or len({axis for axis, _ in self.coordinates}) != len(self.coordinates):
+            raise ValueError("fragment coordinates require nonempty, unique axes")
+        size = len(self.coordinates[0][1])
+        if size == 0 or any(
+            not isinstance(axis, Axis) or len(values) != size or any(not isinstance(value, str) or not value for value in values)
+            for axis, values in self.coordinates
+        ):
+            raise ValueError("fragment coordinates require equally sized nonempty coordinate columns")
+
+    @property
+    def size(self):
+        return len(self.coordinates[0][1])
+
+    @classmethod
+    def row_vector(cls, size):
+        """Describe the row-run vector exposed by the existing shared epilogues."""
+        return cls(
+            ((Axis.BATCH, ("tile_l",) * size), (Axis.M, tuple(_elem_coord(i)[0] for i in range(size))), (Axis.N, tuple(_elem_coord(i)[1] for i in range(size))))
+        )
+
+    def is_uniform(self, expr):
+        if not expr.axes <= {axis for axis, _ in self.coordinates}:
+            raise ValueError("index expression references an axis absent from the fragment")
+        invariant = {axis for axis, values in self.coordinates if all(value == values[0] for value in values)}
+        return expr.axes <= invariant
+
+    def render(self, expr, element):
+        return _render_index_expr(expr, {axis: values[element] for axis, values in self.coordinates})
 
 
 def tma_out_value(j: int) -> str:
@@ -123,6 +178,8 @@ def _sigmoid_lines(x_var: str, tag: str) -> tuple[list[str], str]:
 
 _CMP_OPS = ("cmp_eq", "cmp_neq", "cmp_gt", "cmp_ge", "cmp_lt", "cmp_le")
 
+_CMP_PY_OPS = {"cmp_eq": "==", "cmp_neq": "!=", "cmp_gt": ">", "cmp_ge": ">=", "cmp_lt": "<", "cmp_le": "<="}
+
 _LOGIC_OPS = ("logical_and", "logical_or")
 
 _BACKWARD_OPS = (
@@ -145,6 +202,12 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
     attrs = dict(op.attrs)
 
     if op.op in _CMP_OPS:
+        if op.compute_dtype == "fp32":
+            # Compare natively (arith.cmpf: ordered OEQ/OGT/OGE/OLT/OLE, unordered UNE) to keep IEEE
+            # semantics. The step form below gets NaN operands and equal infinities wrong: a - b is NaN
+            # there, and the NaN-ignoring max/min turn that NaN into 0. Only int32 compute still reaches
+            # the step form, and it does not build there (the DSL's floor takes floating-point types only).
+            return lines + [f"{new} = cutlass._mlir_helpers.vector.where({a} {_CMP_PY_OPS[op.op]} {b}, {_fl(a, 1.0)}, {_fl(a, 0.0)})"], new
         if op.op == "cmp_le":
             step, v = _step01(f"{b} - {a}", f"_{idx}")
             return lines + step + [f"{new} = {v}"], new
@@ -204,7 +267,8 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
             lines += l2 + [f"_rmu{idx} = {m} * ({_fl(b, 1.0)} - {s2})"]
             m = f"_rmu{idx}"
         if slope is not None:
-            lines.append(f"_rf{idx} = {m} + {_fl(b, slope)} * ({_fl(b, 1.0)} - {m})")
+            # cuDNN RELU_BWD: the slope applies only where x <= lower (s1); x >= upper has zero gradient.
+            lines.append(f"_rf{idx} = {m} + {_fl(b, slope)} * {s1}")
             m = f"_rf{idx}"
         return lines + [f"{new} = {a} * {m}"], new
 
@@ -271,6 +335,7 @@ def _emit_op(
     other_in_chain: str | None = None,
     third_in_chain: str | None = None,
     vsize: int = 32,
+    fragment_coordinates: _FragmentCoordinates | None = None,
 ) -> tuple[list[str], str]:
     """Emit lines computing this op, given the previous-step var name."""
     new = f"_op_{idx}"
@@ -278,24 +343,31 @@ def _emit_op(
     if op.op == "identity":
         return [], prev
 
+    # relu (every slope / clip form), leaky_relu and elu keep a NaN input NaN, as torch does and as the frontend
+    # requests for RELU_FWD (CUDNN_PROPAGATE_NAN). The DSL's default max/min (maxnum/minnum) return the non-NaN
+    # operand, which turned NaN into 0 or lower_clip; propagate_nan=True lowers to arith.maximumf/minimumf. The
+    # binary max/min ops keep the default, which matches native cuDNN (eng10) MAX/MIN.
     if op.op == "relu":
         ra = dict(op.attrs)
         if not ra:
-            return [f"{new} = cute.math.max({prev}, cutlass.full_like({prev}, {_compute_literal(op.compute_dtype, 0)}))"], new
+            return [f"{new} = cute.math.max({prev}, cutlass.full_like({prev}, {_compute_literal(op.compute_dtype, 0)}), propagate_nan=True)"], new
         slope, lower, upper = ra.get("negative_slope"), ra.get("lower_clip"), ra.get("upper_clip")
         rl = [f"_r{idx} = {prev}"]
         rv = f"_r{idx}"
         if slope is not None:
-            rl.append(f"_rk{idx} = cute.math.max({rv}, {_fl(rv, 0.0)}) + {_fl(rv, slope)} * cute.math.min({rv}, {_fl(rv, 0.0)})")
+            # cuDNN RELU_FWD: x < lower ? lower + slope * (x - lower) : x, with lower defaulting to 0.
+            # lower_clip is where the slope starts, not a clamp applied after it.
+            lo = 0.0 if lower is None else lower
+            shifted = rv if lo == 0.0 else f"({rv} - {_fl(rv, lo)})"
+            rl.append(
+                f"_rk{idx} = cute.math.max({rv}, {_fl(rv, lo)}, propagate_nan=True) + {_fl(rv, slope)} * cute.math.min({shifted}, {_fl(rv, 0.0)}, propagate_nan=True)"
+            )
             cur = f"_rk{idx}"
-            if lower is not None:
-                rl.append(f"_rl{idx} = cute.math.max({cur}, {_fl(rv, lower)})")
-                cur = f"_rl{idx}"
         else:
-            rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)})")
+            rl.append(f"_rl{idx} = cute.math.max({rv}, {_fl(rv, lower if lower is not None else 0.0)}, propagate_nan=True)")
             cur = f"_rl{idx}"
         if upper is not None:
-            rl.append(f"_ru{idx} = cute.math.min({cur}, {_fl(rv, upper)})")
+            rl.append(f"_ru{idx} = cute.math.min({cur}, {_fl(rv, upper)}, propagate_nan=True)")
             cur = f"_ru{idx}"
         return rl + [f"{new} = {cur}"], new
 
@@ -303,13 +375,13 @@ def _emit_op(
         slope = dict(op.attrs).get("negative_slope", 0.0)
         return [
             f"_lr{idx} = {prev}",
-            f"{new} = cute.math.max(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}) + {_fl(f'_lr{idx}', slope)} * cute.math.min(_lr{idx}, {_fl(f'_lr{idx}', 0.0)})",
+            f"{new} = cute.math.max(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}, propagate_nan=True) + {_fl(f'_lr{idx}', slope)} * cute.math.min(_lr{idx}, {_fl(f'_lr{idx}', 0.0)}, propagate_nan=True)",
         ], new
 
     if op.op == "elu":
         return [
             f"_el{idx} = {prev}",
-            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
+            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
         ], new
 
     if op.op == "softplus":
@@ -326,15 +398,21 @@ def _emit_op(
         return ll + [f"{new} = {_fl(nz, 1.0)} - {nz}"], new
 
     if op.op == "gen_index":
-        axis = dict(op.attrs).get("axis")
-        if axis == 1:
-            return [f"{new} = cutlass.full_like({prev}, cutlass.Float32(row))"], new
-        gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, cutlass.Float32)"]
+        # Normalize the legacy rank-3 attribute ABI into the same integer IR.
+        expr = op.index_expr
+        if expr is None:
+            expr = IndexExpr.coordinate(Axis.M if dict(op.attrs).get("axis") == 1 else Axis.N)
+        fragment = fragment_coordinates if fragment_coordinates is not None else _FragmentCoordinates.row_vector(vsize)
+        if fragment.size != vsize:
+            raise ValueError("index fragment size must match the epilogue vector size")
+        # Integer arithmetic precedes compute-dtype rounding (notably above 2**24).
+        idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
+        if fragment.is_uniform(expr):
+            return [f"{new} = cutlass.full_like({prev}, {idx_t}({fragment.render(expr, 0)}))"], new
+        gl = [f"_gi{idx} = cute.make_rmem_tensor({vsize}, {idx_t})"]
         for k in range(vsize):
-            _, col = _elem_coord(k)
-            gl.append(f"_gi{idx}[{k}] = cutlass.Float32({col})")
-        gl.append(f"{new} = _gi{idx}.load().to_vector()")
-        return gl, new
+            gl.append(f"_gi{idx}[{k}] = {idx_t}({fragment.render(expr, k)})")
+        return gl + [f"{new} = _gi{idx}.load().to_vector()"], new
 
     if op.op == "binary_select":
         assert other_in_chain is not None and third_in_chain is not None
@@ -482,11 +560,29 @@ def _emit_op(
     raise AssertionError(f"unhandled op {op.op!r}")
 
 
+# int8 / uint8 values round to nearest even and saturate, NaN to 0 (cvt.rni.sat), as cuDNN's native engines store
+# them. A bare .to() lowers to fptosi / trunci, which round toward zero and keep the low byte (2.75 -> 2, 300 -> 44).
+_INT8_RANGES: dict[str, tuple[int, int]] = {"int8": (-128, 127), "uint8": (0, 255)}
+
+
 def _emit_round(var: str, out_dtype: Dtype, tag: str, *, source_dtype: Dtype = "fp32") -> tuple[list[str], str]:
     """Round a register value to its declared dtype."""
     if out_dtype == "fp32" and source_dtype == "fp32":
         return [], var
     new = f"_r_{tag}"
+    if out_dtype in _INT8_RANGES and source_dtype in ("fp32", "int32"):
+        lo, hi = _INT8_RANGES[out_dtype]
+        sat = f"_sat_{tag}"
+        if source_dtype == "int32":
+            lo_i, hi_i = _compute_literal("int32", lo), _compute_literal("int32", hi)
+            lines = [f"{sat} = cute.math.min(cute.math.max({var}, cutlass.full_like({var}, {lo_i})), cutlass.full_like({var}, {hi_i}))"]
+        else:
+            # max(x, 0) + min(x, 0) is x, or 0 for NaN: max / min return the non-NaN operand.
+            lines = [
+                f"{sat} = cute.math.max({var}, {_fl(var, 0.0)}) + cute.math.min({var}, {_fl(var, 0.0)})",
+                f"{sat} = cute.math.min(cute.math.max(cute.math.roundeven({sat}), {_fl(sat, lo)}), {_fl(sat, hi)})",
+            ]
+        return lines + [f"{new} = ({sat}).to({DTYPE_TO_CUTLASS[out_dtype]})"], new
     lines = [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"]
     if out_dtype == "fp32" and source_dtype == "int32":
         lines.append(f"{new} = {new} + cutlass.full_like({new}, 0.0)")
@@ -767,6 +863,48 @@ _MAINLOOP_IDENTITY_CAST_INTRINSICS: dict[tuple[Dtype, Dtype], str] = {
 }
 
 
+def _mainloop_local_coordinates(linear, group=None):
+    """Decode an unswizzled SMEM offset; group=None denotes K-major storage."""
+    if group is not None:
+        return (
+            f"(({linear} // ({group} * cta_tile_mnk[2])) * {group} + {linear} % {group})",
+            f"({linear} % ({group} * cta_tile_mnk[2])) // {group}",
+        )
+    return f"({linear} // cta_tile_mnk[2])", f"{linear} % cta_tile_mnk[2]"
+
+
+def _prepare_mainloop_index_coordinates(chain, operand):
+    """Prepare coordinates and validity once per transformed operand fragment.
+
+    MN-major TMA groups consecutive M/N elements inside each K column. K-major
+    vectors advance K. Tile origins belong to the mainloop scheduler, not IR.
+    """
+    tag = f"ml_{operand}_coords"
+    linear = f"{tag}_linear"
+    mn_major = chain.matmul.a_major == "m" if operand == "a" else chain.matmul.b_major == "n"
+    local_mn, local_k = _mainloop_local_coordinates(linear, f"{operand}_tma_group_elems" if mn_major else None)
+    batch = chain.matmul.a_batch if operand == "a" else chain.matmul.b_batch
+    mn_axis = Axis.M if operand == "a" else Axis.N
+    extent = "m" if operand == "a" else "n"
+    lane = f"{tag}_lane"
+    lines = [
+        f"{tag}_mn = cute.make_rmem_tensor(ml_vec_elems, cutlass.Int64)",
+        f"{tag}_k = cute.make_rmem_tensor(ml_vec_elems, cutlass.Int64)",
+        f"{tag}_valid = cute.make_rmem_tensor(ml_vec_elems, cutlass.Boolean)",
+        f"for {lane} in cutlass.range_constexpr(ml_vec_elems):",
+        f"    {linear} = cutlass.Int64(ml_L) + {lane}",
+        f"    {tag}_mn[{lane}] = cutlass.Int64(ml_coord_{extent}) + {local_mn}",
+        f"    {tag}_k[{lane}] = cutlass.Int64(k_tile_idx) * cta_tile_mnk[2] + {local_k}",
+        f"    {tag}_valid[{lane}] = ({tag}_k[{lane}] < k) & ({tag}_mn[{lane}] < {extent})",
+    ]
+    coordinates = {
+        Axis.BATCH: "0" if batch == 1 else "ml_batch",
+        mn_axis: f"{tag}_mn",
+        Axis.K: f"{tag}_k",
+    }
+    return lines, coordinates, f"{tag}_valid"
+
+
 def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     """Generate one operand mainloop transform."""
     ops = chain.mainloop_a_ops if operand == "a" else chain.mainloop_b_ops
@@ -785,7 +923,10 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     if identity_cast_intrinsic is not None:
         cvt = f"{identity_cast_intrinsic}({vec_var}.ir_value(), ml_vec_elems)"
         return f"{out_var} = cutlass.Vector({cvt}, dtype={ab_dtype})"
+    has_index = any(op.op == "gen_index" for op in ops)
     lines: list[str] = []
+    if has_index:
+        lines, index_coordinates, index_valid = _prepare_mainloop_index_coordinates(chain, operand)
     result_var: dict[int, str] = {-1: vec_var}
     for i, op in enumerate(ops):
         parent = op.resolved_parent_idx(i)
@@ -796,9 +937,53 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         aux_loads = {}
         if op.aux is not None:
             ptr = f"{op.aux}.iterator.raw_ptr()"
-            aux_loads[op.aux] = f"cutlass.full_like({parent_var}, ({ptr} + 0).load().to({DTYPE_TO_CUTLASS[op.compute_dtype]}))"
-        emit_lines, cur = _emit_op(op, parent_var, base + i, aux_loads)
-        lines.extend(emit_lines)
+            ref = chain.aux_by_name(op.aux)
+            if ref.bcast_mode == "per_k":
+                dt = DTYPE_TO_CUTLASS[op.compute_dtype]
+                # The renderer selects logical (unswizzled) vector accesses for
+                # this path. The operand is K-major, so vector lanes advance K.
+                local_k = _mainloop_local_coordinates("ml_L")[1]
+                scale_k = f"{index_coordinates[Axis.K]}[{tag}_lane]" if has_index else f"{tag}_k + {tag}_lane"
+                scale_valid = f"{index_valid}[{tag}_lane]" if has_index else f"{tag}_gk < k"
+                lines.extend(
+                    [
+                        f"{tag}_scale = cute.make_rmem_tensor(ml_vec_elems, {dt})",
+                        *([] if has_index else [f"{tag}_k = k_tile_idx * cta_tile_mnk[2] + {local_k}"]),
+                        f"for {tag}_lane in cutlass.range_constexpr(ml_vec_elems):",
+                        f"    {tag}_gk = {scale_k}",
+                        f"    {tag}_scale[{tag}_lane] = {dt}(0.0)",
+                        f"    if {scale_valid}:",
+                        f"        {tag}_scale[{tag}_lane] = ({ptr} + {tag}_gk).load().to({dt})",
+                    ]
+                )
+                aux_loads[op.aux] = f"{tag}_scale.load().to_vector()"
+            else:
+                aux_loads[op.aux] = f"cutlass.full_like({parent_var}, ({ptr} + 0).load().to({DTYPE_TO_CUTLASS[op.compute_dtype]}))"
+        other_var = None
+        if op.parent_idx_b is not None:
+            other = op.parent_idx_b
+            other_dtype = (load_dtype or src_dtype) if other < 0 else ops[other].out_dtype
+            cast_lines, other_var = _compute_cast(result_var[other], op.compute_dtype, tag + "_b", source_dtype=other_dtype)
+            lines.extend(cast_lines)
+        if op.op == "gen_index":
+            if op.index_expr is None:
+                raise ValueError("mainloop gen_index requires a lowered coordinate expression")
+            dt = DTYPE_TO_CUTLASS[op.compute_dtype]
+            coordinates = {axis: value if axis == Axis.BATCH else f"{value}[{tag}_lane]" for axis, value in index_coordinates.items()}
+            expression = _render_index_expr(op.index_expr, coordinates)
+            lines.extend(
+                [
+                    f"{tag}_index = cute.make_rmem_tensor(ml_vec_elems, {dt})",
+                    f"for {tag}_lane in cutlass.range_constexpr(ml_vec_elems):",
+                    f"    {tag}_index[{tag}_lane] = {dt}(0)",
+                    f"    if {index_valid}[{tag}_lane]:",
+                    f"        {tag}_index[{tag}_lane] = {dt}({expression})",
+                ]
+            )
+            cur = f"{tag}_index.load().to_vector()"
+        else:
+            emit_lines, cur = _emit_op(op, parent_var, base + i, aux_loads, other_in_chain=other_var)
+            lines.extend(emit_lines)
         if op.out_dtype in ("fp8_e4m3", "fp8_e5m2") and (op.compute_dtype == "int32" or (op.op == "identity" and parent_dtype in ("int8", "uint8", "int32"))):
             cur = f"(({cur}).to(cutlass.Float32) + cutlass.full_like(({cur}).to(cutlass.Float32), 0.0))"
         round_lines, cur = _emit_round(cur, op.out_dtype, tag, source_dtype=op.compute_dtype)
@@ -806,15 +991,20 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         result_var[i] = cur
     terminal_var = result_var[len(ops) - 1]
     lines.append(f"{out_var} = ({terminal_var}).to({ab_dtype})")
+    if has_index:
+        lines.append(f"{out_var} = cutlass._mlir_helpers.vector.where({index_valid}.load().to_vector(), {out_var}, cutlass.full_like({out_var}, 0.0))")
+        return "\n".join(lines)
     major = "a_is_m_major" if operand == "a" else "b_is_n_major"
     group = f"{operand}_tma_group_elems"
+    mn_major_k = _mainloop_local_coordinates("ml_L", group)[1]
+    k_major_k = _mainloop_local_coordinates("ml_L")[1]
     lines.extend(
         [
             "if cutlass.const_expr(mainloop_koob_fix):",
             f"    if cutlass.const_expr({major}):",
-            f"        ml_k_of_L = (ml_L % ({group} * cta_tile_mnk[2])) // {group}",
+            f"        ml_k_of_L = {mn_major_k}",
             "    else:",
-            "        ml_k_of_L = ml_L % cta_tile_mnk[2]",
+            f"        ml_k_of_L = {k_major_k}",
             f"    ml_valid = cutlass.full_like({out_var}.to(cutlass.Float32), cutlass.Float32(ml_k_of_L)) < cutlass.full_like({out_var}.to(cutlass.Float32), cutlass.Float32(k - k_tile_idx * cta_tile_mnk[2]))",
             f"    {out_var} = cutlass._mlir_helpers.vector.where(ml_valid, {out_var}, cutlass.full_like({out_var}, 0.0))",
         ]
@@ -920,9 +1110,11 @@ class _AuxCodegen:
         raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
 
-def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None):
+def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=None, fragment_coordinates=None):
     """Generate per-GEMM rounding and the shared pointwise DAG."""
     scatter = chain.has_moe and chain.moe.mode == "scatter"
+    if fragment_coordinates is None and any(op.op == "gen_index" for op in chain.ops):
+        fragment_coordinates = _FragmentCoordinates.row_vector(vsize)
     body_lines = []
     result_var: dict[int, str] = {}
     gemm_var: dict[int, str] = {}
@@ -969,17 +1161,18 @@ def _emit_pointwise_dag(chain, *, vsize, bounded, aux_load_expr, gemm_out_dtype=
         if third_in_chain is not None:
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c", source_dtype=_parent_dtype(op.parent_idx_c))
             body_lines.extend(cast_lines)
-        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize)
+        lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vsize, fragment_coordinates=fragment_coordinates)
         if scatter and op.op == "gen_index":
             token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
             if dict(op.attrs).get("axis") == token_axis:
+                idx_t = DTYPE_TO_CUTLASS[op.compute_dtype]
                 if token_axis == 1:
-                    lines = [f"{cur} = cutlass.full_like({parent_var}, cutlass.Float32(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
+                    lines = [f"{cur} = cutlass.full_like({parent_var}, {idx_t}(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
                 else:
                     lines = [
-                        f"_gi{i} = cute.make_rmem_tensor(vsize, cutlass.Float32)",
+                        f"_gi{i} = cute.make_rmem_tensor(vsize, {idx_t})",
                         "for _sk in cutlass.range_constexpr(vsize):",
-                        f"    _gi{i}[_sk] = cutlass.Float32(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
+                        f"    _gi{i}[_sk] = {idx_t}(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
                         f"{cur} = _gi{i}.load().to_vector()",
                     ]
         body_lines.extend(lines)
@@ -1049,7 +1242,10 @@ def _emit_block_quant_row(
         )
     elif quant.grouped_by_moe:
         lines.extend([f"{p}_local_row = row - group_begin", f"{p}_ncb = ((N // {bs}) + 3) // 4", f"{p}_base = start_sf_block_m * {p}_ncb * 512"])
+    vector_scales = not swapped and output_dtype == "fp4_e2m1" and bs == 16 and n_sub == 4 and quant.scale_reorder == "F8_128x4"
+    scalar_scale_indices: list[list[str]] = []
     for k in range(n_sub):
+        index_start = len(lines)
         col = "(col_j - group_begin)" if quant.grouped_by_moe and swapped else "col_j"
         lines.append(f"{p}_scol{k} = {col} // {bs} + {k}")
         if quant.scale_reorder == "F8_128x4":
@@ -1067,6 +1263,11 @@ def _emit_block_quant_row(
             lines.append(
                 f"{p}_sidx{k} = {batch_index_expr} * quant_scale_stride_l_{quant_idx} + row * quant_scale_stride_m_{quant_idx} + {p}_scol{k} * quant_scale_stride_n_{quant_idx}"
             )
+        if vector_scales:
+            scalar_scale_indices.append(lines[index_start:])
+            if k:
+                del lines[index_start:]
+            continue
         _st = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)"
         if row_pred is None:
             lines.append(_st)
@@ -1074,14 +1275,45 @@ def _emit_block_quant_row(
             width = (k + 1) * bs if swapped else vsize
             lines.append(f"if ({row_pred}) & (col_j + {width} <= {col_bound}):")
             lines.append(f"    {_st}")
+    if vector_scales:
+        # A whole F8_128x4 column atom is contiguous. Keep the scalar path for
+        # unaligned carriers, atom boundaries and a partial runtime N drain.
+        row_guard = f"({row_pred}) & " if row_pred is not None else ""
+        scale_ptr = f"(gC_tap_{scale_tap_idx}_ptr + {p}_sidx0)"
+        lines += [
+            f"if {row_guard}(col_j + {vsize} <= N) & (({p}_scol0 % 4) == 0) & (({scale_ptr}.toint() & 3) == 0):",
+            f"    {p}_sfword = cutlass.Uint32({p}_scale0.bitcast(cutlass.Uint8))",
+        ]
+        for k in range(1, 4):
+            lines.append(f"    {p}_sfword = {p}_sfword | (cutlass.Uint32({p}_scale{k}.bitcast(cutlass.Uint8)) << {8 * k})")
+        lines += [
+            f"    {p}_sfptr = cutlass.inttoptr({scale_ptr}.toint(), 1, cutlass.Uint32)",
+            f"    {p}_sfptr.store({p}_sfword, alignment=4)",
+            "else:",
+        ]
+        for k in range(4):
+            if k:
+                lines.extend("    " + line for line in scalar_scale_indices[k])
+            lines += [
+                f"    if {row_guard}(col_j + {(k + 1) * bs} <= N):",
+                f"        (gC_tap_{scale_tap_idx}_ptr + {p}_sidx{k}).store({p}_scale{k}, alignment=1)",
+            ]
     return lines
 
 
-def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain) -> list[str]:
-    """Generate AVG normalization from runtime extents."""
+def _emit_reduction_avg_inverse(red_idx: int, red: ReductionSpec, chain: FusionChain, *, token_extent: str | None = None) -> list[str]:
+    """Generate AVG normalization from runtime extents.
+
+    A MoE kernel's token extent is the routed capacity, but its groups cover only the rows below the
+    final offset. ``token_extent`` names that used-row count for an ungrouped AVG over the token axis;
+    ``None`` divides by the capacity."""
     extents = ["M", "N"]
-    if chain.has_moe and red.grouped_by_moe:
-        extents[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+    if chain.has_moe:
+        token_axis = 1 if isinstance(chain.moe, MoeSwapAbSpec) else 0
+        if red.grouped_by_moe:
+            extents[token_axis] = "cutlass.Int32(group_end) - cutlass.Int32(group_begin)"
+        elif token_extent is not None:
+            extents[token_axis] = token_extent
     factors = [f"cutlass.Float32({extent})" for dim, extent in zip(red.dim[1:], extents) if dim == 1]
     if not chain.has_moe and red.dim[0] == 1 and chain.matmul.batch != 1:
         factors.append(f"cutlass.Float32({float(chain.matmul.batch)})")
@@ -1100,6 +1332,8 @@ _SHARED_EXPORTS = {
     "_compute_cast": _compute_cast,
     "_compute_literal": _compute_literal,
     "_elem_coord": _elem_coord,
+    "_render_index_expr": _render_index_expr,
+    "_FragmentCoordinates": _FragmentCoordinates,
     "tma_out_value": tma_out_value,
     "tma_out_ready_marker": tma_out_ready_marker,
     "_aux_reads_row": _aux_reads_row,
@@ -1111,6 +1345,7 @@ _SHARED_EXPORTS = {
     "_nonzero01": _nonzero01,
     "_sigmoid_lines": _sigmoid_lines,
     "_CMP_OPS": _CMP_OPS,
+    "_CMP_PY_OPS": _CMP_PY_OPS,
     "_LOGIC_OPS": _LOGIC_OPS,
     "_BACKWARD_OPS": _BACKWARD_OPS,
     "_emit_binary_ext": _emit_binary_ext,
@@ -1134,6 +1369,8 @@ _SHARED_EXPORTS = {
     "_MAINLOOP_IDX_BASE": _MAINLOOP_IDX_BASE,
     "_MAINLOOP_IDENTITY_CAST_INTRINSICS": _MAINLOOP_IDENTITY_CAST_INTRINSICS,
     "generate_mainloop": generate_mainloop,
+    "_mainloop_local_coordinates": _mainloop_local_coordinates,
+    "_prepare_mainloop_index_coordinates": _prepare_mainloop_index_coordinates,
     "_emit_splitk_partial_store": _emit_splitk_partial_store,
 }
 

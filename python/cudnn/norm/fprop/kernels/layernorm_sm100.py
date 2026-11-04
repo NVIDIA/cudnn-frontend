@@ -24,8 +24,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream
+from cudnn.norm.dtypes import DTYPE_TO_CUTLASS
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi
 from cudnn.norm._common_sm100 import (
+    affine_gamma,
     STAGE_BULK,
     STAGE_CPASYNC,
     STAGE_NONE,
@@ -54,9 +56,17 @@ def _ln_fwd_kernel(
     vec: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    affine: cutlass.Constexpr = None,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     r, _, _ = cute.arch.block_idx()
+    per_row: cutlass.Constexpr = affine is not None and affine[3]
+    gamma_step: cutlass.Constexpr = 0 if per_row else 1
+    gamma_base = cutlass.Int64(0)
+    if cutlass.const_expr(per_row):
+        gamma_base = cutlass.Int64(r)
+    elif cutlass.const_expr(affine is not None):
+        gamma_base = cutlass.Int64((r // affine[1]) % affine[0]) * M
     staged: cutlass.Constexpr = stage_mode != STAGE_NONE
     nv: cutlass.Constexpr = M // V
 
@@ -111,9 +121,10 @@ def _ln_fwd_kernel(
 
     mean, rstd = shifted_stats(s1, s2, kshift, Mf, eps, has_mean)
     if tid == 0:
-        if cutlass.const_expr(has_mean):
+        if cutlass.const_expr(has_mean and mMean is not None):
             mMean[r] = mean
-        mRstd[r] = rstd
+        if cutlass.const_expr(mRstd is not None):
+            mRstd[r] = rstd
 
     # --- pass 2: normalize + affine, store Y ---
     if cutlass.const_expr(vec):
@@ -128,9 +139,9 @@ def _ln_fwd_kernel(
                 cute.autovec_copy(xvg[None, vi], xf)
             for e in cutlass.range_constexpr(V):
                 x = (sX[j0 + e] if cutlass.const_expr(staged) else xf[e]).to(cutlass.Float32)
-                y = mGamma[j0 + e].to(cutlass.Float32) * ((x - mean) * rstd)
+                y = affine_gamma(mGamma[gamma_base + (j0 + e) * gamma_step], affine) * ((x - mean) * rstd)
                 if cutlass.const_expr(has_beta):
-                    y = y + mBeta[j0 + e].to(cutlass.Float32)
+                    y = y + mBeta[gamma_base + (j0 + e) * gamma_step].to(cutlass.Float32)
                 yf[e] = y.to(mY.element_type)
             cute.autovec_copy(yf, yv[None, vi])
             vi = vi + bt
@@ -138,9 +149,9 @@ def _ln_fwd_kernel(
         j = tid
         while j < M:
             x = (sX[j] if cutlass.const_expr(staged) else mX[r, j]).to(cutlass.Float32)
-            y = mGamma[j].to(cutlass.Float32) * ((x - mean) * rstd)
+            y = affine_gamma(mGamma[gamma_base + j * gamma_step], affine) * ((x - mean) * rstd)
             if cutlass.const_expr(has_beta):
-                y = y + mBeta[j].to(cutlass.Float32)
+                y = y + mBeta[gamma_base + j * gamma_step].to(cutlass.Float32)
             mY[r, j] = y.to(mY.element_type)
             j = j + bt
 
@@ -202,21 +213,20 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params, out_y=None, out_mean=No
     mean = torch.empty(spec.R, dtype=torch.float32, device=x2d.device) if out_mean is None else out_mean
     rstd = torch.empty(spec.R, dtype=torch.float32, device=x2d.device) if out_rstd is None else out_rstd
 
-    args = (
-        dyn(x2d),
-        dyn(y),
-        dyn(gamma),
-        dyn(beta),
-        dyn(mean),
-        dyn(rstd),
-        cutlass.Int32(spec.R),
-        cutlass.Float32(eps),
-    )
     ce = (spec.M, cfg.V, cfg.block_threads, cfg.elem_bytes, cfg.stage_mode, cfg.vec, spec.has_mean, has_beta)
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_fwd_host, *args, *ce, fake_stream())
+        et, rows = DTYPE_TO_CUTLASS[params.io_dtype], cute.sym_int()
+        fakes = (
+            fake_rows(et, spec.M, rows=rows),
+            fake_rows(et, spec.M, rows=rows),
+            fake_rows(et, rows=spec.M),
+            fake_rows(et, rows=spec.M),
+            fake_rows(cutlass.Float32, rows=rows),
+            fake_rows(cutlass.Float32, rows=rows),
+        )
+        fn = cute.compile(_ln_fwd_host, *fakes, cutlass.Int32(0), cutlass.Float32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
         _KCACHE[key] = fn
-    fn(*args, cur_stream())
+    fn(ffi(x2d), ffi(y), ffi(gamma), ffi(beta), ffi(mean), ffi(rstd), spec.R, eps, cur_stream())
     return y, mean, rstd
