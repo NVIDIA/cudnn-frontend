@@ -64,8 +64,6 @@ from cutlass.utils.blackwell_helpers import (
     cluster_shape_to_tma_atom_SFB as _cluster_shape_to_tma_atom_SFB,
 )
 from cutlass.utils import blockscaled_layout as _blockscaled_layout
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import llvm
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 import cuda.bindings.driver as cuda
@@ -75,24 +73,14 @@ from cudnn.deepseek_sparse_attention.utils.sm100.gemm import (
     gemm_ptx_partial_mxfp8 as _gemm_ptx_partial_mxfp8,
 )
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
-from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100 import IndexerScoreSm100Base, _tcgen05_fence_after, _tcgen05_fence_before
 from .dense_score_recompute_sm100 import (
     add_packed_f32x2,
     fma_packed_f32x2,
 )
 
 
-@dsl_user_op
-def _tcgen05_fence_after(*, loc=None, ip=None):
-    llvm.inline_asm(None, [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
-def _tcgen05_fence_before(*, loc=None, ip=None):
-    llvm.inline_asm(None, [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
+class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
     """Block-scaled (MXFP8) dense / compact indexer score with optional LSE."""
 
     arch = 100

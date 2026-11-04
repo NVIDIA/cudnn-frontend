@@ -26,7 +26,7 @@ import cuda.bindings.driver as cuda
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
 from .dense_score_recompute_sm100_mxfp8 import BwdDenseAttnScoreSm100Mxfp8
-from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100, smem_plan as bf16_indexer_smem_plan
 from ._block_scaled import (
     BLOCK_SCALED_FORMATS,
     BLOCK_SCALED_PRECISION_NAMES,
@@ -777,6 +777,17 @@ def _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block
 # ---- Dispatch helpers (mirror _dispatch_sparse_attn_tile_params) -------------
 
 
+def _resolve_bf16_dense_indexer_tile(m_block_size, n_block_size, head_dim, k_block_size):
+    """The BF16 kernel packs a 128-row tile (128 // qhead_per_kv_head tokens) for every head group."""
+    if m_block_size is None:
+        m_block_size = 128
+    if m_block_size != 128 or n_block_size != 128:
+        raise ValueError(f"precision='bf16' dense indexer requires m_block_size=n_block_size=128, got {m_block_size} / {n_block_size}")
+    if bf16_indexer_smem_plan(head_dim, k_block_size) is None:
+        raise ValueError(f"precision='bf16' dense indexer: head_dim={head_dim} does not fit the kernel's shared memory")
+    return m_block_size
+
+
 def _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_bytes):
     """Return m=qhpkv*2 if SMEM fits, else fall back to m=qhpkv."""
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
@@ -989,8 +1000,8 @@ def _dense_indexer_score_recompute(
         k_block_size = 64 if k_block_size is None else k_block_size
         if k_block_size != 64:
             raise ValueError(f"precision={precision!r} dense indexer requires k_block_size=64; got {k_block_size}")
-    elif m_block_size is None:
-        m_block_size = qhead_per_kv_head
+    else:
+        m_block_size = _resolve_bf16_dense_indexer_tile(m_block_size, n_block_size, head_dim, k_block_size)
 
     if is_block_scaled:
         _validate_dense_block_scaled_contract(
@@ -1016,9 +1027,8 @@ def _dense_indexer_score_recompute(
     _require_fp32_output(denom_out, "denom_out", (q.shape[0],) if is_varlen else (bs, seqlen_q))
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
-        k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
-    # The block-scaled kernels size their own SMEM rings from the split schedule.
-    kv_stage = None if is_block_scaled else _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
+        k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
+    # The SM100 indexer kernels size their own SMEM rings (split schedule / SMEM plan).
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
@@ -1055,7 +1065,6 @@ def _dense_indexer_score_recompute(
             m_block_size,
             n_block_size,
             k_block_size,
-            kv_stage,
             ratio,
             is_varlen,
             q_causal_offsets is not None,
@@ -1100,7 +1109,6 @@ def _dense_indexer_score_recompute(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=k_block_size,
-                kv_stage=kv_stage,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 compute_lse=True,

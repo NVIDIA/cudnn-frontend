@@ -108,6 +108,10 @@ class IndexerForward(APIBase):
             d != 128,
             f"IndexerForward is tuned for head_dim=128 only, got {d}",
         )
+        self._value_error_if(
+            self.m_block_size != 128,
+            f"IndexerForward packs a 128-row (token, head) tile for every head group; m_block_size must be 128, got {self.m_block_size}",
+        )
 
         qhpkv = self.qhead_per_kv_head if self.qhead_per_kv_head is not None else (h_q // h_kv)
         self._value_error_if(

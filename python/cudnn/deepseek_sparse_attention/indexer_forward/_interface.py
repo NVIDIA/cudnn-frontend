@@ -34,7 +34,7 @@ from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._support import (
     check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
-    resolve_m_block_size as _resolve_m_block_size,
+    validate_bf16_tile as _validate_bf16_tile,
     resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
@@ -514,7 +514,7 @@ def _indexer_fwd_bound(
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if precision == "bf16":
-        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=False, path="SM100 indexer_fwd")
+        _validate_bf16_tile(m_block_size, head_dim, path="SM100 indexer_fwd")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
 
@@ -677,7 +677,6 @@ def _indexer_fwd_bound(
         m_block_size,
         n_block_size,
         k_block_size,
-        kv_stage,
         num_threads,
         is_varlen,
         q_causal_offsets is not None,
@@ -702,7 +701,6 @@ def _indexer_fwd_bound(
             m_block_size=m_block_size,
             n_block_size=n_block_size,
             k_block_size=k_block_size,
-            kv_stage=kv_stage,
             ratio=ratio,
             is_varlen=is_varlen,
             compute_lse=False,

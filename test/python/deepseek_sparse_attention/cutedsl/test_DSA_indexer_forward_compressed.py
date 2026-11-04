@@ -140,9 +140,8 @@ def _assert_topk_sets_match(dense_ref: torch.Tensor, indices: torch.Tensor, top_
     ids=["bf16-w-bf16", "bf16-w-fp32", "mxfp8", "mxfp4"],
 )
 def test_DSA_compressed_indexer_forward_bshd_small_head_groups(precision, weight_dtype, h_q):
-    """4 / 8 / 16 heads per KV head pack several query tokens per tile (BF16: 8 tokens into a 32- / 64- / 128-column
-    tile; MXFP8 / MXFP4: 128 // group tokens into the 128-row tile, the scale packing ``token * group + head`` per 128
-    packed rows); the per-token head reduce, the compact store, the top-k and the per-token online LSE are checked
+    """4 / 8 / 16 heads per KV head pack 128 // group query tokens into the 128-row tile at every precision (block-scaled:
+    the scale packing ``token * group + head`` per 128 packed rows); the per-token head reduce, the compact store, the top-k and the per-token online LSE are checked
     against the dense fp64 reference (on the dequantized values), with a query tail past the last complete block
     (seqlen_q = 4 * 33 + 1) and a per-batch causal offset; the LSE is ``-inf`` exactly where a token sees no block."""
     if precision == "bf16":
@@ -477,7 +476,7 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_unit_scales_is_the_plain_e4m3_
 
 @pytest.mark.L0
 def test_indexer_forward_support_tables_are_the_shared_contract():
-    """Host-only: the head-group set, the per-group tile width and the query-tail geometry bound every entry
+    """Host-only: the head-group set, the BF16 tile contract and the query-tail geometry bound every entry
     point of indexer_forward applies come from one module, and read as documented."""
     try:
         from cudnn.deepseek_sparse_attention.indexer_forward import _support
@@ -497,16 +496,14 @@ def test_indexer_forward_support_tables_are_the_shared_contract():
     with pytest.raises(ValueError, match=r"precision='mxfp8' indexer requires qhead_per_kv_head in \(4, 8, 16, 32, 64\), got 12"):
         _support.validate_qhead_per_kv_head(12, "mxfp8")
     _support.validate_qhead_per_kv_head(4, "mxfp4")
-    # the default 128-wide tile resolves to (qhead_per_kv_head x tokens) per path; 32 / 64 keep their measured picks
-    dense = {g: _support.resolve_m_block_size(128, g, 128, compressed=False, path="t") for g in (4, 8, 16, 32, 64)}
-    compressed = {g: _support.resolve_m_block_size(128, g, 128, compressed=True, path="t") for g in (4, 8, 16, 32, 64)}
-    assert dense == {4: 32, 8: 64, 16: 128, 32: 128, 64: 128}
-    assert compressed == {4: 32, 8: 64, 16: 128, 32: 64, 64: 128}
-    assert all(m // g <= 8 for g, m in dense.items()) and all(m // g <= 8 for g, m in compressed.items())
-    # an explicit width past the cap is refused, a smaller one kept
-    with pytest.raises(ValueError, match="at most 8 q tokens per tile"):
-        _support.resolve_m_block_size(64, 4, 128, compressed=True, path="t")
-    assert _support.resolve_m_block_size(16, 4, 128, compressed=True, path="t") == 16
+    # the BF16 kernel packs a 128-row tile for every head group: any other width, or a head dim whose Q tile and
+    # two K blocks overflow shared memory, is refused
+    _support.validate_bf16_tile(128, 128, path="t")
+    _support.validate_bf16_tile(128, 512, path="t")
+    with pytest.raises(ValueError, match="m_block_size must be 128, got 64"):
+        _support.validate_bf16_tile(64, 128, path="t")
+    with pytest.raises(ValueError, match="head_dim=1024 does not fit"):
+        _support.validate_bf16_tile(128, 1024, path="t")
     # a query may trail the last complete block by ratio - 1 tokens, no more
     _support.check_q_covered_by_k(4 * 32 + 3, 32, 4)
     with pytest.raises(ValueError, match=r"seqlen_q \(132\) must be <= seqlen_k \* ratio \+ \(ratio - 1\) \(131\)"):
