@@ -27,9 +27,6 @@ navigation:
           - page: Gated Attention Block (SM107)
             path: ../../operations/attention/gated_attention_block.md
             slug: gated_attention_block
-          - page: Triangle Attention (SM107)
-            path: ../../operations/attention/triangle_attention.md
-            slug: triangle_attention
           - page: Compact GQA backward (SM107)
             path: ../../operations/attention/compact_gqa_backward.md
             slug: compact_gqa_backward
@@ -198,9 +195,6 @@ navigation:
               - page: DSv4.1 mHC Projection/RMS Backward (SM100/SM103)
                 path: ../../operations/gemm_fusions/mhc_projection_bwd.md
                 slug: mhc_projection_bwd
-          - page: Triangle Multiplicative Update
-            path: ../../operations/matmul/triangle_multiplicative_update.md
-            slug: triangle_multiplicative_update
       - page: MoE Grouped Matmul
         path: ../../operations/MoeGroupedMatmul.md
         slug: operations/MoeGroupedMatmul
