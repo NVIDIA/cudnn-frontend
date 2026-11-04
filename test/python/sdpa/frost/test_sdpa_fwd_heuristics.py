@@ -936,6 +936,41 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
 
 
 @pytest.mark.L0
+def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
+    """sm100 d192x128 f16/bf16 without GQA, causal: plain LPT leads while the grid is at most
+    _SM100_D192_LPT_MAX_WAVES waves of 512-row pair units; above that LPT_L2 leads, except on cc 10.3 with more
+    (batch, head) streams than SMs, where NATURAL leads; a mask-free graph proposes NATURAL alone; a GQA d192 graph
+    keeps the L2-budget rule."""
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.heuristics import _SM100_D192_LPT_MAX_WAVES, _sched_points
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    f16 = caps[engines.engine_name()]
+    d192 = dict(d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_sm_count=148)
+
+    def points(b, h, s, **over):
+        return _sched_points(f16, _facts(b=b, h_q=h, h_kv=over.pop("h_kv", h), s_q=s, s_kv=s, **d192, **over))
+
+    lpt, lpt_l2, natural = [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2]
+    assert _SM100_D192_LPT_MAX_WAVES == 12
+    for cc in ((10, 0), (10, 3)):
+        assert points(2, 64, 2048, device_cc=cc) == lpt  # 512 pair units / 74 clusters = 6.9 waves
+        assert points(1, 64, 4096, device_cc=cc) == lpt  # 6.9 waves
+        assert points(2, 96, 2048, device_cc=cc) == lpt  # 10.4 waves
+        assert points(2, 64, 4096, device_cc=cc) == lpt_l2  # 13.8 waves, 128 streams
+        assert points(1, 64, 16384, device_cc=cc) == lpt_l2  # 27.7 waves, 64 streams
+        assert points(2, 64, 2048, device_cc=cc, causal=False) == [SCHED_NATURAL]
+        assert points(2, 64, 2048, device_cc=cc, h_kv=8) == lpt_l2
+    assert points(2, 128, 2048, device_cc=(10, 0)) == lpt_l2  # 13.8 waves, 256 streams
+    assert points(2, 128, 2048, device_cc=(10, 3)) == natural
+    assert points(2, 96, 4096, device_cc=(10, 0)) == lpt_l2  # 20.8 waves, 192 streams
+    assert points(2, 96, 4096, device_cc=(10, 3)) == natural
+    plans = recommend("A", _facts(b=2, h_q=64, h_kv=64, s_q=2048, s_kv=2048, **d192), _OFFERED)
+    lead = next(p for p in plans if p.engine_id == 20500)
+    assert (lead.knobs.split_kv, lead.knobs.cga, lead.knobs.sched_policy) == (1, 2, SCHED_LPT), lead.knobs
+
+
+@pytest.mark.L0
 def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
     name = engines.engine_name(mxfp8=True)
     offered = {name: 20510}

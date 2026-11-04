@@ -335,6 +335,10 @@ class Capabilities:
     # resolves it, so ``capabilities.band`` is never None after construction,
     # and a legacy flag that is SET outside an explicit claim is refused there.
     band: Optional["band.BandSupport"] = None
+    # A packed implementation can have a narrower native tile domain than its
+    # dense sibling. Empty retains the row's existing dense domain.
+    thd_tile_ms: frozenset[int] = frozenset()
+    thd_tile_ns: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         """Single normalization layer: legacy mask flags -> canonical band set."""
@@ -383,8 +387,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if not isinstance(requested, SdpaBwdKnobs):
             return f"knob request is a {type(requested).__name__}, not SdpaBwdKnobs — wrong operation's vocabulary"
         for value, domain, label in (
-            (requested.tile_m, capabilities.tile_ms, "tile_m"),
-            (requested.tile_n, capabilities.tile_ns, "tile_n"),
+            (requested.tile_m, (capabilities.thd_tile_ms or capabilities.tile_ms) if facts.thd else capabilities.tile_ms, "tile_m"),
+            (requested.tile_n, (capabilities.thd_tile_ns or capabilities.tile_ns) if facts.thd else capabilities.tile_ns, "tile_n"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
@@ -654,6 +658,8 @@ class EngineSpec:
 
 
 def _sm120_spec() -> EngineSpec:
+    from .sm120_thd_contract import graph_mismatch
+
     return EngineSpec(
         name="sdpa_bwd_sm120",
         capabilities=Capabilities(
@@ -678,6 +684,13 @@ def _sm120_spec() -> EngineSpec:
             layouts=frozenset({"bshd", "dense_flex"}),
             strided_stats=True,
             deterministic=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_ragged_offsets=True,
+            thd_head_stride=True,
+            thd_tile_ms=frozenset({64}),
+            thd_tile_ns=frozenset({64}),
+            declaration_check=graph_mismatch,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
         ),
@@ -804,7 +817,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    adapter_cls = _adapter(api_type)
+    if api_type == _SM120 and thd:
+        from .api_dsl_sm120_thd import SdpaBwdDslSm120Thd
+
+        adapter_cls = SdpaBwdDslSm120Thd
+    else:
+        adapter_cls = _adapter(api_type)
     # Bound ragged offsets, read on device by rows that declare it: per port,
     # the IR tensor's offset tensor, dtype and multiplier.
     _ragged = {}

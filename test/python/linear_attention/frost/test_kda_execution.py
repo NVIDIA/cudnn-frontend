@@ -364,6 +364,7 @@ def test_kda_warm_chain_binds_current_operands(optional, safe_gate, checkpoint):
             inputs["beta"],
             inputs["cu_seqlens"],
             inputs.get("initial_state"),
+            None,
             inputs["O"],
             inputs.get("final_state"),
             inputs.get("state_checkpoints"),

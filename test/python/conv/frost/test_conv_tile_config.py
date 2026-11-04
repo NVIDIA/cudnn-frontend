@@ -469,6 +469,7 @@ _DENSE_CATALOG = tuple(
 
 
 def _run_bf16_config(tile_config: ConvTileConfig) -> None:
+    import cutlass
     import torch
     from cuda.bindings import driver as cuda
 
@@ -492,6 +493,10 @@ def _run_bf16_config(tile_config: ConvTileConfig) -> None:
         weight_gpu.permute(0, 2, 3, 4, 1),
         output_gpu.permute(0, 2, 3, 4, 1),
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        (cutlass.Int32(0),) * 3,
+        (cutlass.Int32(0),) * 3,
+        (cutlass.Int32(1),) * 3,
+        (cutlass.Int32(1),) * 3,
     )
     torch.cuda.synchronize()
 

@@ -138,7 +138,8 @@ _TWO_LOG2E = "cutlass.Float32(2.8853900817779268)"
 
 
 def _tanh_expr(v: str) -> str:
-    """Generate vector tanh."""
+    """Generate vector tanh as 1 - 2/(e^2x + 1). Its absolute error, about 1e-7, is enough for gelu_tanh and the
+    backward ops but is the whole result as x goes to 0, so the tanh op switches to _TANH_SERIES there."""
     one = f"cutlass.full_like({v}, cutlass.Float32(1.0))"
     two = f"cutlass.full_like({v}, cutlass.Float32(2.0))"
     e2 = f"cute.math.exp2({v} * cutlass.full_like({v}, {_TWO_LOG2E}), fastmath=True)"
@@ -147,6 +148,28 @@ def _tanh_expr(v: str) -> str:
 
 def _fl(var: str, c: float) -> str:
     return f"cutlass.full_like({var}, cutlass.Float32({float(c)}))"
+
+
+# The closed forms of tanh (1 - 2/(e^2x + 1)) and elu (e^x - 1) near x = 0, and softplus's log(1 + y) for a small
+# y = e^-|x|, cancel: their absolute error (about 1e-7, one rounding of a value near 1) is the whole result as it goes
+# to 0. Below _SERIES_BOUND (in |x| for tanh and elu, in y for softplus) those emitters select the leading Taylor terms
+# instead, whose truncation error at the bound is under 1e-8 of the result; beyond it they keep the closed forms.
+# +-inf and NaN inputs give the same results as before.
+_SERIES_BOUND = 0.125
+
+_TANH_SERIES = (-1.0 / 3.0, 2.0 / 15.0, -17.0 / 315.0)  # x^3, x^5, x^7 coefficients
+
+_EXPM1_SERIES = (1.0 / 2.0, 1.0 / 6.0, 1.0 / 24.0, 1.0 / 120.0, 1.0 / 720.0)  # x^2 .. x^6
+
+_LOG1P_SERIES = (-1.0 / 2.0, 1.0 / 3.0, -1.0 / 4.0, 1.0 / 5.0, -1.0 / 6.0, 1.0 / 7.0, -1.0 / 8.0)  # y^2 .. y^8
+
+
+def _horner(v: str, coeffs: tuple[float, ...]) -> str:
+    """Generate sum(coeffs[i] * v**i) in Horner form."""
+    expr = _fl(v, coeffs[-1])
+    for c in reversed(coeffs[:-1]):
+        expr = f"{_fl(v, c)} + {v} * ({expr})"
+    return expr
 
 
 def _step01(d_expr: str, tag: str) -> tuple[list[str], str]:
@@ -194,6 +217,10 @@ _BACKWARD_OPS = (
     "softplus_backward",
 )
 
+# The largest finite fp32: the RELU upper clip the frontend lowers for fp32 compute when none is set
+# (include/cudnn_frontend/node/pointwise.h).
+_FLT_MAX = 3.4028234663852886e38
+
 
 def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str) -> tuple[list[str], str]:
     """Generate comparison, logical, modulo, and activation-gradient operations."""
@@ -234,6 +261,12 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
         return lines + la + lb + [f"{new} = {na} + {nb} - {na} * {nb}"], new
 
     if op.op == "mod":
+        if op.compute_dtype == "fp32":
+            # MOD is C fmod. `%` on Float32 vectors lowers to arith.remf, an exact fmodf. The form below,
+            # a - b * trunc(a / b), rounds the quotient first: it is off by |b| when a / b rounds up to an
+            # integer, can leave (-|b|, |b|) once |a / b| >= 2**25, and gives NaN for b = +-inf. It is kept
+            # only for INT32 compute, which fails at build today.
+            return lines + [f"{new} = {a} % {b}"], new
         q = f"_mq{idx}"
         lines.append(f"{q} = {a} / {b}")
         lp, sp = _step01(q, f"_{idx}mp")
@@ -253,6 +286,13 @@ def _emit_binary_ext(op: FusionOp, a_expr: str, b_expr: str, idx: int, new: str)
         slope = attrs.get("negative_slope")
         lower = attrs.get("lower_clip", 0.0)
         upper = attrs.get("upper_clip")
+        if not slope and lower == 0.0 and (upper is None or upper >= _FLT_MAX):
+            # cuDNN's default RELU_BWD (lower clip 0, slope 0, no upper clip, which the frontend lowers as FLT_MAX) is
+            # the threshold select dx = x <= 0 ? +0 : dy, like torch's threshold_backward: the native engines return +0
+            # on a dead unit even for an inf or NaN dy, which dy * mask turns into NaN. A NaN x passes dy (OLE is false).
+            # With a clip or a slope the native engines multiply dy by the derivative (inf * 0 = NaN there too), as the
+            # mask product below does.
+            return lines + [f"{new} = cutlass._mlir_helpers.vector.where({b} <= {_fl(b, 0.0)}, {_fl(a, 0.0)}, {a})"], new
         l1, s1 = _step01(f"{_fl(b, lower)} - {b}", f"_{idx}r1")
         lines += l1 + [f"_rm{idx} = {_fl(b, 1.0)} - {s1}"]
         m = f"_rm{idx}"
@@ -348,9 +388,11 @@ def _emit_op(
         slope, lower, upper = ra.get("negative_slope"), ra.get("lower_clip"), ra.get("upper_clip")
         rl = [f"_r{idx} = {prev}"]
         rv = f"_r{idx}"
-        if slope is not None:
+        if slope:
             # cuDNN RELU_FWD: x < lower ? lower + slope * (x - lower) : x, with lower defaulting to 0.
-            # lower_clip is where the slope starts, not a clamp applied after it.
+            # lower_clip is where the slope starts, not a clamp applied after it. A zero slope takes the
+            # max(x, lower) branch below: the frontend sends slope 0.0 when none is set, so it is the same
+            # descriptor, and the native engines return lower at x = -inf, where this line gives 0 * -inf = NaN.
             lo = 0.0 if lower is None else lower
             shifted = rv if lo == 0.0 else f"({rv} - {_fl(rv, lo)})"
             rl.append(
@@ -373,15 +415,24 @@ def _emit_op(
         ], new
 
     if op.op == "elu":
+        # max(x, 0) + expm1(min(x, 0)): the expm1 term is exactly 0 for x >= 0, so a positive x passes through unrounded.
+        n = f"_eln{idx}"
         return [
             f"_el{idx} = {prev}",
-            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) + cute.math.exp2(cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) * cutlass.full_like(_el{idx}, {_LOG2E}), fastmath=True) - {_fl(f'_el{idx}', 1.0)}",
+            f"{n} = cute.math.min(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True)",
+            f"_elm{idx} = cutlass._mlir_helpers.vector.where({n} > {_fl(n, -_SERIES_BOUND)}, {n} + {n} * {n} * ({_horner(n, _EXPM1_SERIES)}), "
+            f"cute.math.exp2({n} * cutlass.full_like({n}, {_LOG2E}), fastmath=True) - {_fl(n, 1.0)})",
+            f"{new} = cute.math.max(_el{idx}, {_fl(f'_el{idx}', 0.0)}, propagate_nan=True) + _elm{idx}",
         ], new
 
     if op.op == "softplus":
+        # max(x, 0) + log1p(y), y = e^-|x|.
+        y = f"_spy{idx}"
         return [
             f"_sp{idx} = {prev}",
-            f"{new} = cute.math.max(_sp{idx}, {_fl(f'_sp{idx}', 0.0)}) + cute.math.log({_fl(f'_sp{idx}', 1.0)} + cute.math.exp2(-cute.math.abs(_sp{idx}) * cutlass.full_like(_sp{idx}, {_LOG2E}), fastmath=True))",
+            f"{y} = cute.math.exp2(-cute.math.abs(_sp{idx}) * cutlass.full_like(_sp{idx}, {_LOG2E}), fastmath=True)",
+            f"{new} = cute.math.max(_sp{idx}, {_fl(f'_sp{idx}', 0.0)}) + cutlass._mlir_helpers.vector.where({y} < {_fl(y, _SERIES_BOUND)}, "
+            f"{y} + {y} * {y} * ({_horner(y, _LOG1P_SERIES)}), cute.math.log({_fl(y, 1.0)} + {y}))",
         ], new
 
     if op.op == "tan":
@@ -424,7 +475,13 @@ def _emit_op(
         return _emit_binary_ext(op, lhs, rhs, idx, new)
 
     if op.op == "tanh":
-        return [f"{new} = {_tanh_expr(prev)}"], new
+        t, t2 = f"_th{idx}", f"_thq{idx}"
+        return [
+            f"{t} = {prev}",
+            f"{t2} = {t} * {t}",
+            f"{new} = cutlass._mlir_helpers.vector.where(cute.math.abs({t}) < {_fl(t, _SERIES_BOUND)}, {t} + {t} * {t2} * ({_horner(t2, _TANH_SERIES)}), "
+            f"{_tanh_expr(t)})",
+        ], new
 
     if op.op == "exp":
 
@@ -1335,6 +1392,11 @@ _SHARED_EXPORTS = {
     "_TWO_LOG2E": _TWO_LOG2E,
     "_tanh_expr": _tanh_expr,
     "_fl": _fl,
+    "_SERIES_BOUND": _SERIES_BOUND,
+    "_TANH_SERIES": _TANH_SERIES,
+    "_EXPM1_SERIES": _EXPM1_SERIES,
+    "_LOG1P_SERIES": _LOG1P_SERIES,
+    "_horner": _horner,
     "_step01": _step01,
     "_nonzero01": _nonzero01,
     "_sigmoid_lines": _sigmoid_lines,

@@ -29,6 +29,8 @@ cudnn.FlexAttentionBwd
 cudnn.FlexAttentionFwd
 cudnn.GatedAttentionBlockBwd
 cudnn.GatedAttentionBlockFwd
+cudnn.GdnDecodeFused
+cudnn.GdnVerifyFused
 cudnn.GemmAmaxSm100
 cudnn.GemmDsreluSm100
 cudnn.GemmProjRopeMxfp8Bf16InSm100
@@ -387,12 +389,21 @@ cudnn.deepseek_sparse_attention.indexer_forward_top_k_wrapper
 cudnn.deepseek_sparse_attention.indexer_forward_wrapper
 cudnn.deepseek_sparse_attention.indexer_top_k_wrapper
 cudnn.deepseek_sparse_attention.local_to_global_wrapper
+cudnn.deepseek_sparse_attention.pooled_expand_compact
+cudnn.deepseek_sparse_attention.pooled_indexer_backward
+cudnn.deepseek_sparse_attention.pooled_indexer_select
+cudnn.deepseek_sparse_attention.pooled_indexer_target
+cudnn.deepseek_sparse_attention.pooled_keys_forward
+cudnn.deepseek_sparse_attention.pooled_sparse_attention_backward
+cudnn.deepseek_sparse_attention.pooled_sparse_attention_backward_with_teacher
+cudnn.deepseek_sparse_attention.pooled_teacher_recompute
 cudnn.deepseek_sparse_attention.sparse_attention
 cudnn.deepseek_sparse_attention.sparse_attention_backward_wrapper
 cudnn.deepseek_sparse_attention.sparse_attention_forward_wrapper
 cudnn.deepseek_sparse_attention.sparse_attention_score_recompute
 cudnn.deepseek_sparse_attention.sparse_attn_score_recompute_wrapper
 cudnn.deepseek_sparse_attention.sparse_indexer_score_recompute_wrapper
+cudnn.deepseek_sparse_attention.unpool_backward
 cudnn.destroy_handle
 cudnn.diagonal_alignment
 cudnn.diagonal_alignment.BOTTOM_RIGHT
@@ -421,6 +432,7 @@ cudnn.engines.BaseEngine.numerical_notes
 cudnn.engines.CPP_OSS_ENGINE_ID_BASE
 cudnn.engines.CompiledPlan
 cudnn.engines.CompiledPlan.execute
+cudnn.engines.CompiledPlan.get_context_size
 cudnn.engines.CompiledPlan.get_workspace_size
 cudnn.engines.CompiledPlan.takes_variant_pack
 cudnn.engines.EngineFamily
@@ -432,6 +444,7 @@ cudnn.engines.EngineFamily.offered_ids
 cudnn.engines.EngineFamily.owns
 cudnn.engines.EngineFamily.validator
 cudnn.engines.ExecutionContext
+cudnn.engines.ExecutionContext.context
 cudnn.engines.ExecutionContext.count
 cudnn.engines.ExecutionContext.handle
 cudnn.engines.ExecutionContext.index
@@ -1500,6 +1513,7 @@ cudnn.pygraph.gen_index
 cudnn.pygraph.genstats
 cudnn.pygraph.get_behavior_notes
 cudnn.pygraph.get_behavior_notes_for_plan_at_index
+cudnn.pygraph.get_context_size
 cudnn.pygraph.get_cuda_graph_retention
 cudnn.pygraph.get_engine_and_knobs_at_index
 cudnn.pygraph.get_execution_plan_count
