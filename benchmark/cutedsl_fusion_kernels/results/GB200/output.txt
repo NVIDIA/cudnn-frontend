@@ -1,16 +1,16 @@
 device: NVIDIA GB200
 shape: experts=8, tokens/expert=4096, M=32768, K=8192, N=4096
 dtype: torch.bfloat16
-torch: 2.12.0a0+5aff3928d8.nv26.05
-transformer_engine: 2.15.0+42b84005
-nvidia-cudnn-frontend: 1.23.0
-nvidia-cutlass-dsl: 4.4.1
+torch: 2.13.0a0+9186a08b2c.nv26.07
+transformer_engine: 2.17.0+2e559f06
+nvidia-cudnn-frontend: 1.33.0
+nvidia-cutlass-dsl: 4.8.1
 
 summary:
 activation   cudnn_ms      te_ms   te/cudnn
-swiglu          1.504      1.849      1.23x
-dswiglu         0.820      1.662      2.03x
-srelu           0.748      1.020      1.36x
-dsrelu          0.771      1.316      1.71x
-geglu           1.519      1.851      1.22x
-dgeglu          0.835      1.801      2.16x
+swiglu          1.460      1.878      1.29x
+dswiglu         0.855      1.670      1.95x
+srelu           0.752      0.984      1.31x
+dsrelu          0.750      1.301      1.73x
+geglu           1.515      1.875      1.24x
+dgeglu          0.876      1.782      2.04x

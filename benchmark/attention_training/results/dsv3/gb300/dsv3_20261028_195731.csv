@@ -1,0 +1,261 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,layout,thd_min_fill,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops,backend_detail
+dsv3,dsv3,cudnn,bfloat16,top_left,2,32768,32768,128,128,192,128,fwd,False,43.343,2029.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,False,178.732,1280.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,True,176.625,1295.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,32768,32768,128,128,192,128,fwd,False,87.702,2006.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,False,364.267,1256.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,True,354.729,1289.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,32768,32768,128,128,192,128,fwd,False,25.868,3400.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,32768,32768,128,128,192,128,bwd,False,95.348,2399.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,32768,32768,128,128,192,128,bwd,True,94.881,2410.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,32768,32768,128,128,192,128,fwd,False,52.097,3377.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,32768,32768,128,128,192,128,bwd,False,187.800,2436.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,32768,32768,128,128,192,128,bwd,True,189.203,2417.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,32768,32768,128,128,192,128,fwd,False,29.596,2972.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,32768,32768,128,128,192,128,bwd,False,118.206,1935.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,32768,32768,128,128,192,128,bwd,True,117.656,1944.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,32768,32768,128,128,192,128,fwd,False,58.156,3025.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,32768,32768,128,128,192,128,bwd,False,230.374,1985.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,32768,32768,128,128,192,128,bwd,True,229.986,1989.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,32768,32768,128,128,192,128,fwd,False,45.080,1951.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,False,191.458,1195.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,True,192.042,1191.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,32768,32768,128,128,192,128,fwd,False,88.811,1981.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,False,373.201,1226.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,True,373.539,1224.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,fp8,top_left,2,32768,32768,128,128,192,128,fwd,False,25.301,3477.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,fp8,no_mask,2,32768,32768,128,128,192,128,fwd,False,49.295,3569.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,top_left,2,32768,32768,128,128,192,128,fwd,False,28.689,3066.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,no_mask,2,32768,32768,128,128,192,128,fwd,False,55.751,3156.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,32768,32768,128,128,192,128,fwd,False,43.615,2017.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,False,178.044,1285.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,True,176.292,1297.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,32768,32768,128,128,192,128,fwd,False,86.749,2028.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,False,364.100,1256.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,True,354.855,1289.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,32768,32768,128,128,192,128,fwd,False,25.790,3411.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,32768,32768,128,128,192,128,bwd,False,94.810,2412.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,32768,32768,128,128,192,128,bwd,True,94.991,2408.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,32768,32768,128,128,192,128,fwd,False,52.398,3357.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,32768,32768,128,128,192,128,bwd,False,186.972,2446.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,32768,32768,128,128,192,128,bwd,True,189.405,2415.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,32768,32768,128,128,192,128,fwd,False,29.279,3004.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,32768,32768,128,128,192,128,bwd,False,117.858,1941.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,32768,32768,128,128,192,128,bwd,True,117.954,1939.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,32768,32768,128,128,192,128,fwd,False,58.679,2998.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,32768,32768,128,128,192,128,bwd,False,230.789,1982.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,32768,32768,128,128,192,128,bwd,True,230.505,1984.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,32768,32768,128,128,192,128,fwd,False,45.823,1920.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,False,183.581,1246.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,32768,32768,128,128,192,128,bwd,True,192.722,1187.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,32768,32768,128,128,192,128,fwd,False,88.595,1986.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,False,346.302,1321.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,32768,32768,128,128,192,128,bwd,True,366.123,1249.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,cudnn,bfloat16,top_left,2,16384,16384,128,128,192,128,fwd,False,10.979,2003.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,False,43.704,1308.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,True,42.869,1334.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,16384,16384,128,128,192,128,fwd,False,21.144,2080.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,False,89.143,1283.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,True,85.296,1341.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,16384,16384,128,128,192,128,fwd,False,6.615,3325.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,16384,16384,128,128,192,128,bwd,False,23.303,2454.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,16384,16384,128,128,192,128,bwd,True,23.609,2422.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,16384,16384,128,128,192,128,fwd,False,12.653,3476.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,16384,16384,128,128,192,128,bwd,False,44.226,2586.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,16384,16384,128,128,192,128,bwd,True,44.200,2587.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,16384,16384,128,128,192,128,fwd,False,7.353,2991.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,16384,16384,128,128,192,128,bwd,False,29.335,1949.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,16384,16384,128,128,192,128,bwd,True,29.065,1967.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,16384,16384,128,128,192,128,fwd,False,14.232,3090.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,16384,16384,128,128,192,128,bwd,False,55.230,2070.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,16384,16384,128,128,192,128,bwd,True,55.504,2060.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,16384,16384,128,128,192,128,fwd,False,11.409,1928.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,False,45.348,1261.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,True,45.452,1258.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,16384,16384,128,128,192,128,fwd,False,21.296,2065.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,False,90.339,1266.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,True,90.061,1270.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,fp8,top_left,2,16384,16384,128,128,192,128,fwd,False,6.560,3352.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,fp8,no_mask,2,16384,16384,128,128,192,128,fwd,False,12.118,3629.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,top_left,2,16384,16384,128,128,192,128,fwd,False,7.293,3015.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,no_mask,2,16384,16384,128,128,192,128,fwd,False,13.749,3199.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,16384,16384,128,128,192,128,fwd,False,10.938,2011.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,False,43.662,1310.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,True,42.109,1358.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,16384,16384,128,128,192,128,fwd,False,21.070,2087.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,False,88.799,1288.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,True,85.619,1336.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,16384,16384,128,128,192,128,fwd,False,6.606,3329.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,16384,16384,128,128,192,128,bwd,False,24.475,2336.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,16384,16384,128,128,192,128,bwd,True,23.564,2427.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,16384,16384,128,128,192,128,fwd,False,12.707,3461.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,16384,16384,128,128,192,128,bwd,False,44.956,2544.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,16384,16384,128,128,192,128,bwd,True,44.762,2555.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,16384,16384,128,128,192,128,fwd,False,7.361,2988.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,16384,16384,128,128,192,128,bwd,False,29.463,1941.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,16384,16384,128,128,192,128,bwd,True,29.360,1948.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,16384,16384,128,128,192,128,fwd,False,14.229,3091.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,16384,16384,128,128,192,128,bwd,False,55.219,2071.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,16384,16384,128,128,192,128,bwd,True,55.926,2045.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,16384,16384,128,128,192,128,fwd,False,11.570,1901.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,False,45.894,1246.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,16384,16384,128,128,192,128,bwd,True,48.381,1182.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,16384,16384,128,128,192,128,fwd,False,20.864,2108.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,False,87.677,1304.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,16384,16384,128,128,192,128,bwd,True,91.921,1244.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,cudnn,bfloat16,top_left,2,8192,8192,128,128,192,128,fwd,False,2.967,1853.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,False,11.139,1283.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,True,10.843,1318.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,8192,8192,128,128,192,128,fwd,False,5.347,2056.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,False,21.517,1329.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,True,21.008,1361.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,8192,8192,128,128,192,128,fwd,False,1.748,3146.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,8192,8192,128,128,192,128,bwd,False,6.161,2320.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,8192,8192,128,128,192,128,bwd,True,6.165,2319.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,8192,8192,128,128,192,128,fwd,False,3.213,3422.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,8192,8192,128,128,192,128,bwd,False,11.146,2565.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,8192,8192,128,128,192,128,bwd,True,11.173,2559.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,8192,8192,128,128,192,128,fwd,False,1.941,2833.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,8192,8192,128,128,192,128,bwd,False,7.824,1827.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,8192,8192,128,128,192,128,bwd,True,7.822,1828.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,8192,8192,128,128,192,128,fwd,False,3.562,3087.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,8192,8192,128,128,192,128,bwd,False,13.919,2054.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,8192,8192,128,128,192,128,bwd,True,13.901,2056.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,8192,8192,128,128,192,128,fwd,False,3.084,1783.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,False,11.678,1224.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,True,11.669,1225.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,8192,8192,128,128,192,128,fwd,False,5.334,2061.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,False,21.605,1323.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,True,21.549,1327.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,fp8,top_left,2,8192,8192,128,128,192,128,fwd,False,1.727,3183.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,fp8,no_mask,2,8192,8192,128,128,192,128,fwd,False,3.100,3547.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,top_left,2,8192,8192,128,128,192,128,fwd,False,1.929,2850.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,no_mask,2,8192,8192,128,128,192,128,fwd,False,3.452,3185.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,8192,8192,128,128,192,128,fwd,False,2.945,1867.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,False,11.116,1286.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,True,10.847,1318.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,8192,8192,128,128,192,128,fwd,False,5.313,2069.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,False,21.318,1341.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,True,20.633,1386.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,8192,8192,128,128,192,128,fwd,False,1.748,3145.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,8192,8192,128,128,192,128,bwd,False,6.164,2319.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,8192,8192,128,128,192,128,bwd,True,6.162,2320.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,8192,8192,128,128,192,128,fwd,False,3.213,3422.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,8192,8192,128,128,192,128,bwd,False,11.364,2516.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,8192,8192,128,128,192,128,bwd,True,11.112,2573.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,8192,8192,128,128,192,128,fwd,False,1.940,2834.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,8192,8192,128,128,192,128,bwd,False,7.808,1831.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,8192,8192,128,128,192,128,bwd,True,7.809,1831.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,8192,8192,128,128,192,128,fwd,False,3.561,3088.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,8192,8192,128,128,192,128,bwd,False,13.924,2053.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,8192,8192,128,128,192,128,bwd,True,13.873,2061.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,8192,8192,128,128,192,128,fwd,False,3.096,1776.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,False,12.100,1181.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,8192,8192,128,128,192,128,bwd,True,12.651,1130.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,8192,8192,128,128,192,128,fwd,False,5.312,2070.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,False,21.349,1339.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,8192,8192,128,128,192,128,bwd,True,22.632,1263.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,cudnn,bfloat16,top_left,2,4096,4096,128,128,192,128,fwd,False,0.842,1633.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,False,3.137,1139.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,True,3.032,1179.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,4096,4096,128,128,192,128,fwd,False,1.385,1985.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,False,5.609,1274.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,True,5.614,1273.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,4096,4096,128,128,192,128,fwd,False,0.490,2805.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,4096,4096,128,128,192,128,bwd,False,1.793,1994.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,4096,4096,128,128,192,128,bwd,True,1.793,1994.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,4096,4096,128,128,192,128,fwd,False,0.826,3330.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,4096,4096,128,128,192,128,bwd,False,2.963,2412.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,4096,4096,128,128,192,128,bwd,True,2.960,2415.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,4096,4096,128,128,192,128,fwd,False,0.544,2528.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,4096,4096,128,128,192,128,bwd,False,2.314,1545.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,4096,4096,128,128,192,128,bwd,True,2.316,1544.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,4096,4096,128,128,192,128,fwd,False,0.916,3000.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,4096,4096,128,128,192,128,bwd,False,3.680,1942.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,4096,4096,128,128,192,128,bwd,True,3.681,1942.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,4096,4096,128,128,192,128,fwd,False,0.888,1548.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,False,3.188,1121.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,True,3.188,1121.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,4096,4096,128,128,192,128,fwd,False,1.390,1978.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,False,5.513,1296.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,True,5.519,1295.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,fp8,top_left,2,4096,4096,128,128,192,128,fwd,False,0.493,2788.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,fp8,no_mask,2,4096,4096,128,128,192,128,fwd,False,0.813,3382.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,top_left,2,4096,4096,128,128,192,128,fwd,False,0.550,2500.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,no_mask,2,4096,4096,128,128,192,128,fwd,False,0.896,3068.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,4096,4096,128,128,192,128,fwd,False,0.842,1633.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,False,3.136,1140.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,True,3.033,1179.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,4096,4096,128,128,192,128,fwd,False,1.395,1970.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,False,5.601,1276.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,True,5.628,1270.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,4096,4096,128,128,192,128,fwd,False,0.491,2802.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,4096,4096,128,128,192,128,bwd,False,1.792,1995.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,4096,4096,128,128,192,128,bwd,True,1.791,1996.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,4096,4096,128,128,192,128,fwd,False,0.824,3335.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,4096,4096,128,128,192,128,bwd,False,2.960,2415.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,4096,4096,128,128,192,128,bwd,True,2.959,2415.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,4096,4096,128,128,192,128,fwd,False,0.543,2531.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,4096,4096,128,128,192,128,bwd,False,2.310,1548.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,4096,4096,128,128,192,128,bwd,True,2.314,1545.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,4096,4096,128,128,192,128,fwd,False,0.916,3000.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,4096,4096,128,128,192,128,bwd,False,3.681,1942.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,4096,4096,128,128,192,128,bwd,True,3.682,1941.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,4096,4096,128,128,192,128,fwd,False,0.880,1562.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,False,3.480,1027.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,4096,4096,128,128,192,128,bwd,True,3.633,984.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,4096,4096,128,128,192,128,fwd,False,1.390,1977.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,False,5.650,1265.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,4096,4096,128,128,192,128,bwd,True,5.984,1194.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,cudnn,bfloat16,top_left,2,2048,2048,128,128,192,128,fwd,False,0.261,1316.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,False,0.979,913.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,True,0.942,949.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.381,1802.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,False,1.602,1115.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,True,1.548,1154.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,2048,2048,128,128,192,128,fwd,False,0.150,2298.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,2048,2048,128,128,192,128,bwd,False,0.588,1520.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,top_left,2,2048,2048,128,128,192,128,bwd,True,0.587,1521.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.224,3068.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,2048,2048,128,128,192,128,bwd,False,0.847,2110.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,fp8,no_mask,2,2048,2048,128,128,192,128,bwd,True,0.849,2106.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,2048,2048,128,128,192,128,fwd,False,0.166,2072.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,2048,2048,128,128,192,128,bwd,False,0.775,1153.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,top_left,2,2048,2048,128,128,192,128,bwd,True,0.775,1153.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.251,2736.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,2048,2048,128,128,192,128,bwd,False,1.064,1680.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn,mxfp8,no_mask,2,2048,2048,128,128,192,128,bwd,True,1.065,1678.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,2048,2048,128,128,192,128,fwd,False,0.279,1230.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,False,0.981,911.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,True,0.982,910.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.384,1788.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,"sdpa_fwd_prefill_sm100[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,False,1.526,1171.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,True,1.524,1172.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,sdpa_bwd_sm100_d256
+dsv3,dsv3,cudnn_oss,fp8,top_left,2,2048,2048,128,128,192,128,fwd,False,0.154,2229.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,fp8,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.224,3069.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_fp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,top_left,2,2048,2048,128,128,192,128,fwd,False,0.173,1987.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=2, SPLIT_KV=1, TILE_CGA_M=1, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_oss,mxfp8,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.247,2779.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,"sdpa_fwd_prefill_sm100_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128, TILE_N=128]"
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,2048,2048,128,128,192,128,fwd,False,0.261,1318.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,False,0.979,913.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,True,0.943,948.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.382,1800.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng10_k24=1_k27=1_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,False,1.600,1117.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k24=2_k27=0_k38=0_k40=2_k41=2
+dsv3,dsv3,cudnn_auto,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,True,1.551,1152.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,2048,2048,128,128,192,128,fwd,False,0.150,2299.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,2048,2048,128,128,192,128,bwd,False,0.587,1522.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,top_left,2,2048,2048,128,128,192,128,bwd,True,0.587,1523.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.224,3074.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,2048,2048,128,128,192,128,bwd,False,0.847,2110.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,fp8,no_mask,2,2048,2048,128,128,192,128,bwd,True,0.847,2110.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,2048,2048,128,128,192,128,fwd,False,0.166,2069.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,2048,2048,128,128,192,128,bwd,False,0.775,1154.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,top_left,2,2048,2048,128,128,192,128,bwd,True,0.775,1153.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.251,2736.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng10_k24=1_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,2048,2048,128,128,192,128,bwd,False,1.065,1678.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,cudnn_auto,mxfp8,no_mask,2,2048,2048,128,128,192,128,bwd,True,1.064,1679.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,5155.000,eng5_k14=2_k24=2_k27=0_k38=0_k40=3_k41=2
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,2048,2048,128,128,192,128,fwd,False,0.276,1246.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,False,1.110,805.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,top_left,2,2048,2048,128,128,192,128,bwd,True,1.158,772.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,2048,2048,128,128,192,128,fwd,False,0.391,1757.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,False,1.629,1097.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
+dsv3,dsv3,flash_attention_4,bfloat16,no_mask,2,2048,2048,128,128,192,128,bwd,True,1.702,1050.000,0.000,20,,bshd,,True,False,,NVIDIA GB300,1.33.0,92800.000,2578.000,
