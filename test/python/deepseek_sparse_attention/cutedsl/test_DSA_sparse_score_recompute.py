@@ -432,6 +432,7 @@ def test_DSA_sparse_score_recompute_disjoint_check_ignores_empty_views():
 def test_DSA_sparse_score_recompute_disjoint_binding_cache_tracks_metadata_without_retaining_storage():
     """The hot-path cache hits only for the same live binding and owns no caller storage."""
     from cudnn.deepseek_sparse_attention.score_recompute.api import _ScoreRecomputeBase
+    from cudnn.tensor_adapter import get_version
 
     class ConcreteScoreRecompute(_ScoreRecomputeBase):
         def check_support(self):
@@ -477,10 +478,28 @@ def test_DSA_sparse_score_recompute_disjoint_binding_cache_tracks_metadata_witho
     reader.set_(storage, 0, (2, 4), (1, 2))
     assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
 
+    # Assigning .data can rebind storage without incrementing the mutation
+    # counter. The cache must still miss and run the exact overlap check.
+    reader = torch.empty(8)
+    tensors = (("out", out), ("reader", reader))
+    binding = _ScoreRecomputeBase._make_sparse_score_disjoint_binding(tensors)
+    cached_version = binding[1][1]
+    reader.data = out
+    assert get_version(reader) == cached_version
+    assert not _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
+    plan = ConcreteScoreRecompute()
+    plan._sparse_score_disjoint_binding = binding
+    with pytest.raises(ValueError, match=r"out must not alias reader"):
+        plan._check_sparse_score_disjoint_binding(out, (("reader", reader),))
+
     reader.set_(storage, 0, (8,), (1,))
     binding = _ScoreRecomputeBase._make_sparse_score_disjoint_binding(tensors)
     storage_ref = weakref.ref(storage)
     storage.resize_(storage.nbytes() + 16)
+    plan = ConcreteScoreRecompute()
+    plan._sparse_score_disjoint_binding = binding
+    plan._check_sparse_score_disjoint_binding(out, (("reader", reader),))
+    binding = plan._sparse_score_disjoint_binding
     assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
 
     tensor_ref = binding[1][0]
@@ -503,8 +522,10 @@ def test_DSA_sparse_score_recompute_disjoint_binding_cache_tracks_metadata_witho
     original_nbytes = storage.nbytes()
     storage.resize_(original_nbytes // 2)
     storage.resize_(original_nbytes)
-    assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(binding, tensors)
-    ConcreteScoreRecompute()._check_sparse_score_disjoint_binding(out, (("reader", reader),))
+    plan = ConcreteScoreRecompute()
+    plan._sparse_score_disjoint_binding = binding
+    plan._check_sparse_score_disjoint_binding(out, (("reader", reader),))
+    assert _ScoreRecomputeBase._sparse_score_disjoint_binding_matches(plan._sparse_score_disjoint_binding, tensors)
 
 
 @pytest.mark.L0

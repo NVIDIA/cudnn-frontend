@@ -167,9 +167,9 @@ class _ScoreRecomputeBase(APIBase):
     def __init__(self):
         super().__init__()
         # The live dtype/device/shape checks run on every execute.  Tensor
-        # identity plus PyTorch's mutation counter covers set_, storage-offset,
-        # and stride changes without re-walking storage metadata on every
-        # launch.  Weak references do not retain caller tensors or storage.
+        # identity, PyTorch's mutation counter, and live pointer/offset/stride
+        # metadata cover both set_ mutations and .data storage rebinding.
+        # Weak references do not retain caller tensors or storage.
         # Resizing a storage may move its base, but cannot make two distinct
         # live storages overlap; same-storage views retain their relative spans.
         self._sparse_score_disjoint_binding = None
@@ -208,7 +208,7 @@ class _ScoreRecomputeBase(APIBase):
     def _sparse_score_disjoint_binding_matches(binding, tensors) -> bool:
         if binding is None or len(binding) != len(tensors):
             return False
-        for cached, (_, tensor) in zip(binding, tensors):
+        for cached, (_, tensor) in zip(binding, tensors, strict=True):
             if tensor is None:
                 if cached is not None:
                     return False
@@ -217,15 +217,17 @@ class _ScoreRecomputeBase(APIBase):
                 return False
             if cached[0]() is not tensor or cached[1] != get_version(tensor):
                 return False
+            if cached[2:] != (int(tensor.data_ptr()), int(tensor.storage_offset()), tuple(tensor.stride())):
+                return False
         return True
 
     @staticmethod
     def _refresh_sparse_score_disjoint_binding(binding, tensors):
-        """Refresh value-only version bumps, inspecting metadata only for changed tensors."""
+        """Refresh value-only version bumps after verifying every live tensor layout."""
         if binding is None or len(binding) != len(tensors):
             return None
         refreshed = list(binding)
-        for index, (cached, (_, tensor)) in enumerate(zip(binding, tensors)):
+        for index, (cached, (_, tensor)) in enumerate(zip(binding, tensors, strict=True)):
             if tensor is None:
                 if cached is not None:
                     return None
@@ -233,8 +235,6 @@ class _ScoreRecomputeBase(APIBase):
             if cached is None or cached[0]() is not tensor:
                 return None
             version = get_version(tensor)
-            if cached[1] == version:
-                continue
             updated = (
                 cached[0],
                 version,
