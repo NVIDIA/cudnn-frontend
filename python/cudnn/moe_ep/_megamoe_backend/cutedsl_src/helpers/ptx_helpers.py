@@ -20,7 +20,7 @@ def _address_value(pointer_or_address, *, loc=None, ip=None):
 
 @dsl_user_op
 def nanosleep(sleep_cycles: int, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> None:
-    """Suspend the calling thread for up to the requested clock cycles."""
+    """Suspend the calling thread for approximately the requested nanoseconds."""
     if cutlass.const_expr(hasattr(cute.arch, "nanosleep")):
         cute.arch.nanosleep(sleep_time=sleep_cycles, loc=loc, ip=ip)
         return
@@ -59,6 +59,16 @@ def read_clock64(*, loc: Optional[ir.Location] = None, ip: Optional[ir.Insertion
     return Int64(
         llvm.inline_asm(
             T.i64(), [], "mov.u64 $0, %clock64;", "=l", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip
+        )
+    )
+
+
+@dsl_user_op
+def read_globaltimer_ns(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> cutlass.Uint64:
+    """Read the 64-bit global nanosecond timer, independent of SM clock rate."""
+    return cutlass.Uint64(
+        llvm.inline_asm(
+            T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip
         )
     )
 
@@ -735,6 +745,7 @@ __all__ = [
     "movmatrix_b16",
     "nanosleep",
     "read_clock64",
+    "read_globaltimer_ns",
     "red_add_relaxed_sys_f32",
     "red_add_relaxed_sys_s32",
     "red_add_relaxed_sys_v2_bf16x2",

@@ -11,7 +11,10 @@
 # updated hashes on 4c28aaa4a in two fresh processes each. Restoring only _correction_warp_group from c1d1ead6e on
 # the current tree restores all three old hashes; the packed-Stats register budget stays in place for that control.
 # dense_bf16_nolse is unchanged. These probes compile fake pointers without a GPU; runtime qualification is separate.
+# Re-recorded for the common service-warpgroup register release. Same-toolchain parent
+# renders reproduce all prior records under public DSL 4.8.0 / CUDA 13.4; the four
+# role-local release sites become one common site, with unchanged register budgets.
 dsl=nvidia-cutlass-dsl 4.8.0
-fwd_d128_f16 sm_107a dense_bf16 rc=0 cubin_md5=4aa4968e22c9a74eb39876c9cf55aa67
-fwd_d128_f16 sm_107a causal_f16 rc=0 cubin_md5=c35b1f3d1cc2086d6c7de612e48258cb
-fwd_d128_f16 sm_107a dense_bf16_nolse rc=0 cubin_md5=700b7b701542d075666670f3ebb572b0
+fwd_d128_f16 sm_107a dense_bf16 rc=0 cubin_md5=98979b5c55b8940781a7cb6024ce5eaf
+fwd_d128_f16 sm_107a causal_f16 rc=0 cubin_md5=04e6e5f99ed3e0cb352ffe1370ff49fc
+fwd_d128_f16 sm_107a dense_bf16_nolse rc=0 cubin_md5=bf772e6171f0662c75bdad91c3c6f7f9

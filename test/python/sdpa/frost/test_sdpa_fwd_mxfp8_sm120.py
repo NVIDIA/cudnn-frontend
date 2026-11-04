@@ -38,6 +38,7 @@ from typing import NamedTuple, Optional
 
 import pytest
 import torch
+import cudnn
 
 from test_utils import torch_fork_set_rng
 
@@ -132,17 +133,16 @@ def _nan_output(shape, dtype):
     return torch.full(shape, float("nan"), device="cuda").to(dtype)
 
 
-def _padded_pitch(x):
-    """A BHSD view over BSHD storage whose head pitch is D + 1 elements: BSHD order, but strides the
-    prepared binder cannot address, so the plan stages compact copies."""
+def _padded_pitch(x, padding=16):
+    """A BHSD view over BSHD storage with a padded physical head pitch."""
     b, h, s, d = x.shape
-    view = torch.full((b, s, h, d + 1), float("nan"), device=x.device).to(x.dtype)[..., :d].transpose(1, 2)
+    view = torch.full((b, s, h, d + padding), float("nan"), device=x.device).to(x.dtype)[..., :d].transpose(1, 2)
     view.copy_(x)
     return view
 
 
 # Storage orders for Q/K/V/O: a BHSD view holding ``x``'s values.
-_LAYOUTS = {"bshd": lambda x: x, "padded_pitch": _padded_pitch, "bhsd": lambda x: x.contiguous()}
+_LAYOUTS = {"bshd": lambda x: x, "padded_pitch": _padded_pitch, "unaligned_pitch": lambda x: _padded_pitch(x, 1), "bhsd": lambda x: x.contiguous()}
 
 
 def _sf_tensor(g, dims):
@@ -636,11 +636,15 @@ def test_mxfp8_sm120_split_kv_graph_head_dims(d_qk, d_v):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("layout", ["padded_pitch", "bhsd"])
+@pytest.mark.parametrize("layout", ["padded_pitch", "bhsd", "unaligned_pitch"])
 @pytest.mark.parametrize("out_dt", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "e4m3"])
 @torch_fork_set_rng(seed=113)
-def test_mxfp8_sm120_graph_conversion_layout(layout, out_dt):
-    """Q/K/V/O with a D + 1 head pitch, or head-major (BHSD) storage."""
+def test_mxfp8_sm120_graph_native_layout(layout, out_dt):
+    """Aligned padded and BHSD layouts bind natively; byte-unaligned pitches decline."""
+    if layout == "unaligned_pitch":
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=r"q: native dense forward.*16-byte outer-stride alignment"):
+            _run(2, 4, 2, 200, 330, out_dt=out_dt, layout=layout, sdpa_kwargs=_MASKS["causal"])
+        return
     _check(_run(2, 4, 2, 200, 330, out_dt=out_dt, layout=layout, sdpa_kwargs=_MASKS["causal"]))
 
 
@@ -734,11 +738,14 @@ def test_mxfp8_sm120_d512_no_stats():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("layout", ["padded_pitch", "bhsd"])
+@pytest.mark.parametrize("layout", ["padded_pitch", "bhsd", "unaligned_pitch"])
 @torch_fork_set_rng(seed=230)
-def test_mxfp8_sm120_d512_conversion_layout(layout):
-    """Q/K/V/O with a D + 1 head pitch, or head-major (BHSD) storage, through the staged copies around the
-    d512 flavor; an fp8 O exercises the strided copy-back of the quantized output."""
+def test_mxfp8_sm120_d512_native_layout(layout):
+    """D512 writes quantized output through native aligned padded or BHSD strides."""
+    if layout == "unaligned_pitch":
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=r"q: native dense forward.*16-byte outer-stride alignment"):
+            _run(1, 4, 2, 65, 193, d_qk=512, out_dt=torch.float8_e4m3fn, layout=layout, sdpa_kwargs=_MASKS["causal"])
+        return
     _check(_run(1, 4, 2, 65, 193, d_qk=512, out_dt=torch.float8_e4m3fn, layout=layout, sdpa_kwargs=_MASKS["causal"]), d_qk=512)
 
 

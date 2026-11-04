@@ -91,6 +91,7 @@ def test_paged_rowmax_architecture_replay(dtype, packed):
     else:
         assert route.endswith("sm100/prefill_d128_f16.py"), route
         assert bool(api._k_mod.FUSED_LDTM_STAT) == (cc == (10, 3))
+        assert api._k_mod._D128_PAGED_JOINT_ROW_MAX == (cc == (10, 0) and dtype == torch.bfloat16 and packed)
     pack = {qn: q, kn: k, vn: v, on: o, sn: lse, tn: table, qln: qlens, kln: klens, qon: qo, son: so}
     workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
 

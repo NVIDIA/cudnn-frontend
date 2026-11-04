@@ -582,6 +582,63 @@ def test_qsa_select_preallocated_outputs_and_scratch():
 
 @needs_dsl_floor
 @needs_sm100_family
+def test_qsa_select_loose_cand_batch_offsets_are_bitwise_the_tight_prefix():
+    """The compact-logits scratch addresses every row of piece ``p`` at ``cand_batch_offsets[p] + G(q_pos0 + i) - G(q_pos0)`` and never
+    reads ``offsets[p + 1]``, so per-piece bases may be LOOSE -- ``base_{p + 1} = base_p + rows_p x n_blocks_max``, plan constants -- as
+    long as every row's region fits ``n_blocks_max`` floats.  Four pieces (37 rows from 0, 133 from 1024, 16 from 129000, 517 from 0) at
+    ``top_k`` 512: the loose-base call on a sentinel-filled scratch with a guard past the last slab selects the SAME sets and scores as the
+    tight-prefix call (``compress_topk_cand_buffer_size_thd``), the sentinel past every piece's compact region (exactly the tight size) and
+    the guard are untouched, and the selection matches the fp64 reference."""
+    import itertools
+
+    from cudnn import DSA
+
+    device = torch.device("cuda")
+    pieces = [(0, 37), (1024, 133), (129000, 16), (0, 517)]
+    pos0, lengths = [p for p, _ in pieces], [n for _, n in pieces]
+    n_blocks = max((p + n) // QSA_BLOCK_SIZE for p, n in pieces)
+    qi, kbar, cu = _inputs(lengths, n_blocks, device, seed=29)
+    q_pos0 = torch.tensor(pos0, dtype=torch.int32, device=device)
+    total = sum(lengths)
+    cu_k = torch.arange(len(lengths) + 1, dtype=torch.int32, device=device) * n_blocks
+    tight_offs, tight_floats = DSA.compress_topk_cand_buffer_size_thd(cu, cu_k, QSA_BLOCK_SIZE, q_pos0)
+    sentinel = 1.5e30
+    cand_tight = torch.full((tight_floats,), sentinel, dtype=torch.float32, device=device)
+    loose_offs = torch.tensor([0] + list(itertools.accumulate(n * n_blocks for n in lengths)), dtype=torch.int64, device=device)
+    guard = 4096
+    cand_loose = torch.full((int(loose_offs[-1]) + guard,), sentinel, dtype=torch.float32, device=device)
+
+    def run(cand, offs):
+        ids = torch.full((total, QSA_TOP_K), -7, dtype=torch.int32, device=device)
+        scores = torch.full((total, QSA_TOP_K), 3.0, dtype=torch.float32, device=device)
+        qsa_select_forward(
+            qi, kbar, cu, q_pos0=q_pos0, max_seqlen_q=max(lengths), block_ids_out=ids, scores_out=scores, cand_buffer=cand, cand_batch_offsets=offs
+        )
+        return ids, scores
+
+    ids_t, sc_t = run(cand_tight, tight_offs)
+    ids_l, sc_l = run(cand_loose, loose_offs)
+    torch.cuda.synchronize()
+    assert torch.equal(torch.sort(ids_t).values, torch.sort(ids_l).values), "the loose-base selection differs from the tight-prefix one"
+    assert torch.equal(torch.sort(sc_t).values, torch.sort(sc_l).values)
+    ref = _qsa_reference(qi, kbar, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
+    _assert_selection(ids_l, sc_l, ref, QSA_TOP_K)
+
+    def G(n):  # sum_{m <= n} floor(m / 4): the compact layout's row prefix
+        q, r = n // QSA_BLOCK_SIZE, n % QSA_BLOCK_SIZE
+        return QSA_BLOCK_SIZE * q * (q - 1) // 2 + q * (r + 1)
+
+    for p, (p0, n) in enumerate(pieces):
+        used = G(p0 + n) - G(p0)
+        base, nxt = int(loose_offs[p]), int(loose_offs[p + 1])
+        assert used == int(tight_offs[p + 1] - tight_offs[p]) <= n * n_blocks
+        assert bool((cand_loose[base + used : nxt] == sentinel).all()), f"piece {p}: the scorer wrote past its compact region"
+        assert not bool((cand_loose[base : base + used] == sentinel).all()), f"piece {p}: the scorer wrote nothing into its region"
+    assert bool((cand_loose[int(loose_offs[-1]) :] == sentinel).all()), "the guard past the last slab was written"
+
+
+@needs_dsl_floor
+@needs_sm100_family
 def test_qsa_select_on_an_explicit_stream_with_a_cold_weight_bucket_matches_the_synchronised_selection():
     """The delayed-producer pin with the REAL scorer: one dense 256-token sequence over 64 compressed keys, top_k 16 (every row past
     token 66 sees more blocks than the list holds, so the selection is a real one), preallocated outputs and scratch (the CUDA-graph form:

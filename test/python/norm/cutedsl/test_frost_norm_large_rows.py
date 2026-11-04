@@ -91,9 +91,6 @@ from cudnn.norm import NormVariant, norm_bprop, norm_fprop  # noqa: E402
 
 LN, RMS = NormVariant.LAYER_NORM, NormVariant.RMS_NORM
 CGA_F = "layernorm_cga_sm100"
-# Relative tolerances: the reductions here are over 16K-128K elements, so the fp32
-# reference and the kernel accumulate in different orders over a long chain.
-TOL = {torch.float32: 1e-5, torch.float16: 6e-2, torch.bfloat16: 1.5e-1}
 SMALL = [torch.float32, torch.float16, torch.bfloat16]
 BIG = [torch.float16, torch.bfloat16]  # fp32 at these sizes is several GB with the ref
 
@@ -153,7 +150,12 @@ def _check(name, got, ref, dtype):
         return True
     amax = (got.float() - ref.float()).abs().max().item()
     scale = max(1.0, ref.float().abs().max().item())
-    ok = amax <= TOL[dtype] * scale
+    try:
+        torch.testing.assert_close(got, ref, check_dtype=False)
+        ok = True
+    except AssertionError as exc:
+        print(f"  {name}: {exc}")
+        ok = False
     print(f"  [{'PASS' if ok else 'FAIL'}] {name:<10} {str(dtype):>16} rel={amax / scale:.2e}")
     return ok
 
@@ -175,16 +177,20 @@ def _check_case(c, dtypes=None):
             b = torch.randn(D, device="cuda", dtype=dtype) if has_beta else None
             kw = dict(normalized_shape=[D])
 
-            with _record_dispatch() as seen:
-                y, mean, rstd = norm_fprop(variant, x, g, b, eps=1e-5, **kw)
-                dy = torch.randn_like(y)
-                dx, dgamma, dbeta = norm_bprop(variant, dy, x, g, mean, rstd, has_beta=has_beta, **kw)
-                torch.cuda.synchronize()
-
             xr = x.float().detach().requires_grad_(True)
             gr = g.float().detach().requires_grad_(True)
             br = b.float().detach().requires_grad_(True) if b is not None else None
             y_ref = F.layer_norm(xr, [D], gr, br, 1e-5) if has_beta else F.rms_norm(xr, [D], gr, eps=1e-5)
+            # Match the notebook loss, then use the same rounded DY in both backward paths.
+            loss = F.mse_loss(y_ref, torch.randn_like(x).float(), reduction="mean")
+            dy = torch.autograd.grad(loss, y_ref, retain_graph=True)[0].to(dtype)
+            del loss
+
+            with _record_dispatch() as seen:
+                y, mean, rstd = norm_fprop(variant, x, g, b, eps=1e-5, **kw)
+                dx, dgamma, dbeta = norm_bprop(variant, dy, x, g, mean, rstd, has_beta=has_beta, **kw)
+                torch.cuda.synchronize()
+
             ins = [t for t in (xr, gr, br) if t is not None]
             grads = torch.autograd.grad(y_ref, ins, grad_outputs=dy.float())
 

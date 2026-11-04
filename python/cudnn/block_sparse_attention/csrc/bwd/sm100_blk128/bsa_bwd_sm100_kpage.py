@@ -1897,8 +1897,9 @@ class BlockSparseAttnBackwardSm100KPage:
         thr_col_offset = tScS_t2r[0][col]
         seqlenk_col_limit = seqlen.seqlen_k - n_block * self.tile_n - thr_col_offset
         if seqlenk_col_limit <= 0:
+            # Applied to P after the exp2 (see compute_loop), so the fill is 0 rather than an S = -inf sentinel.
             for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                acc_S[i] = -cutlass.Float32.inf
+                acc_S[i] = cutlass.Float32(0.0)
 
     @cute.jit
     def compute_loop(
@@ -2057,31 +2058,11 @@ class BlockSparseAttnBackwardSm100KPage:
                 tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-                self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block, seqlen)
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    # S = -inf for non-adjacent pairs before the exp2, so P and
-                    # dS = P * (dP - dPsum) vanish there.
-                    if not all_pairs_valid:
-                        tScS_cur = tScS_t2r[None, stage, 0, 0]
-                        values_per_page = cute.size(tSrS_cur.shape) // 2
-                        q_page_0 = tScS_cur[0][1] // PAGE
-                        q_page_1 = tScS_cur[values_per_page][1] // PAGE
-                        bit_0 = Int64(8) * Int64(q_page_0) + Int64(kv_pg_slot)
-                        bit_1 = Int64(8) * Int64(q_page_1) + Int64(kv_pg_slot)
-                        keep_0 = cutlass.Boolean((pair_mask >> bit_0) & Int64(1))
-                        keep_1 = cutlass.Boolean((pair_mask >> bit_1) & Int64(1))
-                        for v in cutlass.range_constexpr(values_per_page):
-                            tSrS_cur[v] = tSrS_cur[v] if keep_0 else -Float32.inf
-                            tSrS_cur[v + values_per_page] = tSrS_cur[v + values_per_page] if keep_1 else -Float32.inf
-                    if const_expr(self.mask_rows):
-                        if not kv_row_valid:
-                            # padding kv row (block tail): no pair is valid
-                            for v in cutlass.range_constexpr(cute.size(tSrS_cur.shape)):
-                                tSrS_cur[v] = -Float32.inf
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
                     cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
                     tSrLSE = tSrLSE_s2r
@@ -2094,6 +2075,27 @@ class BlockSparseAttnBackwardSm100KPage:
                         )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                    # Non-adjacent pairs, K/V padding rows and rows past seqlen_k get P = 0, so dS = P * (dP - dPsum)
+                    # vanishes there too.  Zeroing P after the exp2 is exact for any softmax scale; an S = -inf
+                    # sentinel before it would turn into NaN / +inf for a zero or negative scale.
+                    if not all_pairs_valid:
+                        tScS_cur = tScS_t2r[None, stage, 0, 0]
+                        values_per_page = cute.size(tSrS_cur.shape) // 2
+                        q_page_0 = tScS_cur[0][1] // PAGE
+                        q_page_1 = tScS_cur[values_per_page][1] // PAGE
+                        bit_0 = Int64(8) * Int64(q_page_0) + Int64(kv_pg_slot)
+                        bit_1 = Int64(8) * Int64(q_page_1) + Int64(kv_pg_slot)
+                        keep_0 = cutlass.Boolean((pair_mask >> bit_0) & Int64(1))
+                        keep_1 = cutlass.Boolean((pair_mask >> bit_1) & Int64(1))
+                        for v in cutlass.range_constexpr(values_per_page):
+                            tSrS_cur[v] = tSrS_cur[v] if keep_0 else Float32(0.0)
+                            tSrS_cur[v + values_per_page] = tSrS_cur[v + values_per_page] if keep_1 else Float32(0.0)
+                    if const_expr(self.mask_rows):
+                        if not kv_row_valid:
+                            # padding kv row (block tail): no pair is valid
+                            for v in cutlass.range_constexpr(cute.size(tSrS_cur.shape)):
+                                tSrS_cur[v] = Float32(0.0)
+                    self.apply_seqlen_k_mask(tSrS_cur, tScS_t2r, n_block, seqlen)
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()

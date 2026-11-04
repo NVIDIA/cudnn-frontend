@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""XLA stream adapters for the existing SM100 blk128 kernels."""
+"""XLA stream adapters for the existing SM100/SM103 blk128 kernels."""
 
 import cutlass
 import cutlass.cute as cute

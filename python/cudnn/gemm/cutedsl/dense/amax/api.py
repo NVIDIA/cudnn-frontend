@@ -22,6 +22,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     framework_dtype,
     get_compute_capability,
+    has_tcgen05,
     get_shape,
     get_strides,
 )
@@ -319,8 +320,8 @@ class GemmAmaxSm100(APIBase):
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         self._runtime_error_if(
-            compute_capability < 100,
-            f"GemmAmax requires SM100+ compute capability, but found SM{compute_capability} on the current device",
+            not has_tcgen05(major),
+            f"GemmAmax requires SM100+ compute capability with tcgen05 (not cc 12.x), but found SM{compute_capability} on the current device",
         )
 
         self._kernel = Sm100BlockScaledPersistentDenseGemmKernel

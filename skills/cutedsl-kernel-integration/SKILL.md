@@ -36,4 +36,16 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 - Run focused formatting or tests for the files changed.
 - At minimum for skill-only edits, verify this `SKILL.md` has valid frontmatter and all referenced paths exist.
 - For kernel integrations, run the relevant `pytest test/python/<operation>/cutedsl/test_<operation>.py` target when the environment has the required GPU and optional dependencies; otherwise report the skipped verification explicitly.
+- For new or modified kernels and DSL upgrades, apply
+  [Rule 7](../../python/cudnn/AGENTS.md): qualify cu12 and cu13 separately at
+  the declared DSL floor and the newer supported version being tested, across
+  the claimed GPU architectures. Use isolated environments, fresh processes,
+  and empty per-flavor caches. Verify the loaded compiler's `CUDA_VERSION`
+  and native-library path; `CUDA_HOME` and `torch.version.cuda` are not proof.
+- Each supported lane must compile and execute the relevant forward/backward,
+  dtype, and boundary/tail tests with finite-output checks and unchanged
+  numerical tolerances. Test a clean pre-JIT rejection for unsupported lanes.
+  Record the exact revision, compiler/framework/backend versions, GPU/driver,
+  and pass/fail/skip counts in the PR; identify unavailable lanes and distinguish
+  DSL-only compatibility from a deployment using CUDA 12 throughout.
 - For architecture-dispatch work, also run `pytest test/python/gemm/cutedsl/test_rubin_kernel_dispatch.py`. On Rubin hardware, the existing FE API e2e tests for the affected operation should still pass without API changes.

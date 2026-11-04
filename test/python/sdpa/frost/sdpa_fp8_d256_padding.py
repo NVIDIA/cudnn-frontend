@@ -22,9 +22,9 @@ def _record_route(monkeypatch):
     seen = []
     load = api_dsl._load_kernel_template
 
-    def record(filename, params, tag):
+    def record(filename, params, tag, part=None):
         seen.append(filename)
-        return load(filename, params, tag)
+        return load(filename, params, tag, part=part)
 
     monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
     return seen

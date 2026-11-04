@@ -138,7 +138,7 @@ def native_components(inputs, backward_inputs, args):
 
     q, k, v = (inputs[name] for name in ("q", "k", "v"))
     lo, hi, first, last = (inputs[name] for name in ("lo", "hi", "block_first", "block_last"))
-    fprop, arch = api._implementation(q, "fprop")
+    fprop, arch = api._implementation(q, k, "fprop")
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     compact_args = (inputs["sel_blocks"], lo, hi, first, last)
     ids, counts = api._compact(*compact_args, arch, stream)
@@ -170,11 +170,12 @@ def native_components(inputs, backward_inputs, args):
     }
     if args.directions != "both":
         return result
-    bprop, _ = api._implementation(q, "bprop")
+    bprop, _ = api._implementation(q, k, "bprop")
     compiled = bprop.compile_kernel(cutlass.BFloat16, q.shape[1], k.shape[1], arch)
-    backward_ids, backward_counts = api._compact_backward(*compact_args, arch, stream, k.shape[1])
-    result["backward_compact_with_allocation"] = timed(lambda: api._compact_backward(*compact_args, arch, stream, k.shape[1]))
-    if arch in (100, 103) and k.shape[1] == 1:
+    heads = (q.shape[1], k.shape[1])
+    backward_ids, backward_counts = api._compact_backward(*compact_args, arch, stream, *heads)
+    result["backward_compact_with_allocation"] = timed(lambda: api._compact_backward(*compact_args, arch, stream, *heads))
+    if arch in (100, 103) and api.paired_backward(*heads):
         result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_group_kernel(arch, bprop.NQ, bprop.BLK_BITS))
     else:
         result["warm_backward_compact_compile_lookup"] = host_timed(lambda: _metadata.compile_kernel(arch))
