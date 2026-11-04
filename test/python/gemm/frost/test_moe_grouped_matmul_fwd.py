@@ -1421,7 +1421,7 @@ def test_moe_tma_store_uses_rank2_output_descriptor(major: str) -> None:
     the fixed-one batch dimension paid by ordinary batched GEMM. Besides being
     redundant in the descriptor, that extra coordinate selects UTMASTG.3D
     instead of UTMASTG.2D in SASS."""
-    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_c_plumbing, _tma_store_sequence
+    from cudnn.gemm.frost.sm100.compiler import _epi_n, _host_tma_c_descs, _tma_c_plumbing, _tma_store_sequence
 
     g = _build_graph(E=4, S=512, N=256, K=128)
     if major == "m":
