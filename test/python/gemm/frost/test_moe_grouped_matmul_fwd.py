@@ -154,6 +154,7 @@ def _build_graph(
     quant_scale_dim: tuple[int, int, int] | None = None,
     weight_major: str = "k",
     gather_rows: int | None = None,
+    quant_block_size: int = 32,
 ):
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -210,7 +211,7 @@ def _build_graph(
         R.set_dim(list(reduction_dims)).set_stride(list(stride))
         R.set_output(True).set_data_type(reduction_dt)
     if quant:
-        q, q_scale = g.block_scale_quantize(input=out, block_size=32, name="q")
+        q, q_scale = g.block_scale_quantize(input=out, block_size=quant_block_size, name="q")
         q.set_data_type(quant_out_dt).set_output(True)
         if quant_scale_dim is not None:
             q_scale.set_dim(list(quant_scale_dim)).set_stride([quant_scale_dim[1] * quant_scale_dim[2], quant_scale_dim[2], 1])
@@ -2089,6 +2090,57 @@ def test_moe_quant_scale_blob_admits_runtime_s_in_its_padding_sm120(gather, swap
     q_ref, scale_ref = _block_quant_ref(_ref_f32(routed, weight, offsets, call_s, call_n, E), bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
     torch.testing.assert_close(q_scale.float(), _to_blocked(scale_ref[0]).view_as(q_scale).float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("N", [256, 288], ids=["tma_drain", "stg_drain"])
+def test_moe_gather_nvfp4_reordered_row_scales_sm100(N):
+    """NVFP4 GATHER with F8_128x4 row scales on a 256-column tile, the packed FP4 output tensor dimensioned [1, S, N]:
+    its kernel argument must bind N // 2 bytes per row, as the undimensioned output does. N=256 drains through TMA;
+    N=288 drains a partial 32-column tile through STG, which used to stop at the packed-output shape check before
+    launch. Only the real scale slots are checked (N=288 ends each scale row two slots into its last quad)."""
+    E, K, bs = 2, 256, 16
+    source_rows, routed = 137, 259
+    blocks = N // bs
+    scale_shape = (1, _ceil_div(routed, 128) * 128, _ceil_div(blocks, 4) * 4)
+    graph = _build_graph(
+        E,
+        source_rows,
+        N,
+        K,
+        quant=True,
+        quant_out_dt=cudnn.data_type.FP4_E2M1,
+        quant_scale_dt=cudnn.data_type.FP8_E4M3,
+        quant_scale_reorder=True,
+        quant_scale_dim=scale_shape,
+        gather_rows=routed,
+        quant_block_size=bs,
+    )
+    compiled = _plan(graph, config=by_name("CONFIG_sm100_256x256x128_128x256x32_cluster1x1_1ctamma"))
+    assert compiled.chain.moe.mode == "gather"
+
+    torch.manual_seed(0)
+    token = torch.randint(-2, 3, (1, source_rows, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = _offsets([120, routed - 120], routed)
+    q = torch.zeros(1, routed, N // 2, dtype=torch.uint8, device="cuda")
+    q_scale = torch.full(scale_shape, 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    vp = _vp_moe(compiled, token, weight, offsets, [q, q_scale])
+    index = torch.randint(source_rows, (1, routed, 1), dtype=torch.int32, device="cuda")
+    vp[compiled.binding.token_index] = index
+    compiled(vp)
+    torch.cuda.synchronize()
+
+    ref = _ref_f32(token[:, index.flatten().long()], weight, offsets, routed, N, E)
+    scale_ref = (ref.view(1, routed, blocks, bs).abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
+    # Undo the F8_128x4 blocking (128-row x 4-column atoms, 32 x 16 bytes each) back to (rows, slots).
+    nrb, ncb = scale_shape[1] // 128, scale_shape[2] // 4
+    slots = q_scale.view(torch.uint8).view(nrb, ncb, 32, 4, 4).transpose(2, 3).reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3).reshape(nrb * 128, ncb * 4)
+    scales = slots[:routed, :blocks].view(torch.float8_e4m3fn).float()
+    torch.testing.assert_close(scales, scale_ref[0].float(), atol=0, rtol=0.07)
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device="cuda")
+    deq = torch.stack([lut[(q & 0xF).long()], lut[(q >> 4).long()]], dim=-1).view(1, routed, N) * scales.repeat_interleave(bs, dim=1)
+    assert ((deq - ref).abs() <= 0.34 * ref.abs() + 0.05 * ref.abs().amax()).float().mean().item() > 0.999
 
 
 @requires_matmul_gpu
