@@ -49,13 +49,6 @@ def fake_rows(dtype, *cols, rows=None, align=16):
     return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
 
 
-def fake_strided_vector(dtype, *, rows):
-    """A 1D FFI input with an independent runtime stride, including broadcast."""
-    import cutlass.cute as cute
-
-    return cute.runtime.make_fake_tensor(dtype, (rows,), (cute.sym_int(64),))
-
-
 def sm_count():
     """Multiprocessor count of the current device (cached)."""
     global _SM_COUNT
