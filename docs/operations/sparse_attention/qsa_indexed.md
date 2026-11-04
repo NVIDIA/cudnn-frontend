@@ -8,8 +8,8 @@ for block selection, bitmap training and the internal two-pass backend.
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
 12Q/1KV and 6Q/1KV (one KV head shared by twelve or six query heads) with head
-dimension 256 on SM100/SM103 (CuTeDSL >= 4.7) and
-SM107 (CuTeDSL >= 4.8 with native SM107 compiler support). The architecture
+dimension 256 on SM90 (H200), SM100/SM103, and SM107 with CuTeDSL >= 4.8.
+SM107 also requires native compiler support for that target. The architecture
 coverage here applies to forward and general-selection backward; the stricter
 `causal_topk` backward has the requirements listed below.
 
@@ -52,10 +52,10 @@ padded explicitly by the caller; this API does not silently convert it. Empty
 rows produce zero output/gradients and negative-infinity LSE. Selection is not
 differentiated. Pass the same selection and scale to forward and backward.
 
-A GPU hash table compacts the selected starts. The backward unions consecutive
-queries' starts (two at 12Q/1KV, four at 6Q/1KV) with owner bits, retaining each
+A GPU hash table compacts the selected starts. Hopper processes one query per
+compact-ID row. On Blackwell and Rubin, backward unions consecutive queries' starts (two at 12Q/1KV, four at 6Q/1KV) with owner bits, retaining each
 query's bounds and mask. Nonfinite K/V
-uses the device-side per-query fallback described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)). Every call
+on those batched paths uses the device-side per-query fallback described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)). Every call
 rebuilds metadata, including during CUDA Graph replay. Warm up before capture.
 
 The public wrappers allocate outputs and one workspace. The internal APIBase
@@ -113,8 +113,13 @@ Use `general` for arbitrary selections. Passing `cu_seqlens` or `max_seq_len`
 with `general` is rejected because that mode obtains its bounds from indices.
 The new keyword-only arguments preserve existing positional calls.
 
+On Hopper, `causal_topk` uses the general native backward kernel after the same
+input checks. It gets packed bounds from the supplied token indices and uses
+the general path's workspace. The two-pass backend remains specific to
+Blackwell.
+
 Sparse 12Q/1KV two-pass execution requires the **CUDA 13 CuTeDSL compiler** in
-addition to CuTeDSL >= 4.7 and SM100/SM103. A CUDA 13 PyTorch build alone does
+addition to CuTeDSL >= 4.8 and SM100/SM103. A CUDA 13 PyTorch build alone does
 not establish the DSL compiler version; unsupported compiler builds are
 rejected before kernel compilation. See two-pass details ([docs](/operations/sparse_attention/qsa/qsa_two_pass), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_two_pass.md))
 for the bounded records and workspace sizing. At 128K, 12Q/1KV uses about

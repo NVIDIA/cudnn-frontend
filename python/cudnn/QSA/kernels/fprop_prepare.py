@@ -21,7 +21,7 @@ TILE_M, MAX_SPAN = 128, 8192
 
 
 @cute.kernel
-def frost_qsa_scan_kv(k: cute.Tensor, v: cute.Tensor, partials: cute.Tensor):
+def frost_qsa_scan_kv(k: cute.Tensor, v: cute.Tensor, partials: cute.Tensor, range_safe: cutlass.Constexpr = False):
     tid = cute.arch.thread_idx()[0]
     block = cute.arch.block_idx()[0]
     bad = Int32(0)
@@ -32,6 +32,10 @@ def frost_qsa_scan_kv(k: cute.Tensor, v: cute.Tensor, partials: cute.Tensor):
             vb = Float32(v[index]).bitcast(Int32) & Int32(0x7F800000)
             if (kb == Int32(0x7F800000)) or (vb == Int32(0x7F800000)):
                 bad = Int32(1)
+            # Hopper uses BF16 probabilities in dense tiles; extreme V needs the FP32 gather path.
+            if cutlass.const_expr(range_safe):
+                if cute.math.abs(Float32(v[index])) > 1e30:
+                    bad = Int32(1)
     bad = cute.arch.warp_reduction_max(bad)
     if tid % 32 == 0:
         partials[Int64(block) * 4 + tid // 32] = bad
@@ -186,8 +190,9 @@ def prepare(
     counts,
     stream: cuda.CUstream,
     vectorized: cutlass.Constexpr = False,
+    range_safe: cutlass.Constexpr = False,
 ):
-    frost_qsa_scan_kv(k, v, partials).launch(grid=(cute.ceil_div(k.shape[0], 1024), 1, 1), block=(128, 1, 1), stream=stream)
+    frost_qsa_scan_kv(k, v, partials, range_safe).launch(grid=(cute.ceil_div(k.shape[0], 1024), 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_tile_bounds(lo, hi, partials, modes, ranges).launch(grid=(cute.ceil_div(lo.shape[0], TILE_M), 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_schedule(modes, ranges, order).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
     frost_qsa_pack_bits(sel, lo, hi, bases, origins, first, last, bits, modes, ranges, ids, counts, vectorized).launch(

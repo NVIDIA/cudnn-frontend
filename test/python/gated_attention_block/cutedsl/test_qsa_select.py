@@ -5,7 +5,7 @@
 
 The reject / gate tests run on any CUDA device (the declines fire before a kernel is compiled; the gates BEHIND the
 CuTe DSL floor -- the head groups, the target, the device family -- skip below it, where the version decline answers
-first); the accept cells need an SM100-family GPU (the scorer is a tcgen05 kernel) and compare the selected SETS against
+first); the accept cells run on Hopper, Blackwell and Rubin and compare the selected SETS against
 ``torch.topk`` of an fp64 re-derivation of the indexer score (Qwen3.8 QSA, Eq. 15-16: ReLU-summed 4-head
 scores over the complete 4-token blocks a token can see, scaled by ``1 / sqrt(128)``), up to ties at the
 k-th boundary.
@@ -35,6 +35,7 @@ def _cc():
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA device is needed for the input tensors")
 needs_sm100_family = pytest.mark.skipif(_cc() is None or _cc()[0] != 10, reason=f"the scorer is a tcgen05 kernel (cc 10.x); found {_cc()}")
+needs_prefill_arch = pytest.mark.skipif(_cc() is None or (_cc() != (9, 0) and _cc()[0] != 10), reason=f"QSA selection requires SM90 or cc 10.x; found {_cc()}")
 # Below FROST's CuTe DSL floor the selector declines by VERSION ahead of its later gates (the head groups, the target, the device family)
 # and ahead of any scorer launch (Rule 7): the cells that expect one of those later answers, and every accept cell, skip there instead of
 # failing; the form checks ahead of the gate and the version-decline cell itself run on any DSL.
@@ -190,11 +191,11 @@ def test_qsa_select_declines_a_dsl_without_the_target(monkeypatch):
 
 @needs_cuda
 @needs_dsl_floor
-def test_qsa_select_declines_devices_below_the_sm100_family(monkeypatch):
+def test_qsa_select_declines_devices_below_hopper(monkeypatch):
     device = torch.device("cuda")
     qi, kbar, cu = _inputs([8], 4, device)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
-    with pytest.raises(NotImplementedError, match=r"cc 10\.x.*found cc 9\.0"):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))
+    with pytest.raises(NotImplementedError, match=r"SM90.*found cc 8\.0"):
         qsa_select_forward(qi, kbar, cu, top_k=2)
 
 
@@ -424,7 +425,7 @@ def test_unit_scale_blob_views_of_one_bucket_keep_the_batched_decode_packing_con
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 @pytest.mark.parametrize("n_blocks", [1, 7, 512, 513, 8192, 65536])
 def test_qsa_select_matches_topk_of_the_fp64_reference(n_blocks):
     """top_k = 512 over n_blocks compressed keys: the selected set equals torch.topk of the fp64 reference up to
@@ -459,7 +460,7 @@ def test_qsa_select_matches_topk_of_the_fp64_reference(n_blocks):
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_thd_tails_and_chunked_prefill():
     """Three packed sequences: 5 tokens (one complete block), 2051 tokens (the identity bound: the last token
     sees exactly 512 blocks), 133 tokens of a chunked prefill from position 1024 (rows see 256 .. 289 blocks)."""
@@ -493,7 +494,7 @@ def test_qsa_select_thd_tails_and_chunked_prefill():
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_deterministic_ties_keep_the_smaller_block_ids():
     """Identical compressed keys tie every visible block; with deterministic=True the kept set is the 512
     smallest block ids of each row (reproducible sets, the smaller id wins a boundary tie)."""
@@ -515,7 +516,7 @@ def test_qsa_select_deterministic_ties_keep_the_smaller_block_ids():
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_constant_weight_matches_explicit_w_and_reads_a_strided_slab():
     """``w=None`` (the constant 1 / sqrt(128)) is bitwise the explicit all-ones ``w`` with the same scale, and a
     query slab column slice (unit last stride, wider row stride) is read in place with the same result."""
@@ -541,7 +542,7 @@ def test_qsa_select_constant_weight_matches_explicit_w_and_reads_a_strided_slab(
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_preallocated_outputs_and_scratch():
     """Caller-owned outputs and the compact-logits scratch (the CUDA-graph form) are written in place."""
     from cudnn import DSA
@@ -581,7 +582,7 @@ def test_qsa_select_preallocated_outputs_and_scratch():
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_loose_cand_batch_offsets_are_bitwise_the_tight_prefix():
     """The compact-logits scratch addresses every row of piece ``p`` at ``cand_batch_offsets[p] + G(q_pos0 + i) - G(q_pos0)`` and never
     reads ``offsets[p + 1]``, so per-piece bases may be LOOSE -- ``base_{p + 1} = base_p + rows_p x n_blocks_max``, plan constants -- as
@@ -739,7 +740,7 @@ def test_qsa_select_refuses_a_scale_prefix_on_the_bf16_arm_and_a_malformed_one()
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_e4m3_cache_takes_a_precomputed_scale_prefix():
     """The e4m3 arm with the padded Q scale prefix handed in (the block's plan constant: ``_fp8_q_scale_prefix``, every length rounded up to
     the 32-token scale span of 4 heads, built on the host or on device alike) selects the same sets and scores as the per-call derivation
@@ -763,7 +764,7 @@ def test_qsa_select_e4m3_cache_takes_a_precomputed_scale_prefix():
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 @pytest.mark.parametrize("n_blocks", [7, 513, 8192])
 def test_qsa_select_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(n_blocks):
     """The fp8 indexer cache arm: e4m3 ``qi`` / ``kbar`` through the MXFP8 scorer with all-ones scales select the top-k of
@@ -801,7 +802,7 @@ def test_qsa_select_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(n_b
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
     """Packed e4m3 sequences whose lengths are not multiples of the 32-token scale span of a 4-head MXFP8 tile: 5 tokens
     (one block), 2051 (the identity bound), 133 from position 1024 (chunked prefill) -- the per-sequence scale prefix
@@ -830,7 +831,7 @@ def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
 
 
 @needs_dsl_floor
-@needs_sm100_family
+@needs_prefill_arch
 def test_qsa_select_e4m3_cache_flips_only_at_the_rank_boundary_against_the_bf16_selection():
     """The acceptance measurement of the fp8 cache in miniature: one dense sequence of 4096 unit-variance tokens (1024
     blocks), the e4m3 selection against the bf16 selection of the SAME values. Two statements about every block that is

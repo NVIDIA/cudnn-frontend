@@ -19,8 +19,8 @@ def supported_gpu():
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
     cc = torch.cuda.get_device_capability()
-    if cc not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("QSA requires SM100, SM103 or SM107")
+    if cc not in ((9, 0), (10, 0), (10, 3), (10, 7)):
+        pytest.skip("QSA requires SM90, SM100, SM103 or SM107")
     installed, version = cutedsl_state()
     if not installed or cutedsl_too_old(version):
         pytest.skip(cutedsl_requirement_error("QSA") or "QSA requires nvidia-cutlass-dsl")
@@ -189,7 +189,7 @@ def test_packed_forward_backward(supported_gpu, heads, lengths):
 @pytest.mark.L0
 @pytest.mark.parametrize("lengths", [(513,), (2056,)], ids=["gated-dense", "gathered"])
 def test_six_query_heads_forward_routes(supported_gpu, lengths):
-    """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV; neither is specialised for 12 heads."""
+    """Exercise 6Q/1KV on both sides of the Blackwell dense-tile threshold."""
     check_case(make_inputs(lengths, 6, 1, empty=True))
 
 
@@ -218,7 +218,7 @@ def group_compaction_reference(inputs, nq):
 @pytest.mark.L0
 @pytest.mark.parametrize("heads,nq", [((12, 1), 2), ((6, 1), 4), ((24, 2), 1)])
 def test_backward_batches_queries_by_geometry(supported_gpu, heads, nq):
-    """12Q/1KV and 6Q/1KV take the batched backward (two or four queries per compact-ID row); 24Q/2KV the single-query kernel."""
+    """Check each architecture's compact-ID layout and backward dispatch."""
     from cudnn.QSA import api
     from cudnn.QSA._contract import paired_queries
 
@@ -226,9 +226,13 @@ def test_backward_batches_queries_by_geometry(supported_gpu, heads, nq):
     major, minor = torch.cuda.get_device_capability()
     arch = major * 10 + minor
     module, _ = api._implementation(inputs["q"], inputs["k"], "bprop")
-    single = "bprop_sm107" if arch == 107 else "bprop_sm100_base"
-    assert module.__name__.rsplit(".", 1)[1] == ("bprop_sm100" if nq > 1 else single)
     assert paired_queries(*heads) == nq
+    if arch == 90:
+        nq, expected_module = 1, "bprop_sm90"
+    else:
+        single = "bprop_sm107" if arch == 107 else "bprop_sm100_base"
+        expected_module = "bprop_sm100" if nq > 1 else single
+    assert module.__name__.rsplit(".", 1)[1] == expected_module
     from cuda.bindings import driver as cuda
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -344,8 +348,9 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 @pytest.mark.L0
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
-def test_backward_cancellation(supported_gpu, heads, large_logits):
-    inputs = make_inputs((257,), *heads, all_selected=True)
+@pytest.mark.parametrize("total", [257, 513], ids=["gathered", "dense"])
+def test_backward_cancellation(supported_gpu, heads, large_logits, total):
+    inputs = make_inputs((total,), *heads, all_selected=True)
     inputs["k"].fill_(1)
     if large_logits:
         inputs["q"].fill_(8)
