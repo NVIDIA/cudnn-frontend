@@ -112,16 +112,18 @@ cover the host entries (typed declines, the plan-time compile key, the knob vali
 shared-memory budget per tokens count on the cc 10.0 and cc 12.0 readings, the budget-derived
 pick tables of both parts, the DSL and architecture gates) and, on an SM100-class or SM120-class
 device, the null-slot and padding contracts, determinism, CUDA-graph replay over distinct
-layers, a torch reference of the fused chain and the bitwise agreement of every knob arm with
-the default pick. When `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR` names a directory of saved verify
+layers, a torch reference of the fused chain and the bitwise agreement of every knob arm the part's
+shared memory holds with the default pick (an arm the part does not hold is its typed decline,
+reported as a skip). When `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR` names a directory of saved verify
 operand sets with the reference kernel's outputs (`set_<tag>.pt` / `ref_<tag>.pt`), every set is
 replayed and compared byte for byte.
 
 `test/python/linear_attention/frost/test_flashinfer_gdn_backend.py` runs
 FlashInfer's own decode and verify tests (`tests/experimental/qwen_3_5_gdn_block/`)
 against `frost_fe` when a FlashInfer source tree is next to the installed package --
-the verify reference also under the 148-SM launch policy and with the
-two-CTAs-per-SM form forced at every shape -- and checks the backend bitwise
+the verify reference also under the 148-SM launch policy and with the SM count held
+below one request's grid (the regime's budget-fitting form at every shape: the two-CTAs-per-SM
+form on a cc 10.0 part, the one-CTA landing-slab form on a cc 12.0 part) -- and checks the backend bitwise
 against the built-in `frost` backend where that one is served: decode on its
 reference cases, verify on the benchmark's own input sets at requests 1 / 2 / 4 x 6
 tokens (every token accepted, and random acceptance with a padding request).

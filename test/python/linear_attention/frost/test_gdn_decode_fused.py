@@ -3,12 +3,13 @@
 
 """The fused GDN decode step (``cudnn.linear_attention.frost.gdn_decode_fused``): the typed declines of its host entry (host-only,
 CPU tensors), the plan-time-only compile key, the config knob validation (the occupancy pad and the co-residency on every part reading), the DSL-floor
-decline, and -- on a cc 10.x device -- the null-slot contract, the reader tickets, determinism, CUDA-graph replay over distinct
-layers, a loose torch reference of the fused math, and the bitwise agreement of every knob arm (the shared-memory state path, the
-streamed two-CTAs-per-SM form, the PDL order, the TPR mappings, the 128-thread form, the tap-contiguous conv-state layout) with the
-entry's default pick on one operand set that carries a null row and non-monotone slots.  The default's per-rows pick (one CTA per
-SM while the rows x 48 grid fits the SMs, the streamed two-CTAs-per-SM form past that) is pinned on the host for two SM counts and
-on the device."""
+decline, and -- on a cc 10.x or 12.x device -- the null-slot contract, the reader tickets, determinism, CUDA-graph replay over distinct
+layers, a loose torch reference of the fused math, and the bitwise agreement of every knob arm the part's shared memory holds (the
+shared-memory state path, the streamed two-CTAs-per-SM form, the PDL order, the TPR mappings, the 128-thread form, the tap-contiguous
+conv-state layout) with the entry's default pick on one operand set that carries a null row and non-monotone slots -- an arm the part
+does not hold is its typed decline, reported as a skip.  The default's per-rows pick (the pair, one CTA per SM while the rows x 48 grid
+fits the SMs, past that the capped two-CTAs-per-SM form where two of its CTAs share an SM, else the one-CTA form in two waves) is pinned
+on the host for both validated parts' readings over several SM counts and on the device."""
 
 import math
 from dataclasses import replace
@@ -128,11 +129,13 @@ def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count
     the cap), so the pick is PAIR_CFG / CFG / CAPPED_CFG by the SM-count rule alone at every rows count -- the byte-identity pin of the
     budget-aware pick with the measured cc 10.0 pick, over six SM counts."""
     per_sm, optin = SM100_READING
-    for sms in (84, 148, 152, 170, 188, 212):
+    for sms in (84, 148, 152, 170, 188):
         for rows in range(1, 17):
             want = kcfg.PAIR_CFG if rows * 96 <= sms else (kcfg.CFG if rows * 48 <= sms else kcfg.CAPPED_CFG)
             assert kcfg.default_cfg(rows, sms) == kcfg.default_cfg(rows, sms, per_sm, optin) == want, (sms, rows)
-    assert kcfg.default_cfg(2, 212) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 212) == kcfg.CFG and kcfg.default_cfg(5, 212) == kcfg.CAPPED_CFG
+    assert (
+        kcfg.default_cfg(2, 192) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 192) == kcfg.CFG and kcfg.default_cfg(5, 192) == kcfg.CAPPED_CFG
+    )  # a 192-SM part would pair rows 2
     assert kcfg.default_cfg(1, 84) == kcfg.CFG and kcfg.default_cfg(2, 84) == kcfg.CAPPED_CFG  # 84 SMs hold no 96-CTA cluster grid
     assert kcfg.first_fitting(kcfg.ONE_CTA_FORMS) == kcfg.CFG and kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.CAPPED_CFG
     assert kcfg.admissible(kcfg.CAPPED_CFG) and kcfg.admissible(kcfg.STREAMED_CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
@@ -883,9 +886,10 @@ def _default_snapshot(dev, seed=31):
     ],
     ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "one-cta-form",
 )
-def test_knob_arms_are_bitwise_with_the_default_pick_at_b4(arm):
+def test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick_at_b4(arm):
     """Every knob arm this part's shared memory holds writes the bytes of the entry's pick; an arm it does not hold (a two-slab pad on a
-    100 KB SM) is the typed decline at construction, never a skip and never a launch."""
+    100 KB SM: three arms on the cc 12.0 readings, none on the cc 10.0 ones) is asserted to be the typed decline at construction, never a
+    launch, and then reported as a SKIP with that reason, so the count shows which arms ran on the part."""
     dev = _device_or_skip()
     cfg = kcfg.make_cfg(**arm)
     try:
@@ -894,7 +898,7 @@ def test_knob_arms_are_bitwise_with_the_default_pick_at_b4(arm):
         assert "do not fit the SM" in str(exc), exc
         with pytest.raises(ValueError, match="do not fit the SM"):
             entry.GdnDecodeFused(dev, 1e-6, cfg=cfg)
-        return
+        pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
     base = _default_snapshot(dev)
     ops = make_operands(rows=4, slots=5, device=dev, seed=31, idx=torch.tensor(B4_IDX, dtype=torch.int32, device=dev))
     got = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=cfg), ops)

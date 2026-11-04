@@ -62,6 +62,7 @@ from .kernel.gdn_verify_fused_config import (
     SM100_SMEM_OPTIN_BYTES,
     SM100_SMEM_PER_SM_BYTES,
     TICKET_STRIDE,
+    TOKENS_MIN,
     V_HEADS,
     Cfg,
     default_cfg,
@@ -72,10 +73,11 @@ from .kernel.gdn_verify_fused_config import (
     validate_tokens,
 )
 
-#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts (cc 10.x; validated on cc 10.0, 10.3 and
-#: 10.7) and SM120-class parts (cc 12.x; validated on cc 12.0 -- 100 KB of shared memory per SM, 99 KB per-CTA opt-in, 170 SMs -- the
-#: same kernel body on the budget-derived picks; cc 12.1 shares the family admission on those picks).  cc 11.x has never run these
-#: kernels and stays declined by name; the DSL's target gate (``cutedsl_arch_requirement_error``) decides per part on top.
+#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts (cc 10.x; validated on cc 10.0) and
+#: SM120-class parts (cc 12.x; validated on cc 12.0 -- 100 KB of shared memory per SM, 99 KB per-CTA opt-in, 170 SMs -- the same kernel
+#: body on the budget-derived picks; cc 12.1 shares the family admission on those picks and has not run).  cc 11.x has never run these
+#: kernels and stays declined by name.  cc 12.x needs no DSL target gate of its own: the 4.8.0 floor (``DSL_FLOOR``) carries the sm_120a
+#: and sm_121a targets, and ``cutedsl_arch_requirement_error`` only gates the one SM100-class target that needs a newer DSL.
 SUPPORTED_CC_RANGES = ((100, 109), (120, 129))
 SUPPORTED_CC_TEXT = "10.x (SM100-class) or 12.x (SM120-class)"
 DSL_FLOOR = (4, 8, 0)
@@ -287,6 +289,12 @@ def check_binding(
         raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_REQUESTS} (CUDA's grid Y limit); got requests={requests}")
     if state_indices.stride(1) != 1:
         raise NotImplementedError(f"{NAME} needs the tokens of a request contiguous in state_indices; got strides {tuple(state_indices.stride())}")
+    if cfg is None and tokens > CFG.max_tokens():  # a check without a form: the module default form's bound, never a statement about a part
+        raise NotImplementedError(
+            f"{NAME}: without a form the step is bounded by the module default form (TPR {CFG.TPR}, NBUF {CFG.NBUF}) on the cc 10.0 readings, "
+            f"which holds at most {CFG.max_tokens()} tokens per request; got {tokens} -- an entry bounds a step by its own pick for the part "
+            f"(GdnVerifyFused.cfg_for / max_tokens_for: 35 / 8 / 45 by regime on a cc 10.0 part, 17 on a 99 KB per-CTA opt-in)"
+        )
     validate_tokens(cfg if cfg is not None else CFG, tokens)
     if rows is None:
         rows = requests * tokens  # the FlashInfer contract: every request carries exactly T tokens
@@ -478,8 +486,12 @@ class GdnVerifyFused:
         the caller's ``cfg`` when one was given, else the pick (``default_cfg`` on this device's SM count and shared-memory readings; the
         one-CTA form without a CUDA device).  ``tokens`` moves the pick only on a part whose shared memory does not hold the regime's
         primary form (a 99 KB opt-in: T 9 .. 17 fall through to the landing-slab pair); past the ladder's bound the deepest form is
-        returned, so ``validate_tokens`` on it names the part's true bound.  One resolved form per (module form, requests)."""
-        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count, *self.readings, tokens)
+        returned, so ``validate_tokens`` on it names the part's true bound; a count below the minimum (a malformed slot table) picks at
+        the minimum, so :func:`check_binding` keeps its typed decline of it.  One resolved form per (module form, requests)."""
+        if tokens is not None and not isinstance(tokens, int):
+            raise ValueError(f"{NAME}: tokens must be an int or None, got {tokens!r}")
+        want = None if tokens is None else max(tokens, TOKENS_MIN)
+        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count, *self.readings, want)
         key = (form, requests)
         if key not in self.forms:
             self.forms[key] = resolve_cfg(self._on_this_part(form), requests)

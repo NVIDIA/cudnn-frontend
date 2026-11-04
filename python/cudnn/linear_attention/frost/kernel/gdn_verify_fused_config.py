@@ -497,8 +497,8 @@ TWO_CTA_CFG = make_cfg(
 )  # two CTAs per SM, one wave -- where the part's shared memory holds two (co_resident_ctas(TOKENS_MIN) >= 2: the cc 10.0 readings)
 
 # The forms a 99 KB per-CTA opt-in holds (the three picks above carry a 3-deep ring of 64 KB -- or 32 KB half -- slabs and hold no token
-# count there): the same kernel body under existing knobs, bitwise with the picks (no knob moves an fp32 addition; the sm_120a run of
-# record replayed every saved reference set byte for byte).  Footprint law: 6,464 + 3,536 T + ring (+ 144 on the pair), ring = NBUF x
+# count there): the same kernel body under existing knobs, bitwise with the picks (no knob moves an fp32 addition; the cc 12.0 run
+# replayed every saved reference set byte for byte).  Footprint law: 6,464 + 3,536 T + ring (+ 144 on the pair), ring = NBUF x
 # 65,664 (one CTA) or NBUF x 32,896 (the pair).  What the ring depth buys: at NBUF 3 token t + 1's write-back waits only for the store of
 # t - 2, at NBUF 2 for the store of t - 1, at NBUF 1 the box read-out is exposed between the two passes of every token.
 PAIR_NBUF2_CFG = make_cfg(
@@ -577,7 +577,7 @@ def default_cfg(
 ) -> Cfg:
     """The pick per requests on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a two-argument
     call is the measured cc 10.0 pick).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
-    the ``requests x 96`` cluster grid has an SM of its own (one request on a 148- or 152-SM part, two on a 212-SM one), ``CFG`` (one CTA
+    the ``requests x 96`` cluster grid has an SM of its own (one request on a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA
     per SM) while every CTA of the ``requests x 48`` grid has one, ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the
     device's SMs -- on a 148- or 152-SM part the switches are between 1 request (96 cluster CTAs) and 2 (192 as a pair; 96 one-CTA CTAs),
     and between 3 requests (144 CTAs) and 4 (192).  The regime's primary form is returned wherever it is ``admissible`` on the readings

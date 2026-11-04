@@ -11,7 +11,8 @@ a subprocess proof that the probe loads no kernel, and the per-row trip of the d
 (the probe and the entries' own ``check_support``).  Device (an SM100- or SM120-class part, cc 10.x / 12.x, with a serving DSL): FlashInfer's OWN decode and verify
 tests -- the torch reference at decode rows 1 .. 64 and at verify requests 1 / 2 / 4 x tokens 4 / 6, the CUDA-graph replays, the
 dim-first conv pool (served by decode, a typed decline for verify) -- run against ``frost_fe`` (FlashInfer's checks, the cuDNN Frontend backend), the verify
-reference under the 148-SM launch policy and with the two-CTAs-per-SM form forced at every shape, the fp32-parameter decode decline at
+reference under the 148-SM launch policy and with the SM count held below one request's grid (the regime's budget-fitting form at every
+shape: the two-CTAs-per-SM form on a cc 10.0 part, the one-CTA landing-slab form on a 99 KB opt-in), the fp32-parameter decode decline at
 plan time, the capture guards, and bitwise agreement with FlashInfer's built-in ``frost`` backend where that one is served (cc 10.0):
 decode on its reference cases, verify on the benchmark's own input sets at requests 1 / 2 / 4 x 6 tokens (all accepted, and random
 acceptance with a padding request).  The FlashInfer tests and benchmark are imported from the source tree next to the installed
@@ -170,22 +171,25 @@ def test_an_unknown_form_is_declined_by_kind_form():
 @pytest.fixture
 def as_sm100(monkeypatch):
     """The support question as it reads on a cc 10.0 part (148 SMs) with a serving DSL: the device fact FlashInfer's helper reads, both
-    entries' DSL gates and the verify form's device readings patched, nothing else."""
+    entries' DSL gates, the decode entry's shared-memory reader and the verify form's device readings patched, nothing else."""
     monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM100_READINGS["SMEM_PER_SM_BYTES"], SM100_READINGS["SMEM_OPTIN_BYTES"]))
     monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
 
 
 @pytest.fixture
 def as_sm120(monkeypatch):
     """The support question as it reads on a cc 12.0 part (170 SMs, 100 KB of shared memory per SM, 99 KB per-CTA opt-in) with a serving
-    DSL: the device fact FlashInfer's helper reads, the DSL gates, and the verify entry's DEVICE READERS patched to that part -- the real
-    ``verify_form`` / ``verify_max_tokens`` run on the host, picking through the real entry."""
+    DSL: the device fact FlashInfer's helper reads, the DSL gates, and both entries' DEVICE READERS patched to that part -- the real
+    ``verify_form`` / ``verify_max_tokens`` and the decode form's fit run on the host, through the real entries."""
+    sm120 = (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"])
     monkeypatch.setattr(fi_support, "device_cc", lambda device: (12, 0))
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
-    monkeypatch.setattr(ventry, "device_shared_memory", lambda device: (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"]))
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: sm120)
+    monkeypatch.setattr(ventry, "device_shared_memory", lambda device: sm120)
     monkeypatch.setattr(ventry, "device_multiprocessor_count", lambda device: SM120_SMS)
 
 
@@ -205,6 +209,7 @@ def test_other_geometries_are_declined_by_field_name(as_sm100, form):
 def test_devices_are_declined_by_compute_capability(monkeypatch, form):
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM100_READINGS["SMEM_PER_SM_BYTES"], SM100_READINGS["SMEM_OPTIN_BYTES"]))
     monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
     kw = dict(tokens_per_request=6) if form == "verify" else {}
     sup = _probe(CPU, form, **kw)  # the real probe on a CPU device
@@ -309,25 +314,15 @@ def test_verify_step_shape_envelope_on_a_99kb_part(as_sm120):
     assert _probe("cuda:0", "decode").served and _probe("cuda:0", "decode", requests=64).served
 
 
-DOCS_PAGE = Path(__file__).resolve().parents[4] / "docs" / "operations" / "linear_attention" / "gdn_decode_flashinfer_backend.md"  # <repo>/docs/...
-
-
-def _docs_table_rows():
-    """The docs page's served / declined table as ``{question: answer}`` (the GDN support matrix, maintained by hand)."""
-    rows = {}
-    for line in DOCS_PAGE.read_text().splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")] if line.startswith("| ") else []
-        if len(cells) == 2 and cells[0] not in ("question", "---"):
-            rows[cells[0]] = cells[1]
-    return rows
-
-
 def test_docs_served_and_declined_rows_are_reachable_with_the_published_bounds(monkeypatch):
     """The docs page's served / declined table is the GDN support matrix: its ``device`` and ``verify step shape`` rows name exactly the
     compute capabilities and the per-part token bounds the code computes, and every decline those rows publish is reachable through BOTH
     twins -- FlashInfer's probe (``support``) and the entries' own ``check_support`` -- with the published tokens in its text (a row no
-    code path reaches, or a bound the page misquotes, fails here)."""
-    rows = _docs_table_rows()
+    code path reaches, or a bound the page misquotes, fails here).  The FlashInfer-free twin of the table pins (the rows against the code
+    and the entries' own declines) is ``test_gdn_support_matrix_docs.py``, which a lane without FlashInfer still runs."""
+    from test_gdn_support_matrix_docs import docs_table_rows
+
+    rows = docs_table_rows()
     assert {"device", "verify step shape", "decode rows"} <= set(rows), sorted(rows)
     device_row, shape_row = rows["device"], rows["verify step shape"]
     for token in ("10.x", "12.x", "cc 10.0", "cc 12.0", "kind `device`"):
@@ -343,6 +338,7 @@ def test_docs_served_and_declined_rows_are_reachable_with_the_published_bounds(m
     # the device row through both twins: every declined capability by name, every served one through
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM100_READINGS["SMEM_PER_SM_BYTES"], SM100_READINGS["SMEM_OPTIN_BYTES"]))
     monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
     dspec, vspec = _spec(rows=2), _spec(form="verify", rows=1, tokens=4)
     dargs = backend.FrostFeDecodeRunner(dspec)._args(fi_api.bind_inputs(dspec, **_tensors(2, CPU)))
@@ -386,13 +382,15 @@ def test_docs_served_and_declined_rows_are_reachable_with_the_published_bounds(m
     ventry.check_support(**vkw, device_cc=(12, 0), cfg=k120.cfg_for(1, 4))
 
 
-def test_verify_probe_declines_a_part_whose_shared_memory_holds_no_form_by_kind_device(monkeypatch):
-    """A device whose shared memory holds no verify form (a 40 KB opt-in): the entry's typed NotImplementedError at construction reaches
-    the probe as kind ``device`` naming the opt-in -- never a raised error inside ``support`` -- with and without a step shape; the
-    decode form, whose one-CTA footprint every served part holds, is unaffected by the verify reading."""
+def test_probe_declines_a_part_whose_shared_memory_holds_no_form_by_kind_device(monkeypatch):
+    """A device whose shared memory holds no form (a 40 KB opt-in): each entry's typed NotImplementedError at construction reaches the
+    probe as kind ``device`` naming the opt-in -- never a raised error inside ``support``, and never a served probe that ``build`` then
+    refuses -- for the verify form with a step shape, and for the decode form with and without one (its one-CTA form must fit the opt-in;
+    every admitted part holds it); a verify probe without a token count asks no budget and stays served, as before."""
     monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (40960, 40000))
     monkeypatch.setattr(ventry, "device_shared_memory", lambda device: (40960, 40000))
     monkeypatch.setattr(ventry, "device_multiprocessor_count", lambda device: SM120_SMS)
     for kw in (dict(requests=2, tokens_per_request=6), dict(tokens_per_request=2), dict(requests=1, tokens_per_request=18)):
@@ -401,7 +399,18 @@ def test_verify_probe_declines_a_part_whose_shared_memory_holds_no_form_by_kind_
     assert _probe("cuda:0", "verify", requests=2).served, "no tokens count: the budget is not asked"
     with pytest.raises(NotImplementedError, match="40000-byte"):
         backend.verify_max_tokens("cuda:0", 2)
-    assert _probe("cuda:0", "decode", requests=4).served
+    for kw in ({}, dict(requests=4), dict(requests=1, tokens_per_request=1)):
+        sup = _probe("cuda:0", "decode", **kw)
+        assert (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "holds no decode form" in sup.reason, (kw, sup)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"]))
+    assert _probe("cuda:0", "decode", requests=4).served, "a 99 KB opt-in holds the 74,848 B decode form"
+
+    def unreadable(device):
+        raise RuntimeError("cuDeviceGetAttribute failed")
+
+    monkeypatch.setattr(entry, "device_shared_memory", unreadable)
+    sup = _probe("cuda:0", "decode")
+    assert (sup.served, sup.kind) == (False, "device") and "could not read" in sup.reason and "cuDeviceGetAttribute failed" in sup.reason, sup
 
 
 def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_device_decline(monkeypatch):

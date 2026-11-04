@@ -1,6 +1,8 @@
 # SMOKE tier, cc 12.0 (SM120-class: RTX 5090 / RTX PRO 6000 class, 170 / 188 SMs, 100 KB of shared memory per SM): one cell per code path at the
 # smallest shape -- the rules are in README.md; the code path each id stands for is in smoke_cc120_code_paths.tsv.  conftest.py marks
-# these ids `smoke`:   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= @tiers/smoke_cc120.txt)
+# these ids `smoke`:   from test/python:  pytest -m smoke <paths>
+#   (or, without the marker:  pytest -o addopts= $(grep -v '^#' tiers/smoke_cc120.txt)  -- the @file form would pass these comment lines as
+#   arguments and collects nothing)
 # Only the fused GDN decode / verify steps are listed so far (their picks on this part: the decode pair at rows 1 and the one-CTA form
 # past it, the verify 2-deep-ring pair / one-CTA landing-slab form to 8 tokens and the landing-slab pair to 17); the FROST SDPA sm120
 # modules have no list yet.

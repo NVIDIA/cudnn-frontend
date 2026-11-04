@@ -422,7 +422,7 @@ def first_fitting(forms, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin:
 def default_cfg(rows: int, sm_count: int, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> Cfg:
     """The measured pick per rows on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a
     two-argument call is the cc 10.0 pick): ``PAIR_CFG`` while every CTA of the ``rows x 96`` cluster grid has an SM of its own (rows 1 on
-    a 148- or 152-SM part, rows 1 .. 2 on a 212-SM one), ``CFG`` (one CTA per SM) while every CTA of the ``rows x 48`` grid has one (rows
+    a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA per SM) while every CTA of the ``rows x 48`` grid has one (rows
     2 and 3), and once the grid outgrows the device's SMs (rows 4 and up: 192 CTAs) ``CAPPED_CFG`` (two CTAs per SM, one wave) where two of
     its CTAs share an SM on the readings (``co_resident_ctas`` 2: the cc 10.0 readings), else ``CFG`` in two waves (the cc 12.0 readings:
     rows 1 the pair, rows 2 and up the one-CTA form on 170 / 188 SMs; never a cap that spills).  A part no form fits is the typed decline

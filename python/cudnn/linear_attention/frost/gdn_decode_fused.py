@@ -58,10 +58,11 @@ from .kernel.gdn_decode_fused_config import (
     validate_cfg,
 )
 
-#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts (cc 10.x; validated on cc 10.0, 10.3 and
-#: 10.7) and SM120-class parts (cc 12.x; validated on cc 12.0 -- 100 KB of shared memory per SM, 99 KB per-CTA opt-in, 170 SMs -- the
-#: same kernel body on the budget-derived picks; cc 12.1 shares the family admission on those picks).  cc 11.x has never run these
-#: kernels and stays declined by name; the DSL's target gate (``cutedsl_arch_requirement_error``) decides per part on top.
+#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts (cc 10.x; validated on cc 10.0) and
+#: SM120-class parts (cc 12.x; validated on cc 12.0 -- 100 KB of shared memory per SM, 99 KB per-CTA opt-in, 170 SMs -- the same kernel
+#: body on the budget-derived picks; cc 12.1 shares the family admission on those picks and has not run).  cc 11.x has never run these
+#: kernels and stays declined by name.  cc 12.x needs no DSL target gate of its own: the 4.8.0 floor (``DSL_FLOOR``) carries the sm_120a
+#: and sm_121a targets, and ``cutedsl_arch_requirement_error`` only gates the one SM100-class target that needs a newer DSL.
 SUPPORTED_CC_RANGES = ((100, 109), (120, 129))
 SUPPORTED_CC_TEXT = "10.x (SM100-class) or 12.x (SM120-class)"
 DSL_FLOOR = (4, 8, 0)

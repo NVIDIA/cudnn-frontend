@@ -3,14 +3,15 @@
 
 """The fused GDN verify step (``cudnn.linear_attention.frost.gdn_verify_fused``): the typed declines of its host entry (host-only,
 CPU tensors), the plan-time-only compile key, the config knob validation and the per-T shared-memory budget (the occupancy pad and the
-co-residency on every part reading), the DSL-floor decline, and -- on a cc 10.x device -- the semantics against a pure-torch reference of the fused
+co-residency on every part reading), the DSL-floor decline, and -- on a cc 10.x or 12.x device -- the semantics against a pure-torch reference of the fused
 chain (the FP64 recurrence with the chain's rounding points; its tolerances are the ones the reference verify kernel was validated
 with: the bf16 output within 2^-6 relative + 1e-3, fp8 bytes equal on > 99.9 % of the live outputs and bitwise equal to the static
 quantization of the kernel's own bf16 output, the conv pool bitwise, written state slots within 1e-4, untouched slots untouched,
 padding outputs zero) over requests 1 / 2 / 4 x tokens 2 / 4 / 6 with random acceptance counts, padding requests, skipped slot
-writes and non-monotone slot ids, the two-CTAs-per-SM form at 8 and 16 requests, determinism, CUDA-graph replay over distinct
-layers, the bitwise agreement of every knob arm with the entry's default pick, and the two-CTAs-per-head PAIR form (the pick at one
-request on a 148- / 152-SM part) against the one-CTA form at one request.  When ``CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR``
+writes and non-monotone slot ids, the pick past the one-CTA grid at 8 and 16 requests, determinism, CUDA-graph replay over distinct
+layers, the bitwise agreement of every knob arm the part's shared memory holds with the entry's default pick (an arm the part does not
+hold is its typed decline, reported as a skip), and the two-CTAs-per-head pair form the part holds (the pick at one request) against
+its one-CTA form at one request.  When ``CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR``
 names a directory of saved operand sets with the reference verify kernel's outputs (``set_<tag>.pt`` / ``ref_<tag>.pt``), every set
 is replayed and compared BYTE for byte (fp8 output, bf16 output, every fp32 state slot, the conv pool, the reader tickets)."""
 
@@ -304,14 +305,16 @@ def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count
     envelope is the published 35 / 8 / 45 (the byte-identity pin of the budget-aware pick with the measured cc 10.0 pick)."""
     per_sm, optin = SM100_READING
     envelope = {kcfg.PAIR_CFG: 35, kcfg.CFG: 8, kcfg.TWO_CTA_CFG: 45}
-    for sms in (84, 148, 152, 170, 188, 212):
+    for sms in (84, 148, 152, 170, 188):
         for requests in range(1, 17):
             want = kcfg.PAIR_CFG if requests * 96 <= sms else (kcfg.CFG if requests * 48 <= sms else kcfg.TWO_CTA_CFG)
             assert kcfg.default_cfg(requests, sms) == want, (sms, requests)
             for tokens in (None, 2, 6, 9, 17, 18, 40, 64):
                 assert kcfg.default_cfg(requests, sms, per_sm, optin, tokens) == want, (sms, requests, tokens)
             assert kcfg.max_tokens_served(requests, sms) == kcfg.max_tokens_served(requests, sms, per_sm, optin) == envelope[want], (sms, requests)
-    assert kcfg.default_cfg(2, 212) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 212) == kcfg.CFG and kcfg.default_cfg(5, 212) == kcfg.TWO_CTA_CFG
+    assert (
+        kcfg.default_cfg(2, 192) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 192) == kcfg.CFG and kcfg.default_cfg(5, 192) == kcfg.TWO_CTA_CFG
+    )  # a 192-SM part would pair two
     assert kcfg.first_fitting(kcfg.ONE_CTA_FORMS) == kcfg.CFG and kcfg.first_fitting(kcfg.PAIR_FORMS, per_sm, optin) == kcfg.PAIR_CFG
     assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.TWO_CTA_CFG
     assert kcfg.admissible(kcfg.TWO_CTA_CFG) and kcfg.admissible(kcfg.CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
@@ -439,12 +442,16 @@ def test_entry_on_a_99kb_part_starts_from_the_fitting_one_cta_form_and_picks_per
     ops = make_operands(requests=1, tokens=12)
     assert _key(k, ops)[2] == k.cfg_for(1, 12) and _key(k, ops) != _key(k, make_operands(requests=1, tokens=6))
     # the step is bounded by the T-aware pick: T 12 at one request passes the host checks with it, T 18 is the typed decline naming 17,
-    # and a host caller without a form keeps the module's one-CTA bound (8), as documented
+    # and a host caller without a form is bounded by the module default form (8) -- said as such, never as a statement about the part
     entry.check_support(**ops, device_cc=(10, 0), cfg=k.cfg_for(1, 12))
     with pytest.raises(NotImplementedError, match="at most 17 on this part"):
         entry.check_support(**make_operands(requests=1, tokens=18), device_cc=(10, 0), cfg=k.cfg_for(1, 18))
-    with pytest.raises(NotImplementedError, match="at most 8 on this part"):
+    with pytest.raises(
+        NotImplementedError,
+        match=r"without a form the step is bounded by the module default form \(TPR 4, NBUF 3\) on the cc 10\.0 readings, which holds at most 8 tokens per request; got 12 -- an entry bounds a step by its own pick for the part",
+    ) as e:
         call_check(ops)
+    assert "on this part" not in str(e.value) and "17 on a 99 KB per-CTA opt-in" in str(e.value)
     # the launch path resolves the pick from the table's shape: a planted kernel under the T-aware key is reached only after the
     # binding checks (CPU operands against a CUDA entry: the device check declines first, the token bound never did)
     calls = []
@@ -694,9 +701,32 @@ def test_typed_declines_name_the_operand(mutation, exc, token):
 
 def test_declines_a_tokens_count_the_form_cannot_hold():
     ops = make_operands(requests=1, tokens=9)
-    with pytest.raises(NotImplementedError, match="at most 8"):
-        call_check(ops)
+    with pytest.raises(NotImplementedError, match="module default form .* at most 8"):
+        call_check(ops)  # no form given: the module default form's bound, named as such
     call_check(ops, cfg=kcfg.make_cfg(NBUF=2))  # a shallower ring holds it
+    with pytest.raises(NotImplementedError, match="at most 8 on this part"):
+        call_check(ops, cfg=kcfg.CFG)  # the same form given explicitly: validate_tokens' per-form bound
+
+
+def test_a_table_of_fewer_tokens_than_the_minimum_is_check_bindings_typed_decline_on_a_cuda_entry(monkeypatch):
+    """A ``[requests, 0]`` slot table on an entry that picks per step shape without a given form: the pick runs at the minimum token count
+    (``cfg_for`` clamps the table's count, never raising on it) so ``check_binding`` keeps the typed ``NotImplementedError`` naming the
+    minimum on the launch and compile paths; ``key()`` carries the minimum-count pick without raising.  Host-only: a host entry steered to
+    each part's SM count and readings (as the host cells above steer theirs), so the CPU operands and the entry share one device and the
+    token bound is the first check that can decline."""
+    for reading, sms in ((SM120_READING, 170), (SM100_READING, 148)):
+        k = entry.GdnVerifyFused("cpu", 1e-6)
+        k.sm_count, k.readings, k.part = sms, reading, _on(reading)  # the pick's inputs on this part; the forms it stamps carry the reading
+        ops = dict(make_operands(requests=1, tokens=2), state_indices=torch.zeros(1, 0, dtype=torch.int32))
+        assert entry.step_shape(ops["state_indices"]) == (1, 0) and ops["state_indices"].stride(1) == 1
+        with pytest.raises(NotImplementedError, match="serves at least 2 tokens per request"):
+            _run(k, ops)
+        with pytest.raises(NotImplementedError, match="serves at least 2 tokens per request"):
+            k.compile(**ops)
+        assert _key(k, ops)[1:3] == (0, k.cfg_for(1, 2)), reading  # the key carries the minimum-count pick; nothing was compiled or launched
+        assert k.cfg_for(1, 0) is k.cfg_for(1, 1) is k.cfg_for(1, 2) is k.cfg_for(1) and not k.compiled
+        with pytest.raises(ValueError, match="tokens must be an int or None"):
+            k.cfg_for(1, 2.0)
 
 
 def test_rows_bounds_a_ragged_or_padded_step_instead_of_requests_times_tokens():
@@ -917,7 +947,8 @@ def _part_form(dev, forms):
 def _fits_or_declines(dev, cfg, tokens):
     """``cfg`` stamped with this part's readings when it holds ``tokens`` per request; else the typed decline is asserted (a form whose
     shared memory the part does not hold at the minimum token count is validate_cfg's ValueError at construction, one that holds too few
-    tokens is validate_tokens' NotImplementedError at the call) and None is returned -- a knob arm is never a skip, on any part."""
+    tokens is validate_tokens' NotImplementedError at the call) and the cell is SKIPPED with that reason -- the count then shows which
+    arms ran on the part (every arm on the cc 10.0 readings; 17 of 43 on the cc 12.0 ones), and an unheld arm is never a launch."""
     on_part = replace(cfg, **_on(entry.device_shared_memory(dev)))
     try:
         kcfg.validate_cfg(on_part)
@@ -925,11 +956,11 @@ def _fits_or_declines(dev, cfg, tokens):
         assert "does not fit" in str(exc), exc
         with pytest.raises(ValueError, match="does not fit"):
             entry.GdnVerifyFused(dev, 1e-6, cfg=cfg)
-        return None
+        pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
     if tokens > on_part.max_tokens():
         with pytest.raises(NotImplementedError, match=f"at most {on_part.max_tokens()} on this part"):
             kcfg.validate_tokens(on_part, tokens)
-        return None
+        pytest.skip(f"this part's shared memory holds the arm for at most {on_part.max_tokens()} tokens per request, not {tokens} (declined by type)")
     return on_part
 
 
@@ -1237,13 +1268,13 @@ def _default_snapshot(dev, seed=31):
     ],
     ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "one-cta-form",
 )
-def test_knob_arms_are_bitwise_with_the_default_pick(arm):
+def test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick(arm):
     """Every knob arm this part's shared memory holds at T 6 writes the bytes of the entry's pick; an arm it does not hold (the 3-deep
-    rings and the two-slab pads on a 99 KB opt-in) is the typed decline (``_fits_or_declines``), never a skip and never a launch."""
+    rings and the two-slab pads on a 99 KB opt-in: 26 of the 43 arms) is asserted to be the typed decline and reported as a skip with that
+    reason (``_fits_or_declines``), never a launch -- so the count shows which arms ran on the part."""
     dev = _device_or_skip()
     cfg = kcfg.make_cfg(**arm)
-    if _fits_or_declines(dev, cfg, 6) is None:
-        return
+    _fits_or_declines(dev, cfg, 6)
     base = _default_snapshot(dev)
     ops = make_operands(4, 6, dev, seed=31, accepted="random", pad="last", skip="mid")
     got = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=cfg), ops)

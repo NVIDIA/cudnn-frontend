@@ -25,7 +25,7 @@ per V head, while the ``requests x 96`` CTAs have an SM each, the one-CTA-per-SM
 two-CTAs-per-SM form past that -- on a cc 10.0 part 35, 8 and 45 tokens per request; on a 99 KB per-CTA opt-in (cc 12.0) the
 shallower-ring forms of the same ladder, 17 tokens per request at every requests count, the pick moving with the step's token count).
 Declined with FlashInfer's typed kinds: another form (``form``), another geometry (``geometry``, naming the fields), another device
-(``device``: the compute capability, a failed device reading, or a shared memory that holds no verify form), a missing or too-old DSL
+(``device``: the compute capability, a failed device reading, or a shared memory that holds no decode or verify form), a missing or too-old DSL
 (``dsl``), a step shape outside the envelope (``shape``, naming the deepest form and its bound).  A plan's parameter dtypes are not part
 of FlashInfer's support question: the decode kernel reads ``A_log`` fp32
 and ``dt_bias`` / ``norm_weight`` bf16 (FlashInfer's default ``param_dtypes``; callers convert), so a decode plan built for other dtypes
@@ -120,7 +120,9 @@ def verify_form(device, requests: Optional[int] = None, norm_eps: float = 1e-6, 
     memory holds it, else the regime's shallower-ring forms by the step's token count; the pick at one request when no requests count is
     given) with the device's shared-memory readings.  Reads device properties only; imports no kernel.  A device whose shared memory
     holds no verify form is the entry's ``NotImplementedError`` (``support`` maps it to kind ``device``)."""
-    return _verify.GdnVerifyFused(device, norm_eps).cfg_for(1 if requests is None else int(requests), tokens_per_request)
+    return _verify.GdnVerifyFused(device, norm_eps).cfg_for(
+        1 if requests is None else int(requests), None if tokens_per_request is None else int(tokens_per_request)
+    )
 
 
 def verify_max_tokens(device, requests: Optional[int] = None) -> int:
@@ -131,8 +133,8 @@ def verify_max_tokens(device, requests: Optional[int] = None) -> int:
 
 def support(device, geometry, form: str, requests: Optional[int], tokens_per_request: Optional[int]):
     """FlashInfer's ``support_fn``: ``None`` when served, else a typed ``Qwen35GdnDecline``.  Imports no kernel and no DSL (the DSL gate
-    reads package metadata; the verify token bound reads the device's properties); ``requests`` / ``tokens_per_request`` are ``None``
-    when the caller asks without a step shape."""
+    reads package metadata; the decode form's fit and the verify token bound read the device's shared-memory properties); ``requests`` /
+    ``tokens_per_request`` are ``None`` when the caller asks without a step shape."""
     from flashinfer.experimental.qwen_3_5_gdn_block.support import Qwen35GdnDecline, device_cc
 
     if form not in FORMS:
@@ -159,6 +161,14 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
                 f"the cuDNN Frontend GDN decode kernel launches one grid row per request, at most {DECODE_MAX_ROWS} (CUDA's grid Y limit); got "
                 f"requests={requests}",
             )
+        try:
+            # the one-CTA decode form must fit this device's per-CTA opt-in (74,848 B; every admitted part holds it): the entry's own
+            # construction-time decline, answered here so the probe and build() agree on a part that holds no form
+            _decode.first_fitting(_decode.ONE_CTA_FORMS, *_decode.device_shared_memory(device))
+        except RuntimeError as exc:  # the device-attribute readers' failure; anything else is a bug and propagates
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel could not read this device's shared memory: {exc}")
+        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no decode form
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel has no form for this device's shared memory: {exc}")
         return None
     if requests is not None and requests > VERIFY_MAX_REQUESTS:
         return Qwen35GdnDecline(
