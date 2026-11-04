@@ -245,7 +245,8 @@ class TemplateParams:
     # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above, and the d64
     # decode tile, sm100/decode_d128_f16.py, through its own set) -- widen only after an A/B on the new
     # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
-    # kernels read it.
+    # kernels read it; make_cfg_d192 also derives CfgD192.EXP2_TAIL_MIX, the d192x128 f16 kernel's dense-causal arm
+    # spelling, from it.
     exp2_fma_split: bool = False
     # The L2-prefetching loader of the half-input single-CTA d192x128 tile (sm100/prefill_d192_d128_f16.py at cta_mma=1,
     # half precision): the TMA-LDG warp prefetches the K/V tiles one kv step ahead and the next tile's Q / first K/V
@@ -512,7 +513,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
         and thd
         and not padded_stats
         and (
-            (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
+            (d_shape == (64, 64) and max_q > 0 and (not paged or device_cc in ((10, 0), (10, 3))))
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (d_shape == (256, 256) and max_q > 0)
@@ -522,19 +523,22 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 
 
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
-    """Scalar-tail masking composes with D128 and native Rubin half D512 split."""
-    return (device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)) or (
-        device_cc == (10, 7) and d_shape == (512, 512) and not fp8
-    )
+    """Scalar-tail masking composes with the native half split flavors."""
+    if device_cc not in ((10, 0), (10, 3), (10, 7)):
+        return False
+    if fp8:
+        return d_shape == (128, 128) and pertensor
+    return d_shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
 
 
-def supports_quantized_split_sink(*, device_cc, pertensor, thd):
-    """Per-tensor SM100/SM103/SM107 dense-Q partials fold the sink in combine.
+def supports_quantized_split_sink(*, device_cc, pertensor, thd, d_shape=None, paged=False):
+    """Qualified per-tensor dense-Q partials fold the sink in combine.
 
     Existing split, packing and paged head-dimension domains still apply.
-    MXFP8, packed queries and native SM120 need separate qualification.
+    SM120 serves exact D128 with dense KV only; use the logical dimensions,
+    not the covering head tile. MXFP8 and packed queries stay outside this gate.
     """
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and pertensor and not thd
+    return pertensor and not thd and (device_cc in ((10, 0), (10, 3), (10, 7)) or (device_cc in ((12, 0), (12, 1)) and d_shape == (128, 128) and not paged))
 
 
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
@@ -693,7 +697,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
-            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
+            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and not fp8)
             or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
             or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
@@ -718,7 +722,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         if k.thd_varlen and not (
             not fp8
             and (
-                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.split_kv > 1)
                 or (
                     flavor == "d128"
                     and (
@@ -731,7 +735,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             )
         ):
             raise ValueError(
-                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, "
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, "
                 "paged half d256 cga2 unsplit, or native half d576 cga2"
             )
     if k.ragged_q:
@@ -870,42 +874,23 @@ def bshd_compact(shape_bhsd: tuple, stride_bhsd: tuple) -> bool:
 
 
 def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
-    """The BSHD ``(b, s, h, d)`` stride tuple a dense prefill kernel is COMPILED
-    at for a logical BHSD operand, or None.
+    """Return declared B/S/H/D strides for an aligned covering dense layout.
 
-    None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
-    layout the kernels cannot bind zero-copy"; a caller that must tell the two
-    apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback). The rules describe the kernels' TMA layout requirements,
-    checked before compilation so the engine rows
-    (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter's admission and prepared binder
-    judge a layout with ONE function (rule 8b lockstep):
-
-      * the head dim is innermost-contiguous (stride 1);
-      * the batch, seq and head strides are 16-byte multiples (TMA global-stride rule;
-        the DSL floors a misaligned stride to TMA units, so a violation would mis-address);
-      * the declaration is TOKEN-MAJOR and COVERING: head >= d, seq >= h*head,
-        batch >= s*seq.  A head-major nest (a torch-contiguous ``[B, H, S, D]``:
-        seq stride d < h*head) returns None because the kernels' TMA
-        descriptors are built in BSHD order and no other nesting has been
-        validated zero-copy; an overlapping declaration returns None because
-        it would alias distinct rows onto one address (a write race on O).
-
-    ``graph_analyzer.dense_layout_ok`` is deliberately WIDER (any B/H/S stride
-    order, any alignment): that is the contract of the copy-normalising Q/K/V/O
-    path, not of a zero-copy binding.
+    Descriptor axes describe logical coordinates; their global strides need not
+    follow the same physical nesting. B/H/S may therefore be any permutation,
+    with padding, provided every stepped outer stride is 16-byte aligned.
+    Compact BSHD returns None because it needs no explicit stride declaration;
+    callers distinguish that case with ``bshd_compact``.
     """
-    b, h, s, d = (int(x) for x in shape_bhsd)
-    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    from cudnn.sdpa.layout import dense_layout_ok
+
+    if not dense_layout_ok(shape_bhsd, stride_bhsd):
+        return None
+    _b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if es != 1 or any(st * elem_bytes % 16 for st in (bs, hs, ss)):
+        return None
     if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
-        return None  # compact: nothing to declare
-    if es != 1:
-        return None
-    per16 = 16 // elem_bytes
-    if ss % per16 or hs % per16 or (b > 1 and bs % per16):  # every non-innermost TMA global stride, the batch one included
-        return None
-    if hs < d or ss < h * hs or bs < s * ss:
         return None
     return (bs, ss, hs, es)
 
@@ -932,7 +917,7 @@ def canonical_bhsd_strides(shape_bhsd: tuple, stride_bhsd: tuple) -> tuple:
 @lru_cache(maxsize=256)
 def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
     """The ``(batch, seq, head)`` element strides a dense prefill kernel binds a logical BHSD
-    operand at zero-copy, or None when the layout needs a repack: singleton axes canonicalized,
+    operand natively, or None for an unsupported layout: singleton axes canonicalized,
     then BSHD-compact or ``bshd_zero_copy_stride``. ONE predicate for the lowering's decision to
     attach the prepared launch and for the binder's per-call admission (rule 8b lockstep).
 
@@ -940,6 +925,8 @@ def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -
     device, address alignment, observed span and compiled shape envelope. The bounded
     cache retains no buffers, pointers or per-call frames."""
     st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if any(stride * elem_bytes % 16 for stride in st[:3]):
+        return None
     if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
         return None
     bs, hs, ss, _es = st
@@ -3704,7 +3691,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
-        (not cfg.THD_VARLEN or cfg.PAGED_KV, "d64 decode: THD requires paged KV"),
+        (not cfg.THD_VARLEN or cfg.PAGED_KV or cfg.SPLIT_KV > 1, "d64 decode: unsplit THD requires paged KV"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
@@ -3726,11 +3713,10 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen and not params.paged_kv:
-        # The THD leg of this tile rides the paged loader (page pools through block tables): a ragged K/V
-        # needs the prefill tile's clamped descriptors.  Unsplit, the per-batch O descriptors place the
-        # rows (LSE_KINDS token / head / padded); split, the combine does.
-        raise ValueError("d64 decode: THD requires paged KV")
+    if params.thd_varlen and not params.paged_kv and params.split_kv == 1:
+        # Nonpaged split loads use compact or per-sequence input descriptors;
+        # the shared combine owns final O/Stats origins. Unsplit stays on prefill.
+        raise ValueError("d64 decode: unsplit THD requires paged KV")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
@@ -3761,9 +3747,10 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
-        # partial=False, as on the d64 prefill tile: the capability row leaves
-        # (64, 64) out of pack_gqa_partial_d_shapes.
-        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=False),
+        # The shared single-Q body addresses packed rows through PACK_G,
+        # including a proper divisor of G on the native-width SM107 split leg.
+        # SM100 graph admission retains its existing whole-group domain.
+        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=True),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
     )
@@ -3800,7 +3787,8 @@ class CfgD192(CfgD128):
     L2_PREFETCH_MIN_STEPS: int = 4
     # Unroll factor of the TMA-LDG warp's kv loop (1 with the L2-prefetching loader, 6 otherwise).
     LDG_UNROLL: int = 6
-    # The dense-causal exp2 tail emulation of the softmax (0 with the L2-prefetching loader, 1 otherwise).
+    # The dense top-left causal arm's exp2-split spelling (BMM1/BMM2 issue tweaks, chunk 1's row-sum after its publish):
+    # 1 on a build with the exp2 FMA split claim and the develop loader, 0 otherwise (plain MUFU exp2, default issue order).
     EXP2_TAIL_MIX: int = 1
 
 
@@ -3858,8 +3846,8 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             "d192: the TMA-LDG kv loop is unrolled 1x with the L2-prefetching loader and 6x otherwise",
         ),
         (
-            cfg.EXP2_TAIL_MIX == (0 if cfg.L2_PREFETCH_KV else 1),
-            "d192: the dense-causal exp2 tail emulation is folded out with the L2-prefetching loader and kept otherwise",
+            cfg.L2_PREFETCH_KV == 0 or cfg.EXP2_TAIL_MIX == 0,
+            "d192: EXP2_TAIL_MIX (the dense-causal arm's exp2-split spelling) is folded out with the L2-prefetching loader",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -4012,6 +4000,9 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     k_sub = (192 * b) // 128 if (not fp8 and params.cta_mma == 1) else 1  # one slot per 128 B TMA D-subtile
     half_input_cga1 = not fp8 and params.cta_mma == 1
     cga1_loader = half_input_cga1 and bool(params.cga1_l2_prefetch)
+    # The dense-causal arm's exp2-split spelling (CfgD192.EXP2_TAIL_MIX) comes with the exp2 FMA split claim and the
+    # develop loader; a build without the claim, or with the L2-prefetching loader, keeps the plain MUFU exp2 there.
+    exp2_tail_mix = bool(params.exp2_fma_split) and not cga1_loader
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -4038,7 +4029,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         L2_PREFETCH_KV=1 if cga1_loader else 0,
         L2_PREFETCH_NEXT_TILE=1 if cga1_loader else 0,
         LDG_UNROLL=1 if cga1_loader else 6,
-        EXP2_TAIL_MIX=0 if cga1_loader else 1,
+        EXP2_TAIL_MIX=1 if exp2_tail_mix else 0,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,

@@ -24,8 +24,8 @@ from cudnn.frost.workspace import Workspace
 
 from .arch_family import active_family
 from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _pow2_floor, tensor_alignment
-from .fusion_ir import FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
-from .recipe import REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
+from .fusion_ir import Axis, FusionChain, MoeSwapAbSpec, TensorRef, segmented_row_scale_capacity_rows
+from .recipe import AX_MN, FROM_M, FROM_N, REDUCTION_INIT_VALUE, _output_rule, contiguous_modulus, expected_shape
 
 
 class _RuntimeConfig(Protocol):
@@ -62,36 +62,23 @@ _CTAMMA_SUFFIX = re.compile(r"_[12]ctamma$")
 _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=re.MULTILINE)
 
 
+def _aux_kernel_shape(aux: TensorRef) -> tuple[int | Axis, ...]:
+    """Lower logical extents to the existing minimum-rank-2 aux ABI."""
+    shape = aux.symbolic_shape
+    return (1,) * max(0, 2 - len(shape)) + shape
+
+
 def _aux_fake_shape_code(aux: TensorRef) -> str:
-    """Generate the symbolic shape of an auxiliary tensor."""
-    if len(aux.dim) == 3:
-        if aux.grouped_by_moe:
-            batch = "sym_g"
-        else:
-            batch = "1" if aux.dim[0] == 1 else "sym_l"
-        if aux.bcast_mode == "scalar":
-            return f"({batch}, 1, 1)"
-        if aux.bcast_mode == "per_row":
-            return f"({batch}, sym_m, 1)"
-        if aux.bcast_mode == "per_col":
-            return f"({batch}, 1, sym_n)"
-        if aux.bcast_mode == "per_elem":
-            return f"({batch}, sym_m, sym_n)"
-    else:
-        if aux.bcast_mode == "scalar":
-            return "(1, 1)"
-        if aux.bcast_mode == "per_row":
-            return "(sym_m, 1)"
-        if aux.bcast_mode == "per_col":
-            return "(1, sym_n)"
-        if aux.bcast_mode == "per_elem":
-            return "(sym_m, sym_n)"
-    raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
+    """Render lowered extents without reconstructing broadcasts."""
+    symbols = {Axis.M: "sym_m", Axis.N: "sym_n", Axis.K: "sym_k", Axis.BATCH: "sym_l", Axis.GROUP: "sym_g"}
+    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux)) + ")"
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
     """Check whether auxiliary strides can be encoded directly."""
-    if len(aux.dim) not in (2, 3):
+    # Unit-axis strides also change when dynamic K is rebound; do not bake
+    # the originally declared K-sized strides into a per-K fake tensor.
+    if aux.bcast_mode == "per_k" or len(aux.dim) not in (2, 3):
         return False
     stride1_dims = [i for i, stride in enumerate(aux.stride) if stride == 1]
     if len(stride1_dims) <= 1:
@@ -111,7 +98,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
             stride = "(" + ", ".join(str(s) for s in aux.stride) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
         else:
-            _rank = 3 if len(aux.dim) == 3 else 2
+            _rank = len(_aux_kernel_shape(aux))
             stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + ")"
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
     return "\n".join(lines) if lines else "pass"
@@ -459,8 +446,8 @@ def _is_layout_ambiguous(t: object) -> bool:
 
 def _aux_fake_real_axes(ref: TensorRef) -> list[bool]:
     """Identify symbolic axes in an auxiliary tensor."""
-    row = ref.bcast_mode in ("per_row", "per_elem")
-    col = ref.bcast_mode in ("per_col", "per_elem")
+    row = ref.bcast_mode in ("per_row", "per_elem") or (ref.bcast_mode == "per_k" and ref.k_axis == 1)
+    col = ref.bcast_mode in ("per_col", "per_elem") or (ref.bcast_mode == "per_k" and ref.k_axis == 2)
     if len(ref.dim) == 3:
         batch_real = ref.grouped_by_moe or ref.dim[0] != 1
         return [batch_real, row, col]
@@ -469,6 +456,10 @@ def _aux_fake_real_axes(ref: TensorRef) -> list[bool]:
 
 def _swap_mn_view(t: object) -> object:
     """Transpose the logical M/N axes without moving the runtime storage."""
+    # A contiguous DeviceView needs no strided transpose when one axis is unit,
+    # as for per-K scales. Its reshape preserves the pointer and owns no memory.
+    if isinstance(t, buffers.DeviceView) and len(t.shape) == 3 and 1 in t.shape[1:]:
+        return t.reshape(t.shape[0], t.shape[2], t.shape[1])
     if len(t.shape) == 3:
         return t.permute(0, 2, 1)
     if len(t.shape) == 2:
@@ -994,6 +985,53 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             return 0
         return backend.align_up(self.config.split_k_slices * batch * m * n * 4)
 
+    # The partials span the call's M and N, which the launch path reads off A and B.
+    # Output 0 is no stand-in: a graph whose only outputs are reductions has a reduction there.
+    def workspace_bytes_for_operands(self, operands, graph_order=None) -> int:
+        """workspace for one call's A and B buffers, in the axis order the launch path reads."""
+        r = self.recipe
+        if r is None:
+            return self.workspace_bytes
+        operands = r.operand_views(operands, check_outputs=False)
+        mn = []
+        for op in (r.a, r.b):
+            v = operands[op.index]
+            sh = v.shape
+            axes = op.axes(sh, v.stride(), bool(graph_order) and graph_order[op.index]) if len(sh) == 3 else None
+            if axes is None:
+                return 0  # the launch path refuses this layout before it reads the workspace
+            mn.append(int(sh[axes[AX_MN]]))
+        return self.workspace_bytes_for(r.batch, *mn)
+
+    def workspace_bytes_for_overrides(self, override_uids, override_shapes) -> int:
+        """workspace for an override-shape call: A and B dims it names (graph order), else an output's, else the plan's."""
+        r = self.recipe
+        if r is None:
+            return self.workspace_bytes
+        matrix_rules = {self.bound[index].get_uid(): index for index, _prefix in r.matrix_views}
+        dims = {
+            uid: r.operand_shape(matrix_rules[uid], shape) if uid in matrix_rules else shape
+            for uid, shape in zip(override_uids or (), override_shapes or ())
+            if uid in matrix_rules or len(shape) == 3
+        }
+        mn = [None, None]
+        for i, op in enumerate((r.a, r.b)):
+            shape = dims.get(self.bound[op.index].get_uid())
+            if shape is not None:
+                mn[i] = int(shape[op.declared[AX_MN]])
+        # A list may leave A or B out while a strided view of it (which keeps its own description) runs at
+        # new extents. The launch path holds every output to A's M and B's N, so a named output carries them.
+        for out in r.outputs:
+            shape = dims.get(self.bound[out.index].get_uid())
+            if shape is None:
+                continue
+            for axis, (source, _) in enumerate(out.rule):
+                at = {FROM_M: 0, FROM_N: 1}.get(source)
+                if at is not None and mn[at] is None:
+                    mn[at] = int(shape[axis])  # override dims count elements: no fp4 n // 2 to undo
+        planned = (self.chain.matmul.M, self.chain.matmul.N)
+        return self.workspace_bytes_for(r.batch, *(p if v is None else v for v, p in zip(mn, planned)))
+
     recipe: Any = field(default=None, init=False, repr=False, compare=False)
     lowered: Any = field(default=None, init=False, repr=False, compare=False)
     bound: Any = field(default=(), init=False, repr=False, compare=False)
@@ -1048,16 +1086,16 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             return decline("scale factors without a block size")
         renorm = tuple(
             (
-                (j, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1])
+                (j, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1], op.graph_order)
                 for j, op in enumerate(r.inputs)
-                if op.declared != backend.KERNEL_AXES
+                if op.graph_order or op.declared != backend.KERNEL_AXES
             )
         )
         stride_ins = r.stride_ins
         in_slots = tuple((op.index for op in r.inputs))
         ins = tuple(((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs)))
         outs = tuple(((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs))
-        auxs = tuple(((x.index, x.align) for x in r.aux))
+        auxs = tuple((x.index, x.align, x.mainloop_scale) for x in r.aux)
         sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf))
         tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = (r.shared_layout, r.seeds)
@@ -1074,6 +1112,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             (o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4")
         )
         mn_view_slots = (frozenset((o.index for o in r.outputs)) | frozenset((x.index for x in r.aux))) - packed_scale_slots
+        aux_views = {id(x.ref): x.transposed for x in r.aux}
+        tail = tuple((i, ref, (swap_ab ^ aux_views.get(id(ref), False)) if ref is not None else (swap_ab and i in mn_view_slots)) for i, ref in tail)
         if split_k_slices > 1:
             cta_k_elems = backend._cta_k_elems(self.chain, self.config)
         if needs_workspace:
@@ -1087,13 +1127,15 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         def lowered(operands, graph_order=None, stream=None, workspace=None):
             """Validate resolved buffers and launch the already compiled GEMM plan."""
             backend._check_plan_device(device)
+            original_operands = operands
+            operands = r.operand_views(operands)
             vs = [operands[i] for i in in_slots]
-            for j, perm, dsh, dst in renorm:
+            for j, perm, dsh, dst, force_graph_order in renorm:
                 v = vs[j]
                 sh = v.shape
                 if len(sh) != 3:
                     continue
-                declared = bool(graph_order) and graph_order[in_slots[j]]
+                declared = force_graph_order or (bool(graph_order) and graph_order[in_slots[j]])
                 if not declared and dsh is not None:
                     declared = sh[0] == dsh[0] and sh[1] == dsh[1] and (sh[2] == dsh[2])
                     if declared:
@@ -1104,7 +1146,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             a_sh, b_sh = (vs[a_pos].shape, vs[b_pos].shape)
             if len(a_sh) != 3 or len(b_sh) != 3:
                 gave_up["A or B is not rank 3"] += 1
-                return refuse(operands, graph_order)
+                return refuse(original_operands, graph_order)
             m, n, k = (a_sh[1], b_sh[1], a_sh[2] * a_kpack)
             problem = [m, n, k, batch]
             for (kc, mod, ebatch, kpack, is_b, takes_stride), v in zip(ins, vs):
@@ -1119,12 +1161,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     or (backend._pow2_floor(v.data_ptr()) < 16)
                 ):
                     gave_up["input layout"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
                 if takes_stride:
                     problem += (st[1], st[2], st[0])
             if quant_mn is not None and (m, n) != quant_mn and (quant_reason(quant_chain, quant_cfg, m, n) is not None):
                 gave_up["quant extents"] += 1
-                return refuse(operands, graph_order)
+                return refuse(original_operands, graph_order)
             for idx, k0, v0, k1, v1, k2, v2, align in outs:
                 v = operands[idx]
                 sh, st = (v.shape, v.stride())
@@ -1136,21 +1178,23 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     or (backend.tensor_alignment(tuple(sh), tuple(st), v.element_size(), ptr=v.data_ptr()) < align)
                 ):
                     gave_up["output layout"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
                 problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
-            for idx, align in auxs:
+            for idx, align, scale_rule in auxs:
                 v = operands[idx]
+                if scale_rule is not None:
+                    scale_rule.check(v, k)
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
             for idx, aux_layout_reason in aux_layouts:
                 if aux_layout_reason(operands[idx], m, n) is not None:
                     gave_up["aux layout"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
             if sfs:
                 if whole_scale_blocks and k % block_size:
                     gave_up["partial scale block"] += 1
-                    return refuse(operands, graph_order)
+                    return refuse(original_operands, graph_order)
                 k4 = (k // block_size + 3) // 4
                 for idx, is_a, sf_batch in sfs:
                     v = operands[idx]
@@ -1162,13 +1206,13 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         or (count * v.element_size() < 512 * k4 * (((m if is_a else n) + 127) // 128) * sf_batch)
                     ):
                         gave_up["scale-factor blob"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
             for lead, followers in shared:
                 st = tuple(vs[lead].stride())
                 for j in followers:
                     if tuple(vs[j].stride()) != st:
                         gave_up["operands do not share a layout"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
             if split_k_slices > 1:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
             extra = ()
@@ -1184,7 +1228,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     v = operands[idx]
                     if v.element_size() != elem_bytes:
                         gave_up["reduction seed dtype"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
                     sh, st = (v.shape, v.stride())
                     if is_contiguous(sh, st):
                         fills.append((v.data_ptr(), None, int(v.numel()), word))
@@ -1192,7 +1236,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     plan = fill_plan(sh, st)
                     if plan is None:
                         gave_up["reduction output writes an element twice"] += 1
-                        return refuse(operands, graph_order)
+                        return refuse(original_operands, graph_order)
                     fills.append((v.data_ptr(), plan, 0, word))
                 for ptr, plan, count, word in fills:
                     if plan is None:
@@ -1204,11 +1248,11 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 *(v.permute(1, 2, 0) for v in vs),
                 *(
                     (
-                        (backend._swap_mn_view(operands[i]) if swap_ab and i in mn_view_slots else operands[i]).permute(1, 2, 0)
+                        (backend._swap_mn_view(operands[i]) if transpose_view else operands[i]).permute(1, 2, 0)
                         if ref is None
-                        else backend._reshape_aux_to_fake(backend._swap_mn_view(operands[i]) if swap_ab else operands[i], ref)
+                        else backend._reshape_aux_to_fake(backend._swap_mn_view(operands[i]) if transpose_view else operands[i], ref)
                     )
-                    for i, ref in tail
+                    for i, ref, transpose_view in tail
                 ),
                 *extra,
                 stream=backend._as_custream(stream),
@@ -1221,6 +1265,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         backend = self._compiler
         recipe = self.recipe
         backend._check_plan_device(recipe.device)
+        operands = recipe.operand_views(operands)
         mnk, axes = recipe.problem(operands, graph_order)
         backend.check_shapes(recipe, operands, mnk, axes)
         backend.check_alignment(recipe, operands, axes)
@@ -1741,6 +1786,7 @@ _SHARED_EXPORTS = {
     "_CTAMMA_SUFFIX": _CTAMMA_SUFFIX,
     "_INJECT_MARKER_LINE": _INJECT_MARKER_LINE,
     "_aux_fake_shape_code": _aux_fake_shape_code,
+    "_aux_kernel_shape": _aux_kernel_shape,
     "_aux_can_use_explicit_fake_stride": _aux_can_use_explicit_fake_stride,
     "_aux_fake_block": _aux_fake_block,
     "_aux_signature_block": _aux_signature_block,

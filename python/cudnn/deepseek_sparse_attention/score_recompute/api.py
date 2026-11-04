@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.tensor_adapter import has_tcgen05
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_capability,
     maybe_contiguous,
@@ -37,8 +38,8 @@ from ._block_scaled import BLOCK_SCALED_PRECISION_NAMES
 def _check_score_arch(api: APIBase) -> None:
     major, _ = torch.cuda.get_device_capability()
     api._runtime_error_if(
-        major != 9 and major < 10,
-        f"{type(api).__name__} requires SM90 or SM100+ compute capability, found SM{major}",
+        major != 9 and not has_tcgen05(major),
+        f"{type(api).__name__} requires SM90 or SM100+ compute capability with tcgen05 (not cc 12.x), found SM{major}",
     )
 
 

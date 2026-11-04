@@ -988,7 +988,7 @@ def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
     compiled = object.__new__(compiler.CompiledFusedGemm)
     compiled.chain = swap_ab(chain)
     compiled.config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=True)
-    compiled.recipe = SimpleNamespace(device=0, problem=lambda *args: ((128, 128, 128), ()), batch=1)
+    compiled.recipe = SimpleNamespace(device=0, problem=lambda *args: ((128, 128, 128), ()), batch=1, operand_views=lambda operands: operands)
     for name in ("_check_plan_device", "check_shapes", "check_alignment"):
         monkeypatch.setattr(compiler, name, lambda *args: None)
 
@@ -1123,16 +1123,18 @@ _SM120_AUX_LAYOUTS = {
         plan=(M, 1),
         refusal=rf"the kernel reads shape \(1, 1, {N}\) with strides \(\*, \*, 0\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 2,",
     ),
+    # A rank-1 aux's fake is (1, N) at any plan M (_aux_kernel_shape): a (1, N) buffer serves
+    # every M, since the kernel reads row 0 for each row, and no (M, N) view can be passed.
     "unit_m_rank1": _aux_layout(
         (N,),
         (1,),
         (
             (1, N, lambda m, n: _small_ints(1, n)),
-            (M, N, lambda m, n: _small_ints(1, n).expand(m, n)),
+            (M, N, lambda m, n: _small_ints(1, n)),
         ),
-        (M, N, lambda m, n: _small_ints(m, n)),
+        (M, N, lambda m, n: _small_ints(1, n).expand(m, n)),
         plan=(1, N),
-        refusal=rf"the kernel reads shape \({M}, {N}\) with strides \(0, 1\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 0,",
+        refusal=rf"the kernel reads shape \(1, {N}\) with strides \(\*, 1\) on every axis of extent > 1",
     ),
 }
 

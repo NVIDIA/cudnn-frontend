@@ -52,6 +52,8 @@ from cudnn.sdpa.fwd.config_sm90 import (
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_NATIVE_LEGS as _SM107_SMALL_D_NATIVE_LEGS
+from cudnn.sdpa.fwd.config_sm107 import supports_native_d64_pack, supports_native_d256_dense_split, supports_native_d128_single_q
 from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
@@ -539,8 +541,8 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # sm100/prefill_d128_mxfp8.py, prefill_d128_fp8.py and prefill_d192_d128_f16.py) is claimed per KERNEL and per
 # ARCH.  It trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's MUFU rate -- MEASURED
 # 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
-# costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, so the split
-# stays off there until a GB300 A/B says otherwise.  Positive gate on the measured cc, never a negative gate on
+# costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, and a B300 A/B
+# (below) confirms it: the split stays off there.  Positive gate on the measured cc, never a negative gate on
 # 10.3: the engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.  Precisely: with
 # the gate OFF the four kernels trace the all-MUFU exp2 spelling (``_E2E_ENABLED`` False, ``cute.math.exp2`` at
 # every softmax site), and the d128 MXFP8 kernel ADDITIONALLY carries its arch-independent Amax_O FMNMX fold
@@ -566,6 +568,13 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # ("mxfp8", (192, 128)) -3.3..-4.0 % dense -- neither block was merged, and neither is what those entries gate;
 # BF16 D64 nonpaged causal interiors also use the existing mix; masked tiles, dense bands and other layouts stay on MUFU.
 # Every d256 / d512 flavor is unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
+# cc 10.3, MEASURED 2026-10-31 on a B300 SXM6 (1100 W, cuDNN 9.28.0.38) for the five entries above measured on B200 only:
+# _EXP2_FMA_SPLIT_CC widened to {(10, 0), (10, 3)} vs develop, FROST forward pinned (benchmark_single_sdpa.py
+# --sdpa_backend cudnn_oss), A/B/A/B in separate processes, CUDA-event medians, split-on / split-off time at the B200
+# cases: ("mxfp8", (128, 128)) B=1 H=24/8 S=16K 1.27x dense / 1.15x causal; ("fp8", (128, 128)) H=64/8 S=8K 1.05x dense /
+# 1.12x causal; ("f16", (192, 128)) H=128/128 S=8K 1.02x dense / 1.00x causal; ("f16", (128, 128)) H=64/8 S=8K 1.05x dense
+# / 1.00x causal (the kernel's dense-band gate keeps causal all-MUFU); ("f16", (64, 64)) causal H=32/32 S=8K 1.05x. No
+# entry wins on cc 10.3, so _EXP2_FMA_SPLIT_CC stays {(10, 0)}. The d64 decode tile's set was not measured there.
 _EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
 _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
     {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128)), ("f16", (64, 64))}
@@ -696,8 +705,13 @@ def softmax_arms_of(k_mod, *, has_lse: bool) -> str:
     return tag
 
 
-def _load_kernel_template(filename: str, params: Hashable, tag: str):
-    """Load one uniquely named kernel module per template parameter set."""
+# The parts whose template modules keep the cache key every caller has had. Another SM100-line part (cc 10.3) folds itself into
+# the key: the module, its outer ``compile()`` cache and its compiled artifacts then never serve a different part in one process.
+_HOME_KEY_PARTS = frozenset({(10, 0), (10, 7)})
+
+
+def _load_kernel_template(filename: str, params: Hashable, tag: str, part=None):
+    """Load one uniquely named kernel module per template parameter set (and per part off :data:`_HOME_KEY_PARTS`)."""
 
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
     # The sm107 config module's private sweep seams specialize a body WITHOUT touching the record: fold their state into the module
@@ -709,10 +723,12 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
     # The SM100 small tiles' own seam (config_sm100._STAGES_KV_OVERRIDE_FOR_SWEEPS) joins the key ONLY when it is set, so every key a
     # process without it builds is the key it always had (the sm107 seams' alone, or None).
     extra_key = seams if seams_sm100 is None else (seams, seams_sm100)
+    if part is not None and tuple(part) not in _HOME_KEY_PARTS:
+        extra_key = (extra_key, ("part", tuple(part)))
     return load_template(path, params, tag=tag, extra_key=extra_key)
 
 
-def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
+def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False, part=None):
     """Load one SM100-family module for the selected flavor and quantization
     path. Rubin uses its SM107 siblings, including paged D128 half, except for
     the shared half single-Q split and D256 paged pipelines, whose SMEM fits the version-0 descriptor window,
@@ -720,8 +736,28 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     and native D128 prefill under PackGQA."""
 
     tag = _flavor_tag(flavor)
+    if rubin and not fp8 and flavor == (128, 128) and params.softmax_wgs == 1:
+        return _load_kernel_template("sm107/prefill_d256_f16.py", params, "sdpa_fwd_sm107_d128_single_q")
     if params.dtype_kv != -1 and (fp8 or flavor != (128, 128)):
         raise ValueError("independent FP8 KV storage requires the SM100/SM107 D128 half pipeline")
+    if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
+        params = replace(params, d_flavor=192)
+        return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
+    if (
+        rubin
+        and not fp8
+        and flavor == (64, 64)
+        and params.cta_mma == 1
+        and (params.split_kv > 1 or params.decode_tile)
+        and (not params.thd_varlen or params.split_kv > 1)
+        and not params.paged_kv
+        and params.tile_n == 128
+    ):
+        # The single-Q body also serves physical D64 on SM107. A second Q slab
+        # wastes an MMA/softmax chain on decode; retain the native prefill body
+        # for two CTAs and N64. The shared body is compiled for the actual part.
+        params = replace(params, d_flavor=64, decode_tile=True)
+        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.ragged_q:
         # The single-query paged split ABI uses the shared decode tile, as
         # on SM100/SM103, compiled for the actual SM107 target.
@@ -798,7 +834,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     else:
         filename = _SM100_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{tag}"
-    return _load_kernel_template(filename, params, tag)
+    return _load_kernel_template(filename, params, tag, part=None if rubin else part)
 
 
 def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = False):
@@ -937,6 +973,8 @@ class SdpaFwdDsl(APIBase):
         fallback the heuristics pick above the resident budget); None = the pick (``config_sm107.sm107_bias_mode_pick``).
         ``bias_stages`` (APPENDED, optional): the streamed ring's depth, 2 or 3 (None = the deepest that fits); a request on a
         plan that runs the resident block is a typed decline.
+        ``softmax_wgs=1`` selects the one-Q native D128 half THD topology at cga1 / TILE_M128 / TILE_N128,
+        unsplit, unpacked and nonpaged, without bias, KV mask, gate or mixed KV storage.
         ``softmax_wgs`` (APPENDED, optional): the number of softmax warp groups of the Rubin f16/bf16 d128-file body -- 2 (the
         classic 16-warp body) or 3 (the third softmax warp group: a 20-warp body whose pair work item takes THREE rows of the chunk per
         step; an EXPERIMENT, served on the (n, n+1) pair item at tile_n 64 / cga 1 only and declined typed elsewhere).  None = 2 (or
@@ -1127,6 +1165,7 @@ class SdpaFwdDsl(APIBase):
                     f"decode_q_tile_max must be one of {_widths} (the Rubin d256 decode tile's single-unit widths) or None; got {decode_q_tile_max}"
                 )
         self.use_pdl = bool(use_pdl)
+        self._cluster_combine = False
         # THD Stats declared WITHOUT ragged offsets: per-batch padded (b, s_max, h)
         # rows (FlashInfer's form). The kernel stores per batch; the adapter fills
         # the rows past each sequence's length with -inf, as the backend does.
@@ -1195,6 +1234,18 @@ class SdpaFwdDsl(APIBase):
     @property
     def paged(self) -> bool:
         return self.paged_page_size > 0
+
+    @staticmethod
+    def _paged_pool_stride(desc) -> tuple:
+        """Container strides ``[num_pages, H_kv, page_size, D]`` re-expressed in
+        the kernel's ``[num_pages, page_size, H_kv, D]`` order (a permutation,
+        so HND and NHD storage both bind as views)."""
+        s = tuple(int(x) for x in desc.stride)
+        return (s[0], s[2], s[1], s[3])
+
+    def _paged_table_expected_stride(self, which_v: bool, n_pages: int) -> tuple:
+        declared = self.paged_table_v_stride if which_v else self.paged_table_stride
+        return declared if declared is not None else (n_pages, 1)
 
     @abstractmethod
     def _initialize_implementation(self) -> None:
@@ -1498,6 +1549,20 @@ class SdpaFwdDsl(APIBase):
             width = 1
         return dense_bind_strides(shape, stride, width)
 
+    def _check_native_dense_layouts(self):
+        """Every accepted dense data port binds its declared storage directly."""
+        if self.thd:
+            return
+        for role in ("q", "k", "v", "o"):
+            if self.paged and role in ("k", "v"):
+                continue  # Page pools have their own per-port layout contract.
+            desc = getattr(self, role + "_desc")
+            self._not_implemented_error_if(
+                self._prepared_operand_layout(desc) is None,
+                f"{role}: native dense forward requires contiguous D, non-overlapping B/H/S strides and 16-byte outer-stride alignment; "
+                f"got shape {tuple(desc.shape)}, strides {tuple(desc.stride)}",
+            )
+
     def _can_prepare_block_output(self):
         return bool(self.o_block_scale) and not (
             self.thd or self.paged or self.split_kv > 1 or self.pack_gqa or self.gate_desc is not None or getattr(self, "pv_bf16", False)
@@ -1516,6 +1581,7 @@ class SdpaFwdDsl(APIBase):
             execute_native_thd_tensors,
             facts_of_tensor,
         )
+        from cudnn._torch_stream import device_context
 
         spec = self._thd_spec if self.thd else self._dense_spec
         if self.thd:
@@ -1532,7 +1598,6 @@ class SdpaFwdDsl(APIBase):
             raise ValueError(f"cudnn.sdpa: prepared FP8 workspace must cover {required} bytes on the Q device")
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
-        _ensure_current_context(stream_int, q.device.index)
         if spec.quant.block_output is None and scales.get("sf_o") is not None:
             raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
         if self.thd:
@@ -1540,12 +1605,16 @@ class SdpaFwdDsl(APIBase):
                 raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
             buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
             buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
-            launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
+            with device_context(q.device):
+                _ensure_current_context(stream_int, q.device.index)
+                launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
         else:
             buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
             buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
             buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
-            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+            with device_context(q.device):
+                _ensure_current_context(stream_int, q.device.index)
+                execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
             launched = True
         # Preserve the retired tensor path's diagnostics at the live entry.
         if self.thd and getattr(self, "_prepared_mxfp8", False):
@@ -1559,6 +1628,8 @@ class SdpaFwdDsl(APIBase):
             else:
                 self._logger.debug("execute (FP8 THD): no addressable Q token, nothing to do")
         self._logger.debug("execute (prepared FP8) completed")
+        # Preserve the completion diagnostics from the retired staging executor.
+        self._logger.debug("execute (FP8 per-tensor) completed" if self._pertensor else "execute (MXFP8) completed")
 
     def _o_dtype(self):
         """The torch dtype O is STORED as.
@@ -1613,8 +1684,8 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside per-tensor FP8 D64/D128/D192, half D128/D192, native
-          half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
+        * SM107 (Rubin) outside per-tensor FP8 and half D64/D128/D192, native
+          half D256 dense prefill, half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
           partial-output slot.  The decode tile (sm107/decode_d256_f16.py) is
           the SM100 body and stores fp32 partials unconditionally under a split
           (its O slot and o_partial slot are both Float32 then), so it takes
@@ -1635,10 +1706,11 @@ class SdpaFwdDsl(APIBase):
             return False
         if self._device_cc == (10, 7):
             return (
-                bool(not self._fp8 and self.flavor in ((128, 128), (192, 128)))
+                bool(not self._fp8 and self.flavor in ((64, 64), (128, 128), (192, 128)))
                 or bool(self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
                 or self._decode_q_tile() > 0
                 or self._rubin_native_d512_leg()
+                or self._rubin_native_d256_split_leg()
             )
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
@@ -1812,6 +1884,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``check_support`` declines an explicit 128 for it typed), else 128."""
         if self.tile_n is not None:
             return int(self.tile_n)
+        if self.packed_thd_split and self.flavor == (64, 64):
+            return 128  # the shared one-Q split body has a fixed 128-column KV tile
         if self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE) and self._device_cc == (10, 7) and not self._fp8:
             return _sm107_tile_n_pick(
                 self.flavor[0],
@@ -1930,6 +2004,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """The ``TemplateParams.s_slots`` of this plan: Two for the native D128 narrow tile. On Rubin 32- / 64-wide f16/bf16 tiles,
         ``config_sm107.sm107_s_slots_pick`` decides (the MEASURED rule: 2 on the plain body -- no bias, no kv_mask -- at TILE_N 64, 1 on
         every other form; the sweep seam's value verbatim, which the factory validates against TILE_N 64 and the TMEM fit)."""
+        if self.softmax_wgs == 1:
+            return 2
         # D128's explicit narrow tile uses the double-buffered score pipeline.
         # Its default tile width remains 128; this does not choose a plan.
         if self._native_d128_narrow_tile() and self._effective_tile_n() == 64:
@@ -2139,8 +2215,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
         )
 
+    def _rubin_native_d256_split_leg(self) -> bool:
+        return supports_native_d256_dense_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, pack_gqa=self.pack_gqa)
+
     def _rubin_native_d512_leg(self) -> bool:
         return supports_native_d512_dense_pack_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
+
+    def _rubin_native_d64_pack_leg(self) -> bool:
+        return not self.softmax_scale_prefolded and supports_native_d64_pack(
+            self.flavor,
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            paged=self.paged,
+            split_kv=self.split_kv,
+            cga=self.cga,
+            thd=self.thd,
+        )
 
     def _rubin_shared_dense_leg(self) -> bool:
         """Historical dense D128 decode/packing admission predicate (issue #1472).
@@ -2179,8 +2269,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             ),
         )
 
+    def _rubin_native_d192_paged_leg(self) -> bool:
+        from cudnn.sdpa.fwd.config_sm107 import supports_native_d192_paged
+
+        return supports_native_d192_paged(
+            self.flavor,
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            paged=self.paged,
+            cga=self.cga,
+            split_kv=self.split_kv,
+        )
+
     def _rubin_native_thd_prefill_leg(self) -> bool:
         """The exact-D128 native THD prefill domain, shared with graph admission."""
+        if self.thd and self._rubin_native_d64_pack_leg():
+            return True
         return not self.softmax_scale_prefolded and supports_nonpaged_d128_thd_prefill(
             (int(self.q_desc.shape[-1]), int(self.v_desc.shape[-1])),
             device_cc=self._device_cc,
@@ -2193,6 +2297,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _rubin_shared_thd_pack_leg(self) -> bool:
         """Unsplit nonpaged D128 THD packing on the native prefill body."""
+        if self.thd and self.pack_gqa and self._rubin_native_d64_pack_leg():
+            return True
         return self.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
             self.flavor,
             device_cc=self._device_cc,
@@ -2479,7 +2585,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                         "supports_native_d576_packed_split"
                         if (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE
                         else (
-                            "supports_paged_d64_packed_split"
+                            ("supports_paged_d64_packed_split" if self.paged else "supports_nonpaged_d64_packed_split")
                             if int(d_v) == 64
                             else (
                                 ("supports_paged_d256_packed_split" if self.paged else "supports_nonpaged_d256_packed_split")
@@ -2550,8 +2656,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # A graph must only land on a flavor that HAS a kernel for its
         # quantization AND its arch line: the per-tensor and block-scale
         # families have different native maps, and the Rubin f16 pool is
-        # exactly _SM107_KERNEL_FILES (today the four SM100 shapes d128,
-        # d192xd128, d256, d512; no native d64).  Without the Rubin narrowing a
+        # exactly _SM107_KERNEL_FILES, including the native small tiles.
+        # Without the Rubin narrowing a
         # shape the map lacks would be picked and then KeyError in
         # _load_sm100_kernel_module; with it, the graph falls to the next
         # covering envelope exactly as it does for a missing FP8 flavor.
@@ -2566,12 +2672,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f for f in _SM100_FLAVORS if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
             )
         elif self._device_cc == (10, 7):
-            # The Rubin f16 pool: a small head-dim tile (config_sm107.SM107_F16_SMALL_D_SHAPES) only for a graph on its
-            # DENSE leg (no THD / paged KV / split-KV / PackGQA / score side outputs -- sm107_small_tile_leg) at a cga it
-            # is validated at (SM107_SMALL_D_CGAS, or unset); any other graph walks past the small tiles onto the d128
-            # flavor it rode before they existed (zero-filled to 128), where that leg is wired.  The twin of the engine
-            # row's dense_only_d_shapes walk in engines._selected_d_shape (rule 8b'); the tests assert they agree per leg.
-            _leg = _sm107_small_tile_leg(
+            # Each small tile admits its own feature set and CTA widths. D32
+            # remains dense-only; D64 also carries THD, PackGQA and dense splitting. Check every
+            # requested feature before selecting a tile, matching the graph's
+            # native_legs_by_d_shape walk (rule 8b').
+            _legs = dict(
                 prefolded=bool(self.softmax_scale_prefolded),
                 thd=self.thd,
                 paged=self.paged,
@@ -2583,7 +2688,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f
                 for f in _SM107_FLAVORS
                 if f in _SM107_KERNEL_FILES
-                and (f not in _SM107_F16_SMALL_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM107_SMALL_D_CGAS[f])))
+                and (
+                    f not in _SM107_F16_SMALL_D_SHAPES
+                    or (
+                        _sm107_small_tile_leg(**_legs, allowed_legs=_SM107_SMALL_D_NATIVE_LEGS[f]) is None
+                        and (self.cga is None or self.cga in _SM107_SMALL_D_CGAS[f])
+                    )
+                )
             )
         else:
             # The SM100 f16/bf16 pool: the 32-wide small tile (the sm100 d128 file at d_flavor 32, config_sm100.SM100_DENSE_ONLY_D_SHAPES) only for a
@@ -2643,6 +2754,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self.paged
                 and not self.packed_thd_split
                 and not self._rubin_shared_thd_pack_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not self._rubin_native_d512_leg()
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
@@ -2651,6 +2763,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
+                and not self._rubin_native_d64_pack_leg()
+                and not self._rubin_native_d192_paged_leg()
                 and not (self.packed_thd_split and int(d_qk) in (64, 128, 576))
                 and not supports_paged_d256_pack_gqa(
                     (int(d_qk), int(d_v)),
@@ -2677,6 +2791,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
                 or self._rubin_native_d512_leg()
+                or self._rubin_native_d192_paged_leg()
+                or self._rubin_native_d64_pack_leg()
                 or self._rubin_shared_thd_pack_leg()
                 or supports_paged_d128_partial_pack_gqa(
                     (int(d_qk), int(d_v)),
@@ -2769,6 +2885,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _tile_ns = dict(_SM107_FP8_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128}))
         if self._native_d128_narrow_tile():
             _tile_ns = frozenset({64, 128})
+        if self.packed_thd_split and self.flavor == (64, 64):
+            _tile_ns = frozenset({128})
         self._value_error_if(
             self.tile_n is not None and self.tile_n not in _tile_ns,
             f"SM100 DSL SDPA serves tile_n in {sorted(_tile_ns)} on the {self.flavor} flavor; got {self.tile_n}",
@@ -2862,13 +2980,33 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.cga == 1 or (self.cga is None and self.flavor == (64, 64)),
                 "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store (pin cga=2)",
             )
+        if self.softmax_wgs == 1:
+            self._not_implemented_error_if(
+                not supports_native_d128_single_q(
+                    (d_qk, d_v),
+                    device_cc=self._device_cc,
+                    half_precision=self.q_desc.dtype in (torch.float16, torch.bfloat16),
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                    pack_gqa=self.pack_gqa,
+                    tile_m=self.tile_m,
+                    tile_n=self.tile_n,
+                    has_bias=self.bias_desc is not None,
+                    has_kv_mask=self.kv_mask_desc is not None,
+                    has_gate=self.gate_desc is not None,
+                    mixed_kv=self.k_desc.dtype != self.q_desc.dtype or self.v_desc.dtype != self.q_desc.dtype,
+                ),
+                "softmax_wgs=1 requires native half D128 THD, CTA1 M128 N128, unsplit/unpacked, without bias, KV mask or gate",
+            )
         if self.bias_desc is None:
             # n_chunk is the resident-bias arm's work-item form (the (n, n+1) pair item): typed decline on a plan without a bias.
             self._not_implemented_error_if(
                 self.n_chunk is not None and self.n_chunk >= 1, "n_chunk is the resident-bias arm's work-item form; this plan has no bias"
             )
             self._not_implemented_error_if(
-                self._resident_arm_softmax_wgs() != 2,
+                self._resident_arm_softmax_wgs() not in (1, 2),
                 "softmax_wgs=3 (the third softmax warp group) is the resident-bias pair item's arm; this plan has no bias",
             )
         # The PLAIN padded body's tail form (padded_tail_form=): a REQUEST is honoured on the Rubin small tiles' padded, band-less,
@@ -2900,13 +3038,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"kv_mask={self.kv_mask_desc is not None}, pack_gqa={self.pack_gqa}, thd={self.thd}, gate={self.gate_desc is not None}",
         )
         if self.bias_desc is not None or self.kv_mask_desc is not None:
-            # The resident-block arms bind through the PREPARED launch only: the staging-copy executor (a layout TMA cannot bind
-            # zero-copy) forwards neither operand, so that path is a typed decline here, never an execute-time error (the engine
-            # row's _resident_arm_layout_decline is the twin, rule 8b).
+            # Bias and mask ports use the same native prepared launch contract.
             self._value_error_if(
                 not self._fp8 and not self._can_prepare_dense_layout(),
-                "the additive bias / kv_mask arms bind through the prepared launch only: Q/K/V/O need 16-byte-aligned BSHD-physical strides "
-                "that bind without a copy (the staging-copy path does not carry these operands)",
+                "the additive bias / kv_mask arms require native Q/K/V/O layouts: contiguous D and 16-byte-aligned covering B/H/S strides",
             )
             # Additive bias / per-key mask: the twin of the engine row's gates (engines._bias_arm_decline; rule 8b)
             # through the SAME constants (rule 8b').  The resident row-block lives in the Rubin f16/bf16 d128 file's
@@ -3161,7 +3296,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256)))
-                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
+                and not self._rubin_native_d192_paged_leg(),
                 "Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256, and decode-shaped half D256 graphs on the decode tile (per-tensor FP8 pools and other dense half queries are not wired)",
             )
             self._not_implemented_error_if(
@@ -3259,32 +3395,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # (sm107/decode_d256_f16.py) writes the SM100 tile's fp32 split partials into the split-major
             # workspace that sm100/split_combine reduces, packed or not, over a dense or paged cache -- so a
             # decode-shaped half d256 graph keeps its split on cc 10.7 (engines.mismatch lifts the same two
-            # rules through d256_decode_tile_selected); the d256 PREFILL kernel's split stays the paged THD
-            # packed split.
+            # rules through d256_decode_tile_selected); half d256 prefill also splits on its native dense
+            # unpacked body and the shared paged THD packed body.
             _rubin_decode_tile = self._device_cc == (10, 7) and self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)) > 0
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and self.pack_gqa
                 and not _rubin_decode_tile
                 and not self._rubin_native_d512_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not (
                     self.thd_decode_leg
                     or self.packed_thd_split
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_PACK_GQA_SHAPES)
                     or self._rubin_shared_dense_leg()
                 ),
-                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged THD, a dense D128 half graph, native dense D512 half, or the d256 decode tile",
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged THD, a dense D64/D128 half graph, native dense D512 half, or the d256 decode tile",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and not _rubin_decode_tile
+                and not self._rubin_native_d256_split_leg()
                 and not self._rubin_native_d512_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not (
                     self.packed_thd_split
                     or (not self._fp8 and self.flavor in ((128, 128), (192, 128)))
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
                 ),
-                "split_kv > 1 on cc10.7 requires per-tensor FP8 D64, half/per-tensor FP8 D128 or D192/V128, per-tensor FP8 D256, half D256 THD, native dense D512 half, or the d256 decode tile",
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D64/D128 or D192/V128, per-tensor FP8 D256, half D256 THD or native dense unpacked prefill, native dense D512 half, or the d256 decode tile",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
@@ -3356,6 +3495,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"MXFP8 {sorted(_SM107_MXFP8_THD_SHAPES)} or f16/bf16 {sorted(_SM107_F16_THD_SHAPES)} only; "
             f"got (D_QK={d_qk}, D_V={d_v}) on the "
             f"{'MXFP8' if (self._fp8 and not self._pertensor) else 'FP8' if self._fp8 else 'f16/bf16'} path",
+        )
+        self._not_implemented_error_if(
+            self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
+            "native D64 THD requires nonpaged half-precision plans, with one CTA for split execution",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`
@@ -3451,9 +3594,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "the d256 decode tile's split combine; the dense d256 prefill kernel runs unpacked",
             )
             if _gate_in_combine:
-                # The gated combine is reached through the prepared dense launch only
-                # (the staged path binds the split through the same native binder, which
-                # knows no gate on a split): the operands must bind zero-copy.
+                # The gated combine uses the prepared dense launch; every
+                # operand must satisfy its native binding contract.
                 self._not_implemented_error_if(
                     not self._can_prepare_dense_layout(),
                     "the gate-in-combine split (the d256 decode tile) needs Q/K/V layouts the prepared dense launch binds zero-copy (BSHD-physical)",
@@ -3476,20 +3618,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     "the epilogue gate is bfloat16 on the quantized (FP8) path" if self._fp8 else "the epilogue gate must match Q dtype on the f16/bf16 path"
                 ),
             )
-            # The gate binds zero-copy or not at all: compact, or a TMA-expressible
-            # token-major declaration the artifact is compiled at (a G sliced out
-            # of a fused projection slab).  ONE rule decides -- the same
-            # `epilogue_gate_layout_declarable` the engine rows apply to G in
-            # mismatch() -- so a graph that entered the ranked list cannot die
-            # here (rule 8b lockstep).  It is STRICTER than dense_layout_ok:
-            # a head-major (torch-contiguous [B, H, S, D]) or 16-byte-unaligned
-            # G is a legal Q/K/V/O layout (those take the normalisation copy)
-            # but not a gate layout, because no hidden copy is made for the gate.
+            # Graph and standalone gate admission share the same per-port
+            # native stride predicate as Q/K/V/O.
             self._value_error_if(
                 not _epilogue_gate_layout_declarable(tuple(self.gate_desc.shape), tuple(self.gate_desc.stride), self.gate_desc.dtype.itemsize),
-                f"GATE layout is not TMA-expressible for a zero-copy binding: the gate must be BSHD-compact or a token-major "
-                f"declaration (D innermost-contiguous, then heads, then tokens; seq and head strides 16-byte multiples; covering) "
-                f"-- a head-major or unaligned G is neither, and no hidden copy is made for the gate; got BHSD strides {tuple(self.gate_desc.stride)}",
+                f"GATE layout is not TMA-expressible: contiguous D and 16-byte-aligned covering B/H/S strides are required; "
+                f"got BHSD strides {tuple(self.gate_desc.stride)}",
             )
         self._value_error_if(
             not self.has_amax_o and not self._fp8,
@@ -3527,7 +3661,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._kv_tail_mask
                 and (self.split_kv or 1) > 1
                 and not native_fp8_padded_split
-                and not supports_scalar_kv_tail_split((int(d_qk), int(d_v)), device_cc=self._device_cc, fp8=self._fp8, pertensor=self._pertensor),
+                and not supports_scalar_kv_tail_split(
+                    (int(d_qk), int(d_v)) if self._fp8 else self.flavor,
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    pertensor=self._pertensor,
+                ),
                 f"S_kv ({s_kv}) is not a multiple of {_SM100_TILE_N}: split-KV needs a padding mask (seq_len_kv) or a causal mask covering the KV tail",
             )
 
@@ -3550,6 +3689,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.head_dim_qk = int(d_qk)
         self.head_dim_v = int(d_v)
 
+        self._check_native_dense_layouts()
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
@@ -3664,12 +3804,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         decode tile serves the d64 flavor's whole graph contract (paged / dense,
         padding, causal bottom-right, SWA, right band, sink, Stats natural or
         base-2, split-KV partials) for graphs whose S_q x packed heads fit one
-        128-row tile -- S_q = 1 decode and MTP. Explicit paged THD split
+        128-row tile -- S_q = 1 decode and MTP. Explicit THD split
         plans use the same tile across multiple Q blocks. Other THD, larger
-        dense S_q and an explicit cga2 stay on the prefill tile.  d128 keys the same
+        dense S_q and an explicit cga2 stay on the prefill tile. SM107 uses
+        this specialization for dense unsplit N128 without prefolded scale.
+        d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
-        if self._fp8 or self.flavor != (64, 64) or self._device_cc == (10, 7):
+        if self._fp8 or self.flavor != (64, 64):
+            return False
+        if self.thd and self.packed_thd_split and not self.paged:
+            return True  # D64 nonpaged split uses the same physical-width single-Q body.
+        if self._device_cc == (10, 7) and (self.thd or self.paged or self.split_kv != 1 or self.softmax_scale_prefolded or self._effective_tile_n() != 128):
+            # Native THD, paged/envelope and prefolded-scale contracts keep
+            # their existing bodies. Dense split selection is handled by the
+            # loader independently of the short-Q unsplit specialization.
             return False
         if self.bias_desc is not None or self.kv_mask_desc is not None:
             # The decode tile carries no additive-bias / kv_mask arm (compile() refuses the operands): a d64 plan with either
@@ -3934,6 +4083,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 s_q=self.s_q_max,
                 s_kv=self.s_k_max,
             )
+            if self._rubin_native_d192_paged_leg():
+                params = replace(params, cta_mma=2)
         elif self.flavor == (256, 256):
             from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
 
@@ -4022,18 +4173,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def compile(self) -> None:
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
-        self._staged_spec = None
-        if (self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8())) or (not self._fp8 and not self._can_prepare_dense_layout()):
-            from .prepared_staged_forward import compile_plan
-
-            self._dense_spec = self._thd_spec = None
-            self._prepared_fp8 = self._prepared_mxfp8 = False
-            self._staged_spec = compile_plan(self)
-            self._compiled_kernel = self._staged_spec.core.owner
-            self._logger.debug("compile completed")
-            return
         params = self.template_params()
-        self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
+        self._k_mod = _load_sm100_kernel_module(
+            self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
+        )
         # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.
@@ -4218,6 +4361,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if "use_pdl" in accepted and self.use_pdl:
             # The programmatic-dependent-launch form (the launch attribute + the griddepcontrol pair); compile() declined a kernel without the knob.
             kw["use_pdl"] = True
+        if "cluster_combine" in accepted:
+            from cudnn import _pybind_module
+
+            # A native implementation of an already selected split8 plan, not a
+            # candidate or split-policy change. Old extensions retain two launches.
+            self._cluster_combine = bool(
+                getattr(_pybind_module._SdpaDenseBinder, "supports_fused_split", False)
+                and self._device_cc == (10, 7)
+                and not self.thd
+                and self.s_q_max == 1
+                and not self.use_pdl
+                and not self.stats_log2
+                and self.gate_desc is None
+                and km.cluster_combine_supported(self.head_dim_qk, self.head_dim_v)
+            )
+            kw.update(cluster_combine=self._cluster_combine, has_final_lse=self.lse_desc is not None)
         return kw
 
     def _build_prepared_specs(self) -> None:
@@ -4258,7 +4417,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         kv_mask=None,
     ) -> None:
         """Dense (padded) launch through the prepared native binder from this call's
-        torch tensors. Conversion plans use the shared staged entry instead; a split writes the
+        torch tensors. A split writes the
         partial slabs and recombines through the plan-time-compiled combine pass.
         ``ragged`` (the decode tile's ragged-Q
         leg): the (Q, O, Stats) ragged-offset tensors; Q / O / Stats then bind AS PASSED (packed, no
@@ -4418,21 +4577,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if inv_scale != spec.template[spec.index["inv_scale_softmax"]]:
                 frame[spec.index["inv_scale_softmax"]] = inv_scale
         spec.fn(*frame)
-        if self.split_kv > 1:
+        if self.split_kv > 1 and not spec.fused_split:
             spec.combine.fn(*combine_args)
         self._logger.debug("execute completed")
-
-    @staticmethod
-    def _paged_pool_stride(desc) -> tuple:
-        """Container strides ``[num_pages, H_kv, page_size, D]`` re-expressed in
-        the kernel's ``[num_pages, page_size, H_kv, D]`` order (a permutation,
-        so HND and NHD storage both bind as views)."""
-        s = tuple(int(x) for x in desc.stride)
-        return (s[0], s[2], s[1], s[3])
-
-    def _paged_table_expected_stride(self, which_v: bool, n_pages: int) -> tuple:
-        declared = self.paged_table_v_stride if which_v else self.paged_table_stride
-        return declared if declared is not None else (n_pages, 1)
 
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch ``execute()`` carves from its ``workspace``.
@@ -4446,17 +4593,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         holds unused amax and identity-scale words as well as THD metadata.
         """
         self._ensure_support_checked()
-        staged = getattr(self, "_staged_spec", None)
-        if staged is not None:
-            return staged.workspace_bytes
         b, qh = self.batch_size, self.h_q
         compiled = self._compiled_kernel is not None
-        if not compiled and (
-            (self._fp8 and not (self._can_prepare_fp8() or self._can_prepare_mxfp8())) or (not self._fp8 and not self._can_prepare_dense_layout())
-        ):
-            from .prepared_staged_forward import workspace_bytes
-
-            return workspace_bytes(self)
         if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd and not self.thd_decode_leg:
@@ -4594,9 +4732,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Run on the caller's stream (ExecutionContext.stream, resolved from the
         # execute-time handle); None -> the default stream. Threaded to every
         # kernel launch below (dense / fp8 / mxfp8 / THD).
-        explicit_stream = current_stream is not None
-        if getattr(self, "_staged_spec", None) is None:
-            current_stream = self._get_default_stream(current_stream)
+        from cudnn._torch_stream import _raw_current_stream
+
+        if current_stream is None:
+            current_stream = cuda.CUstream(_raw_current_stream(torch, self.q_desc.device))
 
         self._value_error_if(
             self.softmax_scale_prefolded and scale_softmax is not None,
@@ -4695,30 +4834,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self._value_error_if(_desc is None and _t is not None, f"this specialization was compiled without a {_name}; construct the API with sample_{_name}")
 
-        if getattr(self, "_staged_spec", None) is not None:
-            from .prepared_staged_forward import execute as execute_staged
-
-            self._value_error_if(self._pertensor and any(t is not None for t in (sf_q, sf_k, sf_v)), "per-tensor FP8 does not accept MXFP8 input scales")
-            scales = dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v) if self._pertensor else dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
-            tensors = dict(
-                q=q_tensor,
-                k=k_tensor,
-                v=v_tensor,
-                o=o_tensor,
-                lse=lse_tensor,
-                sinks=sinks,
-                seq_q_lens=seq_q_lens,
-                seq_kv_lens=seq_kv_lens,
-                scale_o=scale_o,
-                amax_o=amax_o,
-                sf_o=sf_o,
-                gate=gate,
-                block_table=block_table,
-                block_table_v=block_table_v,
-                **scales,
-            )
-            execute_staged(self, tensors, workspace, current_stream if explicit_stream else None, scale_val)
-            return
         if getattr(self, "_prepared_fp8", False):
             self._execute_fp8_prepared(
                 q_tensor,
@@ -4908,7 +5023,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             units = env if env <= initial_limit else resident
             wave_envelope = env
             if (
-                ((self._device_cc == (10, 0) and self.paged) or (self._device_cc == (10, 7) and not self.paged))
+                (
+                    (self._device_cc == (10, 0) and self.paged)
+                    # cc 10.3: GQA4 only (B300 A/B: GQA4 0.80-0.97x the resident-wave count, GQA8 0.996-1.03x)
+                    or (self._device_cc == (10, 3) and self.paged and cfg.PACK_G == 4)
+                    or (self._device_cc == (10, 7) and not self.paged)
+                )
                 and self.dtype == torch.bfloat16
                 and self.head_dim_qk == self.head_dim_v == 128
                 and self.batch_size == 1
@@ -5677,8 +5797,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     on the MXFP8 template ``sm120/prefill_mxfp8.py`` (both head dims up to
     256, multiples of 16) or its d512 flavor ``sm120/prefill_d512_mxfp8.py``
     (both head dims in (256, 512], multiples of 16).
-    Native layouts bind through the prepared MXFP8 entry and conversion layouts
-    through the staged forward (the scale tensors bind unchanged). A
+    Supported layouts bind their declared strides through the prepared MXFP8
+    entry; scale tensors bind unchanged and unsupported layouts decline. A
     block-scaled MXFP8 O (E4M3 + UE8M0 per 32, ``sample_sf_o``, with an
     optional global ``sample_scale_o``) is served as on the per-tensor path
     at d128; the FP4 (NVFP4) O is per-tensor only.
@@ -5730,13 +5850,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # Layout gate (same envelope as SM100): THD keeps the strict BSHD
         # stride order (the varlen path binds (1, T, H, D) views with the
         # DECLARED token/head strides; _thd_check_strides_native declines
-        # what TMA cannot express); dense graphs get the dense_flex
-        # relaxation — execute() normalizes to the kernel's compact-BSHD
-        # storage via the prepared staging plan (zero-copy when already
-        # BSHD-compact, one gather / scatter copy otherwise), so only what
-        # normalization needs is required: head dim innermost-contiguous
-        # (stride 1), non-broadcast, non-overlapping strides, any B/H/S
-        # order, padded strides allowed.
+        # what TMA cannot express). Dense layouts bind their strides directly:
+        # D is innermost with stride 1, B/H/S may use any non-overlapping
+        # nesting, and stepped outer byte pitches must be 16-byte aligned.
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, packed_layout_ok, thd_stats_packing
 
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
@@ -6019,10 +6135,21 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # on this arch, so there is no room to widen the O tile the way the
             # SM100 kernels do.
             #
-            # The half templates write sink-free partials and the combine folds
-            # the sink once; the FP8 epilogues still fold it per split.
+            # Half templates and qualified per-tensor FP8 lowering write
+            # sink-free partials; only the final combine folds the sink.
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
-            self._value_error_if(self.has_sink and self._fp8, "split_kv > 1 with an attention sink is served by the FP16/BF16 templates only")
+            self._value_error_if(
+                self.has_sink
+                and self._fp8
+                and not supports_quantized_split_sink(
+                    device_cc=self.compute_capability,
+                    pertensor=self._pertensor,
+                    thd=self.thd,
+                    d_shape=(int(d_q), int(d_v)),
+                    paged=self.paged,
+                ),
+                "SM120 split_kv > 1 with an attention sink requires exact D128 dense per-tensor FP8 or FP16/BF16",
+            )
             self._value_error_if(
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 "split_kv > 1 serves unpadded dense graphs only",
@@ -6043,6 +6170,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.h_kv = int(h_kv)
         self.head_dim_qk = int(d_q)
         self.head_dim_v = int(d_v)
+        self._check_native_dense_layouts()
         self._is_supported = True
 
         self._logger.debug("check_support completed successfully")
@@ -6054,17 +6182,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
-            return
-
-        self._staged_spec = None
-        self._dense_spec = self._thd_spec = None
-        if not self._can_prepare_layout():
-            from .prepared_staged_forward import compile_plan
-
-            self._prepared_fp8 = self._prepared_mxfp8 = False
-            self._staged_spec = compile_plan(self)
-            self._compiled_kernel = self._staged_spec.core.owner
-            self._logger.debug("compile completed")
             return
 
         # None = the standalone-wrapper tier stated no preference: derive the
@@ -6099,7 +6216,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             bottom_right=self.causal_bottom_right,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
-            has_sink=self.has_sink,
+            # Quantized split partials exclude the sink; the prepared spec
+            # retains api.has_sink and folds it once in the final combine.
+            has_sink=self.has_sink and not (self._fp8 and self.split_kv > 1),
             stats_log2=self.stats_log2 and self.split_kv == 1,
             thd_varlen=self.thd,
             q_tile=self.q_tile,
@@ -6184,13 +6303,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
         On MXFP8, ``scale_o`` is that O's optional global scale (bound exactly
         when constructed with ``sample_scale_o``).
-        Prepared FP8 / MXFP8, half THD, split-KV and dense layout conversions require caller-owned ``workspace``
+        Prepared FP8 / MXFP8, half THD and split-KV require caller-owned ``workspace``
         of at least ``scratch_workspace_bytes()`` bytes, contiguous, 16-byte
         aligned and on the Q device. Graph callers use ``get_workspace_size()``.
         """
 
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
+        from cudnn._torch_stream import _raw_current_stream, device_context
+
+        if current_stream is None:
+            current_stream = cuda.CUstream(_raw_current_stream(torch, self.q_desc.device))
         self._value_error_if(
             self.o_block_scale > 0 and sf_o is None,
             "sf_o is required by this compiled specialization (block-scaled O)",
@@ -6235,16 +6358,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             quant = dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o)
         else:
             quant = {}
-        if getattr(self, "_staged_spec", None) is not None:
-            from .prepared_staged_forward import execute as execute_staged
-
-            self._value_error_if(
-                not mxfp8 and any(t is not None for t in (sf_q, sf_k, sf_v)),
-                "SM120 staged forward takes MXFP8 input scales on MXFP8 plans only",
-            )
-            tensors = dict(q=q_tensor, k=k_tensor, v=v_tensor, o=o_tensor, lse=lse_tensor, sinks=sinks, seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens)
-            execute_staged(self, {**tensors, **quant}, workspace, current_stream, scale_val)
-            return
         if self._fp8:
             self._value_error_if(
                 not mxfp8 and any(t is not None for t in (sf_q, sf_k, sf_v)),
@@ -6272,7 +6385,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
             current_stream = self._get_default_stream(current_stream)
             stream_int = int(current_stream)
-            _ensure_current_context(stream_int, q_tensor.device.index)
             ws_ptr = 0
             if self.split_kv > 1:
                 if workspace is None:
@@ -6280,14 +6392,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 if workspace.device != q_tensor.device or not workspace.is_contiguous():
                     raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
                 ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (split)")
-            execute_native_dense_tensors(
-                self._dense_spec,
-                (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
-                current_stream,
-                scale_softmax_log2,
-                ws_ptr,
-            )
+            with device_context(q_tensor.device):
+                _ensure_current_context(stream_int, q_tensor.device.index)
+                execute_native_dense_tensors(
+                    self._dense_spec,
+                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
+                    current_stream,
+                    scale_softmax_log2,
+                    ws_ptr,
+                )
             self._logger.debug("execute completed (prepared dense)")
+            self._logger.debug("execute completed")
             return
         if self.thd:
             self._execute_thd(
@@ -6390,13 +6505,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     def scratch_workspace_bytes(self) -> int:
         self._ensure_support_checked()
         compiled = self._compiled_kernel is not None
-        staged = getattr(self, "_staged_spec", None)
-        if staged is not None:
-            return staged.workspace_bytes
-        if not compiled and not self._can_prepare_layout():
-            from .prepared_staged_forward import workspace_bytes
-
-            return workspace_bytes(self)
         if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
@@ -6517,17 +6625,13 @@ def sdpa_fwd_wrapper_dsl_sm120(
 
 from cudnn.sdpa.fwd import config_sm80 as _sm80_config
 
-_SM80_FLAVOR_CFGS = {
-    "gptoss": _sm80_config.GPTOSS_CFG,
-    "llama": _sm80_config.LLAMA_CFG,
-    "dsv3": _sm80_config.DSV3_CFG,
-    "qwen": _sm80_config.QWEN_CFG,
-}
+_SM80_FLAVOR_CFGS = _sm80_config.FLAVOR_CFGS
 
 # (D_QK, D_V) envelope per flavor.
 _SM80_FLAVOR_DIMS = {name: (cfg.D_QK, cfg.D_V) for name, cfg in _SM80_FLAVOR_CFGS.items()}
 
-# (tile_m, num_warps, tile_n) per flavor — frozen from the A100 perf sweep.
+# (tile_m, num_warps, tile_n) per flavor. Wide heads use a bounded
+# two-column-partition tile; their geometry has no performance claim yet.
 _SM80_FLAVOR_KNOBS = {name: (cfg.TILE_M, cfg.NUM_WARPS, cfg.TILE_N) for name, cfg in _SM80_FLAVOR_CFGS.items()}
 
 # Causal L2 budget (MiB) for ``sched=lpt_l2`` per flavor.  Larger d_qk
@@ -6537,35 +6641,24 @@ _SM80_FLAVOR_CAUSAL_L2_MIB = {
     "gptoss": 16,
     "dsv3": 8,
     "qwen": 8,
+    "wide512": 8,
+    "mla576": 8,
 }
 
 # Ascending (D_QK, D_V) order so the flavor pick walks closest-from-above.
-_SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen")
+_SM80_SUPPORTED_FLAVORS = ("gptoss", "llama", "dsv3", "qwen", "wide512", "mla576")
 
 # Flavors that route to the dedicated d=256 kernel (symmetric K+V prefetch);
 # all others use the shared generic kernel.
-_SM80_D256_FLAVORS = ("qwen",)
+_SM80_D256_FLAVORS = ("qwen", "wide512", "mla576")
 
 
 def _sm80_pick_flavor(d_qk: int, d_v: int) -> str:
     """Smallest kernel flavor whose ``(D_QK, D_V)`` envelope covers
     ``(d_qk, d_v)``.  Exact-match wins when both axes match; otherwise walk
-    gptoss → llama → dsv3 → qwen and pick the first that fits.  Raises if
-    nothing fits (heads bigger than the qwen envelope are not supported on
-    SM80 yet)."""
-    for flavor in _SM80_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
-        if d_qk == fdqk and d_v == fdv:
-            return flavor
-    for flavor in _SM80_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
-        if d_qk <= fdqk and d_v <= fdv:
-            return flavor
-    raise ValueError(
-        f"SM80 SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}).  "
-        f"Supported envelopes: {_SM80_FLAVOR_DIMS}.  Heads larger than qwen "
-        "(256/256) are not yet ported to SM80."
-    )
+    the supported flavors in ascending order and pick the first that fits.
+    Raises if either head dimension exceeds the native envelopes."""
+    return _sm80_config.pick_flavor(d_qk, d_v)
 
 
 def _sm80_resolve_scheduler(
@@ -6614,7 +6707,11 @@ def _sm80_load_kernel_module(flavor: str, params):
     # Tag from the BASENAME: `filename` carries the arch subdirectory, and a
     # slash would land in the generated template module name.
     stem = os.path.splitext(os.path.basename(filename))[0]
-    return load_template(path, params, tag=f"sm80_{stem}")
+    from cudnn.sdpa.fwd.kernels.sm80.paged_load import FROST_SOURCE_DIGEST as paged_load_digest
+
+    from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import FROST_SOURCE_DIGEST as ragged_origin_digest
+
+    return load_template(path, params, tag=f"sm80_{stem}", extra_key=f"{paged_load_digest}:{ragged_origin_digest}")
 
 
 def _sm80_sched_policy_int(token: str) -> int:
@@ -6644,7 +6741,21 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
     declarations and RoPE decline before compilation.
     """
 
-    def __init__(self, *args, scheduler: Optional[str] = None, bias_present: bool = False, bias_fp32: bool = False, rope_max_s: int = 0, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        scheduler: Optional[str] = None,
+        bias_present: bool = False,
+        bias_fp32: bool = False,
+        rope_max_s: int = 0,
+        sample_ragged_q=None,
+        sample_ragged_k=None,
+        sample_ragged_v=None,
+        sample_ragged_o=None,
+        sample_ragged_lse=None,
+        ragged_offset_multipliers=(1, 1, 1, 1, 1),
+        **kwargs,
+    ) -> None:
         # SM80-only plan-time axes (see class docstring). ``scheduler`` is the
         # token override for standalone callers; the graph path leaves it None
         # and carries the heuristic's explicit sched_policy knob instead
@@ -6654,6 +6765,14 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._bias_fp32 = bool(bias_fp32)
         self._rope_max_s = int(rope_max_s)
         super().__init__(*args, **kwargs)
+        # Element offsets address each port independently; lengths still own
+        # the live rows. Device values never enter a compile key.
+        self._sm80_origin_multipliers = tuple(ragged_offset_multipliers)
+        self._value_error_if(len(self._sm80_origin_multipliers) != 5, "SM80 requires five ragged offset multipliers")
+        self._sm80_origin_descs = tuple(
+            self._make_tensor_desc(tensor, name="ragged_" + name)
+            for name, tensor in zip(("q", "k", "v", "o", "lse"), (sample_ragged_q, sample_ragged_k, sample_ragged_v, sample_ragged_o, sample_ragged_lse))
+        )
 
     def _initialize_implementation(self) -> None:
         self.flavor: Optional[str] = None
@@ -6670,14 +6789,19 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._k_mod = None
         self._params = None
         self._sm80_spec = None
-        self._sm80_copy_spec = None
         self._lse_stride: Optional[tuple[int, int, int]] = None
         self._thd_meta_fn = None
         self._thd_lse_head_stride = 0
         self._thd_lse_token_major = False
+        self._thd_lse_raw_storage = False
         self._t_q_cap = 0
         self._t_kv_cap = 0
         self._thd_launch = None
+        self._sm80_paged_table_geometry = None
+        self._sm80_origin_descs = (None,) * 5
+        self._sm80_origin_geometry = None
+        self._thd_origin_batch_strides = (None,) * 5
+        self._sm80_extended_origins = False
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -6695,7 +6819,21 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, thd_stats_packing
         from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
-        self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
+        if self.paged:
+            from cudnn import _pybind_module
+
+            self._not_implemented_error_if(
+                not getattr(_pybind_module._SdpaSm80FwdBinder, "supports_paged_kv", False),
+                "SM80 paged KV requires the matching native cuDNN Frontend extension",
+            )
+            self._value_error_if(
+                self.paged_max_seq_len_kv is None or not 0 < self.paged_max_seq_len_kv < 2**31,
+                "SM80 paged KV requires a positive int32 paged_max_seq_len_kv",
+            )
+            self._not_implemented_error_if(
+                not self.seq_kv_lens_present and not (self.thd and self.cu_seq_kv_lens),
+                "SM80 paged KV requires per-request KV lengths",
+            )
         self._not_implemented_error_if(self.gate_desc is not None, "epilogue gate fusion is served by the SM107 d256 SDPA engines only")
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             self._value_error_if(
@@ -6703,7 +6841,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
             )
             _shape, _stride = tuple(desc.shape), tuple(desc.stride)
-            if self.thd:
+            if self.thd and not (self.paged and desc in (self.k_desc, self.v_desc)):
                 reason = forward_thd_layout_mismatch(desc.name, _shape, _stride)
                 self._not_implemented_error_if(reason is not None, reason)
             else:
@@ -6719,8 +6857,25 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         _, _, _, d_v = self.v_desc.shape
 
         self._check_tensor_shape(self.q_desc, (b, h_qo, s_qo, d_qk), name="Q")
-        self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        if self.paged:
+            self._value_error_if(s_kv != self.paged_page_size, "K pool page size must match paged_page_size")
+            self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (self.v_desc.shape[0], h_kv, self.paged_page_size, d_v), name="V")
+            self._value_error_if(self.k_desc.shape[0] <= 0 or self.v_desc.shape[0] <= 0, "K/V page pools must have positive capacity")
+            s_kv = int(self.paged_max_seq_len_kv)
+            n_pages = (s_kv + self.paged_page_size - 1) // self.paged_page_size
+            table_geometry = []
+            for which_v in (False, True):
+                strides = self._paged_table_expected_stride(which_v, n_pages)
+                self._value_error_if(
+                    len(strides) != 2 or not dense_layout_ok((b, 1, n_pages, 1), (strides[0], 0, strides[1], 1)),
+                    "SM80 page table must have non-overlapping batch/page strides",
+                )
+                table_geometry.append(((int(b), n_pages), tuple(strides)))
+            self._sm80_paged_table_geometry = tuple(table_geometry)
+        else:
+            self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_qo, s_qo, d_v), name="O")
 
         for label, val in (("B", b), ("H_q", h_qo), ("H_kv", h_kv), ("S_q", s_qo), ("S_kv", s_kv), ("D_QK", d_qk), ("D_V", d_v)):
@@ -6730,6 +6885,26 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             h_qo % h_kv != 0,
             f"H_q ({h_qo}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
+
+        origin_geometry = []
+        for index, desc in enumerate(self._sm80_origin_descs):
+            if desc is None:
+                origin_geometry.append(None)
+                continue
+            self._not_implemented_error_if(not self.thd, "SM80 physical origins require THD lengths")
+            self._not_implemented_error_if(self.paged and index in (1, 2), "paged K/V pools cannot also have ragged origins")
+            self._value_error_if(index == 4 and self.lse_desc is None, "Stats origins require a Stats output")
+            self._check_dtype(desc, [torch.int32, torch.int64], name=desc.name)
+            stepped = [(int(n), int(st)) for n, st in zip(desc.shape, desc.stride) if n != 1]
+            self._value_error_if(
+                len(stepped) != 1 or stepped[0][0] != b + 1 or stepped[0][1] <= 0,
+                f"{desc.name} must declare B+1 offsets along one positive-stride axis",
+            )
+            self._value_error_if(desc.device != self.q_desc.device, f"{desc.name} must be on Q's device")
+            multiplier = self._sm80_origin_multipliers[index]
+            self._value_error_if(type(multiplier) is not int or not 0 < multiplier < 2**63, f"{desc.name}: multiplier must be a positive int64 integer")
+            origin_geometry.append((str(desc.dtype), stepped[0][1], multiplier))
+        self._sm80_origin_geometry = tuple(origin_geometry) if any(g is not None for g in origin_geometry) else None
 
         max_d_qk = max(fdqk for fdqk, _ in _SM80_FLAVOR_DIMS.values())
         max_d_v = max(fdv for _, fdv in _SM80_FLAVOR_DIMS.values())
@@ -6790,10 +6965,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 "SM80 THD Q lengths cannot be both per-batch and cumulative",
             )
             self._not_implemented_error_if(
-                (d_qk, d_v) not in _SM80_FLAVOR_DIMS.values(),
-                f"SM80 THD graph path supports native head dims {sorted(_SM80_FLAVOR_DIMS.values())} only",
-            )
-            self._not_implemented_error_if(
                 self._bias_present or self.has_sink or self._rope_max_s,
                 "SM80 THD graph path does not support bias, sinks, or RoPE fusion",
             )
@@ -6850,9 +7021,23 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self.flavor = _sm80_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_FLAVOR_DIMS[self.flavor]
         tile_m_default, num_warps_default, tile_n_default = _SM80_FLAVOR_KNOBS[self.flavor]
+        # Smaller CTAs expose more parallelism for short dense queries. At
+        # D192, 64 rows also shrink the Q/V shared-memory region. Keep sixteen
+        # rows per warp and leave explicit TILE_M requests intact.
+        short_d256 = not self.thd and d_qk == d_v == 256 and s_qo <= 128
+        if short_d256 or (not self.thd and ((d_qk == d_v == 128 and s_qo <= 128) or (d_qk == 192 and d_v == 128 and s_qo <= 64))):
+            tile_m_default = 64
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
-        self.kernel_num_warps = num_warps_default
+        self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
+        # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
+        # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
+        if short_d256 and self.kernel_tile_m == 64:
+            tile_n_default = 32
         self.kernel_tile_n = tile_n_default if self.tile_n is None else int(self.tile_n)
+        self._value_error_if(
+            self.flavor in ("wide512", "mla576") and (self.kernel_tile_m, self.kernel_tile_n, self.kernel_num_warps) != (32, 16, 4),
+            "SM80 wide heads require TILE_M=32 and TILE_N=16 with four warps",
+        )
         self._value_error_if(
             self.cga not in (None, 1),
             f"SM80 SDPA has no CGA clustering; cga must be 1 (or unset), got {self.cga}",
@@ -6939,9 +7124,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._ensure_support_checked()
         from cudnn.sdpa.fwd import config_sm80 as _sm80_cfg
 
-        from cudnn.sdpa.fwd.prepared_sm80 import build_spec, native_layouts
+        from cudnn.sdpa.fwd.prepared_sm80 import build_spec
 
-        prepared = not self.thd and native_layouts(self)
         self._params = _sm80_cfg.TemplateParams(
             io_bf16=(self.dtype == torch.bfloat16),
             d_qk=self.flavor_d_qk,
@@ -6965,11 +7149,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             has_lse=self.lse_desc is not None,
             sink_natural=True,
             score_sign=_sm80_cfg.score_sign(self.scale_softmax),
+            paged_page_size=self.paged_page_size,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if self.thd:
             from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
 
+            self._sm80_extended_origins = self.paged or self._sm80_origin_geometry is not None or any(s is not None for s in self._thd_origin_batch_strides)
             self._compiled_kernel, self._thd_launch = compile_thd_host(
                 self._k_mod,
                 self.h_q,
@@ -6979,19 +7165,24 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 lse_stride=self._lse_stride,
                 initialize_outputs=False,
                 o_stride=(int(self.o_desc.stride[2]), int(self.o_desc.stride[1])),
+                dimensions=(self.head_dim_qk, self.head_dim_v),
+                paged_geometry=(
+                    (
+                        *((tuple(desc.shape[i] for i in (0, 2, 1, 3)), self._paged_pool_stride(desc)) for desc in (self.k_desc, self.v_desc)),
+                        *self._sm80_paged_table_geometry,
+                    )
+                    if self.paged
+                    else None
+                ),
+                max_skv=self.s_k_max if self.paged else 0,
+                ragged_geometry=self._sm80_origin_geometry,
+                origin_batch_strides=self._thd_origin_batch_strides,
             )
             self._compile_thd_meta()
             self._logger.debug("compile completed")
             return
-        if prepared:
-            self._sm80_spec = build_spec(self)
-            self._compiled_kernel = self._sm80_spec.artifact
-            self._logger.debug("compile completed")
-            return
-        from cudnn.sdpa.fwd.prepared_staged_sm80 import compile_plan
-
-        self._sm80_copy_spec = compile_plan(self)
-        self._compiled_kernel = self._sm80_copy_spec.core.artifact
+        self._sm80_spec = build_spec(self)
+        self._compiled_kernel = self._sm80_spec.artifact
         self._logger.debug("compile completed")
 
     def _compile_thd_meta(self) -> None:
@@ -7016,20 +7207,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
 
     def scratch_workspace_bytes(self) -> int:
-        """Plan-owned gather/scatter storage; native operands need no scratch."""
-        if self._sm80_spec is not None:
-            return 0
-        if self._sm80_copy_spec is not None:
-            return self._sm80_copy_spec.workspace_bytes
+        """Dense native IO needs no scratch; packed IO reserves length metadata."""
         self._ensure_support_checked()
-        from cudnn.sdpa.fwd.prepared_sm80 import native_layouts
-        from cudnn.sdpa.fwd.prepared_staged_sm80 import workspace_bytes
-
         if self.thd:
             from cudnn.frost.tile_dsl.thd import THD_META_WORDS
 
             return ws_align(THD_META_WORDS(self.batch_size) * 4)
-        return 0 if native_layouts(self) else workspace_bytes(self)
+        return 0
 
     def _execute_thd(
         self,
@@ -7043,6 +7227,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         scale_softmax: Optional[float],
         workspace: Optional[torch.Tensor],
         current_stream: Optional[cuda.CUstream],
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
+        ragged_q: Optional[torch.Tensor] = None,
+        ragged_k: Optional[torch.Tensor] = None,
+        ragged_v: Optional[torch.Tensor] = None,
+        ragged_o: Optional[torch.Tensor] = None,
+        ragged_lse: Optional[torch.Tensor] = None,
     ) -> None:
         """Bind native packed buffers and launch the already-compiled THD artifact."""
         import cutlass
@@ -7072,9 +7263,13 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             # when the caller did not supply max_total_seq_len_q. Q/O may
             # legitimately carry extra allocation capacity beyond it.
             t_q = min(t_q, self._thd_lse_head_stride)
-        t_kv = min(capacity(k_tensor, self.k_desc), capacity(v_tensor, self.v_desc))
-        if self.max_total_seq_len_kv is not None:
-            t_kv = min(t_kv, self.max_total_seq_len_kv)
+        if self.paged:
+            self._check_sm80_paged_buffers(k_tensor, v_tensor, block_table, block_table_v)
+            t_kv = self._t_kv_cap
+        else:
+            t_kv = min(capacity(k_tensor, self.k_desc), capacity(v_tensor, self.v_desc))
+            if self.max_total_seq_len_kv is not None:
+                t_kv = min(t_kv, self.max_total_seq_len_kv)
         # Planned capacities bound live totals (caller contract); extra
         # allocation beyond them is never addressed.
         t_q = min(t_q, self._t_q_cap)
@@ -7086,6 +7281,18 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 lse_tensor.dtype != torch.float32 or lse_tensor.device != device,
                 f"SM80 THD Stats must be fp32 on {device}",
             )
+            if self._thd_lse_raw_storage:
+                # Graph variant packs bind storage, not a packed carrier shape.
+                # Bound the view by the exposed carrier span, not unused bytes
+                # elsewhere in its backing allocation. No device lengths read.
+                head_stride, token_stride = map(int, self.lse_desc.stride[1:3])
+                required = 0 if t_q == 0 else (self.h_q - 1) * head_stride + (t_q - 1) * token_stride + 1
+                span = 0 if lse_tensor.numel() == 0 else 1 + sum((n - 1) * st for n, st in zip(lse_tensor.shape, lse_tensor.stride()))
+                self._value_error_if(span < required, f"SM80 THD Stats storage capacity {span} is smaller than the declared span {required}")
+                if self._thd_lse_token_major:
+                    lse_tensor = lse_tensor.as_strided((t_q, self.h_q), (token_stride, head_stride), lse_tensor.storage_offset())
+                else:
+                    lse_tensor = lse_tensor.as_strided((1, self.h_q, t_q), (0, head_stride, token_stride), lse_tensor.storage_offset())
             if self._thd_lse_token_major:
                 self._value_error_if(
                     not (lse_tensor.ndim == 2 or (lse_tensor.ndim == 3 and lse_tensor.shape[2] == 1))
@@ -7172,7 +7379,52 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 int(self.right_bound_runtime),
                 (1, 1, 1),
                 int(launch_stream),
+                *((block_table.data_ptr(), block_table_v.data_ptr()) if self.paged else (None, None) if self._sm80_extended_origins else ()),
+                *(
+                    (tuple(t.data_ptr() if t is not None else None for t in (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)))
+                    if self._sm80_extended_origins
+                    else ()
+                ),
             )
+
+    def _check_sm80_origins(self, tensors):
+        """Check observable storage before any metadata/output write, without D2H.
+
+        Values are caller-owned element offsets: each live segment must fit
+        its port's storage and preserve the declared vector alignment.
+        """
+        for desc, tensor in zip(self._sm80_origin_descs, tensors):
+            self._value_error_if((desc is None) != (tensor is None), "SM80 ragged-origin presence must match the compiled plan")
+            if desc is None:
+                continue
+            self._value_error_if(
+                tensor.dtype != desc.dtype or tensor.device != self.q_desc.device, f"{desc.name}: runtime dtype/device must match its declaration"
+            )
+            self._value_error_if(tensor.data_ptr() % tensor.element_size() != 0, f"{desc.name}: runtime base must be element-aligned")
+            self._value_error_if(any(st < 0 for st in tensor.stride()), f"{desc.name}: negative storage strides are unsupported")
+            span = 0 if tensor.numel() == 0 else 1 + sum((n - 1) * st for n, st in zip(tensor.shape, tensor.stride()))
+            required = 1 + sum((n - 1) * st for n, st in zip(desc.shape, desc.stride))
+            self._value_error_if(span < required, f"{desc.name}: exposed storage span {span} is smaller than declared span {required}")
+
+    def _check_sm80_paged_buffers(self, k_tensor, v_tensor, block_table, block_table_v):
+        """Validate the fixed pools/tables before the packed metadata launch."""
+        for tensor, desc in ((k_tensor, self.k_desc), (v_tensor, self.v_desc)):
+            self._value_error_if(
+                tensor.dtype != desc.dtype or tensor.device != self.q_desc.device, f"{desc.name}: runtime dtype/device must match its declaration"
+            )
+            self._value_error_if(tensor.data_ptr() % 16 != 0, f"{desc.name}: runtime base must be 16-byte aligned")
+            self._value_error_if(
+                tuple(tensor.shape) != tuple(desc.shape) or any(n > 1 and a != b for n, a, b in zip(desc.shape, tensor.stride(), desc.stride)),
+                f"{desc.name}: page pool shape/strides must match its declaration",
+            )
+        for name, tensor, (shape, strides) in zip(("block_table", "block_table_v"), (block_table, block_table_v), self._sm80_paged_table_geometry):
+            self._value_error_if(tensor is None, f"{name} is required by this paged plan")
+            self._value_error_if(tensor.dtype != torch.int32 or tensor.device != self.q_desc.device, f"{name} must be int32 on Q's device")
+            self._value_error_if(tensor.data_ptr() % 4 != 0, f"{name} must be 4-byte aligned")
+            self._value_error_if(
+                tensor.ndim != 2 or tensor.shape[0] != shape[0] or tensor.shape[1] < shape[1], f"{name} must cover the declared batch and logical page count"
+            )
+            self._value_error_if(any(n > 1 and a != b for n, a, b in zip(shape, tensor.stride(), strides)), f"{name} strides must match its declaration")
 
     # ------------------------------------------------------------------
     def execute(
@@ -7190,29 +7442,53 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         current_stream: Optional[cuda.CUstream] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
+        ragged_q: Optional[torch.Tensor] = None,
+        ragged_k: Optional[torch.Tensor] = None,
+        ragged_v: Optional[torch.Tensor] = None,
+        ragged_o: Optional[torch.Tensor] = None,
+        ragged_lse: Optional[torch.Tensor] = None,
     ) -> None:
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
+        self._value_error_if(
+            not self.paged and (block_table is not None or block_table_v is not None),
+            "page tables were not compiled into this specialization",
+        )
+        self._check_sm80_origins((ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse))
         if self.thd:
             self._value_error_if(
                 sinks is not None or bias_tensor is not None or rope_freqs is not None, "SM80 THD does not accept sinks, bias, or RoPE tensors"
             )
-            self._execute_thd(q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_q_lens, seq_kv_lens, scale_softmax, workspace, current_stream)
-            return
-        if self._sm80_copy_spec is not None:
-            from cudnn.sdpa.fwd.prepared_staged_sm80 import execute
-
-            self._value_error_if(self._params.has_rope != (rope_freqs is not None), "rope_freqs presence must match the compiled specialization")
-            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
-            execute(self, buffers, workspace, current_stream, scale_softmax, rope_freqs=rope_freqs)
-            self._logger.debug("execute completed")
+            self._execute_thd(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                seq_q_lens,
+                seq_kv_lens,
+                scale_softmax,
+                workspace,
+                current_stream,
+                block_table,
+                block_table_v,
+                ragged_q,
+                ragged_k,
+                ragged_v,
+                ragged_o,
+                ragged_lse,
+            )
             return
         if self._sm80_spec is not None:
             from cudnn.sdpa.fwd.prepared_sm80 import execute_tensors
 
             self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
+            if self.paged:
+                buffers += (block_table, block_table_v)
             device = q_tensor.device
             context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
             with context:
@@ -7256,11 +7532,14 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
     if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    pad_v = d_v < fdv
-    if d_qk < fdqk or pad_v:
-        from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
+    from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
-        q, k, v = copy_packed_half((q, k, v), (fdqk, fdqk, fdv), (True, False, False))
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        shape = tuple(tensor.shape[i] for i in (0, 2, 1, 3))
+        stride = tuple(tensor.stride(i) for i in (0, 2, 1, 3))
+        reason = forward_thd_layout_mismatch(name, shape, stride)
+        if reason is not None:
+            raise NotImplementedError(reason)
     wl, wr = window_size
     right_bound = wr if (is_causal and wr is not None and wr > 0) else 0
 
@@ -7311,11 +7590,12 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         int(max(0, wl)) if wl is not None else 0,
         (str(cu_q_t.dtype), str(cu_k_t.dtype)),
         str(sinks_b.dtype) if sinks_b is not None else "torch.float32",
+        (d_qk, d_v),
     )
 
     t_q = q.shape[1]
     # The prepared host initializes both complete capacities before attention.
-    o_buf = torch.empty(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
+    o_buf = torch.empty(1, t_q, h_q, d_v, dtype=q.dtype, device=device)
     lse_buf = torch.empty(1, h_q, t_q, dtype=torch.float32, device=device)
     stream = current_stream if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
     execute(
@@ -7326,8 +7606,6 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         int(right_bound),
         int(stream),
     )
-    if pad_v:
-        (o_buf,) = copy_packed_half((o_buf,), (d_v,), (True,))
     return TupleDict(o_tensor=o_buf, lse_tensor=lse_buf)
 
 

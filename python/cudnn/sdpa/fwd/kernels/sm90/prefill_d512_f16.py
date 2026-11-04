@@ -93,6 +93,7 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     score_prefix_mask,
     store_fragment,
     wgmma_descriptor,
+    zero_v_tail_rows,
 )
 
 # The FROST loader injects one immutable specialization before executing this module. A
@@ -282,6 +283,8 @@ class SM90FusedMultiHeadAttentionForward:
         # store.
         self.bar_vo = 1
         self.bar_o_half_base = 2
+        # Ids 4 and 5 order each compute warpgroup's V-tail zeroing before its PV.
+        self.bar_v_tail_base = 4
 
         self.threads_per_cta = len(self.REG_BUDGETS) * cute.arch.THREADS_PER_WARPGROUP
 
@@ -622,6 +625,21 @@ class SM90FusedMultiHeadAttentionForward:
         return s_regs
 
     @cute.jit
+    def sanitize_v_tail(self, sV_raw, work, local_tid, half: cutlass.Constexpr):
+        """Zero this warpgroup's V-half rows past the batch's runtime KV length.
+
+        A dense graph's pad rows lie inside the declared S_kv, so TMA loads them as they
+        are: the score mask zeroes P there, but ``0 * NaN = NaN`` would still reach O.
+        Only the first visited tile can hold such rows, because the reverse walk starts at
+        the tile that holds ``kv_len - 1``. Runtime padding is unread data, as in the
+        SM80 (#2135) and SM120 bodies.
+        """
+        row_lo = work.kv_len - (work.kv_right - 1) * self.KV_TILE
+        zero_v_tail_rows(sV_raw.subview(half * self.vo_half_elements), row_lo, local_tid, self.storage_dtype)
+        prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+        prims.barrier_cta_sync(self.bar_v_tail_base + half, thread_count=cute.arch.THREADS_PER_WARPGROUP)
+
+    @cute.jit
     def compute_one_kv_tile(
         self,
         basic_params: SimpleNamespace,
@@ -685,6 +703,8 @@ class SM90FusedMultiHeadAttentionForward:
             rescale_output(output, alpha)
         if not v_ready:
             bars.mb_tma_v_full.wait(kv_full_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths and is_first_kv_tile):
+            self.sanitize_v_tail(basic_params.sV_raw, work, local_tid, half=0)
         mma_pv(mma_params, probability_words, is_first_kv_tile, ab_dtype=self.storage_dtype)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
@@ -733,6 +753,8 @@ class SM90FusedMultiHeadAttentionForward:
         bars.mb_p_xfer_full[p_state.idx].wait(p_state.phase)
         if not v_ready:
             bars.mb_tma_v_full.wait(v_full_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths and is_first_kv_tile):
+            self.sanitize_v_tail(basic_params.sV_raw, basic_params.work, local_tid, half=1)
         mma_pv(mma_params, p_desc + p_state.idx * (self.p_xfer_elems * self.storage_dtype.bytes // 16), is_first_kv_tile, ab_dtype=self.storage_dtype)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
@@ -988,6 +1010,7 @@ class SM90FusedMultiHeadAttentionForward:
                     basic_params = SimpleNamespace(
                         sP_xfer_raw=sP_xfer_raw,
                         sAlpha_xfer_raw=sAlpha_xfer_raw,
+                        sV_raw=sV.base,
                         bars=bars,
                         local_tid=local_tid,
                         work=work,
@@ -1163,6 +1186,7 @@ class SM90FusedMultiHeadAttentionForward:
                     # is mutable.
                     basic_params = SimpleNamespace(
                         sAlpha_xfer_raw=sAlpha_xfer_raw,
+                        sV_raw=sV.base,
                         bars=bars,
                         local_tid=local_tid,
                         work=work,

@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from block_sparse_attention.cutedsl.bsa_reference import assert_fp8_quantization_matches_fp32
+from block_sparse_attention.cutedsl.bsa_utils import require_arch, require_cutedsl
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -22,14 +23,10 @@ with_block = pytest.mark.parametrize("block", [pytest.param(64, id="blk64"), pyt
 
 @pytest.fixture(autouse=True)
 def require_sm90(request):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("requires Hopper SM90")
-    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    require_arch(families=(9,), reason="requires Hopper SM90")
     block = request.node.callspec.params.get("block", 64) if hasattr(request.node, "callspec") else 64
     # blk128 needs a newer DSL than blk64.
-    required = (4, 6, 2) if block == 128 else (4, 6, 1)
-    if interface._cutlass_dsl_version() < required:
-        pytest.skip(f"Sage FP8 blk{block} requires nvidia-cutlass-dsl>={'.'.join(map(str, required))}")
+    require_cutedsl((4, 6, 2) if block == 128 else (4, 6, 1), f"Sage FP8 blk{block}")
 
 
 def _inputs(batch=1, heads=1, sq=64, sk=192):

@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--relax-source", type=Path, required=True, help="Directory containing unchanged grouped.py and selector.py")
     parser.add_argument("--frontend-source", type=Path, help="Verify that cudnn imports from this checkout; never silently overrides an editable install")
     parser.add_argument("--lengths", default="8192")
-    parser.add_argument("--heads", type=int, choices=(12, 24), default=12)
+    parser.add_argument("--heads", type=int, choices=(6, 12, 24), default=12)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--output", required=True)
@@ -48,8 +48,10 @@ def main():
     lengths = tuple(map(int, args.lengths.split(",")))
     if not lengths or min(lengths) < 1 or sum(lengths) > 131072 or args.repeats < 3 or args.warmup < 2:
         parser.error("Require positive packed lengths totaling at most 131072 and at least three samples and two warmups")
-    if args.indexed and args.heads != 12:
-        parser.error("The indexed path supports 12Q/1KV")
+    if args.indexed and args.heads not in (6, 12):
+        parser.error("The indexed path supports 12Q/1KV and 6Q/1KV")
+    if args.causal_topk and args.heads != 12:
+        parser.error("--causal-topk supports 12Q/1KV")
     if args.causal_topk and not args.indexed:
         parser.error("--causal-topk requires --indexed")
     if args.compare_general and not args.causal_topk:
@@ -73,7 +75,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(20261016)
-    total, hq, hkv = sum(lengths), args.heads, args.heads // 12
+    total, hq, hkv = sum(lengths), args.heads, max(args.heads // 12, 1)
     q = torch.randn((total, hq, 256), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((total, hkv, 256), device="cuda", dtype=torch.bfloat16)
     v, grad = torch.randn_like(k), torch.randn_like(q)

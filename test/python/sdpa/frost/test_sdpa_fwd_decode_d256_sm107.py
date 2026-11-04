@@ -50,6 +50,7 @@ and wired into every ``SmemTile``, ``SPIN_RING_WAITS`` on exactly the per-KV-ite
 ring waits, the config twin's backstops, and the CuTe DSL version gate (Rule 7).
 """
 
+import ast
 import math
 import os
 import re
@@ -145,12 +146,47 @@ def test_sm107_decode_routes_to_the_rubin_sibling():
     assert sm100.__file__.endswith("/sm100/decode_d256_f16.py") and "sm100_decode" in sm100.__name__, sm100.__name__
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"split_kv": 4},
+        {"pack_gqa": False},
+        {"qh_per_kh": 8},
+        {"decode_q_tile": 32},
+        {"dtype_qkv": 3},
+        {"dtype_qkv": 3, "dtype_o": 3},
+        {"paged_kv": True, "page_size": 16, "seq_kv_lens_present": True},
+        {"has_sink": True},
+        {"window_right": 0},
+        {"stats_log2": True},
+        {"seq_q_lens_present": True, "seq_kv_lens_present": True},
+        {"seq_kv_lens_present": True},
+    ],
+)
+def test_cluster_combine_keeps_other_decode_contracts_unfused(change):
+    params = dict(dtype_qkv=2, split_kv=8, pack_gqa=True, qh_per_kh=16, decode_q_tile=16)
+    mod = _load(**(params | change))
+    assert mod.cluster_combine_supported(256, 256) == (not change)
+    if change:
+        with pytest.raises(ValueError, match="cluster combine requires"):
+            mod.compile(cluster_combine=True)
+
+
+@pytest.mark.parametrize("kwargs", [{"use_pdl": True}, {"has_lse": False}, {"d_qk": 248}, {"d_v": 248}])
+def test_cluster_combine_rejects_incompatible_compile_contract(kwargs):
+    mod = _load(dtype_qkv=2, split_kv=8, pack_gqa=True, qh_per_kh=16, decode_q_tile=16)
+    with pytest.raises(ValueError, match="cluster combine requires|per-split LSE"):
+        mod.compile(cluster_combine=True, **kwargs)
+
+
 def test_sm107_decode_body_matches_the_sm100_body():
-    """The SNAPSHOT pin: the Rubin module is the SM100 body line for line, modulo the
+    """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits and the header prose.  A fix that lands in one file and
-    not the other fails here; so does a body change smuggled into the port."""
+    keyword on the ring waits and the header prose. The optional cluster reducer and
+    its host/compiler bindings are separate implementations, exercised by the cluster
+    binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
 
     kdir = Path(api_dsl.__file__).parent / "kernels"
@@ -158,6 +194,20 @@ def test_sm107_decode_body_matches_the_sm100_body():
     sm107 = (kdir / "sm107" / "decode_d256_f16.py").read_text(encoding="utf-8")
 
     def _body(src):
+        lines = src.splitlines(keepends=True)
+        omitted = set()
+        for node in ast.parse(src).body:
+            if isinstance(node, ast.FunctionDef) and node.name in ("_host", "compile", "cluster_combine_supported"):
+                start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                omitted.update(range(start, node.end_lineno + 1))
+            if isinstance(node, ast.FunctionDef) and node.name == "_kernel":
+                for arg in node.args.args:
+                    if arg.arg in ("final_o_tensor", "final_lse_tensor"):
+                        omitted.update(range(arg.lineno, arg.end_lineno + 1))
+                tail = node.body[-1]
+                if isinstance(tail, ast.If) and ast.unparse(tail.test) == "cutlass.const_expr(final_o_tensor is not None)":
+                    omitted.update(range(tail.lineno, tail.end_lineno + 1))
+        src = "".join(line for n, line in enumerate(lines, 1) if n not in omitted)
         # everything after the module docstring, comments dropped
         end = src.index('"""', src.index('"""') + 3) + 3
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
