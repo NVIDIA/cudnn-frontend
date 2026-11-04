@@ -11,6 +11,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cuda.bindings import driver as cuda
 from cudnn._cutlass_compat import SmemAllocator
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from cudnn.QSA._contract import BLK_BITS
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -69,8 +70,8 @@ def frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, NQ: cu
             offset += prefix[other + 1]
         if key >= 0:
             code = key
-            if cutlass.const_expr(NQ == 2):
-                code = key | (flags[slot] << Int32(28))
+            if cutlass.const_expr(NQ > 1):
+                code = key | (flags[slot] << Int32(BLK_BITS))  # one owner bit per batched query above the start
             ids[Int64(pair), Int64(offset + Int32(cute.arch.popc(ballot & lower)))] = code
         cute.arch.sync_threads()
         if tid == 0:

@@ -260,7 +260,9 @@ def test_DSA_dense_score_recompute_thd_plan_requires_max_seqlen(score_type):
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense score recompute requires SM90+")
 
     q, k, aux, out, denom = _thd_plan_samples(score_type)
@@ -391,7 +393,9 @@ def test_DSA_dense_score_recompute_output_contiguity_declined(score_type):
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense score recompute requires SM90+")
 
     q, k, aux, out, denom = _bshd_plan_samples(score_type)
@@ -417,7 +421,9 @@ def test_DSA_dense_score_recompute_wrapper_stages_noncontiguous_outputs(score_ty
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense score recompute requires SM90+")
 
     q, k, aux, out, denom = _bshd_plan_samples(score_type)
@@ -445,7 +451,9 @@ def test_DSA_dense_score_recompute_execute_requires_outputs(score_type, compile_
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense score recompute requires SM90+")
 
     q, k, aux, out, denom = _bshd_plan_samples(score_type)
@@ -476,7 +484,9 @@ def test_DSA_dense_score_recompute_execute_allocates_nothing_and_never_synchroni
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense score recompute requires SM90+")
 
     q, k, aux, out, denom = _bshd_plan_samples(score_type)
@@ -521,7 +531,9 @@ def test_DSA_dense_score_recompute_thd_execute_uses_plan_envelope(score_type):
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("THD dense score recompute is SM100+")
 
     device = torch.device("cuda")
@@ -805,7 +817,9 @@ def test_DSA_dense_score_recompute_wrapper_thd_mxfp8_compact_padded_scales(
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("THD MXFP8 dense score recompute requires SM100+")
 
     device = torch.device("cuda")

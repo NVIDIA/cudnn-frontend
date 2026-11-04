@@ -18,8 +18,8 @@ What stays the SM100 row's, by construction: the head-chunk budget and the works
 (``mm_lo`` / ``mm_hi`` at ``causal_gran = CLUSTER_Q_ROWS = 256``) and the causal zero-fill, ``scratch_workspace_bytes``,
 the standalone ``execute``.  What this row declines on day one, each flipped together with a board-run accept test and a
 tracker line (the ``sdpa_bwd_sm107`` growth pattern): THD / ragged (the SM100 row serves it; the cc 10.7 board has not run
-it -- and the packed path's multi-chunk correctness is open, Track B item B0) and ``dense_flex`` staging layouts (BSHD-physical
-io only).
+it -- and the packed path's multi-chunk correctness is open, Track B item B0) and graph ``dense_flex`` layouts (BSHD-physical graph IO only). The standalone adapter
+shares the SM100 native aligned-stride contract.
 
 Rule 7: the public DSL 4.7.0 lacks ``sm_107a``; :meth:`check_support` declines through ``cutedsl_arch_requirement_error``
 with the installed version BEFORE the SM100 backstops run.  That gate knows cc 10.7 (the one part of the line that exists
@@ -57,10 +57,6 @@ class SdpaBwdDslSm107D512(SdpaBwdDslSm100):
         n = self._NAME
         # Day-one declines (plan A4): each flips together with its board-run accept test and tracker line.
         self._value_error_if(self.thd, f"{n}: THD / ragged is not implemented on this row yet (the SM100 row's packed path has not run on cc 10.7)")
-        self._value_error_if(
-            bool(self._stage_in or self._stage_out),
-            f"{n}: {', '.join(self._stage_in + self._stage_out)} must be BSHD-physical (stride order 3,1,2,0); the staging path is not claimed on this row",
-        )
         return super().check_support()
 
     # --- stage-2 template selection -------------------------------------------

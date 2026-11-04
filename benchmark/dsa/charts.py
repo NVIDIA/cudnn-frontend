@@ -41,7 +41,10 @@ def _series_label(row, with_head_dim: bool = False) -> str:
     dtype = _DTYPE_TAG.get(row["data_type"], row["data_type"])
     det = " det" if str(row["deterministic_bwd"]).lower() == "true" else ""
     dim = f" d={row['head_dim_qk']}" if with_head_dim else ""
-    return f"{row['model_name']} H{row['num_q_heads']}{dim} K={row['topk']} ({dtype}){det}"
+    # QSA rows carry their own KV heads and gather four-token blocks; DSA rows share one record.
+    kv = f"/{row['num_kv_heads']}" if row.get("kind", "dsa") == "qsa" else ""
+    blocks = f"x{row['block_size']}" if int(row.get("block_size", 1)) > 1 else ""
+    return f"{row['model_name']} H{row['num_q_heads']}{kv}{dim} K={row['topk']}{blocks} ({dtype}){det}"
 
 
 def generate_charts(
@@ -67,13 +70,16 @@ def generate_charts(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     head_dims = sorted(int(d) for d in df["head_dim_qk"].unique())
+    kinds = set(df["kind"]) if "kind" in df.columns else {"dsa"}
     df["series"] = df.apply(lambda r: _series_label(r, with_head_dim=len(head_dims) > 1), axis=1)
     df["seqlen_label"] = df.apply(lambda r: f"{_fmt_len(int(r['q_seqlen']))}x{_fmt_len(int(r['kv_seqlen']))}", axis=1)
     df["det_order"] = df["deterministic_bwd"].astype(str).str.lower().map({"false": 0, "true": 1})
-    df.sort_values(["q_seqlen", "num_q_heads", "data_type", "det_order"], inplace=True)
+    # DSA presets read up by head count; a TP sweep reads from the whole model down (24/2, 12/1, 6/1).
+    df["head_order"] = df["num_q_heads"].astype(int) * (-1 if kinds == {"qsa"} else 1)
+    df.sort_values(["q_seqlen", "head_order", "data_type", "det_order"], inplace=True)
 
     series_order = list(
-        df[["series", "num_q_heads", "data_type", "det_order"]].drop_duplicates().sort_values(["num_q_heads", "data_type", "det_order"])["series"]
+        df[["series", "head_order", "data_type", "det_order"]].drop_duplicates().sort_values(["head_order", "data_type", "det_order"])["series"]
     )
     palette = {s: SERIES_COLORS[i % len(SERIES_COLORS)] for i, s in enumerate(series_order)}
     seqlen_order = list(df.sort_values("q_seqlen")["seqlen_label"].drop_duplicates())
@@ -83,7 +89,8 @@ def generate_charts(
     panels = [(t, d) for t, d in (("Forward", fwd_df), ("Backward", bwd_df)) if not d.empty]
 
     fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 6), dpi=150, squeeze=False)
-    fig.suptitle(f"{config.name} — DSA sparse attention (shared K=V, d={'/'.join(map(str, head_dims))})", fontsize=TITLE_FONT_SIZE)
+    family = "QSA block-sparse attention (per-head K/V, 4-token blocks" if kinds == {"qsa"} else "DSA sparse attention (shared K=V"
+    fig.suptitle(f"{config.name} — {family}, d={'/'.join(map(str, head_dims))})", fontsize=TITLE_FONT_SIZE)
 
     for ax, (title, pdf) in zip(axes[0], panels):
         sns.barplot(

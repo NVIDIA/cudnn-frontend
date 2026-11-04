@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-DSL prefill SDPA kernel — classic pipeline, f16/bf16, d=128, SM107 (Rubin).
+DSL prefill SDPA kernel — classic half pipeline, D32/D64/D128 and paged D192/V128, SM107.
 
 The native pipeline uses two Q slabs and softmax warpgroups, four correction
 warps, and the persistent scheduler. D128 at CGA2 keeps four KV stages
@@ -17,14 +17,16 @@ scheduler's token span, sinks and Stats all use that mapping. At PACK_G=1
 the coordinates fold to the unpacked case. THD uses device length metadata
 and per-sequence output descriptors, including changed lengths under replay.
 
-The 32- and 64-wide tiles below run four KV stages at CGA1. Their packing
-requests still select the D128 flavor through the existing engine contract.
+The 32- and 64-wide tiles below run four KV stages at CGA1. D64 also
+serves native packing. Paged D192/V128 uses two KV stages at CGA2; its
+240 KiB of operand buffers stay inside the version-0 descriptor window.
 
-**Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128}).**  One
-body, three ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /
-``make_cfg_d128`` set ``TILE_K = TILE_O`` and everything coupled to it -- the
+**Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128, 192}).**  One
+body, four ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /
+``make_cfg_d128`` use equal K/O widths; ``make_cfg_d192_paged`` uses K=192,
+O=128. The factories set the widths and everything coupled to them -- the
 Q/K/V/O TMA boxes and swizzle atoms (64-byte rows at TILE_K = 32), the BMM1
-k-step count (``TILE_K / 16``: 2 / 4 / 8), BMM2's N, the O slab and the TMEM O
+k-step count (``TILE_K / 16``: 2 / 4 / 8 / 12), BMM2's N, the O slab and the TMEM O
 slot width (``config_sm107.d128_family_tmem_layout``: S 0 / 128, P in the S
 tails, O at 256 + qs * TILE_O, STATS at the top).  Any head dim D <= TILE_K
 with D % 8 == 0 rides the width: the TMA descriptors carry the TRUE extents
@@ -73,7 +75,7 @@ from dataclasses import dataclass, replace
 # parameters travel as typed dataclasses). The loader injects
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a direct
 # `import` usable as a standalone driver.
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128, make_cfg_d192_paged
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
 from cudnn.sdpa.fwd.config_sm107 import (
     BIAS_MODE_RESIDENT,
@@ -87,9 +89,10 @@ from cudnn.sdpa.fwd.config_sm107 import (
 from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-# One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
-# sm100 sibling's `_MAKE_CFG` convention.  128 is the default so a direct import keeps the classic d128 geometry.
-_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}
+# The record selects equal-width D32/D64/D128 or paged D192/V128. The latter
+# has its own factory so the nonpaged D192 body cannot admit page-pool records.
+# A plain import retains the default D128 geometry.
+_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192_paged}
 if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_f16_sm107: d_flavor must be one of {sorted(_MAKE_CFG)}; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
@@ -784,6 +787,24 @@ LAYOUT = KernelTmemLayout()
 # would end at 576+, past STATS).  Register split: unchanged (one step's S per lane; one Int32 cursor per role).  Every seam folds on
 # cutlass.const_expr(_S2) or a trace-time `s_idx is None` ternary: the one-slot renderings are byte-identical (the committed md5 records).
 _S2: bool = CFG.S_SLOTS == 2
+# A two-CTA causal tile shares one KV range across four Q sub-tiles. Keep
+# that producer range and every handshake, but publish zero P directly for
+# the suffix that is wholly masked in this softmax group.
+_ZERO_CAUSAL_TAIL = bool(
+    CFG.TILE_K == 128
+    and CFG.TILE_O == 128
+    and CFG.TILE_M == 128
+    and CFG.THD_VARLEN
+    and CFG.CTA_MMA == 2
+    and SPLIT_KV == 1
+    and not CFG.PACK_GQA
+    and CFG.SOFTMAX_WARPGROUPS == 2
+    and not IS_TF32
+    and not MIXED_FP8_KV
+    and not _INF_MASK_ARM
+    and (CFG.MASK_FLAGS & MASK_CAUSAL)
+    and not (CFG.MASK_FLAGS & MASK_SWA)
+)
 if CFG.S_SLOTS not in (1, 2):
     raise ValueError(f"prefill_d128_f16_sm107: the body walks a 1- or 2-slot S / P cursor (CFG.S_SLOTS={CFG.S_SLOTS})")
 if _S2 and (CFG.TILE_N != 64 or CFG.TILE_K > 128 or IS_TF32):
@@ -1239,6 +1260,12 @@ def _kernel(
     softmax_regs = 184 if cutlass.const_expr(packed_stats_regs) else CFG.SOFTMAX_REGS
     other_regs = 56 if cutlass.const_expr(packed_stats_regs) else CFG.OTHER_REGS
 
+    # MMA, TMA load/store and scheduler occupy one complete warpgroup.
+    # setmaxnreg is warpgroup-collective: release at one common instruction
+    # before those four warps take their individual role branches.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
+
     # === Per-warp role dispatch ===
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(softmax_regs, nvvm.SetMaxRegisterAction.INCREASE)
@@ -1379,7 +1406,6 @@ def _kernel(
 
     elif warp_idx == CFG.MMA_WARP_ID:
         # Under cga2 the non-leader CTA runs the quiet body (alloc + dealloc only).
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -1425,7 +1451,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1467,7 +1492,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -1487,7 +1511,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(other_regs, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = (bias_mcast_rank == cutlass.Int32(0)) if cutlass.const_expr(_BIAS_MCAST) else (cta_id_x == cutlass.Int32(0))
@@ -3347,6 +3370,7 @@ def _softmax_kv_body_quiet(
     stat_empty_phase,
     leader_cta_id,
     s_idx=None,
+    write_zero_p: cutlass.Constexpr[bool] = False,
 ):
     """The QUIET per-iter kv body of a DEAD softmax sub-tile (CFG.DEAD_SUBTILE_QUIET == 1; no live row in this warp group's 128 rows):
     the live body's barrier sequence in the live body's order -- the mb_bmm1_done wait, the top ping-pong sync (sub-tile 1), alpha = 1
@@ -3357,6 +3381,8 @@ def _softmax_kv_body_quiet(
     ``s_idx`` (the double-buffered S, CFG.S_SLOTS == 2): the slot cursor of the live bodies -- a DEAD sub-tile walks the SAME kv tiles
     the MMA warp issues into alternating slots, so its bmm1_done wait and its bmm2_ready arrives name the slot and the cursor advances
     once per kv tile exactly as in the live body (every role's cursor stays in lockstep; P14).  None = the one-slot body.
+    ``write_zero_p`` also serves fully masked suffix tiles of LIVE Q rows: each chunk must be explicitly zeroed before
+    bmm2_ready, since those output rows are consumed. The bmm1_done wait orders these stores after the aliased score write.
     Returns (bmm1_phase, stat_empty_phase[, s_idx])."""
     stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
     N_CHUNKS = CFG.N_BMM2_CHUNKS
@@ -3374,6 +3400,15 @@ def _softmax_kv_body_quiet(
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[sub_tile_id].arrive()
     for c in cutlass.range_constexpr(N_CHUNKS):
+        if cutlass.const_expr(write_zero_p):
+            # Live rows require actual zero probabilities; the original dead-
+            # output-row body may leave residual P only when this flag is false.
+            zero = opaque_f32_zero()
+            zeros = cutlass.Vector.from_elements(tuple(zero for _ in range(CFG.BMM2_CHUNK_SIZE)), cutlass.Float32).to(STORAGE_DTYPE)
+            slot_col = cutlass.Int32(0) if s_idx is None else s_idx * cutlass.Int32(LAYOUT.S_SLOT_STRIDE)
+            p_addr = tmem_ptr_i32.load() + cutlass.Int32(LAYOUT.P_OFF[sub_tile_id] + c * (CFG.BMM2_CHUNK_SIZE // 2)) + slot_col
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr, cutlass.Float32), zeros)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_bmm2_ready[ready0 + c].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
     if sub_tile_id == 0:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
@@ -4321,6 +4356,26 @@ def _softmax_warp_group(
                 live_lo = quiet_hi
                 live_mid_lo = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.unmasked_lo.ir_value()))
                 live_mid_hi = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.unmasked_hi.ir_value()))
+            live_right = bounds.right
+            if cutlass.const_expr(_ZERO_CAUSAL_TAIL):
+                sub_bounds = _compute_kv_loop_bounds(
+                    q_row_coord + cutlass.Int32(sub_tile_id * TOKENS_PER_TILE),
+                    eff_seqlen_q,
+                    eff_seqlen_kv,
+                    CFG.WINDOW_LEFT,
+                    CFG.MASK_FLAGS,
+                    CFG.TILE_N,
+                    TOKENS_PER_TILE,
+                    bottom_right=bool(CFG.BOTTOM_RIGHT),
+                    window_right=int(CFG.WINDOW_RIGHT),
+                )
+                # live_lo is already right after the dead-row quiet path:
+                # its iterations must not be repeated by the zero-P suffix.
+                sub_right = cute.math.min(cute.math.max(sub_bounds.right, live_lo), bounds.right)
+                # Preserve the existing arithmetic for zero/negative/NaN scale.
+                live_right = cutlass.Int32(arith.select((scale_log2 > cutlass.Float32(0.0)).ir_value(), sub_right.ir_value(), bounds.right.ir_value()))
+                live_mid_hi = cute.math.min(live_mid_hi, live_right)
+                live_mid_lo = cute.math.min(live_mid_lo, live_mid_hi)
             # 3-segment kv loop: LEFT-masked / fully-unmasked / RIGHT-masked.
             # At MASK_NONE bounds collapse so the two masked sub-loops have empty range and fold out.
             if cutlass.const_expr(_INF_MASK_ARM):
@@ -4471,7 +4526,7 @@ def _softmax_warp_group(
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _r[:5]
                     if cutlass.const_expr(_S2):
                         s_idx = _r[5]
-                for kv_loop in cutlass.range(live_mid_hi, bounds.right, 1, unroll=1):
+                for kv_loop in cutlass.range(live_mid_hi, live_right, 1, unroll=1):
                     _r = _softmax_kv_body(
                         True,
                         sub_tile_id,
@@ -4494,6 +4549,25 @@ def _softmax_warp_group(
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _r[:5]
                     if cutlass.const_expr(_S2):
                         s_idx = _r[5]
+
+            if cutlass.const_expr(_ZERO_CAUSAL_TAIL):
+                for unused in cutlass.range(live_right, bounds.right, 1, unroll=1):
+                    _r = _softmax_kv_body_quiet(
+                        sub_tile_id,
+                        tmem_ptr_i32,
+                        bars,
+                        bmm1_phase,
+                        stat_empty_phase,
+                        leader_cta_id,
+                        s_idx,
+                        write_zero_p=True,
+                    )
+                    bmm1_phase, stat_empty_phase = _r[:2]
+                    if cutlass.const_expr(_S2):
+                        s_idx = _r[2]
+                    if cutlass.const_expr(track_true_max):
+                        masked_max = NEG_INF if SCALE_PREFOLDED else NEG_INF * scale_log2
+                        true_max = cute.math.max(true_max, masked_max, ftz=True)
 
             # End-of-kv: publish (total_max, total_sum_final) to TMEM Stats — corr reads it for LSE.
             total_sum_scalar = total_sum[0] + total_sum[1]

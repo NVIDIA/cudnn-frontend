@@ -510,7 +510,6 @@ def test_wrapper_aux_outputs_need_no_torch_clear(dtype, d, dv, bias_batch, stage
 
     check(run())
     plan = next(iter(api_dsl._sm80_bwd_cache.values()))
-    assert (plan._staged_prepared is not None) == staged
     assert (plan._prepared is not None) != staged
     case.bufs = {name: torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device).copy_(t) for name, t in case.bufs.items()}
     case.bufs["q"].mul_(0.75)

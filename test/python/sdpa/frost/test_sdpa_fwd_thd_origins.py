@@ -40,7 +40,17 @@ pytestmark = [requires_dsl]
     ],
 )
 def test_independent_thd_origins_rebind_and_capture(
-    dim, dtype_name, stats_layout, total_hints, pack_gqa, splits, kv_dtype_name=None, engine_name="sdpa_fwd_prefill_sm100", cga=None
+    dim,
+    dtype_name,
+    stats_layout,
+    total_hints,
+    pack_gqa,
+    splits,
+    kv_dtype_name=None,
+    engine_name="sdpa_fwd_prefill_sm100",
+    cga=None,
+    compact=False,
+    heads_override=None,
 ):
     import cudnn
     import torch
@@ -49,13 +59,14 @@ def test_independent_thd_origins_rebind_and_capture(
         pytest.skip("SM100/SM103 physical THD origin path")
     torch.manual_seed(117)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
-    batch, heads, kv_heads, maximum = 4, (24 if d_qk == 576 else 8), 2, 256
+    batch, heads, kv_heads, maximum = 4, (heads_override or (24 if d_qk == 576 else 8)), 2, 256
     capacity = batch * maximum
     dtype = getattr(torch, dtype_name)
     ports = ("q", "k", "v", "o", "stats")
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
-    # D576's +16 head padding must still represent integral token origins.
-    multipliers = (heads * (16 if d_qk == 576 else d_qk), 16 if d_qk == 576 else d_qk, 1, d_v, 1)
+    # +16 head padding must represent integral compact and gapped token origins.
+    qk_multiplier = 16 if d_qk in (64, 192, 576) else d_qk
+    multipliers = (heads * qk_multiplier, qk_multiplier, 1, d_v, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
     log2_stats = stats_layout == "head"
 
@@ -87,6 +98,10 @@ def test_independent_thd_origins_rebind_and_capture(
         # Replay also turns a live query sequence into a keyless row.
         kl = [101, 0, 76, 0] if short else kv_lengths
         origins = {name: [shift + port * 16 + x for x in (0, 176, 224, 384)] for port, name in enumerate(ports)}
+        if compact:
+            from itertools import accumulate
+
+            origins = {name: [0, *accumulate(kl if name in ("k", "v") else ql)][:batch] for name in ports}
         values["ql"].copy_(torch.tensor(ql, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
         values["kl"].copy_(torch.tensor(kl, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1))
         for name, multiplier in zip(ports, multipliers):

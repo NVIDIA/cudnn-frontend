@@ -411,6 +411,42 @@ def test_DSA_indexer_top_k_deterministic_compact_index_storage():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "rows,num_cols,top_k,expected",
+    [
+        (1, 4096, 64, "bitmap"),  # narrow rows: bitmap at every top_k (the SM100 rule picks bitonic here)
+        (64, 65536, 128, "bitmap"),
+        (64, 131072, 128, "bitonic"),  # wide rows, small top_k
+        (64, 131072, 129, "bitmap"),
+        (512, 262144, 512, "bitonic"),  # large occupancy widens the bitonic band to top_k 512
+        (64, 262144, 512, "bitmap"),
+        (512, 262144, 2048, "bitmap"),
+        (1, 300000, 2048, "bitonic"),  # past the bitmap column limit
+    ],
+)
+def test_DSA_indexer_top_k_sm103_auto_ordering(monkeypatch, rows, num_cols, top_k, expected):
+    """On SM103 the deterministic auto ordering follows the B300 measurements, not the SM100 bitmap limits."""
+    from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_decode_varlen as kernel_module
+
+    class _Resolved(Exception):
+        pass
+
+    def capture(max_num_cols, deterministic, ordering):
+        raise _Resolved(ordering)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    monkeypatch.setattr(kernel_module, "resolve_deterministic_ordering", capture)
+    with pytest.raises(_Resolved) as resolved:
+        kernel_module.compile_topk_kernel(torch.float32, rows, num_cols, top_k, 1, deterministic=True)
+    assert resolved.value.args[0] == expected
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    with pytest.raises(_Resolved) as resolved:
+        kernel_module.compile_topk_kernel(torch.float32, rows, num_cols, top_k, 1, deterministic=True)
+    bitmap_limit = kernel_module._sm100_deterministic_bitmap_max_cols(kernel_module.cutlass.Float32, top_k, rows > 148)
+    assert resolved.value.args[0] == ("bitmap" if kernel_module._bucket_num_cols(num_cols) <= bitmap_limit else "bitonic")
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=7)
 def test_DSA_indexer_top_k_rejects_overlapping_writable_ranges(monkeypatch):
     """Reject exact byte-range overlap before launch, but allow disjoint views of one allocation."""
