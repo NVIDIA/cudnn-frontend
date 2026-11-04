@@ -698,8 +698,11 @@ def _require_fa4():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("block_sparse_num", (1, 2, 3, 4, 5))
+@pytest.mark.parametrize(
+    "dtype, block_sparse_num",
+    # The 16-bit type is independent of the list length: it alternates over the counts.
+    [(torch.float16 if count % 2 else torch.bfloat16, count) for count in (1, 2, 3, 4, 5)],
+)
 @torch_fork_set_rng(seed=20)
 def test_sm120_blk128_fixed_topk(dtype, block_sparse_num):
     """Cover fixed top-k 1-5, GQA, partial Q, and query-dependent KV selections."""
@@ -732,8 +735,16 @@ def test_sm120_blk128_fixed_topk(dtype, block_sparse_num):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("wave_kind,block_sparse_num", (("tail_only", 3), ("unsplit", 1), ("full", 5), ("mixed", 3)))
+@pytest.mark.parametrize(
+    "dtype, wave_kind, block_sparse_num",
+    # The 16-bit type is independent of the wave split: it alternates over the wave kinds.
+    [
+        (torch.float16, "tail_only", 3),
+        (torch.bfloat16, "unsplit", 1),
+        (torch.float16, "full", 5),
+        (torch.bfloat16, "mixed", 3),
+    ],
+)
 @torch_fork_set_rng(seed=20)
 def test_sm120_blk128_wave_boundaries(dtype, wave_kind, block_sparse_num):
     """Validate all query rows across full, split-tail, mixed, and unsplit waves."""

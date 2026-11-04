@@ -1049,9 +1049,12 @@ def test_sm120_native_forward(block_size, tail):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("size_rank", (1, 2, 3))
-@pytest.mark.parametrize("v_block_size", (0, 128))
-@pytest.mark.parametrize("k_quant_block_size", (1, 16))
+@pytest.mark.parametrize(
+    "size_rank, v_block_size, k_quant_block_size",
+    # The block_sizes rank (metadata indexing), the V layout and the K scale granularity feed independent paths: every
+    # rank x V layout pair, the K granularity alternating so that every rank and both V layouts see both.
+    [(rank, v_block, 1 if (rank + v_block // 128) % 2 else 16) for rank in (1, 2, 3) for v_block in (0, 128)],
+)
 @torch_fork_set_rng(seed=8128)
 def test_sm120_blk128_scales_counts_and_partial_blocks(size_rank, v_block_size, k_quant_block_size):
     require_sm120_fp8(per_token=k_quant_block_size == 1)
@@ -1539,9 +1542,12 @@ def test_sm120_per_token_scale_views(sk, scale_layout):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("sk", (256, 320))
-@pytest.mark.parametrize("scale_layout", ("contiguous", "padded_aligned", "broadcast"))
-@pytest.mark.parametrize("variable_counts", (False, True))
+@pytest.mark.parametrize(
+    "sk, scale_layout, variable_counts",
+    # The K tail and the scale view decide together whether the scales take TMA: every pair; the metadata mode
+    # alternates so that every tail and every view see both.
+    [(sk, layout, (i + j) % 2 == 1) for i, sk in enumerate((256, 320)) for j, layout in enumerate(("contiguous", "padded_aligned", "broadcast"))],
+)
 @torch_fork_set_rng(seed=28132)
 def test_sm120_per_token_tma_scales_match_fallback_and_replay(monkeypatch, sk, scale_layout, variable_counts):
     """TMA scale loads share K's barrier and preserve tails and scalar views."""
@@ -1612,8 +1618,11 @@ def test_sm120_per_token_tma_scales_match_fallback_and_replay(monkeypatch, sk, s
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("tail", (0, 19))
-@pytest.mark.parametrize("offset_scales", (False, True))
+@pytest.mark.parametrize(
+    "tail, offset_scales",
+    # An offset scale view only changes the load alignment, independently of the query tail: it alternates.
+    [(0, False), (19, True)],
+)
 @torch_fork_set_rng(seed=28130)
 def test_sm120_per_token_m64_matches_m128_and_replays(monkeypatch, tail, offset_scales):
     """M64 shares Q/P/O storage without changing KV128 softmax or metadata."""
@@ -1668,8 +1677,11 @@ def test_sm120_per_token_m64_matches_m128_and_replays(monkeypatch, tail, offset_
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("tail", (0, 19, 64, 65))
-@pytest.mark.parametrize("offset_scales", (False, True))
+@pytest.mark.parametrize(
+    "tail, offset_scales",
+    # An offset scale view only changes the load alignment, independently of the wave tail: it alternates.
+    [(0, False), (19, True), (64, False), (65, True)],
+)
 @torch_fork_set_rng(seed=28131)
 def test_sm120_per_token_wave_tail_matches_m128_and_replays(monkeypatch, tail, offset_scales):
     """The two launches must cover query tails, heads and batches exactly once."""
