@@ -477,8 +477,8 @@ def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs
             cutlass.Int32(N),
         )
         ce = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, mparts > 1, it_ty, et, float(HW), has_beta, smem_bytes, N, fgrid, fcw, fr, fsmem)
-        # dyn() specializes unit strides; other strides use a dynamic signature.
-        key = (params.io_dtype, gamma.stride(0) == 1, mean.stride(0) == 1, rstd.stride(0) == 1) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
         fn = _KCACHE.get(key)
         if fn is None:
             fn = cute.compile(_in_bwd_nhwc_host, *args, *ce, fake_stream())
