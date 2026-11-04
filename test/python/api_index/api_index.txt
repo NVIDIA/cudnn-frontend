@@ -29,6 +29,8 @@ cudnn.FlexAttentionBwd
 cudnn.FlexAttentionFwd
 cudnn.GatedAttentionBlockBwd
 cudnn.GatedAttentionBlockFwd
+cudnn.GdnDecodeFused
+cudnn.GdnVerifyFused
 cudnn.GemmAmaxSm100
 cudnn.GemmDsreluSm100
 cudnn.GemmProjRopeMxfp8Bf16InSm100
