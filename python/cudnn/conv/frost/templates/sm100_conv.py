@@ -3,7 +3,7 @@
 
 # Dynamic-geometry implicit-GEMM fprop convolution kernel for Blackwell B200.
 #
-# Maps a 3D convolution onto an implicit GEMM: M = N*Z*P*Q, N_gemm = K,
+# Maps a 3D convolution onto an implicit GEMM: M_gemm = N*Z*P*Q, N_gemm = K,
 # K_gemm = T*R*S*C. Warp-specialized with explicit roles (1 TMA producer warp,
 # 1 MMA consumer warp, 4 epilogue warps), mbarrier-based producer/consumer
 # synchronization, and a tcgen05.mma + tcgen05.commit handshake for the TMEM
@@ -204,13 +204,13 @@ def _kernel(
     c_dtype: cutlass.Constexpr[Type[Numeric]],
     acc_dtype: cutlass.Constexpr[Type[Numeric]],
     # Conv geometry consumed by the im2col TMA producer / epilogue:
-    # zpq = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q), converted to FDDs on the host.
+    # zpq_divisors = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q), converted to FDDs on the host.
     # trs = filter spatial dims (T, R, S) used to decompose K-tile index
     # lower_pad_dhw / stride_dhw / dilation_dhw = standard conv params
     lower_pad_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     stride_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     dilation_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
-    zpq: Tuple[cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2],
+    zpq_divisors: Tuple[cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2],
     trs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     # Host-built TMA descriptors, consumed by the device-side
     # prims.cp_async_bulk_tensor_* / prims.prefetch_tensormap calls.
@@ -407,8 +407,8 @@ def _kernel(
     # so the loop body never divides the linear k by T*R*S.
     if warp_idx == tma_warp_id:
         ab_stage_idx = 0
-        Z_out, P_out, Q_out = zpq
-        T_filt, R_filt, S_filt = trs
+        z_divisor, p_divisor, q_divisor = zpq_divisors
+        t_filt, r_filt, s_filt = trs
         pad_d, pad_h, pad_w = lower_pad_dhw
         str_d, str_h, str_w = stride_dhw
         dil_d, dil_h, dil_w = dilation_dhw
@@ -422,9 +422,9 @@ def _kernel(
             # M index for this CTA's portion of the M-tile.
             m_off_cta = mma_tile_coord_mnl[0] * mma_tiler[0] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
             # Output (n, z, p, q) from linear M (col-major Q-fastest).
-            div, q_idx = divmod(m_off_cta, Q_out)
-            div, p_idx = divmod(div, P_out)
-            n_idx, z_idx = divmod(div, Z_out)
+            div, q_idx = divmod(m_off_cta, q_divisor)
+            div, p_idx = divmod(div, p_divisor)
+            n_idx, z_idx = divmod(div, z_divisor)
 
             # Spatial anchors for im2col TMA: idx*stride - pad_lower.
             w_anchor = q_idx * str_w - pad_w
@@ -502,13 +502,13 @@ def _kernel(
                 # wrap. Nested single-compare ifs (no boolean-and on traced
                 # predicates) advance the coord over (S, R, T, *).
                 s_idx += 1
-                if s_idx == S_filt:
+                if s_idx == s_filt:
                     s_idx = 0
                     r_idx += 1
-                    if r_idx == R_filt:
+                    if r_idx == r_filt:
                         r_idx = 0
                         t_idx += 1
-                        if t_idx == T_filt:
+                        if t_idx == t_filt:
                             t_idx = 0
                             c_chunk_idx += 1
 
@@ -751,7 +751,7 @@ def _kernel(
         # uses zero corners, so output spatial coords are bare pixels (no pad
         # subtraction, no stride multiply). Decompose the linear per-CTA M index
         # into (n, z, p, q) per work-tile in the loop.
-        Z_out, P_out, Q_out = zpq
+        z_divisor, p_divisor, q_divisor = zpq_divisors
 
         # Allocator warp (epi 0) reserves 512 TMEM cols and stashes the pointer
         # in tmem_holding_buf. Every CTA allocates from its own 512-col bank;
@@ -808,9 +808,9 @@ def _kernel(
             m_off_cta = mma_tile_coord_mnl[0] * mma_tiler[0] + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
             # Bare output pixels (col-major Q-fastest). No pad/stride: the C
             # descriptor uses zero corners, so output has no halo concept.
-            div, q_out = divmod(m_off_cta, Q_out)
-            div, p_out = divmod(div, P_out)
-            n_out, z_out = divmod(div, Z_out)
+            div, q_out = divmod(m_off_cta, q_divisor)
+            div, p_out = divmod(div, p_divisor)
+            n_out, z_out = divmod(div, z_divisor)
 
             # K-out channel base for this N-tile (no cta_rank, see above).
             k_off_base = mma_tile_coord_mnl[1] * mma_tiler[1]
@@ -1118,7 +1118,7 @@ def _compute_stages(
     """Compute the number of (ACC, A/B, C) stages from SMEM-capacity heuristics.
 
     Byte sizes per stage are passed in (computed by the caller as
-    ``per_cta_M * K_tile * dtype.width // 8``); the remaining SMEM after the
+    ``per_cta_M * k_tile * dtype.width // 8``); the remaining SMEM after the
     mbarrier reserve and the initial C budget is split into A/B stages, then
     leftover SMEM is folded back into extra C stages.
     """
@@ -1495,13 +1495,13 @@ class _FpropKernel:
 
         # Host TMA descriptors, built directly from the raw input tensors via
         # cuda.create_tensor_map_*.
-        T_filter, R_filter, S_filter = b.shape[1:4]
+        t_filter, r_filter, s_filter = b.shape[1:4]
         upad_d, upad_h, upad_w = upper_padding_dhw
         lpad_d, lpad_h, lpad_w = lower_padding_dhw
         dil_d, dil_h, dil_w = dilation_dhw
         # Per-CTA M tile (use_2cta_instrs splits M between 2 CTAs along cluster_m).
         mma_tiler_per_cta_m = p.mma_tiler[0] // 2 if p.use_2cta_instrs else p.mma_tiler[0]
-        # mma_tiler[2] is a sub-tuple (K_tile,) after _setup_attributes.
+        # mma_tiler[2] is a sub-tuple (k_tile,) after _setup_attributes.
         k_tile = cute.size(p.mma_tiler, mode=[2])
         # Epilogue subtile width (K-mode of NZPQK), from the shared datapath
         # descriptor. Must match the device epilogue + the C descriptor swizzle
@@ -1529,9 +1529,9 @@ class _FpropKernel:
             global_strides=tuple(a.stride[i] * p.a_dtype.width // 128 for i in (3, 2, 1, 0)),
             lower_corner=[-lpad_w, -lpad_h, -lpad_d],
             upper_corner=[
-                upad_w - (S_filter - 1) * dil_w,
-                upad_h - (R_filter - 1) * dil_h,
-                upad_d - (T_filter - 1) * dil_d,
+                upad_w - (s_filter - 1) * dil_w,
+                upad_h - (r_filter - 1) * dil_h,
+                upad_d - (t_filter - 1) * dil_d,
             ],
             channels_per_pixel=k_tile,
             pixels_per_column=mma_tiler_per_cta_m,
@@ -1540,7 +1540,7 @@ class _FpropKernel:
         )
 
         # Filter B: KTRSC raw, tiled descriptor.
-        # box_dims is in tensor mode order (K, T, R, S, C). When C >= K_tile,
+        # box_dims is in tensor mode order (K, T, R, S, C). When C >= k_tile,
         # the GEMM-K tile fits inside C alone and (T,R,S) box dims are 1.
         n_per_cta = p.mma_tiler[1] // 2 if p.use_2cta_instrs else p.mma_tiler[1]
         tma_b_desc = cuda.create_tensor_map_tiled_from_view(
@@ -1596,13 +1596,13 @@ class _FpropKernel:
 
         # GEMM-K tile count: GEMM-K = T*R*S*C, tiled by mma_tiler_k.
         mma_tiler_k = cute.size(p.mma_tiler, mode=[2])
-        gemm_k = T_filter * R_filter * S_filter * a.shape[4]
+        gemm_k = t_filter * r_filter * s_filter * a.shape[4]
         k_tile_cnt = (gemm_k + mma_tiler_k - 1) // mma_tiler_k
 
         # Output spatial dims for the im2col producer/epilogue coord decode.
         # c.shape = (N, Z, P, Q, K); filter_trs / padding / stride / dilation
         # come from runtime arguments and tensor metadata.
-        zpq = tuple(cute.fast_divmod_create_divisor_v2(x) for x in (c.shape[1:4]))
+        zpq_divisors = tuple(cute.fast_divmod_create_divisor_v2(x) for x in (c.shape[1:4]))
 
         # Launch the kernel (argument order matches the device kernel
         # signature).
@@ -1621,8 +1621,8 @@ class _FpropKernel:
             lower_padding_dhw,
             stride_dhw,
             dilation_dhw,
-            zpq,
-            (T_filter, R_filter, S_filter),
+            zpq_divisors,
+            (t_filter, r_filter, s_filter),
             tma_a_desc,
             tma_b_desc,
             tma_c_desc,
