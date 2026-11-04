@@ -107,3 +107,18 @@ The CUDA 12 compiler runs used the same CUDA 13 framework/backend and driver
 
 No selected case skipped. These are kernel/API correctness results, not model
 accuracy or performance measurements.
+
+### Sanitizer review follow-up
+
+On 2026-11-04, the same six publication cases passed on GB300 SM103 with
+CuTeDSL 4.8.0, both CUDA compiler flavors (12.9 and 13.4), and both Compute
+Sanitizer versions 2025.3.1.0 and 2026.3.0.0. Each combination ran baseline
+and fixed sources under ordinary execution, racecheck and synccheck: six
+numerical passes per run, no skips, racecheck **120 errors → 0** (exit **86 → 0**),
+and zero synccheck errors. The source kernel and regression were unchanged.
+The framework/backend and driver were the same as recorded above.
+
+This did not reproduce the [reviewer's native SM100 numerical failures under
+racecheck](https://github.com/NVIDIA/cudnn-frontend/pull/2244#pullrequestreview-5760287966).
+Those failures also affect the baseline; their cause remains unresolved.
+The follow-up qualifies GB300/SM103 only.
