@@ -29,6 +29,7 @@ BACKEND_CONFIG = {
     "fla": {"name": "FLA (Triton)", "color": "#FF8C00", "order": 0},
     "flash_qla": {"name": "FlashQLA (TileLang)", "color": "#6495ED", "order": 1},
     "flash_kda": {"name": "FlashKDA", "color": "#9370DB", "order": 2},
+    "mamba_ssm": {"name": "mamba_ssm (Triton)", "color": "#B22222", "order": 2},
     "cudnn": {"name": "cuDNN (default)", "color": "#76b900", "order": 3},
     "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
 }
@@ -146,7 +147,8 @@ def generate_charts(
                 fig, ax_bwd = plt.subplots(1, 1, figsize=(10, 6), dpi=150)
                 ax_fwd = None
 
-            heads = sub["num_q_heads"].iloc[0]
+            heads = sub["num_kv_heads"].iloc[0] if variant == "mamba2" else sub["num_q_heads"].iloc[0]
+            groups_label = f", B / C groups = {sub['num_q_heads'].iloc[0]}" if variant == "mamba2" else ""
             head_dim = sub["head_dim"].iloc[0]
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
@@ -154,7 +156,7 @@ def generate_charts(
             norm_label = "" if variant == "mamba2" else ", use_qk_l2norm = True"
             title_variant = "Mamba-2" if variant == "mamba2" else variant.upper()
             fig.suptitle(
-                f"{title_variant} Linear Attention (BF16) — {group_label}, Heads = {heads}, {dims}" f"{norm_label}{gpu_info}",
+                f"{title_variant} Linear Attention (BF16) — {group_label}, Heads = {heads}{groups_label}, {dims}" f"{norm_label}{gpu_info}",
                 fontsize=TITLE_FONT_SIZE,
             )
 

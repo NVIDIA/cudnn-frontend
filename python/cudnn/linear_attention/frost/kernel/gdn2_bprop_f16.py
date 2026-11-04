@@ -37,7 +37,7 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
   dU inter      : dU inter = dstate input(T) @ K inv
   dU intra      : dU intra += dO^T(S) @ A
   dstate Q-term : dstate Q-term += dO^T(S) @ Q decay
-  U             : U = Y(T) @ T^-1,  Y = W .* V - k state
+  U             : U = Y(T) @ T^-1,  Y = W .* V - k state (BF16: fp32 residual, then one Y rounding)
   dY            : dY = dU(T) @ T^-1
   dQ inter      : dQ inter = state(T) @ dO^T
   dK restore    : dK restore part = dstate(S) @ U^T
@@ -156,8 +156,9 @@ from cudnn.frost.tile_dsl.pointwise import (
     mul_f16x2,
     opaque_f32_zero,
     pack_u16x2,
-    sub_f16x2,
 )
+
+from ..common.residual import residual_operand
 
 USE_PDL = True
 
@@ -2348,15 +2349,15 @@ def compute1_warp_group(
                     state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
                 for reg_idx in cutlass.range_constexpr(4):
                     frag_pair = reg_idx * 2
-                    state_k_pair = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
-                    wv_pair = mul_f16x2(raw_w_frag_lo[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype)
-                    y_input_pack_lo[reg_idx] = sub_f16x2(wv_pair, state_k_pair, cfg.io_dtype)
+                    y_input_pack_lo[reg_idx] = residual_operand(
+                        raw_v_frag_lo[reg_idx], state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], w_word=raw_w_frag_lo[reg_idx], dtype=cfg.io_dtype
+                    )
                 if cutlass.const_expr(dv_halves == 2):
                     for reg_idx in cutlass.range_constexpr(4):
                         frag_pair = reg_idx * 2
-                        state_k_pair = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
-                        wv_pair = mul_f16x2(raw_w_frag_hi[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype)
-                        y_input_pack_hi[reg_idx] = sub_f16x2(wv_pair, state_k_pair, cfg.io_dtype)
+                        y_input_pack_hi[reg_idx] = residual_operand(
+                            raw_v_frag_hi[reg_idx], state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], w_word=raw_w_frag_hi[reg_idx], dtype=cfg.io_dtype
+                        )
             if chunk_idx < FIRST_STATE_CHUNK:
                 for reg_idx in cutlass.range_constexpr(4):
                     y_input_pack_lo[reg_idx] = mul_f16x2(raw_w_frag_lo[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype)

@@ -463,7 +463,7 @@ class CompiledMamba2Bwd:
     def __init__(self, node, bwd_module, prefill_module, recompute_module):
         from .common.host import tensormap_workspace_bytes
         from .common.gate_bwd import mamba2_gate_bwd, mamba2_zgate_bwd
-        from .common.head_reduce import head_group_reduce_dot_product
+        from .common.head_reduce import head_group_reduce
         from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
         from .kernel.mamba2_chain_backward_f16 import build_chain_backward, run_chain_backward
@@ -479,7 +479,7 @@ class CompiledMamba2Bwd:
         self.run_regenerate_backward = run_regenerate_backward
         self.build_chain_backward = build_chain_backward
         self.run_chain_backward = run_chain_backward
-        self.head_group_reduce_dot_product = head_group_reduce_dot_product
+        self.head_group_reduce = head_group_reduce
         self.zgate_bwd = mamba2_zgate_bwd
         self.gate_bwd = mamba2_gate_bwd
         self.plan_name = "Mamba2FrostEngine (MAMBA2_BWD)"
@@ -771,8 +771,10 @@ class CompiledMamba2Bwd:
             )
 
         # ---- the dt gate, the parameters, the D skip, the group folds -------------------------
-        self.head_group_reduce_dot_product(dq_out, q, dq if self.fold_dq else None, region["dot_q"], stream=stream)
-        self.head_group_reduce_dot_product(dk_out, k, dk if self.fold_dk else None, region["dot_k"], stream=stream)
+        if self.fold_dq:
+            self.head_group_reduce(dq_out, dq, stream=stream)
+        if self.fold_dk:
+            self.head_group_reduce(dk_out, dk, stream=stream)
         self.gate_bwd(
             region["dot_q"],
             region["dot_k"],
@@ -866,6 +868,8 @@ class CompiledMamba2Bwd:
             dcomposed=dcomposed,
             dstate0=dstate0 if self.use_dstate0 else None,
             exit_dots=region["exit_dots"],
+            dot_q=region["dot_q"],
+            dot_k=region["dot_k"],
             skip_bwd_part=skip_bwd_part,
             exit_slots=region["gate_slots"],
             exit_base=region["exit_base"],
@@ -940,6 +944,8 @@ class CompiledMamba2Bwd:
                 dv=dv,
                 series=region["state_checkpoints"],
                 exit_dots=region["exit_dots"],
+                dot_q=region["dot_q"],
+                dot_k=region["dot_k"],
                 skip_bwd_part=skip_bwd_part,
                 cu_seqlens=cu,
                 state_in=None if coarse else state0,
@@ -994,6 +1000,8 @@ class CompiledMamba2Bwd:
             dv=dv,
             checkpoints=state_checkpoints,
             exit_dots=region["exit_dots"],
+            dot_q=region["dot_q"],
+            dot_k=region["dot_k"],
             skip_bwd_part=skip_bwd_part,
             cu_seqlens=cu,
             dstate_in=dstate_in,

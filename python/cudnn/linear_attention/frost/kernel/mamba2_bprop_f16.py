@@ -119,8 +119,10 @@ class Mamba2BpropBars(NamedTuple):
 
     mb_q_ready: MBarrier
     mb_q_done: MBarrier
+    mb_q_cg0_done: MBarrier
     mb_k_ready: MBarrier
     mb_k_done: MBarrier
+    mb_k_cg1_done: MBarrier
     mb_v_ready: MBarrier
     mb_v_mma_done: MBarrier
     mb_v_cg1_done: MBarrier
@@ -187,8 +189,10 @@ def make_bars(cfg) -> Mamba2BpropBars:
     return Mamba2BpropBars(
         mb_q_ready=MBarrier(alloc(cfg.smem_q_stages), try_wait=True, stages=cfg.smem_q_stages, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_done=MBarrier(alloc(cfg.smem_q_stages), try_wait=True, stages=cfg.smem_q_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_q_cg0_done=MBarrier(alloc(cfg.smem_q_stages), try_wait=True, stages=cfg.smem_q_stages, init_count=CG0_THREADS, producer=Producer.THREAD),
         mb_k_ready=MBarrier(alloc(cfg.smem_k_stages), try_wait=True, stages=cfg.smem_k_stages, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
         mb_k_done=MBarrier(alloc(cfg.smem_k_stages), try_wait=True, stages=cfg.smem_k_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_k_cg1_done=MBarrier(alloc(cfg.smem_k_stages), try_wait=True, stages=cfg.smem_k_stages, init_count=CG1_THREADS, producer=Producer.THREAD),
         mb_v_ready=MBarrier(alloc(cfg.smem_v_stages), try_wait=True, stages=cfg.smem_v_stages, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
         mb_v_mma_done=MBarrier(alloc(cfg.smem_v_stages), try_wait=True, stages=cfg.smem_v_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_v_cg1_done=MBarrier(
@@ -951,6 +955,7 @@ def tmaldg_warp(
 
             # ---- K load --------------------------------------------------------------------
             bars.mb_k_done[0].wait(k_index.phase)
+            bars.mb_k_cg1_done[0].wait(k_index.phase)
             k_index = advance(k_index, 1)
             if elect_one:
                 bars.mb_k_ready[0].arrive(n_bytes=cfg.tma_k_bytes)
@@ -959,6 +964,7 @@ def tmaldg_warp(
 
             # ---- Q load --------------------------------------------------------------------
             bars.mb_q_done[0].wait(q_index.phase)
+            bars.mb_q_cg0_done[0].wait(q_index.phase)
             q_index = advance(q_index, 1)
             if elect_one:
                 bars.mb_q_ready[0].arrive(n_bytes=cfg.tma_q_bytes)
@@ -977,7 +983,9 @@ def tmaldg_warp(
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
 
     bars.mb_q_done[0].wait(q_index.phase)
+    bars.mb_q_cg0_done[0].wait(q_index.phase)
     bars.mb_k_done[0].wait(k_index.phase)
+    bars.mb_k_cg1_done[0].wait(k_index.phase)
     bars.mb_v_mma_done[0].wait(v_index.phase)
     bars.mb_v_cg1_done[0].wait(v_index.phase)
     bars.mb_state_mma_done[0].wait(state_index.phase)
@@ -1004,6 +1012,8 @@ def compute0_warp_group(
     sDa_raw,
     sCumsumlog,
     sBeta,
+    sQ_raw,
+    mDotQ,
     sScheduler,
     bars,
 ):
@@ -1031,6 +1041,7 @@ def compute0_warp_group(
     neg_inf = cutlass.Float32(float("-inf"))
     zero = opaque_f32_zero()
     sDa_base = sDa_raw.data_ptr()
+    sQ_base = sQ_raw.data_ptr()
     tile_idx = cutlass.Int32(bidx)
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
@@ -1044,9 +1055,11 @@ def compute0_warp_group(
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
+        head_o, _ = decode_head(cfg, head_idx)
         n_local = compute_end - write_start
 
-        for reverse_idx in cutlass.range(n_local):  # noqa: B007
+        for reverse_idx in cutlass.range(n_local):
+            chunk_idx = compute_end - 1 - reverse_idx
             gate_idx = gate_index.idx
             bars.mb_gate_ready[gate_idx].wait(gate_index.phase)
             gate_index = advance(gate_index, cfg.smem_gate_stages)
@@ -1135,6 +1148,8 @@ def compute0_warp_group(
             bars.mb_dk_acc_ready[0].wait(dk_ready_index.phase)
             dk_ready_index = advance(dk_ready_index, 1)
             acc_vector = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_dq_col, cutlass.Float32), num=32)
+            dot_lo = zero
+            dot_hi = zero
             for piece in cutlass.range_constexpr(num_dq_pieces):
                 if cutlass.const_expr(piece + 1 < num_dq_pieces):
                     acc_next = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_dq_col + (piece + 1) * ldtm_width, cutlass.Float32), num=32)
@@ -1144,12 +1159,21 @@ def compute0_warp_group(
                 for q in cutlass.range_constexpr(ldtm_width // vector_width):
                     c0 = piece * ldtm_width + q * vector_width
                     swizzle_offset = (c0 // 64) * block_elements + cg0_tidx * 64 + swizzle_xor_128b(cg0_tidx, c0 % 64)
+                    # ---- <dQ, Q> row dot from the fp32 accumulator and the resident Q tile ----
+                    q_words = (sQ_base + swizzle_offset).load(count=vector_width, alignment=16).bitcast(cutlass.Int32)
+                    for w in cutlass.range_constexpr(vector_width // 2):
+                        q_lo, q_hi = f16x2_to_f32(q_words[w], dtype=cfg.io_dtype)
+                        dot_lo, dot_hi = ffma2(q_lo, q_hi, acc_vector[q * vector_width + 2 * w], acc_vector[q * vector_width + 2 * w + 1], dot_lo, dot_hi)
                     words = []
                     for m in cutlass.range_constexpr(vector_width // 2):
                         words.append(fp32_to_fp16(acc_vector[q * vector_width + 2 * m], acc_vector[q * vector_width + 2 * m + 1], dtype=cfg.io_dtype))
                     (sDa_base + swizzle_offset).store(cutlass.Vector.from_elements(tuple(words), cutlass.Int32).bitcast(cfg.io_dtype), alignment=16)
                 if cutlass.const_expr(piece + 1 < num_dq_pieces):
                     acc_vector = acc_next
+            bars.mb_q_cg0_done[0].arrive()
+            token = batch_start + chunk_idx * cutlass.Int32(cfg.b_t) + cg0_tidx
+            if chunk_idx < write_end and token < batch_end:
+                mDotQ[token, head_o] = dot_lo + dot_hi
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dq_tmastg_ready[0].arrive()
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
@@ -1177,6 +1201,8 @@ def compute1_warp_group(
     sCumsumlog,
     sBeta,
     mD,
+    sK_raw,
+    mDotK,
     sScheduler,
     bars,
 ):
@@ -1218,6 +1244,7 @@ def compute1_warp_group(
     row_swizzle_bytes = (cg1_tidx & 7) << 4
     row_swizzle_elements = (cg1_tidx & 7) * vector_width
     sdK_base = sdK_raw.data_ptr()
+    sK_base = sK_raw.data_ptr()
     sDo_base = sDo_raw.data_ptr()
     v_row_address = sV_raw.data_ptr().toint(cutlass.Int32) + cg1_tidx * row_bytes + row_swizzle_bytes
     do_address = sDo_raw.data_ptr().toint(cutlass.Int32) + cg1_tidx * row_bytes + row_swizzle_bytes
@@ -1380,6 +1407,8 @@ def compute1_warp_group(
             bars.mb_dk_acc_ready[0].wait(dk_ready_index.phase)
             dk_ready_index = advance(dk_ready_index, 1)
             acc_vector = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_dk_col, cutlass.Float32), num=32)
+            dot_lo = zero
+            dot_hi = zero
             for piece in cutlass.range_constexpr(num_dk_pieces):
                 if cutlass.const_expr(piece + 1 < num_dk_pieces):
                     acc_next = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + tmem_dk_col + (piece + 1) * ldtm_width, cutlass.Float32), num=32)
@@ -1390,12 +1419,21 @@ def compute1_warp_group(
                 for q in cutlass.range_constexpr(ldtm_width // vector_width):
                     c0 = piece * ldtm_width + q * vector_width
                     swizzle_offset = (c0 // 64) * block_elements + cg1_tidx * 64 + swizzle_xor_128b(cg1_tidx, c0 % 64)
+                    # ---- <dK, K> row dot from the fp32 accumulator and the resident K tile ----
+                    k_words = (sK_base + swizzle_offset).load(count=vector_width, alignment=16).bitcast(cutlass.Int32)
+                    for w in cutlass.range_constexpr(vector_width // 2):
+                        k_lo, k_hi = f16x2_to_f32(k_words[w], dtype=cfg.io_dtype)
+                        dot_lo, dot_hi = ffma2(k_lo, k_hi, acc_vector[q * vector_width + 2 * w], acc_vector[q * vector_width + 2 * w + 1], dot_lo, dot_hi)
                     words = []
                     for m in cutlass.range_constexpr(vector_width // 2):
                         words.append(fp32_to_fp16(acc_vector[q * vector_width + 2 * m], acc_vector[q * vector_width + 2 * m + 1], dtype=cfg.io_dtype))
                     (sdK_base + swizzle_offset).store(cutlass.Vector.from_elements(tuple(words), cutlass.Int32).bitcast(cfg.io_dtype), alignment=16)
                 if cutlass.const_expr(piece + 1 < num_dk_pieces):
                     acc_vector = acc_next
+            bars.mb_k_cg1_done[0].arrive()
+            token = batch_start + chunk_idx * cutlass.Int32(cfg.b_t) + cg1_tidx
+            if chunk_idx < write_end and token < batch_end:
+                mDotK[token, head_o] = dot_lo + dot_hi
             nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_dk_tmastg_ready[0].arrive()
             bars.mb_gate_done[gate_idx].arrive()
@@ -1767,6 +1805,8 @@ def frost_mamba2_bprop(
     mDcomposed: Optional[cute.Tensor],
     mDstate0: Optional[cute.Tensor],
     mExit: cute.Tensor,
+    mDotQ: cute.Tensor,
+    mDotK: cute.Tensor,
     mSkipPart: Optional[cute.Tensor],
     mExitBase: Optional[cute.Tensor],
     mWorkItems: cute.Tensor,
@@ -1891,9 +1931,11 @@ def frost_mamba2_bprop(
     for s in range(cfg.smem_q_stages):
         bars.mb_q_ready[s].init()
         bars.mb_q_done[s].init()
+        bars.mb_q_cg0_done[s].init()
     for s in range(cfg.smem_k_stages):
         bars.mb_k_ready[s].init()
         bars.mb_k_done[s].init()
+        bars.mb_k_cg1_done[s].init()
     for s in range(cfg.smem_v_stages):
         bars.mb_v_ready[s].init()
         bars.mb_v_mma_done[s].init()
@@ -1957,6 +1999,8 @@ def frost_mamba2_bprop(
             sDa_raw=sdQ_raw,
             sCumsumlog=sCumsumlog,
             sBeta=sBeta,
+            sQ_raw=sQ_raw,
+            mDotQ=mDotQ,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -1979,6 +2023,8 @@ def frost_mamba2_bprop(
             sCumsumlog=sCumsumlog,
             sBeta=sBeta,
             mD=mD,
+            sK_raw=sK_raw,
+            mDotK=mDotK,
             sScheduler=sScheduler,
             bars=bars,
         )
@@ -2513,6 +2559,8 @@ def host(
     dv: cute.Tensor,
     state_checkpoints: cute.Tensor,
     exit_dots: cute.Tensor,
+    dot_q: cute.Tensor,
+    dot_k: cute.Tensor,
     skip_bwd_part: Optional[cute.Tensor],
     exit_base: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
@@ -2609,6 +2657,8 @@ def host(
         dcomposed,
         dstate0,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
         exit_base,
         work_items,

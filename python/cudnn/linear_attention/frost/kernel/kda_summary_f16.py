@@ -132,7 +132,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     fp32_to_fp16,
 )
 
-from ..common.kda_residual import residual_operand
+from ..common.residual import residual_operand
 
 USE_PDL = True
 STATE_DIMS = (64, 128)

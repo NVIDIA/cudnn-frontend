@@ -152,7 +152,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     pack_u16x2,
 )
 
-from ..common.kda_residual import residual_operand, residual_pair
+from ..common.residual import residual_operand, residual_pair
 
 USE_PDL = True
 
