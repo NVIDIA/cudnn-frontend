@@ -58,7 +58,7 @@ def _active_family():
         from cudnn.gemm.frost.arch_family import active_family
 
         return active_family()
-    except Exception:  # noqa: BLE001 -- collection must not fail on a broken frost import; the tests themselves report that
+    except Exception:  # noqa: BLE001 -- collection must not fail if the FROST import fails; the tests themselves report that
         return "sm100"
 
 
