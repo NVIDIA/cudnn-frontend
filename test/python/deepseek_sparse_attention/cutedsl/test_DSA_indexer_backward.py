@@ -942,7 +942,13 @@ def test_DSA_indexer_backward_deterministic_contract(dk_dtype, repeats, topk_ind
         pytest.param(64, 1, 128, 128, 128, 128, torch.float32, False, id="planes128-single-row-stripe"),
         pytest.param(64, 1, 148, 128, 128, 148, torch.float32, False, id="planes148-single-row-stripe"),
         pytest.param(64, 1, 149, 128, 128, 148, torch.bfloat16, False, id="planes148-bf16-reused-plane"),
+        # Pin the deterministic dW strategy boundary: topk384 keeps the
+        # private-slot fold; topk512 selects the lane-quad fold and crosses a
+        # 96-plane wave boundary.
+        pytest.param(64, 1, 2, 512, 384, 96, torch.float32, False, id="dw-private-fold-topk384"),
+        pytest.param(64, 1, 97, 512, 512, 96, torch.float32, False, id="dw-quad-fold-topk512-multi-wave"),
         # Large top-k and repeated producer-row handoffs (193 rows over 96 planes).
+        pytest.param(64, 1, 2, 1024, 1024, 96, torch.float32, False, id="short-topk1024"),
         pytest.param(64, 1, 2, 2048, 2048, 96, torch.float32, False, id="short-topk2048"),
         pytest.param(64, 1, 193, 2048, 896, 96, torch.float32, False, id="multi-wave-topk896"),
         pytest.param(64, 1, 193, 2048, 2048, 96, torch.float32, False, id="multi-wave-topk2048"),

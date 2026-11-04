@@ -961,7 +961,7 @@ def indexer_backward_wrapper(
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
             on SM90/SM100/SM103/SM107. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``; SM90 also folds per-thread dW slots in fixed order.
+            ``d_index_k``; SM90 also folds dW in fixed lane and warp order.
             Requires H=64 on SM90 or H in {32, 64} on SM100-family devices,
             D=128, block_I=128, and topk % 128 == 0 with 128 <= topk <= 2048. A
             warmed plan with preallocated outputs

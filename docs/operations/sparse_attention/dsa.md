@@ -913,8 +913,8 @@ with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103/SM1
 additionally require `H in {32, 64}` and SM90 requires `H == 64`. `d_index_q`
 and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
 
-With `deterministic=True` on SM90, SM100, SM103 or SM107, kernel 2 launches a fixed producer
-grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
+With `deterministic=True` on SM90, SM100, SM103 or SM107, kernel 2 uses fixed
+producer-plane ownership and accumulates dK into a CTA-private FP32 workspace. The compile-time
 `deterministic_dk_planes` specialization selects 96, 128, or 148 producer
 planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
 CTA order, converting only once to the requested `d_index_k` dtype. The dQ

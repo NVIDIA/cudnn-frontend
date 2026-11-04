@@ -23,8 +23,8 @@ Kernel 2 — 3-Warpgroup architecture (12 warps, 384 threads):
     Both cooperatively: Load Q/grad_signal/weights from GMEM to SMEM
     Per topk-block: GEMM1(S_half) -> fused dS/dW -> GEMM2(dK_half) -> GEMM3(dQ_half)
     Epilogue: output dQ_half, ordinary dW/dK via reductions; deterministic dW
-    uses per-thread slots and a fixed thread-order fold, while dK targets the
-    CTA's private plane.
+    keeps the private-slot fold for small top-k and uses a fixed lane-quad then
+    warp-order fold for top-k >= 512, while dK targets the CTA's private plane.
   WG2 (warps 8-11): K-load warpgroup
     Per topk-block: loads indices + sparse K via cp.async gather (3-stage)
 
@@ -43,7 +43,8 @@ Barriers:
   CTA barrier(5): wg_sched_1  (ping-pong: WG1 syncs on this, WG0 arrives)
 
 SMEM (kernel 2): sGradSignal[topk] holds precomputed grad_signal from kernel 1.
-Grid: (seqlen, batch, 1). Each CTA handles one query position.
+Ordinary grid: (seqlen, batch, 1). Deterministic launches bounded
+(min(remaining_rows, dK planes), 1, 1) waves. Each CTA handles one query row.
 """
 
 from __future__ import annotations
@@ -169,7 +170,12 @@ class IndexerBackwardSm90:
 
         self.dw_elems_per_thread = self.heads_padded * self.block_I // self.WARPGROUP_SIZE
         self.dw_smem_size = self.WARPGROUP_SIZE * self.dw_elems_per_thread
-        self.dw_deterministic_slots = self.TOTAL_COMPUTE_THREADS * 2 if self.deterministic else 1
+        # ``topk`` already specializes the generated loop nest and compile
+        # cache. Keep the lower-overhead private-slot fold for small top-k;
+        # amortize the fixed quad shuffle/fold for larger loop nests without
+        # introducing another compile-key axis.
+        self.use_deterministic_dw_quad = self.deterministic and self.topk >= 512
+        self.dw_deterministic_slots = self.TOTAL_COMPUTE_THREADS * 2 if self.deterministic and not self.use_deterministic_dw_quad else 1
         self.dw_deterministic_warp_partials = (self.TOTAL_COMPUTE_THREADS // self.WARP_SIZE) * self.heads if self.deterministic else 1
 
         self.dk_staging_stride_n = self.head_dim_padded + 4  # 132: 16B-aligned + bank-conflict-free
@@ -859,6 +865,12 @@ class IndexerBackwardSm90:
         dk_staging_barrier_id = self.DK_STAGING_BARRIER_WG0 if compute_wg_idx == 0 else self.DK_STAGING_BARRIER_WG1
 
         # ---- Step 0: Load Q (TMA), grad_signal, weights — 256 threads cooperate ----
+        if const_expr(self.use_deterministic_dw_quad):
+            # Eight compute warps publish one partial per head. Initialize all
+            # 8x64 slots here and reuse _load_q_and_scores' final compute-group
+            # barrier instead of adding a deterministic-only synchronization.
+            for partial_idx in cutlass.range_constexpr(2):
+                sDwWarpPartial[partial_idx * self.TOTAL_COMPUTE_THREADS + tidx] = Float32(0.0)
         self._load_q_and_scores(
             mW,
             mGradSignal,
@@ -936,9 +948,9 @@ class IndexerBackwardSm90:
         w_reg_h0 = Float32(sW[my_first_h]) if my_first_h < self.heads else Float32(0.0)
         w_reg_h1 = Float32(sW[my_second_h]) if my_second_h < self.heads else Float32(0.0)
 
-        # Ordinary execution merges dW through CTA-local atomics.  The
-        # deterministic path uses per-thread slots below and therefore needs
-        # no shared accumulator initialization.
+        # Ordinary execution merges dW through CTA-local atomics. Deterministic
+        # execution uses either private slots or lane-quad warp partials below,
+        # so neither variant needs this shared accumulator initialization.
         DW_PER_THREAD = const_expr((self.heads_padded + self.TOTAL_COMPUTE_THREADS - 1) // self.TOTAL_COMPUTE_THREADS)
         if const_expr(not self.deterministic):
             for di in cutlass.range_constexpr(DW_PER_THREAD):
@@ -1168,14 +1180,36 @@ class IndexerBackwardSm90:
             tCsDQ[ei] = self.q_dtype(acc_dQ[ei] * Float32(sm_scale))
 
         if const_expr(self.deterministic):
-            # Every compute thread publishes exactly two private contributions.
-            # WG0 later folds slot 0..511 in numeric order, so dW no longer
-            # depends on shared-atomic arbitration between the two WGs.
-            slot = tidx * 2
-            sDwContrib[slot] = dw_h0
-            sDwHead[slot] = Int32(my_first_h)
-            sDwContrib[slot + 1] = dw_h1
-            sDwHead[slot + 1] = Int32(my_second_h)
+            if const_expr(self.use_deterministic_dw_quad):
+                # Hopper WGMMA's H64 C layout maps
+                # (T128,V64)->(M64,N128) with thread modes
+                # (_4,_8,_4):(128,1,16): every four consecutive lanes own the
+                # same two M/head coordinates (eight rows apart). Fold each
+                # head in ascending lane order, matching the private-slot
+                # association. Keep the distinct-head guard as a tripwire for
+                # a future layout that exposes only one head per lane.
+                # All lanes execute every shuffle; only each quad leader
+                # publishes.
+                compute_warp_idx = tidx // self.WARP_SIZE
+                lane_idx = tidx % self.WARP_SIZE
+                quad_base_lane = (lane_idx // 4) * 4
+                dw_warp_h0 = Float32(0.0)
+                dw_warp_h1 = Float32(0.0)
+                for source_offset in cutlass.range_constexpr(4):
+                    source_lane = quad_base_lane + source_offset
+                    dw_warp_h0 += cute.arch.shuffle_sync(dw_h0, source_lane)
+                    dw_warp_h1 += cute.arch.shuffle_sync(dw_h1, source_lane)
+                if lane_idx % 4 == 0:
+                    sDwWarpPartial[compute_warp_idx * self.heads + my_first_h] = dw_warp_h0
+                    if my_second_h != my_first_h:
+                        sDwWarpPartial[compute_warp_idx * self.heads + my_second_h] = dw_warp_h1
+            else:
+                # Small top-k keeps the lower-overhead private-slot fold.
+                slot = tidx * 2
+                sDwContrib[slot] = dw_h0
+                sDwHead[slot] = Int32(my_first_h)
+                sDwContrib[slot + 1] = dw_h1
+                sDwHead[slot + 1] = Int32(my_second_h)
         else:
             # dW ordinary fast path: merge the two-register accumulators via
             # shared-memory atomics inside this CTA.
@@ -1188,12 +1222,10 @@ class IndexerBackwardSm90:
         cute.arch.fence_view_async_shared()
         nvvm.barrier_cta_sync(self.COMPUTE_SYNC_BARRIER_ID, thread_count=self.TOTAL_COMPUTE_THREADS)
 
-        if const_expr(self.deterministic):
-            # First fold each warp's 64 private slots into one partial per
-            # head.  Every lane owns two heads and visits the warp's slots in
-            # increasing thread/contribution order. A second fixed eight-warp
-            # fold below gives a stable hierarchical association without a
-            # 512-iteration loop in the already-large WGMMA epilogue.
+        if const_expr(self.deterministic and not self.use_deterministic_dw_quad):
+            # Fold each warp's private slots in increasing numeric order. The
+            # second fixed eight-warp fold below preserves the original small
+            # top-k association.
             compute_warp_idx = tidx // self.WARP_SIZE
             lane_idx = tidx % self.WARP_SIZE
             slots_per_warp = self.WARP_SIZE * 2
