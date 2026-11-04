@@ -3156,8 +3156,10 @@ def test_e2e_quant_scale_k_padding_is_zeroed_sm120(grouped, swap_ab) -> None:
     for the feature-axis quant: N=160 has 5 scale blocks, so every routed row's
     three padding slots must come out 0 from a 0xFF buffer, in the global blob and
     in the per-group segmented one (each group starts a fresh 128-row atom)."""
+    from gemm_test_utils import skip_unless_pipeline_active
     from test_moe_grouped_matmul_fwd import _f8_128x4_logical
 
+    skip_unless_pipeline_active(by_name(_SM120_BS_CFG))  # the sm100 tree's quant chunk check declines this config before its family check
     E, S, N, K, bs = 2, 300, 160, 256, 32
     offsets_list = [0, 100, 100, 220, S]
     num_groups, sf_k, blocks = len(offsets_list) - 1, K // bs, N // bs
@@ -3290,12 +3292,20 @@ def test_sm100_moe_mxfp8_partial_scale_block_graph_is_declined(mode, swap_ab) ->
     _check_moe_mxfp8_partial_scale_block_graph_is_declined(_SM100_BS_CFG, mode, swap_ab)
 
 
-def _check_moe_mxfp8_partial_scale_block_call_is_refused(config_name, swap_ab):
+def _check_moe_mxfp8_partial_scale_block_call_is_refused(config_name, swap_ab, monkeypatch):
     """The kernel binds K per call: a plan built at a whole-block K refuses a call whose K ends
-    inside a scale block before it writes anything, and still serves a K tail of whole blocks."""
+    inside a scale block before it launches or writes anything, and still serves a K tail of whole
+    blocks."""
     E, S, N = 2, 256, 256
     offsets_list = [0, 128, S]
     compiled = _plan(_build_graph(E, S, N, 160, 2, combo="mxfp8"), config=by_name(config_name), swap_ab=swap_ab)
+    launches, launch = [], compiled._compiled._launchable
+
+    def recorded_launch(*args, **kwargs):
+        launches.append(args)
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(compiled._compiled, "_launchable", recorded_launch)
     torch.manual_seed(0)
 
     def call(K):
@@ -3319,24 +3329,26 @@ def _check_moe_mxfp8_partial_scale_block_call_is_refused(config_name, swap_ab):
     compiled(vp)
     torch.cuda.synchronize()
     torch.testing.assert_close(out[0], ref, atol=2e-1, rtol=2e-2)
+    assert len(launches) == 1
 
     vp, out, _ = call(144)
     with pytest.raises(ValueError, match="not a multiple of the scale block size 32"):
         compiled(vp)
     torch.cuda.synchronize()
+    assert len(launches) == 1
     assert torch.all(out == 7.0)
 
 
 @requires_sm120
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
-    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM120_BS_CFG, swap_ab)
+def test_sm120_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab, monkeypatch) -> None:
+    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM120_BS_CFG, swap_ab, monkeypatch)
 
 
 @requires_sm100
 @pytest.mark.parametrize("swap_ab", [False, True], ids=["normal", "swap_ab"])
-def test_sm100_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab) -> None:
-    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM100_BS_CFG, swap_ab)
+def test_sm100_moe_mxfp8_partial_scale_block_call_is_refused(swap_ab, monkeypatch) -> None:
+    _check_moe_mxfp8_partial_scale_block_call_is_refused(_SM100_BS_CFG, swap_ab, monkeypatch)
 
 
 @requires_sm120

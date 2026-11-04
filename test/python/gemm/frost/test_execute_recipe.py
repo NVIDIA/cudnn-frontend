@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from gemm_test_utils import kw, requires_sm100, to_blocked
+from gemm_test_utils import kw, requires_sm100, requires_sm120, to_blocked
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
@@ -998,3 +998,480 @@ def test_sm120_swap_quant_diagnostic_uses_package_import(monkeypatch):
     monkeypatch.setattr(compiler, "_check_block_quant_semantics", reject)
     with pytest.raises(ValueError, match="invalid quant extent"):
         compiled.explain([])
+
+
+# --- a zero extent never reaches an sm120 template host ---------------------
+#
+# Each template's host encodes its TMA descriptors from the call's extents, and
+# cuTensorMapEncodeTiled rejects a zero dimension; the DSL checks that result
+# with an assertion that abort()s the process. The plans below record their
+# launch instead of compiling one, so code that still launches fails the test
+# rather than taking the test process down with it.
+
+_SM120_CFG = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
+
+
+def _max_reduction_graph():
+    """A dense output and a whole-problem MAX, whose identity (-inf) no output holds by accident."""
+    g = _plain_graph()
+    Y = [t for t in g._nodes[-1].outputs.values()][0]
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.MAX, name="red")
+    R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(F32)
+    return g
+
+
+def _recorded_sm120_plan(graph, cfg):
+    """An sm120 plan built the way the JIT path builds it, with its launch recorded rather than compiled."""
+    from pathlib import Path
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    chain, binding = C120._analyze_graph(graph)
+    use_tma = C120._use_tma_store_epi(chain, cfg)
+    calls = []
+    compiled = C120.CompiledFusedGemm(
+        chain=chain,
+        config=cfg,
+        aux_names=[aux.name for aux in chain.aux_tensors],
+        generated_path=Path("unused"),
+        _launchable=lambda *args, **kwargs: calls.append(args),
+        block_scale=chain.has_block_scale,
+        binding=binding,
+        store_modes=C120._store_modes(chain, cfg),
+        use_tma_store=use_tma,
+        vec_bytes_epi=C120._out_vec_bytes(chain, cfg, use_tma),
+        workspace_bytes=C120._splitk_workspace_bytes(chain, cfg),
+    )
+    assert compiled.lowered is not None, compiled.declined
+    return compiled, calls
+
+
+def _sentinel_operands(compiled, m, n, k):
+    """One buffer per bound tensor at a runtime (M, N, K), every output holding 17."""
+    r = compiled.recipe
+    bufs = [None] * len(compiled.binding.bound_tensors())
+    for op in r.inputs:
+        dtype = torch.uint8 if compiled.block_scale else torch.bfloat16
+        bufs[op.index] = torch.ones(op.batch, n if op.is_b else m, k // op.kpack, dtype=dtype, device="cuda")
+    for sf in r.sf:
+        bufs[sf.index] = torch.ones(1, 128, 4, dtype=torch.uint8, device="cuda")  # one F8_128x4 atom
+    for spec, out in zip(compiled.chain.outputs, r.outputs):
+        dtype = torch.float32 if out.raw else {"bf16": torch.bfloat16, "fp16": torch.float16}[spec.dtype]
+        bufs[out.index] = torch.full(expected_shape(out.rule, m, n), 17.0, dtype=dtype, device="cuda")
+    assert all(b is not None for b in bufs)
+    return bufs
+
+
+@pytest.mark.parametrize("split_k", (1, 2), ids=("whole_k", "split_k2"))
+@pytest.mark.parametrize("empty", ("m", "n"))
+def test_sm120_an_empty_call_seeds_its_reductions_and_launches_nothing(split_k, empty):
+    """M or N == 0 leaves nothing to compute: the reduction identity is the whole result.
+
+    No workspace is passed: the engine sizes a split-K plan's workspace from the
+    call's output, and an empty output asks for none.
+    """
+    from cudnn.gemm.frost.tile_config import by_name
+
+    compiled, calls = _recorded_sm120_plan(_max_reduction_graph(), replace(by_name(_SM120_CFG), split_k_slices=split_k))
+    operands = _sentinel_operands(compiled, 0 if empty == "m" else M, 0 if empty == "n" else N, K)
+    compiled.lowered(operands)
+    torch.cuda.synchronize()
+    assert calls == []
+    assert not compiled.deferrals
+    [seed] = [operands[o.index] for o in compiled.recipe.outputs if o.init is not None]
+    assert torch.isneginf(seed).all()
+
+
+@pytest.mark.parametrize("case", ("bf16_k0", "mxfp8_k16"))
+def test_sm120_an_unencodable_k_is_refused_before_anything_is_written(case):
+    """K = 0, or an MXFP8 K below one 32-element scale block (its scale-factor K
+    extent rounds down to 0), still has outputs to write but no K extent a TMA
+    descriptor can encode: the call is refused before the seed or the launch.
+
+    K = 16 also ends inside a scale block, and checks of the scale factors may
+    refuse it first, each in its own words, so that case checks the refusal
+    (ValueError, no launch, nothing written) and not the message."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    if case == "bf16_k0":
+        graph, k, match = _max_reduction_graph(), 0, "K=0 is a zero K extent"
+    else:
+        from test_block_scale_matmul import _build_nvfp4_graph
+
+        fp8, e8m0 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0
+        graph, k, match = _build_nvfp4_graph(M, N, 256, block_size=32, sf_dt=e8m0, a_dt=fp8, b_dt=fp8), 16, None
+    compiled, calls = _recorded_sm120_plan(graph, by_name(_SM120_CFG))
+    operands = _sentinel_operands(compiled, M, N, k)
+    with pytest.raises(ValueError, match=match):
+        compiled.lowered(operands)
+    torch.cuda.synchronize()
+    assert calls == []
+    for out in compiled.recipe.outputs:
+        assert torch.all(operands[out.index] == 17.0)
+
+
+@requires_sm120
+def test_sm120_frost_engine_runs_an_empty_override_and_refuses_k0():
+    """The public route to a zero extent: a FROST plan executed with override_shapes.
+
+    Each of these abort()ed the process inside the template host. An empty call
+    now leaves the output alone, K = 0 raises, and the plan still serves a real
+    call afterwards.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16).set_uid(3)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not frost:
+        pytest.skip("no FROST plan for this graph")
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, N, K, dtype=torch.bfloat16, device="cuda")
+    c = torch.full((1, M, N), 7.0, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+
+    def run(m, n, k):
+        g.execute(
+            {1: a.data_ptr(), 2: b.data_ptr(), 3: c.data_ptr()},
+            ws,
+            override_uids=[1, 2, 3],
+            override_shapes=[[1, m, k], [1, k, n], [1, m, n]],
+            override_strides=[[M * K, K, 1], [K * N, 1, K], [M * N, N, 1]],
+        )
+        torch.cuda.synchronize()
+
+    run(0, N, K)
+    run(M, 0, K)
+    assert torch.all(c == 7.0)
+    with pytest.raises(ValueError, match="K=0 is a zero K extent"):
+        run(M, N, 0)
+    assert torch.all(c == 7.0)
+    run(128, N, K)
+    ref = torch.einsum("bmk,bnk->bmn", a[:, :128].float(), b.float())
+    torch.testing.assert_close(c[:, :128].float(), ref, atol=2e-1, rtol=2e-2)
+    assert torch.all(c[:, 128:] == 7.0)
+
+
+# --- an aux is read at the strides the graph declared -----------------------
+
+
+def _residual_graph(aux_dim, aux_stride, batch=1, plan=(M, N), **options):
+    """``matmul(A, B) + R``: R's declared layout is the one compiled into the kernel."""
+    m0, n0 = plan
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32, **options)
+    A = g.tensor(name="A", uid=1, dim=[batch, m0, K], stride=[m0 * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[batch, K, n0], stride=[K * n0, 1, K])
+    R = g.tensor(name="R", uid=3, dim=list(aux_dim), stride=list(aux_stride), data_type=F32)
+    Y = g.add(a=g.matmul(A=A, B=B, name="mm"), b=R, name="residual")
+    Y.set_output(True).set_data_type(F32).set_uid(4)
+    return g, A, B, R, Y
+
+
+def _small_ints(*shape):
+    return torch.randint(-3, 4, shape, device="cuda").float()
+
+
+def _compact_in(storage_elems, *shape):
+    """A compact ``shape`` view carved from larger storage: should the guard let a
+    call through, the kernel's reads at the declared strides stay inside it."""
+    count = 1
+    for extent in shape:
+        count *= extent
+    return _small_ints(storage_elems)[:count].view(*shape)
+
+
+_AUX_STRIDES = r"the kernel reads shape \(.*\) with strides \(.*\) on every axis of extent > 1"
+# The advice the refusal gives: a buffer with the strides it names, unless no buffer of the call's extents can be served.
+_PASS_A_BUFFER = r"pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan"
+
+
+def _aux_layout(aux_dim, aux_stride, legal, illegal, *, batch=1, plan=(M, N), refusal=_AUX_STRIDES, remedy=_PASS_A_BUFFER):
+    """R declared as ``aux_dim`` / ``aux_stride`` in a plan built at ``plan`` = (M, N):
+    the ``legal`` calls run exactly, ``illegal`` is refused as ``refusal`` says, with
+    ``remedy`` as the advice. A call is (M, N, how to make R at that M and N)."""
+    return SimpleNamespace(aux_dim=aux_dim, aux_stride=aux_stride, legal=legal, illegal=illegal, batch=batch, plan=plan, refusal=refusal, remedy=remedy)
+
+
+_SM120_AUX_LAYOUTS = {
+    "per_elem_n_major": _aux_layout(
+        (1, M, N),
+        (M * N, N, 1),
+        (
+            (M, N, lambda m, n: _small_ints(1, m, n)),
+            (2 * M, N, lambda m, n: _small_ints(1, m, n)),  # M is only on the unit-extent axis's stride
+            (2 * M, N, lambda m, n: _small_ints(m, n)),  # a rank-2 buffer, viewed onto the declared axes
+            (M, N // 2, lambda m, n: _small_ints(1, m, N)[:, :, :n]),  # rows still N apart
+        ),
+        (M, N // 2, lambda m, n: _compact_in(M * N, 1, m, n)),
+    ),
+    "per_elem_m_major": _aux_layout(
+        (1, M, N),
+        (M * N, 1, M),
+        (
+            (M, N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
+            (M, 2 * N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
+        ),
+        (2 * M, N, lambda m, n: _small_ints(1, n, m).transpose(1, 2)),
+    ),
+    "batched_per_row": _aux_layout(
+        (2, M, 1),
+        (M, 1, 1),
+        (
+            (M, N, lambda m, n: _small_ints(2, m, 1)),
+            (M, 2 * N, lambda m, n: _small_ints(2, m, 1)),
+        ),
+        (2 * M, N, lambda m, n: _small_ints(2, m, 1)),
+        batch=2,
+    ),
+    # A rank-1 aux's fake carries no strides, so nothing but the guard stands
+    # between the kernel and a buffer of another stride. (A swap-AB plan sees it as
+    # a per-row aux whose fake pins the stride: there the guard names a refusal the
+    # front door made raw.)
+    "rank1_strided_per_col": _aux_layout(
+        (N,),
+        (2,),
+        (
+            (M, N, lambda m, n: _small_ints(2 * n)[::2]),
+            (M, N // 2, lambda m, n: _small_ints(2 * n)[::2]),
+        ),
+        (M, N, lambda m, n: _compact_in(2 * n, n)),
+    ),
+    # A plan built at M = 1 (or N = 1) classifies R by the matmul output, whose extent
+    # there is 1 too, so its fake lets that axis grow with the call -- but the kernel
+    # never steps an axis R declared at extent 1: it reads index 0 for every row
+    # (column). Only a broadcast along that axis is read correctly, and only where the
+    # fake does not pin a stride there; here it pins N, so no buffer can be served.
+    "unit_m_per_elem": _aux_layout(
+        (1, 1, N),
+        (N, N, 1),
+        (
+            (1, N, lambda m, n: _small_ints(1, m, n)),
+            (1, N // 2, lambda m, n: _small_ints(1, m, n)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, m, n)),
+        plan=(1, N),
+        refusal=rf"the kernel reads only index 0 of axis 1, which had extent 1 when the plan was built, so it cannot serve extent {M} there",
+        remedy="rebuild the plan",
+    ),
+    "unit_m_per_row": _aux_layout(
+        (1, 1, 1),
+        (1, 1, 1),
+        (
+            (1, N, lambda m, n: _small_ints(1, 1, 1)),
+            (M, N, lambda m, n: _small_ints(1, 1, 1).expand(1, m, 1)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, m, 1)),
+        plan=(1, N),
+        refusal=rf"the kernel reads shape \(1, {M}, 1\) with strides \(\*, 0, \*\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 1,",
+    ),
+    "unit_n_per_col": _aux_layout(
+        (1, 1, 1),
+        (1, 1, 1),
+        (
+            (M, 1, lambda m, n: _small_ints(1, 1, 1)),
+            (M, N, lambda m, n: _small_ints(1, 1, 1).expand(1, 1, n)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, 1, n)),
+        plan=(M, 1),
+        refusal=rf"the kernel reads shape \(1, 1, {N}\) with strides \(\*, \*, 0\) on every axis of extent > 1 \(0: the plan was built at extent 1 on axis 2,",
+    ),
+    # A rank-1 aux's fake is (1, N) at any plan M (_aux_kernel_shape): a (1, N) buffer serves
+    # every M, since the kernel reads row 0 for each row, and no (M, N) view can be passed.
+    "unit_m_rank1": _aux_layout(
+        (N,),
+        (1,),
+        (
+            (1, N, lambda m, n: _small_ints(1, n)),
+            (M, N, lambda m, n: _small_ints(1, n)),
+        ),
+        (M, N, lambda m, n: _small_ints(1, n).expand(m, n)),
+        plan=(1, N),
+        refusal=rf"the kernel reads shape \(1, {N}\) with strides \(\*, 1\) on every axis of extent > 1",
+    ),
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "layout,swap_ab",
+    [pytest.param(name, False, id=name) for name in _SM120_AUX_LAYOUTS]
+    + [pytest.param(name, True, id=f"{name}-swap_ab") for name in ("per_elem_n_major", "rank1_strided_per_col")],
+)
+def test_sm120_aux_layout_is_refused_by_name_before_launch(layout, swap_ab):
+    """The SM120 epilogue reads an aux at the strides the graph declared.
+
+    They are literals in the generated kernel, not launch arguments, and an axis
+    the graph declared at extent 1 is not stepped at all, so a call whose aux has
+    other strides on an axis it spans cannot be served. The launch path refuses
+    it, counts it, and ``explain`` names the aux; nothing is written. Before, the
+    call died in the tvm-ffi front door with a raw "Mismatched R.strides[i]" from
+    inside the body that is not allowed to raise -- or, where the fake carries no
+    stride on that axis (a rank-1 aux; per-row or per-column R of a plan built at
+    M = 1 or N = 1) or pins one on an axis the kernel never steps (per-element R of
+    a plan built at M = 1: the pinned stride N is a compact buffer's row stride),
+    ran and read the wrong elements. Calls whose aux keeps the declared strides on
+    every axis of extent > 1 the kernel steps, and broadcasts along any other,
+    stay legal at any M and N, in either kernel frame.
+    """
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.tile_config import by_name
+
+    case = _SM120_AUX_LAYOUTS[layout]
+    batch, legal, illegal = case.batch, case.legal, case.illegal
+    g, A, B, R, Y = _residual_graph(case.aux_dim, case.aux_stride, batch=batch, plan=case.plan)
+    config = replace(by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"), swap_ab=swap_ab)
+    compiled = compiler.jit_from_cudnn_graph(g, config)
+
+    def call(m, n, make_aux):
+        torch.manual_seed(0)
+        a = torch.randint(-2, 3, (batch, m, K), device="cuda").to(torch.bfloat16)
+        b = torch.randint(-2, 3, (batch, n, K), device="cuda").to(torch.bfloat16)
+        r = make_aux(m, n)
+        y = torch.full((batch, m, n), float("nan"), device="cuda")
+        compiled.deferrals.clear()
+        return (lambda: compiled({A: a, B: b, R: r, Y: y})), y, torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + r
+
+    for m, n, make_aux in legal:
+        run, y, ref = call(m, n, make_aux)
+        run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y, ref, atol=0, rtol=0)
+        assert dict(compiled.deferrals) == {}
+
+    run, y, _ = call(*illegal)
+    with pytest.raises(ValueError, match=rf"\({case.remedy}\): aux 'R': {case.refusal}.*; got shape \("):
+        run()
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {"aux layout": 1}
+    assert torch.isnan(y).all()
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", (False, True), ids=("plain", "swap_ab"))
+def test_sm120_block_scale_aux_layout_is_refused_by_name_before_launch(swap_ab):
+    """A dense nvfp4 block-scale plan takes the same per-call aux check.
+
+    A residual that keeps the declared strides runs exactly at another M; one
+    with padded rows, which the kernel would read N apart, is refused by name
+    before anything is written.
+    """
+    from cudnn.gemm.frost.sm120 import compiler
+    from cudnn.gemm.frost.tile_config import by_name
+
+    sf_k = BS_K // BS_BLOCK
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    reorder = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, BS_M, BS_K], stride=[BS_M * BS_K, BS_K, 1], data_type=fp4)
+    SFA = g.tensor(name="SFA", dim=[1, BS_M, sf_k], stride=[BS_M * sf_k, sf_k, 1], data_type=fp8, **reorder)
+    B = g.tensor(name="B", dim=[1, BS_K, BS_N], stride=[BS_K * BS_N, 1, BS_K], data_type=fp4)
+    SFB = g.tensor(name="SFB", dim=[1, sf_k, BS_N], stride=[sf_k * BS_N, 1, sf_k], data_type=fp8, **reorder)
+    R = g.tensor(name="R", dim=[1, BS_M, BS_N], stride=[BS_M * BS_N, BS_N, 1], data_type=F32)
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, BS_BLOCK])
+    Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[BS_BLOCK, 1])
+    Y = g.add(a=g.matmul(A=Ad, B=Bd, name="mm"), b=R, name="residual")
+    Y.set_output(True).set_data_type(F32)
+    config = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap_ab)
+    compiled = compiler.jit_from_cudnn_graph(g, config)
+    assert compiled.block_scale
+
+    def call(m, r):
+        torch.manual_seed(0)
+        a = torch.randint(0, 256, (1, m, BS_K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+        sfa = to_blocked(torch.randint(1, 4, (m, sf_k), device="cuda").to(torch.float8_e4m3fn)).view(1, m, sf_k)
+        b = torch.randint(0, 256, (1, BS_N, BS_K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+        sfb = to_blocked(torch.randint(1, 4, (BS_N, sf_k), device="cuda").to(torch.float8_e4m3fn)).view(1, BS_N, sf_k)
+        y = torch.full((1, m, BS_N), float("nan"), device="cuda")
+        compiled.deferrals.clear()
+        return (lambda: compiled({A: a, SFA: sfa, B: b, SFB: sfb, R: r, Y: y})), y
+
+    # Every product is a multiple of 1/4 and every sum stays far below 2**22, so the fp32
+    # output is exact: a call adds exactly its residual to the same call with R = 0.
+    for m in (BS_M, 2 * BS_M):
+        r = _small_ints(1, m, BS_N)
+        (run, y), (run_zero, y_zero) = call(m, r), call(m, torch.zeros_like(r))
+        run()
+        run_zero()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y - y_zero, r, atol=0, rtol=0)
+        assert dict(compiled.deferrals) == {}
+
+    run, y = call(BS_M, _small_ints(1, BS_M, 2 * BS_N)[:, :, :BS_N])  # rows 2N apart; the kernel reads them N apart
+    with pytest.raises(ValueError, match=rf"\({_PASS_A_BUFFER}\): aux 'R': {_AUX_STRIDES}.*; got shape \("):
+        run()
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {"aux layout": 1}
+    assert torch.isnan(y).all()
+
+
+@requires_sm120
+@pytest.mark.skipif(cudnn.backend_version() < 92100, reason="override shape requires cuDNN backend 9.21.0+")
+def test_sm120_aux_layout_refusal_reaches_graph_execute():
+    """A dynamic-shape graph is how such a call arrives through ``execute``.
+
+    Its FROST plan runs a new M with a compact residual (the declared strides
+    still hold on every axis R spans) and refuses a new N, whose compact
+    residual rows are no longer N apart, by name and before writing anything.
+    """
+    g, A, B, R, Y = _residual_graph((1, M, N), (M * N, N, 1), is_dynamic_shape_enabled=True, is_override_shape_enabled=True)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not frost:
+        pytest.skip("no FROST plan for this graph")
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+
+    for m, n in ((2 * M, N), (M, N // 2)):
+        torch.manual_seed(0)
+        a = torch.randint(-2, 3, (1, m, K), device="cuda").to(torch.bfloat16)
+        b = torch.randint(-2, 3, (1, n, K), device="cuda").to(torch.bfloat16)
+        r = _compact_in(2 * M * N, 1, m, n)
+        y = torch.full((1, m, n), float("nan"), device="cuda")
+        ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        overrides = dict(
+            override_uids=[1, 2, 3, 4],
+            override_shapes=[[1, m, K], [1, K, n], [1, m, n], [1, m, n]],
+            override_strides=[[m * K, K, 1], [K * n, 1, K], [m * n, n, 1], [m * n, n, 1]],
+        )
+        if n == N:
+            g.execute({1: a, 2: b, 3: r, 4: y}, ws, **overrides)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, torch.einsum("bmk,bnk->bmn", a.float(), b.float()) + r, atol=0, rtol=0)
+            continue
+        with pytest.raises(ValueError, match=r"aux 'R': the kernel reads shape \(1, 256, 128\) with strides \(\*, 256, 1\)"):
+            g.execute({1: a, 2: b, 3: r, 4: y}, ws, **overrides)
+        torch.cuda.synchronize()
+        assert torch.isnan(y).all()
+
+
+def test_sm120_an_empty_call_skips_the_aux_layout_check():
+    """An empty call (M or N == 0) reads no aux element, so the aux layout check above
+    leaves it to the launch path, which runs it as a no-op. A fresh per-element aux of the
+    call's extents is not refused for the stride torch gives its empty axis."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    g, *_ = _residual_graph((1, M, N), (M * N, N, 1))
+    compiled, calls = _recorded_sm120_plan(g, by_name(_SM120_CFG))
+    r = compiled.recipe
+    for m, n in ((M, 0), (0, N)):
+        bufs = [None] * len(compiled.binding.bound_tensors())
+        for op in r.inputs:
+            bufs[op.index] = torch.ones(op.batch, n if op.is_b else m, K // op.kpack, dtype=torch.bfloat16, device="cuda")
+        for x in r.aux:
+            bufs[x.index] = torch.empty(1, m, n, device="cuda")
+        for out in r.outputs:
+            bufs[out.index] = torch.empty(1, m, n, device="cuda")
+        compiled.lowered(bufs)
+        assert calls == [], (m, n)
+        assert not compiled.deferrals, (m, n, dict(compiled.deferrals))
