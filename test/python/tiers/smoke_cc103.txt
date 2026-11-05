@@ -1,7 +1,7 @@
 # SMOKE tier, cc 10.3 (Blackwell Ultra B300 / GB300): the cells of smoke_cc100.txt that run on cc 10.3 -- the same engine rows, their
 # sm100 bodies compiled for sm_103a; the rules are in README.md.  The code path each id stands for is in smoke_cc103_code_paths.tsv.
 # conftest.py marks these ids `smoke`:
-#   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= @tiers/smoke_cc103.txt)
+#   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= $(grep -v '^#' tiers/smoke_cc103.txt) -- the @file form would pass these comment lines as arguments and collects nothing)
 # Not listed (24 cc 10.0 cells that skip on cc 10.3): the cc 10.7 / SM120 kernels and bindings (9); the native dense, prefill, sink and
 # split bindings, gated to SM100 (5); the gated block's dense and FP8-projection forms, admitted on (10, 0) only (9); and the FP8
 # backward graph of test_mhas_v2 at D = 144, which no engine serves on cc 10.3 with cuDNN 9.27 (1).

@@ -4,12 +4,15 @@
 """The FlashInfer backend ``"frost_fe"`` of the fused GDN decode and verify steps (``cudnn.linear_attention.frost.flashinfer_gdn_backend``).
 Skipped without FlashInfer's experimental Qwen 3.5 GDN block.  Host: the import-time registration (idempotent, ``replace``), the typed
 declines through FlashInfer's own probe (form, geometry by field, device by compute capability, the DSL gate, the decode row envelope,
-the verify step-shape envelope: tokens per request against the picked form's shared-memory budget on a cc 10.0 reading), the build-time
+the verify step-shape envelope: tokens per request against the pick's shared-memory budget on a cc 10.0 reading and on a 99 KB one, a
+part whose shared memory holds no verify form), the build-time
 dtype / device declines, both runners' argument mapping onto their entry's call contract and their refusal of an unprepared binding, and
-a subprocess proof that the probe loads no kernel.  Device (an SM100-class part, cc 10.x, with a serving DSL): FlashInfer's OWN decode and verify
+a subprocess proof that the probe loads no kernel, and the per-row trip of the docs page's served / declined table through both twins
+(the probe and the entries' own ``check_support``).  Device (an SM100- or SM120-class part, cc 10.x / 12.x, with a serving DSL): FlashInfer's OWN decode and verify
 tests -- the torch reference at decode rows 1 .. 64 and at verify requests 1 / 2 / 4 x tokens 4 / 6, the CUDA-graph replays, the
 dim-first conv pool (served by decode, a typed decline for verify) -- run against ``frost_fe`` (FlashInfer's checks, the cuDNN Frontend backend), the verify
-reference under the 148-SM launch policy and with the two-CTAs-per-SM form forced at every shape, the fp32-parameter decode decline at
+reference under the 148-SM launch policy and with the SM count held below one request's grid (the regime's budget-fitting form at every
+shape: the two-CTAs-per-SM form on a cc 10.0 part, the 2-deep-ring pair on a 99 KB opt-in), the fp32-parameter decode decline at
 plan time, the capture guards, and bitwise agreement with FlashInfer's built-in ``frost`` backend where that one is served (cc 10.0):
 decode on its reference cases, verify on the benchmark's own input sets at requests 1 / 2 / 4 x 6 tokens (all accepted, and random
 acceptance with a padding request).  The FlashInfer tests and benchmark are imported from the source tree next to the installed
@@ -54,7 +57,12 @@ ROWS = [1, 2, 3, 4, 8, 16, 64]  # FlashInfer's decode rows (the last row a paddi
 VERIFY_SHAPES = [(1, 4), (1, 6), (2, 4), (2, 6), (4, 4), (4, 6)]  # FlashInfer's verify (requests, tokens per request)
 SM100_READINGS = dict(SMEM_PER_SM_BYTES=233472, SMEM_OPTIN_BYTES=232448)  # a cc 10.0 part: 228 KB per SM, 227 KB per-CTA opt-in
 SM100_SMS = 148
+SM120_READINGS = dict(
+    SMEM_PER_SM_BYTES=kvcfg.SM120_SMEM_PER_SM_BYTES, SMEM_OPTIN_BYTES=kvcfg.SM120_SMEM_OPTIN_BYTES
+)  # a cc 12.0 part: 100 KB per SM, 99 KB opt-in
+SM120_SMS = 170
 POLICY_SMS = {"148 SMs": SM100_SMS, "two CTAs per SM": 47}  # the SM-count input of the entry's pick per launch policy
+_REAL_VERIFY_FORM = backend.verify_form  # the unpatched probe path, for cells that patch it to a host twin and back
 
 
 def _probe(device, form="decode", **kw):
@@ -106,11 +114,22 @@ def _verify_tensors(requests, tokens, device, seed=0):
     return t
 
 
-def _sm100_verify_form(device, requests=None, norm_eps=1e-6):
-    """The verify form a cc 10.0 part with 148 SMs picks, for a host without one: the entry's pick with that part's readings (no requests
-    count = the pick at one request, as the backend reads it)."""
-    cfg = kvcfg.default_cfg(1 if requests is None else int(requests), SM100_SMS)
-    return kvcfg.resolve_cfg(replace(cfg, **SM100_READINGS), 1 if requests is None else int(requests))
+def _part_verify_form(readings, sms, requests, tokens_per_request):
+    """The verify form a part (``readings``, ``sms``) picks for a step shape, for a host without one: the module pick with that part's
+    readings, resolved (no requests count = the pick at one request, as the backend reads it)."""
+    requests = 1 if requests is None else int(requests)
+    cfg = kvcfg.default_cfg(requests, sms, readings["SMEM_PER_SM_BYTES"], readings["SMEM_OPTIN_BYTES"], tokens_per_request)
+    return kvcfg.resolve_cfg(replace(cfg, **readings), requests)
+
+
+def _sm100_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    """The verify form a cc 10.0 part with 148 SMs picks (``verify_form``'s twin for a host without one)."""
+    return _part_verify_form(SM100_READINGS, SM100_SMS, requests, tokens_per_request)
+
+
+def _sm120_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    """The verify form a 99 KB-opt-in part with 170 SMs (cc 12.0) picks for a step shape (``verify_form``'s twin for a host without one)."""
+    return _part_verify_form(SM120_READINGS, SM120_SMS, requests, tokens_per_request)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -152,11 +171,26 @@ def test_an_unknown_form_is_declined_by_kind_form():
 @pytest.fixture
 def as_sm100(monkeypatch):
     """The support question as it reads on a cc 10.0 part (148 SMs) with a serving DSL: the device fact FlashInfer's helper reads, both
-    entries' DSL gates and the verify form's device readings patched, nothing else."""
+    entries' DSL gates, the decode entry's shared-memory reader and the verify form's device readings patched, nothing else."""
     monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM100_READINGS["SMEM_PER_SM_BYTES"], SM100_READINGS["SMEM_OPTIN_BYTES"]))
     monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
+
+
+@pytest.fixture
+def as_sm120(monkeypatch):
+    """The support question as it reads on a cc 12.0 part (170 SMs, 100 KB of shared memory per SM, 99 KB per-CTA opt-in) with a serving
+    DSL: the device fact FlashInfer's helper reads, the DSL gates, and both entries' DEVICE READERS patched to that part -- the real
+    ``verify_form`` / ``verify_max_tokens`` and the decode form's fit run on the host, through the real entries."""
+    sm120 = (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"])
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (12, 0))
+    monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: sm120)
+    monkeypatch.setattr(ventry, "device_shared_memory", lambda device: sm120)
+    monkeypatch.setattr(ventry, "device_multiprocessor_count", lambda device: SM120_SMS)
 
 
 @pytest.mark.parametrize("form", backend.FORMS)
@@ -175,16 +209,18 @@ def test_other_geometries_are_declined_by_field_name(as_sm100, form):
 def test_devices_are_declined_by_compute_capability(monkeypatch, form):
     monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM100_READINGS["SMEM_PER_SM_BYTES"], SM100_READINGS["SMEM_OPTIN_BYTES"]))
     monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
     kw = dict(tokens_per_request=6) if form == "verify" else {}
     sup = _probe(CPU, form, **kw)  # the real probe on a CPU device
     assert (sup.served, sup.kind) == (False, "device") and "no CUDA device" in sup.reason and form in sup.reason, sup
-    for cc, token in (((8, 0), "SM80"), ((9, 0), "SM90"), ((12, 0), "SM120")):
+    for cc, token in (((8, 0), "SM80"), ((9, 0), "SM90"), ((11, 0), "SM110"), ((13, 0), "SM130")):
         monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
         sup = _probe("cuda:0", form, **kw)
-        assert (sup.served, sup.kind) == (False, "device") and token in sup.reason and "10.x" in sup.reason, sup
-    assert entry.SUPPORTED_CC_MAJOR == ventry.SUPPORTED_CC_MAJOR == 10
-    for cc in ((10, 0), (10, 3)):
+        assert (sup.served, sup.kind) == (False, "device") and token in sup.reason and "10.x" in sup.reason and "12.x" in sup.reason, sup
+    assert entry.SUPPORTED_CC_RANGES == ventry.SUPPORTED_CC_RANGES == ((100, 109), (120, 129))
+    assert entry.SUPPORTED_CC_TEXT == ventry.SUPPORTED_CC_TEXT and not hasattr(entry, "SUPPORTED_CC_MAJOR") and not hasattr(ventry, "SUPPORTED_CC_MAJOR")
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
         monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
         assert _probe("cuda:0", form, **kw).served, cc
 
@@ -244,27 +280,175 @@ def test_verify_step_shape_envelope(as_sm100):
     )
 
 
+def test_verify_step_shape_envelope_on_a_99kb_part(as_sm120):
+    """The verify form on a 99 KB-opt-in part with 170 SMs (the cc 12.0 readings) through the REAL probe path (the entry's device readers
+    patched): the pick is token-aware -- the 2-deep-ring pair at one request and the one-CTA landing-slab form at two and three (the
+    2-deep-ring pair again from four) hold 8 tokens, the landing-slab pair holds 17 at every requests count -- so the served envelope is
+    2 .. 17 tokens per request everywhere,
+    ``verify_max_tokens`` answers 17, and T 18 is a ``shape`` decline naming the deepest form (two CTAs per head) and the bound; the
+    probe and the entry's own ``max_tokens_for`` agree (no served-then-raise shape exists)."""
+    k = ventry.GdnVerifyFused("cuda:0", GEOMETRY.norm_eps)
+    assert k.readings == (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"]) and k.sm_count == SM120_SMS
+    assert replace(k.cfg, **SM100_READINGS) == kvcfg.ONE_CTA_NBUF1_CFG, "the start form: the one-CTA form this part holds"
+    for requests, tokens, want in (
+        (1, None, kvcfg.PAIR_NBUF2_CFG),
+        (1, 6, kvcfg.PAIR_NBUF2_CFG),
+        (1, 12, kvcfg.PAIR_NBUF1_CFG),
+        (2, 6, kvcfg.ONE_CTA_NBUF1_CFG),
+        (2, 8, kvcfg.ONE_CTA_NBUF1_CFG),
+        (4, 6, kvcfg.PAIR_NBUF2_CFG),  # past the one-CTA grid the 2-deep-ring pair again (the measured wave-quantization order)
+        (4, 8, kvcfg.PAIR_NBUF2_CFG),
+        (4, 17, kvcfg.PAIR_NBUF1_CFG),
+    ):
+        got = backend.verify_form("cuda:0", requests, GEOMETRY.norm_eps, tokens)
+        assert replace(got, NORM_FORM=None, **SM100_READINGS) == want and got == _sm120_verify_form("cuda:0", requests, GEOMETRY.norm_eps, tokens), (
+            requests,
+            tokens,
+        )
+    assert backend.verify_form("cuda:0") == backend.verify_form("cuda:0", 1, GEOMETRY.norm_eps, 2), "no step shape: the pick at one request, two tokens"
+    for requests in (None, 1, 2, 3, 4, 8, 16):
+        assert backend.verify_max_tokens("cuda:0", requests) == 17 == k.max_tokens_for(1 if requests is None else requests), requests
+    assert _probe("cuda:0", "verify").served and _probe("cuda:0", "verify", requests=3).served
+    for requests, tokens in [(1, t) for t in range(2, 18)] + [(2, 8), (2, 9), (3, 8), (4, 17), (16, 17), (backend.VERIFY_MAX_REQUESTS, 17)]:
+        assert _probe("cuda:0", "verify", requests=requests, tokens_per_request=tokens).served, (requests, tokens)
+    for requests in (1, 2, 4, None):
+        sup = _probe("cuda:0", "verify", requests=requests, tokens_per_request=18)
+        assert (sup.served, sup.kind) == (False, "shape"), (requests, sup)
+        assert "two CTAs per head" in sup.reason and "at most 17" in sup.reason and "tokens_per_request=18" in sup.reason and "101376 B" in sup.reason, sup
+    assert _probe("cuda:0", "decode").served and _probe("cuda:0", "decode", requests=64).served
+
+
+def test_docs_served_and_declined_rows_are_reachable_with_the_published_bounds(monkeypatch):
+    """The docs page's served / declined table is the GDN support matrix: its ``device`` and ``verify step shape`` rows name exactly the
+    compute capabilities and the per-part token bounds the code computes, and every decline those rows publish is reachable through BOTH
+    twins -- FlashInfer's probe (``support``) and the entries' own ``check_support`` -- with the published tokens in its text (a row no
+    code path reaches, or a bound the page misquotes, fails here).  The FlashInfer-free twin of the table pins (the rows against the code
+    and the entries' own declines) is ``test_gdn_support_matrix_docs.py``, which a lane without FlashInfer still runs."""
+    from test_gdn_support_matrix_docs import docs_table_rows
+
+    rows = docs_table_rows()
+    assert {"device", "verify step shape", "decode rows"} <= set(rows), sorted(rows)
+    device_row, shape_row = rows["device"], rows["verify step shape"]
+    for token in ("10.x", "12.x", "cc 10.0", "cc 12.0", "kind `device`"):
+        assert token in device_row, (token, device_row)
+    assert entry.SUPPORTED_CC_TEXT == ventry.SUPPORTED_CC_TEXT == "10.x (SM100-class) or 12.x (SM120-class)"
+    assert entry.SUPPORTED_CC_RANGES == ventry.SUPPORTED_CC_RANGES == ((100, 109), (120, 129))
+    for token in ("35, 8 and 45", "17", "kind `shape`", "`verify_max_tokens(device, requests)`"):
+        assert token in shape_row, (token, shape_row)
+    assert [kvcfg.max_tokens_served(r, SM100_SMS) for r in (1, 2, 3, 4)] == [35, 8, 8, 45]
+    sm120 = (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"])
+    assert all(kvcfg.max_tokens_served(r, SM120_SMS, *sm120) == 17 for r in (1, 2, 3, 4, 8, 16))
+    assert all(replace(kvcfg.default_cfg(r, SM120_SMS, *sm120, 8), **SM120_READINGS).max_tokens() == 8 for r in (1, 2, 4))  # "8 with the picked form"
+    # the device row through both twins: every declined capability by name, every served one through
+    monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM100_READINGS["SMEM_PER_SM_BYTES"], SM100_READINGS["SMEM_OPTIN_BYTES"]))
+    monkeypatch.setattr(backend, "verify_form", _sm100_verify_form)
+    dspec, vspec = _spec(rows=2), _spec(form="verify", rows=1, tokens=4)
+    dargs = backend.FrostFeDecodeRunner(dspec)._args(fi_api.bind_inputs(dspec, **_tensors(2, CPU)))
+    vkw = backend.FrostFeVerifyRunner(vspec)._kwargs(fi_api.bind_inputs(vspec, **_verify_tensors(1, 4, CPU)))
+    for cc, name in (((9, 0), "SM90"), ((11, 0), "SM110"), ((13, 0), "SM130")):
+        monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
+        for form, kw in (("decode", {}), ("verify", dict(requests=1, tokens_per_request=4))):
+            sup = _probe("cuda:0", form, **kw)
+            assert (sup.served, sup.kind) == (False, "device") and name in sup.reason and "10.x" in sup.reason and "12.x" in sup.reason, sup
+        with pytest.raises(NotImplementedError, match=rf"10\.x .*12\.x.*{cc[0]}\.{cc[1]}"):
+            entry.check_support(*dargs, device_cc=cc)
+        with pytest.raises(NotImplementedError, match=rf"10\.x .*12\.x.*{cc[0]}\.{cc[1]}"):
+            ventry.check_support(**vkw, device_cc=cc)
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
+        monkeypatch.setattr(fi_support, "device_cc", lambda device, cc=cc: cc)
+        assert _probe("cuda:0", "decode").served and _probe("cuda:0", "verify", requests=1, tokens_per_request=4).served, cc
+        entry.check_support(*dargs, device_cc=cc)
+        ventry.check_support(**vkw, device_cc=cc)
+    # the verify step-shape row through both twins: the cc 10.0 bound at one request (35) and the 99 KB bound (17)
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
+    sup = _probe("cuda:0", "verify", requests=1, tokens_per_request=36)
+    assert (sup.served, sup.kind) == (False, "shape") and "at most 35" in sup.reason and "two CTAs per head" in sup.reason, sup
+    vkw36 = backend.FrostFeVerifyRunner(_spec(form="verify", rows=1, tokens=36))._kwargs(
+        fi_api.bind_inputs(_spec(form="verify", rows=1, tokens=36), **_verify_tensors(1, 36, CPU))
+    )
+    with pytest.raises(NotImplementedError, match="at most 35 on this part"):
+        ventry.check_support(**vkw36, device_cc=(10, 0), cfg=_sm100_verify_form("cuda:0", 1))
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (12, 0))
+    monkeypatch.setattr(ventry, "device_shared_memory", lambda device: sm120)
+    monkeypatch.setattr(ventry, "device_multiprocessor_count", lambda device: SM120_SMS)
+    monkeypatch.setattr(backend, "verify_form", _REAL_VERIFY_FORM)  # the real probe path again, now reading the 99 KB part
+    sup = _probe("cuda:0", "verify", requests=1, tokens_per_request=18)
+    assert (sup.served, sup.kind) == (False, "shape") and "at most 17" in sup.reason and "two CTAs per head" in sup.reason, sup
+    assert _probe("cuda:0", "verify", requests=4, tokens_per_request=17).served
+    vkw18 = backend.FrostFeVerifyRunner(_spec(form="verify", rows=1, tokens=18))._kwargs(
+        fi_api.bind_inputs(_spec(form="verify", rows=1, tokens=18), **_verify_tensors(1, 18, CPU))
+    )
+    k120 = ventry.GdnVerifyFused("cuda:0", GEOMETRY.norm_eps)
+    with pytest.raises(NotImplementedError, match="at most 17 on this part"):
+        ventry.check_support(**vkw18, device_cc=(12, 0), cfg=k120.cfg_for(1, 18))
+    ventry.check_support(**vkw, device_cc=(12, 0), cfg=k120.cfg_for(1, 4))
+
+
+def test_probe_declines_a_part_whose_shared_memory_holds_no_form_by_kind_device(monkeypatch):
+    """A device whose shared memory holds no form (a 40 KB opt-in): each entry's typed NotImplementedError at construction reaches the
+    probe as kind ``device`` naming the opt-in -- never a raised error inside ``support``, and never a served probe that ``build`` then
+    refuses -- for the verify form with a step shape, and for the decode form with and without one (its one-CTA form must fit the opt-in;
+    every admitted part holds it); a verify probe without a token count asks no budget and stays served, as before."""
+    monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
+    monkeypatch.setattr(entry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (40960, 40000))
+    monkeypatch.setattr(ventry, "device_shared_memory", lambda device: (40960, 40000))
+    monkeypatch.setattr(ventry, "device_multiprocessor_count", lambda device: SM120_SMS)
+    for kw in (dict(requests=2, tokens_per_request=6), dict(tokens_per_request=2), dict(requests=1, tokens_per_request=18)):
+        sup = _probe("cuda:0", "verify", **kw)
+        assert (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "holds no verify form" in sup.reason, (kw, sup)
+        assert "has no form" in sup.reason and "could not read" not in sup.reason, sup  # the typed decline, not the readers' failure
+    assert _probe("cuda:0", "verify", requests=2).served, "no tokens count: the budget is not asked"
+    with pytest.raises(NotImplementedError, match="40000-byte"):
+        backend.verify_max_tokens("cuda:0", 2)
+    for kw in ({}, dict(requests=4), dict(requests=1, tokens_per_request=1)):
+        sup = _probe("cuda:0", "decode", **kw)
+        assert (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "holds no decode form" in sup.reason, (kw, sup)
+        assert "has no form" in sup.reason and "could not read" not in sup.reason, sup
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"]))
+    assert _probe("cuda:0", "decode", requests=4).served, "a 99 KB opt-in holds the 74,848 B decode form"
+
+    def unreadable(device):
+        raise RuntimeError("cuDeviceGetAttribute failed")
+
+    monkeypatch.setattr(entry, "device_shared_memory", unreadable)
+    sup = _probe("cuda:0", "decode")
+    assert (sup.served, sup.kind) == (False, "device") and "could not read" in sup.reason and "cuDeviceGetAttribute failed" in sup.reason, sup
+
+
 def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_device_decline(monkeypatch):
     monkeypatch.setattr(fi_support, "device_cc", lambda device: (10, 0))
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
     seen = []
 
-    def form(device, requests=None, norm_eps=1e-6):
-        seen.append((device, requests, norm_eps))
-        return _sm100_verify_form(device, requests, norm_eps)
+    def form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+        seen.append((device, requests, norm_eps, tokens_per_request))
+        return _sm100_verify_form(device, requests, norm_eps, tokens_per_request)
 
     monkeypatch.setattr(backend, "verify_form", form)
-    assert _probe("cuda:0", "verify", requests=2, tokens_per_request=6).served and seen == [("cuda:0", 2, GEOMETRY.norm_eps)]
+    assert _probe("cuda:0", "verify", requests=2, tokens_per_request=6).served and seen == [("cuda:0", 2, GEOMETRY.norm_eps, 6)]
     assert _probe("cuda:0", "verify", requests=2).served and len(seen) == 1, "no tokens count: no device reading needed"
 
-    def failing(device, requests=None, norm_eps=1e-6):
+    def failing(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
         raise RuntimeError("cuDeviceGetAttribute failed")
 
     monkeypatch.setattr(backend, "verify_form", failing)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
     assert (sup.served, sup.kind) == (False, "device") and "cuDeviceGetAttribute failed" in sup.reason, sup
 
-    def regressed(device, requests=None, norm_eps=1e-6):
+    def no_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+        raise NotImplementedError("gdn_verify_fused: this part's 40000-byte shared-memory opt-in per CTA holds no verify form")
+
+    monkeypatch.setattr(backend, "verify_form", no_form)
+    sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
+    assert (
+        (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "has no form" in sup.reason
+    ), sup  # the entry's typed decline of a part with no form, not the readers' failure
+
+    def regressed(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
         raise ValueError("a config regression")
 
     monkeypatch.setattr(backend, "verify_form", regressed)
@@ -534,17 +718,33 @@ def test_flashinfer_verify_reference_test_passes_against_frost_fe(monkeypatch, r
 @pytest.mark.parametrize("requests, tokens", VERIFY_SHAPES, ids=str)
 def test_flashinfer_verify_reference_passes_under_the_sm_count_policies(requests, tokens, policy):
     """FlashInfer's verify reference with the entry's SM-count pick steered the way its own test steers the built-in backend (its ``b200``
-    policy sets the wrapper's SM count before the first compile): the 148-SM policy (the cluster pair at one request, the one-CTA-per-SM
-    form at 2 .. 3, two CTAs per SM from 4) and, with an SM count below one request's grid, the two-CTAs-per-SM form at every shape.  The
-    expected form follows the SM-count rule itself (the pair while ``requests x 96`` CTAs have an SM each, streaming once ``requests x 48``
-    outgrow them), so a part with another SM count pins its own switch points."""
+    policy sets the wrapper's SM count before the first compile): the 148-SM policy (on a cc 10.0 part the cluster pair at one request,
+    the one-CTA-per-SM form at 2 .. 3, two CTAs per SM from 4) and, with an SM count below one request's grid, the beyond-the-grid form at
+    every shape.  The expected form is the module pick on that SM count and THIS part's readings (the budget decides which form of the
+    regime's ladder serves: the streamed two-CTAs-per-SM form on a cc 10.0 part, the 2-deep-ring pair on a 99 KB opt-in), so a
+    part with another SM count or budget pins its own switch points."""
     dev = _verify_device_or_skip(requests, tokens)
     fi = _flashinfer_tests()
     plan = prepare_qwen_3_5_gdn_block("verify", geometry=GEOMETRY, device=dev, requests=requests, tokens_per_request=tokens, backend=backend.BACKEND)
     sms = POLICY_SMS[policy]
     plan._runner.kernel.sm_count = sms  # the pick's SM-count input, before the first compile
-    form = plan._runner.kernel.cfg_for(requests)
-    assert form.STATE_STREAM == (requests * 48 > sms) and form.TWO_CTAS_PER_HEAD == (requests * 96 <= sms), (policy, requests, form)
+    form = plan._runner.kernel.cfg_for(requests, tokens)
+    readings = plan._runner.kernel.readings
+    want = kvcfg.default_cfg(requests, sms, *readings, tokens)
+    assert replace(form, NORM_FORM=None, **SM100_READINGS) == want, (policy, requests, form)
+    # the regime by SM count selects the ladder, the part's budget the form within it -- one rule on every part; T 4 / 6 fit the first
+    # admissible form of every ladder, so the pick is that form
+    ladder = kvcfg.PAIR_FORMS if requests * 96 <= sms else (kvcfg.ONE_CTA_FORMS if requests * 48 <= sms else kvcfg.BEYOND_FORMS)
+    assert want == kvcfg.first_fitting(ladder, *readings), (policy, requests, want)
+    pair_regime, beyond_grid = requests * 96 <= sms, requests * 48 > sms
+    if kvcfg.admissible(ladder[0], *readings):  # a cc 10.x part: the SM100 policy itself -- the pair in its regime, 3-deep rings, streaming past the grid
+        assert form.TWO_CTAS_PER_HEAD == pair_regime and form.STATE_STREAM == beyond_grid, (policy, requests, form)
+        assert form.NBUF == (1 if form.STATE_STREAM else 3), (policy, requests, form)
+    else:  # a 99 KB opt-in: the shallower rings of the same ladder -- the 2-deep-ring pair in the pair regime AND past the grid (the measured
+        # wave-quantization order), the one-CTA landing-slab form while the one-CTA grid is one wave, never the streamed cap (one CTA per SM
+        # there, and it spills)
+        assert form.TWO_CTAS_PER_HEAD == (pair_regime or beyond_grid) and not form.STATE_STREAM and form.MIN_CTAS_PER_SM == 1, (policy, requests, form)
+        assert form.NBUF == (2 if form.TWO_CTAS_PER_HEAD else 1), (policy, requests, form)
     case = fi.ver.make_case(requests, tokens, seed=100 * requests + tokens, device=dev, form="verify")
     ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
     q, out = fi.ver._outputs(requests * tokens, dev)

@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""K3 of the triangle multiplicative update -- LayerNorm of ``y`` (MN-major rows) and of ``z`` (recomputed), the dual GEMM (output projection ‖
-output gate) with the pairing across the two accumulators, sigmoid * mul, the pair-major update -- on the ``cudnn.gemm.frost.ln_prologue``
+"""The output-stage instance of the LayerNorm-prologue dual GEMM substrate -- LayerNorm of ``y`` (MN-major rows) and of ``z`` (recomputed), the dual GEMM (output projection ‖
+output gate) with the pairing across the two accumulators, sigmoid * mul, the row-major update -- on the ``cudnn.gemm.frost.ln_prologue``
 substrate's ``pairing = "accumulators"`` arm, against an fp64 reference, plus the GPU-free contract tests.
 
-The K3 inputs come from a torch model of K1 / K2 (fp64 LayerNorm -> gated projections -> the per-channel contraction -> bf16 ``y`` in the
-channel-major, inner-padded layout the contraction writes), so ``y`` has the magnitude and structure the kernel sees in production.
+The output stage's inputs come from a torch model of the projection and the per-channel batched GEMM (fp64 LayerNorm -> gated projections ->
+the per-channel GEMM -> bf16 ``y`` in the channel-major, inner-padded layout), so ``y`` has the magnitude and structure the kernel sees in production.
 
-Tolerance of the oracle (derived, stated -- the same derivation as K1's): both MMA operands are LayerNormed rows rounded ONCE to bf16 and
+Tolerance of the oracle (derived, stated -- the same derivation as the projection's): both MMA operands are LayerNormed rows rounded ONCE to bf16 and
 the reference models exactly that (fp64 LayerNorm -> bf16 -> fp64 GEMM); what remains is the fp32 accumulation over K <= 256 (<= K * 2^-24),
 the sigmoid through ``tanh.approx`` (<= 2^-12 on sigma, times |value| ~ O(1)), the one bf16 rounding of the output (half-ulp 2^-9 relative)
 and the fp32-vs-fp64 statistics flipping a few operand roundings by one ulp: ``|diff| <= 4e-3 + |ref| / 128``.  Under ``affine_fold`` the
@@ -28,14 +28,14 @@ import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-requirement_error = cutedsl_requirement_error("Triangle multiplicative update tests")
+requirement_error = cutedsl_requirement_error("LayerNorm-prologue dual GEMM tests")
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 pytestmark = pytest.mark.L0
 
 from cudnn.gemm.frost import ln_prologue as sub  # noqa: E402
-from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3  # noqa: E402
+import ln_dual_gemm_tail_instance as tail  # noqa: E402  -- the test-local output-stage instance of the substrate (this directory)
 
 _SM107 = (10, 7)
 #: the compute capabilities the substrate has a rendered body for: Rubin (sm107) and Blackwell SM100 / SM103 (sm100)
@@ -93,26 +93,26 @@ def test_re_read_ln_form_declines_the_transpose_prologue():
     on the host, never a race on the device."""
     for lnf in ("smem", "smem_rolled", "smem_rolled_pf", "smem_rolled_tree"):
         with pytest.raises(ValueError, match="a0_prologue='mn_major'"):
-            sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, a0_prologue="transpose", ln_pass_form=lnf))
-        sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, a0_prologue="mn_major", ln_pass_form=lnf))  # the served pair
+            sub.validate_ln_dual_gemm_params(tail.tail_params(128, 128, has_bias=True, a0_prologue="transpose", ln_pass_form=lnf))
+        sub.validate_ln_dual_gemm_params(tail.tail_params(128, 128, has_bias=True, a0_prologue="mn_major", ln_pass_form=lnf))  # the served pair
 
 
 def test_tail_params_is_the_accumulators_arm():
-    p = k3.tail_params(128, 128, has_bias=True)
+    p = tail.tail_params(128, 128, has_bias=True)
     sub.validate_ln_dual_gemm_params(p)
     assert p.dual and p.n_out == 128 and p.num_a_operands == 2 and p.passes == 1 and not p.has_mask and p.a0_prologue == "mn_major" and not p.affine_fold
-    assert k3.tail_params(128, 128, has_bias=False, a0_prologue="transpose").a0_prologue == "transpose"
+    assert tail.tail_params(128, 128, has_bias=False, a0_prologue="transpose").a0_prologue == "transpose"
     with pytest.raises(ValueError, match="c == c_z"):
-        k3.tail_params(256, 128, has_bias=True)  # the Protenix-v2 geometry: one K for both GEMMs is the arm's contract (typed, not silent)
+        tail.tail_params(256, 128, has_bias=True)  # c != c_z: one K for both GEMMs is the arm's contract (typed, not silent)
     with pytest.raises(ValueError, match="accumulators arm"):
-        k3.build_trimul_tail(sub.LnDualGemmParams())  # a columns-arm params object is not K3
+        tail.build_tail(sub.LnDualGemmParams())  # a columns-arm params object is not the output stage
 
 
 def test_stack_tail_biases_interleaves_per_128_block():
     c_z = 256
     bo = torch.arange(c_z, dtype=torch.float32)
     bg = -torch.arange(c_z, dtype=torch.float32)
-    s = k3.stack_tail_biases(bo, bg)
+    s = tail.stack_tail_biases(bo, bg)
     assert s.shape == (2 * c_z,)
     assert (
         torch.equal(s[0:128], bo[0:128])
@@ -123,10 +123,10 @@ def test_stack_tail_biases_interleaves_per_128_block():
 
 
 def test_y_shape_and_model_counts():
-    assert k3.y_shape(128, 2, 217) == (128, 434, 224)
-    assert k3.tail_flop(128, 128, 1, 512) == 2 * 512 * 512 * (128 * 128 + 128 * 128)
-    assert k3.tail_bytes(128, 128, 1, 512, with_stats=False) == 512 * 512 * (128 * 2 + 2 * 128 * 2)
-    assert k3.tail_bytes(128, 128, 1, 512) == k3.tail_bytes(128, 128, 1, 512, with_stats=False) + 512 * 512 * 8
+    assert tail.y_shape(128, 2, 217) == (128, 434, 224)
+    assert tail.tail_flop(128, 128, 1, 512) == 2 * 512 * 512 * (128 * 128 + 128 * 128)
+    assert tail.tail_bytes(128, 128, 1, 512, with_stats=False) == 512 * 512 * (128 * 2 + 2 * 128 * 2)
+    assert tail.tail_bytes(128, 128, 1, 512) == tail.tail_bytes(128, 128, 1, 512, with_stats=False) + 512 * 512 * 8
 
 
 def test_every_tcgen05_smem_descriptor_of_the_body_takes_the_module_desc_version_and_it_is_v1():
@@ -163,7 +163,7 @@ def _fake_plan(params):
 
 
 def test_tail_runner_declines_before_touching_the_artifact():
-    p = k3.tail_params(128, 128, has_bias=True, want_stats=True)
+    p = tail.tail_params(128, 128, has_bias=True, want_stats=True)
     plan = _fake_plan(p)
     n_res, bn = 40, 2  # n_res >= 33 (the MN-major 64-row box of one bi)
     rows = bn * n_res
@@ -255,12 +255,12 @@ def test_tail_runner_declines_before_touching_the_artifact():
 
 
 # ---------------------------------------------------------------------------
-# Rubin: the fp64 oracle (y from a torch K1 / K2), the knob pins, the degenerate rows
+# Rubin: the fp64 oracle (y from a torch model of the projection and the batched GEMM), the knob pins, the degenerate rows
 # ---------------------------------------------------------------------------
 def test_tail_runner_declines_a_row_tile_below_the_mn_major_box():
     """``k_block`` < 64 cannot serve the accumulators arm (its MN-major operand lands in 64-row boxes of ONE bi): a typed ValueError before the
     artifact, while 64 / 128 / 256 reach it; a malformed value (not a power of two) is the geometry's own ValueError."""
-    p = k3.tail_params(128, 128, has_bias=False, want_stats=False)
+    p = tail.tail_params(128, 128, has_bias=False, want_stats=False)
     plan = _fake_plan(p)
     n_res, bn = 384, 2
     rows = bn * n_res
@@ -286,7 +286,7 @@ def test_tail_runner_declines_a_row_tile_below_the_mn_major_box():
 
 
 def _inputs(n_res, batch, c_z, c, with_bias, seed=0, device="cuda"):
-    """z and the K3 weights (cuEquivariance's conventions) plus a torch model of K1 / K2 producing the channel-major bf16 y."""
+    """z and the output-stage weights plus a torch model of the projection and the per-channel batched GEMM producing the channel-major bf16 y."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     bf16 = torch.bfloat16
     z = (torch.randn(batch, n_res, n_res, c_z, generator=g) * 0.7 + torch.randn(c_z, generator=g)[None, None, None, :] * 0.5).to(bf16)
@@ -300,15 +300,15 @@ def _inputs(n_res, batch, c_z, c, with_bias, seed=0, device="cuda"):
     g_out = (torch.randn(c_z, c_z, generator=g) / math.sqrt(c_z)).to(bf16)  # [c_z, c_z]
     p_ob = (0.2 * torch.randn(c_z, generator=g)).to(bf16) if with_bias else None
     g_ob = (0.2 * torch.randn(c_z, generator=g)).to(bf16) if with_bias else None
-    # a torch K1 / K2 (fp64, the mask all ones): a, b gated projections -> the outgoing contraction -> bf16 y, channel-major with the inner pad
+    # a torch model of the projection and the batched GEMM (fp64, the mask all ones): a, b gated projections -> the per-channel GEMM over the planes -> bf16 y, channel-major with the inner pad
     z64 = z.double().reshape(-1, c_z)
     zin = torch.nn.functional.layer_norm(z64, (c_z,), ln_in_w.double(), ln_in_b.double(), 1e-5)
     a = torch.sigmoid(zin @ g_in.double()[:c].T) * (zin @ p_in.double()[:c].T)
     b = torch.sigmoid(zin @ g_in.double()[c:].T) * (zin @ p_in.double()[c:].T)
     a = a.reshape(batch, n_res, n_res, c)
     b = b.reshape(batch, n_res, n_res, c)
-    y = torch.einsum("bikc,bjkc->bijc", a, b)  # outgoing
-    npd = k3.n_pad(n_res)
+    y = torch.einsum("bikc,bjkc->bijc", a, b)  # the per-channel batched GEMM over the planes
+    npd = tail.n_pad(n_res)
     y_cm = torch.full((c, batch * n_res, npd), float("nan"), dtype=torch.float64)  # the pad columns are never read: NaN proves it
     y_cm[:, :, :n_res] = y.permute(3, 0, 1, 2).reshape(c, batch * n_res, n_res)
     y_cm = y_cm.to(bf16)
@@ -350,23 +350,23 @@ def _reference(inp, eps, *, folded=None, residual=False):
 
 
 def _stacked_biases(inp, p_ob=None):
-    """The kernel's interleaved ``[2 c_z]`` bias from cuEquivariance's two ``[c_z]`` biases (``p_ob`` = the folded bias under
+    """The kernel's interleaved ``[2 c_z]`` bias from the two ``[c_z]`` biases (``p_ob`` = the folded bias under
     ``affine_fold``, else ``inp["p_ob"]``) -- a ``torch.cat``, i.e. a GPU kernel of its own.  A timed callable does this ONCE, outside
     the timing (``_launch(..., biases=...)``); done per call it rides inside every CUDA-graph replay as a second kernel."""
     p_ob = inp["p_ob"] if p_ob is None else p_ob
-    return k3.stack_tail_biases(p_ob, inp["g_ob"]) if (p_ob is not None or inp["g_ob"] is not None) else None
+    return tail.stack_tail_biases(p_ob, inp["g_ob"]) if (p_ob is not None or inp["g_ob"] is not None) else None
 
 
-def _build_k3(params):
-    """The K3 plan on the live device's body (:func:`_arch`): a cell's cubin is the arch's, never the Rubin body's on a Blackwell part."""
-    return k3.build_trimul_tail(params, _arch(), _target())
+def _build_tail(params):
+    """The tail plan on the live device's body (:func:`_arch`): a cell's cubin is the arch's, never the Rubin body's on a Blackwell part."""
+    return tail.build_tail(params, _arch(), _target())
 
 
 def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None, biases=None, k_block=None):
     p_out, p_ob = (inp["p_out"], inp["p_ob"]) if weights is None else weights
     if biases is None:
         biases = _stacked_biases(inp, p_ob)
-    return k3.run_trimul_tail(
+    return tail.run_tail(
         plan,
         inp["y"],
         inp["z"],
@@ -412,10 +412,10 @@ def _check_oracle(out, ref, label):
         (128, 1, 256, True),  # c_z = c = 256: 4 K stages per tile, two N tiles, the interleaved bias blocks
     ],
 )
-def test_k3_matches_the_fp64_oracle(n_res, batch, c_z, with_bias):
+def test_tail_matches_the_fp64_oracle(n_res, batch, c_z, with_bias):
     eps = 1e-5
     c = c_z
-    plan = _build_k3(k3.tail_params(c_z, c, has_bias=with_bias, want_stats=True, eps=eps))
+    plan = _build_tail(tail.tail_params(c_z, c, has_bias=with_bias, want_stats=True, eps=eps))
     inp = _inputs(n_res, batch, c_z, c, with_bias)
     out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
     stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda", dtype=torch.float32)
@@ -425,7 +425,7 @@ def test_k3_matches_the_fp64_oracle(n_res, batch, c_z, with_bias):
     assert not (out.float() == _SENTINEL).any(), "a never-written cell survived"
     assert torch.isfinite(out.float()).all(), "a non-finite output (the NaN pad columns of y leaked into a live row?)"
     ref, mean64, rstd64 = _reference(inp, eps)
-    _check_oracle(out, ref, f"K3 {n_res}:{batch}:{c_z}")
+    _check_oracle(out, ref, f"tail {n_res}:{batch}:{c_z}")
     torch.testing.assert_close(stats[:, 0].double(), mean64, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(stats[:, 1].double(), rstd64, rtol=1e-4, atol=1e-5)
     out2 = torch.empty_like(out)
@@ -446,14 +446,14 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
     inp = _inputs(n_res, batch, c_z, c, True, seed=5)
     outs = {}
     for form in ("mn_major", "transpose"):
-        plan = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=True, eps=eps, a0_prologue=form))
+        plan = _build_tail(tail.tail_params(c_z, c, has_bias=True, want_stats=True, eps=eps, a0_prologue=form))
         out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
         outs[form] = (out, stats)
     ref, _, _ = _reference(inp, eps)
-    _check_oracle(outs["transpose"][0], ref, f"K3 transpose {n_res}:{batch}")
+    _check_oracle(outs["transpose"][0], ref, f"tail transpose {n_res}:{batch}")
     n_diff = int((outs["mn_major"][0].view(torch.int16) != outs["transpose"][0].view(torch.int16)).sum().item())
     print(f"mn_major vs transpose: {n_diff} cells differ (of {outs['mn_major'][0].numel()})")
     assert torch.equal(outs["mn_major"][1], outs["transpose"][1]), "the statistics must be bitwise equal (same reads, same arithmetic)"
@@ -461,32 +461,31 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,c_z,clc_stages", [(217, 2, 256, 1), (33, 1, 256, 2)])  # a padded tail; the N 33 floor under clc 2
-def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, clc_stages):
+@pytest.mark.parametrize(
+    "n_res,batch,c_z,clc_stages,k_block", [(217, 2, 256, 1, 256), (33, 1, 256, 2, 64)]
+)  # a padded tail; the N 33 floor under clc 2; k_block = the former knob table's pick
+def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, clc_stages, k_block):
     """The LayerNorm-once work item of the output stage (c = 256: the row block's two A operands resident across its two N tiles, both LayerNorms once;
     T27) computes the SAME update and statistics as the per-tile item, BITWISE; two ON launches bitwise equal; the ON output within the oracle's bound.
     (At c = 128 the item is one tile and the knob is a typed decline -- `test_accumulators_arm_declines_typed`.)"""
-    from cudnn.triangle_multiplicative_update import heuristics as th
-
     inp = _inputs(n_res, batch, c_z, c_z, True, seed=11)
-    kn = th.recommend(n_res, c_z, batch, "outgoing")
     common = dict(has_bias=True, want_stats=True, a0_prologue="mn_major", clc_stages=clc_stages, ln_pass_form="smem_rolled_pf", epi_math="packed")
-    plan_off = _build_k3(k3.tail_params(c_z, c_z, **common))
-    plan_on = _build_k3(k3.tail_params(c_z, c_z, ln_once="block", **common))
+    plan_off = _build_tail(tail.tail_params(c_z, c_z, **common))
+    plan_on = _build_tail(tail.tail_params(c_z, c_z, ln_once="block", **common))
     stream = torch.cuda.current_stream().cuda_stream
     biases = _stacked_biases(inp)
     outs = []
     for plan in (plan_off, plan_on, plan_on):
         out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
-        _launch(plan, inp, out, stats, stream, biases=biases, k_block=kn.k_block)
+        _launch(plan, inp, out, stats, stream, biases=biases, k_block=k_block)
         torch.cuda.synchronize()
         outs.append((out, stats))
     assert torch.equal(outs[1][0], outs[0][0]) and torch.equal(outs[1][1], outs[0][1]), "the LayerNorm-once item must be bitwise the per-tile item"
     assert torch.equal(outs[2][0], outs[1][0]) and torch.equal(outs[2][1], outs[1][1]), "two launches of the LayerNorm-once item differ (a first-launch race)"
     assert not (outs[1][0].float() == _SENTINEL).any(), "a never-written cell survived"
     ref, _, _ = _reference(inp, 1e-5)
-    _check_oracle(outs[1][0], ref, f"ln_once K3 {n_res}:{batch}:{c_z}")
+    _check_oracle(outs[1][0], ref, f"ln_once tail {n_res}:{batch}:{c_z}")
 
 
 # the two shipped (form, epilogue) pairs on their geometry (`registers / packed` at c 128, `smem_rolled_pf / packed` at c 256) + every other
@@ -506,16 +505,16 @@ _FORM_CELLS = [
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, ln_pass_form, epi_math):
     """On the accumulators arm (mn_major prologue): the re-read LayerNorm forms and the packed epilogue are BITWISE the default forms (output and
     the LN2 statistics) -- the same bf16 words summed in the same order, the same fp32 operations per element -- every public value once."""
-    probe = k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, a0_prologue="mn_major", ln_pass_form=ln_pass_form, epi_math=epi_math)
+    probe = tail.tail_params(c_z, c_z, has_bias=True, want_stats=True, a0_prologue="mn_major", ln_pass_form=ln_pass_form, epi_math=epi_math)
     if sub.sm100_register_form_unallocatable(probe, _arch()):
         # the sm100 body's typed decline (ptxas C7600 at K = 256 for the register-form LayerNorm with any packed epilogue on the accumulators arm)
         with pytest.raises(ValueError, match="C7600"):
-            _build_k3(probe)
+            _build_tail(probe)
         return
     inp = _inputs(n_res, batch, c_z, c_z, True, seed=17)
     outs = []
     for lnf, epm in (("registers", "scalar"), (ln_pass_form, epi_math)):
-        plan = _build_k3(k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, a0_prologue="mn_major", ln_pass_form=lnf, epi_math=epm))
+        plan = _build_tail(tail.tail_params(c_z, c_z, has_bias=True, want_stats=True, a0_prologue="mn_major", ln_pass_form=lnf, epi_math=epm))
         out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
@@ -531,12 +530,12 @@ def test_register_split_hint_vocabulary_is_a_typed_decline():
     80 registers with the split impossible, a bool is not an int -- both a ValueError naming the axis, from the validator, before any build."""
     for bad in (2, -1, True):
         with pytest.raises(ValueError, match="min_blocks_per_mp"):
-            sub.validate_ln_dual_gemm_params(k3.tail_params(256, 256, has_bias=False, ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=bad))
+            sub.validate_ln_dual_gemm_params(tail.tail_params(256, 256, has_bias=False, ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=bad))
     for ok in (0, 1):
-        p = k3.tail_params(256, 256, has_bias=False, ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=ok)
+        p = tail.tail_params(256, 256, has_bias=False, ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=ok)
         sub.validate_ln_dual_gemm_params(p)
         assert p.min_blocks_per_mp == ok
-    assert k3.tail_params(256, 256, has_bias=False).min_blocks_per_mp == 0  # None = the substrate's default: no directive
+    assert tail.tail_params(256, 256, has_bias=False).min_blocks_per_mp == 0  # None = the substrate's default: no directive
 
 
 @requires_served_arch
@@ -544,12 +543,12 @@ def test_register_split_hint_vocabulary_is_a_typed_decline():
 def test_register_split_hint_is_bitwise_the_default_rendering(n_res, batch, c_z, with_bias):
     """The `.minnctapersm` hint (`min_blocks_per_mp=1`: ptxas honours the register split instead of allocating the flat count) is a launch
     attribute -- the SAME body, the same arithmetic: output and statistics BITWISE the hint-0 plan's, with and without the output biases, on the
-    rolled + packed forms the heuristics ship at c = 256 (the rendering whose bias-off form spills without the hint)."""
+    rolled + packed forms the former knob table shipped at c = 256 (the rendering whose bias-off form spills without the hint)."""
     inp = _inputs(n_res, batch, c_z, c_z, with_bias, seed=23)
     outs = []
     for hint in (0, 1):
-        plan = _build_k3(
-            k3.tail_params(
+        plan = _build_tail(
+            tail.tail_params(
                 c_z, c_z, has_bias=with_bias, want_stats=True, a0_prologue="mn_major", ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=hint
             )
         )
@@ -581,7 +580,7 @@ def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form
     ref, mean64, rstd64 = _reference(inp, eps)
     outs = {}
     for lnf in ("smem_rolled", "smem_rolled_tree"):
-        plan = _build_k3(k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, eps=eps, a0_prologue="mn_major", ln_pass_form=lnf, epi_math="packed"))
+        plan = _build_tail(tail.tail_params(c_z, c_z, has_bias=True, want_stats=True, eps=eps, a0_prologue="mn_major", ln_pass_form=lnf, epi_math="packed"))
         out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
@@ -593,9 +592,9 @@ def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form
         bad_bulk, bad_cap = int((diff > bulk).sum().item()), int((diff > cap).sum().item())
         rel_rms = (diff.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
         print(
-            f"K3 {lnf} {n_res}:{batch}:{c_z}: {bad_bulk} of {diff.numel()} cells beyond the bulk bound, {bad_cap} beyond the cap; max |diff| {diff.max().item():.4g}; rel RMS {rel_rms:.3g}"
+            f"tail {lnf} {n_res}:{batch}:{c_z}: {bad_bulk} of {diff.numel()} cells beyond the bulk bound, {bad_cap} beyond the cap; max |diff| {diff.max().item():.4g}; rel RMS {rel_rms:.3g}"
         )
-        assert bad_cap == 0 and bad_bulk <= 2e-5 * diff.numel() and rel_rms < 2e-3, f"K3 {lnf}: {bad_bulk} bulk / {bad_cap} cap / rel RMS {rel_rms:.3g}"
+        assert bad_cap == 0 and bad_bulk <= 2e-5 * diff.numel() and rel_rms < 2e-3, f"tail {lnf}: {bad_bulk} bulk / {bad_cap} cap / rel RMS {rel_rms:.3g}"
         torch.testing.assert_close(stats[:, 0].double(), mean64, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(stats[:, 1].double(), rstd64, rtol=1e-4, atol=1e-5)
         outs[lnf] = (out, stats)
@@ -610,11 +609,11 @@ def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form
 
 @requires_served_arch
 def test_tail_runner_declines_a_small_n_and_a_misshaped_y():
-    plan = _build_k3(k3.tail_params(128, 128, has_bias=False, want_stats=False))
+    plan = _build_tail(tail.tail_params(128, 128, has_bias=False, want_stats=False))
     bf16 = torch.bfloat16
     z = torch.zeros(1, 32, 32, 128, device="cuda", dtype=bf16)
     with pytest.raises(ValueError, match="N >= 33"):
-        k3.run_trimul_tail(
+        tail.run_tail(
             plan,
             torch.zeros(128, 32, 32, device="cuda", dtype=bf16),
             z,
@@ -626,7 +625,7 @@ def test_tail_runner_declines_a_small_n_and_a_misshaped_y():
         )
     z = torch.zeros(1, 40, 40, 128, device="cuda", dtype=bf16)
     with pytest.raises(ValueError, match="y must be"):
-        k3.run_trimul_tail(
+        tail.run_tail(
             plan,
             torch.zeros(128, 40, 48, device="cuda", dtype=bf16),
             z,
@@ -639,12 +638,12 @@ def test_tail_runner_declines_a_small_n_and_a_misshaped_y():
 
 
 @requires_served_arch
-@pytest.mark.parametrize("n_res,batch,k_block", [(384, 1, 64)])  # the MN-major box floor on K3 (the proj module pins the other knob values)
-def test_k3_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
+@pytest.mark.parametrize("n_res,batch,k_block", [(384, 1, 64)])  # the MN-major box floor on tail (the proj module pins the other knob values)
+def test_tail_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
     """The accumulators arm under ``k_block``: the same plan, the same bits as the rule (output and statistics).  kb = 64 gives each of the CTA's
-    two MN-major boxes its own bi (as N = 64 does) where the rule's 256 pads 25 % of every pair tile at N = 384."""
+    two MN-major boxes its own bi (as N = 64 does) where the rule's 256 pads 25 % of every tile at N = 384."""
     c_z = c = 128
-    plan = _build_k3(k3.tail_params(c_z, c, has_bias=True, want_stats=True, eps=1e-5))
+    plan = _build_tail(tail.tail_params(c_z, c, has_bias=True, want_stats=True, eps=1e-5))
     inp = _inputs(n_res, batch, c_z, c, True, seed=33)
     stream = torch.cuda.current_stream().cuda_stream
     outs = []
