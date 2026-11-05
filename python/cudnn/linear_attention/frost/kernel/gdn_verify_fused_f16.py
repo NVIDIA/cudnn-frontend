@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Fused Gated DeltaNet VERIFY step (SM100- and SM120-class parts: arch-portable PTX -- no TMEM, no MMA, no multicast -- on Cutlass primitives) for the geometry of ``gdn_verify_fused_config.py`` (the
-Qwen 3.5-architecture dense 27B GDN sub-layer at TP 1): the speculative causal conv + SiLU over the request's ``T`` tokens, the BA projection of every token,
-the Q / K RMS scales, the gated delta-rule recurrence over the tokens (the state after every token written to its own slot), the
-gated RMSNorm, the static FP8 output quantization and the conv-history shift, in one launch after the stock FP8 QKVZ projection of
-an MTP verify step.
+Fused Gated DeltaNet VERIFY step (SM100- and SM120-class parts: arch-portable PTX -- no TMEM, no MMA, no multicast -- on Cutlass primitives) for the geometry of ``cfg.GEOM``
+(``gdn_geometry.py``: the rank's K-head and V-head counts and hidden width; head dim 128 and conv width 4 pinned -- the default geometry
+is the Qwen 3.5-architecture dense 27B GDN sub-layer at TP 1: 16 K heads, 48 V heads, hidden 5120, the numbers of this docstring): the
+speculative causal conv + SiLU over the request's ``T`` tokens, the BA projection of every token, the Q / K RMS scales, the gated
+delta-rule recurrence over the tokens (the state after every token written to its own slot), the gated RMSNorm, the static FP8 output
+quantization and the conv-history shift, in one launch after the stock FP8 QKVZ projection of an MTP verify step.
 
-Per CTA (one V head ``h`` of one request ``n``; K head ``kh = h // 3``), 256 threads = two warpgroups.  Lane ``l`` of warp ``w`` owns
+Per CTA (one V head ``h`` of one request ``n``; K head ``kh = h // VK_RATIO``, ``VK_RATIO`` = V heads per K head: 3), 256 threads = two
+warpgroups.  Lane ``l`` of warp ``w`` owns
 the column slice ``tpr = l // RG`` (``C = 128 / TPR`` columns) of the ``R = CTA_ROWS x TPR / 256`` consecutive state rows ``CTA_ROWS r +
 BOX_ROWS * rg + R * w + m`` (``rg = l % RG``, ``RG = 32 / TPR``, ``BOX_ROWS = CTA_ROWS / RG``; ``CTA_ROWS`` 128 and ``r`` 0 on the one-CTA
 form): the RG row groups of a warp sit in RG different state BOXES, so the eight lanes of a 128-bit shared-memory phase never share a
@@ -16,10 +18,10 @@ bank.  The row slice is REGISTER-RESIDENT across the request's tokens (``R x C``
 ``STATE_STREAM`` keeps it in the boxes.  ``T`` (tokens per request) is a compile-time constant; the request's token ``t`` is row
 ``bos + t`` of the row-major operands (``bos = cu_seqlens[n]``).
 
-``TWO_CTAS_PER_HEAD`` (the pair; the default pick while ``requests x 96 <= SM count``): the grid is ``(96, requests)`` in clusters of two
-along x, CTA ``r = bx % 2`` of head ``bx // 2`` owns rows ``64 r .. 64 r + 63`` (a 32 KB slab in, 32 KB of write-back per token through
-its own SM's bulk-copy path), both CTAs recompute the BA and the conv + RMS of every token, each shifts the V-conv history of its own
-64 channels, the reader ticket wraps at 5.  The recurrence is row-local; the ONE cross-CTA datum per token is the gated norm's sum of
+``TWO_CTAS_PER_HEAD`` (the pair; the default pick while ``requests x 2 V_HEADS <= SM count``, ``requests x 96`` at the default geometry):
+the grid is ``(2 V_HEADS, requests)`` in clusters of two along x, CTA ``r = bx % 2`` of head ``bx // 2`` owns rows ``64 r .. 64 r + 63`` (a
+32 KB slab in, 32 KB of write-back per token through its own SM's bulk-copy path), both CTAs recompute the BA and the conv + RMS of every
+token, each shifts the V-conv history of its own 64 channels, the reader ticket wraps at ``2 VK_RATIO - 1`` (5).  The recurrence is row-local; the ONE cross-CTA datum per token is the gated norm's sum of
 squares: the norm warp of each CTA sums its ``NORM_CHAINS_CTA`` local chains of token ``t - 1`` at the TOP of iteration ``t`` (the slot
 was published by barrier ``t - 1``), lane 0 arms ``mb_norm[(t - 1) % 2]`` with ``expect_tx(NORM_XFER_BYTES)``, lanes ``< NORM_CHAINS_CTA``
 ship their chain value into the peer's ``norm_recv_s`` slot by one ``st.async ... mbarrier::complete_tx::bytes.f32`` each (both addresses
@@ -34,7 +36,9 @@ hand-off barrier; the null tail at its start) -- the kernel's only cluster barri
              indices[n, 0]``, ``bos``, ``ntok``; a request is LIVE when ``src > 0``, ``cv_slot > 0`` and ``ntok > 0``);
              warpgroup 0 (warps 0-3): warp 0 lane 0 initialises the state mbarrier (+ fence; under ``BULK_ISSUE`` spread ``bar.sync 2,
              128`` publishes it to the issuing warps 1-3 before the live arm); the two BA weight rows of the reference's
-             256-virtual-thread partition (10 x LDG.128 per lane: virtual threads ``lane`` and ``lane + 128``);
+             256-virtual-thread partition (2 x (2 ``BA_CHUNKS_VERIFY`` - 1) = 10 x LDG.128 per lane at hidden 5120: virtual threads
+             ``lane`` in every 2048-element chunk and ``lane + 128`` in every chunk whose second half exists --
+             ``Geometry.ba_verify_half_live``, false only for a trailing half chunk);
              warpgroup 1 (warps 4-7): warp 4 lane 0 initialises the conv-operand mbarrier (+ fence), ``bar.sync 1, 128`` publishes it.
   live       warp 0 lane 0 arms ``expect_tx(65536)``; the RG ``cp.async.bulk`` boxes of the source slab land in padded shared-memory
              boxes (box ``b`` issued by BA warp ``b mod 4``'s lane 0 under ``BULK_ISSUE`` spread, by warp 0 lane 0 under single);
@@ -42,8 +46,9 @@ hand-off barrier; the null tail at its start) -- the kernel's only cluster barri
              ``a - 1 .. a + 1`` of its three channel pieces (9 x 256 B); the ``T x 3`` input rows (256 B each) by conv warp
              ``5 + t mod 3``'s lane 0 (spread) after the PDL wait when any; under PDL every thread's ``griddepcontrol.wait`` sits here,
              before ``hidden`` / ``x`` / ``z`` and every global write.
-  BA (WG0)   the reference partition per virtual thread: fp32 chains over the three 2048-element chunks (``+= lo * b_lo; += hi * b_hi``
-             per word, every token its own chain), one 5-step butterfly per (virtual warp, token), the 8 virtual-warp partials in
+  BA (WG0)   the reference partition per virtual thread: fp32 chains over the ``BA_CHUNKS_VERIFY`` 2048-element chunks (three at hidden
+             5120; ``+= lo * b_lo; += hi * b_hi`` per word, every token its own chain; the ``lane + 128`` thread's chain over the chunks
+             whose second half exists), one 5-step butterfly per (virtual warp, token), the 8 virtual-warp partials in
              shared memory (``bar.sync 2, 128``), the totals summed in virtual-warp order by threads ``< 2 T``, rounded to bf16:
              ``beta_t = 1 / (1 + exp(-b))``, ``decay_t = exp(-exp(A_log) * softplus(a + dt_bias))`` (linear above 20) -> ``scal_s[t]``.
   conv (WG1) mbarrier wait; warp 4 lane 0 draws the reader ticket (``atom.relaxed.gpu.inc``); each thread's Q, K and V channel of
@@ -70,8 +75,8 @@ hand-off barrier; the null tail at its start) -- the kernel's only cluster barri
              straight to the slot right after pass 2 (the per-token barrier stays for ``o_s`` / ``inv_s``).
   epilogue   the outputs of token ``T - 2``; warp 1: the norm of token ``T - 1``; ``bar.sync 0``; the outputs of token ``T - 1``; the
              conv-state shift: the new slot is ``[old[a], old[a + 1], x_0 .. x_{T-1}]`` -- this CTA's 128 V channels always, the K head's
-             256 Q / K channels by the CTA that drew the last ticket (16-B copies from smem by threads < 48 per column); the issuing
-             lanes: ``cp.async.bulk.wait_group.read 0`` before exit.
+             256 Q / K channels by the CTA that drew the last ticket (the ``VK_RATIO x CTAS_PER_HEAD``-th reader; 16-B copies from smem
+             by threads < 48 per column); the issuing lanes: ``cp.async.bulk.wait_group.read 0`` before exit.
   not live   zero ``out`` / ``qout`` for the request's ``ntok`` rows of this head; no state, conv-state or ticket write; nothing in flight.
 
 Barriers executed per thread (T tokens): ``bar.sync 0`` x (T + 2) (+ T - 1 at NBUF 1), ``bar.sync 1`` x 2 (WG1) or ``bar.sync 2`` x 1
@@ -162,25 +167,18 @@ from cudnn.frost.tile_dsl.tma import ld_global_v4, ld_shared_v4, st_global_v4, s
 
 from .gdn_verify_fused_config import (
     BA_CHUNK,
-    BA_CHUNKS,
     CONV_HIST_TAPS,
     CONV_MBAR_ARRIVERS,
     CONV_WIDTH,
     HEAD_DIM,
-    HIDDEN,
-    K_CHANNEL0,
     NORM_MBAR_ARRIVERS,
     NORM_MBAR_STAGES,
     NORM_RECV_MAX_FLOATS,
-    OUT_ROW,
-    QKV_CHANNELS,
     RMS_COLS,
     RMS_LANES,
     STATE_MBAR_ARRIVERS,
     THREADS,
     TICKET_STRIDE,
-    V_CHANNEL0,
-    V_HEADS,
     WARPGROUP,
     WARPS,
     conv_bulk_bytes,
@@ -302,13 +300,13 @@ def _gaddr(tensor, elem_offset):
 # --------------------------------------------------------------------------------------------------------------------------
 # straight-line helpers (plain Python: traced inline, no DSL control flow inside)
 # --------------------------------------------------------------------------------------------------------------------------
-def _conv_piece_channel0(piece, head, kh):
-    """The first QKV channel of piece ``piece`` (0 = this K head's Q, 1 = its K, 2 = this V head's V)."""
+def _conv_piece_channel0(cfg, piece, head, kh):
+    """The first QKV channel of piece ``piece`` (0 = this K head's Q, 1 = its K, 2 = this V head's V) in the slab of ``cfg.GEOM``."""
     if piece == 0:
         return kh * HEAD_DIM
     if piece == 1:
-        return K_CHANNEL0 + kh * HEAD_DIM
-    return V_CHANNEL0 + head * HEAD_DIM
+        return cfg.GEOM.K_CHANNEL0 + kh * HEAD_DIM
+    return cfg.GEOM.V_CHANNEL0 + head * HEAD_DIM
 
 
 def _box_offset(cfg, slot, head, r, SS, b):
@@ -347,12 +345,12 @@ def _store_row_gmem(state, slot, head, rowm, col0, vals, SS):
         st_global_v4(base + 16 * c4, vals[4 * c4 : 4 * c4 + 4], FP32)
 
 
-def _issue_conv_param_copies(cw, cs, cw_s, hist_s, mb_arr, head, kh, cv_slot, hist0, CSS, CST):
+def _issue_conv_param_copies(cfg, cw, cs, cw_s, hist_s, mb_arr, head, kh, cv_slot, hist0, CSS, CST):
     """The ``cp.async.bulk`` copies of this head's conv WEIGHTS (3 x 1 KB) and the HISTORY taps ``a - 1 .. a + 1`` of its three pieces
     (9 x 256 B; ``hist0`` = column ``a - 1`` of the channel-contiguous pool): written by earlier steps, never by the predecessor
     grid, so they are issued ahead of a PDL wait."""
     for piece in range(3):
-        ch0 = _conv_piece_channel0(piece, head, kh)
+        ch0 = _conv_piece_channel0(cfg, piece, head, kh)
         nvvm.cp_async_bulk_shared_cluster_global(
             cw_s.subview(piece * HEAD_DIM * CONV_WIDTH), _gmem_ptr(cw, ch0 * CONV_WIDTH, BF16), mb_arr, HEAD_DIM * CONV_WIDTH * 2
         )
@@ -365,11 +363,11 @@ def _issue_conv_param_copies(cw, cs, cw_s, hist_s, mb_arr, head, kh, cv_slot, hi
             )
 
 
-def _issue_conv_x_copies(qkv, x_s, mb_arr, row, head, kh, XS, t):
+def _issue_conv_x_copies(cfg, qkv, x_s, mb_arr, row, head, kh, XS, t):
     """The three 256-B copies of this head's Q / K / V pieces of token ``t``'s input row (``row`` = its 64-bit row index, clamped to
     the request's last token): the predecessor's output, issued after a PDL wait."""
     for piece in range(3):
-        ch0 = _conv_piece_channel0(piece, head, kh)
+        ch0 = _conv_piece_channel0(cfg, piece, head, kh)
         nvvm.cp_async_bulk_shared_cluster_global(x_s.subview((t * 3 + piece) * HEAD_DIM), _gmem_ptr(qkv, row * XS + ch0, BF16), mb_arr, HEAD_DIM * 2)
 
 
@@ -601,7 +599,14 @@ def _ba_role(
     SS: cutlass.Constexpr,
     T: cutlass.Constexpr,
 ):
-    u = tid  # 0 .. 127: virtual threads u (chunks 0 .. 2) and u + 128 (chunks 0, 1) of the reference partition
+    G = cfg.GEOM
+    NCHUNK = G.BA_CHUNKS_VERIFY  # 2048-element chunks of the hidden width (3 at hidden 5120, the last a half chunk there)
+    HID = G.HIDDEN
+    NV = G.V_HEADS
+    # 0 .. 127: virtual threads u (the first half of every chunk) and u + 128 (the second half of every chunk that has one:
+    # G.ba_verify_half_live(c) -- the ONE predicate of the second thread's weight loads, hidden loads and dot chains, so an input is never
+    # loaded without being accumulated; at hidden 5120 chunks 0 and 1, at 8192 all four, at 4096 both)
+    u = tid
     wl = tid // 32
     lane = tid % 32
     P = cfg.BA_PREFETCH_CHUNKS
@@ -629,13 +634,13 @@ def _ba_role(
     dtv = dt[head].to(FP32)
     # the two BA weight rows: parameters, never a predecessor's output -> ahead of a PDL wait
     bw0, aw0, bw1, aw1 = [], [], [], []
-    for wc in cutlass.range_constexpr(BA_CHUNKS):
+    for wc in cutlass.range_constexpr(NCHUNK):
         kk = wc * BA_CHUNK + u * 8
-        bw0.append(ld_global_v4(_gaddr(baweight, head * HIDDEN + kk), INT32))
-        aw0.append(ld_global_v4(_gaddr(baweight, (head + V_HEADS) * HIDDEN + kk), INT32))
-        if cutlass.const_expr(wc * BA_CHUNK + WARPGROUP * 8 < HIDDEN):
-            bw1.append(ld_global_v4(_gaddr(baweight, head * HIDDEN + kk + WARPGROUP * 8), INT32))
-            aw1.append(ld_global_v4(_gaddr(baweight, (head + V_HEADS) * HIDDEN + kk + WARPGROUP * 8), INT32))
+        bw0.append(ld_global_v4(_gaddr(baweight, head * HID + kk), INT32))
+        aw0.append(ld_global_v4(_gaddr(baweight, (head + NV) * HID + kk), INT32))
+        if cutlass.const_expr(G.ba_verify_half_live(wc)):
+            bw1.append(ld_global_v4(_gaddr(baweight, head * HID + kk + WARPGROUP * 8), INT32))
+            aw1.append(ld_global_v4(_gaddr(baweight, (head + NV) * HID + kk + WARPGROUP * 8), INT32))
     if live:
         if lane == 0:
             # warp 0 arms the slab's bytes once; box b is issued by warp b mod 4 (spread: the init reached these lanes through the
@@ -655,11 +660,11 @@ def _ba_role(
             wait_on_dependent_grids()
         rows = []
         for t in cutlass.range_constexpr(T):
-            rows.append((bos + cutlass.min(INT32(t), ntok - 1)).to(INT64) * HIDDEN)
+            rows.append((bos + cutlass.min(INT32(t), ntok - 1)).to(INT64) * HID)
         # the hidden pieces, one FLAT list per virtual thread indexed c * T + t: a nested subscript store (hx[c][t] = ...) would mark
         # every name of its inner index as written in this dynamic region and the DSL would hand P back as a traced value
-        hx0 = [None] * (BA_CHUNKS * T)
-        hx1 = [None] * (BA_CHUNKS * T)
+        hx0 = [None] * (NCHUNK * T)
+        hx1 = [None] * (NCHUNK * T)
         bd0, ad0, bd1, ad1 = [], [], [], []
         for _ in cutlass.range_constexpr(T):
             bd0.append(FP32(0))
@@ -670,14 +675,14 @@ def _ba_role(
         for c in cutlass.range_constexpr(P):
             for t in cutlass.range_constexpr(T):
                 hx0[c * T + t] = ld_global_v4(_gaddr(hidden, rows[t] + c * BA_CHUNK + u * 8), INT32)
-                if cutlass.const_expr(c < BA_CHUNKS - 1):
+                if cutlass.const_expr(G.ba_verify_half_live(c)):
                     hx1[c * T + t] = ld_global_v4(_gaddr(hidden, rows[t] + c * BA_CHUNK + WARPGROUP * 8 + u * 8), INT32)
-        for c in cutlass.range_constexpr(BA_CHUNKS):
+        for c in cutlass.range_constexpr(NCHUNK):
             b0, a0, b1, a1 = [], [], [], []
             for j in cutlass.range_constexpr(4):
                 b0.extend(_unpack_bf16x2(bw0[c][j]))
                 a0.extend(_unpack_bf16x2(aw0[c][j]))
-                if cutlass.const_expr(c < BA_CHUNKS - 1):
+                if cutlass.const_expr(G.ba_verify_half_live(c)):
                     b1.extend(_unpack_bf16x2(bw1[c][j]))
                     a1.extend(_unpack_bf16x2(aw1[c][j]))
             for t in cutlass.range_constexpr(T):
@@ -687,16 +692,16 @@ def _ba_role(
                     bd0[t] = bd0[t] + hhi * b0[2 * j + 1]
                     ad0[t] = ad0[t] + hlo * a0[2 * j]
                     ad0[t] = ad0[t] + hhi * a0[2 * j + 1]
-                    if cutlass.const_expr(c < BA_CHUNKS - 1):
+                    if cutlass.const_expr(G.ba_verify_half_live(c)):
                         glo, ghi = _unpack_bf16x2(hx1[c * T + t][j])
                         bd1[t] = bd1[t] + glo * b1[2 * j]
                         bd1[t] = bd1[t] + ghi * b1[2 * j + 1]
                         ad1[t] = ad1[t] + glo * a1[2 * j]
                         ad1[t] = ad1[t] + ghi * a1[2 * j + 1]
-            if cutlass.const_expr(c + P < BA_CHUNKS):
+            if cutlass.const_expr(c + P < NCHUNK):
                 for t in cutlass.range_constexpr(T):
                     hx0[(c + P) * T + t] = ld_global_v4(_gaddr(hidden, rows[t] + (c + P) * BA_CHUNK + u * 8), INT32)
-                    if cutlass.const_expr(c + P < BA_CHUNKS - 1):
+                    if cutlass.const_expr(G.ba_verify_half_live(c + P)):
                         hx1[(c + P) * T + t] = ld_global_v4(_gaddr(hidden, rows[t] + (c + P) * BA_CHUNK + WARPGROUP * 8 + u * 8), INT32)
         # one 5-step butterfly per (virtual warp, token): virtual warps wl (thread u) and wl + 4 (thread u + 128) pair the same lanes
         for t in cutlass.range_constexpr(T):
@@ -721,7 +726,7 @@ def _ba_role(
             if u % 2 == 0:
                 scal_s[4 * tok + 1] = FP32(1) / (FP32(1) + cute.math.exp(-gv))
                 if cutlass.const_expr(cfg.DEBUG):
-                    baout[(bos + cutlass.min(tok, ntok - 1)).to(INT64) * (2 * V_HEADS) + head] = gv.to(BF16)
+                    baout[(bos + cutlass.min(tok, ntok - 1)).to(INT64) * (2 * NV) + head] = gv.to(BF16)
             else:
                 gx = gv + dtv
                 soft = gx
@@ -729,7 +734,7 @@ def _ba_role(
                     soft = cute.math.log(FP32(1) + cute.math.exp(gx))
                 scal_s[4 * tok] = cute.math.exp(-cute.math.exp(alv) * soft)
                 if cutlass.const_expr(cfg.DEBUG):
-                    baout[(bos + cutlass.min(tok, ntok - 1)).to(INT64) * (2 * V_HEADS) + head + V_HEADS] = gv.to(BF16)
+                    baout[(bos + cutlass.min(tok, ntok - 1)).to(INT64) * (2 * NV) + head + NV] = gv.to(BF16)
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -790,15 +795,15 @@ def _conv_role(
             # warp 4 arms the operand bytes once and issues the weights + history; token t's input rows by warp 5 + t mod 3 (spread)
             if wl == 0:
                 nvvm.mbarrier_arrive_expect_tx(mb_arr, conv_bulk_bytes(T))
-                _issue_conv_param_copies(cw, cs, cw_s, hist_s, mb_arr, head, kh, cv_slot, (acc - 1).to(INT64), CSS, CST)
+                _issue_conv_param_copies(cfg, cw, cs, cw_s, hist_s, mb_arr, head, kh, cv_slot, (acc - 1).to(INT64), CSS, CST)
             if cutlass.const_expr(not cfg.PDL):
                 for t in cutlass.range_constexpr(T):
                     if cutlass.const_expr(cfg.SPREAD_ISSUE):
                         if wl == 1 + t % 3:
-                            _issue_conv_x_copies(qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
+                            _issue_conv_x_copies(cfg, qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
                     else:
                         if wl == 0:
-                            _issue_conv_x_copies(qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
+                            _issue_conv_x_copies(cfg, qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
         if cutlass.const_expr(cfg.PDL):
             # the QKVZ projection's rows are read only past this point
             wait_on_dependent_grids()
@@ -806,10 +811,10 @@ def _conv_role(
                 for t in cutlass.range_constexpr(T):
                     if cutlass.const_expr(cfg.SPREAD_ISSUE):
                         if wl == 1 + t % 3:
-                            _issue_conv_x_copies(qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
+                            _issue_conv_x_copies(cfg, qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
                     else:
                         if wl == 0:
-                            _issue_conv_x_copies(qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
+                            _issue_conv_x_copies(cfg, qkv, x_s, mb_arr, rows[t], head, kh, XS, t)
         wait(mb_arr, 0)
         if wl == 0:
             if lane == 0:
@@ -832,10 +837,10 @@ def _conv_role(
             v_s[t * HEAD_DIM + vperm] = vval
             if cutlass.const_expr(cfg.DEBUG):
                 if ntok > t:
-                    convout[rows[t] * QKV_CHANNELS + V_CHANNEL0 + head * HEAD_DIM + u] = vval.to(BF16)
-                    if head % 3 == 0:
-                        convout[rows[t] * QKV_CHANNELS + kh * HEAD_DIM + u] = qval.to(BF16)
-                        convout[rows[t] * QKV_CHANNELS + K_CHANNEL0 + kh * HEAD_DIM + u] = kval.to(BF16)
+                    convout[rows[t] * cfg.GEOM.QKV_CHANNELS + cfg.GEOM.V_CHANNEL0 + head * HEAD_DIM + u] = vval.to(BF16)
+                    if head % cfg.GEOM.VK_RATIO == 0:  # the first V head of a K head writes the K head's Q / K conv values
+                        convout[rows[t] * cfg.GEOM.QKV_CHANNELS + kh * HEAD_DIM + u] = qval.to(BF16)
+                        convout[rows[t] * cfg.GEOM.QKV_CHANNELS + cfg.GEOM.K_CHANNEL0 + kh * HEAD_DIM + u] = kval.to(BF16)
         _wg_barrier(1)
         # the per-token RMS scales: half-warp hw reduces token 8 r + hw as the reference's half-warps do (same lanes, same butterfly),
         # then writes that token's SCALED q / k slices (lanes past the last token compute a duplicate and store nothing)
@@ -981,7 +986,7 @@ def _token_step_rolled(
     if t >= 2:
         if tpr < R:
             if ntok > t - 2:
-                oi = (bos + (t - 2)).to(INT64) * OUT_ROW + head * HEAD_DIM + orow
+                oi = (bos + (t - 2)).to(INT64) * cfg.GEOM.OUT_ROW + head * HEAD_DIM + orow
                 _emit_output(cfg, c_prev2, tpr, inv_s[(t - 2) % 2], wv, _pick_dyn(zv, t - 2), scv, oi, out, qout, raw)
     if cutlass.const_expr(cfg.BULK_STORE and NBUF >= 2):
         if lane == 0:
@@ -1152,7 +1157,7 @@ def _tail_live(
         if cutlass.const_expr(t >= 2):
             if tpr < R:
                 if ntok > t - 2:
-                    oi = (bos + (t - 2)).to(INT64) * OUT_ROW + head * HEAD_DIM + orow
+                    oi = (bos + (t - 2)).to(INT64) * cfg.GEOM.OUT_ROW + head * HEAD_DIM + orow
                     _emit_output(cfg, core_hist[t - 2], tpr, inv_s[(t - 2) % 2], wv, zv[t - 2], scv, oi, out, qout, raw)
         if cutlass.const_expr(cfg.BULK_STORE and NBUF >= 2):
             if lane == 0:
@@ -1210,7 +1215,7 @@ def _tail_live(
     if cutlass.const_expr(T >= 2):
         if tpr < R:
             if ntok > T - 2:
-                oi = (bos + (T - 2)).to(INT64) * OUT_ROW + head * HEAD_DIM + orow
+                oi = (bos + (T - 2)).to(INT64) * cfg.GEOM.OUT_ROW + head * HEAD_DIM + orow
                 _emit_output(cfg, core_hist[-2], tpr, inv_s[(T - 2) % 2], wv, zv[T - 2], scv, oi, out, qout, raw)
     if warp == NORM_WARP:
         if cutlass.const_expr(TWO):
@@ -1223,14 +1228,14 @@ def _tail_live(
     _cta_barrier()
     if tpr < R:
         if ntok > T - 1:
-            oi = (bos + (T - 1)).to(INT64) * OUT_ROW + head * HEAD_DIM + orow
+            oi = (bos + (T - 1)).to(INT64) * cfg.GEOM.OUT_ROW + head * HEAD_DIM + orow
             _emit_output(cfg, core_hist[-1], tpr, inv_s[(T - 1) % 2], wv, zv[T - 1], scv, oi, out, qout, raw)
     # ---- the conv-state shift: the new slot is [old[a], old[a + 1], x_0 .. x_{T-1}] (16-B groups of 8 channels per thread) ----
     if tid < SHIFT_THREADS:
         piece = tid // (HEAD_DIM // 8)
         cg = tid % (HEAD_DIM // 8)
         # this CTA's V channels (its own 64 of the head's 128 on the pair: 16-B groups 8 r .. 8 r + 7); the K head's Q / K channels belong
-        # to the last of its 3 x CTAS_PER_HEAD readers
+        # to the last of its VK_RATIO x CTAS_PER_HEAD readers
         own = piece == 2
         if cutlass.const_expr(cfg.TWO_CTAS_PER_HEAD):
             own = (piece == 2) & (cg // (HEAD_DIM // 8 // cfg.CTAS_PER_HEAD) == r)
@@ -1240,9 +1245,9 @@ def _tail_live(
             if ticket_s[0] == cfg.TICKET_LIMIT:
                 own = piece < 3
         if own:
-            ch0 = kh * HEAD_DIM + piece * K_CHANNEL0  # pieces 0 / 1: this K head's Q / K channels
+            ch0 = kh * HEAD_DIM + piece * cfg.GEOM.K_CHANNEL0  # pieces 0 / 1: this K head's Q / K channels
             if piece == 2:
-                ch0 = V_CHANNEL0 + head * HEAD_DIM
+                ch0 = cfg.GEOM.V_CHANNEL0 + head * HEAD_DIM
             dst_base_cs = cv_slot * CSS + ch0 + cg * 8
             x_addr = _smem_addr(x_s) + (piece * HEAD_DIM + cg * 8) * 2
             h_addr = _smem_addr(hist_s) + (piece * CONV_HIST_TAPS * HEAD_DIM + cg * 8) * 2
@@ -1278,7 +1283,7 @@ def _tail_null(cfg: cutlass.Constexpr, tid, head, r, bos, ntok, out, qout, raw, 
     if tpr < R:
         for t in cutlass.range_constexpr(T):
             if ntok > t:
-                oi = (bos + t).to(INT64) * OUT_ROW + head * HEAD_DIM + orow
+                oi = (bos + t).to(INT64) * cfg.GEOM.OUT_ROW + head * HEAD_DIM + orow
                 qout[oi] = UINT8(0)
                 out[oi] = BF16(0)
                 if cutlass.const_expr(cfg.DEBUG):
@@ -1325,7 +1330,7 @@ def frost_gdn_verify_fused(
     # the two-CTAs-per-head form: blocks (2 h, 2 h + 1) are one cluster along x; r = the CTA's rank in it (= %cluster_ctarank) = its row half
     head = bx // cfg.CTAS_PER_HEAD if cfg.TWO_CTAS_PER_HEAD else bx
     r = bx % cfg.CTAS_PER_HEAD if cfg.TWO_CTAS_PER_HEAD else INT32(0)
-    kh = head // 3
+    kh = head // cfg.GEOM.VK_RATIO  # the K head serving this V head (V heads per K head: 3 at the default geometry)
     if cutlass.const_expr(cfg.PDL_RELEASE):
         launch_dependent_grids()
 
@@ -1351,7 +1356,7 @@ def frost_gdn_verify_fused(
     ring = cutlass.Array(FP32, cfg.RING_SMEM_ELEMS, space=SMEM, alignment=16)
     if cutlass.const_expr(cfg.smem_pad_bytes(T) > 0):
         pad_s = cutlass.Array(INT32, cfg.smem_pad_bytes(T) // 4, space=SMEM, alignment=16)
-        if head == INT32(0x7FFFFFF):  # never true for a 48-wide grid: keeps the occupancy pad allocated
+        if head == INT32(0x7FFFFFF):  # never true for a grid of at most 2^27 heads: keeps the occupancy pad allocated
             pad_s[0] = tid
 
     # ---- the slot chain (never a predecessor's output): the source slot, the conv slot, the token range, the live predicate ----
@@ -1423,8 +1428,8 @@ def launch(
     T: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
-    """One CTA per (V head, request) -- a cluster of two per head under ``TWO_CTAS_PER_HEAD``; 256 threads; ``MIN_CTAS_PER_SM`` sets
-    ptxas's register cap (1 -> 255, 2 -> 128) and ``CTAS_PER_SM`` the shared-memory cap.  ``raw`` / ``convout`` / ``baout`` are the DEBUG
+    """One CTA per (V head, request): grid ``(cfg.GEOM.V_HEADS, requests)`` -- a cluster of two per head under ``TWO_CTAS_PER_HEAD``; 256
+    threads; ``MIN_CTAS_PER_SM`` sets ptxas's register cap (1 -> 255, 2 -> 128) and ``CTAS_PER_SM`` the shared-memory cap.  ``raw`` / ``convout`` / ``baout`` are the DEBUG
     dumps: ``None`` unless ``cfg.DEBUG`` -- the DSL specializes on ``None`` and the slots are compiled out (every use sits under the
     DEBUG constexpr), never bound to an allocation."""
     kernel = frost_gdn_verify_fused(
@@ -1433,7 +1438,7 @@ def launch(
     )  # fmt: skip
     if cutlass.const_expr(cfg.TWO_CTAS_PER_HEAD):
         kernel.launch(
-            grid=(V_HEADS * cfg.CTAS_PER_HEAD, REQUESTS, 1),
+            grid=(cfg.GEOM.V_HEADS * cfg.CTAS_PER_HEAD, REQUESTS, 1),
             block=(THREADS, 1, 1),
             cluster=(cfg.CTAS_PER_HEAD, 1, 1),
             stream=stream,
@@ -1442,7 +1447,7 @@ def launch(
         )
     else:
         kernel.launch(
-            grid=(V_HEADS, REQUESTS, 1),
+            grid=(cfg.GEOM.V_HEADS, REQUESTS, 1),
             block=(THREADS, 1, 1),
             stream=stream,
             min_blocks_per_mp=cfg.MIN_CTAS_PER_SM,
