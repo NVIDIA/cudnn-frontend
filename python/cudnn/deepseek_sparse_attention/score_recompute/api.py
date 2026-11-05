@@ -46,6 +46,24 @@ def _check_score_arch(api: APIBase) -> None:
     )
 
 
+def _check_sm100_bf16_indexer_tile(api: APIBase, q_desc, k_desc, is_thd: bool) -> None:
+    """The SM100 BF16 indexer kernel packs 128 // H tokens per 128-row tile: head groups 4..64, and a head dim
+    whose Q tile plus two K blocks fit shared memory (SM90 runs its own kernel)."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 9:
+        return
+    from cudnn.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
+    from ._interface_sm100 import bf16_indexer_smem_plan
+
+    h_q, h_kv, d = (q_desc.shape[1], k_desc.shape[1], q_desc.shape[2]) if is_thd else (q_desc.shape[2], k_desc.shape[2], q_desc.shape[3])
+    group = h_q // h_kv if h_kv > 0 else 0
+    api._value_error_if(
+        group not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
+        f"{type(api).__name__}: SM100 BF16 dense indexer requires qhead_per_kv_head in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16}, got {group}",
+    )
+    api._value_error_if(bf16_indexer_smem_plan(d) is None, f"{type(api).__name__}: SM100 BF16 dense indexer: head_dim={d} does not fit shared memory")
+
+
 def _decline_unless_unit_innermost(api: APIBase, desc, name: str) -> None:
     """R5: the kernels read every operand natively; a non-unit innermost stride is declined, never copied."""
     api._not_implemented_error_if(
@@ -1045,6 +1063,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
             self.is_thd,
             self.qhead_per_kv_head,
         )
+        _check_sm100_bf16_indexer_tile(self, self.q_desc, self.k_desc, self.is_thd)
         _check_dense_thd_plan(self)
         self._is_supported = True
         return True

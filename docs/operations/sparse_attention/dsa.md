@@ -594,11 +594,10 @@ compressed column 0.
     `NotImplementedError`.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
-  SM100 BF16 dense and combined Top-K paths support
-  `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (a group packs up to 8 query
-  tokens per MMA tile: 4 heads x 8 tokens = 32 columns, ..., 64 heads x 2
-  tokens = 128), their MXFP8 and MXFP4 paths the same set at a fixed
-  128-row tile (4 heads x 32 tokens, ..., 64 heads x 2 tokens). All currently
+  SM100 BF16, MXFP8 and MXFP4 dense and combined Top-K paths support
+  `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` at a fixed 128-row MMA tile
+  (4 heads x 32 tokens, ..., 64 heads x 2 tokens), so `m_block_size` must be
+  128. All currently
   require `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer
   than `ratio * seqlen_k` (its trailing tokens have not completed a compressed
   block and score the complete blocks only); a longer one is refused.
@@ -867,8 +866,10 @@ passes `denom=None`, so the LSE slot is compiled out (no placeholder buffer),
 while dense indexer score recompute runs it with `compute_lse=True` and a live
 `denom`. The shared implementation lives in `score_recompute`;
 `indexer_forward` only imports it.
-Dense Attention Score Recompute has a separate MXFP8 kernel because its score
-and normalization semantics differ from the indexer path.
+Dense Attention Score Recompute has separate BF16 and MXFP8 kernels because its
+score and normalization semantics differ from the indexer path; the MXFP8 one
+shares the indexer kernels' warp-specialized scaffolding and block-scale
+plumbing.
 
 - **Precision** — on SM100, `dense_indexer_score_recompute_wrapper` takes
   `precision="bf16"`, `"mxfp8"`, or `"mxfp4"` with the Q/K and scale
@@ -1129,7 +1130,7 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
-  (`H_kv = 1`); MXFP8 and MXFP4 keep their 128-row tile for every head
+  (`H_kv = 1`); every precision keeps its 128-row tile for every head
   group; explicit microbatching cannot be combined with MXFP8, MXFP4, LSE, or
   explicit per-batch causal offsets.
 
