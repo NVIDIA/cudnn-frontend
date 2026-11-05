@@ -9,6 +9,7 @@ Gradients are generated via autograd on the gather-based forward reference.
 import ast
 import inspect
 import math
+import re
 import textwrap
 
 import pytest
@@ -32,9 +33,30 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
-def _import_or_skip(module_name):
+def _import_or_skip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed"):
     """Import an optional CuTeDSL module or skip when the environment lacks it."""
-    return pytest.importorskip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed")
+    return pytest.importorskip(module_name, reason=reason)
+
+
+def _require_sm90_relay_dependencies():
+    """Skip before the relay package import can load optional dependencies."""
+    _import_or_skip("cutlass")
+    _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+
+
+def _require_sm90_relay_dsl():
+    """Skip feature tests when the deterministic SM90 relay cannot compile."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward._sm90_relay import sm90_deterministic_relay_requirement_error
+
+    requirement_error = sm90_deterministic_relay_requirement_error()
+    if requirement_error is not None:
+        pytest.skip(requirement_error)
+
+
+def _require_sm90_deterministic_relay():
+    _require_sm90()
+    _require_sm90_relay_dsl()
 
 
 @pytest.mark.L0
@@ -132,6 +154,7 @@ def _plan_case(
     has_topk_length=False,
     deterministic=False,
     q_cluster_mode="off",
+    deterministic_relay_cluster_size=None,
     compile_plan=True,
 ):
     """Inputs, a checked plan, caller-owned outputs, and scratch for one route."""
@@ -158,6 +181,7 @@ def _plan_case(
         softmax_scale=softmax_scale,
         deterministic=deterministic,
         q_cluster_mode=q_cluster_mode,
+        deterministic_relay_cluster_size=deterministic_relay_cluster_size,
     )
     assert plan.check_support()
     if compile_plan:
@@ -376,11 +400,55 @@ def test_DSA_sparse_attention_backward_qcluster_public_contract():
     plan = inspect.signature(DSA.SparseAttentionBackward).parameters
     assert wrapper["q_cluster_mode"].default == "off"
     assert plan["q_cluster_mode"].default == "off"
+    assert wrapper["deterministic_relay_cluster_size"].default is None
+    assert plan["deterministic_relay_cluster_size"].default is None
+    assert "deterministic_dkv_relay_cluster_size" not in wrapper
+    assert "deterministic_dkv_relay_cluster_size" not in plan
     assert "q_cluster_shared_topk" not in wrapper
 
     dummy = torch.empty(1)
     with pytest.raises(ValueError, match="q_cluster_mode must be 'off' or 'adaptive_pair'"):
         DSA.sparse_attention_backward_wrapper(dummy, dummy, dummy, dummy, dummy, dummy, dummy, q_cluster_mode="fixed")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("value", [True, 0, 2, 128, 4.0, "4"])
+def test_DSA_sparse_attention_backward_relay_cluster_public_validation(value):
+    """Reject coercible and unsupported values before staging any tensors."""
+    from cudnn import DSA
+
+    dummy = torch.empty(1)
+    with pytest.raises(ValueError, match=r"must be one of \{4, 8, 16, 32, 64\} or None"):
+        DSA.sparse_attention_backward_wrapper(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            deterministic=True,
+            deterministic_relay_cluster_size=value,
+        )
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_relay_cluster_requires_deterministic():
+    """Never silently ignore a relay override on the ordinary path."""
+    from cudnn import DSA
+
+    dummy = torch.empty(1)
+    with pytest.raises(ValueError, match="requires deterministic=True"):
+        DSA.sparse_attention_backward_wrapper(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            deterministic_relay_cluster_size=4,
+        )
 
 
 @pytest.mark.L0
@@ -705,6 +773,8 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
             FlashAttentionDSABackwardSm100Deterministic32,
             FlashAttentionDSABackwardSm100Deterministic64,
             FlashAttentionDSABackwardSm100DeterministicCluster16,
+            FlashAttentionDSABackwardSm100DeterministicCluster32,
+            FlashAttentionDSABackwardSm100DeterministicCluster64,
             FlashAttentionDSABackwardSm100DeterministicCluster4,
             FlashAttentionDSABackwardSm100DeterministicCluster8,
             _RELAY_WORKSPACE_BUDGET_BYTES,
@@ -715,6 +785,7 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
             deterministic_kernel_class,
             use_cluster_dkv_relay,
         )
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common import flash_attn_bwd_sm100_workspace_size
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -745,6 +816,17 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert FlashAttentionDSABackwardSm100DeterministicCluster16.q_wave_ctas == 128
     assert FlashAttentionDSABackwardSm100DeterministicCluster16.dkv_cluster_shape == (16, 1, 1)
     assert FlashAttentionDSABackwardSm100DeterministicCluster16.dkv_mask_rows_per_word == 2
+    assert FlashAttentionDSABackwardSm100DeterministicCluster32.num_dkv_shards == 4
+    assert FlashAttentionDSABackwardSm100DeterministicCluster32.q_wave_ctas == 128
+    assert FlashAttentionDSABackwardSm100DeterministicCluster32.dkv_cluster_shape == (16, 1, 1)
+    assert FlashAttentionDSABackwardSm100DeterministicCluster32.dkv_relay_phases == 2
+    assert FlashAttentionDSABackwardSm100DeterministicCluster32.dkv_mask_rows_per_word == 1
+    assert FlashAttentionDSABackwardSm100DeterministicCluster64.num_dkv_shards == 2
+    assert FlashAttentionDSABackwardSm100DeterministicCluster64.q_wave_ctas == 128
+    assert FlashAttentionDSABackwardSm100DeterministicCluster64.dkv_cluster_shape == (16, 1, 1)
+    assert FlashAttentionDSABackwardSm100DeterministicCluster64.dkv_relay_phases == 4
+    assert FlashAttentionDSABackwardSm100DeterministicCluster64.dkv_mask_rows_per_word == 1
+    assert FlashAttentionDSABackwardSm100DeterministicCluster64.dkv_mask_word_bits == 64
     assert use_cluster_dkv_relay(16384, 278528, 576)
     assert use_cluster_dkv_relay(16384, 131072, 576)
     assert not use_cluster_dkv_relay(128, 131072, 576)
@@ -762,6 +844,8 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         FlashAttentionDSABackwardSm100DeterministicCluster4,
         FlashAttentionDSABackwardSm100DeterministicCluster8,
         FlashAttentionDSABackwardSm100DeterministicCluster16,
+        FlashAttentionDSABackwardSm100DeterministicCluster32,
+        FlashAttentionDSABackwardSm100DeterministicCluster64,
     ):
         dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(16384, 524288, 576, 64, 1, cutlass.Float32)
         assert math.prod(dkv_shape) == _relay_workspace_bytes(16384, 524288, 576, 64, kernel_cls.dkv_relay_cluster_size)
@@ -772,9 +856,33 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     assert deterministic_kernel_class(8192, 65537, 512) is FlashAttentionDSABackwardSm100DeterministicCluster4
     assert deterministic_kernel_class(16384, 524288, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
     assert deterministic_kernel_class(16384, 1048576, 576) is FlashAttentionDSABackwardSm100DeterministicCluster16
+    assert deterministic_kernel_class(16384, 524288, 576, deterministic_relay_cluster_size=4) is FlashAttentionDSABackwardSm100DeterministicCluster4
+    assert deterministic_kernel_class(16384, 524288, 576, deterministic_relay_cluster_size=8) is FlashAttentionDSABackwardSm100DeterministicCluster8
+    assert deterministic_kernel_class(16384, 524288, 576, deterministic_relay_cluster_size=16) is FlashAttentionDSABackwardSm100DeterministicCluster16
+    assert deterministic_kernel_class(16384, 524288, 576, deterministic_relay_cluster_size=32) is FlashAttentionDSABackwardSm100DeterministicCluster32
+    assert deterministic_kernel_class(16384, 524288, 576, deterministic_relay_cluster_size=64) is FlashAttentionDSABackwardSm100DeterministicCluster64
+    forced_workspace = [
+        flash_attn_bwd_sm100_workspace_size(
+            16384,
+            524288,
+            576,
+            64,
+            deterministic=True,
+            backend="generic_m64",
+            deterministic_relay_cluster_size=cluster_size,
+        )
+        for cluster_size in (4, 8, 16, 32, 64)
+    ]
+    assert forced_workspace[0] > forced_workspace[1] > forced_workspace[2] > forced_workspace[3]
+    with pytest.raises(ValueError, match="requires deterministic=True"):
+        flash_attn_bwd_sm100_workspace_size(16384, 524288, 576, 64, deterministic_relay_cluster_size=4)
+    with pytest.raises(ValueError, match="supported only by the deterministic generic_m64 backend"):
+        flash_attn_bwd_sm100_workspace_size(16384, 524288, 576, 64, deterministic=True, deterministic_relay_cluster_size=4)
     assert _deterministic_kernel_class_for_config(16, 8) is FlashAttentionDSABackwardSm100DeterministicCluster8
     assert _deterministic_kernel_class_for_config(32, 4) is FlashAttentionDSABackwardSm100DeterministicCluster4
     assert _deterministic_kernel_class_for_config(8, 16) is FlashAttentionDSABackwardSm100DeterministicCluster16
+    assert _deterministic_kernel_class_for_config(4, 32) is FlashAttentionDSABackwardSm100DeterministicCluster32
+    assert _deterministic_kernel_class_for_config(2, 64) is FlashAttentionDSABackwardSm100DeterministicCluster64
     # The cap is inclusive: switch only when the selected ordinary layout is
     # strictly larger than 16 GiB. Exercise every adaptive shard boundary.
     for s_q, boundary_k in ((128, 262144), (129, 131072), (257, 65536)):
@@ -807,15 +915,21 @@ def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
         deterministic_kernel_class(128, total_seqlen_kv=256)
     with pytest.raises(ValueError, match="must be provided together"):
         deterministic_kernel_class(128, head_dim=576)
+    with pytest.raises(ValueError, match="valid only when the deterministic large-context relay is selected"):
+        deterministic_kernel_class(257, 65536, 512, deterministic_relay_cluster_size=4)
+    for value in (True, 4.0, "4", 2, 128):
+        with pytest.raises(ValueError, match=r"must be one of \{4, 8, 16, 32, 64\}"):
+            deterministic_kernel_class(257, 65537, 512, deterministic_relay_cluster_size=value)
     assert FlashAttentionDSABackwardSm100.q_wave_ctas == 0
     assert not FlashAttentionDSABackwardSm100.serialize_head_blocks
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_relay_acquire_load_controls_exit():
+@pytest.mark.parametrize("helper_name", ["_wait_lower_rank_mask", "_wait_lower_rank_mask64"])
+def test_DSA_sparse_attention_backward_relay_acquire_load_controls_exit(helper_name):
     """Keep the GPU acquire load live by feeding its value to loop control."""
     deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
-    tree = ast.parse(textwrap.dedent(inspect.getsource(deterministic._wait_lower_rank_mask)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(deterministic, helper_name))))
 
     acquire_values = set()
     for node in ast.walk(tree):
@@ -927,6 +1041,7 @@ def _exercise_deterministic_sm100_case(
     check_graph=False,
     has_topk_length=True,
     expected_relay_cluster_size=None,
+    deterministic_relay_cluster_size=None,
     dtype=torch.bfloat16,
 ):
     """Run one deterministic case against bitwise and numerical contracts."""
@@ -981,7 +1096,15 @@ def _exercise_deterministic_sm100_case(
         device_capability=torch.cuda.get_device_capability(),
         deterministic=True,
     )
-    workspace_bytes = flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend=backend)
+    workspace_bytes = flash_attn_bwd_sm100_workspace_size(
+        s_q,
+        s_kv,
+        head_dim,
+        num_heads,
+        deterministic=True,
+        backend=backend,
+        deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+    )
     api = DSA.SparseAttentionBackward(
         sample_q=q,
         sample_kv=kv,
@@ -993,12 +1116,21 @@ def _exercise_deterministic_sm100_case(
         sample_topk_length=topk_length,
         softmax_scale=softmax_scale,
         deterministic=True,
+        deterministic_relay_cluster_size=deterministic_relay_cluster_size,
     )
     assert api.check_support()
     api.compile()
     assert api.scratch_workspace_bytes() == workspace_bytes
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
-    kernel_cls = _get_sm100_kernel_class(backend, True, s_q, s_kv, head_dim, num_heads)
+    kernel_cls = _get_sm100_kernel_class(
+        backend,
+        True,
+        s_q,
+        s_kv,
+        head_dim,
+        num_heads,
+        deterministic_relay_cluster_size,
+    )
     if expected_relay_cluster_size is not None:
         assert kernel_cls.dkv_relay_cluster_size == expected_relay_cluster_size
     if hasattr(kernel_cls, "_get_workspace_size_dKV_for_q"):
@@ -1051,6 +1183,7 @@ def _exercise_deterministic_sm100_case(
                 softmax_scale=softmax_scale,
                 topk_length=topk_length,
                 deterministic=True,
+                deterministic_relay_cluster_size=deterministic_relay_cluster_size,
                 workspace=torch.empty(workspace_bytes - 1, dtype=torch.uint8, device=device),
             )
 
@@ -1471,6 +1604,73 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_d512():
             topk=129,
             shared_topk=True,
             expected_relay_cluster_size=8,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261031)
+@pytest.mark.parametrize("relay_cluster_size", [4, 8, 16, 32, 64], ids=["cluster4", "cluster8", "cluster16", "cluster32", "cluster64"])
+def test_DSA_sparse_attention_backward_sm100_explicit_relay_cluster_size(relay_cluster_size):
+    """Every caller-selected relay remains exact, repeatable, and graph-safe."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            512,
+            257,
+            65537,
+            repeats=3,
+            topk=129,
+            shared_topk=True,
+            check_graph=True,
+            check_short_workspace=True,
+            expected_relay_cluster_size=relay_cluster_size,
+            deterministic_relay_cluster_size=relay_cluster_size,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261101)
+def test_DSA_sparse_attention_backward_sm100_cluster32_repeat100():
+    """Two physical relay phases remain exact under sustained row overlap."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            512,
+            257,
+            65537,
+            repeats=100,
+            topk=511,
+            shared_topk=True,
+            check_graph=True,
+            check_short_workspace=True,
+            expected_relay_cluster_size=32,
+            deterministic_relay_cluster_size=32,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261102)
+def test_DSA_sparse_attention_backward_sm100_cluster64_repeat100():
+    """Four physical relay phases remain exact under sustained row overlap."""
+    try:
+        _exercise_deterministic_sm100_case(
+            64,
+            512,
+            257,
+            65537,
+            repeats=100,
+            topk=511,
+            shared_topk=True,
+            check_graph=True,
+            check_short_workspace=True,
+            expected_relay_cluster_size=64,
+            deterministic_relay_cluster_size=64,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -3022,7 +3222,9 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("sink-normalization regression test targets the SM100 kernel")
     if num_heads == 128 and (major, minor) not in _TWO_CTA_CAPABILITIES:
         # The H128 case covers the D576 two-CTA route; elsewhere H128/D576 runs
@@ -3118,7 +3320,9 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
     if not torch.cuda.is_available():
         pytest.skip("SM90+ GPU required")
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 90:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if major != 9 and not has_tcgen05(major):
         pytest.skip("sparse attention backward requires SM90+")
     if num_heads == 128 and head_dim == 512:
         _require_sm100_family()
@@ -4081,7 +4285,9 @@ def test_DSA_sparse_attention_backward_sm100_partial_max_topk(num_heads, s_kv, t
     if not torch.cuda.is_available():
         pytest.skip("SM100 GPU required")
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("dedicated H16/H32 regression test targets the SM100 kernel")
 
     try:
@@ -4205,12 +4411,9 @@ def test_DSA_sparse_attention_backward_check_support_declines_strided_inputs():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=385)
 def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(monkeypatch):
-    try:
-        from cudnn import DSA
-        from cuda.bindings import driver as cuda
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    DSA = _import_or_skip("cudnn").DSA
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+    _interface_sm90 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90")
 
     _require_sm90()
     device = torch.device("cuda")
@@ -4259,7 +4462,9 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
 
     # qhpkv controls the query-head tiling and must remain part of the main
     # compile key, independently of the runtime tensor shape.
-    assert any(key[1:4] == (head_dim, head_dim_v, num_heads) for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache)
+    matching_keys = [key for key in _interface_sm90.flash_attn_bwd_sm90.compile_cache if key[1:4] == (head_dim, head_dim_v, num_heads) and key[-5] is False]
+    assert matching_keys
+    assert all(key[-1] == 0 for key in matching_keys), "non-deterministic kernels must not specialize on rounded head extents"
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
     assert torch.isfinite(dq).all()
@@ -4306,7 +4511,9 @@ def test_DSA_sparse_attention_backward_staged_store():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     major, minor = torch.cuda.get_device_capability()
-    if major * 10 + minor < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip("staged-store regression test targets the SM100 kernel")
 
     s_q = s_kv = 512
@@ -4975,7 +5182,8 @@ def test_DSA_sparse_attention_backward_rejects_unsupported_head_dim_runtime():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=90)
 def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
-    """SM90 reports its FP32 dPsum / log2-LSE / dKV-accumulator scratch (R2) instead of allocating it per call."""
+    """SM90 reports ordinary or deterministic FP32 scratch (R2)."""
+    _require_sm90_relay_dsl()
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90 import flash_attn_bwd_sm90_workspace_size
         from cudnn.api_base import ws_align
@@ -4987,6 +5195,139 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     expected = 2 * ws_align(sq_r * num_heads * 4) + ws_align(sk_r * hd_r * 4)
     assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads) == expected
     assert flash_attn_bwd_sm90_workspace_size(64, 64, 512, 16) == 2 * ws_align(64 * 16 * 4) + ws_align(64 * 512 * 4)
+    # Packed ownership masks follow every logical relay plane.
+    expected_cluster8 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(16 * (sk_r + 1) * hd_r * 4)
+    expected_cluster4 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(32 * (sk_r + 1) * hd_r * 4)
+    expected_cluster16 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(8 * (sk_r + 1) * hd_r * 4)
+    expected_cluster32 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(4 * (sk_r + 2) * hd_r * 4)
+    expected_cluster64 = 2 * ws_align(sq_r * num_heads * 4) + ws_align(2 * (sk_r + 4) * hd_r * 4)
+    assert flash_attn_bwd_sm90_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True) == expected_cluster16
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_relay_cluster_size=4,
+        )
+        == expected_cluster4
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_relay_cluster_size=8,
+        )
+        == expected_cluster8
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_relay_cluster_size=16,
+        )
+        == expected_cluster16
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_relay_cluster_size=32,
+        )
+        == expected_cluster32
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_relay_cluster_size=64,
+        )
+        == expected_cluster64
+    )
+    with pytest.raises(ValueError, match="must be 4, 8, 16, 32, or 64"):
+        flash_attn_bwd_sm90_workspace_size(
+            s_q,
+            s_kv,
+            head_dim,
+            num_heads,
+            deterministic=True,
+            deterministic_relay_cluster_size=2,
+        )
+    large_stats = ws_align(1088 * 128 * 4)
+    expected_large_cluster8 = 2 * large_stats + ws_align(16 * (1088 + 9) * 576 * 4)
+    expected_large_cluster4 = 2 * large_stats + ws_align(32 * (1088 + 5) * 576 * 4)
+    expected_large_cluster16 = 2 * large_stats + ws_align(8 * (1088 + 17) * 576 * 4)
+    expected_large_cluster32 = 2 * large_stats + ws_align(4 * (1088 + 34) * 576 * 4)
+    expected_large_cluster64 = 2 * large_stats + ws_align(2 * (1088 + 68) * 576 * 4)
+    assert flash_attn_bwd_sm90_workspace_size(1025, 1025, 576, 128, deterministic=True) == expected_large_cluster16
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_relay_cluster_size=4,
+        )
+        == expected_large_cluster4
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_relay_cluster_size=8,
+        )
+        == expected_large_cluster8
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_relay_cluster_size=16,
+        )
+        == expected_large_cluster16
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_relay_cluster_size=32,
+        )
+        == expected_large_cluster32
+    )
+    assert (
+        flash_attn_bwd_sm90_workspace_size(
+            1025,
+            1025,
+            576,
+            128,
+            deterministic=True,
+            deterministic_relay_cluster_size=64,
+        )
+        == expected_large_cluster64
+    )
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         return
@@ -5005,6 +5346,170 @@ def test_DSA_sparse_attention_backward_sm90_scratch_workspace_bytes_formula():
     assert plan.check_support()
     assert plan.scratch_workspace_bytes() == expected
 
+    cluster4_plan = DSA.SparseAttentionBackward(
+        sample_q=torch.empty(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device),
+        sample_kv=torch.empty(s_kv, head_dim, dtype=torch.bfloat16, device=device),
+        sample_out=torch.empty(s_q, num_heads, 512, dtype=torch.bfloat16, device=device),
+        sample_dout=torch.empty(s_q, num_heads, 512, dtype=torch.bfloat16, device=device),
+        sample_lse=torch.empty(s_q, num_heads, dtype=torch.float32, device=device),
+        sample_attn_sink=torch.empty(num_heads, dtype=torch.float32, device=device),
+        sample_topk_idxs=torch.empty(s_q, 64, dtype=torch.int32, device=device),
+        deterministic=True,
+        deterministic_relay_cluster_size=4,
+    )
+    assert cluster4_plan.check_support()
+    assert cluster4_plan.scratch_workspace_bytes() == expected_cluster4
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_cluster_size_rejects_before_staging(monkeypatch):
+    """Invalid public relay attributes fail before the wrapper stages inputs."""
+    _require_sm90()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
+
+    def forbidden_staging(*args, **kwargs):
+        raise AssertionError("invalid relay configuration reached input staging")
+
+    monkeypatch.setattr(api, "contiguous_on_stream", forbidden_staging)
+    q = torch.empty(0, device="cuda")
+    args = (q, None, None, None, None, None, None)
+    with pytest.raises(ValueError, match="requires deterministic=True"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=False, deterministic_relay_cluster_size=4)
+    with pytest.raises(ValueError, match=r"must be one of \{4, 8, 16, 32, 64\}"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_relay_cluster_size=2)
+    with pytest.raises(ValueError, match=r"must be one of \{4, 8, 16, 32, 64\}"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_relay_cluster_size=4.5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("4.7.1", "deterministic SM90 DSA backward requires nvidia-cutlass-dsl >= 4.8.0; found 4.7.1"),
+        ("4.8.0", None),
+        ("4.9.0", None),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm90_relay_cutedsl_version_gate(monkeypatch, version, expected):
+    """The SM90 relay names its 4.8 DSL floor without importing a kernel."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", version)))
+    assert _sm90_relay.sm90_deterministic_relay_requirement_error() == expected
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_feature_tests_skip_old_cutedsl(monkeypatch):
+    """Feature tests skip, while the dedicated version-refusal test remains active."""
+    _require_sm90_relay_dependencies()
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.1")))
+    with pytest.raises(pytest.skip.Exception, match=r"requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.7\.1"):
+        _require_sm90_relay_dsl()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("missing_dependency", ["cutlass", "cuda.bindings.driver"])
+def test_DSA_sparse_attention_backward_sm90_relay_dependencies_skip_before_package_import(monkeypatch, missing_dependency):
+    """A missing optional dependency skips before importing the relay package."""
+    attempted_imports = []
+
+    def import_or_skip(module_name, reason=None):
+        attempted_imports.append(module_name)
+        if module_name == missing_dependency:
+            pytest.skip(f"missing {module_name}")
+
+    monkeypatch.setitem(globals(), "_import_or_skip", import_or_skip)
+    with pytest.raises(pytest.skip.Exception, match=rf"missing {re.escape(missing_dependency)}"):
+        _require_sm90_relay_dsl()
+
+    expected_imports = ["cutlass"] if missing_dependency == "cutlass" else ["cutlass", "cuda.bindings.driver"]
+    assert attempted_imports == expected_imports
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_int32_element_boundary():
+    """The largest valid signed-Int32 element offset is accepted exactly."""
+    _require_sm90_relay_dependencies()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _sm90_relay
+
+    limit = 1 << 31
+    assert _sm90_relay.sm90_deterministic_relay_indexing_error(limit) is None
+    assert _sm90_relay.sm90_deterministic_relay_indexing_error(limit + 1) == (
+        "deterministic SM90 DSA backward dKV accumulator has 2147483649 elements, " "which exceeds the signed Int32 element offset range"
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("relay_cluster_size", [4, 8, 16, 32, 64])
+def test_DSA_sparse_attention_backward_sm90_relay_host_span_matches_workspace_layout(relay_cluster_size):
+    """The support-check span calculation matches the execution workspace."""
+    _require_sm90_relay_dsl()
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm90, _sm90_relay
+
+    planes, physical_plane_elems, *_ = _interface_sm90._deterministic_relay_layout(257, 1001, 576, 96, relay_cluster_size)
+    assert _sm90_relay.sm90_deterministic_relay_accumulator_elements(257, 1001, 576, 96, relay_cluster_size) == planes * physical_plane_elems
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_rejects_oversized_accumulator_during_support_check(monkeypatch):
+    """The prepared plan rejects unsafe dynamic offsets before compilation."""
+    _require_sm90_deterministic_relay()
+    from cudnn import DSA
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api
+
+    monkeypatch.setattr(api, "sm90_deterministic_relay_accumulator_elements", lambda *args: (1 << 31) + 1)
+    device = torch.device("cuda")
+    plan = DSA.SparseAttentionBackward(
+        sample_q=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_kv=torch.empty(64, 512, dtype=torch.bfloat16, device=device),
+        sample_out=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_dout=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_lse=torch.empty(1, 16, dtype=torch.float32, device=device),
+        sample_attn_sink=torch.empty(16, dtype=torch.float32, device=device),
+        sample_topk_idxs=torch.empty(1, 16, dtype=torch.int32, device=device),
+        deterministic=True,
+    )
+    with pytest.raises(ValueError, match=r"2147483649 elements.*signed Int32 element offset range"):
+        plan.check_support()
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_relay_rejects_old_cutedsl_before_compile(monkeypatch):
+    """Prepared SM90 deterministic plans enforce the relay-specific DSL floor."""
+    _require_sm90()
+    from cudnn import DSA
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.1")))
+    device = torch.device("cuda")
+    plan = DSA.SparseAttentionBackward(
+        sample_q=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_kv=torch.empty(64, 512, dtype=torch.bfloat16, device=device),
+        sample_out=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_dout=torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device),
+        sample_lse=torch.empty(1, 16, dtype=torch.float32, device=device),
+        sample_attn_sink=torch.empty(16, dtype=torch.float32, device=device),
+        sample_topk_idxs=torch.empty(1, 16, dtype=torch.int32, device=device),
+        deterministic=True,
+    )
+    with pytest.raises(RuntimeError, match=r"requires nvidia-cutlass-dsl >= 4\.8\.0; found 4\.7\.1"):
+        plan.check_support()
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_kernels_have_public_symbol_prefix():
+    """Every CuTeDSL kernel in the SM90 backward module uses the public prefix."""
+    _require_sm90_relay_dsl()
+    module = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm90")
+    source = inspect.getsource(module)
+
+    assert source.count("@cute.kernel") == 5
+    assert source.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)') == 5
+
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=91)
@@ -5019,6 +5524,274 @@ def test_DSA_sparse_attention_backward_sm90_execute_allocates_nothing_and_never_
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(32, 576, 64, has_topk_length=True)
     assert plan.scratch_workspace_bytes() == flash_attn_bwd_sm90_workspace_size(8, 256, 576, 32)
     _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=92)
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["compact", "lengths"])
+@pytest.mark.parametrize(
+    "relay_cluster_size",
+    [4, 8, 16, 32, 64],
+    ids=["cluster4", "cluster8", "cluster16", "cluster32", "cluster64"],
+)
+def test_DSA_sparse_attention_backward_sm90_deterministic_relay(has_topk_length, relay_cluster_size):
+    """Hopper relay ranks, head phases, and query waves stay bitwise stable."""
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+
+    _require_sm90_deterministic_relay()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        96,
+        576,
+        128,
+        s_q=129,
+        s_kv=256,
+        has_topk_length=has_topk_length,
+        deterministic=True,
+        deterministic_relay_cluster_size=relay_cluster_size,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def run():
+        dq, dkv, d_sink = outputs
+        for tensor in (*outputs, workspace):
+            tensor.view(torch.uint8).fill_(0xA5)
+        result = plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+        torch.cuda.synchronize()
+        return tuple(tensor.clone() for tensor in result)
+
+    reference = run()
+    for repeat in range(1, 4):
+        actual = run()
+        for name, actual_tensor, reference_tensor in zip(("dQ", "dKV", "dSink"), actual, reference):
+            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), f"{name} differs at repetition {repeat}"
+
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        *reference,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=94)
+def test_DSA_sparse_attention_backward_sm90_deterministic_compile_cache_reuses_runtime_extents(monkeypatch):
+    """Packed Q/KV extents stay runtime values for all deterministic artifacts."""
+    _require_sm90_deterministic_relay()
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+    _interface_sm90 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90")
+
+    launch = _interface_sm90.flash_attn_bwd_sm90
+    monkeypatch.setattr(launch, "compile_cache_relay_masks", {})
+    monkeypatch.setattr(launch, "compile_cache", {})
+    monkeypatch.setattr(launch, "compile_cache_post", {})
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def execute(s_q, s_kv):
+        plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+            64,
+            512,
+            64,
+            s_q=s_q,
+            s_kv=s_kv,
+            has_topk_length=True,
+            deterministic=True,
+            deterministic_relay_cluster_size=16,
+        )
+        dq, dkv, d_sink = outputs
+        result = plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+        torch.cuda.synchronize()
+        assert all(torch.isfinite(tensor).all() for tensor in result)
+
+    execute(65, 192)
+    compiled = {name: next(iter(getattr(launch, name).values())) for name in ("compile_cache_relay_masks", "compile_cache", "compile_cache_post")}
+    execute(129, 256)
+
+    for name, first_callable in compiled.items():
+        cache = getattr(launch, name)
+        assert len(cache) == 1, f"{name} specialized on a runtime packed extent: {tuple(cache)}"
+        assert next(iter(cache.values())) is first_callable
+
+
+@pytest.mark.L2
+@torch_fork_set_rng(seed=20261102)
+@pytest.mark.parametrize("relay_cluster_size", [32, 64], ids=["cluster32", "cluster64"])
+def test_DSA_sparse_attention_backward_sm90_multiphase_relay_repeat100(relay_cluster_size):
+    """Logical relays remain bitwise exact under 100 high-overlap repetitions."""
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+
+    _require_sm90_deterministic_relay()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        511,
+        s_q=257,
+        s_kv=1024,
+        deterministic=True,
+        deterministic_relay_cluster_size=relay_cluster_size,
+    )
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    topk_idxs.copy_(topk_idxs[0].clone().expand_as(topk_idxs))
+    shared_out, shared_lse = ref_sparse_attention_forward_chunked(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    out.copy_(shared_out)
+    lse.copy_(shared_lse)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def run():
+        dq, dkv, d_sink = outputs
+        for tensor in (*outputs, workspace):
+            tensor.view(torch.uint8).fill_(0xA5)
+        result = plan.execute(
+            *inputs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+        torch.cuda.synchronize()
+        return tuple(tensor.clone() for tensor in result)
+
+    reference = run()
+    for repeat in range(1, 100):
+        actual = run()
+        for name, actual_tensor, reference_tensor in zip(("dQ", "dKV", "dSink"), actual, reference):
+            assert torch.equal(bitwise_bits(actual_tensor), bitwise_bits(reference_tensor)), f"{name} differs at repetition {repeat}"
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=93)
+@pytest.mark.parametrize(
+    "relay_cluster_size",
+    [None, 32, 64],
+    ids=["default-cluster16", "cluster32", "cluster64"],
+)
+def test_DSA_sparse_attention_backward_sm90_relay_cuda_graph(relay_cluster_size):
+    """C16/C32/C64 relays replay with poisoned storage and changed sparse inputs."""
+    cuda = _import_or_skip("cuda.bindings.driver", reason="Environment not supported: cuda-python not installed")
+
+    _require_sm90_deterministic_relay()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        96,
+        576,
+        128,
+        s_q=129,
+        s_kv=256,
+        has_topk_length=True,
+        deterministic=True,
+        deterministic_relay_cluster_size=relay_cluster_size,
+    )
+    assert plan.deterministic_relay_cluster_size == relay_cluster_size
+    assert plan._sm90_deterministic_relay_cluster_size == (16 if relay_cluster_size is None else relay_cluster_size)
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    saved_topk_idxs = topk_idxs.clone()
+    saved_topk_length = topk_length.clone()
+    changed_topk_idxs = topk_idxs.roll(1, dims=1)
+    launch_stream = torch.cuda.Stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    stream = cuda.CUstream(launch_stream.cuda_stream)
+
+    def poison():
+        for buffer in (workspace, *outputs):
+            buffer.view(torch.uint8).fill_(0xA5)
+
+    def execute(active_workspace=workspace):
+        dq, dkv, d_sink = outputs
+        return plan.execute(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            current_stream=stream,
+            workspace=active_workspace,
+            d_sink=d_sink,
+        )
+
+    with pytest.raises(ValueError, match="workspace"):
+        execute(workspace[:-1])
+
+    with torch.cuda.stream(launch_stream):
+        poison()
+        execute()  # Populate the legacy SM90 concrete-tensor compile caches.
+        eager = tuple(tensor.clone() for tensor in outputs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=launch_stream):
+            execute()
+        for repeat in range(3):
+            with torch.cuda.stream(launch_stream):
+                poison()
+                graph.replay()
+            torch.cuda.synchronize()
+            for name, actual, expected in zip(("dQ", "dKV", "dSink"), outputs, eager):
+                assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} differs on graph replay {repeat}"
+
+        with torch.cuda.stream(launch_stream):
+            topk_idxs.copy_(changed_topk_idxs)
+            topk_length.fill_(64)
+            poison()
+            execute()
+            changed_eager = tuple(tensor.clone() for tensor in outputs)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(launch_stream):
+            poison()
+            graph.replay()
+        torch.cuda.synchronize()
+        for name, actual, expected in zip(("dQ", "dKV", "dSink"), outputs, changed_eager):
+            assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} graph replay ignores changed sparse inputs"
+    finally:
+        with torch.cuda.stream(launch_stream):
+            topk_idxs.copy_(saved_topk_idxs)
+            topk_length.copy_(saved_topk_length)
+        launch_stream.synchronize()
+        graph.reset()
 
 
 @pytest.mark.L0

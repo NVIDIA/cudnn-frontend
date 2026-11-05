@@ -12,31 +12,9 @@ import torch
 from cudnn.api_base import TupleDict
 from block_sparse_attention.cutedsl.bsa_reference import attention_reference, block_sparse_mask, assert_fp8_quantization_matches_fp32
 from test_utils import torch_fork_set_rng
+from block_sparse_attention.cutedsl.bsa_utils import import_bsa
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
-
-
-def _import_bsa():
-    try:
-        from cudnn import ops
-
-        importlib.import_module("cudnn.block_sparse_attention._interface")
-        return ops
-    except (ImportError, OSError) as error:
-        pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
-
-
-def _require_sm100_fp8(*, allow_sm120=False):
-    if not torch.cuda.is_available():
-        pytest.skip("Sage FP8 block sparse attention requires CUDA")
-    major, _ = torch.cuda.get_device_capability()
-    supported = {10, 11, 12} if allow_sm120 else {10, 11}
-    if major not in supported:
-        pytest.skip(f"this numerical Sage FP8 test requires architecture family {sorted(supported)}")
-    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
-    if interface._cutlass_dsl_version() < (4, 6, 1):
-        pytest.skip("Sage FP8 requires nvidia-cutlass-dsl>=4.6.1")
-    return _import_bsa()
 
 
 def _make_block_index(batch: int, heads: int, seqlen_q: int, seqlen_k: int, topk: int) -> torch.Tensor:
@@ -78,7 +56,7 @@ def test_bsa_fp8_public_exports_do_not_eagerly_import_quantizer():
     ),
 )
 def test_bsa_fp8_cutedsl_version_parser(monkeypatch, version, expected):
-    _import_bsa()
+    import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface.cutlass, "__version__", version)
     assert interface._cutlass_dsl_version() == expected
@@ -140,7 +118,7 @@ def test_bsa_fp8_interface_quantizes_before_private_launch(monkeypatch):
 @pytest.mark.L0
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (1, 3), (2, 3)))
 def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, batch, heads):
-    ops = _import_bsa()
+    ops = import_bsa()
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: 100)
@@ -179,7 +157,7 @@ def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, bat
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=20260709)
 def test_bsa_fp8_private_cutedsl_quantizer_matches_recipe(batch, heads):
-    _require_sm100_fp8(allow_sm120=True)
+    import_bsa(families=(10, 11, 12), min_cutedsl=(4, 6, 1), feature="this numerical Sage FP8 test")
     quantizer = importlib.import_module("cudnn.block_sparse_attention._fp8_quant")
 
     seqlen_q, seqlen_k, head_dim = 128, 192, 128
@@ -230,14 +208,14 @@ def test_bsa_fp8_private_cutedsl_quantizer_matches_recipe(batch, heads):
     ),
 )
 def test_bsa_fp8_sm100_sm110_auto_kv_splits(heads, seqlen_q, topk, expected_splits):
-    _import_bsa()
+    import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     assert interface._sm100_blk64_auto_fp8_kv_splits(topk, heads, seqlen_q) == expected_splits
 
 
 @pytest.mark.L0
 def test_bsa_fp8_sm100_auto_split_uses_workspace_fallback(monkeypatch):
-    _require_sm100_fp8()
+    import_bsa(families=(10, 11), min_cutedsl=(4, 6, 1), feature="this numerical Sage FP8 test")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface, "_get_device_arch", lambda: 100)
 
@@ -277,7 +255,7 @@ def test_bsa_fp8_sm100_auto_split_uses_workspace_fallback(monkeypatch):
 
 @pytest.mark.L0
 def test_bsa_fp8_quantized_inputs_require_fully_contiguous_bhsd():
-    _require_sm100_fp8()
+    import_bsa(families=(10, 11), min_cutedsl=(4, 6, 1), feature="this numerical Sage FP8 test")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
 
     batch, heads, seqlen, head_dim = 1, 4, 64, 128
@@ -311,7 +289,7 @@ def test_bsa_fp8_quantized_inputs_require_fully_contiguous_bhsd():
 
 @pytest.mark.L0
 def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
-    _import_bsa()
+    import_bsa()
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
 
     batch, heads, seqlen_q, value_dim, kv_splits = 1, 4, 64, 128, 2
@@ -329,7 +307,7 @@ def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=2026)
 def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
-    ops = _require_sm100_fp8()
+    ops = import_bsa(families=(10, 11), min_cutedsl=(4, 6, 1), feature="this numerical Sage FP8 test")
     seqlen_q, seqlen_k, head_dim, topk = 128, 640, 128, 5
     q = torch.randn((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
     k = torch.randn((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.bfloat16) * 0.5
@@ -363,7 +341,7 @@ def test_bsa_fp8_sm100_bf16_forward_matches_reference(batch, heads):
 @pytest.mark.L0
 @pytest.mark.parametrize("arch", (90, 120))
 def test_bsa_fp8_blk128_dispatch_preserves_v_layout_and_metadata(monkeypatch, arch):
-    """The two native blk128 paths share an API but require different V storage."""
+    """Pin each blk128 path's V layout, K scaling and sparse metadata."""
     api = importlib.import_module("cudnn.block_sparse_attention.api")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(api, "_device_arch", lambda tensor: arch)

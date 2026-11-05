@@ -982,6 +982,13 @@ the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
 
+When sharing a native backward ABI with another architecture, retain its registered
+`BwdLaunchSpec.name` or extend every name-based native guard. The fixed backward
+binder uses that name to enable gradient-overlap checks. Pin the public engine
+identity separately, verify the emitted target, and keep a real overlapping-gradient
+negative control with unchanged output/workspace sentinels. The SM120 THD cases
+in `test_sdpa_bwd_thd_sm120.py` exercise this boundary.
+
 Exercise the actual standalone adapter as well as the prepared binder. A lower-level
 frame test can miss an incompatible metadata container built by the adapter.
 `test_shared_standalone_adapter_uses_current_native_storage` calls that boundary

@@ -2943,10 +2943,44 @@ def precheck_path(
         _precheck_plain(chain, config)
 
 
+# Scale-factor types without a sign bit: ``is_negative_scale`` cannot change their values.
+_SIGN_FREE_SF_DTYPES = frozenset({"fp8_e8m0", "fp8_e5m3"})
+
+
+def _check_block_scale_sign(state: dict) -> None:
+    """Decline ``block_scale_dequantize(is_negative_scale=True)`` on scale factors that can be negative.
+
+    The shared analyzer records the attribute, but no chain field carries it. The tcgen05 block-scale
+    MMA takes every scale factor as an unsigned ``.ue4m3`` / ``.ue8m0`` operand, so a block with
+    ``s < 0`` would contribute ``x * |s|`` where the attribute asks for ``x * s``. A sign-free scale
+    cannot be negative, so the attribute changes nothing there. Same rule as the sm120 tree (#2015)."""
+    meta = state["tensor_meta"]
+    for op in state["ops"]:
+        if op.cudnn_name != "block_scale_dequantize" or not op.is_negative_scale:
+            continue
+        sf = meta[op.inputs[1]]
+        if sf.dtype not in _SIGN_FREE_SF_DTYPES:
+            raise NotImplementedError(
+                f"block_scale_dequantize {op.op_name!r} sets is_negative_scale=True on its {sf.dtype} scale factors "
+                f"{sf.name!r}, which the sm100 block-scale MMA cannot honor: it reads every scale as an unsigned "
+                ".ue4m3 / .ue8m0 value, so a negative scale would be applied as its magnitude"
+            )
+
+
+def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | None]":
+    """Analyze the graph and decline attributes the sm100 templates cannot honor."""
+    from ..graph_analyzer import _analyze_state, _state_from_graph
+
+    state = _state_from_graph(graph)
+    chain, binding = _analyze_state(state)
+    _check_block_scale_sign(state)
+    return chain, binding
+
+
 def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT ``cute.compile``."""
     probe_cutedsl()
-    chain, _binding = analyze_with_binding(graph)
+    chain, _binding = _analyze_graph(graph)
     if config is None:
         config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), shapes_fixed=_graph_shapes_fixed(graph))
     probe_chain(chain, config)
@@ -3032,7 +3066,7 @@ def jit_from_cudnn_graph(
     config: TileConfig = DEFAULT_CONFIG,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel."""
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _analyze_graph(graph)
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 

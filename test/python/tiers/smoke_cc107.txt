@@ -178,6 +178,24 @@ sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_right_band_widening
 sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_gqa_mqa[r2]
 sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_head_dim_band[384]
 sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_non_tile_multiple_seqlens[257-129]
+# The d128 f16/bf16 backward family (sdpa_bwd_sm100_d128, admitted on cc 10.7 2026-11-03 with its SM100 bodies compiled for sm_107a): one cell per
+# body x mask arm -- dense MHA accumulation, dense MHA recompute (deterministic), THD MHA, dense GQA one-CTA, THD GQA one-CTA, THD GQA pair body,
+# the dense GQA pair twin (square + rectangular) and the pair body's cc 10.7-only TMEM map dq_576
+sdpa/frost/test_sdpa_bwd_d128_accum_sm100.py::test_accumulation_matches_fp64[dt0-False-128-128]
+sdpa/frost/test_sdpa_bwd_d128_accum_sm100.py::test_accumulation_matches_fp64[dt3-True-128-128]
+sdpa/frost/test_sdpa_bwd_d128_sm100.py::test_deterministic_dense_mha_repeated_eager_and_replay[257-193-True-dt0]
+sdpa/frost/test_sdpa_bwd_d128_sm100.py::test_deterministic_dense_mha_repeated_eager_and_replay[257-193-False-dt1]
+sdpa/frost/test_sdpa_bwd_d128_thd_sm100.py::test_thd_mha_standalone_smoke[fp16]
+sdpa/frost/test_sdpa_bwd_d128_thd_sm100.py::test_thd_mha_matrix[lens_q2-lens_kv2-2-dtype2-True]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[4-2-dtype0-False-False]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[6-2-dtype1-True-False]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[4-2-dtype4-True-True]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[6-2-dtype5-False-True]
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_thd_matrix[uniform-256-causal]
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_thd_matrix[uniform-384-noncausal]
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_launch_census_per_selection[on-s256-pair-dense]
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_dense_twin_matches_thd_uniform[rect-sq256-skv512-causal]
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_tmem_maps_agree_bitwise[uniform-256-causal]
 gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]
 gated_attention_block/cutedsl/test_block_end_to_end.py::test_non_causal_arm
 gated_attention_block/cutedsl/test_block_end_to_end.py::test_fully_fused_block_matches_the_fp32_oracle[256]
@@ -301,7 +319,7 @@ sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_d512_split_recombines_o_a
 sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_dsink_fact
 sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_engines_registered
 sdpa/frost/test_sdpa_native_arch_binding.py::test_arch_native_graph_fresh_storage_overrides_and_replay[cc18-128-128-65-bfloat16]
-sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan
+sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan[block_table_ptr]
 sdpa/frost/test_sdpa_native_block_output_binding.py::test_block_output_native_graph_fresh_buffers_and_replay[False-16-False-True]
 sdpa/frost/test_sdpa_native_bwd_binding.py::test_actual_backward_host_frames_match_python[ordinary-False-bfloat16-sm100]
 sdpa/frost/test_sdpa_native_bwd_binding.py::test_backward_frames_do_not_share_runtime_storage

@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -87,34 +87,30 @@ def _build_q_work_queues(
     small_costs: Tensor,
     small_q: Tensor,
     large_q: Tensor,
+    route_counts: Tensor,
     n_small_q: int,
     n_large_q: int,
     stream,
 ) -> Tuple[Tensor, Tensor]:
-    """Expand per-Q route templates into exact M128 and M64 queues."""
-    small_work = torch.empty(num_heads * n_small_q, dtype=torch.int32, device=device)
-    large_work = torch.empty(num_heads * n_large_q, dtype=torch.int32, device=device)
+    """Expand per-Q route templates into exact M128 and M64 queues (one launch orders both)."""
+    small_work = torch.empty(max(num_heads * n_small_q, 1), dtype=torch.int32, device=device)
+    large_work = torch.empty(max(num_heads * n_large_q, 1), dtype=torch.int32, device=device)
     from ._build_kernels import order_q_route_work
 
-    if large_work.numel() > 0:
+    if n_small_q + n_large_q > 0:
         order_q_route_work(
-            large_q[:n_large_q],
+            route_counts,
+            large_q,
             large_costs,
             large_work,
-            heavy_threshold=_Q128_HEAVY_ITER_THRESHOLD,
-            is_q64=False,
-            stream=stream,
-        )
-    if small_work.numel() > 0:
-        order_q_route_work(
-            small_q[:n_small_q],
+            small_q,
             small_costs,
             small_work,
-            heavy_threshold=_Q64_HEAVY_ITER_THRESHOLD,
-            is_q64=True,
+            large_threshold=_Q128_HEAVY_ITER_THRESHOLD,
+            small_threshold=_Q64_HEAVY_ITER_THRESHOLD,
             stream=stream,
         )
-    return large_work, small_work
+    return large_work[: num_heads * n_large_q], small_work[: num_heads * n_small_q]
 
 
 # ---------------------------------------------------------------------------
@@ -204,25 +200,21 @@ def _bwd_paged_kv_stats(
     num_groups = (num_q_blocks + blocks_per_group - 1) // blocks_per_group
     from ._build_kernels import (
         bwd_kv_bitmap_stats,
-        bwd_kv_compact_work,
         bwd_kv_edge_bitmap,
-        bwd_kv_nostraddle_pack,
+        bwd_kv_pack_slots,
         bwd_kv_page_table_fill,
+        bwd_kv_scatter_work,
     )
 
-    q_page_counts = ((q_sizes + (PAGE - 1)) // PAGE).clamp(0, FRAGS_PER_TILE)
-    page_counts = ((kv_sizes + (PAGE - 1)) // PAGE).clamp(0, FRAGS_PER_TILE)
     # Full blocks first (tile-aligned), then partial blocks from short to long;
     # packing similar sizes together keeps the union Q walks short.
-    pack_key = page_counts & (FRAGS_PER_TILE - 1)
-    order = torch.argsort(pack_key, stable=True)
-    ordered_page_counts = page_counts[order].contiguous()
-    ordered_start_slots = torch.empty_like(ordered_page_counts)
-    bwd_kv_nostraddle_pack(ordered_page_counts, ordered_start_slots)
-    start_slots = torch.empty_like(ordered_start_slots)
-    start_slots[order] = ordered_start_slots
-    first_tiles = start_slots // FRAGS_PER_TILE
-    tile_slots = start_slots - first_tiles * FRAGS_PER_TILE
+    page_counts = torch.empty(num_kv_blocks, dtype=torch.int32, device=device)
+    q_page_counts = torch.empty(num_q_blocks, dtype=torch.int32, device=device)
+    start_slots = torch.empty_like(page_counts)
+    first_tiles = torch.empty_like(page_counts)
+    tile_slots = torch.empty_like(page_counts)
+    total_slots = torch.empty(1, dtype=torch.int32, device=device)
+    bwd_kv_pack_slots(kv_sizes, q_sizes, page_counts, q_page_counts, start_slots, first_tiles, tile_slots, total_slots)
 
     # Allocate at the padded bound (one tile per KV block), then slice to num_kv_tiles * 8.
     kv_page_table = torch.full(
@@ -237,6 +229,7 @@ def _bwd_paged_kv_stats(
     # One bitmap byte per (walk row, Q block in its group).
     words_per_bitmap_row = (blocks_per_group + 3) // 4
     num_padded_rows = num_heads * num_groups * num_kv_blocks
+    # Pinned and non-blocking: a pageable host-to-device copy would synchronize the host with the stream.
     config = torch.tensor(
         (
             num_q_blocks,
@@ -246,8 +239,8 @@ def _bwd_paged_kv_stats(
             num_kv_blocks,
         ),
         dtype=torch.int32,
-        device=device,
-    )
+        pin_memory=True,
+    ).to(device, non_blocking=True)
     bitmap = torch.zeros(
         num_padded_rows * words_per_bitmap_row,
         dtype=torch.int32,
@@ -271,13 +264,8 @@ def _bwd_paged_kv_stats(
     entry_counts = torch.empty_like(step_counts)
     bwd_kv_bitmap_stats(bitmap, q_page_counts, step_counts, entry_counts, config)
     work_indices = torch.empty((num_padded_rows, 2), dtype=torch.int32, device=device)
-    active_count = torch.empty(1, dtype=torch.int32, device=device)
-    bwd_kv_compact_work(
-        step_counts,
-        config,
-        work_indices,
-        active_count,
-    )
+    active_end = torch.cumsum(step_counts > 0, 0, dtype=torch.int32)  # active rows in stable order
+    bwd_kv_scatter_work(active_end, config, work_indices)
     tile_offsets = torch.cumsum(step_counts, 0, dtype=torch.int64) - step_counts
     entry_offsets = torch.zeros(num_padded_rows + 1, dtype=torch.int32, device=device)
     torch.cumsum(entry_counts, 0, dtype=torch.int32, out=entry_offsets[1:])
@@ -295,8 +283,8 @@ def _bwd_paged_kv_stats(
         tile_offsets=tile_offsets,
         entry_offsets=entry_offsets,
         work_indices=work_indices,
-        active_count=active_count[0].to(torch.int64),
-        total_slots=(ordered_start_slots[-1] + ordered_page_counts[-1]).to(torch.int64),
+        active_count=active_end[-1].to(torch.int64),
+        total_slots=total_slots[0].to(torch.int64),
         total_steps=tile_offsets[-1] + step_counts[-1],
         total_entries=entry_offsets[-1].to(torch.int64),
     )
@@ -445,6 +433,7 @@ def build_walk_tables(
     kv_sizes: Tensor,  # [nKV] int32 valid rows per KV block; device kernels clamp on load
     H: int,
     bwd_kv_groups: Optional[int] = None,
+    after_sizing: Optional[Callable[[], object]] = None,
 ) -> Tuple[WalkTables, Blk64ForwardTables]:
     """Forward page walks for both kernels, plus the deferred backward state.
 
@@ -453,7 +442,8 @@ def build_walk_tables(
     larger one to a multiple of two (M128 kernel); each Q block lands in
     exactly one work queue.  Long walks are queued first to shorten the
     persistent-scheduler tail.  One readback of the route counts sizes the
-    tables exactly.
+    tables exactly; ``after_sizing`` runs right after it, before any kernel
+    that indexes memory by the metadata unclamped.
     """
 
     dev = kv_sizes.device
@@ -464,6 +454,7 @@ def build_walk_tables(
     n_walks = idx.shape[0]
 
     shared_counts = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    full_pages = torch.empty(n_walks, dtype=torch.int32, device=dev)
     from ._build_kernels import current_stream, walk_stats
 
     stream = current_stream()
@@ -473,11 +464,13 @@ def build_walk_tables(
         q_sizes,
         kv_sizes,
         shared_counts,
+        full_pages,
         stream,
     )
 
     n_q_blocks = q_sizes.numel()
-    tile_off = torch.cumsum(shared_counts, dim=0, dtype=torch.int32) - shared_counts
+    # Inclusive tile ends; WalkFill turns each into its walk's first tile in place.
+    tile_off = torch.cumsum(shared_counts, dim=0, dtype=torch.int32)
     q_route_state = _prepare_q_route_templates(
         q_sizes,
         shared_counts,
@@ -495,6 +488,8 @@ def build_walk_tables(
     )
 
     n_small_q, n_large_q, total_tiles = (int(value) for value in q_route_state[2].cpu())
+    if after_sizing is not None:
+        after_sizing()
 
     # Dummy page ids are out of bounds for the TMA descriptor and load as zeros.
     nt = max(total_tiles, 1)
@@ -513,12 +508,14 @@ def build_walk_tables(
         kv_sizes,
         tile_off,
         shared_counts,
+        full_pages,
         full_tile_counts,
         tile_offsets_q64,
         iter_counts_q64,
         full_iter_counts_q64,
         page_table,
         mask_table,
+        mask_table,  # heavy flags: blk64 only, not written here
         stream,
     )
 
@@ -529,6 +526,7 @@ def build_walk_tables(
         iter_counts_q64,
         q_route_state[0],
         q_route_state[1],
+        q_route_state[2],
         n_small_q,
         n_large_q,
         stream,
@@ -559,14 +557,15 @@ def build_walk_tables_blk64(
     q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
     q2k_block_nums: Tensor,  # [1, H, nQ] int32
     kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+    after_sizing: Optional[Callable[[], object]] = None,
 ) -> Blk64ForwardTables:
     """Forward page walks for sparse_block_size=64 metadata, for the M64 x N256 kernel.
 
     A 64-row Q block is one M64 tile, so the tables are indexed by the Q block itself (``[1, H, nQ]``, not the two
     halves of a 128-row block) and the M128 route is never used.  Q padding is not skipped, as in the base blk64
-    kernel.  One readback sizes the tables.
+    kernel.  One readback sizes the tables; ``after_sizing`` runs right after it.
     """
-    from ._build_kernels import current_stream, walk_fill, walk_stats
+    from ._build_kernels import current_stream, stable_partition_scatter, walk_fill, walk_stats
 
     dev = kv_sizes.device
     batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
@@ -575,13 +574,17 @@ def build_walk_tables_blk64(
     cnt = q2k_block_nums.view(-1)  # [H*nQ]
     assert idx.dtype == torch.int32 and cnt.dtype == torch.int32 and kv_sizes.dtype == torch.int32
     n_walks = idx.shape[0]
-    q_sizes = torch.full((n_q_blocks,), _BLOCK64, dtype=torch.int32, device=dev)
+    q_sizes = kv_sizes  # placeholder: with block 64 the walk kernels treat every Q block as 64 rows and do not read it
 
     stream = current_stream()
     iter_tiles = torch.empty(n_walks, dtype=torch.int32, device=dev)
-    walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, stream, block=_BLOCK64)
-    tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32) - iter_tiles
-    total_tiles = int((tile_off[-1] + iter_tiles[-1]).cpu())
+    full_pages = torch.empty(n_walks, dtype=torch.int32, device=dev)
+    walk_stats(idx, cnt, q_sizes, kv_sizes, iter_tiles, full_pages, stream, block=_BLOCK64)
+    # Inclusive tile ends; WalkFill turns each into its walk's first tile in place.
+    tile_off = torch.cumsum(iter_tiles, dim=0, dtype=torch.int32)
+    total_tiles = int(tile_off[-1].cpu())
+    if after_sizing is not None:
+        after_sizing()
 
     # Dummy page ids are out of bounds for the TMA descriptor and load as zeros.
     nt = max(total_tiles, 1)
@@ -591,6 +594,7 @@ def build_walk_tables_blk64(
     tile_offsets = torch.empty(n_walks, dtype=torch.int32, device=dev)
     iter_counts = torch.empty_like(tile_offsets)
     full_iter_counts = torch.empty_like(tile_offsets)
+    heavy = torch.empty_like(tile_offsets)
     walk_fill(
         idx,
         cnt,
@@ -598,20 +602,24 @@ def build_walk_tables_blk64(
         kv_sizes,
         tile_off,
         iter_tiles,
+        full_pages,
         full_tile_counts,
         tile_offsets,
         iter_counts,
         full_iter_counts,
         page_table,
         mask_table,
+        heavy,
         stream,
         block=_BLOCK64,
+        heavy_threshold=_Q64_HEAVY_ITER_THRESHOLD,
     )
 
     # Every walk is queued, as on the blk128 route: an empty one (allow_empty_block_nums) takes the kernel's
     # empty-tile path and writes O = 0, LSE = -inf.  Long walks first, stable within each class.
-    heavy = iter_counts > _Q64_HEAVY_ITER_THRESHOLD
-    work_indices = torch.argsort(~heavy, stable=True).to(torch.int32).contiguous()
+    heavy_end = torch.cumsum(heavy, 0, dtype=torch.int32)
+    work_indices = torch.empty_like(heavy_end)
+    stable_partition_scatter(heavy_end, work_indices)
     return Blk64ForwardTables(
         page_table=page_table,
         tile_offsets=tile_offsets.view(1, num_heads, n_q_blocks),
@@ -620,6 +628,102 @@ def build_walk_tables_blk64(
         mask_table=mask_table,
         work_indices=work_indices,
     )
+
+
+@dataclass
+class Blk64PairForwardTables:
+    """Forward page walks for the SM90 Q-paired kernel: one walk per pair of 64-row Q blocks (2p, 2p + 1).
+
+    A walk covers the union of both KV lists, ordered first-only, common, second-only, as 8-page (128-row) tiles.
+    Compute WG0 (Q block 2p) runs tiles [0, ranges[..., 2]), WG1 (Q block 2p + 1) tiles [ranges[..., 3], ranges[..., 4]);
+    each masks its tiles with its own keep words (rows of its own blocks only, padding excluded).
+    """
+
+    page_table: Tensor  # [total_tiles, 8] int32 page ids; dummy ids >= num_kv_blocks * 4 load as zeros
+    keep: Tensor  # [total_tiles, 2, 4] int32 packed per-WG keep bits, two Page16 entries per word
+    ranges: Tensor  # [H, num_pairs, 5] int32: tile offset, tiles, WG0 end, WG1 begin, WG1 end
+
+
+def build_pair_walk_tables_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 64
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 64-row KV block; device kernels clamp on load
+    after_sizing: Optional[Callable[[], object]] = None,
+) -> Blk64PairForwardTables:
+    """Q-pair page walks for sparse_block_size=64 metadata.  One readback sizes the tables; ``after_sizing`` runs right after it."""
+    from ._build_kernels import current_stream, pair_walk_fill, pair_walk_stats
+
+    dev = kv_sizes.device
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage blk64 runs a batch as independent heads; batch must be 1"
+    assert q2k_block_index.dtype == torch.int32 and q2k_block_nums.dtype == torch.int32 and kv_sizes.dtype == torch.int32
+    n_pairs = (n_q_blocks + 1) // 2
+    words = (kv_sizes.numel() + 31) // 32
+
+    stream = current_stream()
+    bits = torch.zeros((num_heads * n_pairs, 2, words), dtype=torch.int32, device=dev)
+    class_pages = torch.empty((num_heads * n_pairs, 3), dtype=torch.int32, device=dev)
+    tiles = torch.empty((num_heads * n_pairs,), dtype=torch.int32, device=dev)
+    pair_walk_stats(q2k_block_index.view(num_heads, n_q_blocks, cap), q2k_block_nums.view(num_heads, n_q_blocks), kv_sizes, bits, class_pages, tiles, stream)
+    tile_ends = torch.cumsum(tiles, dim=0, dtype=torch.int32)  # inclusive; PairWalkFill subtracts its own count
+    total_tiles = int(tile_ends[-1].cpu())
+    if after_sizing is not None:
+        after_sizing()
+
+    nt = max(total_tiles, 1)
+    page_table = torch.empty((nt, FRAGS_PER_TILE), dtype=torch.int32, device=dev)
+    keep = torch.empty((nt, 2, 4), dtype=torch.int32, device=dev)
+    ranges = torch.empty((num_heads * n_pairs, 5), dtype=torch.int32, device=dev)
+    pair_walk_fill(kv_sizes, bits, class_pages, tile_ends, page_table, keep, ranges, stream)
+    return Blk64PairForwardTables(page_table=page_table, keep=keep, ranges=ranges.view(num_heads, n_pairs, 5))
+
+
+@dataclass
+class Blk64Refinement:
+    """blk128 metadata rewritten as the blk64 metadata of the same function (SM90 blk128 KPage).
+
+    Every 128-row block is split into its two 64-row halves; KV halves without valid rows are dropped from the lists
+    and Q halves without valid rows get count 0, so neither costs work in the blk64 forward and backward.  Only the
+    first ``block_count`` entries of a ``block_index`` row are written (the rest is uninitialized): every consumer
+    reads a row up to its count, as the blk64 metadata contract allows.
+    """
+
+    block_index: Tensor  # [1, H, n_q64, 2 * cap] int32, n_q64 = ceil(seqlen_q / 64)
+    block_count: Tensor  # [1, H, n_q64] int32
+    block_sizes: Tensor  # [n_kv64] int32, n_kv64 = ceil(seqlen_k / 64)
+
+
+def refine_blk128_to_blk64(
+    q2k_block_index: Tensor,  # [1, H, nQ, cap] int32, sparse_block_size 128
+    q2k_block_nums: Tensor,  # [1, H, nQ] int32
+    q_sizes: Tensor,  # [nQ] int32 valid rows per 128-row Q block
+    kv_sizes: Tensor,  # [nKV] int32 valid rows per 128-row KV block
+    seqlen_q: int,
+    seqlen_k: int,
+) -> Blk64Refinement:
+    """The halves past a sequence that ends 64 rows into its final block are left out (as blk64 metadata of that length has them)."""
+    from ._build_kernels import current_stream, refine_blk128_to_blk64 as refine_cute
+
+    batch, num_heads, n_q_blocks, cap = q2k_block_index.shape
+    assert batch == 1, "kpage runs a batch as independent heads; batch must be 1"
+    dev = q2k_block_index.device
+    half = BLOCK // 2
+    n_q64, n_kv64 = (seqlen_q + half - 1) // half, (seqlen_k + half - 1) // half
+    # Written in the final [heads, n_q64] row order: a half past the sequence is never written, so nothing is sliced or copied.
+    index64 = torch.empty((num_heads * n_q64, 2 * cap), dtype=torch.int32, device=dev)  # written up to each count
+    count64 = torch.empty((num_heads * n_q64,), dtype=torch.int32, device=dev)
+    sizes64 = torch.empty((2 * kv_sizes.numel(),), dtype=torch.int32, device=dev)
+    refine_cute(
+        q2k_block_index.view(num_heads * n_q_blocks, cap),
+        q2k_block_nums.view(num_heads * n_q_blocks),
+        q_sizes,
+        kv_sizes,
+        index64,
+        count64,
+        sizes64,
+        current_stream(),
+    )
+    return Blk64Refinement(block_index=index64.view(1, num_heads, n_q64, 2 * cap), block_count=count64.view(1, num_heads, n_q64), block_sizes=sizes64[:n_kv64])
 
 
 # ---------------------------------------------------------------------------

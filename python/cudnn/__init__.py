@@ -386,6 +386,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "gated_attention_block": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "GdnDecodeFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "GdnVerifyFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -404,6 +406,11 @@ _LAZY_OPTIONAL_IMPORTS = {
     "gated_attention_block_backward": (".gated_attention_block", "gated_attention_block_backward"),
     "GatedAttentionBlockFwd": (".gated_attention_block", "GatedAttentionBlockFwd"),
     "GatedAttentionBlockBwd": (".gated_attention_block", "GatedAttentionBlockBwd"),
+    # the fused GDN decode / MTP verify step entries for SM100-class parts: direct-call kernels with the FlashInfer Qwen 3.5 GDN block's
+    # argument contract (also `cudnn.linear_attention.frost.GdnDecodeFused` / `GdnVerifyFused`); their FlashInfer backend registration is
+    # the explicit import of `cudnn.linear_attention.frost.flashinfer_gdn_backend`, never reached from here
+    "GdnDecodeFused": (".linear_attention.frost.gdn_decode_fused", "GdnDecodeFused"),
+    "GdnVerifyFused": (".linear_attention.frost.gdn_verify_fused", "GdnVerifyFused"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),

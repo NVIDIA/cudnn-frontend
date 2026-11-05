@@ -1372,12 +1372,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         )
         device = self.q_desc.device
         major, minor = torch.cuda.get_device_capability(device)
-        self._value_error_if((major, minor) != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
-
-        self._value_error_if(
-            self.tile_m is not None or self.tile_n is not None,
-            "SM80 BPROP wires no tile knobs; tile_m/tile_n must be unset",
-        )
+        self._check_native_device((major, minor), device)
+        self._check_native_tiles()
 
         self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v)
         self.flavor_d_qk, self.flavor_d_v = _SM80_BWD_FLAVOR_DIMS[self.flavor]
@@ -1451,6 +1447,16 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._logger.debug("check_support completed")
         return True
 
+    def _check_native_device(self, capability, device):
+        major, minor = capability
+        self._value_error_if(capability != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
+
+    def _check_native_tiles(self):
+        self._value_error_if(self.tile_m is not None or self.tile_n is not None, "SM80 BPROP wires no tile knobs; tile_m/tile_n must be unset")
+
+    def _check_native_scale(self, scale):
+        pass
+
     # ------------------------------------------------------------------
     def compile(self) -> None:
         """Plan-time JIT: build the TemplateParams from the plan facts, load
@@ -1485,6 +1491,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             deterministic=self.deterministic,
             thd_varlen=self.thd,
             sched_policy=sched,
+            **dict(getattr(self, "_native_template_overrides", ())),
         )
         # RoPE preconditions the old backward() asserted (the params validator
         # covers d_qk <= 128; these two involve the shape, known only here).
@@ -1542,6 +1549,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm80 is not compiled")
+        self._check_native_scale(scale_softmax)
 
         # Init-time flags are compile-time facts; execute must match them
         # exactly, in both directions (Hard Rule 1).  Under THD the length
