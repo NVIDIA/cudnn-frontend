@@ -1134,6 +1134,7 @@ def test_DSA_indexer_backward_deterministic_rejects_invalid_policy_early(monkeyp
         from cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm90 import indexer_backward_sm90
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return
 
     args = (None,) * 7
     for value in (0, 95, 97, 149, 96.0, True, None):
