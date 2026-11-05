@@ -18,7 +18,7 @@ The output epilogue reuses the exchange storage in two rounds.
 
 Q/K/V arrive pre-quantized e4m3/e5m2 with one E8M0 scale per 32 elements
 (Q/K along D, V along S) in the F8_128x4 atom order, there are no per-tensor
-descales, and P takes the unit block scale with a fixed 2**4 cast bias whose
+descales, and P takes the unit block scale with a fixed 2**8 cast bias whose
 inverse scales O.
 A warp's 256-column head-dim half spans two 128-column scale planes:
 - Q scales: one 32-bit word (four D blocks) per plane per lane, loaded from
@@ -103,13 +103,15 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(d
 
 # P -> fp8 cast bias (BAKED constant). P is quantized as P * 2**P_CAST_LOG2_SCALE
 # via the exp2 bias under the unit block scale: the online softmax adopts every
-# new row max, so P <= 1 and the cast peaks at 2^4 = 16, far below the e4m3
-# maximum of 448, while flat-row entries (P ~ 1/S) sit four binades above
-# e4m3's subnormal cliff (quantization stays normal out to S ~ 2^13). row_sum
-# accumulates in the same 2^4-scaled units and is de-scaled by the EXACT 2^-4
-# before the finalize paths (sink mix, rcp, LSE, zero-row guards run on
-# bit-identical true sums); the O leg's 2^4 is cancelled by O_SCALE.
-P_CAST_LOG2_SCALE = 4.0
+# new row max, so P <= 1 and the cast peaks at 2^8 = 256, below the e4m3
+# maximum of 448. P is relative to the row max, not normalized, so in a peaked
+# long row the other keys sit far below 1/S; the cast keeps them while P * 2^8
+# reaches half of e4m3's smallest subnormal (2^-10), i.e. down to P = 2^-18,
+# about 12.5 nats below the max. row_sum accumulates in the same 2^8-scaled
+# units and is de-scaled by the EXACT 2^-8 before the finalize paths (sink mix,
+# rcp, LSE, zero-row guards run on bit-identical true sums); the O leg's 2^8 is
+# cancelled by O_SCALE.
+P_CAST_LOG2_SCALE = 8.0
 # The O factor, which the epilogue reads as the runtime ``o_scale`` argument.
 O_SCALE = 2.0**-P_CAST_LOG2_SCALE
 # MXFP8 SF constants -- E8M0 scale factor, 32 elems share one SF (the K of one
@@ -993,7 +995,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P (EX2 is
+            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^8 * P (EX2 is
             # binade-shift-exact); see P_CAST_LOG2_SCALE.
             neg_exp_max_scaled = cutlass.Float32(P_CAST_LOG2_SCALE) - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)

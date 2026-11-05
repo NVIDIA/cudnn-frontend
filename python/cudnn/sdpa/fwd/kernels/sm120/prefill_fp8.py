@@ -113,14 +113,15 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(d
 # P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
 # accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE via the
 # exp2 bias: the online softmax adopts every new row max, so P <= 1 and the
-# cast peaks at 2^4 = 16, far below the e4m3 maximum of 448, while flat-row
-# entries (P ~ 1/S) sit four binades above e4m3's subnormal cliff
-# (quantization stays normal out to S ~ 2^13). row_sum accumulates in the
-# same 2^4-scaled units and is de-scaled by the EXACT 2^-4 before the
-# finalize paths (sink mix, rcp, LSE, zero-row guards run on bit-identical
-# true sums); the O leg's 2^4 is cancelled by the 2^-4 folded into
-# o_scale_fused.
-P_CAST_LOG2_SCALE = 4.0
+# cast peaks at 2^8 = 256, below the e4m3 maximum of 448. P is relative to the
+# row max, not normalized, so in a peaked long row the other keys sit far below
+# 1/S; the cast keeps them while P * 2^8 reaches half of e4m3's smallest
+# subnormal (2^-10), i.e. down to P = 2^-18, about 12.5 nats below the max --
+# the range the backend's Scale_S = 448 gives. row_sum accumulates in the same
+# 2^8-scaled units and is de-scaled by the EXACT 2^-8 before the finalize paths
+# (sink mix, rcp, LSE, zero-row guards run on bit-identical true sums); the O
+# leg's 2^8 is cancelled by the 2^-8 folded into o_scale_fused.
+P_CAST_LOG2_SCALE = 8.0
 validate_params(
     PARAMS,
     allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2),
@@ -727,7 +728,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P (EX2 is
+            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^8 * P (EX2 is
             # binade-shift-exact); see P_CAST_LOG2_SCALE.
             neg_exp_max_scaled = cutlass.Float32(P_CAST_LOG2_SCALE) - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)
@@ -1345,8 +1346,8 @@ class SM120FusedMultiHeadAttentionForward:
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
-                # row_sum carries the P-cast 2^4 — take it out with the EXACT
-                # 2^-4 so every finalize path below sees the true sum.
+                # row_sum carries the P-cast 2^8 — take it out with the EXACT
+                # 2^-8 so every finalize path below sees the true sum.
                 row_sum[row_half] = row_sum[row_half] * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
                 if cutlass.const_expr(self.has_sink):
