@@ -15,14 +15,16 @@ import torch
 from test_utils import bitwise_bits
 
 
-def snapshot(outputs):
+def snapshot(outputs, *, allowed_inf=None):
     assert outputs, "no outputs to compare"
+    allowed_inf = {"lse": -torch.inf} if allowed_inf is None else allowed_inf
     result = {}
     for name, value in outputs.items():
         assert isinstance(value, torch.Tensor), f"{name}: missing tensor"
         valid = torch.isfinite(value)
-        if name == "lse":
-            valid |= torch.isneginf(value)
+        if name in allowed_inf:
+            assert allowed_inf[name] in (-torch.inf, torch.inf), "only infinity sentinels may be allowed"
+            valid |= value == allowed_inf[name]
         assert valid.all(), f"{name}: non-finite result"
         result[name] = value.detach().clone()
     return result
@@ -38,9 +40,9 @@ def assert_bitwise(actual, expected, label=""):
         assert count == 0, f"{label} {name}: {count}/{a.numel()} bytes differ"
 
 
-def assert_replays(run, repeats=8):
+def assert_replays(run, repeats=8, *, allowed_inf=None):
     assert repeats >= 2, "at least two executions are required"
-    expected = snapshot(run())  # Compile before adding scheduling pressure.
+    expected = snapshot(run(), allowed_inf=allowed_inf)  # Compile before adding scheduling pressure.
     stream = torch.cuda.Stream()
     noise = torch.ones(1024 * 1024, device="cuda")
     for repeat in range(1, repeats):
@@ -49,7 +51,7 @@ def assert_replays(run, repeats=8):
             for _ in range(32):
                 noise.mul_(1.00001).add_(0.00001)
         try:
-            actual = snapshot(run())
+            actual = snapshot(run(), allowed_inf=allowed_inf)
         finally:
             torch.cuda.current_stream().wait_stream(stream)
         assert_bitwise(actual, expected, f"replay {repeat}")
@@ -82,7 +84,7 @@ def runtime():
     }
 
 
-def assert_golden(name, inputs, outputs):
+def assert_golden(name, inputs, outputs, *, allowed_inf=None):
     """Compare committed bytes; recording requires an explicit, new destination."""
     environment = runtime()
     key = hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()[:16]
@@ -95,7 +97,7 @@ def assert_golden(name, inputs, outputs):
         "schema": 1,
         "runtime": environment,
         "inputs": {name: tensor_record(value) for name, value in inputs.items()},
-        "outputs": {name: tensor_record(value) for name, value in snapshot(outputs).items()},
+        "outputs": {name: tensor_record(value) for name, value in snapshot(outputs, allowed_inf=allowed_inf).items()},
     }
     if record_dir:
         path.parent.mkdir(parents=True, exist_ok=True)

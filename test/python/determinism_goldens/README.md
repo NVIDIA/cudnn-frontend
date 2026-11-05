@@ -1,9 +1,10 @@
 # Attention determinism
 
-These five suites check the public cuDNN Frontend APIs. Run from `test/python`:
+These six suites check the public cuDNN Frontend APIs. Run from `test/python`:
 
 ```bash
-pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py -m L0
+pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0
 pytest core/test_determinism_utils.py
 ```
 
@@ -14,12 +15,14 @@ pytest core/test_determinism_utils.py
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
+| `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
 
 The four linear-attention suites live in `linear_attention/frost/test_*_determinism.py`.
 They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
 nonzero initial state and fixed output/final-state gradients. QSA lives in
 `QSA/cutedsl/test_qsa_determinism.py`; its public API has no determinism switch.
 It covers BF16 with 12:1, 24:2, and 6:1 query/KV head counts.
+DSA uses FP16/BF16 and enables `deterministic=True` on backward.
 
 Replay checks use fresh inputs and side-stream contention. Batch
 checks reuse exact sequence data and upstream gradients while removing,
@@ -30,10 +33,12 @@ while shifting its packed token and block offsets. Stress cases cross the
 boundary, or create more sequence/head work items than GPU SMs.
 
 Comparisons check tensor names, shapes, dtypes, and raw bytes. Signed zero
-differences fail. Non-finite results fail, except QSA's specified negative
-infinity LSE for an empty attention row. Snapshots own their storage. The
-helper tests include signed-zero, NaN-payload, missing-gradient, and golden
-mutation controls.
+differences fail. Non-finite results fail unless the operation declares an
+infinity sentinel: QSA uses negative-infinity LSE; DSA uses positive-infinity
+LSE and negative-infinity max logits for empty rows. DSA also checks the exact
+empty-row locations. Snapshots own their storage. Helper controls reject
+changed signed zeros, NaN payloads, missing gradients, wrong infinity signs,
+and golden mutations.
 
 ## How to read the test cases
 
@@ -43,14 +48,14 @@ node after parameter expansion. For example,
 Those eight executions are not eight reported tests. Backward cases also check
 the forward outputs and saved state used to compute gradients.
 
-The expanded set has **156 cases**: 151 operation cases and five harness
-controls. This adds 79 cases to the first 77-case set. All 156 cases are L0,
+The expanded set has **205 cases**: 199 operation cases and six harness
+controls. All 205 cases are L0,
 including stress and boundary cases, so the default marker selects the full set.
 List the exact node IDs without executing the kernels:
 
 ```bash
 pytest core/test_determinism_utils.py linear_attention/frost/test_*_determinism.py \
-  QSA/cutedsl/test_qsa_determinism.py --collect-only -q
+  QSA/cutedsl/test_qsa_determinism.py deepseek_sparse_attention/cutedsl/test_DSA_determinism.py --collect-only -q
 ```
 
 | Check | What stays fixed | What changes | Pass condition |
@@ -59,7 +64,7 @@ pytest core/test_determinism_utils.py linear_attention/frost/test_*_determinism.
 | Batch invariance | Each selected sequence and its upstream gradients | Batch size, neighbors, order, packed offsets | Its results match the corresponding baseline slice |
 | Neighbor isolation | Target sequence, mask, state, upstream gradients | Other sequences' data, state, gradients, and QSA masks | Target results do not change |
 | Golden regression | Input hashes and complete runtime key | Frontend source revision | All result hashes match the committed baseline |
-| Numerical reference | Mathematical inputs and gradient sources | GPU kernel versus independent FP64 implementation | Existing operation tolerances pass |
+| Numerical reference | Mathematical inputs and gradient sources | GPU kernel versus independent reference | Existing operation tolerances pass |
 
 The golden cases check replay and the numerical reference before reading the
 saved baseline. The new head-layout, GDP step-count, isolated-loss, and QSA
@@ -114,6 +119,36 @@ Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 direction without a separate lookup table. A test stops at its first mismatch;
 later checks in that case are not claimed as passes.
 
+### DSA: 48 cases
+
+The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`.
+Each case checks all returned forward tensors. Backward uses deterministic
+execution and checks dQ, the shared K/V latent gradient dKV, and dSink.
+The three `(heads, QK dimension, Top-K)` layouts are `(64,512,64)`,
+`(64,576,64)`, and `(128,512,128)`. The 576-wide path uses all QK dimensions
+but only the first 512 KV dimensions for values.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts; eight executions, input mutation check, numerical reference | 12 |
+| `test_batch_invariance` | L0 | Same twelve combinations; each sequence alone, packed, reversed, and duplicated | 12 |
+| `test_selection` | L0 | fprop/bprop × ragged lengths, invalid indices, empty rows, Top-K 65 tail, indexer prefix 512; replay, reference, batch checks | 10 |
+| `test_query_boundary` | L0 | fprop/bprop × H64 with 128/129/257 queries and H128 with 74/75 queries; four replays then batch checks | 10 |
+| `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring Q/KV values and Top-K selection while keeping the target fixed | 2 |
+| `test_golden` | L0 | fprop/bprop; query lengths 3, 2; Top-K 16; three executions, reference, saved hashes | 2 |
+
+Packing shifts valid Top-K indices by the sequence's KV offset. Negative and
+out-of-bounds indices stay invalid; they must not name a neighboring KV row.
+Every active row has unique valid indices, as required by generic deterministic
+DSA backward. Duplicating a sequence creates a separate KV region.
+
+dSink is one shared per-head vector, so it cannot be sliced by sequence.
+Backward batch checks isolate one target's loss: its dO stays fixed and all
+other sequences receive zero dO. The complete dSink vector is then comparable
+to the target alone. Replay/reference cases also cover nonzero dO for every
+sequence. Empty-row sentinels retain their actual float dtype and raw bits;
+NaNs and non-finite outputs/gradients still fail.
+
 ## Golden checks
 
 Each golden records SHA-256 hashes of all input and result bytes, with their
@@ -125,7 +160,8 @@ detect changes across frontend revisions on the same runtime.
 
 Golden cases first pass replay and an independent numerical reference.
 Linear attention uses the existing FP64 recurrent references on the CPU.
-QSA uses its existing FP64 attention and gradient reference. Reference
+QSA uses its existing FP64 attention and gradient reference. DSA uses the
+existing FP32 gather-based forward and autograd gradient references. Reference
 tolerances test mathematical correctness; golden and replay checks use no
 tolerance. A first execution is only a replay baseline, never a saved golden.
 
@@ -135,17 +171,19 @@ runtime baseline with an explicit directory. Missing goldens then fail:
 
 ```bash
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
-  pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py -m L0
+  pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0
 ```
 
 Record candidates into a **new** directory on a known-good revision:
 
 ```bash
 CUDNN_DETERMINISM_RECORD=/tmp/attention-goldens-candidate \
-  pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py -m L0 -k golden
+  pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -k golden
 ```
 
-Recording refuses to overwrite an existing file. Check all ten cases, inspect
+Recording refuses to overwrite an existing file. Check all twelve cases, inspect
 the input/output hashes, and explain any numerical change before replacing
 committed files. Never enable recording in a PR check. A new runtime needs its
 own reviewed baseline; matching results across architectures is not assumed.
@@ -159,35 +197,37 @@ explanation. Extend this table and the suites when adding an operation or a
 new numerical path. Keep skips limited to unsupported hardware/dependencies;
 a missing FROST plan on a supported runtime is a failure.
 
-The initial scope is the FROST training path and packed public QSA training API
+The scope is the FROST training path and public QSA/DSA sparse-attention APIs
 on SM100, SM103, and SM107. It does not establish a contract for cuTile, CAKE,
 Hopper, QSA indexed/two-pass APIs, checkpoint/summary/decode paths, shared gate
-parameters, or distributed training recipes. Existing tests cover some of
+parameters, DSA indexer/Top-K generation, score recompute, pooled DSA, or
+distributed training recipes. Existing tests cover some of
 these paths separately. Full recipe CI and an automatic source-to-test PR
 gate remain separate integration work; the checklist is a review safeguard.
 
 ## Validation: 2026-11-04
 
-Base commit: `da88207aa5b9197b0c84514a7321d5bc3d2683b4` (`develop`).
+Kernel base: `da88207aa5b9197b0c84514a7321d5bc3d2683b4` (`develop`).
 GPU: SM100, 148 SMs. Runtime: Torch `2.15.0.dev20260820+cu134`, CUDA `13.4`,
 cuDNN `92500`, CuTe DSL `4.8.0.dev0`, TVM FFI `0.1.12`.
-The complete runtime record is in [the goldens](5f8a825586430e85/kda-fprop.json).
-The test banner confirmed imports from this checkout.
+The complete runtime record is in [the goldens](5f8a825586430e85/dsa-fprop.json).
+The test banners confirmed imports from this checkout.
+
+Two disjoint default-L0 runs covered all 205 cases. Run from `test/python`:
 
 ```bash
-CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
-  python -m pytest core/test_determinism_utils.py \
-  linear_attention/frost/test_*_determinism.py \
-  QSA/cutedsl/test_qsa_determinism.py -m L0 -q
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4
+export CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"
+python -m pytest core/test_determinism_utils.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -q
+python -m pytest linear_attention/frost/test_*_determinism.py \
+  QSA/cutedsl/test_qsa_determinism.py -q
 ```
 
-The GPU run used these same 156 cases before their markers were unified as L0,
-with `-m "L0 or L1"`. Test bodies are unchanged. Default L0 collection was
-checked after the marker change.
-
-Result: **142 passed, 14 failed, 0 skipped** in 474.36 seconds.
-Of the 79 added cases, 73 passed and six failed. All six new failures are QSA.
+- DSA plus harness: **49 passed, 5 failed, 0 skipped** in 76.01 seconds.
+- Existing five operation suites: **137 passed, 14 failed, 0 skipped** in 489.44 seconds.
+- Combined: **186 passed, 19 failed, 0 skipped**. Executed node IDs match the
+  205 cases selected by default L0 collection (0.26 seconds).
 
 | Suite | fprop | bprop |
 | --- | --- | --- |
@@ -196,51 +236,64 @@ Of the 79 added cases, 73 passed and six failed. All six new failures are QSA.
 | GDN | 13 passed | 15 passed |
 | GDN-2 | 13 passed | 15 passed |
 | QSA | 15 passed, 2 failed | 6 passed, 12 failed |
+| DSA | 24 passed | 19 passed, 5 failed |
 
-All five harness controls passed. All ten golden cases passed both independent
-reference checks and saved-byte comparison in the fresh test process.
-Black, Python syntax, license headers, and `git diff --check` passed.
-The four runtime warnings were existing CuTe DSL allocator deprecations.
+All six harness controls and all twelve golden cases passed. Each golden
+case also passed replay and its independent numerical reference. DSA adds two
+new baselines; the ten existing records are unchanged. Golden recording was
+disabled in both validation runs.
+Pre-commit (Black, Black Jupyter, SPDX), Python syntax, and `git diff --check`
+passed. Runtime warnings were Torch context/debug notices and existing CuTe
+DSL scheduler/allocator deprecations.
 
-All 14 failures are in `QSA/cutedsl/test_qsa_determinism.py::TestQSA`.
-The table gives the first mismatch in each test; atomic-race counts can vary.
+### DSA failures
+
+All 24 fprop cases passed. Bprop had 19 passes and five failures, all in batch
+invariance. Every replay and numerical-reference check reached in this suite
+passed. The first mismatch in each failed case was dKV; forward results and
+dQ matched. dSink comparison was not reached after those failures.
 
 | Test | First mismatch |
 | --- | --- |
-| `test_replay[bprop-q12-kv1]` | replay 1 dK: 2 / 43,520 bytes |
-| `test_replay[bprop-q24-kv2]` | replay 1 dK: 2 / 87,040 bytes |
-| `test_replay[bprop-q6-kv1]` | replay 1 dK: 1 / 43,520 bytes |
-| `test_batch_invariance[bprop-q12-kv1]` | standalone sequence 0 dK: 4 / 33,280 bytes |
-| `test_batch_invariance[bprop-q24-kv2]` | standalone sequence 0 dK: 1 / 66,560 bytes |
-| `test_batch_invariance[bprop-q6-kv1]` | reordered batch `(1, 0)`, sequence 0 dQ: 1 / 199,680 bytes |
-| `test_sparse_batch_invariance[fprop]` | saved FP32 output: 237 / 36,864 bytes |
-| `test_sparse_batch_invariance[bprop]` | replay 1 dK: 137 / 1,054,720 bytes |
-| `test_dispatch_boundary[total513-fprop]` | target at position 0, saved FP32 output: 196 / 36,864 bytes |
-| `test_dispatch_boundary[total513-bprop]` | target at position 0, saved FP32 output: 196 / 36,864 bytes; gradient comparison not reached |
-| `test_mask_replay[all-selected-bprop]` | replay 1 dK: 1 / 43,520 bytes |
-| `test_mask_replay[empty-rows-bprop]` | replay 4 dK: 1 / 43,520 bytes |
-| `test_mask_batch_invariance[all-selected-bprop]` | standalone sequence 0 dK: 1 / 33,280 bytes |
-| `test_mask_batch_invariance[empty-rows-bprop]` | duplicated sequence 0 dK: 1 / 33,280 bytes |
+| `test_batch_invariance[h128-d512-k128-bf16-bprop]` | batch (1, 0), sequence 0 dkv: 4/164864 bytes differ |
+| `test_query_boundary[h64-q129-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `test_query_boundary[h64-q257-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `test_query_boundary[h128-q74-bprop]` | batch (1, 0), sequence 0 dkv: 6/164864 bytes differ |
+| `test_query_boundary[h128-q75-bprop]` | batch (1, 0), sequence 0 dkv: 6/164864 bytes differ |
+
+The H64 failures cross the documented 32/64/128-shard query-count thresholds.
+The H128 BF16 failures move the target within the two-CTA path. Same-shape
+replay passed: `deterministic=True` did not establish batch invariance for
+these cases. No kernel changes, xfails, or relaxed comparisons were added.
+
+### QSA failures
+
+The same 14 case IDs failed in the earlier run. First mismatch counts and
+tensors can vary with the order of atomic reductions.
+
+| Test | First mismatch |
+| --- | --- |
+| `test_replay[bprop-q12-kv1]` | replay 1 dk: 1/43520 bytes differ |
+| `test_replay[bprop-q24-kv2]` | replay 1 dk: 1/87040 bytes differ |
+| `test_replay[bprop-q6-kv1]` | replay 1 dk: 1/43520 bytes differ |
+| `test_batch_invariance[bprop-q12-kv1]` | batch (0,), sequence 0 dk: 3/33280 bytes differ |
+| `test_batch_invariance[bprop-q24-kv2]` | batch (0,), sequence 0 dk: 1/66560 bytes differ |
+| `test_batch_invariance[bprop-q6-kv1]` | batch (0,), sequence 0 dk: 1/33280 bytes differ |
+| `test_sparse_batch_invariance[fprop]` | sparse sequence 1 out_fp32: 237/36864 bytes differ |
+| `test_sparse_batch_invariance[bprop]` | replay 1 dk: 136/1054720 bytes differ |
+| `test_dispatch_boundary[total513-fprop]` | total 513, target position 0 out_fp32: 196/36864 bytes differ |
+| `test_dispatch_boundary[total513-bprop]` | total 513, target position 0 out_fp32: 196/36864 bytes differ |
+| `test_mask_replay[all-selected-bprop]` | replay 1 dv: 3/43520 bytes differ |
+| `test_mask_replay[empty-rows-bprop]` | replay 1 dk: 1/43520 bytes differ |
+| `test_mask_batch_invariance[all-selected-bprop]` | mask all-selected, batch (0,), sequence 0 dv: 3/33280 bytes differ |
+| `test_mask_batch_invariance[empty-rows-bprop]` | mask empty-rows, batch (0,), sequence 0 dk: 1/33280 bytes differ |
 
 QSA backward [documents floating-point atomic reductions](../../../docs/operations/sparse_attention/qsa.md).
-The dK replay drift is consistent with that reduction order changing. The dQ
-batch mismatch needs separate kernel analysis. The backward stress test fails
-replay before it reaches the batch comparison.
-
-Both 512-token boundary cases passed. At 513 tokens, fprop and bprop cases
-first failed on saved FP32 output; BF16 output matched. This isolates the
-batch-dependent forward routing threshold. All-masked rows, changed-neighbor
-isolation, and zero-upstream-gradient QSA cases passed in this run. The two
-failing mask-replay cases passed the numerical reference before failing exact
-byte comparison.
-
-An earlier forward probe confirmed that a 3-token sequence uses the gated
-forward path when packed after 2057 tokens, and the ungated path alone.
-Both results passed the independent reference. BF16 output was byte-identical,
-but saved FP32 output differed by at most `2.384185791015625e-7`; LSE also
-differed in 6 / 144 bytes, by at most `5.960464477539063e-8`.
-These are batch-invariance failures even though numerical tolerances pass.
-The failing tests remain active, with no xfail or relaxed tolerance.
+The dK/dV replay changes are consistent with changing reduction order. Sparse
+bprop fails replay before the batch comparison. Both 513-token cases first
+fail on saved FP32 output, before gradient comparison; BF16 output matches.
+Both 512-token controls pass. All-masked rows, changed-neighbor isolation,
+and zero-upstream-gradient QSA cases pass.
 
 ## Method
 

@@ -55,6 +55,28 @@ def test_replay_detects_changed_gradient_with_reused_storage():
         checks.assert_replays(launch, repeats=1)
 
 
+def test_infinity_sentinels_are_explicit_and_keep_sign_and_nan_checks(tmp_path, monkeypatch):
+    outputs = {"lse": torch.tensor([torch.inf]), "max_logits": torch.tensor([-torch.inf])}
+    allowed = {"lse": torch.inf, "max_logits": -torch.inf}
+    checks.assert_replays(lambda: outputs, repeats=2, allowed_inf=allowed)
+    for invalid in (-torch.inf, torch.nan):
+        with pytest.raises(AssertionError, match="non-finite"):
+            checks.snapshot({"lse": torch.tensor([invalid])}, allowed_inf=allowed)
+    with pytest.raises(AssertionError, match="non-finite"):
+        checks.snapshot(outputs)
+    with pytest.raises(AssertionError, match="non-finite"):
+        checks.snapshot({"out": torch.tensor([torch.inf])}, allowed_inf=allowed)
+    with pytest.raises(AssertionError, match="only infinity"):
+        checks.snapshot(outputs, allowed_inf={"lse": torch.nan})
+    monkeypatch.setattr(checks, "runtime", lambda: {"sm": [10, 0]})
+    monkeypatch.delenv("CUDNN_DETERMINISM_GOLDENS", raising=False)
+    monkeypatch.setenv("CUDNN_DETERMINISM_RECORD", str(tmp_path))
+    checks.assert_golden("sentinels", {}, outputs, allowed_inf=allowed)
+    monkeypatch.delenv("CUDNN_DETERMINISM_RECORD")
+    monkeypatch.setenv("CUDNN_DETERMINISM_GOLDENS", str(tmp_path))
+    checks.assert_golden("sentinels", {}, outputs, allowed_inf=allowed)
+
+
 def test_golden_requires_exact_outputs_and_never_overwrites(tmp_path, monkeypatch):
     monkeypatch.setattr(checks, "runtime", lambda: {"sm": [10, 0]})
     monkeypatch.delenv("CUDNN_DETERMINISM_GOLDENS", raising=False)

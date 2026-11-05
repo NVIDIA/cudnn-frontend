@@ -1,7 +1,7 @@
 # test — Agent Guide
 
 For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
-and the [five-suite coverage table](python/determinism_goldens/README.md).
+and the [coverage table](python/determinism_goldens/README.md).
 The shared comparator checks bytes, tensor names, shapes, and dtypes. Clone each
 result before the next launch so reused storage cannot make replay pass.
 For backward batch checks, slice fixed upstream gradients with the inputs;
@@ -13,7 +13,12 @@ Name parameter IDs with direction, dtype, and shape where applicable. Report
 collected cases separately from replay executions. Include tile/routing
 boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
 and isolated upstream-gradient sources when the operation supports them.
-Keep these five determinism suites in L0, including stress cases.
+Keep these determinism suites in L0, including stress cases.
+For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
+invalid after packing. Use unique active indices for deterministic backward.
+The sink gradient is shared across sequences: isolate the target's upstream
+gradient before comparing it across batches. Check DSA's signed infinity
+sentinels against the expected empty rows before byte comparison.
 
 MXFP8 backward's element-count allowance needs the same magnitude cap as its
 row-count allowance: an isolated large error can preserve amax and still fit
