@@ -741,8 +741,8 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     Blackwell line (cc 10.0 / 10.3), whose launches keep the module's own forms, and any line the rule was
     never measured on (``_DECODE_COMBINE_RULE_CC`` is the one line it holds for); ``None`` reads the cc 10.7
     rule (the model's direct callers; a plan always names its device).  The sparse adapter's LEAN plans on the Blackwell parts of
-    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0) evaluate this rule at the measured line's cc on purpose
-    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 class; the table sits there)."""
+    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0 / 10.3) evaluate this rule at the measured line's cc on purpose
+    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 and GB300 classes; the tables sit there)."""
     if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
         return False
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:

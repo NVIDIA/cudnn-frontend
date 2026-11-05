@@ -4348,16 +4348,19 @@ every other part / past the bound; the explicit `"lean"` takes it anywhere the b
 Blackwell parts (2026-10-28, UNMEASURED):** `sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS = ((10, 0), (10, 3))` -- on cc 10.0 / 10.3,
 outside the core's record (`sm_lo .. sm_hi` = 107 .. 119, unchanged), the adapter serves the EXPLICIT `tile_form="lean"` only (the lean body
 is SM100-legal instruction for instruction, its config pins no Rubin-only size, the DSL targets the ambient device, the sm100 split combine
-reduces the slab with the gate as for the dense d256 decode tile there -- a lean plan's combine form: on cc 10.0 the cc 10.7 split-aware
-rule's shape, measured, the next paragraph; on cc 10.3 the module's own forms, unmeasured); `"auto"` / `"tcgen05"` there resolve the core
+reduces the slab with the gate as for the dense d256 decode tile there -- a lean plan's combine form: on cc 10.0 / 10.3 the cc 10.7
+split-aware rule's shape, measured on each part, the next paragraph); `"auto"` / `"tcgen05"` there resolve the core
 and are declined by name (`sparse_tile_part_decline`, the text ending with the former Rubin-line spelling; the part set is also the record's `SparseCapabilities.lean_explicit_ccs`, appended, pinned equal to the
 rules constant), so the route can be measured on a B200-class part; the AUTO pin and the placement rule stay cc 10.7's, and the
 gated attention block's other stages keep their Rubin pins (the standalone adapter is the entry on those parts).  **The lean route's
-combine FORM on cc 10.0 (2026-10-29, MEASURED):** `sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS = ((10, 0),)` -- a LEAN plan there follows
-the cc 10.7 split-aware rule's shape (`sparse_lean_combine_rule_cc`; the decode-grid kernel on the 24-96-row grids at the lean splits, the
-module's own forms on the 384-row grid below split 32), from the 2026-10-28 measurement on the GB200 152-SM class (the decode-grid kernel
-3.0-3.8 us against the module's own forms 6.8-16.3 at 24-96 rows, 8.8-8.9 vs 7.4-16.3 at 384 rows; 15 of 16 cells named); cc 10.3 is
-UNMEASURED and keeps the module's own forms.  **The FUSED gated e4m3 store (2026-10-29; `SparseCapabilities.gated_e4m3_out`):** `o` declared
+combine FORM on cc 10.0 / 10.3 (2026-10-29 and 2026-11-05, MEASURED):** `sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS = ((10, 0), (10, 3))`
+-- a LEAN plan there follows the cc 10.7 split-aware rule's shape (`sparse_lean_combine_rule_cc`; the decode-grid kernel on the small grids at
+the lean splits, the module's own forms on the 384-row grid below split 32), from the 2026-10-28 measurement on the GB200 152-SM class (the
+decode-grid kernel 3.0-3.8 us against the module's own forms 6.8-16.3 at 24-96 rows, 8.8-8.9 vs 7.4-16.3 at 384 rows; 15 of 16 cells named)
+and the 2026-11-05 measurement on a GB300 (cc 10.3, 152 SMs at a fixed 1830 MHz clock; bf16 KV, d256, 8 / 4 / 16 query heads per KV head,
+S_q 1 and 4, KV 2k: the decode-grid kernel 3.0-3.4 us against the module's own forms 6.2-15.0 at 8-64 rows, 42 of 42 cells; the lean body at
+8 / 1 x KV 2k x S_q 1 12.8 us against 18.2 with the module's own forms); a part outside the tuple keeps the module's own forms.  **The FUSED
+gated e4m3 store (2026-10-29; `SparseCapabilities.gated_e4m3_out`):** `o` declared
 `float8_e4m3fn` + `out_scale` (one fp32 element: the consumer's static per-tensor DEQUANT scale) + the epilogue gate on a SPLIT plan (the lean
 tile always splits; the tcgen05 core needs `split_kv >= 2`; never THD) takes the split combine's fused entry
 (`sm100/split_combine.compile_ptr(gate=True, gate_e4m3=True, dtype_o="e4m3")`): `e4m3(rn, satfinite)(O32 * sigmoid(G) * div.rn(1, scale))`,
