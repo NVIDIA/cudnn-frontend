@@ -1,0 +1,25 @@
+# sm_107a PTX md5 PER KERNEL of the d128 grouped THD cta_group::2 chain with tmem_map "dq_576" AND smem_map "rubin_b2" NAMED on cc 10.7
+# (prepared_d128_host.compile_host_grouped_2cta with sm = 107, tmem_map="dq_576", smem_map="rubin_b2", every other typed field unset: warp_roles 16w,
+# mask_form fsel, dkv_accum bf16_partials, stats_form tma_ring, no probe, no stamps; host trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2
+# is in test_sdpa_bwd_d128_2cta_stail_sm100.py).  The pair body of bprop_d128_f16.py on the 327 KiB oversized carveout (the
+# SOL card's arm R2.c, 2026-11-03; SMEM_BYTES 314368): sQ1 x2, sDO1 x2, the TWO-STAGE sDS + sDS_xchg staging ring with the lagging epilogue order and the
+# LEADER row dq_read_done, on the independent dQ TMEM image (the kernel header sections 5 / 8 / 11; selectable by name, not a default: its A/B/A against
+# smem_map "sm100" on cc 10.7 is the benchmark step's row).  Only the MAIN kernel's row differs from the dq_576 record
+# (md5_d128_accum_grouped_2cta_stail_dq576_sm_107a.txt): the setup, delta-and-stats and cast kernels read neither map.  Census vs the dq_576 x sm100
+# rendering at this geometry: mbarrier.arrive 40 -> 44 (the two dq_read_done arrive sites + the two extra dQ rounds' dq_full), the relaxed cluster
+# arrive form 5 -> 7, mapa 15 -> 16 (one hoisted mapa serves both dq_read_done sites), try_wait 65 -> 75 and bar.warp.sync 64 -> 74 (dq_read_done x 3 =
+# two issue sites + the P15 drain, the item-end dq_done wait, 2 x 2 dq_empty waits of the extra rounds, the two ring drains at depth 2),
+# tcgen05.fence::after_thread_sync 27 -> 31, tcgen05.fence::before_thread_sync 7 -> 8 and tcgen05.wait::ld 8 -> 9 (the item-end readout), mbarrier.init
+# 41 -> 50 (8 grown slots + the new row), fence.proxy.async 15 -> 17 and st.shared.v2.b64 24 -> 40 (the two extra rounds); every other row equal (72 MMA,
+# 13 commits, 12 TMA, the ship, 4 reduce-adds, 12 expect_tx, 38 LDS.128, .local 0, nanosleep 0, the 144 / 144 / 80 split, the exclusive 576-column alloc).
+# One row per kernel the chain OWNS: the md5 of that kernel's `.entry` region of the dumped module (frost_test_utils.ptx_kernel_md5s), so a row
+# moves only when the kernel it names changes.  The dK / dV group fold dkv_reduce_thd_origins_kernel is launched by this chain AND the one-CTA
+# grouped THD chain and is EXCLUDED here (frost_test_utils.D128_THD_SHARED_KERNELS).  Re-render deliberately on a protocol change and say so here.
+# Re-pinned once before the first GREEN run: the bring-up rendering (a58973ea) hung on cc 10.7 -- the leader advanced its sQ1 ring state by the base
+# record's depth (1) against the loader's geometry depth (2); the barrier AUDIT of the snapshot named the one token (`advance(q1_state, geo.Q1_STAGES)`),
+# the main row moved to the rendering below, the census above is unchanged (a depth constant is not a site).
+dsl=nvidia-cutlass-dsl 4.8.1
+d128_accum_grouped_2cta_stail_dq576_b2 sm_107a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=824f5ab6c74347df9b7441ecac028820
+d128_accum_grouped_2cta_stail_dq576_b2 sm_107a default kernel=delta_zero_stats_thd_d128_2cta_kernel rc=0 ptx_md5=1826f78e59b07a34dc67f398503e466e
+d128_accum_grouped_2cta_stail_dq576_b2 sm_107a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=defcba6fadff68ebce0518818af4bc31
+d128_accum_grouped_2cta_stail_dq576_b2 sm_107a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=9621254b15c92badbdb00185d4efcb19

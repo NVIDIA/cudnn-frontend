@@ -415,10 +415,10 @@ class Mxfp8ColRequant:
         self.dst_k_major = bool(dst_k_major)
 
         self._require_token_padding_block(self.token_padding_block)
-        if self.sf_padding_block != self.SfAtomNonK:
+        if self.sf_padding_block <= 0 or self.sf_padding_block % self.SfAtomNonK:
             raise ValueError(
-                f"sf_padding_block must be {self.SfAtomNonK} for the 32x4x4 atom layout, "
-                f"got {self.sf_padding_block}."
+                f"sf_padding_block must be a positive multiple of {self.SfAtomNonK} "
+                f"for the 32x4x4 atom layout, got {self.sf_padding_block}."
             )
 
         if scaled_cvt is None:
@@ -820,6 +820,43 @@ class Mxfp8ColRequant:
                 cute.copy(store_atom, zero, destination)
                 vector_index = vector_index + vector_stride
 
+    @cute.jit
+    def _clear_sf_padding_atoms(self, dst_sf, tbl_vend, tbl_data, tbl_sf, tidx, bidx, grid_dim_x):
+        """Clear whole SF atoms beyond each expert's live 128-token tiles.
+
+        For unequal data/SF padding, consumers skip all-padding tiles and
+        this helper owns their SF atoms. The stores are disjoint and need no
+        grid barrier. Equal padding uses the consumer stores alone.
+        """
+        zero = cute.make_rmem_tensor((4,), Int32)
+        for element in cutlass.range_constexpr(4):
+            zero[element] = Int32(0)
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128)
+        vector_stride = Int64(grid_dim_x) * Int64(self.ThreadsPerCta)
+        vectors_per_atom = cutlass.const_expr(self.SfAtomBytes // 16)
+        for expert in cutlass.range(self.num_experts, unroll=1):
+            valid_rows = Int32(tbl_vend[expert]) - Int32(tbl_data[expert])
+            live_atoms = (valid_rows + Int32(self.SfAtomNonK - 1)) // Int32(self.SfAtomNonK)
+            sf_atoms = (Int32(tbl_sf[expert + 1]) - Int32(tbl_sf[expert])) // Int32(self.SfAtomNonK)
+            padding_vectors = Int64(sf_atoms - live_atoms) * Int64(vectors_per_atom)
+            total_vectors = padding_vectors * Int64(self._hidden_atoms)
+            vector_index = Int64(bidx) * Int64(self.ThreadsPerCta) + Int64(tidx)
+            while vector_index < total_vectors:
+                hidden_atom = vector_index // padding_vectors
+                padding_vector = vector_index - hidden_atom * padding_vectors
+                byte_offset = (
+                    Int64(tbl_sf[expert]) * Int64(self.hidden // self.TokensPerBlock)
+                    + (hidden_atom * Int64(sf_atoms) + Int64(live_atoms)) * Int64(self.SfAtomBytes)
+                    + padding_vector * Int64(16)
+                )
+                destination = cute.make_tensor(
+                    cute.make_ptr(Int32, dst_sf.iterator.toint() + byte_offset,
+                                  AddressSpace.gmem, assumed_align=16),
+                    cute.make_layout((4,)),
+                )
+                cute.copy(store_atom, zero, destination)
+                vector_index = vector_index + vector_stride
+
     # ---------------------------------------------------------------- kernel
     @cute.kernel
     def ws_kernel(
@@ -903,6 +940,11 @@ class Mxfp8ColRequant:
                 dst_data, Int32(tbl_data[self.num_experts]),
                 Int32(previous_data_rows[0]), tidx, bidx, grid_dim_x,
             )
+
+        if cutlass.const_expr(
+            self.sf_padding_block > self.SfAtomNonK and TOKPAD != self.sf_padding_block
+        ):
+            self._clear_sf_padding_atoms(dst_sf_u8, tbl_vend, tbl_data, tbl_sf, tidx, bidx, grid_dim_x)
 
         total_tiles = Int32(tbl_data[self.num_experts]) // Int32(TOK)
 

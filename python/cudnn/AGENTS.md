@@ -368,8 +368,10 @@ DSL satisfies your kernel.**
   floor. Keep the existing version gates and actionable errors.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
-  `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
-  version** — `cutedsl_requirement_error(what)` builds it. Never let the failure
+  `CUTEDSL_MIN_VERSION`; a kernel whose own floor is higher passes it as
+  `floor=`, never a second copy of the version parse) and **decline, or raise an
+  error that names the version** — `cutedsl_requirement_error(what, floor=...)`
+  builds it. Never let the failure
   surface as an `AttributeError` / `TypeError` / `ModuleNotFoundError` from
   inside the DSL, and never let it read as a missing-dependency install hint:
   the package is installed, and that `pip install` changes nothing.

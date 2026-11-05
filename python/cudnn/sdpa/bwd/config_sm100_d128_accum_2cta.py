@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Grouped THD d128 accumulation geometry on the cta_group::2 datapath (one cga2 PAIR per 256 kv rows).
 
-Layout-only record for ``kernels/sm100/bprop_d128_accum_grouped_2cta_f16.py``: every byte offset, TMEM column and
+Layout-only record of the d128 pair chain (the base record ``config_sm100_d128_accum_2cta_stail`` refines; the pair chain kernels of ``kernels/sm100/bprop_d128_f16.py`` read it): every byte offset, TMEM column and
 register count derives from the geometry fields below and is re-derived by :func:`validate_config` at import.  The
 barrier table (``BAR_LAYOUT``) is FILLED BY the barrier audit; this module only reserves its bytes.
 
@@ -482,7 +482,23 @@ class Config:
         #                      wavefronts per tile per CTA; registers / compute / waits unchanged)
         #   sdq_sts_off:       the sDQ slice STS + its proxy fence skipped per round; the reduce-add reads stale staging (-256 wavefronts);
         #                      the ring protocol kept
-        return ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
+        #   s_tail_wait_off:   the leader's s_tail_empty WAIT sites skipped (the s_tail body's three D1 sites + the post-loop drain); every
+        #                      arrive and every state advance kept: a LEADER relaxed thread-count row with no tx bytes, so the unobserved
+        #                      phases flip without an over-arrival fault; S^T(t+1) may overwrite an unread dQ(t-1): dQ wrong = the ceiling
+        #                      of the s_tail_empty edge (an independent dQ TMEM image)
+        #   s_read_wait_off:   the leader's s_read WAIT at slot 2 of every tile skipped (arrive / ready_state kept, the same argument); dQ(t-1)
+        #                      may land under the softmax's S^T(t) read: S / dQ wrong = the ceiling of the s_read edge
+        #   s_tail_and_s_read_wait_off: both of the above in ONE rendering (two const_expr guards, no third code path) = the ceiling of the
+        #                      whole S-tail alias (both edges of the dQ-in-S^T-tail image)
+        return (
+            "dq_reduce_add_off",
+            "exchange_off",
+            "stats_one_chunk",
+            "sdq_sts_off",
+            "s_tail_wait_off",
+            "s_read_wait_off",
+            "s_tail_and_s_read_wait_off",
+        )
 
     @property
     def DV_FULL_LANES(self):
@@ -713,8 +729,22 @@ def validate_config():
     assert (c.SOFTMAX_WARPS * s_regs + c.EPILOGUE_WARPS * e_regs + c.SERVICE_WARPS * v_regs) * 32 == c.REGFILE
     assert all(r % 8 == 0 and 24 <= r <= 256 for r in (s_regs, e_regs, v_regs))
     assert s_regs >= c.ENTRY_REGS and e_regs >= c.ENTRY_REGS and v_regs <= c.ENTRY_REGS  # INCREASE / INCREASE / DECREASE
-    assert c.DIAG_2CTA_NAMES == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off") and len(set(c.DIAG_2CTA_NAMES)) == 4
-    assert diag_2cta_code(None) == 0 and [diag_2cta_code(n) for n in c.DIAG_2CTA_NAMES] == [1, 2, 3, 4]  # distinct, non-zero codes
+    assert (
+        c.DIAG_2CTA_NAMES
+        == (
+            "dq_reduce_add_off",
+            "exchange_off",
+            "stats_one_chunk",
+            "sdq_sts_off",
+            "s_tail_wait_off",
+            "s_read_wait_off",
+            "s_tail_and_s_read_wait_off",
+        )
+        and len(set(c.DIAG_2CTA_NAMES)) == 7
+    )
+    # distinct, non-zero codes; the three S-tail wait probes joined AFTER the four earlier ones (codes 1-4 unchanged)
+    assert diag_2cta_code(None) == 0 and [diag_2cta_code(n) for n in c.DIAG_2CTA_NAMES] == list(range(1, 8))
+    assert c.DIAG_2CTA_NAMES[:4] == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")
     assert c.DQ_SLICE_LANES == c.Q_HALF  # one lane per q row of ONE d half: the M=128 D image's lane split
     assert (c.MCAST_PAIR_MASK, c.XCHG_BARRIER) == (0b11, 2) and c.XCHG_BARRIER not in (0, c.SOFTMAX_BARRIER)
     assert (c.Q1_TX, c.Q2_TX, c.DO1_HALF_TX, c.DO2_TX) == (32768, 32768, 16384, 32768)

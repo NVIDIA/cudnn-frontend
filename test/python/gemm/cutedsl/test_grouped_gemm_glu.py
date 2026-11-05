@@ -77,7 +77,9 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
     ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
 )
 def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
 
     problem = make_grouped_gemm_glu_bf16_problem(discrete=discrete, b_major=b_major)
@@ -110,7 +112,9 @@ def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
 
 @pytest.mark.L0
 def test_grouped_gemm_glu_class_bf16_rejects_single_group_runtime_offsets():
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
 
     problem = make_grouped_gemm_glu_bf16_problem(discrete=False, b_major="k")
@@ -2206,7 +2210,9 @@ def test_grouped_gemm_glu_bf16_rejects_sf_fp8_dtype_override(request):
     This is what the None default buys: with an "e4m3" default the value would
     always be non-None and could not be distinguished from an explicit request.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
 
     try:

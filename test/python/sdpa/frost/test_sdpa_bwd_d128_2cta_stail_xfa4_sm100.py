@@ -178,7 +178,7 @@ def test_xfa4_warp_roles_is_typed_and_declines_by_name():
 
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import warp_roles
 
     assert cfgmod.resolve_warp_roles(None) == "16w" == cfgmod.resolve_warp_roles("16w")
@@ -280,7 +280,7 @@ def test_xfa4_softmax_site_order_is_the_audited_stub_order():
         "_skew_leader_ship(rank)",
         "bars.ds_recv_full.arrive(n_bytes=xchg_tx, pred=ship_pred)",  # the merged tree: exchange_off re-sited -- the config-selected byte count (0 under the probe)
         "if cutlass.const_expr(not exchange_off):",  # the merged tree: the ship is the ONLY statement under the exchange_off guard (as at the 16w site)
-        "_ship_xchg(slab, bars, rank, ship_pred)",
+        "_ship_xchg(slab, bars, rank, ship_pred, None, geo, False)",  # the smem_map arm: stage None / the sm100 ring form (rubin_b2 declines 16w_fa4)
     ]
     assert [_stmt(ln) for ln in fa4] == order, fa4
     assert not any("tcgen05_fence" in ln for ln in fa4), "no tcgen05 fence between the STS and the ds_smem arrive (the words come from registers)"
@@ -303,7 +303,7 @@ def test_xfa4_softmax_site_order_is_the_audited_stub_order():
     issue = _function_code(src, "_dq_issue", "_dq_slot")
     i_c = next(i for i, ln in enumerate(issue) if "_commit_pair(bars.dq_war_done, elect_p)" in ln)
     assert _stmt(issue[i_c - 1]) == "if cutlass.const_expr(fa4_roles):" and "_commit_pair(bars.dq_done, elect_p)" in issue[i_c + 1], issue[i_c - 1 : i_c + 2]
-    assert "mma_ss(dqdesc, dsd, k2d, dq_acc)" in issue[i_c - 2], issue[i_c - 2]
+    assert "mma_ss(dqdesc, dsd_s, k2d, dq_acc)" in issue[i_c - 2], issue[i_c - 2]
     assert (
         len(re.findall(r"^\s+_commit_pair\(bars\.dq_war_done, elect_p\)", src, re.M)) == 1
     ), "ONE commit site in code (the helper at two call sites; the header quotes it)"
@@ -327,7 +327,7 @@ def test_xfa4_reduce_group_order_and_no_ds_work():
     src = _body_source()
     rd = _function_code(src, "_reduce_loop", "_load_loop")
     wait = next(i for i, ln in enumerate(rd) if "_wait_tcgen(bars.dq_done, dq_state.phase, None, 0)" in ln)
-    ld = next(i for i, ln in enumerate(rd) if "dq = _tmem_load(tmem_base + CFG.DQ_COL, CFG.DQ_COLS)" in ln)
+    ld = next(i for i, ln in enumerate(rd) if "dq = _tmem_load(tmem_base + geo.DQ_COL, CFG.DQ_COLS)" in ln)
     arrive = next(i for i, ln in enumerate(rd) if "_arrive_leader(bars.s_tail_empty)" in ln)
     rounds = [i for i, ln in enumerate(rd) if "_dq_round(" in ln]
     assert wait < ld < arrive < rounds[0] < rounds[1] and len(rounds) == 2, (wait, ld, arrive, rounds)
@@ -358,23 +358,43 @@ def test_xfa4_dp_empty_and_ds_tmem_absent_from_the_16w_fa4_paths():
     assert len(dpe) == 4, dpe  # the state, the slot-1 wait, the advance, the drain
     for i in dpe:
         assert leader[i - 1].strip() == "if cutlass.const_expr(not fa4_roles):", (leader[i - 1], leader[i])
-    assert leader[-1].strip() == '_wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])' and "dvk_empty" in leader[-2]
+    assert leader[-1].strip() == '_wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])'
+    # the drain under its s_tail_wait_off guard, under the s_tail map's guard (tmem_map dq_576 has no row to drain), after the dvk_empty drain
+    assert (
+        leader[-2].strip() == "if cutlass.const_expr(not s_tail_off):"
+        and leader[-3].strip() == "if cutlass.const_expr(not dq576):"
+        and "_wait_tcgen(bars.dq_read_done, dq_read_state.phase" in leader[-4]  # the rubin_b2 P15 drain (smem_map; 16w_fa4 declines it by name)
+        and leader[-5].strip() == "if cutlass.const_expr(b2):"
+        and "dvk_empty" in leader[-6]
+    )
     kernel = _function_code(src, "bprop_d128_accum_grouped_2cta_stail_kernel", "main_thd_2cta_stail_host")
-    assert any("bars = _bars(slab, fa4_roles, tma_ring)" in ln for ln in kernel) and any(
+    assert any("bars = _bars(slab, fa4_roles, tma_ring, dq576, b2)" in ln for ln in kernel) and any(
         "fa4_roles = warp_roles_code == WARP_ROLES_16W_FA4" in ln for ln in kernel
     )
     assert any("tma_ring = stats_form_code == STATS_FORM_TMA_RING" in ln for ln in kernel)
     i_red = next(i for i, ln in enumerate(kernel) if "_reduce_loop(" in ln)
     assert kernel[i_red - 1].strip() == "if cutlass.const_expr(fa4_roles):" and kernel[i_red + 1].strip() == "else:" and "_epilogue_loop(" in kernel[i_red + 2]
-    for guard in ("warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)", "fa4_roles and debug_clk", "fa4_roles and dkv_fp32", "tma_ring and fa4_roles"):
+    for guard in (
+        "warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)",
+        "fa4_roles and debug_clk",
+        "fa4_roles and dkv_fp32",
+        "tma_ring and fa4_roles",
+        "dq576 and fa4_roles",  # the TMEM map dq_576 is the 16w epilogue's (its reuse edge rides that role's program order)
+    ):
         assert any(f"if cutlass.const_expr({guard}):" in ln for ln in kernel), guard
     # the bundles: one 34-field class + one 32-field NamedTuple built from BAR_LAYOUT_XFA4; the init loop runs over whichever bundle it was handed
     assert 'BarsXFA4 = NamedTuple("BarsXFA4", [(row[0], MBarrier) for row in BAR_LAYOUT_XFA4])' in src
     assert "for i in cutlass.range_constexpr(len(bars)):" in src
     bars_fn = _function_code(src, "_bars", "_wait")
-    assert any('bar_layout_for_roles("16w_fa4" if fa4_roles else "16w", "tma_ring" if tma_ring else "ldg")' in ln for ln in bars_fn) and any(
-        "bundle = BarsRing if tma_ring else (BarsXFA4 if fa4_roles else Bars)" in ln for ln in bars_fn
-    )
+    assert any(
+        '"16w_fa4" if fa4_roles else "16w", "tma_ring" if tma_ring else "ldg", "dq_576" if dq576 else "s_tail", "rubin_b2" if b2 else "sm100"' in ln
+        for ln in bars_fn
+    ) and any("bundle = _BUNDLES.get((fa4_roles, tma_ring, dq576, b2))" in ln for ln in bars_fn)
+    import importlib
+
+    body = importlib.import_module(_BODY_MODULE)
+    assert body._BUNDLES[(True, False, False, False)] is body.BarsXFA4 and body._BUNDLES[(True, True, False, False)] is None
+    assert (True, False, True, False) not in body._BUNDLES and not any(k[0] and k[3] for k in body._BUNDLES)  # no 16w_fa4 x dq_576 / x rubin_b2 bundle
     # the follower relay, the loader, the store warp and the scheduler read no role shape (item 6)
     for fn, nxt in (("_mma_loop_follower", "_reduce_loop"), ("_load_loop", "_store_loop"), ("_store_loop", "_scheduler_loop")):
         code = _function_code(src, fn, nxt)
@@ -395,12 +415,13 @@ def test_xfa4_skew_levers_keep_one_site_each_and_the_new_dq_war_lever_exists():
         ("_skew_follower_item_end", "FOLLOWER_EPILOGUE_ITEM_END"),
     ):
         assert src.count(f"cutlass.const_expr(DEBUG_{lever}_DELAY_US > 0)") == 1, lever
-        assert len(re.findall(rf"^\s+{helper}\(rank\)", src, re.M)) == 2, helper  # the 16w site (epilogue) + the 16w_fa4 site (softmax / reduce group)
+        # the 16w site (epilogue) + the 16w_fa4 site (softmax / reduce group); the dQ readout lever has the two rubin_b2 readout sites too (in-loop, item end)
+        assert len(re.findall(rf"^\s+{helper}\(rank\)", src, re.M)) == (4 if helper == "_skew_follower_dq_readout" else 2), helper
     issue = _function_code(src, "_dq_issue", "_dq_slot")
-    gates = [i for i, ln in enumerate(issue) if "_wait_tcgen(bars." in ln]
+    gates = [i for i, ln in enumerate(issue) if "_wait_tcgen(" in ln]  # the three dS gates (ring slots) + the rubin_b2 dq_read_done gate under its guard
     lever = next(i for i, ln in enumerate(issue) if "DEBUG_SOFTMAX_DQ_WAR_DELAY_US > 0" in ln)
-    mma = next(i for i, ln in enumerate(issue) if "mma_ss(dqdesc, dsd, k2d, dq_acc)" in ln)
-    assert len(gates) == 3 and gates[-1] < lever < mma, (gates, lever, mma)
+    mma = next(i for i, ln in enumerate(issue) if "mma_ss(dqdesc, dsd_s, k2d, dq_acc)" in ln)
+    assert len(gates) == 4 and gates[-1] < lever < mma, (gates, lever, mma)
     assert src.count('nvvm.inline_ptx("nanosleep.u32 1000;"') == len(exposed)
 
 

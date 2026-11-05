@@ -4,8 +4,11 @@
 
 import pytest
 import torch
+from block_sparse_attention.cutedsl.bsa_utils import require_arch
 
 from cudnn import BSA
+
+pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 @pytest.mark.L0
@@ -32,8 +35,7 @@ def test_blk128_padding_rejects_unsupported_arch_before_dispatch(monkeypatch, ar
 @pytest.mark.parametrize("bucket", [1, 128])
 @pytest.mark.parametrize("sq,sk,dim,layout", [(512, 512, 128, "bshd"), (389, 517, 128, "bhsd"), (257, 257, 64, "bshd")])
 def test_sm100_blk128_padding(bucket, sq, sk, dim, layout):
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Requires SM100/SM103")
+    require_arch(archs=(100, 103), reason="Requires SM100/SM103")
     torch.manual_seed(13)
     q = torch.randn(2, sq, 2, dim, device="cuda", dtype=torch.bfloat16)
     k, v = [torch.randn(2, sk, 2, dim, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
@@ -75,8 +77,7 @@ def test_sm100_blk128_padding(bucket, sq, sk, dim, layout):
 
 @pytest.mark.L0
 def test_sm100_blk128_padding_graph_replay():
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Requires SM100/SM103")
+    require_arch(archs=(100, 103), reason="Requires SM100/SM103")
     torch.manual_seed(19)
     q, k, v, do = [torch.randn(1, 256, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)]
     ids = torch.tensor([0, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 2).expand(1, 2, 2, 2).contiguous()
@@ -105,8 +106,7 @@ def test_sm100_blk128_padding_graph_replay():
 @pytest.mark.L1
 def test_sm100_blk128_auto_bucket_cache_transitions():
     """One visible token gives an exact oracle across single/multiple Q groups."""
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Requires SM100/SM103")
+    require_arch(archs=(100, 103), reason="Requires SM100/SM103")
     k = torch.zeros(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16)
     v = torch.full_like(k, -7)
     v[:, 0] = 2
@@ -130,8 +130,7 @@ def test_sm100_blk128_auto_bucket_cache_transitions():
 @pytest.mark.L0
 def test_sm100_blk128_kv_prefix_boundaries():
     """Partial KV prefixes must preserve all gradients across internal MMA boundaries."""
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Requires SM100/SM103")
+    require_arch(archs=(100, 103), reason="Requires SM100/SM103")
     torch.manual_seed(123)
     q, k, v, do = [torch.randn(1, 256, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)]
     ids = torch.tensor([0, 1], device="cuda", dtype=torch.int32).view(1, 1, 1, 2).expand(1, 2, 2, 2).contiguous()

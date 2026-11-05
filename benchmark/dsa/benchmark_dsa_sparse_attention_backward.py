@@ -362,6 +362,7 @@ def comma_separated_ints(s):
 
 
 def parse_args():
+    """Parse command-line options for the DSA backward benchmark."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "mode",
@@ -414,7 +415,7 @@ def parse_args():
         type=int,
         choices=(4, 8, 16, 32, 64),
         default=None,
-        help="force the deterministic large-context relay to 4, 8, 16, 32, or 64 logical CTAs per group (default: automatic)",
+        help=("force the deterministic relay to 4, 8, 16, 32, or 64 logical CTAs per group " "(default: C16 on SM90, automatic on SM100)"),
     )
     p.add_argument(
         "--sorted-topk",
