@@ -549,6 +549,12 @@ PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
 ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_SMALL_SMEM_ORDER = (PAIR_NBUF2_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_FORMS = (TWO_CTA_CFG,) + BEYOND_SMALL_SMEM_ORDER
+# Past the one-CTA grid at a geometry OTHER than the default the register-capped two-CTAs-per-SM form is not picked: on sm_100a it is
+# spill-free at the default geometry (128 registers, 0 stack, 0 STL / LDL) but spills at every per-rank geometry rendered (1 / 8 / 8192,
+# 2 / 16 / 8192, 4 / 32 / 8192 and 4 / 16 / 4096 alike: 128 registers + 56 B stack + 14 STL / 14 LDL -- not a hidden-width term), and a
+# form that spills is unmeasured there by the budget rule; the one-CTA form runs in two waves instead (the same kernel body, bitwise), with
+# the one-CTA token bound (8 on the cc 10.0 readings).  TWO_CTA_CFG stays available as an explicit form.
+BEYOND_FORMS_OFF_DEFAULT = (CFG,) + BEYOND_SMALL_SMEM_ORDER
 
 
 def part_readings(smem_per_sm: int, smem_optin: int) -> dict:
@@ -598,7 +604,9 @@ def with_geometry(form: Cfg, geometry: Geometry) -> Cfg:
 def _ladder(requests: int, sm_count: int, geometry: Geometry = DEFAULT_GEOMETRY):
     """The regime's ladder by the SM count for ``geometry``'s V heads per rank: the pair forms while every CTA of the ``requests x 2
     V_HEADS`` cluster grid has an SM of its own (``requests x 96`` at the default geometry), the one-CTA forms while every CTA of the
-    ``requests x V_HEADS`` grid has one (``requests x 48``), the beyond forms past that.  Plan-time facts, validated."""
+    ``requests x V_HEADS`` grid has one (``requests x 48``), the beyond forms past that -- ``BEYOND_FORMS`` (the two-CTAs-per-SM form first)
+    at the default geometry, ``BEYOND_FORMS_OFF_DEFAULT`` (the one-CTA form in two waves first) at any other, where that capped form spills.
+    Plan-time facts, validated."""
     if not isinstance(requests, int) or requests < 1:
         raise ValueError(f"gdn_verify_fused: requests must be a positive int, got {requests!r}")
     if not isinstance(sm_count, int) or sm_count < 1:
@@ -607,7 +615,9 @@ def _ladder(requests: int, sm_count: int, geometry: Geometry = DEFAULT_GEOMETRY)
         raise ValueError(f"gdn_verify_fused: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
     if requests * geometry.V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
         return PAIR_FORMS
-    return ONE_CTA_FORMS if requests * geometry.V_HEADS <= sm_count else BEYOND_FORMS
+    if requests * geometry.V_HEADS <= sm_count:
+        return ONE_CTA_FORMS
+    return BEYOND_FORMS if geometry == DEFAULT_GEOMETRY else BEYOND_FORMS_OFF_DEFAULT  # the capped form spills off the default geometry
 
 
 def default_cfg(
@@ -621,7 +631,8 @@ def default_cfg(
     """The pick per requests on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a two-argument
     call is the measured cc 10.0 pick) for ``geometry`` (the default geometry's 48 V heads per rank unless given; a rank with fewer V heads
     moves the switches up by the same rule -- 8 V heads on 152 SMs: the pair to 9 requests, one CTA per SM to 19 -- the budget rule,
-    unmeasured there until its own cells run).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
+    unmeasured there until its own cells run; past the one-CTA grid such a geometry takes the one-CTA form in two waves, never the
+    two-CTAs-per-SM form, which spills there: ``BEYOND_FORMS_OFF_DEFAULT``).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
     the ``requests x 96`` cluster grid has an SM of its own (one request on a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA
     per SM) while every CTA of the ``requests x 48`` grid has one, ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the
     device's SMs -- on a 148- or 152-SM part the switches are between 1 request (96 cluster CTAs) and 2 (192 as a pair; 96 one-CTA CTAs),
@@ -661,7 +672,8 @@ def max_tokens_served(
     geometry: Geometry = DEFAULT_GEOMETRY,
 ) -> int:
     """The largest tokens-per-request count ``default_cfg`` serves for ``requests`` on the part (for ``geometry``'s V heads per rank, which
-    set the regime): the primary form's bound where it is admissible (35 / 8 / 45 on the cc 10.0 readings by regime), else the largest
+    set the regime): the primary form's bound where it is admissible (35 / 8 / 45 on the cc 10.0 readings by regime at the default
+    geometry; 35 / 8 / 8 at any other, whose beyond-the-grid pick is the one-CTA form), else the largest
     bound over the admissible rest of the ladder (17 on the cc 12.0 readings at every requests count); the typed decline of a part with no
     form.  The one bound the entry, its ``check_support`` and FlashInfer's probe answer alike."""
     ladder = _ladder(requests, sm_count, geometry)

@@ -462,8 +462,11 @@ def test_the_default_geometry_is_the_validated_one_and_its_constants_are_unchang
 def test_a_rank_geometry_derives_its_forms_ladder_and_token_bounds(g):
     """A form compiled for a per-rank geometry differs from the module form in ``GEOM`` alone (the shared-memory budget per token count,
     the token bound, the lane map and the co-residency carry no head-count or hidden term; the ticket limit follows the V-per-K ratio); the
-    pick's regime switches move with the V heads per rank by the one rule, the served token bound with them (35 / 8 / 45 by regime on the
-    cc 10.0 readings), the resolved norm form rides on the geometry form, and the cc 12.0 readings walk the same ladder."""
+    pick's regime switches move with the V heads per rank by the one rule, the served token bound with them (35 / 8 / 8 by regime on the
+    cc 10.0 readings: past the one-CTA grid a per-rank geometry takes the one-CTA form in two waves, never the two-CTAs-per-SM form, which
+    is spill-free at the default geometry only -- the sm_100a census: 128 registers / 0 stack / 0 STL-LDL at 16 / 48 / 5120 against 128 /
+    56 B / 14 STL + 14 LDL at every per-rank geometry, hidden 4096 included), the resolved norm form rides on the geometry form, and the
+    cc 12.0 readings walk the same ladder."""
     V = g.V_HEADS
     cfg, pair, two = (kcfg.with_geometry(f, g) for f in (kcfg.CFG, kcfg.PAIR_CFG, kcfg.TWO_CTA_CFG))
     assert cfg == replace(kcfg.CFG, GEOM=g) and cfg.GEOM is g and cfg != kcfg.CFG and hash(cfg) != hash(kcfg.CFG)
@@ -479,14 +482,19 @@ def test_a_rank_geometry_derives_its_forms_ladder_and_token_bounds(g):
             b.STATE_BOX_PITCH_ELEMS,
             b.co_resident_ctas(2),
         )
-    envelope = {kcfg.PAIR_CFG: 35, kcfg.CFG: 8, kcfg.TWO_CTA_CFG: 45}
+    envelope = {kcfg.PAIR_CFG: 35, kcfg.CFG: 8}
+    assert kcfg.BEYOND_FORMS_OFF_DEFAULT[0] is kcfg.CFG and kcfg.TWO_CTA_CFG not in kcfg.BEYOND_FORMS_OFF_DEFAULT and kcfg.BEYOND_FORMS[0] is kcfg.TWO_CTA_CFG
     for sms in (148, 152, 170, 188):
         for requests in range(1, 41):
-            want = kcfg.PAIR_CFG if requests * 2 * V <= sms else (kcfg.CFG if requests * V <= sms else kcfg.TWO_CTA_CFG)
+            want = kcfg.PAIR_CFG if requests * 2 * V <= sms else kcfg.CFG  # the one-CTA form past the grid too (two waves)
             got = kcfg.default_cfg(requests, sms, geometry=g)
-            assert got == replace(want, GEOM=g) and got.GEOM is g, (sms, requests)
+            assert got == replace(want, GEOM=g) and got.GEOM is g and got.MIN_CTAS_PER_SM == 1, (sms, requests)
             assert kcfg.default_cfg(requests, sms, *SM100_READING, 6, g) == got
             assert kcfg.max_tokens_served(requests, sms, geometry=g) == envelope[want], (sms, requests)
+            if requests * V > sms:
+                assert kcfg._ladder(requests, sms, g) is kcfg.BEYOND_FORMS_OFF_DEFAULT
+    # the default geometry's ladders are untouched: the two-CTAs-per-SM form past the grid, 45 tokens
+    assert kcfg._ladder(4, 152) is kcfg.BEYOND_FORMS and kcfg.default_cfg(4, 152) is kcfg.TWO_CTA_CFG and kcfg.max_tokens_served(4, 152) == 45
     one = kcfg.resolve_cfg(kcfg.default_cfg(1, 152, geometry=g), 1)
     assert (one.NORM_FORM, one.GEOM, one.TWO_CTAS_PER_HEAD) == ("ctas2", g, True)
     per_sm, optin = SM120_READING
@@ -544,8 +552,11 @@ def test_entry_takes_the_geometry_and_keys_every_form_by_it(g):
     k.sm_count = 152
     assert replace(k.cfg_for(1), NORM_FORM=None) == replace(kcfg.PAIR_CFG, GEOM=g) and k.cfg_for(1).GEOM is g
     assert replace(k.cfg_for(152 // (2 * V) + 1), NORM_FORM=None) == replace(kcfg.CFG, GEOM=g)
-    assert replace(k.cfg_for(152 // V + 1, 6), NORM_FORM=None) == replace(kcfg.TWO_CTA_CFG, GEOM=g)
-    assert (k.max_tokens_for(1), k.max_tokens_for(152 // (2 * V) + 1), k.max_tokens_for(152 // V + 1)) == (35, 8, 45)
+    beyond = k.cfg_for(152 // V + 1, 6)  # past the one-CTA grid: the one-CTA form in two waves (the capped form spills off the default geometry)
+    assert replace(beyond, NORM_FORM=None) == replace(kcfg.CFG, GEOM=g) and beyond.NORM_FORM == "ctas1" and beyond.MIN_CTAS_PER_SM == 1
+    assert (k.max_tokens_for(1), k.max_tokens_for(152 // (2 * V) + 1), k.max_tokens_for(152 // V + 1)) == (35, 8, 8)
+    with pytest.raises(NotImplementedError, match="at most 8 on this part"):
+        kcfg.validate_tokens(beyond, 9)  # the two-wave pick's bound past the grid (the default geometry's capped form would hold 45)
     out = k.outputs(2, 4)
     assert tuple(out["qout"].shape) == (8, V, 128) == tuple(out["out"].shape) and out["counts"].shape == (2 * kcfg.TICKET_STRIDE,)
     dbg = entry.GdnVerifyFused("cpu", 1e-6, geometry=g, debug=True).outputs(2, 4)
@@ -1615,7 +1626,7 @@ def test_bitwise_with_the_reference_verify_kernel_outputs(tag):
 # form on a set with a padding request, a skipped slot and non-monotone slots, the requests of a step batch-invariant -- the 27B cells
 # above are unchanged (the geometry is the compile key, and the default geometry's renderings are byte-identical to the pre-geometry kernels)
 # ---------------------------------------------------------------------------------------------------------------------------
-RANK_VERIFY_SHAPES = [(requests, tokens) for requests in (1, 2, 4) for tokens in (2, 4, 6)]
+RANK_VERIFY_SHAPES = [(requests, tokens) for requests in (1, 2, 4) for tokens in (2, 4, 6)] + [(8, 6)]  # 8 x 6: past the one-CTA grid at 32 V heads
 # the form families (Cfg deltas from the unrolled one-CTA form): the three pick forms (rolled pair / rolled one-CTA / two CTAs per SM),
 # the shallower rings, the per-row thread mappings, the register-capped mappings, the streamed state path, the PDL order, the spread
 # bulk issue, the per-thread store path, non-resident K, the BA prefetch depths, and the pair with the knobs it is picked with
@@ -1650,8 +1661,9 @@ RANK_SET = dict(accepted="random", pad="last", skip="mid")  # the 4-request set:
 @pytest.mark.parametrize("requests, tokens", RANK_VERIFY_SHAPES, ids=str)
 @pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
 def test_rank_geometry_matches_the_torch_reference_and_replays_bitwise(g, requests, tokens):
-    """The entry's pick for the step shape at a per-rank geometry (the pair, one CTA per SM or the two-CTAs-per-SM form by ``requests x
-    V`` against this part's SM count: the module pick) against the FP64 torch reference at the reference kernel's bars (random acceptance
+    """The entry's pick for the step shape at a per-rank geometry (the pair, one CTA per SM, or -- past the one-CTA grid, 8 requests at 32
+    V heads on 152 SMs -- the one-CTA form in two waves, by ``requests x V`` against this part's SM count: the module pick) against the
+    FP64 torch reference at the reference kernel's bars (random acceptance
     counts, a padding request from two requests on, a skipped slot write, non-monotone slots), the tickets back at zero -- and twice on
     fresh identical operands: byte-identical (fp8 / bf16 outputs, every state slot, the conv pool)."""
     dev = _device_or_skip()
