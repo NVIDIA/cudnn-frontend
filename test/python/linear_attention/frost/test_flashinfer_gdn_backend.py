@@ -400,12 +400,14 @@ def test_probe_declines_a_part_whose_shared_memory_holds_no_form_by_kind_device(
     for kw in (dict(requests=2, tokens_per_request=6), dict(tokens_per_request=2), dict(requests=1, tokens_per_request=18)):
         sup = _probe("cuda:0", "verify", **kw)
         assert (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "holds no verify form" in sup.reason, (kw, sup)
+        assert "has no form" in sup.reason and "could not read" not in sup.reason, sup  # the typed decline, not the readers' failure
     assert _probe("cuda:0", "verify", requests=2).served, "no tokens count: the budget is not asked"
     with pytest.raises(NotImplementedError, match="40000-byte"):
         backend.verify_max_tokens("cuda:0", 2)
     for kw in ({}, dict(requests=4), dict(requests=1, tokens_per_request=1)):
         sup = _probe("cuda:0", "decode", **kw)
         assert (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "holds no decode form" in sup.reason, (kw, sup)
+        assert "has no form" in sup.reason and "could not read" not in sup.reason, sup
     monkeypatch.setattr(entry, "device_shared_memory", lambda device: (SM120_READINGS["SMEM_PER_SM_BYTES"], SM120_READINGS["SMEM_OPTIN_BYTES"]))
     assert _probe("cuda:0", "decode", requests=4).served, "a 99 KB opt-in holds the 74,848 B decode form"
 
@@ -442,7 +444,9 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
 
     monkeypatch.setattr(backend, "verify_form", no_form)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
-    assert (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason, sup  # the entry's typed decline of a part with no form
+    assert (
+        (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "has no form" in sup.reason
+    ), sup  # the entry's typed decline of a part with no form, not the readers' failure
 
     def regressed(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
         raise ValueError("a config regression")

@@ -165,10 +165,11 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
             # the one-CTA decode form must fit this device's per-CTA opt-in (74,848 B; every admitted part holds it): the entry's own
             # construction-time decline, answered here so the probe and build() agree on a part that holds no form
             _decode.first_fitting(_decode.ONE_CTA_FORMS, *_decode.device_shared_memory(device))
+        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no decode form (a RuntimeError
+            # subclass, so it is caught before the readers' failure below)
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel has no form for this device's shared memory: {exc}")
         except RuntimeError as exc:  # the device-attribute readers' failure; anything else is a bug and propagates
             return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel could not read this device's shared memory: {exc}")
-        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no decode form
-            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel has no form for this device's shared memory: {exc}")
         return None
     if requests is not None and requests > VERIFY_MAX_REQUESTS:
         return Qwen35GdnDecline(
@@ -186,10 +187,11 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
         try:
             # the pick for this step shape: past the ladder's bound the deepest form, so its max_tokens() IS the ladder-wide bound
             cfg = verify_form(device, requests, float(geometry.norm_eps), tokens_per_request)
+        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no verify form (a RuntimeError
+            # subclass, so it is caught before the readers' failure below)
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel has no form for this device's shared memory: {exc}")
         except RuntimeError as exc:  # the device-attribute readers' failure; anything else is a bug and propagates (FlashInfer reports it by type)
             return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel could not read this device's shared memory or SM count: {exc}")
-        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no verify form
-            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel has no form for this device's shared memory: {exc}")
         limit = cfg.max_tokens()
         if tokens_per_request > limit:
             form_name = "two CTAs per head" if cfg.TWO_CTAS_PER_HEAD else ("one CTA per SM" if cfg.CTAS_PER_SM == 1 else "two CTAs per SM")
