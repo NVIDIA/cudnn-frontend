@@ -308,8 +308,8 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
-            # One CTA of two warpgroups per SM: every thread can hold up to 255
-            # registers, so no setmaxnreg reallocation is needed.
+            # Every CTA allocates all 512 TMEM columns, so only one CTA per SM can make progress, and each of its
+            # 256 threads may use the per-thread register maximum: no warpgroup register split (#2274).
             min_blocks_per_mp=1,
         )
 

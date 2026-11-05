@@ -274,6 +274,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
+            min_blocks_per_mp=1,  # entry register count for the setmaxnreg split (C7508 otherwise)
         )
 
     @cute.jit

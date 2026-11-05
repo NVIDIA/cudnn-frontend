@@ -132,7 +132,8 @@ class ScoreKernelSm100:
         """Warps 0-3 (load / MMA / CLC / aux) plus ``num_math_wg`` math warpgroups, and their setmaxnreg split.
 
         setmaxnreg only redistributes the CTA's launch allocation (floor8(64K / threads) per thread);
-        asking for more than that pool hangs the increasing warpgroups.
+        asking for more than that pool hangs the increasing warpgroups.  The launch must pass
+        ``min_blocks_per_mp=1``: without an entry register count ptxas drops every setmaxnreg (C7508).
         """
         self.num_math_wg = num_math_wg
         self.num_warps = 4 + 4 * num_math_wg
