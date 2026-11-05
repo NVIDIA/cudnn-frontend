@@ -21,6 +21,17 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 )
 
 
+def _require_indexer_backward_gpu():
+    """Skip unless the current GPU runs the sm90 or sm100 kernels."""
+    from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import INDEXER_BACKWARD_SM100_CAPABILITIES
+
+    if not torch.cuda.is_available():
+        pytest.skip("IndexerBackward requires a CUDA GPU")
+    capability = torch.cuda.get_device_capability()
+    if capability[0] != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES:
+        pytest.skip(f"IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}")
+
+
 def _require_exact_sm100():
     """Keep hardware-validation cases on the available SM100 runner.
 
@@ -1051,7 +1062,9 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_indexer_backward_gpu()
+    if backend == "sm100_v2":
+        _require_indexer_backward_v2_gpu()
 
     cfg = dict(b=2, s_q=NUM_DK_PRODUCER_CTAS // 2 + 1, s_kv=257, head_dim=128, qhead_per_kv_head=64, topk=512)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1338,7 +1351,7 @@ def test_DSA_indexer_backward_deterministic_workspace_alias_rejected_before_laun
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_indexer_backward_gpu()
 
     cfg = dict(b=1, s_q=96, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1542,15 +1555,17 @@ def test_DSA_indexer_backward_deterministic_empty_query_rejected_before_allocati
 
 @pytest.mark.L1
 @pytest.mark.parametrize("backend", ["default", "sm100_v2"])
-@pytest.mark.parametrize("s_q", [7, 17], ids=["short-grid", "uneven-grid"])
+@pytest.mark.parametrize("s_q", [7, 17, 97], ids=["short-grid", "uneven-grid", "multi-wave-grid"])
 @torch_fork_set_rng(seed=1703)
 def test_DSA_indexer_backward_deterministic_cuda_graph(backend, s_q):
-    """Short and uneven warmed plans with fixed scratch are replay-safe."""
+    """Short, uneven, and multi-wave plans replay with fixed scratch."""
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-    _require_exact_sm100()
+    _require_indexer_backward_gpu()
+    if backend == "sm100_v2":
+        _require_indexer_backward_v2_gpu()
 
     cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
@@ -1682,10 +1697,10 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend, s_q, topk
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("capability,supported", [((9, 0), False), ((10, 3), True), ((10, 7), False)])
+@pytest.mark.parametrize("capability,supported", [((9, 0), True), ((10, 3), True), ((10, 7), False)])
 @torch_fork_set_rng(seed=1707)
 def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capability, supported):
-    """The deterministic path accepts SM100/SM103 and fails closed elsewhere."""
+    """Deterministic plans admit SM90/SM100/SM103 and select the matching factory."""
     try:
         from cudnn import DSA
     except ImportError:
@@ -1710,8 +1725,19 @@ def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capabil
     attn_before = attn_score.clone()
     if supported:
         assert plan.check_support()
+        from cudnn.deepseek_sparse_attention.indexer_backward import api
+
+        calls = []
+        factory = "indexer_backward_sm90" if capability[0] == 9 else "indexer_backward_sm100"
+        monkeypatch.setattr(api, factory, lambda *args, **kwargs: calls.append(kwargs))
+        plan.compile()
+        assert len(calls) == 1 and calls[0]["deterministic"] is True
+        if capability[0] == 9:
+            plan.heads = 32
+            with pytest.raises(ValueError, match=r"H in \(64,\)"):
+                plan.check_support()
     else:
-        with pytest.raises(ValueError, match="deterministic IndexerBackward requires capability"):
+        with pytest.raises(ValueError, match="deterministic IndexerBackward requires SM90 or capability"):
             plan.check_support()
     assert torch.equal(attn_score, attn_before)
 
@@ -3812,3 +3838,161 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
         assert torch.isfinite(actual_flat).all(), f"{name} contains NaN/Inf"
         assert cosine >= 0.99, f"{name} cosine={cosine:.6f}"
         assert rms_relative <= 0.02, f"{name} RMS-relative error={rms_relative:.6f}"
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=1706)
+def test_DSA_indexer_backward_deterministic_packed_shapes_reuse_compilation(monkeypatch):
+    """Deterministic producer artifacts key plane policy and tile facts, not
+    changing packed B/Sq/Sk extents.  The second shape also makes every default
+    producer CTA consume at least three rows."""
+    _require_indexer_backward_gpu()
+    try:
+        import cutlass.cute as cute
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("deterministic indexer backward recompiled for a new packed shape")
+
+    for i, (b, s_q, s_kv) in enumerate([(1, 7, 128), (2, 193, 257)]):
+        cfg = dict(b=b, s_q=s_q, s_kv=s_kv, head_dim=128, qhead_per_kv_head=64, topk=128)
+        index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+        attn_score_ref, index_score_ref = attn_score.clone(), index_score.clone()
+        result = DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            sm_scale=1.0,
+            loss_coeff=float(b * s_q),
+            grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
+            block_I=128,
+            deterministic=True,
+        )
+        torch.cuda.synchronize()
+        check_ref_indexer_backward(
+            index_q,
+            weights,
+            index_k,
+            attn_score_ref,
+            index_score_ref,
+            topk_indices,
+            result["d_index_q"],
+            result["d_weights"],
+            result["d_index_k"],
+            sm_scale=1.0,
+            grad_scale=1.0,
+            cos_min=0.99,
+            rms_rel_max=0.02,
+        )
+        if i == 0:
+            monkeypatch.setattr(cute, "compile", forbidden_compile)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "h,b,s_q,s_kv,topk,dk_planes,dk_dtype,topk_indices_global",
+    [
+        # Compact H32: with 96 planes, 194 rows make producer zero revisit its plane twice.
+        pytest.param(32, 2, 97, 512, 512, 96, torch.float32, False, id="h32-topk512-fp32-local-ids"),
+        pytest.param(32, 2, 97, 512, 512, 96, torch.bfloat16, True, id="h32-topk512-bf16-global-ids"),
+        pytest.param(32, 2, 97, 2048, 2048, 96, torch.float32, True, id="h32-topk2048-fp32-global-ids"),
+        # Larger compile-time grids; the last case has one more row than planes,
+        # so plane zero is reused before the fixed-order reducer converts it.
+        pytest.param(64, 1, 128, 128, 128, 128, torch.float32, False, id="planes128-single-row-stripe"),
+        pytest.param(64, 1, 148, 128, 128, 148, torch.float32, False, id="planes148-single-row-stripe"),
+        pytest.param(64, 1, 149, 128, 128, 148, torch.bfloat16, False, id="planes148-bf16-reused-plane"),
+        # Pin the deterministic dW strategy boundary: topk384 keeps the
+        # private-slot fold; topk512 selects the lane-quad fold and crosses a
+        # 96-plane wave boundary.
+        pytest.param(64, 1, 2, 512, 384, 96, torch.float32, False, id="dw-private-fold-topk384"),
+        pytest.param(64, 1, 97, 512, 512, 96, torch.float32, False, id="dw-quad-fold-topk512-multi-wave"),
+        # Large top-k and repeated producer-row handoffs (193 rows over 96 planes).
+        pytest.param(64, 1, 2, 1024, 1024, 96, torch.float32, False, id="short-topk1024"),
+        pytest.param(64, 1, 2, 2048, 2048, 96, torch.float32, False, id="short-topk2048"),
+        pytest.param(64, 1, 193, 2048, 896, 96, torch.float32, False, id="multi-wave-topk896"),
+        pytest.param(64, 1, 193, 2048, 2048, 96, torch.float32, False, id="multi-wave-topk2048"),
+    ],
+)
+@torch_fork_set_rng(seed=1711)
+def test_DSA_indexer_backward_deterministic_reproducible_and_correct(h, b, s_q, s_kv, topk, dk_planes, dk_dtype, topk_indices_global):
+    """Deterministic execution reproduces every output bit across runs and matches
+    the reference, over compact H32, the larger plane grids (exact scratch size),
+    large top-k and repeated producer handoffs. Canary tails check that the M64
+    tile never escapes the compact H32 dQ/dW stores."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_indexer_backward_gpu()
+    if torch.cuda.get_device_capability()[0] == 9 and h != 64:
+        pytest.skip("SM90 deterministic IndexerBackward requires H=64")
+
+    cfg = dict(b=b, s_q=s_q, s_kv=s_kv, head_dim=128, qhead_per_kv_head=h, topk=topk)
+    index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    reference_topk_indices = topk_indices
+    if topk_indices_global:
+        batch_offsets = torch.arange(b, dtype=torch.int32, device="cuda").view(b, 1, 1) * s_kv
+        topk_indices = torch.where(topk_indices >= 0, topk_indices + batch_offsets, topk_indices)
+    attn = attn_source.clone()
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+
+    guard_elems = 256
+    guard_value = 23.0
+    dq_storage = torch.full((index_q.numel() + guard_elems,), guard_value, dtype=index_q.dtype, device=index_q.device)
+    dw_storage = torch.full((weights.numel() + guard_elems,), guard_value, dtype=weights.dtype, device=weights.device)
+    d_index_q = dq_storage[: index_q.numel()].view_as(index_q)
+    d_weights = dw_storage[: weights.numel()].view_as(weights)
+    d_index_k = torch.empty_like(index_k, dtype=dk_dtype)
+    workspace_bytes = deterministic_dk_workspace_bytes(b, s_kv, 128, dk_planes)
+    assert workspace_bytes == ws_align(dk_planes * b * s_kv * 128 * 4)
+    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn.copy_(attn_source)
+        workspace.fill_(0xA5)
+        for output in (d_index_q, d_weights, d_index_k):
+            output.fill_(float("nan"))
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss=grad_loss,
+            # loss_coeff / (B * S_q) == 1.0 matches the reference's unit grad_scale.
+            loss_coeff=float(b * s_q),
+            d_index_q=d_index_q,
+            d_weights=d_weights,
+            d_index_k=d_index_k,
+            workspace=workspace,
+            deterministic=True,
+            deterministic_dk_planes=dk_planes,
+            topk_indices_global=topk_indices_global,
+        )
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    assert_bitwise_runs(run, label=f"H{h} topk={topk} planes={dk_planes} {dk_dtype=} {topk_indices_global=}")
+    torch.testing.assert_close(dq_storage[index_q.numel() :], torch.full_like(dq_storage[index_q.numel() :], guard_value), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(dw_storage[weights.numel() :], torch.full_like(dw_storage[weights.numel() :], guard_value), rtol=0.0, atol=0.0)
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_source,
+        index_score,
+        reference_topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+        cos_min=0.99,
+        rms_rel_max=0.02,
+    )

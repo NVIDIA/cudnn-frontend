@@ -851,8 +851,8 @@ indexer tower:
    `dIndexK_f32` to a BF16 output. Deterministic execution instead uses the
    fixed-order reduction below to write the requested output dtype directly.
 
-With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
-grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
+With `deterministic=True` on SM90, SM100 or SM103, kernel 2 uses fixed
+producer-plane ownership and accumulates dK into private FP32 workspace. The compile-time
 `deterministic_dk_planes` specialization selects 96, 128, or 148 producer
 planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
 CTA order, converting only once to the requested `d_index_k` dtype. The dQ
@@ -869,15 +869,15 @@ missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100/SM103, `D == 128`,
-`block_I == 128`, and `topk % 128 == 0` for `128 <= topk <= 2048`. The default
-backend accepts `H in {32, 64}` while `sm100_v2` accepts `H == 64`. Each
-producer CTA owns one plane and processes the fixed row stripe `cta`,
-`cta + num_ctas`, ...; the v2 backend disables its ordinary dynamic ticket
-assignment for this path. The main GEMM therefore retains its existing Tensor
-Core math while dK has a fixed association order across launches. Scratch is
-exactly `ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for
-either backend. It is cleared on the launch stream at every execute, then
+`deterministic=True` requires H64 on SM90 or H32/H64 on either SM100 backend,
+`D == 128`, `block_I == 128`, and `topk % 128 == 0` for
+`128 <= topk <= 2048`. Each producer CTA owns one plane. SM100 kernels use
+fixed grid-stride row ownership; the v2 backend disables dynamic ticket assignment.
+SM90 submits bounded waves of at most `deterministic_dk_planes` one-row CTAs
+on the same stream. A later wave cannot reuse a plane until the previous wave
+completes. Scratch is exactly
+`ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for either
+backend. It is cleared on the launch stream at every execute, then
 reduced once in fixed plane order. The live scratch byte range must not overlap
 any input or output; `execute` validates this before clearing the planes, while
 allowing disjoint views of the same allocation. A warmed plan with caller-owned
@@ -937,7 +937,11 @@ counts retain their existing behavior.
 
 On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate
-conversion solely for Indexer Backward is unlikely to help.
+conversion solely for Indexer Backward is unlikely to help. Deterministic SM90
+uses the same fixed producer-plane ownership and fixed-order reducer described
+above. Its stream-ordered bounded waves also form the synchronization boundary:
+every one-row CTA in wave N completes before wave N+1 can reuse the same producer
+planes, and the fixed reducer runs only after the last wave.
 
 #### SM100-family sparse backward v2 (opt-in)
 
