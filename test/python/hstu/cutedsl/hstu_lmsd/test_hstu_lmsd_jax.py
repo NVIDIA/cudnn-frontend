@@ -13,9 +13,9 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 def jax_ops():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("JAX HSTU LMSD requires an SM10x GPU")
-    from cudnn.frost.buffers import cutedsl_requirement_error
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
-    requirement_error = cutedsl_requirement_error("JAX HSTU LMSD tests")
+    requirement_error = cutedsl_requirement_error("JAX HSTU LMSD tests") or cutedsl_arch_requirement_error(torch.cuda.get_device_capability())
     if requirement_error:
         pytest.skip(requirement_error)
     jax = pytest.importorskip("jax", minversion="0.9.1")

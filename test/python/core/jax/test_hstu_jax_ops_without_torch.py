@@ -8,16 +8,18 @@ import sys
 
 import pytest
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX op import test")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+pytest.importorskip("jax", minversion="0.9.1")
+
 pytestmark = pytest.mark.L0
 
 
 def test_hstu_jax_ops_import_without_torch():
-    pytest.importorskip("jax", minversion="0.9.1")
-    from cudnn.frost.buffers import cutedsl_requirement_error
-
-    requirement_error = cutedsl_requirement_error("JAX op import test")
-    if requirement_error:
-        pytest.skip(requirement_error)
     script = """
 import sys
 class NoTorch:

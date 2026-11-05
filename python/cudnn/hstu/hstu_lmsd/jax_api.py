@@ -10,7 +10,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 requirement_error = cutedsl_requirement_error("JAX HSTU LMSD")
 if requirement_error:
@@ -62,6 +62,9 @@ def target_device(arrays):
     capability = str(getattr(device, "compute_capability", ""))
     if jax.process_count() != 1 or device.platform != "gpu" or not capability.startswith("10."):
         raise ValueError("JAX HSTU LMSD requires a single process and arrays on one SM10x GPU")
+    arch_error = cutedsl_arch_requirement_error(tuple(int(x) for x in capability.split(".")))
+    if arch_error:
+        raise ValueError(arch_error)
     return device, "sm_" + capability.replace(".", "") + "a"
 
 
