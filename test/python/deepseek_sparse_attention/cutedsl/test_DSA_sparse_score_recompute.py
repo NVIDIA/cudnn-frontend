@@ -707,6 +707,7 @@ def test_DSA_sparse_score_recompute_public_support_rejects_sm90_topk_boundaries(
     from cudnn.deepseek_sparse_attention.score_recompute import api as score_api
 
     monkeypatch.setattr(score_api, "device_capability", lambda _device: (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (9, 0))
     q = torch.empty((1, 1, 32, 128), dtype=torch.bfloat16, device="cuda")
     k = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
     aux_dtype = torch.bfloat16 if score_type == "indexer" else torch.float32
@@ -727,6 +728,7 @@ def test_DSA_sparse_score_recompute_public_support_preserves_sm100_topk_contract
     from cudnn.deepseek_sparse_attention.score_recompute import api as score_api
 
     monkeypatch.setattr(score_api, "device_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
     q = torch.empty((1, 1, 32, 128), dtype=torch.bfloat16, device="cuda")
     k = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
     aux_dtype = torch.bfloat16 if score_type == "indexer" else torch.float32
