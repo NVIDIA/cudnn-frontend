@@ -72,7 +72,10 @@ from cudnn.moe_ep._validation import (
     validate_training_non_aliasing,
 )
 from cudnn.moe_ep.api import _resolve_training_device
-from moe_ep.moe_ep_distributed_workers import _distributed_backward_worker
+from moe_ep.moe_ep_distributed_workers import (
+    _distributed_backward_worker,
+    _distributed_ds3_numerics_worker,
+)
 from moe_ep.moe_ep_test_support import (
     _allocate_stateless_training_outputs,
     _allocate_training_wgrad_outputs,
@@ -2494,6 +2497,29 @@ def test_training_forward_kernel_tuning_does_not_accumulate_across_calls(case_na
         _training_forward_tuning_worker,
         (case_name,),
         what=f"training forward tuning case {case_name}",
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("routing", ["uniform", "skewed"])
+def test_ds3_ep4_profiles_match_baseline_and_reference(routing, tmp_path):
+    """Run baseline, rolling and ds3_ep4_pattern on the qualified DS3 EP4 workload.
+
+    Each profile must meet norm bounds against the independent oracle and stay within
+    10% of baseline's error. Profiles that share baseline's FP8 conversion must also
+    reproduce its outputs bit for bit, with dprob allowed FP32 reduction-order noise.
+    """
+
+    world_size = 4
+    _require_distributed_training(world_size)
+    os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
+    init_file = tmp_path / f"ds3_numerics_{routing}.init"
+    mp.spawn(
+        _distributed_ds3_numerics_worker,
+        args=(world_size, str(init_file), routing),
+        nprocs=world_size,
+        join=True,
     )
 
 
