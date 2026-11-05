@@ -8,7 +8,17 @@ from contextlib import nullcontext
 import torch
 
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from .d128_contract import ACCUMULATION, DENSE_SM_RANGE, RECOMPUTE, select_implementation, validate_dense_bounds, workspace_layout
+from .d128_contract import (
+    ACCUMULATION,
+    DENSE_SM_RANGE,
+    PAIR,
+    PAIR_CCS,
+    RECOMPUTE,
+    pair_workspace_layout,
+    select_implementation,
+    validate_dense_bounds,
+    workspace_layout,
+)
 
 
 class SdpaBwdDslSm100D128(SdpaBwdDsl):
@@ -178,8 +188,11 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     def _uses_grouped_heads(self):
         return self.q_desc.ndim == 4 and self.k_desc.ndim == 4 and self.q_desc.shape[1] != self.k_desc.shape[1]
 
+    def _pair_grouped(self):
+        return self._uses_grouped_heads() and bool(self.deterministic) and not self.thd
+
     def check_support(self):
-        if self._uses_grouped_heads():
+        if self._uses_grouped_heads() and not self._pair_grouped():
             from .prepared_sm100_d128_grouped_2cta import check_support_selected
 
             return check_support_selected(self)
@@ -235,7 +248,8 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         b, h, sq, d = self.q_desc.shape
         bk, hk, sk, dk = self.k_desc.shape
         require(d == dk and d in (64, 128), "D_QK and D_V must equal 64 or 128")
-        require(b == bk and h == hk, "Q and KV require equal batch and head counts (dense MHA)")
+        require(b == bk and hk > 0 and h % hk == 0, "Q and KV require equal batch counts and an integral head ratio")
+        require(h == hk or self.deterministic, "grouped heads take the dense route only under a deterministic request")
         try:
             validate_dense_bounds(b, h, sq, sk, self.window_size_left)
         except ValueError as error:
@@ -248,26 +262,33 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
                 require(tuple(desc.shape) == (b, h, sq, 1) and desc.dtype == torch.float32, "Stats must be FP32 (B, H, S_q, 1)")
                 require(desc.is_contiguous(), "Stats must be contiguous")
             else:
-                s = sk if role in ("k", "v", "dk", "dv") else sq
-                expected = (b, h, s, d)
+                kv = role in ("k", "v", "dk", "dv")
+                s = sk if kv else sq
+                expected = (b, hk if kv else h, s, d)
                 require(tuple(desc.shape) == expected and desc.dtype == self.dtype, f"{role} must have shape {expected} and Q's dtype")
-                require(_same_geometry((desc.shape, desc.stride), (expected, (s * h * d, d, h * d, 1))), f"{role} must use compact BSHD storage")
-        self.batch_size, self.h_q, self.h_kv = b, h, h
+                require(
+                    _same_geometry((desc.shape, desc.stride), (expected, (s * expected[1] * d, d, expected[1] * d, 1))), f"{role} must use compact BSHD storage"
+                )
+        self.batch_size, self.h_q, self.h_kv = b, h, hk
         self.s_q_max, self.s_k_max = sq, sk
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        window_in_envelope = self.window_size_left is None or (d == 64 and self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1)
-        self._implementation = (
-            RECOMPUTE
-            if self.deterministic or not window_in_envelope
-            else select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
-        )
+        window_bounded = self.window_size_left is None or self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1
+        window_in_envelope = self.window_size_left is None or (d == 64 and window_bounded)
+        natural = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
+        if self.deterministic:
+            # Each kernel of the pair owns its output tiles; outside the pair's envelope the recompute body serves dense MHA.
+            pair = natural == ACCUMULATION and window_bounded and tuple(cc) in PAIR_CCS
+            require(h == hk or pair, "grouped deterministic backward requires the kernel pair's envelope (cc 10.0 / 10.3)")
+            self._implementation = PAIR if pair else RECOMPUTE
+        else:
+            self._implementation = natural if window_in_envelope else RECOMPUTE
         self._is_supported = True
         return True
 
     def compile(self):
-        if self._uses_grouped_heads():
+        if self._uses_grouped_heads() and not self._pair_grouped():
             from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
 
             self._ensure_support_checked()  # resolves cta_pair and records the chosen body first
@@ -289,12 +310,14 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
 
     def scratch_workspace_bytes(self):
         self._ensure_support_checked()
-        if self.h_q != self.h_kv:
+        if self.h_q != self.h_kv and self._implementation != PAIR:
             return self._grouped_workspace_bytes
         if self.thd:
             return self._thd_workspace_bytes
         if self._implementation == ACCUMULATION:
             return workspace_layout(self.batch_size, self.h_q, self.s_q_max, self.head_dim_qk)[1]
+        if self._implementation == PAIR:
+            return pair_workspace_layout(self.batch_size, self.h_q, self.s_q_max)[1]
         return 0
 
     def execute(

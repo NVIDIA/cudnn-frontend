@@ -33,7 +33,9 @@ def test_small_swa_rebind_replay(dt, d, causal, left, sq, sk, cudnn_handle):
     original_stream = cudnn.get_stream(cudnn_handle)
     capture = None
     try:
-        case = _case(dt=dt, d=d, causal=causal, left=left, b=2, h=3, sq=sq, sk=sk, deterministic=True, accumulation=None)
+        # A one-key window makes the oracle's dQ / dK identically zero: the separately rounded delta launch of the pair leaves
+        # sub-ulp residuals there, compared by absolute tolerance.
+        case = _case(dt=dt, d=d, causal=causal, left=left, b=2, h=3, sq=sq, sk=sk, deterministic=True, accumulation=None, allow_zero=True)
         for _ in range(2):
             fresh = {name: torch.empty_like(tensor) for name, tensor in case.tensors.items()}
             for name in ("q", "k", "v", "do"):
@@ -45,20 +47,20 @@ def test_small_swa_rebind_replay(dt, d, causal, left, sq, sk, cudnn_handle):
                 fresh[name].fill_(float("nan"))
             case.tensors, case.expected = fresh, expected
             case.pack = {case.refs[name]: tensor for name, tensor in fresh.items()}
-            case.graph.execute(case.pack, None)
-            _check_case(case)
+            case.graph.execute(case.pack, case.workspace)
+            _check_case(case, allow_zero=True)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         cudnn.set_stream(cudnn_handle, stream.cuda_stream)
         capture = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture, stream=stream):
-            case.graph.execute(case.pack, None, handle=cudnn_handle)
+            case.graph.execute(case.pack, case.workspace, handle=cudnn_handle)
         expected_bits = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
         for _ in range(3):
             for name in expected_bits:
                 case.tensors[name].fill_(float("nan"))
             capture.replay()
-            _check_case(case)
+            _check_case(case, allow_zero=True)
             for name, expected in expected_bits.items():
                 assert torch.equal(case.tensors[name], expected)
         for name in ("q", "k", "v", "do"):
@@ -69,7 +71,7 @@ def test_small_swa_rebind_replay(dt, d, causal, left, sq, sk, cudnn_handle):
         for name in expected_bits:
             case.tensors[name].fill_(float("nan"))
         capture.replay()
-        _check_case(case)
+        _check_case(case, allow_zero=True)
     finally:
         try:
             if capture is not None:

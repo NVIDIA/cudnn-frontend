@@ -8,6 +8,7 @@ import struct
 
 ACCUMULATION = "accumulation"
 RECOMPUTE = "recompute"
+PAIR = "pair"
 WORKSPACE_ALIGNMENT = 256
 WORKSPACE_SLACK = WORKSPACE_ALIGNMENT - 16
 ABI_VERSION = 3
@@ -60,6 +61,8 @@ def validate_accumulation_scale(scale):
 # unchanged).  The compile target follows the device in every prepared host (``--gpu-arch sm_{sm}a`` with ``sm = cc[0] * 10 + cc[1]``), so
 # admitting a part is this tuple plus the engine row's sm range -- never a copy of a kernel into another arch directory.
 ACCUMULATION_CCS = ((10, 0), (10, 3), (10, 7))
+# The parts the deterministic kernel pair of the dense d128 route runs on (a subset of ``ACCUMULATION_CCS``).
+PAIR_CCS = ((10, 0), (10, 3))
 # The text every decline off these parts carries (the graph row's declaration check and the THD / grouped standalone adapters pin ONE token).
 ACCUMULATION_PARTS = "SM100, SM103 or SM107 (cc 10.0 / 10.3 / 10.7)"
 # The dense MHA envelope of the ``sdpa_bwd_sm100_d128`` row (its ``Capabilities.sm_lo`` / ``sm_hi``, inclusive): the one-launch recompute body
@@ -126,6 +129,18 @@ def workspace_layout(batch, heads, sq, d=128):
         (dq_bytes, (batch, heads, rounded), (heads * rounded, rounded, 1)),
     )
     total = dq_bytes + delta_bytes + WORKSPACE_SLACK
+    if total > 2**63 - 1:
+        raise ValueError("dense d128 workspace exceeds the signed pointer range")
+    return regions, total
+
+
+def pair_workspace_layout(batch, heads, sq):
+    """The deterministic pair's scratch: the fp32 delta rows over the 128-row-rounded S_q, nothing else."""
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)):
+        raise ValueError("dense d128 workspace dimensions must be positive integers")
+    rounded = (sq + 127) // 128 * 128
+    regions = ((0, (batch, heads, rounded), (heads * rounded, rounded, 1)),)
+    total = 4 * batch * heads * rounded + WORKSPACE_SLACK
     if total > 2**63 - 1:
         raise ValueError("dense d128 workspace exceeds the signed pointer range")
     return regions, total

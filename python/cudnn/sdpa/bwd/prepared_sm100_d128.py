@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.bwd.prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
-from .d128_contract import ACCUMULATION, validate_launch, workspace_layout
+from .d128_contract import ACCUMULATION, PAIR, pair_workspace_layout, validate_launch, workspace_layout
 
 
 class _GuardedAccumulationEntry:
@@ -60,6 +60,12 @@ def compile_plan(api):
         regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
         with torch.cuda.device(device):
             entry = compile_host_accum(tuple(geometry), regions, dtype, api.is_causal, sm, window)
+    elif api._implementation == PAIR:
+        from .kernels.sm100.prepared_d128_pair_host import compile_host as compile_host_pair
+
+        regions, required = pair_workspace_layout(api.batch_size, api.h_q, api.s_q_max)
+        with torch.cuda.device(device):
+            entry = compile_host_pair(tuple(geometry), regions, dtype, api.is_causal, sm, window, api.h_q // api.h_kv)
     else:
         from .kernels.sm100.prepared_d128_host import compile_host_recompute
 
@@ -70,7 +76,7 @@ def compile_plan(api):
         raise NotImplementedError("sdpa_bwd_sm100_d128 requires a positional tvm-ffi entry")
     if required != api.scratch_workspace_bytes():
         raise RuntimeError("dense d128 compiled workspace disagrees with its advertised size")
-    if api._implementation == ACCUMULATION:
+    if api._implementation in (ACCUMULATION, PAIR):
         fn = _GuardedAccumulationEntry(fn, operands, required)
     return BwdLaunchSpec(
         SimpleNamespace(entry=entry, workspace_bytes=required, workspace_regions=regions, implementation=api._implementation),
