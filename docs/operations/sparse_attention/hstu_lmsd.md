@@ -58,7 +58,7 @@ The forward and backward functions are available through lazy top-level
 exports:
 
 ```python
-from cudnn import hstu_lmsd_backward, hstu_lmsd_forward
+from cudnn.ops import hstu_lmsd_backward, hstu_lmsd_forward
 ```
 
 ## Supported configurations
@@ -113,7 +113,7 @@ compiled kernel is reused across supported row counts:
 ```python
 import torch
 
-from cudnn import hstu_lmsd_backward, hstu_lmsd_forward
+from cudnn.ops import hstu_lmsd_backward, hstu_lmsd_forward
 
 n, d = 257, 128
 x_storage = torch.randn((n, 3 * d), device="cuda", dtype=torch.bfloat16)
