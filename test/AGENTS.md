@@ -24,6 +24,11 @@ For indexer backward, restore the score buffers that the API mutates. Keep
 all three gradients and mutated scores; test BF16 and FP32 dK separately.
 Remap global Top-K IDs when batches move and preserve negative padding.
 Record API-by-dtype results in [the operation report](../docs/operations/determinism.md).
+For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
+bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
+Check against dequantized inputs and include a scale-only change. Keep SM90
+FP8 and SM100/SM103/SM107 MXFP8 results separate; an architecture skip is not
+a measured pass on that architecture.
 
 MXFP8 backward's element-count allowance needs the same magnitude cap as its
 row-count allowance: an isolated large error can preserve amax and still fit

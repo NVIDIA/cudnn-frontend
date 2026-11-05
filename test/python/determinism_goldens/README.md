@@ -18,6 +18,7 @@ pytest core/test_determinism_utils.py
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
+| `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
 
 The four linear-attention suites live in `linear_attention/frost/test_*_determinism.py`.
 They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
@@ -50,8 +51,8 @@ node after parameter expansion. For example,
 Those eight executions are not eight reported tests. Backward cases also check
 the forward outputs and saved state used to compute gradients.
 
-The expanded set has **251 cases**: 245 operation cases and six harness
-controls. All 251 cases are L0,
+The expanded set has **285 cases**: 279 operation cases and six harness
+controls. All 285 cases are L0,
 including stress and boundary cases, so the default marker selects the full set.
 List the exact node IDs without executing the kernels:
 
@@ -151,13 +152,12 @@ to the target alone. Replay/reference cases also cover nonzero dO for every
 sequence. Empty-row sentinels retain their actual float dtype and raw bits;
 NaNs and non-finite outputs/gradients still fail.
 
-### DSA indexer: 46 cases
+### DSA BF16 indexer: 46 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
 Q/K are BF16. Forward weights use BF16 or FP32; scores are FP32. Backward
 weights, dQ and dWeights are BF16; dK uses BF16 or FP32. Score operands,
-normalizers and the loss gradient are FP32. No FP16 or block-scaled indexer
-path is exercised here.
+normalizers and the loss gradient are FP32. This BF16-input suite is separate from the FP8/MXFP8 cases below.
 
 | Test method | API path | Parameters and purpose | Cases |
 | --- | --- | --- | ---: |
@@ -191,6 +191,38 @@ establish determinism for multi-query reductions.
 
 See the [API-by-dtype result table](../../../docs/operations/determinism.md)
 for measured pass/fail counts and indexer failures.
+
+### DSA FP8/MXFP8 indexer: 34 cases
+
+`deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py` adds
+17 L0 cases for SM100/SM103/SM107 MXFP8 and the same 17 for SM90 FP8.
+Each parameter ID names the architecture group and precision. The fixture
+skips other architectures before launching a kernel and checks the DSL target.
+
+| Method | Parameters | Cases per precision |
+| --- | --- | ---: |
+| `test_replay` | H32/H64 × ratio 1/4; eight executions, numerical reference | 4 |
+| `test_batch_invariance` | Same combinations; standalone, packed, reordered, each sequence duplicated | 4 |
+| `test_boundary` | Q/K lengths 127/128/129, all-masked rows; four executions, reference, batch checks | 4 |
+| `test_ragged_batch` | H32/H64; lengths (3,7)/(17,129); replay, reference, reorder/duplicate with repacked scales | 2 |
+| `test_neighbor_isolation` | Fixed target payload/scales with changed neighbors | 1 |
+| `test_scale_change` | Fixed FP8 payload; doubled Q scales must change scores and still match the reference/replay | 1 |
+| `test_golden` | Three queries; reference, three executions, payload/physical-scale/output hashes | 1 |
+
+Both paths use E4M3 Q/K and BF16 weights. MXFP8 uses nonuniform E8M0 scales
+per 32 values, packed with the independent scale-layout reference. SM90 uses
+FP32 token/head descales. Quantization happens once per sequence using CPU-seeded
+inputs; repacking never requantizes. Input mutation checks compare raw payload
+and scale bytes. Both paths compare FP32 scores; SM90 also compares FP32 LSE.
+The score reference uses dequantized inputs and FP64 computation. Existing
+correctness tolerances apply only to references; replay and batch comparisons
+remain byte-exact.
+
+Only SM100 was run: **17 passed, 0 failed**, including the new MXFP8 golden.
+The 17 SM90 cases skipped on that host. SM90, SM103, and SM107 results and
+runtime-specific goldens remain unmeasured. The [architecture/API tables](../../../docs/operations/determinism.md)
+keep these gaps separate from measured results. FP8/MXFP8 backward is not
+supported by these DSA attention/indexer APIs and has no positive test cases.
 
 ## Golden checks
 
@@ -226,7 +258,7 @@ CUDNN_DETERMINISM_RECORD=/tmp/attention-goldens-candidate \
   deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0 -k golden
 ```
 
-Recording refuses to overwrite an existing file. Check all fifteen cases, inspect
+Recording refuses to overwrite an existing file. Check every golden supported on the target architecture, inspect
 the input/output hashes, and explain any numerical change before replacing
 committed files. Never enable recording in a PR check. A new runtime needs its
 own reviewed baseline; matching results across architectures is not assumed.
@@ -240,14 +272,14 @@ explanation. Extend this table and the suites when adding an operation or a
 new numerical path. Keep skips limited to unsupported hardware/dependencies;
 a missing FROST plan on a supported runtime is a failure.
 
-The scope is the FROST training path and public QSA/DSA sparse-attention APIs
-on SM100, SM103, and SM107. It does not establish a contract for cuTile, CAKE,
-Hopper, QSA indexed/two-pass APIs, checkpoint/summary/decode paths, shared gate
-parameters, DSA fused/separate Top-K generation, paged or block-scaled indexer
-forward, THD dense indexer backward, score recompute, pooled DSA, or
-distributed training recipes. Existing tests cover some of
-these paths separately. Full recipe CI and an automatic source-to-test PR
-gate remain separate integration work; the checklist is a review safeguard.
+The earlier suites cover FROST and public QSA/DSA APIs on SM100/SM103/SM107.
+The quantized indexer suite adds SM90 FP8 and SM100/SM103/SM107 MXFP8.
+The set excludes cuTile/CAKE, other Hopper paths, QSA indexed/two-pass APIs,
+checkpoint/summary/decode paths, shared gate parameters, fused/separate Top-K,
+paged/MXFP4 indexer forward, THD dense indexer backward, score recompute,
+pooled DSA, and distributed recipes. Existing tests cover some paths separately.
+Recipe CI and an automatic source-to-test gate remain integration work;
+the checklist is a review safeguard.
 
 ## Validation: 2026-11-04
 
@@ -257,21 +289,24 @@ cuDNN `92500`, CuTe DSL `4.8.0.dev0`, TVM FFI `0.1.12`.
 The complete runtime record is in [the goldens](5f8a825586430e85/dsa-fprop.json).
 The test banners confirmed imports from this checkout.
 
-Two disjoint default-L0 runs covered all 251 cases. Run from `test/python`:
+Three disjoint default-L0 runs covered all 285 cases. Run from `test/python`:
 
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4
 export CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"
 python -m pytest core/test_determinism_utils.py \
-  deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -q
+  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -q
 python -m pytest linear_attention/frost/test_*_determinism.py \
   QSA/cutedsl/test_qsa_determinism.py -q
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py -q
 ```
 
 - DSA attention, indexer, and harness: **89 passed, 11 failed, 0 skipped** in 128.77 seconds.
 - Existing five operation suites: **137 passed, 14 failed, 0 skipped** in 489.44 seconds.
-- Combined: **226 passed, 25 failed, 0 skipped**. Executed node IDs match the
-  251 cases selected by default L0 collection (0.28 seconds). The five existing
+- New FP8/MXFP8 module: **17 passed, 0 failed, 17 skipped** in 20.17 seconds.
+- Combined: **243 passed, 25 failed, 17 skipped**. Node IDs match the
+  285 cases selected by default L0 collection (0.29 seconds). The five existing
   operation suites retain their earlier results; their code is unchanged by
   the indexer addition.
 
@@ -283,14 +318,16 @@ python -m pytest linear_attention/frost/test_*_determinism.py \
 | GDN-2 | 13 passed | 15 passed |
 | QSA | 15 passed, 2 failed | 6 passed, 12 failed |
 | DSA sparse attention | 24 passed | 19 passed, 5 failed |
-| DSA indexer forward | 24 passed | — |
+| DSA BF16 indexer forward | 24 passed | — |
 | DSA sparse indexer backward | — | 13 passed, 2 failed |
 | DSA dense indexer backward | — | 3 passed, 4 failed |
+| DSA MXFP8 indexer (SM100) | 17 passed | Unsupported |
+| DSA FP8 indexer (SM90) | 17 skipped on SM100; SM90 not run | Unsupported |
 
-All six harness controls and all fifteen golden cases passed. Each golden
-also passed replay and its independent numerical reference. The indexer adds
-three baselines; the twelve existing records are unchanged. Golden recording
-was disabled in validation. Sparse indexer large-Top-K cases pass replay and
+All six harness controls and all sixteen goldens runnable on SM100 passed,
+including replay and independent references. The SM90 golden case skipped on
+SM100 and has no saved baseline. MXFP8 adds one record; the fifteen existing
+records are unchanged. Golden recording was disabled in validation. Sparse indexer large-Top-K cases pass replay and
 reference, then fail dK after reorder. Dense indexer backward fails dK replay,
 batch, or neighbor checks. The [API-by-dtype table and indexer failure list](../../../docs/operations/determinism.md)
 record the measured results.
