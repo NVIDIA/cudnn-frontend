@@ -2506,9 +2506,10 @@ def test_training_forward_kernel_tuning_does_not_accumulate_across_calls(case_na
 def test_ds3_ep4_profiles_match_baseline_and_reference(routing, tmp_path):
     """Run baseline, rolling and ds3_ep4_pattern on the qualified DS3 EP4 workload.
 
-    Each profile must meet norm bounds against the independent oracle and stay within
-    10% of baseline's error. Profiles that share baseline's FP8 conversion must also
-    reproduce its outputs bit for bit, with dprob allowed FP32 reduction-order noise.
+    Kernel and oracle consume one pre-quantized MXFP8 output gradient. Each profile must
+    meet norm bounds against the independent oracle and stay within 10% of baseline's
+    error. Profiles that share baseline's FP8 conversion must also reproduce its outputs
+    bit for bit, with dprob allowed FP32 reduction-order noise.
     """
 
     world_size = 4

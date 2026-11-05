@@ -890,11 +890,13 @@ _DS3_EP4_SHAPE = {
     "physical_recv_pool_rows": 131968,
 }
 _DS3_DGRAD_PROFILES = ("baseline", "rolling", "ds3_ep4_pattern")
-# Relative Frobenius error bounds against the independent oracle, about 3-5x above
+# Relative Frobenius error bounds against the independent oracle, several times above
 # the values measured on GB200 for every profile (y 3.8e-4, dx 1.7e-3, dW 8.8e-5,
-# dprob 2.7e-2). dprob is held to a norm bound only: at this hidden size its
-# elementwise error exceeds the small-shape tolerance for all profiles, baseline included.
-_DS3_REFERENCE_REL_FRO = {"y": 2e-3, "dx": 5e-3, "dprob": 5e-2, "dw1": 5e-4, "dw2": 5e-4}
+# dprob 2.4e-5). The oracle computes dprob from the unquantized output gradient, so
+# kernel and oracle share one MXFP8 gradient; otherwise dprob would differ by that
+# gradient's quantization noise (about 2.7%) instead of by kernel error.
+_DS3_REFERENCE_REL_FRO = {"y": 2e-3, "dx": 5e-3, "dprob": 2e-4, "dw1": 5e-4, "dw2": 5e-4}
+_DS3_DPROB_CLOSE_KWARGS = {"rtol": 1e-2, "atol": 1e-2}
 _DS3_REFERENCE_MIN_COSINE = 0.999
 # A profile may not be noticeably less accurate than baseline on the same inputs.
 _DS3_BASELINE_ERROR_RATIO = 1.1
@@ -902,7 +904,10 @@ _DS3_WGRAD_OPERANDS = ("fc1_a", "fc1_sfa", "fc1_b", "fc1_sfb", "fc2_a", "fc2_sfa
 
 
 def _make_ds3_ep4_training_inputs(ep_rank: int, ep_size: int, device: torch.device, routing: str):
-    """Build random DS3 EP4 training inputs with uniform or skewed routing."""
+    """Build random DS3 EP4 training inputs with uniform or skewed routing.
+
+    The output gradient is returned pre-quantized as MXFP8 along the hidden axis.
+    """
 
     shape = _DS3_EP4_SHAPE
     tokens = shape["max_tokens_per_rank"]
@@ -934,7 +939,10 @@ def _make_ds3_ep4_training_inputs(ep_rank: int, ep_size: int, device: torch.devi
     topk_idx = scores.topk(shape["top_k"], dim=1).indices.to(torch.int32).contiguous()
     raw_weights = torch.rand(tokens, shape["top_k"], generator=generator, device=device) + 0.05
     topk_weights = (raw_weights / raw_weights.sum(dim=1, keepdim=True)).contiguous()
-    grad_output = _grad_output(device, tokens, seed=20261112 + ep_rank, hidden_size=hidden)
+    grad_output = quantize_mxfp8(
+        _grad_output(device, tokens, seed=20261112 + ep_rank, hidden_size=hidden),
+        axis=1,
+    )
     return (activation, fc1_weight, fc2_weight, topk_idx, topk_weights), grad_output
 
 
@@ -1044,6 +1052,7 @@ def _check_ds3_profiles(outputs, resolved, expected) -> None:
         torch.testing.assert_close(actual["dx"].float(), expected_dx, **_BACKWARD_CLOSE_KWARGS[0])
         torch.testing.assert_close(actual["dw1"], expected_dense[0], **_WGRAD_CLOSE_KWARGS)
         torch.testing.assert_close(actual["dw2"], expected_dense[1], **_WGRAD_CLOSE_KWARGS)
+        torch.testing.assert_close(actual["dprob"], expected_dprob, **_DS3_DPROB_CLOSE_KWARGS)
 
     # The optimized profiles only reschedule work. With the same FP8 conversion as
     # baseline they must reproduce its bits; dprob may differ only by FP32 reduction order.
@@ -1082,7 +1091,7 @@ def _distributed_ds3_numerics_worker(
         # Finish the collective oracle before any production operator exists.
         expected_y, expected_dx, expected_dprob, expected_wgrads = _fixed_training_reference(
             args,
-            grad_output,
+            grad_output.dequantize(torch.float32),
             combine_format="mxfp8",
             gate_up_clamp=None,
             ep_group=ep_group,
