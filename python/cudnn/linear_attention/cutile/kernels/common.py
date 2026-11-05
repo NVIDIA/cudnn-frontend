@@ -21,6 +21,10 @@ Every buffer reaching this module comes from an engine (a variant-pack operand
 or a workspace carve), so it is contiguous and needs no probing.
 """
 
+import hashlib
+import json
+import os
+import sys
 from types import SimpleNamespace
 
 import cuda.tile as ct
@@ -71,6 +75,48 @@ def opt(t, bufs, dtype_name: str = "float32"):
 launch_hint_cache: dict = {}
 
 
+def deterministic_requested() -> bool:
+    """Whether torch's deterministic-algorithms flag is on (a JAX-only process never loads torch, so it is off)."""
+    torch = sys.modules.get("torch")
+    return torch is not None and torch.are_deterministic_algorithms_enabled()
+
+
+def settled_pick(name, cache_key, tune):
+    """The launch hints every process uses for this kernel and shape on this architecture.
+
+    The timed pick can change the bits of some kernels (GDN), so two runs that time differently disagree. A deterministic
+    run therefore tunes only when no pick is on disk, and publishes it first-writer-wins: concurrent first runs adopt one
+    winner, and later runs reuse it. The directory is ``$CUDNN_FRONTEND_LA_TUNE_CACHE`` and must be shared by the runs
+    that have to agree; with a private one each run still tunes for itself.
+    """
+    import torch
+
+    root = os.environ.get("CUDNN_FRONTEND_LA_TUNE_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "cudnn_frontend", "la_tune")
+    arch = "sm%d%d" % torch.cuda.get_device_capability()
+    path = os.path.join(root, hashlib.sha256(f"{arch}|{name}|{cache_key!r}".encode()).hexdigest() + ".json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass
+    best = tune()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(root, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(best, f)
+        os.link(tmp, path)
+    except FileExistsError:
+        with open(path) as f:
+            best = json.load(f)
+    except OSError:
+        pass
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return best
+
+
 def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
     """occupancy x num_worker_warps grid; deduped, default (occ=1,nww=4) first."""
     seen = set()
@@ -93,24 +139,31 @@ def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nw
     Default config (occ=1, nww=4) is explored first so a no-improvement shape
     keeps the base behaviour. ``cache_key`` is qualified
     by the kernel's own name, so two kernels sharing a key shape stay apart.
+
+    Under ``torch.use_deterministic_algorithms(True)`` the winner is kept on disk and reused (see :func:`settled_pick`),
+    so it cannot vary between runs.
     """
     stream = 0 if stream is None else stream
-    cache_key = (getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel)), cache_key)
+    name = getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
+    cache_key = (name, cache_key, deterministic_requested())
     if cache_key not in launch_hint_cache:
         tuned = None
         try:
-            configs = launch_hint_configs(occ_choices, nww_choices)
-            with ct.compiler_timeout(timeout):
-                result = exhaustive_search(
-                    configs,
-                    stream,
-                    lambda cfg: grid,
-                    kernel,
-                    lambda cfg: args,
-                    lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
-                )
-            best = result.best.config
-            tuned = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
+
+            def tune():
+                with ct.compiler_timeout(timeout):
+                    result = exhaustive_search(
+                        launch_hint_configs(occ_choices, nww_choices),
+                        stream,
+                        lambda cfg: grid,
+                        kernel,
+                        lambda cfg: args,
+                        lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
+                    )
+                return {"occupancy": result.best.config.occupancy, "num_worker_warps": result.best.config.num_worker_warps}
+
+            best = settled_pick(name, cache_key[1], tune) if cache_key[2] else tune()
+            tuned = kernel.replace_hints(**best)
         except Exception:
             tuned = None
         launch_hint_cache[cache_key] = tuned
