@@ -1,5 +1,7 @@
 # test — Agent Guide
 
+For new numerical APIs and kernel paths, use the
+[determinism skill](../skills/determinism_tests/SKILL.md) to add/run L0 tests and update API support.
 For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
 and the [coverage table](python/determinism_goldens/README.md).
 The shared comparator checks bytes, tensor names, shapes, and dtypes. Clone each

@@ -28,6 +28,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 4. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra now holds only `cuda-python`.
 5. Add FE OSS documentation and update the relevant overview or operation index links.
 6. Add tests under `test/python/<operation>/cutedsl/`, including support validation and numerical/reference coverage when executable.
+   For each new numerical API or kernel path, follow [the determinism skill](../determinism_tests/SKILL.md): add and run L0 forward/backward checks, then update `docs/operations/determinism.md`. Mark unavailable GPU coverage unverified.
 7. For grouped/discrete/MoE/SDPA kernels, preserve the source helper and scheduler topology; shared helper modules should be internal package files, not public `cudnn` exports.
 8. When an existing SM100 kernel needs a Rubin (`sm107`) variant, follow the architecture-dispatch pattern in `references/integration-pattern.md` instead of exposing a new public API. Current examples: `grouped_gemm_quant`, `grouped_gemm_glu`, and `grouped_gemm_dglu`.
 

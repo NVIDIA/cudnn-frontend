@@ -104,6 +104,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
+- [skills/determinism_tests/](skills/determinism_tests/SKILL.md) — required for new numerical APIs and changes to kernels, datatypes, or GPU targets: add and run L0 determinism tests, then update the API support page.
 
 ## Links
 
@@ -122,6 +123,7 @@ Leave `closed-*` and `open-*` labels for maintainers; Milestone/Projects sidebar
 
 ### Kernel determinism and batch invariance
 
+- Use [skills/determinism_tests/SKILL.md](skills/determinism_tests/SKILL.md) when adding a numerical API or changing its kernel paths, datatypes, or GPU targets. Run the affected L0 suites and update the support page in the same PR; mark unavailable GPU coverage unverified.
 - New kernels and numerical kernel changes need forward and backward determinism tests in the same PR. Include every output, input gradient, gate gradient, and state gradient. If a direction is unsupported, name that gap in the test documentation.
 - Use raw-byte equality for replay and batch invariance. Do not replace it with a tolerance, a rounded metric, or float-value equality. Keep an independent numerical reference as a separate correctness check.
 - Build inputs once. Reuse the same values and upstream gradients after batch splitting, insertion, removal, and reordering. Restore mutable state and RNG state where used. Include ragged lengths and partial tiles; include empty sequences where supported.
