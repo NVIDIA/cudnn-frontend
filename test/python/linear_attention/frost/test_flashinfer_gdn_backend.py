@@ -46,11 +46,18 @@ qwen_3_5_gdn_block_verify = fi_block.qwen_3_5_gdn_block_verify
 from cudnn.linear_attention.frost import flashinfer_gdn_backend as backend  # noqa: E402  (the import registers "frost_fe")
 from cudnn.linear_attention.frost import gdn_decode_fused as entry  # noqa: E402
 from cudnn.linear_attention.frost import gdn_verify_fused as ventry  # noqa: E402
+from cudnn.linear_attention.frost.kernel import gdn_geometry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_verify_fused_config as kvcfg  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
 GEOMETRY = Qwen35GdnGeometry(**backend.GEOMETRY)
+# the per-rank geometries of the larger dense models in FlashInfer's field names: (K heads, V heads, d_model) at 16- / 8- / 4-way tensor
+# parallelism of a d_model-8192 model and at 4-way of a d_model-4096 one
+RANK_GEOMETRIES = [
+    Qwen35GdnGeometry(d_model=d, num_v_heads=v, num_k_heads=k, head_k_dim=128, head_v_dim=128, conv_kernel=4)
+    for k, v, d in ((1, 8, 8192), (2, 16, 8192), (4, 32, 8192), (4, 16, 4096))
+]
 CPU = torch.device("cpu")
 F32, BF16 = torch.float32, torch.bfloat16
 ROWS = [1, 2, 3, 4, 8, 16, 64]  # FlashInfer's decode rows (the last row a padding row from two rows on)
@@ -74,62 +81,66 @@ def _spec(device=CPU, rows=2, param_dtypes=(F32, BF16, BF16), form="decode", tok
     return fi_api.Qwen35GdnPlanSpec(backend.BACKEND, form, rows, tokens, GEOMETRY, torch.device(device), tuple(param_dtypes))
 
 
-def _tensors(rows, device, slots=None, seed=0):
-    """One decode call's tensors in FlashInfer's serving layout: ``qkv`` / ``z`` views of one QKVZ slab, the conv pool channel-innermost
-    (``[slots, 3, C]`` transposed to the ``[slots, C, 3]`` view), the kernel-native parameter dtypes."""
+def _tensors(rows, device, slots=None, seed=0, geometry=GEOMETRY):
+    """One decode call's tensors in FlashInfer's serving layout at ``geometry`` (the kernels' default when not given): ``qkv`` / ``z`` views
+    of one QKVZ slab, the conv pool channel-innermost (``[slots, 3, C]`` transposed to the ``[slots, C, 3]`` view), the kernel-native
+    parameter dtypes."""
     slots = rows + 1 if slots is None else slots
+    C, NV, D = geometry.conv_dim, geometry.num_v_heads, geometry.d_model
     g = torch.Generator().manual_seed(seed)
 
     def rn(*shape):
         return torch.randn(*shape, generator=g).to(device)
 
-    qkvz = (rn(rows, 16384) * 2).bfloat16()
+    qkvz = (rn(rows, C + geometry.value_dim) * 2).bfloat16()
     return dict(
-        qkv=qkvz[:, :10240],
-        z=qkvz[:, 10240:].view(rows, 48, 128),
-        hidden=rn(rows, 5120).bfloat16(),
-        ba_weight=(rn(96, 5120) / 5120**0.5).bfloat16(),
-        A_log=rn(48) * 0.5,
-        dt_bias=(rn(48) * 0.5).bfloat16(),
-        ssm_state=rn(slots, 48, 128, 128) * 0.1,
+        qkv=qkvz[:, :C],
+        z=qkvz[:, C:].view(rows, NV, 128),
+        hidden=rn(rows, D).bfloat16(),
+        ba_weight=(rn(2 * NV, D) / D**0.5).bfloat16(),
+        A_log=rn(NV) * 0.5,
+        dt_bias=(rn(NV) * 0.5).bfloat16(),
+        ssm_state=rn(slots, NV, 128, 128) * 0.1,
         state_indices=torch.arange(1, rows + 1, dtype=torch.int32).to(device),
         norm_weight=(1 + 0.2 * rn(128)).bfloat16(),
         out_scale=torch.tensor([0.02], device=device),
-        conv_state=rn(slots, 3, 10240).bfloat16().transpose(1, 2),
-        conv_weight=(0.3 * rn(10240, 4)).bfloat16(),
-        out=torch.empty(rows, 48, 128, dtype=torch.float8_e4m3fn, device=device),
+        conv_state=rn(slots, 3, C).bfloat16().transpose(1, 2),
+        conv_weight=(0.3 * rn(C, 4)).bfloat16(),
+        out=torch.empty(rows, NV, 128, dtype=torch.float8_e4m3fn, device=device),
     )
 
 
-def _verify_tensors(requests, tokens, device, seed=0):
-    """One verify call's tensors in FlashInfer's layout: ``state_indices`` ``[requests, T]``, the conv pool channel-innermost (``[slots, T + 2,
-    C]`` transposed to the ``[slots, C, T + 2]`` view), ``cu_seqlens`` / ``num_accepted_tokens`` int32, every request fully accepted."""
+def _verify_tensors(requests, tokens, device, seed=0, geometry=GEOMETRY):
+    """One verify call's tensors in FlashInfer's layout at ``geometry``: ``state_indices`` ``[requests, T]``, the conv pool
+    channel-innermost (``[slots, T + 2, C]`` transposed to the ``[slots, C, T + 2]`` view), ``cu_seqlens`` / ``num_accepted_tokens`` int32,
+    every request fully accepted."""
     rows = requests * tokens
-    t = _tensors(rows, device, slots=rows + 1, seed=seed)
+    t = _tensors(rows, device, slots=rows + 1, seed=seed, geometry=geometry)
     g = torch.Generator().manual_seed(seed + 1)
-    t["conv_state"] = torch.randn(rows + 1, tokens + 2, 10240, generator=g).to(device).bfloat16().transpose(1, 2)
+    t["conv_state"] = torch.randn(rows + 1, tokens + 2, geometry.conv_dim, generator=g).to(device).bfloat16().transpose(1, 2)
     t["state_indices"] = torch.arange(1, rows + 1, dtype=torch.int32).view(requests, tokens).to(device)
     t["cu_seqlens"] = torch.arange(0, rows + 1, tokens, dtype=torch.int32).to(device)
     t["num_accepted_tokens"] = torch.full((requests,), tokens, dtype=torch.int32).to(device)
     return t
 
 
-def _part_verify_form(readings, sms, requests, tokens_per_request):
-    """The verify form a part (``readings``, ``sms``) picks for a step shape, for a host without one: the module pick with that part's
-    readings, resolved (no requests count = the pick at one request, as the backend reads it)."""
+def _part_verify_form(readings, sms, requests, tokens_per_request, geometry=None):
+    """The verify form a part (``readings``, ``sms``) picks for a step shape at ``geometry`` (the kernels' default when None), for a host
+    without one: the module pick with that part's readings, resolved (no requests count = the pick at one request, as the backend reads it)."""
     requests = 1 if requests is None else int(requests)
-    cfg = kvcfg.default_cfg(requests, sms, readings["SMEM_PER_SM_BYTES"], readings["SMEM_OPTIN_BYTES"], tokens_per_request)
+    geometry = gdn_geometry.DEFAULT_GEOMETRY if geometry is None else geometry
+    cfg = kvcfg.default_cfg(requests, sms, readings["SMEM_PER_SM_BYTES"], readings["SMEM_OPTIN_BYTES"], tokens_per_request, geometry)
     return kvcfg.resolve_cfg(replace(cfg, **readings), requests)
 
 
-def _sm100_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+def _sm100_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
     """The verify form a cc 10.0 part with 148 SMs picks (``verify_form``'s twin for a host without one)."""
-    return _part_verify_form(SM100_READINGS, SM100_SMS, requests, tokens_per_request)
+    return _part_verify_form(SM100_READINGS, SM100_SMS, requests, tokens_per_request, geometry)
 
 
-def _sm120_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+def _sm120_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
     """The verify form a 99 KB-opt-in part with 170 SMs (cc 12.0) picks for a step shape (``verify_form``'s twin for a host without one)."""
-    return _part_verify_form(SM120_READINGS, SM120_SMS, requests, tokens_per_request)
+    return _part_verify_form(SM120_READINGS, SM120_SMS, requests, tokens_per_request, geometry)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -194,13 +205,24 @@ def as_sm120(monkeypatch):
 
 
 @pytest.mark.parametrize("form", backend.FORMS)
-def test_other_geometries_are_declined_by_field_name(as_sm100, form):
+def test_geometries_outside_the_envelope_are_declined_by_field_name_and_rank_shards_are_served(as_sm100, form):
+    """A pinned field with another value (the head dims, the conv kernel) or a head count / ``d_model`` outside the kernels' envelope (more
+    than 16 K heads, more than 128 V heads, a ``d_model`` that is not a multiple of 1024) is kind ``geometry`` naming the field; the
+    default geometry and the per-rank shards of the larger dense models are served, each mapping onto the kernels' ``Geometry``."""
     kw = dict(tokens_per_request=6) if form == "verify" else {}
-    for field, value in (("d_model", 4096), ("num_v_heads", 32), ("num_k_heads", 8), ("head_k_dim", 64), ("head_v_dim", 64), ("conv_kernel", 3)):
+    for field, value in (("head_k_dim", 64), ("head_v_dim", 64), ("conv_kernel", 3), ("d_model", 5000), ("num_k_heads", 48), ("num_v_heads", 144)):
         g = Qwen35GdnGeometry(**dict(backend.GEOMETRY, **{field: value}))
-        assert backend.geometry_off(g) == {field: value}
+        assert backend.geometry_off(g) == {field: value}, field
         sup = qwen_3_5_gdn_block_support("cuda:0", g, form, backend.BACKEND, **kw)
         assert (sup.served, sup.kind) == (False, "geometry") and field in sup.reason and form in sup.reason, (field, sup)
+    two = Qwen35GdnGeometry(**dict(backend.GEOMETRY, head_k_dim=64, d_model=5000))
+    assert backend.geometry_off(two) == {"head_k_dim": 64, "d_model": 5000}, "every offending field is named"
+    assert backend.geometry_off(GEOMETRY) == {} and backend.geometry_of(GEOMETRY) is not None and backend.geometry_of(GEOMETRY) == gdn_geometry.DEFAULT_GEOMETRY
+    for g in RANK_GEOMETRIES + [Qwen35GdnGeometry(d_model=4096, num_v_heads=64, num_k_heads=16, head_k_dim=128, head_v_dim=128, conv_kernel=4)]:
+        assert backend.geometry_off(g) == {}, g
+        assert backend.geometry_of(g) == gdn_geometry.Geometry(g.num_k_heads, g.num_v_heads, g.d_model)
+        assert qwen_3_5_gdn_block_support("cuda:0", g, form, backend.BACKEND, **kw).served, (g, form)
+    assert backend.PINNED == dict(head_k_dim=128, head_v_dim=128, conv_kernel=4)
     assert _probe("cuda:0", form, **kw).served, "the kernels' geometry with another norm_eps is served (the epsilon is compiled into a plan)"
     assert qwen_3_5_gdn_block_support("cuda:0", Qwen35GdnGeometry(**backend.GEOMETRY, norm_eps=1e-5), form, backend.BACKEND, **kw).served
 
@@ -424,22 +446,25 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
     seen = []
 
-    def form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
-        seen.append((device, requests, norm_eps, tokens_per_request))
-        return _sm100_verify_form(device, requests, norm_eps, tokens_per_request)
+    def form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
+        seen.append((device, requests, norm_eps, tokens_per_request, geometry))
+        return _sm100_verify_form(device, requests, norm_eps, tokens_per_request, geometry)
 
     monkeypatch.setattr(backend, "verify_form", form)
-    assert _probe("cuda:0", "verify", requests=2, tokens_per_request=6).served and seen == [("cuda:0", 2, GEOMETRY.norm_eps, 6)]
+    assert _probe("cuda:0", "verify", requests=2, tokens_per_request=6).served and seen == [("cuda:0", 2, GEOMETRY.norm_eps, 6, gdn_geometry.DEFAULT_GEOMETRY)]
     assert _probe("cuda:0", "verify", requests=2).served and len(seen) == 1, "no tokens count: no device reading needed"
+    shard = RANK_GEOMETRIES[0]
+    assert qwen_3_5_gdn_block_support("cuda:0", shard, "verify", backend.BACKEND, requests=2, tokens_per_request=6).served
+    assert seen[-1] == ("cuda:0", 2, shard.norm_eps, 6, gdn_geometry.Geometry(1, 8, 8192)), "the probe asks the pick at the plan's geometry"
 
-    def failing(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    def failing(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
         raise RuntimeError("cuDeviceGetAttribute failed")
 
     monkeypatch.setattr(backend, "verify_form", failing)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
     assert (sup.served, sup.kind) == (False, "device") and "cuDeviceGetAttribute failed" in sup.reason, sup
 
-    def no_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    def no_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
         raise NotImplementedError("gdn_verify_fused: this part's 40000-byte shared-memory opt-in per CTA holds no verify form")
 
     monkeypatch.setattr(backend, "verify_form", no_form)
@@ -448,7 +473,7 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
         (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "has no form" in sup.reason
     ), sup  # the entry's typed decline of a part with no form, not the readers' failure
 
-    def regressed(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    def regressed(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
         raise ValueError("a config regression")
 
     monkeypatch.setattr(backend, "verify_form", regressed)
@@ -516,6 +541,40 @@ def test_verify_runner_maps_flashinfer_inputs_onto_the_entry_call_contract():
     assert runner.kernel.compiled is not backend._shared_compiled(_spec(rows=2))
     bf16 = fi_api.bind_inputs(spec, **dict(t, out_bf16=torch.empty(8, 48, 128, dtype=BF16)))
     assert runner._kwargs(bf16)["out_bf16"] is bf16.out_bf16
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=lambda g: f"k{g.num_k_heads}v{g.num_v_heads}d{g.d_model}")
+def test_runners_build_the_entries_with_the_plan_geometry(g):
+    """A plan at a per-rank geometry builds its entry with that geometry (``geometry_of`` of the spec's ``Qwen35GdnGeometry``): the
+    entry's forms carry it, its buffers take the rank's V heads, its binding checks accept FlashInfer's operands of that geometry (and the
+    default geometry's checks refuse them), and plans of two geometries share one compiled table under distinct keys."""
+    geo = gdn_geometry.Geometry(g.num_k_heads, g.num_v_heads, g.d_model)
+    spec = fi_api.Qwen35GdnPlanSpec(backend.BACKEND, "decode", 2, 1, g, CPU, (F32, BF16, BF16))
+    runner = backend.FrostFeDecodeRunner(spec)
+    assert runner.kernel.geometry == geo == backend.geometry_of(g) and runner.kernel.cfg.GEOM == geo
+    assert tuple(runner.buffers["qout"].shape) == (2, g.num_v_heads, 128) and runner.buffers["counts"].shape == (2 * kvcfg.TICKET_STRIDE,)
+    x = fi_api.bind_inputs(spec, **_tensors(2, CPU, geometry=g))
+    args = runner._args(x)
+    entry.check_support(*args, device_cc=(10, 0), geometry=runner.kernel.geometry)
+    with pytest.raises(NotImplementedError, match="x as"):
+        entry.check_support(*args, device_cc=(10, 0))  # the default geometry's checks refuse the rank's shapes
+    with pytest.raises(RuntimeError, match="eagerly"):
+        runner.run(x)
+    default_runner = backend.FrostFeDecodeRunner(_spec(rows=2))
+    assert runner.kernel.compiled is default_runner.kernel.compiled, "one table per (form, device, epsilon); the key carries the geometry"
+    d = default_runner._args(fi_api.bind_inputs(_spec(rows=2), **_tensors(2, CPU)))
+    assert runner.kernel.key(args[0], args[1], args[2], args[6], args[8]) != default_runner.kernel.key(d[0], d[1], d[2], d[6], d[8])
+    assert runner.kernel.key(args[0], args[1], args[2], args[6], args[8])[1].GEOM == geo
+    vspec = fi_api.Qwen35GdnPlanSpec(backend.BACKEND, "verify", 2, 4, g, CPU, (F32, BF16, BF16))
+    vrunner = backend.FrostFeVerifyRunner(vspec)
+    assert vrunner.kernel.geometry == geo and tuple(vrunner.buffers["qout"].shape) == (8, g.num_v_heads, 128)
+    vx = fi_api.bind_inputs(vspec, **_verify_tensors(2, 4, CPU, geometry=g))
+    kw = vrunner._kwargs(vx)
+    ventry.check_support(**kw, device_cc=(10, 0), geometry=vrunner.kernel.geometry)
+    ventry.check_support(**kw, device_cc=(10, 0), cfg=vrunner.kernel.cfg_for(2, 4))
+    with pytest.raises(NotImplementedError, match="qkv as"):
+        ventry.check_support(**kw, device_cc=(10, 0))
+    assert vrunner.kernel.cfg_for(2, 4).GEOM == geo
 
 
 def test_runner_launch_re_checks_the_binding():

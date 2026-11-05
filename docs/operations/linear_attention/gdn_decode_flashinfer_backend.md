@@ -15,11 +15,17 @@ conv + SiLU over the slot's history, the Q / K RMS scales, the gated delta-rule 
 state written to its own slot), the gated RMSNorm, the static per-tensor FP8 output quantization
 and the conv-history shift. One CTA per (request, V head) with 256 threads; the 128 x 128 fp32
 state rows are register-resident and travel through padded shared-memory boxes by
-`cp.async.bulk`. The default form follows three plan-time facts, the request count, the
-device's SM count and the device's shared-memory readings (per SM and the per-CTA opt-in): a
-cluster of two CTAs per head (half the state rows each) while the `requests x 96` cluster grid
-has an SM per CTA (one request on 148- / 152- / 170-SM parts), one CTA per SM while the
-`requests x 48` grid has one, and past that a register-capped two-CTAs-per-SM form so the grid
+`cp.async.bulk`. The kernels serve the GDN sub-layer of one tensor-parallel rank as a geometry
+`Geometry(K_HEADS, V_HEADS, HIDDEN)` (`cudnn.linear_attention.frost.kernel.gdn_geometry`): the
+head counts and the hidden width move, head dim 128 and conv width 4 are pinned, and every
+geometry is its own compiled form of the same kernel body (the default geometry -- 16 K heads,
+48 V heads, hidden 5120 -- is the one every number on this page is written for; an entry takes
+another with `geometry=`, a FlashInfer plan through its `Qwen35GdnGeometry`). The default form
+follows three plan-time facts, the request count, the device's SM count and the device's
+shared-memory readings (per SM and the per-CTA opt-in): a cluster of two CTAs per head (half the
+state rows each) while the `requests x 2 V` cluster grid has an SM per CTA (`requests x 96` at 48
+V heads: one request on 148- / 152- / 170-SM parts), one CTA per SM while the `requests x V` grid
+has one (`requests x 48`), and past that a register-capped two-CTAs-per-SM form so the grid
 runs in one wave -- where two of its CTAs can share an SM, i.e. `2 x (footprint + 1 KB)` fits
 the SM's shared memory (228 KB on cc 10.0 parts). On a 100 KB-per-SM part (cc 12.0: 99 KB
 per-CTA opt-in) every whole-slab form is one CTA per SM by shared memory alone, so the cap is
@@ -84,7 +90,7 @@ requests (one grid row each). CPU operands or operands on another CUDA device ar
 | question | answer |
 |---|---|
 | form | `decode` and `verify` (kind `form` otherwise) |
-| geometry | the block's dense-27B geometry at tensor-parallel rank 1: `d_model` 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4 (kind `geometry`, naming the fields otherwise); any `norm_eps` |
+| geometry | head dims 128 and conv kernel 4 (pinned), with the head counts and `d_model` of a tensor-parallel rank inside the kernels' envelope: at most 16 K heads, at most 128 V heads (a whole number of V heads per K head), `d_model` a multiple of 1024 -- the block's dense-27B geometry at rank 1 (`d_model` 5120, 48 V heads, 16 K heads; the default every figure on this page is measured at) and the per-rank shards of larger dense models (e.g. `d_model` 8192 with 1 K head and 8 V heads at 16-way tensor parallelism), each its own compiled form (kind `geometry`, naming the fields otherwise); any `norm_eps` |
 | device | an SM100-class part (compute capability 10.x) or an SM120-class part (12.x) (kind `device` otherwise, naming both served families; cc 11.x has never run these kernels and is declined); validated on cc 10.0 (GB200: 152 SMs, 228 KB of shared memory per SM, 227 KB per-CTA opt-in) and cc 12.0 (RTX 5090: 170 SMs, 100 KB per SM, 99 KB opt-in); cc 12.1 is admitted on the same budget-derived picks without a run of its own; a device whose shared memory holds no verify form is kind `device` too, naming its opt-in |
 | CuTe DSL | `nvidia-cutlass-dsl >= 4.8.0` (kind `dsl`, naming the installed version) |
 | FlashInfer | the experimental Qwen 3.5 GDN block with its backend registry (`flashinfer.experimental.qwen_3_5_gdn_block.api.register_backend`): FlashInfer main at or after PR #8131 (2026-10-31); no tagged release carried it at the time of writing, and FlashInfer marks the block experimental (it may change or be removed without deprecation). Importing the backend module without it raises `ImportError` naming the requirement |
@@ -117,7 +123,8 @@ conv state or slot indices. The default forms keep PDL off.
 `test/python/linear_attention/frost/test_gdn_decode_fused.py` and `test_gdn_verify_fused.py`
 cover the host entries (typed declines, the plan-time compile key, the knob validation, the
 shared-memory budget per tokens count on the cc 10.0 and cc 12.0 readings, the budget-derived
-pick tables of both parts, the DSL and architecture gates) and, on an SM100-class or SM120-class
+pick tables of both parts, the geometry envelope and the per-rank geometries' derived constants,
+operand shapes and BA-partition coverage, the DSL and architecture gates) and, on an SM100-class or SM120-class
 device, the null-slot and padding contracts, determinism, CUDA-graph replay over distinct
 layers, a torch reference of the fused chain and the bitwise agreement of every knob arm the part's
 shared memory holds with the default pick (an arm the part does not hold is its typed decline,
