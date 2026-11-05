@@ -2570,6 +2570,9 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
     std::stringstream tag{""};
     ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     auto status                             = extractedEngine->get_status();
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return "INVALID_ENGINE_NAME_CFG";
+    }
 
     cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
     int64_t elemCount                         = 0;
