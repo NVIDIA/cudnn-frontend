@@ -1455,8 +1455,12 @@ cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
 cudnn.ops.kpage_prepare_layout
 cudnn.ops.nsa
+cudnn.ops.nsa.compression_attention_forward
 cudnn.ops.nsa.compression_attention_forward_jax
+cudnn.ops.nsa.selection_attention_forward
 cudnn.ops.nsa.selection_attention_forward_jax
+cudnn.ops.nsa.sliding_window_attention_forward
+cudnn.ops.nsa.top_k_reduction_forward
 cudnn.ops.nsa.top_k_reduction_forward_jax
 cudnn.ops.nvfp4_block_scale_dequantize
 cudnn.ops.nvfp4_block_scale_quantize

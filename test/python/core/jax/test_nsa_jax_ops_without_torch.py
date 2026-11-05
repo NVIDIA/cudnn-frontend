@@ -28,7 +28,7 @@ class NoTorch:
             raise RuntimeError("torch import attempted: " + fullname)
 sys.meta_path.insert(0, NoTorch())
 import cudnn.ops
-for name in cudnn.ops.nsa.__all__:
+for name in [n for n in cudnn.ops.nsa.__all__ if n.endswith("_jax")]:
     assert callable(getattr(cudnn.ops.nsa, name))
 assert "torch" not in sys.modules
 """

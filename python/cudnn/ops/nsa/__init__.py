@@ -11,6 +11,10 @@ import importlib
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "selection_attention_forward": ("cudnn.native_sparse_attention.selection", "selection_attention_wrapper"),
+    "compression_attention_forward": ("cudnn.native_sparse_attention.compression", "compression_attention_wrapper"),
+    "sliding_window_attention_forward": ("cudnn.native_sparse_attention.sliding_window_attention", "sliding_window_attention_wrapper"),
+    "top_k_reduction_forward": ("cudnn.native_sparse_attention.top_k", "topk_reduction_wrapper"),
     "selection_attention_forward_jax": ("cudnn.native_sparse_attention.jax_api", "selection_attention_forward"),
     "compression_attention_forward_jax": ("cudnn.native_sparse_attention.jax_api", "compression_attention_forward"),
     "top_k_reduction_forward_jax": ("cudnn.native_sparse_attention.jax_api", "top_k_reduction_forward"),
