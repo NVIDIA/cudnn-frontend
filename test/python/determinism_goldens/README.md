@@ -1,10 +1,10 @@
 # Attention determinism
 
-These six suites check the public cuDNN Frontend APIs. Run from `test/python`:
+These suites check six attention families and the DSA indexer APIs. Run from `test/python`:
 
 ```bash
 pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
-  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0
+  deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0
 pytest core/test_determinism_utils.py
 ```
 
@@ -16,6 +16,8 @@ pytest core/test_determinism_utils.py
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
+| `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
+| `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
 
 The four linear-attention suites live in `linear_attention/frost/test_*_determinism.py`.
 They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
@@ -48,14 +50,14 @@ node after parameter expansion. For example,
 Those eight executions are not eight reported tests. Backward cases also check
 the forward outputs and saved state used to compute gradients.
 
-The expanded set has **205 cases**: 199 operation cases and six harness
-controls. All 205 cases are L0,
+The expanded set has **251 cases**: 245 operation cases and six harness
+controls. All 251 cases are L0,
 including stress and boundary cases, so the default marker selects the full set.
 List the exact node IDs without executing the kernels:
 
 ```bash
 pytest core/test_determinism_utils.py linear_attention/frost/test_*_determinism.py \
-  QSA/cutedsl/test_qsa_determinism.py deepseek_sparse_attention/cutedsl/test_DSA_determinism.py --collect-only -q
+  QSA/cutedsl/test_qsa_determinism.py deepseek_sparse_attention/cutedsl/test_DSA*determinism.py --collect-only -q
 ```
 
 | Check | What stays fixed | What changes | Pass condition |
@@ -149,6 +151,47 @@ to the target alone. Replay/reference cases also cover nonzero dO for every
 sequence. Empty-row sentinels retain their actual float dtype and raw bits;
 NaNs and non-finite outputs/gradients still fail.
 
+### DSA indexer: 46 cases
+
+The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py`.
+Q/K are BF16. Forward weights use BF16 or FP32; scores are FP32. Backward
+weights, dQ and dWeights are BF16; dK uses BF16 or FP32. Score operands,
+normalizers and the loss gradient are FP32. No FP16 or block-scaled indexer
+path is exercised here.
+
+| Test method | API path | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | Forward | H32/H64 × BF16/FP32 weights × ratio 1/4; eight executions and FP64 reference | 8 |
+| `test_batch_invariance` | Forward | Same eight combinations; standalone, packed, reversed, duplicate | 8 |
+| `test_boundary` | Forward | Q/K lengths 127/128/129; all-masked rows; four executions, reference, batch checks | 4 |
+| `test_ragged_batch` | Forward | BF16/FP32 weights; packed query/key lengths (3,7)/(17,129), reorder/duplicate, mask padding | 2 |
+| `test_neighbor_isolation` | Forward | Fixed target with changed neighboring Q/K/weights | 1 |
+| `test_golden` | Forward | BF16 weights, three queries; reference, three executions, saved hash | 1 |
+| `test_replay` | Backward | Sparse H32/H64 and dense H64 × BF16/FP32 dK; reference then eight executions | 6 |
+| `test_batch_invariance` | Backward | Same six combinations; standalone, packed, reversed, duplicate | 6 |
+| `test_sparse_invalid_slots` | Sparse backward | Local/global indices with negative padding; reference, replay, batch checks | 2 |
+| `test_sparse_persistent_rows` | Sparse backward | Top-K 896/2048, 193 queries over 96 producer planes; reference, four executions, batch checks | 2 |
+| `test_zero_loss_gradient` | Both backward APIs | Zero loss gradient; eight executions and exact zero gradients | 2 |
+| `test_neighbor_isolation` | Both backward APIs | Fixed target and loss scale with changed neighbors | 2 |
+| `test_golden` | Both backward APIs | One query, FP32 dK; reference, three executions, saved hashes | 2 |
+
+All 46 cases are L0. Sparse backward sets `deterministic=True`; dense backward
+has no determinism switch. Each call restores mutable score inputs and checks
+immutable inputs. Gradient buffers start at NaN; sparse deterministic workspace
+starts at `0xA5`. Results include all three gradients and each mutated score
+buffer. Numerical references use the existing autograd checks with cosine
+similarity at least 0.99 and RMS relative error at most 0.02; bitwise checks
+still allow no difference.
+
+Backward sets `loss_coeff = B * S_q` and fixes `grad_loss = 0.75`, so adding or
+removing a batch member does not change its gradient scale. Local Top-K IDs
+stay local. Global IDs are rebuilt for each batch order; negative padding stays
+invalid. The 193-row cases force a persistent producer to process a third row. Golden backward cases have one query; their passes do not
+establish determinism for multi-query reductions.
+
+See the [API-by-dtype result table](../../../docs/operations/determinism.md)
+for measured pass/fail counts and indexer failures.
+
 ## Golden checks
 
 Each golden records SHA-256 hashes of all input and result bytes, with their
@@ -172,7 +215,7 @@ runtime baseline with an explicit directory. Missing goldens then fail:
 ```bash
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
-  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0
+  deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0
 ```
 
 Record candidates into a **new** directory on a known-good revision:
@@ -180,10 +223,10 @@ Record candidates into a **new** directory on a known-good revision:
 ```bash
 CUDNN_DETERMINISM_RECORD=/tmp/attention-goldens-candidate \
   pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
-  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -k golden
+  deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0 -k golden
 ```
 
-Recording refuses to overwrite an existing file. Check all twelve cases, inspect
+Recording refuses to overwrite an existing file. Check all fifteen cases, inspect
 the input/output hashes, and explain any numerical change before replacing
 committed files. Never enable recording in a PR check. A new runtime needs its
 own reviewed baseline; matching results across architectures is not assumed.
@@ -200,7 +243,8 @@ a missing FROST plan on a supported runtime is a failure.
 The scope is the FROST training path and public QSA/DSA sparse-attention APIs
 on SM100, SM103, and SM107. It does not establish a contract for cuTile, CAKE,
 Hopper, QSA indexed/two-pass APIs, checkpoint/summary/decode paths, shared gate
-parameters, DSA indexer/Top-K generation, score recompute, pooled DSA, or
+parameters, DSA fused/separate Top-K generation, paged or block-scaled indexer
+forward, THD dense indexer backward, score recompute, pooled DSA, or
 distributed training recipes. Existing tests cover some of
 these paths separately. Full recipe CI and an automatic source-to-test PR
 gate remain separate integration work; the checklist is a review safeguard.
@@ -213,21 +257,23 @@ cuDNN `92500`, CuTe DSL `4.8.0.dev0`, TVM FFI `0.1.12`.
 The complete runtime record is in [the goldens](5f8a825586430e85/dsa-fprop.json).
 The test banners confirmed imports from this checkout.
 
-Two disjoint default-L0 runs covered all 205 cases. Run from `test/python`:
+Two disjoint default-L0 runs covered all 251 cases. Run from `test/python`:
 
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4
 export CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"
 python -m pytest core/test_determinism_utils.py \
-  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -q
+  deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -q
 python -m pytest linear_attention/frost/test_*_determinism.py \
   QSA/cutedsl/test_qsa_determinism.py -q
 ```
 
-- DSA plus harness: **49 passed, 5 failed, 0 skipped** in 76.01 seconds.
+- DSA attention, indexer, and harness: **89 passed, 11 failed, 0 skipped** in 128.77 seconds.
 - Existing five operation suites: **137 passed, 14 failed, 0 skipped** in 489.44 seconds.
-- Combined: **186 passed, 19 failed, 0 skipped**. Executed node IDs match the
-  205 cases selected by default L0 collection (0.26 seconds).
+- Combined: **226 passed, 25 failed, 0 skipped**. Executed node IDs match the
+  251 cases selected by default L0 collection (0.28 seconds). The five existing
+  operation suites retain their earlier results; their code is unchanged by
+  the indexer addition.
 
 | Suite | fprop | bprop |
 | --- | --- | --- |
@@ -236,15 +282,23 @@ python -m pytest linear_attention/frost/test_*_determinism.py \
 | GDN | 13 passed | 15 passed |
 | GDN-2 | 13 passed | 15 passed |
 | QSA | 15 passed, 2 failed | 6 passed, 12 failed |
-| DSA | 24 passed | 19 passed, 5 failed |
+| DSA sparse attention | 24 passed | 19 passed, 5 failed |
+| DSA indexer forward | 24 passed | — |
+| DSA sparse indexer backward | — | 13 passed, 2 failed |
+| DSA dense indexer backward | — | 3 passed, 4 failed |
 
-All six harness controls and all twelve golden cases passed. Each golden
-case also passed replay and its independent numerical reference. DSA adds two
-new baselines; the ten existing records are unchanged. Golden recording was
-disabled in both validation runs.
+All six harness controls and all fifteen golden cases passed. Each golden
+also passed replay and its independent numerical reference. The indexer adds
+three baselines; the twelve existing records are unchanged. Golden recording
+was disabled in validation. Sparse indexer large-Top-K cases pass replay and
+reference, then fail dK after reorder. Dense indexer backward fails dK replay,
+batch, or neighbor checks. The [API-by-dtype table and indexer failure list](../../../docs/operations/determinism.md)
+record the measured results.
+
 Pre-commit (Black, Black Jupyter, SPDX), Python syntax, and `git diff --check`
 passed. Runtime warnings were Torch context/debug notices and existing CuTe
-DSL scheduler/allocator deprecations.
+DSL scheduler/allocator deprecations. `fern check --warnings` found zero
+errors; the remote redirect check was skipped after an FDR HTTP 403 response.
 
 ### DSA failures
 

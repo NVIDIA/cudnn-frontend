@@ -19,6 +19,11 @@ invalid after packing. Use unique active indices for deterministic backward.
 The sink gradient is shared across sequences: isolate the target's upstream
 gradient before comparing it across batches. Check DSA's signed infinity
 sentinels against the expected empty rows before byte comparison.
+For indexer backward, restore the score buffers that the API mutates. Keep
+`loss_coeff / query_count` and `grad_loss` fixed across batch layouts. Compare
+all three gradients and mutated scores; test BF16 and FP32 dK separately.
+Remap global Top-K IDs when batches move and preserve negative padding.
+Record API-by-dtype results in [the operation report](../docs/operations/determinism.md).
 
 MXFP8 backward's element-count allowance needs the same magnitude cap as its
 row-count allowance: an isolated large error can preserve amax and still fit

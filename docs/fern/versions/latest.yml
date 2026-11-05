@@ -20,6 +20,9 @@ navigation:
       - page: Python API Naming Conventions
         path: ../../operations/api_conventions.md
         slug: operations/api_conventions
+      - page: Determinism Test Results
+        path: ../../operations/determinism.md
+        slug: operations/determinism
       - section: Attention
         path: ../../operations/Attention.md
         slug: operations/Attention
