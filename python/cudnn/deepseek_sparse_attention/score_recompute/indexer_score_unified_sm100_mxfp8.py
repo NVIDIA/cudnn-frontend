@@ -1428,7 +1428,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         cute.arch.sync_threads()
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        head_producer, head_consumer = pipeline_head.make_participants()
         Q_producer, Q_consumer = pipeline_Q.make_participants()
         K_producer, K_consumer = pipeline_K.make_participants()
         KScale_producer, KScale_consumer = pipeline_KScale.make_participants()
@@ -1473,6 +1472,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         if warp_group_idx == 0:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
             tile_sched, work_tile, clc_consumer_state = self._role_tile_scheduler(tile_sched_params, clc_response_ptr)
+            head_producer = pipeline_head.make_producer()
 
             if warp_idx == self.load_warp_id:
                 # Load warp: stage W, Q/QScale, then walk K blocks from high to
@@ -1773,6 +1773,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         if warp_group_idx == 1:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             tile_sched, work_tile, clc_consumer_state = self._role_tile_scheduler(tile_sched_params, clc_response_ptr)
+            head_consumer = pipeline_head.make_consumer()
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
             sScoreAll_epi0 = cute.make_tensor(
@@ -1893,6 +1894,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         if warp_group_idx == 2:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             tile_sched, work_tile, clc_consumer_state = self._role_tile_scheduler(tile_sched_params, clc_response_ptr)
+            head_consumer = pipeline_head.make_consumer()
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
             sScoreAll_epi1 = cute.make_tensor(
