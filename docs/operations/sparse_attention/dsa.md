@@ -866,8 +866,10 @@ passes `denom=None`, so the LSE slot is compiled out (no placeholder buffer),
 while dense indexer score recompute runs it with `compute_lse=True` and a live
 `denom`. The shared implementation lives in `score_recompute`;
 `indexer_forward` only imports it.
-Dense Attention Score Recompute has a separate MXFP8 kernel because its score
-and normalization semantics differ from the indexer path.
+Dense Attention Score Recompute has separate BF16 and MXFP8 kernels because its
+score and normalization semantics differ from the indexer path; the MXFP8 one
+shares the indexer kernels' warp-specialized scaffolding and block-scale
+plumbing.
 
 - **Precision** — on SM100, `dense_indexer_score_recompute_wrapper` takes
   `precision="bf16"`, `"mxfp8"`, or `"mxfp4"` with the Q/K and scale

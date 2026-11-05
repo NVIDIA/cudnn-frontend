@@ -810,7 +810,6 @@ def _dispatch_dense_attn_tile_params(
     qhead_per_kv_head,
     *,
     precision: str = "bf16",
-    seqlen_k_hint: Optional[int] = None,
     k_block_size: Optional[int] = None,
 ):
     """Select (m_block_size, n_block_size, k_block_size) for dense attention backward.
@@ -826,11 +825,10 @@ def _dispatch_dense_attn_tile_params(
     """
     precision = precision.lower()
     if precision == "mxfp8":
-        if head_dim == 512:
-            default_k = 256 if seqlen_k_hint is not None and seqlen_k_hint >= 4096 else 128
-        else:
-            default_k = 64
-        return 128, 128, default_k if k_block_size is None else k_block_size
+        # One 128-row (token, head) tile for 64 / 128 heads; the head dim streams in fixed 128-wide chunks.
+        if k_block_size is not None and k_block_size != 128:
+            raise ValueError(f"precision='mxfp8' dense attention streams head_dim in 128-wide chunks; k_block_size must be None or 128, got {k_block_size}")
+        return 128, 128, None
     if precision != "bf16":
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
 
@@ -1329,27 +1327,14 @@ def _dense_attn_score_recompute(
 
     _require_fp32_output(out, "out", (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k))
     _require_fp32_output(denom_out, "denom_out", (q.shape[0],) if is_varlen else (bs, seqlen_q))
-    if precision == "mxfp8" and ((head_dim == 512 and qhead_per_kv_head >= 128) or (head_dim == 128 and qhead_per_kv_head == 64)):
-        with _torch_stream_context(current_stream):
-            out.zero_()
-            denom_out.zero_()
-
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-    if k_block_size is None:
-        k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=4)
-    kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=4)
     if precision == "mxfp8":
-        if head_dim == 512:
-            if k_block_size == 64:
-                kv_stage = 7
-            elif k_block_size == 256:
-                kv_stage = 3
-            elif qhead_per_kv_head >= 128:
-                kv_stage = 9
-            else:
-                kv_stage = 7
-        else:
-            kv_stage = 4
+        # The MXFP8 kernel streams the head dim in fixed 128-wide chunks and sizes its own SMEM rings.
+        kv_stage = None
+    else:
+        if k_block_size is None:
+            k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=4)
+        kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=4)
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
@@ -1370,9 +1355,6 @@ def _dense_attn_score_recompute(
             qhead_per_kv_head,
             m_block_size,
             n_block_size,
-            k_block_size,
-            head_dim_padded // k_block_size,
-            kv_stage,
             ratio,
             is_varlen,
             q_causal_offsets is not None,
@@ -1415,8 +1397,6 @@ def _dense_attn_score_recompute(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=k_block_size,
-                kv_stage=kv_stage,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,
@@ -1431,7 +1411,6 @@ def _dense_attn_score_recompute(
                 n_block_size=n_block_size,
                 k_block_size=k_block_size,
                 kv_stage=kv_stage,
-                score_type="attention",
                 ratio=ratio,
                 is_varlen=is_varlen,
             )
@@ -1678,12 +1657,10 @@ def dense_attn_score_recompute(
     head_dim = q.shape[-1]
 
     precision = _normalize_dense_precision(precision, q_scale, k_scale)
-    seqlen_k_hint = int(max_seqlen_k) if max_seqlen_k is not None else (k.shape[0] if q.ndim == 3 else k.shape[1])
     m, n, kbs = _dispatch_dense_attn_tile_params(
         head_dim,
         qhead_per_kv_head,
         precision=precision,
-        seqlen_k_hint=seqlen_k_hint,
         k_block_size=k_block_size,
     )
 

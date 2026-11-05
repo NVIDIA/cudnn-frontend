@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -55,16 +54,8 @@ from cutlass.pipeline import (
     PipelineClcFetchAsync,
 )
 import cutlass.utils as utils
-from cutlass.utils.blackwell_helpers import (
-    make_trivial_tiled_mma as _make_trivial_tiled_mma,
-    make_smem_layout_a as _make_smem_layout_a,
-    make_smem_layout_b as _make_smem_layout_b,
-    make_blockscaled_trivial_tiled_mma as _make_blockscaled_trivial_tiled_mma,
-    cluster_shape_to_tma_atom_A as _cluster_shape_to_tma_atom_A,
-    cluster_shape_to_tma_atom_SFB as _cluster_shape_to_tma_atom_SFB,
-)
 from cutlass.utils import blockscaled_layout as _blockscaled_layout
-from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 import cuda.bindings.driver as cuda
 
@@ -73,14 +64,17 @@ from cudnn.deepseek_sparse_attention.utils.sm100.gemm import (
     gemm_ptx_partial_mxfp8 as _gemm_ptx_partial_mxfp8,
 )
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
-from .indexer_score_unified_sm100 import IndexerScoreSm100Base, _tcgen05_fence_after, _tcgen05_fence_before
-from .dense_score_recompute_sm100 import (
+from .indexer_score_unified_sm100 import IndexerScoreSm100Base
+from .score_kernel_sm100 import (
+    BlockScaledScoreSm100Mixin,
     add_packed_f32x2,
     fma_packed_f32x2,
+    tcgen05_fence_after as _tcgen05_fence_after,
+    tcgen05_fence_before as _tcgen05_fence_before,
 )
 
 
-class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
+class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm100Base):
     """Block-scaled (MXFP8) dense / compact indexer score with optional LSE."""
 
     arch = 100
@@ -161,19 +155,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
         # Warps: 0 load, 1 MMA, 2 CLC scheduler, 3 K-scale S2T, then the math warpgroups.
         # H64 tiles hold 2 tokens (one per math warpgroup); smaller groups use 4 warpgroups so a
         # thread's resident W / score columns stay small and 4 warps per SMSP hide TMEM latency.
-        self.load_warp_id, self.mma_warp_id, self.sched_warp_id, self.sf_warp_id = 0, 1, 2, 3
-        self.num_math_wg = 2 if self.q_tokens_per_tile == 2 else 4
+        self.sf_warp_id = 3
+        self._set_register_split(2 if self.q_tokens_per_tile == 2 else 4)
         assert self.q_tokens_per_tile % self.num_math_wg == 0
-        self.num_warps = 4 + 4 * self.num_math_wg
-        self.threads_per_cta = self.WARP_SIZE * self.num_warps
-        # setmaxnreg only redistributes the CTA's launch allocation (floor8(64K / threads) per thread);
-        # asking for more than that pool hangs the increasing warpgroups.
-        self.num_regs_load = 56
-        launch_regs = (65536 // self.threads_per_cta) // 8 * 8
-        self.num_regs_epilogue = min(
-            256,
-            ((launch_regs * self.threads_per_cta - self.WARPGROUP_SIZE * self.num_regs_load) // (self.WARPGROUP_SIZE * self.num_math_wg)) // 8 * 8,
-        )
         # relu via (s + |s|) for every head pair below H64 (the reduce is issue bound there); H64 keeps
         # the ALU/FMA split (FMNMX for even pairs, FADD2 for odd pairs).
         self.relu_fadd_all = self.qhead_per_kvhead != 64
@@ -188,23 +172,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
         self.tmem_q_sfb_offset = self.tmem_k_sfa_base_offset + self.NUM_SF_STAGES * self.sfa_stage_cols
         self.tmem_alloc_cols = 512
         assert self.tmem_q_sfb_offset + self.tmem_sfb_cols <= self.tmem_alloc_cols
-
-    @staticmethod
-    def _qk_tensor(t: cute.Tensor) -> cute.Tensor:
-        """Q or K as this kernel reads it, from the tensor it is launched with (the same tensor here)."""
-        return t
-
-    def _make_data_tiled_mma(self, blockscaled_tiled_mma_qk, cta_group):
-        """Tiled MMA that lays out and partitions the Q/K data tiles: the unscaled E4M3 MMA of the QK tile."""
-        return _make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_dtype,
-            self.k_major_mode,
-            self.q_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
 
     @cute.jit
     def __call__(
@@ -228,19 +195,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
         mCandBatchOffsets: cute.Tensor | None = None,
     ):
         # mDenom is None when compute_lse is off: the slot is compiled out (R3).
-        # Runtime tensor metadata is needed to build CuTe layouts and compile
-        # the matching kernel.  The element dtypes become compile-time constants
-        # inside cute.compile.
-        mQ = self._qk_tensor(mQ)
-        mK = self._qk_tensor(mK)
-        self.q_dtype = mQ.element_type
-        self.k_dtype = mK.element_type
-        self.sf_dtype = mQScale.element_type
         is_varlen = mCuSeqlensQ is not None
-
-        # The API accepts either BSHD or packed THD.  The compile key records
-        # is_varlen, and these asserts make accidental mismatches fail during
-        # compilation instead of silently interpreting strides incorrectly.
+        # The API accepts BSHD or packed THD; the compile key records is_varlen and these asserts make a mismatch
+        # fail at compile time instead of silently misreading strides.
         if const_expr(is_varlen):
             assert self.is_varlen
             assert mCuSeqlensQ is not None and mCuSeqlensK is not None
@@ -252,183 +209,35 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
             assert mCuSeqlensQScalePadded is None
             assert mCuSeqlensKScalePadded is None
 
-        # Normalize BSHD and THD tensors into the K-major/Q-major shapes expected
-        # by the SM100 TMA helpers.  THD keeps batch in cu_seqlens; BSHD exposes
-        # the batch as the final tensor mode.
-        Q_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
-        K_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
-        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
-        mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=K_layout_transpose))
-
-        seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else cute.size(mQ.shape[0])
-        seqlen_q_packed = seqlen_q_static * self.qhead_per_kvhead
-
-        # The packed scale tensors expose their caller-defined, atom-aligned MN
-        # address extent directly in the second mode.
-        scale_l_size = cute.size(mQScale.shape[0])
-        q_scale_layout = _blockscaled_layout.tile_atom_to_shape_SF(
-            (cute.size(mQScale.shape[1]), self.head_dim_padded, scale_l_size),
-            self.sf_vec_size,
-        )
-        k_scale_layout = _blockscaled_layout.tile_atom_to_shape_SF(
-            (cute.size(mKScale.shape[1]), self.head_dim_padded, scale_l_size),
-            self.sf_vec_size,
-        )
-        mQScale = cute.make_tensor(mQScale.iterator, q_scale_layout)
-        mKScale = cute.make_tensor(mKScale.iterator, k_scale_layout)
-
-        # Fold qhead_per_kvhead into the M dimension so one m tile covers two
-        # QH64 tokens or four QH32 tokens. The epilogue reverses this packed
-        # index when writing outputs.
-        shape_Q_packed = (
-            (self.qhead_per_kvhead, mQ.shape[0]),
-            mQ.shape[1],
-            1,
-            *mQ.shape[3:],
-        )
-        stride_Q_packed = (
-            (mQ.stride[2], mQ.stride[0]),
-            mQ.stride[1],
-            mQ.stride[2] * self.qhead_per_kvhead,
-            *mQ.stride[3:],
-        )
-        mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
-
-        cta_group = tcgen05.CtaGroup.ONE
-        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
-        self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
-
-        # blockscaled_tiled_mma_qk is the UMMA op with SFA/SFB fields.  tiled_mma_qk
-        # (``_make_data_tiled_mma``) lays out and partitions the data tensors; it may
-        # be the block-scaled op itself.
-        blockscaled_tiled_mma_qk = _make_blockscaled_trivial_tiled_mma(
-            self.k_dtype,
-            self.k_dtype,
-            self.k_major_mode,
-            self.q_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
-        tiled_mma_qk = self._make_data_tiled_mma(blockscaled_tiled_mma_qk, cta_group)
-
-        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
-            (tiled_mma_qk.thr_id.shape,),
-        )
-
-        # Data SMEM follows the data tiled MMA's layouts; scale SMEM follows CUTLASS
-        # blockscaled SFA/SFB layouts so tcgen05 can consume E8M0 factors from
-        # TMEM fields rather than doing explicit dequant math in registers.
-        sK_layout = _make_smem_layout_a(
-            tiled_mma_qk,
-            self.mma_tiler_qk,
-            self.k_dtype,
-            self.kv_stage,
-        )
-        sQ_layout = _make_smem_layout_b(
-            tiled_mma_qk,
-            self.mma_tiler_qk,
-            self.q_dtype,
-            self.num_k_chunks * self.q_stage,
-        )
-        scale_tile_k = self.scale_tile_k
-        scale_mma_tiler_qk = (self.n_block_size, self.m_block_size, scale_tile_k)
-        sKScale_layout = _blockscaled_layout.make_smem_layout_sfa(
-            blockscaled_tiled_mma_qk,
-            scale_mma_tiler_qk,
-            self.sf_vec_size,
-            self.k_scale_stage,
-        )
-        sQScale_layout = _blockscaled_layout.make_smem_layout_sfb(
-            blockscaled_tiled_mma_qk,
-            scale_mma_tiler_qk,
-            self.sf_vec_size,
-            self.num_q_scale_stages,
-        )
-        self.sQ_layout = sQ_layout
-        self.sK_layout = sK_layout
-        self.sQScale_layout = sQScale_layout
-        self.sKScale_layout = sKScale_layout
-
-        # Data TMA atoms load the Q/K tiles into SMEM.  Scale TMA atoms load
-        # packed E8M0 factors as Int16 internally because CUTLASS blockscaled
-        # layouts store two E8M0 bytes per logical compact element.
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
-
-        tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
+        # One full-D scale tile per n block (K) / per work tile (Q); K and its scales share the split barrier.
+        ops = self._block_scaled_operands(
             mQ,
-            cute.select(sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            self.cluster_layout_vmnk.shape,
-        )
-        tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
             mK,
-            cute.select(sK_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            self.cluster_layout_vmnk.shape,
-        )
-
-        k_scale_tma_op = _cluster_shape_to_tma_atom_A(self.cluster_shape_mn, blockscaled_tiled_mma_qk.thr_id)
-        q_scale_tma_op = _cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, blockscaled_tiled_mma_qk.thr_id)
-        k_scale_smem_layout = cute.slice_(sKScale_layout, (None, None, None, 0))
-        q_scale_smem_layout = cute.slice_(sQScale_layout, (None, None, None, 0))
-        tma_atom_KScale, mKScale = cute.nvgpu.make_tiled_tma_atom_A(
-            k_scale_tma_op,
-            mKScale,
-            k_scale_smem_layout,
-            scale_mma_tiler_qk,
-            blockscaled_tiled_mma_qk,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-        tma_atom_QScale, mQScale = cute.nvgpu.make_tiled_tma_atom_B(
-            q_scale_tma_op,
             mQScale,
-            q_scale_smem_layout,
-            scale_mma_tiler_qk,
-            blockscaled_tiled_mma_qk,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
+            mKScale,
+            is_varlen,
+            scale_tile_k=self.scale_tile_k,
+            q_data_stages=self.num_k_chunks * self.q_stage,
+            q_scale_stages=self.num_q_scale_stages,
+            k_data_stages=self.kv_stage,
+            k_scale_stages=self.k_scale_stage,
         )
+        mQ, mK, mQScale, mKScale = ops["mQ"], ops["mK"], ops["mQScale"], ops["mKScale"]
+        tiled_mma_qk, blockscaled_tiled_mma_qk = ops["tiled_mma_qk"], ops["blockscaled_tiled_mma_qk"]
+        sQ_layout, sK_layout, sQScale_layout, sKScale_layout = ops["sQ_layout"], ops["sK_layout"], ops["sQScale_layout"], ops["sKScale_layout"]
+        tma_atom_Q, tma_atom_K, tma_atom_QScale, tma_atom_KScale = ops["tma_atom_Q"], ops["tma_atom_K"], ops["tma_atom_QScale"], ops["tma_atom_KScale"]
+        b = self.tma_bytes
+        self.tma_copy_bytes = {"Q": self.num_k_chunks * b["q_data"] + b["q_scale"], "K": b["k_data"], "KScale": b["k_scale"]}
+        seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else ops["seqlen_q"]
 
-        q_data_tma_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
-        k_data_tma_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
-        q_scale_tma_bytes = cute.size_in_bytes(self.sf_dtype, q_scale_smem_layout)
-        k_scale_tma_bytes = cute.size_in_bytes(self.sf_dtype, k_scale_smem_layout)
-        # KScale has its own pipeline and barrier accounting.  One full-D128
-        # scale tile is reused by the two k64 data chunks for the same n block.
-        self.tma_copy_bytes = {
-            "Q": self.num_k_chunks * q_data_tma_bytes + q_scale_tma_bytes,
-            "K": k_data_tma_bytes,
-            "KScale": k_scale_tma_bytes,
-        }
-
-        PerHead_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
-        mPerHead = cute.make_tensor(mPerHead.iterator, cute.select(mPerHead.layout, mode=PerHead_transpose))
-
+        assert mDenom is not None or not self.compute_lse, "mDenom is None but compute_lse=True writes the denominator"
+        mPerHead = self._rows_first(mPerHead, is_varlen, 3)
         if const_expr(not self.is_compressed_logits):
-            Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
-            mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
+            mOut = self._rows_first(mOut, is_varlen, 3)
+        mDenom = self._rows_first(mDenom, is_varlen, 2)
 
-        if const_expr(mDenom is not None):
-            Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
-            mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
-        else:
-            assert not self.compute_lse, "mDenom is None but compute_lse=True writes the denominator"
-
-        # Persistent scheduler grid: one logical work tile per m block and
-        # batch.  The kernel itself walks all dense K blocks for that m tile.
-        num_m_blocks = cute.ceil_div(seqlen_q_packed, self.m_block_size)
         batch_size = cute.size(mCuSeqlensQ.shape[0]) - 1 if const_expr(is_varlen) else cute.size(mQ.shape[3])
-        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((num_m_blocks, 1, batch_size), (*self.cluster_shape_mn, 1))
-        grid_dim = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
+        tile_sched_params, grid_dim = self._tile_scheduler(seqlen_q_static, batch_size)
         # Launch signature keeps Q/K scales explicit so the same unified object
         # can serve forward score-only and backward score+LSE dispatches.
         self.kernel(
@@ -465,29 +274,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
             cluster=self.cluster_shape_mnk,
             stream=stream,
         )
-
-    @cute.jit
-    def mainloop_s2t_copy_and_partition(
-        self,
-        sSF: cute.Tensor,
-        tSF: cute.Tensor,
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        # Scale factors are loaded by TMA into SMEM and then copied into TMEM
-        # SFA/SFB fields with tcgen05 S2T copies.  filter_zeros keeps the copy
-        # compact for the blockscaled layout's sparse logical strides.
-        tCsSF_compact = cute.filter_zeros(sSF)
-        tCtSF_compact = cute.filter_zeros(tSF)
-
-        copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
-            self.sf_dtype,
-        )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
-        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
     @cute.jit
     def _gemm_blockscaled_qk(
@@ -692,7 +478,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
             blockscaled_tiled_mma_qk, (self.n_block_size, self.m_block_size, self.head_dim_padded), self.sf_vec_size, q_scale_smem_layout
         )
         tCtQSFB = cute.make_tensor(sf_tmem_ptr + tmem_sf_offset_scale * self.tmem_q_sfb_offset, tCtQSFB_layout)
-        tiled_copy_s2t_qsfb, tCsQSFB_compact_s2t, tCtQSFB_compact_s2t = self.mainloop_s2t_copy_and_partition(sQScale, tCtQSFB)
+        tiled_copy_s2t_qsfb, tCsQSFB_compact_s2t, tCtQSFB_compact_s2t = self._s2t_copy_and_partition(sQScale, tCtQSFB)
 
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.WARPGROUP_SIZE)
 
@@ -707,35 +493,16 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
                 k_scale_n_block = Int32(0)
                 KV_producer_state = make_pipeline_state(PipelineUserType.Producer, self.NUM_SPLIT_STAGES)
                 while work_tile.is_valid_tile:
-                    m_block_sched = work_tile.tile_idx[0]
-                    batch_idx = work_tile.tile_idx[2]
-                    seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-                    if const_expr(is_varlen):
-                        scale_l_idx = 0
-                        if batch_idx != scale_batch_idx:
-                            q_scale_m_block = mCuSeqlensQScalePadded[batch_idx] * self.qhead_per_kvhead // self.m_block_size
-                            k_scale_n_block = mCuSeqlensKScalePadded[batch_idx] // self.n_block_size
-                            scale_batch_idx = batch_idx
-                    else:
-                        scale_l_idx = batch_idx
-                    num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-                    if m_block_sched < num_m_blocks_cur:
-                        m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+                    valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+                    scale_l_idx, scale_batch_idx, q_scale_m_block, k_scale_n_block = self._scale_offsets(
+                        batch_idx, scale_batch_idx, q_scale_m_block, k_scale_n_block, mCuSeqlensQScalePadded, mCuSeqlensKScalePadded
+                    )
+                    if valid:
                         num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                         num_splits = cute.ceil_div(num_n_blocks, SPLIT)
                         head = head_producer.acquire_and_advance()
-                        per_head_buf_off = head.index * self.m_block_size
                         mPerHead_cur = seqlen.offset_batch_Q(mPerHead, batch_idx, dim=2)
-                        for ri in cutlass.range_constexpr(self.m_block_size // self.WARP_SIZE):
-                            row = ri * self.WARP_SIZE + lane_id
-                            m_packed_idx = m_block * self.m_block_size + row
-                            m_idx = m_packed_idx // self.qhead_per_kvhead
-                            h_idx = m_packed_idx - m_idx * self.qhead_per_kvhead
-                            if m_idx < seqlen.seqlen_q:
-                                sPerHead[per_head_buf_off + row] = Float32(mPerHead_cur[m_idx, h_idx])
-                            else:
-                                sPerHead[per_head_buf_off + row] = Float32(0.0)
+                        self._stage_per_head(sPerHead, head.index * self.m_block_size, mPerHead_cur, m_block, seqlen.seqlen_q, lane_id)
                         head.commit()
                         cute.arch.fence_view_async_shared()
 
@@ -798,13 +565,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
                 sf_ctr = Int32(0)
                 sf_empty_bits = Int32((1 << self.NUM_SF_STAGES) - 1)
                 while work_tile.is_valid_tile:
-                    m_block_sched = work_tile.tile_idx[0]
-                    batch_idx = work_tile.tile_idx[2]
-                    seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-                    num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-                    if m_block_sched < num_m_blocks_cur:
-                        m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+                    valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+                    if valid:
                         num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                         num_splits = cute.ceil_div(num_n_blocks, SPLIT)
                         split = Int32(0)
@@ -817,7 +579,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
                             for j in cutlass.range_constexpr(SPLIT):
                                 col = Int32(self.tmem_k_sfa_base_offset) + st * Int32(self.sfa_stage_cols) + Int32(j * self.tmem_sfa_cols)
                                 tCtKSFA = cute.make_tensor(sf_tmem_ptr + Int32(tmem_sf_offset_scale) * col, tCtKSFA_layout)
-                                tiled_copy_s2t_ksfa, tCsKSFA_s2t, tCtKSFA_s2t = self.mainloop_s2t_copy_and_partition(sKScale, tCtKSFA)
+                                tiled_copy_s2t_ksfa, tCsKSFA_s2t, tCtKSFA_s2t = self._s2t_copy_and_partition(sKScale, tCtKSFA)
                                 cute.copy(tiled_copy_s2t_ksfa, tCsKSFA_s2t[(None, None, None, None, KV_sf_state.index * SPLIT + j)], tCtKSFA_s2t)
                             with cute.arch.elect_one():
                                 tcgen05.commit(SF_mbar_ptr + st)
@@ -841,13 +603,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
                 tSrK = tiled_mma_qk.make_fragment_A(sK)
                 tSrQ = tiled_mma_qk.make_fragment_B(sQ)
                 while work_tile.is_valid_tile:
-                    m_block_sched = work_tile.tile_idx[0]
-                    batch_idx = work_tile.tile_idx[2]
-                    seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-                    num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-                    if m_block_sched < num_m_blocks_cur:
-                        m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+                    valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+                    if valid:
                         num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                         num_splits = cute.ceil_div(num_n_blocks, SPLIT)
                         handle_Q = Q_consumer.wait_and_advance()
@@ -902,17 +659,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
 
             # ---------------- CLC scheduler warp ----------------
             if warp_idx == self.sched_warp_id:
-                clc_producer_state = make_pipeline_state(PipelineUserType.ProducerConsumer, self.num_clc_stage)
-                while work_tile.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
-                    tile_sched.advance_to_next_work(mbarrier_addr)
-                    clc_producer_state.advance()
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
+                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state)
 
         # ---------------- math warpgroups ----------------
         if warp_group_idx > 0:
@@ -981,13 +728,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreSm100Base):
         kv_offset = tScS[0][0]
         rW = cute.make_rmem_tensor((cols,), Float32)
         while work_tile.is_valid_tile:
-            m_block_sched = work_tile.tile_idx[0]
-            batch_idx = work_tile.tile_idx[2]
-            seqlen = SeqlenInfoCls(batch_idx)
-            q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-            num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-            if m_block_sched < num_m_blocks_cur:
-                m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+            valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+            if valid:
                 num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                 num_splits = cute.ceil_div(num_n_blocks, SPLIT)
                 if const_expr(self.is_compressed_logits):

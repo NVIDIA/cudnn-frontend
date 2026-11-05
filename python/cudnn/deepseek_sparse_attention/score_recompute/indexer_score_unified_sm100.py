@@ -55,9 +55,7 @@ from cutlass.utils.blackwell_helpers import (
     make_smem_layout_a as _make_smem_layout_a,
     make_smem_layout_b as _make_smem_layout_b,
 )
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import llvm
-from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 import cuda.bindings.driver as cuda
 from functools import partial
@@ -65,18 +63,13 @@ from functools import partial
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 from cudnn.deepseek_sparse_attention.utils.sm100.gemm import gemm_ptx_partial as _gemm_ptx_partial
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
-from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100, add_packed_f32x2, fma_packed_f32x2
-
-
-@dsl_user_op
-def _tcgen05_fence_after(*, loc=None, ip=None):
-    llvm.inline_asm(None, [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
-def _tcgen05_fence_before(*, loc=None, ip=None):
-    llvm.inline_asm(None, [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-
+from .score_kernel_sm100 import (
+    ScoreKernelSm100,
+    add_packed_f32x2,
+    fma_packed_f32x2,
+    tcgen05_fence_after as _tcgen05_fence_after,
+    tcgen05_fence_before as _tcgen05_fence_before,
+)
 
 _SMEM_BYTES = 232448  # SM100 dynamic SMEM per CTA
 _SMEM_RESERVE = 4096  # barriers, W ring, LSE scratch, alignment
@@ -106,15 +99,13 @@ def smem_plan(head_dim: int, k_block_size: int | None = None, *, tile: int = 128
     return q_stage, kv_group, num_kv_stages
 
 
-class IndexerScoreSm100Base(DenseScoreRecomputeSm100):
+class IndexerScoreSm100Base(ScoreKernelSm100):
     """Indexer-score contract shared by the SM100 indexer kernels (BF16 here, block-scaled subclasses).
 
     The packed M tile holds ``q_tokens_per_tile = m_block_size // qhead_per_kvhead`` query tokens; every
     token's ReLU(QK) * W head reduce writes one score per key, densely or into the compact ratio-causal
     candidate buffer (``is_compressed_logits``), with an optional per-token LSE (``compute_lse``).
     """
-
-    max_q_tokens_per_tile = 8
 
     def __init__(
         self,
@@ -124,9 +115,6 @@ class IndexerScoreSm100Base(DenseScoreRecomputeSm100):
         cand_2d: bool = False,
         **kwargs,
     ):
-        # Reuse the dense-score base mainloop, but force its epilogue contract
-        # to dense indexer score.
-        kwargs["score_type"] = "indexer"
         super().__init__(*args, **kwargs)
         # Dense FE entry points remain the default. The compressed forward path
         # opts in and writes only ratio-causal candidates into a compact buffer.
@@ -203,18 +191,8 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
         self.q_stage = q_stage
 
         # Warps: 0 load, 1 MMA, 2 CLC scheduler, 3 idle, then the math warpgroups.
-        self.load_warp_id, self.mma_warp_id, self.sched_warp_id = 0, 1, 2
-        self.num_math_wg = self.NUM_MATH_WG if self.NUM_MATH_WG else (2 if self.q_tokens_per_tile == 2 else 4)
+        self._set_register_split(self.NUM_MATH_WG if self.NUM_MATH_WG else (2 if self.q_tokens_per_tile == 2 else 4))
         assert self.q_tokens_per_tile % self.num_math_wg == 0
-        self.num_warps = 4 + 4 * self.num_math_wg
-        self.threads_per_cta = self.WARP_SIZE * self.num_warps
-        # setmaxnreg only redistributes the CTA's launch allocation (floor8(64K / threads) per thread).
-        self.num_regs_load = 56
-        launch_regs = (65536 // self.threads_per_cta) // 8 * 8
-        self.num_regs_epilogue = min(
-            256,
-            ((launch_regs * self.threads_per_cta - self.WARPGROUP_SIZE * self.num_regs_load) // (self.WARPGROUP_SIZE * self.num_math_wg)) // 8 * 8,
-        )
         self.relu_fadd_all = self.qhead_per_kvhead != 64
         # TMEM -> register chunk width: a thread holds W (cols) plus two chunks (load next / reduce current).
         # ptxas sizes the math region against the launch budget (168 regs at 384 threads, 96 at 640).
@@ -259,18 +237,8 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
         else:
             assert self.page_size == 0 and mKvLens is None
 
-        # BSHD (bs, s, h, d) -> (s, d, h, bs); THD (t, h, d) -> (t, d, h); paged K pool (pages, page, h, d) -> (page, d, h, pages).
-        Q_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
-        K_layout_transpose = [0, 2, 1] if const_expr(is_varlen and not is_paged) else [1, 3, 2, 0]
-        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
-        mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=K_layout_transpose))
-        shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], 1, *mQ.shape[3:])
-        stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
-        mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
-
+        mQ, mK, seqlen_q = self._pack_qk(mQ, mK, is_varlen, is_paged)
         cta_group = tcgen05.CtaGroup.ONE
-        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
-        self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype, self.q_dtype, self.k_major_mode, self.q_major_mode, self.qk_acc_dtype, cta_group, self.mma_tiler_qk[:2]
         )
@@ -297,22 +265,15 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
         k_chunk_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
         self.tma_copy_bytes = {"Q": self.num_k_chunks * q_chunk_bytes, "K": self.kv_group * k_chunk_bytes}
 
-        PerHead_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
-        mPerHead = cute.make_tensor(mPerHead.iterator, cute.select(mPerHead.layout, mode=PerHead_transpose))
+        assert mDenom is not None or not self.compute_lse
+        mPerHead = self._rows_first(mPerHead, is_varlen, 3)
         if const_expr(not self.is_compressed_logits):
-            Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
-            mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
-        if const_expr(mDenom is not None):
-            Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
-            mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
-        else:
-            assert not self.compute_lse
+            mOut = self._rows_first(mOut, is_varlen, 3)
+        mDenom = self._rows_first(mDenom, is_varlen, 2)
 
-        seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else cute.size(mQ.shape[0]) // self.qhead_per_kvhead
-        num_m_blocks = cute.ceil_div(seqlen_q_static * self.qhead_per_kvhead, self.m_block_size)
+        seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else seqlen_q
         batch_size = cute.size(mCuSeqlensQ.shape[0]) - 1 if const_expr(is_varlen) else cute.size(mQ.shape[3])
-        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((num_m_blocks, 1, batch_size), (*self.cluster_shape_mn, 1))
-        grid_dim = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
+        tile_sched_params, grid_dim = self._tile_scheduler(seqlen_q_static, batch_size)
         self.kernel(
             mQ,
             mK,
@@ -489,26 +450,12 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
                 lane_id = tidx % self.WARP_SIZE
                 KV_producer_state = make_pipeline_state(PipelineUserType.Producer, self.num_kv_stages)
                 while work_tile.is_valid_tile:
-                    m_block_sched = work_tile.tile_idx[0]
-                    batch_idx = work_tile.tile_idx[2]
-                    seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-                    num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-                    if m_block_sched < num_m_blocks_cur:
-                        m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+                    valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+                    if valid:
                         num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                         head = head_producer.acquire_and_advance()
-                        per_head_buf_off = head.index * self.m_block_size
                         mPerHead_cur = seqlen.offset_batch_Q(mPerHead, batch_idx, dim=2)
-                        for ri in cutlass.range_constexpr(self.m_block_size // self.WARP_SIZE):
-                            row = ri * self.WARP_SIZE + lane_id
-                            m_packed_idx = m_block * self.m_block_size + row
-                            m_idx = m_packed_idx // self.qhead_per_kvhead
-                            h_idx = m_packed_idx - m_idx * self.qhead_per_kvhead
-                            if m_idx < seqlen.seqlen_q:
-                                sPerHead[per_head_buf_off + row] = Float32(mPerHead_cur[m_idx, h_idx])
-                            else:
-                                sPerHead[per_head_buf_off + row] = Float32(0.0)
+                        self._stage_per_head(sPerHead, head.index * self.m_block_size, mPerHead_cur, m_block, seqlen.seqlen_q, lane_id)
                         head.commit()
                         cute.arch.fence_view_async_shared()
 
@@ -586,13 +533,8 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
                 tSrQ = tiled_mma_qk.make_fragment_B(sQ)
                 qk_mma_op = tiled_mma_qk.op
                 while work_tile.is_valid_tile:
-                    m_block_sched = work_tile.tile_idx[0]
-                    batch_idx = work_tile.tile_idx[2]
-                    seqlen = SeqlenInfoCls(batch_idx)
-                    q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-                    num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-                    if m_block_sched < num_m_blocks_cur:
-                        m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+                    valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+                    if valid:
                         num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                         handle_Q = Q_consumer.wait_and_advance()
                         nb = Int32(0)
@@ -634,17 +576,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
 
             # ---------------- CLC scheduler warp ----------------
             if warp_idx == self.sched_warp_id:
-                clc_producer_state = make_pipeline_state(PipelineUserType.ProducerConsumer, self.num_clc_stage)
-                while work_tile.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
-                    tile_sched.advance_to_next_work(mbarrier_addr)
-                    clc_producer_state.advance()
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
+                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state)
 
         # ---------------- math warpgroups ----------------
         if warp_group_idx > 0:
@@ -708,13 +640,8 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
         kv_offset = tScS[0][0]
         rW = cute.make_rmem_tensor((cols,), Float32)
         while work_tile.is_valid_tile:
-            m_block_sched = work_tile.tile_idx[0]
-            batch_idx = work_tile.tile_idx[2]
-            seqlen = SeqlenInfoCls(batch_idx)
-            q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
-            num_m_blocks_cur = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.m_block_size)
-            if m_block_sched < num_m_blocks_cur:
-                m_block = num_m_blocks_cur - Int32(1) - m_block_sched
+            valid, m_block, seqlen, batch_idx, q_causal_offset = self._tile_info(work_tile, SeqlenInfoCls, mQCausalOffsets)
+            if valid:
                 num_n_blocks = self._dense_compute_n_blocks(m_block, seqlen.seqlen_q, seqlen.seqlen_k, q_causal_offset)
                 if const_expr(self.is_compressed_logits):
                     mOut_cur = mOut

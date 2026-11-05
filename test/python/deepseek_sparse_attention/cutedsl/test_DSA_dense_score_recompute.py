@@ -687,13 +687,17 @@ def test_DSA_dense_score_recompute_wrapper(
             )
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize(
-    "score_type,qhead_per_kv_head,s_q_default",
+    "score_type,qhead_per_kv_head,s_q_default,head_dim,s_kv_default",
     [
-        pytest.param("indexer", 64, 128, id="indexer_qh64"),
-        pytest.param("attention", 64, 128, id="attention_qh64"),
-        pytest.param("indexer", 32, 5, id="indexer_qh32_query_tail"),
+        pytest.param("indexer", 64, 128, 128, 128, marks=pytest.mark.L0, id="indexer_qh64"),
+        pytest.param("attention", 64, 128, 128, 128, marks=pytest.mark.L0, id="attention_qh64"),
+        pytest.param("indexer", 32, 5, 128, 128, marks=pytest.mark.L0, id="indexer_qh32_query_tail"),
+        # One query token per 128-row tile (H128), at both head dims; D512 streams four 128-wide K chunks.
+        pytest.param("attention", 128, 37, 128, 200, marks=pytest.mark.L0, id="attention_qh128_key_tail"),
+        pytest.param("attention", 128, 64, 512, 300, marks=pytest.mark.L0, id="attention_d512_qh128"),
+        # More tiles than SMs: persistent CTAs carry the accumulator / scale / LSE ring phases across tiles.
+        pytest.param("attention", 128, 600, 512, 160, marks=pytest.mark.L1, id="attention_d512_qh128_persistent"),
     ],
 )
 @torch_fork_set_rng(seed=13)
@@ -701,6 +705,8 @@ def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
     score_type,
     qhead_per_kv_head,
     s_q_default,
+    head_dim,
+    s_kv_default,
     request,
 ):
     """Compare MXFP8 score recompute with a dequantized reference."""
@@ -714,13 +720,13 @@ def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
 
     cfg = dsa_init(
         request=request,
-        head_dim=128,
+        head_dim=head_dim,
         qhead_per_kv_head=qhead_per_kv_head,
         score_type=score_type,
         min_compute_capability=100,
         b_default=1,
         s_q_default=s_q_default,
-        s_kv_default=128,
+        s_kv_default=s_kv_default,
     )
     ratio = 4
     q, k, q_deq, k_deq, q_scale, k_scale = _allocate_mxfp8_qk(cfg, scale_utils)
@@ -799,17 +805,19 @@ def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "score_type,head_dim",
+    "score_type,head_dim,h_q",
     [
-        pytest.param("indexer", 128, id="indexer_d128"),
-        pytest.param("attention", 128, id="attention_d128"),
-        pytest.param("attention", 512, id="attention_d512"),
+        pytest.param("indexer", 128, 64, id="indexer_d128"),
+        pytest.param("attention", 128, 64, id="attention_d128"),
+        pytest.param("attention", 512, 64, id="attention_d512"),
+        pytest.param("attention", 512, 128, id="attention_d512_qh128"),
     ],
 )
 @torch_fork_set_rng(seed=23)
 def test_DSA_dense_score_recompute_wrapper_thd_mxfp8_compact_padded_scales(
     score_type,
     head_dim,
+    h_q,
 ):
     try:
         from cudnn import DSA
@@ -824,7 +832,7 @@ def test_DSA_dense_score_recompute_wrapper_thd_mxfp8_compact_padded_scales(
 
     device = torch.device("cuda")
     shapes = [(127, 32), (129, 64)]
-    ratio, h_q, h_kv, d = 4, 64, 1, head_dim
+    ratio, h_kv, d = 4, 1, head_dim
     q_lengths = [s_q for s_q, _ in shapes]
     k_lengths = [s_k for _, s_k in shapes]
     cu_q = torch.tensor(
