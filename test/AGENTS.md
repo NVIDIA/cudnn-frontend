@@ -23,7 +23,9 @@ For indexer backward, restore the score buffers that the API mutates. Keep
 `loss_coeff / query_count` and `grad_loss` fixed across batch layouts. Compare
 all three gradients and mutated scores; test BF16 and FP32 dK separately.
 Remap global Top-K IDs when batches move and preserve negative padding.
-Record API-by-dtype results in [the operation report](../docs/operations/determinism.md).
+Keep API-by-dtype/GPU support in [the status page](../docs/operations/determinism.md).
+Put test counts, commands, runtimes, and failure diagnostics in
+[the test report](python/determinism_goldens/README.md), not the status page.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
 Check against dequantized inputs and include a scale-only change. Keep SM90

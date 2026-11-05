@@ -20,7 +20,7 @@ navigation:
       - page: Python API Naming Conventions
         path: ../../operations/api_conventions.md
         slug: operations/api_conventions
-      - page: Determinism Test Results
+      - page: Determinism Support
         path: ../../operations/determinism.md
         slug: operations/determinism
       - section: Attention

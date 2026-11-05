@@ -1,5 +1,9 @@
 # Attention determinism
 
+For API support by GPU and datatype, see the
+[determinism status page](../../../docs/operations/determinism.md).
+This report holds test coverage, measured results, and failure diagnostics.
+
 These suites check six attention families and the DSA indexer APIs. Run from `test/python`:
 
 ```bash
@@ -189,8 +193,8 @@ stay local. Global IDs are rebuilt for each batch order; negative padding stays
 invalid. The 193-row cases force a persistent producer to process a third row. Golden backward cases have one query; their passes do not
 establish determinism for multi-query reductions.
 
-See the [API-by-dtype result table](../../../docs/operations/determinism.md)
-for measured pass/fail counts and indexer failures.
+See the [API-by-dtype results](#api-and-datatype-results) and
+[SM100 indexer failures](#indexer-failures-sm100) below.
 
 ### DSA FP8/MXFP8 indexer: 34 cases
 
@@ -219,8 +223,9 @@ correctness tolerances apply only to references; replay and batch comparisons
 remain byte-exact.
 
 SM100/SM103/SM107 MXFP8 and SM90 FP8 each had **17 passed, 0 failed**,
-including their own saved golden. Each device skips the other precision group. The [architecture/API tables](../../../docs/operations/determinism.md)
-keep these gaps separate from measured results. FP8/MXFP8 backward is not
+including their own saved golden. Each device skips the other precision group.
+The [API-by-dtype results](#api-and-datatype-results) keep these gaps separate
+from measured results. FP8/MXFP8 backward is not
 supported by these DSA attention/indexer APIs and has no positive test cases.
 
 ## Golden checks
@@ -328,13 +333,72 @@ including replay and independent references. SM90 also passed its FP8 golden
 on Hopper. MXFP8 and Hopper FP8 each add one record; the fifteen earlier
 records are unchanged. Golden recording was disabled in validation. Sparse indexer large-Top-K cases pass replay and
 reference, then fail dK after reorder. Dense indexer backward fails dK replay,
-batch, or neighbor checks. The [API-by-dtype table and indexer failure list](../../../docs/operations/determinism.md)
-record the measured results.
+batch, or neighbor checks. The [API-by-dtype results](#api-and-datatype-results)
+and [SM100 indexer failure list](#indexer-failures-sm100) record the measurements.
 
 Pre-commit (Black, Black Jupyter, SPDX), Python syntax, and `git diff --check`
 passed. Runtime warnings were Torch context/debug notices and existing CuTe
 DSL scheduler/allocator deprecations. `fern check --warnings` found zero
 errors; the remote redirect check was skipped after an FDR HTTP 403 response.
+
+### API and datatype results
+
+Each cell is **passed / failed / skipped** for the 2026-11-04 runs.
+Counts are expanded pytest cases, each assigned once to its direction.
+Backward cases also compare forward results where applicable. A case stops at
+its first mismatch; later comparisons do not count as passes.
+
+| API | Direction | Datatype | SM90 Hopper | SM100 | SM103 | SM107 Rubin |
+| --- | --- | --- | --- | --- | --- | --- |
+| `kimi_delta_attention` | fprop | BF16 | 0 / 0 / 10 | 10 / 0 / 0 | 10 / 0 / 0 | 10 / 0 / 0 |
+| `kimi_delta_attention` | fprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `kimi_delta_attention` | bprop | BF16 | 0 / 0 / 12 | 12 / 0 / 0 | 12 / 0 / 0 | 12 / 0 / 0 |
+| `kimi_delta_attention` | bprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `gated_delta_product` | fprop | BF16 | 0 / 0 / 12 | 12 / 0 / 0 | 12 / 0 / 0 | 12 / 0 / 0 |
+| `gated_delta_product` | fprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `gated_delta_product` | bprop | BF16 | 0 / 0 / 14 | 14 / 0 / 0 | 14 / 0 / 0 | 14 / 0 / 0 |
+| `gated_delta_product` | bprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `gated_delta_net` | fprop | BF16 | 0 / 0 / 10 | 10 / 0 / 0 | 10 / 0 / 0 | 10 / 0 / 0 |
+| `gated_delta_net` | fprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `gated_delta_net` | bprop | BF16 | 0 / 0 / 12 | 12 / 0 / 0 | 12 / 0 / 0 | 12 / 0 / 0 |
+| `gated_delta_net` | bprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `gated_delta_net_v2` | fprop | BF16 | 0 / 0 / 10 | 10 / 0 / 0 | 10 / 0 / 0 | 10 / 0 / 0 |
+| `gated_delta_net_v2` | fprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `gated_delta_net_v2` | bprop | BF16 | 0 / 0 / 12 | 12 / 0 / 0 | 12 / 0 / 0 | 12 / 0 / 0 |
+| `gated_delta_net_v2` | bprop | FP16 | 0 / 0 / 3 | 3 / 0 / 0 | 3 / 0 / 0 | 3 / 0 / 0 |
+| `qsa_forward` | fprop | BF16 | 0 / 0 / 17 | 15 / 2 / 0 | 15 / 2 / 0 | 15 / 2 / 0 |
+| `qsa_backward` | bprop | BF16 | 0 / 0 / 18 | 6 / 12 / 0 | 7 / 11 / 0 | 6 / 12 / 0 |
+| `DSA.sparse_attention_forward_wrapper` | fprop | BF16 | 0 / 0 / 18 | 18 / 0 / 0 | 18 / 0 / 0 | 18 / 0 / 0 |
+| `DSA.sparse_attention_forward_wrapper` | fprop | FP16 | 0 / 0 / 6 | 6 / 0 / 0 | 6 / 0 / 0 | 6 / 0 / 0 |
+| `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | 0 / 0 / 18 | 13 / 5 / 0 | 13 / 5 / 0 | 14 / 4 / 0 |
+| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | 0 / 0 / 6 | 6 / 0 / 0 | 6 / 0 / 0 | 6 / 0 / 0 |
+| `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 weights | 0 / 0 / 15 | 15 / 0 / 0 | 15 / 0 / 0 | 15 / 0 / 0 |
+| `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; FP32 weights | 0 / 0 / 9 | 9 / 0 / 0 | 9 / 0 / 0 | 9 / 0 / 0 |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | 0 / 0 / 4 | 4 / 0 / 0 | 4 / 0 / 0 | 4 / 0 / 0 |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | 0 / 0 / 11 | 9 / 2 / 0 | 9 / 2 / 0 | 9 / 2 / 0 |
+| `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | 0 / 0 / 2 | 1 / 1 / 0 | 1 / 1 / 0 | 1 / 1 / 0 |
+| `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | 0 / 0 / 5 | 2 / 3 / 0 | 2 / 3 / 0 | 2 / 3 / 0 |
+| `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | 0 / 0 / 17 | 17 / 0 / 0 | 17 / 0 / 0 | 17 / 0 / 0 |
+| `DSA.indexer_forward_wrapper` | fprop | SM90 FP8 E4M3 Q/K; FP32 scales; BF16 weights | 17 / 0 / 0 | 0 / 0 / 17 | 0 / 0 / 17 | 0 / 0 / 17 |
+
+The table covers 279 operation cases per GPU. Six harness controls also passed
+on each GPU. Hopper attention and BF16 indexer skips are coverage gaps; they
+do not establish that the APIs are unsupported. The other precision group's
+FP8/MXFP8 cases skip on each architecture. Runtime details follow below.
+
+Run the full selection from `test/python`, with imports from this checkout:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4
+export CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"
+python -m pytest core/test_determinism_utils.py \
+  linear_attention/frost/test_*_determinism.py \
+  QSA/cutedsl/test_qsa_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -q
+```
+
+Add `--collect-only` to list the 285 L0 cases. The explicit golden directory
+makes missing runtime baselines fail. Keep golden recording disabled.
 
 ### SM90 Hopper validation
 
@@ -364,7 +428,7 @@ CuTe DSL `4.8.0`, TVM FFI `0.1.14.post1`. Source snapshot:
 `8671c79c2a1e7073bf1efe0cce1939f093a0d840`; imports resolved to that snapshot.
 The [SM103 goldens](7a727a3958771fbc) passed replay and independent references
 before a separate run with recording disabled. The same full-suite command
-listed in the operation report selected all 285 cases.
+listed under [API and datatype results](#api-and-datatype-results) selected all 285 cases.
 
 These 16 records add a new GPU/runtime baseline. Existing records are unchanged.
 Compared with SM100, linear-attention gate input hashes differ; the other input
@@ -444,6 +508,28 @@ actual inputs. No cross-device byte equality is inferred from separate passes.
 | `TestDSAIndexerBackward::test_sparse_persistent_rows[topk896]` | batch (1, 0), sequence 0 d_index_k: 132358/1048576 bytes differ |
 | `TestDSAIndexerBackward::test_sparse_persistent_rows[topk2048]` | batch (1, 0), sequence 0 d_index_k: 202644/1048576 bytes differ |
 | `TestDSAIndexerBackward::test_neighbor_isolation[dense]` | changed neighbor d_index_k: 1035/131072 bytes differ |
+
+### Indexer failures (SM100)
+
+**DSA BF16 indexer: 40 passed, 6 failed, 0 skipped.** The first mismatch in each failed case is dK.
+Sparse large-Top-K cases pass replay and reference, then fail after batch
+reorder. Dense backward also has replay and neighbor differences. Sparse dK
+reduction assigns query rows to fixed producers; changing batch position can
+change the grouping even when replay is stable. Dense backward uses atomic
+dK accumulation. These facts explain why a replay pass alone cannot establish
+batch invariance. Exact mismatch counts may vary between runs.
+
+| Indexer case | First mismatch |
+| --- | --- |
+| `TestDSAIndexerBackward::test_replay[dk-fp32-dense-h64]` | replay 1 d_index_k: 2166/262144 bytes differ |
+| `TestDSAIndexerBackward::test_batch_invariance[dk-bf16-dense-h64]` | batch (0, 1), sequence 0 d_index_k: 1/65536 bytes differ |
+| `TestDSAIndexerBackward::test_batch_invariance[dk-fp32-dense-h64]` | batch (0, 1), sequence 0 d_index_k: 793/131072 bytes differ |
+| `TestDSAIndexerBackward::test_sparse_persistent_rows[topk896]` | batch (1, 0), sequence 0 d_index_k: 132237/1048576 bytes differ |
+| `TestDSAIndexerBackward::test_sparse_persistent_rows[topk2048]` | batch (1, 0), sequence 0 d_index_k: 202412/1048576 bytes differ |
+| `TestDSAIndexerBackward::test_neighbor_isolation[dense]` | changed neighbor d_index_k: 1095/131072 bytes differ |
+
+The backward golden cases use one query. Their passes do not establish
+bitwise determinism for the multi-query reductions that fail above.
 
 ### DSA failures (SM100)
 
