@@ -9,9 +9,14 @@ shared-memory state path, the streamed two-CTAs-per-SM form, the PDL order, the 
 conv-state layout) with the entry's default pick on one operand set that carries a null row and non-monotone slots -- an arm the part
 does not hold is its typed decline, reported as a skip.  The default's per-rows pick (the pair, one CTA per SM while the rows x 48 grid
 fits the SMs, past that the capped two-CTAs-per-SM form where two of its CTAs share an SM, else the one-CTA form in two waves) is pinned
-on the host for both validated parts' readings over several SM counts and on the device."""
+on the host for both validated parts' readings over several SM counts and on the device.  The geometry (``Geometry(K_HEADS, V_HEADS,
+HIDDEN)`` of ``kernel/gdn_geometry.py``) is pinned on the host too: the default geometry's constants and forms unchanged, and for the
+per-rank geometries of the larger dense models (1 K head / 8 V heads / hidden 8192 at 16-way tensor parallelism, 2 / 16 / 8192, 4 / 32 /
+8192, 4 / 16 / 4096) the derived constants, the operand shapes the entry accepts, the per-geometry pick ladder, the entry's forms and keys,
+and the BA partition's coverage of every hidden index."""
 
 import math
+from collections import Counter
 from dataclasses import replace
 
 import pytest
@@ -21,11 +26,26 @@ cudnn = pytest.importorskip("cudnn")
 
 from cudnn.linear_attention.frost import gdn_decode_fused as entry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_decode_fused_config as kcfg  # noqa: E402
+from cudnn.linear_attention.frost.kernel import gdn_geometry  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
 ROWS = 2
 SLOTS = ROWS + 1
+# the per-rank geometries of the larger dense models: (K heads, V heads, hidden) at 16- / 8- / 4-way tensor parallelism of a hidden-8192
+# model and at 4-way of a hidden-4096 one
+RANK_GEOMETRIES = [
+    gdn_geometry.Geometry(1, 8, 8192),
+    gdn_geometry.Geometry(2, 16, 8192),
+    gdn_geometry.Geometry(4, 32, 8192),
+    gdn_geometry.Geometry(4, 16, 4096),
+]
+
+
+def _gid(g):
+    return f"k{g.K_HEADS}v{g.V_HEADS}h{g.HIDDEN}"
+
+
 # the cc 10.0 part reading (228 KB per SM, 227 KB opt-in), a hypothetical larger part (336 KiB per SM, 335 KiB opt-in) and the cc 12.0 part
 # reading (100 KB per SM, 99 KB opt-in): the pad must do what it claims on each, and a form two of which cannot share the SM is a typed
 # decline where the caller asks for two
@@ -39,30 +59,33 @@ def _on(reading):
     return dict(SMEM_PER_SM_BYTES=reading[0], SMEM_OPTIN_BYTES=reading[1])
 
 
-def make_operands(rows=ROWS, device="cpu", slots=SLOTS, seed=0, **overrides):
-    """The entry's operand set in the serving layout (x = the QKV part of a [rows, 16384] slab, z its Z part viewed [rows, 48, 128],
-    cs the [slots, 3, 10240] conv buffer transposed to [slots, 10240, 3])."""
+def make_operands(rows=ROWS, device="cpu", slots=SLOTS, seed=0, geometry=None, **overrides):
+    """The entry's operand set in the serving layout at ``geometry`` (the default geometry when None: x = the QKV part of a [rows, 16384]
+    slab, z its Z part viewed [rows, 48, 128], cs the [slots, 3, 10240] conv buffer transposed to [slots, 10240, 3]; the same draws in the
+    same order as before the geometry was a parameter, so every seeded cell keeps its operands)."""
+    geo = geometry or kcfg.DEFAULT_GEOMETRY
+    QKV, NV, HID = geo.QKV_CHANNELS, geo.V_HEADS, geo.HIDDEN
     g = torch.Generator(device="cpu").manual_seed(seed)
 
     def rn(*shape):
         return torch.randn(*shape, generator=g).to(device)
 
-    qkvz = (rn(rows, 16384) * 2).bfloat16()
-    conv = rn(slots, 3, 10240).bfloat16()
+    qkvz = (rn(rows, QKV + geo.OUT_ROW) * 2).bfloat16()
+    conv = rn(slots, 3, QKV).bfloat16()
     ops = dict(
         rows=rows,
-        x=qkvz[:, :10240],
+        x=qkvz[:, :QKV],
         cs=conv.transpose(-1, -2),
-        cw=(0.3 * rn(10240, 4)).bfloat16(),
-        al=rn(48) * 0.5,
-        dt=(rn(48) * 0.5).bfloat16(),
-        state=rn(slots, 48, 128, 128) * 0.1,
+        cw=(0.3 * rn(QKV, 4)).bfloat16(),
+        al=rn(NV) * 0.5,
+        dt=(rn(NV) * 0.5).bfloat16(),
+        state=rn(slots, NV, 128, 128) * 0.1,
         idx=torch.arange(1, rows + 1, dtype=torch.int32).to(device),
-        z=qkvz[:, 10240:].view(rows, 48, 128),
+        z=qkvz[:, QKV:].view(rows, NV, 128),
         w=(1 + 0.2 * rn(128)).bfloat16(),
         scale=torch.tensor([0.02]).to(device),
-        hidden=rn(rows, 5120).bfloat16(),
-        baw=(rn(96, 5120) / math.sqrt(5120)).bfloat16(),
+        hidden=rn(rows, HID).bfloat16(),
+        baw=(rn(2 * NV, HID) / math.sqrt(HID)).bfloat16(),
     )
     ops.update(overrides)
     return ops
@@ -177,6 +200,188 @@ def test_default_cfg_on_the_cc120_reading_never_picks_a_cap_the_part_cannot_use(
 
 def test_cudnn_level_export_resolves_to_the_entry():
     assert cudnn.GdnDecodeFused is entry.GdnDecodeFused, "the lazy cudnn-level export (import cudnn; cudnn.GdnDecodeFused) is the entry class"
+    from cudnn.linear_attention import frost
+
+    assert frost.GdnGeometry is gdn_geometry.Geometry, "the geometry type is exported beside the entries"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# the geometry: the default unchanged, the per-rank geometries derived, admitted and keyed
+# ---------------------------------------------------------------------------------------------------------------------------
+def test_the_default_geometry_is_the_validated_one_and_its_constants_are_unchanged():
+    """The default ``Geometry`` is the 16 K / 48 V / hidden 5120 one every form was validated at; the module constants name it; every
+    module form carries it (the SAME object: a default-geometry pick is the module form itself, so the forms cache and the compile keys of
+    existing callers are untouched); head dim and conv width are pinned."""
+    g = kcfg.DEFAULT_GEOMETRY
+    assert g is gdn_geometry.DEFAULT_GEOMETRY and (g.K_HEADS, g.V_HEADS, g.HIDDEN) == (16, 48, 5120) == (kcfg.K_HEADS, kcfg.V_HEADS, kcfg.HIDDEN)
+    assert (kcfg.QKV_CHANNELS, kcfg.K_CHANNEL0, kcfg.V_CHANNEL0, kcfg.BA_CHUNKS, kcfg.TICKET_LIMIT, kcfg.TICKET_STRIDE) == (10240, 2048, 4096, 5, 2, 512)
+    assert (g.QKV_CHANNELS, g.K_CHANNEL0, g.V_CHANNEL0, g.OUT_ROW, g.VK_RATIO, g.BA_CHUNKS_DECODE, g.BA_CHUNKS_VERIFY) == (10240, 2048, 4096, 6144, 3, 5, 3)
+    assert g.BA_VERIFY_HALF_LIVE == (True, True, False) and g.TICKET_STRIDE == 512
+    assert (kcfg.HEAD_DIM, kcfg.CONV_WIDTH) == (gdn_geometry.HEAD_DIM, gdn_geometry.CONV_WIDTH) == (128, 4)
+    for form in (kcfg.CFG, kcfg.PAIR_CFG, kcfg.CAPPED_CFG, kcfg.STREAMED_CFG, kcfg.make_cfg(), kcfg.Cfg()):
+        assert form.GEOM is g
+    assert (kcfg.CFG.TICKET_LIMIT, kcfg.PAIR_CFG.TICKET_LIMIT) == (2, 5)
+    assert kcfg.default_cfg(1, 148) is kcfg.PAIR_CFG and kcfg.default_cfg(2, 148, geometry=g) is kcfg.CFG and kcfg.default_cfg(4, 148) is kcfg.CAPPED_CFG
+    assert kcfg.with_geometry(kcfg.CFG, g) is kcfg.CFG
+    assert g.describe() == "16 K heads, 48 V heads x 128, hidden 5120"
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_a_rank_geometry_derives_its_constants_and_moves_nothing_but_the_geometry(g):
+    """The derived constants of a per-rank geometry (the QKV channel layout, the output row, the V-per-K ratio, the BA chunk counts, the
+    ticket limits) follow from (K, V, HIDDEN); a form compiled for it differs from the module form in ``GEOM`` alone -- the shared-memory
+    budget, the lane map, the box pad and the co-residency carry no head-count or hidden term -- and is a distinct compile key."""
+    K, V, H = g.K_HEADS, g.V_HEADS, g.HIDDEN
+    assert (g.QKV_CHANNELS, g.K_CHANNEL0, g.V_CHANNEL0, g.OUT_ROW) == (2 * K * 128 + V * 128, K * 128, 2 * K * 128, V * 128)
+    assert g.VK_RATIO * K == V and g.BA_CHUNKS_DECODE * 1024 == H and g.BA_CHUNKS_VERIFY == -(-H // 2048)
+    assert g.TICKET_STRIDE == 512 and K * 32 <= 512, "the reader-ticket layout counts[row * 512 + kh * 32] holds every K head"
+    assert g.describe() == f"{K} K heads, {V} V heads x 128, hidden {H}"
+    cfg, pair, capped = (kcfg.with_geometry(f, g) for f in (kcfg.CFG, kcfg.PAIR_CFG, kcfg.CAPPED_CFG))
+    assert cfg == replace(kcfg.CFG, GEOM=g) and cfg.GEOM is g and cfg is not kcfg.CFG and cfg != kcfg.CFG and hash(cfg) != hash(kcfg.CFG)
+    assert (cfg.TICKET_LIMIT, pair.TICKET_LIMIT, capped.TICKET_LIMIT) == (g.VK_RATIO - 1, 2 * g.VK_RATIO - 1, g.VK_RATIO - 1)
+    for a, b in ((cfg, kcfg.CFG), (pair, kcfg.PAIR_CFG), (capped, kcfg.CAPPED_CFG)):
+        kcfg.validate_cfg(a)
+        same = (
+            "NATURAL_SMEM_BYTES",
+            "SMEM_BYTES",
+            "SMEM_PAD_BYTES",
+            "R",
+            "C",
+            "RG",
+            "BOX_ROWS",
+            "STATE_BOX_PITCH_ELEMS",
+            "STATE_SLAB_BYTES_CTA",
+            "co_resident_ctas",
+        )
+        assert [getattr(a, n) for n in same] == [getattr(b, n) for n in same], b
+    assert kcfg.make_cfg(GEOM=g).GEOM is g and kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, GEOM=g) == pair
+    assert kcfg.admissible(cfg) and kcfg.admissible(pair) and kcfg.first_fitting((cfg,)) is cfg
+
+
+def test_geometry_envelope_declines_by_field():
+    """Outside the envelope (a non-positive count, more than 16 K heads, more than 128 V heads, V heads not a multiple of the K heads, a
+    hidden width that is not a multiple of 1024) is a ``ValueError`` naming the field at construction; the field-wise form of the same
+    answer (``geometry_fields_off``) is what the FlashInfer backend's decline names; a config or pick handed something else than a
+    ``Geometry`` is a ``ValueError`` too."""
+    for bad, token in (
+        ((0, 8, 8192), "K_HEADS must be a positive int"),
+        ((17, 17, 8192), "K_HEADS=17 exceeds the 16 K heads"),
+        ((1, 129, 8192), "V_HEADS=129 exceeds"),
+        ((3, 8, 8192), "V_HEADS=8 must be a multiple of K_HEADS=3"),
+        ((1, 8, 5000), "HIDDEN=5000 must be a multiple of 1024"),
+        ((1, 8, 0), "HIDDEN must be a positive int"),
+        ((True, 8, 8192), "K_HEADS must be a positive int"),
+        ((1, 8.0, 8192), "V_HEADS must be a positive int"),
+    ):
+        with pytest.raises(ValueError, match=token):
+            gdn_geometry.Geometry(*bad)
+    off = gdn_geometry.geometry_fields_off
+    assert off(16, 48, 5120) == {} and off(1, 8, 8192) == {} and off(16, 128, 8192) == {}
+    assert off(17, 17, 8192) == {"K_HEADS": 17} and off(1, 129, 8192) == {"V_HEADS": 129} and off(3, 8, 8192) == {"V_HEADS": 8}
+    assert off(1, 8, 5000) == {"HIDDEN": 5000} and off(0, 8, 5000) == {"K_HEADS": 0, "HIDDEN": 5000} and off(2, 3, 1023) == {"V_HEADS": 3, "HIDDEN": 1023}
+    assert gdn_geometry.geometry_error(1, 8, 8192) is None and "1024" in gdn_geometry.geometry_error(1, 8, 1000)
+    assert (gdn_geometry.MAX_K_HEADS, gdn_geometry.MAX_V_HEADS, gdn_geometry.HIDDEN_GRANULE) == (16, 128, 1024)
+    with pytest.raises(ValueError, match="GEOM"):
+        kcfg.make_cfg(GEOM="k1v8h8192")
+    with pytest.raises(ValueError, match="geometry"):
+        kcfg.default_cfg(1, 148, geometry=(1, 8, 8192))
+    with pytest.raises(ValueError, match="geometry"):
+        kcfg.with_geometry(kcfg.CFG, None)
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_default_cfg_ladder_follows_the_geometry_v_heads(g):
+    """The pick's regime switches move with the V heads per rank by the one rule (the pair while ``rows x 2 V <= SMs``, one CTA per SM while
+    ``rows x V <= SMs``, the capped form past that where the part holds two; the budget rule, unmeasured at these geometries until their
+    own cells run), every pick carrying the geometry; on the cc 12.0 readings the cap is never picked, as at the default geometry."""
+    V = g.V_HEADS
+    for sms in (148, 152, 170, 188):
+        for rows in range(1, 41):
+            want = kcfg.PAIR_CFG if rows * 2 * V <= sms else (kcfg.CFG if rows * V <= sms else kcfg.CAPPED_CFG)
+            got = kcfg.default_cfg(rows, sms, geometry=g)
+            assert got == replace(want, GEOM=g) and got.GEOM is g, (sms, rows)
+            assert kcfg.default_cfg(rows, sms, *SM100_READING, g) == got
+    pairs, fits = 152 // (2 * V), 152 // V
+    assert kcfg.default_cfg(pairs, 152, geometry=g).TWO_CTAS_PER_HEAD and not kcfg.default_cfg(pairs + 1, 152, geometry=g).TWO_CTAS_PER_HEAD
+    assert kcfg.default_cfg(fits, 152, geometry=g).MIN_CTAS_PER_SM == 1 and kcfg.default_cfg(fits + 1, 152, geometry=g).MIN_CTAS_PER_SM == 2
+    per_sm, optin = SM120_READING
+    assert kcfg.default_cfg(fits + 1, 170, per_sm, optin, g) == replace(kcfg.CFG, GEOM=g) and kcfg.default_cfg(1, 170, per_sm, optin, g) == replace(
+        kcfg.PAIR_CFG, GEOM=g
+    )
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_host_checks_accept_the_rank_geometry_operands_and_decline_a_mismatch(g):
+    """The entry's binding checks at a per-rank geometry: its operand shapes pass (the QKV slab width, the state slab per V head, the BA
+    weight's two rows per V head over the hidden width), the default geometry's checks refuse them by name and vice versa, a hidden or
+    BA weight of another width is declined by name, and a geometry that is not a ``Geometry`` is a ``TypeError``."""
+    ops = make_operands(rows=3, geometry=g)
+    assert (
+        tuple(ops["x"].shape) == (3, g.QKV_CHANNELS) and tuple(ops["z"].shape) == (3, g.V_HEADS, 128) and tuple(ops["baw"].shape) == (2 * g.V_HEADS, g.HIDDEN)
+    )
+    assert tuple(ops["state"].shape[1:]) == (g.V_HEADS, 128, 128) and tuple(ops["state"].stride()) == (g.V_HEADS * 16384, 16384, 128, 1)
+    assert ops["x"].stride(0) == g.QKV_CHANNELS + g.OUT_ROW and tuple(ops["cs"].shape[1:]) == (g.QKV_CHANNELS, 3)
+    entry.check_support(*_binding_args(ops), device_cc=(10, 0), geometry=g)
+    entry.check_binding(*_binding_args(ops), geometry=g)
+    with pytest.raises(NotImplementedError, match="x as"):
+        entry.check_support(*_binding_args(ops), device_cc=(10, 0))  # the default geometry's checks refuse the rank's slab width
+    with pytest.raises(NotImplementedError, match="x as"):
+        entry.check_support(*_binding_args(make_operands(rows=3)), device_cc=(10, 0), geometry=g)
+    with pytest.raises(NotImplementedError, match="hidden"):
+        entry.check_support(*_binding_args(dict(ops, hidden=torch.zeros(3, g.HIDDEN + 1024, dtype=torch.bfloat16))), device_cc=(10, 0), geometry=g)
+    with pytest.raises(NotImplementedError, match="BA weight"):
+        entry.check_support(*_binding_args(dict(ops, baw=torch.zeros(2 * g.V_HEADS, 5120, dtype=torch.bfloat16))), device_cc=(10, 0), geometry=g)
+    with pytest.raises(NotImplementedError, match="A_log"):
+        entry.check_support(*_binding_args(dict(ops, al=torch.zeros(g.V_HEADS - 1))), device_cc=(10, 0), geometry=g)
+    with pytest.raises(TypeError, match="geometry"):
+        entry.check_support(*_binding_args(ops), device_cc=(10, 0), geometry=(g.K_HEADS, g.V_HEADS, g.HIDDEN))
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_entry_takes_the_geometry_and_keys_every_form_by_it(g):
+    """An entry built for a per-rank geometry stamps it into every form it picks (the pick ladder at the geometry's V heads), sizes its
+    output buffers by it, carries it in every compile key (a default-geometry entry's key differs), takes it from a given ``cfg`` when
+    none is named, refuses a ``cfg`` and a ``geometry`` that disagree, and keeps the PDL launch knobs on top."""
+    V = g.V_HEADS
+    k = entry.GdnDecodeFused("cpu", 1e-6, geometry=g)
+    assert k.geometry is g and k.cfg == replace(kcfg.CFG, GEOM=g) and k.cfg_for(1).GEOM is g and k.cfg_for(1) == k.cfg_for(64)
+    k.sm_count = 152
+    assert k.cfg_for(1) == replace(kcfg.PAIR_CFG, GEOM=g) and k.cfg_for(152 // (2 * V) + 1) == replace(kcfg.CFG, GEOM=g)
+    assert k.cfg_for(152 // V + 1) == replace(kcfg.CAPPED_CFG, GEOM=g) and k.cfg_for(152 // V + 1) is k.cfg_for(
+        152 // V + 2
+    ), "one stamped form per module form"
+    out = k.outputs(2)
+    assert tuple(out["qout"].shape) == (2, V, 128) == tuple(out["out"].shape) and out["counts"].shape == (2 * kcfg.TICKET_STRIDE,)
+    dbg = entry.GdnDecodeFused("cpu", 1e-6, geometry=g, debug=True).outputs(2)
+    assert tuple(dbg["raw"].shape) == (2, V, 128) and tuple(dbg["convout"].shape) == (2, g.QKV_CHANNELS) and tuple(dbg["baout"].shape) == (2, 2 * V)
+    ops, default_ops = make_operands(rows=2, geometry=g), make_operands(rows=2)
+    default = entry.GdnDecodeFused("cpu", 1e-6)
+    assert default.geometry is kcfg.DEFAULT_GEOMETRY
+    key = k.key(2, ops["x"], ops["cs"], ops["state"], ops["z"])
+    assert key[1].GEOM is g and key != default.key(2, default_ops["x"], default_ops["cs"], default_ops["state"], default_ops["z"])
+    given = kcfg.make_cfg(TPR=8, GEOM=g)
+    assert entry.GdnDecodeFused("cpu", 1e-6, cfg=given).geometry is g and entry.GdnDecodeFused("cpu", 1e-6, cfg=given, geometry=g).cfg == given
+    assert entry.GdnDecodeFused("cpu", 1e-6, cfg=kcfg.make_cfg(TPR=8)).geometry is kcfg.DEFAULT_GEOMETRY
+    with pytest.raises(ValueError, match="compiled for"):
+        entry.GdnDecodeFused("cpu", 1e-6, cfg=given, geometry=kcfg.DEFAULT_GEOMETRY)
+    with pytest.raises(TypeError, match="geometry"):
+        entry.GdnDecodeFused("cpu", 1e-6, geometry="k1v8h8192")
+    pdl = entry.GdnDecodeFused("cpu", 1e-6, geometry=g, pdl=True)
+    pdl.sm_count = 152
+    assert pdl.cfg_for(1) == replace(kcfg.PAIR_CFG, GEOM=g, PDL=True, PDL_RELEASE=True)
+
+
+@pytest.mark.parametrize("g", [kcfg.DEFAULT_GEOMETRY] + RANK_GEOMETRIES, ids=_gid)
+def test_decode_ba_partition_covers_every_hidden_index_once(g):
+    """The reference 128-thread BA partition the kernel loads and accumulates (``_ba_weight_loads`` / ``_ba_hidden_loads`` / ``_ba_dots``:
+    thread ``t`` of 128, chunk ``c`` of ``BA_CHUNKS_DECODE`` -> elements ``c * 1024 + 8 t + j``) covers ``0 .. HIDDEN - 1`` exactly once at
+    every served hidden width (a pure-Python mirror of the kernel's index arithmetic, no GPU)."""
+    seen = Counter()
+    for t in range(128):
+        for c in range(g.BA_CHUNKS_DECODE):
+            kk = c * 1024 + t * 8
+            seen.update(range(kk, kk + 8))
+    assert seen == Counter(range(g.HIDDEN)), g
 
 
 def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():

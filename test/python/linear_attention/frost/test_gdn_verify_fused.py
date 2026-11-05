@@ -13,10 +13,17 @@ layers, the bitwise agreement of every knob arm the part's shared memory holds w
 hold is its typed decline, reported as a skip), and the two-CTAs-per-head pair form the part holds (the pick at one request) against
 its one-CTA form at one request.  When ``CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR``
 names a directory of saved operand sets with the reference verify kernel's outputs (``set_<tag>.pt`` / ``ref_<tag>.pt``), every set
-is replayed and compared BYTE for byte (fp8 output, bf16 output, every fp32 state slot, the conv pool, the reader tickets)."""
+is replayed and compared BYTE for byte (fp8 output, bf16 output, every fp32 state slot, the conv pool, the reader tickets).  The geometry
+(``Geometry(K_HEADS, V_HEADS, HIDDEN)`` of ``kernel/gdn_geometry.py``) is pinned on the host too: the default geometry's constants and
+forms unchanged, and for the per-rank geometries of the larger dense models the derived constants, the pick ladder and token bounds per
+regime, the entry's forms and keys, the operand shapes the entry accepts -- and the BA partition's coverage of every hidden index through
+the kernel's ONE half-chunk predicate, with the stale "last chunk is the half chunk" form shown to drop 1024 inputs at hidden 8192."""
 
+import importlib.util
 import os
+from collections import Counter
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -24,9 +31,24 @@ torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 
 from cudnn.linear_attention.frost import gdn_verify_fused as entry  # noqa: E402
+from cudnn.linear_attention.frost.kernel import gdn_geometry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_verify_fused_config as kcfg  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
+
+# the per-rank geometries of the larger dense models: (K heads, V heads, hidden) at 16- / 8- / 4-way tensor parallelism of a hidden-8192
+# model and at 4-way of a hidden-4096 one
+RANK_GEOMETRIES = [
+    gdn_geometry.Geometry(1, 8, 8192),
+    gdn_geometry.Geometry(2, 16, 8192),
+    gdn_geometry.Geometry(4, 32, 8192),
+    gdn_geometry.Geometry(4, 16, 4096),
+]
+
+
+def _gid(g):
+    return f"k{g.K_HEADS}v{g.V_HEADS}h{g.HIDDEN}"
+
 
 # the cc 10.0 / 10.3 part reading (228 KB per SM, 227 KB opt-in), a hypothetical larger part (336 KiB per SM, 335 KiB opt-in) and the cc
 # 12.0 part reading (100 KB per SM, 99 KB opt-in): the pad must do what it claims on each, and a form two of which cannot share the SM is
@@ -49,12 +71,16 @@ AMBIGUOUS_REL = 2.0**-16
 # ---------------------------------------------------------------------------------------------------------------------------
 # operands (the reference verify kernel's test distributions) and the torch reference of the fused chain
 # ---------------------------------------------------------------------------------------------------------------------------
-def make_operands(requests=2, tokens=4, device="cpu", seed=0, accepted="random", pad="none", skip="none", param_dtypes=None, slots=None):
-    """One seeded verify step in the serving layout: ``qkv`` / ``z`` strided views of one [rows, 16384] QKVZ slab, the conv pool
-    stored ``[slots, T + 2, 10240]`` and viewed ``[slots, 10240, T + 2]`` (channel-contiguous), distinct random (non-monotone) live
-    slots, ``hidden`` in {-1, 0, 1} and ``ba_weight`` in k / 256 (the BA dot exact before its bf16 rounding).  ``accepted``: random in
-    [1, T], ``full`` (T) or ``one``; ``pad``: ``last`` / ``mid`` makes that request a padding one (every slot 0); ``skip``: ``first`` /
-    ``mid`` / ``last`` zeroes one slot (t >= 1, never the source slot) of every live request -- a skipped state write."""
+def make_operands(requests=2, tokens=4, device="cpu", seed=0, accepted="random", pad="none", skip="none", param_dtypes=None, slots=None, geometry=None):
+    """One seeded verify step in the serving layout at ``geometry`` (the default geometry when None): ``qkv`` / ``z`` strided views of
+    one [rows, QKV + V x 128] QKVZ slab ([rows, 16384] at the default), the conv pool stored ``[slots, T + 2, QKV]`` and viewed ``[slots,
+    QKV, T + 2]`` (channel-contiguous), distinct random (non-monotone) live slots, ``hidden`` in {-1, 0, 1} and ``ba_weight`` in k / 256
+    (the BA dot exact before its bf16 rounding); the same draws in the same order as before the geometry was a parameter, so every seeded
+    cell keeps its operands.  ``accepted``: random in [1, T], ``full`` (T) or ``one``; ``pad``: ``last`` / ``mid`` makes that request a
+    padding one (every slot 0); ``skip``: ``first`` / ``mid`` / ``last`` zeroes one slot (t >= 1, never the source slot) of every live
+    request -- a skipped state write."""
+    geo = geometry or kcfg.DEFAULT_GEOMETRY
+    QKV, NV, HID = geo.QKV_CHANNELS, geo.V_HEADS, geo.HIDDEN
     g = torch.Generator(device="cpu").manual_seed(seed)
     a_dt, dt_dt, w_dt = param_dtypes or (torch.float32, torch.bfloat16, torch.bfloat16)
     rows = requests * tokens
@@ -64,8 +90,8 @@ def make_operands(requests=2, tokens=4, device="cpu", seed=0, accepted="random",
     def rn(*shape):
         return torch.randn(*shape, generator=g)
 
-    qkvz = rn(rows, 16384).bfloat16().to(device)  # moved as one slab so qkv / z stay strided views of it (the serving layout)
-    conv = rn(slots, L, kcfg.QKV_CHANNELS).bfloat16().to(device)
+    qkvz = rn(rows, QKV + geo.OUT_ROW).bfloat16().to(device)  # moved as one slab so qkv / z stay strided views of it (the serving layout)
+    conv = rn(slots, L, QKV).bfloat16().to(device)
     idx = (torch.randperm(slots - 1, generator=g)[:rows] + 1).int().view(requests, tokens)
     if accepted == "full":
         acc = torch.full((requests,), tokens, dtype=torch.int32)
@@ -87,20 +113,20 @@ def make_operands(requests=2, tokens=4, device="cpu", seed=0, accepted="random",
             if 1 <= want < tokens and want != int(acc[n]) - 1:
                 idx[n, want] = 0
     ops = dict(
-        qkv=qkvz[:, : kcfg.QKV_CHANNELS],
-        z=qkvz[:, kcfg.QKV_CHANNELS :].view(rows, kcfg.V_HEADS, kcfg.HEAD_DIM),
-        hidden=torch.randint(-1, 2, (rows, kcfg.HIDDEN), generator=g).bfloat16().to(device),
-        ba_weight=(torch.randint(-8, 9, (2 * kcfg.V_HEADS, kcfg.HIDDEN), generator=g).float() / 256).bfloat16().to(device),
-        A_log=(rn(kcfg.V_HEADS) * 0.5).to(a_dt).to(device),
-        dt_bias=(rn(kcfg.V_HEADS) * 0.5).to(dt_dt).to(device),
-        ssm_state=(rn(slots, kcfg.V_HEADS, kcfg.HEAD_DIM, kcfg.HEAD_DIM) * 0.1).to(device),
+        qkv=qkvz[:, :QKV],
+        z=qkvz[:, QKV:].view(rows, NV, kcfg.HEAD_DIM),
+        hidden=torch.randint(-1, 2, (rows, HID), generator=g).bfloat16().to(device),
+        ba_weight=(torch.randint(-8, 9, (2 * NV, HID), generator=g).float() / 256).bfloat16().to(device),
+        A_log=(rn(NV) * 0.5).to(a_dt).to(device),
+        dt_bias=(rn(NV) * 0.5).to(dt_dt).to(device),
+        ssm_state=(rn(slots, NV, kcfg.HEAD_DIM, kcfg.HEAD_DIM) * 0.1).to(device),
         state_indices=idx.to(device),
         cu_seqlens=torch.arange(0, rows + 1, tokens, dtype=torch.int32).to(device),
         num_accepted_tokens=acc.to(device),
         norm_weight=(1 + 0.2 * rn(kcfg.HEAD_DIM)).to(w_dt).to(device),
         out_scale=torch.tensor([0.05]).to(device),
         conv_state=conv.transpose(1, 2),
-        conv_weight=(rn(kcfg.QKV_CHANNELS, kcfg.CONV_WIDTH) * 0.3).bfloat16().to(device),
+        conv_weight=(rn(QKV, kcfg.CONV_WIDTH) * 0.3).bfloat16().to(device),
     )
     return ops
 
@@ -169,9 +195,10 @@ def quant_fp8(x, scale):
 
 def reference(ops, eps=1e-6):
     """The fused chain on ``ops``: ``(out_bf16, out_fp8, ssm_state, conv_state, live_rows)``.  Rounding points as the fused kernels':
-    bf16 tap products and SiLU, the BA projection to bf16, the recurrence in FP64, the core output to bf16, the normed value to bf16."""
-    hv, dv, dk = kcfg.V_HEADS, kcfg.HEAD_DIM, kcfg.HEAD_DIM
-    hk = kcfg.K_HEADS
+    bf16 tap products and SiLU, the BA projection to bf16, the recurrence in FP64, the core output to bf16, the normed value to bf16.
+    The geometry is read off the operands (the state's V heads, the QKV slab's K heads), so a per-rank cell reuses it."""
+    hv, dv, dk = int(ops["ssm_state"].shape[1]), kcfg.HEAD_DIM, kcfg.HEAD_DIM
+    hk = (int(ops["qkv"].shape[1]) - hv * dv) // (2 * dk)
     K = ops["conv_weight"].shape[1]
     rows = ops["qkv"].shape[0]
     dev = ops["qkv"].device
@@ -406,6 +433,179 @@ def test_norm_form_follows_the_reference_ctas_policy_and_resolves_per_requests()
 
 def test_cudnn_level_export_resolves_to_the_entry():
     assert cudnn.GdnVerifyFused is entry.GdnVerifyFused, "the lazy cudnn-level export (import cudnn; cudnn.GdnVerifyFused) is the entry class"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# the geometry: the default unchanged, the per-rank geometries derived, admitted and keyed; the BA partition's coverage
+# ---------------------------------------------------------------------------------------------------------------------------
+def test_the_default_geometry_is_the_validated_one_and_its_constants_are_unchanged():
+    """The default ``Geometry`` (16 K / 48 V / hidden 5120, the one every form was validated at) is the one the module constants name and
+    every module form carries (the SAME object, so a default-geometry pick is the module form itself: the forms cache and the compile keys
+    of existing callers are untouched); the verify BA partition at that hidden width has three chunks, the last a half chunk."""
+    g = kcfg.DEFAULT_GEOMETRY
+    assert g is gdn_geometry.DEFAULT_GEOMETRY and (g.K_HEADS, g.V_HEADS, g.HIDDEN) == (16, 48, 5120) == (kcfg.K_HEADS, kcfg.V_HEADS, kcfg.HIDDEN)
+    assert (kcfg.QKV_CHANNELS, kcfg.K_CHANNEL0, kcfg.V_CHANNEL0, kcfg.OUT_ROW, kcfg.BA_CHUNK, kcfg.BA_CHUNKS) == (10240, 2048, 4096, 6144, 2048, 3)
+    assert (kcfg.TICKET_LIMIT, kcfg.TICKET_STRIDE, kcfg.HEAD_DIM, kcfg.CONV_WIDTH) == (2, 512, 128, 4)
+    assert (g.BA_CHUNKS_VERIFY, g.BA_VERIFY_HALF_LIVE, g.BA_CHUNKS_DECODE, g.VK_RATIO) == (3, (True, True, False), 5, 3)
+    for form in (kcfg.CFG, kcfg.PAIR_CFG, kcfg.TWO_CTA_CFG, kcfg.PAIR_NBUF2_CFG, kcfg.PAIR_NBUF1_CFG, kcfg.ONE_CTA_NBUF1_CFG, kcfg.make_cfg(), kcfg.Cfg()):
+        assert form.GEOM is g
+    assert (kcfg.CFG.TICKET_LIMIT, kcfg.PAIR_CFG.TICKET_LIMIT) == (2, 5)
+    assert kcfg.default_cfg(1, 148) is kcfg.PAIR_CFG and kcfg.default_cfg(2, 148, geometry=g) is kcfg.CFG and kcfg.default_cfg(4, 148) is kcfg.TWO_CTA_CFG
+    assert kcfg.with_geometry(kcfg.CFG, g) is kcfg.CFG and kcfg.resolve_cfg(kcfg.CFG, 1).GEOM is g
+    assert kcfg.max_tokens_served(1, 148, geometry=g) == kcfg.max_tokens_served(1, 148) == 35
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_a_rank_geometry_derives_its_forms_ladder_and_token_bounds(g):
+    """A form compiled for a per-rank geometry differs from the module form in ``GEOM`` alone (the shared-memory budget per token count,
+    the token bound, the lane map and the co-residency carry no head-count or hidden term; the ticket limit follows the V-per-K ratio); the
+    pick's regime switches move with the V heads per rank by the one rule, the served token bound with them (35 / 8 / 45 by regime on the
+    cc 10.0 readings), the resolved norm form rides on the geometry form, and the cc 12.0 readings walk the same ladder."""
+    V = g.V_HEADS
+    cfg, pair, two = (kcfg.with_geometry(f, g) for f in (kcfg.CFG, kcfg.PAIR_CFG, kcfg.TWO_CTA_CFG))
+    assert cfg == replace(kcfg.CFG, GEOM=g) and cfg.GEOM is g and cfg != kcfg.CFG and hash(cfg) != hash(kcfg.CFG)
+    assert (cfg.TICKET_LIMIT, pair.TICKET_LIMIT, two.TICKET_LIMIT) == (g.VK_RATIO - 1, 2 * g.VK_RATIO - 1, g.VK_RATIO - 1)
+    for a, b in ((cfg, kcfg.CFG), (pair, kcfg.PAIR_CFG), (two, kcfg.TWO_CTA_CFG)):
+        kcfg.validate_cfg(a)
+        assert [a.natural_smem_bytes(t) for t in (2, 6, 8)] == [b.natural_smem_bytes(t) for t in (2, 6, 8)] and a.max_tokens() == b.max_tokens()
+        assert (a.R, a.C, a.RG, a.BOX_ROWS, a.STATE_BOX_PITCH_ELEMS, a.co_resident_ctas(2)) == (
+            b.R,
+            b.C,
+            b.RG,
+            b.BOX_ROWS,
+            b.STATE_BOX_PITCH_ELEMS,
+            b.co_resident_ctas(2),
+        )
+    envelope = {kcfg.PAIR_CFG: 35, kcfg.CFG: 8, kcfg.TWO_CTA_CFG: 45}
+    for sms in (148, 152, 170, 188):
+        for requests in range(1, 41):
+            want = kcfg.PAIR_CFG if requests * 2 * V <= sms else (kcfg.CFG if requests * V <= sms else kcfg.TWO_CTA_CFG)
+            got = kcfg.default_cfg(requests, sms, geometry=g)
+            assert got == replace(want, GEOM=g) and got.GEOM is g, (sms, requests)
+            assert kcfg.default_cfg(requests, sms, *SM100_READING, 6, g) == got
+            assert kcfg.max_tokens_served(requests, sms, geometry=g) == envelope[want], (sms, requests)
+    one = kcfg.resolve_cfg(kcfg.default_cfg(1, 152, geometry=g), 1)
+    assert (one.NORM_FORM, one.GEOM, one.TWO_CTAS_PER_HEAD) == ("ctas2", g, True)
+    per_sm, optin = SM120_READING
+    assert kcfg.default_cfg(1, 170, per_sm, optin, 6, g) == replace(kcfg.PAIR_NBUF2_CFG, GEOM=g)
+    assert kcfg.default_cfg(1, 170, per_sm, optin, 12, g) == replace(kcfg.PAIR_NBUF1_CFG, GEOM=g)
+    assert kcfg.max_tokens_served(1, 170, per_sm, optin, g) == 17
+    assert kcfg.make_cfg(TPR=8, NBUF=1, GEOM=g).GEOM is g
+    with pytest.raises(ValueError, match="GEOM"):
+        kcfg.make_cfg(GEOM=(g.K_HEADS, g.V_HEADS, g.HIDDEN))
+    with pytest.raises(ValueError, match="geometry"):
+        kcfg.max_tokens_served(1, 152, geometry="k1v8h8192")
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_host_checks_accept_the_rank_geometry_operands_and_decline_a_mismatch(g):
+    """The entry's binding checks at a per-rank geometry: its operand shapes pass -- named by ``geometry`` or carried by the ``cfg`` --
+    the default geometry's checks refuse them by name and vice versa, another hidden width is declined by name, a ``cfg`` and a
+    ``geometry`` that disagree are a ``ValueError``, a geometry that is not a ``Geometry`` a ``TypeError``."""
+    ops = make_operands(requests=2, tokens=4, geometry=g)
+    assert (
+        tuple(ops["qkv"].shape) == (8, g.QKV_CHANNELS)
+        and tuple(ops["z"].shape) == (8, g.V_HEADS, 128)
+        and tuple(ops["ba_weight"].shape) == (2 * g.V_HEADS, g.HIDDEN)
+    )
+    assert tuple(ops["ssm_state"].shape[1:]) == (g.V_HEADS, 128, 128) and tuple(ops["conv_state"].shape[1:]) == (g.QKV_CHANNELS, 6)
+    entry.check_support(**ops, device_cc=(10, 0), geometry=g)
+    entry.check_support(**ops, device_cc=(10, 0), cfg=kcfg.resolve_cfg(kcfg.with_geometry(kcfg.CFG, g), 2))  # the cfg's own geometry
+    entry.check_binding(**ops, geometry=g)
+    with pytest.raises(NotImplementedError, match="qkv as"):
+        entry.check_support(**ops, device_cc=(10, 0))  # the default geometry's checks refuse the rank's slab width
+    with pytest.raises(NotImplementedError, match="qkv as"):
+        entry.check_support(**make_operands(requests=2, tokens=4), device_cc=(10, 0), geometry=g)
+    with pytest.raises(NotImplementedError, match="hidden"):
+        entry.check_support(**dict(ops, hidden=torch.zeros(8, g.HIDDEN + 1024, dtype=torch.bfloat16)), device_cc=(10, 0), geometry=g)
+    with pytest.raises(NotImplementedError, match="ba_weight"):
+        entry.check_support(**dict(ops, ba_weight=torch.zeros(2 * g.V_HEADS, 5120, dtype=torch.bfloat16)), device_cc=(10, 0), geometry=g)
+    with pytest.raises(ValueError, match="compiled for"):
+        entry.check_support(**ops, device_cc=(10, 0), cfg=kcfg.resolve_cfg(kcfg.CFG, 2), geometry=g)
+    with pytest.raises(TypeError, match="geometry"):
+        entry.check_support(**ops, device_cc=(10, 0), geometry=(g.K_HEADS, g.V_HEADS, g.HIDDEN))
+    assert entry.resolve_geometry(None, kcfg.resolve_cfg(kcfg.with_geometry(kcfg.CFG, g), 2)) is g and entry.resolve_geometry(None) is kcfg.DEFAULT_GEOMETRY
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_entry_takes_the_geometry_and_keys_every_form_by_it(g):
+    """An entry built for a per-rank geometry stamps it into every form it picks (the pick ladder and token bounds at the geometry's V
+    heads), sizes its buffers by it, carries it in every compile key (a default-geometry entry's key differs), takes it from a given
+    ``cfg`` when none is named and refuses a ``cfg`` and a ``geometry`` that disagree."""
+    V = g.V_HEADS
+    k = entry.GdnVerifyFused("cpu", 1e-6, geometry=g)
+    assert k.geometry is g and replace(k.cfg_for(1), NORM_FORM=None) == replace(kcfg.CFG, GEOM=g) and k.cfg_for(1).NORM_FORM == "ctas2"
+    k.sm_count = 152
+    assert replace(k.cfg_for(1), NORM_FORM=None) == replace(kcfg.PAIR_CFG, GEOM=g) and k.cfg_for(1).GEOM is g
+    assert replace(k.cfg_for(152 // (2 * V) + 1), NORM_FORM=None) == replace(kcfg.CFG, GEOM=g)
+    assert replace(k.cfg_for(152 // V + 1, 6), NORM_FORM=None) == replace(kcfg.TWO_CTA_CFG, GEOM=g)
+    assert (k.max_tokens_for(1), k.max_tokens_for(152 // (2 * V) + 1), k.max_tokens_for(152 // V + 1)) == (35, 8, 45)
+    out = k.outputs(2, 4)
+    assert tuple(out["qout"].shape) == (8, V, 128) == tuple(out["out"].shape) and out["counts"].shape == (2 * kcfg.TICKET_STRIDE,)
+    dbg = entry.GdnVerifyFused("cpu", 1e-6, geometry=g, debug=True).outputs(2, 4)
+    assert tuple(dbg["raw"].shape) == (8, V, 128) and tuple(dbg["convout"].shape) == (8, g.QKV_CHANNELS) and tuple(dbg["baout"].shape) == (8, 2 * V)
+    ops = make_operands(requests=2, tokens=4, geometry=g)
+    default = entry.GdnVerifyFused("cpu", 1e-6)
+    assert default.geometry is kcfg.DEFAULT_GEOMETRY
+    assert _key(k, ops)[2].GEOM is g and _key(k, ops) != _key(default, make_operands(requests=2, tokens=4))
+    given = kcfg.make_cfg(TPR=8, NBUF=1, GEOM=g)
+    assert entry.GdnVerifyFused("cpu", 1e-6, cfg=given).geometry is g and entry.GdnVerifyFused("cpu", 1e-6, cfg=given, geometry=g).cfg == given
+    with pytest.raises(ValueError, match="compiled for"):
+        entry.GdnVerifyFused("cpu", 1e-6, cfg=given, geometry=kcfg.DEFAULT_GEOMETRY)
+    with pytest.raises(TypeError, match="geometry"):
+        entry.GdnVerifyFused("cpu", 1e-6, geometry="k1v8h8192")
+
+
+def verify_ba_partition(g, half_live):
+    """The hidden indices the verify BA role accumulates, as ``_ba_role`` traces them: virtual thread ``u`` (0 .. 127) sums elements
+    ``c * 2048 + 8 u + j`` of every chunk ``c``; virtual thread ``u + 128`` sums ``c * 2048 + 1024 + 8 u + j`` of the chunks with
+    ``half_live(c)`` -- the predicate under test (a pure-Python mirror of the kernel's index arithmetic, no GPU)."""
+    seen = Counter()
+    for c in range(g.BA_CHUNKS_VERIFY):
+        for u in range(128):
+            kk = c * 2048 + 8 * u
+            seen.update(range(kk, kk + 8))
+            if half_live(c):
+                seen.update(range(kk + 1024, kk + 1024 + 8))
+    return seen
+
+
+@pytest.mark.parametrize("hidden", [1024, 2048, 3072, 4096, 5120, 6144, 8192])
+def test_verify_ba_partition_covers_every_hidden_index_once_with_the_kernels_half_chunk_predicate(hidden):
+    """With the kernel's one predicate (``Geometry.ba_verify_half_live``: a chunk has its second half unless it is a trailing half chunk)
+    the verify BA partition covers ``0 .. HIDDEN - 1`` exactly once at every served hidden width.  The RED half: the predicate the dot
+    chains used to carry -- "the LAST chunk is the half chunk", ``c < BA_CHUNKS - 1`` -- holds at hidden 5120 only; at a hidden width of
+    whole chunks (8192, 4096, ...) it never accumulates the last chunk's second half: 1024 inputs loaded, dropped, no error."""
+    g = gdn_geometry.Geometry(1, 8, hidden)
+    assert verify_ba_partition(g, g.ba_verify_half_live) == Counter(range(hidden)), hidden
+    assert g.BA_VERIFY_HALF_LIVE == tuple(c * 2048 + 1024 < hidden for c in range(g.BA_CHUNKS_VERIFY))
+    assert g.ba_verify_half_live(g.BA_CHUNKS_VERIFY - 1) == (hidden % 2048 == 0), "the last chunk has a second half iff it is a whole chunk"
+
+    def stale(c):
+        return c < g.BA_CHUNKS_VERIFY - 1
+
+    covered = verify_ba_partition(g, stale)
+    if hidden % 2048 == 1024:
+        assert covered == Counter(range(hidden)), "at a trailing half chunk the stale predicate happens to agree"
+    else:
+        missing = sorted(set(range(hidden)) - set(covered))
+        assert missing == list(range(hidden - 1024, hidden)), (hidden, len(missing))
+
+
+def test_verify_kernel_reads_the_one_half_chunk_predicate_at_every_ba_site():
+    """Source tripwire (no DSL import): the verify kernel's BA role spells the second virtual thread's liveness through
+    ``ba_verify_half_live`` at every site -- the weight loads, the prefetched and the streamed hidden loads, the weight unpack, the dot
+    chains -- and never through the stale ``BA_CHUNKS - 1`` form or a bare module constant of the default geometry."""
+    spec = importlib.util.find_spec("cudnn.linear_attention.frost.kernel.gdn_verify_fused_f16")
+    src = Path(spec.origin).read_text()
+    assert "BA_CHUNKS - 1" not in src and "BA_CHUNKS -1" not in src
+    assert src.count("ba_verify_half_live(") >= 5, src.count("ba_verify_half_live(")
+    body = src.split('"""', 2)[2]  # past the module docstring
+    for name in ("HIDDEN", "V_HEADS", "QKV_CHANNELS", "K_CHANNEL0", "V_CHANNEL0", "OUT_ROW", "BA_CHUNKS"):
+        bare = [
+            ln for ln in body.splitlines() if name in ln and "GEOM" not in ln and ("import" in ln or f" {name}" in ln.split("#")[0] and f".{name}" not in ln)
+        ]
+        assert not [ln for ln in bare if "import" in ln], (name, bare)
 
 
 def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
