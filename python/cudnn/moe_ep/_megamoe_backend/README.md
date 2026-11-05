@@ -9,7 +9,8 @@ The private backend provides Rubin SM107 MXFP8 execution for `cudnn.moe_ep`.
 - `hidden_size % 128 == 0`
 - `intermediate_size % 256 == 0`
 - `top_k <= min(32, num_experts)`
-- positive `max_tokens_per_rank`
+- positive `max_tokens_per_rank`, at most 65536 (the vendored routing metadata
+  stores the source token index in 16 bits)
 - `apply_topk_in_fc1=True`
 
 Inference accepts BF16/FP16/FP32 or MXFP8 operands. Training accepts

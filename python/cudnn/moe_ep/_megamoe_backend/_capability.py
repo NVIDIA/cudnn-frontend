@@ -17,6 +17,11 @@ from .._config import ResolvedMoeEpConfig
 from .._contracts import _ForwardCall
 from .._types import BlockScaledTensor, MoeFormat
 
+# The vendored routing metadata record (``TokenSrcMetadata``) stores the
+# source token index in 16 bits; its communication component rejects larger
+# per-rank token capacities when the kernel is constructed.
+_MAX_TOKENS_PER_RANK = 1 << 16
+
 
 def _validate_operand(name, tensor) -> None:
     if isinstance(tensor, BlockScaledTensor):
@@ -65,6 +70,11 @@ def validate_config(config: ResolvedMoeEpConfig) -> None:
         raise NotImplementedError("MoeEp MegaMoE backend requires an explicit max_tokens_per_rank")
     if parallel.max_tokens_per_rank == 0:
         raise NotImplementedError("MoeEp SM107 MXFP8 execution requires " "max_tokens_per_rank to be positive")
+    if parallel.max_tokens_per_rank > _MAX_TOKENS_PER_RANK:
+        raise NotImplementedError(
+            "MoeEp SM107 MXFP8 routing metadata stores the source token index in 16 bits; "
+            f"max_tokens_per_rank must be <= {_MAX_TOKENS_PER_RANK}, got {parallel.max_tokens_per_rank}"
+        )
     if model.hidden_size % 128:
         raise NotImplementedError("MoeEp SM107 MXFP8 kernel currently requires hidden_size " f"to be divisible by 128, got {model.hidden_size}")
     if model.intermediate_size % 256:

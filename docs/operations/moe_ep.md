@@ -684,7 +684,8 @@ new operator preparation; caller-address changes require recapture.
 - `intermediate_size` divisible by 256.
 - `top_k <= min(32, num_experts)`.
 - `num_experts` divisible by the expert-parallel group size.
-- An explicit positive `max_tokens_per_rank`.
+- An explicit positive `max_tokens_per_rank` no greater than 65536. The
+  routing metadata stores the source token index in 16 bits.
 
 The stateless training CUDA Graph path has hardware acceptance through EP32 when
 all ranks are in one direct-P2P MNNVL peer-access domain. The Python capability

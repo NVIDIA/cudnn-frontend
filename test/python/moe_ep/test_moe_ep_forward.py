@@ -1420,6 +1420,33 @@ def test_megamoe_capability_and_kernel_config_accept_ep_above_16():
 
 
 @pytest.mark.L0
+def test_megamoe_capability_bounds_tokens_by_routing_metadata():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend._capability import (
+        _MAX_TOKENS_PER_RANK,
+        validate_config,
+    )
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.token_protocol import (
+        TokenSrcMetadata,
+    )
+
+    # The capability bound mirrors the vendored record's 16-bit token field.
+    assert _MAX_TOKENS_PER_RANK == TokenSrcMetadata.MAX_TOKENS
+
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        resolved = op._execution_state.resolved_config
+
+    def with_max_tokens(max_tokens_per_rank):
+        public = resolved.public_config
+        parallel = replace(public.parallel, max_tokens_per_rank=max_tokens_per_rank)
+        return replace(resolved, public_config=replace(public, parallel=parallel))
+
+    validate_config(with_max_tokens(_MAX_TOKENS_PER_RANK))
+    with pytest.raises(NotImplementedError, match=f"max_tokens_per_rank must be <= {_MAX_TOKENS_PER_RANK}"):
+        validate_config(with_max_tokens(_MAX_TOKENS_PER_RANK + 1))
+
+
+@pytest.mark.L0
 def test_ep32_peer_mapping_selects_version_compatible_payload():
     import cutlass
     from cutlass._mlir import ir
