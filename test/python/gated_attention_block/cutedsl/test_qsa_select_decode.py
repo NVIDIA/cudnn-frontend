@@ -417,20 +417,22 @@ def test_decode_agrees_with_the_prefill_selector_on_the_same_rows():
 
 @needs_dsl_floor
 @needs_sm100_family
-def test_decode_scorer_tile_is_a_knob():
-    """``m_block_size`` changes the scorer's schedule only: 16 (the default, four tokens of four heads) and 32 give
-    the same sets and scores."""
+def test_decode_scorer_tile_is_fixed_at_128():
+    """The scorer packs a fixed 128-row tile: ``m_block_size=128`` is the default, and any other tile is refused before launch."""
     device = torch.device("cuda")
     rows_per_seq, n_blocks_max = 3, 1024
     pos0 = [4 * 900 + 2, 4 * 50]
     qi, kbar = _inputs(2, rows_per_seq, n_blocks_max, device, seed=37)
     kv = _kv_lens(pos0, rows_per_seq, device)
     a = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False)
-    b = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False, m_block_size=32)
+    b = qsa_select_decode_forward(qi, kbar, kv, list_per_sequence=False, m_block_size=128)
     torch.cuda.synchronize()
     assert torch.equal(torch.sort(a["block_ids"], dim=-1).values, torch.sort(b["block_ids"], dim=-1).values)
     assert torch.equal(torch.sort(a["scores"], dim=-1).values, torch.sort(b["scores"], dim=-1).values)
     assert torch.equal(a["block_lens"], b["block_lens"])
+    for tile in (16, 32):
+        with pytest.raises(ValueError, match="fixed 128-row tile"):
+            qsa_select_decode_forward(qi, kbar, kv, m_block_size=tile)
 
 
 # --------------------------------------------------------------------------------------------- the fp8 indexer cache arm
