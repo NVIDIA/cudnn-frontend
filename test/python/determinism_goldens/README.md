@@ -218,9 +218,8 @@ The score reference uses dequantized inputs and FP64 computation. Existing
 correctness tolerances apply only to references; replay and batch comparisons
 remain byte-exact.
 
-SM100 MXFP8 and SM90 FP8 each had **17 passed, 0 failed**, including their
-own saved golden. Each device skips the other precision group. SM103 and
-SM107 results and runtime-specific goldens remain unmeasured. The [architecture/API tables](../../../docs/operations/determinism.md)
+SM100/SM103/SM107 MXFP8 and SM90 FP8 each had **17 passed, 0 failed**,
+including their own saved golden. Each device skips the other precision group. The [architecture/API tables](../../../docs/operations/determinism.md)
 keep these gaps separate from measured results. FP8/MXFP8 backward is not
 supported by these DSA attention/indexer APIs and has no positive test cases.
 
@@ -352,9 +351,101 @@ recording disabled. It includes E4M3 input bytes, FP32 scales, weights, offsets,
 scores, and LSE. Test source came from commit
 `35cf3082e5f3e505b066097f29bf232a848ea269`; imports resolved to that snapshot.
 
-The SM107 run is queued for a GPU allocation; no result is measured yet.
+### SM103 validation
 
-### DSA failures
+All 285 L0 cases ran: **244 passed, 24 failed, 17 skipped** in 482.93 seconds.
+The 17 skips are SM90-only FP8 cases. All 17 MXFP8 indexer cases, six harness
+controls, and 16 operation goldens passed. Failures: 13 QSA, five DSA attention
+backward, and six BF16 indexer backward cases.
+
+GPU: `NVIDIA B300 SXM6 AC`, SM103, 148 SMs. Torch
+`2.14.0a0+b2c75dd062.nv26.09`, CUDA `13.4`, driver API `13040`, cuDNN `92700`,
+CuTe DSL `4.8.0`, TVM FFI `0.1.14.post1`. Source snapshot:
+`8671c79c2a1e7073bf1efe0cce1939f093a0d840`; imports resolved to that snapshot.
+The [SM103 goldens](7a727a3958771fbc) passed replay and independent references
+before a separate run with recording disabled. The same full-suite command
+listed in the operation report selected all 285 cases.
+
+These 16 records add a new GPU/runtime baseline. Existing records are unchanged.
+Compared with SM100, linear-attention gate input hashes differ; the other input
+hashes match. The numerical reference checks use each run's actual inputs.
+Software versions differ between SM100 and SM103, so these are separate
+measurements, not a hardware-only comparison.
+
+| SM103 failed case | First mismatch |
+| --- | --- |
+| `TestQSA::test_replay[bprop-q12-kv1]` | replay 1 dk: 2/43520 bytes differ |
+| `TestQSA::test_replay[bprop-q24-kv2]` | replay 1 dk: 3/87040 bytes differ |
+| `TestQSA::test_batch_invariance[bprop-q12-kv1]` | batch (1, 0), sequence 0 dq: 1/399360 bytes differ |
+| `TestQSA::test_batch_invariance[bprop-q24-kv2]` | batch (0,), sequence 0 dk: 2/66560 bytes differ |
+| `TestQSA::test_batch_invariance[bprop-q6-kv1]` | batch (1, 0), sequence 0 dq: 1/199680 bytes differ |
+| `TestQSA::test_sparse_batch_invariance[fprop]` | sparse sequence 1 out_fp32: 237/36864 bytes differ |
+| `TestQSA::test_sparse_batch_invariance[bprop]` | replay 1 dk: 142/1054720 bytes differ |
+| `TestQSA::test_dispatch_boundary[total513-fprop]` | total 513, target position 0 out_fp32: 196/36864 bytes differ |
+| `TestQSA::test_dispatch_boundary[total513-bprop]` | total 513, target position 0 out_fp32: 196/36864 bytes differ |
+| `TestQSA::test_mask_replay[all-selected-bprop]` | replay 1 dv: 1/43520 bytes differ |
+| `TestQSA::test_mask_replay[empty-rows-bprop]` | replay 3 dk: 1/43520 bytes differ |
+| `TestQSA::test_mask_batch_invariance[all-selected-bprop]` | mask all-selected, batch (0,), sequence 0 dv: 2/33280 bytes differ |
+| `TestQSA::test_mask_batch_invariance[empty-rows-bprop]` | mask empty-rows, batch (0,), sequence 0 dk: 1/33280 bytes differ |
+| `TestDSA::test_batch_invariance[h128-d512-k128-bf16-bprop]` | batch (1, 0), sequence 0 dkv: 4/164864 bytes differ |
+| `TestDSA::test_query_boundary[h64-q129-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `TestDSA::test_query_boundary[h64-q257-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `TestDSA::test_query_boundary[h128-q74-bprop]` | batch (1, 0), sequence 0 dkv: 6/164864 bytes differ |
+| `TestDSA::test_query_boundary[h128-q75-bprop]` | batch (1, 0), sequence 0 dkv: 6/164864 bytes differ |
+| `TestDSAIndexerBackward::test_replay[dk-bf16-dense-h64]` | replay 5 d_index_k: 1/131072 bytes differ |
+| `TestDSAIndexerBackward::test_replay[dk-fp32-dense-h64]` | replay 1 d_index_k: 2038/262144 bytes differ |
+| `TestDSAIndexerBackward::test_batch_invariance[dk-fp32-dense-h64]` | batch (0, 1), sequence 0 d_index_k: 989/131072 bytes differ |
+| `TestDSAIndexerBackward::test_sparse_persistent_rows[topk896]` | batch (1, 0), sequence 0 d_index_k: 132237/1048576 bytes differ |
+| `TestDSAIndexerBackward::test_sparse_persistent_rows[topk2048]` | batch (1, 0), sequence 0 d_index_k: 202412/1048576 bytes differ |
+| `TestDSAIndexerBackward::test_neighbor_isolation[dense]` | changed neighbor d_index_k: 513/131072 bytes differ |
+
+### SM107 validation
+
+All 285 L0 cases ran: **244 passed, 24 failed, 17 skipped** in 399.55 seconds.
+The 17 skips are SM90-only FP8 cases. All 17 MXFP8 indexer cases, six harness
+controls, and 16 operation goldens passed. Failures: 14 QSA, four DSA attention
+backward, and six BF16 indexer backward cases.
+
+GPU: `NVIDIA VR NVL72`, SM107, 212 SMs, on ARM64. Torch
+`2.14.0a0+b2c75dd062.nv26.09`, CUDA `13.4`, driver API `13050`, cuDNN `92700`,
+CuTe DSL `4.8.0`, TVM FFI `0.1.14.post1`. Source snapshot:
+`35cf3082e5f3e505b066097f29bf232a848ea269`; imports resolved to that snapshot.
+Test and kernel source match the SM103 run. The [SM107 goldens](72e27159dc117014)
+passed replay and independent references before a separate full-suite run
+with recording disabled. The same command selected all 285 L0 cases.
+
+These 16 records add a new GPU/runtime baseline. Existing records are unchanged.
+Some CPU-generated input hashes differ from the x86 runs; references use the
+actual inputs. No cross-device byte equality is inferred from separate passes.
+
+| SM107 failed case | First mismatch |
+| --- | --- |
+| `TestQSA::test_replay[bprop-q12-kv1]` | replay 1 dk: 1/43520 bytes differ |
+| `TestQSA::test_replay[bprop-q24-kv2]` | replay 1 dk: 1/87040 bytes differ |
+| `TestQSA::test_replay[bprop-q6-kv1]` | replay 1 dv: 2/43520 bytes differ |
+| `TestQSA::test_batch_invariance[bprop-q12-kv1]` | batch (0,), sequence 0 dk: 2/33280 bytes differ |
+| `TestQSA::test_batch_invariance[bprop-q24-kv2]` | batch (0,), sequence 0 dk: 1/66560 bytes differ |
+| `TestQSA::test_batch_invariance[bprop-q6-kv1]` | batch (0,), sequence 0 dk: 1/33280 bytes differ |
+| `TestQSA::test_sparse_batch_invariance[fprop]` | sparse sequence 1 out_fp32: 237/36864 bytes differ |
+| `TestQSA::test_sparse_batch_invariance[bprop]` | replay 1 dk: 140/1054720 bytes differ |
+| `TestQSA::test_dispatch_boundary[total513-fprop]` | total 513, target position 0 out_fp32: 196/36864 bytes differ |
+| `TestQSA::test_dispatch_boundary[total513-bprop]` | total 513, target position 0 out_fp32: 196/36864 bytes differ |
+| `TestQSA::test_mask_replay[all-selected-bprop]` | replay 4 dv: 1/43520 bytes differ |
+| `TestQSA::test_mask_replay[empty-rows-bprop]` | replay 1 dv: 1/43520 bytes differ |
+| `TestQSA::test_mask_batch_invariance[all-selected-bprop]` | mask all-selected, batch (0,), sequence 0 dk: 1/33280 bytes differ |
+| `TestQSA::test_mask_batch_invariance[empty-rows-bprop]` | mask empty-rows, batch (0,), sequence 0 dk: 1/33280 bytes differ |
+| `TestDSA::test_query_boundary[h64-q129-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `TestDSA::test_query_boundary[h64-q257-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `TestDSA::test_query_boundary[h128-q74-bprop]` | batch (1, 0), sequence 0 dkv: 9/164864 bytes differ |
+| `TestDSA::test_query_boundary[h128-q75-bprop]` | batch (1, 0), sequence 0 dkv: 12/164864 bytes differ |
+| `TestDSAIndexerBackward::test_replay[dk-bf16-dense-h64]` | replay 1 d_index_k: 1/131072 bytes differ |
+| `TestDSAIndexerBackward::test_replay[dk-fp32-dense-h64]` | replay 1 d_index_k: 1843/262144 bytes differ |
+| `TestDSAIndexerBackward::test_batch_invariance[dk-fp32-dense-h64]` | batch (0, 1), sequence 0 d_index_k: 1083/131072 bytes differ |
+| `TestDSAIndexerBackward::test_sparse_persistent_rows[topk896]` | batch (1, 0), sequence 0 d_index_k: 132358/1048576 bytes differ |
+| `TestDSAIndexerBackward::test_sparse_persistent_rows[topk2048]` | batch (1, 0), sequence 0 d_index_k: 202644/1048576 bytes differ |
+| `TestDSAIndexerBackward::test_neighbor_isolation[dense]` | changed neighbor d_index_k: 1035/131072 bytes differ |
+
+### DSA failures (SM100)
 
 All 24 fprop cases passed. Bprop had 19 passes and five failures, all in batch
 invariance. Every replay and numerical-reference check reached in this suite
@@ -374,7 +465,7 @@ The H128 BF16 failures move the target within the two-CTA path. Same-shape
 replay passed: `deterministic=True` did not establish batch invariance for
 these cases. No kernel changes, xfails, or relaxed comparisons were added.
 
-### QSA failures
+### QSA failures (SM100)
 
 The same 14 case IDs failed in the earlier run. First mismatch counts and
 tensors can vary with the order of atomic reductions.
