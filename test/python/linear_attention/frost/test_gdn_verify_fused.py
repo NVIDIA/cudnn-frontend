@@ -1679,10 +1679,12 @@ def test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form(g, arm):
     slot, the conv pool; the padding request zero, the tickets back at zero.  An arm the part does not hold is its typed decline,
     reported as a skip (``_fits_or_declines``)."""
     dev = _device_or_skip()
-    cfg = kcfg.make_cfg(**arm)
-    _fits_or_declines(dev, cfg, 6, geometry=g)
-    base = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.CFG, geometry=g), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
-    got = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=cfg, geometry=g), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
+    cfg = kcfg.with_geometry(kcfg.make_cfg(**arm), g)  # the form compiled for the geometry (a form of another geometry beside geometry= is refused)
+    _fits_or_declines(dev, cfg, 6)
+    base = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.with_geometry(kcfg.CFG, g)), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
+    got = entry.GdnVerifyFused(dev, 1e-6, cfg=cfg)
+    assert got.geometry == g and got.cfg.GEOM == g
+    got = _snapshot(got, make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
     _assert_bitwise(base, got, f"{_gid(g)} {arm}")
     assert not got["qout"][18:24].any() and got["qout"][:18].any(), "the padding request is zero, the live rows written"
 
@@ -1690,12 +1692,17 @@ def test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form(g, arm):
 @pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
 def test_rank_geometry_requests_are_batch_invariant(g):
     """Batch invariance at a per-rank geometry: every live request of a 4-request T-6 step (the entry's pick at four requests; random
-    acceptance counts, a skipped slot, non-monotone slots) writes the bytes it writes alone (one request: the pair pick) from the same
-    pools -- its fp8 / bf16 rows, its written state slots, its conv slot -- so a request's result does not depend on which requests share
-    its step."""
+    acceptance counts, a skipped slot, non-monotone slots) writes the bytes it writes alone from the same pools -- its fp8 / bf16 rows,
+    its written state slots, its conv slot -- so a request's result does not depend on which requests share its step.  Under ONE gated-norm
+    association: the lone request runs the one-CTA form with the multi-request association (``ctas1``, the pick's at four requests), because
+    the one-request pick itself takes the reference kernel's two-CTAs-per-head association (``ctas2``: 4-row chains) by policy, which
+    rounds the normed output's last bits differently by design (``norm_form_for``); the forms' agreement under one association is the
+    cross-form cell above and the 27B's one-request pair-vs-one-CTA cell."""
     dev = _device_or_skip()
     requests, tokens = 4, 6
     k = entry.GdnVerifyFused(dev, 1e-6, geometry=g)
+    assert k.cfg_for(requests, tokens).NORM_FORM == "ctas1"
+    alone = entry.GdnVerifyFused(dev, 1e-6, cfg=replace(kcfg.with_geometry(kcfg.CFG, g), NORM_FORM="ctas1"))
     kw = dict(accepted="random", skip="mid")
     ops = make_operands(requests, tokens, dev, seed=71, geometry=g, **kw)
     idx = ops["state_indices"].clone()
@@ -1705,14 +1712,14 @@ def test_rank_geometry_requests_are_batch_invariant(g):
         rows = slice(n * tokens, (n + 1) * tokens)
         one = dict(
             again,
-            qkv=again["qkv"][rows],
+            qkv=again["qkv"][rows],  # row slices of the slab keep its 16-byte-multiple row stride (the serving layout's views)
             z=again["z"][rows],
             hidden=again["hidden"][rows],
-            state_indices=again["state_indices"][n : n + 1],
+            state_indices=again["state_indices"][n : n + 1].clone(),  # fresh allocations: a sliced int32 table is not 16-byte aligned at odd n
             cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=dev),
-            num_accepted_tokens=again["num_accepted_tokens"][n : n + 1],
+            num_accepted_tokens=again["num_accepted_tokens"][n : n + 1].clone(),
         )
-        snap1 = _snapshot(k, one)
+        snap1 = _snapshot(alone, one)
         assert torch.equal(snap1["qout"], snap4["qout"][rows]) and torch.equal(snap1["out"], snap4["out"][rows]), f"{_gid(g)} request {n}: the outputs"
         for t in range(tokens):
             slot = int(idx[n, t])

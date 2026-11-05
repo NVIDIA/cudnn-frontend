@@ -1267,16 +1267,18 @@ def test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form(g, arm):
     null row zero, the tickets back at zero (at 1 K head per rank, 8 or 16 readers share one K head's conv history per row).  An arm the
     part's shared memory does not hold is its typed decline at construction, reported as a skip."""
     dev = _device_or_skip()
-    cfg = kcfg.make_cfg(**arm)
+    cfg = kcfg.with_geometry(kcfg.make_cfg(**arm), g)  # the form compiled for the geometry (a form of another geometry beside geometry= is refused)
     try:
-        kcfg.validate_cfg(replace(cfg, GEOM=g, **_on(entry.device_shared_memory(dev))))
+        kcfg.validate_cfg(replace(cfg, **_on(entry.device_shared_memory(dev))))
     except ValueError as exc:
         assert "do not fit the SM" in str(exc), exc
         with pytest.raises(ValueError, match="do not fit the SM"):
-            entry.GdnDecodeFused(dev, 1e-6, cfg=cfg, geometry=g)
+            entry.GdnDecodeFused(dev, 1e-6, cfg=cfg)
         pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
-    base = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=kcfg.CFG, geometry=g), _rank_operands(g, 4, dev, seed=31, idx=B4_IDX))
-    got = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=cfg, geometry=g), _rank_operands(g, 4, dev, seed=31, idx=B4_IDX))
+    base = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=kcfg.with_geometry(kcfg.CFG, g)), _rank_operands(g, 4, dev, seed=31, idx=B4_IDX))
+    got = entry.GdnDecodeFused(dev, 1e-6, cfg=cfg)
+    assert got.geometry == g and got.cfg.GEOM == g
+    got = _snapshot(got, _rank_operands(g, 4, dev, seed=31, idx=B4_IDX))
     _assert_bitwise(base, got, f"{_gid(g)} {arm}")
     assert not got["qout"][1].any() and got["qout"][0].any() and got["qout"][2].any() and got["qout"][3].any(), "the null row is zero, the live rows written"
 
