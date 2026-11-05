@@ -90,6 +90,33 @@ def test_qsa_backward_packed_sequences(cu_seqlens, h_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+@pytest.mark.parametrize(
+    "seq_len, cu_seqlens",
+    [
+        (4099, None),  # the dense kernel alone
+        (24000, None),  # dense, query-major and key-major kernels: the key slots are claimed with atomics
+        (32769, None),  # two KV passes
+        (32769, [0, 3, 32769]),
+    ],
+)
+def test_qsa_backward_is_bitwise_repeatable(seq_len, cu_seqlens, h_kv):
+    inputs = make_inputs(seq_len, seed=seq_len, h_kv=h_kv, cu_seqlens=cu_seqlens)
+    bounds = cu_seqlens or [0, seq_len]
+    max_seq_len = max(e - s for s, e in zip(bounds[:-1], bounds[1:]))
+
+    def run():
+        grads = _backward(*(inputs[name] for name in _INPUT_NAMES), cu_seqlens=inputs.get("cu_seqlens"), max_seq_len=max_seq_len)
+        grads = (grads["dq"], grads["dk"], grads["dv"]) if isinstance(grads, dict) else tuple(grads)
+        return [g.clone() for g in grads]
+
+    first = run()
+    for repeat in range(1, 6):
+        for name, a, b in zip(("dq", "dk", "dv"), first, run()):
+            assert torch.equal(a, b), f"{name} differs bitwise on repeat {repeat}: {int((a != b).sum())} elements"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("h_kv", [1, 2])
 def test_qsa_backward_accepts_the_padded_index_width(h_kv):
     # 2052 columns: the fourth tail slot is never read, only the row stride changes
