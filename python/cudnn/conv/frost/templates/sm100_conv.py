@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Implicit-GEMM fprop convolution kernel for Blackwell B200.
+# Dynamic-geometry implicit-GEMM fprop convolution kernel for Blackwell B200.
 #
-# Maps a 3D convolution onto an implicit GEMM: M = N*Z*P*Q, N_gemm = K,
+# Maps a 3D convolution onto an implicit GEMM: M_gemm = N*Z*P*Q, N_gemm = K,
 # K_gemm = T*R*S*C. Warp-specialized with explicit roles (1 TMA producer warp,
 # 1 MMA consumer warp, 4 epilogue warps), mbarrier-based producer/consumer
 # synchronization, and a tcgen05.mma + tcgen05.commit handshake for the TMEM
@@ -213,8 +213,8 @@ def _kernel(
     mma_tiler: cutlass.Constexpr[Tuple[int, int, int]],
     mma_inst_shape_mnk: cutlass.Constexpr[Tuple[int, int, int]],
     # Channel/filter tile count for the temporal planes handled by the MMA loop.
-    k_tile_cnt: cutlass.Constexpr[int],
-    channel_tiles: cutlass.Constexpr[int],
+    k_tile_cnt: cutlass.Int32,
+    channel_tiles: cutlass.Int32,
     m_tiles_per_work: cutlass.Constexpr[int],
     first_filter_t: cutlass.Constexpr[int],
     channel_first: cutlass.Constexpr[bool],
@@ -226,14 +226,14 @@ def _kernel(
     c_dtype: cutlass.Constexpr[Type[Numeric]],
     acc_dtype: cutlass.Constexpr[Type[Numeric]],
     # Conv geometry consumed by the im2col TMA producer / epilogue:
-    # zpq      = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q)
-    # trs      = filter spatial dims (T, R, S) used to decompose K-tile index
+    # zpq_divisors = output spatial dims (Z, P, Q) used to decompose linear M -> (n,z,p,q), converted to FDDs on the host.
+    # trs = filter spatial dims (T, R, S) used to decompose K-tile index
     # lower_pad_dhw / stride_dhw / dilation_dhw = standard conv params
-    lower_pad_dhw: cutlass.Constexpr[Tuple[int, int, int]],
-    stride_dhw: cutlass.Constexpr[Tuple[int, int, int]],
-    dilation_dhw: cutlass.Constexpr[Tuple[int, int, int]],
-    zpq: cutlass.Constexpr[Tuple[int, int, int]],
-    trs: cutlass.Constexpr[Tuple[int, int, int]],
+    lower_pad_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    stride_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    dilation_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    zpq_divisors: Tuple[cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2, cute.FastDivmodDivisorV2],
+    trs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
     # Host-built TMA descriptors, consumed by the device-side
     # prims.cp_async_bulk_tensor_* / prims.prefetch_tensormap calls.
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -437,8 +437,8 @@ def _kernel(
     # other shapes retain the original filter-first reduction order.
     if warp_idx == tma_warp_id:
         ab_stage_idx = 0
-        Z_out, P_out, Q_out = zpq
-        T_filt, R_filt, S_filt = trs
+        z_divisor, p_divisor, q_divisor = zpq_divisors
+        t_filt, r_filt, s_filt = trs
         pad_d, pad_h, pad_w = lower_pad_dhw
         str_d, str_h, str_w = stride_dhw
         dil_d, dil_h, dil_w = dilation_dhw
@@ -459,12 +459,9 @@ def _kernel(
             d_anchors = cutlass.Array(cutlass.Int32, m_tiles_per_work)
             for output_tile in cutlass.range_constexpr(m_tiles_per_work):
                 m_offset = m_off_cta + output_tile * mma_tiler[0]
-                n_idx = m_offset // (Q_out * P_out * Z_out)
-                rem = m_offset % (Q_out * P_out * Z_out)
-                z_idx = rem // (Q_out * P_out)
-                rem = rem % (Q_out * P_out)
-                p_idx = rem // Q_out
-                q_idx = rem % Q_out
+                div, q_idx = divmod(m_offset, q_divisor)
+                div, p_idx = divmod(div, p_divisor)
+                n_idx, z_idx = divmod(div, z_divisor)
                 n_anchors[output_tile] = n_idx
                 w_anchors[output_tile] = q_idx * str_w - pad_w
                 h_anchors[output_tile] = p_idx * str_h - pad_h
@@ -480,7 +477,7 @@ def _kernel(
             c_chunk_idx = 0
             # Initial C96/K96 frames benefit from issuing their three channel
             # loads together.
-            producer_unroll = 3 if channel_first and zpq[0] == 1 and lower_pad_dhw[0] == 2 else 1
+            producer_unroll = 3 if channel_first and first_filter_t == 2 else 1
             for k in cutlass.range(0, k_tile_cnt, 1, unroll=producer_unroll):
                 mbar_full = ab_full_mbar_ptr.subview(ab_stage_idx)
                 mbar_empty = ab_empty_mbar_ptr.subview(ab_stage_idx)
@@ -546,21 +543,21 @@ def _kernel(
                     if c_chunk_idx == channel_tiles:
                         c_chunk_idx = 0
                         s_idx += 1
-                        if s_idx == S_filt:
+                        if s_idx == s_filt:
                             s_idx = 0
                             r_idx += 1
-                            if r_idx == R_filt:
+                            if r_idx == r_filt:
                                 r_idx = 0
                                 t_idx += 1
                 else:
                     s_idx += 1
-                    if s_idx == S_filt:
+                    if s_idx == s_filt:
                         s_idx = 0
                         r_idx += 1
-                        if r_idx == R_filt:
+                        if r_idx == r_filt:
                             r_idx = 0
                             t_idx += 1
-                            if t_idx == T_filt:
+                            if t_idx == t_filt:
                                 t_idx = first_filter_t
                                 c_chunk_idx += 1
 
@@ -804,7 +801,7 @@ def _kernel(
         # uses zero corners, so output spatial coords are bare pixels (no pad
         # subtraction, no stride multiply). Decompose the linear per-CTA M index
         # into (n, z, p, q) per work-tile in the loop.
-        Z_out, P_out, Q_out = zpq
+        z_divisor, p_divisor, q_divisor = zpq_divisors
 
         # Allocator warp (epi 0) reserves 512 TMEM cols and stashes the pointer
         # in tmem_holding_buf. Every CTA allocates from its own 512-col bank;
@@ -865,12 +862,9 @@ def _kernel(
                 # Bare output pixels (col-major Q-fastest). No pad/stride: the C
                 # descriptor uses zero corners, so output has no halo concept.
                 m_off_cta += output_tile * mma_tiler[0]
-                n_out = m_off_cta // (Q_out * P_out * Z_out)
-                rem_m = m_off_cta % (Q_out * P_out * Z_out)
-                z_out = rem_m // (Q_out * P_out)
-                rem_m = rem_m % (Q_out * P_out)
-                p_out = rem_m // Q_out
-                q_out = rem_m % Q_out
+                div, q_out = divmod(m_off_cta, q_divisor)
+                div, p_out = divmod(div, p_divisor)
+                n_out, z_out = divmod(div, z_divisor)
                 # K-out channel base for this N-tile (no cta_rank, see above).
                 k_off_base = mma_tile_coord_mnl[1] * mma_tiler[1]
 
@@ -1190,7 +1184,7 @@ def _compute_stages(
     """Compute the number of (ACC, A/B, C) stages from SMEM-capacity heuristics.
 
     Byte sizes per stage are passed in (computed by the caller as
-    ``per_cta_M * K_tile * dtype.width // 8``); the remaining SMEM after the
+    ``per_cta_M * k_tile * dtype.width // 8``); the remaining SMEM after the
     mbarrier reserve and the initial C budget is split into A/B stages, then
     leftover SMEM is folded back into extra C stages.
     """
@@ -1238,11 +1232,6 @@ class _PersistentConvSetup:
         self,
         acc_dtype: Type[Numeric],
         tile_config: ConvTileConfig,
-        filter_trs: Tuple[int, int, int],
-        upper_padding_dhw: Tuple[int, int, int],
-        lower_padding_dhw: Tuple[int, int, int],
-        stride_dhw: Tuple[int, int, int],
-        dilation_dhw: Tuple[int, int, int],
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
     ):
@@ -1277,13 +1266,6 @@ class _PersistentConvSetup:
         # --- preferred-cluster overrides ---
         self.preferred_cluster_shape_mn = cluster_shape_mn
         self.fallback_cluster_shape_mn = cluster_shape_mn
-
-        # --- conv parameters for im2col TMA ---
-        self.filter_trs = filter_trs
-        self.upper_padding_dhw = upper_padding_dhw
-        self.lower_padding_dhw = lower_padding_dhw
-        self.stride_dhw = stride_dhw
-        self.dilation_dhw = dilation_dhw
 
     def check_supported_dtypes(
         self,
@@ -1425,6 +1407,11 @@ class _PersistentConvSetup:
         k: int,
         ab_dtype: Type[Numeric],
         c_dtype: Type[Numeric],
+        upper_padding_dhw,
+        lower_padding_dhw,
+        stride_dhw,
+        dilation_dhw,
+        filter_trs,
     ) -> bool:
         """Determine if the given tensor configuration can be implemented."""
         try:
@@ -1446,11 +1433,11 @@ class _PersistentConvSetup:
             # Compute implicit GEMM M
             z, p, q = _compute_zpq(
                 ncdhw[2:],
-                self.filter_trs,
-                self.stride_dhw,
-                self.upper_padding_dhw,
-                self.lower_padding_dhw,
-                self.dilation_dhw,
+                filter_trs,
+                stride_dhw,
+                upper_padding_dhw,
+                lower_padding_dhw,
+                dilation_dhw,
             )
             _check_swizzle_size(
                 ncdhw[0] * z * p * q,
@@ -1539,28 +1526,22 @@ class _FpropKernel:
         self,
         acc_dtype: Type[Numeric],
         tile_config: ConvTileConfig,
-        filter_trs: Tuple[int, int, int],
-        upper_padding_dhw: Tuple[int, int, int],
-        lower_padding_dhw: Tuple[int, int, int],
-        stride_dhw: Tuple[int, int, int],
-        dilation_dhw: Tuple[int, int, int],
         swizzle_size: int = 1,
         raster_along: str = "m",
+        m_tiles_per_work: int = 1,
+        channel_first: bool = False,
     ):
+        self._m_tiles_per_work = m_tiles_per_work
+        self._channel_first = channel_first
         self._setup = _PersistentConvSetup(
             acc_dtype=acc_dtype,
             tile_config=tile_config,
-            filter_trs=filter_trs,
-            upper_padding_dhw=upper_padding_dhw,
-            lower_padding_dhw=lower_padding_dhw,
-            stride_dhw=stride_dhw,
-            dilation_dhw=dilation_dhw,
             swizzle_size=swizzle_size,
             raster_along=raster_along,
         )
 
-    def can_implement(self, ncdhw, k, ab_dtype, c_dtype) -> bool:
-        return self._setup.can_implement(ncdhw, k, ab_dtype, c_dtype)
+    def can_implement(self, ncdhw, k, ab_dtype, c_dtype, *geometry) -> bool:
+        return self._setup.can_implement(ncdhw, k, ab_dtype, c_dtype, *geometry)
 
     @cute.jit
     def __call__(
@@ -1570,6 +1551,10 @@ class _FpropKernel:
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream,
+        upper_padding_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        lower_padding_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        stride_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        dilation_dhw: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
         epilogue_op: cutlass.Constexpr = lambda x: x,
         padded_plane_flags=None,
     ):
@@ -1583,30 +1568,20 @@ class _FpropKernel:
         # reduction order. Five AB stages leave room for all four A tiles.
         # This schedule is qualified for the two-CTA C96/K96 BF16 geometry;
         # single-frame outputs and other geometries retain one tile per work.
-        m_tiles_per_work = 1
-        if cutlass.const_expr(
-            c.shape[1] > 1
-            and a.shape[4] == c.shape[4] == 96
-            and p.a_dtype == p.c_dtype == cutlass.BFloat16
-            and p.tile_config.cta_tile_m == 128
-            and p.tile_config.cta_tile_n == 96
-            and p.tile_config.cta_tile_k_bytes == 64
-            and p.use_2cta_instrs
-            and p.preferred_cluster_shape_mn == (2, 1)
-        ):
-            m_tiles_per_work = 4
+        m_tiles_per_work = self._m_tiles_per_work
+        if cutlass.const_expr(m_tiles_per_work == 4):
             p.num_ab_stage = 5
             p.num_acc_stage = 4
 
         # Host TMA descriptors, built directly from the raw input tensors via
         # cuda.create_tensor_map_*.
-        T_filter, R_filter, S_filter = p.filter_trs
-        upad_d, upad_h, upad_w = p.upper_padding_dhw
-        lpad_d, lpad_h, lpad_w = p.lower_padding_dhw
-        dil_d, dil_h, dil_w = p.dilation_dhw
+        t_filter, r_filter, s_filter = b.shape[1:4]
+        upad_d, upad_h, upad_w = upper_padding_dhw
+        lpad_d, lpad_h, lpad_w = lower_padding_dhw
+        dil_d, dil_h, dil_w = dilation_dhw
         # Per-CTA M tile (use_2cta_instrs splits M between 2 CTAs along cluster_m).
         mma_tiler_per_cta_m = p.mma_tiler[0] // 2 if p.use_2cta_instrs else p.mma_tiler[0]
-        # mma_tiler[2] is a sub-tuple (K_tile,) after _setup_attributes.
+        # mma_tiler[2] is a sub-tuple (k_tile,) after _setup_attributes.
         k_tile = cute.size(p.mma_tiler, mode=[2])
         # Epilogue subtile width (K-mode of NZPQK), from the shared datapath
         # descriptor. Must match the device epilogue + the C descriptor swizzle
@@ -1634,18 +1609,18 @@ class _FpropKernel:
             global_strides=tuple(a.stride[i] * p.a_dtype.width // 128 for i in (3, 2, 1, 0)),
             lower_corner=[-lpad_w, -lpad_h, -lpad_d],
             upper_corner=[
-                upad_w - (S_filter - 1) * dil_w,
-                upad_h - (R_filter - 1) * dil_h,
-                upad_d - (T_filter - 1) * dil_d,
+                upad_w - (s_filter - 1) * dil_w,
+                upad_h - (r_filter - 1) * dil_h,
+                upad_d - (t_filter - 1) * dil_d,
             ],
             channels_per_pixel=k_tile,
             pixels_per_column=mma_tiler_per_cta_m,
-            traversal_strides=(1, p.stride_dhw[2], p.stride_dhw[1], p.stride_dhw[0], 1),
+            traversal_strides=(1, stride_dhw[2], stride_dhw[1], stride_dhw[0], 1),
             swizzle=cuda.TensorMapSwizzle.s64b if p.tile_config.cta_tile_k_bytes == 64 else cuda.TensorMapSwizzle.s128b,
         )
 
         # Filter B: KTRSC raw, tiled descriptor.
-        # box_dims is in tensor mode order (K, T, R, S, C). When C >= K_tile,
+        # box_dims is in tensor mode order (K, T, R, S, C). When C >= k_tile,
         # the GEMM-K tile fits inside C alone and (T,R,S) box dims are 1.
         n_per_cta = p.mma_tiler[1] // 2 if p.use_2cta_instrs else p.mma_tiler[1]
         tma_b_desc = cuda.create_tensor_map_tiled_from_view(
@@ -1713,12 +1688,12 @@ class _FpropKernel:
         # The scan evaluates the nonfinite effect of every skipped zero product.
         # It runs on every execute, including changed-weight graph replays.
         first_filter_t = 2 if cutlass.const_expr(padded_plane_flags is not None) else 0
-        k_tile_cnt = (T_filter - first_filter_t) * R_filter * S_filter * channel_tiles
+        k_tile_cnt = (t_filter - first_filter_t) * r_filter * s_filter * channel_tiles
 
         # Output spatial dims for the im2col producer/epilogue coord decode.
         # c.shape = (N, Z, P, Q, K); filter_trs / padding / stride / dilation
-        # live on the PersistentConvSetup instance.
-        zpq = (c.shape[1], c.shape[2], c.shape[3])
+        # come from runtime arguments and tensor metadata.
+        zpq_divisors = tuple(cute.fast_divmod_create_divisor_v2(x) for x in (c.shape[1:4]))
 
         # Launch the kernel (argument order matches the device kernel
         # signature).
@@ -1732,7 +1707,7 @@ class _FpropKernel:
             channel_tiles,
             m_tiles_per_work,
             first_filter_t,
-            a.shape[4] == 96 and c.shape[4] == 96 and p.a_dtype == cutlass.BFloat16,
+            self._channel_first,
             p.num_ab_stage,
             p.num_acc_stage,
             p.num_c_stage,
@@ -1740,11 +1715,11 @@ class _FpropKernel:
             p.a_dtype,
             p.c_dtype,
             p.acc_dtype,
-            p.lower_padding_dhw,
-            p.stride_dhw,
-            p.dilation_dhw,
-            zpq,
-            p.filter_trs,
+            lower_padding_dhw,
+            stride_dhw,
+            dilation_dhw,
+            zpq_divisors,
+            (t_filter, r_filter, s_filter),
             tma_a_desc,
             tma_b_desc,
             tma_c_desc,
@@ -1807,8 +1782,8 @@ class _PaddedFrameConv:
     launch: object
     workspace_bytes: int = 96 * 4
 
-    def __call__(self, image, weight, output, stream, flags):
-        self.launch(image, weight, output, stream, flags)
+    def __call__(self, image, weight, output, stream, upper_padding_dhw, lower_padding_dhw, stride_dhw, dilation_dhw, flags):
+        self.launch(image, weight, output, stream, upper_padding_dhw, lower_padding_dhw, stride_dhw, dilation_dhw, flags)
 
 
 def compile(
@@ -1824,55 +1799,14 @@ def compile(
     c_dtype: Type[Numeric] = _DEFAULT_DTYPE,
     tile_config: ConvTileConfig | None = None,
 ):  # noqa: A001
-    """Compile the SM100 fprop kernel for the requested convolution.
+    """Select a tile and compile a convolution artifact with runtime geometry.
 
-    The shape is explicit because im2col TMA descriptors bake it into the
-    artifact. Padding, stride, and dilation are likewise plan-time
-    specializations. Input/output storage dtypes and an explicitly supplied
-    ``tile_config`` are specialized independently; when no config is supplied,
-    the shared predicate-based selector chooses one from the implicit-GEMM
-    shape. The accumulator remains FP32. Each build device compiles its own
-    artifact for its own target (``_cutedsl.build_target``).
+    Shapes, padding, stride, and dilation select the tile but do not specialize
+    the artifact. Dtypes, epilogue, resolved tile, build device, and GPU target
+    define the compile-cache key. C96 additionally specializes its channel sizes,
+    grouped-output schedule, and padded-plane scan. Graph geometry is validated
+    by the engine.
     """
-    device, gpu_arch = build_target()
-    return _compile_cached(
-        ncdhw,
-        ktrs,
-        upper_padding_dhw,
-        lower_padding_dhw,
-        stride_dhw,
-        dilation_dhw,
-        epilogue,
-        epilogue_attrs,
-        ab_dtype,
-        c_dtype,
-        tile_config,
-        device=device,
-        gpu_arch=gpu_arch,
-    )
-
-
-@lru_cache(maxsize=None)
-def _compile_cached(
-    ncdhw: Tuple[int, int, int, int, int],
-    ktrs: Tuple[int, int, int, int],
-    upper_padding_dhw: Tuple[int, int, int],
-    lower_padding_dhw: Tuple[int, int, int],
-    stride_dhw: Tuple[int, int, int],
-    dilation_dhw: Tuple[int, int, int],
-    epilogue: str,
-    epilogue_attrs: tuple[tuple[str, float], ...],
-    ab_dtype: Type[Numeric],
-    c_dtype: Type[Numeric],
-    tile_config: ConvTileConfig | None,
-    *,
-    device: int,
-    gpu_arch: str,
-):
-    """Cache a specialization per build device and target, including the padded-plane scan."""
-    acc_dtype = cutlass.Float32
-    epilogue_op = get_epilogue_op(epilogue, epilogue_attrs)
-
     N, C, D, H, W = ncdhw
     K, T, R, S = ktrs
     Z, P, Q = _compute_zpq((D, H, W), (T, R, S), stride_dhw, upper_padding_dhw, lower_padding_dhw, dilation_dhw)
@@ -1892,41 +1826,90 @@ def _compile_cached(
         if violation is not None:
             raise ValueError(f"dense convolution config {tile_config.name} is incompatible: {violation}")
 
-    # NDHWC + KTRSC + NZPQK fake tensors (channel/K-fastest, contiguous layout).
-    fake_a = make_fake_compact_tensor(ab_dtype, (N, D, H, W, C), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
-    fake_b = make_fake_compact_tensor(ab_dtype, (K, T, R, S, C), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
-    fake_c = make_fake_compact_tensor(c_dtype, (N, Z, P, Q, K), stride_order=(4, 3, 2, 1, 0), assumed_align=16)
-
-    fprop_op = _FpropKernel(
-        acc_dtype=acc_dtype,
-        tile_config=tile_config,
-        filter_trs=ktrs[1:],
-        upper_padding_dhw=upper_padding_dhw,
-        lower_padding_dhw=lower_padding_dhw,
-        stride_dhw=stride_dhw,
-        dilation_dhw=dilation_dhw,
-    )
-    if not fprop_op.can_implement(ncdhw, ktrs[0], ab_dtype, c_dtype):
+    fprop_op = _FpropKernel(cutlass.Float32, tile_config)
+    if not fprop_op.can_implement(ncdhw, K, ab_dtype, c_dtype, upper_padding_dhw, lower_padding_dhw, stride_dhw, dilation_dhw, ktrs[1:]):
         raise testing.CantImplementError(
             f"Config {tile_config.name} not implementable: ncdhw={ncdhw}, ktrs={ktrs}, upper_padding_dhw={upper_padding_dhw}, "
             f"lower_padding_dhw={lower_padding_dhw}, stride_dhw={stride_dhw}, dilation_dhw={dilation_dhw}"
         )
+    use_padded_plane_scan = (
+        allow_c96
+        and K == 96
+        and D == Z == 1
+        and (T, R, S) == (3, 3, 3)
+        and lower_padding_dhw == (2, 1, 1)
+        and upper_padding_dhw == (0, 1, 1)
+        and stride_dhw == dilation_dhw == (1, 1, 1)
+        and epilogue == "identity"
+        and tile_config.cta_tile_m == 128
+        and tile_config.cta_tile_n == 96
+    )
+    m_tiles_per_work = 1
+    if (
+        allow_c96
+        and K == 96
+        and Z > 1
+        and tile_config.cta_tile_m == 128
+        and tile_config.cta_tile_n == 96
+        and tile_config.cta_tile_k_bytes == 64
+        and tile_config.cta_group == 2
+        and tile_config.cluster_shape_mn == (2, 1)
+    ):
+        m_tiles_per_work = 4
+    device, gpu_arch = build_target()
+    return _compile_cached(
+        epilogue,
+        epilogue_attrs,
+        ab_dtype,
+        c_dtype,
+        tile_config,
+        device=device,
+        gpu_arch=gpu_arch,
+        c96_output_channels=K if allow_c96 else 0,
+        m_tiles_per_work=m_tiles_per_work,
+        use_padded_plane_scan=use_padded_plane_scan,
+    )
 
-    cluster_size = tile_config.cluster_shape_mn[0] * tile_config.cluster_shape_mn[1]
+
+@lru_cache(maxsize=None)
+def _compile_cached(
+    epilogue: str,
+    epilogue_attrs: tuple[tuple[str, float], ...],
+    ab_dtype: Type[Numeric],
+    c_dtype: Type[Numeric],
+    tile_config: ConvTileConfig,
+    *,
+    device: int,
+    gpu_arch: str,
+    c96_output_channels: int = 0,
+    m_tiles_per_work: int = 1,
+    use_padded_plane_scan: bool = False,
+):
+    """Reuse runtime geometry within each device, target, and C96 schedule variant."""
     with device_context(device):
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
-        use_padded_plane_scan = (
-            allow_c96
-            and K == 96
-            and D == Z == 1
-            and (T, R, S) == (3, 3, 3)
-            and lower_padding_dhw == (2, 1, 1)
-            and upper_padding_dhw == (0, 1, 1)
-            and stride_dhw == dilation_dhw == (1, 1, 1)
-            and epilogue == "identity"
-            and tile_config.cta_tile_m == 128
-            and tile_config.cta_tile_n == 96
+        epilogue_op = get_epilogue_op(epilogue, epilogue_attrs)
+        fprop_op = _FpropKernel(
+            cutlass.Float32,
+            tile_config,
+            m_tiles_per_work=m_tiles_per_work,
+            channel_first=c96_output_channels == 96,
         )
+        cluster_size = tile_config.cluster_shape_mn[0] * tile_config.cluster_shape_mn[1]
+        fake_N = cute.sym_int()
+        # C96 can have a partial C64 tile; its channels must not inherit the
+        # generic full-channel-tile divisibility promise. Spatial axes stay dynamic.
+        fake_C = 96 if c96_output_channels else cute.sym_int(divisibility=tile_config.cta_tile_k(ab_dtype.width))
+        fake_K = c96_output_channels or cute.sym_int(divisibility=128 // c_dtype.width)
+        fake_ndhwc = (fake_N, cute.sym_int(), cute.sym_int(), cute.sym_int(), fake_C)
+        fake_ktrsc = (fake_K, cute.sym_int(), cute.sym_int(), cute.sym_int(), fake_C)
+        fake_nzpqk = (fake_N, cute.sym_int(), cute.sym_int(), cute.sym_int(), fake_K)
+
+        fake_a = make_fake_compact_tensor(ab_dtype, fake_ndhwc, stride_order=(4, 3, 2, 1, 0), assumed_align=16)
+        fake_b = make_fake_compact_tensor(ab_dtype, fake_ktrsc, stride_order=(4, 3, 2, 1, 0), assumed_align=16)
+        fake_c = make_fake_compact_tensor(c_dtype, fake_nzpqk, stride_order=(4, 3, 2, 1, 0), assumed_align=16)
+        runtime_tuple = (cutlass.Int32(0),) * 3
+
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
         if use_padded_plane_scan:
             flags = make_fake_compact_tensor(cutlass.Int32, (96,), assumed_align=16)
             return _PaddedFrameConv(
@@ -1937,6 +1920,10 @@ def _compile_cached(
                     fake_c,
                     max_active_clusters,
                     make_fake_stream(),
+                    runtime_tuple,
+                    runtime_tuple,
+                    runtime_tuple,
+                    runtime_tuple,
                     epilogue_op,
                     flags,
                     options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
@@ -1949,6 +1936,10 @@ def _compile_cached(
             fake_c,
             max_active_clusters,
             make_fake_stream(),
+            runtime_tuple,
+            runtime_tuple,
+            runtime_tuple,
+            runtime_tuple,
             epilogue_op,
             options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
         )

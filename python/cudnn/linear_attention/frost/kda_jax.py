@@ -153,6 +153,8 @@ def make_launcher(plan, names):
         args = dict(
             config, q=q, k=k, v=v, gate=g, beta=beta, a_log=a, dt_bias=dt, cu_seqlens=cu, checkpoints=checkpoints, work_items=w["work_items"], stream=stream
         )
+        # A JAX graph has no context-parallel ports, so the composed boundary state and the piece arms stay off.
+        args.update(composed=None, dcomposed=None, has_piece_transitions=False, has_piece_state_grads=False)
         if is_bwd:
             dq = w["dq_ho"] if hq != ho else ports["dQ"]
             dkey = w["dk_ho"] if hk != ho else ports["dK"]

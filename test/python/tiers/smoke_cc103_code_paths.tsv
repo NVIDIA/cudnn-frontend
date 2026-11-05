@@ -122,6 +122,20 @@ sdpa/frost/test_sdpa_bwd_thd_sm100.py::test_graph_thd_causal[2x2-bf16]	bwd THD S
 sdpa/frost/test_sdpa_bwd_thd_sm100.py::test_graph_thd_gqa[2x2-gqa_group2]	bwd THD SM100 | GQA
 sdpa/frost/test_sdpa_bwd_thd_sm100.py::test_graph_thd_zero_length_sequence[2x2]	bwd THD SM100 | empty sequence
 sdpa/frost/test_sdpa_bwd_thd_sm100.py::test_graph_thd_causal_swa[2x2]	bwd THD SM100 | SWA
+sdpa/frost/test_sdpa_bwd_d128_accum_sm100.py::test_accumulation_matches_fp64[dt0-False-128-128]	bwd d128 SM100 | dense MHA accumulation (3-launch chain) | bf16 | unmasked
+sdpa/frost/test_sdpa_bwd_d128_accum_sm100.py::test_accumulation_matches_fp64[dt1-True-128-256]	bwd d128 SM100 | dense MHA accumulation | bf16 | causal
+sdpa/frost/test_sdpa_bwd_d128_thd_sm100.py::test_thd_mha_matrix[lens_q0-lens_kv0-3-dtype0-False]	bwd d128 SM100 | THD MHA (4-launch chain) | bf16 | unmasked | empty + tail sequences
+sdpa/frost/test_sdpa_bwd_d128_thd_sm100.py::test_thd_mha_matrix[lens_q2-lens_kv2-2-dtype2-True]	bwd d128 SM100 | THD MHA | bf16 | causal
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[4-2-dtype0-False-False]	bwd d128 SM100 | one-CTA grouped DENSE body (accumulation_grouped_dense, 4 launches) | GQA 4/2 | unmasked | graph API
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[6-2-dtype1-True-False]	bwd d128 SM100 | one-CTA grouped DENSE body | GQA 6/2 | causal
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[4-2-dtype4-True-True]	bwd d128 SM100 | one-CTA grouped THD body (accumulation_grouped_thd, 5 launches) | GQA 4/2 | causal | TH1 Stats
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[6-2-dtype5-False-True]	bwd d128 SM100 | one-CTA grouped THD body | GQA 6/2 | unmasked | HN Stats
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_thd_matrix[uniform-256-causal]	bwd d128 SM100 | cta_group::2 pair body (accumulation_grouped_thd_2cta, s_tail map) | THD | GQA 4/2 | causal | tma_ring stats
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_thd_matrix[uniform-384-noncausal]	bwd d128 SM100 | cta_group::2 pair body | THD | GQA 4/2 | unmasked | half-dead last pair (S % 256 != 0)
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_launch_census_per_selection[on-s256-pair-dense]	bwd d128 SM100 | cta_group::2 pair body DENSE twin (accumulation_grouped_dense_2cta) | dense compact BSHD | GQA 4/2 | causal | launch census + fp64 gate
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_dense_twin_matches_thd_uniform[uniform-384-noncausal]	bwd d128 SM100 | cta_group::2 pair body DENSE twin | dense compact BSHD | GQA 4/2 | unmasked | dK / dV bitwise the THD chain
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_dense_twin_matches_thd_uniform[rect-sq256-skv512-causal]	bwd d128 SM100 | cta_group::2 pair body DENSE twin | dense compact BSHD | RECTANGULAR S_q 256 x S_kv 512 (the setup kernel's dense extents told apart) | GQA 4/2 | top-left causal | dK / dV bitwise the THD chain + fp64 gate
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_launch_census_per_selection[auto-s256-one-cta-dense]	bwd d128 SM100 | cta_pair=auto below the threshold on dense -> the one-CTA grouped dense body | 4 launches | causal
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_dense[bf16]	bwd mxfp8 SM100 (two-kernel chain) | dense
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_causal	bwd mxfp8 SM100 | causal
 sdpa/frost/test_sdpa_bwd_mxfp8_sm100.py::test_gqa	bwd mxfp8 SM100 | GQA
@@ -186,7 +200,7 @@ sdpa/frost/test_sdpa_fwd_pointer_abi.py::test_d256_paged_host_rebinds_table_colu
 sdpa/frost/test_sdpa_fwd_pointer_abi.py::test_direct_d256_decode_launch_follows_the_token_unit_contract	rule: first L0 cell of test_direct_d256_decode_launch_follows_the_token_unit_contract
 sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_dsink_fact	rule: first L0 cell of test_bwd_dsink_fact
 sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_engines_registered	rule: first L0 cell of test_bwd_engines_registered
-sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan	rule: first L0 cell of test_sm107_dense_only_host_cannot_bind_paged_plan
+sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan[block_table_ptr]	rule: first L0 cell of test_sm107_dense_only_host_cannot_bind_paged_plan
 sdpa/frost/test_sdpa_native_block_output_binding.py::test_block_output_native_graph_fresh_buffers_and_replay[False-16-False-True]	rule: first L0 cell of test_block_output_native_graph_fresh_buffers_and_replay
 sdpa/frost/test_sdpa_native_bwd_binding.py::test_actual_backward_host_frames_match_python[ordinary-False-bfloat16-sm100]	rule: first L0 cell of test_actual_backward_host_frames_match_python
 sdpa/frost/test_sdpa_native_bwd_binding.py::test_backward_frames_do_not_share_runtime_storage	rule: first L0 cell of test_backward_frames_do_not_share_runtime_storage
@@ -243,7 +257,7 @@ sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_thd_tensormaps_rebind_and_re
 sdpa/frost/test_sdpa_torch_varlen_metadata.py::test_frost_torch_auxiliary_metadata_rebind_and_replay[False-lengths]	rule: first L0 cell of test_frost_torch_auxiliary_metadata_rebind_and_replay
 sdpa/frost/test_sdpa_torch_varlen_metadata.py::test_frost_torch_varlen_metadata_rebind_and_replay[False]	rule: first L0 cell of test_frost_torch_varlen_metadata_rebind_and_replay
 sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d128_f16_folds_the_split_out_of_the_band_builds[causal-cga2-bf16-cc100_on]	rule: first L0 cell of test_d128_f16_folds_the_split_out_of_the_band_builds
-sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate[cc100_on]	rule: first L0 cell of test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate
+sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d192_f16_causal_arm_spelling_follows_the_split_claim[cc100_on]	rule: first L0 cell of test_d192_f16_causal_arm_spelling_follows_the_split_claim
 sdpa/frost/test_sm100_mask_form.py::test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain[sm100]	rule: first L0 cell of test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain
 sdpa/frost/test_split_kv_heuristic.py::test_bigger_batch_needs_less_split	rule: first L0 cell of test_bigger_batch_needs_less_split
 sdpa/frost/test_split_kv_heuristic.py::test_chip_already_full_does_not_split	rule: first L0 cell of test_chip_already_full_does_not_split

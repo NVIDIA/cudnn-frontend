@@ -368,8 +368,10 @@ DSL satisfies your kernel.**
   floor. Keep the existing version gates and actionable errors.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
-  `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
-  version** — `cutedsl_requirement_error(what)` builds it. Never let the failure
+  `CUTEDSL_MIN_VERSION`; a kernel whose own floor is higher passes it as
+  `floor=`, never a second copy of the version parse) and **decline, or raise an
+  error that names the version** — `cutedsl_requirement_error(what, floor=...)`
+  builds it. Never let the failure
   surface as an `AttributeError` / `TypeError` / `ModuleNotFoundError` from
   inside the DSL, and never let it read as a missing-dependency install hint:
   the package is installed, and that `pip install` changes nothing.
@@ -386,10 +388,11 @@ DSL satisfies your kernel.**
 - Check the DSL compiler's CUDA version separately when a kernel depends on
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
-  the DSL wheel. QSA's 12Q/1KV two-pass key kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
-  `check_support` rejects that compiler before JIT compilation, and its tests
-  exercise the rejection rather than crashing or silently skipping the gate.
+  the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; both
+  QSA backward entries decline that compiler for 12Q/1KV before JIT
+  compilation, and the tests exercise the decline rather than crashing or
+  silently skipping the gate.
 - **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
   and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
   and cu13 in separate environments/processes and empty, separate caches.

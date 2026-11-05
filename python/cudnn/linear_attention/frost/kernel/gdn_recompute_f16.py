@@ -836,6 +836,7 @@ def compute1_warp_group(
     sCumprod,
     sCheckpoint_raw,
     mState_init,
+    mComposed,
     mState_out,
     mSeedCheckpoints,
     checkpoint_every_n_tokens,
@@ -932,10 +933,14 @@ def compute1_warp_group(
                     )
                 nvvm.tcgen05_wait("store")
             if cutlass.const_expr(cfg.use_initial_state or cfg.seed_identity):
-                if cutlass.const_expr(cfg.use_initial_state):
+                if cutlass.const_expr(cfg.state_table):
                     gState_init = mState_init[None, None, head_o, batch_idx]
                     seed_vw = 16 // (mState_init.element_type.width // 8)
                     seed_src = (gState_init.iterator + gState_init.layout((state_gmem_row + v_offset, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.has_composed):
+                    is_boundary = batch_idx == cutlass.Int32(0)
+                    gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
+                    composed_src = (gComposed.iterator + gComposed.layout((state_gmem_row + v_offset, 0))).raw_ptr()
                 seed_state = compute_start == 0
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
@@ -943,11 +948,19 @@ def compute1_warp_group(
                         if cutlass.const_expr(cfg.seed_identity):
                             for k in cutlass.range_constexpr(32):
                                 words.append(cutlass.Float32(1.0) if state_gmem_row == i * ldtm_width + k else cutlass.Float32(0.0))
-                        else:
+                        elif cutlass.const_expr(cfg.state_table):
                             for g in cutlass.range_constexpr(ldtm_width // seed_vw):
                                 seed_chunk = (seed_src + i * ldtm_width + g * seed_vw).load(count=seed_vw, alignment=16)
                                 for t in cutlass.range_constexpr(seed_vw):
                                     words.append(seed_chunk[t].to(cfg.acc_dtype))
+                        else:
+                            for _ in cutlass.range_constexpr(ldtm_width):
+                                words.append(cutlass.Float32(0.0))
+                        if cutlass.const_expr(cfg.has_composed):
+                            for g in cutlass.range_constexpr(ldtm_width // 4):
+                                composed_chunk = (composed_src + i * ldtm_width + g * 4).load(count=4, alignment=16)
+                                for t in cutlass.range_constexpr(4):
+                                    words[g * 4 + t] = composed_chunk[t] if is_boundary else words[g * 4 + t]
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -1175,10 +1188,21 @@ def compute1_warp_group(
                 if write_passthrough:
                     gState_out = mState_out[None, None, head_o, batch_idx]
                     if cutlass.const_expr(cfg.use_initial_state):
-                        gState_in = mState_init[None, None, head_o, batch_idx]
+                        if cutlass.const_expr(cfg.state_table):
+                            gState_in = mState_init[None, None, head_o, batch_idx]
+                        if cutlass.const_expr(cfg.has_composed):
+                            is_boundary = batch_idx == cutlass.Int32(0)
+                            gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
                         for r in cutlass.range(num_ldtms * ldtm_width):
                             if state_row_valid:
-                                gState_out[state_gmem_row + v_offset, r] = gState_in[state_gmem_row + v_offset, r]
+                                if cutlass.const_expr(cfg.state_table):
+                                    seed_val = gState_in[state_gmem_row + v_offset, r]
+                                else:
+                                    seed_val = cutlass.Float32(0.0).to(mState_out.element_type)
+                                if cutlass.const_expr(cfg.has_composed):
+                                    composed_val = gComposed[state_gmem_row + v_offset, r].to(mState_out.element_type)
+                                    seed_val = composed_val if is_boundary else seed_val.to(mState_out.element_type)
+                                gState_out[state_gmem_row + v_offset, r] = seed_val
                     elif cutlass.const_expr(cfg.seed_identity):
                         for i in cutlass.range_constexpr(num_ldtms):
                             for k in cutlass.range_constexpr(32):
@@ -1509,6 +1533,7 @@ def host(
     dt_bias: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_state_checkpoints: Optional[cute.Tensor],
     tinv: cute.Tensor,
@@ -1538,6 +1563,14 @@ def host(
             cute.make_layout(
                 (state_in.shape[2], state_in.shape[3], state_in.shape[1], state_in.shape[0]),
                 stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
+            ),
+        )
+    if cutlass.const_expr(composed is not None):
+        composed = cute.make_tensor(
+            composed.iterator,
+            cute.make_layout(
+                (composed.shape[2], composed.shape[3], composed.shape[1], composed.shape[0]),
+                stride=(composed.stride[2], composed.stride[3], composed.stride[1], composed.stride[0]),
             ),
         )
     if cutlass.const_expr(state_out is not None):
@@ -1587,6 +1620,7 @@ def host(
         dt_bias,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_state_checkpoints,
         tinv,
@@ -1620,6 +1654,7 @@ def frost_gdn_recompute(
     mDt_bias: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
+    mComposed: Optional[cute.Tensor],
     mState_out: Optional[cute.Tensor],
     mSeedCheckpoints: Optional[cute.Tensor],
     mTinv: cute.Tensor,
@@ -1783,6 +1818,7 @@ def frost_gdn_recompute(
             sCumprod=sCumprod,
             sCheckpoint_raw=sCheckpoint_raw,
             mState_init=mState_init,
+            mComposed=mComposed,
             mState_out=mState_out,
             mSeedCheckpoints=mSeedCheckpoints,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
@@ -1890,6 +1926,8 @@ class GdnRecomputeCfg:
     seed_identity: bool = False
     v_is_zero: bool = False
     tiles_per_head: int = 1
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -1956,6 +1994,8 @@ def build_cfg(
     k_slots: int = 1,
     v_slots: int = 1,
     tiles_per_head: int = 1,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
 ) -> GdnRecomputeCfg:
     """Build the per-compile ``GdnRecomputeCfg`` (io_dtype in {Float16, BFloat16}; acc is
     always Float32).  ``tiles_per_head`` > 1 runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value columns each."""
@@ -1965,6 +2005,8 @@ def build_cfg(
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         seed_checkpoints=seed_checkpoints,
@@ -2027,6 +2069,8 @@ def get_compiled_cache(
     order_gen: bool,
     tiles_per_head: int,
     layout_key: tuple = (),
+    has_composed: bool = False,
+    state_table: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2060,6 +2104,9 @@ def compile(
     state_in_cute,
     state_out_cute,
     seed_checkpoints_cute=None,
+    composed_cute=None,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
     tinv_cute,
     work_items_cute=None,
     work_count_cute=None,
@@ -2088,6 +2135,8 @@ def compile(
         k_slots=k_slots,
         v_slots=v_slots,
         tiles_per_head=tiles_per_head,
+        state_table=state_table,
+        has_composed=has_composed,
     )
 
     return cute.compile(
@@ -2100,6 +2149,7 @@ def compile(
         dt_bias_cute,
         cu_seqlens_cute,
         state_in_cute,
+        composed_cute,
         state_out_cute,
         seed_checkpoints_cute,
         tinv_cute,
@@ -2147,6 +2197,7 @@ def chunk_gdn_recompute(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    composed=None,
 ) -> None:
     """Execute the chunked GDN recompute kernel (state/checkpoint-only,
     THD / varlen entry).
@@ -2163,7 +2214,9 @@ def chunk_gdn_recompute(
             when ``safe_gate``, which applies the safe-gate transform
             ``-exp(a_log) * softplus(gate + dt_bias)``
         cu_seqlens: ``(num_seqs + 1,)`` int32
-        initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
+        initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None (the caller's own state table)
+        composed: ``(1, HO, DK, DV)`` float32 or None: the context-parallel boundary state that sequence 0 starts from in
+            place of its ``initial_state`` row; the other sequences keep their table row, or start from zero without a table
         output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
         checkpoint_every_n_tokens: emit a checkpoint entry every N tokens (0 = off)
         output_state_checkpoints: ``(total_checkpoints, HO, DK, DK)`` io dtype, or None.  Entry j is the
@@ -2210,14 +2263,16 @@ def chunk_gdn_recompute(
     else:
         DV = v.shape[-1]
     if seed_identity:
-        if initial_state is not None:
-            raise ValueError("seed_identity replaces initial_state; pass one or the other")
+        if initial_state is not None or composed is not None:
+            raise ValueError("seed_identity replaces initial_state and the composed state; pass one or the other")
         if DK != DV:
             raise ValueError("seed_identity requires a square (DK, DK) state")
         if checkpoint_every_n_tokens > 0 or seed_state_checkpoints is not None:
             raise ValueError("seed_identity does not support checkpoint staging")
     cu_seqlens.shape[0] - 1
-    use_initial_state = initial_state is not None
+    state_table = initial_state is not None
+    has_composed = composed is not None
+    use_initial_state = state_table or has_composed
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
     seed_checkpoints = seed_state_checkpoints is not None
@@ -2276,6 +2331,8 @@ def chunk_gdn_recompute(
         order_gen,
         tiles_per_head,
         layout_key=(len(k.shape), len(v.shape), k_slots, v_slots),
+        has_composed=has_composed,
+        state_table=state_table,
     )
 
     if "compiled" not in cache:
@@ -2287,8 +2344,11 @@ def chunk_gdn_recompute(
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
-        if use_initial_state:
+        if state_table:
             state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_cute = None
+        if has_composed:
+            composed_cute = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
         state_out_cute = None
         if store_final_state:
@@ -2335,6 +2395,9 @@ def chunk_gdn_recompute(
             state_in_cute=state_in_cute,
             state_out_cute=state_out_cute,
             seed_checkpoints_cute=seed_checkpoints_cute,
+            composed_cute=composed_cute,
+            state_table=state_table,
+            has_composed=has_composed,
             tinv_cute=tinv_cute,
             work_items_cute=work_items_cute,
             work_count_cute=work_count_cute,
@@ -2419,6 +2482,7 @@ def chunk_gdn_recompute(
         dt_bias,
         cu_seqlens,
         initial_state,
+        composed,
         output_state,
         seed_state_checkpoints,
         tinv,
@@ -2458,6 +2522,7 @@ def run_recompute(
     *,
     tinv,
     own_prologue=True,
+    composed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.
     The caller owns the contract, which the plan validated at build, so
@@ -2488,6 +2553,7 @@ def run_recompute(
         dt_bias,
         cu_seqlens,
         initial_state,
+        composed,
         output_state,
         seed_state_checkpoints,
         tinv,

@@ -455,3 +455,27 @@ def test_frost_conv_c96_initial_capture_separate_workspaces(cudnn_handle):
         for captured in captures:
             captured.reset()
         cudnn.set_stream(cudnn_handle, original_stream)
+
+
+@pytest.mark.parametrize("k", [96, 192])
+@pytest.mark.parametrize("first_frame", [True, False])
+def test_frost_conv_c96_reuses_artifact_across_shapes(monkeypatch, k, first_frame):
+    """Reuse each C96 schedule across batch/spatial/history changes without recompiling."""
+    from cudnn.conv.frost.templates import sm100_conv
+
+    cases = [((1, 96, 1, 17, 19), 0), ((2, 96, 1, 19, 23), 0)] if first_frame else [((1, 96, 4, 7, 9), 1), ((2, 96, 6, 9, 11), 2)]
+    sm100_conv._compile_cached.cache_clear()
+    try:
+        for index, (shape, history) in enumerate((*cases, cases[0])):
+            image = make_input(shape, torch.bfloat16, seed=801 + index)
+            weight = make_input((k, 96, 3, 3, 3), torch.bfloat16, seed=811 + index)
+            if index == 1 and first_frame:
+                weight[0, 95, 0, 0, 0] = float("nan")
+            actual = _conv(image, weight, history)
+            expected = _reference(image, weight, history)
+            epsilon = float(torch.finfo(torch.bfloat16).eps)
+            torch.testing.assert_close(actual.float(), expected.float(), atol=2 * epsilon, rtol=2 * epsilon, equal_nan=True)
+            if index == 0:
+                monkeypatch.setattr(sm100_conv.cute, "compile", lambda *args, **kwargs: pytest.fail("C96 geometry change recompiled"))
+    finally:
+        sm100_conv._compile_cached.cache_clear()

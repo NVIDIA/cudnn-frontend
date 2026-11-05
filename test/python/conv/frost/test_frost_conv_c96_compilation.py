@@ -69,7 +69,8 @@ def test_frost_c96_compiler_uses_build_device_and_target(monkeypatch, depth, k):
         assert active[0] == target[0]
         assert args[4] == 10 + active[0]
         assert options == f"--enable-tvm-ffi --gpu-arch {target[1]}"
-        assert len(args) == (8 if depth == 1 and k == 96 else 7)
+        assert len(args) == (12 if depth == 1 and k == 96 else 11)
+        assert all(len(values) == 3 for values in args[6:10])
         result = object()
         compiled.append(result)
         return result
