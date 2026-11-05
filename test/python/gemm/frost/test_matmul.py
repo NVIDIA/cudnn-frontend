@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from gemm_test_utils import (
+    requires_sm100_tree,
     requires_int8_mma,
     requires_matmul_gpu,
     skip_unless_pipeline_active as _skip_unless_active,
@@ -2860,6 +2861,7 @@ def test_tma_arm_never_writes_past_the_output_rows() -> None:
         assert touched == 0, f"{o.source}: the epilogue wrote {touched} bytes past its {rows} rows"
 
 
+@requires_sm100_tree
 @pytest.mark.parametrize("name", ["CONFIG_sm100_128x16x128_128x16x32_cluster2x1", "CONFIG_sm100_128x32x128_128x32x32_cluster2x1"])
 def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None:
     """`cta_group == 2 and cta_tile_n < 64` used to fall back to STG on the
@@ -2887,6 +2889,7 @@ def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None
         ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2),
     ],
 )
+@requires_sm100_tree
 @pytest.mark.parametrize("shape", [(4096, 4096, 512), (255, 256, 240)])
 @requires_sm100
 def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: tuple) -> None:
@@ -2942,6 +2945,7 @@ def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: t
         ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1, "fp32", 128),
     ],
 )
+@requires_sm100_tree
 def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: int, out_dt: str, want: int) -> None:
     """The TMA-store SMEM stage is written at `smem_subtile_ptr + tidx * epi_n`,
     so the tightest true alignment is one subtile row -- `epi_n * elem_bytes`,
@@ -2969,6 +2973,7 @@ def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: 
     assert f"alignment={want}" in seq, seq
 
 
+@requires_sm100_tree
 def test_no_template_hardcodes_the_staging_alignment() -> None:
     """The staging alignment is the SMEM row width, which is per output
     (`epi_n * its own element width`), so no template carries it: every one hands
@@ -3551,6 +3556,7 @@ def test_sm120_single_gemm_tile_without_an_ab_stage_declines_at_probe(kind, monk
         g.build_plans()
 
 
+@requires_sm100_tree
 def test_sm120_epi_vec_clamp_and_stg_only() -> None:
     """sm120 always renders the transposed-STG epilogue, with the chunk capped
     at the 8-element fragment row run; the sm100 derivation is untouched."""

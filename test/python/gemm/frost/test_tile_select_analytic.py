@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+
+from gemm_test_utils import requires_sm100_tree
 from cudnn.gemm.frost.tile_config import as_mma_tile_k, as_pipeline, by_name, select_config
 from gemm_test_utils import requires_sm100
 
@@ -873,6 +875,7 @@ def test_small_m_rule_preserves_other_paths(case):
     assert planning.select_strategies(chain, baseline, device=_strategy_device(), shapes_fixed=True, probe=lambda chain, config: None) == [baseline]
 
 
+@requires_sm100_tree
 @pytest.mark.L0
 @pytest.mark.parametrize("M,expected_cta_group", [(384, 1), (1408, 1), (1409, 2), (4096, 2)])
 @requires_sm100
@@ -885,6 +888,7 @@ def test_planner_bounds_terminal_quant_one_cta_to_measured_total_rows(monkeypatc
     assert config.cta_group == expected_cta_group
 
 
+@requires_sm100_tree
 @pytest.mark.L0
 @requires_sm100
 def test_planner_uses_total_m_not_unobservable_moe_row_distribution(monkeypatch):
@@ -897,6 +901,7 @@ def test_planner_uses_total_m_not_unobservable_moe_row_distribution(monkeypatch)
     assert compiler.plan_config(_block_scaled_chain(M=2816, moe_groups=23)).cta_group == 1
 
 
+@requires_sm100_tree
 @pytest.mark.L0
 @requires_sm100
 def test_planner_counts_every_dense_batch_row(monkeypatch):
@@ -908,6 +913,7 @@ def test_planner_counts_every_dense_batch_row(monkeypatch):
     assert compiler.plan_config(_block_scaled_chain(M=384, batch=4)).cta_group == 2
 
 
+@requires_sm100_tree
 @pytest.mark.L0
 @requires_sm100
 def test_non_quantizing_graph_keeps_default_cta_policy(monkeypatch):

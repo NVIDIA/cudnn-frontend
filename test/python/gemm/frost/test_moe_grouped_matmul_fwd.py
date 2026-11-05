@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from gemm_test_utils import (
+    requires_sm100_tree,
     requires_sm100,
     requires_sm120,
     requires_matmul_gpu,
@@ -1415,6 +1416,7 @@ def test_moe_grouped_matmul_fwd_auto_config_n_major_small_n() -> None:
     torch.testing.assert_close(output[0], _ref_f32(token, weight_k, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
+@requires_sm100_tree
 @pytest.mark.L0
 @pytest.mark.parametrize("major", ("n", "m"))
 def test_moe_tma_store_uses_rank2_output_descriptor(major: str) -> None:

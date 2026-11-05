@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from gemm_test_utils import (
+    requires_sm100_tree,
     requires_sm100,
     requires_sm107,
     requires_sm120,
@@ -1296,6 +1297,7 @@ def test_analyzer_offset_dtype_int64() -> None:
     assert chain.moe.offset_dtype == "int64"
 
 
+@requires_sm100_tree
 @pytest.mark.L0
 def test_moe_block_scale_tma_store_uses_rank2_output_descriptor() -> None:
     """The block-scale MoE template shares the flat (S, N) TMA output surface
