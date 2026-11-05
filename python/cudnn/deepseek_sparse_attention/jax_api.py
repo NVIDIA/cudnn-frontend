@@ -87,7 +87,6 @@ def indexer_forward_jax(q: Any, k: Any, weights: Any, *, ratio: int = 4, sm_scal
             m_block_size=128,
             n_block_size=128,
             k_block_size=64,
-            kv_stage=4,
             ratio=ratio,
             is_varlen=False,
             compute_lse=bool(return_lse),
@@ -570,7 +569,7 @@ def indexer_backward_jax(
         raise ValueError("grad_loss must be a single float32 element")
 
     sm_count = jax.devices()[0].core_count
-    key = (head_dim, heads, topk, batch * seqlen_q, batch * seqlen_k, sm_count)
+    key = (head_dim, heads, topk, batch * seqlen_q, sm_count)
     kernels = _sparse_indexer_bwd_kernels.get(key)
     if kernels is None:
         kernels = (
@@ -580,7 +579,6 @@ def indexer_backward_jax(
                 heads=heads,
                 block_I=128,
                 topk=topk,
-                total_seqlen_k=batch * seqlen_k,
                 total_rows=batch * seqlen_q,
                 persistent_grid_size=sm_count,
                 topk_indices_global=False,
