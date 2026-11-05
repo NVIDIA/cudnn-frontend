@@ -508,6 +508,13 @@ dimensions as compile-time constants: the same binder fixes those per plan.
 
 ### Sparse score-recompute resource boundaries
 
+Metadata-only support tests must mock every architecture query reached by the
+public check. Sparse score support uses both `device_capability()` and
+`torch.cuda.get_device_capability()`; mocking just one leaves SM8 hosts failing
+before the intended boundary assertion. Run the existing `public_support`
+cases in `test_DSA_sparse_score_recompute.py` on an SM8 host as the detector.
+These tests allocate tensors but do not launch the modeled SM90/SM100 kernels.
+
 Exercise non-power-of-two TMEM slot counts and partial ring wraps across
 persistent query tiles; a full-ring single-tile case misses slot aliasing and
 per-slot barrier-phase drift. Keep the focused regressions in

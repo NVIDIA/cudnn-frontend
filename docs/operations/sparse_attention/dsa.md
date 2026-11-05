@@ -817,9 +817,19 @@ Computes softmax over top-K entries of the indexer score:
   `topk_indices` / `topk_length` must be contiguous int32. `check_support()`
   declines anything else with `NotImplementedError` naming the tensor and its
   strides, and `execute()` re-validates the live tensors with `ValueError`;
-  nothing is copied, cast, or allocated on the execute path. The wrapper keeps
-  the convenience: it copies strided inputs contiguous, casts the index tensors
-  to int32, and allocates `out` when omitted, all on `stream`.
+  nothing is copied, cast, or allocated on the execute path. A prepared SM90
+  plan also rejects an `out` whose byte range overlaps any input. The wrapper
+  keeps the convenience: it copies strided inputs contiguous, casts the index
+  tensors to int32, allocates `out` when omitted, and stages an overlapping
+  SM90 output before copying it back, all on `stream`.
+- **Prepared SM90 plans** — `compile()` builds the CuTeDSL artifact from symbolic
+  batch and sequence extents. Exact `B`, `S_q`, `S_k`, runtime scale, pointers,
+  and stream do not specialize the artifact. Physical top-K widths in
+  `[1, 2176]` use one of 17 bounded 128-slot capacity buckets. `execute()` reads
+  the public `(B, S_q, H)` weights layout directly, performs no layout copy or
+  allocation, and is CUDA Graph capturable with caller-owned `out`. The kernel
+  has a fixed reduction tree and one writer per output element, so identical
+  inputs and one compiled plan produce bitwise-identical output bytes.
 
 ### 7. Sparse Attn Score Recompute
 
@@ -833,11 +843,16 @@ L1-normalised head-summed softmax over top-K entries:
 - **Output** — `target`: `(B, S_q, topk)` FP32.
 - Note: the wrapper handles the `-log2(e) * lse` preprocessing internally.
 - **Layout contract** — as in §6: the class requires a contiguous `out` at
-  `execute()`, declines strided `q_attn` / `k_attn` / `lse` and non-contiguous
-  or non-int32 `topk_indices` / `topk_length` in `check_support()`, and never
-  copies; the wrapper keeps the convenience copies and allocates `out` when
-  omitted. On SM100 a plan built without `topk_length` compiles the
+  `execute()`, declines a non-unit innermost stride on `q_attn` / `k_attn` /
+  `lse` and non-contiguous or non-int32 `topk_indices` / `topk_length` in
+  `check_support()`, and never copies; the wrapper keeps the convenience copies
+  and allocates `out` when omitted. On SM100 a plan built without `topk_length` compiles the
   `mTopkLength` operand out entirely (no placeholder tensor).
+- **Prepared SM90 plans** — the same symbolic compile and bounded Top-K buckets
+  as §6 apply. `softmax_scale` is a runtime scalar rather than a compile key,
+  and the kernel reads `(B, S_q, H)` LSE directly. A warmed class plan with its
+  caller-owned, disjoint `out` is allocation-free, CUDA Graph capturable on an
+  explicit non-default stream, and bitwise deterministic for identical inputs.
 
 ### 8. Dense Indexer / Dense Attn Score Recompute
 
