@@ -1937,10 +1937,10 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
     label = "d128 grouped" if grouped else "d128 THD"
     import re
 
-    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+    from .d128_contract import ACCUMULATION_CCS, ACCUMULATION_PARTS, validate_accumulation_scale
 
     if facts.device_cc not in ACCUMULATION_CCS:
-        return f"{label} requires SM100 or SM103 (cc 10.0 / 10.3)"
+        return f"{label} requires {ACCUMULATION_PARTS}"
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
         return f"{label} requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
@@ -2016,15 +2016,21 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
 def _sm100_d128_spec() -> EngineSpec:
     """Dense and packed d128 with plan-time prepared implementation selection.
 
-    Dense MHA declarations retain the SM100-106 envelope. Packed or grouped
-    accumulation requires SM100 or SM103, DSL >= 4.8 and positive FP32 scale.
-    Grouped variants fold native per-Q-head dK/dV partials in FP32.
+    Dense MHA declarations take the ``d128_contract.DENSE_SM_RANGE`` envelope (SM100-107: the SM100 line and Rubin, the
+    one-launch recompute body compiled per device).  Packed or grouped accumulation requires one of the admitted parts
+    (``d128_contract.ACCUMULATION_CCS``: cc 10.0 / 10.3 / 10.7 -- the same bodies, ``--gpu-arch sm_{cc}a`` following the
+    device), DSL >= 4.8 and positive FP32 scale.  Grouped variants fold native per-Q-head dK/dV partials in FP32.  On cc
+    10.7 the DSL must carry the sm_107a target (``cutedsl_arch_requirement_error`` in :func:`mismatch`, Rule 7); the row's
+    placement there follows the cc 10.0 rule (``heuristics.D128_LEAD_CCS``: unwindowed d128 THD ahead of the backend, which
+    serves no such plan on cc 10.7; dense behind), measured 2026-11-03.
     """
+    from .d128_contract import DENSE_SM_RANGE
+
     return EngineSpec(
         name="sdpa_bwd_sm100_d128",
         capabilities=Capabilities(
-            sm_lo=100,
-            sm_hi=106,
+            sm_lo=DENSE_SM_RANGE[0],
+            sm_hi=DENSE_SM_RANGE[1],
             d=frozenset({64, 128}),
             causal=True,
             swa=True,

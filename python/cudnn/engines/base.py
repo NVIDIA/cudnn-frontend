@@ -112,6 +112,7 @@ class ExecutionContext(NamedTuple):
     handle: Any = None
     stream: Any = None
     workspace: Any = None
+    context: Any = None
 
 
 class VariantPack:
@@ -349,6 +350,11 @@ class CompiledPlan:
 
     def get_workspace_size(self) -> int:
         """Workspace bytes this plan needs at execute time (default 0)."""
+        return 0
+
+    def get_context_size(self) -> int:
+        """Bytes of the context this plan writes for, or reads from, the plan of the other call over the same tokens
+        (default 0: the plan has none)."""
         return 0
 
     def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:

@@ -23,7 +23,9 @@ TOL = 2e-3
 
 
 def _require_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100+ GPU required")
 
 

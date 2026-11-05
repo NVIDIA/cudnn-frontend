@@ -333,6 +333,11 @@ def dsa_init(
         required_major = min_compute_capability // 10
         required_minor = min_compute_capability % 10
         pytest.skip(f"DSA requires compute capability >= {required_major}.{required_minor}, " f"found SM{major}{minor}")
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if min_compute_capability >= 100 and not has_tcgen05(major):
+        # An SM100 floor means the SM100-family tcgen05 kernels; cc 12.x passes the threshold but has no tcgen05.
+        pytest.skip(f"DSA requires an SM100-family (tcgen05) device, found SM{major}{minor}")
 
     def opt(name: str, default):
         value = request.config.getoption(name, default=None)

@@ -47,7 +47,7 @@ def test_DSA_sparse_attention_forward_check_support_rejects_cpu_inputs():
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_forward_check_support_rejects_sm90(monkeypatch):
+def test_DSA_sparse_attention_forward_check_support_rejects_pre_sm90(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
     try:
@@ -58,8 +58,8 @@ def test_DSA_sparse_attention_forward_check_support_rejects_sm90(monkeypatch):
     q = torch.empty((1, 64, 512), dtype=torch.bfloat16, device="cuda")
     kv = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
     topk_idxs = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
-    with pytest.raises(RuntimeError, match="requires an SM100-family GPU"):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))
+    with pytest.raises(RuntimeError, match="requires an SM90 or SM100-family GPU"):
         DSA.SparseAttentionForward(q, kv, topk_idxs).check_support()
 
 

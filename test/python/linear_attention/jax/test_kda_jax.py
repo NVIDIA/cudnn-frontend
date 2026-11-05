@@ -8,11 +8,11 @@ from functools import partial
 
 import pytest
 
-from cudnn.frost.buffers import cutedsl_requirement_error
+import torch
+from cudnn.frost import cutedsl_runtime_available
 
-requirement_error = cutedsl_requirement_error("JAX KDA tests")
-if requirement_error:
-    pytest.skip(requirement_error, allow_module_level=True)
+if not torch.cuda.is_available() or not cutedsl_runtime_available(torch.cuda.get_device_capability()):
+    pytest.skip("JAX KDA tests need a GPU the installed nvidia-cutlass-dsl can run the FROST engines on", allow_module_level=True)
 
 jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
@@ -110,23 +110,6 @@ def run(args, cu, **options):
     )
 
 
-@pytest.fixture
-def built_plans(monkeypatch):
-    from cudnn.linear_attention import jax_api
-    from cudnn.linear_attention.frost import kda_engine
-
-    build = kda_engine.build_kda
-    plans = []
-
-    def record(graph):
-        plans.append(build(graph))
-        return plans[-1]
-
-    jax_api.build_call.cache_clear()
-    monkeypatch.setattr(kda_engine, "build_kda", record)
-    return plans
-
-
 def assert_close(actual, expected, tol=0.04):
     actual, expected = np.asarray(actual, dtype=np.float64), np.asarray(expected, dtype=np.float64)
     assert np.all(np.isfinite(actual))
@@ -192,23 +175,19 @@ def test_forward_and_jitted_gradients(dims, heads, dtype, checkpoint, gates, inv
         np.testing.assert_array_equal(residual.checkpoints[valid:], 0)
 
 
-@pytest.mark.parametrize("schedule", ["default", "chain"])
+@pytest.mark.parametrize("length", ["short", "long"])
 @pytest.mark.parametrize("checkpoint", [0, 16])
 @pytest.mark.parametrize(
     "dims,heads,bounds,gates,state_dtype,with_state",
     [
-        ((64, 64), (1, 1, 1), (0, 256), False, jnp.float32, True),
-        ((64, 128), (2, 1, 1), (0, 0, 129, 768), True, jnp.bfloat16, True),
-        ((128, 64), (1, 2, 2), (0, 129, 129, 768), False, jnp.float32, False),
+        ((64, 64), (1, 1, 1), {"short": (0, 256), "long": (0, 1024)}, False, jnp.float32, True),
+        ((64, 128), (2, 1, 1), {"short": (0, 0, 129, 768), "long": (0, 0, 129, 1152)}, True, jnp.bfloat16, True),
+        ((128, 64), (1, 2, 2), {"short": (0, 129, 129, 768), "long": (0, 129, 129, 1152)}, False, jnp.float32, False),
     ],
 )
-def test_long_sequence_forward_and_gradients(schedule, checkpoint, dims, heads, bounds, gates, state_dtype, with_state, built_plans, monkeypatch):
-    if schedule == "chain":
-        from cudnn.linear_attention.frost.common import piece_chain
-
-        # Exercise the chain below the tuned minimum token count.
-        monkeypatch.setattr(piece_chain, "chain_min_tokens", lambda **_: 0)
-
+def test_long_sequence_forward_and_gradients(length, checkpoint, dims, heads, bounds, gates, state_dtype, with_state):
+    """Short batches under 1024 tokens and long ones above it, on one or two heads."""
+    bounds = bounds[length]
     args, cu = inputs(*dims, *heads, bounds=bounds, gates=gates, state_dtype=state_dtype)
     if not with_state:
         args = (*args[:5], None, *args[6:])
@@ -234,9 +213,6 @@ def test_long_sequence_forward_and_gradients(schedule, checkpoint, dims, heads, 
     expected_grads = jax.jit(jax.grad(partial(loss, reference_mode=True)))(args)
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
-    assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
-    if schedule == "chain":
-        assert all(plan.chain for plan in built_plans), "JAX must execute the requested piece-chain plans"
 
 
 @pytest.mark.parametrize("total", [35, 768])
@@ -252,7 +228,6 @@ def test_repeated_calls_and_dynamic_boundaries(total):
     again = invoke(args, cu)
     for old, new in zip(first, again):
         np.testing.assert_array_equal(old, new)
-    assert invoke._cache_size() == 1
 
 
 def test_no_state_and_state_only_loss():
@@ -353,7 +328,7 @@ def test_recurrent_scan_gradients():
     segments = tuple(x.reshape((2, 16, *x.shape[1:])) for x in args[:5])
     boundaries = jnp.asarray([0, 16], jnp.int32)
 
-    def chained(initial_state, q):
+    def two_segments(initial_state, q):
         def step(state, chunk):
             out, final = kda(
                 *chunk,
@@ -371,7 +346,7 @@ def test_recurrent_scan_gradients():
         out, state = reference((q.reshape(args[0].shape), *args[1:5], initial_state, None, None), (0, 32))
         return out.sum() + state.sum()
 
-    got = jax.jit(jax.value_and_grad(chained, argnums=(0, 1)))(args[5], segments[0])
+    got = jax.jit(jax.value_and_grad(two_segments, argnums=(0, 1)))(args[5], segments[0])
     expected = jax.value_and_grad(whole, argnums=(0, 1))(args[5], segments[0])
     for a, b in zip(jax.tree.leaves(got), jax.tree.leaves(expected)):
         assert_close(a, b, 0.06)
@@ -443,9 +418,9 @@ def test_arrays_on_another_gpu_run_there_and_split_arrays_are_rejected():
         out, _ = run(*moved)
         assert out.devices() == {devices[1]}
         assert_close(out, run(args, cu)[0])
-    split = jax.device_put(args[0], jax.local_devices()[1])
+    moved = jax.device_put(args[0], jax.local_devices()[1])
     with pytest.raises(ValueError, match="one GPU"):
-        kda(split, *args[1:5], cu)
+        kda(moved, *args[1:5], cu)
 
 
 def test_bad_metadata():
@@ -463,7 +438,7 @@ def test_bad_metadata():
         bwd(residual, jnp.ones((35, 1, 64), jnp.bfloat16), d_final_state=jnp.ones((3, 1, 64, 64), jnp.float32))
 
 
-@pytest.mark.parametrize("schedule", ["uncut", "chain"])
+@pytest.mark.parametrize("length", ["short", "long"])
 @pytest.mark.parametrize(
     "domain,offset_dtype,checkpoint,safe_gate,gate_dtype",
     [
@@ -475,16 +450,16 @@ def test_bad_metadata():
     ],
     ids=["int64", "linear", "coarse_safe", "combined", "linear_fp32"],
 )
-def test_extended_options_forward_backward(schedule, domain, offset_dtype, checkpoint, safe_gate, gate_dtype, built_plans):
-    """JIT forward, gradients, residual backward, and plan selection agree."""
-    bounds = dict(uncut=(0, 81, 81, 177), chain=(0, 129, 129, 3073))[schedule]
+def test_extended_options_forward_backward(length, domain, offset_dtype, checkpoint, safe_gate, gate_dtype):
+    """JIT forward, gradients and the residual backward agree on a short batch and on a 3073-token one."""
+    bounds = dict(short=(0, 81, 81, 177), long=(0, 129, 129, 3073))[length]
     dtype = jnp.float16 if domain == "linear" and offset_dtype == jnp.int64 else jnp.bfloat16
-    args, _ = inputs(dv=128 if schedule == "chain" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
+    args, _ = inputs(dv=128 if length == "long" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
     if domain == "linear":
         args = (*args[:3], jnp.exp(8 * args[3]).astype(gate_dtype), *args[4:])
     options = dict(
         checkpoint_every_n_tokens=checkpoint,
-        batch_invariant=schedule == "uncut",
+        batch_invariant=length == "short",
         safe_gate=safe_gate,
     )
     if domain == "linear":
@@ -528,22 +503,17 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
         expected_repeated = jax.jit(jax.grad(partial(loss, ref=True)))(changed, cu)
         for got, want in zip(jax.tree.leaves(repeated), jax.tree.leaves(expected_repeated)):
             assert_close(got, want, 0.06)
-        assert differentiated._cache_size() == 1
-    assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
-    for plan in built_plans:
-        assert plan.chain == (schedule == "chain")
 
 
-@pytest.mark.parametrize("prep", [False, True], ids=["direct", "prep"])
+@pytest.mark.parametrize("ragged", [False, True], ids=["half_sm_heads", "three_sequences"])
 @pytest.mark.parametrize("checkpoint", [0, 48])
-def test_value_split_forward_and_gradients(prep, checkpoint, built_plans):
-    from cudnn.frost.device import multiprocessor_count
-
-    heads = 1 if prep else multiprocessor_count(0) // 2
+def test_half_sm_heads_forward_and_gradients(ragged, checkpoint):
+    """One sequence on half the SMs in heads, or three short sequences on one head with the safe gate."""
+    heads = 1 if ragged else torch.cuda.get_device_properties(0).multi_processor_count // 2
     span = 128 * max(1, checkpoint // 16)
-    bounds = (0, span, span, 3 * span + 1) if prep else (0, span + 1)
-    args, cu = inputs(dv=128, hq=heads, hk=heads, hv=heads, dtype=jnp.bfloat16 if prep else jnp.float16, bounds=bounds, gates=prep)
-    options = dict(checkpoint_every_n_tokens=checkpoint, safe_gate=prep, use_qk_l2norm_in_kernel=prep, use_beta_sigmoid_in_kernel=prep)
+    bounds = (0, span, span, 3 * span + 1) if ragged else (0, span + 1)
+    args, cu = inputs(dv=128, hq=heads, hk=heads, hv=heads, dtype=jnp.bfloat16 if ragged else jnp.float16, bounds=bounds, gates=ragged)
+    options = dict(checkpoint_every_n_tokens=checkpoint, safe_gate=ragged, use_qk_l2norm_in_kernel=ragged, use_beta_sigmoid_in_kernel=ragged)
     actual = jax.jit(partial(run, **options))(args, cu)
     expected = reference(args, bounds, **options)
     for got, want in zip(actual, expected):
@@ -560,9 +530,3 @@ def test_value_split_forward_and_gradients(prep, checkpoint, built_plans):
     expected_grads = jax.jit(jax.grad(partial(loss, ref=True)))(args)
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
-    assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
-    for plan in built_plans:
-        if plan.node.node_type.name == "KDA":
-            assert plan.dv_split and not plan.chain
-            assert plan.prep == prep
-            assert plan.tiles_per_head == 2

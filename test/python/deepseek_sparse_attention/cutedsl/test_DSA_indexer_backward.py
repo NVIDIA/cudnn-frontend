@@ -1320,7 +1320,9 @@ def test_DSA_indexer_backward_keyword_only_signatures():
 def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
     """Use persistence only once a CTA can amortize setup across rows, for global
     and local top-k ids alike."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100+ required")
 
     try:
@@ -1371,7 +1373,9 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_dispatch_threshold():
 @pytest.mark.parametrize("topk", [128, 256, 384, 512])
 def test_DSA_indexer_backward_sm100_score_grad_packed_rows_and_fused_dk_zero(topk):
     """Packed tail rows preserve score math and clear the FP32 dK scratch."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100+ required")
 
     try:
@@ -1433,7 +1437,9 @@ def test_DSA_indexer_backward_sm100_score_grad_packed_rows_and_fused_dk_zero(top
 @pytest.mark.parametrize("topk", [128, 256, 384])
 def test_DSA_indexer_backward_sm100_score_grad_pdl_full_pipeline_matches_serial(topk):
     """PDL prologue overlap remains ordered across back-to-back calls."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100+ required")
 
     try:

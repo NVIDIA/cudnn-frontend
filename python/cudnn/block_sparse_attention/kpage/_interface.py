@@ -342,7 +342,7 @@ def _bwd_sm90_refined(
 
     refined = layout._refined
     if layout._has_partial_q is not False:
-        lse = lse.masked_fill(layout._pad_q_rows, float("inf"))
+        lse = lse.masked_fill(layout._padding_q_rows(), float("inf"))
     # resolve_layout admits compact BHSD or BSHD (batch 1) views; run BSHD storage as BSHD instead of copying it.
     bshd = not q.is_contiguous()
     swap = (lambda t: None if t is None else t.transpose(1, 2)) if bshd else (lambda t: t)

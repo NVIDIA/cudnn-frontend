@@ -336,7 +336,8 @@ def copy_case_storage(destination, source):
     assert destination.offsets.keys() == source.offsets.keys()
     for role in destination.offsets:
         destination.offsets[role].copy_(source.offsets[role])
-    for role in ("seq_q", "seq_kv"):
+    assert destination.lengths.keys() == source.lengths.keys()  # both THD sides' lengths, or none on a dense case
+    for role in destination.lengths:
         destination.lengths[role].copy_(source.lengths[role])
     for field in ("lens_q", "lens_kv", "origins", "sequences", "dead_rows"):
         setattr(destination, field, getattr(source, field))

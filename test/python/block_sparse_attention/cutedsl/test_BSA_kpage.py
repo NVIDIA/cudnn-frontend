@@ -292,6 +292,23 @@ def test_kpage_rejects_unsupported_configurations():
         BSA.kpage_prepare_layout(q2k, None, bs, nums, allow_empty_block_nums=True)
     with pytest.raises(ValueError, match="block_sizes"):
         BSA.kpage_prepare_layout(q2k, 2, torch.full((num_blocks,), 200, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="zero valid tokens"):
+        BSA.kpage_prepare_layout(q2k, 2, torch.tensor([0, BLOCK, 0, BLOCK], dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="exceeds"):
+        BSA.kpage_prepare_layout(q2k, None, bs, torch.full((1, heads, num_blocks), 3, dtype=torch.int32, device="cuda"))
+    # more walks than the device check has CTAs: a clean pattern repeated in every walk passes; a violation in a late
+    # walk (ids in different bitset words) is still found
+    many_blocks = 1200
+    many_bs = torch.full((80,), BLOCK, dtype=torch.int32, device="cuda")
+    many = torch.tensor([0, 40, 70], dtype=torch.int32, device="cuda").repeat(1, heads, many_blocks, 1)
+    BSA.kpage_prepare_layout(many, 3, many_bs)
+    late = many.clone()
+    late[0, heads - 1, many_blocks - 7, 2] = 0
+    with pytest.raises(ValueError, match="duplicate"):
+        BSA.kpage_prepare_layout(late, 3, many_bs)
+    late[0, heads - 1, many_blocks - 7, 2] = 80
+    with pytest.raises(ValueError, match="outside"):
+        BSA.kpage_prepare_layout(late, 3, many_bs)
 
     # a layout built for another problem, or from other metadata tensors, is rejected
     other = BSA.kpage_prepare_layout(q2k[:, :1], 2, bs)
