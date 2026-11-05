@@ -1392,6 +1392,7 @@ cudnn.norm_forward_phase.value
 cudnn.numerical_note
 cudnn.numerical_note.DOWN_CONVERT_INPUTS
 cudnn.numerical_note.FFT
+cudnn.numerical_note.FULL_PRECISION_MATH
 cudnn.numerical_note.NONDETERMINISTIC
 cudnn.numerical_note.REDUCED_PRECISION_REDUCTION
 cudnn.numerical_note.STRICT_NAN_PROP
