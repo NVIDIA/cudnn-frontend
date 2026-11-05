@@ -19,6 +19,7 @@ from gemm_test_utils import (
     requires_sm100,
     requires_sm120,
     requires_matmul_gpu,
+    assert_quant_scale_blob_guard as _assert_quant_scale_blob_guard,
     Plan as _plan,
     ceil_div as _ceil_div,
     to_blocked as _to_blocked,
@@ -153,6 +154,7 @@ def _build_graph(
     quant_scale_dim: tuple[int, int, int] | None = None,
     weight_major: str = "k",
     gather_rows: int | None = None,
+    quant_block_size: int = 32,
 ):
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -209,7 +211,7 @@ def _build_graph(
         R.set_dim(list(reduction_dims)).set_stride(list(stride))
         R.set_output(True).set_data_type(reduction_dt)
     if quant:
-        q, q_scale = g.block_scale_quantize(input=out, block_size=32, name="q")
+        q, q_scale = g.block_scale_quantize(input=out, block_size=quant_block_size, name="q")
         q.set_data_type(quant_out_dt).set_output(True)
         if quant_scale_dim is not None:
             q_scale.set_dim(list(quant_scale_dim)).set_stride([quant_scale_dim[1] * quant_scale_dim[2], quant_scale_dim[2], 1])
@@ -1420,7 +1422,7 @@ def test_moe_tma_store_uses_rank2_output_descriptor(major: str) -> None:
     the fixed-one batch dimension paid by ordinary batched GEMM. Besides being
     redundant in the descriptor, that extra coordinate selects UTMASTG.3D
     instead of UTMASTG.2D in SASS."""
-    from cudnn.gemm.frost.compiler import _epi_n, _host_tma_c_descs, _tma_c_plumbing, _tma_store_sequence
+    from cudnn.gemm.frost.sm100.compiler import _epi_n, _host_tma_c_descs, _tma_c_plumbing, _tma_store_sequence
 
     g = _build_graph(E=4, S=512, N=256, K=128)
     if major == "m":
@@ -2090,6 +2092,57 @@ def test_moe_quant_scale_blob_admits_runtime_s_in_its_padding_sm120(gather, swap
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
+@requires_sm100
+@pytest.mark.parametrize("N", [256, 288], ids=["tma_drain", "stg_drain"])
+def test_moe_gather_nvfp4_reordered_row_scales_sm100(N):
+    """NVFP4 GATHER with F8_128x4 row scales on a 256-column tile, the packed FP4 output tensor dimensioned [1, S, N]:
+    its kernel argument must bind N // 2 bytes per row, as the undimensioned output does. N=256 drains through TMA;
+    N=288 drains a partial 32-column tile through STG, which used to stop at the packed-output shape check before
+    launch. Only the real scale slots are checked (N=288 ends each scale row two slots into its last quad)."""
+    E, K, bs = 2, 256, 16
+    source_rows, routed = 137, 259
+    blocks = N // bs
+    scale_shape = (1, _ceil_div(routed, 128) * 128, _ceil_div(blocks, 4) * 4)
+    graph = _build_graph(
+        E,
+        source_rows,
+        N,
+        K,
+        quant=True,
+        quant_out_dt=cudnn.data_type.FP4_E2M1,
+        quant_scale_dt=cudnn.data_type.FP8_E4M3,
+        quant_scale_reorder=True,
+        quant_scale_dim=scale_shape,
+        gather_rows=routed,
+        quant_block_size=bs,
+    )
+    compiled = _plan(graph, config=by_name("CONFIG_sm100_256x256x128_128x256x32_cluster1x1_1ctamma"))
+    assert compiled.chain.moe.mode == "gather"
+
+    torch.manual_seed(0)
+    token = torch.randint(-2, 3, (1, source_rows, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = _offsets([120, routed - 120], routed)
+    q = torch.zeros(1, routed, N // 2, dtype=torch.uint8, device="cuda")
+    q_scale = torch.full(scale_shape, 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    vp = _vp_moe(compiled, token, weight, offsets, [q, q_scale])
+    index = torch.randint(source_rows, (1, routed, 1), dtype=torch.int32, device="cuda")
+    vp[compiled.binding.token_index] = index
+    compiled(vp)
+    torch.cuda.synchronize()
+
+    ref = _ref_f32(token[:, index.flatten().long()], weight, offsets, routed, N, E)
+    scale_ref = (ref.view(1, routed, blocks, bs).abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
+    # Undo the F8_128x4 blocking (128-row x 4-column atoms, 32 x 16 bytes each) back to (rows, slots).
+    nrb, ncb = scale_shape[1] // 128, scale_shape[2] // 4
+    slots = q_scale.view(torch.uint8).view(nrb, ncb, 32, 4, 4).transpose(2, 3).reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3).reshape(nrb * 128, ncb * 4)
+    scales = slots[:routed, :blocks].view(torch.float8_e4m3fn).float()
+    torch.testing.assert_close(scales, scale_ref[0].float(), atol=0, rtol=0.07)
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device="cuda")
+    deq = torch.stack([lut[(q & 0xF).long()], lut[(q >> 4).long()]], dim=-1).view(1, routed, N) * scales.repeat_interleave(bs, dim=1)
+    assert ((deq - ref).abs() <= 0.34 * ref.abs() + 0.05 * ref.abs().amax()).float().mean().item() > 0.999
+
+
 @requires_matmul_gpu
 @pytest.mark.parametrize("case", ["tiny_fp16", "aligned_fp8", "n_major_weight", "int8", "frontend"])
 def test_gather_layouts_and_frontend_sm120(case):
@@ -2114,6 +2167,9 @@ def _check_moe_quant_scale_k_padding_is_zeroed(cfg, axis, swap_ab, runs):
     """The slots after each real scale row's last block come out as raw 0x00 bytes from a 0xFF buffer. Each axis is
     the row quant in one kernel orientation and the col quant in the other. Every ``(groups, N)`` in ``runs`` goes
     through ONE kernel compiled for the first, with the same padded scale extent."""
+    from gemm_test_utils import skip_unless_pipeline_active
+
+    skip_unless_pipeline_active(cfg)  # check the active family before quant-chunk admission
     E, K, bs = 4, 128, 32
 
     def dims_of(groups, N):
@@ -2212,6 +2268,68 @@ def test_moe_int8_output_rounds_to_nearest_even_and_saturates_sm120(swap_ab, out
     assert not bad, "x -> got (expected): " + ", ".join(f"{float(x[s])} -> {int(out[0, s, 0])} ({int(ref[0, s, 0])})" for s in bad[:8])
 
 
+@requires_sm120
+@pytest.mark.parametrize("relu,swap", [(False, False), (True, False), (False, True)], ids=["one_gemm", "epilogue_op", "swap_ab"])
+def test_moe_quant_scale_output_must_be_a_packed_blob_sm120(relu, swap):
+    """All three plain MoE launchers (one GEMM, the multi-GEMM path an epilogue op takes, and
+    swap-AB) decline an F8_128x4 quant-scale binding the blob would spill out of, before any
+    write. S = 512 gives the [1, 512, 8] scale a row-aliasing view whose span equals its
+    element count, which the swap-AB launcher's whole-blob check alone accepts."""
+    from cudnn.gemm.frost.fusion_ir import MoeSwapAbSpec
+
+    E, K, N, bs = 4, 128, 256, 32
+    group_sizes = [128, 0, 288, 96]
+    S = sum(group_sizes)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    y = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    if relu:
+        y = g.relu(input=y, name="relu")
+    q, sf = g.block_scale_quantize(input=y, block_size=bs, name="q")
+    q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    sf.set_dim([1, S, N // bs]).set_stride([S * N // bs, N // bs, 1]).set_data_type(cudnn.data_type.FP8_E8M0).set_output(True)
+    sf.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap)
+    assert bool(compiled.chain.ops) == relu
+    assert isinstance(compiled.chain.moe, MoeSwapAbSpec) == swap
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = _offsets(group_sizes, S)
+    out = torch.empty(1, S, N, dtype=torch.float8_e4m3fn, device="cuda")
+    _assert_quant_scale_blob_guard(
+        lambda view: compiled(_vp_moe(compiled, token, weight, offsets, [out, view])), (1, S, N // bs), torch.float8_e8m0fnu, others=[out.view(torch.uint8)]
+    )
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_sm120_moe_empty_call_runs_as_a_no_op(swap):
+    """An expert-parallel rank that received no tokens calls its plan with S = 0.
+
+    The template host encoded a zero-extent TMA descriptor, and the DSL answered
+    with abort(). Both empty extents now return without a launch, and the plan
+    still serves the next call.
+    """
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K = 8, 768, 256, 128
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=replace(by_name(_SM120_CFG), swap_ab=swap))
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    no_rows = torch.zeros(E + 1, dtype=torch.int32, device="cuda")
+    compiled(_vp_moe(compiled, token[:, :0], weight, no_rows, torch.empty(1, 0, N, dtype=torch.bfloat16, device="cuda")), workspace=workspace)
+    offsets = _offsets([64, 0, 200, 128, 100, 12, 196, 68], S)
+    compiled(_vp_moe(compiled, token, weight[:, :0], offsets, torch.empty(1, S, 0, dtype=torch.bfloat16, device="cuda")), workspace=workspace)
+    out = torch.empty(1, S, N, dtype=torch.bfloat16, device="cuda")
+    compiled(_vp_moe(compiled, token, weight, offsets, out), workspace=workspace)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[0], _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
 @pytest.mark.parametrize("weight_major", ["k", "n"])
 @pytest.mark.parametrize("gather", [False, True])
 def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
@@ -2255,6 +2373,69 @@ def test_sm120_moe_render_smoke(weight_major: str, gather: bool) -> None:
     m = re.search(r"^def _host\(\n(.*?)^\) -> None:", src, re.S | re.M)
     params = [ln.strip().split(":")[0] for ln in m.group(1).splitlines() if ln.strip()]
     assert params == ["problem_size", "first_token_offset", "a_tma_workspace", *(["token_index"] if gather else []), "a_0", "b_0", "c_tap_0", "stream"], params
+
+
+@requires_matmul_gpu
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_offsets_outside_the_contract_stay_in_bounds_sm120(swap_ab):
+    """first_token_offset is device data the host never checks. A table that breaks the
+    contract (a boundary past S, or below zero) is clamped into the S routed rows: rows
+    it no longer covers keep their contents, and nothing is stored outside the output."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    E, S, N, K, guard, sentinel = 2, 256, 256, 128, 128, 123.0
+    compiled = C120.jit_from_cudnn_graph(_build_graph(E, S, N, K), config=replace(by_name(_SM120_CFG), swap_ab=swap_ab))
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+    per_expert = [(token[0].float() @ weight[e].float().T).to(torch.bfloat16) for e in range(E)]
+    # The exactly shaped [1, S, N] output between two guard regions.
+    backing = torch.empty(guard + S + guard, N, dtype=torch.bfloat16, device="cuda")
+    out = backing[guard : guard + S].unsqueeze(0)
+    # Each table with the rows every group computes once it is clamped into [0, S].
+    for table, rows in (
+        ([0, 128, 256], [(0, 128), (128, 256)]),
+        ([0, 128, 384], [(0, 128), (128, 256)]),
+        ([0, -64, 128], [(0, 0), (0, 128)]),
+    ):
+        backing.fill_(sentinel)
+        compiled(_vp_moe(compiled, token, weight, torch.tensor(table, dtype=torch.int32, device="cuda"), out))
+        torch.cuda.synchronize()
+        assert torch.all(backing[:guard] == sentinel) and torch.all(backing[guard + S :] == sentinel), f"offsets {table} stored outside the output"
+        expected = torch.full((S, N), sentinel, dtype=torch.bfloat16, device="cuda")
+        for group, (begin, end) in enumerate(rows):
+            expected[begin:end] = per_expert[group % E][begin:end]
+        torch.testing.assert_close(out[0], expected, atol=0.125, rtol=0.01)
+
+
+@requires_matmul_gpu
+def test_gather_offsets_outside_the_contract_stay_in_bounds_sm120():
+    """A GATHER table whose last boundary passes the R routed rows reads token_index and
+    stores output rows below R only: its last group is clamped to R."""
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    g, x, weights, offsets, indices, y = _build_gather_graph()
+    compiled = C120.jit_from_cudnn_graph(g, config=by_name(_SM120_CFG))
+    source_rows, R, n, guard, sentinel = 137, 257, 96, 64, 123.0
+    torch.manual_seed(123)
+    token = torch.randn(1, source_rows, 96, device="cuda", dtype=torch.bfloat16)
+    wbuf = torch.randn(3, n, 96, device="cuda", dtype=torch.bfloat16) * 0.1
+    # The index entries past R name a real source row, so a read past R would also feed a store.
+    index_backing = torch.full((R + guard,), 5, dtype=torch.int32, device="cuda")
+    index_backing[:R] = torch.randint(source_rows, (R,), device="cuda", dtype=torch.int32)
+    index = index_backing[:R].view(1, R, 1)
+    backing = torch.full((R + guard, n), sentinel, dtype=torch.bfloat16, device="cuda")
+    out = backing[:R].unsqueeze(0)
+    starts = [0, 65, 65, 68, 197, 198, R + 40]
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int32).view(7, 1, 1)
+    compiled({x: token, offsets: fto, indices: index, y: out, weights[0]: wbuf})
+    torch.cuda.synchronize()
+    assert torch.all(backing[R:] == sentinel), "a row past R was stored"
+    ref = torch.empty(R, n, device="cuda", dtype=torch.float32)
+    for group in range(6):
+        begin, end = starts[group], min(starts[group + 1], R)
+        ref[begin:end] = token[0, index.flatten()[begin:end].long()].float() @ wbuf[group % 3].float().T
+    torch.testing.assert_close(out[0].float(), ref.to(torch.bfloat16).float(), atol=0.03, rtol=0.02)
 
 
 _SM120_MOE_TEMPLATES = (
@@ -3035,6 +3216,65 @@ def test_moe_swap_ab_reduction_runtime_token_tail(mode):
         torch.testing.assert_close(red, torch.full_like(red, expected), atol=1e-4, rtol=1e-5)
 
 
+@requires_sm120
+@pytest.mark.parametrize("align", [1, 8], ids=["align1", "align8"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_moe_reductions_skip_nan_sm120(swap_ab, align):
+    """AMAX, MAX and MIN skip NaN elements in both SM120 MoE orientations, as the
+    native cuDNN engines do. ``fusion_ir.swap_ab`` transposes each reduction, so a
+    per-token or per-feature reduction moves between per-element atomics and
+    per-chunk folds with the orientation; the swap-AB plan's chunks are as many
+    tokens wide as the declared ``first_token_offset`` alignment (1 or 8 here). The
+    scalar and per-expert ones fold through register partials. The NaN token used
+    to make every per-feature AMAX NaN on the normal plan and on the swap-AB plan at
+    alignment 1, but none on the swap-AB plan at alignment 8."""
+    from cudnn.gemm.frost.recipe import REDUCTION_INIT_VALUE
+
+    E, S, N, K = 2, 64, 64, 64
+    starts = [0, 24, S]
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto.set_alignment_value(align)
+    C = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    reds = []
+    for src_name, src in (("c", C), ("neg", g.neg(input=C, name="neg"))):
+        for mode in ("amax", "max", "min"):
+            for dims in ((1, 1, 1), (1, S, 1), (1, 1, N), (E, 1, 1)):
+                kw = {"group_offset": fto} if dims[0] == E else {}
+                r = g.reduction(input=src, mode=getattr(cudnn.reduction_mode, mode.upper()), name=f"{src_name}_{mode}_{'x'.join(map(str, dims))}", **kw)
+                r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+                reds.append((src_name, mode, dims, r))
+    compiled = _plan(g, config=by_name(_SM120_CFG), swap_ab=swap_ab)
+
+    torch.manual_seed(0)
+    token = torch.randint(-3, 4, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-3, 4, (E, N, K), device="cuda").to(torch.bfloat16)
+    token[0, 5, 3] = float("nan")  # token 5 (expert 0) is NaN in every feature
+    weight[1, 9, 3] = float("nan")  # feature 9 is NaN for every token of expert 1
+    offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
+    outs = [torch.full(dims, 12345.0, device="cuda") for _s, _m, dims, _r in reds]
+    compiled({tok: token, w: weight.transpose(1, 2), fto: offsets, **{r: out for (_s, _m, _d, r), out in zip(reds, outs)}})
+    torch.cuda.synchronize()
+
+    c = _ref_f32(token, weight, offsets, S, N, E)
+    bad = []
+    for (src_name, mode, dims, _r), out in zip(reds, outs):
+        x = c if src_name == "c" else -c
+        x = torch.where(torch.isnan(x), REDUCTION_INIT_VALUE["fp32"][mode], x)  # a NaN element contributes nothing
+        x = x.abs() if mode == "amax" else x
+        fold = torch.amin if mode == "min" else torch.amax
+        if dims[0] == E:
+            want = torch.stack([fold(x[starts[e] : starts[e + 1]]) for e in range(E)])
+        else:
+            want = fold(x, dim=tuple(i for i, extent in enumerate(dims[1:]) if extent == 1))
+        want = want.reshape(dims)
+        if not torch.equal(out, want):
+            bad.append(f"{src_name} {mode} {dims}: {int(torch.isnan(out).sum())} NaN cells, {int((~torch.isnan(out) & (out != want)).sum())} other mismatches")
+    assert not bad, "\n".join(bad)
+
+
 @requires_sm100
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("axis", ["scalar", "feature", "token"])
@@ -3206,8 +3446,8 @@ def test_moe_reduction_initialization_validates_all_outputs_before_writing():
     assert (last_raw[1::2] == -12345).all()
 
 
-def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
-    """Build a launch recorder for MoE runtime validation."""
+def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False, *, rows=128, n=128, k=128, combo="nvfp4"):
+    """Build a launch recorder for MoE runtime validation; ``rows``, ``n`` and ``k`` size the call's buffers."""
     import importlib
     from pathlib import Path
     from dataclasses import replace
@@ -3217,7 +3457,7 @@ def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
     if block_scale:
         from moe_block_scale_test_utils import _build_graph as bs_graph
 
-        graph = bs_graph(2, 128, 128, 128, 2)
+        graph = bs_graph(2, 128, 128, 128, 2, combo)
     else:
         graph = _build_graph(2, 128, 128, 128, num_groups=2)
     _, original = analyze_with_binding(graph)
@@ -3245,14 +3485,14 @@ def _recorded_moe_plan(family, block_scale, multi, reduction, swap=False):
             output_specs=[replace(spec, source_ref=0) for spec in chain.output_specs],
             reductions=[replace(red, source_ref=0) for red in chain.reductions],
         )
-    storage_k = 64 if block_scale else 128
+    storage_k = k // 2 if block_scale and combo != "mxfp8" else k
     dtype = torch.uint8 if block_scale else torch.bfloat16
-    vp = {t: torch.ones((1, 128, storage_k), device="cuda", dtype=dtype) for t in binding.a_operands}
-    vp.update({t: torch.ones((2, 128, storage_k), device="cuda", dtype=dtype) for t in binding.b_operands})
+    vp = {t: torch.ones((1, rows, storage_k), device="cuda", dtype=dtype) for t in binding.a_operands}
+    vp.update({t: torch.ones((2, n, storage_k), device="cuda", dtype=dtype) for t in binding.b_operands})
     vp.update({t: torch.ones((1, 1, 8192), device="cuda", dtype=torch.uint8) for t in binding.sfa_operands})
     vp.update({t: torch.ones((2, 1, 8192), device="cuda", dtype=torch.uint8) for t in binding.sfb_operands})
-    vp[binding.first_token_offset] = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
-    output = torch.full((1, 1, 1) if reduction else (1, 128, 128), 17.0, device="cuda", dtype=torch.float32 if reduction else torch.bfloat16)
+    vp[binding.first_token_offset] = torch.tensor([0, min(64, rows), rows], device="cuda", dtype=torch.int32)
+    output = torch.full((1, 1, 1) if reduction else (1, rows, n), 17.0, device="cuda", dtype=torch.float32 if reduction else torch.bfloat16)
     vp[binding.outputs[0]] = output
     if swap:
         chain, binding = swap_ab(chain), swap_ab_binding(binding)
@@ -3302,6 +3542,110 @@ def test_moe_workspace_failure_preserves_reduction_outputs(family, block_scale, 
         compiled(vp, workspace=workspace)
     assert calls == []
     torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_moe_operand_rejections_name_graph_roles(family, block_scale, swap):
+    """Name a misaligned or missing operand by its graph role; swap-AB puts the weight in kernel A."""
+    from gemm_test_utils import graph_binding
+
+    compiled, vp, _, calls, _ = _recorded_moe_plan(family, block_scale, False, False, swap)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    bd = graph_binding(compiled)
+    roles = [("token", bd.a_operands[0]), ("weight", bd.b_operands[0])]
+    if block_scale:
+        roles += [("token SF", bd.sfa_operands[0]), ("weight SF", bd.sfb_operands[0])]
+    for role, tensor in roles:
+        good = vp[tensor]
+        storage = torch.empty(good.numel() * good.element_size() + 8, device="cuda", dtype=torch.uint8)
+        misaligned = storage[8:].view(good.dtype).view(good.shape)
+        with pytest.raises(ValueError, match=f"requirement: {role}: alignment 8B < required 16B"):
+            compiled({**vp, tensor: misaligned}, workspace=workspace)
+        # str(KeyError) quotes its message; the closing quote pins the exact role.
+        with pytest.raises(KeyError, match=f"missing a buffer for {role}'"):
+            compiled({key: buf for key, buf in vp.items() if key is not tensor}, workspace=workspace)
+    assert calls == []
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("block_scale", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("empty", ["rows", "n"])
+def test_sm120_moe_empty_call_seeds_and_skips_the_launch(block_scale, multi, swap, empty):
+    """No routed rows (an expert-parallel rank that received none) or no output
+    features leave nothing to compute. The template host would encode a TMA
+    descriptor with a zero extent, which the DSL answers with abort(), so the
+    launch is skipped; the seeded reduction identity is the whole result."""
+    compiled, vp, output, calls, _ = _recorded_moe_plan("sm120", block_scale, multi, True, swap, **{empty: 0})
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled(vp, workspace=workspace)
+    torch.cuda.synchronize()
+    assert calls == []
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("combo,k", [("bf16", 0), ("nvfp4", 0), ("mxfp8", 16)])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("swap", [False, True])
+def test_sm120_moe_unencodable_k_is_refused_before_anything_is_written(combo, k, multi, swap):
+    """K = 0, or an MXFP8 K below one 32-element scale block (its scale-factor K
+    extent rounds down to 0), still has outputs to write but no K extent a TMA
+    descriptor can encode: refuse the call before the reduction seed.
+
+    K = 16 also ends inside a scale block, and checks of the scale factors may
+    refuse it first, each in its own words, so that case checks the refusal
+    (ValueError, no launch, nothing written) and not the message."""
+    compiled, vp, output, calls, _ = _recorded_moe_plan("sm120", combo != "bf16", multi, True, swap, k=k, combo=combo)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="K=0 is a zero K extent" if k == 0 else None):
+        compiled(vp, workspace=workspace)
+    torch.cuda.synchronize()
+    assert calls == []
+    torch.testing.assert_close(output, torch.full_like(output, 17.0), atol=0, rtol=0)
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("swap", [False, True])
+def test_sm120_moe_gather_from_an_empty_token_buffer_is_refused(swap):
+    """GATHER reads every routed row from the token buffer; an empty one leaves the
+    source descriptor a zero row extent, so the call is refused, not launched."""
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.graph_analyzer import swap_ab_binding
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    g, x, weights, offsets, indices, y = _build_gather_graph()
+    chain, binding = analyze_with_binding(g)
+    if swap:
+        chain, binding = swap_ab(chain), swap_ab_binding(binding)
+    calls = []
+    compiled = C120.CompiledMoeGemm(
+        chain=chain,
+        config=replace(by_name(_SM120_CFG), swap_ab=swap),
+        generated_path=pathlib.Path("unused"),
+        _launchable=lambda *args, **kwargs: calls.append(args),
+        binding=binding,
+        vec_bytes_epi=32,
+    )
+    out = torch.full((1, 257, 96), 17.0, device="cuda", dtype=torch.bfloat16)
+    vp = {
+        offsets: torch.tensor([0, 65, 65, 68, 197, 198, 257], device="cuda", dtype=torch.int32).view(7, 1, 1),
+        indices: torch.zeros((1, 257, 1), device="cuda", dtype=torch.int32),
+        y: out,
+        weights[0]: torch.ones((3, 96, 96), device="cuda", dtype=torch.bfloat16),
+    }
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled({**vp, x: torch.ones((1, 137, 96), device="cuda", dtype=torch.bfloat16)}, workspace=workspace)
+    assert len(calls) == 1
+    calls.clear()
+    with pytest.raises(ValueError, match="token buffer that has none"):
+        compiled({**vp, x: torch.ones((1, 0, 96), device="cuda", dtype=torch.bfloat16)}, workspace=workspace)
+    assert calls == []
+    assert torch.all(out == 17.0)
 
 
 @pytest.mark.parametrize("family", ["sm100", "sm120"])

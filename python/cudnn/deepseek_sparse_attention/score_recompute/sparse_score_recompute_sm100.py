@@ -100,8 +100,13 @@ class SparseScoreRecomputeSm100:
         topk_in_smem: bool = True,
         k_block_size: int | None = None,
         topk_indices_global: bool = True,
+        pool_size: int = 0,
     ):
         assert score_type in ("indexer", "attention")
+        assert pool_size in (0, 4, 16), f"pool_size must be 0, 4 or 16, got {pool_size}"
+        if pool_size:
+            assert score_type == "attention" and n_block_size == 64 and have_topk_length, "pooled output needs the attention n64 epilogue with topk_length"
+        self.pool_size = pool_size
         self.score_type = score_type
         self.head_dim = head_dim
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -1702,6 +1707,14 @@ class SparseScoreRecomputeSm100:
                     mask_and_clamp=31,
                 )
                 rScores[n_blk] = partial_score + partner_partial
+                if const_expr(self.pool_size != 0):
+                    for _po in (4, 8) if self.pool_size == 4 else (4, 8, 1, 16):
+                        rScores[n_blk] = rScores[n_blk] + cute.arch.shuffle_sync_bfly(
+                            rScores[n_blk],
+                            offset=_po,
+                            mask=-1,
+                            mask_and_clamp=31,
+                        )
 
         # ---- Phase 2: L1-norm (scores already non-negative from exp) ----
         global_sum, reduce_phase = self._inter_warp_sync_sum(
@@ -1712,15 +1725,35 @@ class SparseScoreRecomputeSm100:
             warp_sum_acc,
         )
 
-        if is_active:
-            if global_sum > Float32(1e-10):
-                inv_sum = Float32(1.0) / global_sum
-                for ei in cutlass.range_constexpr(self.num_n_blocks):
-                    pos = kv_offset + ei * self.n_block_size
-                    mOut[q_token_idx, pos, batch_idx] = rScores[ei] * inv_sum
+        if const_expr(self.pool_size != 0):
+            lane = tidx_wg % self.WARP_SIZE
+            if const_expr(self.pool_size == 4):
+                is_rep = (lane & 14) == 0
+                pool_in_warp = 2 * (lane & 1) + (lane >> 4)
             else:
+                is_rep = lane == 0
+                pool_in_warp = Int32(0)
+            pools_per_block = self.n_block_size // self.pool_size
+            pools_per_warp = pools_per_block // self.num_warps_in_epi_wg
+            k_out = cute.size(mOut.shape[1])
+            if is_rep:
+                inv_sum = Float32(0.0)
+                if global_sum > Float32(1e-10):
+                    inv_sum = Float32(1.0) / global_sum
                 for ei in cutlass.range_constexpr(self.num_n_blocks):
-                    pos = kv_offset + ei * self.n_block_size
-                    mOut[q_token_idx, pos, batch_idx] = Float32(0.0)
+                    g = ei * pools_per_block + warp_id_in_wg * pools_per_warp + pool_in_warp
+                    if g < k_out:
+                        mOut[q_token_idx, g, batch_idx] = rScores[ei] * inv_sum
+        else:
+            if is_active:
+                if global_sum > Float32(1e-10):
+                    inv_sum = Float32(1.0) / global_sum
+                    for ei in cutlass.range_constexpr(self.num_n_blocks):
+                        pos = kv_offset + ei * self.n_block_size
+                        mOut[q_token_idx, pos, batch_idx] = rScores[ei] * inv_sum
+                else:
+                    for ei in cutlass.range_constexpr(self.num_n_blocks):
+                        pos = kv_offset + ei * self.n_block_size
+                        mOut[q_token_idx, pos, batch_idx] = Float32(0.0)
 
         return s_full_phase_bits, reduce_phase

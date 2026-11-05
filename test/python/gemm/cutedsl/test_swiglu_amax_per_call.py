@@ -11,7 +11,9 @@ from gemm.cutedsl.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_in
 
 @pytest.mark.L0
 def test_cached_swiglu_amax_is_per_call():
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM100+ is required")
     torch.manual_seed(1233)
     api._cache_of_GroupedGemmSwigluSm100Objects.clear()

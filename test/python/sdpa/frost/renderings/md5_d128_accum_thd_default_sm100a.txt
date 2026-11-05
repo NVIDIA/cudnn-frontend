@@ -1,4 +1,4 @@
-# sm_100a PTX md5 PER KERNEL of the d128 accumulation THD hosts' DEFAULT renderings (prepared_d128_thd_host / prepared_d128_grouped_thd_host
+# sm_100a PTX md5 PER KERNEL of the d128 accumulation THD hosts' DEFAULT renderings (prepared_d128_host.compile_host_thd / .compile_host_grouped_thd
 # .compile_host with every typed field unset; host trace-compile, no device; the probe geometry is in test_sdpa_bwd_d128_diag_dq_reduce_add_sm100.py).
 # One row per kernel each chain OWNS: the md5 of that kernel's `.entry` region of the dumped module (frost_test_utils.ptx_kernel_md5s), so a row
 # moves only when the kernel it names changes.  The grouped chain's dK / dV group fold dkv_reduce_thd_origins_kernel is launched by the pair

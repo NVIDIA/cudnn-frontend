@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped THD d128 declarations on the cta_group::2 datapath: the grouped THD checks plus the pair envelope and nine maps.
+"""Grouped d128 declarations on the cta_group::2 datapath: the grouped THD checks plus the pair envelope and nine maps, and the dense twin
+(a dense compact-BSHD GQA / MQA declaration lowered onto the same chain: ``d128_grouped_2cta_contract`` module docstring).
 
 Also the grouped route's DISPATCH behind the typed adapter field ``SdpaBwdDslSm100D128.cta_pair`` (the per-S heuristic of
 ``d128_grouped_2cta_contract``): :func:`resolve_cta_pair_body` reads the declaration and the device, :func:`check_support_selected` /
@@ -15,21 +16,40 @@ from types import SimpleNamespace
 from cudnn.frost.compiled_cache import positional_entry
 from .config_sm100_d128_accum_2cta import resolve_diag_2cta
 from .config_sm100_d128_accum_2cta_stail import (
+    TmemMapNotServed,
     dbg_clk_records,
     dbg_clk_region_offset,
+    SmemMapNotServed,
     dbg_clk_for_stats_form,
     resolve_debug_clk,
     resolve_mask_form,
     resolve_stats_form,
+    resolve_smem_map,
+    resolve_tmem_map,
     resolve_warp_roles,
     validate_fields_for_roles,
 )
-from .d128_grouped_2cta_contract import CTA_PAIR_BODY, CTA_PAIR_CLUSTER, ONE_CTA_BODY, PAIR_BODY, CtaPairDecline, resolve_cta_pair, select_cta_pair
-from .d128_grouped_2cta_contract import THD as IMPLEMENTATION
-from .d128_grouped_2cta_contract import WORKSPACE_SLACK, thd_workspace_layout, thd_workspace_offsets, validate_thd_bounds
+from .d128_grouped_2cta_contract import (
+    CTA_PAIR_BODY,
+    CTA_PAIR_CLUSTER,
+    DENSE_ORIGIN_DTYPES,
+    DENSE_ORIGIN_SPECS,
+    IMPLEMENTATIONS,
+    ONE_CTA_BODY,
+    PAIR_BODY,
+    WORKSPACE_SLACK,
+    CtaPairDecline,
+    dense_capacities,
+    layout_form_of,
+    resolve_cta_pair,
+    select_cta_pair,
+    thd_workspace_layout,
+    thd_workspace_offsets,
+    validate_thd_bounds,
+)
 from .d128_grouped_contract import dsl_version_decline
-from .d128_thd_contract import KV_PORTS
-from .prepared import ROLES, BwdLaunchSpec, Operand
+from .d128_thd_contract import KV_PORTS, validate_launch
+from .prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
 from .prepared_sm100_d128_grouped import check_support as _check_support_grouped
 from .prepared_sm100_d128_grouped import dkv_accum
 from .prepared_sm100_d128_thd import THD_ATTRIBUTES, THD_ROLES, _GuardedEntry
@@ -126,7 +146,7 @@ def resolve_cta_pair_body(api):
     try:
         resolution = select_cta_pair(
             mode,
-            thd=bool(api.thd),
+            layout=layout_form_of(api.thd),
             s_q_max=s_q_max,
             s_kv_max=s_kv_max,
             cc=_device_cc(api),
@@ -203,6 +223,38 @@ def stats_form(api):
         raise ValueError(f"{api._NAME}: {error}") from None
 
 
+def tmem_map(api):
+    """The adapter record's TMEM MAP of the pair body (``SdpaBwdDslSm100D128.tmem_map``: a name of the s_tail body's ``CFG.TMEM_MAPS`` -- "s_tail"
+    (the dQ image in S^T's dead tail behind the s_read / s_tail_empty rows: the 512-column parts' rendering) | "dq_576" (the independent dQ image
+    at [512, 576) of the 576-column carve, `tcgen05.alloc` 576 exclusive on both CTAs, the two rows deleted: selectable by name on cc 10.7, a
+    neutral structural map) -- or ``None`` = the PART's default under the role shape (``resolve_tmem_map`` on Q's device cc: "s_tail" on every
+    admitted part today), typed: a name outside the domain (or no CUDA part) is a ``ValueError`` by name; a map NAMED on a part that does not serve
+    it ("dq_576" off cc 10.7) is the engine's typed decline, ``NotImplementedError`` by name (``TmemMapNotServed``).  The field is read only on
+    the 2-CTA route and never changes the workspace."""
+    try:
+        return resolve_tmem_map(getattr(api, "tmem_map", None), _device_cc(api), warp_roles(api))
+    except TmemMapNotServed as error:
+        raise NotImplementedError(f"{api._NAME}: 2-CTA datapath {error}") from None
+    except ValueError as error:
+        raise ValueError(f"{api._NAME}: {error}") from None
+
+
+def smem_map(api):
+    """The adapter record's SMEM MAP of the pair body (``SdpaBwdDslSm100D128.smem_map``: a name of the s_tail body's ``CFG.SMEM_MAPS`` -- "sm100" (the
+    opt-in slab chain of every part: the default everywhere) | "rubin_b2" (the 327 KiB oversized carveout of cc 10.7: the two-stage dS / exchange staging
+    ring, the sQ1 / sDO1 rings and the dq_read_done row; selectable by name ON ``tmem_map = "dq_576"`` under the default role shape and stats form) -- or
+    ``None`` = the PART's default (``resolve_smem_map`` on Q's device cc)), typed: a name outside the domain (or no CUDA part) is a ``ValueError`` by
+    name; a map NAMED on a part that does not serve it ("rubin_b2" off cc 10.7) is the engine's typed decline, ``NotImplementedError`` by name
+    (``SmemMapNotServed``); the cross-field rules ("rubin_b2" x s_tail / 16w_fa4 / ldg) decline in ``check_support`` through validate_fields_for_roles.
+    The field is read only on the 2-CTA route and never changes the workspace."""
+    try:
+        return resolve_smem_map(getattr(api, "smem_map", None), _device_cc(api), warp_roles(api), stats_form(api), tmem_map(api))
+    except SmemMapNotServed as error:
+        raise NotImplementedError(f"{api._NAME}: 2-CTA datapath {error}") from None
+    except ValueError as error:
+        raise ValueError(f"{api._NAME}: {error}") from None
+
+
 def diag_2cta(api):
     """The adapter record's DIAGNOSTIC probe (``SdpaBwdDslSm100D128.diag_2cta``: a ``CFG.DIAG_2CTA_NAMES`` name or ``None`` = no probe,
     the shipped body), typed: a ``ValueError`` names the field and the domain.  A set value makes the OUTPUT WRONG BY DESIGN."""
@@ -224,15 +276,16 @@ def debug_clk(api):
 
 def debug_clk_record(api):
     """The STAMPS record of this adapter's rendering: the ONE value the carve (``check_support``), the dump reader (``debug_clk_records``) and
-    the tests read -- the record of the stats form and the role shape the body renders (``dbg_clk_for_stats_form``: 88 words under the default
-    tma_ring layout, 96 under ldg; the same word map), its WORDS / BYTES the bar block's spare DERIVED from that layout ((TMEM_HANDLE - the
-    layout's end) / 4; config = truth, never a literal) and asserted here against the form's geometry, so a layout change can never leave a
-    stale record size behind."""
-    from .config_sm100_d128_accum_2cta_stail import cfg_for_stats_form
+    the tests read -- the record of the stats form, the role shape AND the TMEM map the body renders (``dbg_clk_for_stats_form``: 88 words under
+    the default tma_ring layout, 96 under ldg on the s_tail map; 96 / 104 under dq_576, whose bar block is two rows shorter; the same word map, the
+    four S-tail words dead under dq_576), its WORDS / BYTES the bar block's spare DERIVED from that layout ((TMEM_HANDLE - the layout's end) / 4;
+    config = truth, never a literal) and asserted here against the rendering's geometry, so a layout change can never leave a stale record size
+    behind."""
+    from .config_sm100_d128_accum_2cta_stail import cfg_for_geometry
 
-    form, roles = stats_form(api), warp_roles(api)
-    record = dbg_clk_for_stats_form(form, roles)
-    assert record.BYTES == 4 * record.WORDS == cfg_for_stats_form(form, roles).TMEM_HANDLE - record.SMEM, (form, roles, record)
+    form, roles, tmap, smap = stats_form(api), warp_roles(api), tmem_map(api), smem_map(api)
+    record = dbg_clk_for_stats_form(form, roles, tmap, smap)
+    assert record.BYTES == 4 * record.WORDS == cfg_for_geometry(form, tmap, smap).TMEM_HANDLE - record.SMEM, (form, roles, tmap, smap, record)
     return record
 
 
@@ -252,17 +305,30 @@ def debug_clk_records(api, workspace):
     return workspace[base : base + n_rec * d.BYTES].view(torch.int32).view(n_rec, d.WORDS)
 
 
+def layout_form(api):
+    """The chain's layout form of this declaration (``d128_grouped_2cta_contract.LAYOUT_FORMS``): "thd" for a packed declaration, "dense" for the
+    compact-BSHD twin.  Derived from the adapter's ``thd`` flag, never a user field."""
+    return layout_form_of(api.thd)
+
+
 def check_support(api):
-    """Grouped THD only: the shipping grouped checks, then the pair envelope and the nine-map workspace replace the 1-CTA ones."""
+    """Grouped BF16 d128 on both layouts: the shipping grouped checks (packed or dense compact BSHD), then the pair envelope and the nine-map
+    workspace replace the 1-CTA ones.  The dense twin records the packed-view capacities (``dense_capacities``: B*S per side), the head-major
+    Stats pitch S_q and the synthesized stats origin spec the setup kernel's dense arm writes (``DENSE_ORIGIN_SPECS``)."""
 
     def require(condition, reason):
         if not condition:
             raise NotImplementedError(f"{api._NAME}: 2-CTA datapath {reason}")
 
-    require(api.thd, "requires THD (the dense twin of the pair body is not built)")
     require(api._uses_grouped_heads(), "requires grouped heads (Hq > Hkv); the MHA path has no pair body")
-    _check_support_grouped(api)
+    _check_support_grouped(api)  # packed: the grouped THD checks record _thd_*; dense: compact BSHD, contiguous Stats, S % 128, dkv_accum default
     b, h, hk, sq, sk = api.batch_size, api.h_q, api.h_kv, api.s_q_max, api.s_k_max
+    if layout_form(api) == "dense":
+        # the packed Stats declaration fields (thd_stats_token_major / thd_stats_head_stride) describe a THD declaration only and are not read
+        # here, as on the one-CTA dense grouped chain: dense Stats are the contiguous (B, H, S_q, 1) tensor _check_dense required
+        api._thd_t_q, api._thd_t_kv, api._thd_t_q_phys, api._thd_t_kv_phys = dense_capacities(b, sq, sk)
+        api._thd_head_pitch = sq  # dense contiguous (B, H, S_q) Stats = head-major packed Stats with pitch S_q + the per-sequence origin b*H*S_q
+        api._thd_origins, api._thd_origin_dtypes = DENSE_ORIGIN_SPECS, DENSE_ORIGIN_DTYPES
     try:
         validate_thd_bounds(b, h, hk, sq, sk, api._thd_t_q, api._thd_t_kv, api._thd_t_q_phys, api._thd_t_kv_phys)
     except ValueError as error:
@@ -270,11 +336,14 @@ def check_support(api):
     # The body's whole typed field bundle, resolved HERE: a value outside a domain is a ValueError BY NAME at support time (never first at
     # compile, after auto committed to the pair); then the role shape's cross-field rule (config_sm100_d128_accum_2cta_stail.
     # validate_fields_for_roles): a combination that is not built is a typed DECLINE -- under cta_pair=auto the dispatch then serves the
-    # one-CTA body with this text in its reason, under on it is the answer.  ``stats_form`` joins the bundle (tma_ring x 16w_fa4 declines here).
+    # one-CTA body with this text in its reason, under on it is the answer.  ``stats_form`` joins the bundle (tma_ring x 16w_fa4 declines here);
+    # ``tmem_map`` joins it PART-KEYED (``tmem_map(api)``: a map the part does not serve is the typed decline itself; dq_576 x 16w_fa4 and the
+    # S-tail wait probes x dq_576 decline here).
     mask_form(api)
-    roles, probe, stamps, accum, form = warp_roles(api), diag_2cta(api), debug_clk(api), dkv_accum(api), stats_form(api)
+    roles, probe, stamps, accum, form, tmap = warp_roles(api), diag_2cta(api), debug_clk(api), dkv_accum(api), stats_form(api), tmem_map(api)
+    smap = smem_map(api)  # PART-KEYED too: a map the part does not serve is the typed decline itself; rubin_b2 x s_tail / 16w_fa4 / ldg decline below
     try:
-        validate_fields_for_roles(roles, probe, debug_clk=stamps, dkv_accum=accum, stats_form=form)
+        validate_fields_for_roles(roles, probe, debug_clk=stamps, dkv_accum=accum, stats_form=form, tmem_map=tmap, smem_map=smap)
     except ValueError as error:
         require(False, str(error))
     # stats_form = tma_ring (s_tail only; typed above; the default): the compact delta region becomes the q-tile-padded pre-scaled stats region +
@@ -291,9 +360,29 @@ def check_support(api):
         n_rec = dbg_clk_records(b, h, sk)
         api._dbg_clk_region = (offset, n_rec)
         api._grouped_workspace_bytes = max(api._grouped_workspace_bytes, offset + n_rec * debug_clk_record(api).BYTES + WORKSPACE_SLACK)
-    api._implementation = IMPLEMENTATION
+    api._implementation = IMPLEMENTATIONS[layout_form(api)]
     api._is_supported = True
     return True
+
+
+class _GuardedDenseEntry:
+    """The dense twin's launch guard: the dense native frame (nine pointers, workspace, scale, stream -- the one-CTA dense grouped frame) is
+    validated (``validate_launch``: alignment, aliasing, workspace extent, scale) and re-framed onto the chain's compiled signature, which keeps
+    the packed form's slots: the seven runtime capacities, the two absent length operands and the nine absent origin operands (None, as they
+    were compiled) and a length form of 0."""
+
+    ABSENT = 2 + 9  # the two length operands + the nine ragged-offset operands the dense form never binds
+
+    def __init__(self, entry, prefix, operands, workspace_bytes):
+        self.entry = entry
+        self.prefix = tuple(prefix)
+        self.spans = tuple(op.span * op.itemsize for op in operands)
+        self.workspace_bytes = workspace_bytes
+
+    def __call__(self, q, k, v, o, do, lse, dq, dk, dv, workspace, scale, stream):
+        absent = (None,) * self.ABSENT  # the chain's validator reads the packed frame: the absent slots are None with a zero span
+        validate_launch((q, k, v, o, do, lse, dq, dk, dv) + absent, self.spans + (0,) * self.ABSENT, workspace, self.workspace_bytes, scale)
+        self.entry(*self.prefix, q, k, v, o, do, lse, dq, dk, dv, *absent, workspace, scale, 0, stream)
 
 
 def compile_plan(api):
@@ -301,22 +390,28 @@ def compile_plan(api):
     import torch
 
     from cudnn.frost.device import compute_capability, resolve_device
-    from .kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from .kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
 
     b, h, hk = api.batch_size, api.h_q, api.h_kv
+    layout = layout_form(api)
+    dense = layout == "dense"
+    # the packed Stats field describes a THD declaration only (check_support): the dense form binds head-major Stats whatever the field says
+    token_major = bool(api.thd_stats_token_major) and not dense
     operands = []
     for role in ROLES[:9]:
         desc = getattr(api, role + "_desc")
         if role == "stats":
             shape, strides = (
-                ((api._thd_t_q_phys, h), (h, 1))
-                if api.thd_stats_token_major
-                else ((1, h, api._thd_head_pitch), (h * api._thd_head_pitch, api._thd_head_pitch, 1))
+                ((api._thd_t_q_phys, h), (h, 1)) if token_major else ((1, h, api._thd_head_pitch), (h * api._thd_head_pitch, api._thd_head_pitch, 1))
             )
         else:
             tokens, heads = (api._thd_t_kv_phys, hk) if role in KV_PORTS else (api._thd_t_q_phys, h)
             shape, strides = (1, tokens, heads, 128), (tokens * heads * 128, heads * 128, 128, 1)
         span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
+        if dense and role == "stats":
+            # the dense Stats operand is bound as the head-major packed form (1, H, S_q) + the per-sequence origin b*H*S_q (check_support), so the
+            # layout's own span (H*S_q) covers the first sequence only: the storage and overlap checks must cover the whole (B, H, S_q) tensor
+            span = b * h * api._thd_head_pitch
         if span * desc.dtype.itemsize > 2**63 - 1:
             raise NotImplementedError(f"{api._NAME}: grouped {role} exceeds the signed pointer range")
         operands.append(Operand(str(desc.dtype).split(".")[-1], shape, strides, span, 4 if role == "stats" else 16, desc.dtype.itemsize))
@@ -327,13 +422,14 @@ def compile_plan(api):
     regions, required = api._grouped_workspace_regions, api._grouped_workspace_bytes
     if required != api.scratch_workspace_bytes():
         raise RuntimeError("grouped 2-CTA d128 compiled workspace disagrees with its advertised size")
-    operands.extend(Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2))
-    for name in api._thd_origin_dtypes:
-        width = 8 if name == "int64" else 4
-        operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
+    if not dense:
+        operands.extend(Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2))
+        for name in api._thd_origin_dtypes:
+            width = 8 if name == "int64" else 4
+            operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
     with torch.cuda.device(device):
         entry = compile_host(
-            (b, h, hk, bool(api.thd_stats_token_major)),
+            (b, h, hk, token_major),
             api._thd_origins,
             api._thd_origin_dtypes,
             dtype,
@@ -345,17 +441,20 @@ def compile_plan(api):
             dkv_accum=dkv_accum(api),
             warp_roles=warp_roles(api),
             stats_form=stats_form(api),
+            layout=layout,
+            tmem_map=tmem_map(api),
+            smem_map=smem_map(api),
         )
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("grouped 2-CTA d128 requires a positional tvm-ffi entry")
     prefix = (api._thd_t_q, api._thd_t_kv, api._thd_t_q_phys, api._thd_t_kv_phys, api.s_q_max, api.s_k_max, api._thd_head_pitch)
-    fn = _GuardedEntry(partial(fn, *prefix), operands, required)
+    fn = _GuardedDenseEntry(fn, prefix, operands, required) if dense else _GuardedEntry(partial(fn, *prefix), operands, required)
     owner = SimpleNamespace(
         entry=entry,
         workspace_bytes=required,
         workspace_regions=regions,
-        implementation=IMPLEMENTATION,
+        implementation=IMPLEMENTATIONS[layout],
         partial_dtype=str(api.dtype).split(".")[-1],
         dkv_accum=dkv_accum(api),
     )
@@ -367,9 +466,9 @@ def compile_plan(api):
         device,
         api.scale_softmax,
         api._NAME,
-        length_form=True,
-        roles=THD_ROLES,
-        attributes=THD_ATTRIBUTES,
+        length_form=not dense,
+        roles=ROLES[:9] if dense else THD_ROLES,
+        attributes=ATTRIBUTES[:9] if dense else THD_ATTRIBUTES,
         scale_log2=False,
         native_binding=True,
     )
