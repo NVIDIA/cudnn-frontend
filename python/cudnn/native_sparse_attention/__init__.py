@@ -1,29 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from importlib import import_module
 
-_SYMBOLS = {
-    "SelectionAttention": ".selection",
-    "selection_attention_wrapper": ".selection",
-    "SlidingWindowAttention": ".sliding_window_attention",
-    "sliding_window_attention_wrapper": ".sliding_window_attention",
-    "CompressionAttention": ".compression",
-    "compression_attention_wrapper": ".compression",
-    "TopKReduction": ".top_k",
-    "topk_reduction_wrapper": ".top_k",
-}
+# NSA is built on first access, so importing the kernel modules (as ``jax_api`` does) does not import torch.
+# It imports every PyTorch API at once, so ``from cudnn import NSA`` still fails when a dependency is missing.
+def __getattr__(name):
+    if name != "NSA":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+    from . import compression, selection, sliding_window_attention, top_k
 
-# Resolved on first access so the kernel modules (used by ``jax_api``) import without torch.
-class NSANamespace:
-    def __getattr__(self, name):
-        if name in _SYMBOLS:
-            return getattr(import_module(_SYMBOLS[name], __name__), name)
-        raise AttributeError(f"NSA has no attribute {name!r}")
+    class NSANamespace:
+        SelectionAttention = staticmethod(selection.SelectionAttention)
+        selection_attention_wrapper = staticmethod(selection.selection_attention_wrapper)
 
+        SlidingWindowAttention = staticmethod(sliding_window_attention.SlidingWindowAttention)
+        sliding_window_attention_wrapper = staticmethod(sliding_window_attention.sliding_window_attention_wrapper)
 
-NSA = NSANamespace()
+        CompressionAttention = staticmethod(compression.CompressionAttention)
+        compression_attention_wrapper = staticmethod(compression.compression_attention_wrapper)
+
+        TopKReduction = staticmethod(top_k.TopKReduction)
+        topk_reduction_wrapper = staticmethod(top_k.topk_reduction_wrapper)
+
+    globals()["NSA"] = NSANamespace()
+    return globals()["NSA"]
+
 
 __all__ = [
     "NSA",
