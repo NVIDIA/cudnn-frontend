@@ -438,7 +438,7 @@ def _indexer_top_k_adapter(stream, scores, seq_lens, indices, scratch, *, kernel
     kernel(scores, None, scratch, None, seq_lens, indices, None, stream)
 
 
-def indexer_top_k_forward_jax(scores: Any, seq_lens: Any, *, top_k: int, tie_break: int = 1) -> Any:
+def top_k_forward_jax(scores: Any, seq_lens: Any, *, top_k: int, tie_break: int = 1) -> Any:
     """Per-row top-``top_k`` column indices of ``scores`` using the CuTeDSL radix kernel.
 
     ``scores`` is ``(n_rows, num_cols)`` float32/float16/bfloat16 and ``seq_lens`` is ``(n_rows,)`` int32: row ``i``
@@ -620,7 +620,7 @@ def indexer_backward_jax(
 __all__ = [
     "indexer_forward_jax",
     "dense_indexer_backward_jax",
-    "indexer_top_k_forward_jax",
+    "top_k_forward_jax",
     "indexer_backward_jax",
     "sparse_attention_forward_jax",
     "sparse_attention_backward_jax",

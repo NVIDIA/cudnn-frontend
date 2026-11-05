@@ -250,7 +250,10 @@ grad_kv, grad_score, grad_ape = dsa.compressor_backward_jax(
 accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch. They support
 `ratio=4, coff=2` (CSA) and `ratio=128, coff in {1, 2}` with `head_dim in {128, 512}`
 (HCA), BF16 KV/scores, FP32 APE and int32 packed-sequence metadata, on SM100-family
-GPUs. Forward and backward are separate calls; the caller owns the VJP.
+GPUs. Forward and backward are separate calls; the caller owns the VJP. The
+PyTorch counterparts are `cudnn.ops.dsa.compressor_forward` and
+`cudnn.ops.dsa.compressor_backward`, the same functions as
+`cudnn.csa.csa_compressor_forward_wrapper` and `csa_compressor_backward_wrapper`.
 
 ### High-level wrappers
 

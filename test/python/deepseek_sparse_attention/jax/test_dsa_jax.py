@@ -71,7 +71,7 @@ def test_indexer_top_k_jax_matches_lax_top_k(dtype, num_cols):
     top_k, rows = 64, 8
     scores = jax.random.normal(jax.random.key(6), (rows, num_cols), jnp.float32).astype(dtype)
     seq_lens = jnp.array([num_cols, num_cols - 1, 700, 65, top_k, 40, 1, 0], jnp.int32)
-    got = np.asarray(jax.jit(lambda s, n: dsa.indexer_top_k_forward_jax(s, n, top_k=top_k))(scores, seq_lens))
+    got = np.asarray(jax.jit(lambda s, n: dsa.top_k_forward_jax(s, n, top_k=top_k))(scores, seq_lens))
     for row, length in enumerate(np.asarray(seq_lens)):
         if length <= top_k:
             expected = np.concatenate([np.arange(length), np.full(top_k - length, -1)])
