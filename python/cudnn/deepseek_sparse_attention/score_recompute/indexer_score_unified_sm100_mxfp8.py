@@ -152,8 +152,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.sf_dtype = cutlass.Float8E8M0FNU
         # Load warp keeps fewer registers so the epilogue warpgroups have enough
         # register budget for head reduction and optional online LSE.
-        self.num_regs_load = 64
-        self.num_regs_epilogue = 64
+        self.num_regs_load = 48
+        self.num_regs_epilogue = 224
         # k_block_size=64 splits D128 into two data chunks.  K data and K scale
         # use separate TMA barriers so the load warp can prefetch the next scale
         # tile while the MMA warp consumes K data stages.
@@ -471,6 +471,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
+            min_blocks_per_mp=1,
         )
 
     @cute.jit
@@ -547,6 +548,23 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                 tSrQ_stage[kphase_coord],
                 tStS_stage,
             )
+
+    @cute.jit
+    def _role_tile_scheduler(self, tile_sched_params, clc_response_ptr):
+        """Tile scheduler, first work tile and CLC consumer state of one warpgroup role.
+
+        Each warpgroup builds its own after its setmaxnreg: one copy built
+        before the role branches would stay live across the register-split
+        points, where ptxas spills it.
+        """
+        clc_consumer_state = make_pipeline_state(PipelineUserType.Consumer, self.num_clc_stage)
+        tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+            tile_sched_params,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            clc_response_ptr,
+        )
+        return tile_sched, tile_sched.initial_work_tile_info(), clc_consumer_state
 
     @cute.jit
     def _epilogue_indexer_dense_single_q(
@@ -1410,15 +1428,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         cute.arch.sync_threads()
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        clc_consumer_state = make_pipeline_state(PipelineUserType.Consumer, self.num_clc_stage)
-        tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
-            tile_sched_params,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            clc_response_ptr,
-        )
-        work_tile = tile_sched.initial_work_tile_info()
-
         head_producer, head_consumer = pipeline_head.make_participants()
         Q_producer, Q_consumer = pipeline_Q.make_participants()
         K_producer, K_consumer = pipeline_K.make_participants()
@@ -1463,6 +1472,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
 
         if warp_group_idx == 0:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            tile_sched, work_tile, clc_consumer_state = self._role_tile_scheduler(tile_sched_params, clc_response_ptr)
 
             if warp_idx == self.load_warp_id:
                 # Load warp: stage W, Q/QScale, then walk K blocks from high to
@@ -1762,6 +1772,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
 
         if warp_group_idx == 1:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
+            tile_sched, work_tile, clc_consumer_state = self._role_tile_scheduler(tile_sched_params, clc_response_ptr)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
             sScoreAll_epi0 = cute.make_tensor(
@@ -1881,6 +1892,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                     cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
         if warp_group_idx == 2:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
+            tile_sched, work_tile, clc_consumer_state = self._role_tile_scheduler(tile_sched_params, clc_response_ptr)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
             sScoreAll_epi1 = cute.make_tensor(

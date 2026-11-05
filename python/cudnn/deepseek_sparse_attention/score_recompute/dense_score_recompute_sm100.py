@@ -162,9 +162,6 @@ class DenseScoreRecomputeSm100:
         self.epilogue_wg_warp_ids = (4, 5, 6, 7)
         self.num_warps = 8
         self.threads_per_cta = self.WARP_SIZE * self.num_warps  # 256
-        self.num_regs_load = 48
-        self.num_regs_mma = 48
-        self.num_regs_epilogue = 256
 
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_s_stride = self.m_block_size
@@ -399,6 +396,9 @@ class DenseScoreRecomputeSm100:
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
+            # One CTA of two warpgroups per SM: every thread can hold up to 255
+            # registers, so no setmaxnreg reallocation is needed.
+            min_blocks_per_mp=1,
         )
 
     # =========================================================================
@@ -604,8 +604,6 @@ class DenseScoreRecomputeSm100:
         # Warpgroup 0 (warps 0-3): Load + MMA + Scheduler
         # =====================================================================
         if warp_group_idx == 0:
-            cute.arch.setmaxregister_decrease(self.num_regs_load)
-
             # -----------------------------------------------------------------
             # Load warp (warp 0): PerHead data + TMA Q + TMA K
             # -----------------------------------------------------------------
@@ -862,7 +860,6 @@ class DenseScoreRecomputeSm100:
         # Warpgroup 1 (warps 4-7): Epilogue — score write + denom accumulation
         # =====================================================================
         if warp_group_idx == 1:
-            cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
             while work_tile.is_valid_tile:
