@@ -286,30 +286,40 @@ def split_candidates(chain: FusionChain, config: TileConfig) -> range:
 _SMALL_M_BLOCK_SCALE_MAX_TOKENS = 32
 _SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES = 48
 
-# The narrow-token geometry of the sm120 (CC 12.x, warp-MMA) block-scale pipeline on a part no cost profile above names.  The sm120
-# catalog's smallest M tile is 32 rows, so one CTA row covers every decode batch of up to 32 tokens with the tokens left on M (no
-# swap); the 2x4 warp grid is the measured form.  Measured on an NVIDIA GeForce RTX 5090 (CC 12.0, 170 SMs, 96 MiB L2, GDDR7 pin
-# 1,575 GB/s; sweep run 20261104T024301Z, cold-L2 CUDA-graph timing, M in {1, 6, 24}) against the sm120 auto pick, which
-# `select_config` makes 128x128x128 for every block-scaled GEMM: NVFP4 (fp4_e2m1 x fp4_e2m1, e4m3 block-16 scales) K=5120 N=34816
-# M=1 93.5 -> 62.1 us (68 -> 103 % of the byte roofline), N=5120 K=17408 M=1 35.7 (split-K 4) -> 32.7 us (89 -> 98 %, split-K 4),
-# N=248320 K=5120 M=1 639 -> 426 us (71 -> 107 %); at M=6 and M=24 the same tile stays within 3 % of the best FlashInfer kernel
-# while the 128-row tile trails it by 12-33 %.  The split-K count follows the sm100 rule (one wave of CTAs over the weight tiles,
-# at most 16 slices): the measured N=5120 / K=17408 cell wants 4 slices, the two wide-N cells none.  MXFP8 (8-bit data) and the
-# calibrated parts were NOT measured and keep their picks.
+# The narrow-token geometry of the sm120 (CC 12.x, warp-MMA) block-scale pipeline on a part no cost profile above names (`_calibrated`).
+# The sm120 catalog's smallest M tile is 32 rows, so one CTA row covers every decode batch of up to 32 tokens with the tokens left on M
+# (no swap); the 2x4 warp grid is the measured form.  Measured on an RTX 5090 (compute capability 12.0, 170 SMs, 96 MiB L2) at boost
+# clocks with no clock lock, cold-L2 CUDA-graph timing (3 rounds x 100 replays, A/B/A order; in-process round spread <= 0.8 % on every
+# cited cell), M in {1, 6, 24}, against the sm120 auto pick, which `select_config` makes 128x128x128 for every block-scaled GEMM.  The
+# percentages are of a 1,575 GB/s pin measured on the board with a 1 GiB device-memory add stream (read + write bytes counted; the GDDR7
+# peak is 1,792 GB/s), so a weight stream can exceed 100 % of it.  NVFP4 (fp4_e2m1 x fp4_e2m1, e4m3 block-16 scales): N=34816 K=5120
+# M=1 93.5 -> 62.1 us (68 -> 103 %), N=5120 K=17408 M=1 35.7 (split-K 4) -> 32.7 us (89 -> 98 %, split-K 4), N=248320 K=5120 M=1
+# 639 -> 426 us (71 -> 107 %) -- the 128-row times from one sweep invocation, the 32-row times from a later one the same day (the
+# third-party reference arms repeat within 0.6 % across the two).  At M=6 and M=24 the 32-row tile stays within 3.5 % of the best
+# FlashInfer kernel on every cell (-3.0..+3.5 %), while that kernel is +2.4..+51 % faster than the 128-row auto pick (time ratio minus
+# one; the +2.4 % is the K=17408 M=24 cell, which the auto split-K had already cut to 4 slices).  The split-K count follows the sm100
+# rule (one wave of CTAs over the weight tiles, at most 16 slices): the measured N=5120 / K=17408 cell wants 4 slices, the two wide-N
+# cells none.  Admitted but NOT measured: M other than 1, 6 and 24 (25-32 lie past the measured range), other (N, K), override-shape
+# graphs (up to the 48-weight-tile hedge), and MXFP4 (e8m0 block-32 scales: the same 4-bit weight stream, admitted by width).  MXFP8
+# (8-bit data) and the calibrated parts keep their picks.
 _SM120_SMALL_M_BLOCK_SCALE_GEOMETRY = "CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps2x4"
 
 # The narrow-token geometry of the sm120 DENSE fp8 pipeline on a part no cost profile above names, for the GEMMs whose weight tiles alone
 # leave more than half the SMs idle (the shape needs split-K to fill the machine).  Not a catalog row -- the catalog's smallest sm120 M tile
 # is 32 rows, so `by_name` synthesizes the 16-row tile from its canonical name: its 1x8 warp grid lays the eight compute warps along N, and
-# one CTA row covers every decode batch of up to 16 tokens with the tokens left on M.  Measured on an NVIDIA GeForce RTX 5090 (CC 12.0,
-# 170 SMs, 96 MiB L2, GDDR7 pin 1,575 GB/s; tile search run 20261104T041341Z, cold-L2 CUDA-graph timing, M in {1, 2, 4, 6, 8}) on the
-# fp8_e4m3 x fp8_e4m3 -> bf16 GEMM N=5120 K=6144 (40 weight tiles): this tile with 4 slices (160 CTAs, one 94 %-full wave) ran
-# 21.33-21.59 us = 93-94 % of the byte roofline at every M, +1.9..+2.8 % over the best 32-row tile (32x128x128 warps2x4, 4 slices) and
-# +2.5..+3 % over the auto pick (32x64x128 warps2x4 with its own 2-slice split, 90-91 %); the same tile with a 128-byte K tile was the
-# runner-up (92-93 %).  On the wide-N fp8 GEMMs of the same sweep (N=16384 and N=14336: 128 and 112 weight tiles, sweep run
-# 20261104T032237Z) the auto pick already streams at 97-99 % unsplit, so the rule declines every shape whose weight tiles alone fill more
-# than half the SMs (`_SM120_SMALL_M_FP8_MIN_SLICES`), and -- like the family's own auto split-K -- every shallow-K GEMM.  Block-scaled
-# data has its own rule above; 16-bit data and the calibrated parts were NOT measured and keep their picks.
+# one CTA row covers every decode batch of up to 16 tokens with the tokens left on M.  Measured on an RTX 5090 (compute capability 12.0,
+# 170 SMs, 96 MiB L2) at boost clocks with no clock lock, cold-L2 CUDA-graph timing (3 rounds x 100 replays, A/B/A order; in-process round
+# spread <= 1.2 % on every cited cell) in an explicit-tile search at M in {1, 2, 4, 6, 8} on the fp8_e4m3 x fp8_e4m3 -> bf16 GEMM N=5120
+# K=6144 (40 weight tiles), percentages of the pin named above: this tile with 4 slices (160 CTAs, one 94 %-full wave) ran 21.33-21.59 us
+# = 93-94 % at every M, +1.9..+2.8 % over the best 32-row tile of the search (32x128x128 with 4 slices, in its 2x4 or 1x8 warp grid) and
+# +2.4..+3.2 % over the auto pick (32x64x128 warps2x4 with its own 2-slice split, 90-91 %); the same tile with a 128-byte K tile was the
+# runner-up (92-93 %), and the planner path reproduced the pick in the decode-GEMM sweep (21.30 / 21.54 us at M = 1 / 6).  On the wide-N
+# fp8 GEMMs of that sweep (N=16384 and N=14336: 128 and 112 weight tiles) the auto pick already streams at 97-99 % unsplit, so the rule
+# declines every shape whose weight tiles alone fill more than half the SMs (`_SM120_SMALL_M_FP8_MIN_SLICES`), and -- like the family's own
+# auto split-K -- every shallow-K GEMM.  Admitted but NOT measured: fp8_e5m2 and mixed e4m3 x e5m2 pairs (the same bytes per element,
+# admitted by width), M 9-16, K other than 6144 (down to the 2048-element floor), N other than 5120 (every N up to 128 x (SMs // 2)
+# columns is admitted), and override-shape graphs (up to the 48-weight-tile hedge).  Block-scaled data has its own rule above; 16-bit
+# data and the calibrated parts keep their picks.
 _SM120_SMALL_M_FP8_GEOMETRY = "CONFIG_sm120_16x128x64_16x16x32_cluster1x1_warps1x8"
 _SM120_SMALL_M_FP8_MAX_TOKENS = 16  # the tile's rows: one CTA row covers the batch
 _SM120_SMALL_M_FP8_MIN_SLICES = 2  # the rule applies where at least two slices fit in one wave beside the weight tiles
@@ -318,7 +328,10 @@ _FP8_DTYPES = frozenset({"fp8_e4m3", "fp8_e5m2"})
 
 
 def _calibrated(device: DeviceProperties) -> bool:
-    """Whether a cost profile above names this part (by its SM version and reported name)."""
+    """Whether a cost profile above names this part (by its SM version and reported name).  The two sm120 small-M rules below apply only
+    where this is False: today the only CC 12.x name in ``_PROFILES`` is the RTX PRO 6000 Blackwell Server Edition, so every other CC 12.x
+    part -- the measured GeForce RTX 5090, the Workstation / Max-Q editions, the 84-SM parts, CC 12.1 -- takes them, measured or not.  A
+    future profile for such a name retires both rules for that part on every dtype (intended: a fitted cost model outranks a rule)."""
     return any(key[0] == device.arch and profile.device_name == device.name for key, profile in _PROFILES.items())
 
 

@@ -950,6 +950,17 @@ coefficients unchanged. Automatic candidates still use workspace reduction.
 The B200-targeted rule leads on SM100; other GPUs retain the existing first
 choice and include the new geometry as an autotuning candidate. A four-shape
 SM107 comparison found both wins and regressions from unconditional preference.
+On a CC 12.x part no cost profile names (`planning._calibrated`: a profile
+keyed on the part's SM version and reported name), two further profile-free
+rules lead with the auto pick second: a block-scaled fp4 x fp4 GEMM of up to
+32 tokens plans the family's 32-row tile with the tokens left on M, and a
+dense fp8 x fp8 GEMM of up to 16 tokens with K >= 2048 plans a synthesized
+16-row 1x8-warp tile; both take the one-wave split-K, and the fp8 rule
+declines where the weight tiles alone fill more than half the SMs. A cost
+profile for such a part retires both rules for it; the calibrated RTX PRO
+6000 and every SM 10.x part keep their picks. Both rules stay host-testable:
+`gemm/frost/test_tile_select_analytic.py` pins the picks, the K-floor and
+weight-grid boundaries, and the plan list through the sm120 compiler's gates.
 
 The dense SM100, mainloop-fusion, block-scale and SM103 hosts resolve the L2
 swizzle width once per call from the current logical M/N/K, then pass an Int32

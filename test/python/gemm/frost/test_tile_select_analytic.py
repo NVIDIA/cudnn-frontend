@@ -1007,13 +1007,19 @@ def _rtx5090_device():
     return replace(_strategy_device(120, "NVIDIA GeForce RTX 5090", 170), l2_bytes=96 << 20)
 
 
+def _cc12x_device(arch):
+    """The RTX 5090's geometry under SM version ``arch`` (120 or 121): the sm120 small-M rules gate on the CC 12.x family
+    (``family_for_arch``) and on ``_calibrated`` -- a profile keyed on the exact SM version AND the name -- so neither part is calibrated."""
+    return _rtx5090_device() if arch == 120 else replace(_rtx5090_device(), arch=arch, name=f"unprofiled CC 12.{arch - 120} part")
+
+
 def _rtx_pro_6000_device():
     """The CC 12.0 part the sm120 cost profiles were fitted on (188 SMs)."""
     return replace(_strategy_device(120, "NVIDIA RTX PRO 6000 Blackwell Server Edition", 188), l2_bytes=96 << 20)
 
 
-# The NVFP4 decode GEMMs of the RTX 5090 sweep (run 20261104T024301Z) as (N, K, split-K slices the one-wave rule gives on 170 SMs):
-# 272 weight tiles leave no room for a split, 40 weight tiles take 4 slices (160 CTAs), 1940 weight tiles none.
+# The NVFP4 decode GEMMs measured on an RTX 5090 (compute capability 12.0, 170 SMs) as (N, K, split-K slices the one-wave rule gives on
+# 170 SMs): 272 weight tiles leave no room for a split, 40 weight tiles take 4 slices (160 CTAs), 1940 weight tiles none.
 _SM120_DECODE_GEMMS = ((34816, 5120, 1), (5120, 17408, 4), (248320, 5120, 1))
 
 
@@ -1100,21 +1106,22 @@ def test_sm120_small_m_rule_leaves_calibrated_and_other_parts_byte_identical():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("arch", [120, 121])
 @pytest.mark.parametrize("N,K,slices", _SM120_DECODE_GEMMS)
-def test_sm120_compiler_plans_the_small_m_block_scale_tile_through_its_real_gates(monkeypatch, N, K, slices):
+def test_sm120_compiler_plans_the_small_m_block_scale_tile_through_its_real_gates(monkeypatch, arch, N, K, slices):
     """End to end through the sm120 compiler on an uncalibrated CC 12.x part: ``plan_config`` returns the 32-row tile, the shortlist is
     [narrow, auto pick], and every entry passes the compiler's real support probe (device facts pinned to the RTX 5090: 170 SMs, the SM
-    12.x SMEM opt-in)."""
+    12.x SMEM opt-in; arch 121 = a CC 12.1 part of the same geometry, which the family gate admits alike)."""
     from cudnn.gemm.frost import compiler as facade
     from cudnn.gemm.frost import planning, tile_config
     from cudnn.gemm.frost.sm120 import compiler as C120
 
-    device = _rtx5090_device()
+    device = _cc12x_device(arch)
     monkeypatch.setattr(planning, "current_device_properties", lambda: device)
     monkeypatch.setattr(tile_config, "_sm_count", lambda: device.sm_count)
     monkeypatch.setattr(C120, "_sm_count", lambda: device.sm_count)
-    monkeypatch.setattr(C120, "_current_arch", lambda device=None: 120)
-    monkeypatch.setattr(facade, "_current_arch", lambda device=None: 120)
+    monkeypatch.setattr(C120, "_current_arch", lambda device=None: arch)
+    monkeypatch.setattr(facade, "_current_arch", lambda device=None: arch)
     monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 99 * 1024)
     chain = _block_scaled_chain(M=1, N=N, K=K, quantized=False)
     config = C120.plan_config(chain, shapes_fixed=True)
@@ -1128,10 +1135,13 @@ def test_sm120_compiler_plans_the_small_m_block_scale_tile_through_its_real_gate
     assert (dynamic.pipeline, dynamic.cta_tile_m, dynamic.split_k_slices) == ("sm120", 128, 1)
 
 
-# The dense fp8 decode GEMMs of the RTX 5090 sweeps (runs 20261104T032237Z and 20261104T041341Z) as (N, K): the 40-weight-tile projection
-# takes the 16-row tile with 4 slices (160 CTAs on 170 SMs); the two wide-N GEMMs (128 and 112 weight tiles) keep the auto pick.
+# The dense fp8 decode GEMMs measured on an RTX 5090 (compute capability 12.0, 170 SMs) as (N, K): the 40-weight-tile projection takes the
+# 16-row tile with 4 slices (160 CTAs on 170 SMs); the two wide-N GEMMs (128 and 112 weight tiles) keep the auto pick.
 _SM120_FP8_PROJECTION = (5120, 6144)
 _SM120_FP8_WIDE_GEMMS = ((16384, 5120), (14336, 5120))
+# fp8_e4m3 x fp8_e4m3 is the measured pair; fp8_e5m2 and the mixed e4m3 x e5m2 pair move the same bytes per element and are admitted by that
+# width, UNMEASURED -- pinned as accepts so the admission stays deliberate (narrow `planning._FP8_DTYPES` if a measurement says otherwise).
+_SM120_FP8_PAIRS = [("fp8_e4m3", "fp8_e4m3"), ("fp8_e5m2", "fp8_e5m2"), ("fp8_e4m3", "fp8_e5m2")]
 
 
 def _unprofiled_sm120_device(sm_count):
@@ -1155,18 +1165,19 @@ def _sm120_fp8_baseline(M, N, K, sm_count=170):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("M", [1, 2, 4, 6, 8, 16])
-@pytest.mark.parametrize("dtype", ["fp8_e4m3", "fp8_e5m2"])
-def test_uncalibrated_sm120_part_plans_the_16_row_tile_for_small_m_fp8(M, dtype):
+@pytest.mark.parametrize("a_dtype,b_dtype", _SM120_FP8_PAIRS)
+def test_uncalibrated_sm120_part_plans_the_16_row_tile_for_small_m_fp8(M, a_dtype, b_dtype):
     """On a CC 12.x part without a cost profile, the dense fp8 projection GEMM of up to 16 tokens plans the 16-row 1x8-warp tile with the
     one-wave split-K first (4 slices: 40 weight tiles x 4 = 160 CTAs on 170 SMs) and the auto pick second; the plan survives the public knob
-    round trip, and the synthesized (non-catalog) geometry names itself canonically."""
+    round trip, and the synthesized (non-catalog) geometry names itself canonically.  Every fp8 pair of ``_SM120_FP8_PAIRS`` is admitted
+    (only e4m3 x e4m3 was measured; see the note on that list)."""
     from cudnn.gemm.frost import planning
     from cudnn.gemm.frost.knobs import GemmKnobs
     from cudnn.gemm.frost.tile_config import CATALOG
 
     N, K = _SM120_FP8_PROJECTION
     chain = _dense_fp8_chain(M, N, K)
-    chain = replace(chain, matmul=replace(chain.matmul, a_dtype=dtype, b_dtype=dtype))
+    chain = replace(chain, matmul=replace(chain.matmul, a_dtype=a_dtype, b_dtype=b_dtype))
     device = _rtx5090_device()
     baseline = _sm120_fp8_baseline(M, N, K, device.sm_count)
     assert baseline.pipeline == "sm120" and baseline.cta_tile_m >= 32  # the catalog's auto picks start at 32 rows
@@ -1287,22 +1298,24 @@ def test_sm120_small_m_fp8_split_k_fills_one_wave_on_any_sm_count(sm_count, N, K
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("arch", [120, 121])
 @pytest.mark.parametrize("M", [1, 8, 16])
-def test_sm120_compiler_plans_the_small_m_fp8_tile_through_its_real_gates(monkeypatch, M):
+def test_sm120_compiler_plans_the_small_m_fp8_tile_through_its_real_gates(monkeypatch, arch, M):
     """End to end through the sm120 compiler on an uncalibrated CC 12.x part (device facts pinned to the RTX 5090: 170 SMs, the SM 12.x SMEM
-    opt-in): ``plan_config`` returns the 16-row tile with 4 slices for the projection GEMM, the shortlist is [narrow, the auto pick -- the
-    32x64 tile with its own 2-slice auto split-K], every entry passes the compiler's real support probe, an override-shape graph plans the
-    same, the wide-N GEMMs plan their unsplit auto pick alone, and dynamic shapes bypass the planner and the auto split-K."""
+    opt-in; arch 121 = a CC 12.1 part of the same geometry, which the family gate admits alike): ``plan_config`` returns the 16-row tile with
+    4 slices for the projection GEMM, the shortlist is [narrow, the auto pick -- the 32x64 tile with its own 2-slice auto split-K], every
+    entry passes the compiler's real support probe, an override-shape graph plans the same, the wide-N GEMMs plan their unsplit auto pick
+    alone, and dynamic shapes bypass the planner and the auto split-K."""
     from cudnn.gemm.frost import compiler as facade
     from cudnn.gemm.frost import planning, tile_config
     from cudnn.gemm.frost.sm120 import compiler as C120
 
-    device = _rtx5090_device()
+    device = _cc12x_device(arch)
     monkeypatch.setattr(planning, "current_device_properties", lambda: device)
     monkeypatch.setattr(tile_config, "_sm_count", lambda: device.sm_count)
     monkeypatch.setattr(C120, "_sm_count", lambda: device.sm_count)
-    monkeypatch.setattr(C120, "_current_arch", lambda device=None: 120)
-    monkeypatch.setattr(facade, "_current_arch", lambda device=None: 120)
+    monkeypatch.setattr(C120, "_current_arch", lambda device=None: arch)
+    monkeypatch.setattr(facade, "_current_arch", lambda device=None: arch)
     monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 99 * 1024)
     N, K = _SM120_FP8_PROJECTION
     chain = _dense_fp8_chain(M, N, K)
@@ -1323,3 +1336,83 @@ def test_sm120_compiler_plans_the_small_m_fp8_tile_through_its_real_gates(monkey
         assert plans == [C120._baseline_config(wide)] and plans[0].name == "CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps2x4"
     dynamic = C120.plan_config(chain, dynamic_shapes=True, shapes_fixed=True)
     assert (dynamic.pipeline, dynamic.cta_tile_m, dynamic.split_k_slices) == ("sm120", 32, 1)
+
+
+@pytest.mark.L0
+def test_sm120_small_m_rules_gate_on_the_cc_12_x_family_not_the_exact_sm_version():
+    """Both rules key on ``family_for_arch`` (every SM 12.x -> the sm120 tree) and on ``_calibrated`` (a profile keyed on the exact SM version
+    AND the reported name), so a CC 12.1 part no profile names takes them with exactly the picks a CC 12.0 part gets: the 32-row fp4 tile on
+    the three decode GEMMs and the 16-row fp8 tile on the projection.  A CC 12.1 part reporting the RTX PRO 6000's name is still uncalibrated
+    (its profiles are keyed on SM 12.0), and a CC 10.x part reporting an unknown name never reaches either rule."""
+    from cudnn.gemm.frost import planning
+    from cudnn.gemm.frost.arch_family import family_for_arch
+
+    accept = lambda chain, config: None  # noqa: E731
+    cc120, cc121 = _cc12x_device(120), _cc12x_device(121)
+    assert family_for_arch(121) == "sm120" and not planning._calibrated(cc121)
+    assert not planning._calibrated(replace(cc121, name=_rtx_pro_6000_device().name))
+    for N, K, slices in _SM120_DECODE_GEMMS:
+        chain = _block_scaled_chain(M=8, N=N, K=K, quantized=False)
+        baseline = select_config(8, N, 1, K=K, block_scale=True, sm_count=170, _pipeline="sm120")
+        plans = planning.select_strategies(chain, baseline, device=cc121, shapes_fixed=True, probe=accept)
+        assert plans == planning.select_strategies(chain, baseline, device=cc120, shapes_fixed=True, probe=accept)
+        assert plans == [replace(by_name(planning._SM120_SMALL_M_BLOCK_SCALE_GEOMETRY), split_k_slices=slices), baseline]
+    N, K = _SM120_FP8_PROJECTION
+    chain, baseline = _dense_fp8_chain(8, N, K), _sm120_fp8_baseline(8, N, K)
+    plans = planning.select_strategies(chain, baseline, device=cc121, shapes_fixed=True, probe=accept)
+    assert plans == planning.select_strategies(chain, baseline, device=cc120, shapes_fixed=True, probe=accept)
+    assert plans == [replace(by_name(planning._SM120_SMALL_M_FP8_GEOMETRY), split_k_slices=4), baseline]
+    assert planning._sm120_small_m_fp8_config(chain, baseline, replace(cc121, arch=103), True) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("a_dtype,b_dtype", _SM120_FP8_PAIRS)
+def test_sm120_small_m_fp8_k_floor_is_2048_bytes_per_row(a_dtype, b_dtype):
+    """The depth floor is the sm120 auto split-K's own, in BYTES per row of A (``K x bits(A) < 2048 x 8`` declines): for 8-bit data K = 2047 is
+    the last declining K and K = 2048 the first accepting one (elements = bytes; operand alignment is the probe's business, not the rule's).
+    At K = 2048 the projection still takes 4 slices (32 K tiles of 64 elements), and the compiler's own auto split-K flips at the same K."""
+    from cudnn.gemm.frost import planning
+    from cudnn.gemm.frost.sm120 import compiler as C120
+
+    assert planning._SM120_SMALL_M_FP8_MIN_K_BYTES == 2048
+    accept = lambda chain, config: None  # noqa: E731
+    device = _rtx5090_device()
+    N = _SM120_FP8_PROJECTION[0]
+    for K, slices in ((2047, 0), (2048, 4)):
+        chain = _dense_fp8_chain(8, N, K)
+        chain = replace(chain, matmul=replace(chain.matmul, a_dtype=a_dtype, b_dtype=b_dtype))
+        baseline = _sm120_fp8_baseline(8, N, K)
+        assert baseline.split_k_slices == 1
+        config = planning._sm120_small_m_fp8_config(chain, baseline, device, True)
+        assert _fp8_rule_slices(N, K, device.sm_count) == slices
+        # the compiler's own auto split-K flips at the same K: on a tile whose 80 output tiles underfill the 170 SMs it splits K = 2048 in two
+        # (16 K tiles of 128 bytes, one wave) and leaves K = 2047 unsplit (below its 2048-byte floor)
+        underfilled = by_name("CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4")
+        assert C120._auto_split_k(chain, underfilled, sm_count=device.sm_count).split_k_slices == (1 if slices == 0 else 2)
+        if slices == 0:
+            assert config is None
+            assert planning.select_strategies(chain, baseline, device=device, shapes_fixed=True, probe=accept) == [baseline]
+        else:
+            assert config == replace(by_name(planning._SM120_SMALL_M_FP8_GEOMETRY), split_k_slices=slices)
+            assert planning.select_strategies(chain, baseline, device=device, shapes_fixed=True, probe=accept) == [config, baseline]
+
+
+@pytest.mark.L0
+def test_sm120_small_m_fp8_override_shape_hedge_flips_at_48_weight_tiles():
+    """An override-shape graph takes the block-scale rule's weight-grid hedge at the same constant: 48 weight tiles (N = 6144) pass it and
+    plan the 16-row tile with 2 slices (170 // 48 = 3 -> the power of two below), 49 weight tiles (N = 6145: the ceil-div boundary) decline
+    it and keep the auto pick -- and take the same 2-slice plan once the shapes are fixed."""
+    from cudnn.gemm.frost import planning
+
+    assert planning._SMALL_M_WIDE_TILE_MAX_WEIGHT_TILES == 48
+    accept = lambda chain, config: None  # noqa: E731
+    device = _rtx5090_device()
+    K = _SM120_FP8_PROJECTION[1]
+    narrow = replace(by_name(planning._SM120_SMALL_M_FP8_GEOMETRY), split_k_slices=2)
+    for N, weight_tiles, unfixed_takes_it in ((6144, 48, True), (6145, 49, False)):
+        assert -(-N // 128) == weight_tiles
+        chain, baseline = _dense_fp8_chain(8, N, K), _sm120_fp8_baseline(8, N, K)
+        assert planning._sm120_small_m_fp8_config(chain, baseline, device, False) == (narrow if unfixed_takes_it else None)
+        unfixed = planning.select_strategies(chain, baseline, device=device, shapes_fixed=False, probe=accept)
+        assert unfixed == ([narrow, baseline] if unfixed_takes_it else [baseline])
+        assert planning.select_strategies(chain, baseline, device=device, shapes_fixed=True, probe=accept) == [narrow, baseline]
