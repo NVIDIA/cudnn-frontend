@@ -9,13 +9,11 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
-    _require_mxfp4_indexer,
+    _require_sm100_indexer,
     dsa_init,
-    expand_mxfp8_scale,
+    make_random_indexer_input,
     make_random_mxfp4,
-    make_random_mxfp8_scale,
     pack_mxfp8_scales_thd,
-    quantize_mxfp8,
     with_dsa_score_recompute_params,
 )
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
@@ -176,42 +174,6 @@ def _allocate(cfg, score_type: str):
         return q, k, weights
     lse = torch.randn(b, s_q, h_kv * qhpkv, dtype=torch.float32, device=device)
     return q, k, lse
-
-
-def _allocate_mxfp8_qk(cfg, scale_utils):
-    b = cfg["b"]
-    s_q = cfg["s_q"]
-    s_k = cfg["s_kv"]
-    d = cfg["head_dim"]
-    qhpkv = cfg["qhead_per_kv_head"]
-    h_kv = cfg["h_kv"]
-    h_q = h_kv * qhpkv
-    sf_groups = (d + 31) // 32
-    device = "cuda"
-
-    q_ref = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
-    k_ref = torch.randn(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
-    q_scale_logical = make_random_mxfp8_scale(
-        (b, s_q, h_q, sf_groups),
-        device=device,
-        seed=201,
-        exponent_min=-2,
-        exponent_max=3,
-    )
-    k_scale_logical = make_random_mxfp8_scale(
-        (b, s_k, h_kv, sf_groups),
-        device=device,
-        seed=203,
-        exponent_min=-2,
-        exponent_max=3,
-    )
-    q = quantize_mxfp8(q_ref, q_scale_logical)
-    k = quantize_mxfp8(k_ref, k_scale_logical)
-    q_deq = q.float() * expand_mxfp8_scale(q_scale_logical, d)
-    k_deq = k.float() * expand_mxfp8_scale(k_scale_logical, d)
-    q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=qhpkv)
-    k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
-    return q, k, q_deq, k_deq, q_scale, k_scale
 
 
 def _dense_attn_lse(q, k, softmax_scale):
@@ -687,381 +649,138 @@ def test_DSA_dense_score_recompute_wrapper(
             )
 
 
-@pytest.mark.parametrize(
-    "score_type,qhead_per_kv_head,s_q_default,head_dim,s_kv_default",
-    [
-        pytest.param("indexer", 64, 128, 128, 128, marks=pytest.mark.L0, id="indexer_qh64"),
-        pytest.param("attention", 64, 128, 128, 128, marks=pytest.mark.L0, id="attention_qh64"),
-        pytest.param("indexer", 32, 5, 128, 128, marks=pytest.mark.L0, id="indexer_qh32_query_tail"),
-        # One query token per 128-row tile (H128), at both head dims; D512 streams four 128-wide K chunks.
-        pytest.param("attention", 128, 37, 128, 200, marks=pytest.mark.L0, id="attention_qh128_key_tail"),
-        pytest.param("attention", 128, 64, 512, 300, marks=pytest.mark.L0, id="attention_d512_qh128"),
-        # More tiles than SMs: persistent CTAs carry the accumulator / scale / LSE ring phases across tiles.
-        pytest.param("attention", 128, 600, 512, 160, marks=pytest.mark.L1, id="attention_d512_qh128_persistent"),
-    ],
-)
+def _with_precisions(precisions, cases):
+    """Cross ``precisions`` with ``cases`` (each a ``pytest.param`` whose first value is the score type); the dense attention
+    score has no MXFP4 kernel."""
+    return [
+        pytest.param(precision, *case.values, marks=case.marks, id=f"{case.id}-{precision}")
+        for case in cases
+        for precision in precisions
+        if not (case.values[0] == "attention" and precision == "mxfp4")
+    ]
+
+
 @torch_fork_set_rng(seed=13)
-def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
-    score_type,
-    qhead_per_kv_head,
-    s_q_default,
-    head_dim,
-    s_kv_default,
-    request,
-):
-    """Compare MXFP8 score recompute with a dequantized reference."""
-    try:
-        from cudnn import DSA
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-
-    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
-
-    cfg = dsa_init(
-        request=request,
-        head_dim=head_dim,
-        qhead_per_kv_head=qhead_per_kv_head,
-        score_type=score_type,
-        min_compute_capability=100,
-        b_default=1,
-        s_q_default=s_q_default,
-        s_kv_default=s_kv_default,
-    )
-    ratio = 4
-    q, k, q_deq, k_deq, q_scale, k_scale = _allocate_mxfp8_qk(cfg, scale_utils)
-    q_causal_offsets = torch.full((cfg["b"],), 16, dtype=torch.int32, device=q.device)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    if score_type == "indexer":
-        aux = (
-            torch.randn(
-                cfg["b"],
-                cfg["s_q"],
-                cfg["h_kv"] * cfg["qhead_per_kv_head"],
-                dtype=torch.bfloat16,
-                device="cuda",
-            ).abs()
-            * 0.1
-        )
-        result = DSA.dense_indexer_score_recompute_wrapper(
-            q,
-            k,
-            aux,
-            qhead_per_kv_head=cfg["qhead_per_kv_head"],
-            ratio=ratio,
-            q_causal_offsets=q_causal_offsets,
-            precision="mxfp8",
-            q_scale=q_scale,
-            k_scale=k_scale,
-            stream=stream,
-        )
-        check_ref_dense_score_recompute(
-            "indexer",
-            q_deq,
-            k_deq,
-            aux,
-            result["out"],
-            result["denom"],
-            ratio=ratio,
-            q_causal_offsets=q_causal_offsets,
-            atol_scores=5e-3,
-            rtol_scores=5e-3,
-            atol_denom=5e-3,
-            rtol_denom=5e-3,
-        )
-    else:
-        softmax_scale = 1.0 / math.sqrt(cfg["head_dim"])
-        aux = _dense_attn_lse(q_deq, k_deq, softmax_scale)
-        result = DSA.dense_attn_score_recompute_wrapper(
-            q,
-            k,
-            aux,
-            softmax_scale,
-            qhead_per_kv_head=cfg["qhead_per_kv_head"],
-            ratio=ratio,
-            q_causal_offsets=q_causal_offsets,
-            precision="mxfp8",
-            q_scale=q_scale,
-            k_scale=k_scale,
-            stream=stream,
-        )
-        check_ref_dense_score_recompute(
-            "attention",
-            q_deq,
-            k_deq,
-            aux,
-            result["out"],
-            result["denom"],
-            softmax_scale=softmax_scale,
-            ratio=ratio,
-            q_causal_offsets=q_causal_offsets,
-            atol_scores=5e-3,
-            rtol_scores=5e-3,
-            atol_denom=5e-3,
-            rtol_denom=5e-3,
-        )
-
-
-@pytest.mark.L0
 @pytest.mark.parametrize(
-    "score_type,head_dim,h_q",
-    [
-        pytest.param("indexer", 128, 64, id="indexer_d128"),
-        pytest.param("attention", 128, 64, id="attention_d128"),
-        pytest.param("attention", 512, 64, id="attention_d512"),
-        pytest.param("attention", 512, 128, id="attention_d512_qh128"),
-    ],
+    "precision,score_type,qhead_per_kv_head,b,s_q,s_k,head_dim,ratio,offsets",
+    _with_precisions(
+        ("bf16", "mxfp8", "mxfp4"),
+        [
+            pytest.param("indexer", 64, 1, 128, 128, 128, 4, (16,), marks=pytest.mark.L0, id="indexer_qh64"),
+            pytest.param("indexer", 32, 1, 5, 128, 128, 4, (16,), marks=pytest.mark.L0, id="indexer_qh32_query_tail"),
+            # Two batches exercise the packed-scale L index; batch 0 reaches the S_k=200 key tail (one full and one partial KV block).
+            pytest.param("indexer", 64, 2, 64, 200, 128, 1, (136, 100), marks=pytest.mark.L1, id="indexer_qh64_ratio1_b2_key_tail"),
+            # Batch 0's ratio-causal limit (up to 264) exceeds S_k=200, so the KV length bounds its rows.
+            pytest.param("indexer", 64, 2, 64, 200, 128, 1, (200, 136), marks=pytest.mark.L1, id="indexer_qh64_ratio1_b2_kv_clamp"),
+            # Three KV blocks per tile rotate the accumulator and K-scale TMEM slots.
+            pytest.param("indexer", 32, 1, 40, 384, 128, 4, (1496,), marks=pytest.mark.L1, id="indexer_qh32_ratio4_three_kv_blocks"),
+            pytest.param("indexer", 32, 1, 40, 320, 128, 1, (280,), marks=pytest.mark.L0, id="indexer_qh32_ratio1_three_kv_blocks"),
+            # More query tiles than SMs, each with 6..8 KV blocks: persistent CTAs carry the ring phases across tiles.
+            pytest.param("indexer", 64, 1, 1024, 1024, 128, 4, (3072,), marks=pytest.mark.L0, id="indexer_qh64_ratio4_persistent"),
+            pytest.param("attention", 64, 1, 128, 128, 128, 4, (16,), marks=pytest.mark.L0, id="attention_qh64"),
+            # One query token per 128-row tile (H128), at both head dims; D512 streams four 128-wide K chunks.
+            pytest.param("attention", 128, 1, 37, 200, 128, 4, (16,), marks=pytest.mark.L0, id="attention_qh128_key_tail"),
+            # Two queries per tile, more tiles than SMs, and a ratio-causal limit past S_k=300.
+            pytest.param("attention", 64, 1, 1200, 300, 128, 4, (16,), marks=pytest.mark.L1, id="attention_qh64_persistent_kv_clamp"),
+            pytest.param("attention", 128, 1, 64, 300, 512, 4, (16,), marks=pytest.mark.L0, id="attention_d512_qh128"),
+            # More tiles than SMs: persistent CTAs carry the accumulator / scale / LSE ring phases across tiles.
+            pytest.param("attention", 128, 1, 600, 160, 512, 4, (16,), marks=pytest.mark.L1, id="attention_d512_qh128_persistent"),
+        ],
+    ),
 )
-@torch_fork_set_rng(seed=23)
-def test_DSA_dense_score_recompute_wrapper_thd_mxfp8_compact_padded_scales(
-    score_type,
-    head_dim,
-    h_q,
-):
-    try:
-        from cudnn import DSA
-        from cuda.bindings import driver as cuda
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
-
-    from cudnn.tensor_adapter import has_tcgen05
-
-    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
-        pytest.skip("THD MXFP8 dense score recompute requires SM100+")
-
-    device = torch.device("cuda")
-    shapes = [(127, 32), (129, 64)]
-    ratio, h_kv, d = 4, 1, head_dim
-    q_lengths = [s_q for s_q, _ in shapes]
-    k_lengths = [s_k for _, s_k in shapes]
-    cu_q = torch.tensor(
-        [0, *torch.tensor(q_lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=device,
-    )
-    cu_k = torch.tensor(
-        [0, *torch.tensor(k_lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=device,
-    )
-    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    max_q, max_k = max(q_lengths), max(k_lengths)
-
-    q_ref = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
-    k_ref = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
-    q_scale_logical = make_random_mxfp8_scale(
-        (total_q, h_q, d // 32),
-        device=device,
-        seed=211,
-        exponent_min=-2,
-        exponent_max=3,
-    )
-    k_scale_logical = make_random_mxfp8_scale(
-        (total_k, h_kv, d // 32),
-        device=device,
-        seed=223,
-        exponent_min=-2,
-        exponent_max=3,
-    )
-    q = quantize_mxfp8(q_ref, q_scale_logical)
-    k = quantize_mxfp8(k_ref, k_scale_logical)
-    q_deq = q.float() * expand_mxfp8_scale(q_scale_logical, d)
-    k_deq = k.float() * expand_mxfp8_scale(k_scale_logical, d)
-    q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(
-        q_scale_logical,
-        k_scale_logical,
-        cu_q,
-        cu_k,
-        h_q // h_kv,
-        q_alignment=256,
-        k_alignment=256,
-    )
-    expected_scale_prefix = torch.tensor(
-        [0, 256, 512],
-        dtype=torch.int32,
-        device=device,
-    )
-    assert torch.equal(cu_q_scale, expected_scale_prefix)
-    assert torch.equal(cu_k_scale, expected_scale_prefix)
-    q_causal_offsets = torch.tensor([1, 17], dtype=torch.int32, device=device)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    if score_type == "indexer":
-        aux = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
-        result = DSA.dense_indexer_score_recompute_wrapper(
-            q,
-            k,
-            aux,
-            qhead_per_kv_head=h_q // h_kv,
-            ratio=ratio,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=max_q,
-            max_seqlen_k=max_k,
-            q_causal_offsets=q_causal_offsets,
-            precision="mxfp8",
-            q_scale=q_scale,
-            k_scale=k_scale,
-            cu_seqlens_q_scale_padded=cu_q_scale,
-            cu_seqlens_k_scale_padded=cu_k_scale,
-            stream=stream,
-        )
-        softmax_scale = None
-    else:
-        softmax_scale = 1.0 / math.sqrt(d)
-        lse_parts = []
-        cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
-        for batch in range(len(shapes)):
-            q0, q1 = cu_q_host[batch : batch + 2]
-            k0, k1 = cu_k_host[batch : batch + 2]
-            lse_parts.append(
-                _dense_attn_lse(
-                    q_deq[q0:q1].unsqueeze(0),
-                    k_deq[k0:k1].unsqueeze(0),
-                    softmax_scale,
-                ).squeeze(0)
-            )
-        aux = torch.cat(lse_parts, dim=0).contiguous()
-        result = DSA.dense_attn_score_recompute_wrapper(
-            q,
-            k,
-            aux,
-            softmax_scale,
-            qhead_per_kv_head=h_q // h_kv,
-            ratio=ratio,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=max_q,
-            max_seqlen_k=max_k,
-            q_causal_offsets=q_causal_offsets,
-            precision="mxfp8",
-            q_scale=q_scale,
-            k_scale=k_scale,
-            cu_seqlens_q_scale_padded=cu_q_scale,
-            cu_seqlens_k_scale_padded=cu_k_scale,
-            stream=stream,
-        )
-    torch.cuda.synchronize()
-
-    assert result["out"].shape == (total_q, max_k)
-    assert result["denom"].shape == (total_q,)
-    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
-    for batch, (_, s_k) in enumerate(shapes):
-        q0, q1 = cu_q_host[batch : batch + 2]
-        k0, k1 = cu_k_host[batch : batch + 2]
-        check_ref_dense_score_recompute(
-            score_type,
-            q_deq[q0:q1].unsqueeze(0),
-            k_deq[k0:k1].unsqueeze(0),
-            aux[q0:q1].unsqueeze(0),
-            result["out"][q0:q1, :s_k].unsqueeze(0),
-            result["denom"][q0:q1].unsqueeze(0),
-            softmax_scale=softmax_scale,
-            ratio=ratio,
-            q_causal_offsets=q_causal_offsets[batch : batch + 1],
-            atol_scores=5e-3,
-            rtol_scores=5e-3,
-            atol_denom=5e-3,
-            rtol_denom=5e-3,
-        )
-
-
-@pytest.mark.parametrize(
-    "h_q,b,s_q,s_k,ratio,offsets",
-    [
-        pytest.param(64, 1, 128, 128, 4, (16,), marks=pytest.mark.L0, id="qh64_ratio4"),
-        pytest.param(32, 1, 5, 128, 4, (16,), marks=pytest.mark.L0, id="qh32_query_tail"),
-        # Two batches exercise the packed-scale L index; batch 0 reaches the S_k=200 key tail (one full and one partial KV block).
-        pytest.param(64, 2, 64, 200, 1, (136, 100), marks=pytest.mark.L1, id="qh64_ratio1_b2_key_tail"),
-        # Batch 0's ratio-causal limit (up to 264) exceeds S_k=200, so the KV length bounds its rows.
-        pytest.param(64, 2, 64, 200, 1, (200, 136), marks=pytest.mark.L1, id="qh64_ratio1_b2_kv_clamp"),
-        # Three KV blocks per tile rotate the accumulator and K-scale TMEM slots on the direct-PTX (ratio 4) and CuTe GEMM (ratio 1)
-        # paths; the CuTe GEMM path selects each 64-wide MMA's scale pair by K phase.
-        pytest.param(32, 1, 40, 384, 4, (1496,), marks=pytest.mark.L1, id="qh32_ratio4_three_kv_blocks"),
-        pytest.param(32, 1, 40, 320, 1, (280,), marks=pytest.mark.L0, id="qh32_ratio1_three_kv_blocks"),
-        # More query tiles than SMs, each with 6..8 KV blocks: persistent CTAs carry TMEM slot phases across tiles, and the
-        # eight-stage dense-LSE K pipeline (two stages per KV block) wraps within every tile.
-        pytest.param(64, 1, 1024, 1024, 4, (3072,), marks=pytest.mark.L0, id="qh64_ratio4_persistent_kv_stage_wrap"),
-    ],
-)
-@torch_fork_set_rng(seed=31)
-def test_DSA_dense_indexer_score_recompute_wrapper_mxfp4_matches_dequant_reference(h_q, b, s_q, s_k, ratio, offsets):
-    """MXFP4 dense indexer scores and LSE match an FP32 reference on dequantized inputs; signed weights pin the ReLU before weighting."""
+def test_DSA_dense_score_recompute_wrapper_matches_dequant_reference(precision, score_type, qhead_per_kv_head, b, s_q, s_k, head_dim, ratio, offsets):
+    """SM100 BF16 / MXFP8 / MXFP4 dense indexer and attention scores and denominators match an FP32 reference on the
+    (dequantized) inputs; signed indexer weights pin the ReLU before weighting."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
-    _require_mxfp4_indexer()
+    _require_sm100_indexer(precision)
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
     device = "cuda"
-    d = 128
-    q, q_deq, q_scale_logical = make_random_mxfp4((b, s_q, h_q, d), device="cuda", seed=301)
-    k, k_deq, k_scale_logical = make_random_mxfp4((b, s_k, 1, d), device="cuda", seed=303)
-    weights = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device) * 0.1
+    h_q = qhead_per_kv_head
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (b, s_q, h_q, head_dim), device=device, seed=301)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (b, s_k, 1, head_dim), device=device, seed=303)
     q_causal_offsets = torch.tensor([offsets[i % len(offsets)] for i in range(b)], dtype=torch.int32, device=device)
-
-    result = DSA.dense_indexer_score_recompute_wrapper(
-        q,
-        k,
-        weights,
+    common = dict(
         qhead_per_kv_head=h_q,
         ratio=ratio,
         q_causal_offsets=q_causal_offsets,
-        precision="mxfp4",
-        q_scale=scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q),
-        k_scale=scale_utils.pack_k_scale_bshd(k_scale_logical),
+        precision=precision,
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
+    if precision != "bf16":
+        common.update(
+            q_scale=scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q),
+            k_scale=scale_utils.pack_k_scale_bshd(k_scale_logical),
+        )
+
+    if score_type == "indexer":
+        softmax_scale = None
+        aux = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device) * 0.1
+        result = DSA.dense_indexer_score_recompute_wrapper(q, k, aux, **common)
+    else:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+        aux = _dense_attn_lse(q_deq, k_deq, softmax_scale)
+        result = DSA.dense_attn_score_recompute_wrapper(q, k, aux, softmax_scale, **common)
     torch.cuda.synchronize()
 
     assert result["out"].shape == (b, s_q, s_k)
+    tol = 1e-3 if score_type == "indexer" else 5e-3
     check_ref_dense_score_recompute(
-        "indexer",
+        score_type,
         q_deq,
         k_deq,
-        weights,
+        aux,
         result["out"],
         result["denom"],
+        softmax_scale=softmax_scale,
         ratio=ratio,
         q_causal_offsets=q_causal_offsets,
-        atol_scores=1e-3,
-        rtol_scores=1e-3,
-        atol_denom=1e-3,
-        rtol_denom=1e-3,
+        atol_scores=tol,
+        rtol_scores=tol,
+        atol_denom=tol,
+        rtol_denom=tol,
     )
 
 
 @torch_fork_set_rng(seed=37)
 @pytest.mark.parametrize(
-    "h_q,shapes,offsets,q_alignment",
-    [
-        # Segment 0's ratio-causal limit (up to 47) exceeds its 32 keys.
-        pytest.param(64, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L0, id="qh64_kv_clamp"),
-        pytest.param(32, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L1, id="qh32_kv_clamp"),
-        # The packer's minimal Q alignment puts segment 1's scale prefix at a token offset that is not a multiple of 128.
-        pytest.param(64, [(63, 32), (129, 64)], (1, 17), None, marks=pytest.mark.L1, id="qh64_tight_q_alignment"),
-        pytest.param(32, [(61, 32), (129, 64)], (1, 17), None, marks=pytest.mark.L0, id="qh32_tight_q_alignment"),
-    ],
+    "precision,score_type,head_dim,h_q,shapes,offsets,q_alignment",
+    _with_precisions(
+        ("mxfp8", "mxfp4"),
+        [
+            # Segment 0's ratio-causal limit (up to 47) exceeds its 32 keys.
+            pytest.param("indexer", 128, 64, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L0, id="indexer_qh64_kv_clamp"),
+            pytest.param("indexer", 128, 32, [(127, 32), (129, 64)], (64, 17), 256, marks=pytest.mark.L1, id="indexer_qh32_kv_clamp"),
+            # The packer's minimal Q alignment puts segment 1's scale prefix at a token offset that is not a multiple of 128.
+            pytest.param("indexer", 128, 64, [(63, 32), (129, 64)], (1, 17), None, marks=pytest.mark.L1, id="indexer_qh64_tight_q_alignment"),
+            pytest.param("indexer", 128, 32, [(61, 32), (129, 64)], (1, 17), None, marks=pytest.mark.L0, id="indexer_qh32_tight_q_alignment"),
+            pytest.param("attention", 128, 64, [(127, 32), (129, 64)], (1, 17), 256, marks=pytest.mark.L0, id="attention_d128"),
+            pytest.param("attention", 512, 64, [(127, 32), (129, 64)], (1, 17), 256, marks=pytest.mark.L0, id="attention_d512"),
+            pytest.param("attention", 512, 128, [(127, 32), (129, 64)], (1, 17), 256, marks=pytest.mark.L0, id="attention_d512_qh128"),
+        ],
+    ),
 )
-def test_DSA_dense_indexer_score_recompute_wrapper_thd_mxfp4_compact_padded_scales(h_q, shapes, offsets, q_alignment):
-    """THD MXFP4 dense indexer scores and LSE match the per-segment reference through compact padded scale prefixes."""
+def test_DSA_dense_score_recompute_wrapper_thd_block_scaled_compact_padded_scales(precision, score_type, head_dim, h_q, shapes, offsets, q_alignment):
+    """THD MXFP8 / MXFP4 dense indexer and attention scores and denominators match the per-segment reference through
+    compact padded scale prefixes; columns past a segment's own keys stay -inf."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     cuda = pytest.importorskip("cuda.bindings.driver", reason="Environment not supported: cudnn[cutedsl] not installed")
-    _require_mxfp4_indexer()
+    _require_sm100_indexer(precision)
 
     device = torch.device("cuda")
-    ratio, d = 4, 128
+    ratio = 4
     q_lengths = [s_q for s_q, _ in shapes]
     k_lengths = [s_k for _, s_k in shapes]
     cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
     cu_k = torch.tensor([0, *torch.tensor(k_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
     max_q, max_k = max(q_lengths), max(k_lengths)
+    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
 
-    q, q_deq, q_scale_logical = make_random_mxfp4((total_q, h_q, d), device="cuda", seed=311)
-    k, k_deq, k_scale_logical = make_random_mxfp4((total_k, 1, d), device="cuda", seed=313)
-    weights = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device) * 0.1
+    q, q_deq, q_scale_logical = make_random_indexer_input(precision, (total_q, h_q, head_dim), device=device, seed=311)
+    k, k_deq, k_scale_logical = make_random_indexer_input(precision, (total_k, 1, head_dim), device=device, seed=313)
     q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(
         q_scale_logical,
         k_scale_logical,
@@ -1072,11 +791,7 @@ def test_DSA_dense_indexer_score_recompute_wrapper_thd_mxfp4_compact_padded_scal
         k_alignment=256,
     )
     q_causal_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
-
-    result = DSA.dense_indexer_score_recompute_wrapper(
-        q,
-        k,
-        weights,
+    common = dict(
         qhead_per_kv_head=h_q,
         ratio=ratio,
         cu_seqlens_q=cu_q,
@@ -1084,85 +799,116 @@ def test_DSA_dense_indexer_score_recompute_wrapper_thd_mxfp4_compact_padded_scal
         max_seqlen_q=max_q,
         max_seqlen_k=max_k,
         q_causal_offsets=q_causal_offsets,
-        precision="mxfp4",
+        precision=precision,
         q_scale=q_scale,
         k_scale=k_scale,
         cu_seqlens_q_scale_padded=cu_q_scale,
         cu_seqlens_k_scale_padded=cu_k_scale,
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
+
+    if score_type == "indexer":
+        softmax_scale = None
+        aux = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device) * 0.1
+        result = DSA.dense_indexer_score_recompute_wrapper(q, k, aux, **common)
+    else:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+        segments = zip(zip(cu_q_host, cu_q_host[1:]), zip(cu_k_host, cu_k_host[1:]))
+        aux = torch.cat([_dense_attn_lse(q_deq[q0:q1].unsqueeze(0), k_deq[k0:k1].unsqueeze(0), softmax_scale).squeeze(0) for (q0, q1), (k0, k1) in segments])
+        result = DSA.dense_attn_score_recompute_wrapper(q, k, aux, softmax_scale, **common)
     torch.cuda.synchronize()
 
     assert result["out"].shape == (total_q, max_k)
     assert result["denom"].shape == (total_q,)
-    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
+    tol = 1e-3 if score_type == "indexer" else 5e-3
     for batch, (_, s_k) in enumerate(shapes):
         q0, q1 = cu_q_host[batch : batch + 2]
         k0, k1 = cu_k_host[batch : batch + 2]
         # Columns past a segment's own keys are padding and stay -inf.
         assert torch.isneginf(result["out"][q0:q1, s_k:]).all()
         check_ref_dense_score_recompute(
-            "indexer",
+            score_type,
             q_deq[q0:q1].unsqueeze(0),
             k_deq[k0:k1].unsqueeze(0),
-            weights[q0:q1].unsqueeze(0),
+            aux[q0:q1].unsqueeze(0),
             result["out"][q0:q1, :s_k].unsqueeze(0),
             result["denom"][q0:q1].unsqueeze(0),
+            softmax_scale=softmax_scale,
             ratio=ratio,
             q_causal_offsets=q_causal_offsets[batch : batch + 1],
-            atol_scores=1e-3,
-            rtol_scores=1e-3,
-            atol_denom=1e-3,
-            rtol_denom=1e-3,
+            atol_scores=tol,
+            rtol_scores=tol,
+            atol_denom=tol,
+            rtol_denom=tol,
         )
 
 
 @pytest.mark.L0
-def test_DSA_dense_score_recompute_wrapper_mxfp4_rejects_mismatched_inputs():
-    """MXFP4 dense indexer score inputs that break the contract are refused on the host; the dense attention score declines MXFP4."""
+@pytest.mark.parametrize(
+    "score_type,precision",
+    [("indexer", "mxfp8"), ("indexer", "mxfp4"), ("attention", "mxfp8")],
+    ids=["indexer-mxfp8", "indexer-mxfp4", "attention-mxfp8"],
+)
+def test_DSA_dense_score_recompute_wrapper_block_scaled_rejects_mismatched_inputs(score_type, precision):
+    """Block-scaled dense indexer / attention score inputs that break the contract are refused on the host."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
-    _require_mxfp4_indexer()
+    _require_sm100_indexer(precision)
 
     from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
 
     device = "cuda"
     b, s_q, s_k, h_q, d = 1, 8, 128, 64, 128
-    q, _, q_scale_logical = make_random_mxfp4((b, s_q, h_q, d), device="cuda", seed=1)
-    k, _, k_scale_logical = make_random_mxfp4((b, s_k, 1, d), device="cuda", seed=2)
-    weights = torch.rand(b, s_q, h_q, dtype=torch.bfloat16, device=device)
+    q, _, q_scale_logical = make_random_indexer_input(precision, (b, s_q, h_q, d), device=device, seed=1)
+    k, _, k_scale_logical = make_random_indexer_input(precision, (b, s_k, 1, d), device=device, seed=2)
     q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q)
     k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
-    common = dict(qhead_per_kv_head=h_q, precision="mxfp4", q_scale=q_scale, k_scale=k_scale)
+    common = dict(qhead_per_kv_head=h_q, precision=precision, q_scale=q_scale, k_scale=k_scale)
+    if score_type == "indexer":
+        aux = torch.rand(b, s_q, h_q, dtype=torch.bfloat16, device=device)
+        wrong_aux, aux_error = aux.float(), "weights to be torch.bfloat16"
+
+        def score(q, k, aux, **kwargs):
+            return DSA.dense_indexer_score_recompute_wrapper(q, k, aux, **kwargs)
+
+    else:
+        aux = torch.zeros(b, s_q, h_q, dtype=torch.float32, device=device)
+        wrong_aux, aux_error = aux.bfloat16(), "lse to be torch.float32"
+
+        def score(q, k, aux, **kwargs):
+            return DSA.dense_attn_score_recompute_wrapper(q, k, aux, 1.0, **kwargs)
 
     with pytest.raises(ValueError, match="requires q_scale and k_scale"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, qhead_per_kv_head=h_q, precision="mxfp4")
+        score(q, k, aux, qhead_per_kv_head=h_q, precision=precision)
     with pytest.raises(TypeError, match="q_scale and k_scale"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, **{**common, "q_scale": q_scale.view(torch.uint8)})
+        score(q, k, aux, **{**common, "q_scale": q_scale.view(torch.uint8)})
     with pytest.raises(TypeError, match="q and k"):
-        DSA.dense_indexer_score_recompute_wrapper(q.view(torch.uint8), k.view(torch.uint8), weights, **common)
-    with pytest.raises(TypeError, match="weights to be torch.bfloat16"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k, weights.float(), **common)
+        score(q.view(torch.uint8), k.view(torch.uint8), aux, **common)
+    with pytest.raises(TypeError, match=aux_error):
+        score(q, k, wrong_aux, **common)
     with pytest.raises(ValueError, match="sf_vec_size=32"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, sf_vec_size=16, **common)
+        score(q, k, aux, sf_vec_size=16, **common)
     with pytest.raises(ValueError, match="q_scale packed shape"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, **{**common, "q_scale": k_scale})
+        score(q, k, aux, **{**common, "q_scale": k_scale})
+    if precision != "mxfp4":
+        return
+
     # Unpacked E4M3 Q/K under precision='mxfp4' are named as a dtype error, not as a doubled head_dim.
     q8, k8 = (torch.randn(*t.shape[:-1], d, device=device).to(torch.float8_e4m3fn) for t in (q, k))
     with pytest.raises(TypeError, match="q and k"):
-        DSA.dense_indexer_score_recompute_wrapper(q8, k8, weights, **common)
+        score(q8, k8, aux, **common)
     # Packed E2M1 Q/K under precision='mxfp8' are a dtype error as well.
     with pytest.raises(TypeError, match="q and k to be torch.float8_e4m3fn"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k, weights, **{**common, "precision": "mxfp8"})
+        score(q, k, aux, **{**common, "precision": "mxfp8"})
     k_wide = torch.cat([k.view(torch.uint8)] * 2, dim=-1).view(k.dtype)
     with pytest.raises(ValueError, match=r"q last dim \(\d+\) != k last dim"):
-        DSA.dense_indexer_score_recompute_wrapper(q, k_wide, weights, **common)
+        score(q, k_wide, aux, **common)
     # THD reports the same mismatch.
     cu_q = torch.tensor([0, s_q], dtype=torch.int32, device=device)
     cu_k = torch.tensor([0, s_k], dtype=torch.int32, device=device)
     q_scale_thd, k_scale_thd, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(q_scale_logical[0], k_scale_logical[0], cu_q, cu_k, h_q)
     thd = dict(
         qhead_per_kv_head=h_q,
-        precision="mxfp4",
+        precision=precision,
         q_scale=q_scale_thd,
         k_scale=k_scale_thd,
         cu_seqlens_q=cu_q,
@@ -1173,51 +919,20 @@ def test_DSA_dense_score_recompute_wrapper_mxfp4_rejects_mismatched_inputs():
         max_seqlen_k=s_k,
     )
     with pytest.raises(ValueError, match=r"q last dim \(64\) != k last dim \(128\)"):
-        DSA.dense_indexer_score_recompute_wrapper(q[0], k_wide[0], weights[0], **thd)
+        score(q[0], k_wide[0], aux[0], **thd)
     # A last dim of head_dim instead of head_dim // 2 names the packed width.
     q_wide = torch.cat([q.view(torch.uint8)] * 2, dim=-1).view(q.dtype)
     with pytest.raises(ValueError, match="stored as q/k last dim 64"):
-        DSA.dense_indexer_score_recompute_wrapper(q_wide, k_wide, weights, **common)
+        score(q_wide, k_wide, aux, **common)
     # The block-scaled dense indexer score packs 32 or 64 heads per KV head.
-    q16, _, q16_scale_logical = make_random_mxfp4((b, s_q, 16, d), device="cuda", seed=3)
+    q16, _, q16_scale_logical = make_random_mxfp4((b, s_q, 16, d), device=device, seed=3)
     q16_scale = scale_utils.pack_q_scale_bshd(q16_scale_logical, qhead_per_kv_head=16)
     with pytest.raises(ValueError, match="precision='mxfp4' dense indexer requires qhead_per_kv_head=32 or 64"):
-        DSA.dense_indexer_score_recompute_wrapper(q16, k, weights[..., :16], **{**common, "qhead_per_kv_head": 16, "q_scale": q16_scale})
+        score(q16, k, aux[..., :16], **{**common, "qhead_per_kv_head": 16, "q_scale": q16_scale})
     # The dense attention score has no MXFP4 kernel.
     lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device=device)
     with pytest.raises(ValueError, match="precision must be 'bf16' or 'mxfp8', got 'mxfp4'"):
         DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, **common)
-
-
-@pytest.mark.L0
-def test_DSA_dense_attn_score_recompute_wrapper_mxfp8_rejects_mismatched_inputs(request):
-    """MXFP8 dense attention score inputs that break the contract are refused on the host."""
-    DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
-
-    from deepseek_sparse_attention.cutedsl import mxfp8_scale_reference as scale_utils
-
-    cfg = dsa_init(
-        request=request,
-        head_dim=128,
-        qhead_per_kv_head=64,
-        score_type="attention",
-        min_compute_capability=100,
-        b_default=1,
-        s_q_default=8,
-        s_kv_default=128,
-    )
-    q, k, _, _, q_scale, k_scale = _allocate_mxfp8_qk(cfg, scale_utils)
-    lse = torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device)
-    common = dict(qhead_per_kv_head=cfg["qhead_per_kv_head"], precision="mxfp8", q_scale=q_scale, k_scale=k_scale)
-
-    with pytest.raises(ValueError, match="requires q_scale and k_scale"):
-        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, qhead_per_kv_head=cfg["qhead_per_kv_head"], precision="mxfp8")
-    with pytest.raises(TypeError, match="lse to be torch.float32"):
-        DSA.dense_attn_score_recompute_wrapper(q, k, lse.bfloat16(), 1.0, **common)
-    with pytest.raises(ValueError, match="sf_vec_size=32"):
-        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, sf_vec_size=16, **common)
-    with pytest.raises(ValueError, match="q_scale packed shape"):
-        DSA.dense_attn_score_recompute_wrapper(q, k, lse, 1.0, **{**common, "q_scale": k_scale})
 
 
 @pytest.mark.L0
