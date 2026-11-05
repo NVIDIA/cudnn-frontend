@@ -756,14 +756,16 @@ def _render_tile_constants(
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
-        lines.append(f"mainloop_has_index = {any(op.index_expr is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}")
+        lines.append(
+            f"mainloop_needs_coordinates = {any(op.index_expr is not None or op.operand_access is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}"
+        )
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
         # Per-K aux indexing needs ml_L in logical order, not the physical
         # swizzled SMEM address. The K-OOB path already provides that access.
         koob_fix = (
-            any(aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
+            any(aux.coordinate_mapped or aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
             or not _mainloop_chain_zero_preserving(chain.mainloop_a_ops)
             or not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
         )
@@ -2049,6 +2051,8 @@ def _wrap_raw_tensor(t: object) -> object:
 def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     """View a broadcast-aux runtime tensor to the fake's rank/unit-dim layout so the tvm-ffi front door's ndim/shape check accepts it."""
     if not _TVM_FFI_OK:
+        return t
+    if ref.coordinate_mapped:
         return t
     real = _aux_fake_real_axes(ref)
     if len(t.shape) == len(real):
