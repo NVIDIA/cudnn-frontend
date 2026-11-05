@@ -71,7 +71,8 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
   ``SMEM_PER_SM_BYTES`` -- the DEVICE's shared memory per SM, which the host entry reads from the part.
 * ``BA_PREFETCH_CHUNKS``: how many of the 2048-element chunks of the BA projection's ``hidden`` rows (all ``T`` tokens; three chunks at
   hidden 5120) are in flight at once in the BA warpgroup (3 = one load latency, 20 registers per token per chunk; 1 = three latencies, a
-  third of the registers -- the register-capped forms); bounded by the geometry's chunk count (``Cfg.BA_PREFETCH_DEPTH``: 2 at hidden 4096).
+  third of the registers -- the register-capped forms); the domain 1 / 2 / 3 is the register budget's cap, and the geometry's chunk count
+  bounds the depth below it (``Cfg.BA_PREFETCH_DEPTH``: 2 at hidden 4096; at hidden 8192 the fourth chunk streams behind the three in flight).
 * ``NORM_FORM``: the association of the gated norm's sum of squares, which the reference verify kernel fixes by its CTAs-per-head
   policy: ``"ctas2"`` (one request: two 64-row halves of 16 four-row chains each, summed last) or ``"ctas1"`` (sixteen eight-row
   chains); ``None`` = that policy for the compiled requests count.
@@ -446,8 +447,11 @@ def validate_cfg(cfg: Cfg) -> None:
         raise ValueError(
             f"gdn_verify_fused: MIN_CTAS_PER_SM={cfg.MIN_CTAS_PER_SM} (the register cap aims at that many CTAs per SM) contradicts CTAS_PER_SM={cfg.CTAS_PER_SM} (the pad caps the SM at fewer)"
         )
-    if cfg.BA_PREFETCH_CHUNKS not in (1, 2, 3):
-        raise ValueError(f"gdn_verify_fused: BA_PREFETCH_CHUNKS must be 1, 2 or 3, got {cfg.BA_PREFETCH_CHUNKS}")
+    if cfg.BA_PREFETCH_CHUNKS not in (1, 2, 3):  # the register budget's cap (3 chunks x T tokens x 8 words in flight), not the chunk count's: a
+        # geometry with fewer chunks bounds the depth below it (BA_PREFETCH_DEPTH), one with more streams the rest
+        raise ValueError(
+            f"gdn_verify_fused: BA_PREFETCH_CHUNKS must be 1, 2 or 3 (the register budget's cap on the chunks in flight), got {cfg.BA_PREFETCH_CHUNKS}"
+        )
     if cfg.NORM_FORM is not None and cfg.NORM_FORM not in NORM_FORMS:
         raise ValueError(f"gdn_verify_fused: NORM_FORM must be one of {NORM_FORMS} or None (the reference policy per requests), got {cfg.NORM_FORM!r}")
     if cfg.STATE_LOAD_PATH not in STATE_LOAD_PATHS:

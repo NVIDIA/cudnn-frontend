@@ -13,7 +13,8 @@ on the host for both validated parts' readings over several SM counts and on the
 HIDDEN)`` of ``kernel/gdn_geometry.py``) is pinned on the host too: the default geometry's constants and forms unchanged, and for the
 per-rank geometries of the larger dense models (1 K head / 8 V heads / hidden 8192 at 16-way tensor parallelism, 2 / 16 / 8192, 4 / 32 /
 8192, 4 / 16 / 4096) the derived constants, the operand shapes the entry accepts, the per-geometry pick ladder, the entry's forms and keys,
-and the BA partition's coverage of every hidden index."""
+and the BA partition's coverage of every hidden index -- and, on the device, the torch model and determinism per rows, every form family
+bitwise with the one-CTA form, and batch invariance at each of those geometries."""
 
 import math
 from collections import Counter
@@ -382,6 +383,47 @@ def test_decode_ba_partition_covers_every_hidden_index_once(g):
             kk = c * 1024 + t * 8
             seen.update(range(kk, kk + 8))
     assert seen == Counter(range(g.HIDDEN)), g
+
+
+def test_rows_are_bounded_by_the_int32_row_address_headroom_at_wide_geometries():
+    """The kernel forms its row addresses in 32-bit arithmetic: ``check_binding`` declines, by type and naming the geometry, a rows count
+    whose widest row stride overflows 2^31 elements -- below ``MAX_ROWS`` only off the default geometry.  At the default geometry
+    (QKVZ row 16384) the bound is ``MAX_ROWS`` itself; at 16 K / 128 V heads with hidden 8192 and a fused QKVZ view (row 36864) it is 58254."""
+    d = kcfg.DEFAULT_GEOMETRY
+    assert entry.max_rows_for(d.QKV_CHANNELS + d.OUT_ROW, d.QKV_CHANNELS + d.OUT_ROW, d) == entry.MAX_ROWS == 65535
+    wide = gdn_geometry.Geometry(16, 128, 8192)
+    slab = wide.QKV_CHANNELS + wide.OUT_ROW  # 20480 + 16384
+    assert slab == 36864 and entry.max_rows_for(slab, slab, wide) == (2**31 - 1) // 36864 == 58254
+    assert (
+        (2**31 - 1) // wide.QKV_CHANNELS == 104857 > entry.MAX_ROWS == entry.max_rows_for(wide.QKV_CHANNELS, wide.OUT_ROW, wide)
+    ), "contiguous x / z: the grid-Y cap binds first"
+    rows = entry.max_rows_for(slab, slab, wide) + 1
+    ops = make_operands(rows=1, geometry=wide)
+    # the row count claims rows rows of the (one-row) operands: the stride check comes first, so size the strided views to hold them
+    x = torch.empty(rows, slab, dtype=torch.bfloat16)
+    ops.update(
+        rows=rows,
+        x=x[:, : wide.QKV_CHANNELS],
+        z=x[:, wide.QKV_CHANNELS :].view(rows, wide.V_HEADS, 128),
+        idx=torch.ones(rows, dtype=torch.int32),
+        hidden=torch.empty(rows, wide.HIDDEN, dtype=torch.bfloat16),
+    )
+    with pytest.raises(NotImplementedError, match="32-bit arithmetic: at most 58254 rows .* 36864 / 36864 .* hidden 8192; got rows=58255"):
+        entry.check_binding(*_binding_args(ops), geometry=wide)
+    ops["rows"] = rows - 1
+    entry.check_binding(*_binding_args(ops), geometry=wide)  # the bound itself is served
+
+
+def test_geometry_envelope_takes_any_integral_and_holds_plain_ints():
+    """A numpy integer (a config's field) constructs the same Geometry as the Python int; a bool never does; the fields are plain ints."""
+    np = pytest.importorskip("numpy")
+    g = gdn_geometry.Geometry(np.int64(1), np.int32(8), np.int64(8192))
+    assert g == gdn_geometry.Geometry(1, 8, 8192) and hash(g) == hash(gdn_geometry.Geometry(1, 8, 8192))
+    assert all(type(v) is int for v in (g.K_HEADS, g.V_HEADS, g.HIDDEN))
+    assert gdn_geometry.geometry_fields_off(np.int64(1), np.int64(8), np.int64(8192)) == {}
+    with pytest.raises(ValueError, match="K_HEADS must be a positive int"):
+        gdn_geometry.Geometry(True, 8, 8192)
+    assert gdn_geometry.geometry_fields_off(True, 8, 8192) == {"K_HEADS": True}
 
 
 def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
@@ -799,19 +841,25 @@ def _run(k, ops):
 def _reference(ops, eps=1e-6):
     """A plain torch (fp32 / fp64) model of the fused math; the kernel rounds exactly where the serving chain rounds (BA in bf16,
     the conv taps and SiLU in bf16, the core output in bf16, the normed value in bf16), the model's SiLU and transcendental forms
-    are torch's -- so the comparison is loose, a function check, never a bit check."""
+    are torch's -- so the comparison is loose, a function check, never a bit check.  The geometry is read off the operands (the
+    state's V heads, the QKV slab's K heads, the hidden width), so a per-rank cell reuses it."""
     rows = ops["rows"]
     x, cs, cw, al, dt, st, idx, z, w, scale, hid, baw = (ops[k] for k in ("x", "cs", "cw", "al", "dt", "state", "idx", "z", "w", "scale", "hidden", "baw"))
-    out = torch.zeros(rows, 48, 128, dtype=torch.float64, device=x.device)
+    D = gdn_geometry.HEAD_DIM
+    NV, QKV = int(st.shape[1]), int(x.shape[1])
+    NK = (QKV - NV * D) // (2 * D)
+    VK = NV // NK  # V heads per K head: the K head of V head h is h // VK
+    K0, V0 = NK * D, 2 * NK * D  # the first K / V channel of the QKV slab
+    out = torch.zeros(rows, NV, D, dtype=torch.float64, device=x.device)
     state_new = st.clone()
     cs_new = cs.clone()
     for b in range(rows):
         slot = int(idx[b])
         if slot <= 0:
             continue
-        taps = cs[slot].float()  # [10240, 3]
+        taps = cs[slot].float()  # [QKV, 3]
         xb = x[b].float()
-        acc = torch.zeros(10240, dtype=torch.float32, device=x.device)
+        acc = torch.zeros(QKV, dtype=torch.float32, device=x.device)
         for j in range(3):
             acc = acc + (taps[:, j] * cw[:, j].float()).bfloat16().float()
         acc = acc + (xb * cw[:, 3].float()).bfloat16().float()
@@ -819,18 +867,18 @@ def _reference(ops, eps=1e-6):
         cs_new[slot, :, 0] = cs[slot, :, 1]
         cs_new[slot, :, 1] = cs[slot, :, 2]
         cs_new[slot, :, 2] = x[b]
-        for h in range(48):
-            kh = h // 3
+        for h in range(NV):
+            kh = h // VK
             bval = (hid[b].float() @ baw[h].float()).bfloat16().float()
-            aval = (hid[b].float() @ baw[48 + h].float()).bfloat16().float()
+            aval = (hid[b].float() @ baw[NV + h].float()).bfloat16().float()
             av = aval + dt[h].float()
             soft = torch.nn.functional.softplus(av) if float(av) <= 20 else av
             decay = torch.exp(-torch.exp(al[h]) * soft)
             beta = torch.sigmoid(bval)
-            q = conv[kh * 128 : (kh + 1) * 128]
-            k_ = conv[2048 + kh * 128 : 2048 + (kh + 1) * 128]
-            v = conv[4096 + h * 128 : 4096 + (h + 1) * 128]
-            q = q * (128**-0.5 / torch.sqrt((q * q).sum() + 1e-6))
+            q = conv[kh * D : (kh + 1) * D]
+            k_ = conv[K0 + kh * D : K0 + (kh + 1) * D]
+            v = conv[V0 + h * D : V0 + (h + 1) * D]
+            q = q * (D**-0.5 / torch.sqrt((q * q).sum() + 1e-6))
             k_ = k_ / torch.sqrt((k_ * k_).sum() + 1e-6)
             S = st[slot, h].double() * decay.double()
             dot = S @ k_.double()
@@ -1142,3 +1190,110 @@ def test_tap_contiguous_conv_state_layout_is_bitwise_with_the_serving_layout():
         ops_p = dict(ops, cs=ops["cs"].clone(), state=make_operands(rows=4, slots=5, device=dev, seed=31)["state"])
         got = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=kcfg.make_cfg(**arm)), ops_p)
         _assert_bitwise(base, got, f"tap-contiguous conv state, {arm}")  # the values agree layout to layout (compared in one layout)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# the per-rank geometries on the device: the torch model and determinism per rows, every form family bitwise with the one-CTA form on a
+# set with a null row and non-monotone slots, the rows of a step batch-invariant -- the 27B cells above are unchanged (the geometry is
+# the compile key, and the default geometry's renderings are byte-identical to the pre-geometry kernels)
+# ---------------------------------------------------------------------------------------------------------------------------
+RANK_ROWS = [1, 2, 4, 8, 16]
+# the form families (Cfg deltas from the one-CTA form): the three pick forms (pair / capped / streamed), the per-row thread mappings, the
+# register state path, the 128-thread form, the PDL order, the twice-traced tail, the conv-first and store-pipeline issue orders, the
+# no-split and non-resident-K bodies, and the pair with the mappings it is picked with
+RANK_ARMS = [
+    dict(),  # the one-CTA form itself, a second entry
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0),  # = PAIR_CFG: the rows-1 pick (rows x 2 V cluster CTAs)
+    dict(MIN_CTAS_PER_SM=2, CTAS_PER_SM=0),  # = CAPPED_CFG: the beyond-the-grid pick on the cc 10.0 readings
+    dict(STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0),  # = STREAMED_CFG
+    dict(TPR=8),
+    dict(TPR=16),
+    dict(TPR=2),
+    dict(TPR=8, MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+    dict(STATE_LOAD_PATH="ldg128", TPR=8),
+    dict(THREADS=128, TPR=1, WARPGROUP_SPLIT=False, STATE_STREAM=True),
+    dict(PDL=True, PDL_RELEASE=True),
+    dict(SINGLE_TAIL=False),
+    dict(CONV_FIRST=True),
+    dict(STORE_PIPELINE=True),
+    dict(WARPGROUP_SPLIT=False),
+    dict(K_RESIDENT=False),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, TPR=8),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, CONV_FIRST=True, STORE_PIPELINE=True),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, PDL=True, PDL_RELEASE=True),
+]
+
+
+def _rank_operands(g, rows, dev, seed, idx=None):
+    """``make_operands`` at geometry ``g`` on ``dev``; ``idx`` (a slot per row, 0 = a null row) sizes the pools to hold it."""
+    if idx is None:
+        return make_operands(rows=rows, slots=rows + 1, device=dev, seed=seed, geometry=g)
+    return make_operands(rows=rows, slots=max(idx) + 1, device=dev, seed=seed, geometry=g, idx=torch.tensor(idx, dtype=torch.int32, device=dev))
+
+
+@pytest.mark.parametrize("rows", RANK_ROWS)
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_rank_geometry_matches_the_torch_model_and_replays_bitwise(g, rows):
+    """The entry's pick for ``rows`` at a per-rank geometry (the pair, one CTA per SM or the capped form by ``rows x V`` against this
+    part's SM count: the module pick) against the torch model at the default geometry's bands (the function check), the conv history
+    shifted bitwise, the reader tickets back at zero -- and twice on fresh identical operands: byte-identical (fp8 / bf16 outputs, every
+    state slot, the conv pool)."""
+    dev = _device_or_skip()
+    k = entry.GdnDecodeFused(dev, 1e-6, geometry=g)
+    cfg = k.cfg_for(rows)
+    assert cfg.GEOM == g and replace(cfg, **_on(SM100_READING)) == kcfg.default_cfg(rows, k.sm_count, *k.readings, g)
+    ops_a = _rank_operands(g, rows, dev, seed=500 + rows)
+    ops_b = _rank_operands(g, rows, dev, seed=500 + rows)
+    ref_out, ref_state, ref_cs = _reference(ops_a)
+    snap_a = _snapshot(k, ops_a)
+    snap_b = _snapshot(k, ops_b)
+    _assert_bitwise(snap_a, snap_b, f"{_gid(g)} rows {rows}: two identical operand sets")
+    assert torch.equal(ops_a["cs"], ref_cs), "the conv history shifts by one tap for every channel"
+    out = snap_a["out"].view(torch.bfloat16)
+    live = ref_out.abs().max()
+    err = (out.double() - ref_out).abs().max()
+    assert err <= 2e-2 * live + 1e-3, f"out max |err| {err} vs max |ref| {live}"
+    serr = (ops_a["state"][1:].double() - ref_state[1:].double()).abs().max()
+    assert serr <= 1e-3 * ref_state.abs().max() + 1e-5, f"state max |err| {serr}"
+    assert torch.isfinite(snap_a["qout"].view(torch.float8_e4m3fn).float()).all()
+    assert snap_a["qout"].any(), "the fp8 output is written"
+
+
+@pytest.mark.parametrize("arm", RANK_ARMS, ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "one-cta-form")
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form(g, arm):
+    """Every form family this part holds, at a per-rank geometry, writes the bytes of the explicit one-CTA form (``CFG`` at that geometry)
+    on the 4-row set with a null row and non-monotone slots [3, 0, 4, 1]: the fp8 / bf16 outputs, every state slot, the conv pool; the
+    null row zero, the tickets back at zero (at 1 K head per rank, 8 or 16 readers share one K head's conv history per row).  An arm the
+    part's shared memory does not hold is its typed decline at construction, reported as a skip."""
+    dev = _device_or_skip()
+    cfg = kcfg.make_cfg(**arm)
+    try:
+        kcfg.validate_cfg(replace(cfg, GEOM=g, **_on(entry.device_shared_memory(dev))))
+    except ValueError as exc:
+        assert "do not fit the SM" in str(exc), exc
+        with pytest.raises(ValueError, match="do not fit the SM"):
+            entry.GdnDecodeFused(dev, 1e-6, cfg=cfg, geometry=g)
+        pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
+    base = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=kcfg.CFG, geometry=g), _rank_operands(g, 4, dev, seed=31, idx=B4_IDX))
+    got = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=cfg, geometry=g), _rank_operands(g, 4, dev, seed=31, idx=B4_IDX))
+    _assert_bitwise(base, got, f"{_gid(g)} {arm}")
+    assert not got["qout"][1].any() and got["qout"][0].any() and got["qout"][2].any() and got["qout"][3].any(), "the null row is zero, the live rows written"
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_rank_geometry_rows_are_batch_invariant(g):
+    """Batch invariance at a per-rank geometry: every row of a 4-row step (the entry's pick at rows 4, non-monotone slots) writes the
+    bytes it writes alone (rows 1: the pair pick) from the same pools -- its fp8 / bf16 outputs, its state slot, its conv slot -- so a
+    request's result does not depend on which requests share its step."""
+    dev = _device_or_skip()
+    k = entry.GdnDecodeFused(dev, 1e-6, geometry=g)
+    idx = [2, 4, 1, 3]
+    snap4 = _snapshot(k, _rank_operands(g, 4, dev, seed=61, idx=idx))
+    for r in range(4):
+        ops = _rank_operands(g, 4, dev, seed=61, idx=idx)  # the same draws; row r alone, the pools whole (the serving layout's views kept)
+        one = dict(ops, rows=1, x=ops["x"][r : r + 1], z=ops["z"][r : r + 1], hidden=ops["hidden"][r : r + 1], idx=ops["idx"][r : r + 1])
+        snap1 = _snapshot(k, one)
+        assert torch.equal(snap1["qout"][0], snap4["qout"][r]) and torch.equal(snap1["out"][0], snap4["out"][r]), f"{_gid(g)} row {r}: the outputs"
+        assert torch.equal(snap1["state"][idx[r]], snap4["state"][idx[r]]), f"{_gid(g)} row {r}: the state slot"
+        assert torch.equal(_bytes(snap1["cs"][idx[r]]), _bytes(snap4["cs"][idx[r]])), f"{_gid(g)} row {r}: the conv slot"

@@ -17,10 +17,13 @@ is replayed and compared BYTE for byte (fp8 output, bf16 output, every fp32 stat
 (``Geometry(K_HEADS, V_HEADS, HIDDEN)`` of ``kernel/gdn_geometry.py``) is pinned on the host too: the default geometry's constants and
 forms unchanged, and for the per-rank geometries of the larger dense models the derived constants, the pick ladder and token bounds per
 regime, the entry's forms and keys, the operand shapes the entry accepts -- and the BA partition's coverage of every hidden index through
-the kernel's ONE half-chunk predicate, with the stale "last chunk is the half chunk" form shown to drop 1024 inputs at hidden 8192."""
+the kernel's ONE half-chunk predicate, with the stale "last chunk is the half chunk" form shown to drop 1024 inputs at hidden 8192 -- and, on
+the device, the torch reference and determinism per step shape, every form family bitwise with the one-CTA form, and batch invariance at
+each of those geometries."""
 
 import importlib.util
 import os
+import re
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -603,12 +606,10 @@ def test_verify_kernel_reads_the_one_half_chunk_predicate_at_every_ba_site():
     src = Path(spec.origin).read_text()
     assert "BA_CHUNKS - 1" not in src and "BA_CHUNKS -1" not in src
     assert src.count("ba_verify_half_live(") >= 5, src.count("ba_verify_half_live(")
-    body = src.split('"""', 2)[2]  # past the module docstring
+    imports = src[src.index("from .gdn_verify_fused_config import (") :]
+    imports = imports[: imports.index(")")]  # the kernel's one import block from its config
     for name in ("HIDDEN", "V_HEADS", "QKV_CHANNELS", "K_CHANNEL0", "V_CHANNEL0", "OUT_ROW", "BA_CHUNKS"):
-        bare = [
-            ln for ln in body.splitlines() if name in ln and "GEOM" not in ln and ("import" in ln or f" {name}" in ln.split("#")[0] and f".{name}" not in ln)
-        ]
-        assert not [ln for ln in bare if "import" in ln], (name, bare)
+        assert not re.search(rf"\b{name}\b", imports), f"the kernel imports the default geometry's {name}; every geometry fact reaches it through cfg.GEOM"
 
 
 def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
@@ -1159,18 +1160,18 @@ def _part_form(dev, forms):
     return kcfg.first_fitting(forms, *entry.device_shared_memory(dev))
 
 
-def _fits_or_declines(dev, cfg, tokens):
+def _fits_or_declines(dev, cfg, tokens, geometry=None):
     """``cfg`` stamped with this part's readings when it holds ``tokens`` per request; else the typed decline is asserted (a form whose
     shared memory the part does not hold at the minimum token count is validate_cfg's ValueError at construction, one that holds too few
     tokens is validate_tokens' NotImplementedError at the call) and the cell is SKIPPED with that reason -- the count then shows which
     arms ran on the part (every arm on the cc 10.0 readings; 17 of 43 on the cc 12.0 ones), and an unheld arm is never a launch."""
-    on_part = replace(cfg, **_on(entry.device_shared_memory(dev)))
+    on_part = replace(cfg, **_on(entry.device_shared_memory(dev)), **({} if geometry is None else dict(GEOM=geometry)))
     try:
         kcfg.validate_cfg(on_part)
     except ValueError as exc:
         assert "does not fit" in str(exc), exc
         with pytest.raises(ValueError, match="does not fit"):
-            entry.GdnVerifyFused(dev, 1e-6, cfg=cfg)
+            entry.GdnVerifyFused(dev, 1e-6, cfg=cfg, geometry=geometry)
         pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
     if tokens > on_part.max_tokens():
         with pytest.raises(NotImplementedError, match=f"at most {on_part.max_tokens()} on this part"):
@@ -1182,7 +1183,7 @@ def _fits_or_declines(dev, cfg, tokens):
 def _snapshot(k, ops):
     """Run once; the bytes of every output (the fp8 / bf16 outputs, the state and conv pools, the tickets back at zero)."""
     rows = ops["qkv"].shape[0]
-    outb = torch.empty(rows, kcfg.V_HEADS, kcfg.HEAD_DIM, dtype=torch.bfloat16, device=ops["qkv"].device)
+    outb = torch.empty(rows, int(ops["ssm_state"].shape[1]), kcfg.HEAD_DIM, dtype=torch.bfloat16, device=ops["qkv"].device)  # the operands' V heads
     q = _run(k, ops, out_bf16=outb)
     torch.cuda.synchronize()
     requests, tokens = ops["state_indices"].shape
@@ -1607,3 +1608,114 @@ def test_bitwise_with_the_reference_verify_kernel_outputs(tag):
         ), f"{tag}: {key} differs from the reference kernel's bytes"
     if "counts" in ref:
         assert not ref["counts"].any()
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# the per-rank geometries on the device: the torch reference and determinism per step shape, every form family bitwise with the one-CTA
+# form on a set with a padding request, a skipped slot and non-monotone slots, the requests of a step batch-invariant -- the 27B cells
+# above are unchanged (the geometry is the compile key, and the default geometry's renderings are byte-identical to the pre-geometry kernels)
+# ---------------------------------------------------------------------------------------------------------------------------
+RANK_VERIFY_SHAPES = [(requests, tokens) for requests in (1, 2, 4) for tokens in (2, 4, 6)]
+# the form families (Cfg deltas from the unrolled one-CTA form): the three pick forms (rolled pair / rolled one-CTA / two CTAs per SM),
+# the shallower rings, the per-row thread mappings, the register-capped mappings, the streamed state path, the PDL order, the spread
+# bulk issue, the per-thread store path, non-resident K, the BA prefetch depths, and the pair with the knobs it is picked with
+RANK_VERIFY_ARMS = [
+    dict(),  # the one-CTA form with the unrolled token loop
+    dict(ROLLED_TOKENS=True),  # = CFG: the base itself, a second entry
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True),  # = PAIR_CFG
+    dict(TPR=4, NBUF=1, STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0, BA_PREFETCH_CHUNKS=1),  # = TWO_CTA_CFG
+    dict(ROLLED_TOKENS=True, NBUF=1),  # = ONE_CTA_NBUF1_CFG
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=2),  # = PAIR_NBUF2_CFG
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, NBUF=1),  # = PAIR_NBUF1_CFG
+    dict(NBUF=2),
+    dict(K_RESIDENT=False),
+    dict(BA_PREFETCH_CHUNKS=1),
+    dict(BA_PREFETCH_CHUNKS=2),
+    dict(TPR=2, NBUF=2),
+    dict(TPR=8, NBUF=1),
+    dict(TPR=16, NBUF=1),
+    dict(TPR=8, NBUF=1, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0, BA_PREFETCH_CHUNKS=1),
+    dict(STATE_STREAM=True, NBUF=2),
+    dict(PDL=True, PDL_RELEASE=True),
+    dict(BULK_ISSUE="spread"),
+    dict(STATE_STORE_PATH="stg", NBUF=1),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, TPR=8),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, BA_PREFETCH_CHUNKS=1),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, PDL=True, PDL_RELEASE=True),
+    dict(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, ROLLED_TOKENS=True, BULK_ISSUE="spread"),
+]
+RANK_SET = dict(accepted="random", pad="last", skip="mid")  # the 4-request set: a padding request, a skipped slot write, non-monotone slots
+
+
+@pytest.mark.parametrize("requests, tokens", RANK_VERIFY_SHAPES, ids=str)
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_rank_geometry_matches_the_torch_reference_and_replays_bitwise(g, requests, tokens):
+    """The entry's pick for the step shape at a per-rank geometry (the pair, one CTA per SM or the two-CTAs-per-SM form by ``requests x
+    V`` against this part's SM count: the module pick) against the FP64 torch reference at the reference kernel's bars (random acceptance
+    counts, a padding request from two requests on, a skipped slot write, non-monotone slots), the tickets back at zero -- and twice on
+    fresh identical operands: byte-identical (fp8 / bf16 outputs, every state slot, the conv pool)."""
+    dev = _device_or_skip()
+    kw = dict(accepted="random", pad="last" if requests > 1 else "none", skip="mid")
+    seed = 700 + 10 * requests + tokens
+    ops = make_operands(requests, tokens, dev, seed=seed, geometry=g, **kw)
+    condition_conv_inputs(ops)
+    twin = make_operands(requests, tokens, dev, seed=seed, geometry=g, **kw)
+    twin["qkv"].copy_(ops["qkv"])  # the same conditioned inputs (the conditioning moves qkv values only)
+    ssm0, conv0 = pools_before(ops)
+    k = entry.GdnVerifyFused(dev, 1e-6, geometry=g)
+    cfg = k.cfg_for(requests, tokens)
+    assert cfg.GEOM == g and replace(cfg, NORM_FORM=None, **_on(SM100_READING)) == kcfg.default_cfg(requests, k.sm_count, *k.readings, tokens, g)
+    got = _snapshot(k, ops)
+    check_against_reference(ops, got["qout"].view(torch.float8_e4m3fn), got["out"].view(torch.bfloat16), ssm0, conv0)
+    again = _snapshot(k, twin)
+    _assert_bitwise(got, again, f"{_gid(g)} {requests} x {tokens}: two identical operand sets")
+
+
+@pytest.mark.parametrize("arm", RANK_VERIFY_ARMS, ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "unrolled-one-cta-form")
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form(g, arm):
+    """Every form family this part holds at T 6, at a per-rank geometry, writes the bytes of the explicit rolled one-CTA form (``CFG`` at
+    that geometry) on the 4-request set with a padding request, a skipped slot and non-monotone slots: the fp8 / bf16 outputs, every state
+    slot, the conv pool; the padding request zero, the tickets back at zero.  An arm the part does not hold is its typed decline,
+    reported as a skip (``_fits_or_declines``)."""
+    dev = _device_or_skip()
+    cfg = kcfg.make_cfg(**arm)
+    _fits_or_declines(dev, cfg, 6, geometry=g)
+    base = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.CFG, geometry=g), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
+    got = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=cfg, geometry=g), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
+    _assert_bitwise(base, got, f"{_gid(g)} {arm}")
+    assert not got["qout"][18:24].any() and got["qout"][:18].any(), "the padding request is zero, the live rows written"
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
+def test_rank_geometry_requests_are_batch_invariant(g):
+    """Batch invariance at a per-rank geometry: every live request of a 4-request T-6 step (the entry's pick at four requests; random
+    acceptance counts, a skipped slot, non-monotone slots) writes the bytes it writes alone (one request: the pair pick) from the same
+    pools -- its fp8 / bf16 rows, its written state slots, its conv slot -- so a request's result does not depend on which requests share
+    its step."""
+    dev = _device_or_skip()
+    requests, tokens = 4, 6
+    k = entry.GdnVerifyFused(dev, 1e-6, geometry=g)
+    kw = dict(accepted="random", skip="mid")
+    ops = make_operands(requests, tokens, dev, seed=71, geometry=g, **kw)
+    idx = ops["state_indices"].clone()
+    snap4 = _snapshot(k, ops)
+    for n in range(requests):
+        again = make_operands(requests, tokens, dev, seed=71, geometry=g, **kw)  # the same draws; request n alone, the pools whole
+        rows = slice(n * tokens, (n + 1) * tokens)
+        one = dict(
+            again,
+            qkv=again["qkv"][rows],
+            z=again["z"][rows],
+            hidden=again["hidden"][rows],
+            state_indices=again["state_indices"][n : n + 1],
+            cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=dev),
+            num_accepted_tokens=again["num_accepted_tokens"][n : n + 1],
+        )
+        snap1 = _snapshot(k, one)
+        assert torch.equal(snap1["qout"], snap4["qout"][rows]) and torch.equal(snap1["out"], snap4["out"][rows]), f"{_gid(g)} request {n}: the outputs"
+        for t in range(tokens):
+            slot = int(idx[n, t])
+            if slot > 0:
+                assert torch.equal(snap1["ssm"][slot], snap4["ssm"][slot]), f"{_gid(g)} request {n}: state slot {slot}"
+        assert torch.equal(snap1["conv"][int(idx[n, 0])], snap4["conv"][int(idx[n, 0])]), f"{_gid(g)} request {n}: the conv slot"

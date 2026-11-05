@@ -27,6 +27,7 @@ model is a geometry of its own (e.g. hidden 8192 with 1 K head and 8 V heads per
 """
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Dict, Optional
 
 # --- pinned: every slab / box / lane map / norm term of both kernels (another value is the host entries' typed decline) ---
@@ -34,6 +35,7 @@ HEAD_DIM = 128
 CONV_WIDTH = 4
 # the reader ticket of a (row, K head) conv history: counts[row * TICKET_STRIDE + kh * 32] -- the reference layout; holds MAX_K_HEADS
 TICKET_STRIDE = 512
+_TICKET_STRIDE = TICKET_STRIDE  # read by the Geometry.TICKET_STRIDE property (same name as the module constant)
 MAX_K_HEADS = TICKET_STRIDE // 32  # 16
 MAX_V_HEADS = 128
 # the BA projection partitions: decode = 128 threads x 8 elements per chunk; verify = 256 virtual threads x 8 elements per chunk,
@@ -56,6 +58,8 @@ class Geometry:
         msg = geometry_error(self.K_HEADS, self.V_HEADS, self.HIDDEN)
         if msg is not None:
             raise ValueError(f"Geometry: {msg}")
+        for name in ("K_HEADS", "V_HEADS", "HIDDEN"):  # any Integral (a numpy int from a config) is held as a plain int: one hash, one repr
+            object.__setattr__(self, name, int(getattr(self, name)))
 
     # --- the QKV slab [rows, QKV_CHANNELS] = Q (K_HEADS x 128) | K (K_HEADS x 128) | V (V_HEADS x 128) ---
     @property
@@ -108,11 +112,16 @@ class Geometry:
     @property
     def TICKET_STRIDE(self) -> int:
         """``counts`` entries per row (the per-(row, K head) reader ticket sits at ``kh * 32``)."""
-        return TICKET_STRIDE
+        return _TICKET_STRIDE
 
     def describe(self) -> str:
         """The geometry in words, for the typed declines' messages."""
         return f"{self.K_HEADS} K heads, {self.V_HEADS} V heads x {HEAD_DIM}, hidden {self.HIDDEN}"
+
+
+def _is_int(value) -> bool:
+    """An integer in the envelope's sense: any ``numbers.Integral`` (a Python or numpy int), never a bool."""
+    return isinstance(value, Integral) and not isinstance(value, bool)
 
 
 def geometry_error(k_heads, v_heads, hidden) -> Optional[str]:
@@ -120,7 +129,7 @@ def geometry_error(k_heads, v_heads, hidden) -> Optional[str]:
     K heads (the reader-ticket layout), at most ``MAX_V_HEADS`` V heads, a whole number of V heads per K head, the hidden width a
     multiple of ``HIDDEN_GRANULE``."""
     for name, value in (("K_HEADS", k_heads), ("V_HEADS", v_heads), ("HIDDEN", hidden)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        if not _is_int(value) or value < 1:
             return f"{name} must be a positive int, got {value!r}"
     if k_heads > MAX_K_HEADS:
         return f"K_HEADS={k_heads} exceeds the {MAX_K_HEADS} K heads the reader-ticket layout (counts[row * {TICKET_STRIDE} + kh * 32]) holds"
@@ -136,11 +145,11 @@ def geometry_error(k_heads, v_heads, hidden) -> Optional[str]:
 def geometry_fields_off(k_heads, v_heads, hidden) -> Dict[str, int]:
     """The fields of ``(k_heads, v_heads, hidden)`` the envelope refuses, by name (empty = served) -- for a decline that names them."""
     off: Dict[str, int] = {}
-    if isinstance(k_heads, bool) or not isinstance(k_heads, int) or not 1 <= k_heads <= MAX_K_HEADS:
+    if not _is_int(k_heads) or not 1 <= k_heads <= MAX_K_HEADS:
         off["K_HEADS"] = k_heads
-    if isinstance(v_heads, bool) or not isinstance(v_heads, int) or not 1 <= v_heads <= MAX_V_HEADS or ("K_HEADS" not in off and v_heads % k_heads):
+    if not _is_int(v_heads) or not 1 <= v_heads <= MAX_V_HEADS or ("K_HEADS" not in off and v_heads % k_heads):
         off["V_HEADS"] = v_heads
-    if isinstance(hidden, bool) or not isinstance(hidden, int) or hidden < 1 or hidden % HIDDEN_GRANULE:
+    if not _is_int(hidden) or hidden < 1 or hidden % HIDDEN_GRANULE:
         off["HIDDEN"] = hidden
     return off
 

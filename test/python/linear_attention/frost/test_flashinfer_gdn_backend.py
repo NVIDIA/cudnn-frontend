@@ -545,7 +545,7 @@ def test_verify_runner_maps_flashinfer_inputs_onto_the_entry_call_contract():
 
 @pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=lambda g: f"k{g.num_k_heads}v{g.num_v_heads}d{g.d_model}")
 def test_runners_build_the_entries_with_the_plan_geometry(g):
-    """A plan at a per-rank geometry builds its entry with that geometry (``geometry_of`` of the spec's ``Qwen35GdnGeometry``): the
+    """A plan at a per-rank geometry builds its entry with that geometry (``geometry_of(spec.geometry)``): the
     entry's forms carry it, its buffers take the rank's V heads, its binding checks accept FlashInfer's operands of that geometry (and the
     default geometry's checks refuse them), and plans of two geometries share one compiled table under distinct keys."""
     geo = gdn_geometry.Geometry(g.num_k_heads, g.num_v_heads, g.d_model)
@@ -910,3 +910,139 @@ def test_verify_bitwise_with_the_built_in_frost_backend_on_the_bench_input_sets(
         assert not torch.equal(g["ssm_state"], base["ssm_state"]) and not torch.equal(g["conv_state"], base["conv_state"]), "the pools advanced"
         if arm != "all accepted" and requests > 1:
             assert not g["out"][-tokens:].view(torch.uint8).any() and not g["out_bf16"][-tokens:].any(), "the padding request's rows are zero"
+
+
+# --- the per-rank geometries through FlashInfer's plan API ---------------------------------------------------------------------------
+def _fgid(g):
+    return f"k{g.num_k_heads}v{g.num_v_heads}d{g.d_model}"
+
+
+def _fi_geometry_dict(g):
+    """A FlashInfer geometry as the dict its reference's ``make_case(..., g=)`` takes."""
+    return dict(
+        d_model=g.d_model, num_v_heads=g.num_v_heads, num_k_heads=g.num_k_heads, head_k_dim=g.head_k_dim, head_v_dim=g.head_v_dim, conv_kernel=g.conv_kernel
+    )
+
+
+def _rank_device_or_skip(g, form="decode", **kw):
+    """The device (gated by the default geometry's probe: compute capability, DSL) -- on which ``frost_fe`` MUST serve the rank geometry
+    (its envelope admits it: a decline there is a failure, never a skip)."""
+    dev = _device_or_skip(form, **kw)
+    sup = qwen_3_5_gdn_block_support(dev, g, form, backend.BACKEND, **kw)
+    assert sup.served, f"frost_fe serves the rank geometry {_fgid(g)} by its envelope; declined here: {sup.kind}: {sup.reason}"
+    return dev
+
+
+def _rank_outputs(g, rows, device):
+    return (
+        torch.empty(rows, g.num_v_heads, g.head_v_dim, dtype=torch.float8_e4m3fn, device=device),
+        torch.empty(rows, g.num_v_heads, g.head_v_dim, dtype=torch.bfloat16, device=device),
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 4, 16])
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_flashinfer_decode_reference_at_the_rank_geometries_passes_against_frost_fe(g, rows):
+    """FlashInfer's own FP64 reference (``make_case`` at the rank geometry's dict, ``_check`` with its tolerances) against ``frost_fe``
+    through the public entry point at a per-rank geometry: rows 1 (the pair pick), 4 and 16 (a padding row from two rows on)."""
+    dev = _rank_device_or_skip(g)
+    fi = _flashinfer_tests()
+    case = fi.ref.make_case(rows, 1, seed=300 + rows, device=dev, form="decode", g=_fi_geometry_dict(g))
+    ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
+    q, out = _rank_outputs(g, rows, dev)
+    assert qwen_3_5_gdn_block_decode(**fi.dec._tensors(case, ssm, conv), geometry=g, backend=backend.BACKEND, out=q, out_bf16=out) is q
+    torch.cuda.synchronize()
+    fi.dec._check(case, q, out, ssm, conv)
+
+
+@pytest.mark.parametrize("requests, tokens", [(1, 6), (2, 4), (4, 6)], ids=str)
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_flashinfer_verify_reference_at_the_rank_geometries_passes_against_frost_fe(g, requests, tokens):
+    """FlashInfer's own FP64 verify reference (random acceptance counts, a padding request from two requests on) against ``frost_fe``
+    through the public entry point at a per-rank geometry, its tolerances."""
+    dev = _rank_device_or_skip(g, "verify", requests=requests, tokens_per_request=tokens)
+    fi = _flashinfer_tests()
+    case = fi.ref.make_case(requests, tokens, seed=100 * requests + tokens, device=dev, form="verify", g=_fi_geometry_dict(g))
+    ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
+    q, out = _rank_outputs(g, requests * tokens, dev)
+    assert qwen_3_5_gdn_block_verify(**fi.ver._tensors(case, ssm, conv), geometry=g, backend=backend.BACKEND, out=q, out_bf16=out) is q
+    torch.cuda.synchronize()
+    fi.ver._check(case, q, out, ssm, conv)
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_plan_api_is_bitwise_with_the_direct_entries_and_replays_at_the_rank_geometries(g):
+    """FlashInfer's plan API (``prepare`` + ``run``, then a CUDA-graph capture of the prepared binding) and the direct cuDNN Frontend
+    entries on identical inputs at a per-rank geometry, byte for byte (the fp8 output, every state slot, the conv pool): decode at rows 4,
+    verify at 2 requests x 4 tokens."""
+    dev = _rank_device_or_skip(g, "verify", requests=2, tokens_per_request=4)
+    geom = backend.geometry_of(g)
+    # decode: the plan vs the entry, then the plan under capture vs its eager run
+    plan = prepare_qwen_3_5_gdn_block("decode", geometry=g, device=dev, requests=4, backend=backend.BACKEND)
+    xa = _tensors(4, dev, seed=5, geometry=g)
+    assert plan.run(**xa) is xa["out"]
+    xb = _tensors(4, dev, seed=5, geometry=g)
+    k = entry.GdnDecodeFused(dev, 1e-6, geometry=geom)
+    qb = k(
+        4,
+        xb["qkv"],
+        xb["conv_state"],
+        xb["conv_weight"],
+        xb["A_log"],
+        xb["dt_bias"],
+        xb["ssm_state"],
+        xb["state_indices"],
+        xb["z"],
+        xb["norm_weight"],
+        xb["out_scale"],
+        xb["hidden"],
+        xb["ba_weight"],
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(xa["out"].view(torch.uint8), qb.view(torch.uint8)), f"{_fgid(g)} decode: fp8 out (plan API vs the entry)"
+    assert torch.equal(xa["ssm_state"], xb["ssm_state"]) and torch.equal(
+        xa["conv_state"].contiguous(), xb["conv_state"].contiguous()
+    ), f"{_fgid(g)} decode: the pools"
+    xc = _tensors(4, dev, seed=5, geometry=g)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(**xc)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(xc["out"].view(torch.uint8), xa["out"].view(torch.uint8)) and torch.equal(
+        xc["ssm_state"], xa["ssm_state"]
+    ), f"{_fgid(g)} decode: the graph replay"
+    assert torch.equal(xc["conv_state"].contiguous(), xa["conv_state"].contiguous())
+    # verify: the plan vs the entry
+    vplan = prepare_qwen_3_5_gdn_block("verify", geometry=g, device=dev, requests=2, tokens_per_request=4, backend=backend.BACKEND)
+    va = _verify_tensors(2, 4, dev, seed=9, geometry=g)
+    assert vplan.run(**va) is va["out"]
+    vb = _verify_tensors(2, 4, dev, seed=9, geometry=g)
+    kv = ventry.GdnVerifyFused(dev, 1e-6, geometry=geom)
+    qv = kv(**{name: vb[name] for name in ventry.OPERANDS})
+    torch.cuda.synchronize()
+    assert torch.equal(va["out"].view(torch.uint8), qv.view(torch.uint8)), f"{_fgid(g)} verify: fp8 out (plan API vs the entry)"
+    assert torch.equal(va["ssm_state"], vb["ssm_state"]) and torch.equal(
+        va["conv_state"].contiguous(), vb["conv_state"].contiguous()
+    ), f"{_fgid(g)} verify: the pools"
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_built_in_frost_backend_answers_the_rank_geometries_that_frost_fe_serves(g):
+    """The built-in ``frost`` backend's answer at a per-rank geometry, recorded: where it declines, by kind ``geometry`` (the kernels it
+    ships are written for the 27B geometry; a device decline would be another kind); where a FlashInfer serves it, bitwise with
+    ``frost_fe`` on one 4-row decode set."""
+    dev = _rank_device_or_skip(g)
+    sup = qwen_3_5_gdn_block_support(dev, g, "decode", "frost")
+    if not sup.served:
+        assert sup.kind == "geometry", (sup.kind, sup.reason)
+        return
+    got = {}
+    for name in ("frost", backend.BACKEND):
+        x = _tensors(4, dev, seed=17, geometry=g)
+        prepare_qwen_3_5_gdn_block("decode", geometry=g, device=dev, requests=4, backend=name).run(**x)
+        torch.cuda.synchronize()
+        got[name] = x
+    for key in ("out", "ssm_state", "conv_state"):
+        a, b = got["frost"][key], got[backend.BACKEND][key]
+        assert torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)), f"{_fgid(g)}: {key} differs between frost and frost_fe"

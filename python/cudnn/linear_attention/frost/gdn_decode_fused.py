@@ -71,6 +71,10 @@ DSL_FLOOR_TEXT = ".".join(str(x) for x in DSL_FLOOR)
 NAME = "the fused GDN decode step"
 #: the launch is grid ``(V_HEADS, rows, 1)`` (``kernel/gdn_decode_fused_f16.py``), one grid row per request: CUDA caps grid Y at 65535
 MAX_ROWS = 65535
+#: the kernel forms its row-strided addresses (``row x`` the x / z row stride, ``row x HIDDEN``, ``row x OUT_ROW``) in 32-bit arithmetic,
+#: so ``rows x`` the largest row stride must stay below 2^31 elements (:func:`max_rows_for`); the default geometry's strides never reach
+#: it below MAX_ROWS (16384 x 65535), a wide shard with a fused QKVZ view does (16 K / 128 V heads, hidden 8192: 36864 x 58256)
+ROW_ADDRESS_LIMIT = 2**31 - 1
 
 
 def cc_supported(cc) -> bool:
@@ -157,10 +161,20 @@ def resolve_geometry(geometry, cfg: Optional[Cfg] = None) -> Geometry:
     if geometry is not None and not isinstance(geometry, Geometry):
         raise TypeError(f"{NAME}: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
     if cfg is not None and geometry is not None and cfg.GEOM != geometry:
-        raise ValueError(f"{NAME}: the cfg is compiled for {cfg.GEOM.describe()} but the geometry names {geometry.describe()}; give one source")
+        raise ValueError(
+            f"{NAME}: the cfg is compiled for {cfg.GEOM.describe()} but the geometry names {geometry.describe()}; give one source "
+            f"(kernel.gdn_decode_fused_config.with_geometry(cfg, geometry) compiles a form for the geometry)"
+        )
     if geometry is not None:
         return geometry
     return cfg.GEOM if cfg is not None else DEFAULT_GEOMETRY
+
+
+def max_rows_for(x_stride: int, z_stride: int, geometry: Geometry) -> int:
+    """The rows count the kernel's 32-bit row addresses hold for these row strides (elements) at ``geometry``: the smaller of ``MAX_ROWS``
+    (CUDA's grid Y) and ``ROW_ADDRESS_LIMIT // max(x stride, z stride, HIDDEN, OUT_ROW, QKV_CHANNELS)``."""
+    widest = max(int(x_stride), int(z_stride), geometry.HIDDEN, geometry.OUT_ROW, geometry.QKV_CHANNELS)
+    return min(MAX_ROWS, ROW_ADDRESS_LIMIT // widest)
 
 
 def _check_device(tensors, device, anchor) -> None:
@@ -238,6 +252,12 @@ def check_binding(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw,
         raise NotImplementedError(f"{NAME} serves z as [rows, {NV}, {HEAD_DIM}]; got {tuple(z.shape)}")
     if tuple(z.stride()[1:]) != (HEAD_DIM, 1) or z.stride(0) % 8:
         raise NotImplementedError(f"{NAME} needs z heads contiguous with a 16-byte-multiple row stride; got strides {tuple(z.stride())}")
+    row_max = max_rows_for(x.stride(0), z.stride(0), g)
+    if rows > row_max:  # the Int32 row-address headroom at this geometry and these strides (below MAX_ROWS only off the default geometry)
+        raise NotImplementedError(
+            f"{NAME} forms its row addresses in 32-bit arithmetic: at most {row_max} rows for x / z row strides {int(x.stride(0))} / {int(z.stride(0))} at "
+            f"{g.describe()}; got rows={rows}"
+        )
     if w.numel() != HEAD_DIM or not w.is_contiguous():
         raise NotImplementedError(f"{NAME} serves a contiguous norm weight of {HEAD_DIM}; got {tuple(w.shape)}")
     if scale.numel() < 1:

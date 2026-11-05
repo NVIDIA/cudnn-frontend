@@ -201,7 +201,10 @@ def resolve_geometry(geometry, cfg: Optional[Cfg] = None) -> Geometry:
     if geometry is not None and not isinstance(geometry, Geometry):
         raise TypeError(f"{NAME}: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
     if cfg is not None and geometry is not None and cfg.GEOM != geometry:
-        raise ValueError(f"{NAME}: the cfg is compiled for {cfg.GEOM.describe()} but the geometry names {geometry.describe()}; give one source")
+        raise ValueError(
+            f"{NAME}: the cfg is compiled for {cfg.GEOM.describe()} but the geometry names {geometry.describe()}; give one source "
+            f"(kernel.gdn_verify_fused_config.with_geometry(cfg, geometry) compiles a form for the geometry)"
+        )
     if geometry is not None:
         return geometry
     return cfg.GEOM if cfg is not None else DEFAULT_GEOMETRY
