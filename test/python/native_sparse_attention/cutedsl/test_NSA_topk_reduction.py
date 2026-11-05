@@ -88,6 +88,66 @@ def test_nsa_topk_reduction_compile_execute(
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("is_causal", [True, False])
+@torch_fork_set_rng(seed=0)
+def test_nsa_topk_reduction_thd_ignores_keys_past_the_sequence(is_causal):
+    """A sequence's top-k must not depend on the next sequence's compressed keys (T,H,D).
+
+    There is no reference for this kernel, so this is a noninterference check: perturb the first compressed
+    key of sequence 2 and require sequence 1's scores and indices to stay bit-identical. With
+    s_k < s_q / compress_stride - 2 * selection_block_size / compress_stride, the selection block that holds
+    key index s_k (one past sequence 1) is still a top-k candidate for sequence 1's later queries, and
+    s_k % 128 != 0 puts that key in the same 128-column key tile as sequence 1's last keys.
+    """
+    try:
+        from cudnn import NSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("Environment not supported: requires CUDA")
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
+
+    s_q, s_k, h_q, h_k, d = 4096, 64, 4, 1, 128
+    selection_block_size, compress_stride, k_value = 64, 32, 16
+    assert s_k < s_q // compress_stride - 2 * selection_block_size // compress_stride and s_k % 128 != 0
+
+    q = torch.randn(2 * s_q, h_q, d, dtype=torch.float16).cuda()
+    k = torch.randn(2 * s_k, h_k, d, dtype=torch.float16).cuda()
+    lse = (-1.0 * torch.randn(1, h_q, 2 * s_q, dtype=torch.float32)).transpose(0, 2).cuda()  # (T, H_q, 1), T at unit stride
+    cum_seqlen_q = torch.tensor([0, s_q, 2 * s_q], dtype=torch.int32).cuda()
+    cum_seqlen_k = torch.tensor([0, s_k, 2 * s_k], dtype=torch.int32).cuda()
+
+    def sequence_1_topk(k_tensor):
+        result = NSA.topk_reduction_wrapper(
+            q_tensor=q,
+            k_tensor=k_tensor,
+            lse_tensor=lse,
+            cum_seqlen_q_tensor=cum_seqlen_q,
+            cum_seqlen_k_tensor=cum_seqlen_k,
+            max_s_q=s_q,
+            max_s_k=s_k,
+            k_value=k_value,
+            selection_block_size=selection_block_size,
+            compress_stride=compress_stride,
+            is_causal=is_causal,
+        )
+        return result["topk_scores_tensor"][:s_q].clone(), result["topk_indices_tensor"][:s_q].clone()
+
+    scores, indices = sequence_1_topk(k)
+    # The last query has more than k_value candidate blocks with keys: every slot holds a real block.
+    assert (indices[-1] > 0).all() and torch.isfinite(scores[-1]).all()
+
+    k_perturbed = k.clone()
+    k_perturbed[s_k] *= 4  # the first compressed key of sequence 2
+    scores_perturbed, indices_perturbed = sequence_1_topk(k_perturbed)
+
+    torch.testing.assert_close(indices_perturbed, indices, rtol=0, atol=0)
+    torch.testing.assert_close(scores_perturbed, scores, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_nsa_topk_reduction_params
 def test_nsa_topk_reduction_wrapper(
