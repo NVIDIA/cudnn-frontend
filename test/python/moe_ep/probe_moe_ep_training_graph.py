@@ -412,7 +412,7 @@ def _run_error_mode_assert_probe(
             expected in error_text
             for expected in (
                 "device-side assert triggered",
-                "Rubin MegaMoE receive route-pool overflow",
+                "MegaMoE receive route-pool overflow",
                 "unspecified launch failure",
                 "cudaErrorLaunchFailure",
                 "CUDA_ERROR_LAUNCH_FAILED",

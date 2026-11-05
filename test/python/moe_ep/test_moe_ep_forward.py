@@ -446,11 +446,11 @@ def test_vendored_mega_kernels_keep_data_token_capacity_overlay(module_name, cla
     # Each architecture's vendored copy carries its own overlay; an upstream
     # sync that drops one copy must fail here rather than at kernel construction.
     from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
-        require_rubin_cutedsl,
+        require_megamoe_cutedsl,
     )
 
     try:
-        require_rubin_cutedsl()
+        require_megamoe_cutedsl()
     except RuntimeError as error:
         pytest.skip(str(error))
     module = importlib.import_module(f"cudnn.moe_ep._megamoe_backend.cutedsl_src.kernel_src.{module_name}")
@@ -1701,6 +1701,105 @@ def test_megamoe_capability_bounds_fc2_bulk_store():
             else:
                 with pytest.raises(NotImplementedError, match=f"exceeds the {stages[-1]}-stage limit"):
                     validate_config(config)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "name", "cute_dsl_arch", "supports_inference", "supports_forward_schedule_options", "bulk_store_requires_quantized_combine"),
+    [
+        ((10, 0), "Blackwell SM100", "sm_100a", False, False, True),
+        ((10, 7), "Rubin SM107", "sm_107a", True, True, False),
+    ],
+)
+def test_megamoe_architecture_table(
+    capability, name, cute_dsl_arch, supports_inference, supports_forward_schedule_options, bulk_store_requires_quantized_combine
+):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    architecture = architecture_for(capability)
+
+    assert architecture.name == name
+    assert architecture.cute_dsl_arch == cute_dsl_arch
+    assert architecture.supports_inference is supports_inference
+    assert architecture.supports_forward_schedule_options is supports_forward_schedule_options
+    assert architecture.forward_bulk_store_requires_quantized_combine is bulk_store_requires_quantized_combine
+
+
+@pytest.mark.L0
+def test_megamoe_architecture_declines_unsupported_forward_tuning_on_blackwell():
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import BLACKWELL_SM100, RUBIN_SM107
+
+    name = "training_forward_tuning"
+    for tuning, combine_format in (
+        (MoeEpTuningConfig(), "bf16"),
+        (MoeEpTuningConfig(scheduling="static"), "bf16"),
+        (MoeEpTuningConfig(scheduling="atomic"), "bf16"),
+        (MoeEpTuningConfig(fc2_bulk_store="auto"), "mxfp8"),
+        (MoeEpTuningConfig(fc2_bulk_store=2), "mxfp8"),
+    ):
+        BLACKWELL_SM100.validate_forward_tuning(name, tuning, combine_format)
+    with pytest.raises(NotImplementedError, match=r"training_forward_tuning.scheduling='phase_interleave' is not supported on Blackwell SM100"):
+        BLACKWELL_SM100.validate_forward_tuning(name, MoeEpTuningConfig(scheduling="phase_interleave"), "bf16")
+    with pytest.raises(NotImplementedError, match=r"training_forward_tuning.mixed_cga=True is not supported on Blackwell SM100"):
+        BLACKWELL_SM100.validate_forward_tuning(name, MoeEpTuningConfig(mixed_cga=True), "bf16")
+    # The Blackwell forward kernel stages FC2 bulk stores only for an MXFP8 combine.
+    for fc2_bulk_store in ("auto", 1):
+        with pytest.raises(NotImplementedError, match=r"training_forward_tuning.fc2_bulk_store requires combine_format='mxfp8' on Blackwell SM100"):
+            BLACKWELL_SM100.validate_forward_tuning(name, MoeEpTuningConfig(fc2_bulk_store=fc2_bulk_store), "bf16")
+
+    for tuning in (
+        MoeEpTuningConfig(scheduling="phase_interleave"),
+        MoeEpTuningConfig(mixed_cga=True),
+        MoeEpTuningConfig(fc2_bulk_store="auto"),
+    ):
+        RUBIN_SM107.validate_forward_tuning(name, tuning, "bf16")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("capability", [(9, 0), (10, 3), (12, 0)])
+def test_megamoe_architecture_declines_unsupported_devices(capability):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    with pytest.raises(NotImplementedError, match=r"Blackwell SM100 \(compute capability 10\.0\) or Rubin SM107"):
+        architecture_for(capability)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "forward_class", "backward_class"),
+    [
+        ((10, 0), "Sm100MegaMoEMxfp8GluKernel", "Sm100MegaMoEMxfp8DgluKernel"),
+        ((10, 7), "Sm107MegaMoEMxfp8GluKernel", "Sm107MegaMoEMxfp8DgluKernel"),
+    ],
+)
+def test_megamoe_architecture_selects_vendored_kernels(capability, forward_class, backward_class):
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import (
+        require_megamoe_cutedsl,
+    )
+
+    try:
+        require_megamoe_cutedsl()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    architecture = architecture_for(capability)
+
+    assert architecture.forward_kernel_class().__name__ == forward_class
+    assert architecture.backward_kernel_class().__name__ == backward_class
+
+
+@pytest.mark.L0
+def test_megamoe_inference_declines_blackwell(monkeypatch):
+    from cudnn.moe_ep._megamoe_backend import _capability
+
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    with pytest.raises(NotImplementedError, match="inference is not supported on Blackwell SM100"):
+        _capability._validate_inference_device(device)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
+    _capability._validate_inference_device(device)
 
 
 @pytest.mark.L0

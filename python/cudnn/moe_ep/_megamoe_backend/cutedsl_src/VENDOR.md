@@ -156,10 +156,12 @@ The vendored Rubin sources require a CUTLASS DSL distribution that provides
 
 ## Consumers
 
-- `_megamoe_backend/mxfp8/_compile.py`: Rubin MXFP8 forward preparation and
-  compilation.
-- `_megamoe_backend/mxfp8/_backward_compile.py`: Rubin MXFP8 backward dGLU
+- `_megamoe_backend/mxfp8/_arch.py`: per-architecture selection of the Rubin
+  SM107 and Blackwell SM100 forward and backward kernel classes.
+- `_megamoe_backend/mxfp8/_compile.py`: Rubin and Blackwell MXFP8 forward
   preparation and compilation.
+- `_megamoe_backend/mxfp8/_backward_compile.py`: Rubin and Blackwell MXFP8
+  backward dGLU preparation and compilation.
 - `_megamoe_backend/_comm.py`: symmetric-buffer peer mapping.
 - `_megamoe_backend/mxfp8/_training_stage_kernel.py`: MXFP8 staging constants
   and PTX conversion helpers.
@@ -167,6 +169,3 @@ The vendored Rubin sources require a CUTLASS DSL distribution that provides
   compilation, and launch.
 - `_megamoe_backend/mxfp8/_fingerprint.py` and `_training_resources.py`:
   vendored source-tree fingerprint.
-
-The backend does not consume `kernel_src/blackwell` yet; it still selects only
-the Rubin kernels.

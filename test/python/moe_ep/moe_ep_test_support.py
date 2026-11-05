@@ -1226,24 +1226,24 @@ def _run_grouped_wgrad_kernel(
     )["wgrad_tensor"]
 
 
-def _training_wgrad_unavailable_reason() -> str | None:
-    """Why ``MoeEp.training_wgrad`` cannot run with the installed DSL, or None."""
+def _training_wgrad_unavailable_reason(device) -> str | None:
+    """Why ``MoeEp.training_wgrad`` cannot run on ``device`` with the installed DSL, or None."""
 
     from cudnn.moe_ep._megamoe_backend.mxfp8._wgrad_compile import wgrad_unavailable_reason
 
-    return wgrad_unavailable_reason()
+    return wgrad_unavailable_reason(torch.cuda.get_device_capability(device))
 
 
-def _require_training_wgrad() -> None:
-    """Skip below the Rubin DSL floor; above it, fail: every supported DSL (public 4.8.0 and later) runs training WGrad."""
+def _require_training_wgrad(device) -> None:
+    """Skip below the MegaMoE DSL floor; above it, fail: every supported DSL (public 4.8.0 and later) runs training WGrad."""
 
-    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import require_rubin_cutedsl
+    from cudnn.moe_ep._megamoe_backend.mxfp8._cutedsl import require_megamoe_cutedsl
 
     try:
-        require_rubin_cutedsl()
+        require_megamoe_cutedsl()
     except RuntimeError as error:
         pytest.skip(str(error))
-    reason = _training_wgrad_unavailable_reason()
+    reason = _training_wgrad_unavailable_reason(device)
     if reason is not None:
         pytest.fail(f"MoeEp training WGrad is unavailable on a supported DSL: {reason}")
 
@@ -1253,7 +1253,7 @@ def _allocate_training_wgrad_outputs(expected, dtype=torch.bfloat16):
 
     from cudnn.moe_ep import MoeEpTrainingWgradOutputs
 
-    _require_training_wgrad()
+    _require_training_wgrad(expected[0].device)
     return MoeEpTrainingWgradOutputs(
         fc1=torch.empty_like(expected[0], dtype=dtype),
         fc2=torch.empty_like(expected[1], dtype=dtype),

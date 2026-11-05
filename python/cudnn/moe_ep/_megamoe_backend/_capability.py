@@ -16,6 +16,7 @@ import torch
 from .._config import ResolvedMoeEpConfig
 from .._contracts import _ForwardCall
 from .._types import BlockScaledTensor, MoeFormat
+from .mxfp8._arch import inference_architecture_for
 
 # The vendored routing metadata record (``TokenSrcMetadata``) stores the
 # source token index in 16 bits; its communication component rejects larger
@@ -48,13 +49,11 @@ def _validate_operand(name, tensor) -> None:
         raise NotImplementedError(f"MoeEp MegaMoE {name} staging supports BF16, FP16, " f"or FP32 plain tensors, got {tensor.dtype}")
 
 
-def _validate_device(device: torch.device) -> None:
+def _validate_inference_device(device: torch.device) -> None:
     if device.type != "cuda":
         raise NotImplementedError(f"MoeEp MegaMoE backend requires a CUDA device, got {device}")
 
-    major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) != (10, 7):
-        raise NotImplementedError("MoeEp MegaMoE backend requires Rubin SM107 " "(compute capability 10.7); " f"found compute capability {major}.{minor}")
+    inference_architecture_for(torch.cuda.get_device_capability(device))
 
 
 def _is_cuda_stream_capturing(device: torch.device) -> bool:
@@ -72,7 +71,7 @@ def validate_config(config: ResolvedMoeEpConfig) -> None:
     data_path = config.public_config.data_path
     if config.topology.ep_size > _MAX_EP_SIZE:
         raise NotImplementedError(
-            "MoeEp SM107 MXFP8 routing metadata stores the source rank in 8 bits; "
+            "MoeEp MegaMoE MXFP8 routing metadata stores the source rank in 8 bits; "
             f"the expert-parallel size must be <= {_MAX_EP_SIZE}, got {config.topology.ep_size}"
         )
     if data_path.output_format is not MoeFormat.BF16:
@@ -86,20 +85,20 @@ def validate_config(config: ResolvedMoeEpConfig) -> None:
     if parallel.max_tokens_per_rank is None:
         raise NotImplementedError("MoeEp MegaMoE backend requires an explicit max_tokens_per_rank")
     if parallel.max_tokens_per_rank == 0:
-        raise NotImplementedError("MoeEp SM107 MXFP8 execution requires " "max_tokens_per_rank to be positive")
+        raise NotImplementedError("MoeEp MegaMoE MXFP8 execution requires " "max_tokens_per_rank to be positive")
     if parallel.max_tokens_per_rank > _MAX_TOKENS_PER_RANK:
         raise NotImplementedError(
-            "MoeEp SM107 MXFP8 routing metadata stores the source token index in 16 bits; "
+            "MoeEp MegaMoE MXFP8 routing metadata stores the source token index in 16 bits; "
             f"max_tokens_per_rank must be <= {_MAX_TOKENS_PER_RANK}, got {parallel.max_tokens_per_rank}"
         )
     if model.hidden_size % 128:
-        raise NotImplementedError("MoeEp SM107 MXFP8 kernel currently requires hidden_size " f"to be divisible by 128, got {model.hidden_size}")
+        raise NotImplementedError("MoeEp MegaMoE MXFP8 kernel currently requires hidden_size " f"to be divisible by 128, got {model.hidden_size}")
     if model.intermediate_size % 256:
-        raise NotImplementedError("MoeEp SM107 MXFP8 kernel currently requires intermediate_size " f"to be divisible by 256, got {model.intermediate_size}")
+        raise NotImplementedError("MoeEp MegaMoE MXFP8 kernel currently requires intermediate_size " f"to be divisible by 256, got {model.intermediate_size}")
     if model.top_k > 32:
-        raise NotImplementedError("MoeEp SM107 MXFP8 dispatch currently requires top_k <= 32")
+        raise NotImplementedError("MoeEp MegaMoE MXFP8 dispatch currently requires top_k <= 32")
     if not data_path.apply_topk_in_fc1:
-        raise NotImplementedError("MoeEp Rubin training MegaMoE requires apply_topk_in_fc1=True")
+        raise NotImplementedError("MoeEp MegaMoE requires apply_topk_in_fc1=True")
     for name, tuning in (
         ("inference_tuning", config.public_config.inference_tuning),
         ("training_forward_tuning", config.public_config.training_forward_tuning),
@@ -135,7 +134,7 @@ def validate_request(
     ):
         _validate_operand(name, tensor)
 
-    _validate_device(request.device)
+    _validate_inference_device(request.device)
 
 
 __all__ = [

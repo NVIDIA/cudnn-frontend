@@ -1491,7 +1491,8 @@ class MoeEp:
         padding rows contribute zero. ``accumulate=False`` overwrites ``out``;
         ``accumulate=True`` adds to it. Runs on the current CUDA stream after
         the backward that produced ``operands``. Requires a CUTLASS DSL with
-        Rubin TMA descriptor overrides; other DSL builds raise ``RuntimeError``.
+        Rubin TMA descriptor overrides; other DSL builds raise ``RuntimeError``,
+        as does Blackwell SM100, which has no vendored WGrad kernel.
         """
 
         with self._lifecycle_lock:

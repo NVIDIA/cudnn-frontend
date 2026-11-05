@@ -210,10 +210,21 @@ def test_wgrad_operand_validation_names_the_operand():
 
 
 @pytest.mark.L0
+def test_wgrad_declines_architectures_without_a_wgrad_kernel():
+    from cudnn.moe_ep._megamoe_backend.mxfp8._wgrad_compile import wgrad_unavailable_reason
+
+    # Decided before any DSL probe, so the reason holds on every installation.
+    reason = wgrad_unavailable_reason((10, 0))
+    assert reason is not None and "not supported on Blackwell SM100" in reason
+    with pytest.raises(NotImplementedError, match="compute capability 10.3"):
+        wgrad_unavailable_reason((10, 3))
+
+
+@pytest.mark.L0
 def test_wgrad_gate_probes_the_tma_residue_op(monkeypatch):
     pytest.importorskip("cutlass")
     try:
-        _cutedsl.require_rubin_cutedsl()
+        _cutedsl.require_megamoe_cutedsl()
     except RuntimeError as error:
         pytest.skip(str(error))
     import cutlass._mlir.dialects.cute_nvgpu as cute_nvgpu_ir
@@ -450,7 +461,7 @@ _EXPERTS = 4
 @pytest.fixture(scope="module")
 def wgrad_op():
     device = _sm107_device()
-    _require_training_wgrad()
+    _require_training_wgrad(device)
     capacity = 512
     top_k = 2
     with MoeEp(

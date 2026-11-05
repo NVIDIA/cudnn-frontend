@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""In-process JIT cache for the vendored Rubin SM107 MXFP8 kernel."""
+"""In-process JIT cache for the vendored MegaMoE MXFP8 forward kernels."""
 
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from ..._config import ResolvedMoeEpConfig
 from .._plan import PreparedResources
 from .._workspace import WorkspaceRequirements
 from ._adapter import Mxfp8LaunchInputs
-from ._compile_common import _compile_kernel, _prepare_rubin_environment
+from ._arch import architecture_for
+from ._compile_common import _compile_kernel, _prepare_environment
 from ._config import (
     MXFP8_CLUSTER_SHAPE_MNK,
     MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK,
@@ -60,7 +61,6 @@ class CompiledMxfp8Kernel:
 _COMPILE_LOCK = threading.RLock()
 _COMPILE_CACHE: dict[tuple, CompiledMxfp8Kernel] = {}
 _TOKEN_SRC_METADATA_REGION = "nvlink.token_comm.token_src_metadata"
-_COL_QUANT_SIZES_REGION = "rubin.glu_mxfp8.mega.col_quant_expert_token_sizes"
 _PRE_REDUCED_ACTIVATION_REGION = "nvlink.token_comm.pre_reduced_activation"
 _PRE_REDUCED_ACTIVATION_SF_REGION = "nvlink.token_comm.pre_reduced_activation_sf"
 
@@ -68,10 +68,10 @@ _PRE_REDUCED_ACTIVATION_SF_REGION = "nvlink.token_comm.pre_reduced_activation_sf
 def prepare_environment(
     device: torch.device,
 ) -> tuple[tuple[int, int], int]:
-    """Query the Rubin environment before constructing a final config."""
+    """Query the device environment before constructing a final config."""
 
     cluster_size = MXFP8_CLUSTER_SHAPE_MNK[0] * MXFP8_CLUSTER_SHAPE_MNK[1]
-    return _prepare_rubin_environment(
+    return _prepare_environment(
         device,
         cluster_size=cluster_size,
         context="forward",
@@ -85,7 +85,7 @@ def prepare_mixed_cga_launch(
 ) -> Mxfp8MixedCgaLaunch:
     """Query resident 4-CTA clusters and split the device for mixed CGA."""
 
-    _, preferred_max_active_clusters = _prepare_rubin_environment(
+    _, preferred_max_active_clusters = _prepare_environment(
         device,
         cluster_size=MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK[0] * MXFP8_MIXED_CGA_CLUSTER_SHAPE_MNK[1],
         context="forward mixed CGA",
@@ -104,7 +104,7 @@ def _pre_reduced_workspace_metadata(
     """Describe the standalone combine plane."""
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_REGION)
     if region.buffer_space != "shared":
-        raise RuntimeError("Rubin pre_reduced_activation must reside in shared workspace")
+        raise RuntimeError("MegaMoE pre_reduced_activation must reside in shared workspace")
     offset = int(device_workspace.offset(_PRE_REDUCED_ACTIVATION_REGION))
     nbytes = int(device_workspace.nbytes(_PRE_REDUCED_ACTIVATION_REGION))
     wire_bits_per_element = {
@@ -122,10 +122,10 @@ def _pre_reduced_workspace_metadata(
     expected_bytes = config.max_tokens_per_rank * bytes_per_token
     if nbytes != expected_bytes:
         raise RuntimeError(
-            "Rubin pre_reduced_activation size does not match " f"combine_format={config.combine_format!r}: {nbytes} bytes, " f"expected {expected_bytes}"
+            "MegaMoE pre_reduced_activation size does not match " f"combine_format={config.combine_format!r}: {nbytes} bytes, " f"expected {expected_bytes}"
         )
     if offset + nbytes > shared_bytes:
-        raise RuntimeError("Rubin pre_reduced_activation region exceeds shared workspace")
+        raise RuntimeError("MegaMoE pre_reduced_activation region exceeds shared workspace")
     return offset, bytes_per_token
 
 
@@ -140,13 +140,13 @@ def _pre_reduced_sf_workspace_metadata(
 
     region = device_workspace.region(_PRE_REDUCED_ACTIVATION_SF_REGION)
     if region.buffer_space != "shared":
-        raise RuntimeError("Rubin pre_reduced_activation_sf must reside in shared workspace")
+        raise RuntimeError("MegaMoE pre_reduced_activation_sf must reside in shared workspace")
     offset = int(device_workspace.offset(_PRE_REDUCED_ACTIVATION_SF_REGION))
     nbytes = int(device_workspace.nbytes(_PRE_REDUCED_ACTIVATION_SF_REGION))
     if nbytes % config.max_tokens_per_rank:
-        raise RuntimeError("Rubin pre_reduced_activation_sf size is not token aligned")
+        raise RuntimeError("MegaMoE pre_reduced_activation_sf size is not token aligned")
     if offset + nbytes > shared_bytes:
-        raise RuntimeError("Rubin pre_reduced_activation_sf region exceeds shared workspace")
+        raise RuntimeError("MegaMoE pre_reduced_activation_sf region exceeds shared workspace")
     return offset, nbytes // config.max_tokens_per_rank
 
 
@@ -161,10 +161,10 @@ def prepare_kernel(
 
     import cutlass
 
-    from ..cutedsl_src.kernel_src.rubin.training.mega.fwd_glu.glu_mxfp8_mega_moe_kernel import (
-        Sm107MegaMoEMxfp8GluKernel,
-    )
     from ..cutedsl_src.quant_def import CombineFormat
+
+    kernel_architecture = architecture_for(architecture)
+    kernel_class = kernel_architecture.forward_kernel_class()
 
     kernel_kwargs = dict(
         mma_tiler_mnk=config.mma_tiler_mnk,
@@ -187,7 +187,7 @@ def prepare_kernel(
         world_size=config.world_size,
         # Runtime rank is carried by SymmetricBufferHost. Keeping this
         # descriptor rank-independent allows every EP rank to compile the
-        # same Rubin kernel.
+        # same kernel.
         local_rank=0,
         num_topk=config.top_k,
         max_tokens_per_rank=config.max_tokens_per_rank,
@@ -195,10 +195,6 @@ def prepare_kernel(
         data_token_capacity=config.physical_recv_pool_size,
         hidden=config.hidden,
         launch_cluster_count=config.launch_cluster_count,
-        schedule_mode=config.schedule_mode,
-        fallback_cluster_shape_mn=config.fallback_cluster_shape_mn,
-        preferred_cluster_count=config.preferred_cluster_count,
-        fallback_cluster_count=config.fallback_cluster_count,
         drop_on_overflow=config.kernel_drop_on_overflow,
         token_back_mode=config.token_back_mode,
         epi_flag_batch=config.epi_flag_batch,
@@ -212,7 +208,23 @@ def prepare_kernel(
         enable_col_quant=config.enable_col_quant,
         weight_storage_mode=config.weight_storage_mode,
     )
-    kernel = Sm107MegaMoEMxfp8GluKernel.from_kwargs(**kernel_kwargs)
+    schedule_kwargs = dict(
+        schedule_mode=config.schedule_mode,
+        fallback_cluster_shape_mn=config.fallback_cluster_shape_mn,
+        preferred_cluster_count=config.preferred_cluster_count,
+        fallback_cluster_count=config.fallback_cluster_count,
+    )
+    if kernel_architecture.supports_forward_schedule_options:
+        kernel_kwargs.update(schedule_kwargs)
+    elif schedule_kwargs != dict(
+        schedule_mode="grouped",
+        fallback_cluster_shape_mn=None,
+        preferred_cluster_count=None,
+        fallback_cluster_count=None,
+    ):
+        # The tuning check declines these before preparation; keep the kernel from silently dropping them.
+        raise NotImplementedError(f"MoeEp MegaMoE forward schedule options {schedule_kwargs} are not supported on " f"{kernel_architecture.name}")
+    kernel = kernel_class.from_kwargs(**kernel_kwargs)
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     local_zero_bytes, shared_zero_bytes = kernel.require_zero_workspace_leading_bytes
     for name, zero_bytes, total_bytes in (
@@ -220,35 +232,35 @@ def prepare_kernel(
         ("shared", shared_zero_bytes, shared_bytes),
     ):
         if zero_bytes < 0 or zero_bytes > total_bytes:
-            raise RuntimeError(f"Rubin kernel {name} zero prefix {zero_bytes} exceeds " f"workspace size {total_bytes}")
+            raise RuntimeError(f"MegaMoE kernel {name} zero prefix {zero_bytes} exceeds " f"workspace size {total_bytes}")
     device_workspace = kernel._mega_device_workspace
     metadata_region = device_workspace.region(_TOKEN_SRC_METADATA_REGION)
     if metadata_region.buffer_space != "shared":
-        raise RuntimeError("Rubin token_src_metadata must reside in shared workspace")
+        raise RuntimeError("MegaMoE token_src_metadata must reside in shared workspace")
     token_src_metadata_offset = int(device_workspace.offset(_TOKEN_SRC_METADATA_REGION))
     token_src_metadata_bytes = int(device_workspace.nbytes(_TOKEN_SRC_METADATA_REGION))
     if token_src_metadata_offset + token_src_metadata_bytes > shared_bytes:
-        raise RuntimeError("Rubin token_src_metadata region exceeds shared workspace")
+        raise RuntimeError("MegaMoE token_src_metadata region exceeds shared workspace")
     pool_token_capacity = int(kernel.pool_token_capacity)
     if pool_token_capacity != config.physical_recv_pool_size:
         raise RuntimeError(
-            "Rubin data_token_capacity did not preserve the prescribed " f"physical pool: {pool_token_capacity} != " f"{config.physical_recv_pool_size}"
+            "MegaMoE data_token_capacity did not preserve the prescribed " f"physical pool: {pool_token_capacity} != " f"{config.physical_recv_pool_size}"
         )
     if token_src_metadata_bytes != pool_token_capacity * 8:
-        raise RuntimeError("Rubin token_src_metadata must contain one Int64 per pool token")
+        raise RuntimeError("MegaMoE token_src_metadata must contain one Int64 per pool token")
     col_quant_data_rows = pool_token_capacity if config.enable_col_quant else 0
     col_quant_sf_elements = int(kernel.token_comm.worst_case_sf_token_count) * (config.hidden // config.sf_vec_size) if config.enable_col_quant else 0
     if config.enable_col_quant:
-        col_quant_sizes_region = device_workspace.region(_COL_QUANT_SIZES_REGION)
+        col_quant_sizes_region = device_workspace.region(kernel.col_quant_sizes_region)
         if col_quant_sizes_region.buffer_space != "local":
-            raise RuntimeError("Rubin col-quant expert-size snapshot must reside in " "local workspace")
-        col_quant_sizes_offset = int(device_workspace.offset(_COL_QUANT_SIZES_REGION))
-        col_quant_sizes_bytes = int(device_workspace.nbytes(_COL_QUANT_SIZES_REGION))
+            raise RuntimeError("MegaMoE col-quant expert-size snapshot must reside in " "local workspace")
+        col_quant_sizes_offset = int(device_workspace.offset(kernel.col_quant_sizes_region))
+        col_quant_sizes_bytes = int(device_workspace.nbytes(kernel.col_quant_sizes_region))
         expected_sizes_bytes = config.num_experts * torch.int32.itemsize
         if col_quant_sizes_bytes != expected_sizes_bytes:
-            raise RuntimeError("Rubin col-quant expert-size snapshot has " f"{col_quant_sizes_bytes} bytes, expected " f"{expected_sizes_bytes}")
+            raise RuntimeError("MegaMoE col-quant expert-size snapshot has " f"{col_quant_sizes_bytes} bytes, expected " f"{expected_sizes_bytes}")
         if col_quant_sizes_offset + col_quant_sizes_bytes > local_bytes:
-            raise RuntimeError("Rubin col-quant expert-size snapshot exceeds local workspace")
+            raise RuntimeError("MegaMoE col-quant expert-size snapshot exceeds local workspace")
     else:
         col_quant_sizes_offset = None
         col_quant_sizes_bytes = 0
