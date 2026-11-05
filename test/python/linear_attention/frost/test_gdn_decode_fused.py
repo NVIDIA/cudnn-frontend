@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The fused GDN decode step (``cudnn.linear_attention.frost.gdn_decode_fused``): the typed declines of its host entry (host-only,
-CPU tensors), the plan-time-only compile key, the config knob validation (the occupancy pad on both part readings), the DSL-floor
-decline, and -- on a cc 10.x device -- the null-slot contract, the reader tickets, determinism, CUDA-graph replay over distinct
-layers, a loose torch reference of the fused math, and the bitwise agreement of every knob arm (the shared-memory state path, the
-streamed two-CTAs-per-SM form, the PDL order, the TPR mappings, the 128-thread form, the tap-contiguous conv-state layout) with the
-entry's default pick on one operand set that carries a null row and non-monotone slots.  The default's per-rows pick (one CTA per
-SM while the rows x 48 grid fits the SMs, the streamed two-CTAs-per-SM form past that) is pinned on the host for two SM counts and
-on the device."""
+CPU tensors), the plan-time-only compile key, the config knob validation (the occupancy pad and the co-residency on every part reading), the DSL-floor
+decline, and -- on a cc 10.x or 12.x device -- the null-slot contract, the reader tickets, determinism, CUDA-graph replay over distinct
+layers, a loose torch reference of the fused math, and the bitwise agreement of every knob arm the part's shared memory holds (the
+shared-memory state path, the streamed two-CTAs-per-SM form, the PDL order, the TPR mappings, the 128-thread form, the tap-contiguous
+conv-state layout) with the entry's default pick on one operand set that carries a null row and non-monotone slots -- an arm the part
+does not hold is its typed decline, reported as a skip.  The default's per-rows pick (the pair, one CTA per SM while the rows x 48 grid
+fits the SMs, past that the capped two-CTAs-per-SM form where two of its CTAs share an SM, else the one-CTA form in two waves) is pinned
+on the host for both validated parts' readings over several SM counts and on the device."""
 
 import math
 from dataclasses import replace
@@ -25,9 +26,17 @@ pytestmark = [pytest.mark.L0]
 
 ROWS = 2
 SLOTS = ROWS + 1
-# the cc 10.0 part reading (228 KB per SM, 227 KB opt-in) and a hypothetical larger part (336 KiB per SM, 335 KiB opt-in): the pad must do
-# what it claims on both
-PART_READINGS = [(233472, 232448), (344064, 343040)]
+# the cc 10.0 part reading (228 KB per SM, 227 KB opt-in), a hypothetical larger part (336 KiB per SM, 335 KiB opt-in) and the cc 12.0 part
+# reading (100 KB per SM, 99 KB opt-in): the pad must do what it claims on each, and a form two of which cannot share the SM is a typed
+# decline where the caller asks for two
+SM100_READING = (kcfg.SM100_SMEM_PER_SM_BYTES, kcfg.SM100_SMEM_OPTIN_BYTES)  # 233,472 / 232,448
+SM120_READING = (kcfg.SM120_SMEM_PER_SM_BYTES, kcfg.SM120_SMEM_OPTIN_BYTES)  # 102,400 / 101,376
+PART_READINGS = [SM100_READING, (344064, 343040), SM120_READING]
+
+
+def _on(reading):
+    """The ``Cfg`` fields of a part reading ``(shared memory per SM, per-CTA opt-in)``."""
+    return dict(SMEM_PER_SM_BYTES=reading[0], SMEM_OPTIN_BYTES=reading[1])
 
 
 def make_operands(rows=ROWS, device="cpu", slots=SLOTS, seed=0, **overrides):
@@ -115,6 +124,57 @@ def test_default_form_switches_where_the_grid_outgrows_the_sms(sm_count):
         kcfg.default_cfg(1, 0)
 
 
+def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count():
+    """The cc 10.0 readings, explicit and as the defaults: the capped form IS two per SM there (three footprints by shared memory, two by
+    the cap), so the pick is PAIR_CFG / CFG / CAPPED_CFG by the SM-count rule alone at every rows count -- the byte-identity pin of the
+    budget-aware pick with the measured cc 10.0 pick, over six SM counts."""
+    per_sm, optin = SM100_READING
+    for sms in (84, 148, 152, 170, 188):
+        for rows in range(1, 17):
+            want = kcfg.PAIR_CFG if rows * 96 <= sms else (kcfg.CFG if rows * 48 <= sms else kcfg.CAPPED_CFG)
+            assert kcfg.default_cfg(rows, sms) == kcfg.default_cfg(rows, sms, per_sm, optin) == want, (sms, rows)
+    assert (
+        kcfg.default_cfg(2, 192) == kcfg.PAIR_CFG and kcfg.default_cfg(3, 192) == kcfg.CFG and kcfg.default_cfg(5, 192) == kcfg.CAPPED_CFG
+    )  # a 192-SM part would pair rows 2
+    assert kcfg.default_cfg(1, 84) == kcfg.CFG and kcfg.default_cfg(2, 84) == kcfg.CAPPED_CFG  # 84 SMs hold no 96-CTA cluster grid
+    assert kcfg.first_fitting(kcfg.ONE_CTA_FORMS) == kcfg.CFG and kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.CAPPED_CFG
+    assert kcfg.admissible(kcfg.CAPPED_CFG) and kcfg.admissible(kcfg.STREAMED_CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
+    assert (kcfg.PAIR_FORMS, kcfg.ONE_CTA_FORMS, kcfg.BEYOND_FORMS) == ((kcfg.PAIR_CFG,), (kcfg.CFG,), (kcfg.CAPPED_CFG, kcfg.CFG))
+    assert kcfg.part_readings(per_sm, optin) == _on(SM100_READING)
+
+
+def test_default_cfg_on_the_cc120_reading_never_picks_a_cap_the_part_cannot_use():
+    """The cc 12.0 readings (100 KB per SM, 99 KB opt-in) on 170 / 188 SMs: rows 1 the pair, rows 2 and up the one-CTA form -- two waves
+    from rows 4 rather than CAPPED_CFG / STREAMED_CFG, whose cap keeps nothing co-resident on a 100 KB SM and spills; on 84 SMs the
+    one-CTA form at every rows count; a two-per-SM occupancy pad (``CTAS_PER_SM`` 2, valid on the 228 KB readings) is inadmissible there by
+    the validator's fit term; a part no form fits is the typed decline naming its opt-in."""
+    per_sm, optin = SM120_READING
+    for sms in (170, 188):
+        assert kcfg.default_cfg(1, sms, per_sm, optin) == kcfg.PAIR_CFG
+        for rows in range(2, 65):
+            assert kcfg.default_cfg(rows, sms, per_sm, optin) == kcfg.CFG, (sms, rows)
+    for rows in range(1, 17):
+        assert kcfg.default_cfg(rows, 84, per_sm, optin) == kcfg.CFG, rows
+    assert not kcfg.admissible(kcfg.CAPPED_CFG, per_sm, optin) and not kcfg.admissible(kcfg.STREAMED_CFG, per_sm, optin)
+    assert kcfg.admissible(kcfg.CFG, per_sm, optin) and kcfg.admissible(kcfg.PAIR_CFG, per_sm, optin)
+    assert kcfg.admissible(
+        kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2), per_sm, optin
+    ), "the one capped form two of which share a 100 KB SM"
+    assert not kcfg.admissible(kcfg.make_cfg(CTAS_PER_SM=2), per_sm, optin), "two whole-slab footprints plus the reserves exceed the 100 KB SM"
+    assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.CFG
+    for call in (
+        lambda: kcfg.default_cfg(1, 170, 40960, 40000),
+        lambda: kcfg.default_cfg(4, 170, 40960, 40000),
+        lambda: kcfg.first_fitting(kcfg.ONE_CTA_FORMS, 40960, 40000),
+    ):
+        with pytest.raises(NotImplementedError, match="40000-byte shared-memory opt-in per CTA .* holds no decode form"):
+            call()
+    with pytest.raises(ValueError, match="cannot exceed the SM"):
+        kcfg.default_cfg(1, 170, 100000, 200000)
+    with pytest.raises(ValueError, match="smem_optin"):
+        kcfg.default_cfg(1, 170, per_sm, 0)
+
+
 def test_cudnn_level_export_resolves_to_the_entry():
     assert cudnn.GdnDecodeFused is entry.GdnDecodeFused, "the lazy cudnn-level export (import cudnn; cudnn.GdnDecodeFused) is the entry class"
 
@@ -129,6 +189,39 @@ def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
     k8 = entry.GdnDecodeFused("cpu", 1e-6, cfg=given)
     k8.sm_count = 148
     assert k8.cfg_given and k8.cfg_for(1) == k8.cfg_for(4) == given  # the override wins at every rows
+
+
+def test_entry_on_a_99kb_part_picks_the_one_cta_form_past_the_pair_regime(monkeypatch):
+    """Host-only, the device readers stubbed to the cc 12.0 readings and 170 SMs: the entry's pick reads the part -- the pair at rows 1,
+    the one-CTA form from rows 2 on (two waves from rows 4, never CAPPED_CFG: the whole slab is one CTA per SM by shared memory there,
+    ``co_resident_ctas`` 1) -- every form stamped with the readings; the same entry on the cc 10.0 readings picks CAPPED_CFG at rows 4; a
+    part holding no form is the typed decline at construction, and a caller's explicit form is validated as given."""
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: SM120_READING)
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: 170)
+    k = entry.GdnDecodeFused("cuda:0", 1e-6)
+    assert (k.readings, k.sm_count) == (SM120_READING, 170) and k.cfg == replace(kcfg.CFG, **_on(SM120_READING))
+    assert replace(k.cfg_for(1), **_on(SM100_READING)) == kcfg.PAIR_CFG and k.cfg_for(1).co_resident_ctas == 1
+    for rows in (2, 3, 4, 8, 64):
+        got = k.cfg_for(rows)
+        assert replace(got, **_on(SM100_READING)) == kcfg.CFG, rows
+        assert (got.MIN_CTAS_PER_SM, got.co_resident_ctas, got.SMEM_PAD_BYTES, got.SMEM_BYTES) == (1, 1, 0, 74848), rows
+        assert (got.SMEM_PER_SM_BYTES, got.SMEM_OPTIN_BYTES) == SM120_READING, "every pick carries the part's readings"
+    assert k.cfg_for(4) is k.cfg_for(8), "one stamped form per module form: the forms cache"
+    assert replace(kcfg.CAPPED_CFG, **_on(SM120_READING)).co_resident_ctas == 1, "the cap would keep nothing co-resident on this part"
+    ops = make_operands(rows=4)
+    assert k.key(4, ops["x"], ops["cs"], ops["state"], ops["z"])[1] == k.cfg_for(4)
+    # the cc 10.0 readings on 148 SMs: the measured picks, the capped form two per SM at rows 4
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: SM100_READING)
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: 148)
+    k100 = entry.GdnDecodeFused("cuda:0", 1e-6)
+    assert k100.cfg == kcfg.CFG and k100.readings == SM100_READING
+    assert k100.cfg_for(1) == kcfg.PAIR_CFG and k100.cfg_for(2) == kcfg.CFG and k100.cfg_for(4) == kcfg.CAPPED_CFG and k100.cfg_for(4).co_resident_ctas == 2
+    # a part that holds no form: the typed decline at construction; a caller's explicit form is validated as given (its own typed error)
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: (40960, 40000))
+    with pytest.raises(NotImplementedError, match="40000-byte shared-memory opt-in per CTA .* holds no decode form"):
+        entry.GdnDecodeFused("cuda:0", 1e-6)
+    with pytest.raises(ValueError, match="exceeds the per-CTA opt-in maximum 40000"):
+        entry.GdnDecodeFused("cuda:0", 1e-6, cfg=kcfg.PAIR_CFG)
 
 
 def test_pdl_launch_knobs_apply_on_top_of_the_pick_and_of_a_given_cfg():
@@ -225,14 +318,57 @@ def test_cfg_knobs_validate():
 
 @pytest.mark.parametrize("per_sm, optin", PART_READINGS)
 @pytest.mark.parametrize("path", kcfg.STATE_LOAD_PATHS)
-def test_occupancy_pad_caps_the_ctas_per_sm_on_both_part_readings(per_sm, optin, path):
+def test_occupancy_pad_caps_the_ctas_per_sm_on_every_part_reading(per_sm, optin, path):
+    """``CTAS_PER_SM`` n pads the footprint so that n + 1 CTAs exceed the SM while n fit it; where even the NATURAL footprints of n CTAs do
+    not fit (the whole-slab bulk form at n = 2 on the cc 12.0 reading: 2 x (74,848 + 1,024) B > 102,400 B) the knob is a typed decline,
+    never a silent one-per-SM launch."""
     for n in (1, 2):
+        natural = kcfg.make_cfg(CTAS_PER_SM=0, STATE_LOAD_PATH=path, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin).NATURAL_SMEM_BYTES
+        if n * (natural + kcfg.SMEM_CTA_RESERVE_BYTES) > per_sm:
+            with pytest.raises(ValueError, match="do not fit the SM"):
+                kcfg.make_cfg(CTAS_PER_SM=n, STATE_LOAD_PATH=path, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin)
+            continue
         c = kcfg.make_cfg(CTAS_PER_SM=n, STATE_LOAD_PATH=path, SMEM_PER_SM_BYTES=per_sm, SMEM_OPTIN_BYTES=optin)
         per_cta = c.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES
         assert (n + 1) * per_cta > per_sm, "one CTA more than allowed does not fit the SM"
         assert n * per_cta <= per_sm, "the allowed count does"
         assert c.SMEM_BYTES <= optin
         assert c.SMEM_PAD_BYTES % 16 == 0
+        assert per_sm // per_cta == n and c.co_resident_ctas == 1, "the pad admits exactly n by shared memory; an uncapped form guarantees one by registers"
+
+
+def test_cc120_reading_footprints_and_co_residency():
+    """The cc 12.0 readings (100 KB per SM, 99 KB per-CTA opt-in) through the module's own arithmetic: the launch footprints of the forms
+    (no pad fits beside a slab there: the natural footprints launch), which of them two can share an SM -- ``co_resident_ctas`` reads BOTH
+    budgets, the part's shared memory and the register cap the launch asks for -- and the knob arms that cannot be asked for two."""
+    per_sm, optin = SM120_READING
+    assert SM120_READING == (102400, 101376) and SM100_READING == (233472, 232448)
+    pair, cfg, capped, streamed = (replace(f, **_on(SM120_READING)) for f in (kcfg.PAIR_CFG, kcfg.CFG, kcfg.CAPPED_CFG, kcfg.STREAMED_CFG))
+    assert (pair.SMEM_BYTES, cfg.SMEM_BYTES, capped.SMEM_BYTES, streamed.SMEM_BYTES) == (42112, 74848, 74848, 74848)
+    assert (pair.SMEM_PAD_BYTES, cfg.SMEM_PAD_BYTES, capped.SMEM_PAD_BYTES) == (0, 0, 0)
+    for form in (pair, cfg, capped, streamed):
+        kcfg.validate_cfg(form)  # every form fits the 99 KB opt-in at one CTA per SM
+    # the whole-slab forms are one per SM by shared memory alone (2 x 75,872 B > 102,400 B), cap or no cap; the uncapped pair guarantees one
+    assert (pair.co_resident_ctas, cfg.co_resident_ctas, capped.co_resident_ctas, streamed.co_resident_ctas) == (1, 1, 1, 1)
+    assert 2 * (capped.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) == 151744 > per_sm
+    pair2 = kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2, **_on(SM120_READING))
+    assert pair2.co_resident_ctas == 2 and 2 * (pair2.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) == 86272 <= per_sm < 3 * (
+        pair2.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES
+    )
+    ldg2 = kcfg.make_cfg(STATE_LOAD_PATH="ldg128", TPR=16, CTAS_PER_SM=2, MIN_CTAS_PER_SM=2, **_on(SM120_READING))
+    assert (ldg2.NATURAL_SMEM_BYTES, ldg2.SMEM_PAD_BYTES, ldg2.SMEM_BYTES, ldg2.co_resident_ctas) == (9392, 27824, 37216, 2)
+    assert kcfg.make_cfg(STATE_LOAD_PATH="ldg128", **_on(SM120_READING)).SMEM_BYTES == 54272  # CTAS_PER_SM 1: padded to one per SM
+    for arm in (
+        dict(MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+        dict(STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+        dict(TPR=8, MIN_CTAS_PER_SM=2, CTAS_PER_SM=2),
+    ):
+        with pytest.raises(ValueError, match="do not fit the SM"):
+            kcfg.make_cfg(**arm, **_on(SM120_READING))  # two whole slabs asked for by the pad: the typed decline
+    # the cc 10.0 readings: the capped whole-slab forms ARE two per SM (three by shared memory, two by the cap); the uncapped forms one
+    assert replace(kcfg.CAPPED_CFG, **_on(SM100_READING)).co_resident_ctas == replace(kcfg.STREAMED_CFG, **_on(SM100_READING)).co_resident_ctas == 2
+    assert replace(kcfg.CFG, **_on(SM100_READING)).co_resident_ctas == replace(kcfg.PAIR_CFG, **_on(SM100_READING)).co_resident_ctas == 1
+    assert kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2, **_on(SM100_READING)).co_resident_ctas == 2
 
 
 def test_state_box_bank_map_is_conflict_free_at_every_tpr():
@@ -294,11 +430,18 @@ def test_typed_declines_name_the_operand(mutation, exc, token):
 
 
 def test_declines_an_unserved_compute_capability_by_name():
-    with pytest.raises(NotImplementedError, match=r"9\.0"):
-        call_check(make_operands(), device_cc=(9, 0))
-    with pytest.raises(NotImplementedError, match=r"12\.0"):
-        call_check(make_operands(), device_cc=(12, 0))
-    assert entry.cc_supported((10, 0)) and entry.cc_supported((10, 3)) and not entry.cc_supported((9, 0)) and not entry.cc_supported(None)
+    """The admission is two closed ranges of ``10 * major + minor``: SM100-class (cc 10.x) and SM120-class (cc 12.x) -- cc 12.0 is served,
+    cc 12.1 structurally with it, while cc 9.x, 11.x (these kernels never ran there) and 13.x are declined by name, the decline naming
+    both served families and the device's capability; the single-major constant is gone (the ranges are the one source)."""
+    for cc in ((9, 0), (8, 0), (11, 0), (13, 0)):
+        with pytest.raises(NotImplementedError, match=rf"10\.x .*12\.x.*{cc[0]}\.{cc[1]}"):
+            call_check(make_operands(), device_cc=cc)
+        assert not entry.cc_supported(cc), cc
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
+        call_check(make_operands(), device_cc=cc)
+        assert entry.cc_supported(cc), cc
+    assert entry.SUPPORTED_CC_RANGES == ((100, 109), (120, 129)) and "10.x" in entry.SUPPORTED_CC_TEXT and "12.x" in entry.SUPPORTED_CC_TEXT
+    assert not entry.cc_supported(None) and not hasattr(entry, "SUPPORTED_CC_MAJOR")
 
 
 def test_declines_cpu_operands_when_no_capability_is_given():
@@ -437,7 +580,7 @@ def _device_or_skip():
         pytest.skip("needs a CUDA device")
     cc = tuple(torch.cuda.get_device_capability())
     if not entry.cc_supported(cc):
-        pytest.skip(f"the fused GDN decode step serves SM100-class parts (cc 10.x), this device is {cc}")
+        pytest.skip(f"the fused GDN decode step serves compute capability {entry.SUPPORTED_CC_TEXT}, this device is {cc}")
     msg = entry._dsl_version_error()
     if msg:
         pytest.skip(msg)
@@ -502,25 +645,36 @@ def test_entry_reads_the_device_shared_memory():
     props = torch.cuda.get_device_properties(dev)
     assert k.cfg.SMEM_PER_SM_BYTES == props.shared_memory_per_multiprocessor
     assert k.cfg.SMEM_OPTIN_BYTES == props.shared_memory_per_block_optin
+    assert k.readings == (props.shared_memory_per_multiprocessor, props.shared_memory_per_block_optin)
     assert k.cfg.SMEM_BYTES <= k.cfg.SMEM_OPTIN_BYTES and 2 * (k.cfg.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) > k.cfg.SMEM_PER_SM_BYTES
+    assert k.cfg == replace(kcfg.first_fitting(kcfg.ONE_CTA_FORMS, *k.readings), **k.part), "the start form: the one-CTA form this part holds"
 
 
 def test_entry_picks_the_form_per_rows_on_this_device():
+    """The entry's pick per rows on THIS part equals the module pick on the part's SM count and readings; the two-per-SM premise of the
+    capped form is asserted only where the pick carries the register cap (the cc 10.0 readings), and where it does not (a 100 KB SM keeps
+    the whole slab at one CTA per SM) the pick past the one-CTA grid is the one-CTA form itself, two waves, ``co_resident_ctas`` 1."""
     dev = _device_or_skip()
     k = entry.GdnDecodeFused(dev, 1e-6)
-    sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    assert k.sm_count == sms and not k.cfg_given
-    for rows in (1, 2, 3, 4, 8):
-        want, got = kcfg.default_cfg(rows, sms), k.cfg_for(rows)
-        assert (got.TWO_CTAS_PER_HEAD, got.MIN_CTAS_PER_SM, got.CTAS_PER_SM) == (want.TWO_CTAS_PER_HEAD, want.MIN_CTAS_PER_SM, want.CTAS_PER_SM), rows
+    props = torch.cuda.get_device_properties(dev)
+    sms = props.multi_processor_count
+    assert k.sm_count == sms and not k.cfg_given and k.readings == (props.shared_memory_per_multiprocessor, props.shared_memory_per_block_optin)
+    for rows in (1, 2, 3, 4, 8, 64):
+        want, got = kcfg.default_cfg(rows, sms, *k.readings), k.cfg_for(rows)
+        assert replace(got, **_on(SM100_READING)) == want, rows
         assert (got.STATE_LOAD_PATH, got.TPR, got.PDL, got.SINGLE_TAIL) == ("bulk", 4, False, True)
-        assert (got.SMEM_PER_SM_BYTES, got.SMEM_OPTIN_BYTES) == (k.cfg.SMEM_PER_SM_BYTES, k.cfg.SMEM_OPTIN_BYTES)  # the part's readings
+        assert (got.SMEM_PER_SM_BYTES, got.SMEM_OPTIN_BYTES) == k.readings  # the part's readings
     pair = k.cfg_for(1)
-    assert pair.TWO_CTAS_PER_HEAD and pair.SMEM_PAD_BYTES == 0 and 2 * (pair.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= pair.SMEM_PER_SM_BYTES
-    one = k.cfg_for(sms // (2 * kcfg.V_HEADS) + 1)  # the first rows count whose cluster grid outgrows the SMs (rows 2 on 148 / 152 SMs)
-    assert not one.TWO_CTAS_PER_HEAD and 2 * (one.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES  # one CTA per SM by shared memory
-    two = k.cfg_for(sms // kcfg.V_HEADS + 1)  # the first rows count whose one-CTA grid outgrows the SMs
-    assert two.MIN_CTAS_PER_SM == 2 and two.SMEM_PAD_BYTES == 0 and 2 * (two.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= two.SMEM_PER_SM_BYTES
+    assert pair.TWO_CTAS_PER_HEAD == (2 * kcfg.V_HEADS <= sms)  # the pair while its 96 cluster CTAs have an SM each
+    if pair.TWO_CTAS_PER_HEAD:
+        assert pair.SMEM_PAD_BYTES == 0 and 2 * (pair.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= pair.SMEM_PER_SM_BYTES
+    one = k.cfg_for(sms // (2 * kcfg.V_HEADS) + 1)  # the first rows count whose cluster grid outgrows the SMs (rows 2 on 148 / 152 / 170 SMs)
+    assert not one.TWO_CTAS_PER_HEAD and one.co_resident_ctas == 1 and 2 * (one.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES
+    beyond = k.cfg_for(sms // kcfg.V_HEADS + 1)  # the first rows count whose one-CTA grid outgrows the SMs
+    if beyond.MIN_CTAS_PER_SM == 2:  # the capped form: this part's shared memory holds two of its CTAs per SM (the cc 10.0 readings)
+        assert beyond.co_resident_ctas == 2 and beyond.SMEM_PAD_BYTES == 0 and 2 * (beyond.SMEM_BYTES + kcfg.SMEM_CTA_RESERVE_BYTES) <= beyond.SMEM_PER_SM_BYTES
+    else:  # the whole slab is one CTA per SM by shared memory on this part, so the cap left the pick: the one-CTA form in two waves
+        assert beyond == one and replace(kcfg.CAPPED_CFG, **k.part).co_resident_ctas == 1 and not kcfg.admissible(kcfg.CAPPED_CFG, *k.readings)
 
 
 def test_warm_entry_rejects_cpu_operands_before_the_compiled_kernel_is_looked_up():
@@ -734,11 +888,22 @@ def _default_snapshot(dev, seed=31):
     ],
     ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "one-cta-form",
 )
-def test_knob_arms_are_bitwise_with_the_default_pick_at_b4(arm):
+def test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick_at_b4(arm):
+    """Every knob arm this part's shared memory holds writes the bytes of the entry's pick; an arm it does not hold (a two-slab pad on a
+    100 KB SM: three arms on the cc 12.0 readings, none on the cc 10.0 ones) is asserted to be the typed decline at construction, never a
+    launch, and then reported as a SKIP with that reason, so the count shows which arms ran on the part."""
     dev = _device_or_skip()
+    cfg = kcfg.make_cfg(**arm)
+    try:
+        kcfg.validate_cfg(replace(cfg, **_on(entry.device_shared_memory(dev))))
+    except ValueError as exc:
+        assert "do not fit the SM" in str(exc), exc
+        with pytest.raises(ValueError, match="do not fit the SM"):
+            entry.GdnDecodeFused(dev, 1e-6, cfg=cfg)
+        pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
     base = _default_snapshot(dev)
     ops = make_operands(rows=4, slots=5, device=dev, seed=31, idx=torch.tensor(B4_IDX, dtype=torch.int32, device=dev))
-    got = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=kcfg.make_cfg(**arm)), ops)
+    got = _snapshot(entry.GdnDecodeFused(dev, 1e-6, cfg=cfg), ops)
     _assert_bitwise(base, got, str(arm))
     assert not got["qout"][1].any() and got["qout"][0].any(), "the null row is zero, the live rows written"
 

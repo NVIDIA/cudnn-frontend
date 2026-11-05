@@ -18,9 +18,18 @@ While the ``rows x 96`` CTAs of the two-CTAs-per-head form have an SM each (``ro
 ``PAIR_CFG`` serves -- ``TWO_CTAS_PER_HEAD``, ``CTAS_PER_SM`` 0 -- because the pair buys a second SM's bulk-copy path per head (the
 fastest form at rows 1; the pair loses once it has to share an SM).  While every CTA of the ``rows x 48`` grid has an SM of its own
 (``rows * 48 <= SM count``) the one-CTA-per-SM form ``CFG`` serves.  Past that the register-resident form under the 128-register cap
-``CAPPED_CFG`` serves -- ``MIN_CTAS_PER_SM`` 2, ``CTAS_PER_SM`` 0, spill-free with one tail -- so two CTAs share an SM and the grid runs
-in ONE wave (slightly ahead of the streamed form ``STREAMED_CFG``).  ``PDL`` stays off in every form: it needs the caller's stream
-contract (its knob below).  A caller's ``Cfg`` overrides the pick as a whole.
+``CAPPED_CFG`` serves -- ``MIN_CTAS_PER_SM`` 2, ``CTAS_PER_SM`` 0 -- so two CTAs share an SM and the grid runs in ONE wave (slightly ahead
+of the streamed form ``STREAMED_CFG``) -- on a part where two of its CTAs CAN share an SM (``Cfg.co_resident_ctas`` >= 2: the cc 10.0
+part's 228 KB per SM holds three 75 KB footprints, the register cap two CTAs of 256 threads; spill-free there with one tail).  Two CTAs per
+SM is a PER-PART premise, read from ``co_resident_ctas``: on a 100 KB part (cc 12.0: 102,400 B per SM, 101,376 B opt-in) the whole-slab
+form is one CTA per SM by shared memory alone (2 x (74,848 + 1,024) = 151,744 B > 102,400 B), so the 128-register cap buys nothing there
+and costs spills -- measured on sm_120a (``cuobjdump -res-usage``, 256 threads): ``CAPPED_CFG`` 128 registers + 16 B stack + 7 STL / LDL,
+``STREAMED_CFG`` 128 / 0, ``CFG`` 145 / 0, ``PAIR_CFG`` 111 / 0, ``PAIR_CFG`` with ``MIN_CTAS_PER_SM`` 2 109 / 0 (the cap a no-op: the pair
+is two per SM by registers without it, and 2 x (42,112 + 1,024) = 86,272 B fit the 100 KB SM).  Where the capped form is not ADMISSIBLE
+on the part (``admissible``: the footprint fits the per-CTA opt-in and, under the register cap, two CTAs share an SM) the one-CTA form
+``CFG`` serves past the one-CTA grid too, in two waves -- the cc 12.0 reading on 170 / 188 SMs: rows 1 ``PAIR_CFG`` (96 cluster CTAs,
+one wave), rows 2 and up ``CFG`` (192 CTAs at rows 4 = two waves); a part no form fits is the typed decline.  ``PDL`` stays off in every
+form: it needs the caller's stream contract (its knob below).  A caller's ``Cfg`` overrides the pick as a whole.
 
 Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 
@@ -42,7 +51,9 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 * ``STATE_STREAM`` (bulk only): pass 2 re-reads each row from shared memory and recomputes ``h = S * decay`` (bit-identical) instead of
   keeping the 64 updated values live across the two passes -- the <= 128-register form that lets two CTAs share an SM.
 * ``MIN_CTAS_PER_SM``: the launch's ``min_blocks_per_mp`` = ptxas's register cap (1 -> 255, 2 -> 128 registers per thread at 256 threads);
-  the SASS gate (no ``STL`` / ``LDL``) decides whether a form may use it.
+  the SASS gate (no ``STL`` / ``LDL``) decides whether a form may use it, and ``Cfg.co_resident_ctas`` (the CTAs per SM the part's shared
+  memory and the cap guarantee together) whether it buys anything on the part: a cap on a form whose footprint already keeps the SM at
+  one CTA is pure cost (sm_120a: ``CAPPED_CFG`` spills 7).
 * ``PDL`` / ``PDL_RELEASE``: ``griddepcontrol.wait`` AFTER the predecessor-independent loads (slot, parameters, BA weight rows, the state
   slab, the conv weights and history) and BEFORE ``z``, ``hidden``, the ``x`` copies and every global write (the pre-wait prefetch order
   of the reference verify kernel); ``griddepcontrol.launch_dependents`` at entry; the launch carries the programmatic-stream-
@@ -124,6 +135,10 @@ STATE_LOAD_PATHS = ("ldg128", "bulk")
 # so a hardcoded size never decides an occupancy pad on a part it does not describe.
 SM100_SMEM_PER_SM_BYTES = 228 * 1024
 SM100_SMEM_OPTIN_BYTES = 227 * 1024
+# The cc 12.0 part's readings (100 KB per SM, 99 KB per-CTA opt-in, the same 1 KB reserve; a 170-SM RTX 5090-class part): documentation
+# and tests only, never a default -- the host entry reads the part.
+SM120_SMEM_PER_SM_BYTES = 100 * 1024
+SM120_SMEM_OPTIN_BYTES = 99 * 1024
 SMEM_CTA_RESERVE_BYTES = 1024
 SMEM_PAD_MARGIN_BYTES = 4096  # keeps the cap robust to the allocation granularity
 
@@ -276,6 +291,17 @@ class Cfg:
     def SMEM_BYTES(self) -> int:
         return self.NATURAL_SMEM_BYTES + self.SMEM_PAD_BYTES
 
+    @property
+    def co_resident_ctas(self) -> int:
+        """The CTAs of this form that share one SM on the part, as the host can GUARANTEE them from the two budgets it knows: by shared
+        memory, how many launch footprints plus the driver's per-CTA reserve fit ``SMEM_PER_SM_BYTES``; by registers, ``MIN_CTAS_PER_SM``
+        (the cap the launch asks ptxas for -- 2 = 128 registers, two CTAs of 256 threads in the 64 K file; an uncapped form may take up to
+        255, so the host counts one) -- the smaller of the two.  The ONE predicate the default pick, its docs and its tests read: a
+        ``MIN_CTAS_PER_SM`` 2 form is worth its cap only where this is 2 (the cc 10.0 readings: ``CAPPED_CFG`` 2; the cc 12.0 readings: 1,
+        2 x (74,848 + 1,024) B > 102,400 B), and the half-slab pair under the cap is two per SM on both (42,112 B)."""
+        by_smem = self.SMEM_PER_SM_BYTES // (self.SMEM_BYTES + SMEM_CTA_RESERVE_BYTES)
+        return min(by_smem, self.MIN_CTAS_PER_SM)
+
 
 def validate_cfg(cfg: Cfg) -> None:
     """Raise the typed error of every unexpressible knob combination (structural invariants raise here, never a module assert)."""
@@ -340,21 +366,78 @@ def make_cfg(**overrides) -> Cfg:
 # the forms of the default (the module docstring's "Default" paragraph)
 PAIR_CFG = make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0)  # a cluster of two CTAs per head -- while the rows x 96 CTAs have an SM each
 CFG = make_cfg()  # one CTA per SM: bulk, TPR 4 -- while the rows x 48 CTAs have an SM each
-CAPPED_CFG = make_cfg(MIN_CTAS_PER_SM=2, CTAS_PER_SM=0)  # register-resident under the 128-register cap: two CTAs per SM, one wave -- past that
+CAPPED_CFG = make_cfg(
+    MIN_CTAS_PER_SM=2, CTAS_PER_SM=0
+)  # register-resident under the 128-register cap: two CTAs per SM, one wave -- past that, where the part's shared memory holds two (co_resident_ctas 2)
 STREAMED_CFG = make_cfg(
     STATE_STREAM=True, MIN_CTAS_PER_SM=2, CTAS_PER_SM=0
 )  # the streamed two-CTAs-per-SM form (a measured knob form, slightly behind CAPPED_CFG)
 
+# The ladder of each SM-count regime: the measured cc 10.0 pick first, then what a part whose shared memory does not hold it falls back
+# to.  Past the one-CTA grid the capped form serves only where two of its CTAs share an SM (the cc 10.0 readings); on a 100 KB part the
+# whole-slab footprint is one CTA per SM by shared memory alone, so the plain one-CTA form runs the grid in two waves instead of paying
+# for a cap that spills (sm_120a: CAPPED_CFG 7 STL / LDL).
+PAIR_FORMS = (PAIR_CFG,)
+ONE_CTA_FORMS = (CFG,)
+BEYOND_FORMS = (CAPPED_CFG, CFG)
 
-def default_cfg(rows: int, sm_count: int) -> Cfg:
-    """The measured pick per rows: ``PAIR_CFG`` while every CTA of the ``rows x 96`` cluster grid has an SM of its own (rows 1 on a
-    148- or 152-SM part), ``CFG`` (one CTA per SM) while every CTA of the ``rows x 48`` grid has one (rows 2 and 3), ``CAPPED_CFG``
-    (two CTAs per SM, one wave) once the grid outgrows the device's SMs (rows 4 and up: 192 CTAs).  ``rows`` is in the compile key
-    and ``sm_count`` is the device's multiprocessor count, both plan-time facts (never a runtime value)."""
+
+def part_readings(smem_per_sm: int, smem_optin: int) -> dict:
+    """The ``Cfg`` fields of a part reading ``(shared memory per SM, per-CTA opt-in)`` in bytes, validated (positive, the opt-in no larger
+    than the SM) -- ``replace(form, **part_readings(...))`` is a form on that part."""
+    for name, value in (("smem_per_sm", smem_per_sm), ("smem_optin", smem_optin)):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"gdn_decode_fused: {name} must be a positive int (a device reading in bytes), got {value!r}")
+    if smem_optin > smem_per_sm:
+        raise ValueError(f"gdn_decode_fused: the per-CTA shared-memory opt-in ({smem_optin} B) cannot exceed the SM's ({smem_per_sm} B)")
+    return dict(SMEM_PER_SM_BYTES=smem_per_sm, SMEM_OPTIN_BYTES=smem_optin)
+
+
+def admissible(form: Cfg, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> bool:
+    """Whether ``form`` may serve on a part: its launch footprint fits the per-CTA opt-in, its ``CTAS_PER_SM`` pad fits that many CTAs in
+    the SM (``validate_cfg``'s fit term, re-read on the part's readings: a form validated on the 228 KB readings may not fit twice in a
+    100 KB SM), and a form that asks ptxas for the two-CTA register cap (``MIN_CTAS_PER_SM`` 2) has two CTAs per SM to show for it
+    (``co_resident_ctas`` >= 2) -- a cap on a part whose shared memory keeps the SM at one CTA buys nothing and spills (sm_120a:
+    ``CAPPED_CFG`` 7 STL / LDL)."""
+    on = replace(form, **part_readings(smem_per_sm, smem_optin))
+    fits_optin = on.SMEM_BYTES <= on.SMEM_OPTIN_BYTES
+    fits_sm = on.CTAS_PER_SM == 0 or on.CTAS_PER_SM * (on.SMEM_BYTES + SMEM_CTA_RESERVE_BYTES) <= on.SMEM_PER_SM_BYTES
+    return fits_optin and fits_sm and (on.MIN_CTAS_PER_SM == 1 or on.co_resident_ctas >= 2)
+
+
+def _no_form(forms, smem_per_sm: int, smem_optin: int) -> NotImplementedError:
+    """The typed decline of a part none of ``forms`` fits: it names the opt-in and the smallest footprint asked of it."""
+    need = min(form.NATURAL_SMEM_BYTES for form in forms)
+    return NotImplementedError(
+        f"gdn_decode_fused: this part's {smem_optin}-byte shared-memory opt-in per CTA ({smem_per_sm} B per SM) holds no decode form "
+        f"(the smallest form asks {need} B)"
+    )
+
+
+def first_fitting(forms, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> Cfg:
+    """The first of ``forms`` admissible on the part (the form an entry starts from: ``CFG`` on every served part), else the typed
+    decline of a part none of them fits."""
+    for form in forms:
+        if admissible(form, smem_per_sm, smem_optin):
+            return form
+    raise _no_form(forms, smem_per_sm, smem_optin)
+
+
+def default_cfg(rows: int, sm_count: int, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> Cfg:
+    """The measured pick per rows on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a
+    two-argument call is the cc 10.0 pick): ``PAIR_CFG`` while every CTA of the ``rows x 96`` cluster grid has an SM of its own (rows 1 on
+    a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA per SM) while every CTA of the ``rows x 48`` grid has one (rows
+    2 and 3), and once the grid outgrows the device's SMs (rows 4 and up: 192 CTAs) ``CAPPED_CFG`` (two CTAs per SM, one wave) where two of
+    its CTAs share an SM on the readings (``co_resident_ctas`` 2: the cc 10.0 readings), else ``CFG`` in two waves (the cc 12.0 readings:
+    rows 1 the pair, rows 2 and up the one-CTA form on 170 / 188 SMs; never a cap that spills).  A part no form fits is the typed decline
+    (``NotImplementedError`` naming its opt-in).  ``rows`` is in the compile key and ``sm_count`` is the device's multiprocessor count,
+    all plan-time facts (never a runtime value)."""
     if not isinstance(rows, int) or rows < 1:
         raise ValueError(f"gdn_decode_fused: rows must be a positive int, got {rows!r}")
     if not isinstance(sm_count, int) or sm_count < 1:
         raise ValueError(f"gdn_decode_fused: the SM count must be a positive int, got {sm_count!r}")
     if rows * V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
-        return PAIR_CFG
-    return CFG if rows * V_HEADS <= sm_count else CAPPED_CFG
+        ladder = PAIR_FORMS
+    else:
+        ladder = ONE_CTA_FORMS if rows * V_HEADS <= sm_count else BEYOND_FORMS
+    return first_fitting(ladder, smem_per_sm, smem_optin)

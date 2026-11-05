@@ -16,15 +16,18 @@ when this module was written (:data:`FLASHINFER_FLOOR`; importing this module wi
 and FlashInfer marks the block experimental: it may change or be removed without deprecation.
 
 Served (:func:`support`, the registry's ``support_fn``: cheap, imports no kernel): both forms at the block's dense-27B geometry at
-tensor-parallel rank 1 (d_model 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4) on SM100-class parts (compute capability
-10.x) with a CuTe DSL >= 4.8.0.  The
+tensor-parallel rank 1 (d_model 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4) on SM100-class (compute capability 10.x) and
+SM120-class (12.x) parts with a CuTe DSL >= 4.8.0.  The
 ``decode`` form takes up to 65535 rows (one grid row per request).  The ``verify`` form takes up to 65535 requests (one grid row each) of
-``tokens_per_request`` >= 2 tokens, bounded above by the shared-memory budget of the form the entry picks for that requests count on
-THIS device (:func:`verify_max_tokens`: the cluster pair, two CTAs per V head, while the ``requests x 96`` CTAs have an SM each, the
-one-CTA-per-SM form while the ``requests x 48`` CTAs have one, the two-CTAs-per-SM form past that; on a cc 10.0 part 35, 8 and 45 tokens
-per request).  Declined with FlashInfer's typed kinds: another form (``form``), another
-geometry (``geometry``, naming the fields), another device (``device``), a missing or too-old DSL (``dsl``), a step shape outside the
-envelope (``shape``).  A plan's parameter dtypes are not part of FlashInfer's support question: the decode kernel reads ``A_log`` fp32
+``tokens_per_request`` >= 2 tokens, bounded above by the shared-memory budget of the forms the entry picks for that requests count on
+THIS device (:func:`verify_max_tokens` = the entry's ``max_tokens_for``, the bound of the pick's whole ladder: the cluster pair, two CTAs
+per V head, while the ``requests x 96`` CTAs have an SM each, the one-CTA-per-SM form while the ``requests x 48`` CTAs have one, the
+two-CTAs-per-SM form past that -- on a cc 10.0 part 35, 8 and 45 tokens per request; on a 99 KB per-CTA opt-in (cc 12.0) the
+shallower-ring forms of the same ladder, 17 tokens per request at every requests count, the pick moving with the step's token count).
+Declined with FlashInfer's typed kinds: another form (``form``), another geometry (``geometry``, naming the fields), another device
+(``device``: the compute capability, a failed device reading, or a shared memory that holds no decode or verify form), a missing or too-old DSL
+(``dsl``), a step shape outside the envelope (``shape``, naming the deepest form and its bound).  A plan's parameter dtypes are not part
+of FlashInfer's support question: the decode kernel reads ``A_log`` fp32
 and ``dt_bias`` / ``norm_weight`` bf16 (FlashInfer's default ``param_dtypes``; callers convert), so a decode plan built for other dtypes
 is declined by :func:`build` -- a ``NotImplementedError`` from ``prepare_qwen_3_5_gdn_block`` naming the dtypes, before any device work;
 the verify kernel reads each of the three in fp32 or bf16 (every choice FlashInfer offers), compiled per dtype set.
@@ -110,23 +113,28 @@ def geometry_off(geometry) -> Dict[str, Any]:
     return {name: getattr(geometry, name) for name, want in GEOMETRY.items() if getattr(geometry, name) != want}
 
 
-def verify_form(device, requests: Optional[int] = None, norm_eps: float = 1e-6):
-    """The verify config a plan for ``requests`` compiles with on ``device``: the entry's own pick (``GdnVerifyFused.cfg_for``: the
-    cluster pair -- two CTAs per V head -- while the ``requests x 96`` CTAs have an SM each, the one-CTA-per-SM form while the
-    ``requests x 48`` CTAs have one, the two-CTAs-per-SM form past that; the pick at one request when no requests count is given) with
-    THIS device's shared-memory readings.  Reads device properties only; imports no kernel."""
-    return _verify.GdnVerifyFused(device, norm_eps).cfg_for(1 if requests is None else int(requests))
+def verify_form(device, requests: Optional[int] = None, norm_eps: float = 1e-6, tokens_per_request: Optional[int] = None):
+    """The verify config a plan for ``requests`` (and ``tokens_per_request``; None = the minimum) compiles with on ``device``: the entry's
+    own pick (``GdnVerifyFused.cfg_for``: the cluster pair -- two CTAs per V head -- while the ``requests x 96`` CTAs have an SM each, the
+    one-CTA-per-SM form while the ``requests x 48`` CTAs have one, the two-CTAs-per-SM form past that, each where THIS device's shared
+    memory holds it, else the regime's shallower-ring forms by the step's token count; the pick at one request when no requests count is
+    given) with the device's shared-memory readings.  Reads device properties only; imports no kernel.  A device whose shared memory
+    holds no verify form is the entry's ``NotImplementedError`` (``support`` maps it to kind ``device``)."""
+    return _verify.GdnVerifyFused(device, norm_eps).cfg_for(
+        1 if requests is None else int(requests), None if tokens_per_request is None else int(tokens_per_request)
+    )
 
 
 def verify_max_tokens(device, requests: Optional[int] = None) -> int:
-    """The largest ``tokens_per_request`` the verify form's pick for ``requests`` holds on ``device`` (its shared-memory budget)."""
-    return verify_form(device, requests).max_tokens()
+    """The largest ``tokens_per_request`` the verify pick for ``requests`` holds on ``device``: the bound of the pick's whole ladder
+    (``GdnVerifyFused.max_tokens_for``), the one ``support`` and the entry's own ``check_support`` answer alike."""
+    return _verify.GdnVerifyFused(device, 1e-6).max_tokens_for(1 if requests is None else int(requests))
 
 
 def support(device, geometry, form: str, requests: Optional[int], tokens_per_request: Optional[int]):
     """FlashInfer's ``support_fn``: ``None`` when served, else a typed ``Qwen35GdnDecline``.  Imports no kernel and no DSL (the DSL gate
-    reads package metadata; the verify token bound reads the device's properties); ``requests`` / ``tokens_per_request`` are ``None``
-    when the caller asks without a step shape."""
+    reads package metadata; the decode form's fit and the verify token bound read the device's shared-memory properties); ``requests`` /
+    ``tokens_per_request`` are ``None`` when the caller asks without a step shape."""
     from flashinfer.experimental.qwen_3_5_gdn_block.support import Qwen35GdnDecline, device_cc
 
     if form not in FORMS:
@@ -142,9 +150,7 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
     cc = device_cc(device)
     if not entry.cc_supported(cc):
         found = "no CUDA device" if cc is None else f"SM{cc[0]}{cc[1]}"
-        return Qwen35GdnDecline(
-            "device", f"the cuDNN Frontend GDN {form} kernel serves compute capability {entry.SUPPORTED_CC_TEXT} (SM100-class parts); found {found}"
-        )
+        return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN {form} kernel serves compute capability {entry.SUPPORTED_CC_TEXT}; found {found}")
     msg = entry._dsl_version_error()
     if msg is not None:
         return Qwen35GdnDecline("dsl", msg)
@@ -155,6 +161,15 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
                 f"the cuDNN Frontend GDN decode kernel launches one grid row per request, at most {DECODE_MAX_ROWS} (CUDA's grid Y limit); got "
                 f"requests={requests}",
             )
+        try:
+            # the one-CTA decode form must fit this device's per-CTA opt-in (74,848 B; every admitted part holds it): the entry's own
+            # construction-time decline, answered here so the probe and build() agree on a part that holds no form
+            _decode.first_fitting(_decode.ONE_CTA_FORMS, *_decode.device_shared_memory(device))
+        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no decode form (a RuntimeError
+            # subclass, so it is caught before the readers' failure below)
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel has no form for this device's shared memory: {exc}")
+        except RuntimeError as exc:  # the device-attribute readers' failure; anything else is a bug and propagates
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN decode kernel could not read this device's shared memory: {exc}")
         return None
     if requests is not None and requests > VERIFY_MAX_REQUESTS:
         return Qwen35GdnDecline(
@@ -170,7 +185,11 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
                 "request is the decode form",
             )
         try:
-            cfg = verify_form(device, requests, float(geometry.norm_eps))
+            # the pick for this step shape: past the ladder's bound the deepest form, so its max_tokens() IS the ladder-wide bound
+            cfg = verify_form(device, requests, float(geometry.norm_eps), tokens_per_request)
+        except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no verify form (a RuntimeError
+            # subclass, so it is caught before the readers' failure below)
+            return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel has no form for this device's shared memory: {exc}")
         except RuntimeError as exc:  # the device-attribute readers' failure; anything else is a bug and propagates (FlashInfer reports it by type)
             return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel could not read this device's shared memory or SM count: {exc}")
         limit = cfg.max_tokens()
@@ -178,8 +197,9 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
             form_name = "two CTAs per head" if cfg.TWO_CTAS_PER_HEAD else ("one CTA per SM" if cfg.CTAS_PER_SM == 1 else "two CTAs per SM")
             return Qwen35GdnDecline(
                 "shape",
-                f"the cuDNN Frontend GDN verify kernel's {form_name} form (the pick at requests={requests}) holds at most {limit} tokens per "
-                f"request in this device's shared memory; got tokens_per_request={tokens_per_request}",
+                f"the cuDNN Frontend GDN verify kernel's {form_name} form (the deepest pick at requests={requests}, NBUF {cfg.NBUF}) holds at "
+                f"most {limit} tokens per request in this device's shared memory ({cfg.SMEM_OPTIN_BYTES} B per CTA); got "
+                f"tokens_per_request={tokens_per_request}",
             )
     return None
 
