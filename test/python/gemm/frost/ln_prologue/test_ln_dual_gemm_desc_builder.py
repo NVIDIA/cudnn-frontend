@@ -43,7 +43,6 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gemm.frost import ln_prologue as sub  # noqa: E402
 import ln_dual_gemm_proj_instance as proj  # noqa: E402  -- the test-local projection instance of the substrate (this directory)
-import ln_dual_gemm_tail_instance as tail  # noqa: E402  -- the test-local output-stage instance of the substrate (this directory)
 import os as _os  # noqa: E402
 
 _HERE = _os.path.dirname(_os.path.abspath(__file__))  # the instance modules beside this file, for the probes' fresh interpreters

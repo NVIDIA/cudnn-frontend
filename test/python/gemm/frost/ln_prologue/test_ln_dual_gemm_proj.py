@@ -304,7 +304,6 @@ def test_ln_once_b_ring_depth_is_self_gating_and_buys_the_second_slot_on_sm100_o
     everywhere else (the Rubin body already holds two slots; proj c 128 holds two under its own ring; the two-operand tail region never fits twice).  The
     default 0 keeps every production rendering's constants; the validator declines the field without the item, past the arch's ring, or malformed."""
     from cudnn.gemm.frost import ln_prologue as sub
-    import ln_dual_gemm_proj_instance as proj
     import ln_dual_gemm_tail_instance as tail
 
     def p256(b):
