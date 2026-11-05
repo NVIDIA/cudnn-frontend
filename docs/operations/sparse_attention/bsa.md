@@ -164,7 +164,8 @@ blocks of a row. The BF16/FP16 MHA policy applies at one head per wave (`ceil(S_
 `3 * SMs`), at most 25% density and fixed counts, and declines (one split) otherwise. It was
 measured on H100 with independent random indices and video-generation top-k masks (for example 128 MiB K/V per head with 4-8
 heads: 4-8 splits, +27-67%; 256 MiB: 8-16 splits, up to +86%); 32 MiB per head never gained.
-A caller-provided output also resolves to one split. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
+A caller-provided output also resolves to one split, and so does `"auto"` on SM90 blk128, where the
+policy has not been measured. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
