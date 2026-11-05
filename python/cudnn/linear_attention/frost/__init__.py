@@ -5,8 +5,9 @@
 built on Cutlass primitives; forward and backward on SM100 / SM103 / SM107, ranked ahead of the cuTile fallbacks."""
 
 # The fused GDN decode / verify step entries for SM100- and SM120-class parts (``GdnDecodeFused`` / ``GdnVerifyFused``) are exported here too:
-# direct-call kernels with the FlashInfer Qwen 3.5 GDN block's argument contract, not graph engines.  Their registration as that block's
-# ``frost_fe`` backend is ``flashinfer_gdn_backend``, imported explicitly (the import registers; it is never reached from ``import cudnn``).
+# direct-call kernels with the FlashInfer Qwen 3.5 GDN block's argument contract, not graph engines, taking the rank's head counts and
+# hidden width as a ``GdnGeometry`` (``kernel.gdn_geometry.Geometry``).  Their registration as that block's ``frost_fe`` backend is
+# ``flashinfer_gdn_backend``, imported explicitly (the import registers; it is never reached from ``import cudnn``).
 
 # Lazy: importing one family's engine must not drag its neighbours in.
 import importlib
@@ -25,6 +26,7 @@ _LAZY_EXPORTS = {
     "Mamba2SummaryFrostEngine": (".mamba2_engine", "Mamba2SummaryFrostEngine"),
     "GdnDecodeFused": (".gdn_decode_fused", "GdnDecodeFused"),
     "GdnVerifyFused": (".gdn_verify_fused", "GdnVerifyFused"),
+    "GdnGeometry": (".kernel.gdn_geometry", "Geometry"),
 }
 
 

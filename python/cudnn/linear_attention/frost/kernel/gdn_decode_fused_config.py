@@ -5,10 +5,15 @@
 the compile-time knobs of its one kernel body.  Importable without the CuTe DSL (the host entry validates a ``Cfg`` before the DSL
 version gate runs), so nothing here imports ``cutlass``.
 
-Geometry (the Qwen 3.5-architecture dense 27B GDN sub-layer at tensor-parallel rank 1): 16 K heads, 48 V heads (three per K head), head
-dim 128, causal-conv width 4, hidden 5120; the QKV slab is ``[rows, 10240]`` = Q (16 x 128) | K (16 x 128) | V (48 x 128); the fp32
-recurrent state is ``[slots, 48, 128, 128]`` (one 64 KB slab per V head); the conv history is ``[slots, 10240, 3]`` (three taps per
-channel, any strides the bulk copy can express -- channel-contiguous taps or tap-contiguous channels).
+Geometry: ``Cfg.GEOM``, a ``Geometry(K_HEADS, V_HEADS, HIDDEN)`` of ``gdn_geometry.py`` -- the head counts and hidden width of ONE
+tensor-parallel rank's GDN sub-layer (its envelope and derived constants are documented there); head dim 128 and causal-conv width 4 are
+pinned.  The default geometry (the Qwen 3.5-architecture dense 27B GDN sub-layer at tensor-parallel rank 1: 16 K heads, 48 V heads --
+three per K head -- hidden 5120) is the one every number in this file's docstrings is written for: its QKV slab is ``[rows, 10240]`` = Q
+(16 x 128) | K (16 x 128) | V (48 x 128); the fp32 recurrent state is ``[slots, 48, 128, 128]`` (one 64 KB slab per V head); the conv
+history is ``[slots, 10240, 3]`` (three taps per channel, any strides the bulk copy can express -- channel-contiguous taps or
+tap-contiguous channels).  Another geometry (a tensor-parallel shard of a larger dense model: e.g. 1 K head, 8 V heads, hidden 8192) is
+the same kernel body compiled with its ``GEOM`` -- the slab, box, lane and bank maps and the shared-memory budget carry no head-count
+or hidden term; what moves is the grid (``V_HEADS`` CTAs per row), the QKV channel layout, the BA chunk count and the reader-ticket limit.
 
 Default (``default_cfg``; the host entry's pick when the caller passes no ``Cfg``): the form follows two plan-time facts, the request
 rows and the device's SM count.  The picks were measured on a cc 10.0 part (cold code and data, CUDA-graph replays), every form bitwise
@@ -85,29 +90,30 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
   critical path).  The ONLY cross-CTA datum is the norm: ``T128 = T64(rows 0-63) + T64(rows 64-127)`` -- each CTA builds its T64 (the
   aligned-block tree over its own 64 rows) and ships it to the peer as one ``st.async`` 4-byte store that completes 4 tx bytes on the
   peer's ``mb_norm`` (initialised with the other mbarriers, published cluster-wide by the relaxed cluster arrive at entry + wait before
-  the exchange: the one cluster barrier of the kernel); fp32 addition is commutative, so both ranks compute the same bits.  Six readers
-  per K head: ``TICKET_LIMIT`` 5; each CTA shifts the V-conv history of its own 64 channels.  Use with ``CTAS_PER_SM`` 0 (the natural
-  footprint, 42 KB: registers decide the co-residency) and the grid is ``(96, rows)`` in clusters of 2.
+  the exchange: the one cluster barrier of the kernel); fp32 addition is commutative, so both ranks compute the same bits.  ``2 x
+  VK_RATIO`` readers per K head (six at the default geometry): ``TICKET_LIMIT`` ``2 x VK_RATIO - 1`` (5); each CTA shifts the V-conv
+  history of its own 64 channels.  Use with ``CTAS_PER_SM`` 0 (the natural footprint, 42 KB: registers decide the co-residency) and the
+  grid is ``(2 x V_HEADS, rows)`` in clusters of 2 (``(96, rows)``).
 * ``DEBUG``: the reference kernel's debug outputs (``convout``, ``baout``, ``raw``) for intermediate byte-compares.
 """
 
 from dataclasses import dataclass, replace
 
-# --- the served geometry (the model's constants; the host entry declines everything else) ---
-K_HEADS = 16
-V_HEADS = 48
-HEAD_DIM = 128
-CONV_WIDTH = 4
-HIDDEN = 5120
-QKV_CHANNELS = 2 * K_HEADS * HEAD_DIM + V_HEADS * HEAD_DIM  # 10240
-K_CHANNEL0 = K_HEADS * HEAD_DIM  # 2048: the first K channel of the QKV slab
-V_CHANNEL0 = 2 * K_HEADS * HEAD_DIM  # 4096: the first V channel
-BA_THREADS = 128  # the reference BA partition: thread t sums elements chunk*1024 + t*8 + j, five chunks
-BA_CHUNKS = HIDDEN // (BA_THREADS * 8)  # 5
+from .gdn_geometry import CONV_WIDTH, DEFAULT_GEOMETRY, HEAD_DIM, TICKET_STRIDE, Geometry
+
+# --- the DEFAULT geometry's constants (the kernel reads ``cfg.GEOM``; these name the default for callers, docs and tests) ---
+K_HEADS = DEFAULT_GEOMETRY.K_HEADS  # 16
+V_HEADS = DEFAULT_GEOMETRY.V_HEADS  # 48
+HIDDEN = DEFAULT_GEOMETRY.HIDDEN  # 5120
+QKV_CHANNELS = DEFAULT_GEOMETRY.QKV_CHANNELS  # 10240
+K_CHANNEL0 = DEFAULT_GEOMETRY.K_CHANNEL0  # 2048: the first K channel of the QKV slab
+V_CHANNEL0 = DEFAULT_GEOMETRY.V_CHANNEL0  # 4096: the first V channel
+BA_THREADS = 128  # the reference BA partition: thread t sums elements chunk*1024 + t*8 + j, HIDDEN / 1024 chunks
+BA_CHUNKS = DEFAULT_GEOMETRY.BA_CHUNKS_DECODE  # 5 at the default geometry (``Geometry.BA_CHUNKS_DECODE``)
 CONV_THREADS = 128  # one Q, one K and one V channel per thread
 RMS_LANES = 16  # the reference RMS layout: lane l of a 16-lane group holds the 8 raw q / k values of columns 8 l .. 8 l + 7
-TICKET_STRIDE = 512  # counts[row * 512 + kh * 32]: the reference layout of the per-(row, K head) reader ticket
-TICKET_LIMIT = V_HEADS // K_HEADS - 1  # 2: the third reader of a K head's conv history is the last
+# counts[row * 512 + kh * 32]: the reference layout of the per-(row, K head) reader ticket (holds the envelope's 16 K heads)
+TICKET_LIMIT = DEFAULT_GEOMETRY.VK_RATIO - 1  # 2: the third reader of a K head's conv history is the last (``Cfg.TICKET_LIMIT`` per form)
 
 # bytes the conv-operand bulk copies deliver on the one mbarrier: x pieces 3 x 256, conv weights 3 x 1024, history 3 x 3 x 256
 CONV_BULK_BYTES = 3 * HEAD_DIM * 2 + 3 * HEAD_DIM * CONV_WIDTH * 2 + 3 * (CONV_WIDTH - 1) * HEAD_DIM * 2  # 6144
@@ -163,6 +169,7 @@ class Cfg:
     DEBUG: bool = False
     SMEM_PER_SM_BYTES: int = SM100_SMEM_PER_SM_BYTES
     SMEM_OPTIN_BYTES: int = SM100_SMEM_OPTIN_BYTES
+    GEOM: Geometry = DEFAULT_GEOMETRY  # the rank's head counts and hidden width (``gdn_geometry.py``): in the compile key with the rest
 
     # --- derived (read-only; computed by make_cfg) ---
     @property
@@ -219,8 +226,9 @@ class Cfg:
 
     @property
     def TICKET_LIMIT(self) -> int:
-        """The last reader ticket of a K head's conv history: ``3 x CTAS_PER_HEAD`` CTAs read it, the one that draws this value shifts it."""
-        return (V_HEADS // K_HEADS) * self.CTAS_PER_HEAD - 1
+        """The last reader ticket of a K head's conv history: ``VK_RATIO x CTAS_PER_HEAD`` CTAs read it (3 x at the default geometry), the
+        one that draws this value shifts it."""
+        return self.GEOM.VK_RATIO * self.CTAS_PER_HEAD - 1
 
     @property
     def SLICE_PITCH(self) -> int:
@@ -305,6 +313,8 @@ class Cfg:
 
 def validate_cfg(cfg: Cfg) -> None:
     """Raise the typed error of every unexpressible knob combination (structural invariants raise here, never a module assert)."""
+    if not isinstance(cfg.GEOM, Geometry):
+        raise ValueError(f"gdn_decode_fused: GEOM must be a gdn_geometry.Geometry, got {type(cfg.GEOM).__name__}")
     if cfg.THREADS not in (128, 256):
         raise ValueError(f"gdn_decode_fused: THREADS must be 128 or 256, got {cfg.THREADS}")
     if cfg.TPR not in (1, 2, 4, 8, 16):
@@ -423,21 +433,34 @@ def first_fitting(forms, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin:
     raise _no_form(forms, smem_per_sm, smem_optin)
 
 
-def default_cfg(rows: int, sm_count: int, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> Cfg:
+def with_geometry(form: Cfg, geometry: Geometry) -> Cfg:
+    """``form`` compiled for ``geometry`` (the same object when it already carries it, so a module form stays itself at the default)."""
+    if not isinstance(geometry, Geometry):
+        raise ValueError(f"gdn_decode_fused: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
+    return form if form.GEOM == geometry else replace(form, GEOM=geometry)
+
+
+def default_cfg(
+    rows: int, sm_count: int, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES, geometry: Geometry = DEFAULT_GEOMETRY
+) -> Cfg:
     """The measured pick per rows on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a
-    two-argument call is the cc 10.0 pick): ``PAIR_CFG`` while every CTA of the ``rows x 96`` cluster grid has an SM of its own (rows 1 on
-    a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA per SM) while every CTA of the ``rows x 48`` grid has one (rows
-    2 and 3), and once the grid outgrows the device's SMs (rows 4 and up: 192 CTAs) ``CAPPED_CFG`` (two CTAs per SM, one wave) where two of
-    its CTAs share an SM on the readings (``co_resident_ctas`` 2: the cc 10.0 readings), else ``CFG`` in two waves (the cc 12.0 readings:
-    rows 1 the pair, rows 2 and up the one-CTA form on 170 / 188 SMs; never a cap that spills).  A part no form fits is the typed decline
-    (``NotImplementedError`` naming its opt-in).  ``rows`` is in the compile key and ``sm_count`` is the device's multiprocessor count,
-    all plan-time facts (never a runtime value)."""
+    two-argument call is the cc 10.0 pick) for ``geometry`` (the default geometry's 48 V heads unless given): ``PAIR_CFG`` while every CTA
+    of the ``rows x 2 V_HEADS`` cluster grid has an SM of its own (``rows x 96``: rows 1 on a 148-, 152-, 170- or 188-SM part), ``CFG``
+    (one CTA per SM) while every CTA of the ``rows x V_HEADS`` grid has one (``rows x 48``: rows 2 and 3), and once the grid outgrows the
+    device's SMs (rows 4 and up: 192 CTAs) ``CAPPED_CFG`` (two CTAs per SM, one wave) where two of its CTAs share an SM on the readings
+    (``co_resident_ctas`` 2: the cc 10.0 readings), else ``CFG`` in two waves (the cc 12.0 readings: rows 1 the pair, rows 2 and up the
+    one-CTA form on 170 / 188 SMs; never a cap that spills).  A geometry with fewer V heads per rank moves the switches up by the same
+    rule (8 V heads on 152 SMs: the pair to rows 9, one CTA per SM to rows 19) -- the budget rule, unmeasured there until its own
+    cells run.  A part no form fits is the typed decline (``NotImplementedError`` naming its opt-in).  ``rows`` is in the compile key
+    and ``sm_count`` is the device's multiprocessor count, all plan-time facts (never a runtime value)."""
     if not isinstance(rows, int) or rows < 1:
         raise ValueError(f"gdn_decode_fused: rows must be a positive int, got {rows!r}")
     if not isinstance(sm_count, int) or sm_count < 1:
         raise ValueError(f"gdn_decode_fused: the SM count must be a positive int, got {sm_count!r}")
-    if rows * V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
+    if not isinstance(geometry, Geometry):
+        raise ValueError(f"gdn_decode_fused: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
+    if rows * geometry.V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
         ladder = PAIR_FORMS
     else:
-        ladder = ONE_CTA_FORMS if rows * V_HEADS <= sm_count else BEYOND_FORMS
-    return first_fitting(ladder, smem_per_sm, smem_optin)
+        ladder = ONE_CTA_FORMS if rows * geometry.V_HEADS <= sm_count else BEYOND_FORMS
+    return with_geometry(first_fitting(ladder, smem_per_sm, smem_optin), geometry)
