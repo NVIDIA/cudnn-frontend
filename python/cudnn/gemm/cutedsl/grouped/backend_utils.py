@@ -26,6 +26,8 @@ class GroupedGemmBackend(str, Enum):
 # on by default; never memoized.
 DEBUG_VALIDATE_DEVICE_VALUES_ENV = "CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES"
 DEBUG_VALIDATE_DEVICE_VALUES = os.getenv(DEBUG_VALIDATE_DEVICE_VALUES_ENV, "0") == "1"
+# Read by the wrappers on every call, so part of every launch-plan key (cudnn.launch_plan.planned(env=...)).
+PLAN_ENV = ("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL")
 
 
 def _check_not_capturing(stream, what: str) -> None:

@@ -14,6 +14,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import is_torch_tensor
 
@@ -444,7 +445,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
         ) -> None:
-            compiled(
+            launch(
+                compiled,
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -556,7 +558,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
         ) -> None:
-            compiled(
+            launch(
+                compiled,
                 a_tensor,
                 b_tensor,
                 sfa_tensor,

@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 import math
 
 from ..backend_utils import (
+    PLAN_ENV,
     GroupedGemmBackend,
     _torch_stream_context,
     allocate_wrapper_workspace,
@@ -47,6 +48,7 @@ import cutlass
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import planned
 from cudnn.tensor_adapter import (
     cuda_is_available,
     detect_framework,
@@ -1319,6 +1321,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
     )
 
 
+@planned(env=PLAN_ENV, stream="current_stream")
 def grouped_gemm_dglu_wrapper_sm100(
     a_tensor: torch.Tensor,
     c_tensor: torch.Tensor,

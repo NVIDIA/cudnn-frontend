@@ -47,6 +47,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 
 
@@ -1044,9 +1045,10 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, scheduler_counter_tensor)
+                launch(_compiled_kernel, *kernel_args, scheduler_counter_tensor)
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     *kernel_args,
                     situ_beta1,
                     situ_beta2,
@@ -1268,9 +1270,10 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args)
+                launch(_compiled_kernel, *kernel_args)
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     *kernel_args,
                     situ_beta1,
                     situ_beta2,

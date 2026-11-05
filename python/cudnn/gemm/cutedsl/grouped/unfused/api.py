@@ -14,6 +14,7 @@ import cutlass
 
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import planned
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     cuda_is_available,
@@ -27,7 +28,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from ..backend_utils import row_major_layout
+from ..backend_utils import PLAN_ENV, row_major_layout
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
@@ -291,6 +292,7 @@ def _normalize_call(
     return is_dense, tensor_m, n, experts
 
 
+@planned(env=PLAN_ENV, stream="current_stream")
 def grouped_gemm_wrapper_sm100(
     a_tensor: torch.Tensor,
     padded_offsets: torch.Tensor,

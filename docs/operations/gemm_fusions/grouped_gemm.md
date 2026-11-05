@@ -176,3 +176,12 @@ For a discrete class instance, replace `sample_b` with
   their existing FP4/FP8 block-scaled backends. For BF16 on those fused APIs,
   scale-factor controls are `None`; see their operation pages for the exact
   dispatch and return contracts.
+
+## Launch plans
+
+`grouped_gemm_wrapper_sm100` and the GLU, dGLU, quant and WGrad wrappers are
+[launch-planned](../../utilities/launch_plans.md): from the third call with the
+same arguments (tensor dtypes, shapes and strides, other argument values), a
+call allocates its outputs and launches its kernels from C++ without running the
+wrapper's Python. Outputs match the unplanned call.
+`CUDNN_FRONTEND_LAUNCH_PLANS=0` turns this off.

@@ -6,7 +6,7 @@ import torch
 
 from cudnn.api_base import get_device_type
 from gemm.cutedsl.test_grouped_gemm_canonical_layouts import SF_PHYSICAL_PERMUTE
-from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs, glu_block_scaled_call, raw_bytes
+from gemm.cutedsl.test_grouped_gemm_wrapper_memo import install_memo, mxfp8_inputs, glu_block_scaled_call, raw_bytes
 
 pytestmark = pytest.mark.L0
 
@@ -229,7 +229,7 @@ def test_glu_canonical_reuses_compilation_for_new_m(monkeypatch, dynamic, flat):
     from cudnn.gemm.cutedsl.grouped.glu import api
 
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", dynamic)
-    monkeypatch.setattr(api, "_glu_wrapper_memo", {})
+    install_memo(monkeypatch, api, "_glu_wrapper_memo")
     monkeypatch.setattr(api, "_cache_of_GroupedGemmGluSm100Objects", {})
     for m in (1024, 2048, 1024):
         inputs = allocate_grouped_gemm_input_tensors(
