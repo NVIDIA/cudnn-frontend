@@ -921,12 +921,24 @@ class _CompiledRuntime:
                 raise ValueError(reason)
 
 
+def _k_pad_launchable_for(plan, m: int, n: int) -> Callable:
+    """The plan's kernel for kernel-frame extents ``(m, n)``. A plan whose quantized outputs can end an F8_128x4 scale
+    row inside a quad holds a second kernel that zeroes those K padding slots (``k_pad_axes``: ``(col_quant, block_size)``
+    per output; a col quant's blocks run along M, a row quant's along N); a call takes it only when some row does end
+    inside a quad, so a whole-quad call runs the kernel without the padding stores."""
+    if plan._launchable_k_pad is not None and any(((m if col_quant else n) // block_size) % 4 for col_quant, block_size in plan.k_pad_axes):
+        return plan._launchable_k_pad
+    return plan._launchable
+
+
 @dataclass
 class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     chain: FusionChain
     config: _ConfigT
     generated_path: Path
     _launchable: Callable
+    _launchable_k_pad: "Callable | None" = None
+    k_pad_axes: tuple = ()
     _grid_ctas: int = 0
     device: int = 0
     aux_names: list = field(default_factory=list)
@@ -961,7 +973,7 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
 
     def _launch_moe(self, problem, offsets, workspace, operands, outputs, aux, stream, token_index, token_ks, top_k_scores):
         """Assemble and launch the grouped GEMM arguments."""
-        return self._launchable(
+        return _k_pad_launchable_for(self, int(problem[0]), int(problem[1]))(
             problem,
             offsets,
             workspace,
@@ -983,6 +995,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     aux_names: list[str]
     generated_path: Path
     _launchable: Callable
+    _launchable_k_pad: "Callable | None" = None
+    k_pad_axes: tuple = ()
     block_scale: bool = False
     device: int = 0
     binding: _BindingT | None = None
@@ -1122,6 +1136,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         block_size, batch = (r.block_size, r.batch)
         whole_scale_blocks = self._validate_whole_scale_blocks
         device, launchable, refuse = (r.device, self._launchable, self.explain)
+        k_pad_plan = self if self._launchable_k_pad is not None else None
         fill_word, fill_plan, apply_fill = (backend.buffers.fill_word_async, backend.buffers.strided_fill_plan, backend.buffers.apply_fill_plan)
         is_contiguous = backend.buffers.is_contiguous
         needs_workspace = bool(r.workspace_bytes)
@@ -1275,7 +1290,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         apply_fill(ptr, plan, word, stream)
             if empty:
                 return None
-            return launchable(
+            return (launchable if k_pad_plan is None else _k_pad_launchable_for(k_pad_plan, m, n))(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
                 *(
@@ -1882,6 +1897,7 @@ _SHARED_EXPORTS = {
     "_register_legacy_device_view_adapter": _register_legacy_device_view_adapter,
     "_moe_carve_workspace": _moe_carve_workspace,
     "_moe_launch_tail": _moe_launch_tail,
+    "_k_pad_launchable_for": _k_pad_launchable_for,
 }
 
 _impl = importlib.import_module(f"{__package__}.{active_family()}.compiler")

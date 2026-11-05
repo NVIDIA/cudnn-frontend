@@ -3921,27 +3921,104 @@ def test_sm120_reused_quant_plan_writes_partial_scale_rows(axes) -> None:
     _check_quant_reused_partial_scale_rows("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", axes, [(256, n) for n in (384, 352, 320, 288)])
 
 
-@requires_sm120
-@pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
-def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
+def _check_quant_scale_k_padding_is_zeroed(config_name, axes, shapes) -> None:
     """An F8_128x4 quant-scale row holds roundup(blocks, 4) slots. A block-scaled
     GEMM whose K is the quantized axis reads the padding slots against its
     zero-filled K tail, so a stale 0xFF (the E8M0 NaN) there turns the whole
-    output row into NaN. The epilogue must write them as 0, whatever the caller's
-    buffer held: here 0xFF. Rows past the last real row of a 128-row atom stay
-    unchecked. ``row_col`` also runs the row quant under the col quant's row
-    predicate."""
-    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
-    _skip_unless_active(cfg)  # the sm100 tree's quant chunk check declines this config before its family check
+    output row into NaN. The epilogue must write them as raw 0x00 bytes, whatever
+    the caller's buffer held: here 0xFF. Rows past the last real row of a 128-row
+    atom stay unchecked. ``row_col`` also runs the row quant under the col quant's
+    row predicate. Every ``(M, N)`` in ``shapes`` runs through ONE kernel compiled
+    for the first: shapes whose scale blobs share a padded extent end the scale
+    rows at different residues of the block count mod 4, so a reused kernel must
+    zero exactly the padding of the shape it runs."""
+    cfg = _resolve(config_name)
+    _skip_unless_active(cfg)  # check the active family before quant-chunk admission
     K, bs = 128, 32
+    M0, N0 = shapes[0]
+
+    def scale_dims(axis, M, N):
+        rows, blocks = (M, N // bs) if axis == -1 else (N, M // bs)
+        return rows, blocks, [1, (rows + 127) // 128 * 128, (blocks + 3) // 4 * 4]
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M0, K], stride=_a_stride_batched(M0, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N0], stride=_b_stride_batched(N0, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    taps = []
+    for qi, axis in enumerate(axes):
+        Q, QS = g.block_scale_quantize(input=C, block_size=bs, axis=axis, name=f"q{qi}")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        dims = scale_dims(axis, M0, N0)[2]
+        QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+        taps.append((axis, Q, QS, dims))
+    compiled = _plan(g, config=cfg)
+    assert [q.axis == 1 for q in compiled.chain.quants] == [axis == 1 for axis in axes]
+
+    for M, N in shapes:
+        a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+        mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+        vp, checks = {A: a, B: b}, []
+        for axis, Q, QS, dims0 in taps:
+            rows, blocks, dims = scale_dims(axis, M, N)
+            assert dims == dims0, "the shapes of one compile share a padded scale extent"
+            vp[Q] = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+            vp[QS] = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+            if axis == -1:
+                q_ref, s_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+                addr = _f8_row_scale_addr(M, dims[2] * bs, bs)
+            else:
+                q_ref, s_ref = _col_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+                s_ref = s_ref.transpose(1, 2)
+                addr = _f8_col_scale_addr(dims[2] * bs, N, bs)
+            expected = torch.zeros(rows, dims[2], dtype=torch.uint8, device="cuda")
+            expected[:, :blocks] = s_ref[0].view(torch.uint8)
+            checks.append((Q, QS, q_ref, addr, expected))
+        compiled(vp)
+        torch.cuda.synchronize()
+        for Q, QS, q_ref, addr, expected in checks:
+            torch.testing.assert_close(vp[QS].view(torch.uint8).flatten()[addr], expected, atol=0, rtol=0, msg=lambda m: f"M={M} N={N}: {m}")
+            torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0, msg=lambda m: f"M={M} N={N}: {m}")
+
+
+@requires_sm120
+@pytest.mark.parametrize("axes,M,N", [((-1,), 200, 2880), ((-1, 1), 352, 320)], ids=["row", "row_col"])
+def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
+    _check_quant_scale_k_padding_is_zeroed("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", axes, [(M, N)])
+
+
+# Row quant: 89 / 90 / 91 / 92 blocks of 32 (residues 1, 2, 3, 0) all pad to 92 slots. Col quant (with the row
+# quant on N = 320, residue 2, under its row predicate): 7 / 8 / 5 / 6 M blocks all pad to 8.
+@requires_sm100
+@pytest.mark.parametrize(
+    "axes,shapes",
+    [((-1,), [(200, 2848), (200, 2880), (200, 2912), (200, 2944)]), ((-1, 1), [(224, 320), (256, 320), (160, 320), (192, 320)])],
+    ids=["row", "row_col"],
+)
+def test_sm100_quant_scale_k_padding_is_zeroed(axes, shapes) -> None:
+    _check_quant_scale_k_padding_is_zeroed("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", axes, shapes)
+
+
+def test_sm100_k_padding_stores_only_in_the_padded_variant() -> None:
+    """A plan whose quantized outputs can end an F8_128x4 scale row inside a quad compiles its epilogue twice: once
+    without the K-padding stores (the epilogue a whole-quad call runs, with no padding branch) and once with them. The
+    launch takes the second only when the call's extents end some scale row inside a quad (row quant: N blocks, col
+    quant: M blocks). Host-only: no compile, no GPU."""
+    from types import SimpleNamespace
+
+    from cudnn.gemm.frost.compiler import _k_pad_launchable_for
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.sm100.compiler import _epi_chunk_bytes
+    from cudnn.gemm.frost.sm100.epilogue_codegen import generate, k_pad_axes
+
+    M, N, K, bs = 256, 2944, 128, 32
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
     B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
     C = g.matmul(A=A, B=B, name="mm")
-    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
-    mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
-    vp, checks = {A: a, B: b}, []
-    for qi, axis in enumerate(axes):
+    for qi, axis in enumerate((-1, 1)):
         Q, QS = g.block_scale_quantize(input=C, block_size=bs, axis=axis, name=f"q{qi}")
         Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
         rows, blocks = (M, N // bs) if axis == -1 else (N, M // bs)
@@ -3949,26 +4026,20 @@ def test_sm120_quant_scale_k_padding_is_zeroed(axes, M, N) -> None:
         QS.set_dim(dims).set_stride([dims[1] * dims[2], dims[2], 1])
         QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
         QS.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
-        vp[Q] = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
-        vp[QS] = torch.full(dims, 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
-        if axis == -1:
-            q_ref, s_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
-            addr = _f8_row_scale_addr(M, dims[2] * bs, bs)
-        else:
-            q_ref, s_ref = _col_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
-            s_ref = s_ref.transpose(1, 2)
-            addr = _f8_col_scale_addr(dims[2] * bs, N, bs)
-        expected = torch.zeros(rows, dims[2], dtype=torch.uint8, device="cuda")
-        expected[:, :blocks] = s_ref[0].view(torch.uint8)
-        checks.append((Q, QS, q_ref, addr, expected))
+    chain = analyze(g)
+    axes = k_pad_axes(chain)
+    assert sorted(axes) == [(False, bs), (True, bs)]
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    kwargs = dict(vec_bytes_epi=_epi_chunk_bytes(chain, cfg, False), output_elem_bytes=DTYPE_BYTES[chain.output_dtype])
+    plain, padded = generate(chain, **kwargs).epilogue, generate(chain, **kwargs, k_padding=True).epilogue
+    assert "% 4 != 0" not in plain, "the unpadded variant must carry no padding branch"
+    assert "(N // 32) % 4 != 0" in padded and "(M // 32) % 4 != 0" in padded
 
-    compiled = _plan(g, config=cfg)
-    assert [q.axis == 1 for q in compiled.chain.quants] == [axis == 1 for axis in axes]
-    compiled(vp)
-    torch.cuda.synchronize()
-    for Q, QS, q_ref, addr, expected in checks:
-        torch.testing.assert_close(vp[QS].view(torch.uint8).flatten()[addr], expected, atol=0, rtol=0)
-        torch.testing.assert_close(vp[Q].float(), q_ref.float(), atol=0, rtol=0)
+    plan = SimpleNamespace(_launchable="plain", _launchable_k_pad="padded", k_pad_axes=axes)
+    assert _k_pad_launchable_for(plan, 256, 2944) == "plain"  # 8 M blocks, 92 N blocks: whole quads
+    assert _k_pad_launchable_for(plan, 256, 2912) == "padded"  # 91 N blocks
+    assert _k_pad_launchable_for(plan, 224, 2944) == "padded"  # 7 M blocks
+    assert _k_pad_launchable_for(SimpleNamespace(_launchable="plain", _launchable_k_pad=None, k_pad_axes=()), 224, 2912) == "plain"
 
 
 # (graph builder, torch reference) for the activations whose closed forms cancel near a limit.
