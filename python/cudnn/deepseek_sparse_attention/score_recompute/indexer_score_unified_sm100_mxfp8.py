@@ -36,6 +36,7 @@ from cutlass.pipeline import (
     Agent,
     CooperativeGroup,
     PipelineTmaUmma,
+    PipelineAsync,
     PipelineUserType,
     make_pipeline_state,
     pipeline_init_arrive,
@@ -1280,6 +1281,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         #   - sScoreAll scratch for warpgroup reductions.
         @cute.struct
         class SharedStorage:
+            per_head_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
             Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.Q_mbar_size]
             K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.K_mbar_size]
             KScale_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.KScale_mbar_size]
@@ -1339,6 +1341,16 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         )
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         is_first_cta_in_cluster = cta_rank_in_cluster == 0
+
+        # Both epilogue warpgroups must finish a tile before its weight slot
+        # can be reused by the load warp.
+        pipeline_head = PipelineAsync.create(
+            barrier_storage=storage.per_head_mbar_ptr.data_ptr(),
+            num_stages=2,
+            producer_group=CooperativeGroup(Agent.Thread, self.WARP_SIZE),
+            consumer_group=CooperativeGroup(Agent.Thread, 2 * self.WARPGROUP_SIZE),
+            defer_sync=True,
+        )
 
         # Q is loaded once per work tile.  K and KScale are staged per n block so
         # the MMA warp can consume K blocks from right to left.
@@ -1407,6 +1419,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         )
         work_tile = tile_sched.initial_work_tile_info()
 
+        head_producer, head_consumer = pipeline_head.make_participants()
         Q_producer, Q_consumer = pipeline_Q.make_participants()
         K_producer, K_consumer = pipeline_K.make_participants()
         KScale_producer, KScale_consumer = pipeline_KScale.make_participants()
@@ -1458,7 +1471,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                 # the same order.
                 rows_per_thread = cute.ceil_div(self.m_block_size, self.WARP_SIZE)
                 lane_id = tidx % self.WARP_SIZE
-                tile_count = Int32(0)
                 scale_batch_idx = Int32(-1)
                 q_scale_m_block = Int32(0)
                 k_scale_n_block = Int32(0)
@@ -1490,7 +1502,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                             seqlen.seqlen_k,
                             q_causal_offset,
                         )
-                        per_head_buf_off = (tile_count % 2) * self.m_block_size
+                        head = head_producer.acquire_and_advance()
+                        per_head_buf_off = head.index * self.m_block_size
                         mPerHead_cur = seqlen.offset_batch_Q(mPerHead, batch_idx, dim=2)
                         for ri in cutlass.range_constexpr(rows_per_thread):
                             row = ri * self.WARP_SIZE + lane_id
@@ -1504,6 +1517,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                                 else:
                                     sPerHead[per_head_buf_off + row] = Float32(0.0)
 
+                        head.commit()
                         cute.arch.fence_view_async_shared()
 
                         Q_producer.reset()
@@ -1594,12 +1608,12 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                                 )
                                 load_K_fn(tma_bar_ptr=handle_K.barrier)
                             n_block_k = n_block_k - 1
-                        tile_count = tile_count + 1
 
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
+                head_producer.tail()
                 Q_producer.tail()
                 K_producer.tail()
                 KScale_producer.tail()
@@ -1750,7 +1764,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
-            tile_count = Int32(0)
             sScoreAll_epi0 = cute.make_tensor(
                 sScoreAll.iterator,
                 cute.make_layout((self.sScoreAll_single_size,), stride=(1,)),
@@ -1774,7 +1787,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         seqlen.seqlen_k,
                         q_causal_offset,
                     )
-                    per_head_offset = (tile_count % 2) * self.m_block_size
+                    head = head_consumer.wait_and_advance()
+                    per_head_offset = head.index * self.m_block_size
                     if cutlass.const_expr(self.is_compressed_logits):
                         mOut_cur = mOut
                     else:
@@ -1857,7 +1871,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                             batch_idx=batch_idx,
                             cand_batch_offsets=mCandBatchOffsets,
                         )
-                    tile_count = tile_count + 1
+                    head.release()
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
@@ -1869,7 +1883,6 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
-            tile_count = Int32(0)
             sScoreAll_epi1 = cute.make_tensor(
                 sScoreAll.iterator + self.sScoreAll_single_size,
                 cute.make_layout((self.sScoreAll_single_size,), stride=(1,)),
@@ -1894,7 +1907,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         seqlen.seqlen_k,
                         q_causal_offset,
                     )
-                    per_head_offset = (tile_count % 2) * self.m_block_size
+                    head = head_consumer.wait_and_advance()
+                    per_head_offset = head.index * self.m_block_size
                     if cutlass.const_expr(self.is_compressed_logits):
                         mOut_cur = mOut
                     else:
@@ -1977,7 +1991,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                             batch_idx=batch_idx,
                             cand_batch_offsets=mCandBatchOffsets,
                         )
-                    tile_count = tile_count + 1
+                    head.release()
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
