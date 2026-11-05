@@ -20,7 +20,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, dsl_compile_lock
 from cudnn.norm._common_sm100 import block_reduce_sum2, red_scratch_len
 
 
@@ -184,7 +184,10 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean=Non
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_bn_fwd_host, *args, *ce, fake_stream())
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(_bn_fwd_host, *args, *ce, fake_stream())
+                _KCACHE[key] = fn
     fn(*args, cur_stream())
     return y, saved_mean, saved_rstd

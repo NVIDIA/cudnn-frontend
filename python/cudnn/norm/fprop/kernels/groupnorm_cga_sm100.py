@@ -41,7 +41,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm._common_sm100 import shifted_stats
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, sm_count
+from cudnn.norm.utils import cur_stream, fake_rows, fake_stream, ffi, sm_count, dsl_compile_lock
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
@@ -323,17 +323,20 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None, out_y=None, out_
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        flat, rows = cute.sym_int(), cute.sym_int()
-        fakes = (
-            fake_rows(et, rows=flat),
-            fake_rows(et, rows=flat),
-            fake_rows(et, rows=cute.sym_int()),
-            fake_rows(et, rows=cute.sym_int()),
-            fake_rows(cutlass.Float32, rows=rows),
-            fake_rows(cutlass.Float32, rows=rows),
-        )
-        fn = cute.compile(_gn_fwd_cga_host, *fakes, *(cutlass.Int32(0),) * 3, *ce, fake_stream(), options="--enable-tvm-ffi")
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                flat, rows = cute.sym_int(), cute.sym_int()
+                fakes = (
+                    fake_rows(et, rows=flat),
+                    fake_rows(et, rows=flat),
+                    fake_rows(et, rows=cute.sym_int()),
+                    fake_rows(et, rows=cute.sym_int()),
+                    fake_rows(cutlass.Float32, rows=rows),
+                    fake_rows(cutlass.Float32, rows=rows),
+                )
+                fn = cute.compile(_gn_fwd_cga_host, *fakes, *(cutlass.Int32(0),) * 3, *ce, fake_stream(), options="--enable-tvm-ffi")
+                _KCACHE[key] = fn
     fn(
         ffi(x2d.reshape(-1)),
         ffi(y.reshape(-1)),

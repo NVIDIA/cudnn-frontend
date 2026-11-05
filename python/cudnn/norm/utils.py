@@ -15,6 +15,8 @@ from contextlib import nullcontext
 
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.compiled_cache import dsl_compile_lock  # noqa: F401  (the kernels' lazy compiles take it)
+
 
 def dyn(t):
     """Wrap a torch tensor as a dynamic-layout cute tensor (16-byte aligned).
