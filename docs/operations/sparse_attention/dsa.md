@@ -913,8 +913,8 @@ with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103/SM1
 additionally require `H in {32, 64}` and SM90 requires `H == 64`. `d_index_q`
 and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
 
-With `deterministic=True` on SM100, SM103 or SM107, kernel 2 launches a fixed producer
-grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
+With `deterministic=True` on SM90, SM100, SM103 or SM107, kernel 2 uses fixed
+producer-plane ownership and accumulates dK into a CTA-private FP32 workspace. The compile-time
 `deterministic_dk_planes` specialization selects 96, 128, or 148 producer
 planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
 CTA order, converting only once to the requested `d_index_k` dtype. The dQ
@@ -932,11 +932,14 @@ missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100/SM103/SM107, `D == 128`,
-`block_I == 128`, `H in {32, 64}`, and `topk % 128 == 0` for
-`128 <= topk <= 2048`. Each producer CTA owns one plane and processes the fixed
-row stripe `cta`, `cta + num_ctas`, .... The main GEMM therefore retains its
-existing Tensor Core math while dK has a fixed association order across
+`deterministic=True` is request-or-fail and supports SM90 with `H == 64` and
+SM100/SM103/SM107 with `H in {32, 64}`. All supported devices require `D == 128`,
+`block_I == 128`, and `topk % 128 == 0` for
+`128 <= topk <= 2048`. Each producer CTA owns one plane. SM100-family kernels
+process fixed grid-stride row stripes; SM90 submits bounded waves of at most
+`deterministic_dk_planes` one-row CTAs on the same stream, so a later wave cannot
+reuse a plane until its predecessor completes. The main GEMM therefore retains
+its existing Tensor Core math while dK has a fixed association order across
 launches. Scratch is exactly
 `ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))`. It is cleared on the launch stream at every execute, then
 reduced once in fixed plane order. The live scratch byte range must not overlap
@@ -997,7 +1000,11 @@ counts retain their existing behavior.
 
 On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate
-conversion solely for Indexer Backward is unlikely to help.
+conversion solely for Indexer Backward is unlikely to help. Deterministic SM90
+uses the same fixed producer-plane ownership and fixed-order reducer described
+above. Its stream-ordered bounded waves also form the synchronization boundary:
+every one-row CTA in wave N completes before wave N+1 can reuse the same producer
+planes, and the fixed reducer runs only after the last wave.
 
 ### 10. Dense Indexer Backward
 
