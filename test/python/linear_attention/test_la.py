@@ -3117,24 +3117,27 @@ def tune_cache(tmp_path, monkeypatch):
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
 @pytest.mark.parametrize("variant", CUTILE_VARIANTS)
 def test_determinism_cutile_autotune_configs(backend, variant, tune_cache):
-    """The cuTile autotune pick does not reach the output, whichever candidate wins.
+    """Each autotune candidate repeats itself, and for KDA all of them give the same bits.
 
     The pick is timing-based, so two runs can settle on different ones. Force each candidate in turn instead of timing
-    them; fwd and bwd must give the same bits for all of them."""
+    them. GDN's candidates differ from each other (that is why a settled pick is kept, see the next test); KDA's do not."""
     from cudnn.linear_attention.cutile.kernels import common, kda
 
     shape = dict(seq_lens=[497, 16, 1, 480, 0, 253])
 
-    def run_picking(index):
-        tune_cache(f"pick{index}")
+    def run_picking(index, repeat):
+        tune_cache(f"pick{index}.{repeat}")
         with patch.object(common, "exhaustive_search", picking(index)), patch.object(kda, "exhaustive_search", picking(index)):
             return stress_round(backend, variant, shape)
 
     with waive_unsupported(backend, variant):
-        baseline = run_picking(0)
-    for index in range(1, MAX_AUTOTUNE_CONFIGS):
-        for name, want, have in zip(stress_names(variant), baseline, run_picking(index)):
-            assert_bitwise(f"{variant} autotune pick {index} {name}", have, want)
+        baseline = run_picking(0, 0)
+    for index in range(MAX_AUTOTUNE_CONFIGS):
+        for name, want, have in zip(stress_names(variant), baseline if index == 0 else run_picking(index, 0), run_picking(index, 1)):
+            assert_bitwise(f"{variant} autotune pick {index} repeat {name}", have, want)
+        if variant == "kda" and index:
+            for name, want, have in zip(stress_names(variant), baseline, run_picking(index, 2)):
+                assert_bitwise(f"{variant} autotune pick {index} {name}", have, want)
 
 
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
