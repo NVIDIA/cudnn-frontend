@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Fused Gated DeltaNet DECODE step (SM100-class parts, Cutlass primitives) for the geometry of ``gdn_decode_fused_config.py`` (the
+Fused Gated DeltaNet DECODE step (SM100- and SM120-class parts: arch-portable PTX -- no TMEM, no MMA, no multicast -- on Cutlass primitives) for the geometry of ``gdn_decode_fused_config.py`` (the
 Qwen 3.5-architecture dense 27B GDN sub-layer at TP 1: 16 K heads, 48 V heads, head dim 128, conv width 4, hidden 5120): BA projection, causal conv +
 SiLU, Q / K RMS scales, the gated delta-rule state update, gated RMSNorm, the static FP8 output quantization and the conv-history
 shift in one launch, after the stock FP8 QKVZ projection of a decode step.

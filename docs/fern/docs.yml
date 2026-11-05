@@ -266,14 +266,6 @@ redirects:
     destination: "/cudnn/operations/RoPE/rope-tail"
   - source: "/cudnn/latest/fe-oss-apis/rope_tail"
     destination: "/cudnn/operations/RoPE/rope-tail"
-  - source: "/cudnn/fe-oss-apis/triangle_attention"
-    destination: "/cudnn/operations/Attention/triangle_attention"
-  - source: "/cudnn/latest/fe-oss-apis/triangle_attention"
-    destination: "/cudnn/operations/Attention/triangle_attention"
-  - source: "/cudnn/fe-oss-apis/triangle_multiplicative_update"
-    destination: "/cudnn/operations/Matmul/triangle_multiplicative_update"
-  - source: "/cudnn/latest/fe-oss-apis/triangle_multiplicative_update"
-    destination: "/cudnn/operations/Matmul/triangle_multiplicative_update"
 
   # Legacy Sphinx URLs. Sources are relative to the instance path
   # (docs.nvidia.com/cudnn); destinations are absolute.

@@ -1,25 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""K1 -- LayerNorm of the pair representation + the gated dual projections + the pair mask -> the channel-major planes ``a``, ``b``.
+"""The projection instance of the LayerNorm-prologue gated dual GEMM substrate (``cudnn.gemm.frost.ln_prologue``, the ``pairing = "columns"``
+arm): LayerNorm of a row-block activation + two gated projections (passes ``a``, ``b``) + a per-row mask -> the channel-major planes ``a``, ``b``.
 
-For every pair row ``(b, i, k)`` of ``z`` (``[B, N, N, c_z]`` bf16) and each pass ``p`` in (``a``, ``b``)::
+For every row ``(b, i, k)`` of ``z`` (``[B, N, N, c_z]`` bf16) and each pass ``p`` in (``a``, ``b``)::
 
     z_in      = LayerNorm_{c_z}(z[b, i, k, :]; norm_in_weight, norm_in_bias, eps)             fp32 statistics, bf16 operand
     pass a    a[b, i, k, :] = sigmoid(z_in W_ag^T + b_ag) * (z_in W_ap^T + b_ap) * mask[b, i, k]
     pass b    b[b, i, k, :] = sigmoid(z_in W_bg^T + b_bg) * (z_in W_bp^T + b_bp) * mask[b, i, k]
 
-stored CHANNEL-major as ``planes[p][c][b * N + i][k]`` with the ``k`` axis padded to a multiple of 8 (``n_pad``) -- the contract the
-contraction (K2, ``kernels.contraction``) consumes: per channel ``c`` and batch ``b`` the ``[N, N]`` matrix at rows ``b * N ..``
-with row stride ``n_pad``.  The per-row ``(mean, rstd)`` of the LayerNorm are written once for the backward.
+stored CHANNEL-major as ``planes[p][c][b * N + i][k]`` with the ``k`` axis padded to a multiple of 8 (``n_pad``): per channel ``c`` and batch
+``b`` the ``[N, N]`` matrix at rows ``b * N ..`` with row stride ``n_pad`` -- the layout a per-channel batched GEMM over the planes consumes.
+The per-row ``(mean, rstd)`` of the LayerNorm are written once.
 
-This module writes no kernel: it is the triangle multiplicative update's instance of the LayerNorm-prologue gated dual GEMM
-substrate ``cudnn.gemm.frost.ln_prologue`` (one persistent launch whose tile list is (pass, row block); the mask is
-applied in fp32 before the one bf16 rounding; a masked row is exactly ``+0.0``; a 256-row tile whose rows are all masked skips its
-MMA by a warp vote).  The weight convention is cuEquivariance's: ``p_in_weight, g_in_weight`` are ``[2 c, c_z]`` with rows
-``[a; b]`` -- :func:`stack_projection_weights` turns them into the substrate's ``[2, 2 c, c_z]`` interleaved stack ONCE (plan time).
+This module writes no kernel: it is a TEST-LOCAL instance of the substrate (one persistent launch whose tile list is (pass, row block); the mask
+is applied in fp32 before the one bf16 rounding; a masked row is exactly ``+0.0``; a 256-row tile whose rows are all masked skips its MMA by a
+warp vote).  The weight convention: ``p_in_weight, g_in_weight`` are ``[2 c, c_z]`` with rows ``[a; b]`` -- :func:`stack_projection_weights`
+turns them into the substrate's ``[2, 2 c, c_z]`` interleaved stack ONCE (plan time).  The substrate's tests (``test_ln_dual_gemm_proj.py``,
+``test_ln_dual_gemm_desc_builder.py``) exercise the ``"columns"`` body through this instance; it is not part of the ``cudnn`` package.
 
-Traffic model (:func:`proj_bytes`): read ``z`` (2 B per pair-channel), write ``a`` and ``b`` (2 + 2 B per pair-channel), plus the
-mask (2 B per pair) and the statistics (8 B per pair); FLOPs (:func:`proj_flop`): ``2 * B N^2 * c_z * 4 c``.
+Traffic model (:func:`proj_bytes`): read ``z`` (2 B per row-channel), write ``a`` and ``b`` (2 + 2 B per row-channel), plus the mask (2 B per
+row) and the statistics (8 B per row); FLOPs (:func:`proj_flop`): ``2 * B N^2 * c_z * 4 c``.
 """
 
 from __future__ import annotations
@@ -102,19 +103,19 @@ def n_pad(n_res: int) -> int:
 
 
 def planes_shape(c: int, batch: int, n_res: int) -> Tuple[int, int, int, int]:
-    """``[2, c, B * N, n_pad]`` -- the ``a`` / ``b`` workspace planes K1 writes and K2 reads."""
+    """``[2, c, B * N, n_pad]`` -- the ``a`` / ``b`` planes the projection writes (the channel-major contract a per-channel batched GEMM over them reads)."""
     return (PASSES, int(c), int(batch) * int(n_res), n_pad(n_res))
 
 
 def plane_strides(batch: int, n_res: int) -> Tuple[int, int, int]:
     """Per channel and batch, the ``[N, N]`` matrix ``plane[c][b * N + i][k]``: ``(channel, row i, col k)`` element strides
-    ``(B * N * n_pad, n_pad, 1)`` -- what the contraction graph declares over these planes (the batch ``b`` is a row offset)."""
+    ``(B * N * n_pad, n_pad, 1)`` -- what a per-channel batched GEMM declares over these planes (the batch ``b`` is a row offset)."""
     npd = n_pad(n_res)
     return (int(batch) * int(n_res) * npd, npd, 1)
 
 
 def stack_projection_weights(p_in_weight, g_in_weight):
-    """cuEquivariance's ``p_in_weight, g_in_weight`` (``[2 c, c_z]``, rows ``[a; b]``) -> the substrate's ``[2, 2 c, c_z]`` stack:
+    """``p_in_weight, g_in_weight`` (``[2 c, c_z]``, rows ``[a; b]``) -> the substrate's ``[2, 2 c, c_z]`` stack:
     pass 0 = (W_ap, W_ag), pass 1 = (W_bp, W_bg), each interleaved per 128-channel block (``interleave_value_gate``).  A copy; plan time."""
     import torch
 
@@ -136,15 +137,15 @@ def stack_projection_biases(p_in_bias, g_in_bias):
     return torch.stack([interleave_value_gate_bias(p_in_bias[:c], g_in_bias[:c]), interleave_value_gate_bias(p_in_bias[c:], g_in_bias[c:])], dim=0).contiguous()
 
 
-def build_trimul_proj(params: LnDualGemmParams, arch: str = "sm107", target: Optional[str] = None) -> LnDualGemmPlan:
+def build_proj(params: LnDualGemmParams, arch: str = "sm107", target: Optional[str] = None) -> LnDualGemmPlan:
     """Compile (cached per (params, arch)) -- shapes are runtime.  ``arch`` names the substrate's rendered body (``"sm107"`` Rubin, ``"sm100"``
     Blackwell; ``cudnn.gemm.frost.ln_prologue.body_arch_for_cc`` picks it from the device's compute capability)."""
     if params.passes != PASSES:
-        raise ValueError(f"the triangle multiplicative update's K1 has exactly {PASSES} passes (a, b), got params.passes={params.passes}")
+        raise ValueError(f"the projection instance has exactly {PASSES} passes (a, b), got params.passes={params.passes}")
     return build_ln_dual_gemm(params, arch, target)
 
 
-def run_trimul_proj(
+def run_proj(
     plan: LnDualGemmPlan,
     z,  # [B, N, N, c_z] bf16 contiguous
     w_stacked,  # [2, 2 c, c_z] bf16 from stack_projection_weights
@@ -153,12 +154,12 @@ def run_trimul_proj(
     norm_in_bias,  # [c_z] bf16
     *,
     bias_stacked=None,  # [2, 2 c] bf16 from stack_projection_biases, iff params.has_bias
-    mask=None,  # [B, N, N] bf16 pair mask, iff params.has_mask
+    mask=None,  # [B, N, N] bf16 row mask, iff params.has_mask
     stats=None,  # [B * N * N, 2] fp32 (mean, rstd), iff params.want_stats
     stream,
-    k_block=None,  # k's per 256-row pair tile (the substrate's rule when None; a performance knob, bitwise the same planes)
+    k_block=None,  # k's per 256-row tile (the substrate's rule when None; a performance knob, bitwise the same planes)
 ) -> RowBlockGeometry:
-    """Launch K1.  No allocation, no conversion (the mask must already be bf16 ``[B, N, N]``; the planes are the caller's workspace)."""
+    """Launch the projection.  No allocation, no conversion (the mask must already be bf16 ``[B, N, N]``; the planes are the caller's workspace)."""
     if z.ndim != 4 or z.shape[1] != z.shape[2]:
         raise ValueError(f"z must be [B, N, N, c_z], got {tuple(z.shape)}")
     batch, n_res, _, c_z = (int(s) for s in z.shape)
@@ -184,7 +185,7 @@ def run_trimul_proj(
 
 
 def proj_bytes(c_z: int, c: int, batch: int, n_res: int, *, with_mask: bool = True, with_stats: bool = True) -> int:
-    """Compulsory HBM traffic of K1: read ``z`` once, write ``a`` and ``b`` once (bf16), plus the mask read and the statistics write."""
+    """Compulsory HBM traffic of the projection: read ``z`` once, write ``a`` and ``b`` once (bf16), plus the mask read and the statistics write."""
     pairs = int(batch) * int(n_res) ** 2
     total = pairs * (int(c_z) * _BF16_BYTES + 2 * int(c) * _BF16_BYTES)
     if with_mask:
@@ -204,7 +205,7 @@ __all__ = [
     "LnDualGemmParams",
     "LnDualGemmPlan",
     "RowBlockGeometry",
-    "build_trimul_proj",
+    "build_proj",
     "n_pad",
     "plane_strides",
     "planes_shape",
@@ -212,7 +213,7 @@ __all__ = [
     "proj_flop",
     "proj_params",
     "row_block_geometry",
-    "run_trimul_proj",
+    "run_proj",
     "stack_projection_biases",
     "stack_projection_weights",
 ]

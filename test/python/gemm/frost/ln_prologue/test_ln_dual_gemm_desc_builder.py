@@ -16,7 +16,7 @@ module proves the floor DSL's path under DSL 4.7.0 and the versioned path under 
     ring roots below and above the line); the PTX immediates agree bit-for-bit between the sm100 body's builder and the non-versioned NVVM op
     (= what the 4.7.0 build() lowers to) below the line and match the PTX ISA layout, while at / above the line the non-versioned op drops
     start-address bit 14 -- the wide field the sm107 body requires;
-  * K1 and K3 RENDER for sm_100a through the builder (the production c 128 picks), the resolution the body reports matching the DSL.
+  * the projection and output-stage instances RENDER for sm_100a through the builder (the c 128 picks), the resolution the body reports matching the DSL.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import pytest
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-requirement_error = cutedsl_requirement_error("Triangle multiplicative update descriptor-builder tests")
+requirement_error = cutedsl_requirement_error("LayerNorm-prologue dual GEMM descriptor-builder tests")
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 pytest.importorskip("cutlass")
@@ -42,8 +42,10 @@ pytest.importorskip("cutlass")
 pytestmark = pytest.mark.L0
 
 from cudnn.gemm.frost import ln_prologue as sub  # noqa: E402
-from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # noqa: E402
-from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3  # noqa: E402
+import ln_dual_gemm_proj_instance as proj  # noqa: E402  -- the test-local projection instance of the substrate (this directory)
+import os as _os  # noqa: E402
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))  # the instance modules beside this file, for the probes' fresh interpreters
 from sdpa.frost import frost_test_utils as sass_utils  # noqa: E402  -- arch_known_to_the_dsl (the sm_100a trace-compile gate)
 
 LIMIT = sub.TCGEN05_SMEM_DESC_LEGACY_ADDR_LIMIT  # 262144
@@ -148,7 +150,7 @@ def test_build_ln_dual_gemm_declines_typed_before_loading_the_sm107_body_without
     _patch_build(monkeypatch, versioned=False)
     monkeypatch.setattr(buffers, "cutedsl_arch_requirement_error", lambda cc: None)
     monkeypatch.setattr(loader, "load_template", _no_load)
-    p = k1.proj_params(128, 128, has_bias=True, has_mask=True)
+    p = proj.proj_params(128, 128, has_bias=True, has_mask=True)
     with pytest.raises(NotImplementedError, match="versioned tcgen05 SMEM-descriptor builder"):
         sub.build_ln_dual_gemm.__wrapped__(p, "sm107")  # __wrapped__: past the lru_cache, so the gate runs whatever this process compiled before
     with pytest.raises(_Loaded):
@@ -170,7 +172,7 @@ def test_both_bodies_build_every_ring_root_through_the_builder():
 # The ENCODINGS.  Constant operands let LLVM fold every descriptor into a PTX immediate; the probe reads them back from the stores.
 # Ring roots: below the line (every address a 227 KiB cc 10.0 / 10.3 CTA can hold; the sm100 body's rings end at 192 KiB) and at / above it
 # (reachable on the 327 KiB Rubin carveout only: the sm107 body's rings end at 288 KiB).  (LBO, SBO): the bodies' K-major SW128 bf16 operands
-# (A and B: 16 / 1024) and the K3 arm's MN-major SW128 bf16 A0 (8192 / 1024); SWIZZLE_128B (tcgen05 code 2) throughout.
+# (A and B: 16 / 1024) and the tail arm's MN-major SW128 bf16 A0 (8192 / 1024); SWIZZLE_128B (tcgen05 code 2) throughout.
 _ROOTS = (1024, 16384, 99328, 197632, 247808, 261120, 262144, 263168, 293888)
 _LBO_SBO = ((16, 1024), (8192, 1024))
 _CASES = [(r, l, s) for r in _ROOTS for (l, s) in _LBO_SBO]
@@ -291,7 +293,7 @@ def test_descriptor_encodings_agree_below_the_line_on_the_installed_dsl(tmp_path
                 assert vals["sm107"][i] == wide, (i, root, hex(vals["sm107"][i]), hex(wide))
 
 
-_RENDER_PROBE = """
+_RENDER_PROBE = ("import sys; sys.path.insert(0, %r)  # the test-local instance modules beside this file\n" % _HERE) + """
 import glob, hashlib, json, os, sys
 dump, arch, params_json = sys.argv[1], sys.argv[2], sys.argv[3]
 os.environ["CUTE_DSL_DUMP_DIR"] = dump
@@ -299,13 +301,13 @@ os.environ["CUTE_DSL_KEEP"] = "cubin"
 os.environ["CUTE_DSL_ARCH"] = arch
 os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips the render
 from cudnn.gemm.frost import ln_prologue
-from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
-from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
+import ln_dual_gemm_proj_instance as proj
+import ln_dual_gemm_tail_instance as tail
 kw = json.loads(params_json)
-if kw["arm"] == "k1":
-    p = k1.proj_params(kw["k"], kw["k"], has_bias=True, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2, ln_pass_form="registers", epi_math="packed")
+if kw["arm"] == "proj":
+    p = proj.proj_params(kw["k"], kw["k"], has_bias=True, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2, ln_pass_form="registers", epi_math="packed")
 else:
-    p = k3.tail_params(kw["k"], kw["k"], has_bias=True, want_stats=False, a0_prologue="transpose", ln_pass_form="registers", epi_math="packed")
+    p = tail.tail_params(kw["k"], kw["k"], has_bias=True, want_stats=False, a0_prologue="transpose", ln_pass_form="registers", epi_math="packed")
 plan = ln_prologue.build_ln_dual_gemm(p, "sm100")
 print("DESC_PATH", plan.module._DESC_BUILD.path)
 print("AB_STAGES", plan.module.ab_stages)
@@ -315,9 +317,9 @@ print("DONE")
 """
 
 
-@pytest.mark.parametrize("arm,k", [("k1", 128), ("k3", 128)])
-def test_k1_and_k3_render_for_sm_100a_through_the_builder(tmp_path, arm, k):
-    """Trace-compile the sm100 body's production c 128 renderings of K1 (the LayerNorm-prologue projection) and K3 (the output stage) for sm_100a
+@pytest.mark.parametrize("arm,k", [("proj", 128), ("tail", 128)])
+def test_proj_and_tail_render_for_sm_100a_through_the_builder(tmp_path, arm, k):
+    """Trace-compile the sm100 body's c 128 renderings of the projection instance and the output-stage instance for sm_100a
     (no GPU) in a fresh interpreter: the render succeeds on the installed DSL -- the versioned path on a DSL whose build() takes ``version``, the
     legacy path on the 4.7.0 floor (the ``version=`` TypeError this module exists for) -- and the body reports the resolution the DSL has."""
     if not sass_utils.arch_known_to_the_dsl("sm_100a"):
@@ -331,5 +333,5 @@ def test_k1_and_k3_render_for_sm_100a_through_the_builder(tmp_path, arm, k):
     out = {ln.split()[0]: ln.split()[1] for ln in proc.stdout.splitlines() if len(ln.split()) == 2 and ln.split()[0].isupper()}
     print(f"\n{arm} K={k} sm_100a: builder {out['DESC_PATH']}, ab_stages {out['AB_STAGES']}, cubin md5 {out['CUBIN_MD5']}")
     assert out["DESC_PATH"] == ("versioned" if _installed_build_is_versioned() else "legacy")
-    assert int(out["AB_STAGES"]) == sub.ring_stages("sm100", "accumulators" if arm == "k3" else "columns")
+    assert int(out["AB_STAGES"]) == sub.ring_stages("sm100", "accumulators" if arm == "tail" else "columns")
     assert out["CUBIN_MD5"] != "none"
