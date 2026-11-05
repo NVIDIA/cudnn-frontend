@@ -203,10 +203,19 @@ class ScoreKernelSm100:
         return valid, m_block, seqlen, batch_idx, q_causal_offset
 
     @cute.jit
-    def _sched_warp(self, work_tile, tile_sched, clc_pipeline, clc_consumer_state):
-        """CLC scheduler warp: request the next work tile while the current one runs."""
+    def _sched_warp(self, work_tile, tile_sched, clc_pipeline, clc_consumer_state, claim_mbar_ptr):
+        """CLC scheduler warp: request the next work tile once the load warp has issued the current
+        tile's last K load (``_release_claim``), so its tail still overlaps the CLC round trip.
+
+        A work tile carries its whole KV range, so tile costs differ by orders of magnitude when long
+        rows follow short ones (packed THD).  Claiming at tile start let a CTA that had just begun a
+        long tile reserve a second one while idle CTAs found the queue empty, serialising long tiles
+        two per CTA on half the SMs."""
         clc_producer_state = make_pipeline_state(PipelineUserType.ProducerConsumer, self.num_clc_stage)
+        claim_phase = Int32(0)
         while work_tile.is_valid_tile:
+            cute.arch.mbarrier_wait(claim_mbar_ptr, claim_phase)
+            claim_phase = claim_phase ^ Int32(1)
             clc_pipeline.producer_acquire(clc_producer_state)
             tile_sched.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer_state))
             clc_producer_state.advance()
@@ -215,6 +224,12 @@ class ScoreKernelSm100:
             clc_pipeline.consumer_release(clc_consumer_state)
             clc_consumer_state.advance()
         clc_pipeline.producer_tail(clc_producer_state)
+
+    @cute.jit
+    def _release_claim(self, claim_mbar_ptr):
+        """Load warp, once per work tile (invalid tiles too): every load of the tile is issued."""
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(claim_mbar_ptr)
 
     @cute.jit
     def _stage_per_head(self, sBuf, off, mPerHead_cur, m_block, seqlen_q, lane_id, scale: cutlass.Constexpr = None):

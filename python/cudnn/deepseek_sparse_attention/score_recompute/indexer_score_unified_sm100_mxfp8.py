@@ -382,6 +382,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             tmem_holding_buf: Int32
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.MemRange[cutlass.Int32, 4]
+            claim_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]  # after clc_response: it is read as one 16-byte word
             sPerHead: cute.struct.Align[cute.struct.MemRange[Float32, sPerHead_size], 128]
             sRed: cute.struct.Align[cute.struct.MemRange[Float32, 8 * self.num_math_wg], 128]  # LSE cross-warp scratch
             sQScale: cute.struct.Align[cute.struct.MemRange[self.sf_dtype, sQScale_size], self.buffer_align_bytes]
@@ -398,6 +399,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
         tmem_holding_buf = storage.tmem_holding_buf.ptr
         clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
+        claim_mbar_ptr = storage.claim_mbar_ptr.data_ptr()
         clc_response_ptr = storage.clc_response.data_ptr()
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -437,6 +439,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         if warp_idx == 1:
             cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
         if warp_idx == 0:
+            cute.arch.mbarrier_init(claim_mbar_ptr, 1)  # load warp -> CLC warp: the tile's loads are issued
             for _s in cutlass.range_constexpr(self.NUM_SF_STAGES):
                 cute.arch.mbarrier_init(SF_mbar_ptr + _s, 1)  # full: SF warp commit
                 cute.arch.mbarrier_init(SF_mbar_ptr + self.NUM_SF_STAGES + _s, 1)  # empty: MMA commit
@@ -551,6 +554,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
                                     load_K_fn(tma_bar_ptr=kv_bar)
                             KV_producer_state.advance()
                             split = split + 1
+                    self._release_claim(claim_mbar_ptr)
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
                     clc_pipeline.consumer_release(clc_consumer_state)
@@ -661,7 +665,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
 
             # ---------------- CLC scheduler warp ----------------
             if warp_idx == self.sched_warp_id:
-                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state)
+                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state, claim_mbar_ptr)
 
         # ---------------- math warpgroups ----------------
         if warp_group_idx > 0:
