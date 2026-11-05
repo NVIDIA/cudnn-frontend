@@ -2961,7 +2961,7 @@ def test_gate_domain_invalid_args_raise(backend, variant):
 # the fallback is not bitwise repeatable.
 # ---------------------------------------------------------------------------
 
-DETERMINISM_BACKENDS = ["frost", "cutile"]
+DETERMINISM_BACKENDS = ["frost", "cutile", "hopper", "hopper_cuda"]
 # Upper bound on the autotune candidates: 4 occupancy values x 2 num_worker_warps values.
 MAX_AUTOTUNE_CONFIGS = 8
 
