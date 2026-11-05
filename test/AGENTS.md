@@ -171,6 +171,13 @@ prefill; a short query alone does not imply the D128 decode template.
 
 ### Conventions for new tests
 
+- Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
+  for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
+  inputs. A flat (N,) fixture can be rejected before kernel execution. Preserve
+  the eligibility guard and numerical assertions; run both existing
+  `test_frost_norm_engines.py` and `test_frost_norm_engine_e2e.py` after tightening
+  graph-shape validation.
+
 - Host-only compile-cache tests that replace `cute.compile` must also isolate
   architecture-dependent compiler options evaluated before that call. Mock
   `compile_options()` when no compilation is intended, so an otherwise valid
