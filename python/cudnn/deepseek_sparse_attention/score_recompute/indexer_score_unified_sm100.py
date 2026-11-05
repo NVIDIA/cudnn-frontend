@@ -67,6 +67,7 @@ from .score_kernel_sm100 import (
     ScoreKernelSm100,
     add_packed_f32x2,
     fma_packed_f32x2,
+    named_barrier_sync,
     tcgen05_fence_after as _tcgen05_fence_after,
     tcgen05_fence_before as _tcgen05_fence_before,
 )
@@ -841,7 +842,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
                 wmax = cute.arch.warp_redux_sync(lmax[u], "fmax")
                 if tidx_wg % self.WARP_SIZE == 0:
                     sRed[wg * 8 + warp] = wmax
-                cute.arch.barrier(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
+                named_barrier_sync(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
                 gmax = sRed[wg * 8]
                 for wi in cutlass.range_constexpr(1, 4):
                     v = sRed[wg * 8 + wi]
@@ -852,7 +853,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
                 wsum = cute.arch.warp_reduction_sum(adj)
                 if tidx_wg % self.WARP_SIZE == 0:
                     sRed[wg * 8 + 4 + warp] = wsum
-                cute.arch.barrier(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
+                named_barrier_sync(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
                 if tidx_wg == 0:
                     gsum = sRed[wg * 8 + 4] + sRed[wg * 8 + 5] + sRed[wg * 8 + 6] + sRed[wg * 8 + 7]
                     lse = -Float32.inf
@@ -860,5 +861,5 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
                         lse = gmax + cute.math.log2(gsum) * inv_log2_e
                     if q_toks[u] < seqlen.seqlen_q:
                         mDenom_cur[q_toks[u]] = lse
-                cute.arch.barrier(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
+                named_barrier_sync(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
         return t_full_bits

@@ -44,6 +44,27 @@ fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
 
 
 @dsl_user_op
+def named_barrier_sync(*, barrier_id, number_of_threads, loc=None, ip=None):
+    """Named barrier over a subset of the CTA's warps, in the unaligned ``barrier.sync`` form.
+
+    ``cute.arch.barrier`` emits ``bar.sync``, i.e. ``barrier.sync.aligned``, whose conditional use requires every
+    thread of the CTA to take the same branch; the warp-role subsets here (MMA + scale warps, one math warpgroup,
+    the math warpgroups) reach it from role branches the other warps never enter.
+    """
+    llvm.inline_asm(
+        None,
+        [Int32(barrier_id).ir_value(loc=loc, ip=ip), Int32(number_of_threads).ir_value(loc=loc, ip=ip)],
+        "barrier.sync $0, $1;",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def tcgen05_fence_after(*, loc=None, ip=None):
     llvm.inline_asm(None, [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
 

@@ -69,6 +69,7 @@ from .score_kernel_sm100 import (
     BlockScaledScoreSm100Mixin,
     add_packed_f32x2,
     fma_packed_f32x2,
+    named_barrier_sync,
     tcgen05_fence_after as _tcgen05_fence_after,
     tcgen05_fence_before as _tcgen05_fence_before,
 )
@@ -560,7 +561,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             # ---------------- SF warp: K scales SMEM -> TMEM (2-deep SFA ring) ----------------
             if warp_idx == self.sf_warp_id:
                 # TMEM is allocated by the MMA warp; wait for it before the first S2T.
-                cute.arch.barrier(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)
+                named_barrier_sync(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)
                 KV_sf_state = make_pipeline_state(PipelineUserType.Consumer, self.NUM_SPLIT_STAGES)
                 sf_ctr = Int32(0)
                 sf_empty_bits = Int32((1 << self.NUM_SF_STAGES) - 1)
@@ -595,7 +596,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             if warp_idx == self.mma_warp_id:
                 cute.arch.alloc_tmem(Int32(self.tmem_alloc_cols), tmem_holding_buf)
                 cute.arch.sync_warp()
-                cute.arch.barrier(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)
+                named_barrier_sync(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)
                 KV_mma_state = make_pipeline_state(PipelineUserType.Consumer, self.NUM_SPLIT_STAGES)
                 sf_ctr = Int32(0)
                 sf_full_bits = Int32(0)
@@ -905,7 +906,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
                 wmax = cute.arch.warp_redux_sync(lmax[u], "fmax")
                 if tidx_wg % self.WARP_SIZE == 0:
                     sRed[wg * 8 + warp] = wmax
-                cute.arch.barrier(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
+                named_barrier_sync(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
                 gmax = sRed[wg * 8]
                 for wi in cutlass.range_constexpr(1, 4):
                     v = sRed[wg * 8 + wi]
@@ -916,7 +917,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
                 wsum = cute.arch.warp_reduction_sum(adj)
                 if tidx_wg % self.WARP_SIZE == 0:
                     sRed[wg * 8 + 4 + warp] = wsum
-                cute.arch.barrier(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
+                named_barrier_sync(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
                 if tidx_wg == 0:
                     gsum = sRed[wg * 8 + 4] + sRed[wg * 8 + 5] + sRed[wg * 8 + 6] + sRed[wg * 8 + 7]
                     lse = -Float32.inf
@@ -925,4 +926,4 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
                     if q_toks[u] < seqlen.seqlen_q:
                         mDenom_cur[q_toks[u]] = lse
                 # sRed is reused by the next token / tile.
-                cute.arch.barrier(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)
+                named_barrier_sync(barrier_id=bar_id, number_of_threads=self.WARPGROUP_SIZE)

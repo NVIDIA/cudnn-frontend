@@ -61,6 +61,7 @@ from .score_kernel_sm100 import (
     ScoreKernelSm100,
     add_packed_f32x2,
     fma_packed_f32x2,
+    named_barrier_sync,
     tcgen05_fence_after as _tcgen05_fence_after,
     tcgen05_fence_before as _tcgen05_fence_before,
 )
@@ -461,7 +462,7 @@ class BwdDenseAttnScoreSm100Mxfp8(BlockScaledScoreSm100Mixin, ScoreKernelSm100):
 
             # ---------------- SF warp: K scales SMEM -> TMEM SFA ring ----------------
             if warp_idx == self.sf_warp_id:
-                cute.arch.barrier(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)  # TMEM allocated
+                named_barrier_sync(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)  # TMEM allocated
                 KV_sf_state = make_pipeline_state(PipelineUserType.Consumer, self.num_kv_stages)
                 sf_ctr = Int32(0)
                 sf_empty_bits = Int32((1 << NSF) - 1)
@@ -495,7 +496,7 @@ class BwdDenseAttnScoreSm100Mxfp8(BlockScaledScoreSm100Mixin, ScoreKernelSm100):
             if warp_idx == self.mma_warp_id:
                 cute.arch.alloc_tmem(Int32(self.tmem_alloc_cols), tmem_holding_buf)
                 cute.arch.sync_warp()
-                cute.arch.barrier(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)
+                named_barrier_sync(barrier_id=1, number_of_threads=2 * self.WARP_SIZE)
                 KV_mma_state = make_pipeline_state(PipelineUserType.Consumer, self.num_kv_stages)
                 sf_ctr = Int32(0)
                 sf_full_bits = Int32(0)
@@ -709,7 +710,7 @@ class BwdDenseAttnScoreSm100Mxfp8(BlockScaledScoreSm100Mixin, ScoreKernelSm100):
                     wsum = cute.arch.warp_reduction_sum(dsum[u])
                     if tidx_wg % self.WARP_SIZE == 0:
                         sRed[red_off + u * 4 * self.num_math_wg + wg * 4 + warp] = wsum
-                cute.arch.barrier(barrier_id=2, number_of_threads=self.WARPGROUP_SIZE * self.num_math_wg)
+                named_barrier_sync(barrier_id=2, number_of_threads=self.WARPGROUP_SIZE * self.num_math_wg)
                 if wg == 0:
                     if tidx_wg < T:
                         total = Float32(0.0)
