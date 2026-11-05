@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar
 
+from cudnn._device import ensure_current_context
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 
@@ -973,6 +974,9 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         if not isinstance(variant_pack, dict):
             raise TypeError(f"compiled kernels are called with a variant-pack dict {{cuDNN tensor | uid | name: buffer}}; got {type(variant_pack).__name__}")
         backend._check_plan_device(self.device)
+        # The launch and the output fills before it are driver calls on this thread. An autograd backward runs on
+        # a worker whose context stack can still be empty, so bind the context first.
+        ensure_current_context(stream, self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_moe(self, problem, offsets, workspace, operands, outputs, aux, stream, token_index, token_ks, top_k_scores):
@@ -1171,6 +1175,9 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         def lowered(operands, graph_order=None, stream=None, workspace=None):
             """Validate resolved buffers and launch the already compiled GEMM plan."""
             backend._check_plan_device(device)
+            # The fills and the launch below are driver calls on this thread (an autograd worker can have no
+            # current context yet).
+            ensure_current_context(stream, device)
             original_operands = operands
             operands = r.operand_views(operands)
             vs = [operands[i] for i in in_slots]
