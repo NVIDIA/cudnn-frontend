@@ -464,9 +464,9 @@ def test_a_rank_geometry_derives_its_forms_ladder_and_token_bounds(g):
     the token bound, the lane map and the co-residency carry no head-count or hidden term; the ticket limit follows the V-per-K ratio); the
     pick's regime switches move with the V heads per rank by the one rule, the served token bound with them (35 / 8 / 8 by regime on the
     cc 10.0 readings: past the one-CTA grid a per-rank geometry takes the one-CTA form in two waves, never the two-CTAs-per-SM form, which
-    is spill-free at the default geometry only -- the sm_100a census: 128 registers / 0 stack / 0 STL-LDL at 16 / 48 / 5120 against 128 /
-    56 B / 14 STL + 14 LDL at every per-rank geometry, hidden 4096 included), the resolved norm form rides on the geometry form, and the
-    cc 12.0 readings walk the same ladder."""
+    is unmeasured off the default geometry and spills at hidden 8192 -- the sm_100a / sm_103a census: 128 registers / 0 stack / 0 STL-LDL
+    at 16 / 48 / 5120 and at 4 / 16 / 4096 against 128 / 56 B / 14 STL + 14 LDL at 1 / 8 / 8192, 2 / 16 / 8192 and 4 / 32 / 8192, a
+    hidden-width term), the resolved norm form rides on the geometry form, and the cc 12.0 readings walk the same ladder."""
     V = g.V_HEADS
     cfg, pair, two = (kcfg.with_geometry(f, g) for f in (kcfg.CFG, kcfg.PAIR_CFG, kcfg.TWO_CTA_CFG))
     assert cfg == replace(kcfg.CFG, GEOM=g) and cfg.GEOM is g and cfg != kcfg.CFG and hash(cfg) != hash(kcfg.CFG)
@@ -552,7 +552,7 @@ def test_entry_takes_the_geometry_and_keys_every_form_by_it(g):
     k.sm_count = 152
     assert replace(k.cfg_for(1), NORM_FORM=None) == replace(kcfg.PAIR_CFG, GEOM=g) and k.cfg_for(1).GEOM is g
     assert replace(k.cfg_for(152 // (2 * V) + 1), NORM_FORM=None) == replace(kcfg.CFG, GEOM=g)
-    beyond = k.cfg_for(152 // V + 1, 6)  # past the one-CTA grid: the one-CTA form in two waves (the capped form spills off the default geometry)
+    beyond = k.cfg_for(152 // V + 1, 6)  # past the one-CTA grid: the one-CTA form in two waves (the capped form: unmeasured off the default, spills at 8192)
     assert replace(beyond, NORM_FORM=None) == replace(kcfg.CFG, GEOM=g) and beyond.NORM_FORM == "ctas1" and beyond.MIN_CTAS_PER_SM == 1
     assert (k.max_tokens_for(1), k.max_tokens_for(152 // (2 * V) + 1), k.max_tokens_for(152 // V + 1)) == (35, 8, 8)
     with pytest.raises(NotImplementedError, match="at most 8 on this part"):
@@ -1686,14 +1686,18 @@ def test_rank_geometry_matches_the_torch_reference_and_replays_bitwise(g, reques
 @pytest.mark.parametrize("arm", RANK_VERIFY_ARMS, ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()) or "unrolled-one-cta-form")
 @pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_gid)
 def test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form(g, arm):
-    """Every form family this part holds at T 6, at a per-rank geometry, writes the bytes of the explicit rolled one-CTA form (``CFG`` at
-    that geometry) on the 4-request set with a padding request, a skipped slot and non-monotone slots: the fp8 / bf16 outputs, every state
-    slot, the conv pool; the padding request zero, the tickets back at zero.  An arm the part does not hold is its typed decline,
-    reported as a skip (``_fits_or_declines``)."""
+    """Every form family this part holds at T 6, at a per-rank geometry, writes the bytes of the one-CTA form THIS part holds at that
+    geometry (``CFG``, the rolled 3-deep-ring form, on a cc 10.0 part; the landing-slab one-CTA form on a 99 KB opt-in -- ``_part_form``,
+    as the 27B cells take it: the footprints carry no geometry term) on the 4-request set with a padding request, a skipped slot and
+    non-monotone slots: the fp8 / bf16 outputs, every state slot, the conv pool; the padding request zero, the tickets back at zero.  An
+    arm the part does not hold is its typed decline, reported as a skip (``_fits_or_declines``), and so is a part whose one-CTA form does
+    not hold T 6."""
     dev = _device_or_skip()
     cfg = kcfg.with_geometry(kcfg.make_cfg(**arm), g)  # the form compiled for the geometry (a form of another geometry beside geometry= is refused)
     _fits_or_declines(dev, cfg, 6)
-    base = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=kcfg.with_geometry(kcfg.CFG, g)), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
+    base_form = kcfg.with_geometry(_part_form(dev, kcfg.ONE_CTA_FORMS), g)  # the one-CTA form this part holds (CFG on cc 10.0), at the geometry
+    _fits_or_declines(dev, base_form, 6)
+    base = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=base_form), make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
     got = entry.GdnVerifyFused(dev, 1e-6, cfg=cfg)
     assert got.geometry == g and got.cfg.GEOM == g
     got = _snapshot(got, make_operands(4, 6, dev, seed=31, geometry=g, **RANK_SET))
@@ -1706,15 +1710,18 @@ def test_rank_geometry_requests_are_batch_invariant(g):
     """Batch invariance at a per-rank geometry: every live request of a 4-request T-6 step (the entry's pick at four requests; random
     acceptance counts, a skipped slot, non-monotone slots) writes the bytes it writes alone from the same pools -- its fp8 / bf16 rows,
     its written state slots, its conv slot -- so a request's result does not depend on which requests share its step.  Under ONE gated-norm
-    association: the lone request runs the one-CTA form with the multi-request association (``ctas1``, the pick's at four requests), because
-    the one-request pick itself takes the reference kernel's two-CTAs-per-head association (``ctas2``: 4-row chains) by policy, which
-    rounds the normed output's last bits differently by design (``norm_form_for``); the forms' agreement under one association is the
-    cross-form cell above and the 27B's one-request pair-vs-one-CTA cell."""
+    association: the lone request runs the one-CTA form this part holds (``CFG`` on a cc 10.0 part, the landing-slab form on a 99 KB
+    opt-in -- ``_part_form``) with the multi-request association (``ctas1``, the pick's at four requests), because the one-request pick
+    itself takes the reference kernel's two-CTAs-per-head association (``ctas2``: 4-row chains) by policy, which rounds the normed
+    output's last bits differently by design (``norm_form_for``); the forms' agreement under one association is the cross-form cell above
+    and the 27B's one-request pair-vs-one-CTA cell."""
     dev = _device_or_skip()
     requests, tokens = 4, 6
     k = entry.GdnVerifyFused(dev, 1e-6, geometry=g)
     assert k.cfg_for(requests, tokens).NORM_FORM == "ctas1"
-    alone = entry.GdnVerifyFused(dev, 1e-6, cfg=replace(kcfg.with_geometry(kcfg.CFG, g), NORM_FORM="ctas1"))
+    one_cta = kcfg.with_geometry(_part_form(dev, kcfg.ONE_CTA_FORMS), g)  # the one-CTA form this part holds, at the geometry
+    _fits_or_declines(dev, one_cta, tokens)
+    alone = entry.GdnVerifyFused(dev, 1e-6, cfg=replace(one_cta, NORM_FORM="ctas1"))
     kw = dict(accepted="random", skip="mid")
     ops = make_operands(requests, tokens, dev, seed=71, geometry=g, **kw)
     idx = ops["state_indices"].clone()

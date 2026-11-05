@@ -549,11 +549,13 @@ PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
 ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_SMALL_SMEM_ORDER = (PAIR_NBUF2_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_FORMS = (TWO_CTA_CFG,) + BEYOND_SMALL_SMEM_ORDER
-# Past the one-CTA grid at a geometry OTHER than the default the register-capped two-CTAs-per-SM form is not picked: on sm_100a it is
-# spill-free at the default geometry (128 registers, 0 stack, 0 STL / LDL) but spills at every per-rank geometry rendered (1 / 8 / 8192,
-# 2 / 16 / 8192, 4 / 32 / 8192 and 4 / 16 / 4096 alike: 128 registers + 56 B stack + 14 STL / 14 LDL -- not a hidden-width term), and a
-# form that spills is unmeasured there by the budget rule; the one-CTA form runs in two waves instead (the same kernel body, bitwise), with
-# the one-CTA token bound (8 on the cc 10.0 readings).  TWO_CTA_CFG stays available as an explicit form.
+# Past the one-CTA grid at a geometry OTHER than the default the register-capped two-CTAs-per-SM form is not picked: it is measured at
+# the default geometry only (the budget rule: a form unmeasured off the default is not picked there), and it spills where the hidden width
+# is 8192 -- on sm_100a and sm_103a alike it is spill-free at the default geometry (128 registers, 0 stack, 0 STL / LDL; hidden 5120 = two
+# full 2048-element BA chunks and a half) and at 4 / 16 / 4096 (two full chunks), but 128 registers + 56 B stack + 14 STL / 14 LDL at
+# 1 / 8 / 8192, 2 / 16 / 8192 and 4 / 32 / 8192: a hidden-width term (four full BA chunks live in the role at 8192).  The one-CTA form runs
+# in two waves instead (the same kernel body, bitwise), with the one-CTA token bound (8 on the cc 10.0 readings); at 4 / 16 / 4096 the
+# exclusion is conservative (spill-free there, unmeasured).  TWO_CTA_CFG stays available as an explicit form.
 BEYOND_FORMS_OFF_DEFAULT = (CFG,) + BEYOND_SMALL_SMEM_ORDER
 
 
@@ -605,8 +607,8 @@ def _ladder(requests: int, sm_count: int, geometry: Geometry = DEFAULT_GEOMETRY)
     """The regime's ladder by the SM count for ``geometry``'s V heads per rank: the pair forms while every CTA of the ``requests x 2
     V_HEADS`` cluster grid has an SM of its own (``requests x 96`` at the default geometry), the one-CTA forms while every CTA of the
     ``requests x V_HEADS`` grid has one (``requests x 48``), the beyond forms past that -- ``BEYOND_FORMS`` (the two-CTAs-per-SM form first)
-    at the default geometry, ``BEYOND_FORMS_OFF_DEFAULT`` (the one-CTA form in two waves first) at any other, where that capped form spills.
-    Plan-time facts, validated."""
+    at the default geometry, ``BEYOND_FORMS_OFF_DEFAULT`` (the one-CTA form in two waves first) at any other, where that capped form is
+    unmeasured and, at hidden 8192, spills.  Plan-time facts, validated."""
     if not isinstance(requests, int) or requests < 1:
         raise ValueError(f"gdn_verify_fused: requests must be a positive int, got {requests!r}")
     if not isinstance(sm_count, int) or sm_count < 1:
@@ -617,7 +619,7 @@ def _ladder(requests: int, sm_count: int, geometry: Geometry = DEFAULT_GEOMETRY)
         return PAIR_FORMS
     if requests * geometry.V_HEADS <= sm_count:
         return ONE_CTA_FORMS
-    return BEYOND_FORMS if geometry == DEFAULT_GEOMETRY else BEYOND_FORMS_OFF_DEFAULT  # the capped form spills off the default geometry
+    return BEYOND_FORMS if geometry == DEFAULT_GEOMETRY else BEYOND_FORMS_OFF_DEFAULT  # the capped form: unmeasured off the default, spills at hidden 8192
 
 
 def default_cfg(
@@ -632,7 +634,7 @@ def default_cfg(
     call is the measured cc 10.0 pick) for ``geometry`` (the default geometry's 48 V heads per rank unless given; a rank with fewer V heads
     moves the switches up by the same rule -- 8 V heads on 152 SMs: the pair to 9 requests, one CTA per SM to 19 -- the budget rule,
     unmeasured there until its own cells run; past the one-CTA grid such a geometry takes the one-CTA form in two waves, never the
-    two-CTAs-per-SM form, which spills there: ``BEYOND_FORMS_OFF_DEFAULT``).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
+    two-CTAs-per-SM form, unmeasured there and spilling at hidden 8192: ``BEYOND_FORMS_OFF_DEFAULT``).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
     the ``requests x 96`` cluster grid has an SM of its own (one request on a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA
     per SM) while every CTA of the ``requests x 48`` grid has one, ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the
     device's SMs -- on a 148- or 152-SM part the switches are between 1 request (96 cluster CTAs) and 2 (192 as a pair; 96 one-CTA CTAs),
