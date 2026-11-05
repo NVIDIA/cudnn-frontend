@@ -180,7 +180,7 @@ def test_tails(sq, sk, variable):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-@pytest.mark.parametrize("splits", [1, 2, 7])
+@pytest.mark.parametrize("splits", [1, 2, 7, "auto"])
 def test_split_partial_gqa(rank, splits):
     check(sq=129, sk=513, variable=True, sizes_rank=rank, splits=splits, ratio=2, backward=False)
 

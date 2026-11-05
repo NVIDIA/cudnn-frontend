@@ -2633,6 +2633,10 @@ def bsa_attn_fwd(
     if arch // 10 == 9 and sparse_block_size == 128:
         if out is not None or lse is not None:
             raise NotImplementedError("SM90 blk128 forward allocates its outputs")
+        if isinstance(kv_splits, str):
+            assert kv_splits == "auto", "SM90 kv_splits string value must be 'auto'"
+            # The automatic split policy was measured on the SM90 blk64 kernel only; blk128 declines to one split.
+            kv_splits = 1
         result = _bsa_attn_fwd_sm90_blk128(q, k, v, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, softmax_scale, layout, int(kv_splits))
         return result if return_lse else result[0]
     if arch // 10 == 9:
