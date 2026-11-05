@@ -273,8 +273,9 @@ Follow [the root agent rules](../../../AGENTS.md#kernel-determinism-and-batch-in
 and [the test guide](../../AGENTS.md). The PR template requires an accompanying
 determinism test change for kernel changes, or an explicit unsupported-path
 explanation. Extend this table and the suites when adding an operation or a
-new numerical path. Keep skips limited to unsupported hardware/dependencies;
-a missing FROST plan on a supported runtime is a failure.
+new numerical path. Keep hardware/dependency skips specific; a missing FROST
+plan on a supported runtime is a failure. Explicitly requested temporary skips
+must name the defect, retain the recorded failures, and be removed with its fix.
 
 The earlier suites cover FROST and public QSA/DSA APIs on SM100/SM103/SM107.
 The quantized indexer suite adds SM90 FP8 and SM100/SM103/SM107 MXFP8.
@@ -285,7 +286,58 @@ pooled DSA, and distributed recipes. Existing tests cover some paths separately.
 Recipe CI and an automatic source-to-test gate remain integration work;
 the checklist is a review safeguard.
 
-## Validation: 2026-11-04
+## Temporary skips
+
+The 26 cases below use `skip until fix` reasons, as requested. They remain L0.
+The set is the union of failures recorded on SM100, SM103, and SM107. A pass
+on one run does not clear a nondeterministic case that failed on another GPU.
+Passing parameters, golden checks, and all FP8/MXFP8 cases remain active.
+
+| Suite | Temporarily skipped parameters | Cases |
+| --- | --- | ---: |
+| QSA | Backward replay and basic batch checks, all three head layouts | 6 |
+| QSA | Sparse batch checks, both directions | 2 |
+| QSA | Dispatch boundary at total513, both directions | 2 |
+| QSA | Backward mask replay/batch checks, all-selected and empty-rows | 4 |
+| DSA attention | H128/D512/Top-K128 BF16 backward batch check | 1 |
+| DSA attention | Backward query boundaries H64 Q129/Q257 and H128 Q74/Q75 | 4 |
+| DSA indexer | Dense H64 replay/batch checks, BF16 and FP32 dK | 4 |
+| DSA indexer | Sparse persistent rows, Top-K896/2048 | 2 |
+| DSA indexer | Dense backward neighbor isolation | 1 |
+
+These skips do not change API support status. The baseline measurements and
+failure diagnostics below were recorded before these skips. Remove each skip
+with the kernel fix and verify the affected cases on the supported GPUs.
+
+### Skip validation: 2026-11-05 (UTC)
+
+The three changed suites ran on SM100: **103 passed, 26 skipped, 0 failed**
+in 131.55 seconds. Runtime key: `5f8a825586430e85`, as in the SM100 baseline
+below. Imports resolved to this checkout. Golden recording was disabled and
+all seven golden cases in these suites passed.
+
+| Suite | Passed | Skipped |
+| --- | ---: | ---: |
+| QSA | 21 | 14 |
+| DSA sparse attention | 43 | 5 |
+| DSA indexer forward | 24 | 0 |
+| DSA indexer backward | 15 | 7 |
+
+The skipped case IDs exactly match the union of the recorded SM100/SM103/SM107
+failures. All 285 original case IDs still collect with `-m L0`. Pre-commit and
+`git diff --check` passed. Other suites and GPUs were not rerun for this change.
+
+Run from `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest QSA/cutedsl/test_qsa_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
+```
+
+## Baseline validation: 2026-11-04
 
 Kernel base: `da88207aa5b9197b0c84514a7321d5bc3d2683b4` (`develop`).
 GPU: SM100, 148 SMs. Runtime: Torch `2.15.0.dev20260820+cu134`, CUDA `13.4`,

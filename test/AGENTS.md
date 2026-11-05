@@ -26,6 +26,8 @@ Remap global Top-K IDs when batches move and preserve negative padding.
 Keep API-by-dtype/GPU support in [the status page](../docs/operations/determinism.md).
 Put test counts, commands, runtimes, and failure diagnostics in
 [the test report](python/determinism_goldens/README.md), not the status page.
+For explicitly requested temporary skips, limit them to known failing cases,
+use a `skip until fix` reason, retain the failure report, and remove them with the fix.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
 Check against dequantized inputs and include a scale-only change. Keep SM90
