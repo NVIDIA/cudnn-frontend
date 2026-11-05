@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.device import current_device
+from cudnn import launch_plan
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fmul2, fp32_to_fp16, l2norm_inv, lane_group_sum
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v4
@@ -184,7 +185,7 @@ class L2NormQkRecipe(NamedTuple):
 
 def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
     """The lowered normalize launch: no validation, no key build."""
-    r.compiled(q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
+    launch_plan.launch(r.compiled, q, k, q_n, k_n, inv_q, inv_k, r.n_q_rows, r.n_rows, r.h_q, r.h_k, r.n_blocks, cuda.CUstream(int(stream)))
 
 
 def build_l2norm_qk(

@@ -34,6 +34,7 @@ from cutlass.cute.runtime import from_dlpack
 
 import cutlass.experimental.cuda.tensor_map as tma
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
+from cudnn import launch_plan
 
 from ..common import split_k
 from ..common.host import get_dtype, family_slots
@@ -806,7 +807,8 @@ def run_warmup_backward(
 ) -> None:
     """Replay the head of the warmup or uncut backward: one crossing into the DSL.  The plan validated the contract at
     build, so nothing here raises."""
-    compiled(
+    launch_plan.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,

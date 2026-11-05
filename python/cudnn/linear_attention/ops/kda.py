@@ -37,6 +37,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.launch_plan import planned
 
 from .common import (
     check_composed_state,
@@ -347,6 +348,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@planned
 def run_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -936,8 +938,8 @@ def build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::kimi_delta_attention_bwd", mutates_args=())
-def kda_bwd(
+@planned
+def run_kda_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -979,11 +981,7 @@ def kda_bwd(
     none.  Returns ``(dq, dk, dv, dg, dbeta, d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
-    if 0 in dO.stride():
-        dO = dO.contiguous()
     check_dtype("dO", dO, q.dtype)
-    if d_final_state is not None and 0 in d_final_state.stride():
-        d_final_state = d_final_state.contiguous()
     HK = k.shape[1]
     HV, V = v.shape[1], v.shape[2]
     if HK not in (H, HV):
@@ -1171,6 +1169,71 @@ def kda_bwd(
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
     return dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias
+
+
+@torch.library.custom_op("cudnn::kimi_delta_attention_bwd", mutates_args=())
+def kda_bwd(
+    dO: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    initial_state: Optional[torch.Tensor] = None,
+    d_final_state: Optional[torch.Tensor] = None,
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+    use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    gate_lower_bound: Optional[float] = None,
+    gate_domain: str = "log",
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    plan_name: Optional[str] = None,
+    following_state_grad: Optional[torch.Tensor] = None,
+    following_transition: Optional[torch.Tensor] = None,
+    composed_initial_state: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Functional KDA backward: :func:`run_kda_bwd` over ``dO`` / ``d_final_state`` with broadcast (stride-0) dims
+    materialized, so the planned body sees dense gradients (``out.sum()`` hands back an expanded ``dO``)."""
+    if 0 in dO.stride():
+        dO = dO.contiguous()
+    if d_final_state is not None and 0 in d_final_state.stride():
+        d_final_state = d_final_state.contiguous()
+    return run_kda_bwd(
+        dO=dO,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        initial_state=initial_state,
+        d_final_state=d_final_state,
+        state_checkpoints=state_checkpoints,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_lower_bound=gate_lower_bound,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        plan_name=plan_name,
+        following_state_grad=following_state_grad,
+        following_transition=following_transition,
+        composed_initial_state=composed_initial_state,
+        context=context,
+    )
 
 
 @kda_bwd.register_fake
