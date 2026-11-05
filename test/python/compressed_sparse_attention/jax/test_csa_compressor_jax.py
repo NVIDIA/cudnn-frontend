@@ -21,9 +21,15 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture(autouse=True)
 def require_sm100():
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
+
     device = jax.local_devices()[0]
-    if device.platform != "gpu" or not str(getattr(device, "compute_capability", "")).startswith("10."):
+    capability = str(getattr(device, "compute_capability", ""))
+    if device.platform != "gpu" or not capability.startswith("10."):
         pytest.skip("The JAX compressor requires the first visible GPU to be SM100-family")
+    arch_error = cutedsl_arch_requirement_error(tuple(int(x) for x in capability.split(".")))
+    if arch_error:
+        pytest.skip(arch_error)
 
 
 def _make_inputs(seed, ratio, blocks, width):

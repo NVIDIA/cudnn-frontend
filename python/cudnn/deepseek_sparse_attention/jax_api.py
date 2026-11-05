@@ -11,6 +11,12 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("DSA JAX ops")
+if requirement_error:
+    raise ImportError(requirement_error)
+
 import cutlass
 import cutlass.cute as cute
 
@@ -35,6 +41,9 @@ def check_sm100():
     major, minor = get_compute_capability()
     if major != 10:
         raise RuntimeError(f"DSA JAX ops require an SM100-family GPU, but found SM{major}{minor}")
+    arch_error = cutedsl_arch_requirement_error((major, minor))
+    if arch_error:
+        raise RuntimeError(arch_error)
 
 
 @cute.jit

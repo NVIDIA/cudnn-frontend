@@ -23,6 +23,11 @@ def __getattr__(name):
     if name not in _LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module, symbol = _LAZY_EXPORTS[name]
-    value = getattr(import_module(module), symbol)
+    try:
+        value = getattr(import_module(module), symbol)
+    except ImportError as error:
+        from cudnn import _optional_dependency_message
+
+        raise ImportError(_optional_dependency_message(name, error)) from error
     globals()[name] = value
     return value

@@ -10,6 +10,12 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("JAX compressor")
+if requirement_error:
+    raise ImportError(requirement_error)
+
 import cutlass
 import cutlass.cute as cute
 
@@ -174,6 +180,9 @@ def _validate(kv: Any, score: Any, ape: Any, cu: Any, cu_comp: Any, ratio: int, 
     major, minor = get_compute_capability()
     if major != 10:
         raise RuntimeError(f"The JAX compressor requires an SM100-family GPU, but found SM{major}{minor}")
+    arch_error = cutedsl_arch_requirement_error((major, minor))
+    if arch_error:
+        raise RuntimeError(arch_error)
     if ratio == 4:
         if coff != 2:
             raise ValueError("The JAX CSA compressor supports coff=2 at ratio=4")
