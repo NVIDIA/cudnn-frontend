@@ -59,9 +59,6 @@ navigation:
               - page: Indexed QSA training
                 path: ../../operations/sparse_attention/qsa_indexed.md
                 slug: qsa_indexed
-              - page: QSA two-pass backend implementation notes
-                path: ../../operations/sparse_attention/qsa_two_pass.md
-                slug: qsa_two_pass
           - page: HSTU Attention (Blackwell SM100/SM103)
             path: ../../operations/sparse_attention/hstu_attention.md
             slug: hstu_attention
