@@ -1,6 +1,6 @@
 # SMOKE tier, cc 10.0 (Blackwell B200 / GB200): one cell per code path (engine row x dtype x mask arm x layout), smallest shape -- the rules are in README.md;
 # the code path each id stands for is in smoke_cc100_code_paths.tsv.  conftest.py marks these ids `smoke`:
-#   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= @tiers/smoke_cc100.txt)
+#   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= $(grep -v '^#' tiers/smoke_cc100.txt) -- the @file form would pass these comment lines as arguments and collects nothing)
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-dense-bf16-llama_d128]
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-fp16-llama_d128]
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-bf16-qwen_d256]

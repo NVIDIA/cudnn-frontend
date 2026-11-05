@@ -282,8 +282,9 @@ def test_verify_step_shape_envelope(as_sm100):
 
 def test_verify_step_shape_envelope_on_a_99kb_part(as_sm120):
     """The verify form on a 99 KB-opt-in part with 170 SMs (the cc 12.0 readings) through the REAL probe path (the entry's device readers
-    patched): the pick is token-aware -- the 2-deep-ring pair at one request and the one-CTA landing-slab form at two and more hold 8
-    tokens, the landing-slab pair holds 17 at every requests count -- so the served envelope is 2 .. 17 tokens per request everywhere,
+    patched): the pick is token-aware -- the 2-deep-ring pair at one request and the one-CTA landing-slab form at two and three (the
+    2-deep-ring pair again from four) hold 8 tokens, the landing-slab pair holds 17 at every requests count -- so the served envelope is
+    2 .. 17 tokens per request everywhere,
     ``verify_max_tokens`` answers 17, and T 18 is a ``shape`` decline naming the deepest form (two CTAs per head) and the bound; the
     probe and the entry's own ``max_tokens_for`` agree (no served-then-raise shape exists)."""
     k = ventry.GdnVerifyFused("cuda:0", GEOMETRY.norm_eps)

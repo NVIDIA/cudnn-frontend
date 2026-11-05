@@ -28,11 +28,15 @@ past the one-CTA grid, and the verify step -- whose cc 10.0 forms carry a 3-deep
 state slabs that a 99 KB opt-in cannot hold -- serves the same kernel body with shallower rings:
 the two-CTAs-per-head pair with a 2-deep ring at one request and again past the one-CTA grid
 (four and more requests on 170- / 188-SM parts: its one-per-SM cluster CTAs fill the waves the
-one-CTA form's nearly empty second wave would leave -- measured +4 to +9 % at four requests on a
-170-SM cc 12.0 part), the one-CTA landing-slab (`NBUF` 1) form at two and three requests, each
-up to 8 tokens per request, and the landing-slab pair for 9 to 17 tokens per request at every
-requests count. The verify step traces its token loop once
-(`ROLLED_TOKENS`) in the forms that keep the state in registers. Every knob is a compile-time
+one-CTA form's nearly empty second wave would leave -- measured at four requests on one 170-SM
+RTX 5090 at boost clocks (the board allows no clock lock; three interleaved A/B/A rounds of 100
+event-timed iterations, the L2 swept before every launch so code and data are cold, every arm
+bitwise with the pick): 65.54 vs 71.68 us at T 6 and 50.90 vs 53.25 us at T 4, +4 to +9 % faster
+than the one-CTA form across the cold, warm and in-situ readings; the other beyond-the-grid cells
+take the order by the budget rule, unmeasured -- see Performance), the one-CTA landing-slab
+(`NBUF` 1) form at two and three requests, each up to 8 tokens per request, and the landing-slab
+pair for 9 to 17 tokens per request at every requests count. The verify step traces its token
+loop once (`ROLLED_TOKENS`) in the forms that keep the state in registers. Every knob is a compile-time
 axis of one kernel body and bitwise with the default pick (no knob moves an fp32 addition), and
 the outputs reproduce FlashInfer's built-in `frost` backend byte for byte.
 
@@ -125,8 +129,8 @@ replayed and compared byte for byte.
 FlashInfer's own decode and verify tests (`tests/experimental/qwen_3_5_gdn_block/`)
 against `frost_fe` when a FlashInfer source tree is next to the installed package --
 the verify reference also under the 148-SM launch policy and with the SM count held
-below one request's grid (the regime's budget-fitting form at every shape: the two-CTAs-per-SM
-form on a cc 10.0 part, the one-CTA landing-slab form on a cc 12.0 part) -- and checks the backend bitwise
+below one request's grid (the beyond-the-grid regime's budget-fitting form at every shape: the
+two-CTAs-per-SM form on a cc 10.0 part, the 2-deep-ring pair on a cc 12.0 part) -- and checks the backend bitwise
 against the built-in `frost` backend where that one is served: decode on its
 reference cases, verify on the benchmark's own input sets at requests 1 / 2 / 4 x 6
 tokens (every token accepted, and random acceptance with a padding request).
@@ -135,7 +139,9 @@ tokens (every token accepted, and random acceptance with a padding request).
 
 One GPU class so far, GB200 (1200 W, 152 SMs, SM clock locked at 1830 MHz, one exclusive GPU) -- the cc 12.0
 admission ships with its functional validation only; a GeForce board allows no clock lock, so an RTX 5090 table
-will be a separate table with its own (boost-clock, interleaved) protocol stated beside it. CUPTI
+will be a separate table with its own (boost-clock, interleaved) protocol stated beside it (the one cc 12.0 figure on
+this page, the verify pick order past the one-CTA grid, is such a boost-clock A/B/A reading with its protocol stated
+inline, not a table entry). CUPTI
 kernel-duration medians inside a serving step at batch 1 (cold code and data, as every layer's
 launch finds them), speed-ups positive = faster (`baseline / new - 1`):
 

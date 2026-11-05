@@ -428,7 +428,8 @@ def test_host_entry_keeps_the_one_cta_form_and_a_given_cfg_overrides_the_pick():
 def test_entry_on_a_99kb_part_starts_from_the_fitting_one_cta_form_and_picks_per_step_shape(monkeypatch):
     """Host-only, the device readers stubbed to the cc 12.0 readings and 170 SMs: the entry constructs (its start form is the one-CTA
     landing-slab form, not CFG, whose 3-deep ring the part does not hold), ``cfg_for`` is token-aware (the 2-deep-ring pair at one request
-    for T <= 8, the one-CTA landing-slab form at two and more, the landing-slab pair for T 9 .. 17 at every requests count),
+    for T <= 8, the one-CTA landing-slab form at two and three (the 2-deep-ring pair again from four), the landing-slab pair for T 9 .. 17
+    at every requests count),
     ``max_tokens_for`` is 17, the compile key carries the T-aware form, and the step shape is bounded by that form -- while a host caller
     of ``check_support`` without a form keeps the module's one-CTA bound.  On the cc 10.0 readings the start form is CFG and the picks
     are the measured ones, tokens ignored; a part holding no form is the typed decline at construction."""
@@ -1165,7 +1166,8 @@ def test_long_steps_on_the_landing_slab_pair_match_the_torch_reference(requests,
 @pytest.mark.parametrize("form", ["pick", "pair"])
 def test_padding_and_skipped_slots_touch_nothing_else(form):
     """The entry's pick at 4 requests (the two-CTAs-per-SM form on a 148- / 152-SM part; the 2-deep-ring pair on a 99 KB opt-in) and the
-    two-CTAs-per-head pair this part holds forced: a padding request (both CTAs of a pair null together: the cluster wait pairs
+    two-CTAs-per-head pair this part holds forced (on a 99 KB opt-in that forced pair IS the 2-deep-ring pick, so both arms run one form
+    there; the arm is kept as the explicit pair): a padding request (both CTAs of a pair null together: the cluster wait pairs
     the entry arrive, nothing shipped) zeroes its rows and touches nothing else; a skipped slot stays."""
     dev = _device_or_skip()
     ops = make_operands(4, 6, dev, seed=5, accepted="random", pad="mid", skip="last")

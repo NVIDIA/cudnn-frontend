@@ -515,12 +515,15 @@ ONE_CTA_NBUF1_CFG = make_cfg(
 # The ladder of each SM-count regime: the primary form (the measured cc 10.0 pick) first, then the forms a smaller shared memory still
 # holds, deepest ring first.  ``default_cfg`` returns the primary wherever it is admissible on the part (every cc 10.x part), so the picks
 # and the token envelopes there never move; on a part whose shared memory does not hold the primary it walks the rest, token-aware.
-# Past the one-CTA grid the fall-through order is a MEASURED exception to "deepest ring first" (BEYOND_SMALL_SMEM_ORDER): on a 170-SM
-# cc 12.0 part (three interleaved boost-clock rounds, every arm bitwise with the pick) the 2-deep-ring pair beat the one-CTA landing-slab
-# form by +4 .. +9 % at four requests (T 4 and T 6; cold-swept, warm and in situ alike) -- the pair's one-per-SM cluster CTAs fill 2.26
-# waves where the one-CTA form's 192 CTAs leave a nearly empty second wave -- while at two requests the one-CTA form's 96 CTAs are one
-# wave and win by 11 .. 21 %, so ONE_CTA_FORMS keeps its order.  Where the pair does not hold the token count (T 9 .. 17) the walk falls
-# through to the one-CTA form and the landing-slab pair as before.
+# Past the one-CTA grid the fall-through order (BEYOND_SMALL_SMEM_ORDER) is deepest ring first as well -- the 2-deep-ring pair ahead of
+# the two landing-slab forms -- and it is the MEASURED order: on a 170-SM cc 12.0 part (three interleaved boost-clock rounds, every arm
+# bitwise with the pick) the 2-deep-ring pair beat the one-CTA landing-slab form by +4 .. +9 % at four requests (T 4 and T 6; cold-swept,
+# warm and in situ alike) -- the pair's one-per-SM cluster CTAs fill 2.26 waves where the one-CTA form's 192 CTAs leave a nearly empty
+# second wave -- while at two requests the one-CTA form's 96 CTAs are one wave and beat the pair by +12 .. +27 % (T 6: 32.77 / 22.53 /
+# 33.06 us against the pair's 38.91 / 28.64 / 37.15 us cold-swept / warm / in situ, ``pair / one-CTA - 1``), so ONE_CTA_FORMS keeps its
+# order.  The beyond-the-grid order was measured at four requests on the 170-SM part only; the other beyond-the-grid cells (eight and
+# more requests, 84- and 188-SM parts, T 2 / 3 / 8) take it by the budget rule, unmeasured.  Where the pair does not hold the token count
+# (T 9 .. 17) the walk falls through to the one-CTA form and the landing-slab pair as before.
 PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
 ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_SMALL_SMEM_ORDER = (PAIR_NBUF2_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
@@ -597,7 +600,9 @@ def default_cfg(
     one wave); two and three requests ``ONE_CTA_NBUF1_CFG`` for T <= 8 (96 / 144 CTAs, one wave); four and more requests ``PAIR_NBUF2_CFG``
     again for T <= 8 (``BEYOND_SMALL_SMEM_ORDER``: its one-per-SM cluster CTAs fill the waves the one-CTA form's nearly empty second wave
     would leave, +4 .. +9 % measured at four requests); ``PAIR_NBUF1_CFG`` for T 9 .. 17 at every requests count; T >= 18 the decline naming
-    17; ``TWO_CTA_CFG`` never (one CTA per SM there, 34 spills).  All are plan-time facts (never a runtime value)."""
+    17; ``TWO_CTA_CFG`` never (one CTA per SM there, 34 spills).  The beyond-the-grid pair order was measured at four requests (T 4 and
+    T 6) on a 170-SM part and applies by the budget rule, unmeasured, to the other beyond-the-grid cells (eight and more requests, 84- and
+    188-SM parts, T 2 / 3 / 8).  All are plan-time facts (never a runtime value)."""
     ladder = _ladder(requests, sm_count)
     if tokens is not None and (not isinstance(tokens, int) or tokens < 1):
         raise ValueError(f"gdn_verify_fused: tokens must be a positive int or None, got {tokens!r}")

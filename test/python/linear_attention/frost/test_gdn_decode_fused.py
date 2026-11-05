@@ -146,7 +146,8 @@ def test_default_cfg_on_the_cc100_reading_is_the_measured_pick_at_every_sm_count
 def test_default_cfg_on_the_cc120_reading_never_picks_a_cap_the_part_cannot_use():
     """The cc 12.0 readings (100 KB per SM, 99 KB opt-in) on 170 / 188 SMs: rows 1 the pair, rows 2 and up the one-CTA form -- two waves
     from rows 4 rather than CAPPED_CFG / STREAMED_CFG, whose cap keeps nothing co-resident on a 100 KB SM and spills; on 84 SMs the
-    one-CTA form at every rows count; a part no form fits is the typed decline naming its opt-in."""
+    one-CTA form at every rows count; a two-per-SM occupancy pad (``CTAS_PER_SM`` 2, valid on the 228 KB readings) is inadmissible there by
+    the validator's fit term; a part no form fits is the typed decline naming its opt-in."""
     per_sm, optin = SM120_READING
     for sms in (170, 188):
         assert kcfg.default_cfg(1, sms, per_sm, optin) == kcfg.PAIR_CFG
@@ -159,6 +160,7 @@ def test_default_cfg_on_the_cc120_reading_never_picks_a_cap_the_part_cannot_use(
     assert kcfg.admissible(
         kcfg.make_cfg(TWO_CTAS_PER_HEAD=True, CTAS_PER_SM=0, MIN_CTAS_PER_SM=2), per_sm, optin
     ), "the one capped form two of which share a 100 KB SM"
+    assert not kcfg.admissible(kcfg.make_cfg(CTAS_PER_SM=2), per_sm, optin), "two whole-slab footprints plus the reserves exceed the 100 KB SM"
     assert kcfg.first_fitting(kcfg.BEYOND_FORMS, per_sm, optin) == kcfg.CFG
     for call in (
         lambda: kcfg.default_cfg(1, 170, 40960, 40000),

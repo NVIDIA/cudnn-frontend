@@ -394,11 +394,15 @@ def part_readings(smem_per_sm: int, smem_optin: int) -> dict:
 
 
 def admissible(form: Cfg, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> bool:
-    """Whether ``form`` may serve on a part: its launch footprint fits the per-CTA opt-in, and a form that asks ptxas for the two-CTA
-    register cap (``MIN_CTAS_PER_SM`` 2) has two CTAs per SM to show for it (``co_resident_ctas`` >= 2) -- a cap on a part whose shared
-    memory keeps the SM at one CTA buys nothing and spills (sm_120a: ``CAPPED_CFG`` 7 STL / LDL)."""
+    """Whether ``form`` may serve on a part: its launch footprint fits the per-CTA opt-in, its ``CTAS_PER_SM`` pad fits that many CTAs in
+    the SM (``validate_cfg``'s fit term, re-read on the part's readings: a form validated on the 228 KB readings may not fit twice in a
+    100 KB SM), and a form that asks ptxas for the two-CTA register cap (``MIN_CTAS_PER_SM`` 2) has two CTAs per SM to show for it
+    (``co_resident_ctas`` >= 2) -- a cap on a part whose shared memory keeps the SM at one CTA buys nothing and spills (sm_120a:
+    ``CAPPED_CFG`` 7 STL / LDL)."""
     on = replace(form, **part_readings(smem_per_sm, smem_optin))
-    return on.SMEM_BYTES <= on.SMEM_OPTIN_BYTES and (on.MIN_CTAS_PER_SM == 1 or on.co_resident_ctas >= 2)
+    fits_optin = on.SMEM_BYTES <= on.SMEM_OPTIN_BYTES
+    fits_sm = on.CTAS_PER_SM == 0 or on.CTAS_PER_SM * (on.SMEM_BYTES + SMEM_CTA_RESERVE_BYTES) <= on.SMEM_PER_SM_BYTES
+    return fits_optin and fits_sm and (on.MIN_CTAS_PER_SM == 1 or on.co_resident_ctas >= 2)
 
 
 def _no_form(forms, smem_per_sm: int, smem_optin: int) -> NotImplementedError:
