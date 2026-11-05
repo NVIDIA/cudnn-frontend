@@ -55,7 +55,7 @@ def test_engine_is_registered():
     assert c.d == frozenset({128, 192}) and c.dqk_ge_dv and not c.d_envelope
     assert c.dtypes == frozenset({cudnn.data_type.FP8_E4M3})
     assert c.out_dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
-    assert c.amax_dgrad and c.causal and not c.gqa and not c.swa and not c.deterministic and not c.bottom_right and not c.thd
+    assert c.amax_dgrad and c.causal and c.deterministic and not c.gqa and not c.swa and not c.bottom_right and not c.thd
     assert (c.sm_lo, c.sm_hi) == (100, 106)
 
 
@@ -72,6 +72,7 @@ def test_row_admits_dense_d192_e4m3(monkeypatch, cc):
     assert _mismatch(monkeypatch, cc=cc, causal=False) is None
     assert _mismatch(monkeypatch, cc=cc, grad_dtypes=(cudnn.data_type.BFLOAT16,) * 3) is None
     assert _mismatch(monkeypatch, cc=cc, request_amax=()) is None
+    assert _mismatch(monkeypatch, cc=cc, deterministic=True) is None
 
 
 @pytest.mark.parametrize(
@@ -83,10 +84,9 @@ def test_row_admits_dense_d192_e4m3(monkeypatch, cc):
         (dict(cc=(12, 0)), "requires SM100-106"),
         (dict(h=4, hkv=2), ""),
         (dict(left_bound=64), ""),
-        (dict(deterministic=True), ""),
         (dict(bottom_right=True), ""),
     ],
-    ids=["d128", "d256", "rubin", "sm120", "gqa", "window", "deterministic", "bottom-right"],
+    ids=["d128", "d256", "rubin", "sm120", "gqa", "window", "bottom-right"],
 )
 def test_row_declines(monkeypatch, kw, needle):
     reason = _mismatch(monkeypatch, **kw)
