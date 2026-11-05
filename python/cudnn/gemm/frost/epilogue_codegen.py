@@ -505,6 +505,23 @@ def _emit_op(
             f"(cutlass.full_like(_e_x{idx}, {_compute_literal(op.compute_dtype, 1)}) + _e_erf{idx})",
         ], new
 
+    if op.op == "div" and op.compute_dtype == "int32":
+        # `/` on Int32 lowers to arith.divf (a Float32 divide) whose result keeps the
+        # Int32 element type, so the output holds the fp32 quotient's bit pattern and
+        # loses the low bits above 2**24. Emit arith.divsi (the signed integer divide,
+        # truncating toward zero, as C and the reference do) on the raw vectors.
+        if op.parent_idx_b is not None:
+            assert other_in_chain is not None
+            rhs = other_in_chain
+        else:
+            assert op.aux is not None
+            rhs = f"({aux_loads[op.aux]})"
+        lhs, rhs = (prev, rhs) if op.aux_on_rhs else (rhs, prev)
+        return [
+            f"{new} = cutlass.Vector(cutlass._mlir.dialects.arith.divsi("
+            f"({lhs}).ir_value(), ({rhs}).ir_value()), dtype=cutlass.Int32)"
+        ], new
+
     if op.op in {"add", "mul", "sub", "div", "max", "min", "pow", "add_square"}:
         py_op = {"add": "+", "mul": "*", "sub": "-", "div": "/"}.get(op.op)
         if op.parent_idx_b is not None:

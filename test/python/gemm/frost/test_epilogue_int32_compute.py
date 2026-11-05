@@ -352,17 +352,19 @@ def test_sm100_int32_compute_op_with_an_int32_emitter_is_accepted(op):
 
 @requires_sm100
 def test_sm100_int32_div_is_exact():
-    """Unlike the sm120 tree, the sm100 epilogue returns the truncated integer quotient for
-    an int32 div, so the decline leaves it served."""
+    """The sm100 epilogue divides int32 operands with arith.divsi, i.e. a signed integer
+    divide truncating toward zero. The operands are chosen above 2**24, where an fp32
+    quotient stops carrying every integer, and cover both signs."""
     from cudnn.gemm.frost.sm100 import compiler
 
     g, A, B, Z, Y = _bf16_graph("div")
     compiled = compiler.jit_from_cudnn_graph(g, config=by_name(_SM100_CFG))
-    torch.manual_seed(0)
-    a = torch.randint(-4, 4, (1, M, K), device="cuda").to(torch.bfloat16)
-    b = torch.randint(-4, 4, (1, N, K), device="cuda").to(torch.bfloat16)
-    z = torch.arange(N, dtype=torch.int32, device="cuda").reshape(1, 1, N) % 7 - 3
-    z = torch.where(z == 0, torch.full_like(z, 2), z)
+    # 1024 * 1024 * K(128) == 2**27: exact in bf16 and in the fp32 accumulator, and
+    # above the 2**24 where an fp32 quotient rounds.
+    a = torch.full((1, M, K), 1024, dtype=torch.bfloat16, device="cuda")
+    b = torch.full((1, N, K), 1024, dtype=torch.bfloat16, device="cuda")
+    z = torch.full((1, 1, N), 3, dtype=torch.int32, device="cuda")
+    z[:, :, 1::2] = -3
     y = torch.full((1, M, N), -12345, dtype=torch.int32, device="cuda")
     compiled({A: a, B: b, Z: z, Y: y})
     torch.cuda.synchronize()

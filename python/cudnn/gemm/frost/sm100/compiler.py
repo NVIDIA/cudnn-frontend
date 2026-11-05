@@ -2964,9 +2964,9 @@ def probe_cutedsl() -> None:
 # their float attributes to int32). The others use Float32-only CuTe DSL math
 # (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
 # log, erf, sin, cos, sqrt, pow), which raises TypeError or a DSL error out of
-# cute.compile instead of declining. The sm120 tree (#2022) also declines div,
-# whose `/` it lowers to the fp32 quotient's bit pattern; the sm100 epilogue
-# returns the truncated integer quotient, so div stays served here.
+# cute.compile instead of declining. div is served: the shared emitter emits
+# arith.divsi (signed truncating division) for an Int32 div, not the `/` that
+# lowers to a Float32 remainder.
 _INT32_COMPUTE_OPS = frozenset(
     ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "div", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
 )

@@ -1674,9 +1674,9 @@ def _check_executable(chain: FusionChain) -> None:
 # Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
 # their float attributes to int32). The others use Float32-only CuTe DSL math
 # (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
-# log, erf, sin, cos, sqrt, pow), which raises TypeError or fails to lower; div
-# emits `/`, which the DSL lowers to an fp32 divide while the vector keeps its
-# Int32 type, so the int32 output would hold the fp32 quotient's bit pattern.
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or fails to lower. div
+# is declined here: the shared emitter now emits arith.divsi for an Int32 div,
+# but the sm120 gate (#2022) has not been validated with that path.
 _INT32_COMPUTE_OPS = frozenset(
     ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
 )
