@@ -4371,15 +4371,10 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
 @_cc107_only
 @pytest.mark.L0
 def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
-    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split -- on the sink-free graph
-    and on the sink graph alike, because the row wires no split (split_kv_supported=False: "not wired in this engine's
-    lowering"); and INDEPENDENTLY of that flag the sink-aware rule every row shares keeps a sink graph unsplit: with the
-    row's split flag flipped (dataclasses.replace -- the shape a cc 10.7 MXFP8 split-KV change would take) the sink graph
-    is still declined with the "sink-free" reason, so wiring split-KV on this row cannot silently split a sink graph."""
+    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split: the row's split-KV serves
+    dense graphs only, so the sink-free pool graph is declined by that clause and the sink graph by the shared sink rule."""
     engine = _cc107_engine("mxfp8")
     _require_frost_sm107(engine)
-    import dataclasses
-
     from cudnn.sdpa.fwd import engines
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
@@ -4392,16 +4387,12 @@ def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
             assert reason is None, (with_sink, reason)  # the unsplit graph IS served, with and without the sink
             served[with_sink] = facts
     split2 = engines.SdpaFwdKnobs(split_kv=2)
-    assert not spec.capabilities.split_kv_supported  # today's deciding clause is the row's flag ...
-    for with_sink, facts in served.items():
-        why = engines.mismatch(spec.capabilities, facts, split2)
-        assert why is not None and "split_kv > 1 is not wired in this engine's lowering" in why, (with_sink, why)
-    # ... and with that flag flipped the shared sink rule still refuses to split the sink graph (engines.mismatch: the
-    # per-split LSE is the combine weight; a sink graph produces no per-split partials until a sink-aware combine lands).
-    caps_split = dataclasses.replace(spec.capabilities, split_kv_supported=True)
-    why_sink = engines.mismatch(caps_split, served[True], split2)
+    assert spec.capabilities.split_kv_supported
+    why = engines.mismatch(spec.capabilities, served[False], split2)
+    assert why is not None and "serves dense graphs with half outputs only" in why, why
+    why_sink = engines.mismatch(spec.capabilities, served[True], split2)
     assert why_sink is not None and "sink-free" in why_sink, why_sink
-    print(f"@@@@ P6a split declines: row flag: {why}; sink rule: {why_sink}")
+    print(f"@@@@ P6a split declines: pools: {why}; sink: {why_sink}")
 
 
 # # =====================================================================
