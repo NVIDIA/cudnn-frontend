@@ -18,6 +18,7 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.experimental import primitives as nvvm
 from cudnn._cutlass_compat import FastDivmodDivisor, LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
@@ -486,9 +487,9 @@ class SparseScoreRecomputeSm90:
 
                 cute.arch.fence_view_async_shared()
                 # ---- Sync: Q+Weights ready (cross-WG) ----
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
@@ -500,9 +501,9 @@ class SparseScoreRecomputeSm90:
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.KVReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
 
                 # ---- Main pipeline: load next KV while WG1 computes ----
@@ -516,9 +517,9 @@ class SparseScoreRecomputeSm90:
                         cute.arch.cp_async_wait_group(0)
                     cute.arch.fence_view_async_shared()
                     # Sync: WG0's load done + WG1's GEMM done
-                    cute.arch.barrier(
+                    nvvm.barrier_cta_sync(
                         barrier_id=int(NamedBarrierBwd.KVReady),
-                        number_of_threads=self.num_threads,
+                        thread_count=self.num_threads,
                     )
 
                     cur_buf = 1 - cur_buf
@@ -527,9 +528,9 @@ class SparseScoreRecomputeSm90:
             # === End head tile loop ===
 
             # ---- Wait for WG1's softmax to complete ----
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -605,9 +606,9 @@ class SparseScoreRecomputeSm90:
             # === Head tile loop: iterate over head slices ===
             for h_tile in cutlass.range_constexpr(self.num_head_tiles):
                 # ---- Sync: wait for Q+Weights from WG0 ----
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.QueryWeightsReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
                 cute.arch.mbarrier_wait(mbar_Q_ptr, mbar_Q_phase)
                 mbar_Q_phase = mbar_Q_phase ^ 1
@@ -616,9 +617,9 @@ class SparseScoreRecomputeSm90:
                 tWeightsrWeights = copy_ops.load_s2r(tWsWeights)
 
                 # ---- Sync: wait for KV prologue from WG0 ----
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=int(NamedBarrierBwd.KVReady),
-                    number_of_threads=self.num_threads,
+                    thread_count=self.num_threads,
                 )
 
                 # ---- Main pipeline: GEMM while WG0 loads next KV ----
@@ -650,9 +651,9 @@ class SparseScoreRecomputeSm90:
                     )
 
                     # Sync: WG1's GEMM done + WG0's next load done
-                    cute.arch.barrier(
+                    nvvm.barrier_cta_sync(
                         barrier_id=int(NamedBarrierBwd.KVReady),
-                        number_of_threads=self.num_threads,
+                        thread_count=self.num_threads,
                     )
 
                     cur_buf = 1 - cur_buf
@@ -662,16 +663,16 @@ class SparseScoreRecomputeSm90:
             # === End head tile loop ===
 
             # ---- Softmax + output (WG1 only, 128 threads) ----
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.WG1_consumer_sync),
-                number_of_threads=self.num_threads_per_warp_group,
+                thread_count=self.num_threads_per_warp_group,
             )
             self.softmax_l1norm_parallel(sTopk_reduced, topK, tidx, mTopkIdxs_cur, mOut_cur)
 
             # ---- Signal WG0: tile complete ----
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=int(NamedBarrierBwd.TileComplete),
-                number_of_threads=self.num_threads,
+                thread_count=self.num_threads,
             )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -914,12 +915,18 @@ class SparseScoreRecomputeSm90:
             for s in cutlass.range_constexpr(5):  # log2(32) = 5
                 local_max = cute.arch.fmax(local_max, cute.arch.shuffle_sync_bfly(local_max, offset=1 << s))
 
+            # Every warp must finish reading the input before any warp
+            # reuses its first four entries as cross-warp scratch.
+            nvvm.barrier_cta_sync(
+                barrier_id=softmax_barrier_id,
+                thread_count=self.num_threads_per_warp_group,
+            )
             # Phase 4: Cross-warp max reduce via sTopk_reduced[0..3] scratch
             if lane_id == 0:
                 sTopk_reduced[warp_id] = local_max
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=softmax_barrier_id,
-                number_of_threads=self.num_threads_per_warp_group,
+                thread_count=self.num_threads_per_warp_group,
             )
             cur_max = sTopk_reduced[0]
             cur_max = cute.arch.fmax(cur_max, sTopk_reduced[1])
@@ -955,9 +962,9 @@ class SparseScoreRecomputeSm90:
                 # Use [4..7] as scratch to avoid race with max scratch in [0..3]
                 if lane_id == 0:
                     sTopk_reduced[warp_id + 4] = local_sum
-                cute.arch.barrier(
+                nvvm.barrier_cta_sync(
                     barrier_id=softmax_barrier_id,
-                    number_of_threads=self.num_threads_per_warp_group,
+                    thread_count=self.num_threads_per_warp_group,
                 )
                 cur_sum = sTopk_reduced[4] + sTopk_reduced[5] + sTopk_reduced[6] + sTopk_reduced[7]
 
@@ -997,11 +1004,16 @@ class SparseScoreRecomputeSm90:
 
             # Phase 3: Cross-thread sum reduce
             local_sum = sm90_ops.warp_reduce(local_sum, operator.add, width=32)
+            # Other warps may still be reading these entries as input.
+            nvvm.barrier_cta_sync(
+                barrier_id=softmax_barrier_id,
+                thread_count=self.num_threads_per_warp_group,
+            )
             if lane_id == 0:
                 sTopk_reduced[warp_id] = local_sum
-            cute.arch.barrier(
+            nvvm.barrier_cta_sync(
                 barrier_id=softmax_barrier_id,
-                number_of_threads=self.num_threads_per_warp_group,
+                thread_count=self.num_threads_per_warp_group,
             )
             cur_sum = sTopk_reduced[0] + sTopk_reduced[1] + sTopk_reduced[2] + sTopk_reduced[3]
 
