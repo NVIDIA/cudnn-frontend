@@ -218,9 +218,9 @@ The score reference uses dequantized inputs and FP64 computation. Existing
 correctness tolerances apply only to references; replay and batch comparisons
 remain byte-exact.
 
-Only SM100 was run: **17 passed, 0 failed**, including the new MXFP8 golden.
-The 17 SM90 cases skipped on that host. SM90, SM103, and SM107 results and
-runtime-specific goldens remain unmeasured. The [architecture/API tables](../../../docs/operations/determinism.md)
+SM100 MXFP8 and SM90 FP8 each had **17 passed, 0 failed**, including their
+own saved golden. Each device skips the other precision group. SM103 and
+SM107 results and runtime-specific goldens remain unmeasured. The [architecture/API tables](../../../docs/operations/determinism.md)
 keep these gaps separate from measured results. FP8/MXFP8 backward is not
 supported by these DSA attention/indexer APIs and has no positive test cases.
 
@@ -289,7 +289,7 @@ cuDNN `92500`, CuTe DSL `4.8.0.dev0`, TVM FFI `0.1.12`.
 The complete runtime record is in [the goldens](5f8a825586430e85/dsa-fprop.json).
 The test banners confirmed imports from this checkout.
 
-Three disjoint default-L0 runs covered all 285 cases. Run from `test/python`:
+Three disjoint default-L0 runs on SM100 covered all 285 cases. Run from `test/python`:
 
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=4
@@ -322,11 +322,11 @@ python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determin
 | DSA sparse indexer backward | — | 13 passed, 2 failed |
 | DSA dense indexer backward | — | 3 passed, 4 failed |
 | DSA MXFP8 indexer (SM100) | 17 passed | Unsupported |
-| DSA FP8 indexer (SM90) | 17 skipped on SM100; SM90 not run | Unsupported |
+| DSA FP8 indexer (SM90) | 17 passed on SM90; 17 skipped on SM100 | Unsupported |
 
 All six harness controls and all sixteen goldens runnable on SM100 passed,
-including replay and independent references. The SM90 golden case skipped on
-SM100 and has no saved baseline. MXFP8 adds one record; the fifteen existing
+including replay and independent references. SM90 also passed its FP8 golden
+on Hopper. MXFP8 and Hopper FP8 each add one record; the fifteen earlier
 records are unchanged. Golden recording was disabled in validation. Sparse indexer large-Top-K cases pass replay and
 reference, then fail dK after reorder. Dense indexer backward fails dK replay,
 batch, or neighbor checks. The [API-by-dtype table and indexer failure list](../../../docs/operations/determinism.md)
@@ -336,6 +336,23 @@ Pre-commit (Black, Black Jupyter, SPDX), Python syntax, and `git diff --check`
 passed. Runtime warnings were Torch context/debug notices and existing CuTe
 DSL scheduler/allocator deprecations. `fern check --warnings` found zero
 errors; the remote redirect check was skipped after an FDR HTTP 403 response.
+
+### SM90 Hopper validation
+
+The same 285-case default-L0 selection had **23 passed, 0 failed, 262 skipped**
+in 13.71 seconds. All 17 FP8 indexer cases and six harness controls passed.
+The other cases skip at their architecture gates. This does not measure
+attention or BF16 indexer behavior on Hopper.
+
+Runtime: SM90, 124 SMs; Torch `2.14.0a0+b2c75dd062.nv26.09`, CUDA `13.4`,
+driver API `13040`, cuDNN `92700`, CuTe DSL `4.8.0`, TVM FFI `0.1.14.post1`.
+The [Hopper golden](ffe6ff35e0022211/dsa-indexer-fp8-fprop.json) was recorded
+only after replay and the FP64 reference passed, then checked again with
+recording disabled. It includes E4M3 input bytes, FP32 scales, weights, offsets,
+scores, and LSE. Test source came from commit
+`35cf3082e5f3e505b066097f29bf232a848ea269`; imports resolved to that snapshot.
+
+The SM107 run is queued for a GPU allocation; no result is measured yet.
 
 ### DSA failures
 

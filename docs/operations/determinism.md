@@ -4,7 +4,11 @@ This report covers every operation API tested by
 [PR #2266](https://github.com/NVIDIA/cudnn-frontend/pull/2266): KDA, GDP, GDN,
 GDN-2, QSA, DSA sparse attention, and DSA indexer forward/backward.
 
-Measured on 2026-11-04: **243 passed, 25 failed, 17 skipped** across **285 L0 cases on SM100**.
+Measured on 2026-11-04 across **285 L0 cases per device**:
+
+- **SM100: 243 passed, 25 failed, 17 skipped.**
+- **SM90 Hopper: 23 passed, 0 failed, 262 skipped** (17 FP8 indexer cases and six harness controls passed).
+
 These counts describe the tested shapes and runtime, not a guarantee for every
 shape or device. Failures stay active; no xfails or relaxed byte checks are used.
 
@@ -19,54 +23,56 @@ The four linear-attention APIs are in `cudnn.linear_attention.ops`; their bprop
 rows use PyTorch autograd through the same API. QSA APIs are in `cudnn.ops`.
 `DSA` is imported from `cudnn`.
 
-Only **SM100** was available for execution. **SM103, SM90, and SM107 were not run**.
-A dash means no measurement. The 17 skips on SM100 are the SM90-only cases;
-they are not measured Hopper results. SM103/SM107 gates also require a supported
-CuTe DSL, including the `sm_107a` target on SM107.
+**SM100 and SM90** were measured. **SM103 and SM107 were not run**.
+A dash means no measurement. Architecture skips are not passes on another GPU.
+SM103/SM107 gates also require a supported CuTe DSL, including the `sm_107a`
+target on SM107.
 
-### SM100 / SM103
+### SM100/103
 
 Counts below are **SM100 only**. SM103 shares the test path but has no measured
 result or golden baseline in this PR.
 
-| API | Direction | Datatype under test | SM100 passed | SM100 failed | SM100 skipped | SM103 status |
-| --- | --- | --- | ---: | ---: | ---: | --- |
-| `kimi_delta_attention` | fprop | BF16 | 10 | 0 | 0 | Not run |
-| `kimi_delta_attention` | fprop | FP16 | 3 | 0 | 0 | Not run |
-| `kimi_delta_attention` | bprop | BF16 | 12 | 0 | 0 | Not run |
-| `kimi_delta_attention` | bprop | FP16 | 3 | 0 | 0 | Not run |
-| `gated_delta_product` | fprop | BF16 | 12 | 0 | 0 | Not run |
-| `gated_delta_product` | fprop | FP16 | 3 | 0 | 0 | Not run |
-| `gated_delta_product` | bprop | BF16 | 14 | 0 | 0 | Not run |
-| `gated_delta_product` | bprop | FP16 | 3 | 0 | 0 | Not run |
-| `gated_delta_net` | fprop | BF16 | 10 | 0 | 0 | Not run |
-| `gated_delta_net` | fprop | FP16 | 3 | 0 | 0 | Not run |
-| `gated_delta_net` | bprop | BF16 | 12 | 0 | 0 | Not run |
-| `gated_delta_net` | bprop | FP16 | 3 | 0 | 0 | Not run |
-| `gated_delta_net_v2` | fprop | BF16 | 10 | 0 | 0 | Not run |
-| `gated_delta_net_v2` | fprop | FP16 | 3 | 0 | 0 | Not run |
-| `gated_delta_net_v2` | bprop | BF16 | 12 | 0 | 0 | Not run |
-| `gated_delta_net_v2` | bprop | FP16 | 3 | 0 | 0 | Not run |
-| `qsa_forward` | fprop | BF16 | 15 | 2 | 0 | Not run |
-| `qsa_backward` | bprop | BF16 | 6 | 12 | 0 | Not run |
-| `DSA.sparse_attention_forward_wrapper` | fprop | BF16 | 18 | 0 | 0 | Not run |
-| `DSA.sparse_attention_forward_wrapper` | fprop | FP16 | 6 | 0 | 0 | Not run |
-| `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | 13 | 5 | 0 | Not run |
-| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | 6 | 0 | 0 | Not run |
-| `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 weights | 15 | 0 | 0 | Not run |
-| `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; FP32 weights | 9 | 0 | 0 | Not run |
-| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | 4 | 0 | 0 | Not run |
-| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | 9 | 2 | 0 | Not run |
-| `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | 1 | 1 | 0 | Not run |
-| `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | 2 | 3 | 0 | Not run |
-| `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | 17 | 0 | 0 | Not run |
-| `DSA.indexer_forward_wrapper` | fprop | SM90 FP8 E4M3 Q/K; FP32 scales; BF16 weights | 0 | 0 | 17 | Not applicable; SM90 only |
+| API | Direction | Datatype under test | SM100 passed | SM100 failed | SM100 skipped |
+| --- | --- | --- | ---: | ---: | ---: |
+| `kimi_delta_attention` | fprop | BF16 | 10 | 0 | 0 |
+| `kimi_delta_attention` | fprop | FP16 | 3 | 0 | 0 |
+| `kimi_delta_attention` | bprop | BF16 | 12 | 0 | 0 |
+| `kimi_delta_attention` | bprop | FP16 | 3 | 0 | 0 |
+| `gated_delta_product` | fprop | BF16 | 12 | 0 | 0 |
+| `gated_delta_product` | fprop | FP16 | 3 | 0 | 0 |
+| `gated_delta_product` | bprop | BF16 | 14 | 0 | 0 |
+| `gated_delta_product` | bprop | FP16 | 3 | 0 | 0 |
+| `gated_delta_net` | fprop | BF16 | 10 | 0 | 0 |
+| `gated_delta_net` | fprop | FP16 | 3 | 0 | 0 |
+| `gated_delta_net` | bprop | BF16 | 12 | 0 | 0 |
+| `gated_delta_net` | bprop | FP16 | 3 | 0 | 0 |
+| `gated_delta_net_v2` | fprop | BF16 | 10 | 0 | 0 |
+| `gated_delta_net_v2` | fprop | FP16 | 3 | 0 | 0 |
+| `gated_delta_net_v2` | bprop | BF16 | 12 | 0 | 0 |
+| `gated_delta_net_v2` | bprop | FP16 | 3 | 0 | 0 |
+| `qsa_forward` | fprop | BF16 | 15 | 2 | 0 |
+| `qsa_backward` | bprop | BF16 | 6 | 12 | 0 |
+| `DSA.sparse_attention_forward_wrapper` | fprop | BF16 | 18 | 0 | 0 |
+| `DSA.sparse_attention_forward_wrapper` | fprop | FP16 | 6 | 0 | 0 |
+| `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | 13 | 5 | 0 |
+| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | 6 | 0 | 0 |
+| `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 weights | 15 | 0 | 0 |
+| `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; FP32 weights | 9 | 0 | 0 |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | 4 | 0 | 0 |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | 9 | 2 | 0 |
+| `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | 1 | 1 | 0 |
+| `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | 2 | 3 | 0 |
+| `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | 17 | 0 | 0 |
+| `DSA.indexer_forward_wrapper` | fprop | SM90 FP8 E4M3 Q/K; FP32 scales; BF16 weights | 0 | 0 | 17 |
 
 ### SM90 Hopper
 
-The 17 FP8 indexer cases are added for SM90. The earlier attention and BF16
-indexer suites still gate on SM100/SM103/SM107; their SM90 rows below are
-coverage gaps, not claims that the underlying API is unsupported.
+All **17 FP8 indexer cases passed** on SM90, including scores, LSE, replay,
+batch changes, and the saved golden. The earlier attention and BF16 indexer
+suites still gate on SM100/SM103/SM107; their SM90 rows below are coverage
+gaps, not claims that the underlying API is unsupported. The full L0 selection
+had 262 architecture skips and six passing harness controls.
 
 | API | Direction | Datatype under test | Passed | Failed | Status |
 | --- | --- | --- | ---: | ---: | --- |
@@ -99,12 +105,13 @@ coverage gaps, not claims that the underlying API is unsupported.
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; BF16 dK | — | — | Not covered by these suites on SM90 |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/W; FP32 dK | — | — | Not covered by these suites on SM90 |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | — | — | Unsupported precision on SM90 |
-| `DSA.indexer_forward_wrapper` | fprop | SM90 FP8 E4M3 Q/K; FP32 scales; BF16 weights | — | — | Not run; 17 L0 cases added |
+| `DSA.indexer_forward_wrapper` | fprop | SM90 FP8 E4M3 Q/K; FP32 scales; BF16 weights | 17 | 0 | Passed |
 
 ### SM107
 
-The existing suites and 17 MXFP8 cases admit SM107. No SM107 GPU or
-golden baseline was available. No SM100 result is copied into this table.
+The existing suites and 17 MXFP8 cases admit SM107. The remote run is queued
+for a GPU allocation; no result or golden baseline is measured yet.
+No SM100 result is copied into this table.
 
 | API | Direction | Datatype under test | Passed | Failed | Status |
 | --- | --- | --- | ---: | ---: | --- |
@@ -142,9 +149,10 @@ golden baseline was available. No SM100 result is copied into this table.
 The SM100 table covers **279 operation cases**: 237 passed, 25 failed, and
 17 architecture skips. Six shared harness controls also passed, giving the
 285-case total. All **16 goldens runnable on SM100** passed replay, an independent
-reference, and the saved-byte comparison. The SM90 golden case was skipped and
-has no recorded baseline. Goldens on unmeasured devices require their own
-reference-checked records before CI can require saved-byte comparisons.
+reference, and the saved-byte comparison. The SM90 FP8 golden also passed
+on Hopper and has its own runtime record. Goldens on unmeasured devices
+require their own reference-checked records before CI can require saved-byte
+comparisons.
 
 Datatype details:
 
@@ -211,6 +219,8 @@ for each test method, shape, and case count.
 
 ## Failures
 
+All failures below were measured on SM100. SM90 had no failed cases.
+
 - **QSA: 14 failed cases.** Failures include backward replay/batch comparisons,
   sparse batch checks, the 513-token boundary, and backward mask cases. First
   mismatches are dK/dV or saved FP32 output; both 512-token controls pass.
@@ -252,6 +262,14 @@ bitwise determinism for the multi-query reductions that fail above.
   from the prior commit; their code is unchanged. Node IDs match default L0
   collection: 285 cases in 0.29 s.
 
+SM90 validation used 124 SMs, Torch `2.14.0a0+b2c75dd062.nv26.09`, CUDA
+`13.4` (driver API `13040`), cuDNN `92700`, CuTe DSL `4.8.0`, and TVM FFI
+`0.1.14.post1`. Golden runtime key: `ffe6ff35e0022211`. A source snapshot
+of commit `35cf3082e5f3e505b066097f29bf232a848ea269` was built in an isolated
+container; imports resolved to that snapshot. Its test and kernel source are
+unchanged by this report. The 285-case L0 run took 13.71 s with golden
+recording disabled and the reviewed Hopper record selected.
+
 Run from `test/python`, with imports resolving to this checkout:
 
 ```bash
@@ -268,7 +286,7 @@ makes missing runtime baselines fail instead of skipping the golden check.
 
 ## Scope limits
 
-Only SM100 execution is measured. The new FP8 suite admits SM90, and the
+SM100 and SM90 execution are measured. The FP8 suite runs on SM90, and the
 MXFP8 suite admits SM100/SM103/SM107; earlier suites still gate on
 SM100/SM103/SM107. Unsupported backward FP8 APIs have no positive execution
 cases. FP16 indexer inputs, MXFP4 indexer paths, fused/separate Top-K generation,
