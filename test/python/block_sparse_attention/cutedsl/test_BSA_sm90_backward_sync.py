@@ -17,6 +17,15 @@ from block_sparse_attention.cutedsl.bsa_utils import require_arch
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
+def _disable_tf32_matmul(request):
+    """Turn off TF32 torch matmuls for the reference and restore the flag at teardown. monkeypatch.setattr cannot
+    do this since pytest 9.2: torch.backends.cuda.matmul serves allow_tf32 through __getattr__/__setattr__, so
+    monkeypatch finds no instance value to restore and its teardown deletes the attribute, raising AttributeError."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    request.addfinalizer(lambda: setattr(torch.backends.cuda.matmul, "allow_tf32", previous))
+
+
 _DELAY_HELPER = """
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -86,7 +95,7 @@ def sm90_bsa(request, tmp_path, monkeypatch):
     except (ImportError, OSError) as error:
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    _disable_tf32_matmul(request)
     # The public wrapper's key does not distinguish the test-only kernel class.
     # Restore both the original cache and class binding after each test.
     monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})

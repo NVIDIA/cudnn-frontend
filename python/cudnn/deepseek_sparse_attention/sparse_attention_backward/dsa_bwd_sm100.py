@@ -58,8 +58,11 @@ class FlashAttentionDSABackwardSm100:
         head_dim_v: int,
         block_tile: int,
         max_topk: int = 0,
+        pool_size: int = 0,
     ):
         """Configure SM100 backward tiling, warp roles, registers, and TMEM regions."""
+        assert pool_size in (0, 4, 16), f"pool_size must be 0, 4 or 16, got {pool_size}"
+        self.pool_size = pool_size
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
         self.same_hdim_kv = head_dim == head_dim_v
@@ -184,13 +187,11 @@ class FlashAttentionDSABackwardSm100:
         self.dQ4_mma_tiler = (64, block_tile, block_tile)
         self.dKV4_mma_tiler = (64, block_tile, block_tile)
 
-        # Preserve the established D512 split. D576 moves eight registers
-        # from the idle/MMA roles to compute while exactly retaining the CTA
-        # pool: 128*64 + 128*128 + 256*128 + 128*32 = 61440.
-        self.num_regs_load_KV = 64
+        # CTA register pool: 128*load_KV + 128*compute + 256*reduce + 128*mma = 61440.
+        self.num_regs_load_KV = 40 if self.same_hdim_kv else 64
         self.num_regs_compute = 120 if self.same_hdim_kv else 128
-        self.num_regs_reduce = 128
-        self.num_regs_mma = 40 if self.same_hdim_kv else 32
+        self.num_regs_reduce = 144 if self.same_hdim_kv else 128
+        self.num_regs_mma = 32
         self.num_regs_empty = self.num_regs_mma
         self.num_regs_load = self.num_regs_mma
 
@@ -436,6 +437,7 @@ class FlashAttentionDSABackwardSm100:
         workspace_dKV: cute.Tensor,
         softmax_scale: Float32 | float,
         stream: cuda.CUstream,
+        mPoolTarget: Optional[cute.Tensor] = None,
     ):
         """
         Forward pass for DeepSeek Sparse Attention.
@@ -480,6 +482,12 @@ class FlashAttentionDSABackwardSm100:
         if cutlass.const_expr(mTopkLength is not None):
             mTopkLength = cute.make_tensor(mTopkLength.iterator, cute.make_layout((mTopkLength.shape[0], (1, 1)), stride=(mTopkLength.stride[0], (0, 0))))
 
+        # [M, K] -> [K, (M, 1)] pooled teacher output when requested
+        if cutlass.const_expr(mPoolTarget is not None):
+            mPoolTarget = cute.make_tensor(
+                mPoolTarget.iterator,
+                cute.make_layout((mPoolTarget.shape[1], (mPoolTarget.shape[0], 1)), stride=(mPoolTarget.stride[1], (mPoolTarget.stride[0], 0))),
+            )
         self._setup_attributes()
 
         cta_group = tcgen05.CtaGroup.ONE
@@ -762,6 +770,7 @@ class FlashAttentionDSABackwardSm100:
                         LSE_smem_layout,
                         sum_OdO_smem_layout,
                         valid_smem_layout,
+                        mPoolTarget,
                     ).launch(
                         grid=(q_launch_size, head_blocks_per_launch, bwd_problem_shape[3][1]),
                         block=[self.threads_per_cta, 1, 1],
@@ -972,6 +981,7 @@ class FlashAttentionDSABackwardSm100:
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
         valid_smem_layout: cute.Layout,
+        mPoolTarget: Optional[cute.Tensor],
     ):
         """Execute one fused query-CTA backward pipeline."""
         wave_idx, launch_head_block_idx, batch_idx = cute.arch.block_idx()
@@ -1264,6 +1274,8 @@ class FlashAttentionDSABackwardSm100:
                 tile_count,
                 token_idx,
                 head_block_idx,
+                mPoolTarget,
+                topk,
                 (
                     mma_compute_S_pipeline,
                     mma_compute_dP_pipeline,
@@ -2062,6 +2074,8 @@ class FlashAttentionDSABackwardSm100:
         tile_count: Int32,
         token_idx: Int32,
         head_block_idx: Int32,
+        mPoolTarget: Optional[cute.Tensor],
+        topk: Int32,
         pipelines,
     ):
         """Consume staged tiles to form softmax gradients and dQ fragments."""
@@ -2213,8 +2227,10 @@ class FlashAttentionDSABackwardSm100:
             tRS_rP.store(smem_store_p.retile(tTR_rS_f16).load())
             if cutlass.const_expr(self.compute_mma_P_stage == 1):
                 cute.copy(smem_store_p, tRS_rP, tRS_sP[None, None, None, 0])
+                p_stage_written = Int32(0)
             else:
                 cute.copy(smem_store_p, tRS_rP, tRS_sP[None, None, None, compute_mma_P_producer_state.index])
+                p_stage_written = compute_mma_P_producer_state.index
 
             # Fence for shared memory
             cute.arch.fence_proxy(
@@ -2269,6 +2285,25 @@ class FlashAttentionDSABackwardSm100:
 
             compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
             compute_mma_dS_producer_state.advance()
+            if cutlass.const_expr(mPoolTarget is not None):
+                sP_chunks = cute.zipped_divide(sP_store[None, None, p_stage_written], (8, 1))
+                chunks_per_half = self.block_tile // 16
+                slot = tidx_in_wg // 2
+                chunk_base = (tidx_in_wg % 2) * chunks_per_half
+                rP_chunk = cute.make_rmem_tensor(sP_chunks[None, (0, 0)].shape, self.element_dtype)
+                pool_mass = Float32(0.0)
+                for _k in cutlass.range_constexpr(chunks_per_half):
+                    cute.autovec_copy(sP_chunks[None, (chunk_base + _k, slot)], rP_chunk)
+                    for _e in cutlass.range_constexpr(8):
+                        pool_mass = pool_mass + Float32(rP_chunk[_e])
+                for _o in (1, 2, 4) if self.pool_size == 4 else (1, 2, 4, 8, 16):
+                    pool_mass = pool_mass + cute.arch.shuffle_sync_bfly(pool_mass, offset=_o, mask=-1, mask_and_clamp=31)
+                threads_per_pool = 2 * self.pool_size
+                pool_index = tile_index * (self.block_tile // self.pool_size) + tidx_in_wg // threads_per_pool
+                pooled_limit = topk - topk % self.pool_size
+                if tidx_in_wg % threads_per_pool == 0 and pool_index < cute.size(mPoolTarget.shape[0]) and pool_index * self.pool_size < pooled_limit:
+                    target_ptr = mPoolTarget.iterator + cute.crd2idx((pool_index, (token_idx, batch_idx)), mPoolTarget.layout)
+                    cute.arch.atomic_add(target_ptr.llvm_ptr, pool_mass)
 
             tile_index -= 1
 

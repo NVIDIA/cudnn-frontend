@@ -245,7 +245,8 @@ class TemplateParams:
     # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above, and the d64
     # decode tile, sm100/decode_d128_f16.py, through its own set) -- widen only after an A/B on the new
     # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
-    # kernels read it.
+    # kernels read it; make_cfg_d192 also derives CfgD192.EXP2_TAIL_MIX, the d192x128 f16 kernel's dense-causal arm
+    # spelling, from it.
     exp2_fma_split: bool = False
     # The L2-prefetching loader of the half-input single-CTA d192x128 tile (sm100/prefill_d192_d128_f16.py at cta_mma=1,
     # half precision): the TMA-LDG warp prefetches the K/V tiles one kv step ahead and the next tile's Q / first K/V
@@ -3786,7 +3787,8 @@ class CfgD192(CfgD128):
     L2_PREFETCH_MIN_STEPS: int = 4
     # Unroll factor of the TMA-LDG warp's kv loop (1 with the L2-prefetching loader, 6 otherwise).
     LDG_UNROLL: int = 6
-    # The dense-causal exp2 tail emulation of the softmax (0 with the L2-prefetching loader, 1 otherwise).
+    # The dense top-left causal arm's exp2-split spelling (BMM1/BMM2 issue tweaks, chunk 1's row-sum after its publish):
+    # 1 on a build with the exp2 FMA split claim and the develop loader, 0 otherwise (plain MUFU exp2, default issue order).
     EXP2_TAIL_MIX: int = 1
 
 
@@ -3844,8 +3846,8 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
             "d192: the TMA-LDG kv loop is unrolled 1x with the L2-prefetching loader and 6x otherwise",
         ),
         (
-            cfg.EXP2_TAIL_MIX == (0 if cfg.L2_PREFETCH_KV else 1),
-            "d192: the dense-causal exp2 tail emulation is folded out with the L2-prefetching loader and kept otherwise",
+            cfg.L2_PREFETCH_KV == 0 or cfg.EXP2_TAIL_MIX == 0,
+            "d192: EXP2_TAIL_MIX (the dense-causal arm's exp2-split spelling) is folded out with the L2-prefetching loader",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -3998,6 +4000,9 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     k_sub = (192 * b) // 128 if (not fp8 and params.cta_mma == 1) else 1  # one slot per 128 B TMA D-subtile
     half_input_cga1 = not fp8 and params.cta_mma == 1
     cga1_loader = half_input_cga1 and bool(params.cga1_l2_prefetch)
+    # The dense-causal arm's exp2-split spelling (CfgD192.EXP2_TAIL_MIX) comes with the exp2 FMA split claim and the
+    # develop loader; a build without the claim, or with the L2-prefetching loader, keeps the plain MUFU exp2 there.
+    exp2_tail_mix = bool(params.exp2_fma_split) and not cga1_loader
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -4024,7 +4029,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         L2_PREFETCH_KV=1 if cga1_loader else 0,
         L2_PREFETCH_NEXT_TILE=1 if cga1_loader else 0,
         LDG_UNROLL=1 if cga1_loader else 6,
-        EXP2_TAIL_MIX=0 if cga1_loader else 1,
+        EXP2_TAIL_MIX=1 if exp2_tail_mix else 0,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,

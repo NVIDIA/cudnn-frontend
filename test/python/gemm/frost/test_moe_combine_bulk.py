@@ -44,11 +44,13 @@ _DTYPES = [(cudnn.data_type.BFLOAT16, torch.bfloat16), (cudnn.data_type.HALF, to
 def test_normal_two_cta_combine_uses_atomics(monkeypatch, output_dt, _torch_dt):
     """The SM100 memcheck failure cannot be re-admitted by output dtype or arch."""
     chain = analyze(_build_graph(2, 1026, 512, 1024, 6, output_dt=output_dt, combine_top_k=2))
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
     for arch in (100, 103, 107):
-        monkeypatch.setattr(C, "_current_arch", lambda: arch)
-        assert C._use_bulk_combine(chain, by_name(_NORMAL))
-        assert not C._use_bulk_combine(chain, by_name(_PAIR))
-        assert C._combine_smem_bytes(chain, by_name(_PAIR)) == 0
+        monkeypatch.setattr(C100, "_current_arch", lambda: arch)
+        assert C100._use_bulk_combine(chain, by_name(_NORMAL))
+        assert not C100._use_bulk_combine(chain, by_name(_PAIR))
+        assert C100._combine_smem_bytes(chain, by_name(_PAIR)) == 0
 
 
 def _make_inputs(rows, features, k, tokens, dtype, bounds, padding=0):

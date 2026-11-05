@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The d128 accumulation DIAGNOSTIC lever ``diag_delete_dq_reduce_add`` (default OFF) renders the shipped kernels byte-identically.
 
-The lever makes the store warp of ``bprop_d128_accum_thd_f16.py`` (shared by the grouped THD kernel) skip the four fp32 dQ
+The lever makes the store warp of the THD body of ``kernels/sm100/bprop_d128_f16.py`` (shared by the grouped THD kernel) skip the four fp32 dQ
 ``tma_reduce_add`` issues per q tile while every barrier arrive / wait, ``tma_store_commit`` and ``tma_store_wait`` stay.
 Armed, dQ stays zero BY DESIGN: it is a timing-only ceiling for the L2 reduce-add term, set on the adapter instance before
 ``compile()`` by a probe driver, never by a graph.  Pins (host trace-compiles for sm_100a, no device):
@@ -45,9 +45,11 @@ _REDUCE_ADDS_PER_Q_TILE = 4  # the four 16 KB fp32 dQ slices the store loop issu
 _PROBE = textwrap.dedent(r"""
     import glob, hashlib, json, os, re, sys
     dump, host, flag, spec = sys.argv[1], sys.argv[2], sys.argv[3] == "1", json.loads(sys.argv[4])
+    arch = sys.argv[6]  # the target: the host's ``--gpu-arch sm_{sm}a`` (the production selector, from the device cc) wins; CUTE_DSL_ARCH agrees
+    sm = int(re.fullmatch(r"sm_(\d+)a", arch).group(1))
     os.environ["CUTE_DSL_DUMP_DIR"] = dump
     os.environ["CUTE_DSL_KEEP"] = "ptx"
-    os.environ["CUTE_DSL_ARCH"] = "sm_100a"
+    os.environ["CUTE_DSL_ARCH"] = arch
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
     import cutlass
     B, H, HK = spec["b"], spec["h"], spec["hk"]
@@ -58,15 +60,16 @@ _PROBE = textwrap.dedent(r"""
     dtypes = tuple("int32" for _ in ports)
     kw = {"diag_delete_dq_reduce_add": True} if flag else {}
     if host == "grouped_thd":
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_thd_host import compile_host
-        compile_host((B, H, HK, True), spec_for(H, HK), dtypes, cutlass.BFloat16, True, 100, **kw)
+        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
+        compile_host((B, H, HK, True), spec_for(H, HK), dtypes, cutlass.BFloat16, True, sm, **kw)
     else:
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_thd_host import compile_host
-        compile_host((B, H, True), spec_for(H, H), dtypes, cutlass.BFloat16, True, 100, **kw)
+        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_thd as compile_host
+        compile_host((B, H, True), spec_for(H, H), dtypes, cutlass.BFloat16, True, sm, **kw)
     ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
     if not ptxs:
         print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
     txt = open(ptxs[-1], "rb").read().decode()
+    print("PTX_TARGET", re.search(r"^\.target\s+(\S+)", txt, re.M).group(1))
     print("PTX_MD5", hashlib.md5(txt.encode()).hexdigest())
     print("PTX_FILE", ptxs[-1])
     for key, pat in json.loads(sys.argv[5]).items():
@@ -85,19 +88,21 @@ def _parse_record(f):
     return read_kernel_record(f, _RECORD_TOKEN)
 
 
-def _render_kernels(tmp_path, host, armed):
-    """Host trace-compile ONE d128 accumulation THD host for sm_100a in a fresh process -> (md5, census, {kernel: md5} in entry order)."""
-    if not arch_known_to_the_dsl("sm_100a"):
-        pytest.skip("this cutlass-dsl has no sm_100a")
-    dump = tmp_path / f"sm100a_d128_accum_{host}_{'armed' if armed else 'default'}"
+def _render_kernels(tmp_path, host, armed, arch="sm_100a"):
+    """Host trace-compile ONE d128 accumulation THD host for ``arch`` (the record's sm_100a by default; sm_107a = the Rubin target the prepared
+    module selects on cc 10.7) in a fresh process -> (md5, census, {kernel: md5} in entry order).  Skips BY NAME on a DSL without the target."""
+    if not arch_known_to_the_dsl(arch):
+        pytest.skip(f"this cutlass-dsl has no {arch} target")
+    dump = tmp_path / f"{arch}_d128_accum_{host}_{'armed' if armed else 'default'}"
     dump.mkdir()
     script = dump / "ptx_probe.py"
     script.write_text(_PROBE)
     spec = json.dumps(dict(b=_B, h=_H, hk=_HK))
-    cmd = [sys.executable, str(script), str(dump), host, "1" if armed else "0", spec, json.dumps(_CENSUS)]
+    cmd = [sys.executable, str(script), str(dump), host, "1" if armed else "0", spec, json.dumps(_CENSUS), arch]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    what = f"sm_100a trace-compile of the {host} host ({'armed' if armed else 'default'})"
+    what = f"{arch} trace-compile of the {host} host ({'armed' if armed else 'default'})"
     assert proc.returncode == 0, f"{what} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    assert re.search(r"^PTX_TARGET (\S+)$", proc.stdout, re.M).group(1) == arch, proc.stdout[-500:]
     md5, ptx_file = None, None
     census = {}
     for ln in proc.stdout.splitlines():
@@ -155,6 +160,23 @@ def test_default_rendering_ptx_md5_is_unchanged(tmp_path, host):
 
 
 @pytest.mark.parametrize("host", _HOSTS)
+def test_default_rendering_for_sm_107a_matches_the_record(tmp_path, host):
+    """The Rubin target (cc 10.7 -> ``sm`` = 107 -> ``--gpu-arch sm_107a``; the cc 10.7 admission of the d128 family, 2026-11-03): each THD
+    host's default rendering for sm_107a hashes, kernel by kernel, to the committed sm_100a record -- the bodies have no per-part branch, so
+    only the module's `.target` line differs (the sm_103a precedent of the pair chain, PR 1964).  One record file serves; skips BY NAME on a DSL
+    without the sm_107a target or on another DSL build -- never a silent pass."""
+    dsl, want = _parse_record(_RECORD)
+    _skip_unless_recorded_dsl(dsl)
+    got, census, kernels = _render_kernels(tmp_path, host, armed=False, arch="sm_107a")
+    print(f"\nSM107 d128 accum {host} default: PTX md5 {got} census {census} kernels {kernels} (record {want.get(host)})")
+    assert census["REDUCE_ADD"] == _REDUCE_ADDS_PER_Q_TILE, census
+    assert _MAIN_KERNEL[host] in kernels, kernels
+    assert_kernel_record(
+        kernels, want.get(host, {}), token=_RECORD_TOKEN, variant=host, excluded=D128_THD_SHARED_KERNELS, what=f"{host}: the default rendering for sm_107a"
+    )
+
+
+@pytest.mark.parametrize("host", _HOSTS)
 def test_armed_rendering_deletes_only_the_reduce_add(tmp_path, host):
     """Armed: a different PTX with ZERO reduce-adds; the mbarrier arrive / wait and bulk-group commit / wait counts are the
     default's (every barrier site and the store-group protocol survive -- the barrier table is unchanged)."""
@@ -174,24 +196,23 @@ def test_flag_defaults_to_false_everywhere():
     """The record field is a typed ``bool`` default ``False``; the kernel, the host entries and ``compile_host`` default it too
     (a plain import renders the shipped kernel), and a non-bool on the record is a ``ValueError`` before any compile."""
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_accum_grouped_f16 as grouped
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_accum_thd_f16 as packed
-    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d128_grouped_host, prepared_d128_grouped_thd_host, prepared_d128_thd_host
+    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_f16 as packed  # the family module: the THD body (section 5) and the grouped bodies (section 7)
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d128_host as hosts
     from cudnn.sdpa.bwd.prepared_sm100_d128_thd import diag_delete_dq_reduce_add
 
     assert SdpaBwdDslSm100D128.diag_delete_dq_reduce_add is False
     assert SdpaBwdDslSm100D128.__annotations__[FLAG] is bool
     for fn in (
         packed.bprop_d128_accum_thd_kernel,
-        packed.host,
-        packed._store_loop,
-        grouped.bprop_d128_accum_grouped_thd_kernel,
-        grouped.bprop_d128_accum_grouped_dense_kernel,
-        grouped.main_thd_host,
-        grouped.main_dense_host,
-        prepared_d128_thd_host.compile_host,
-        prepared_d128_grouped_thd_host.compile_host,
-        prepared_d128_grouped_host.compile_host,
+        packed.host_accum_thd,
+        packed._store_loop_thd,
+        packed.bprop_d128_accum_grouped_thd_kernel,
+        packed.bprop_d128_accum_grouped_dense_kernel,
+        packed.main_thd_host,
+        packed.main_dense_host,
+        hosts.compile_host_thd,
+        hosts.compile_host_grouped_thd,
+        hosts.compile_host_grouped_dense,
     ):
         param = inspect.signature(fn).parameters[FLAG]
         assert param.default is False, (fn, param)

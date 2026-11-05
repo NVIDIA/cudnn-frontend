@@ -89,8 +89,8 @@ def test_native_head_host_specializations(monkeypatch):
 
     narrow = load_template(wide.__file__, 64, tag="sdpa_bwd_d64_host")
     body = load_template(str(Path(wide.__file__).with_name("bprop_d128_f16.py")), 64, tag="sdpa_bwd_d64")
-    assert body.CFG.HEAD_DIM == 64 and body.CFG.TILE_N == 128
-    assert body.CFG.SLAB_ELEMS >= body.CFG.AUX + body.CFG.TILE_M * body.CFG.TILE_N
+    assert body.CFG_RECOMPUTE.HEAD_DIM == 64 and body.CFG_RECOMPUTE.TILE_N == 128  # the recompute body's binding of the family module
+    assert body.CFG_RECOMPUTE.SLAB_ELEMS >= body.CFG_RECOMPUTE.AUX + body.CFG_RECOMPUTE.TILE_M * body.CFG_RECOMPUTE.TILE_N
     captured = []
 
     def compile_host(fn, *args, **kwargs):
@@ -102,7 +102,7 @@ def test_native_head_host_specializations(monkeypatch):
     monkeypatch.setattr(narrow, "compile_cached", compile_host)
     for d, window in ((128, 0), (64, 1), (64, 129)):
         geometry = tuple(((1, 65, 3, d), (65 * 3 * d, 3 * d, d, 1)) if i != 5 else ((1, 3, 65), (195, 65, 1)) for i in range(9))
-        assert wide.compile_host(geometry, cutlass.BFloat16, True, 100, window) is captured[-1][2]
-        assert captured[-1][0] is (narrow.host if d == 64 else wide.host)
-    assert narrow.tensor_host is body.host
+        assert wide.compile_host_recompute(geometry, cutlass.BFloat16, True, 100, window) is captured[-1][2]
+        assert captured[-1][0] is (narrow.host_recompute if d == 64 else wide.host_recompute)
+    assert narrow.tensor_host is body.host_recompute
     assert len({key for _, key, _ in captured}) == 3

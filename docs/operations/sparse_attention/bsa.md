@@ -457,6 +457,18 @@ layer of a diffusion step, every training step with a fixed packing) skip the
 metadata kernels. The layout depends on the metadata only, never on `q`, `k`,
 or `v`. Backward tables are built on the first backward call with that layout.
 
+Prefer a prebuilt layout. The walk tables are sized from counts computed on
+the device, so building a layout synchronizes the host with the current
+stream: the host waits until all previously queued GPU work has finished,
+kernels queued after the call start late, and the call cannot be captured into
+a CUDA graph. `kpage=True` builds a layout on every call (the forward and the
+backward each build their own), so it pays this on every layer. Calls that
+take a `KPageLayout` do not synchronize. Build one layout per sparse pattern
+outside the layer loop and pass it to the forward and backward of every layer
+that uses the pattern; on SM100/SM103 also pass `with_backward=True` so the
+backward tables are not built (with one more synchronization) on the first
+backward call. Keep `kpage=True` for one-off calls and experiments.
+
 `q_block_sizes` (int32, one entry per query block) is specific to this path:
 query rows at or past `q_block_sizes[i]` in block `i` are padding. They are
 not computed, which is where the M64 x N256 route and part of the speedup on
@@ -488,12 +500,13 @@ Contract, in addition to the metadata ranges above:
   no part in the computation and may hold any finite value. Backward writes
   zeros to the masked rows of `dk` and `dv`. Values on valid rows are exact.
 - `kpage_prepare_layout(validate=True)` (default) checks the metadata on the
-  device with one readback and raises `ValueError` naming the offending entry.
-  The layout build itself reads back three counts; `with_backward=True` also
-  builds the backward tables, which otherwise happens on the first backward
-  call. `seqlen_q` / `seqlen_k` are needed only when a sequence is not a
-  multiple of 128 or when `block_sizes` is omitted and `seqlen_k != seqlen_q`
-  (`kpage=True` takes them from the tensors).
+  device and raises `ValueError` naming the offending entry. The check is read
+  back together with the walk-table sizes, so a layout build synchronizes the
+  host once with or without it; `with_backward=True` also builds the backward
+  tables (one more synchronization on SM100/SM103), which otherwise happens on
+  the first backward call. `seqlen_q` / `seqlen_k` are needed only when a
+  sequence is not a multiple of 128 or when `block_sizes` is omitted and
+  `seqlen_k != seqlen_q` (`kpage=True` takes them from the tensors).
 - A `KPageLayout` remembers the metadata tensors it was built from; passing it
   together with other metadata, or with tensors of another shape, raises
   `ValueError`.

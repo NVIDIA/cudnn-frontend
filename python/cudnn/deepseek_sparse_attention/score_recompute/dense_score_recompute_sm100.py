@@ -47,6 +47,7 @@ from cutlass.pipeline import (
     Agent,
     CooperativeGroup,
     PipelineTmaUmma,
+    PipelineAsync,
     PipelineUserType,
     make_pipeline_state,
     pipeline_init_arrive,
@@ -466,6 +467,7 @@ class DenseScoreRecomputeSm100:
 
         @cute.struct
         class SharedStorage:
+            per_head_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
             Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.Q_mbar_size]
             K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.K_mbar_size]
             S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.S_mbar_size]
@@ -516,6 +518,16 @@ class DenseScoreRecomputeSm100:
         )
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         is_first_cta_in_cluster = cta_rank_in_cluster == 0
+
+        # Publish W/LSE from all load lanes to the epilogue; reuse a slot only
+        # after every epilogue lane has finished reading it.
+        pipeline_head = PipelineAsync.create(
+            barrier_storage=storage.per_head_mbar_ptr.data_ptr(),
+            num_stages=2,
+            producer_group=CooperativeGroup(Agent.Thread, self.WARP_SIZE),
+            consumer_group=CooperativeGroup(Agent.Thread, self.WARPGROUP_SIZE),
+            defer_sync=True,
+        )
 
         # Q pipeline (1 stage)
         pipeline_Q = PipelineTmaUmma.create(
@@ -574,6 +586,7 @@ class DenseScoreRecomputeSm100:
         )
         work_tile = tile_sched.initial_work_tile_info()
 
+        head_producer, head_consumer = pipeline_head.make_participants()
         Q_producer, Q_consumer = pipeline_Q.make_participants()
         K_producer, K_consumer = pipeline_K.make_participants()
 
@@ -599,7 +612,6 @@ class DenseScoreRecomputeSm100:
             if warp_idx == self.load_warp_id:
                 rows_per_thread = cute.ceil_div(self.m_block_size, self.WARP_SIZE)
                 lane_id = tidx % self.WARP_SIZE
-                tile_count = Int32(0)
 
                 while work_tile.is_valid_tile:
                     m_block_sched = work_tile.tile_idx[0]
@@ -621,7 +633,8 @@ class DenseScoreRecomputeSm100:
                             q_causal_offset,
                         )
                         # PerHead data load (double-buffered)
-                        per_head_buf_off = (tile_count % 2) * self.m_block_size
+                        head = head_producer.acquire_and_advance()
+                        per_head_buf_off = head.index * self.m_block_size
                         mPerHead_cur = seqlen.offset_batch_Q(mPerHead, batch_idx, dim=2)
                         for ri in cutlass.range_constexpr(rows_per_thread):
                             row = ri * self.WARP_SIZE + lane_id
@@ -638,6 +651,7 @@ class DenseScoreRecomputeSm100:
                                 else:
                                     sPerHead[per_head_buf_off + row] = Float32(0.0)
 
+                        head.commit()
                         cute.arch.fence_view_async_shared()
 
                         # TMA Q load (1 barrier, num_k_chunks TMA copies)
@@ -730,12 +744,12 @@ class DenseScoreRecomputeSm100:
                                     )
                                     load_K_fn(tma_bar_ptr=handle_K.barrier)
                             n_block_k = n_block_k - 1
-                        tile_count = tile_count + 1
 
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
+                head_producer.tail()
                 Q_producer.tail()
                 K_producer.tail()
 
@@ -851,7 +865,6 @@ class DenseScoreRecomputeSm100:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
-            tile_count = Int32(0)
             while work_tile.is_valid_tile:
                 m_block_sched = work_tile.tile_idx[0]
                 batch_idx = work_tile.tile_idx[2]
@@ -871,7 +884,8 @@ class DenseScoreRecomputeSm100:
                         seqlen.seqlen_k,
                         q_causal_offset,
                     )
-                    per_head_offset = (tile_count % 2) * self.m_block_size
+                    head = head_consumer.wait_and_advance()
+                    per_head_offset = head.index * self.m_block_size
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1) if const_expr(mDenom is not None) else None
                     if cutlass.const_expr(self.score_type == "attention"):
                         mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
@@ -946,7 +960,7 @@ class DenseScoreRecomputeSm100:
                             softmax_scale,
                             per_head_offset=per_head_offset,
                         )
-                    tile_count = tile_count + 1
+                    head.release()
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)

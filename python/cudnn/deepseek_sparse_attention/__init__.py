@@ -33,6 +33,15 @@ _SYMBOLS = {
     "indexer_backward_wrapper": (".indexer_backward", "indexer_backward_wrapper"),
     "DenseIndexerBackward": (".indexer_backward", "DenseIndexerBackward"),
     "dense_indexer_backward_wrapper": (".indexer_backward", "dense_indexer_backward_wrapper"),
+    "pooled_keys_forward": (".pooled", "pooled_keys_forward"),
+    "unpool_backward": (".pooled", "unpool_backward"),
+    "pooled_indexer_target": (".pooled", "pooled_indexer_target"),
+    "pooled_indexer_backward": (".pooled", "pooled_indexer_backward"),
+    "pooled_indexer_select": (".pooled", "pooled_indexer_select"),
+    "pooled_expand_compact": (".pooled", "pooled_expand_compact"),
+    "pooled_sparse_attention_backward": (".pooled", "pooled_sparse_attention_backward"),
+    "pooled_sparse_attention_backward_with_teacher": (".pooled", "pooled_sparse_attention_backward_with_teacher"),
+    "pooled_teacher_recompute": (".pooled", "pooled_teacher_recompute"),
 }
 
 

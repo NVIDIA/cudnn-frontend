@@ -24,6 +24,12 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_
 
 from . import _interface_sm100 as _iface_sm100
 from . import _interface_sm100_d576 as _iface_d576
+from ._sm90_relay import (
+    SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE,
+    sm90_deterministic_relay_accumulator_elements,
+    sm90_deterministic_relay_indexing_error,
+    sm90_deterministic_relay_requirement_error,
+)
 
 
 def _checked_deterministic_relay_cluster_size(value: Optional[int]) -> Optional[int]:
@@ -64,12 +70,12 @@ class SparseAttentionBackward(APIBase):
         accept the mode but retain the ordinary backend.
 
         ``deterministic_relay_cluster_size`` optionally requests an exact
-        4-, 8-, 16-, 32-, or 64-CTA logical relay for a deterministic SM100
-        generic-M64 large-context plan. The 32- and 64-CTA options use two and
-        four ordered 16-CTA hardware-cluster launches, respectively. ``None`` retains automatic
-        selection. The choice is compiled into the plan and changes its
-        workspace requirement; it cannot be changed by ``execute()`` or
-        during CUDA Graph replay.
+        4-, 8-, 16-, 32-, or 64-CTA logical deterministic dKV relay. SM90
+        defaults to 16; SM100 generic-M64 large-context plans retain their
+        automatic policy. The 32- and 64-CTA options use two and four ordered
+        16-CTA hardware-cluster launches, respectively. The choice is compiled
+        into the plan and changes its workspace requirement; it cannot be
+        changed by ``execute()`` or during CUDA Graph replay.
         """
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -85,6 +91,7 @@ class SparseAttentionBackward(APIBase):
         self.deterministic = bool(deterministic)
         self.q_cluster_mode = q_cluster_mode
         self.deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
+        self._sm90_deterministic_relay_cluster_size = SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE
         self._backend = None
         self._backend_block_tile = None
         self._device_major = None
@@ -124,9 +131,11 @@ class SparseAttentionBackward(APIBase):
         capability = torch.cuda.get_device_capability(self.q_desc.device)
         major, _ = capability
         self._device_major = major
+        # Only SM90 and the SM100-family targets in _SM100_FAMILY_ARCH_FLAGS have a backward kernel. Any other part
+        # (cc 11.x, cc 12.x) would reach compile() as an "SM90" plan and then be dispatched to the SM100 launch.
         self._runtime_error_if(
-            major < 9,
-            f"SparseAttentionBackward requires SM90+, found SM{major}",
+            major != 9 and capability not in _iface_sm100._SM100_FAMILY_ARCH_FLAGS,
+            f"SparseAttentionBackward requires SM90 or compute capability in {tuple(_iface_sm100._SM100_FAMILY_ARCH_FLAGS)}, found {capability}",
         )
         self._value_error_if(
             self.q_desc.ndim != 3,
@@ -195,13 +204,19 @@ class SparseAttentionBackward(APIBase):
                 "q_cluster_mode='adaptive_pair' requires contiguous SM100 BF16 H16/H32 Dqk576 inputs, " "non-deterministic execution, and 1 <= topk <= 2048",
             )
         self._value_error_if(
-            self.deterministic and (major != 10 or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
-            f"deterministic DSA backward requires SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
+            self.deterministic and (major not in (9, 10) or num_heads not in _iface_sm100._DETERMINISTIC_HEAD_COUNTS),
+            f"deterministic DSA backward requires SM90/SM100 and heads in {_iface_sm100._DETERMINISTIC_HEAD_COUNTS}, found SM{major} H{num_heads}",
         )
         self._value_error_if(
             self.deterministic_relay_cluster_size is not None and not self.deterministic,
             "deterministic_relay_cluster_size requires deterministic=True",
         )
+        if major == 9 and self.deterministic:
+            relay_requirement_error = sm90_deterministic_relay_requirement_error()
+            self._runtime_error_if(relay_requirement_error is not None, relay_requirement_error)
+            self._sm90_deterministic_relay_cluster_size = (
+                SM90_DEFAULT_DETERMINISTIC_RELAY_CLUSTER_SIZE if self.deterministic_relay_cluster_size is None else self.deterministic_relay_cluster_size
+            )
         # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
         # MLA case splits QK=576 / V=512); any other head_dim compiles to a
         # layout that indexes shared memory out of bounds and crashes.
@@ -209,6 +224,16 @@ class SparseAttentionBackward(APIBase):
             head_dim not in (512, 576),
             f"head_dim must be 512 or 576, got {head_dim}",
         )
+        if major == 9 and self.deterministic:
+            accumulator_elements = sm90_deterministic_relay_accumulator_elements(
+                total_s_q,
+                self.kv_desc.shape[0],
+                head_dim,
+                num_heads,
+                self._sm90_deterministic_relay_cluster_size,
+            )
+            indexing_error = sm90_deterministic_relay_indexing_error(accumulator_elements)
+            self._value_error_if(indexing_error is not None, indexing_error)
         head_dim_v = 512 if head_dim == 576 else head_dim
         expected_o_shape = (total_s_q, num_heads, head_dim_v)
         self._value_error_if(
@@ -283,7 +308,7 @@ class SparseAttentionBackward(APIBase):
                 num_heads,
                 self.deterministic_relay_cluster_size,
             )
-        elif self.deterministic_relay_cluster_size is not None:
+        elif major == 10 and self.deterministic_relay_cluster_size is not None:
             raise ValueError("deterministic_relay_cluster_size is supported only by the deterministic SM100 generic_m64 backend")
         if self._backend in _iface_d576.BACKENDS:
             self._value_error_if(total_s_q <= 0 or self.kv_desc.shape[0] <= 0, "Q and KV sequence extents must be positive")
@@ -351,7 +376,7 @@ class SparseAttentionBackward(APIBase):
                     self._wide_addressing,
                 )
             return
-        if self.deterministic:
+        if self.deterministic and self._device_major == 10:
             total_s_q, num_heads, head_dim = self.q_desc.shape
             head_dim_v = self.out_desc.shape[2]
             kernel_cls = _iface_sm100._get_sm100_kernel_class(
@@ -411,9 +436,11 @@ class SparseAttentionBackward(APIBase):
         relay would exceed 32 GiB. An explicit relay cluster size reports that
         exact specialization even when it exceeds the automatic budget.
         Deterministic H96/H128 D576 two-CTA plans use the compact 96-plane
-        capacity. The returned size is authoritative for this plan;
-        ``execute()`` accepts a larger contiguous uint8 buffer on the plan
-        device but never allocates one.
+        capacity. On SM90, logical cluster sizes 4, 8, 16, 32, and 64 use 32,
+        16, 8, 4, and 2 FP32 planes respectively, followed by packed relay-mask
+        rows. The returned size is authoritative for this plan; ``execute()``
+        accepts a larger contiguous uint8 buffer on the plan device but never
+        allocates one.
         """
         self._ensure_support_checked()
         major, _ = device_capability(self.q_desc.device)
@@ -427,7 +454,14 @@ class SparseAttentionBackward(APIBase):
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
-            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(total_s_q, total_s_kv, head_dim, num_heads)
+            return _iface_sm90.flash_attn_bwd_sm90_workspace_size(
+                total_s_q,
+                total_s_kv,
+                head_dim,
+                num_heads,
+                deterministic=self.deterministic,
+                deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
+            )
         return _iface_sm100.flash_attn_bwd_sm100_workspace_size(
             total_s_q,
             total_s_kv,
@@ -466,7 +500,9 @@ class SparseAttentionBackward(APIBase):
         pairing makes its overlap decision on device and launches only stages
         compiled by ``compile()``, so replay needs no host branch or D2H read.
         SM100 runtime inputs must match the sample contract used to compile the
-        plan. SM90 retains its legacy first-execute compilation behavior.
+        plan. SM90 retains its legacy first-execute compilation behavior; after
+        one eager warm-up, its allocation-free execute path is CUDA Graph
+        capturable with fixed tensor addresses.
         Inputs, outputs, and the live workspace must not overlap; concurrent
         executions need distinct output and workspace storage.
         """
@@ -540,6 +576,8 @@ class SparseAttentionBackward(APIBase):
                     softmax_scale=scale,
                     topk_length=topk_length,
                     current_stream=current_stream,
+                    deterministic=self.deterministic,
+                    deterministic_relay_cluster_size=self._sm90_deterministic_relay_cluster_size,
                 )
             return _iface_sm100.flash_attn_bwd_sm100(
                 q,
@@ -589,7 +627,7 @@ def sparse_attention_backward_wrapper(
     Dispatches to SM90 or SM100 from the input device and tensor metadata. The
     returned ``d_sink`` is computed from ``attn_sink`` and ``dout``. Set
     ``deterministic=True`` for bitwise-reproducible
-    H16/H32/H64/H96/H128 gradients on SM100. The optional reusable uint8
+    H16/H32/H64/H96/H128 gradients on SM90 or SM100. The optional reusable uint8
     ``workspace`` must hold at least
     ``SparseAttentionBackward.scratch_workspace_bytes()`` bytes.
 
@@ -606,13 +644,12 @@ def sparse_attention_backward_wrapper(
     ``topk_max <= 256`` and H32 ``topk_max <= 128`` use the ordinary backend.
     The wrapper stages strided inputs and outputs and allocates omitted outputs
     or workspace on the launch stream; the plan's ``execute()`` does neither.
-
     ``deterministic_relay_cluster_size`` optionally fixes a deterministic
-    SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or 64-CTA
-    logical relay. Cluster-32/64 use two/four ordered 16-CTA hardware-cluster launches. The
-    default ``None`` uses the automatic policy. This plan-time choice changes
-    the required workspace and remains fixed across every execution and CUDA
-    Graph replay of the cached plan.
+    SM90 or SM100 generic-M64 large-context plan to a 4-, 8-, 16-, 32-, or
+    64-CTA logical relay. Cluster-32/64 use two/four ordered 16-CTA hardware
+    clusters. ``None`` selects C16 on SM90 and the automatic policy on SM100.
+    This plan-time choice changes the required workspace and remains fixed
+    across every execution and CUDA Graph replay of the cached plan.
     """
     deterministic_relay_cluster_size = _checked_deterministic_relay_cluster_size(deterministic_relay_cluster_size)
     if deterministic_relay_cluster_size is not None and not deterministic:
