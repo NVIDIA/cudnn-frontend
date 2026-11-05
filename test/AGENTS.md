@@ -1,5 +1,20 @@
 # test — Agent Guide
 
+For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
+and the [five-suite coverage table](python/determinism_goldens/README.md).
+The shared comparator checks bytes, tensor names, shapes, and dtypes. Clone each
+result before the next launch so reused storage cannot make replay pass.
+For backward batch checks, slice fixed upstream gradients with the inputs;
+do not use a batch-mean loss. GDP expands K/V/beta by `num_householder`, while
+Q/G remain on the token axis. QSA packing must shift token and block metadata
+and retain each sequence's selection mask. Validate these mappings with all
+gradients, not only dQ/dK.
+Name parameter IDs with direction, dtype, and shape where applicable. Report
+collected cases separately from replay executions. Include tile/routing
+boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
+and isolated upstream-gradient sources when the operation supports them.
+Keep these five determinism suites in L0, including stress cases.
+
 MXFP8 backward's element-count allowance needs the same magnitude cap as its
 row-count allowance: an isolated large error can preserve amax and still fit
 the element budget. `assert_close_mxfp8_grad` caps every extra mismatch;
