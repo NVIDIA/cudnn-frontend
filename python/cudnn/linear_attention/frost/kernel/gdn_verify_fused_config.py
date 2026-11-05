@@ -69,9 +69,9 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
   one CTA is pure cost (sm_120a: ``TWO_CTA_CFG`` spills 34).
 * ``CTAS_PER_SM``: 0 = natural shared memory, 1 / 2 = a dummy pad that caps the co-resident CTAs per SM at one / two, derived from
   ``SMEM_PER_SM_BYTES`` -- the DEVICE's shared memory per SM, which the host entry reads from the part.
-* ``BA_PREFETCH_CHUNKS``: how many of the three 2048-element chunks of the BA projection's ``hidden`` rows (all ``T`` tokens) are in
-  flight at once in the BA warpgroup (3 = one load latency, 20 registers per token per chunk; 1 = three latencies, a third of
-  the registers -- the register-capped forms).
+* ``BA_PREFETCH_CHUNKS``: how many of the 2048-element chunks of the BA projection's ``hidden`` rows (all ``T`` tokens; three chunks at
+  hidden 5120) are in flight at once in the BA warpgroup (3 = one load latency, 20 registers per token per chunk; 1 = three latencies, a
+  third of the registers -- the register-capped forms); bounded by the geometry's chunk count (``Cfg.BA_PREFETCH_DEPTH``: 2 at hidden 4096).
 * ``NORM_FORM``: the association of the gated norm's sum of squares, which the reference verify kernel fixes by its CTAs-per-head
   policy: ``"ctas2"`` (one request: two 64-row halves of 16 four-row chains each, summed last) or ``"ctas1"`` (sixteen eight-row
   chains); ``None`` = that policy for the compiled requests count.
@@ -296,6 +296,12 @@ class Cfg:
         """The last reader ticket of a K head's conv history: ``VK_RATIO x CTAS_PER_HEAD`` CTAs read it (3 x at the default geometry), the
         one that draws this value shifts it."""
         return self.GEOM.VK_RATIO * self.CTAS_PER_HEAD - 1
+
+    @property
+    def BA_PREFETCH_DEPTH(self) -> int:
+        """The BA hidden chunks in flight at once: the knob ``BA_PREFETCH_CHUNKS`` bounded by the geometry's chunk count (a hidden width of two
+        2048-element chunks -- 4096 -- cannot have three in flight; 3 at hidden 5120 and 8192 with the default knob)."""
+        return min(self.BA_PREFETCH_CHUNKS, self.GEOM.BA_CHUNKS_VERIFY)
 
     @property
     def SLICE_PITCH(self) -> int:

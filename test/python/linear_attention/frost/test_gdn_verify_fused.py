@@ -491,6 +491,9 @@ def test_a_rank_geometry_derives_its_forms_ladder_and_token_bounds(g):
     assert kcfg.default_cfg(1, 170, per_sm, optin, 12, g) == replace(kcfg.PAIR_NBUF1_CFG, GEOM=g)
     assert kcfg.max_tokens_served(1, 170, per_sm, optin, g) == 17
     assert kcfg.make_cfg(TPR=8, NBUF=1, GEOM=g).GEOM is g
+    # the BA prefetch depth is the knob bounded by the geometry's chunk count (two chunks at hidden 4096 cannot have three in flight)
+    assert cfg.BA_PREFETCH_DEPTH == min(3, g.BA_CHUNKS_VERIFY) and two.BA_PREFETCH_DEPTH == 1 and kcfg.CFG.BA_PREFETCH_DEPTH == kcfg.CFG.BA_PREFETCH_CHUNKS == 3
+    assert kcfg.make_cfg(BA_PREFETCH_CHUNKS=2, GEOM=g).BA_PREFETCH_DEPTH == 2 and kcfg.make_cfg(GEOM=g).BA_PREFETCH_DEPTH <= g.BA_CHUNKS_VERIFY
     with pytest.raises(ValueError, match="GEOM"):
         kcfg.make_cfg(GEOM=(g.K_HEADS, g.V_HEADS, g.HIDDEN))
     with pytest.raises(ValueError, match="geometry"):

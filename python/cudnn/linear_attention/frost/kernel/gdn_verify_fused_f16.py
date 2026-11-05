@@ -609,7 +609,7 @@ def _ba_role(
     u = tid
     wl = tid // 32
     lane = tid % 32
-    P = cfg.BA_PREFETCH_CHUNKS
+    P = cfg.BA_PREFETCH_DEPTH  # the knob bounded by the chunk count (3 at hidden 5120 / 8192; 2 at 4096: two chunks cannot have three in flight)
     if wl == 0:
         if lane == 0:
             nvvm.mbarrier_init(mb_state, STATE_MBAR_ARRIVERS)
