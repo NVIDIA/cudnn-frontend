@@ -55,6 +55,8 @@ from moe_ep.moe_ep_test_support import (
     _sm107_device,
     _training_abi_prepared,
     _training_config,
+    _training_device,
+    _training_wgrad_supported,
     _training_prepared_pair,
     _unpack_wgrad_scale_part_bytes,
 )
@@ -218,6 +220,29 @@ def test_wgrad_declines_architectures_without_a_wgrad_kernel():
     assert reason is not None and "not supported on Blackwell SM100" in reason
     with pytest.raises(NotImplementedError, match="compute capability 10.3"):
         wgrad_unavailable_reason((10, 3))
+
+
+@pytest.mark.L0
+def test_training_wgrad_declines_on_device_without_a_wgrad_kernel():
+    device = _training_device()
+    if _training_wgrad_supported(device):
+        pytest.skip("this training architecture has a WGrad kernel")
+    capacity = 256
+    with MoeEp(
+        _training_config(
+            num_experts=_EXPERTS,
+            hidden_size=_HIDDEN,
+            intermediate_size=_INTERMEDIATE,
+            top_k=2,
+            max_tokens_per_rank=capacity,
+            physical_recv_pool_rows=_round_up(capacity * 2 + 128 * _EXPERTS, 128),
+            combine_format="bf16",
+        ).public_config
+    ) as op:
+        # Forward and backward still prepare; only WGrad is declined, before any operand check.
+        op.prepare_training(device=device)
+        with pytest.raises(RuntimeError, match="WGrad is not supported on Blackwell SM100"):
+            op.training_wgrad(None, out=None)
 
 
 @pytest.mark.L0

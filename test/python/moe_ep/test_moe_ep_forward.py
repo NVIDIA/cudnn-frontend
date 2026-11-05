@@ -1790,6 +1790,19 @@ def test_megamoe_architecture_selects_vendored_kernels(capability, forward_class
 
 
 @pytest.mark.L0
+def test_inference_call_declines_on_blackwell_device():
+    from cudnn import MoeEp
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 0):
+        pytest.skip("requires a Blackwell SM100 device")
+    args = make_forward_inputs(torch.device("cuda", 0))
+
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        with pytest.raises(NotImplementedError, match="inference is not supported on Blackwell SM100"):
+            op(*args)
+
+
+@pytest.mark.L0
 def test_megamoe_inference_declines_blackwell(monkeypatch):
     from cudnn.moe_ep._megamoe_backend import _capability
 

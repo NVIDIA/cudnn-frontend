@@ -96,11 +96,13 @@ from moe_ep.moe_ep_test_support import (
     _poison_pre_reduced_for_test,
     _poison_training_outputs_for_test,
     _require_distributed_sm107,
+    _require_distributed_training,
     _run_isolated,
     _run_training_wgrad,
     _sm107_device,
     _training_abi_prepared,
     _training_config,
+    _training_device,
     _training_prepared_pair,
     make_forward_inputs,
     quantize_mxfp8,
@@ -2103,7 +2105,7 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
-    _require_distributed_sm107(2)
+    _require_distributed_training(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
@@ -2138,7 +2140,7 @@ def test_training_graph_error_mode_overflow_asserts_on_all_ep2_ranks():
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 def test_training_graph_drop_mode_overflow_completes_forward_and_backward():
-    _require_distributed_sm107(2)
+    _require_distributed_training(2)
     env = os.environ.copy()
     env.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     # The probe runs in a fresh interpreter and imports moe_ep.*, so test/python must be on its path.
@@ -2192,7 +2194,7 @@ def test_ds3_prepares_qualified_upstream_kernel(
         _prepare_environment,
     )
 
-    device = _sm107_device()
+    device = _training_device()
     architecture, launch_cluster_count = _prepare_environment(
         device,
         cluster_size=2,
@@ -2237,7 +2239,8 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
 ):
     from cudnn import MoeEpTuningConfig
 
-    device = _sm107_device()
+    device = _training_device()
+    _skip_forward_tuning_declined_on_device(device, forward_tuning)
     args = make_forward_inputs(device)
     args = (*args[:4], args[4].float().contiguous())
     grad_output = _grad_output(device, args[0].shape[0], seed=20260911)
@@ -2363,7 +2366,7 @@ def test_discrete_training_forward_backward_and_graph_match_reference(
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("world_size", [2, 4], ids=["ep2", "ep4"])
 def test_discrete_training_multi_gpu_matches_reference(world_size, tmp_path):
-    _require_distributed_sm107(world_size)
+    _require_distributed_training(world_size)
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     init_file = tmp_path / f"discrete_training_ep{world_size}.init"
     mp.spawn(
@@ -2402,6 +2405,19 @@ def test_training_multi_gpu_mixed_cga_matches_reference(world_size, tuning_name,
         join=False,
     )
     _join_spawned_with_deadline(context, what=f"EP{world_size} mixed-CGA training {tuning_name} ({storage_mode})")
+
+
+def _skip_forward_tuning_declined_on_device(device: torch.device, tuning: dict, combine_format: str = "bf16") -> None:
+    """Skip a case whose training-forward tuning this device's forward kernel declines (see MegaMoeArchitecture)."""
+
+    from cudnn import MoeEpTuningConfig
+    from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+    architecture = architecture_for(torch.cuda.get_device_capability(device))
+    try:
+        architecture.validate_forward_tuning("training_forward_tuning", MoeEpTuningConfig(**tuning), combine_format)
+    except NotImplementedError as error:
+        pytest.skip(str(error))
 
 
 _TRAINING_FORWARD_TUNING_CASES = {
@@ -2473,7 +2489,7 @@ def _training_forward_tuning_worker(case_name: str) -> None:
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("case_name", sorted(_TRAINING_FORWARD_TUNING_CASES))
 def test_training_forward_kernel_tuning_does_not_accumulate_across_calls(case_name):
-    _sm107_device()
+    _skip_forward_tuning_declined_on_device(_training_device(), _TRAINING_FORWARD_TUNING_CASES[case_name])
     _run_isolated(
         _training_forward_tuning_worker,
         (case_name,),
@@ -2677,7 +2693,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
 ):
     """Consumers must ignore poisoned capacity tails across dynamic expert ranges."""
 
-    device = _sm107_device()
+    device = _training_device()
     base_args = make_forward_inputs(device)
     repeats = (token_count + base_args[0].shape[0] - 1) // base_args[0].shape[0]
     activation = base_args[0].dequantize(input_dtype).repeat((repeats, 1))[:token_count].contiguous()
@@ -2939,7 +2955,7 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
 def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
     """Decode only offsets/counts-defined rows across padding boundaries."""
 
-    device = _sm107_device()
+    device = _training_device()
     generator = torch.Generator(device=device).manual_seed(20260904 + token_count)
     hidden = 128
     intermediate = 256
@@ -3060,7 +3076,7 @@ def test_training_wgrad_valid_range_contract_at_128_row_boundaries(token_count):
 def test_native_io_mxfp8_poisoned_capacity_cuda_graph_replay():
     """Validate poisoned fixed-capacity operands at fixed-T graph replay."""
 
-    device = _sm107_device()
+    device = _training_device()
     base_args = make_forward_inputs(device)
     activation = base_args[0]
     topk_idx = base_args[3]

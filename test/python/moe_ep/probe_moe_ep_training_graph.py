@@ -579,9 +579,9 @@ def main() -> None:
         device_id=device,
     )
     try:
-        capability = torch.cuda.get_device_capability(device)
-        if capability != (10, 7):
-            raise RuntimeError("stateless training graph probe requires SM107")
+        from cudnn.moe_ep._megamoe_backend.mxfp8._arch import architecture_for
+
+        architecture_for(torch.cuda.get_device_capability(device))
         _runtime_debug(
             "probe.main.ready",
             world_size=world_size,
