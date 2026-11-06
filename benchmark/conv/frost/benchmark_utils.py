@@ -73,6 +73,15 @@ class BenchmarkResult:
     error: str = ""
 
 
+def frost_conv_unsupported_reason() -> Optional[str]:
+    """Why the FROST conv engines cannot serve the current GPU, or ``None``: they
+    compile for SM100 and SM103 only."""
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) not in ((10, 0), (10, 3)):
+        return f"FROST conv needs an SM100 or SM103 GPU; found SM{major}{minor}, skipping."
+    return None
+
+
 def select_tile_configs(spec: Optional[str], heuristic_config: str, configs: Sequence[ConvTileConfig]) -> list[str]:
     """Resolve ``--configs`` into compatible catalog names in catalog order."""
     config_by_name = {config.name: config for config in configs}

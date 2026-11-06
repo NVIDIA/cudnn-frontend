@@ -333,6 +333,14 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=5, help="measured runs (default: 5)")
     parser.add_argument("--verbose", action="store_true", help="print complete CuTe DSL logs")
     args = parser.parse_args()
+    import torch
+
+    if torch.cuda.is_available():
+        from benchmark_utils import frost_gemm_unsupported_reason
+
+        reason = frost_gemm_unsupported_reason()
+        if reason is not None:
+            raise SystemExit(reason)
     batch, m, n, k = args.shape
 
     if args.warmup < 0 or args.iters <= 0:
