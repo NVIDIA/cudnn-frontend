@@ -117,7 +117,7 @@ Only setting either (saved mean and inverse_variance) or (epsilon) is necessary.
     - compute_data_type
     - name
 
-`peer_stats` behaves as in [Batchnorm](#batchnorm).
+`peer_stats` behaves as in [Batchnorm Forward](#batchnorm-forward).
 
 ## Generate Stats
 
@@ -401,9 +401,12 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
-`adaptive` is a Python-only flag for the adaptive normalization variant: for a 3-D sequence-first `input` with a
-scale of shape `(S, 1, D)` or `(1, S, D)`, it changes the inferred `mean`/`variance` dims to per-token statistics
-instead of per-channel ones. It is accepted by `rmsnorm`, `instancenorm` and `instancenorm_backward`.
+`adaptive` is a Python-only flag for adaptive InstanceNorm. The input must be channels-first contiguous
+(`[N, C, L]`, `[N, C, H, W]` or `[N, C, D, H, W]`), and `scale`/optional `bias` must be per sample and channel
+with singleton spatial dimensions -- `[N, C, 1]`, `[N, C, 1, 1]`, `[N, C, 1, 1, 1]`; the statistics have that
+same shape and the reduction runs over the spatial axes. Adaptive InstanceNorm is served by Python engines only
+(`adaptive=False` keeps backend eligibility). For the adaptive LayerNorm/RMSNorm layouts (`[B, S, D]` / `[S, B, D]`
+with `[B, 1, D]` / `[1, B, D]` scale) see the norm guide (`python/cudnn/norm/README.md`).
 
 ## Instancenorm Backward (DIN)
 
