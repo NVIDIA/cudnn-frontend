@@ -74,17 +74,25 @@ try_ensure_current_context(std::optional<std::intptr_t> stream, std::optional<in
         CUdevice ordinal = 0;
         if (context_device(&ordinal) == CUDA_SUCCESS && ordinal == *device) return true;
     }
-    // The binding holds the GIL. Like _device._primary_context's lru_cache,
-    // retain at most once per device and preserve a failed lookup as nullptr.
+    // Different graphs can reach this process-wide cache from cold threads.
+    // Serialize lookup AND retain, so each primary context is retained once.
+    // No Python callbacks run while this lock is held. It is a no-op in a
+    // GIL-enabled extension, where the binding still holds the GIL.
+    static py::ft_mutex primary_contexts_mutex;
     static std::unordered_map<int, CUcontext> primary_contexts;
-    auto [entry, inserted] = primary_contexts.try_emplace(*device, nullptr);
-    if (inserted) {
-        CUdevice ordinal  = 0;
-        CUcontext primary = nullptr;
-        if (get_device(&ordinal, *device) == CUDA_SUCCESS && retain_primary(&primary, ordinal) == CUDA_SUCCESS)
-            entry->second = primary;
+    CUcontext target = nullptr;
+    {
+        py::ft_lock_guard lock(primary_contexts_mutex);
+        auto [entry, inserted] = primary_contexts.try_emplace(*device, nullptr);
+        if (inserted) {
+            CUdevice ordinal  = 0;
+            CUcontext primary = nullptr;
+            if (get_device(&ordinal, *device) == CUDA_SUCCESS && retain_primary(&primary, ordinal) == CUDA_SUCCESS)
+                entry->second = primary;
+        }
+        target = entry->second;
     }
-    if (entry->second != nullptr) set_current(entry->second);
+    if (target != nullptr) set_current(target);
     return true;
 #else
     (void)stream;
