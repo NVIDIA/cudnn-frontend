@@ -969,8 +969,8 @@ def select_template(
 ) -> KernelTemplate:
     """The single template that renders (chain, config)."""
     if chain.has_moe and chain.moe.uniform_group_rows:
-        if config.pipeline != "sm100" or config.swap_ab or isinstance(chain.moe, MoeSwapAbSpec):
-            raise NotImplementedError("row gather currently uses the non-swapped SM100 grouped loader")
+        if config.pipeline not in ("sm100", "sm120") or config.swap_ab or isinstance(chain.moe, MoeSwapAbSpec) or chain.has_block_scale:
+            raise NotImplementedError("indirect row gather requires a non-swapped, non-block-scaled grouped loader")
     gt = classify_graph_type(chain)
     matches = [
         t

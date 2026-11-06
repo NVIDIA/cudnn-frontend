@@ -106,14 +106,19 @@ def test_frost_row_gather_declines_unsupported(case, reason):
         analyze_with_binding(g)
 
 
-@pytest.mark.parametrize("pipeline,swap_ab", [("sm100", True), ("sm120", False)])
-def test_frost_row_gather_declines_other_loaders(pipeline, swap_ab):
+@pytest.mark.parametrize("pipeline", ["sm100", "sm120"])
+def test_frost_row_gather_loader_selection(pipeline):
+    from dataclasses import replace
     from cudnn.gemm.frost.kernel_registry import select_template
+    from cudnn.gemm.frost.tile_config import by_name
 
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if pipeline == "sm100" else "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     g, *_ = _graph()
     chain, _ = analyze_with_binding(g)
-    with pytest.raises(NotImplementedError, match="non-swapped SM100"):
-        select_template(chain, SimpleNamespace(pipeline=pipeline, swap_ab=swap_ab))
+    template = select_template(chain, cfg)
+    assert template.async_gather == (pipeline == "sm100")
+    with pytest.raises(NotImplementedError, match="non-swapped"):
+        select_template(chain, replace(cfg, swap_ab=True))
 
 
 def test_frost_gather_validation():
@@ -315,3 +320,282 @@ def test_frost_row_gather_index_helper_on_hopper(dtype):
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
     finally:
         captured.reset()
+
+
+@pytest.mark.parametrize("source_shape,axis", [((3, 4), 0), ((3, 4), -1), ((2, 3, 4), 1), ((2, 3, 4), 2)])
+@pytest.mark.parametrize("view", ["identity", "reshape", "transpose"])
+def test_frost_indirect_index_map(source_shape, axis, view):
+    from itertools import product
+    from cudnn.gemm.frost.fusion_ir import IndirectIndex, IndexMap
+
+    indices_shape = (2, 2)
+    access = IndirectIndex.take("indices", source_shape, indices_shape, axis)
+    normalized_axis = axis % len(source_shape)
+    logical = access.indices_map.consumer_shape
+    mapping = (
+        IndexMap.identity(logical)
+        if view == "identity"
+        else IndexMap.reshape(logical, (prod(logical),)) if view == "reshape" else IndexMap.permutation(logical, tuple(reversed(range(len(logical)))))
+    )
+    projected = access.compose(mapping)
+    assert projected.indices_ref == "indices"
+    assert projected.source_axis == normalized_axis
+    assert projected.bounds_policy == "zero"
+    for coordinates in product(*(range(d) for d in mapping.consumer_shape)):
+        if view == "reshape":
+            linear = coordinates[0]
+            original = tuple((linear // prod(logical[i + 1 :])) % d for i, d in enumerate(logical))
+        elif view == "transpose":
+            original = tuple(reversed(coordinates))
+        else:
+            original = coordinates
+        actual = tuple(expr.evaluate(coordinates) for expr in projected.indices_map.coordinates)
+        assert actual == original[normalized_axis : normalized_axis + len(indices_shape)]
+
+
+def _composition_graph(*, source_prefix=(), repartition=False, epilogue="relu", dtype=cudnn.data_type.BFLOAT16):
+    graph = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+
+    def tensor(shape, dt, name):
+        return graph.tensor(dim=list(shape), stride=_stride(shape), data_type=dt, name=name)
+
+    source = tensor((*source_prefix, 71, 128), dtype, "source")
+    indices = tensor((2, 3, 16), cudnn.data_type.INT32, "indices")
+    gathered = graph.gather(source, indices, axis=len(source_prefix))
+    shape = (*source_prefix, 2, 3, 16, 128)
+    if repartition:
+        shape = (3, 32, 128)
+        gathered = graph.reshape(gathered).set_dim(list(shape)).set_stride(_stride(shape))
+    weight = tensor((*shape[:-2], 128, 128), dtype, "weight")
+    raw = graph.matmul(gathered, weight).set_data_type(dtype)
+    aux = None
+    if epilogue == "bias":
+        aux = tensor((128,), cudnn.data_type.FLOAT, "bias")
+        out = graph.add(raw, aux)
+    elif epilogue == "shared":
+        raw.set_output(True)
+        out = graph.add(graph.relu(raw), graph.neg(raw))
+    elif epilogue == "index":
+        out = raw
+        for axis in range(len(shape)):
+            out = graph.add(out, graph.gen_index(raw, axis=axis))
+    else:
+        out = graph.relu(raw)
+    out.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    return graph, source, indices, weight, raw, out, aux
+
+
+@pytest.mark.parametrize("source_prefix,repartition", [((), False), ((1,), False), ((1, 1), False), ((), True)])
+@pytest.mark.parametrize("epilogue", ["relu", "shared", "bias", "index"])
+def test_frost_gather_composes_with_epilogue_and_views(source_prefix, repartition, epilogue):
+    graph, source, indices, weight, raw, out, aux = _composition_graph(source_prefix=source_prefix, repartition=repartition, epilogue=epilogue)
+    assert validate_graph(graph)
+    chain, binding = analyze_with_binding(graph)
+    assert binding.a_operands == [source]
+    assert binding.b_operands == [weight]
+    assert out in binding.outputs
+    assert (raw in binding.outputs) == (epilogue == "shared")
+    assert chain.indirect_index.indices_ref == "indices"
+    assert chain.indirect_index.source_axis == len(source_prefix)
+    assert chain.moe.uniform_group_rows == (32 if repartition else 16)
+    assert chain.matmul.M == 96
+    if aux is not None:
+        assert chain.aux_tensors[0].dtype == "fp32"
+        assert binding.aux == [aux]
+    if epilogue == "index":
+        from cudnn.gemm.frost.fusion_ir import Axis
+
+        shape = tuple(raw.get_dim())
+        index_ops = [op for op in chain.ops if op.op == "gen_index"]
+        for row in range(96):
+            coords = {Axis.BATCH: 0, Axis.M: row, Axis.N: 17}
+            expected = tuple((row // prod(shape[i + 1 : -1])) % d for i, d in enumerate(shape[:-1])) + (17,)
+            assert tuple(op.index_expr.evaluate(coords) for op in index_ops) == expected
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.INT8, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
+def test_frost_gather_declines_unsupported_output_before_binding(dtype):
+    graph, *_, out, _aux = _composition_graph()
+    out.set_data_type(dtype)
+    with pytest.raises(NotImplementedError, match="outputs only"):
+        analyze_with_binding(graph)
+
+
+def test_frost_gather_epilogue_runtime_binding():
+    if not torch.cuda.is_available():
+        pytest.skip("runtime binding requires CUDA")
+    from cudnn.gemm.frost import compiler
+
+    graph, source, indices, weight, raw, out, aux = _composition_graph(epilogue="bias", repartition=True)
+    chain, binding = analyze_with_binding(graph)
+    compiled = SimpleNamespace(chain=chain, binding=binding, _compiler=compiler, device=torch.cuda.current_device())
+    pack = {
+        source: torch.empty(source.get_dim(), device="cuda", dtype=torch.bfloat16),
+        indices: torch.zeros(indices.get_dim(), device="cuda", dtype=torch.int32),
+        weight: torch.empty(weight.get_dim(), device="cuda", dtype=torch.bfloat16),
+        out: torch.empty(out.get_dim(), device="cuda", dtype=torch.float32),
+        aux: torch.empty(aux.get_dim(), device="cuda", dtype=torch.float32),
+    }
+    resolved = compiler._resolve_moe_variant_pack(compiled, pack)
+    assert tuple(resolved[2][0].shape) == (1, 96, 128)
+    assert tuple(resolved[3][0].shape) == (1, 1, 128)
+    assert resolved[3][0].data_ptr() == pack[aux].data_ptr()
+    bad = {**pack, aux: pack[aux].bfloat16()}
+    with pytest.raises(ValueError, match="dtype"):
+        compiler._resolve_moe_variant_pack(compiled, bad)
+
+
+@pytest.mark.parametrize("epilogue", ["bias", "shared", "index"])
+def test_frost_gather_composed_launch_uses_fixed_groups_without_allocating(epilogue, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("runtime launch-frame test requires CUDA")
+    from pathlib import Path
+    import cutlass.cute as cute
+    from cudnn.gemm.frost.sm100 import compiler
+    from cudnn.gemm.frost.tile_config import by_name
+
+    graph, source, indices, weight, raw, out, aux = _composition_graph(epilogue=epilogue, repartition=True)
+    chain, binding = analyze_with_binding(graph)
+    frames = []
+    compiled = compiler.CompiledMoeGemm(
+        chain,
+        by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"),
+        Path("unused"),
+        lambda *args, **kwargs: frames.append((args, kwargs)),
+        binding=binding,
+        device=torch.cuda.current_device(),
+        vec_bytes_epi=16,
+    )
+    pack = {
+        source: torch.empty(source.get_dim(), device="cuda", dtype=torch.bfloat16),
+        indices: torch.zeros(indices.get_dim(), device="cuda", dtype=torch.int32),
+        weight: torch.empty(weight.get_dim(), device="cuda", dtype=torch.bfloat16),
+        out: torch.empty(out.get_dim(), device="cuda", dtype=torch.float32),
+    }
+    if aux is not None:
+        pack[aux] = torch.empty(aux.get_dim(), device="cuda", dtype=torch.float32)
+    if raw in binding.outputs:
+        pack[raw] = torch.empty(raw.get_dim(), device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared gather launch must not allocate or compile")
+
+    monkeypatch.setattr(torch, "empty", forbidden)
+    monkeypatch.setattr(cute, "compile", forbidden)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        compiled(pack, workspace, stream=stream.cuda_stream)
+        compiled(pack, workspace, stream=stream.cuda_stream)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert len(frames) == 2
+    for args, kwargs in frames:
+        assert args[0][:5] == (96, 128, 128, 3, 3)
+        assert args[1] is None  # No dummy offsets or host-read routing metadata.
+        assert int(kwargs["stream"]) == stream.cuda_stream
+
+
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("pipeline", ["sm100", "sm120"])
+@pytest.mark.parametrize("epilogue", ["bias", pytest.param("index", marks=pytest.mark.L1), pytest.param("shared", marks=pytest.mark.L1)])
+def test_frost_gather_composed_native_capture(pipeline, epilogue):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("full grouped GEMM requires SM100/SM103; sm120 template is tested in SM100 compatibility mode")
+    from cudnn.gemm.frost.sm100 import compiler as sm100
+    from cudnn.gemm.frost.sm120 import compiler as sm120
+    from cudnn.gemm.frost.tile_config import by_name
+
+    graph, source, indices, weight, raw, out, aux = _composition_graph(epilogue=epilogue, repartition=True)
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if pipeline == "sm100" else "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    compiled = (sm100 if pipeline == "sm100" else sm120).jit_from_cudnn_graph(graph, config=cfg)
+    x = torch.randn(source.get_dim(), device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(96, device="cuda", dtype=torch.int32).reshape(indices.get_dim()) % 71
+    ids.reshape(-1)[::7] = -1
+    ids.reshape(-1)[1::11] = 71
+    w = torch.randn(weight.get_dim(), device="cuda", dtype=torch.bfloat16)
+    y = torch.full(out.get_dim(), float("nan"), device="cuda", dtype=torch.float32)
+    pack = {source: x, indices: ids, weight: w, out: y}
+    if aux is not None:
+        pack[aux] = torch.randn(aux.get_dim(), device="cuda", dtype=torch.float32)
+    if raw in compiled.binding.outputs:
+        pack[raw] = torch.full(raw.get_dim(), float("nan"), device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            compiled(pack, workspace, stream=stream.cuda_stream)
+        with torch.cuda.graph(captured, stream=stream):
+            compiled(pack, workspace, stream=stream.cuda_stream)
+        for iteration in range(2):
+            with torch.cuda.stream(stream):
+                x.mul_(-0.5)
+                ids.add_(3).remainder_(73).sub_(1)
+                y.fill_(float("nan"))
+                captured.replay()
+            stream.synchronize()
+            valid = (ids >= 0) & (ids < 71)
+            materialized = torch.where(valid[..., None], x[ids.clamp(0, 70).long()], 0).reshape(3, 32, 128)
+            reference_raw = (materialized.float() @ w.float()).bfloat16()
+            if epilogue == "bias":
+                reference = reference_raw.float() + pack[aux]
+            elif epilogue == "shared":
+                reference = reference_raw.float().relu() - reference_raw.float()
+                torch.testing.assert_close(pack[raw], reference_raw, rtol=0.02, atol=0.25)
+            else:
+                reference = reference_raw.float()
+                for axis, extent in enumerate(raw.get_dim()):
+                    shape = [1] * len(raw.get_dim())
+                    shape[axis] = extent
+                    reference = reference + torch.arange(extent, device="cuda").reshape(shape)
+            assert torch.isfinite(y).all()
+            torch.testing.assert_close(y, reference, rtol=0.02, atol=0.25)
+            previous = y.clone()
+            with torch.cuda.stream(stream):
+                captured.replay()
+            stream.synchronize()
+            assert torch.equal(y, previous)
+    finally:
+        captured.reset()
+
+
+def test_frost_moe_gather_uses_the_same_indirect_description():
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+
+    def tensor(shape, dt, name):
+        return graph.tensor(dim=list(shape), stride=_stride(shape), data_type=dt, name=name)
+
+    source = tensor((1, 71, 128), cudnn.data_type.BFLOAT16, "source")
+    weight = tensor((3, 128, 128), cudnn.data_type.BFLOAT16, "weight")
+    indices = tensor((1, 96, 1), cudnn.data_type.INT32, "indices")
+    offsets = tensor((4, 1, 1), cudnn.data_type.INT32, "offsets")
+    raw = graph.moe_grouped_matmul(source, weight, offsets, token_index=indices, mode=cudnn.moe_grouped_matmul_mode.GATHER)
+    graph.relu(raw).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    chain, binding = analyze_with_binding(graph)
+    access = chain.indirect_index
+    assert access.indices_ref == "indices"
+    assert access.source_axis == 1
+    assert tuple(expr.evaluate((0, 29, 37)) for expr in access.indices_map.coordinates) == (0, 29, 0)
+    assert binding.first_token_offset is offsets
+    assert chain.moe.uniform_group_rows == 0
+    assert [op.op for op in chain.ops] == ["relu"]
+
+
+def test_frost_indirect_map_matches_sparse_attention_key_and_value_views():
+    """One query/slot index relation serves both QK and PV operand layouts."""
+    from cudnn.gemm.frost.fusion_ir import IndirectIndex, IndexMap
+
+    keys = IndirectIndex.take("topk_indices", (71, 576), (3, 5), 0)
+    qk_keys = keys.compose(IndexMap.permutation((3, 5, 576), (0, 2, 1)))
+    values = IndirectIndex.take("topk_indices", (71, 512), (3, 5), 0)
+    for query in range(3):
+        for slot in range(5):
+            assert tuple(expr.evaluate((query, 575, slot)) for expr in qk_keys.indices_map.coordinates) == (query, slot)
+            assert tuple(expr.evaluate((query, slot, 511)) for expr in values.indices_map.coordinates) == (query, slot)

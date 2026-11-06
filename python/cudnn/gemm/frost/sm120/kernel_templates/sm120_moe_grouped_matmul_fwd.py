@@ -255,7 +255,9 @@ def _kernel(
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
     # Every group is cut into the same N tiling; only its M tiling is its own.
     tiles_along_n = cute.ceil_div(cutlass.Int32(N), cgrp_tile_mnk[1])
-    first_token_arr = cutlass.make_array_view(first_token_offset)
+    first_token_arr = None
+    if cutlass.const_expr(gather_group_rows == 0):
+        first_token_arr = cutlass.make_array_view(first_token_offset)
 
     if warp_idx >= NUM_COMPUTE_WARPS:
         nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
@@ -298,9 +300,13 @@ def _kernel(
                     my_end = cutlass.Int32(0)
                     my_tiles = cutlass.Int32(0)
                     if visit_idx < num_groups:
-                        if my_group != 0:
-                            my_begin = cutlass.Int32(first_token_arr[my_group])
-                        my_end = cutlass.Int32(first_token_arr[my_group + 1])
+                        if cutlass.const_expr(gather_group_rows > 0):
+                            my_begin = my_group * gather_group_rows
+                            my_end = my_begin + gather_group_rows
+                        else:
+                            if my_group != 0:
+                                my_begin = cutlass.Int32(first_token_arr[my_group])
+                            my_end = cutlass.Int32(first_token_arr[my_group + 1])
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * tiles_along_n
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):
@@ -528,7 +534,9 @@ def _kernel(
 
         # Routed rows the groups cover (the final offset, at most the capacity M): the count an
         # ungrouped AVG over tokens divides by. At least 1, so an empty routing flushes 0, not NaN.
-        moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), M), cutlass.Int64(1))
+        moe_used_rows = M
+        if cutlass.const_expr(gather_group_rows == 0):
+            moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), M), cutlass.Int64(1))
         _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
         red_part_seed(_red_part)
         while is_valid != 0:
@@ -954,12 +962,14 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    fake_first_token_offset = make_fake_compact_tensor(
-        offset_cutlass_dtype,
-        (cute.sym_int64(),),
-        stride_order=(0,),
-        assumed_align=offset_cutlass_dtype.width // 8,
-    )
+    fake_first_token_offset = None
+    if gather_group_rows == 0:
+        fake_first_token_offset = make_fake_compact_tensor(
+            offset_cutlass_dtype,
+            (cute.sym_int64(),),
+            stride_order=(0,),
+            assumed_align=offset_cutlass_dtype.width // 8,
+        )
     fake_a_tma_workspace = make_fake_compact_tensor(
         cutlass.Int64,
         (grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS + TENSOR_MAP_QWORDS,),

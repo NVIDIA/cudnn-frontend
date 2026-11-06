@@ -99,6 +99,7 @@ cudnn.NodeType.CONCATENATE
 cudnn.NodeType.CONV_DGRAD
 cudnn.NodeType.CONV_FPROP
 cudnn.NodeType.CONV_WGRAD
+cudnn.NodeType.GATHER
 cudnn.NodeType.GDN
 cudnn.NodeType.GDN2
 cudnn.NodeType.GDN2_BWD
@@ -1480,6 +1481,7 @@ cudnn.pygraph.execute_plan_at_index
 cudnn.pygraph.exp
 cudnn.pygraph.find_tensor
 cudnn.pygraph.floor
+cudnn.pygraph.gather
 cudnn.pygraph.gdn
 cudnn.pygraph.gdn2
 cudnn.pygraph.gdn2_bwd

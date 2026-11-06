@@ -701,13 +701,24 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
 
     views = {id(t): view for t, view in b.operand_views} if compiled.chain.moe.uniform_group_rows else {}
 
+    declared_dtypes = None
+    if views:
+        declared_dtypes = {id(t): compiled.chain.matmul.a_dtype for t in b.a_operands}
+        declared_dtypes.update({id(t): compiled.chain.matmul.b_dtype for t in b.b_operands})
+        declared_dtypes.update({id(t): spec.dtype for spec, t in zip(compiled.chain.outputs, b.outputs)})
+        declared_dtypes.update({id(t): ref.dtype for ref, t in zip(compiled.chain.aux_tensors, b.aux)})
+        if b.token_index is not None:
+            declared_dtypes[id(b.token_index)] = "int32"
+
     def pull(t, role):
         if t is None or id(t) not in resolved:
             raise KeyError(f"variant pack is missing a buffer for {role}")
         value = resolved[id(t)]
         if views:
-            declared_dtype = "int32" if t is b.token_index else compiled.chain.output_dtype if role == "output" else compiled.chain.matmul.a_dtype
-            expected_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32", "int32": "int32"}[declared_dtype]
+            declared_dtype = declared_dtypes[id(t)]
+            expected_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32", "int32": "int32"}.get(declared_dtype)
+            if expected_dtype is None:
+                raise ValueError(f"indirect {role} dtype {declared_dtype!r} is not supported by this binding")
             if buffers.dtype_name(value) != expected_dtype:
                 raise ValueError(f"row gather {role} dtype does not match the prepared graph")
             declared_device = getattr(value, "device", None)
@@ -800,11 +811,11 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     if views:
         # Gather inputs remain live throughout the tiled GEMM; output aliasing
         # cannot be made safe by the order of graph nodes.
-        values = [*a_bufs, *b_bufs, *(pull(t, "indices") for t in (b.token_index,))]
+        values = [*a_bufs, *b_bufs, *aux_bufs, pull(b.token_index, "indices")]
         for output in out_bufs:
             olo = buffers.data_ptr(output)
             ohi = olo + (1 + sum((d - 1) * s for d, s in zip(output.shape, output.stride()))) * output.element_size()
-            for value in values:
+            for value in (*values, *(other for other in out_bufs if other is not output)):
                 lo = buffers.data_ptr(value)
                 hi = lo + (1 + sum((d - 1) * s for d, s in zip(value.shape, value.stride()))) * value.element_size()
                 if olo < hi and lo < ohi:
@@ -1471,7 +1482,10 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         if len(outs) != len(outputs_spec):
             raise ValueError(f"fused multi-GEMM MoE has {len(outputs_spec)} output(s); got {len(outs)}")
         out = outs[0]
-        for name, t, rank in (("output", out, 3), ("first_token_offset", first_token_offset, 1)):
+        ranked = [("output", out, 3)]
+        if not chain.moe.uniform_group_rows:
+            ranked.append(("first_token_offset", first_token_offset, 1))
+        for name, t, rank in ranked:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for role, slots, major in (("token", a_slots, chain.matmul.a_major), ("weight", b_slots, chain.matmul.b_major)):
@@ -1489,7 +1503,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                     f"multi-GEMM MoE output {spec.source!r} must have shape {backend._expected_output_shape(spec, chain, (S, N, K), top_k_scores)}; got {tuple(ci.shape)}"
                 )
         num_experts = int(b_slots[0].shape[0])
-        num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        num_groups = self.chain.moe.num_groups if self.chain.moe.uniform_group_rows else backend._moe_num_groups(first_token_offset, num_experts)
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]

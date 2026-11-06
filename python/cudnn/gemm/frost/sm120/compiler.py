@@ -451,6 +451,7 @@ def _render_tile_constants(
         lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        lines.append(f"gather_group_rows = {chain.moe.uniform_group_rows}")
         lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
@@ -789,6 +790,7 @@ def _render_block_scale_tile_constants(
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        lines.append(f"gather_group_rows = {chain.moe.uniform_group_rows}")
         lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
         lines.append("external_counter_reset = False")
     lines.extend(_quant_device_imports(chain))

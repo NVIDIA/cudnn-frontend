@@ -287,6 +287,50 @@ class IndexMap:
         return tuple(expr.substitute(dict(enumerate(coordinates))) for expr in self.coordinates)
 
 
+@dataclass(frozen=True)
+class IndirectIndex:
+    """Override one source coordinate with a runtime index-tensor load.
+
+    indices_map maps consumer coordinates to the index tensor, not to its
+    contents. IndexExpr and IndexMap therefore remain pure integer geometry.
+    Source storage/dtype and the copy mechanism belong to the operand and
+    backend respectively; grouping/scheduling is deliberately not encoded here.
+    """
+
+    indices_ref: str
+    source_axis: int
+    indices_map: IndexMap
+    bounds_policy: str = "zero"
+
+    def __post_init__(self):
+        if not isinstance(self.indices_ref, str) or not self.indices_ref:
+            raise ValueError("indirect index requires a named indices reference")
+        object.__setattr__(self, "source_axis", index(self.source_axis))
+        if self.source_axis < 0 or not isinstance(self.indices_map, IndexMap):
+            raise ValueError("indirect index requires a normalized source axis and an IndexMap")
+        if self.bounds_policy != "zero":
+            raise ValueError("indirect index currently supports only zero-filled out-of-bounds access")
+
+    @classmethod
+    def take(cls, indices_ref, source_shape, indices_shape, axis):
+        """Describe take-style axis insertion independently of copy capability."""
+        source_shape, indices_shape = tuple(source_shape), tuple(indices_shape)
+        IndexMap.identity(source_shape)
+        IndexMap.identity(indices_shape)
+        axis = index(axis)
+        if axis < 0:
+            axis += len(source_shape)
+        if not 0 <= axis < len(source_shape):
+            raise ValueError("gather axis is outside the source rank")
+        consumer_shape = (*source_shape[:axis], *indices_shape, *source_shape[axis + 1 :])
+        indices_map = IndexMap(consumer_shape, indices_shape, tuple(IndexExpr.coordinate(axis + i) for i in range(len(indices_shape))))
+        return cls(indices_ref, axis, indices_map)
+
+    def compose(self, consumer_map):
+        """Reuse ordinary view composition around an indirect access."""
+        return dataclasses.replace(self, indices_map=self.indices_map.compose(consumer_map))
+
+
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
 REDUCTION_DTYPES: tuple[Dtype, ...] = ("fp32", "int32")
 
@@ -823,6 +867,7 @@ class FusionChain:
     reductions: list[ReductionSpec] = field(default_factory=list)
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
     gemm_out_dtypes: tuple[Dtype, ...] = ()
+    indirect_index: IndirectIndex | None = None
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):
