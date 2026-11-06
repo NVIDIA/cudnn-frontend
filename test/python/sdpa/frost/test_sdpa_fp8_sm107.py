@@ -838,12 +838,13 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d256(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d128_mxfp8(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
     cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
     # Block-scaled Rubin cells still refuse split.
     unwired = [
-        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d192 mxfp8", cfg.make_cfg_d192_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d256 mxfp8", cfg.make_cfg_d256_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
     for name, make, params in unwired:
@@ -1928,6 +1929,12 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=False) == (1,)
+    # the per-tensor d192x128 kernel lists the single CTA on the 107 line with an fp8 O only
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True, fp8_o=True) == (1, 2)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (2,)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     # the row domain, narrowed per graph
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert dict(caps.cgas_by_d_shape)[(256, 256)] == frozenset({1, 2})
@@ -2330,3 +2337,16 @@ class TestNativeCausalZeroTail:
     from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
 
     test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)
+
+
+import sdpa_bwd_fp8_d192_sm107 as _d192_bwd_checks
+
+ds_knob = _d192_bwd_checks.ds_knob
+test_stage3_tile_rule_fp8_d192 = _d192_bwd_checks.test_stage3_tile_rule_fp8_d192
+
+
+@requires_rubin
+class TestNativeFp8D192Bwd:
+    """Run the D192/V128 per-tensor fp8 backward pair checks in the native CI entry."""
+
+    test_native_stage3 = staticmethod(_d192_bwd_checks.test_d192_native_stage3_matches_the_oracle_and_the_d256_row)

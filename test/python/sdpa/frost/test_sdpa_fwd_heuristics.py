@@ -904,8 +904,9 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     GQA 1 and 3, S=4K..32K, controls <= 0.35 %; O / Stats / Amax_O bitwise identical across policies).  The notch is
     an explicit oracle arm, not a domain effect (unlike d256: the d128 kernel serves LPT_L2), so the row's domain must
     still list all three.  Everything around it keeps the old proposal: the per-tensor FP8 d128 row measured
-    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor and the Rubin d128 MXFP8 row are unmeasured
-    and lead with LPT_L2 on a GQA graph; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
+    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor leads with LPT_L2 on a
+    GQA graph; the sm107 quantized d128 rows lead with plain LPT below _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES per KV
+    head on a GQA graph and keep the L2-budget arm above it; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
@@ -931,7 +932,13 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     # Scope: d128 only, SM100 row only, causal only.
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
+    rubin_fp8 = caps[engines.engine_name(fp8=True, arch="sm107")]
     assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    for s in (2048, 4096):
+        short = {**quant, "s_q": s, "s_kv": s}
+        assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=24, device_cc=(10, 7), **short))[0] != SCHED_LPT_L2, s
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, causal=False, **quant)) == [SCHED_NATURAL]
 
 
@@ -2414,3 +2421,81 @@ def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     assert paged_thd_split_choice(rubin, f)[0] > 1
     sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
     assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))
+
+
+@pytest.mark.L0
+def test_sm107_pt_fp8_d192_mha_causal_fp8_o_lists_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d192x128 row lists both widths for a dense unsplit MHA causal graph with an fp8 O inside the
+    K/V budget, and the auto pick takes the single CTA; a half-precision O, GQA, a mask-free graph or a larger K/V set keep cga2."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=64,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=192,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    assert effective_cgas(spec.capabilities, _facts(**base)) == frozenset({1, 2})
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+
+    assert _auto_sched_cga(spec, _facts(**base), split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    for off in (dict(dtype_o=cudnn.data_type.BFLOAT16), dict(h_kv=8), dict(causal=False), dict(h_q=128, h_kv=128)):
+        assert effective_cgas(spec.capabilities, _facts(**{**base, **off})) == frozenset({2}), off
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    assert effective_cgas(mx_spec.capabilities, _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "h_q": 128, "h_kv": 128})) == frozenset({2})
+
+
+@pytest.mark.L0
+def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d128 row lists both widths on dense unsplit graphs inside the K/V budget and the auto pick takes
+    the single CTA with the scheduler it was handed; THD and the larger K/V sets keep the pair."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=8,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    for over, sched in (
+        (dict(), SCHED_LPT),
+        (dict(causal=False), SCHED_NATURAL),
+        (dict(b=1, h_q=40, h_kv=40, s_q=7800, s_kv=7800, causal=False), SCHED_NATURAL),
+    ):
+        facts = _facts(**{**base, **over})
+        assert effective_cgas(spec.capabilities, facts) == frozenset({1, 2}), over
+        assert _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched) == (sched, 1), over
+    assert effective_cgas(spec.capabilities, _facts(**{**base, "b": 8, "h_kv": 64})) == frozenset({2})
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_LPT) == (SCHED_LPT, 1)
