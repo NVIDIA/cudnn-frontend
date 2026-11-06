@@ -154,6 +154,18 @@ policies:
   Both launches use the caller stream and are CUDA-graph capture/replay safe after
   `compile()`.
 
+On SM90, production `coff=2`, ratio-2 backward adds one measured 16-row producer
+bucket while keeping 8 rows for smaller capacities. Atomic plans switch at 8,192
+compressed rows for `head_dim=128`. For `head_dim=512`, the atomic 16-row bucket
+is limited to the measured `[4,096, 5,121)` safe interval; larger capacities
+retain 8 rows because additional grid-wave occupancy steps showed regressions.
+Deterministic plans switch at 4,096 and 2,048
+rows for `head_dim=128` and `512`, respectively, and keep 16 rows thereafter.
+Other `coff`/head dimensions and architecture families retain the 8-row schedule.
+The deterministic 16-row bucket halves the partial workspace. The selected row
+count is bound by the prepared plan, so `execute()` does not query device
+capability or specialize on device-side sequence metadata.
+
 #### Deterministic dAPE performance
 
 CUDA-event medians over 100 iterations after 30 warmups on one GB200
@@ -200,8 +212,9 @@ against an unchanged-source checkout for the independent control.
 
 ### Support surface (`check_support`)
 
-- Compute-capability major **>= 10** (SM100 and newer; the kernels use no
-  architecture-specific features beyond the SM100 baseline)
+- SM90 and compute-capability major **>= 10** for the generic ratio `{2, 4}`
+  kernels. Ratio 128 remains SM100-or-newer only; its schedule and tolerance
+  contract have not yet been validated on SM90.
 - `ratio in {2, 4}`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
   `coff == 1` the own-block window form; `ratio == 2` is the configuration used in
   production training) — served by the generic kernels, which are
@@ -256,8 +269,15 @@ Set `coff=1` for the `ratio`-token own-block window (and use `kv` / `score` tens
 packed width is `head_dim`); `coff=2` selects the `2 * ratio` overlapping window shown
 above.
 
-The wrappers cache compiled API instances; the underlying JIT is shared per
-`(ratio, head_dim, coff, device)`, so runtime shape changes never recompile.
+The wrappers keep a bounded LRU of prepared API instances. The generic forward
+artifact is shared per `(ratio, head_dim, coff, device)`; generic backward adds
+`deterministic` and the bounded `rows_per_cta` schedule bucket. In particular,
+the generic row-count domain is the finite set `{8, 16, 24}`: SM90 ratio-2 uses
+the documented capacity bucket, and ratio-4 deterministic backward has only its
+documented short/long capacity buckets. The SM90 and SM100-family artifacts
+remain device-scoped and are lowered for the active device; packed token totals
+and per-sequence length distributions within a schedule bucket are runtime
+data, not compile specializations.
 
 ### Class API
 
