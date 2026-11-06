@@ -82,6 +82,24 @@ def _require_csa_device(ratio=4):
         pytest.skip(f"ratio {ratio} requires compute capability major >= 10")
 
 
+def _bwd_smem_need_and_limit(ratio, d, coff, total_comp):
+    """(per-CTA shared memory the ratio=128 backward needs, what the current device allows)."""
+    from cudnn._device import device_info
+    from cudnn.csa.compressor.compressor_sm100_r128 import bwd_smem_bytes_r128
+
+    return bwd_smem_bytes_r128(ratio, d, coff, total_comp), device_info(torch.cuda.current_device()).shared_memory_per_block_optin
+
+
+def _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp):
+    """Skip where the ratio=128 backward's CTA does not fit the device's per-CTA shared memory (for example d=512 coff=2
+    on cc 12.x): check_support() declines that plan with NotImplementedError instead of launching it."""
+    if ratio != 128:
+        return
+    need, limit = _bwd_smem_need_and_limit(ratio, d, coff, total_comp)
+    if need > limit:
+        pytest.skip(f"ratio=128 backward needs {need} B of shared memory per CTA; this device allows {limit} B")
+
+
 # ---------------------------------------------------------------------------
 # Eager reference (self-contained mirror of the Megatron-LM eager region)
 # ---------------------------------------------------------------------------
@@ -304,6 +322,7 @@ def test_numerics_vs_references(lens, d, ratio, coff):
     ratio=128), upstream eager, and fp64 oracle."""
     _require_csa_device(ratio)
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
 
     r_fused = _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go)
     r_fp32 = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp32")
@@ -767,6 +786,7 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     total_comp = total_true + pad
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     gen = torch.Generator(device="cpu").manual_seed(11)
     go = torch.randn(total_comp, d, generator=gen, dtype=torch.float32).to(torch.bfloat16).cuda()
     total = kv.shape[0] + tok_pad
@@ -1212,6 +1232,7 @@ def test_backward_deterministic_dape(lens, d, ratio, coff):
     _require_csa_device(ratio)
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     r_fp32 = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp32")
 
     prev_det = torch.are_deterministic_algorithms_enabled()
@@ -1846,8 +1867,35 @@ def test_check_support_accepts_envelope_r128(d, coff):
     compressor = _import_compressor()
     for cls in (compressor.CSACompressorForward, compressor.CSACompressorBackward):
         api = cls(**_meta_samples(total=1024, d=d, ratio=128, coff=coff), ratio=128, coff=coff)
+        need, limit = _bwd_smem_need_and_limit(128, d, coff, 8)
+        if cls is compressor.CSACompressorBackward and need > limit:
+            # A device with less per-CTA shared memory than this schedule (cc 12.x for d=512 coff=2) declines it.
+            with pytest.raises(NotImplementedError, match="shared memory per CTA"):
+                api.check_support()
+            continue
         assert api.check_support() is True
         assert api.head_dim == d and api.total_tokens == 1024 and api.total_comp == 8
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True], ids=["atomic", "deterministic"])
+def test_r128_backward_shared_memory_gate_spares_empty_output(monkeypatch, deterministic):
+    """On a device below the ratio=128 backward's per-CTA shared memory, a plan with compressed rows is declined, but an
+    empty output (every sequence shorter than the ratio) launches no kernel and still passes check_support."""
+    import types
+
+    _require_csa_device(128)
+    compressor = _import_compressor()
+    from cudnn.csa.compressor import api as csa_api
+    from cudnn.csa.compressor.compressor_sm100_r128 import bwd_smem_bytes_r128
+
+    need = bwd_smem_bytes_r128(128, 512, 2, 8)
+    monkeypatch.setattr(csa_api, "device_info", lambda index: types.SimpleNamespace(shared_memory_per_block_optin=need - 1))
+    empty = compressor.CSACompressorBackward(**_meta_samples(total=2, d=512, ratio=128, coff=2, total_comp=0), ratio=128, coff=2, deterministic=deterministic)
+    assert empty.check_support() is True
+    rows = compressor.CSACompressorBackward(**_meta_samples(total=1024, d=512, ratio=128, coff=2), ratio=128, coff=2, deterministic=deterministic)
+    with pytest.raises(NotImplementedError, match="shared memory per CTA"):
+        rows.check_support()
 
 
 @pytest.mark.L0
