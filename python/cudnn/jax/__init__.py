@@ -16,8 +16,10 @@ from importlib import import_module
 
 import jax as _jax
 
-if _jax.version.__version_info__ < (0, 9, 1):
-    raise ImportError(f"cudnn.jax requires jax >= 0.9.1; found {_jax.__version__}")
+from cudnn import MIN_JAX_VERSION
+
+if _jax.version.__version_info__ < MIN_JAX_VERSION:
+    raise ImportError(f"cudnn.jax requires jax >= {'.'.join(map(str, MIN_JAX_VERSION))}; found {_jax.__version__}")
 
 from .call import (
     call,
