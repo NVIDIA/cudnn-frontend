@@ -2682,7 +2682,7 @@ graphs retain typed declines. Dense support below remains unchanged.
 | Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, ≤ 512ᵃ | ×8, ≤ 256 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ✅ | ✅ | ✅ (cc 12.0, exact D128 MHA; restrictions above) |
+| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, exact D128 MHA; restrictions above) |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |
 | **Masks / features** | | | |

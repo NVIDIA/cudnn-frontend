@@ -21,7 +21,7 @@ from d128_thd_test_utils import (
 )
 from frost_test_utils import _SM, requires_dsl
 
-pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 120, reason="requires SM120")]
+pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM not in (120, 121), reason="requires SM120 or SM121")]
 
 
 def _graph_case(case):
