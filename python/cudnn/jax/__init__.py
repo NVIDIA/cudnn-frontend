@@ -9,10 +9,15 @@ with ``jax.jit`` (and CUDA graph capture). :func:`cudnn.jax.call` is a thin wrap
 adding the conveniences the cuDNN kernels need — pre-initialized accumulator outputs
 and TensorSpec presets for the layouts the GEMM fusions use.
 
-Requires jax >= 0.5 and the CuTeDSL JAX extensions (shipped with nvidia-cutlass-dsl).
+Requires jax >= 0.9.1 and the CuTeDSL JAX extensions (shipped with nvidia-cutlass-dsl).
 """
 
 from importlib import import_module
+
+import jax as _jax
+
+if _jax.version.__version_info__ < (0, 9, 1):
+    raise ImportError(f"cudnn.jax requires jax >= 0.9.1; found {_jax.__version__}")
 
 from .call import (
     call,
