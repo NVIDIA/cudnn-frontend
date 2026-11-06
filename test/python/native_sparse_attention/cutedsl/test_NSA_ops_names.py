@@ -22,6 +22,7 @@ def test_cudnn_ops_nsa_name_is_the_existing_wrapper(name, wrapper):
         from cudnn import NSA
     except ImportError as error:
         pytest.skip(f"cudnn optional dependencies not installed: {error}")
-    from cudnn.ops import nsa
+    else:
+        from cudnn.ops import nsa
 
-    assert getattr(nsa, name) is getattr(NSA, wrapper)
+        assert getattr(nsa, name) is getattr(NSA, wrapper)
