@@ -14,13 +14,17 @@ The call contract is the FlashInfer Qwen 3.5 GDN block's verify form (its argume
 reference kernel (FlashInfer's built-in ``frost`` verify backend) is a one-line swap: ``entry(qkv, z, hidden, ba_weight, A_log, dt_bias, ssm_state, state_indices,
 cu_seqlens, num_accepted_tokens, norm_weight, out_scale, conv_state, conv_weight, out=None, out_bf16=None) -> out`` (the fp8
 output; ``out_bf16`` receives the bf16 ``y`` before quantization when given, else the entry's scratch).  Served geometry (declined
-otherwise, by name): ``qkv`` [rows, 10240] bf16 (a row-strided view is fine), ``z`` [rows, 48, 128] bf16 (row-strided), ``hidden``
-[rows, 5120] bf16 contiguous, ``ba_weight`` [96, 5120] bf16 contiguous, ``A_log`` / ``dt_bias`` [48] fp32 or bf16, the fp32 state
-``[slots, 48, 128, 128]`` (slot-strided), ``state_indices`` [requests, T] int32 (any row stride; ``T`` = tokens per request, a
-compile-time constant), ``cu_seqlens`` [requests + 1] and ``num_accepted_tokens`` [requests] int32 contiguous, ``norm_weight`` [128]
-fp32 or bf16, ``out_scale`` one fp32, ``conv_state`` [slots, 10240, T + 2] bf16 CHANNEL-CONTIGUOUS (stored ``[slots, T + 2, 10240]``:
-``stride(1) == 1``, the slot and column strides multiples of 8 elements), ``conv_weight`` [10240, 4] bf16 contiguous; every operand
-16-byte aligned; an SM100-class (compute capability 10.x) or SM120-class (12.x) part and a CuTe DSL >= 4.8.0.  Semantics (the per-token state layout): request
+otherwise, by name): the entry's ``geometry`` -- a ``Geometry(K_HEADS, V_HEADS, HIDDEN)`` of ``kernel/gdn_geometry.py`` (the rank's head
+counts and hidden width; the default geometry, 16 K heads / 48 V heads / hidden 5120, when none is given, so existing callers are
+unchanged; a caller's ``cfg`` carries its own in ``cfg.GEOM``) -- with head dim 128 and conv width 4 pinned: ``qkv`` [rows, QKV_CHANNELS =
+2 K 128 + V 128] bf16 (a row-strided view is fine; 10240 at the default), ``z`` [rows, V, 128] bf16 (row-strided), ``hidden`` [rows,
+HIDDEN] bf16 contiguous, ``ba_weight`` [2 V, HIDDEN] bf16 contiguous, ``A_log`` / ``dt_bias`` [V] fp32 or bf16, the fp32 state ``[slots, V,
+128, 128]`` (slot-strided), ``state_indices`` [requests, T] int32 (any row stride; ``T`` = tokens per request, a compile-time constant),
+``cu_seqlens`` [requests + 1] and ``num_accepted_tokens`` [requests] int32 contiguous, ``norm_weight`` [128] fp32 or bf16, ``out_scale``
+one fp32, ``conv_state`` [slots, QKV_CHANNELS, T + 2] bf16 CHANNEL-CONTIGUOUS (stored ``[slots, T + 2, QKV_CHANNELS]``: ``stride(1) ==
+1``, the slot and column strides multiples of 8 elements), ``conv_weight`` [QKV_CHANNELS, 4] bf16 contiguous; every operand 16-byte
+aligned; an SM100-class (compute capability 10.x) or SM120-class (12.x) part and a CuTe DSL >= 4.8.0.  Each geometry is its own compiled
+form (``Cfg.GEOM`` is in the compile key).  Semantics (the per-token state layout): request
 ``n`` with ``a = num_accepted_tokens[n]`` in ``[1, T]`` starts from slot ``state_indices[n, a - 1]`` and writes the state after token
 ``t`` to slot ``state_indices[n, t]`` (a slot ``<= 0`` skips that write); its conv slot ``state_indices[n, 0]`` holds columns ``a - 1 ..
 a + 1`` of the history and becomes ``[old[a], old[a + 1], x_0 .. x_{T-1}]``; a request whose source slot is ``<= 0`` (or whose conv slot
@@ -52,18 +56,16 @@ from typing import Any, Dict, Optional, Tuple
 
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 
+from .kernel.gdn_geometry import DEFAULT_GEOMETRY, Geometry
 from .kernel.gdn_verify_fused_config import (
     CFG,
     CONV_WIDTH,
     HEAD_DIM,
-    HIDDEN,
     ONE_CTA_FORMS,
-    QKV_CHANNELS,
     SM100_SMEM_OPTIN_BYTES,
     SM100_SMEM_PER_SM_BYTES,
     TICKET_STRIDE,
     TOKENS_MIN,
-    V_HEADS,
     Cfg,
     default_cfg,
     first_fitting,
@@ -83,7 +85,7 @@ SUPPORTED_CC_TEXT = "10.x (SM100-class) or 12.x (SM120-class)"
 DSL_FLOOR = (4, 8, 0)
 DSL_FLOOR_TEXT = ".".join(str(x) for x in DSL_FLOOR)
 NAME = "the fused GDN verify step"
-#: the launch is grid ``(48, requests, 1)`` (``kernel/gdn_verify_fused_f16.py``), one grid row per request: CUDA caps grid Y at 65535
+#: the launch is grid ``(V_HEADS, requests, 1)`` (``kernel/gdn_verify_fused_f16.py``), one grid row per request: CUDA caps grid Y at 65535
 MAX_REQUESTS = 65535
 
 
@@ -193,6 +195,21 @@ def _check_device(tensors, device, anchor) -> None:
             raise ValueError(f"{NAME}: every operand must live on one device, {whose} ({want}); {name} is on {t.device}")
 
 
+def resolve_geometry(geometry, cfg: Optional[Cfg] = None) -> Geometry:
+    """The geometry a call is checked against: ``geometry`` when given (a ``Geometry``, else ``TypeError``), else the ``cfg``'s own
+    (``cfg.GEOM``), else the default geometry; a ``cfg`` compiled for another geometry than the one given is a ``ValueError`` (one source)."""
+    if geometry is not None and not isinstance(geometry, Geometry):
+        raise TypeError(f"{NAME}: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
+    if cfg is not None and geometry is not None and cfg.GEOM != geometry:
+        raise ValueError(
+            f"{NAME}: the cfg is compiled for {cfg.GEOM.describe()} but the geometry names {geometry.describe()}; give one source "
+            f"(kernel.gdn_verify_fused_config.with_geometry(cfg, geometry) compiles a form for the geometry)"
+        )
+    if geometry is not None:
+        return geometry
+    return cfg.GEOM if cfg is not None else DEFAULT_GEOMETRY
+
+
 def step_shape(state_indices) -> Tuple[int, int]:
     """``(requests, tokens per request)`` of a verify step: the two extents of the slot-index table."""
     if state_indices.dim() != 2:
@@ -220,20 +237,25 @@ def check_binding(
     cfg: Optional[Cfg] = None,
     rows: Optional[int] = None,
     device=None,
+    geometry: Optional[Geometry] = None,
 ) -> None:
     """The binding checks, run before every compile AND every launch (compile-cache hits included): ``TypeError`` for a dtype (or a
     non-tensor), ``ValueError`` for an inconsistent shape, stride, alignment or device, ``NotImplementedError`` for a geometry / layout /
     step shape this kernel does not serve.  ``device`` (an entry's: a concrete CUDA ordinal) requires every operand on exactly that device,
-    type AND index; without it the operands must share ``qkv``'s.  The compile key pins the plan-time facts only (the step shape, the
-    strides the kernel is specialized on, the parameter dtypes, the config), and a compiled DSL entry accepts a tensor of another dtype,
-    footprint or device silently, so these checks are a launch's only guard; host-only metadata arithmetic, no device work.  ``cfg``
-    (resolved) bounds the tokens per request by its shared-memory budget -- an entry passes the form it picked for the step
-    (:meth:`GdnVerifyFused.cfg_for`, token-aware on this part); without one the module's one-CTA form ``CFG`` bounds it (8 tokens on the
-    cc 10.0 readings), the bound of a host caller that names no device and no form; ``rows`` (the step's token rows, ``>=
-    cu_seqlens[requests]`` by the caller's contract) bounds the row operands and the outputs for a ragged or padded step instead of
-    ``requests x T``.  :func:`check_support` adds the architecture gate."""
+    type AND index; without it the operands must share ``qkv``'s.  ``geometry`` (an entry's) is the rank's head counts and hidden width the
+    operand shapes are checked against: the given ``cfg``'s own (``cfg.GEOM``) without one, the default geometry (16 K heads, 48 V heads,
+    hidden 5120) without either.  The compile key pins the plan-time facts only (the step shape, the strides the kernel is specialized on,
+    the parameter dtypes, the config -- its geometry included), and a compiled DSL entry accepts a tensor of another dtype, footprint or
+    device silently, so these checks are a launch's only guard; host-only metadata arithmetic, no device work.  ``cfg`` (resolved) bounds
+    the tokens per request by its shared-memory budget -- an entry passes the form it picked for the step (:meth:`GdnVerifyFused.cfg_for`,
+    token-aware on this part); without one the module's one-CTA form ``CFG`` bounds it (8 tokens on the cc 10.0 readings), the bound of a
+    host caller that names no device and no form; ``rows`` (the step's token rows, ``>= cu_seqlens[requests]`` by the caller's contract)
+    bounds the row operands and the outputs for a ragged or padded step instead of ``requests x T``.  :func:`check_support` adds the
+    architecture gate."""
     import torch
 
+    g = resolve_geometry(geometry, cfg)
+    QKV, NV, HID = g.QKV_CHANNELS, g.V_HEADS, g.HIDDEN
     tensors = dict(
         zip(
             OPERANDS,
@@ -303,25 +325,25 @@ def check_binding(
         if not isinstance(rows, int) or rows < 1:
             raise ValueError(f"{NAME}: rows must be a positive int (the step's token rows, at least cu_seqlens[requests]); got {rows!r}")
         bound = f"the step's rows = {rows}"
-    # geometry
-    if qkv.dim() != 2 or qkv.shape[0] < rows or qkv.shape[1] != QKV_CHANNELS:
-        raise NotImplementedError(f"{NAME} serves qkv as [rows >= {bound}, {QKV_CHANNELS}] (16 K heads, 48 V heads x 128); got {tuple(qkv.shape)}")
+    # geometry (the entry's ``g``: its head counts and hidden width; head dim 128 and conv width 4 pinned)
+    if qkv.dim() != 2 or qkv.shape[0] < rows or qkv.shape[1] != QKV:
+        raise NotImplementedError(
+            f"{NAME} serves qkv as [rows >= {bound}, {QKV}] ({g.K_HEADS} K heads, {NV} V heads x {HEAD_DIM}: {g.describe()}); got {tuple(qkv.shape)}"
+        )
     if qkv.stride(1) != 1 or qkv.stride(0) % 8:
         raise NotImplementedError(f"{NAME} needs qkv rows contiguous with a 16-byte-multiple row stride; got strides {tuple(qkv.stride())}")
-    if z.dim() != 3 or z.shape[0] < rows or tuple(z.shape[1:]) != (V_HEADS, HEAD_DIM):
-        raise NotImplementedError(f"{NAME} serves z as [rows >= {rows}, {V_HEADS}, {HEAD_DIM}]; got {tuple(z.shape)}")
+    if z.dim() != 3 or z.shape[0] < rows or tuple(z.shape[1:]) != (NV, HEAD_DIM):
+        raise NotImplementedError(f"{NAME} serves z as [rows >= {rows}, {NV}, {HEAD_DIM}]; got {tuple(z.shape)}")
     if tuple(z.stride()[1:]) != (HEAD_DIM, 1) or z.stride(0) % 8:
         raise NotImplementedError(f"{NAME} needs z heads contiguous with a 16-byte-multiple row stride; got strides {tuple(z.stride())}")
-    if hidden.dim() != 2 or hidden.shape[0] < rows or hidden.shape[1] != HIDDEN or not hidden.is_contiguous():
-        raise NotImplementedError(
-            f"{NAME} serves a contiguous hidden of [rows >= {rows}, {HIDDEN}]; got {tuple(hidden.shape)} strides {tuple(hidden.stride())}"
-        )
-    if tuple(ba_weight.shape) != (2 * V_HEADS, HIDDEN) or not ba_weight.is_contiguous():
-        raise NotImplementedError(f"{NAME} serves a contiguous ba_weight of [{2 * V_HEADS}, {HIDDEN}]; got {tuple(ba_weight.shape)}")
-    if A_log.numel() < V_HEADS or dt_bias.numel() < V_HEADS or not A_log.is_contiguous() or not dt_bias.is_contiguous():
-        raise NotImplementedError(f"{NAME} serves contiguous A_log / dt_bias of {V_HEADS} V heads; got {tuple(A_log.shape)} / {tuple(dt_bias.shape)}")
-    if ssm_state.dim() != 4 or tuple(ssm_state.shape[1:]) != (V_HEADS, HEAD_DIM, HEAD_DIM):
-        raise NotImplementedError(f"{NAME} serves the fp32 ssm_state as [slots, {V_HEADS}, {HEAD_DIM}, {HEAD_DIM}]; got {tuple(ssm_state.shape)}")
+    if hidden.dim() != 2 or hidden.shape[0] < rows or hidden.shape[1] != HID or not hidden.is_contiguous():
+        raise NotImplementedError(f"{NAME} serves a contiguous hidden of [rows >= {rows}, {HID}]; got {tuple(hidden.shape)} strides {tuple(hidden.stride())}")
+    if tuple(ba_weight.shape) != (2 * NV, HID) or not ba_weight.is_contiguous():
+        raise NotImplementedError(f"{NAME} serves a contiguous ba_weight of [{2 * NV}, {HID}]; got {tuple(ba_weight.shape)}")
+    if A_log.numel() < NV or dt_bias.numel() < NV or not A_log.is_contiguous() or not dt_bias.is_contiguous():
+        raise NotImplementedError(f"{NAME} serves contiguous A_log / dt_bias of {NV} V heads; got {tuple(A_log.shape)} / {tuple(dt_bias.shape)}")
+    if ssm_state.dim() != 4 or tuple(ssm_state.shape[1:]) != (NV, HEAD_DIM, HEAD_DIM):
+        raise NotImplementedError(f"{NAME} serves the fp32 ssm_state as [slots, {NV}, {HEAD_DIM}, {HEAD_DIM}]; got {tuple(ssm_state.shape)}")
     if tuple(ssm_state.stride()[1:]) != (HEAD_DIM * HEAD_DIM, HEAD_DIM, 1) or ssm_state.stride(0) % 4:
         raise NotImplementedError(
             f"{NAME} needs head slabs of {HEAD_DIM} x {HEAD_DIM} contiguous fp32 and a 16-byte-multiple slot stride; got strides {tuple(ssm_state.stride())}"
@@ -336,25 +358,25 @@ def check_binding(
         raise NotImplementedError(f"{NAME} serves a contiguous norm_weight of {HEAD_DIM}; got {tuple(norm_weight.shape)}")
     if out_scale.numel() < 1:
         raise ValueError(f"{NAME}: out_scale must hold the static FP8 scale (one fp32 element); got {tuple(out_scale.shape)}")
-    if conv_state.dim() != 3 or conv_state.shape[1] != QKV_CHANNELS:
-        raise NotImplementedError(f"{NAME} serves conv_state as [slots, {QKV_CHANNELS}, T + {CONV_WIDTH - 2}]; got {tuple(conv_state.shape)}")
+    if conv_state.dim() != 3 or conv_state.shape[1] != QKV:
+        raise NotImplementedError(f"{NAME} serves conv_state as [slots, {QKV}, T + {CONV_WIDTH - 2}]; got {tuple(conv_state.shape)}")
     if conv_state.shape[2] != tokens + CONV_WIDTH - 2:
         raise NotImplementedError(
             f"{NAME} serves a conv_state of T + {CONV_WIDTH - 2} = {tokens + CONV_WIDTH - 2} history columns for T = {tokens} tokens per request; got {conv_state.shape[2]}"
         )
     css, csd, cst = (int(s) for s in conv_state.stride())
-    if csd != 1 or cst % 8 or cst < QKV_CHANNELS or css % 8:
+    if csd != 1 or cst % 8 or cst < QKV or css % 8:
         raise NotImplementedError(
-            f"{NAME} needs conv_state channel-contiguous (stored [slots, T + {CONV_WIDTH - 2}, {QKV_CHANNELS}]: stride(1) == 1, the slot and column strides multiples of 8 elements); got strides {tuple(conv_state.stride())}"
+            f"{NAME} needs conv_state channel-contiguous (stored [slots, T + {CONV_WIDTH - 2}, {QKV}]: stride(1) == 1, the slot and column strides multiples of 8 elements); got strides {tuple(conv_state.stride())}"
         )
-    if tuple(conv_weight.shape) != (QKV_CHANNELS, CONV_WIDTH) or not conv_weight.is_contiguous():
+    if tuple(conv_weight.shape) != (QKV, CONV_WIDTH) or not conv_weight.is_contiguous():
         raise NotImplementedError(
-            f"{NAME} serves a contiguous conv_weight [{QKV_CHANNELS}, {CONV_WIDTH}]; got {tuple(conv_weight.shape)} strides {tuple(conv_weight.stride())}"
+            f"{NAME} serves a contiguous conv_weight [{QKV}, {CONV_WIDTH}]; got {tuple(conv_weight.shape)} strides {tuple(conv_weight.stride())}"
         )
     for name, t in (("out", out), ("out_bf16", out_bf16)):
-        if t is not None and (t.dim() != 3 or t.shape[0] < rows or tuple(t.shape[1:]) != (V_HEADS, HEAD_DIM) or not t.is_contiguous()):
+        if t is not None and (t.dim() != 3 or t.shape[0] < rows or tuple(t.shape[1:]) != (NV, HEAD_DIM) or not t.is_contiguous()):
             raise ValueError(
-                f"{NAME}: {name} must be a contiguous [rows >= {bound}, {V_HEADS}, {HEAD_DIM}] tensor; got {tuple(t.shape)} strides {tuple(t.stride())}"
+                f"{NAME}: {name} must be a contiguous [rows >= {bound}, {NV}, {HEAD_DIM}] tensor; got {tuple(t.shape)} strides {tuple(t.stride())}"
             )
     for name, t in tensors.items():
         if t.numel() > 1:  # every multi-element operand is declared 16-byte aligned to the kernel (_flat); a one-element scale is not
@@ -382,10 +404,11 @@ def check_support(
     cfg: Optional[Cfg] = None,
     rows: Optional[int] = None,
     device=None,
+    geometry: Optional[Geometry] = None,
 ) -> None:
-    """Typed declines, before any DSL import: the binding checks of :func:`check_binding` (``cfg`` / ``rows`` / ``device`` as there) plus
-    the architecture gate (``NotImplementedError`` for a part this kernel does not serve).  ``device_cc`` overrides the compute-capability
-    probe (tests)."""
+    """Typed declines, before any DSL import: the binding checks of :func:`check_binding` (``cfg`` / ``rows`` / ``device`` / ``geometry``
+    as there) plus the architecture gate (``NotImplementedError`` for a part this kernel does not serve).  ``device_cc`` overrides the
+    compute-capability probe (tests)."""
     import torch
 
     check_binding(
@@ -408,6 +431,7 @@ def check_support(
         cfg=cfg,
         rows=rows,
         device=device,
+        geometry=geometry,
     )
     dev = qkv.device
     if device_cc is None and dev.type != "cuda":
@@ -426,23 +450,36 @@ def _flat(t):
 
 
 class GdnVerifyFused:
-    """Compiled per (requests, tokens per request, strides, parameter dtypes, config) and shared by every GDN layer: all per-layer
-    tensors are launch arguments.  ``cfg`` overrides the config as a whole; without it the entry picks the form per step shape
-    (``default_cfg`` on this device's SM count and shared-memory readings: the cluster pair, two CTAs per V head, while the ``requests x
-    96`` CTAs have an SM each, one CTA per SM while the ``requests x 48`` CTAs have one, two CTAs per SM past that -- each where the part
-    holds it, else the regime's ladder of shallower-ring forms, token-aware; :meth:`max_tokens_for` is the served bound).  The entry starts
-    from the first one-CTA form this part holds (``CFG`` on the cc 10.0 readings, the landing-slab form on a 99 KB opt-in; a part holding
-    none is a typed ``NotImplementedError`` at construction).  An entry built for a non-CUDA device (host tests) has no SM count to pick
-    by and keeps the one-CTA form ``CFG`` on the cc 10.0 readings.  The device is resolved to a concrete CUDA ordinal at construction
-    (:func:`resolve_device`), and every operand of every compile / launch must live on exactly it.  ``pdl`` / ``pdl_release`` (None = the
-    form's own fields) are the launch knobs on top of the form that serves."""
+    """Compiled per (requests, tokens per request, strides, parameter dtypes, config -- its geometry included) and shared by every GDN
+    layer: all per-layer tensors are launch arguments.  ``cfg`` overrides the config as a whole; without it the entry picks the form per
+    step shape (``default_cfg`` on this device's SM count and shared-memory readings for the entry's geometry: the cluster pair, two CTAs
+    per V head, while the ``requests x 2 V`` CTAs have an SM each (``requests x 96`` at the default geometry), one CTA per SM while the
+    ``requests x V`` CTAs have one (``requests x 48``), two CTAs per SM past that -- each where the part holds it, else the regime's ladder
+    of shallower-ring forms, token-aware; :meth:`max_tokens_for` is the served bound).  ``geometry`` is the rank's head counts and hidden
+    width (a ``kernel.gdn_geometry.Geometry``): the default geometry without one, a given ``cfg``'s own (``cfg.GEOM``) otherwise -- a
+    ``cfg`` and a ``geometry`` that disagree are a ``ValueError``; every form the entry picks is stamped with it, every binding check reads
+    it.  The entry starts from the first one-CTA form this part holds (``CFG`` on the cc 10.0 readings, the landing-slab form on a 99 KB
+    opt-in; a part holding none is a typed ``NotImplementedError`` at construction).  An entry built for a non-CUDA device (host tests)
+    has no SM count to pick by and keeps the one-CTA form ``CFG`` on the cc 10.0 readings.  The device is resolved to a concrete CUDA
+    ordinal at construction (:func:`resolve_device`), and every operand of every compile / launch must live on exactly it.  ``pdl`` /
+    ``pdl_release`` (None = the form's own fields) are the launch knobs on top of the form that serves."""
 
-    def __init__(self, device, eps: float, cfg: Optional[Cfg] = None, debug: bool = False, pdl: Optional[bool] = None, pdl_release: Optional[bool] = None):
+    def __init__(
+        self,
+        device,
+        eps: float,
+        cfg: Optional[Cfg] = None,
+        debug: bool = False,
+        pdl: Optional[bool] = None,
+        pdl_release: Optional[bool] = None,
+        geometry: Optional[Geometry] = None,
+    ):
         import torch
 
         self.device = resolve_device(device)  # a CUDA device without an index is the current ordinal: the one every operand must match
         self.eps = float(eps)
         self.cfg_given = cfg is not None
+        self.geometry: Geometry = resolve_geometry(geometry, cfg)  # the rank's head counts and hidden width: stamped into every form
         self.debug_flag = bool(debug)
         # the launch knobs on top of whatever form serves: None keeps the form's own PDL / PDL_RELEASE fields (the picks: off)
         self.pdl: Optional[bool] = None if pdl is None else bool(pdl)
@@ -465,8 +502,8 @@ class GdnVerifyFused:
         self.buffers: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
     def _on_this_part(self, cfg: Cfg) -> Cfg:
-        """``cfg`` with this part's shared-memory readings, the debug flag and the launch knobs, validated."""
-        cfg = replace(cfg, DEBUG=self.debug_flag, **self.part, **self.launch_fields(cfg))
+        """``cfg`` with this part's shared-memory readings, the entry's geometry, the debug flag and the launch knobs, validated."""
+        cfg = replace(cfg, DEBUG=self.debug_flag, GEOM=self.geometry, **self.part, **self.launch_fields(cfg))
         validate_cfg(cfg)
         return cfg
 
@@ -491,7 +528,7 @@ class GdnVerifyFused:
         if tokens is not None and not isinstance(tokens, int):
             raise ValueError(f"{NAME}: tokens must be an int or None, got {tokens!r}")
         want = None if tokens is None else max(tokens, TOKENS_MIN)
-        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count, *self.readings, want)
+        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count, *self.readings, want, self.geometry)
         key = (form, requests)
         if key not in self.forms:
             self.forms[key] = resolve_cfg(self._on_this_part(form), requests)
@@ -503,35 +540,36 @@ class GdnVerifyFused:
         opt-in), or a given ``cfg``'s own bound -- the one bound ``check_support`` and FlashInfer's probe answer alike."""
         if self.cfg_given or self.sm_count is None:
             return self.cfg.max_tokens()
-        return max_tokens_served(requests, self.sm_count, *self.readings)
+        return max_tokens_served(requests, self.sm_count, *self.readings, self.geometry)
 
     @property
     def debug(self) -> bool:
         return self.cfg.DEBUG
 
     def outputs(self, requests: int, tokens: int):
-        """The entry-owned buffers of a step shape: ``qout`` fp8 [rows, 48, 128] and ``out`` bf16 (the defaults when the caller passes
-        no ``out`` / ``out_bf16``), ``counts`` int32 [requests * 512] (the conv-history reader tickets, zero between launches) and, under
-        ``DEBUG`` only, the debug buffers ``raw`` [rows, 48, 128] bf16, ``convout`` [rows, 10240] bf16, ``baout`` [rows, 96] bf16 -- without
-        ``DEBUG`` the kernel's debug slots are compiled out (``None``), never bound to an allocation.  Entry-owned scratch, allocated once
-        per step shape at the first compile / call for it (outside any capture; a FlashInfer runner has no workspace contract to carve it
-        from)."""
+        """The entry-owned buffers of a step shape at the entry's geometry (V V heads, QKV channels): ``qout`` fp8 [rows, V, 128] and
+        ``out`` bf16 (the defaults when the caller passes no ``out`` / ``out_bf16``), ``counts`` int32 [requests * 512] (the conv-history
+        reader tickets, zero between launches) and, under ``DEBUG`` only, the debug buffers ``raw`` [rows, V, 128] bf16, ``convout`` [rows,
+        QKV] bf16, ``baout`` [rows, 2 V] bf16 -- without ``DEBUG`` the kernel's debug slots are compiled out (``None``), never bound to an
+        allocation.  Entry-owned scratch, allocated once per step shape at the first compile / call for it (outside any capture; a
+        FlashInfer runner has no workspace contract to carve it from)."""
         shape = (requests, tokens)
         if shape not in self.buffers:
             import torch
 
             dev = self.device
+            g = self.geometry
             rows = requests * tokens
             buffers = dict(
-                qout=torch.empty(rows, V_HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev),
-                out=torch.empty(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
+                qout=torch.empty(rows, g.V_HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev),
+                out=torch.empty(rows, g.V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
                 counts=torch.zeros(requests * TICKET_STRIDE, dtype=torch.int32, device=dev),
             )
             if self.debug:
                 buffers.update(
-                    raw=torch.zeros(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
-                    convout=torch.zeros(rows, QKV_CHANNELS, dtype=torch.bfloat16, device=dev),
-                    baout=torch.zeros(rows, 2 * V_HEADS, dtype=torch.bfloat16, device=dev),
+                    raw=torch.zeros(rows, g.V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev),
+                    convout=torch.zeros(rows, g.QKV_CHANNELS, dtype=torch.bfloat16, device=dev),
+                    baout=torch.zeros(rows, 2 * g.V_HEADS, dtype=torch.bfloat16, device=dev),
                 )
             self.buffers[shape] = buffers
         return self.buffers[shape]
@@ -650,6 +688,7 @@ class GdnVerifyFused:
             cfg=self.cfg_for(requests, tokens),
             rows=rows,
             device=self.device,
+            geometry=self.geometry,
         )
         key = self.key(qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state)
         if key in self.compiled:
@@ -754,6 +793,7 @@ class GdnVerifyFused:
             cfg=cfg,
             rows=rows,
             device=self.device,
+            geometry=self.geometry,
         )
         key = self.key(qkv, z, A_log, dt_bias, ssm_state, state_indices, norm_weight, conv_state)
         if key not in self.compiled:

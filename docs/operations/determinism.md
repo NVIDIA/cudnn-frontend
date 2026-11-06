@@ -24,8 +24,11 @@ unverified status does not imply an unavailable API.
 ## API support by GPU
 
 The four linear-attention APIs are in `cudnn.linear_attention.ops`; bprop uses
-PyTorch autograd through the same API. QSA APIs are in `cudnn.ops`. `DSA` is
-imported from `cudnn`. The required settings below apply to this table.
+PyTorch autograd through the same API. The two fused GDN step entries
+(`GdnDecodeFused`, `GdnVerifyFused`) are imported from `cudnn` (lazily; also
+under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
+with no backward. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+The required settings below apply to this table.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
@@ -33,6 +36,8 @@ imported from `cudnn`. The required settings below apply to this table.
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
+| `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -45,10 +50,27 @@ imported from `cudnn`. The required settings below apply to this table.
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
 
+`GdnVerifyFused` is batch-invariant under one gated-norm association only: the
+one-request pick takes the two-CTAs-per-head association (`ctas2`, 4-row
+chains), two and more requests one CTA per head (`ctas1`, 8-row chains), so a
+request's normed BF16 output alone differs in its last bits from the same
+request inside a batch by design (`norm_form_for(requests)`); under one
+association its bytes are identical. `GdnDecodeFused` writes the same bytes for
+a row alone and inside a batch under the entry's own picks.
+
 ## Required settings and precision limits
 
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
+- Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
+  switch; every form the entry picks or a knob selects writes the one-CTA
+  form's bytes, so the status holds under any knob and at every served
+  geometry (`Geometry(K_HEADS, V_HEADS, HIDDEN)`; verified at the default
+  27B-class geometry and four per-rank shards). SM100/103 is verified on
+  cc 10.0 and cc 10.3; SM90 is declined by type. The entries also serve
+  SM120-class parts (compute capability 12.x; verified on cc 12.0 with the
+  forms a 99 KB per-CTA opt-in holds) with the same statuses; this page has
+  no SM120 column.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query.

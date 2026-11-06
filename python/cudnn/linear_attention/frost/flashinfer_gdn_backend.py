@@ -15,10 +15,16 @@ FlashInfer floor: the block's backend registry (``api.register_backend`` / ``get
 when this module was written (:data:`FLASHINFER_FLOOR`; importing this module without it raises ``ImportError`` naming the requirement),
 and FlashInfer marks the block experimental: it may change or be removed without deprecation.
 
-Served (:func:`support`, the registry's ``support_fn``: cheap, imports no kernel): both forms at the block's dense-27B geometry at
-tensor-parallel rank 1 (d_model 5120, 48 V heads, 16 K heads, head dims 128, conv kernel 4) on SM100-class (compute capability 10.x) and
-SM120-class (12.x) parts with a CuTe DSL >= 4.8.0.  The
-``decode`` form takes up to 65535 rows (one grid row per request).  The ``verify`` form takes up to 65535 requests (one grid row each) of
+Served (:func:`support`, the registry's ``support_fn``: cheap, imports no kernel): both forms at every geometry inside the kernels'
+envelope -- head dims 128 and conv kernel 4 pinned, at most 16 K heads and 128 V heads per rank (a whole number of V heads per K head),
+``d_model`` a multiple of 1024 (:func:`geometry_off` names the fields outside it): the block's dense-27B geometry at tensor-parallel rank 1
+(``d_model`` 5120, 48 V heads, 16 K heads: :data:`GEOMETRY`, the kernels' default) and the per-rank shards of larger dense models (e.g.
+``d_model`` 8192 with 1 K head and 8 V heads at 16-way tensor parallelism), each compiled as its own form of the same kernel body
+(``Geometry`` of ``kernel/gdn_geometry.py`` rides on the entries' ``Cfg``) -- on SM100-class (compute capability 10.x) and SM120-class
+(12.x) parts with a CuTe DSL >= 4.8.0.  The
+``decode`` form takes up to 65535 rows (one grid row per request; fewer where the kernel's 32-bit row addresses bound the rows first --
+``gdn_decode_fused.max_rows_for``: on contiguous ``qkv`` / ``z`` once ``d_model`` passes 32768, which :func:`support` answers, or with a
+row-strided ``qkv`` / ``z`` view, a typed decline at ``prepare``).  The ``verify`` form takes up to 65535 requests (one grid row each) of
 ``tokens_per_request`` >= 2 tokens, bounded above by the shared-memory budget of the forms the entry picks for that requests count on
 THIS device (:func:`verify_max_tokens` = the entry's ``max_tokens_for``, the bound of the pick's whole ladder: the cluster pair, two CTAs
 per V head, while the ``requests x 96`` CTAs have an SM each, the one-CTA-per-SM form while the ``requests x 48`` CTAs have one, the
@@ -62,6 +68,7 @@ from typing import Any, Dict, Optional, Tuple
 from . import gdn_decode_fused as _decode
 from . import gdn_verify_fused as _verify
 from .kernel.gdn_decode_fused_config import CONV_WIDTH, HEAD_DIM, HIDDEN, K_HEADS, V_HEADS
+from .kernel.gdn_geometry import HIDDEN_GRANULE, MAX_K_HEADS, MAX_V_HEADS, Geometry, geometry_fields_off
 from .kernel.gdn_verify_fused_config import TOKENS_MIN as VERIFY_MIN_TOKENS
 
 __all__ = [
@@ -74,9 +81,11 @@ __all__ = [
     "VERIFY",
     "VERIFY_MAX_REQUESTS",
     "VERIFY_MIN_TOKENS",
+    "PINNED",
     "FrostFeDecodeRunner",
     "FrostFeVerifyRunner",
     "build",
+    "geometry_of",
     "geometry_off",
     "register_frost_fe",
     "support",
@@ -93,13 +102,22 @@ FORMS = (DECODE, VERIFY)
 #: carries from PR #8131 (2026-10-31) on; no tagged FlashInfer release carried it when this module was written, and FlashInfer marks the
 #: block experimental (it may change or be removed without deprecation)
 FLASHINFER_FLOOR = "FlashInfer main at or after PR #8131 (2026-10-31; no tagged release carries the block's backend registry yet)"
-#: the decode launch is grid ``(48, rows, 1)``: CUDA caps grid Y at 65535 -- the entry's own bound (``gdn_decode_fused.MAX_ROWS``; its
-#: ``check_support`` declines past it), so the probe and the direct entry answer alike
+#: the decode launch is grid ``(V_HEADS x CTAS_PER_HEAD, rows, 1)``: CUDA caps grid Y at 65535 -- the entry's own bound
+#: (``gdn_decode_fused.MAX_ROWS``; its ``check_support`` declines past it), so the probe and the direct entry answer alike.  Below it the
+#: kernel's 32-bit row addresses bound the rows (``gdn_decode_fused.max_rows_for``): :func:`support` answers the geometry-only part of that
+#: bound on contiguous ``qkv`` / ``z`` (below 65535 once ``d_model`` passes 32768: 63550 rows at 33792); a row-strided view (a fused QKVZ
+#: projection row) lowers it further, a stride the probe does not see, so the entry declines it by type at ``prepare``
 DECODE_MAX_ROWS = _decode.MAX_ROWS
-#: the verify launch is grid ``(48, requests, 1)``: the same cap, one grid row per request (``gdn_verify_fused.MAX_REQUESTS``)
+#: the verify launch is grid ``(V_HEADS x CTAS_PER_HEAD, requests, 1)``: the same cap, one grid row per request
+#: (``gdn_verify_fused.MAX_REQUESTS``; the verify kernel's row addresses are 64-bit, so no second bound)
 VERIFY_MAX_REQUESTS = _verify.MAX_REQUESTS
-#: the one geometry both kernels are written for, in FlashInfer's ``Qwen35GdnGeometry`` field names (the configs' geometry constants)
+#: the kernels' DEFAULT geometry (the one they were written and validated against: the block's dense-27B geometry at tensor-parallel
+#: rank 1), in FlashInfer's ``Qwen35GdnGeometry`` field names -- one of the geometries served (:func:`geometry_off` admits the envelope)
 GEOMETRY: Dict[str, int] = dict(d_model=HIDDEN, num_v_heads=V_HEADS, num_k_heads=K_HEADS, head_k_dim=HEAD_DIM, head_v_dim=HEAD_DIM, conv_kernel=CONV_WIDTH)
+#: the fields every served geometry pins (the kernels' slab, box, lane and bank maps are written for them)
+PINNED: Dict[str, int] = dict(head_k_dim=HEAD_DIM, head_v_dim=HEAD_DIM, conv_kernel=CONV_WIDTH)
+#: the kernels' ``Geometry`` field per FlashInfer geometry field of the envelope
+_ENVELOPE_FIELDS = dict(K_HEADS="num_k_heads", V_HEADS="num_v_heads", HIDDEN="d_model")
 _PARAM_DTYPE_NAMES = ("torch.float32", "torch.bfloat16", "torch.bfloat16")  # (A_log, dt_bias, norm_weight), the decode kernel's native dtypes
 _ENTRIES = {DECODE: _decode, VERIFY: _verify}
 
@@ -109,26 +127,39 @@ def _what(form: str = DECODE) -> str:
 
 
 def geometry_off(geometry) -> Dict[str, Any]:
-    """The fields of a FlashInfer ``Qwen35GdnGeometry`` that differ from the kernels' geometry (empty = served)."""
-    return {name: getattr(geometry, name) for name, want in GEOMETRY.items() if getattr(geometry, name) != want}
+    """The fields of a FlashInfer ``Qwen35GdnGeometry`` the kernels do not serve, by name (empty = served): a pinned field (``head_k_dim`` /
+    ``head_v_dim`` 128, ``conv_kernel`` 4) with another value, or a head count / ``d_model`` outside the geometry envelope of
+    ``kernel/gdn_geometry.py`` (at most 16 K heads, at most 128 V heads, a whole number of V heads per K head, ``d_model`` a multiple of
+    1024)."""
+    off = {name: getattr(geometry, name) for name, want in PINNED.items() if getattr(geometry, name) != want}
+    for field, value in geometry_fields_off(geometry.num_k_heads, geometry.num_v_heads, geometry.d_model).items():
+        off[_ENVELOPE_FIELDS[field]] = value
+    return off
 
 
-def verify_form(device, requests: Optional[int] = None, norm_eps: float = 1e-6, tokens_per_request: Optional[int] = None):
-    """The verify config a plan for ``requests`` (and ``tokens_per_request``; None = the minimum) compiles with on ``device``: the entry's
-    own pick (``GdnVerifyFused.cfg_for``: the cluster pair -- two CTAs per V head -- while the ``requests x 96`` CTAs have an SM each, the
-    one-CTA-per-SM form while the ``requests x 48`` CTAs have one, the two-CTAs-per-SM form past that, each where THIS device's shared
+def geometry_of(geometry) -> Geometry:
+    """The kernels' ``Geometry`` (K heads, V heads, hidden) of a served FlashInfer ``Qwen35GdnGeometry`` (:func:`geometry_off` empty)."""
+    return Geometry(int(geometry.num_k_heads), int(geometry.num_v_heads), int(geometry.d_model))
+
+
+def verify_form(device, requests: Optional[int] = None, norm_eps: float = 1e-6, tokens_per_request: Optional[int] = None, geometry: Optional[Geometry] = None):
+    """The verify config a plan for ``requests`` (and ``tokens_per_request``; None = the minimum) compiles with on ``device`` for
+    ``geometry`` (the kernels' ``Geometry``; the default geometry when None): the entry's own pick (``GdnVerifyFused.cfg_for``: the cluster
+    pair -- two CTAs per V head -- while the ``requests x 2 V`` CTAs have an SM each (``requests x 96`` at the default geometry), the
+    one-CTA-per-SM form while the ``requests x V`` CTAs have one, the two-CTAs-per-SM form past that, each where THIS device's shared
     memory holds it, else the regime's shallower-ring forms by the step's token count; the pick at one request when no requests count is
     given) with the device's shared-memory readings.  Reads device properties only; imports no kernel.  A device whose shared memory
     holds no verify form is the entry's ``NotImplementedError`` (``support`` maps it to kind ``device``)."""
-    return _verify.GdnVerifyFused(device, norm_eps).cfg_for(
+    return _verify.GdnVerifyFused(device, norm_eps, geometry=geometry).cfg_for(
         1 if requests is None else int(requests), None if tokens_per_request is None else int(tokens_per_request)
     )
 
 
-def verify_max_tokens(device, requests: Optional[int] = None) -> int:
-    """The largest ``tokens_per_request`` the verify pick for ``requests`` holds on ``device``: the bound of the pick's whole ladder
-    (``GdnVerifyFused.max_tokens_for``), the one ``support`` and the entry's own ``check_support`` answer alike."""
-    return _verify.GdnVerifyFused(device, 1e-6).max_tokens_for(1 if requests is None else int(requests))
+def verify_max_tokens(device, requests: Optional[int] = None, geometry: Optional[Geometry] = None) -> int:
+    """The largest ``tokens_per_request`` the verify pick for ``requests`` holds on ``device`` (for ``geometry``; the default when None):
+    the bound of the pick's whole ladder (``GdnVerifyFused.max_tokens_for``), the one ``support`` and the entry's own ``check_support``
+    answer alike."""
+    return _verify.GdnVerifyFused(device, 1e-6, geometry=geometry).max_tokens_for(1 if requests is None else int(requests))
 
 
 def support(device, geometry, form: str, requests: Optional[int], tokens_per_request: Optional[int]):
@@ -144,8 +175,10 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
     if off:
         return Qwen35GdnDecline(
             "geometry",
-            f"the cuDNN Frontend GDN {form} kernel is written for d_model {HIDDEN}, {V_HEADS} V heads, {K_HEADS} K heads, head dims {HEAD_DIM} "
-            f"and conv kernel {CONV_WIDTH} (the block's dense-27B geometry at tensor-parallel rank 1); got {off}",
+            f"the cuDNN Frontend GDN {form} kernel serves head dims {HEAD_DIM} and conv kernel {CONV_WIDTH} with at most {MAX_K_HEADS} K heads "
+            f"and {MAX_V_HEADS} V heads per rank (a whole number of V heads per K head) and a d_model that is a multiple of {HIDDEN_GRANULE} "
+            f"(the block's dense-27B geometry at tensor-parallel rank 1 -- d_model {HIDDEN}, {V_HEADS} V heads, {K_HEADS} K heads -- and its "
+            f"tensor-parallel shards); got {off}",
         )
     cc = device_cc(device)
     if not entry.cc_supported(cc):
@@ -160,6 +193,16 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
                 "shape",
                 f"the cuDNN Frontend GDN decode kernel launches one grid row per request, at most {DECODE_MAX_ROWS} (CUDA's grid Y limit); got "
                 f"requests={requests}",
+            )
+        g = geometry_of(geometry)
+        # the Int32 row-address bound on the geometry's own row widths (contiguous qkv / z): below DECODE_MAX_ROWS once d_model passes 32768;
+        # a row-strided qkv / z view lowers it further by a stride the probe does not see -- the entry's typed decline at prepare
+        row_max = _decode.max_rows_for(g.QKV_CHANNELS, g.OUT_ROW, g)
+        if requests is not None and requests > row_max:
+            return Qwen35GdnDecline(
+                "shape",
+                f"the cuDNN Frontend GDN decode kernel forms its row addresses in 32-bit arithmetic: at most {row_max} rows at {g.describe()} "
+                f"(fewer with a row-strided qkv / z view, declined at prepare); got requests={requests}",
             )
         try:
             # the one-CTA decode form must fit this device's per-CTA opt-in (74,848 B; every admitted part holds it): the entry's own
@@ -185,8 +228,9 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
                 "request is the decode form",
             )
         try:
-            # the pick for this step shape: past the ladder's bound the deepest form, so its max_tokens() IS the ladder-wide bound
-            cfg = verify_form(device, requests, float(geometry.norm_eps), tokens_per_request)
+            # the pick for this step shape (at this geometry's V heads per rank): past the ladder's bound the deepest form, so its
+            # max_tokens() IS the ladder-wide bound
+            cfg = verify_form(device, requests, float(geometry.norm_eps), tokens_per_request, geometry=geometry_of(geometry))
         except NotImplementedError as exc:  # the entry's typed decline of a part whose shared memory holds no verify form (a RuntimeError
             # subclass, so it is caught before the readers' failure below)
             return Qwen35GdnDecline("device", f"the cuDNN Frontend GDN verify kernel has no form for this device's shared memory: {exc}")
@@ -223,8 +267,8 @@ _COMPILED_LOCK = threading.Lock()
 
 def _shared_compiled(spec) -> Dict[tuple, Any]:
     """The compiled-kernel table every plan of one form, device and norm epsilon shares (each entry's compile key carries the step
-    shape, the strides, the config -- with this device's shared-memory readings and SM-count pick -- the parameter dtypes where they
-    vary, and the epsilon)."""
+    shape, the strides, the config -- with this device's shared-memory readings, SM-count pick and the plan's geometry -- the parameter
+    dtypes where they vary, and the epsilon)."""
     key = (str(spec.form), str(spec.device), float(spec.geometry.norm_eps))
     with _COMPILED_LOCK:
         return _COMPILED.setdefault(key, {})
@@ -243,7 +287,7 @@ class FrostFeDecodeRunner:
 
     def __init__(self, spec):
         self.spec = spec
-        self.kernel = _decode.GdnDecodeFused(spec.device, spec.geometry.norm_eps)
+        self.kernel = _decode.GdnDecodeFused(spec.device, spec.geometry.norm_eps, geometry=geometry_of(spec.geometry))
         self.kernel.compiled = _shared_compiled(spec)
         self.buffers = self.kernel.outputs(spec.rows)
         self.scratch_bf16 = self.buffers["out"]  # the bf16 normed value's home when the caller asks for none
@@ -292,7 +336,7 @@ class FrostFeVerifyRunner:
 
     def __init__(self, spec):
         self.spec = spec
-        self.kernel = _verify.GdnVerifyFused(spec.device, spec.geometry.norm_eps)
+        self.kernel = _verify.GdnVerifyFused(spec.device, spec.geometry.norm_eps, geometry=geometry_of(spec.geometry))
         self.kernel.compiled = _shared_compiled(spec)
         self.buffers = self.kernel.outputs(spec.requests, spec.tokens_per_request)
 
