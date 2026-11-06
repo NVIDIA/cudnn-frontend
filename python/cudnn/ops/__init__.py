@@ -40,6 +40,14 @@ _LAZY_EXPORTS = {
     "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
     "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
     "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
+    "hstu_attention_forward": ("cudnn.hstu.hstu_attention", "hstu_attention_forward"),
+    "hstu_attention_backward": ("cudnn.hstu.hstu_attention", "hstu_attention_backward"),
+    "hstu_lmsd_forward": ("cudnn.hstu.hstu_lmsd", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward": ("cudnn.hstu.hstu_lmsd", "hstu_lmsd_backward"),
+    "hstu_attention_forward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_forward"),
+    "hstu_attention_backward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_backward"),
+    "hstu_lmsd_forward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_backward"),
 }
 
 # Op families are subpackages; they resolve lazily like the ops above.
