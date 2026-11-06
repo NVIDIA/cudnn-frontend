@@ -132,10 +132,12 @@ def execute_graph(graph, variant_pack, workspace, handle, context=None):
 
 def eager_dispatch(args) -> bool:
     """Whether a call may bypass its custom op: eager, plain tensors, and no torch function or
-    dispatch mode or functorch transform that has to see the op.  The custom op's own dispatch costs more host time than
-    the planned forward and backward (its autograd wrapper re-reads the op's schema once per argument)."""
+    dispatch mode or functorch transform or ``torch.jit.trace`` that has to see the op.  The custom op's own dispatch costs
+    more host time than the planned forward and backward (its autograd wrapper re-reads the op's schema once per argument).
+    A trace records the dispatcher's ops, so without the custom op it would keep the allocations and miss the kernels."""
     return (
         not torch.compiler.is_compiling()
+        and not torch._C._is_tracing()
         and torch._C._len_torch_dispatch_stack() == 0
         and torch._C._len_torch_function_stack() == 0
         and torch._C._functorch.peek_interpreter_stack() is None

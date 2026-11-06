@@ -4,6 +4,8 @@
 """The eager paths of kimi_delta_attention (EagerKda) and gated_delta_net (EagerGdn) against the custom ops they bypass:
 the same outputs, gradients and autograd metadata; a torch function mode keeps the call on the op."""
 
+import contextlib
+
 import pytest
 import torch
 from torch.overrides import TorchFunctionMode
@@ -104,3 +106,36 @@ def test_eager_path_matches_custom_op(family, preceding, requires_grad):
     assert [m[0] for m in got_meta] == [m[0] for m in want_meta]
     if requires_grad and preceding:
         assert got_grads[5] is None  # under context parallelism initial_state gets no gradient
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_double_backward_raises_like_custom_op(family):
+    """create_graph=True: the first-order gradients carry the op's graph on both paths, and differentiating them again raises
+    the custom op's missing-formula error instead of silently treating the backward as constant."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    public, _, _, channel_gate = FAMILIES[family]
+    leaves, cu, _, (do, dfs) = inputs(4, False, channel_gate)
+    for custom_op in (True, False):
+        xs = {k: v.detach().requires_grad_(True) for k, v in leaves.items()}
+        with PassThrough() if custom_op else contextlib.nullcontext():
+            o, fs = public(*(xs[k] for k in ("q", "k", "v", "g", "beta")), cu, initial_state=xs["initial_state"], output_final_state=True)[:2]
+        gs = torch.autograd.grad([o, fs], [xs[k] for k in ("q", "k", "v", "g", "beta", "initial_state")], [do, dfs], create_graph=True)
+        assert all(g.requires_grad for g in gs), custom_op
+        with pytest.raises(RuntimeError, match="no autograd formula was registered"):
+            torch.autograd.grad(sum(g.float().sum() for g in gs), [xs["q"]])
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_jit_trace_records_the_custom_op(family):
+    """torch.jit.trace records dispatcher ops: the eager path would leave the trace with the allocations and no kernels."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    public, op_name, _, channel_gate = FAMILIES[family]
+    leaves, cu, _, _ = inputs(4, False, channel_gate)
+    args = tuple(leaves[k] for k in ("q", "k", "v", "g", "beta"))
+    call = lambda *t: public(*t, cu, use_qk_l2norm_in_kernel=True)[0]  # noqa: E731
+    with torch.no_grad():
+        traced = torch.jit.trace(call, args, check_trace=False)
+        assert f"cudnn::{op_name}" in {node.kind() for node in traced.graph.nodes()}
+        assert torch.equal(traced(*args), call(*args))
