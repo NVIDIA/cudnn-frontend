@@ -129,6 +129,17 @@ set_convolution_mode(ConvolutionMode_t mode_)
     - compute_data_type
     - name
 
+`conv_dgrad` infers the dims of the returned dX from `loss`, `filter` and the padding/stride/dilation
+attributes; per spatial axis the inferred extent is
+`(S_loss - 1) * stride + (R - 1) * dilation + 1 - 2 * padding`. When the forward convolution used padding
+this is smaller than the forward input (a 32x32 input with a 3x3 filter, stride 2 and padding 1 infers a
+31x31 dX), so set the dims and strides explicitly to get a dX shaped like the forward input:
+
+```python
+dX = graph.conv_dgrad(loss=dY, filter=W, padding=[1, 1], stride=[2, 2], dilation=[1, 1])
+dX.set_output(True).set_dim(list(X.get_dim())).set_stride(list(X.get_stride()))
+```
+
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
 
 ## Convolution Wgrad
