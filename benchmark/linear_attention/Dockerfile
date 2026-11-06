@@ -36,5 +36,9 @@ RUN pip install -v /workspace/FlashQLA
 RUN git clone https://github.com/MoonshotAI/FlashKDA.git
 RUN pip install -v /workspace/FlashKDA
 
+# Install mamba_ssm from source.
+RUN git clone https://github.com/state-spaces/mamba.git
+RUN pip install -v --no-deps /workspace/mamba && pip install transformers
+
 # Install the chart dependencies for plot_results.py
 RUN pip install pandas matplotlib seaborn

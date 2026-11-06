@@ -70,8 +70,10 @@ def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm107_mxfp8",
         "sdpa_fwd_prefill_sm80",
+        "sdpa_fwd_prefill_sm120_fp8",
+        "sdpa_fwd_prefill_sm120_mxfp8",
     }
-    opt_in_rows = {"sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm120_mxfp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm100_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
@@ -596,6 +598,89 @@ def test_propose_ranks_the_rubin_fp8_row_first_without_the_flag(monkeypatch, kin
     offered = {name: _OFFERED[name]}
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **values), offered) == plans + [BACKEND]
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **{**values, "d_qk": 128, "d_v": 128}), offered) == [BACKEND] + plans
+
+
+_SM120_FP8 = "sdpa_fwd_prefill_sm120_fp8"
+_SM120_FP8_DENSE = dict(b=1, h_q=32, h_kv=8, s_q=4096, s_kv=4096, d_qk=128, d_v=128, causal=True, bottom_right=False)
+_SM120_FP8_QUANT = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, device_cc=(12, 0), device_sm_count=188)
+
+
+def _place_sm120(name, **over):
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == name)
+    return placement.place(spec, _facts(**{**_SM120_FP8_DENSE, **_SM120_FP8_QUANT, **over}))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(),
+        dict(d_qk=64, d_v=64, s_q=512, s_kv=512),
+        dict(d_qk=256, d_v=256, s_q=512, s_kv=512),
+        dict(s_q=8, s_kv=512, bottom_right=True),
+        dict(s_q=1, s_kv=512, causal=False),
+        dict(window_left=1023),
+        dict(device_cc=(12, 1), device_sm_count=48),
+    ],
+)
+def test_sm120_fp8_placement_leads_outside_the_short_cache_d128_band(over):
+    """d64, d > 128, decode-shaped graphs and d128 on a long cache lead on every cc 12.x part."""
+    assert _place_sm120(_SM120_FP8, **over) == placement.LEAD
+
+
+@pytest.mark.L0
+def test_sm120_fp8_short_cache_d128_band_structure():
+    """The band reads its bounds from the module, so this pins the gate's structure, not a measured boundary."""
+    short, maskfree = placement.SM120_FP8_SHORT_KV, placement.SM120_FP8_MASKFREE_SHORT_KV
+    assert _place_sm120(_SM120_FP8, s_q=short, s_kv=short) == placement.TRAIL
+    assert _place_sm120(_SM120_FP8, s_q=short + 1, s_kv=short + 1) == placement.LEAD
+    assert _place_sm120(_SM120_FP8, s_q=maskfree, s_kv=maskfree, causal=False) == placement.TRAIL
+    assert _place_sm120(_SM120_FP8, s_q=maskfree + 1, s_kv=maskfree + 1, causal=False) == placement.LEAD
+    assert _place_sm120(_SM120_FP8, d_qk=96, d_v=96, s_q=short, s_kv=short) == placement.TRAIL
+    assert _place_sm120(_SM120_FP8, d_qk=64, d_v=64, s_q=short, s_kv=short) == placement.LEAD
+    decode = placement.DECODE_SHAPED_MAX_S_Q
+    assert _place_sm120(_SM120_FP8, s_q=decode, s_kv=short, bottom_right=True) == placement.LEAD
+    assert _place_sm120(_SM120_FP8, s_q=decode + 1, s_kv=short, bottom_right=True) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(thd=True),
+        dict(padded=True),
+        dict(right_band_widening=True, right_bound=16),
+        dict(has_sink=True),
+        dict(o_block_scale=16),
+        dict(has_epilogue_gate=True),
+        dict(dtype=cudnn.data_type.FP8_E5M2),
+    ],
+)
+def test_sm120_fp8_placement_trails_outside_the_measured_domain(over):
+    """Every graph feature the benchmark did not cover keeps the backend first."""
+    assert _place_sm120(_SM120_FP8, **over) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("over", [dict(), dict(d_qk=64, d_v=64, s_q=512, s_kv=512, causal=False), dict(s_q=1, causal=False), dict(device_cc=(12, 1))])
+def test_sm120_mxfp8_placement_leads_everywhere(over):
+    """The backend has no MXFP8 SDPA on cc 12.x, so the row leads every graph it admits."""
+    assert _place_sm120("sdpa_fwd_prefill_sm120_mxfp8", **{"is_fp8": False, "is_mxfp8": True, **over}) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["A", "FALLBACK"])
+def test_propose_ranks_the_sm120_fp8_row_per_its_band_without_the_flag(monkeypatch, kind):
+    """The arm is wired into place(): with recommend mocked and the flag deleted, propose puts the row ahead of the backend
+    block on a long d128 cache and behind it on a short one."""
+    plans = [PlanConfig(_OFFERED[_SM120_FP8], object())]
+    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=plans))
+    offered = {_SM120_FP8: _OFFERED[_SM120_FP8]}
+    values = {**_SM120_FP8_DENSE, **_SM120_FP8_QUANT}
+    assert heuristics.propose(kind, _facts(**values), offered) == plans + [BACKEND]
+    assert heuristics.propose(kind, _facts(**{**values, "s_q": 512, "s_kv": 512}), offered) == [BACKEND] + plans
 
 
 @pytest.mark.L0

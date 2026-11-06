@@ -555,6 +555,7 @@ class TensorRef:
     bcast_mode: BroadcastMode
     grouped_by_moe: bool = False
     reduction_axis: int | None = None
+    coordinate_mapped: bool = False  # original aux shape/strides, not a matrix view
 
     def __post_init__(self) -> None:
         if self.dtype not in SUPPORTED_DTYPES:
@@ -591,6 +592,8 @@ class TensorRef:
         Kernel ABI rank promotion belongs to lowering, not this record.
         Per-K orientation comes from the operand, even when K equals one.
         """
+        if self.coordinate_mapped:
+            return self.dim
         if self.bcast_mode == "per_k":
             shape = [1, 1, 1]
             shape[self.k_axis] = Axis.K
@@ -605,6 +608,29 @@ class TensorRef:
             batch = Axis.GROUP if self.grouped_by_moe else (1 if self.dim[0] == 1 else Axis.BATCH)
             return (batch, *axes)
         return axes[2 - len(self.dim) :]
+
+
+@dataclass(frozen=True)
+class OperandAccess:
+    """Lowered consumer-to-aux coordinates with a fixed operand domain.
+
+    Coordinates select source elements, not addresses. Runtime strides remain
+    owned by the auxiliary buffer. The domain is canonical (batch, MN, K),
+    independent of graph rank, storage major, or swap-AB.
+    """
+
+    domain: tuple[int, int, int]
+    coordinates: tuple[IndexExpr, ...]
+
+    def __post_init__(self):
+        if len(self.domain) != 3 or any(d <= 0 for d in self.domain) or prod(self.domain) > (1 << 63) - 1:
+            raise ValueError("operand access requires a positive fixed Int64 matrix domain")
+        if not self.coordinates or any(not isinstance(expr, IndexExpr) for expr in self.coordinates):
+            raise ValueError("operand access requires one integer expression per auxiliary axis")
+
+    @property
+    def axes(self):
+        return frozenset().union(*(expr.axes for expr in self.coordinates))
 
 
 def gemm_source(g: int) -> int:
@@ -636,8 +662,11 @@ class FusionOp:
     compute_dtype: Dtype = "fp32"
     out_dtype: Dtype = "fp32"
     index_expr: IndexExpr | None = None
+    operand_access: OperandAccess | None = None
 
     def __post_init__(self) -> None:
+        if self.operand_access is not None and (self.aux is None or not isinstance(self.operand_access, OperandAccess)):
+            raise ValueError("operand access requires an auxiliary tensor")
         if self.op not in ALL_OPS:
             raise ValueError(f"unknown op {self.op!r}; expected one of {ALL_OPS}")
         if self.compute_dtype not in COMPUTE_DTYPES:
@@ -897,6 +926,8 @@ class FusionChain:
         if len(names) != len(self.aux_tensors):
             raise ValueError("aux_tensors contain duplicate names")
         for op in self.ops:
+            if op.operand_access is not None:
+                raise ValueError("operand coordinate access cannot be used in the epilogue")
             if op.aux is not None and op.aux not in names:
                 raise ValueError(f"op {op.op!r} references unknown aux {op.aux!r}")
             if op.aux is not None and self.aux_by_name(op.aux).bcast_mode == "per_k":
@@ -940,6 +971,8 @@ class FusionChain:
         if sorted(quant_refs) != list(range(len(self.quants))):
             raise ValueError(f"each quant needs exactly one dense data output; quants={len(self.quants)}, " f"referenced={sorted(quant_refs)}")
         for op in self.ops:
+            if op.aux is not None and self.aux_by_name(op.aux).coordinate_mapped:
+                raise ValueError("coordinate-mapped operand auxiliary cannot also use the epilogue matrix ABI")
             if op.index_expr is not None and Axis.K in op.index_expr.axes:
                 raise ValueError("epilogue index expression cannot reference K")
         for label, oplist in (
@@ -957,7 +990,14 @@ class FusionChain:
                     if op.aux not in names:
                         raise ValueError(f"{label} op {op.op!r} references unknown aux {op.aux!r}")
                     ref = self.aux_by_name(op.aux)
-                    if ref.bcast_mode == "per_k":
+                    if op.operand_access is not None:
+                        if not ref.coordinate_mapped or len(op.operand_access.coordinates) != len(ref.dim):
+                            raise ValueError("operand access requires the original auxiliary rank")
+                        if not op.operand_access.axes <= allowed:
+                            raise ValueError("operand access references the other operand axis")
+                    elif ref.coordinate_mapped:
+                        raise ValueError("coordinate-mapped auxiliary requires an operand access")
+                    elif ref.bcast_mode == "per_k":
                         expected = (1, 1, self.matmul.K) if label == "mainloop_a_ops" else (1, self.matmul.K, 1)
                         axis = 2 if label == "mainloop_a_ops" else 1
                         if ref.dim != expected or ref.k_axis != axis:
@@ -1138,6 +1178,13 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         return {"per_row": "per_col", "per_col": "per_row"}.get(mode, mode)
 
     def _op(op):
+        access = op.operand_access
+        if access is not None:
+            access = dataclasses.replace(
+                access,
+                coordinates=tuple(expr.substitute({Axis.M: IndexExpr.coordinate(Axis.N), Axis.N: IndexExpr.coordinate(Axis.M)}) for expr in access.coordinates),
+            )
+            op = dataclasses.replace(op, operand_access=access)
         if op.index_expr is not None:
             return dataclasses.replace(op, index_expr=op.index_expr.substitute({Axis.M: IndexExpr.coordinate(Axis.N), Axis.N: IndexExpr.coordinate(Axis.M)}))
         attrs = tuple((key, 3 - value if key == "axis" and value in (1, 2) else value) for key, value in op.attrs)
@@ -1157,6 +1204,9 @@ def swap_ab(chain: FusionChain) -> FusionChain:
     )
     swapped_aux = []
     for t in chain.aux_tensors:
+        if t.coordinate_mapped:
+            swapped_aux.append(t)
+            continue
         dim, stride = t.dim, t.stride
         if len(dim) == 1:
             dim, stride = (1, dim[0]), (stride[0], stride[0])
@@ -1223,8 +1273,8 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         num_a_operands=chain.num_b_operands,
         num_b_operands=chain.num_a_operands,
         gemm_operands=[(b, a) for a, b in chain.gemm_operands],
-        mainloop_a_ops=[_op(op) if op.index_expr is not None else op for op in chain.mainloop_b_ops],
-        mainloop_b_ops=[_op(op) if op.index_expr is not None else op for op in chain.mainloop_a_ops],
+        mainloop_a_ops=[_op(op) for op in chain.mainloop_b_ops],
+        mainloop_b_ops=[_op(op) for op in chain.mainloop_a_ops],
         mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
         mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
         block_scale=block_scale,

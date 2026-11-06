@@ -39,6 +39,20 @@ def fold_batch_layout(shape, stride, *, writable=False, allow_identity_broadcast
     return (batch, *shape[-2:]), (pitch, *stride[-2:])
 
 
+def checked_layout(shape, stride, *, context="strided layout"):
+    """Validate read-only element geometry without imposing a view or layout.
+
+    Zero/overlapping strides are legal for reads. Writable overlap and affine
+    view constraints belong to the operation requesting them, not this check.
+    """
+    shape, stride = tuple(map(index, shape)), tuple(map(index, stride))
+    if not shape or len(shape) != len(stride) or any(d <= 0 for d in shape) or any(s < 0 for s in stride):
+        raise ValueError(f"{context} requires positive extents and nonnegative strides")
+    if max(prod(shape), 1 + sum((d - 1) * s for d, s in zip(shape, stride)), *shape, *stride) > (1 << 63) - 1:
+        raise ValueError(f"{context} exceeds signed 64-bit geometry")
+    return shape, stride
+
+
 def reshape_layout(shape, stride, target):
     """Compute a lexicographic zero-copy reshape using contiguous stride chunks.
 
@@ -52,7 +66,8 @@ def reshape_layout(shape, stride, target):
         raise ValueError("reshape view requires positive extents and nonnegative strides")
     if prod(shape) != prod(target):
         raise ValueError("reshape view must preserve element count")
-    if max(prod(shape), 1 + sum((d - 1) * s for d, s in zip(shape, stride)), *shape, *target, *stride) > limit:
+    checked_layout(shape, stride, context="reshape view")
+    if max(target) > limit:
         raise ValueError("reshape view exceeds signed 64-bit geometry")
     if shape == target:
         return target, stride
@@ -82,10 +97,7 @@ def transpose_layout(shape, stride, permutation):
     shape, stride, permutation = tuple(map(index, shape)), tuple(map(index, stride)), tuple(map(index, permutation))
     if not shape or len(shape) != len(stride) or sorted(permutation) != list(range(len(shape))):
         raise ValueError("transpose view requires a full permutation and matching shape/strides")
-    if any(d <= 0 for d in shape) or any(s < 0 for s in stride):
-        raise ValueError("transpose view requires positive extents and nonnegative strides")
-    if max(*shape, *stride, prod(shape), 1 + sum((d - 1) * s for d, s in zip(shape, stride))) > (1 << 63) - 1:
-        raise ValueError("transpose view exceeds signed 64-bit geometry")
+    checked_layout(shape, stride, context="transpose view")
     return tuple(shape[i] for i in permutation), tuple(stride[i] for i in permutation)
 
 

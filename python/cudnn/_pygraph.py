@@ -1904,6 +1904,16 @@ class pygraph:
             return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index)
         return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
+    def get_context_size(self) -> int:
+        """Bytes of the selected plan's context: what a summary plan writes for the apply of the same tokens, or what an
+        apply plan reads; the caller allocates it like the workspace and passes it to ``execute(context=...)`` of both.
+        0 for a plan without one (every backend plan)."""
+        if not self._is_built:
+            raise RuntimeError("Call build() first")
+        if self.selected_engine is not None:
+            return self._compiled_plans[self._plan_index].get_context_size()
+        return 0
+
     def get_workspace_size_plan_at_index(self, index: int, handle=None, override_uids=None, override_shapes=None, override_strides=None) -> int:
         """Workspace bytes for the plan at ``index`` in the ranked list."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
@@ -2094,6 +2104,7 @@ class pygraph:
         override_shapes: Any = None,
         override_strides: Any = None,
         tensor_uids: Any = None,
+        context: Any = None,
     ) -> None:
         """Execute the selected plan.
 
@@ -2120,8 +2131,13 @@ class pygraph:
                          auto-bound inputs. Metadata
                          is cached internally by value, while buffer observations,
                          workspace and the handle's stream remain per call.
+            context: the buffer of ``get_context_size()`` bytes a summary plan
+                     writes for the apply plan of the same tokens, or the one an
+                     apply plan reads; sized and owned like the workspace, kept
+                     between the two calls.  Python plans with one require it;
+                     every other plan rejects it.
         """
-        return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids)
+        return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids, context=context)
 
     def _execute(
         self,
@@ -2134,6 +2150,7 @@ class pygraph:
         tensor_uids=None,
         *,
         index=None,
+        context=None,
     ):
         # Keep the caller's choice local across binding and launch. Temporarily
         # selecting/restoring an index lets overlapping callers run each other's
@@ -2169,7 +2186,7 @@ class pygraph:
             if index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
-                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
+                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context)
                 self._compiled_plans[index] = eng.build_plan(self, self._plans[index], ctx)
                 if not explicit_index:
                     self._is_built = True
@@ -2185,9 +2202,9 @@ class pygraph:
                 # A producer without the exchange protocol is observed once by
                 # the existing Python completion path, then uses the same plan.
                 pack = self._finish_ordered(schema, result, workspace, override_uids)
-                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace))
+                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context))
                 return
-            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
+            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace, context=context)
             # Overrides go INTO the pack rather than around it: they describe
             # what this execute runs, so an engine reading the pack agrees with
             # the backend without knowing they exist.
@@ -2210,6 +2227,8 @@ class pygraph:
                 plan.execute(self, uid_to_data, ctx)
             return
 
+        if context is not None:
+            raise ValueError("the backend's plans take no context (get_context_size() is 0); pass context= only to a python plan that reports one")
         variant_pack = None if ordered or overriding else self._normalize(uid_to_data, workspace)
 
         # Backend path. Address the plan the WALK built, not the backend's own
@@ -3099,6 +3118,12 @@ def _linear_attention_state_checkpoints_dims(node):
     return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
 
 
+def _linear_attention_composed_state_dims(node):
+    """The one-row composed boundary state of a context-parallel forward: ``[1] + one row of preceding_state_update``."""
+    pre = node.inputs.get("preceding_state_update")
+    return [1] + list(pre.dim[1:]) if pre is not None and pre.dim else None
+
+
 def _linear_attention_o_dims(node):
     # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
@@ -3342,7 +3367,20 @@ _STRUCTURED_OPS = {
     # ---- linear attention ----------------------------------------------------
     "gdn": dict(
         node_type=NodeType.GDN,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "scale",
             "output_final_state",
@@ -3354,18 +3392,41 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "scale",
             "use_qk_l2norm",
@@ -3376,6 +3437,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3399,7 +3461,16 @@ _STRUCTURED_OPS = {
     "gdn_summary": dict(
         node_type=NodeType.GDN_SUMMARY,
         inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "output_context",
+        ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
@@ -3408,7 +3479,18 @@ _STRUCTURED_OPS = {
     "gdn_summary_bwd": dict(
         node_type=NodeType.GDN_SUMMARY_BWD,
         inputs=("q", "k", "g", "beta", "cu_seqlens", "dO", "d_final_state", "a_log", "dt_bias"),
-        attrs=("output_transition", "scale", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "output_transition",
+            "scale",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
+        ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"d_initial_state": linear_attention_summary_bwd_dims, "transition": _linear_attention_transition_dims},
@@ -3416,7 +3498,7 @@ _STRUCTURED_OPS = {
     ),
     "mamba2": dict(
         node_type=NodeType.MAMBA2,
-        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias", "d", "z", "state_indices"),
+        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "initial_state", "dt_bias", "d", "z", "state_indices", "preceding_state_update", "preceding_transition"),
         attrs=(
             "output_final_state",
             "checkpoint_every_n_tokens",
@@ -3427,23 +3509,43 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
         ),
-        outputs=("O", "final_state", "state_checkpoints", "O_pre"),
+        outputs=("O", "final_state", "state_checkpoints", "O_pre", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
             "O_pre": lambda n: bool(n.params.get("output_pre_gate", False)) and "z" in n.inputs,
         },
         infer={
             "O": _linear_attention_o_dims,
             "final_state": _linear_attention_final_state_dims,
             "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
             "O_pre": _linear_attention_o_dims,
         },
         python_only=True,
     ),
     "mamba2_bwd": dict(
         node_type=NodeType.MAMBA2_BWD,
-        inputs=("q", "k", "v", "g", "a", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "dt_bias", "d", "z", "O_pre"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "a",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "dt_bias",
+            "d",
+            "z",
+            "O_pre",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "checkpoint_every_n_tokens",
             "dt_softplus",
@@ -3493,7 +3595,20 @@ _STRUCTURED_OPS = {
     ),
     "gdp": dict(
         node_type=NodeType.GDP,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "num_householder",
             "scale",
@@ -3506,18 +3621,41 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _gdp_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _gdp_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "gdp_bwd": dict(
         node_type=NodeType.GDP_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "num_householder",
             "scale",
@@ -3529,6 +3667,7 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3552,7 +3691,17 @@ _STRUCTURED_OPS = {
     "gdp_summary": dict(
         node_type=NodeType.GDP_SUMMARY,
         inputs=("k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("num_householder", "output_transition", "use_qk_l2norm", "use_beta_sigmoid", "allow_neg_eigval", "safe_gate", "gate_domain", "batch_invariant"),
+        attrs=(
+            "num_householder",
+            "output_transition",
+            "use_qk_l2norm",
+            "use_beta_sigmoid",
+            "allow_neg_eigval",
+            "safe_gate",
+            "gate_domain",
+            "batch_invariant",
+            "output_context",
+        ),
         outputs=("final_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
         infer={"final_state": _linear_attention_summary_final_dims, "transition": _linear_attention_transition_dims},
@@ -3571,6 +3720,8 @@ _STRUCTURED_OPS = {
             "safe_gate",
             "gate_domain",
             "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -3579,7 +3730,20 @@ _STRUCTURED_OPS = {
     ),
     "kda": dict(
         node_type=NodeType.KDA,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "scale",
             "output_final_state",
@@ -3593,17 +3757,39 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "scale",
             "use_qk_l2norm",
@@ -3615,6 +3801,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3666,6 +3853,8 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},
@@ -3674,7 +3863,21 @@ _STRUCTURED_OPS = {
     ),
     "gdn2": dict(
         node_type=NodeType.GDN2,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias", "state_indices"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "w",
+            "cu_seqlens",
+            "initial_state",
+            "a_log",
+            "dt_bias",
+            "state_indices",
+            "preceding_state_update",
+            "preceding_transition",
+        ),
         attrs=(
             "scale",
             "output_final_state",
@@ -3689,17 +3892,40 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
         ),
-        outputs=("O", "final_state", "state_checkpoints"),
+        outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
             "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "composed_initial_state": lambda n: "preceding_state_update" in n.inputs,
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
+        infer={
+            "O": _linear_attention_o_dims,
+            "final_state": _linear_attention_final_state_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
+            "composed_initial_state": _linear_attention_composed_state_dims,
+        },
         python_only=True,
     ),
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state", "a_log", "dt_bias"),
+        inputs=(
+            "q",
+            "k",
+            "v",
+            "g",
+            "beta",
+            "w",
+            "cu_seqlens",
+            "dO",
+            "state_checkpoints",
+            "initial_state",
+            "d_final_state",
+            "a_log",
+            "dt_bias",
+            "following_state_grad",
+            "following_transition",
+            "composed_initial_state",
+        ),
         attrs=(
             "scale",
             "use_qk_l2norm",
@@ -3712,6 +3938,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "input_context",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3766,6 +3993,8 @@ _STRUCTURED_OPS = {
             "gate_domain",
             "gate_lower_bound",
             "batch_invariant",
+            "output_context",
+            "checkpoint_every_n_tokens",
         ),
         outputs=("d_initial_state", "transition"),
         maybe={"transition": lambda n: bool(n.params.get("output_transition", False))},

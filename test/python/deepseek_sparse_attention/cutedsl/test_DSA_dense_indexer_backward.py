@@ -165,7 +165,9 @@ def test_DSA_dense_indexer_backward_wrapper(
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_DSA_dense_indexer_backward_cuda_graph():
-    if torch.cuda.get_device_capability()[0] < 9:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if torch.cuda.get_device_capability()[0] != 9 and not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense indexer backward requires SM90+")
 
     try:
@@ -253,7 +255,9 @@ def test_execute_allocates_nothing_and_never_synchronizes(dk_dtype, compile_allo
     every execute. An fp32 d_index_k declares zero scratch. Without a workspace
     the bf16 plan raises before either score buffer is mutated."""
     major = torch.cuda.get_device_capability()[0]
-    if major != 9 and major < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if major != 9 and not has_tcgen05(major):
         pytest.skip("Dense indexer backward requires SM90 or SM100+")
     try:
         from cudnn import DSA
@@ -385,7 +389,9 @@ def test_dense_plan_rejects_cross_tensor_shape_mismatch():
     its grid and the dK store from index_q / index_k, so a gradient, score or
     denominator buffer of another extent is rejected before compile, on both layouts."""
     major = torch.cuda.get_device_capability()[0]
-    if major != 9 and major < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if major != 9 and not has_tcgen05(major):
         pytest.skip("Dense indexer backward requires SM90 or SM100+")
     try:
         from cudnn import DSA
@@ -448,7 +454,9 @@ def test_dense_plan_rejects_cross_tensor_shape_mismatch():
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(("queries", "keys"), [(1, 1), (17, 31), (32, 128), (33, 129), (32, 513)])
 def test_DSA_dense_indexer_backward_staging_sync(queries: int, keys: int, head_dim: int) -> None:
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Dense indexer SM100 staging test requires Blackwell+")
 
     query = torch.ones(queries, 64, head_dim, device="cuda", dtype=torch.bfloat16)

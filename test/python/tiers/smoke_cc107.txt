@@ -1,6 +1,6 @@
 # SMOKE tier, cc 10.7 (Rubin): one cell per code path (engine row x dtype x mask arm x layout), smallest shape -- the rules are in README.md;
 # the code path each id stands for is in smoke_cc107_code_paths.tsv.  conftest.py marks these ids `smoke`:
-#   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= @tiers/smoke_cc107.txt)
+#   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= $(grep -v '^#' tiers/smoke_cc107.txt) -- the @file form would pass these comment lines as arguments and collects nothing)
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-dense-bf16-llama_d128]
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-fp16-llama_d128]
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-bf16-qwen_d256]
@@ -178,6 +178,24 @@ sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_right_band_widening
 sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_gqa_mqa[r2]
 sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_head_dim_band[384]
 sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_non_tile_multiple_seqlens[257-129]
+# The d128 f16/bf16 backward family (sdpa_bwd_sm100_d128, admitted on cc 10.7 2026-11-03 with its SM100 bodies compiled for sm_107a): one cell per
+# body x mask arm -- dense MHA accumulation, dense MHA recompute (deterministic), THD MHA, dense GQA one-CTA, THD GQA one-CTA, THD GQA pair body,
+# the dense GQA pair twin (square + rectangular) and the pair body's cc 10.7-only TMEM map dq_576
+sdpa/frost/test_sdpa_bwd_d128_accum_sm100.py::test_accumulation_matches_fp64[dt0-False-128-128]
+sdpa/frost/test_sdpa_bwd_d128_accum_sm100.py::test_accumulation_matches_fp64[dt3-True-128-128]
+sdpa/frost/test_sdpa_bwd_d128_sm100.py::test_deterministic_dense_mha_repeated_eager_and_replay[257-193-True-dt0]
+sdpa/frost/test_sdpa_bwd_d128_sm100.py::test_deterministic_dense_mha_repeated_eager_and_replay[257-193-False-dt1]
+sdpa/frost/test_sdpa_bwd_d128_thd_sm100.py::test_thd_mha_standalone_smoke[fp16]
+sdpa/frost/test_sdpa_bwd_d128_thd_sm100.py::test_thd_mha_matrix[lens_q2-lens_kv2-2-dtype2-True]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[4-2-dtype0-False-False]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[6-2-dtype1-True-False]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[4-2-dtype4-True-True]
+sdpa/frost/test_sdpa_bwd_d128_grouped_sm100.py::test_grouped_matrix[6-2-dtype5-False-True]
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_thd_matrix[uniform-256-causal]
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_thd_matrix[uniform-384-noncausal]
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_launch_census_per_selection[on-s256-pair-dense]
+sdpa/frost/test_sdpa_bwd_d128_cta_pair_heuristic.py::test_cta_pair_dense_twin_matches_thd_uniform[rect-sq256-skv512-causal]
+sdpa/frost/test_sdpa_bwd_d128_2cta_stail_sm100.py::test_2cta_stail_tmem_maps_agree_bitwise[uniform-256-causal]
 gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]
 gated_attention_block/cutedsl/test_block_end_to_end.py::test_non_causal_arm
 gated_attention_block/cutedsl/test_block_end_to_end.py::test_fully_fused_block_matches_the_fp32_oracle[256]
@@ -301,7 +319,7 @@ sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_d512_split_recombines_o_a
 sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_dsink_fact
 sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_engines_registered
 sdpa/frost/test_sdpa_native_arch_binding.py::test_arch_native_graph_fresh_storage_overrides_and_replay[cc18-128-128-65-bfloat16]
-sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan
+sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan[block_table_ptr]
 sdpa/frost/test_sdpa_native_block_output_binding.py::test_block_output_native_graph_fresh_buffers_and_replay[False-16-False-True]
 sdpa/frost/test_sdpa_native_bwd_binding.py::test_actual_backward_host_frames_match_python[ordinary-False-bfloat16-sm100]
 sdpa/frost/test_sdpa_native_bwd_binding.py::test_backward_frames_do_not_share_runtime_storage
@@ -352,7 +370,7 @@ sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_quantized_thd_tensormaps_reb
 sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_thd_tensormaps_rebind_and_replay[bf16-d128_cga2]
 sdpa/frost/test_sdpa_torch_varlen_metadata.py::test_frost_torch_auxiliary_metadata_rebind_and_replay[False-lengths]
 sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d128_f16_folds_the_split_out_of_the_band_builds[causal-cga2-bf16-cc100_on]
-sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate[cc100_on]
+sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d192_f16_causal_arm_spelling_follows_the_split_claim[cc100_on]
 sdpa/frost/test_sm100_mask_form.py::test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain[sm100]
 sdpa/frost/test_split_kv_heuristic.py::test_bigger_batch_needs_less_split
 sdpa/frost/test_split_kv_heuristic.py::test_chip_already_full_does_not_split

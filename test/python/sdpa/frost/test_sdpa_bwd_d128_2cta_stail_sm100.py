@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""L0 tests of the d128 grouped THD cta_group::2 pair body (``bprop_d128_accum_grouped_2cta_stail_f16``: the dQ half-row image in S^T's dead
+"""L0 tests of the d128 grouped THD cta_group::2 pair body (section 8 of ``kernels/sm100/bprop_d128_f16.py``: the dQ half-row image in S^T's dead
 tail, FAv4's rotated leader order, the dedicated sDQ ring, 35 barriers).
 
 Rows: the THD matrix (uniform pairs, GQA 8, a varlen ramp, non-causal, the suite's degenerate THD row, a half-dead pair, pair tail 300),
@@ -12,6 +12,21 @@ readout; RED 4: the dS gates on ready_state; RED 5: an unguarded lookahead wait;
 the probes' launch rows, the exchange_off-under-leader-skew child (the mechanism's repro pair), the STAMPS dump accounting row, and the
 mask-form rows (the typed domain and the kernel codes, the EXACTNESS of `tile_may_mask` against the per-cell mask on host ints, the three
 renderings' census, the fsel / predicated BITWISE twins on dK / dV (dQ bitwise on the order-free cells, by the fp64 gate beyond)).
+The TMEM MAP rows (the typed, PART-KEYED field ``tmem_map``; the kernel header sections 9 / 11 / 13): the typed domain and the per-part defaults (s_tail
+on every part; dq_576 selectable by name on cc 10.7 -- a neutral structural map, no perf claim), the declines by name (dq_576 off cc 10.7 = the
+engine's NotImplementedError; dq_576 x 16w_fa4; the S-tail WAIT probes x dq_576), the sm_107a renderings (the s_tail default against the sm_100a record:
+target-independent per-kernel md5s; dq_576 NAMED against its own record), the census delta of the map (exactly the two deleted rows' arrive / wait /
+fence sites + the exclusive alloc), the RED-first SOURCE
+assertion of the independent image's reuse edge (the epilogue's readout trio BEFORE the next tile's staging), the dK / dV twin of the two maps where a
+part serves both, the STAMPS dump under the map (the four S-tail words dead).
+The SMEM MAP rows (the typed, PART-KEYED field ``smem_map``; the kernel header sections 5 / 8 / 11; arm R2.c): the typed domain and the per-part
+defaults (sm100 on every part; rubin_b2 selectable by name on cc 10.7 together with tmem_map dq_576 -- the 327 KiB oversized carveout: sQ1 x2, sDO1 x2,
+the TWO-STAGE sDS + XCHG staging ring with the lagging epilogue order and the LEADER row dq_read_done), the declines by name (rubin_b2 off cc 10.7 = the
+engine's NotImplementedError; rubin_b2 x s_tail / 16w_fa4 / ldg), the sm_107a rendering (dq_576 x rubin_b2 NAMED against its own record; dq_576 x
+sm100 = the dq_576 record), the census delta of the map (the row's arrive / wait sites, the extra rounds' sites, the grown slots' inits), the RED-first
+SOURCE assertion of the row (the arrive after each readout trio, the wait before every dQ issue, the pre-armed state and its drain), the dK / dV twin of
+the two SMEM maps where a part serves both (the P14 killers: zero-trip mix, all-empty, n_q == 1 with more pairs than SMs), the STAMPS dump and the
+skew children under the map.
 Budget: the skew rows and the probe-skew child name ``skew_module`` (every row is a fresh child = cold import + JIT).
 """
 
@@ -47,21 +62,43 @@ _ROUTE_CENSUS = {
     "fence_proxy_async": r"fence\.proxy\.async",
     "bulk_commit_group": r"cp\.async\.bulk\.commit_group",
 }
-_BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_grouped_2cta_stail_f16"
-_BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/bprop_d128_accum_grouped_2cta_stail_f16.py")
+_BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16"  # the d128 family module; the pair body is its section 8
+_BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/bprop_d128_f16.py")
+_BODY_SECTION = ("# section 8:", "# section 9:")  # the pair body's banners in the family module: the source assertions read that section only
 _TREE = pathlib.Path(__file__).resolve().parents[4]  # test/python/sdpa/frost/<file> -> the checkout
 _RECORD = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt"
 _RECORD_DEV = _RECORD.with_name("md5_d128_accum_grouped_2cta_stail_default_sm_100a_dsl_4_9_dev_20261028.txt")
 _RECORD_TOKEN = "d128_accum_grouped_2cta_stail"
 _RECORD_TOKEN_LDG = "d128_accum_grouped_2cta_stail_ldg"  # the stats_form = "ldg" rendering's rows (the previous default), beside the default's in the same file
+_RECORD_TOKEN_DENSE = "d128_accum_grouped_2cta_stail_dense"  # the dense compact-BSHD twin's rendering (layout = "dense"): its own rows in the same file
+_MAIN_KERNEL = "bprop_d128_accum_grouped_2cta_stail_kernel"
+# The TMEM MAP (PART-KEYED): tmem_map "dq_576" NAMED on cc 10.7 (the independent dQ image at [512, 576) of the 576-column carve; the s_read /
+# s_tail_empty rows deleted; selectable by name, not the default) has its own record at its own target; the default (s_tail) on sm_107a renders the
+# sm_100a record's rows.
+_RECORD_DQ576 = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_dq576_sm_107a.txt"
+_RECORD_TOKEN_DQ576 = "d128_accum_grouped_2cta_stail_dq576"
+_RECORD_TOKEN_DQ576_LDG = "d128_accum_grouped_2cta_stail_dq576_ldg"  # tmem_map dq_576 x stats_form ldg, both NAMED: its own rows in the same file
+_RECORD_ARCH_DQ576 = "sm_107a"
+# The SMEM MAP (PART-KEYED): smem_map "rubin_b2" NAMED together with tmem_map "dq_576" on cc 10.7 (the 327 KiB oversized carveout: sQ1 x2, sDO1 x2, the
+# two-stage sDS + XCHG staging ring with the lagging epilogue order and the dq_read_done row; the kernel header sections 5 / 8 / 11; selectable by name,
+# not the default) has its own record at its own target; the dq_576 x sm100 rendering keeps the dq_576 record's rows.
+_RECORD_B2 = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_dq576_b2_sm_107a.txt"
+_RECORD_TOKEN_B2 = "d128_accum_grouped_2cta_stail_dq576_b2"
+_SMEM_MAPS = ("sm100", "rubin_b2", "sm100_oversized")  # CFG.SMEM_MAPS (asserted in the typed row); None = the PART's default (sm100 everywhere)
+_RING_TWIN_MAPS = ("sm100", "rubin_b2")  # the two-stage ring's twin pair (the DIAGNOSTIC sm100_oversized map has its own byte-identity row below)
+_OVS_FIELDS = {"smem_map": "sm100_oversized"}  # the DIAGNOSTIC map: the sm100 map declared in the oversized carveout (cc 10.7 by name, never a default)
+_B2_FIELDS = {"tmem_map": "dq_576", "smem_map": "rubin_b2"}  # the B2 rendering's typed fields (BOTH named: neither is a part default today)
+_TMEM_MAPS = ("s_tail", "dq_576")  # CFG.TMEM_MAPS (asserted in the typed row); None = the PART's default
 # The kernels the pair chain OWNS under the DEFAULT form (tma_ring: the delta-and-stats launch; one record row each; the group fold
 # dkv_reduce_thd_origins_kernel is shared with the one-CTA chain: rendered, never pinned here -- frost_test_utils.D128_THD_SHARED_KERNELS);
 # under "ldg" the delta launch is the compact one.
 _OWN_KERNELS = ("setup_thd_d128_2cta_kernel", "delta_zero_stats_thd_d128_2cta_kernel", "bprop_d128_accum_grouped_2cta_stail_kernel", "cast_dq_thd_d128_kernel")
 _OWN_KERNELS_LDG = ("setup_thd_d128_2cta_kernel", "delta_zero_thd_d128_kernel", "bprop_d128_accum_grouped_2cta_stail_kernel", "cast_dq_thd_d128_kernel")
 # The probes' purity census: the stats / delta LDS.128 (`ld.shared.v4.b32`: stats_one_chunk removes exactly CFG.DIAG_STATS_LDS_REMOVED_PER_LANE
-# static sites), the expect_tx arms (exchange_off keeps the count), the %clock64 reads (0 unless `debug_clk`), and the three counts every probe
-# must leave untouched: `bar.warp.sync`, `tcgen05.fence::after_thread_sync`, `mapa` (exchange_off loses the ship's own two).
+# static sites), the expect_tx arms (exchange_off keeps the count), the %clock64 reads (0 unless `debug_clk`), and the three counts an issue /
+# transfer / bytes probe must leave untouched: `bar.warp.sync`, `tcgen05.fence::after_thread_sync`, `mapa` (exchange_off loses the ship's own
+# two).  The WAIT probes (s_tail_wait_off / s_read_wait_off / both) lower try_wait, bar.warp.sync and tcgen05.fence::after by exactly their
+# static site counts (CFG.DIAG_S_TAIL_WAIT_SITES / DIAG_S_READ_WAIT_SITES) and move no arrive.
 _PROBE_CENSUS = {
     "lds_v4_b32": r"ld\.shared\.v4\.b32",
     "expect_tx": r"mbarrier\.arrive\.expect_tx",
@@ -95,7 +132,76 @@ _EXPECTED = dict(
     mapa=17,
 )
 _EXPECTED_LDG = dict(_EXPECTED, mbarrier_arrive=40, try_wait=68, expect_tx=11, bar_warp_sync=67)  # stats_form = "ldg": the merged rendering's census
-_PROBES = ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off")  # CFG.DIAG_2CTA_NAMES_ON_MAP (asserted in the config-truth row)
+# The TMEM map's census rows beyond the module census: the mbarrier inits (the two deleted rows = -2) and the `tcgen05.fence::before_thread_sync`
+# sites (the softmax's fence before its s_read arrive goes with the arrive: -1; the epilogue's readout fence STAYS = the reuse edge's local half).
+_TMEM_MAP_CENSUS = {"mbarrier_init": r"mbarrier\.init", "tcgen05_fence_before": r"tcgen05\.fence::before_thread_sync"}
+# The SMEM map's census rows beyond the TMEM map's: the dQ readout's `tcgen05.wait::ld` sites, the relaxed cluster arrives (every `_arrive_leader` site
+# = the LEADER rows' arrives: the mapa count is not a site count, two sites may share one hoisted mapa) and the dQ route rows (the extra `_dq_round` sites).
+_SMEM_MAP_CENSUS = dict(_TMEM_MAP_CENSUS, tcgen05_wait_ld=r"tcgen05\.wait::ld", arrive_relaxed_cluster=r"mbarrier\.arrive\.relaxed\.cluster", **_ROUTE_CENSUS)
+
+
+def _smem_map_census_delta(c, cfgmod, base):
+    """What smem_map = rubin_b2 adds to the dq_576 x sm100 rendering's census and nothing else (the kernel header sections 5 / 8 / 11): the row
+    dq_read_done -- its two `_arrive_leader` sites (the in-loop and the item-end readout: mbarrier.arrive +2, the relaxed cluster arrive form +2; mapa
+    +1, the two sites sharing one hoisted mapa of the constant leader address) and its three `_wait_tcgen` sites (the two dQ issue sites + the P15 drain:
+    try_wait / bar.warp.sync / fence::after +3); the lagging order's second readout site (the item end: tcgen05.wait::ld +1, fence::before +1) and its
+    one more dq_done `_wait_tcgen` site (+1 on the three wait rows); the two extra `_dq_round` sites (five instead of three: dq_full arrive +2, their two
+    dq_empty waits each, the slice STS and the proxy fence); the loader's two whole-ring drains at depth 2 (q1_empty, do1_empty: +1 wait site each); the
+    grown slots' inits (+8) and the new row's (+1).  The counts come from the config and the site counts, never a literal."""
+    b2 = cfgmod.CFG_RING_DQ576_B2
+    rounds_extra = 2  # round B of dQ(t-2) in-loop + rounds A / B of dQ(hi-1) at the item end, against today's in-loop B and item-end B: 5 - 3 sites
+    readout_sites_extra = 1  # the readout trio at the item end AND in-loop (under `qtile > lo`), against the single in-loop site
+    dq_read_done_waits = 2 + 1  # `_dq_issue` inlined at the in-tile and the tail site + the P15 drain
+    dq_read_done_arrives = 2
+    drains_extra = (b2.Q1_STAGES - 1) + (b2.DO1_STAGES - 1)  # the loader's whole-ring drains (range_constexpr over the depth)
+    extra_slots = sum(row[2] for row in cfgmod.BAR_LAYOUT_RING_DQ576_B2) - sum(row[2] for row in cfgmod.BAR_LAYOUT_RING_DQ576)  # 8 grown + 1 new
+    waits = dq_read_done_waits + readout_sites_extra + rounds_extra * c.DQ_SLOTS + drains_extra
+    assert (rounds_extra, readout_sites_extra, drains_extra, extra_slots, waits) == (2, 1, 2, 9, 10)
+    return {
+        "mbarrier_arrive": base["mbarrier_arrive"] + dq_read_done_arrives + rounds_extra,
+        "arrive_relaxed_cluster": base["arrive_relaxed_cluster"] + dq_read_done_arrives,
+        "mapa": base["mapa"] + 1,
+        "try_wait": base["try_wait"] + waits,
+        "bar_warp_sync": base["bar_warp_sync"] + waits,
+        "tcgen05_fence_after": base["tcgen05_fence_after"] + dq_read_done_waits + readout_sites_extra,
+        "tcgen05_fence_before": base["tcgen05_fence_before"] + readout_sites_extra,
+        "tcgen05_wait_ld": base["tcgen05_wait_ld"] + readout_sites_extra,
+        "mbarrier_init": base["mbarrier_init"] + extra_slots,
+        "fence_proxy_async": base["fence_proxy_async"] + rounds_extra,
+        "sts_dq_v2_b64": base["sts_dq_v2_b64"] + rounds_extra * (c.DQ_BOX // 4),  # DQ_BOX // 4 = 8 16-B vectors per slice row = 8 st.shared.v2.b64 per site
+    }
+
+
+def _tmem_map_census_delta(c, cfgmod, default):
+    """What tmem_map = dq_576 removes from the s_tail rendering's census and nothing else (the kernel header section 11): the two deleted rows'
+    arrive sites (one each: the softmax's s_read, the epilogue's s_tail_empty -- `_arrive_leader` = a mapa'd relaxed cluster arrive, so mapa -2 too),
+    their inits (-2), the leader's five wait sites (each one try_wait + one bar.warp.sync + one tcgen05.fence::after: CFG.DIAG_S_TAIL_WAIT_SITES +
+    CFG.DIAG_S_READ_WAIT_SITES), the softmax's one before-fence, and the alloc spelled `tcgen05.alloc.exclusive.cta_group::2` (the 576-column carve);
+    the counts come from the config, never a literal."""
+    deleted = len(cfgmod.DELETED_BARRIERS_DQ576)
+    waits = c.DIAG_S_TAIL_WAIT_SITES + c.DIAG_S_READ_WAIT_SITES
+    return {
+        "mbarrier_arrive": default["mbarrier_arrive"] - deleted,
+        "mapa": default["mapa"] - deleted,
+        "mbarrier_init": default["mbarrier_init"] - deleted,  # one slot each
+        "try_wait": default["try_wait"] - waits,
+        "bar_warp_sync": default["bar_warp_sync"] - waits,
+        "tcgen05_fence_after": default["tcgen05_fence_after"] - waits,
+        "tcgen05_fence_before": default["tcgen05_fence_before"] - 1,
+        "tmem_alloc_cta2": 0,
+        "tmem_alloc_exclusive_cta2": 1,
+    }
+
+
+_PROBES = (
+    "dq_reduce_add_off",
+    "exchange_off",
+    "stats_one_chunk",
+    "sdq_sts_off",
+    "s_tail_wait_off",
+    "s_read_wait_off",
+    "s_tail_and_s_read_wait_off",
+)  # CFG.DIAG_2CTA_NAMES_ON_MAP (asserted in the config-truth row)
 # The STATS FORM (lever S1, header section 11): "tma_ring" = THE default since the day-4 decision (the loader-fed two-stage SMEM stats ring: ONE 1 KiB
 # bulk copy per q tile from the chain's padded pre-scaled stats region) | "ldg" = the previous default, selectable (the softmax's per-tile LDG fetch of
 # LSE / delta under the `bar.sync 1,256` pair; the form the 16w_fa4 role shape resolves to when the field is unset).  The census
@@ -114,8 +220,17 @@ _STATS_CENSUS = {
 
 
 def _probe_census_delta(probe, c, default):
-    """What each probe removes from the DEFAULT rendering's census and nothing else (the arrive / try_wait / bar.warp.sync / tcgen05.fence counts
-    are identical by construction: a probe moves no barrier row); the counts come from the config, never a literal."""
+    """What each probe removes from the DEFAULT rendering's census and nothing else (the arrive count is identical by construction: a probe
+    moves no barrier row; the issue / transfer / bytes probes keep every wait, the WAIT probes drop exactly their own `_wait_tcgen` sites =
+    one try_wait + one bar.warp.sync + one tcgen05.fence::after each); the counts come from the config, never a literal."""
+
+    def waits_off(sites):
+        return {
+            "try_wait": default["try_wait"] - sites,
+            "bar_warp_sync": default["bar_warp_sync"] - sites,
+            "tcgen05_fence_after": default["tcgen05_fence_after"] - sites,
+        }
+
     return {
         "dq_reduce_add_off": {"reduce_add": 0},  # dq_reduce_add_off: the four reduce-add ISSUES (the per-round dq_empty arrives stay)
         "exchange_off": {
@@ -127,6 +242,9 @@ def _probe_census_delta(probe, c, default):
             "sts_dq_v2_b64": 0,
             "fence_proxy_async": default["fence_proxy_async"] - c.DQ_ROUNDS - 1,
         },  # sdq_sts_off: the 3 _dq_round STS sites + fences
+        "s_tail_wait_off": waits_off(c.DIAG_S_TAIL_WAIT_SITES),  # the leader's 4 s_tail_empty waits (prologue, lookahead, tail, drain)
+        "s_read_wait_off": waits_off(c.DIAG_S_READ_WAIT_SITES),  # the leader's 1 s_read wait (slot 2, every tile)
+        "s_tail_and_s_read_wait_off": waits_off(c.DIAG_S_TAIL_WAIT_SITES + c.DIAG_S_READ_WAIT_SITES),  # both
     }[probe]
 
 
@@ -148,10 +266,14 @@ def _run_case(case, repeats=2, **fields):
 
 
 def _body_source():
+    """The pair body's section of the family module (its banner to the next): the source pins count sites in THIS body only."""
     path = _TREE / _BODY_REL
     if not path.exists():
         pytest.skip(f"{path} is not in this checkout")
-    return path.read_text()
+    text = path.read_text()
+    start, end = text.index(_BODY_SECTION[0]), text.index(_BODY_SECTION[1])
+    assert start < end, _BODY_SECTION
+    return text[start:end]
 
 
 def _body_module():
@@ -216,6 +338,118 @@ def test_2cta_stail_config_is_the_truth():
         512,
     )
     assert first.CFG.DQ_COL == 192 and c.DQ_COL == first.CFG.S_COL + first.CFG.PACK_COLS  # the image sits in S^T's dead tail, not dP^T's dead half
+    # the TMEM MAP (arm R1, PART-KEYED): the dq_576 records = the same geometry with the image past dK of the 576-column carve, exclusive; SMEM untouched
+    g, gr = cfgmod.CFG_DQ576, cfgmod.CFG_RING_DQ576
+    assert (c.TMEM_MAP, g.TMEM_MAP, gr.TMEM_MAP, c.TMEM_MAPS, cfgmod.TMEM_MAP_CODES) == ("s_tail", "dq_576", "dq_576", _TMEM_MAPS, {"s_tail": 0, "dq_576": 1})
+    assert (g.DQ_COL, g.DQ_COLS, g.TMEM_USED, g.TMEM_COLS, g.TMEM_IS_EXCLUSIVE, cfgmod.TMEM_COLS_SM107) == (512, 64, 576, 576, True, 576)
+    assert g.DQ_COL == g.DK_COL + g.DK_COLS and g.DQ_COL + g.DQ_COLS == g.TMEM_COLS and (c.TMEM_IS_EXCLUSIVE, c.TMEM_COLS, c.TMEM_USED) == (False, 512, 512)
+    assert (g.SMEM_BYTES, g.BARS, g.TMEM_HANDLE, g.TMEM_DEAD_COL, g.DQ_LANE_SPLIT) == (c.SMEM_BYTES, c.BARS, c.TMEM_HANDLE, 192, 64)
+    assert cfgmod.TMEM_MAP_PARTS == {"s_tail": ((10, 0), (10, 3), (10, 7)), "dq_576": ((10, 7),)} and cfgmod.TMEM_MAP_DEFAULT_BY_PART == {
+        (10, 0): "s_tail",
+        (10, 3): "s_tail",
+        (10, 7): "s_tail",  # dq_576 is selectable by name only (the probe verdict: a neutral structural map, kernel header section 13)
+    }
+    assert cfgmod.DELETED_BARRIERS_DQ576 == ("s_read", "s_tail_empty") and c.DIAG_2CTA_S_TAIL_PROBES == _PROBES[4:]
+    dq_tables = (cfgmod.BAR_LAYOUT_DQ576, cfgmod.BAR_LAYOUT_RING_DQ576)
+    assert [(len(t), sum(row[2] for row in t)) for t in dq_tables] == [(33, 38), (35, 42)]
+    assert (cfgmod.BAR_LAYOUT_DQ576_END, cfgmod.BAR_LAYOUT_RING_DQ576_END) == (230928, 231984) and dq_tables[0][0][1] == c.BARS and dq_tables[1][0][1] == 231424
+    assert [row[0] for row in dq_tables[0]] == [row[0] for row in cfgmod.BAR_LAYOUT if row[0] not in ("s_read", "s_tail_empty")]
+    assert cfgmod.bar_kind_counts_for_roles("16w", "tma_ring", "dq_576") == {
+        "tma_leader": 7,
+        "mma": 9,
+        "thread": 10,
+        "leader": 4,
+        "peer": 2,
+        "tma_dsmem": 1,
+        "tma": 2,
+    }
+    assert (cfgmod.DBG_CLK_DQ576.SMEM, cfgmod.DBG_CLK_DQ576.WORDS, cfgmod.DBG_CLK_RING_DQ576.SMEM, cfgmod.DBG_CLK_RING_DQ576.WORDS) == (230928, 104, 231984, 96)
+    assert cfgmod.DBG_CLK_RING_DQ576.WORD == cfgmod.DBG_CLK.WORD and cfgmod.dbg_clk_dead_words("dq_576") == (
+        "wait:leader:s_read",
+        "blocked:leader:s_read",
+        "wait:leader:s_tail_empty",
+        "blocked:leader:s_tail_empty",
+        "wait:leader:dq_read_done",  # the rubin_b2 row: dead on the sm100 SMEM map
+        "blocked:leader:dq_read_done",
+    )
+    # the SMEM MAP (arm R2.c, PART-KEYED; kernel header sections 5 / 8 / 11): the B2 record's slab chain on the oversized carveout, every tcgen05 root
+    # below the version-0 line, the DERIVED 36-row table (51 slots, the 32-B do1_full row, dq_read_done after dp_empty), the STAMPS record's spare
+    b2 = cfgmod.CFG_RING_DQ576_B2
+    assert (b2.SMEM_MAP, b2.Q1_STAGES, b2.DO1_STAGES, b2.DS_STAGES, b2.XCHG_STAGES, b2.TMEM_MAP, b2.TMEM_COLS) == ("rubin_b2", 2, 2, 2, 2, "dq_576", 576)
+    assert (c.SMEM_MAP, c.SMEM_MAPS, cfgmod.SMEM_MAP_CODES, c.DO1_STAGES, c.DS_STAGES, c.XCHG_STAGES) == (
+        "sm100",
+        _SMEM_MAPS,
+        {"sm100": 0, "rubin_b2": 1, "sm100_oversized": 2},
+        1,
+        1,
+        1,
+    )
+    assert (b2.Q1, b2.Q2, b2.DO1, b2.DO2, b2.K1, b2.K2, b2.V, b2.DS, b2.XCHG, b2.DQ, b2.STATS, b2.SLABS_END) == (
+        0,
+        32768,
+        49152,
+        81920,
+        98304,
+        131072,
+        163840,
+        196608,
+        262144,
+        294912,
+        311296,
+        313344,
+    )
+    assert (b2.SMEM_BYTES, b2.BARS, b2.TMEM_HANDLE, b2.SCHED_PAYLOAD, b2.SMEM_CAP, c.SMEM_OPT_IN_CAP, c.SMEM_OVERSIZED_CAP) == (
+        314368,
+        313344,
+        314288,
+        314304,
+        334848,
+        232448,
+        334848,
+    )
+    assert c.SMEM_OPT_IN_CAP < b2.SMEM_BYTES <= b2.SMEM_CAP and b2.SMEM_BYTES - gr.SMEM_BYTES == 81920  # the four second stages: +16 +16 +32 +16 KiB
+    assert (
+        max(b2.desc_roots()) == 229376 < b2.TCGEN05_V0_ADDR_LIMIT == 262144 == b2.XCHG and b2.desc_roots()[-1] + b2.DS_BYTES == 262144
+    )  # the last root ends AT the line
+    assert [b2.ds_stage(s) for s in range(2)] == [196608, 229376] and [b2.xchg_stage(s) for s in range(2)] == [262144, 278528] and b2.dq_slot(1) == 303104
+    assert {b2.dk_store(0, 0), b2.dk_store(0, 1)} == {b2.ds_own_stage(0, 0), b2.xchg_stage(0)}  # the dK staging alias over the STAGE-0 bytes (section 8)
+    t = cfgmod.BAR_LAYOUT_RING_DQ576_B2
+    assert (len(t), sum(r[2] for r in t), cfgmod.BAR_LAYOUT_RING_DQ576_B2_END) == (36, 51, 313936) and t[0][1] == b2.BARS
+    names_b2 = [r[0] for r in t]
+    assert names_b2.index("dq_read_done") == names_b2.index("dp_empty") + 1 and cfgmod.ADDED_BARRIERS_B2 == ("dq_read_done",)
+    assert {r[0]: r[2] for r in t} == dict(
+        {r[0]: r[2] for r in cfgmod.BAR_LAYOUT_RING_DQ576},
+        q1_full=2,
+        q1_empty=2,
+        do1_full=4,
+        do1_empty=2,
+        ds_smem=2,
+        ds_recv_full=2,
+        ds_pair_ready=2,
+        dq_read_done=1,
+    )
+    assert cfgmod.DQ_READ_DONE_ROW == ("dq_read_done", 1, c.PAIR_EPILOGUE_LANES, "leader", "LEADER") and c.PAIR_EPILOGUE_LANES == 256
+    assert cfgmod.bar_kind_counts_for_roles("16w", "tma_ring", "dq_576", "rubin_b2") == {
+        "tma_leader": 7,
+        "mma": 9,
+        "thread": 10,
+        "leader": 5,
+        "peer": 2,
+        "tma_dsmem": 1,
+        "tma": 2,
+    }
+    assert {r[0]: r[1] for r in t}["do1_empty"] - {r[0]: r[1] for r in t}["do1_full"] == 32  # the cumulative walk: a 4-slot row takes 32 B
+    assert (
+        cfgmod.layout_for_geometry(c) == cfgmod.BAR_LAYOUT
+        and cfgmod.layout_for_geometry(gr) == cfgmod.BAR_LAYOUT_RING_DQ576
+        and cfgmod.layout_for_geometry(b2) == t
+    )
+    assert (cfgmod.DBG_CLK_RING_DQ576_B2.SMEM, cfgmod.DBG_CLK_RING_DQ576_B2.WORDS) == (313936, 88) and cfgmod.DBG_CLK_RING_DQ576_B2.WORD == cfgmod.DBG_CLK.WORD
+    assert cfgmod.dbg_clk_dead_words("dq_576", "rubin_b2") == cfgmod.dbg_clk_dead_words("dq_576")[:4] and cfgmod.dbg_clk_dead_words("s_tail") == (
+        "wait:leader:dq_read_done",
+        "blocked:leader:dq_read_done",
+    )
+    assert "dq_read_done" not in {r[0] for r in cfgmod.BAR_LAYOUT} | {r[0] for r in cfgmod.BAR_LAYOUT_RING_DQ576} | {r[0] for r in cfgmod.BAR_LAYOUT_XFA4}
     # 35 rows / 40 slots: + dvk_stage_empty (THREAD 32, the fp32 dK / dV rounds' WAR release; init only under dkv_fp32)
     assert len(cfgmod.BAR_LAYOUT) == 35 and sum(r[2] for r in cfgmod.BAR_LAYOUT) == 40 and cfgmod.BAR_LAYOUT_END == 230960
     assert cfgmod.BAR_LAYOUT[-1][0] == "dvk_stage_empty" and cfgmod.BAR_LAYOUT[-1][3] == cfgmod.CFG.STORE_LANES
@@ -238,16 +472,20 @@ def test_2cta_stail_config_is_the_truth():
         230960,
         96,
         384,
-        17,
-        84,
+        18,
+        86,
         128,
         (100, 400, 1600),
-    )  # the record = the 384-B spare left by the fp32_reduce row (derived); 82 ldg words + the stats ring's 2 (appended after every ldg word)
+    )  # the record = the 384-B spare left by the fp32_reduce row (derived); 82 ldg words + the leader's dq_read_done pair (rubin_b2) + the stats ring's 2
     assert d.SMEM == cfgmod.BAR_LAYOUT_END and d.SMEM + d.BYTES <= c.TMEM_HANDLE and c.DEBUG_CLK_DEFAULT is False
     # --- lever S1 (stats_form; header sections 5 / 8 / 11): the two geometries, the ring, the re-based ring barrier table, the record per form ---
     from cudnn.sdpa.bwd import d128_grouped_2cta_contract as contract
 
     r = cfgmod.CFG_RING
+    assert (gr.DQ_COL, gr.TMEM_COLS, gr.SMEM_BYTES, gr.BARS, gr.TMEM_HANDLE, gr.STATS_STAGES) == (512, 576, r.SMEM_BYTES, r.BARS, r.TMEM_HANDLE, 2)
+    assert cfgmod.cfg_for_part((10, 0)) is r is cfgmod.cfg_for_part((10, 3)) is cfgmod.cfg_for_part((10, 7)) is cfgmod.cfg_for_part((10, 7), tmem_map="s_tail")
+    assert cfgmod.cfg_for_part((10, 7), tmem_map="dq_576") is gr and cfgmod.cfg_for_part((10, 7), "ldg", tmem_map="dq_576") is g  # NAMED on the 576-column part
+    assert cfgmod.cfg_for_part((10, 7), "ldg") is c is cfgmod.cfg_for_part((10, 7), roles="16w_fa4")  # unset: s_tail everywhere (16w_fa4: ldg too)
     assert (c.STATS_FORMS, c.STATS_FORM_DEFAULT, cfgmod.STATS_FORM_CODES) == (("ldg", "tma_ring"), "tma_ring", {"ldg": 0, "tma_ring": 1})
     assert c.STATS_FORM_FA4 == "ldg" and c.STATS_FORM_DEFAULT_BY_ROLES == {"16w": "tma_ring", "16w_fa4": "ldg"}  # the unset field per role shape
     assert (c.STATS_STAGES, r.STATS_STAGES, c.STATS_STAGE_BYTES, c.STATS_TX, c.STATS_DELTA_OFF, c.STATS_RING) == (1, 2, 1024, 1024, 512, 229376)
@@ -271,7 +509,7 @@ def test_2cta_stail_config_is_the_truth():
     assert cfgmod.bar_layout_end_for_roles("16w", "tma_ring") == 232016 and cfgmod.bar_layout_end_for_roles("16w_fa4", "tma_ring") == 231984
     dr = cfgmod.DBG_CLK_RING
     assert (dr.SMEM, dr.WORDS, dr.BYTES) == (232016, 88, 352) and dr.SMEM + dr.BYTES == r.TMEM_HANDLE and dr.WORD == d.WORD  # derived: the re-based spare
-    assert [d.WORD[f"wait:{role}:{b}"] for role, b in cfgmod.DBG_CLK_RING_WAITS] == [82, 83] and cfgmod.dbg_clk_for_stats_form("tma_ring") is dr
+    assert [d.WORD[f"wait:{role}:{b}"] for role, b in cfgmod.DBG_CLK_RING_WAITS] == [84, 85] and cfgmod.dbg_clk_for_stats_form("tma_ring") is dr
     assert cfgmod.dbg_clk_bytes(1, 1, 256, "ldg") == 2 * 384 and cfgmod.dbg_clk_bytes(1, 1, 256) == cfgmod.dbg_clk_bytes(1, 1, 256, "tma_ring") == 2 * 352
     # the padded pre-scaled stats region (the contract): one (head, q tile) record = one ring stage image; PAD_TOTAL bounds every sequence's block
     assert contract.ABI_VERSION == 2 and contract.STATS_KINDS == 2
@@ -306,7 +544,7 @@ def test_2cta_stail_config_is_the_truth():
 
 
 def test_2cta_stail_fields_are_typed():
-    """The typed fields decline BY NAME: ``diag_2cta`` resolves the four probes of the code space and nothing else (two probes of an earlier pair
+    """The typed fields decline BY NAME: ``diag_2cta`` resolves the seven probes of the code space and nothing else (two probes of an earlier pair
     body are outside the domain); ``debug_clk`` is a bool (False by default); the adapter readers prefix the engine name; the record defaults are
     None / False; the pruned perf knobs of the measurement measurement series are not fields of the adapter (one body, one order, one load form)."""
     from types import SimpleNamespace
@@ -317,7 +555,8 @@ def test_2cta_stail_fields_are_typed():
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk, diag_2cta
 
     assert base.resolve_diag_2cta(None) is None and [base.resolve_diag_2cta(p) for p in _PROBES] == list(_PROBES)
-    assert [base.diag_2cta_code(p) for p in _PROBES] == [1, 2, 3, 4] and base.diag_2cta_code(None) == 0
+    assert [base.diag_2cta_code(p) for p in _PROBES] == list(range(1, len(_PROBES) + 1)) and base.diag_2cta_code(None) == 0
+    assert _PROBES[:4] == ("dq_reduce_add_off", "exchange_off", "stats_one_chunk", "sdq_sts_off"), "the three wait probes joined AFTER the first four"
     for bad in ("dp_empty_wait_off", "ds_gates_off", "bogus", "", 1):
         with pytest.raises(ValueError, match="diag_2cta must be None or one of"):
             base.resolve_diag_2cta(bad)
@@ -333,7 +572,8 @@ def test_2cta_stail_fields_are_typed():
     with pytest.raises(ValueError, match="sdpa_bwd_sm100_d128: debug_clk must be a bool"):
         debug_clk(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", debug_clk=1))
     assert SdpaBwdDslSm100D128.debug_clk is False and SdpaBwdDslSm100D128.diag_2cta is None  # the record defaults
-    for pruned in ("tmem_map", "pair_mma_order", "dq_route_pair", "tma_load_form", "store_wait_form", "reg_split", "datapath_2cta"):
+    assert SdpaBwdDslSm100D128.tmem_map is None  # the TMEM map: unset = the PART's default (a typed field since arm R1; the typed row below)
+    for pruned in ("pair_mma_order", "dq_route_pair", "tma_load_form", "store_wait_form", "reg_split", "datapath_2cta"):
         assert not hasattr(SdpaBwdDslSm100D128, pruned), pruned
     for pruned in ("PAIR_MMA_ORDERS", "DQ_ROUTES_PAIR", "TMA_LOAD_FORMS", "STORE_WAIT_FORMS", "REG_SPLITS", "REG_SPLIT_NAMES"):
         assert not hasattr(cfgmod.CFG, pruned) and not hasattr(base.CFG, pruned), pruned
@@ -383,7 +623,7 @@ def test_2cta_stail_stats_form_is_typed():
 
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import stats_form
 
     c = cfgmod.CFG
@@ -421,6 +661,179 @@ def test_2cta_stail_stats_form_is_typed():
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", stats_form="tma_ring")
     with pytest.raises(ValueError, match="stats_form must be one of"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, stats_form="ring")
+
+
+def test_2cta_stail_tmem_map_is_typed_and_part_keyed(monkeypatch):
+    """``tmem_map`` is a typed, PART-KEYED field (the kernel header sections 9 / 11 / 13): ``None`` = the part's default = "s_tail" on every admitted
+    part (the only map the 512-column carve serves; on cc 10.7 "dq_576" is SELECTABLE BY NAME and not the default: its ceiling probe read inside noise,
+    a neutral structural map), "s_tail" under "16w_fa4" too; a name outside the domain declines BY NAME (ValueError); a known map NAMED on a part
+    that does not serve it is the engine's typed decline (the config's ``TmemMapNotServed`` -> the adapter reader's NotImplementedError); an
+    unadmitted part has no default; the cross-field rules decline by name at the config bundle and at ``compile_host`` before any trace ("dq_576" x
+    "16w_fa4", the three S-tail WAIT probes x "dq_576"); the kernel's constants are the config's code space; the record default is None."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd import prepared_sm100_d128_grouped_2cta as prepared
+    from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+
+    c = cfgmod.CFG
+    assert c.TMEM_MAPS == _TMEM_MAPS and tuple(cfgmod.TMEM_MAP_CODES) == _TMEM_MAPS and c.TMEM_MAP == "s_tail" and cfgmod.CFG_DQ576.TMEM_MAP == "dq_576"
+    for cc in ((10, 0), (10, 3)):
+        assert cfgmod.resolve_tmem_map(None, cc) == "s_tail" == cfgmod.resolve_tmem_map("s_tail", cc) and cfgmod.tmem_map_code(None, cc) == 0
+        with pytest.raises(cfgmod.TmemMapNotServed, match="tmem_map 'dq_576' is not served on cc"):
+            cfgmod.resolve_tmem_map("dq_576", cc)
+    assert cfgmod.resolve_tmem_map(None, (10, 7)) == "s_tail" and cfgmod.tmem_map_code(None, (10, 7)) == 0  # the part's default: s_tail (no perf claim)
+    assert (
+        cfgmod.resolve_tmem_map("dq_576", (10, 7)) == "dq_576" == cfgmod.resolve_tmem_map("dq_576", (10, 7), "16w")
+        and cfgmod.tmem_map_code("dq_576", (10, 7)) == 1
+    )
+    assert (
+        cfgmod.resolve_tmem_map("s_tail", (10, 7)) == "s_tail" == cfgmod.resolve_tmem_map(None, (10, 7), "16w_fa4")
+        and cfgmod.tmem_map_code("s_tail", (10, 7)) == 0
+    )
+    for bad_name in ("bogus", "", "DQ_576", 1):
+        with pytest.raises(ValueError, match="tmem_map must be one of") as info:
+            cfgmod.resolve_tmem_map(bad_name, (10, 7))
+        assert not isinstance(info.value, cfgmod.TmemMapNotServed)  # a name outside the domain is a bug, never a decline
+    for bad_cc in (None, (9, 0), (12, 0), (10, 9)):
+        with pytest.raises(ValueError, match="no TMEM map is defined for cc"):
+            cfgmod.resolve_tmem_map(None, bad_cc)
+    # the adapter reader: the part from Q's device (patched here: the host has none), the prefix, the typed decline
+    monkeypatch.setattr(prepared, "_device_cc", lambda api: (10, 7))
+    assert prepared.tmem_map(SimpleNamespace(_NAME="x")) == "s_tail" and prepared.tmem_map(SimpleNamespace(_NAME="x", tmem_map="dq_576")) == "dq_576"
+    assert prepared.tmem_map(SimpleNamespace(_NAME="x", tmem_map="s_tail")) == "s_tail"
+    assert prepared.tmem_map(SimpleNamespace(_NAME="x", warp_roles="16w_fa4")) == "s_tail"
+    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d128: tmem_map must be one of"):
+        prepared.tmem_map(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", tmem_map="dq576"))
+    monkeypatch.setattr(prepared, "_device_cc", lambda api: (10, 0))
+    assert prepared.tmem_map(SimpleNamespace(_NAME="x")) == "s_tail"
+    with pytest.raises(NotImplementedError, match="sdpa_bwd_sm100_d128: 2-CTA datapath tmem_map 'dq_576' is not served on cc \\(10, 0\\)"):
+        prepared.tmem_map(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", tmem_map="dq_576"))
+    assert SdpaBwdDslSm100D128.tmem_map is None  # the record default: the part's map
+    # the cross-field rules at the config bundle and at compile_host (sm = the part): before any trace
+    assert (
+        cfgmod.validate_fields_for_roles("16w", None, tmem_map="dq_576") == "16w" == cfgmod.validate_fields_for_roles("16w", "exchange_off", tmem_map="dq_576")
+    )
+    with pytest.raises(ValueError, match="tmem_map 'dq_576' is not built under warp_roles '16w_fa4'"):
+        cfgmod.validate_fields_for_roles("16w_fa4", None, tmem_map="dq_576")
+    for probe in c.DIAG_2CTA_S_TAIL_PROBES:
+        with pytest.raises(ValueError, match=f"diag_2cta '{probe}' is not defined under tmem_map 'dq_576'"):
+            cfgmod.validate_fields_for_roles("16w", probe, tmem_map="dq_576")
+        assert cfgmod.validate_fields_for_roles("16w", probe, tmem_map="s_tail") == "16w"
+    args = ((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True)
+    with pytest.raises(ValueError, match="tmem_map 'dq_576' is not served on cc \\(10, 0\\)"):
+        compile_host(*args, 100, tmem_map="dq_576")
+    with pytest.raises(ValueError, match="tmem_map 'dq_576' is not served on cc \\(10, 3\\)"):
+        compile_host(*args, 103, tmem_map="dq_576")
+    with pytest.raises(ValueError, match="tmem_map 'dq_576' is not built under warp_roles '16w_fa4'"):
+        compile_host(*args, 107, tmem_map="dq_576", warp_roles="16w_fa4")
+    for probe in c.DIAG_2CTA_S_TAIL_PROBES:
+        with pytest.raises(ValueError, match=f"diag_2cta '{probe}' is not defined under tmem_map 'dq_576'"):
+            compile_host(*args, 107, tmem_map="dq_576", diag_2cta=probe)  # NAMED: the cc 10.7 default map is s_tail, where the probes are served
+    for probe in c.DIAG_2CTA_S_TAIL_PROBES:
+        assert cfgmod.validate_fields_for_roles("16w", probe, tmem_map=cfgmod.resolve_tmem_map(None, (10, 7))) == "16w"  # the default serves them
+    with pytest.raises(ValueError, match="tmem_map must be one of"):
+        compile_host(*args, 107, tmem_map="bogus")
+    body = _body_module()
+    assert (body.TMEM_MAP_S_TAIL, body.TMEM_MAP_DQ576) == (0, 1) and body.DQ_COL_BY_MAP == {0: c.DQ_COL, 1: cfgmod.CFG_DQ576.DQ_COL} == {0: 64, 1: 512}
+    assert body._dq_col(0) == 64 and body._dq_col(1) == 512 and body._geometry(True, True) is cfgmod.CFG_RING_DQ576 and body._geometry(False, False) is c
+    assert tuple(body.BarsDQ576._fields) == tuple(r[0] for r in cfgmod.BAR_LAYOUT_DQ576) and tuple(body.BarsRingDQ576._fields) == tuple(
+        r[0] for r in cfgmod.BAR_LAYOUT_RING_DQ576
+    )
+    assert "s_read" not in body.BarsDQ576._fields and "s_tail_empty" not in body.BarsRingDQ576._fields and body.DVK_STAGE_EMPTY_ROW == 34
+    assert body._dvk_stage_empty_row(body.BarsDQ576) == body._dvk_stage_empty_row(body.BarsRingDQ576) == 32 and body._dvk_stage_empty_row(body.BarsXFA4) == -1
+
+
+def test_2cta_stail_smem_map_is_typed_and_part_keyed(monkeypatch):
+    """``smem_map`` is a typed, PART-KEYED field (the kernel header sections 5 / 8 / 11; arm R2.c): ``None`` = the part's default = "sm100" on every
+    admitted part (the opt-in slab chain); "rubin_b2" (the 327 KiB oversized carveout) is SELECTABLE BY NAME on cc 10.7 together with ``tmem_map =
+    "dq_576"`` under the default role shape and stats form and not a default anywhere (its A/B/A row flips the defaults); a name outside the domain
+    declines BY NAME (ValueError); a known map NAMED on a part that does not serve it is the engine's typed decline (the config's ``SmemMapNotServed`` ->
+    the adapter reader's NotImplementedError); an unadmitted part has no default; the cross-field rules decline by name at the config bundle and at
+    ``compile_host`` before any trace ("rubin_b2" x "s_tail", x "16w_fa4", x "ldg"); the kernel's constants, bundles and trace-time declines are the
+    config's code space; the record default is None."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd import prepared_sm100_d128_grouped_2cta as prepared
+    from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+
+    c = cfgmod.CFG
+    assert (
+        c.SMEM_MAPS == _SMEM_MAPS and tuple(cfgmod.SMEM_MAP_CODES) == _SMEM_MAPS and c.SMEM_MAP == "sm100" and cfgmod.CFG_RING_DQ576_B2.SMEM_MAP == "rubin_b2"
+    )
+    assert cfgmod.SMEM_MAP_PARTS == {"sm100": ((10, 0), (10, 3), (10, 7)), "rubin_b2": ((10, 7),), "sm100_oversized": ((10, 7),)}
+    assert cfgmod.SMEM_MAP_DIAGNOSTIC == ("sm100_oversized",) and cfgmod.smem_map_code("sm100_oversized", (10, 7)) == 2  # the DIAGNOSTIC map, by name
+    assert (cfgmod.CFG_RING_DQ576_OVS.SMEM_BYTES, cfgmod.CFG_RING_OVS.SMEM_BYTES, cfgmod.SMEM_OVERSIZED_PROBE_BYTES) == (262144, 262144, 262144)
+    for cc in ((10, 0), (10, 3)):
+        with pytest.raises(cfgmod.SmemMapNotServed, match="smem_map 'sm100_oversized' is not served on cc"):
+            cfgmod.resolve_smem_map("sm100_oversized", cc)
+    assert cfgmod.SMEM_MAP_DEFAULT_BY_PART == {(10, 0): "sm100", (10, 3): "sm100", (10, 7): "sm100"}  # rubin_b2 by name only (its A/B/A row pending)
+    for cc in ((10, 0), (10, 3)):
+        assert cfgmod.resolve_smem_map(None, cc) == "sm100" == cfgmod.resolve_smem_map("sm100", cc) and cfgmod.smem_map_code(None, cc) == 0
+        with pytest.raises(cfgmod.SmemMapNotServed, match="smem_map 'rubin_b2' is not served on cc"):
+            cfgmod.resolve_smem_map("rubin_b2", cc)
+    assert cfgmod.resolve_smem_map(None, (10, 7)) == "sm100" and cfgmod.smem_map_code(None, (10, 7)) == 0  # the part's default: sm100 (no default flip)
+    assert (
+        cfgmod.resolve_smem_map("rubin_b2", (10, 7)) == "rubin_b2" == cfgmod.resolve_smem_map("rubin_b2", (10, 7), "16w", "tma_ring", "dq_576")
+        and cfgmod.smem_map_code("rubin_b2", (10, 7)) == 1
+    )
+    for bad_name in ("bogus", "", "RUBIN_B2", "b2", 1):
+        with pytest.raises(ValueError, match="smem_map must be one of") as info:
+            cfgmod.resolve_smem_map(bad_name, (10, 7))
+        assert not isinstance(info.value, cfgmod.SmemMapNotServed)  # a name outside the domain is a bug, never a decline
+    for bad_cc in (None, (9, 0), (12, 0), (10, 9)):
+        with pytest.raises(ValueError, match="no SMEM map is defined for cc"):
+            cfgmod.resolve_smem_map(None, bad_cc)
+    # the adapter reader: the part from Q's device (patched here: the host has none), the prefix, the typed decline
+    monkeypatch.setattr(prepared, "_device_cc", lambda api: (10, 7))
+    assert prepared.smem_map(SimpleNamespace(_NAME="x")) == "sm100" and prepared.smem_map(SimpleNamespace(_NAME="x", **_B2_FIELDS)) == "rubin_b2"
+    with pytest.raises(ValueError, match="sdpa_bwd_sm100_d128: smem_map must be one of"):
+        prepared.smem_map(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", smem_map="b2"))
+    monkeypatch.setattr(prepared, "_device_cc", lambda api: (10, 0))
+    assert prepared.smem_map(SimpleNamespace(_NAME="x")) == "sm100"
+    with pytest.raises(NotImplementedError, match="sdpa_bwd_sm100_d128: 2-CTA datapath smem_map 'rubin_b2' is not served on cc \\(10, 0\\)"):
+        prepared.smem_map(SimpleNamespace(_NAME="sdpa_bwd_sm100_d128", smem_map="rubin_b2"))
+    assert SdpaBwdDslSm100D128.smem_map is None  # the record default: the part's map
+    # the cross-field rules at the config bundle and at compile_host (sm = the part): before any trace
+    assert (
+        cfgmod.validate_fields_for_roles("16w", None, tmem_map="dq_576", smem_map="rubin_b2")
+        == "16w"
+        == cfgmod.validate_fields_for_roles("16w", None, smem_map="sm100")
+    )
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not built under tmem_map 's_tail'"):
+        cfgmod.validate_fields_for_roles("16w", None, smem_map="rubin_b2")
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not built under warp_roles '16w_fa4'"):
+        cfgmod.validate_fields_for_roles("16w_fa4", None, tmem_map="dq_576", smem_map="rubin_b2")
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not built under stats_form 'ldg'"):
+        cfgmod.validate_fields_for_roles("16w", None, stats_form="ldg", tmem_map="dq_576", smem_map="rubin_b2")
+    args = ((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True)
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not served on cc \\(10, 0\\)"):
+        compile_host(*args, 100, smem_map="rubin_b2")
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not served on cc \\(10, 3\\)"):
+        compile_host(*args, 103, smem_map="rubin_b2")
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not built under tmem_map 's_tail'"):
+        compile_host(*args, 107, smem_map="rubin_b2")  # the cc 10.7 default TMEM map is s_tail: both maps must be NAMED
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not built under warp_roles '16w_fa4'"):
+        compile_host(*args, 107, warp_roles="16w_fa4", **_B2_FIELDS)
+    with pytest.raises(ValueError, match="smem_map 'rubin_b2' is not built under stats_form 'ldg'"):
+        compile_host(*args, 107, stats_form="ldg", **_B2_FIELDS)
+    with pytest.raises(ValueError, match="smem_map must be one of"):
+        compile_host(*args, 107, smem_map="bogus")
+    body = _body_module()
+    assert (body.SMEM_MAP_SM100, body.SMEM_MAP_RUBIN_B2) == (0, 1) and body._geometry(True, True, True) is cfgmod.CFG_RING_DQ576_B2
+    assert body._geometry(True, True) is cfgmod.CFG_RING_DQ576 and body._geometry(False, False) is c
+    assert tuple(body.BarsRingDQ576B2._fields) == tuple(r[0] for r in cfgmod.BAR_LAYOUT_RING_DQ576_B2) and "dq_read_done" in body.BarsRingDQ576B2._fields
+    assert "dq_read_done" not in body.BarsRingDQ576._fields and "dq_read_done" not in body.Bars._fields and "dq_read_done" not in body.BarsXFA4._fields
+    assert body._dvk_stage_empty_row(body.BarsRingDQ576B2) == body._dvk_stage_empty_row(body.BarsRingDQ576) + 1
+    for bad_geo in ((False, True, True), (True, False, True)):  # ldg x rubin_b2, s_tail x rubin_b2: no geometry record
+        with pytest.raises(ValueError, match="no geometry for"):
+            body._geometry(*bad_geo)
+    kernel = _function_code(_body_source(), "bprop_d128_accum_grouped_2cta_stail_kernel", "main_thd_2cta_stail_host")
+    for guard in ("b2 and not dq576", "b2 and fa4_roles", "b2 and not tma_ring"):  # the trace-time declines by name
+        assert any(f"if cutlass.const_expr({guard}):" in ln for ln in kernel), guard
 
 
 def test_2cta_stail_tile_mask_predicate_is_exact_against_the_per_cell_mask():
@@ -466,33 +879,50 @@ def _render_kernels(tmp_path, form_kw, extra_census=None):
     return render_2cta_kernels(tmp_path, form_kw, dict(_CENSUS, **(extra_census or {})))
 
 
-def _record_kernels(path, token):
-    """Select the installed DSL build's record; an unrecorded build still reaches the existing skip guard."""
-    from cudnn.frost.buffers import cutedsl_state
+def _record_kernels(path, token, arch="sm_100a"):
+    """(dsl line, {kernel: md5}) of a per-kernel record's ``default`` variant for ``arch`` (frost_test_utils.read_kernel_record): the
+    installed DSL build's record where one CARRIES the token (the release record, then the dev-build record beside it); an unrecorded build,
+    or a token the matching build's record lacks, still reaches the existing skip guard."""
+    import cudnn.frost.buffers as buffers
 
-    _installed, version = cutedsl_state()
+    _installed, version = buffers.cutedsl_state()
     have = " ".join(version) if version else None
     paths = (path, _RECORD_DEV) if path == _RECORD else (path,)
-    records = [read_kernel_record(candidate, token) for candidate in paths]
-    dsl, want = next((record for record in records if record[0] == have), records[0])
+    records = [read_kernel_record(candidate, token, arch) for candidate in paths]
+    dsl, want = next((record for record in records if record[0] == have and record[1].get("default")), records[0])
     return dsl, want.get("default", {})
 
 
-def _assert_record(kernels, path, token, what):
+def _assert_record(kernels, path, token, what, arch="sm_100a"):
     """The skip-then-assert pin: a SKIP on another DSL build, else every kernel the chain owns renders the record's md5 and every rendered kernel
     outside the shared set is recorded (the fold is excluded by name) -- never a widened or a conditional pin."""
-    dsl, want = _record_kernels(path, token)
+    dsl, want = _record_kernels(path, token, arch)
     assert dsl and want, (dsl, want, path)
     _skip_unless_record_dsl(dsl)
     assert_kernel_record(kernels, want, token=token, variant="default", excluded=D128_THD_SHARED_KERNELS, what=what)
 
 
+def test_2cta_stail_record_selector_falls_back_to_the_release_record_for_tokens_the_dev_record_lacks(monkeypatch):
+    """RED-first (PR 2086 review): on an install whose DSL build string equals the dev-build record's, the selector must take the dev record
+    only for the tokens that record carries (the default); a token recorded in the release file alone (the dense twin) falls back to the
+    release record, so the skip guard -- never an empty record -- decides; no record file is read as the "installed" one by position."""
+    import cudnn.frost.buffers as buffers
+
+    dev_dsl = read_kernel_record(_RECORD_DEV, _RECORD_TOKEN)[0]
+    assert dev_dsl and dev_dsl != read_kernel_record(_RECORD, _RECORD_TOKEN)[0], dev_dsl
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, tuple(dev_dsl.split(" ", 1))))
+    dsl_default, want_default = _record_kernels(_RECORD, _RECORD_TOKEN)
+    assert dsl_default == dev_dsl and want_default, (dsl_default, want_default)
+    dsl_dense, want_dense = _record_kernels(_RECORD, _RECORD_TOKEN_DENSE)
+    assert want_dense and dsl_dense != dev_dsl, (dsl_dense, want_dense)  # the release record: the guard skips it by name on this build
+
+
 def _skip_unless_record_dsl(dsl):
     """A record's PTX md5 holds for the DSL build that rendered it (its ``dsl=`` line): another installed build is a SKIP before the md5
     assertion -- never a widened or a conditional pin (PR 1943 review)."""
-    from cudnn.frost.buffers import cutedsl_state
+    import cudnn.frost.buffers as buffers
 
-    _installed, version = cutedsl_state()
+    _installed, version = buffers.cutedsl_state()
     have = " ".join(version) if version else None
     if have != dsl:
         pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
@@ -509,6 +939,31 @@ def test_2cta_stail_host_renders_for_sm_100a_and_matches_its_record(tmp_path):
     assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels  # the chain's five launches: four own + the shared fold
     assert _RECORD.is_file(), _RECORD
     _assert_record(kernels, _RECORD, _RECORD_TOKEN, "the s_tail default rendering")
+
+
+def test_2cta_stail_host_renders_dense_form_for_sm_100a_and_matches_its_record(tmp_path):
+    """RED-first (no ``layout`` form existed): the dense compact-BSHD twin (``layout = "dense"``: the setup kernel's dense arm synthesizing the
+    metadata from the two declared extents, the head-major Stats binding with the synthesized stats origin, no length / offset operands)
+    trace-compiles on the host for sm_100a (no device).  The MAIN kernel's `.entry` region hashes to the DEFAULT record's main-kernel md5 -- the
+    twin is a host lowering, the pair body is byte-identical by construction and this row is the proof -- with the main kernel's census and the
+    register split the default form's; the three helper kernels the arm re-renders (setup / delta / cast: their origin-spec and layout Constexprs
+    differ) match their own committed rows (token ``_dense``, same file; skips, never widens, on another DSL build)."""
+    from cudnn.sdpa.bwd.d128_grouped_2cta_contract import DENSE_ORIGIN_DTYPES, DENSE_ORIGIN_SPECS
+
+    md5, census, regs, kernels = render_2cta_kernels(
+        tmp_path, {"layout": "dense"}, _CENSUS, config=(2, 8, 2, False), specs=DENSE_ORIGIN_SPECS, dtypes=DENSE_ORIGIN_DTYPES
+    )
+    print(f"\n2-CTA s_tail sm_100a dense twin: PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
+    assert census == _EXPECTED, census  # the module census is the main kernel's: the three re-rendered helpers carry none of its rows
+    assert sorted(regs) == _setmaxnreg_of(), regs
+    assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels  # the same five launches as the packed chain
+    dsl_default, default = _record_kernels(_RECORD, _RECORD_TOKEN)
+    _skip_unless_record_dsl(dsl_default)  # the default record's main-kernel md5 holds for its DSL build only: another build skips before comparing
+    assert kernels[_MAIN_KERNEL] == default[_MAIN_KERNEL], (
+        f"the dense form re-rendered the MAIN kernel ({kernels[_MAIN_KERNEL]} vs the default record's {default[_MAIN_KERNEL]}): "
+        "the twin is a host lowering, the pair body must be byte-identical"
+    )
+    _assert_record(kernels, _RECORD, _RECORD_TOKEN_DENSE, "the dense twin's rendering")
 
 
 def test_2cta_stail_host_renders_for_sm_103a_and_matches_the_record(tmp_path):
@@ -529,12 +984,184 @@ def test_2cta_stail_host_renders_for_sm_103a_and_matches_the_record(tmp_path):
     _assert_record(kernels, _RECORD, _RECORD_TOKEN, "the s_tail default rendering for sm_103a (per-kernel `.entry` md5s are target-independent)")
 
 
+def test_2cta_stail_host_renders_for_sm_107a_and_matches_the_record(tmp_path):
+    """The Rubin target (cc 10.7 -> the prepared module's ``sm`` = 107 -> ``--gpu-arch sm_107a`` in the host; the cc 10.7 admission of the d128
+    family, 2026-11-03) with every field unset: ``tmem_map`` resolves to the part's default "s_tail" (dq_576 is selectable by name only), so the
+    chain trace-compiles for sm_107a on the host (no device) with the SAME census and register split as the sm_100a rendering, and every kernel's
+    `.entry` region hashes to the committed (sm_100a) record -- the s_tail body has no per-part branch, so only the module's `.target` line differs
+    (as for sm_103a); "s_tail" NAMED renders the same module.  Skips BY NAME on a DSL without the sm_107a target (the public 4.7.x wheels) or on
+    another DSL build -- never a silent pass."""
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a target")
+    md5, census, regs, kernels = render_2cta_kernels(tmp_path, {}, _CENSUS, arch="sm_107a")
+    print(f"\n2-CTA s_tail sm_107a (the default): PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
+    assert census == _EXPECTED, census
+    assert sorted(regs) == _setmaxnreg_of(), regs
+    assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels
+    _assert_record(kernels, _RECORD, _RECORD_TOKEN, "the s_tail default rendering for sm_107a (per-kernel `.entry` md5s are target-independent)")
+    md5_n, census_n, _, kernels_n = render_2cta_kernels(tmp_path, {"tmem_map": "s_tail"}, _CENSUS, arch="sm_107a")
+    assert md5_n == md5 and census_n == census and kernels_n == kernels, "s_tail named explicitly IS the cc 10.7 default rendering"
+
+
+def test_2cta_stail_host_renders_dq576_named_for_sm_107a_and_matches_its_record(tmp_path):
+    """``tmem_map = "dq_576"`` NAMED on cc 10.7 (PART-KEYED: the independent dQ image at [512, 576) of the 576-column carve, the kernel header
+    sections 9 / 11; a neutral structural map, selectable by name, never the default): the chain trace-compiles for sm_107a on the host (no device)
+    with the s_tail census MINUS exactly the two deleted rows' sites (``_tmem_map_census_delta``: arrive / mapa / init -2, the leader's 5 wait sites
+    in try_wait / bar.warp.sync / fence::after, the softmax's one before-fence) and the alloc spelled `tcgen05.alloc.exclusive.cta_group::2` (the
+    512 form gone); the same register split; the record is its OWN per-kernel file at its OWN target (``_RECORD_DQ576``); the three kernels that do
+    not read the map (setup, delta-and-stats, cast) hash to the s_tail record's rows.  Skips BY NAME on a DSL without the sm_107a target or on
+    another DSL build."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a target")
+    census_rows = dict(_CENSUS, **_TMEM_MAP_CENSUS)
+    md5_s, census_s, regs_s, kernels_s = render_2cta_kernels(tmp_path, {}, census_rows, arch="sm_107a")  # the default = s_tail
+    md5, census, regs, kernels = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576"}, census_rows, arch="sm_107a")
+    print(f"\n2-CTA dq_576 sm_107a (named): PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
+    assert {k: v for k, v in census_s.items() if k not in _TMEM_MAP_CENSUS} == _EXPECTED, census_s
+    assert census == dict(census_s, **_tmem_map_census_delta(cfgmod.CFG, cfgmod, census_s)), {
+        k: (census_s.get(k), census.get(k)) for k in census if census_s.get(k) != census.get(k)
+    }
+    assert sorted(regs) == _setmaxnreg_of() and regs == regs_s, (regs, regs_s)
+    assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels
+    assert md5 != md5_s and kernels[_OWN_KERNELS[2]] != kernels_s[_OWN_KERNELS[2]], "the map renders a different MAIN kernel"
+    assert all(kernels[k] == kernels_s[k] for k in _OWN_KERNELS if k != _OWN_KERNELS[2]), (kernels, kernels_s)  # only the MAIN kernel reads the map
+    assert _RECORD_DQ576.is_file(), _RECORD_DQ576
+    _assert_record(kernels, _RECORD_DQ576, _RECORD_TOKEN_DQ576, "the dq_576 rendering named for sm_107a", arch=_RECORD_ARCH_DQ576)
+
+
+def test_2cta_stail_host_renders_dq576_ldg_for_sm_107a_and_matches_its_record(tmp_path):
+    """``tmem_map = "dq_576"`` x ``stats_form = "ldg"``, both NAMED on cc 10.7 (the lever cross the dq_576 record left unpinned -- the barrier AUDIT's
+    u2): the chain trace-compiles for sm_107a on the host (no device) and its census is EXACTLY the s_tail x ldg rendering's census minus the map's
+    delta (``_tmem_map_census_delta``: the two levers commute -- the ring rows the ldg form removes and the two rows the map deletes are disjoint
+    sites), the same register split, the ldg chain's five launches (the compact delta launch); the MAIN kernel differs from both the dq_576 default's
+    and the s_tail x ldg one's; the three kernels that do not read the map (setup without the row-offset pass, compact delta, cast) hash to the ldg
+    record's rows (sm_100a: per-kernel `.entry` md5s are target-independent); the record is its OWN token in the dq_576 file at its own target.
+    Skips BY NAME on a DSL without the sm_107a target or on another DSL build."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a target")
+    rows = {**_CENSUS, **_TMEM_MAP_CENSUS, **_STATS_CENSUS}  # mbarrier_init is in both lever tables (the same regex)
+    md5_l, census_l, regs_l, kernels_l = render_2cta_kernels(tmp_path, {"stats_form": "ldg"}, rows, arch="sm_107a")  # s_tail x ldg
+    md5_d, census_d, regs_d, kernels_d = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576"}, rows, arch="sm_107a")  # dq_576 x tma_ring (the record)
+    md5, census, regs, kernels = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576", "stats_form": "ldg"}, rows, arch="sm_107a")
+    print(f"\n2-CTA dq_576 x ldg sm_107a (named): PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
+    assert {k: v for k, v in census_l.items() if k not in _TMEM_MAP_CENSUS and k not in _STATS_CENSUS} == _EXPECTED_LDG, census_l
+    expected = dict(census_l, **_tmem_map_census_delta(cfgmod.CFG, cfgmod, census_l))
+    assert census == expected, {k: (census.get(k), expected.get(k)) for k in set(census) | set(expected) if census.get(k) != expected.get(k)}
+    assert (census["bar_sync_1_256"], census["st_shared_b32"], census["bulk_g2s_plain"]) == (4, 4, 0), census  # the ldg form's rows under the map
+    assert sorted(regs) == _setmaxnreg_of() and regs == regs_l == regs_d, (regs, regs_l, regs_d)
+    assert set(kernels) == set(_OWN_KERNELS_LDG) | set(D128_THD_SHARED_KERNELS), kernels
+    main = _OWN_KERNELS[2]
+    assert md5 not in (md5_l, md5_d) and kernels[main] not in (kernels_l[main], kernels_d[main]), "dq_576 x ldg renders its own MAIN kernel"
+    ldg_dsl, ldg_record = _record_kernels(_RECORD, _RECORD_TOKEN_LDG)
+    _skip_unless_record_dsl(ldg_dsl)  # the ldg record's rows hold for its DSL build only: another build skips here, before any hash comparison
+    assert all(kernels[k] == kernels_l[k] == ldg_record[k] for k in _OWN_KERNELS_LDG if k != main), (kernels, kernels_l, ldg_record)
+    assert _RECORD_DQ576.is_file(), _RECORD_DQ576
+    _assert_record(kernels, _RECORD_DQ576, _RECORD_TOKEN_DQ576_LDG, "the dq_576 x ldg rendering named for sm_107a", arch=_RECORD_ARCH_DQ576)
+
+
+def test_2cta_stail_host_renders_probes_under_dq576_for_sm_107a(tmp_path):
+    """The four probes the dq_576 map SERVES (``CFG.DIAG_2CTA_NAMES_ON_MAP`` minus ``DIAG_2CTA_S_TAIL_PROBES``: the issue / transfer / bytes probes)
+    render under ``tmem_map = "dq_576"`` on sm_107a with EXACTLY their own purity delta against the dq_576 default rendering (``_probe_census_delta``:
+    the same arithmetic as on the s_tail map -- a probe moves no barrier row on either map; the dq_576 default itself is the s_tail census minus the
+    map's delta, the route rows untouched), each a different md5 from that default; the three S-tail WAIT probes decline BY NAME at ``compile_host``
+    under the map (their wait sites are the deleted rows) -- never a rendering (the barrier AUDIT's u4).  Skips BY NAME on a DSL without the sm_107a
+    target."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a target")
+    c = cfgmod.CFG
+    served = tuple(p for p in _PROBES if p not in c.DIAG_2CTA_S_TAIL_PROBES)
+    assert served == tuple(p for p in c.DIAG_2CTA_NAMES_ON_MAP if p not in c.DIAG_2CTA_S_TAIL_PROBES) and len(served) == 4, served
+    rows = {**_CENSUS, **_TMEM_MAP_CENSUS, **_ROUTE_CENSUS}
+    md5_d, census_d, _, _ = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576"}, rows, arch="sm_107a")
+    delta = _tmem_map_census_delta(c, cfgmod, dict(_EXPECTED, mbarrier_init=0, tcgen05_fence_before=0))  # the module-census rows of the map's delta
+    expected_d = dict(_EXPECTED, **{k: v for k, v in delta.items() if k in _EXPECTED}, sts_dq_v2_b64=24, fence_proxy_async=15, bulk_commit_group=5)
+    assert {k: v for k, v in census_d.items() if k not in _TMEM_MAP_CENSUS} == expected_d, census_d
+    args = ((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True)
+    for probe in c.DIAG_2CTA_S_TAIL_PROBES:
+        with pytest.raises(ValueError, match=f"diag_2cta '{probe}' is not defined under tmem_map 'dq_576'"):
+            compile_host(*args, 107, tmem_map="dq_576", diag_2cta=probe)
+    for probe in served:
+        md5, census, _, _ = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576", "diag_2cta": probe}, rows, arch="sm_107a")
+        print(f"\n2-CTA dq_576 sm_107a PTX census ({probe}): md5 {md5} {census}")
+        expected = dict(census_d, **_probe_census_delta(probe, c, census_d))
+        assert census == expected, (probe, {k: (census.get(k), expected.get(k)) for k in set(census) | set(expected) if census.get(k) != expected.get(k)})
+        assert md5 != md5_d, f"{probe} must render different PTX from the dq_576 default"
+
+
+def test_2cta_stail_host_renders_sm100_oversized_byte_identical_to_sm100(tmp_path):
+    """The DIAGNOSTIC map ``smem_map = "sm100_oversized"`` renders the sm100 map's kernels BYTE-IDENTICAL on both TMEM maps (every per-kernel md5 equal,
+    the census equal, the register split equal): the dynamic-SMEM declaration (`.extern .shared ... []`) carries no size in PTX -- the padded size
+    reaches the launcher alone (``geo.SMEM_BYTES`` 262144 of the two padded records).  The real maps' records hold (dq_576: the R1 record; s_tail named
+    on sm_107a: the sm_100a default record).  Skips BY NAME on a DSL without the sm_107a target or on another DSL build."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a target")
+    assert "slab = cutlass.Array(cutlass.Uint8, geo.SMEM_BYTES, alignment=1024, space=cutlass.AddressSpace.smem)" in _body_source()  # the one size read
+    census_rows = dict(_CENSUS, **_SMEM_MAP_CENSUS)
+    for tmem, record, token, arch in (("dq_576", _RECORD_DQ576, _RECORD_TOKEN_DQ576, _RECORD_ARCH_DQ576), ("s_tail", _RECORD, _RECORD_TOKEN, "sm_100a")):
+        md5_s, census_s, regs_s, kernels_s = render_2cta_kernels(tmp_path, {"tmem_map": tmem}, census_rows, arch="sm_107a")
+        md5_o, census_o, regs_o, kernels_o = render_2cta_kernels(tmp_path, dict(_OVS_FIELDS, tmem_map=tmem), census_rows, arch="sm_107a")
+        print(f"\n2-CTA {tmem} x sm100_oversized sm_107a: PTX md5 {md5_o} (sm100 {md5_s}) kernels {kernels_o}")
+        assert kernels_o == kernels_s and census_o == census_s and regs_o == regs_s, (kernels_o, kernels_s)
+        _assert_record(kernels_o, record, token, f"the {tmem} x sm100_oversized rendering (= the sm100 record)", arch=arch)
+        ovs = cfgmod.cfg_for_geometry("tma_ring", tmem, "sm100_oversized")
+        assert ovs.SMEM_BYTES == 262144 and ovs.SCHED_PAYLOAD == cfgmod.cfg_for_geometry("tma_ring", tmem, "sm100").SCHED_PAYLOAD
+
+
+def test_2cta_stail_host_renders_rubin_b2_named_for_sm_107a_and_matches_its_record(tmp_path):
+    """``smem_map = "rubin_b2"`` NAMED together with ``tmem_map = "dq_576"`` on cc 10.7 (PART-KEYED; the 327 KiB oversized carveout: sQ1 x2, sDO1 x2,
+    the two-stage sDS + XCHG staging ring with the lagging epilogue order and the dq_read_done row -- the kernel header sections 5 / 8 / 11; selectable
+    by name, never a default today): the chain trace-compiles for sm_107a on the host (no device) with the dq_576 x sm100 census PLUS exactly the
+    rows ``_smem_map_census_delta`` names (the dq_read_done row's two arrive sites and three wait sites, the item-end readout site, the two extra dQ
+    rounds, the two deeper drains, the nine extra inits) and nothing else (the MMA / commit / TMA / ship / reduce-add / expect_tx / LDS rows, the
+    exclusive alloc, .local 0, nanosleep 0 and the register split unchanged); the record is its OWN per-kernel file at its OWN target (``_RECORD_B2``);
+    the three kernels that read neither map hash to the dq_576 record's rows; the dq_576 x sm100 rendering (the SMEM map unset or NAMED "sm100")
+    stays the dq_576 record's.  Skips BY NAME on a DSL without the sm_107a target or on another DSL build."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a target")
+    census_rows = dict(_CENSUS, **_SMEM_MAP_CENSUS)
+    md5_d, census_d, regs_d, kernels_d = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576"}, census_rows, arch="sm_107a")  # dq_576 x sm100
+    md5, census, regs, kernels = render_2cta_kernels(tmp_path, _B2_FIELDS, census_rows, arch="sm_107a")
+    print(f"\n2-CTA dq_576 x rubin_b2 sm_107a (named): PTX md5 {md5} census {census} setmaxnreg {regs} kernels {kernels}")
+    assert census == dict(census_d, **_smem_map_census_delta(cfgmod.CFG, cfgmod, census_d)), {
+        k: (census_d.get(k), census.get(k)) for k in census if census_d.get(k) != census.get(k)
+    }
+    assert (census["tmem_alloc_exclusive_cta2"], census["tmem_alloc_cta2"], census["local_mem"], census["nanosleep"]) == (1, 0, 0, 0), census
+    assert sorted(regs) == _setmaxnreg_of() and regs == regs_d, (regs, regs_d)
+    assert set(kernels) == set(_OWN_KERNELS) | set(D128_THD_SHARED_KERNELS), kernels
+    assert md5 != md5_d and kernels[_OWN_KERNELS[2]] != kernels_d[_OWN_KERNELS[2]], "the SMEM map renders a different MAIN kernel"
+    assert all(kernels[k] == kernels_d[k] for k in _OWN_KERNELS if k != _OWN_KERNELS[2]), (kernels, kernels_d)  # only the MAIN kernel reads the maps
+    _assert_record(kernels_d, _RECORD_DQ576, _RECORD_TOKEN_DQ576, "the dq_576 x sm100 rendering (arm R1's record holds)", arch=_RECORD_ARCH_DQ576)
+    assert _RECORD_B2.is_file(), _RECORD_B2
+    _assert_record(kernels, _RECORD_B2, _RECORD_TOKEN_B2, "the dq_576 x rubin_b2 rendering named for sm_107a", arch="sm_107a")
+    md5_n, census_n, _, kernels_n = render_2cta_kernels(tmp_path, {"tmem_map": "dq_576", "smem_map": "sm100"}, census_rows, arch="sm_107a")
+    assert md5_n == md5_d and census_n == census_d and kernels_n == kernels_d, "sm100 named explicitly IS the dq_576 rendering"
+
+
 @pytest.mark.parametrize("probe", _PROBES)
 def test_2cta_stail_host_renders_probes_for_sm_100a(tmp_path, probe):
     """``diag_2cta = <probe>`` removes exactly its own ISSUE (dq_reduce_add_off: the four reduce-adds), TRANSFER (exchange_off: the one bulk copy +
-    its two mapa, the arm keeping its count with a 0-byte operand) or BYTES (stats_one_chunk: 28 of the 32 stats LDS.128; sdq_sts_off: the 24
-    sDQ slice STS + their 3 proxy fences) and nothing else -- every arrive and wait site, every bar.warp.sync and tcgen05.fence stays (the barrier
-    table is identical: the purity census); the probe renders a different md5 from the default."""
+    its two mapa, the arm keeping its count with a 0-byte operand), BYTES (stats_one_chunk: 28 of the 32 stats LDS.128; sdq_sts_off: the 24
+    sDQ slice STS + their 3 proxy fences) or WAIT sites (s_tail_wait_off: the leader's 4 s_tail_empty `_wait_tcgen`; s_read_wait_off: its 1 s_read
+    `_wait_tcgen`; the combined name: 5 -- each site one try_wait + one bar.warp.sync + one tcgen05.fence::after) and nothing else -- every
+    arrive site stays (the barrier table is identical: the purity census); the probe renders a different md5 from the default."""
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta as base
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
 
@@ -557,7 +1184,7 @@ def test_2cta_stail_probes_resolve_the_same_way_under_fp32_dkv_accum(tmp_path):
     row moves; nothing asynchronous writes the recv-half slots under the probe).  The combination is reachable through the typed fields only;
     the ``--validate`` refusal is per probe name."""
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
 
     for accum in (None, "fp32_reduce"):
         with pytest.raises(ValueError, match="diag_2cta must be None or one of"):
@@ -576,7 +1203,7 @@ def test_2cta_stail_fields_under_16w_fa4_decline_or_resite_by_name(tmp_path):
     ship under 16w_fa4 and renders with its own transfer delta only (the one bulk copy + its two mapa gone, the arm's bytes 0; every arrive / wait
     stays), a different md5 from the 16w_fa4 default; both fields pass under the default shape (16w)."""
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
 
     with pytest.raises(ValueError, match="debug_clk is not defined under warp_roles '16w_fa4'"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", debug_clk=True)
@@ -725,7 +1352,7 @@ def test_2cta_stail_stats_ring_sites_follow_the_skeleton():
     ds_at = first(softmax, "words = _ds_values(slab, stats_base + CFG.STATS_DELTA_OFF,")
     store_waits = [i for i, ln in enumerate(softmax) if "tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)" in ln]
     assert ds_at < rel_at < min(i for i in store_waits if i > ds_at)
-    adv_at = guarded(softmax, "stats_state = advance(stats_state, CFG_RING.STATS_STAGES)", "tma_ring")[0]
+    adv_at = guarded(softmax, "stats_state = advance(stats_state, geo.STATS_STAGES)", "tma_ring")[0]  # the geometry's depth (2 under every tma_ring record)
     assert rel_at < adv_at and adv_at < first(softmax, "tile_state = advance(tile_state, 1)") and adv_at > while_at
     for needle in ("_stats(slab, lse, delta, row, group, lo * CFG.N,", "_stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N,"):
         guarded(softmax, needle, "not tma_ring")
@@ -739,7 +1366,9 @@ def test_2cta_stail_stats_ring_sites_follow_the_skeleton():
     arm = guarded(loader, "bars.stats_full[stats_ld.idx].arrive(n_bytes=CFG.STATS_TX, pred=own_pred)", "tma_ring")[0]
     copy = guarded(loader, "bulk_copy(", "tma_ring")[0]
     q1_load = [i for i, ln in enumerate(loader) if "tma_slice_runtime_desc(q1_desc, 0, q_row + q_half, head, 0)" in ln][0]
-    assert q1_load < lwait < arm < copy < first(loader, "_wait(bars.do1_empty, do1_state.phase")
+    assert (
+        q1_load < lwait < arm < copy < first(loader, "_wait(_slot(bars.do1_empty, do1_state, geo.DO1_STAGES), do1_state.phase")
+    )  # the ring slot (depth 1 or 2)
     depth, end = 0, copy  # the copy call's extent (black spreads its arguments over lines): the mbar operand is OUR stats_full copy
     while True:
         depth += loader[end].count("(") - loader[end].count(")")
@@ -748,21 +1377,30 @@ def test_2cta_stail_stats_ring_sites_follow_the_skeleton():
         end += 1
     assert sum("bulk_copy(" in ln for ln in loader) == 1 and any("bars.stats_full[stats_ld.idx].smem_ptr" in ln for ln in loader[copy : end + 1])
     assert not any("is_leader" in ln and "stats_full" in ln for ln in loader) and not any("tma_tensormap_acquire" in ln and "stats" in ln for ln in loader)
-    ladv = guarded(loader, "stats_ld = advance(stats_ld, CFG_RING.STATS_STAGES)", "tma_ring")[0]
+    ladv = guarded(loader, "stats_ld = advance(stats_ld, geo.STATS_STAGES)", "tma_ring")[0]
     assert copy < ladv and ladv < first(loader, "pair, head, batch, valid, sched_state = _next_tile(")
 
 
 def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
     """RED 3: dp_empty arrived after the dQ readout under the rotated order is a deterministic HANG (dP^T(t+1) waits a readout of a dQ issued
     after it).  The epilogue's ONE dp_empty arrive precedes the ds_recv_full arm and the dQ readout."""
-    code = _function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader")
+    full = _function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader")
+    code = _sm100_arm(full)  # the sm100 SMEM maps' view (one readout site); the rubin_b2 view has two readout sites, both after the arm (below)
     arrive = [i for i, ln in enumerate(code) if "_arrive_leader(bars.dp_empty)" in ln]
-    recv = [i for i, ln in enumerate(code) if "bars.ds_recv_full.arrive(" in ln]
-    dq_ld = [i for i, ln in enumerate(code) if "_tmem_load(tmem_base + CFG.DQ_COL" in ln]
+    recv = [i for i, ln in enumerate(code) if "recv_bar.arrive(" in ln]  # the ds_recv_full arm (the slot of the stage under rubin_b2, the bar under sm100)
+    dq_ld = [i for i, ln in enumerate(code) if "_tmem_load(tmem_base + dq_col, CFG.DQ_COLS)" in ln]  # the map-keyed column base (header section 9)
     assert len(arrive) == 1 and len(recv) == 1 and len(dq_ld) == 1, (arrive, recv, dq_ld)
     assert arrive[0] < recv[0] < dq_ld[0], "dp_empty must be arrived right after the dS^T readout, before the XCHG arm, never after the dQ readout"
     s_tail = [i for i, ln in enumerate(code) if "_arrive_leader(bars.s_tail_empty)" in ln]
     assert len(s_tail) == 1 and dq_ld[0] < s_tail[0], "s_tail_empty is arrived right after the dQ readout"
+    b2 = _b2_arm(full)
+    dq_ld_b2 = [i for i, ln in enumerate(b2) if "_tmem_load(tmem_base + dq_col, CFG.DQ_COLS)" in ln]
+    arrive_b2, recv_b2 = [i for i, ln in enumerate(b2) if "_arrive_leader(bars.dp_empty)" in ln], [i for i, ln in enumerate(b2) if "recv_bar.arrive(" in ln]
+    assert len(arrive_b2) == 1 and len(recv_b2) == 1 and len(dq_ld_b2) == 2 and arrive_b2[0] < recv_b2[0] < dq_ld_b2[0] < dq_ld_b2[1], (
+        arrive_b2,
+        recv_b2,
+        dq_ld_b2,
+    )
 
 
 def test_2cta_stail_ds_gates_ride_the_xchg_state():
@@ -771,7 +1409,10 @@ def test_2cta_stail_ds_gates_ride_the_xchg_state():
     ``_dq_slot`` and at the tail), never ready_state.  The in-tile slot is ONE helper at ONE site (before dV(t)); the s_read wait lives inside it,
     every tile, and nowhere else in the leader."""
     source = _body_source()
-    gates = re.findall(r"_wait_tcgen\(bars\.(ds_smem|ds_recv_full|ds_pair_ready), (\w+)\.phase, dbg, _W\[\"wait:leader:\w+\"\]\)", source)
+    # the slot of each gate is the state's (`_slot(bar, state, geo.DS_STAGES)`: the bar under one stage, bar[state.idx] under the two-stage ring)
+    gates = re.findall(
+        r"_wait_tcgen\(_slot\(bars\.(ds_smem|ds_recv_full|ds_pair_ready), (\w+), geo\.DS_STAGES\), \2\.phase, dbg, _W\[\"wait:leader:\w+\"\]\)", source
+    )
     assert sorted(g[0] for g in gates) == ["ds_pair_ready", "ds_recv_full", "ds_smem"], gates
     assert {g[1] for g in gates} == {"xchg_state"}, gates
     issue = _function_code(source, "_dq_issue", "_dq_slot")
@@ -779,10 +1420,11 @@ def test_2cta_stail_ds_gates_ride_the_xchg_state():
     # helper are the STAMPS handshake, the test-only skew lever and the dq_war_done commit of the alternate role shape; none guards a gate
     assert [ln.strip() for ln in issue if ln.strip().startswith("if ")] == [
         "if cutlass.const_expr(dbg is not None):",
+        "if cutlass.const_expr(b2):",  # the FOURTH gate of smem_map rubin_b2 (dq_read_done) + the per-issue dS stage advance: after the three, never guarding them
         "if cutlass.const_expr(DEBUG_SOFTMAX_DQ_WAR_DELAY_US > 0):",
         "if cutlass.const_expr(fa4_roles):",
     ], issue
-    gate_lines = [ln for ln in issue if "_wait_tcgen(bars.ds_" in ln]
+    gate_lines = [ln for ln in issue if "_wait_tcgen(_slot(bars.ds_" in ln]
     assert len(gate_lines) == 3 and len({len(ln) - len(ln.lstrip()) for ln in gate_lines}) == 1 and "DIAG" not in "".join(issue), issue
     leader = _function_code(source, "_mma_loop_leader", "_mma_loop_follower")
     slots = [i for i, ln in enumerate(leader) if "_dq_slot(" in ln and "xchg_state" in ln]
@@ -803,22 +1445,326 @@ def test_2cta_stail_ds_gates_ride_the_xchg_state():
 def test_2cta_stail_s_tail_empty_waits_sit_at_the_three_guarded_sites():
     """RED 5 (D1): table 3's form (a wait before EVERY S^T) parks tile lo's lookahead on the readout of a dQ not yet issued.  The body's four
     s_tail_empty waits are: the prologue S^T(lo) (unguarded inside `if lo < hi`), the lookahead under `if qtile > lo`, the tail under
-    `if hi - 1 > lo`, and the post-loop drain; the lookahead's and the tail's advance sit with their waits."""
+    `if hi - 1 > lo`, and the post-loop drain; the lookahead's and the tail's advance sit with their waits.  Each of the four sits under the ONE
+    DIAGNOSTIC guard `if cutlass.const_expr(not s_tail_off):` (s_tail_wait_off, header section 11) and its advance stays OUTSIDE the guard (the
+    phase flips unobserved under the probe; CFG.DIAG_S_TAIL_WAIT_SITES == 4); the s_read wait of `_dq_slot` sits under `not s_read_off` the same way."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+
     source = _body_source()
     wait_s_tail = r'_wait_tcgen\(bars\.s_tail_empty, s_tail_state\.phase, dbg, _W\["wait:leader:s_tail_empty"\]\)'
+    guard = r"if cutlass\.const_expr\(not s_tail_off\):\n\s+"
     waits = [m.start() for m in re.finditer(r"^\s+" + wait_s_tail, source, re.M)]
-    assert len(waits) == 4, len(waits)
-    assert re.search(r"if qtile > lo:\n\s+" + wait_s_tail + r"\n\s+s_tail_state = advance\(s_tail_state, 1\)", source)
-    assert re.search(r"if hi - 1 > lo:\n\s+" + wait_s_tail + r"\n\s+s_tail_state = advance\(s_tail_state, 1\)", source)
+    assert len(waits) == 4 == cfgmod.CFG.DIAG_S_TAIL_WAIT_SITES, len(waits)
+    assert len(re.findall(guard + wait_s_tail, source)) == 4, "every s_tail_empty wait sits under the s_tail_wait_off guard"
+    assert re.search(r"if qtile > lo:\n\s+" + guard + wait_s_tail + r"\n\s+s_tail_state = advance\(s_tail_state, 1\)", source)
+    assert re.search(r"if hi - 1 > lo:\n\s+" + guard + wait_s_tail + r"\n\s+s_tail_state = advance\(s_tail_state, 1\)", source)
+    assert re.search(guard + wait_s_tail + r"\n\s+s_tail_state = advance", source), "the advance follows the guarded wait (dedented, unconditional)"
+    s_read_wait = r'_wait_tcgen\(bars\.s_read, ready_state\.phase, dbg, _W\["wait:leader:s_read"\]\)'
+    assert len(re.findall(r"if cutlass\.const_expr\(not s_read_off\):\n\s+" + s_read_wait, source)) == 1 == cfgmod.CFG.DIAG_S_READ_WAIT_SITES
+    assert len(re.findall(r"^\s+" + s_read_wait, source, re.M)) == 1
     leader = _function_code(source, "_mma_loop_leader", "_mma_loop_follower")
     prologue = [i for i, ln in enumerate(leader) if "_wait_tcgen(bars.s_tail_empty" in ln]
     s_lo = [i for i, ln in enumerate(leader) if "mma_ss(score, k1d, q1d, s_acc)" in ln]
     assert prologue and s_lo and prologue[0] < s_lo[0], "the prologue S^T(lo) waits s_tail_empty (the previous item's tail readout)"
     assert leader[-1].strip() == '_wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])', leader[-1]  # the P15 drain: last
+    assert leader[-2].strip() == "if cutlass.const_expr(not s_tail_off):", leader[-2]  # the drain's probe guard (the wait is still the last statement)
+    # the guards derive from the threaded code, never a literal; no arrive and no advance sits under a wait-probe guard
+    assert any(
+        ln.strip().startswith("s_tail_off = cutlass.const_expr(") and "DIAG_S_TAIL_WAIT_OFF" in ln and "DIAG_S_TAIL_AND_S_READ_WAIT_OFF" in ln for ln in leader
+    )
+    assert any(
+        ln.strip().startswith("s_read_off = cutlass.const_expr(") and "DIAG_S_READ_WAIT_OFF" in ln and "DIAG_S_TAIL_AND_S_READ_WAIT_OFF" in ln for ln in leader
+    )
+    for i, ln in enumerate(leader):
+        if ln.strip() in ("if cutlass.const_expr(not s_tail_off):", "if cutlass.const_expr(not s_read_off):"):
+            depth = len(ln) - len(ln.lstrip())
+            assert "_wait_tcgen(" in leader[i + 1] and len(leader[i + 1]) - len(leader[i + 1].lstrip()) > depth, leader[i : i + 2]
+            if i + 2 < len(leader):  # the P15 drain's guard is the role's second-to-last statement
+                assert len(leader[i + 2]) - len(leader[i + 2].lstrip()) <= depth, "only the wait sits under a wait-probe guard"
     softmax = _function_code(source, "_softmax_loop", "_epilogue_loop")
-    s_read = [ln for ln in softmax if "_arrive_leader(bars.s_read)" in ln]
-    s_done = [ln for ln in softmax if "_wait_tcgen(bars.s_done" in ln]
-    assert len(s_read) == 1 and len(s_done) == 1 and len(s_read[0]) - len(s_read[0].lstrip()) == len(s_done[0]) - len(s_done[0].lstrip())  # D2: EVERY tile
+    s_read = [i for i, ln in enumerate(softmax) if "_arrive_leader(bars.s_read)" in ln]
+    s_done = [i for i, ln in enumerate(softmax) if "_wait_tcgen(bars.s_done" in ln]
+    assert len(s_read) == 1 and len(s_done) == 1
+    # D2: EVERY tile -- the arrive carries no RUNTIME guard: its only guard is the trace-time map guard (two statements under it: the fence, the
+    # arrive), whose indentation is the s_done wait's; the fence + arrive go together under tmem_map dq_576 (the row does not exist there)
+    guard_at = s_read[0] - 2
+    assert softmax[guard_at].strip() == "if cutlass.const_expr(not dq576):" and "tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)" in softmax[guard_at + 1]
+    depth = lambda ln: len(ln) - len(ln.lstrip())  # noqa: E731
+    assert depth(softmax[guard_at]) == depth(softmax[s_done[0]]) and depth(softmax[s_read[0]]) == depth(softmax[guard_at + 1]) == depth(softmax[guard_at]) + 4
+    assert depth(softmax[s_read[0] + 1]) <= depth(softmax[guard_at]), "only the fence and the arrive sit under the s_tail map's guard"
+    # tmem_map dq_576 (the kernel header sections 5 / 9): EVERY s_tail_empty / s_read / s_tail_state statement of the leader sits under
+    # `if cutlass.const_expr(not dq576):` (the probe guard may sit between); the state's dq_576 arm is the None the lookahead threads through
+    leader_lines = leader
+
+    def enclosing_guards(i):
+        guards, indent = [], depth(leader_lines[i])
+        for j in range(i - 1, -1, -1):
+            if depth(leader_lines[j]) < indent:
+                indent = depth(leader_lines[j])
+                if leader_lines[j].strip().startswith("if cutlass.const_expr("):
+                    guards.append(leader_lines[j].strip())
+        return guards
+
+    s_tail_sites = [i for i, ln in enumerate(leader_lines) if any(tok in ln for tok in ("bars.s_tail_empty", "bars.s_read", "s_tail_state"))]
+    assert (
+        len(s_tail_sites) >= 8
+    ), s_tail_sites  # the state pair, the prologue wait + advance, the slot-2 call, the lookahead call, the tail wait + advance, the drain
+    for i in s_tail_sites:
+        stmt = leader_lines[i].strip()
+        if stmt in ("s_tail_state = PipelineState.start(phase=1)  # pre-armed: the kernel's first S^T(lo) finds the S tail free",) or stmt.startswith(
+            "s_tail_state = None"
+        ):
+            continue  # the definition pair: the s_tail arm under `not dq576`, the dq_576 arm (None) under its else
+        if "_dq_slot(" in stmt or "_s_lookahead(" in stmt:
+            continue  # the two helper calls thread the flags / the state through (the helpers guard their own S-tail sites)
+        assert "if cutlass.const_expr(not dq576):" in enclosing_guards(i), (stmt, enclosing_guards(i))
+    assert any(
+        ln.strip() == "s_tail_state = None  # dq_576: no S-tail row, no state; `_s_lookahead` threads the None through unchanged (no site reads it)"
+        for ln in leader_lines
+    )
+    helper = _function_code(source, "_s_lookahead", "_dq_issue") + _function_code(source, "_dq_slot", "_dq_round")
+    for i, ln in enumerate(helper):
+        if "bars.s_tail_empty" in ln or "bars.s_read" in ln or "s_tail_state = advance" in ln:
+            guards, indent = [], depth(ln)
+            for j in range(i - 1, -1, -1):
+                if depth(helper[j]) < indent:
+                    indent = depth(helper[j])
+                    if helper[j].strip().startswith("if cutlass.const_expr("):
+                        guards.append(helper[j].strip())
+            assert "if cutlass.const_expr(not dq576):" in guards, (ln.strip(), guards)
+    assert not any("s_tail_empty" in ln or "bars.s_read" in ln for ln in _function_code(source, "_dq_issue", "_dq_slot")), "the three gates know no S-tail row"
+
+
+def test_2cta_stail_geometry_keyed_bodies_take_every_depth_and_offset_from_geo():
+    """RED-first source pin of the rubin_b2 bring-up HANG (runs/r2c/l0_map: exit 124 after STAGE=kernel on the FIRST rubin_b2 cell; the three
+    rubin_b2 skew children killed by the watchdog): a role body keyed by the geometry record (``geo``) takes EVERY ring depth and slab offset from
+    ``geo``, never from the module's base ``CFG`` -- the two agree on every sm100 geometry (the byte-identical sm100 renderings cannot see the slip)
+    and disagree under rubin_b2 (``CFG.Q1_STAGES`` = 1 against ``geo.Q1_STAGES`` = 2: the leader walked the sQ1 ring 1-deep against the loader's
+    2-deep walk -- q1_empty[1] never committed, q1_full[0]'s third completion never armed: both CTAs spin).  The differing-field set is computed
+    from the config module (config as truth); NO ``CFG.<field>`` of that set may appear in a role body -- the arms rubin_b2 declines by name (stats_form
+    ldg's `_stats` slab, the 16w_fa4 softmax arm and reduce body) read the record too (the record IS the base config there: byte-identical renderings);
+    comments and docstrings are prose."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfg_mod
+
+    base, b2 = cfg_mod.CFG, cfg_mod.CFG_RING_DQ576_B2
+    differing = sorted(n for n in dir(base) if not n.startswith("_") and not callable(getattr(base, n)) and getattr(base, n) != getattr(b2, n))
+    assert {"Q1_STAGES", "DO1_STAGES", "DS_STAGES", "XCHG_STAGES", "DS", "XCHG", "DQ", "SMEM_BYTES", "BARS"} <= set(differing), differing
+    pattern = re.compile(r"\bCFG\.(" + "|".join(differing) + r")\b")
+    bodies = ("_softmax_loop", "_epilogue_loop", "_mma_loop_leader", "_mma_loop_follower", "_reduce_loop", "_load_loop", "_store_loop")
+    nexts = ("_epilogue_loop", "_mma_loop_leader", "_mma_loop_follower", "_reduce_loop", "_load_loop", "_store_loop", "_scheduler_loop")
+    src = _body_source()
+    offenders = []
+    for name, nxt in zip(bodies, nexts):
+        in_doc = False
+        for ln in _function_code(src, name, nxt):
+            quotes = ln.count('"""')
+            if in_doc:
+                in_doc = quotes % 2 == 0
+                continue
+            if quotes % 2 == 1:
+                in_doc = True
+                continue
+            if quotes >= 2 and ln.strip().startswith('"""'):
+                continue  # a one-line docstring
+            code = ln.split("#", 1)[0]
+            m = pattern.search(code)
+            if m:
+                offenders.append((name, code.strip(), m.group(1)))
+    assert offenders == [], offenders
+
+
+def _const_expr_arm(code, keep_first):
+    """The epilogue's statement lines as ONE SMEM map traces them: every `if cutlass.const_expr(not b2):` keeps its first arm (``keep_first``: the sm100
+    maps) or its `else:` arm (the rubin_b2 map), dedented; the kernel header section 5 is one such view per map."""
+    depth = lambda ln: len(ln) - len(ln.lstrip())  # noqa: E731
+    out, i = [], 0
+    while i < len(code):
+        ln = code[i]
+        if ln.strip() == "if cutlass.const_expr(not b2):":
+            d = depth(ln)
+            i += 1
+            first = []
+            while i < len(code) and depth(code[i]) > d:
+                first.append(code[i][4:])
+                i += 1
+            assert i < len(code) and code[i].strip() == "else:" and depth(code[i]) == d, (ln, code[i] if i < len(code) else None)
+            i += 1
+            second = []
+            while i < len(code) and depth(code[i]) > d:
+                second.append(code[i][4:])
+                i += 1
+            out.extend(first if keep_first else second)
+            continue
+        out.append(ln)
+        i += 1
+    return out
+
+
+def _sm100_arm(code):
+    """The epilogue as the sm100 SMEM map traces it (the audited order: the readout of dQ(t) BEFORE the staging of dS(t+1))."""
+    return _const_expr_arm(code, keep_first=True)
+
+
+def _b2_arm(code):
+    """The epilogue as the rubin_b2 SMEM map traces it (the LAGGING order: the staging of dS(t) BEFORE the readout of dQ(t-1), the dq_read_done arrives)."""
+    return _const_expr_arm(code, keep_first=False)
+
+
+def _assert_epilogue_readout_precedes_next_staging(code):
+    """The static detector of the independent dQ image's REUSE edge on the sm100 SMEM map (tmem_map dq_576; the kernel header section 5, the barrier
+    skeleton R1 1.3.1): in the epilogue's per-tile body the own-half STS + ``smem_bar.arrive()`` (the gate of the leader's dQ issue) come FIRST and the
+    dq_done wait + the dQ readout trio (the LDTM at the map-keyed column base, tcgen05_wait(LOAD), tcgen05_fence(BEFORE_THREAD_SYNC)) come AFTER them at
+    the loop body's depth -- so the readout of dQ(t) precedes the staging (hence the gate) of dQ(t+1) in the SAME warps' program order; the loaded
+    registers are consumed by the rounds of the same iteration (no lagging readout); no second staging follows the readout inside the body.  ``code``
+    = the statement lines of ``_epilogue_loop`` as the sm100 map traces them (``_sm100_arm(_function_code(..))``) -- or a deliberately reordered copy
+    (the RED half of the test)."""
+    idx = lambda needle: [i for i, ln in enumerate(code) if needle in ln]  # noqa: E731
+    depth = lambda i: len(code[i]) - len(code[i].lstrip())  # noqa: E731
+    sts, arrive, ld = idx("_store_words(slab, own_sts, lane,"), idx("smem_bar.arrive()"), idx("dq = _tmem_load(tmem_base + dq_col, CFG.DQ_COLS)")
+    assert len(sts) == 1 and len(arrive) == 1 and len(ld) == 1, (sts, arrive, ld)
+    waits = [i for i in idx("_wait_tcgen(bars.dq_done, dq_state.phase") if i < ld[0]]
+    assert len(waits) == 1, waits  # the in-loop dq_done(t) wait (the zero-trip observation sits after the loop)
+    load_wait = next(i for i in idx("nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)") if i > ld[0])
+    fence = next(i for i in idx("nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)") if i > load_wait)
+    for_at = idx("for qtile in cutlass.range(lo, hi, 1, unroll=1):")[0]
+    end_at = next(i for i in idx("if lo < hi:") if i > for_at)  # the item end
+    assert for_at < sts[0] < arrive[0] < waits[0] < ld[0] < load_wait < fence < end_at, (for_at, sts, arrive, waits, ld, load_wait, fence, end_at)
+    assert depth(arrive[0]) == depth(waits[0]) == depth(ld[0]) == depth(load_wait) == depth(fence) == depth(for_at) + 4, "the readout carries no runtime guard"
+    assert not any("_store_words(slab, own_sts" in code[i] or "smem_bar.arrive()" in code[i] for i in range(fence + 1, end_at)), "no staging after the readout"
+    round_a = [i for i in idx("_dq_half(dq, 0)") if fence < i < end_at]
+    assert len(round_a) == 1, "the loaded registers feed this iteration's round A (no lagging readout)"
+
+
+def test_2cta_stail_dq576_reuse_edge_rides_the_epilogue_program_order():
+    """RED-first SOURCE assertion of the independent dQ image's reuse edge on the sm100 SMEM map (tmem_map dq_576 x smem_map sm100; the kernel header
+    section 5, P14-B): under that map no barrier row frees the dQ image -- dQ(t+1)'s write is gated by the dS gates of tile t+1 (ds_smem /
+    ds_pair_ready), which the epilogues arrive AFTER reading dQ(t) out ONLY because the dq_done(t) wait + the readout trio sit BEFORE the next tile's
+    own-half STS + ``smem_bar.arrive()`` in the loop body.  RED: a deliberately reordered copy of the epilogue (the readout block moved ahead of the
+    staging = the lagging-readout form the two-stage ring takes, which under rubin_b2 is why the dq_read_done row exists; the gate arrive moved
+    behind the readout) FAILS the detector; GREEN: the sm100 arm of the body passes.  The detector reads the statements only."""
+    code = _sm100_arm(_function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader"))
+    _assert_epilogue_readout_precedes_next_staging(code)  # GREEN
+    idx = lambda needle, lines: [i for i, ln in enumerate(lines) if needle in ln]  # noqa: E731
+    wait = [i for i in idx("_wait_tcgen(bars.dq_done, dq_state.phase", code) if i < idx("dq = _tmem_load(tmem_base + dq_col", code)[0]][0]
+    load_wait = next(i for i in idx("nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)", code) if i > wait)
+    fence = next(i for i in idx("nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)", code) if i > load_wait)
+    block = code[wait : fence + 1]  # the dq_done wait, the skew lever, the LDTM, wait(LOAD), the fence
+    ds_tmem_wait = idx("_wait_tcgen(bars.ds_tmem, ds_state.phase", code)[0]
+    # RED 1: the readout block ahead of the dS staging (reads dQ(t-1) out while dS(t) is staged after it: the lagging-readout form)
+    red1 = code[:ds_tmem_wait] + block + code[ds_tmem_wait:wait] + code[fence + 1 :]
+    with pytest.raises(AssertionError):
+        _assert_epilogue_readout_precedes_next_staging(red1)
+    # RED 2: the gate arrive moved behind the readout (ds_smem(t) would publish the STS before the dQ(t) readout -> dQ(t+1) may overwrite an unread image)
+    arrive = idx("smem_bar.arrive()", code)[0]
+    red2 = code[:arrive] + code[arrive + 1 : fence + 1] + [code[arrive]] + code[fence + 1 :]
+    with pytest.raises(AssertionError):
+        _assert_epilogue_readout_precedes_next_staging(red2)
+    # RED 3: the readout under a runtime guard (a conditional readout = a tile whose image is never read: the next write finds it unread)
+    red3 = list(code)
+    for i in range(wait, fence + 1):
+        red3[i] = "    " + red3[i]
+    red3.insert(wait, " " * (len(code[wait]) - len(code[wait].lstrip())) + "if qtile > lo:")
+    with pytest.raises(AssertionError):
+        _assert_epilogue_readout_precedes_next_staging(red3)
+    # RED 4: the rubin_b2 arm itself (the lagging order) FAILS this detector -- that is why the row dq_read_done exists under that map (the next test)
+    with pytest.raises(AssertionError):
+        _assert_epilogue_readout_precedes_next_staging(_b2_arm(_function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader")))
+
+
+_READOUT_TRIO = (
+    "dq = _tmem_load(tmem_base + dq_col, CFG.DQ_COLS)",
+    "nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)",
+    "nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)",
+)
+_DQ_READ_DONE_WAIT = '_wait_tcgen(bars.dq_read_done, dq_read_state.phase, dbg, _W["wait:leader:dq_read_done"])'
+
+
+def _assert_dq_read_done_row(epi_b2, issue, leader):
+    """The static detector of the two-stage ring's reuse edge (smem_map rubin_b2 ON dq_576; the kernel header section 5, the barrier skeleton R2.c 2.5
+    b / 1.7): the epilogue's rubin_b2 arm arrives ``dq_read_done`` bare at EXACTLY two sites, each right after the readout trio, the first in the loop
+    body AFTER the staging's ``smem_bar.arrive()`` under the item's ``qtile > lo`` guard, the second at the item end under ``lo < hi`` (both the
+    loop-structure predicate of _item_bounds, pair-uniform); `_dq_issue` waits the row (``_wait_tcgen``: the after-thread-sync fence) on
+    ``dq_read_state`` after the three dS gates and before the dQ MMA, under its b2 guard, and advances the state right after; the leader pre-arms the
+    state (st(1)) under the b2 guard and drains the row exactly once after its persistent loop (P15).  ``epi_b2`` / ``issue`` / ``leader`` = the
+    statement lines of the three functions (the epilogue's as the rubin_b2 map traces them) -- or deliberately altered copies (the RED half)."""
+    idx = lambda needle, lines: [i for i, ln in enumerate(lines) if needle in ln]  # noqa: E731
+    depth = lambda lines, i: len(lines[i]) - len(lines[i].lstrip())  # noqa: E731
+
+    def guards(lines, i):
+        d, out = depth(lines, i), []
+        for j in range(i - 1, -1, -1):
+            if depth(lines, j) < d and lines[j].rstrip().endswith(":"):
+                out.append(lines[j].strip())
+                d = depth(lines, j)
+        return out
+
+    arrives = idx("_arrive_leader(bars.dq_read_done)", epi_b2)
+    assert len(arrives) == 2, arrives
+    for a in arrives:
+        trio = tuple(ln.strip().split("  #")[0] for ln in epi_b2[a - 3 : a])
+        assert trio == _READOUT_TRIO, trio  # the arrive right after the readout trio (the local half of the edge: G03 lifecycle rule 6)
+    for_at = idx("for qtile in cutlass.range(lo, hi, 1, unroll=1):", epi_b2)[0]
+    staging = idx("smem_bar.arrive()", epi_b2)
+    assert len(staging) == 1 and for_at < staging[0] < arrives[0], (for_at, staging, arrives)  # the lagging order: staged, THEN read out
+    end_at = next(i for i in idx("if lo < hi:", epi_b2) if i > for_at)
+    assert arrives[0] < end_at < arrives[1], (arrives, end_at)  # one in-loop site, one item-end site
+    assert guards(epi_b2, arrives[0])[:2] == ["if qtile > lo:", "for qtile in cutlass.range(lo, hi, 1, unroll=1):"], guards(epi_b2, arrives[0])
+    assert guards(epi_b2, arrives[1])[0] == "if lo < hi:", guards(epi_b2, arrives[1])
+    waits = idx(_DQ_READ_DONE_WAIT, issue)
+    mma = idx("mma_ss(dqdesc, dsd_s, k2d, dq_acc)", issue)
+    gates = idx("_slot(bars.ds_pair_ready, xchg_state, geo.DS_STAGES)", issue)
+    assert len(waits) == 1 and len(mma) == 1 and len(gates) == 1 and gates[0] < waits[0] < mma[0], (gates, waits, mma)
+    assert issue[waits[0] - 1].strip() == "if cutlass.const_expr(b2):" and issue[waits[0] + 1].strip() == "dq_read_state = advance(dq_read_state, 1)", issue[
+        waits[0] - 1 : waits[0] + 2
+    ]
+    pre_arm = idx("dq_read_state = PipelineState.start(phase=1)", leader)
+    assert len(pre_arm) == 1 and leader[pre_arm[0] - 1].strip() == "if cutlass.const_expr(b2):", pre_arm
+    drains = idx(_DQ_READ_DONE_WAIT, leader)
+    loop_end = max(idx("_next_tile(sched, bars, sched_state, dbg,", leader))
+    assert len(drains) == 1 and drains[0] > loop_end and drains[0] > idx("_wait_tcgen(bars.dvk_empty, out_empty.phase", leader)[-1], (drains, loop_end)
+    assert leader[drains[0] - 1].strip() == "if cutlass.const_expr(b2):", leader[drains[0] - 1]
+
+
+def test_2cta_stail_rubin_b2_reuse_edge_is_the_dq_read_done_row():
+    """RED-first SOURCE assertion of the two-stage ring's reuse edge (smem_map rubin_b2 ON dq_576; the kernel header section 5, the barrier skeleton
+    R2.c 2.5 b / 1.7): under the LAGGING order the epilogue arrives ds_smem(t) BEFORE it reads dQ(t-1) out, so the dq_576 map's program-order carrier
+    is void and the LEADER row ``dq_read_done`` (PAIR_EPILOGUE_LANES 256, after dp_empty; in the B2 table only) carries the edge -- the epilogue
+    arrives it after each readout trio (two sites), `_dq_issue` waits it before every dQ issue on the pre-armed state, the leader drains it once.
+    RED: the arrive removed, the arrive moved ahead of its trio, the wait removed, or the drain removed FAILS the detector; GREEN: the body passes."""
+    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+
+    c = cfgmod.CFG
+    assert cfgmod.DQ_READ_DONE_ROW == ("dq_read_done", 1, c.PAIR_EPILOGUE_LANES, "leader", "LEADER") and cfgmod.ADDED_BARRIERS_B2 == ("dq_read_done",)
+    names_b2 = [r[0] for r in cfgmod.BAR_LAYOUT_RING_DQ576_B2]
+    assert names_b2.index("dq_read_done") == names_b2.index("dp_empty") + 1
+    for table in (cfgmod.BAR_LAYOUT, cfgmod.BAR_LAYOUT_RING, cfgmod.BAR_LAYOUT_DQ576, cfgmod.BAR_LAYOUT_RING_DQ576, cfgmod.BAR_LAYOUT_XFA4):
+        assert "dq_read_done" not in {r[0] for r in table}  # the row exists under the two-stage ring only
+    src = _body_source()
+    epi = _b2_arm(_function_code(src, "_epilogue_loop", "_mma_loop_leader"))
+    issue = _function_code(src, "_dq_issue", "_dq_slot")
+    leader = _function_code(src, "_mma_loop_leader", "_mma_loop_follower")
+    _assert_dq_read_done_row(epi, issue, leader)  # GREEN
+    idx = lambda needle, lines: [i for i, ln in enumerate(lines) if needle in ln]  # noqa: E731
+    arrives = idx("_arrive_leader(bars.dq_read_done)", epi)
+    # RED 1: the in-loop arrive removed (the leader's next issue would wait a flip nobody produces: a hang, or with the wait gone too, an unread image overwritten)
+    red1 = epi[: arrives[0]] + epi[arrives[0] + 1 :]
+    with pytest.raises(AssertionError):
+        _assert_dq_read_done_row(red1, issue, leader)
+    # RED 2: the arrive ahead of its readout trio (the image published as read out before the LDTM completed: the next dQ may overwrite it under the read)
+    red2 = list(epi)
+    red2[arrives[0] - 3], red2[arrives[0]] = red2[arrives[0]], red2[arrives[0] - 3]
+    with pytest.raises(AssertionError):
+        _assert_dq_read_done_row(red2, issue, leader)
+    # RED 3: the wait removed from _dq_issue (the gate gone: the overwrite races the readout)
+    waits = idx(_DQ_READ_DONE_WAIT, issue)
+    red3 = issue[: waits[0]] + issue[waits[0] + 1 :]
+    with pytest.raises(AssertionError):
+        _assert_dq_read_done_row(epi, red3, leader)
+    # RED 4: the drain removed (the follower's last relaxed arrive would land on an exited leader: P15)
+    drains = idx(_DQ_READ_DONE_WAIT, leader)
+    red4 = leader[: drains[0]] + leader[drains[0] + 1 :]
+    with pytest.raises(AssertionError):
+        _assert_dq_read_done_row(epi, issue, red4)
 
 
 def test_2cta_stail_dq_ring_release_cadence_is_the_d4_pair():
@@ -835,7 +1781,9 @@ def test_2cta_stail_dq_ring_release_cadence_is_the_d4_pair():
     assert any("for s in cutlass.range_constexpr(CFG.DQ_SLOTS)" in ln for ln in rnd) and any("_wait(bars.dq_empty[s], empty_state.phase" in ln for ln in rnd)
     epi = _function_code(source, "_epilogue_loop", "_mma_loop_leader")
     assert not any("dq_empty" in ln for ln in epi), "the epilogue waits dq_empty only inside _dq_round (both slots, per round)"
-    assert sum("_dq_round(" in ln for ln in epi) == 3  # round B of dQ(t-1), round A of dQ(t), the item-end round B of dQ(hi-1)
+    assert sum("_dq_round(" in ln for ln in _sm100_arm(epi)) == 3  # round B of dQ(t-1), round A of dQ(t), the item-end round B of dQ(hi-1)
+    # smem_map rubin_b2 (the lagging order): round B of dQ(t-2), round A of dQ(t-1), the item end's round B of dQ(hi-2) + rounds A, B of dQ(hi-1)
+    assert sum("_dq_round(" in ln for ln in _b2_arm(epi)) == 5
     assert not any("empty_state = advance" in ln for ln in epi), "no item-end flip: 2N rounds == 2N releases per slot"
 
 
@@ -847,33 +1795,36 @@ def test_2cta_stail_exchange_off_keeps_every_wait_and_fakes_the_bytes():
     the relay in the follower is unconditional."""
     src = _body_source()
     epi = _function_code(src, "_epilogue_loop", "_mma_loop_leader")
-    arms = [ln for ln in epi if "bars.ds_recv_full.arrive(" in ln]
+    arms = [ln for ln in epi if "recv_bar.arrive(" in ln]  # the ds_recv_full arm: the bar (sm100) or the slot of the stage (rubin_b2), ONE site
     assert arms == [ln for ln in arms if "n_bytes=xchg_tx, pred=ship_pred" in ln] and len(arms) == 1, arms
     assert any(
         ln.strip() == "xchg_tx = CFG.DIAG_EXCHANGE_OFF_TX if cutlass.const_expr(diag_2cta_code == DIAG_EXCHANGE_OFF) else CFG.XCHG_TX" for ln in epi
     ), "the arm's byte count is the config-selected constant (0 under exchange_off)"
     guard = [i for i, ln in enumerate(epi) if ln.split("#")[0].strip() == "if cutlass.const_expr(not exchange_off):"]
-    assert len(guard) == 1 and "_ship_xchg(slab, bars, rank, ship_pred)" in epi[guard[0] + 1], epi[guard[0] : guard[0] + 2]
+    assert len(guard) == 1 and "_ship_xchg(slab, bars, rank, ship_pred, stage, geo, b2)" in epi[guard[0] + 1], epi[guard[0] : guard[0] + 2]
     depth = len(epi[guard[0]]) - len(epi[guard[0]].lstrip())
     assert len(epi[guard[0] + 2]) - len(epi[guard[0] + 2].lstrip()) <= depth, "only the ship sits under the exchange_off guard"
     for token in (
-        "_store_words(slab, CFG.XCHG",
+        "_store_words(slab, xchg_sts",
         "named_barrier_fence(CFG.XCHG_BARRIER",
-        "_store_words(slab, own_base",
-        "bars.ds_smem.arrive()",
+        "_store_words(slab, own_sts",
+        "smem_bar.arrive()",
         "_arrive_leader(bars.dp_empty)",
     ):
         lines = [ln for ln in epi if token in ln]
         assert len(lines) == 1 and len(lines[0]) - len(lines[0].lstrip()) == depth, (token, lines)  # at the loop body's depth: never guarded
     assert not any("exchange_off" in ln and ("_wait" in ln or ".arrive(" in ln) for ln in epi), "exchange_off guards no wait and no arrive"
     relay = _function_code(src, "_mma_loop_follower", "_reduce_loop")
-    assert sum('_wait(bars.ds_recv_full, relay_state.phase, dbg, _W["wait:follower:ds_recv_full"])' in ln for ln in relay) == 1
+    assert (
+        sum('_wait(_slot(bars.ds_recv_full, relay_state, geo.DS_STAGES), relay_state.phase, dbg, _W["wait:follower:ds_recv_full"])' in ln for ln in relay) == 1
+    )
     assert not any("diag" in ln.lower() for ln in relay), "no probe reaches the relay"
 
 
 def test_2cta_stail_skew_levers_follow_the_house_form():
-    """The body exposes the four base levers plus SOFTMAX_S_READ / EPILOGUE_DQ_READOUT / SOFTMAX_DQ_WAR, each in the house form (module global +
-    const_expr nanosleep loop, default 0 = no traced code: the default render's census pins nanosleep == 0)."""
+    """The body exposes the four base levers plus SOFTMAX_S_READ / EPILOGUE_DQ_READOUT / SOFTMAX_DQ_WAR and the rubin_b2 ring's LEADER_ARM_DELAY /
+    LEADER_SLOT1_DELAY, each in the house form (module global + const_expr nanosleep loop, default 0 = no traced code: the default render's census
+    pins nanosleep == 0)."""
     source = _body_source()
     exposed = set(LEVER_LINE.findall(source))
     known = {row["lever"] for row in SITES.values()}
@@ -888,12 +1839,17 @@ def test_2cta_stail_skew_levers_follow_the_house_form():
 
 
 # ------------------------------------------------------------------------------------------------------------ GPU (the fp64 gate)
-def test_2cta_stail_route_declines_dense_and_mha_typed():
-    """The pair body serves grouped THD only: dense and MHA requests decline BY NAME before any compile."""
+def test_2cta_stail_route_accepts_dense_and_declines_mha_typed():
+    """RED-first (the pair body served grouped THD only; a dense declaration declined "requires THD"): the direct entry (``cta_pair = "on"``) ACCEPTS
+    a dense compact-BSHD BF16 GQA declaration -- the resolution names the pair body, the plan the dense implementation token, the workspace is the
+    THD chain's at the packed-view capacities B*S -- and an MHA request still declines BY NAME before any compile."""
     _require_2cta()
+    from cudnn.sdpa.bwd import d128_grouped_2cta_contract as c
+
     dense = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=False)
-    with pytest.raises(NotImplementedError, match="requires THD"):  # the typed decline of the direct entry (cta_pair 'on'): by name, before any compile
-        make_adapter_2cta_stail(dense, compile_plan=False).check_support()
+    api = make_adapter_2cta_stail(dense, compile_plan=False)
+    assert api.check_support() is True and api._cta_pair.body == c.PAIR_BODY and api._implementation == c.DENSE, api._cta_pair
+    assert api.scratch_workspace_bytes() == c.thd_workspace_layout(2, 4, 2 * 256, 2 * 256, True)[1]
     from d128_thd_test_utils import declaration as mha_declaration
     from d128_thd_test_utils import make_case as make_mha_case
 
@@ -955,8 +1911,15 @@ def test_2cta_stail_launch_count_and_cluster_facts():
 
     body = importlib.import_module(_BODY_MODULE)
     assert (body.CFG.CGA_M, body.CFG.CGA_N, body.CFG.PAIR_KV_ROWS, body.CFG.DQ_COL, body.CFG.Q1_STAGES) == (2, 1, 256, 64, 1)
+    assert (body.CFG_DQ576.DQ_COL, body.CFG_DQ576.TMEM_COLS, body.CFG_DQ576.TMEM_IS_EXCLUSIVE) == (512, 576, True)  # the cc 10.7 map (header section 9)
+    assert (body.CFG_RING_DQ576_B2.SMEM_BYTES, body.CFG_RING_DQ576_B2.DS_STAGES, body.CFG_RING_DQ576_B2.SMEM_CAP) == (314368, 2, 334848)  # header section 8
     case = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True)
     api, workspace = _run_case(case, repeats=1)
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import SMEM_MAP_DEFAULT_BY_PART, TMEM_MAP_DEFAULT_BY_PART
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import smem_map, tmem_map
+
+    assert tmem_map(api) == TMEM_MAP_DEFAULT_BY_PART[torch.cuda.get_device_capability()]  # the map this device rendered = its part's default
+    assert smem_map(api) == SMEM_MAP_DEFAULT_BY_PART[torch.cuda.get_device_capability()] == "sm100"  # the SMEM map unset: the opt-in chain everywhere
     names = []
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
         api.execute(**adapter_arguments(case), workspace=workspace.tensor)
@@ -1067,6 +2030,190 @@ def test_2cta_stail_tma_ring_launch_count_and_stats_launch():
     assert any("bprop_d128_accum_grouped_2cta_stail_kernel" in n for n in kernels) and any("setup_thd_d128_2cta_kernel" in n for n in kernels), kernels
 
 
+_TMEM_MAP_TWIN_CASES = [
+    pytest.param(dict(lq=(256, 256), lk=(256, 256), hq=4, hkv=2, causal=True), id="uniform-256-causal"),
+    pytest.param(dict(lq=(256, 512, 768, 1024), lk=(256, 512, 768, 1024), hq=4, hkv=2, causal=True), id="ramp-1024-causal"),  # N up to 8, dead pairs
+    pytest.param(dict(lq=(300, 300), lk=(300, 300), hq=3, hkv=1, causal=True), id="pair-tail-300"),  # a partial last q tile, a half-dead second CTA
+    pytest.param(dict(lq=(300, 128, 1000), lk=(2000, 700, 1000), hq=4, hkv=2, causal=True), id="zero-trip-mix"),  # N = 3 / 1 / 0 items: the N-walk
+    pytest.param(dict(lq=(0, 0), lk=(0, 0), hq=3, hkv=1, causal=True, stats_layout="HN", envelope=(128, 128)), id="all-empty"),
+    pytest.param(dict(lq=(128, 64), lk=("skv", "skv - 256"), hq=8, hkv=1, causal=True), id="n_q-1-pairs-gt-sms"),  # n_q == 1: the tail dQ(lo) alone
+]
+
+
+def _require_tmem_map(name):
+    """The GPU rows of a TMEM map run on the parts that SERVE it (``TMEM_MAP_PARTS``: the library's own set, never a copy) and skip elsewhere."""
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import TMEM_MAP_PARTS
+
+    _require_2cta()
+    cc = torch.cuda.get_device_capability()
+    if cc not in TMEM_MAP_PARTS[name]:
+        pytest.skip(f"tmem_map {name!r} is served on cc {TMEM_MAP_PARTS[name]}; got {cc}")
+
+
+@pytest.mark.parametrize("spec", _TMEM_MAP_TWIN_CASES)
+def test_2cta_stail_tmem_maps_agree_bitwise(spec):
+    """The TMEM map's twin (G09: a claim BY CONSTRUCTION -- the map moves the dQ accumulator's columns and deletes two barrier rows; no GEMM, k-order
+    or rounding changes): on a part that serves both maps (cc 10.7) dK / dV are BITWISE between ``tmem_map = "s_tail"`` and ``"dq_576"`` on every
+    row, dQ BITWISE where the sequences have at most _DQ_ORDER_FREE_PAIRS kv pairs and by the fp64 gate beyond; each map passes the suite's fp64 gate
+    first.  The rows: the uniform cell, the ramp with dead pairs (N up to 8), the partial last q tile with a half-dead CTA, the zero-trip mix (N = 3 /
+    1 / 0: the independent image's N-walk), the all-empty case, and n_q == 1 with more pairs than SMs (the tail dQ(lo) alone, two items per CTA)."""
+    _require_tmem_map("dq_576")
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+
+    spec = dict(spec)
+    lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
+    if lk and lk[0] == "skv":
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        skv = 256 * ((sms // (spec["hq"] * 2)) + 2) + 128  # pairs x hq x b > sms, the last pair half-dead (the P14 row's cell)
+        lk = (skv, skv - 256)
+    case = make_case(lq, lk, thd=True, dtype=torch.bfloat16, causal=causal, stats_layout=spec.pop("stats_layout", "TH1"), **spec)
+    dq_bitwise = max(lk) <= _DQ_ORDER_FREE_PAIRS * CFG.PAIR_KV_ROWS
+    grads = {}
+    for name in _TMEM_MAPS:
+        api = make_adapter_2cta_stail(case, tmem_map=name)
+        workspace = make_workspace(api.scratch_workspace_bytes())
+        poison(case, workspace)
+        api.execute(**adapter_arguments(case), workspace=workspace.tensor)
+        torch.cuda.synchronize()
+        check_case(case, workspace)
+        grads[name] = {role: case.tensors[role][0].detach().clone() for role in ("dq", "dk", "dv")}
+    for role in ("dk", "dv") + (("dq",) if dq_bitwise else ()):
+        assert torch.equal(grads["s_tail"][role].view(torch.int16), grads["dq_576"][role].view(torch.int16)), f"{role}: s_tail vs dq_576 differ bitwise"
+
+
+def test_2cta_stail_tmem_maps_agree_under_fp32_dkv_accum():
+    """``dkv_accum = "fp32_reduce"`` x the TMEM map (the barrier AUDIT's u1): under dq_576 the fp32 staging row ``dvk_stage_empty`` moves from slot 34
+    to 32 (``_dvk_stage_empty_row(BarsDQ576)``: the two deleted rows sat ahead of it) and the body's init loop guards that slot BY INDEX -- a wrong
+    index leaves ``dvk_stage_empty`` or the slot it displaces uninitialised: a hang or silent wrong dK / dV that no s_tail cell and no bf16-partials
+    dq_576 cell can see.  On the part that serves the map (cc 10.7; skips by name elsewhere) one THD GQA cell (two sequences, up to two kv pairs,
+    causal: the item-end fp32 rounds across items) runs under fp32_reduce on EACH map through the suite's fp64 gate (two executes on a poisoned
+    workspace, the fp32 form pinned on the artifact), and dK / dV are BITWISE between the maps (the same fp32 reduce-adds -- Hq / Hkv = 2 per element
+    into a zero-filled image, order-free -- the map changes no arithmetic: a claim by construction); dQ bitwise too at <= _DQ_ORDER_FREE_PAIRS kv pairs."""
+    _require_tmem_map("dq_576")
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+
+    hq, hkv = 4, 2
+    case = make_case((256, 512), (256, 512), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
+    assert hq // hkv <= 2 and max(case.lens_kv) <= _DQ_ORDER_FREE_PAIRS * CFG.PAIR_KV_ROWS  # the bitwise claims below are by construction: name the cell
+    grads = {}
+    for name in _TMEM_MAPS:
+        api, _ = _run_case(case, dkv_accum="fp32_reduce", tmem_map=name)
+        assert api._prepared.artifact.dkv_accum == "fp32_reduce"
+        grads[name] = {role: case.tensors[role][0].detach().clone() for role in ("dq", "dk", "dv")}
+    for role in ("dk", "dv", "dq"):
+        assert torch.equal(
+            grads["s_tail"][role].view(torch.int16), grads["dq_576"][role].view(torch.int16)
+        ), f"{role}: fp32_reduce x s_tail vs x dq_576 differ bitwise"
+
+
+def test_2cta_stail_dq576_declines_by_name_on_a_512_column_part():
+    """``tmem_map = "dq_576"`` NAMED on a part without the 576-column carve (cc 10.0 / 10.3) is the engine's typed decline at ``check_support``
+    (NotImplementedError naming the field, the map and the part) -- never a compile, never a silent s_tail; on cc 10.7 the row is the twin above."""
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import TMEM_MAP_PARTS
+
+    _require_2cta()
+    cc = torch.cuda.get_device_capability()
+    if cc in TMEM_MAP_PARTS["dq_576"]:
+        pytest.skip(f"cc {cc} serves tmem_map 'dq_576' (the bitwise twin covers it)")
+    case = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True)
+    with pytest.raises(NotImplementedError, match="2-CTA datapath tmem_map 'dq_576' is not served on cc"):
+        make_adapter_2cta_stail(case, compile_plan=False, tmem_map="dq_576").check_support()
+    assert make_adapter_2cta_stail(case, compile_plan=False, tmem_map="s_tail").check_support() is True
+
+
+def _require_smem_map(name):
+    """The GPU rows of an SMEM map run on the parts that SERVE it (``SMEM_MAP_PARTS``: the library's own set, never a copy) and skip elsewhere."""
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import SMEM_MAP_PARTS
+
+    _require_2cta()
+    cc = torch.cuda.get_device_capability()
+    if cc not in SMEM_MAP_PARTS[name]:
+        pytest.skip(f"smem_map {name!r} is served on cc {SMEM_MAP_PARTS[name]}; got {cc}")
+
+
+@pytest.mark.parametrize("spec", _TMEM_MAP_TWIN_CASES)
+def test_2cta_stail_smem_maps_agree_bitwise(spec):
+    """The SMEM map's twin (G09: a claim BY CONSTRUCTION -- the map re-stages the same bytes through deeper rings and re-orders the epilogue's waits;
+    no GEMM, k-order or rounding changes): on a part that serves rubin_b2 (cc 10.7) dK / dV are BITWISE between ``smem_map = "sm100"`` and
+    ``"rubin_b2"`` ON ``tmem_map = "dq_576"`` on every row, dQ BITWISE where the sequences have at most _DQ_ORDER_FREE_PAIRS kv pairs and by the fp64
+    gate beyond; each map passes the suite's fp64 gate first.  The rows are the TMEM map's (the uniform cell, the ramp with dead pairs, the partial
+    last q tile with a half-dead CTA, the zero-trip mix = the N-walk of the dq_read_done row and the two-slot rings, the all-empty case, and n_q == 1
+    with more pairs than SMs = the tail dQ(lo) alone, two items per CTA: the P14 killers of the kernel header section 12).  The first launch of the
+    314368-B slab IS the oversized-SMEM launch proof (a launcher that did not set the mode fails the launch)."""
+    _require_smem_map("rubin_b2")
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+
+    spec = dict(spec)
+    lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
+    if lk and lk[0] == "skv":
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        skv = 256 * ((sms // (spec["hq"] * 2)) + 2) + 128  # pairs x hq x b > sms, the last pair half-dead (the P14 row's cell)
+        lk = (skv, skv - 256)
+    case = make_case(lq, lk, thd=True, dtype=torch.bfloat16, causal=causal, stats_layout=spec.pop("stats_layout", "TH1"), **spec)
+    dq_bitwise = max(lk) <= _DQ_ORDER_FREE_PAIRS * CFG.PAIR_KV_ROWS
+    grads = {}
+    for name in _RING_TWIN_MAPS:
+        api = make_adapter_2cta_stail(case, tmem_map="dq_576", smem_map=name)
+        workspace = make_workspace(api.scratch_workspace_bytes())
+        poison(case, workspace)
+        api.execute(**adapter_arguments(case), workspace=workspace.tensor)
+        torch.cuda.synchronize()
+        check_case(case, workspace)
+        grads[name] = {role: case.tensors[role][0].detach().clone() for role in ("dq", "dk", "dv")}
+    for role in ("dk", "dv") + (("dq",) if dq_bitwise else ()):
+        assert torch.equal(grads["sm100"][role].view(torch.int16), grads["rubin_b2"][role].view(torch.int16)), f"{role}: sm100 vs rubin_b2 differ bitwise"
+
+
+@pytest.mark.parametrize("tmem", ["dq_576", "s_tail"])
+def test_2cta_stail_sm100_oversized_agrees_bitwise_with_sm100(tmem):
+    """The DIAGNOSTIC map ``smem_map = "sm100_oversized"`` (the kernel header section 11; cc 10.7 by name, never a default): the sm100 map ITSELF
+    declared with SMEM_BYTES 262144 (above the 232448-B opt-in cap), so the DSL launcher takes the oversized carveout for the shipping map -- the probe
+    of the carveout's own cost (the SKU card's L1 shrink).  On the smallest L0 cell dQ / dK / dV are BITWISE against ``"sm100"`` on the same TMEM map
+    (the same kernel bytes; dQ bitwise at <= _DQ_ORDER_FREE_PAIRS kv pairs) and each passes the fp64 gate; the launch under the map IS the proof that
+    the 262144-B declaration launched in the carveout (the opt-in cap cannot hold it).  The declared size is read back from the geometry record."""
+    _require_smem_map("sm100_oversized")
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG, cfg_for_part
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import smem_map
+
+    cc = torch.cuda.get_device_capability()
+    geo = cfg_for_part(cc, "tma_ring", "16w", tmem, "sm100_oversized")
+    assert geo.SMEM_MAP == "sm100_oversized" and geo.SMEM_BYTES == 262144 > CFG.SMEM_OPT_IN_CAP and geo.SMEM_PAD_BYTES == 29696
+    print(
+        f"\nsm100_oversized x {tmem} on cc {cc}: the launch declares {geo.SMEM_BYTES} B of dynamic SMEM (opt-in cap {CFG.SMEM_OPT_IN_CAP}, pad {geo.SMEM_PAD_BYTES})"
+    )
+    case = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
+    grads = {}
+    for name in ("sm100", "sm100_oversized"):
+        api = make_adapter_2cta_stail(case, tmem_map=tmem, smem_map=name)
+        assert smem_map(api) == name
+        workspace = make_workspace(api.scratch_workspace_bytes())
+        poison(case, workspace)
+        api.execute(**adapter_arguments(case), workspace=workspace.tensor)
+        torch.cuda.synchronize()
+        check_case(case, workspace)
+        grads[name] = {role: case.tensors[role][0].detach().clone() for role in ("dq", "dk", "dv")}
+    for role in ("dq", "dk", "dv"):  # 256 kv rows = one pair: dQ bitwise too
+        assert torch.equal(
+            grads["sm100"][role].view(torch.int16), grads["sm100_oversized"][role].view(torch.int16)
+        ), f"{role}: sm100 vs sm100_oversized differ bitwise"
+
+
+def test_2cta_stail_rubin_b2_declines_by_name_on_a_sm100_part():
+    """``smem_map = "rubin_b2"`` NAMED on a part without the oversized carveout (cc 10.0 / 10.3) is the engine's typed decline at ``check_support``
+    (NotImplementedError by name, through the prepared module's reader); "sm100" named is served.  On a part that serves rubin_b2 the row skips (the
+    bitwise twin covers it)."""
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import SMEM_MAP_PARTS
+
+    _require_2cta()
+    cc = torch.cuda.get_device_capability()
+    if cc in SMEM_MAP_PARTS["rubin_b2"]:
+        pytest.skip(f"cc {cc} serves smem_map 'rubin_b2' (the bitwise twin covers it)")
+    case = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True)
+    with pytest.raises(NotImplementedError, match="2-CTA datapath smem_map 'rubin_b2' is not served on cc"):
+        make_adapter_2cta_stail(case, compile_plan=False, smem_map="rubin_b2").check_support()
+    assert make_adapter_2cta_stail(case, compile_plan=False, smem_map="sm100").check_support() is True
+
+
 @pytest.mark.parametrize("spec", _MASK_TWIN_CASES)
 def test_2cta_stail_mask_forms_agree_bitwise(spec):
     """The mask-form twin (a claim BY CONSTRUCTION: a masked P / dS cell is exactly +0.0 under fsel and under predicated, and an interior
@@ -1108,23 +2255,40 @@ def _expected_tile_visits(case, hq):
     return total * hq * 2
 
 
-def test_2cta_stail_debug_clk_dump_accounts_the_waits():
-    """The STAMPS lever (`debug_clk = True`, header section 11): dK / dV BITWISE vs the default (the lever changes no arithmetic) and the fp64 gate
+@pytest.mark.parametrize(
+    "maps",
+    [
+        pytest.param({}, id="default-map"),
+        pytest.param({"tmem_map": "dq_576"}, id="dq_576"),
+        pytest.param(dict(_B2_FIELDS), id="dq_576-rubin_b2"),  # + the leader's dq_read_done words live (the record of the re-based bar block's spare)
+    ],
+)
+def test_2cta_stail_debug_clk_dump_accounts_the_waits(maps):
+    """The STAMPS lever (`debug_clk = True`, header section 11) on the part's default map and, where served, on ``tmem_map = "dq_576"`` (its record
+    is the shorter bar block's spare with the same word map; the four S-tail words are dead): dK / dV BITWISE vs the default (the lever changes no arithmetic) and the fp64 gate
     under both; the dump's record layout (config DBG_CLK): every record carries the magic and its rank; each role accumulates EXACTLY the barriers
     it waits on -- the leader's words non-zero on rank 0 and zero on rank 1, the relay's the reverse, the shared roles' on both -- the tile
     counts agree across the roles and the pair and sum to the case's tile visits, the ship -> recv handshake accounts every dQ issue / relay,
     the ship histogram accounts every tile, the body clock and its %globaltimer span are live (the implied SM clock is a plausible GHz).
     Only the CTAs that RAN wrote a record (the CLC scheduler cancels the rest of the declared grid; the region is not zeroed): a record is valid
     iff its magic word matches, and a never-launched cluster leaves BOTH of its CTAs' records unwritten."""
-    _require_2cta()
+    if not maps:
+        _require_2cta()
+    elif "smem_map" in maps:
+        _require_smem_map(maps["smem_map"])
+    else:
+        _require_tmem_map(maps["tmem_map"])
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk_record, debug_clk_records
 
+    on_map = dict(maps)
     hq, hkv = 4, 2
     case = make_case((256, 512), (256, 512), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    _bitwise_twin(case, make_adapter_2cta_stail, lambda c: make_adapter_2cta_stail(c, debug_clk=True), "the stamps lever (off vs on)")
-    plain = make_adapter_2cta_stail(case)
-    api = make_adapter_2cta_stail(case, debug_clk=True)
+    _bitwise_twin(
+        case, lambda c: make_adapter_2cta_stail(c, **on_map), lambda c: make_adapter_2cta_stail(c, debug_clk=True, **on_map), "the stamps lever (off vs on)"
+    )
+    plain = make_adapter_2cta_stail(case, **on_map)
+    api = make_adapter_2cta_stail(case, debug_clk=True, **on_map)
     d = debug_clk_record(api)  # the record the carve and the dump use: derived from the layout the body renders (never a literal here)
     W = d.WORD
     n_rec = cfgmod.dbg_clk_records(case.batch, hq, api.s_k_max)
@@ -1156,14 +2320,20 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits():
     assert bool((col("tiles_leader") == torch.where(rank == 0, tiles, 0)).all()) and bool((col("tiles_follower") == torch.where(rank == 1, tiles, 0)).all())
     assert bool((tiles[rank == 0] == tiles[rank == 1]).all()), "both CTAs of a pair walk the same tiles (the valid records alternate rank 0 / 1)"
     live = tiles > 0
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import smem_map, tmem_map
+
+    # tmem_map dq_576: the four S-tail words have no site and read 0; smem_map sm100: the dq_read_done pair has no site (the same word map everywhere)
+    dead = set(cfgmod.dbg_clk_dead_words(tmem_map(api), smem_map(api)))
     for role, bars in d.ROLE_WAITS.items():
-        words = torch.stack([col(f"wait:{role}:{b}") for b in bars], dim=1)  # (records, barriers)
+        words = torch.stack([col(f"wait:{role}:{b}") for b in bars if f"wait:{role}:{b}" not in dead], dim=1)  # (records, barriers)
         on = {"leader": (rank == 0) & live, "follower": (rank == 1) & live}.get(role, live)
         off = {"leader": rank == 1, "follower": rank == 0}.get(role)
         assert bool((words[on] > 0).all()), (role, words[on])  # every barrier the role waits on, every live CTA that runs it
         if off is not None:
             assert bool((words[off] == 0).all()), (role, "a role that does not run on this rank must accumulate nothing")
-    blocked = torch.stack([col(f"blocked:leader:{b}") for b in d.ROLE_WAITS["leader"]], dim=1)
+    for name in sorted(dead):
+        assert bool((col(name) == 0).all()), (name, "a word without a site under this map must read 0")
+    blocked = torch.stack([col(f"blocked:leader:{b}") for b in d.ROLE_WAITS["leader"] if f"blocked:leader:{b}" not in dead], dim=1)
     assert bool((blocked[rank == 1] == 0).all()) and bool((blocked >= 0).all())
     for side, tcount in (("leader", col("tiles_leader")), ("follower", col("tiles_follower"))):
         assert bool((col(f"recv_{side}_matched") + col(f"recv_{side}_missed") == tcount).all()), side  # one handshake per dQ issue / per relay
@@ -1176,11 +2346,18 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits():
 
 @pytest.mark.parametrize("probe", _PROBES)
 def test_2cta_stail_probes_launch_and_return(probe):
-    """Each DIAGNOSTIC probe of this map builds, launches and returns (no fault, no hang: the probes delete bytes / a transfer, never a wait); the
-    output is WRONG BY DESIGN and is NOT checked here -- `--validate` refuses them by name in the driver.  exchange_off is the SAFE form (every wait kept)."""
+    """Each DIAGNOSTIC probe of this map builds, launches and returns (no fault, no hang: the issue / transfer / bytes probes delete bytes or a
+    transfer and keep every wait; the WAIT probes skip LEADER-waited relaxed thread-count rows with no tx bytes, whose arrives keep landing on
+    phases nobody observes -- no over-arrival fault, no waiter left behind); the output is WRONG BY DESIGN and is NOT checked here --
+    `--validate` refuses them by name in the driver.  exchange_off is the SAFE form (every wait kept).  The three S-tail WAIT probes are built on
+    the map that defines them (``tmem_map = "s_tail"``, NAMED: under dq_576 they decline by name), so the row RUNS on every admitted part whatever
+    its default; the other probes run on the part's default map."""
+    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+
     _require_2cta()
     case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
-    api = make_adapter_2cta_stail(case, diag_2cta=probe)
+    fields = {"tmem_map": "s_tail"} if probe in CFG.DIAG_2CTA_S_TAIL_PROBES else {}
+    api = make_adapter_2cta_stail(case, diag_2cta=probe, **fields)
     workspace = make_workspace(api.scratch_workspace_bytes())
     poison(case, workspace)
     for _ in range(2):
@@ -1269,7 +2446,8 @@ SITES = dict(
         site="_softmax_loop: between _wait_tcgen(bars.s_done, ...) and the S^T ld pair (_s_values), EVERY tile",
         delay_us=300,
         isolates="s_read (the leader's slot-2 wait <- 512 lanes after the S^T ld + wait(LOAD)): with the follower softmax asleep, dQ(t-1) is held by "
-        "s_read ALONE (the dS gates of t-1 and the leader softmax's arrive are long done)",
+        "s_read ALONE (the dS gates of t-1 and the leader softmax's arrive are long done); under tmem_map dq_576 (selectable on cc 10.7) the row does not "
+        "exist and the lever isolates nothing: a held S^T read delays p_ready only (SKEW_OK = the expected PASS)",
         red="the s_read wait removed before dQ(t-1) (or the arrive moved after the exp body): dQ(t-1) lands in cols 64..127 before the follower reads "
         "S^T(t) -> the follower's P^T(t) q columns 64..127 = exp2 of dQ values -> dV / dK RED on the follower's kv rows (g03 Rule 6 'second half')",
         green="fp64 gate on dQ / dK / dV, eager x2 + capture / replay x4, no hang",
@@ -1281,9 +2459,15 @@ SITES = dict(
         site="_epilogue_loop: between _wait_tcgen(bars.dq_done, ...) and the dQ tcgen05.ld (64 cols @ DQ_COL)",
         delay_us=300,
         isolates="s_tail_empty (the leader's wait before S^T(t+1) / the tail dQ / the next prologue <- 256 lanes after the dQ ld): with the follower "
-        "epilogue asleep, S^T(t+1) is held by s_tail_empty ALONE (q1_full landed long ago, the leader's readout is done)",
+        "epilogue asleep, S^T(t+1) is held by s_tail_empty ALONE (q1_full landed long ago, the leader's readout is done); under tmem_map dq_576 "
+        "(selectable on cc 10.7) the row does not exist and the lever is the TIMING probe of the independent image's reuse edge: the held readout delays "
+        "this warp's next ds_smem.arrive() and hence dQ(t+1) (the carrier of the kernel header section 5) -- SKEW_OK, no RED exists by construction; "
+        "under smem_map rubin_b2 (ON dq_576, the lagging order) the held readout holds the LEADER row dq_read_done ALONE: the leader's next dQ issue "
+        "(the fourth gate inside _dq_issue) waits that readout, nothing else does -- SKEW_OK is the expected PASS",
         red="the wait removed at the lookahead: S^T(t+1) overwrites cols 64..127 before the follower reads dQ(t-1) -> its 64 dQ rows of tile t-1 = "
-        "S^T values (dQ RED, dK / dV green); at the tail: dQ rows of tile hi-2 wrong; at the prologue: dQ rows of tile hi-1 of the previous item wrong",
+        "S^T values (dQ RED, dK / dV green); at the tail: dQ rows of tile hi-2 wrong; at the prologue: dQ rows of tile hi-1 of the previous item wrong; "
+        "under rubin_b2: the dq_read_done wait inside _dq_issue removed -> dQ(t) overwrites the independent image before the follower reads dQ(t-1) -> its "
+        "64 dQ rows of tile t-1 = dQ(t) values (dQ RED, dK / dV green); the static source pin test_2cta_stail_rubin_b2_reuse_edge_is_the_dq_read_done_row is the detector",
         green="fp64 gate on dQ / dK / dV, eager x2 + capture / replay x4, no hang",
         cell="skew",
     ),
@@ -1296,6 +2480,35 @@ SITES = dict(
         "observation of dq_done(t-1) ALONE (the alternate role shape X7; the barrier audit x-fa4 table section 12 item 12); under 16w the epilogue's dq_done(t-1) "
         "readout wait before its dS(t) STS (the same WAR by program order)",
         red="the softmax `dq_war` wait removed (16w_fa4): the dS(t) STS lands under dQ(t-1)'s async A read of sDS own + recv -> dQ rows wrong, dK / dV green",
+        green="fp64 gate on dQ / dK / dV, eager x2 + capture / replay x4, no hang",
+        cell="skew",
+    ),
+    # smem_map rubin_b2 (the barrier skeleton R2.c section 2.8; the AUDIT R2.c follow-up): the correctness instruments of the staging ring's two new edges.
+    # The plain ids run them on the part's default map too (a pure delay there); the ``-rubin_b2`` ids are the rows the skeleton names.
+    leader_arm=dict(
+        lever="LEADER_ARM",  # the house-form id (the global is DEBUG_LEADER_ARM_DELAY_US; the skeleton 2.8 writes LEADER_ARM_DELAY)
+        role="epilogue warps 8-11 of the LEADER (rank 0)",
+        site="_epilogue_loop: right before ds_recv_full[s].arrive(n_bytes=XCHG_TX) (slot s = sds_state.idx under rubin_b2; the single row under sm100), EVERY tile",
+        delay_us=300,
+        isolates="the bytes-first order on slot s: the follower's ship (its XCHG stage -> our sDS stage s + complete_tx on our ds_recv_full[s]) lands BEFORE "
+        "our expect_tx arm -> the transiently negative tx-count path of that mbarrier phase, which still completes at the arm (one arrival + the bytes "
+        "already counted); under sm100 the same order on the single row",
+        red="a wrong mbar / stage mapping inside _ship_xchg (the peer's complete_tx on another slot, or another stage's bytes): the armed phase never "
+        "balances (HANG) or a pending phase over-arrives (the tx fault); SKEW_OK is the expected PASS -- the static ring pins are the RED detectors",
+        green="fp64 gate on dQ / dK / dV, eager x2 + capture / replay x4, no hang",
+        cell="skew",
+    ),
+    leader_slot1=dict(
+        lever="LEADER_SLOT1",  # the house-form id (the global is DEBUG_LEADER_SLOT1_DELAY_US; the skeleton 2.8 writes LEADER_SLOT1_DELAY)
+        role="MMA warp 12 of the LEADER (rank 0)",
+        site="_mma_loop_leader: slot 1 of EVERY tile, before its first wait (leader-only by construction)",
+        delay_us=300,
+        isolates="under rubin_b2 the depth-2 ABA of the ds_smem / ds_recv_full / ds_pair_ready rings: with the leader held at slot 1 of tile t, both "
+        "epilogues stage dS(t) into slot t % 2 and the follower relays ds_pair_ready[t % 2] BEFORE the leader consumed flip t-1 of the other slot at "
+        "slot 2 -- the two slots' phases must stay distinct (SKEW_OK); a 1-slot form would HANG (the skeleton's static-RED row 2.6); under sm100 the "
+        "single-slot rows are gated by dq_done (dS(t) is staged only after dq_done(t-1)): a pure delay",
+        red="one state or one slot shared by the two stages (xchg_state / relay_state / sds_state at different cadences): the leader's gate of slot s "
+        "passes on the OTHER tile's flip -> dQ(t-1) built on dS(t), or a HANG; SKEW_OK is the expected PASS",
         green="fp64 gate on dQ / dK / dV, eager x2 + capture / replay x4, no hang",
         cell="skew",
     ),
@@ -1366,15 +2579,26 @@ _DKV_ACCUM_SEAM_ROWS = {
 # behind the loader: the loader's stats_empty credit wait is the one that blocks -- bounded by the ring's depth) and the leader's ship lever (the
 # exchange chain late while the ring keeps running).  Each a fresh child; the pass criterion is the SAME fp64 gate + capture / replay.
 _STATS_RING_SKEW_ROWS = ("loader_zero_trip", "softmax_s_read", "leader_ship")
+# ``tmem_map = "dq_576"`` (the independent dQ image; the kernel header section 5): the two levers that touch the deleted rows' former seams become
+# the TIMING probes of the new reuse edge (a held readout / a held own-half STS delays ds_smem(t+1), hence dQ(t+1)): SKEW_OK is the expected PASS, no
+# RED exists by construction (the static order pin is the RED detector).  The child names the map; a part that does not serve it exits 77 = skip.
+_TMEM_MAP_SKEW_ROWS = ("epilogue_dq_readout", "follower_own_half")
+# ``smem_map = "rubin_b2"`` ON dq_576 (the two-stage ring; the kernel header section 5, the barrier skeleton R2.c 2.8): the leader's held ship isolates
+# ds_recv_full[s] and the per-stage ship routing (the peer's slot s), the follower's held own-half STS isolates ds_pair_ready[s] through the two-slot relay,
+# and the held readout is the TIMING probe of the dq_read_done row (the leader's next issue waits the readout ALONE): SKEW_OK is the expected PASS; the
+# RED detector of the row is the static source pin.  The child names both maps; a part without the carveout exits 77 = skip.
+_SMEM_MAP_SKEW_ROWS = ("leader_ship", "follower_own_half", "epilogue_dq_readout", "leader_arm", "leader_slot1")
 _SKEW_ROWS = (
-    [pytest.param(site, None, None, id=site) for site in SITES]
-    + [pytest.param(site, "fp32_reduce", None, id=f"{site}-fp32_reduce") for site in _DKV_ACCUM_SEAM_ROWS]
-    + [pytest.param(site, None, "tma_ring", id=f"{site}-tma_ring") for site in _STATS_RING_SKEW_ROWS]
+    [pytest.param(site, None, None, None, None, id=site) for site in SITES]
+    + [pytest.param(site, "fp32_reduce", None, None, None, id=f"{site}-fp32_reduce") for site in _DKV_ACCUM_SEAM_ROWS]
+    + [pytest.param(site, None, "tma_ring", None, None, id=f"{site}-tma_ring") for site in _STATS_RING_SKEW_ROWS]
+    + [pytest.param(site, None, None, "dq_576", None, id=f"{site}-dq_576") for site in _TMEM_MAP_SKEW_ROWS]
+    + [pytest.param(site, None, None, "dq_576", "rubin_b2", id=f"{site}-rubin_b2") for site in _SMEM_MAP_SKEW_ROWS]
 )
 
 
-@pytest.mark.parametrize("site, dkv_accum, stats_form", _SKEW_ROWS)
-def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form, tmp_path):
+@pytest.mark.parametrize("site, dkv_accum, stats_form, tmem_map, smem_map", _SKEW_ROWS)
+def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form, tmem_map, smem_map, tmp_path):
     """One lever per id on the SECOND body (``SITES[site]``: role, site, delay, what it isolates, the RED form, the expected PASS): a fresh process
     arms ``FROST_D128_2CTA_DEBUG_<SITE>_DELAY_US`` before the body executes, runs the skew / p14 cell (more pairs than SMs) under ``process_watchdog``
     and asserts the fp64 gate eagerly and under capture / replay.  Exit 70 or a subprocess timeout = HANG -> the barrier AUDIT, never a bigger
@@ -1386,6 +2610,10 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form
     fields = {} if dkv_accum is None else {"dkv_accum": dkv_accum}
     if stats_form is not None:
         fields["stats_form"] = stats_form  # lever S1: the typed stats form in the child, as the driver sets it
+    if tmem_map is not None:
+        fields["tmem_map"] = tmem_map  # the TMEM map in the child (the ``-dq_576`` ids): a part without the carve declines -> exit 77 -> skip
+    if smem_map is not None:
+        fields["smem_map"] = smem_map  # the SMEM map in the child (the ``-rubin_b2`` ids, ON dq_576): a part without the carveout declines -> exit 77 -> skip
     form = "bf16_partials" if dkv_accum is None else dkv_accum
     seam = _DKV_ACCUM_SEAM_ROWS.get(site, "(the field does not move this lever's bytes)") if dkv_accum else ""
     assert row["lever"] in set(LEVER_LINE.findall(_body_source())), f"the second body must expose {row['lever']}"
@@ -1407,7 +2635,12 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form
         fields=fields,
         dkv=form,
     )
-    tag = f"{site}_{form}" + ("" if stats_form is None else f"_{stats_form}")
+    tag = (
+        f"{site}_{form}"
+        + ("" if stats_form is None else f"_{stats_form}")
+        + ("" if tmem_map is None else f"_{tmem_map}")
+        + ("" if smem_map is None else f"_{smem_map}")
+    )
     (tmp_path / f"skew_stail_{tag}.py").write_text(script)
     print(f"\n[{site}] {row['role']} sleeps {row['delay_us']} us at {row['site']}; isolates {row['isolates']}; RED = {row['red']}; GREEN = {row['green']}")
     if dkv_accum:

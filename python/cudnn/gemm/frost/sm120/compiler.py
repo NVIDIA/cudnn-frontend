@@ -99,6 +99,7 @@ from ..compiler import (
     _CTAMMA_SUFFIX,
     _INJECT_MARKER_LINE,
     _aux_fake_shape_code,
+    _aux_kernel_shape,
     _aux_can_use_explicit_fake_stride,
     _aux_fake_block,
     _aux_signature_block,
@@ -277,6 +278,16 @@ def _splitk_reduce_elems(chain: FusionChain) -> int:
     while chain.matmul.N % elems:
         elems //= 2
     return elems
+
+
+def _splitk_reduce_tile_n(split_k_slices: int, reduce_elems: int) -> int:
+    """Output columns per split-K reducer CTA: the reducer kernel's ``splitk_reduce_tile_n``,
+    restated here because that module imports CuTe DSL, which the support probe does not load
+    (a test pins the two together)."""
+    groups = 1
+    while groups < 4 and split_k_slices > 4 * groups:
+        groups *= 2
+    return 32 // groups * reduce_elems
 
 
 def _out_vec_bytes(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
@@ -1224,6 +1235,78 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     return t.reshape(shape)
 
 
+def _aux_layout_check(ref: TensorRef, swap_ab: bool) -> Callable:
+    """Build the per-call check of one aux buffer: ``(buf, m, n) -> (reason, unservable) | None``,
+    where ``unservable`` says that no buffer of this call's extents can be served.
+
+    The epilogue addresses an aux through its raw pointer at the strides the graph
+    declared, written into the kernel as literals (``_AuxCodegen.index_expr``), and
+    never steps an axis the graph declared at extent 1: it reads index 0 there. The
+    fake binds its symbolic extents (``_aux_kernel_shape``) to this call's M and N,
+    so such an axis grows with them in a plan built at M = 1 or N = 1; a rank-1
+    aux's fake keeps its added row axis at 1. On every axis of extent > 1 the view the
+    launch hands over must therefore have the declared stride where the kernel
+    steps, and stride 0 (a broadcast) where it does not. The tvm-ffi front door
+    enforces only the strides a fake carries (``_aux_fake_block``): a rank-1 aux's
+    fake carries none, and a fake that pins a nonzero stride on an axis the kernel
+    does not step leaves this plan no buffer of extent > 1 there that it can serve."""
+    # The axes the fake binds to the call, read off the shape it is rendered from: an int there is an extent it fixes.
+    real = [not isinstance(extent, int) for extent in _aux_kernel_shape(ref)]
+    rank, lead, (row, col) = len(real), ((int(ref.dim[0]),) if len(real) == 3 else ()), real[-2:]
+    if len(ref.dim) == rank:
+        steps, declared, pinned = tuple(d != 1 for d in ref.dim), tuple(ref.stride), _aux_can_use_explicit_fake_stride(ref)
+    else:  # rank 1: the fake adds a unit row axis, and the kernel steps the column at stride[0]
+        steps, declared, pinned = (False, ref.dim[0] != 1), (0, ref.stride[0]), False
+    # Per axis, the stride a view of extent > 1 needs: "*" where the fake fixes the extent at 1, and
+    # None where none serves (the kernel reads index 0 only and the fake pins a nonzero stride).
+    want_stride = tuple("*" if not r else s if st else 0 if not pinned or s == 0 else None for r, st, s in zip(real, steps, declared))
+    unstepped = tuple(i for i, (r, st) in enumerate(zip(real, steps)) if r and not st)
+    frame = " (in the kernel frame of this swap-AB plan, M and N exchanged)" if swap_ab else ""
+
+    def reason(buf, m: int, n: int) -> "tuple[str, bool] | None":
+        if not (m and n):  # an empty call reads no aux element: the launch path skips it (_zero_extent_problem)
+            return None
+        # The view the launch passes (_reshape_aux_to_fake is the identity at the fake's rank).
+        view = buf if len(buf.shape) == rank and not swap_ab else _reshape_aux_to_fake(_swap_mn_view(buf) if swap_ab else buf, ref)
+        shape, stride = tuple(view.shape), tuple(view.stride())
+        want_shape = (*lead, m if row else 1, n if col else 1)
+        if shape == want_shape and all(w == "*" or shape[i] == 1 or stride[i] == w for i, w in enumerate(want_stride)):
+            return None
+        got = f"got shape {shape}, stride {stride}"
+        stuck = [i for i in unstepped if want_stride[i] is None and want_shape[i] != 1]
+        if stuck:
+            return (
+                f"aux {ref.name!r}: the kernel reads only index 0 of axis {stuck[0]}, which had extent 1 when the plan was built, so it cannot serve extent {want_shape[stuck[0]]} there{frame}; {got}",
+                True,
+            )
+        strides = "(" + ", ".join("*" if w == "*" or want_shape[i] == 1 else str(w) for i, w in enumerate(want_stride)) + ")"
+        unit = [str(i) for i in unstepped if want_shape[i] != 1]
+        note = (
+            f" (0: the plan was built at extent 1 on {'axes' if len(unit) > 1 else 'axis'} {', '.join(unit)}, where the kernel reads only index 0)"
+            if unit
+            else ""
+        )
+        return f"aux {ref.name!r}: the kernel reads shape {want_shape} with strides {strides} on every axis of extent > 1{note}{frame}; {got}", False
+
+    return reason
+
+
+def _check_aux_layout(recipe, operands, m: int, n: int, swap_ab: bool) -> None:
+    """Raise what ``_aux_layout_check`` finds wrong with any aux of this call."""
+    bad = [found for x in recipe.aux if (found := _aux_layout_check(x.ref, swap_ab)(operands[x.index], m, n)) is not None]
+    if bad:
+        # An aux this plan cannot serve at these extents leaves no buffer to pass: only a new plan runs the call.
+        remedy = (
+            "rebuild the plan"
+            if any(unservable for _, unservable in bad)
+            else "pass a buffer with those strides, such as a view into an allocation of the declared shape, or rebuild the plan"
+        )
+        raise ValueError(
+            "runtime aux layout does not match the one compiled into the kernel, which reads each aux at the strides the graph declared and only index 0 "
+            f"of an axis it declared at extent 1 ({remedy}): " + "; ".join(text for text, _ in bad)
+        )
+
+
 def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None:
     """Zero COMBINE's final output on the launch stream after runtime checks: the kernel only ever adds into it."""
     if chain.moe.mode != "combine":
@@ -1239,12 +1322,110 @@ def _initialize_combine_output(chain: FusionChain, outputs, stream=None) -> None
     buffers.apply_zero_fill_plan(output.data_ptr(), plan, DTYPE_BYTES[chain.outputs[0].dtype], stream)
 
 
+def _quant_scale_plane_reject(buf) -> "str | None":
+    """Why an F8_128x4 quant-scale output binding cannot take the blob its epilogue writes, or None.
+
+    The epilogue writes the 128x4-atom stream at compact offsets from a batch plane's base
+    (``tile_l * quant_scale_stride_l``) and never applies the M/N strides. Each batch plane
+    must therefore be one dense byte run, and the batch stride must not let planes overlap.
+    A dense permuted view qualifies (the blob is read back as raw bytes). A pitched or
+    element-strided view would get the blob written into its gaps, outside the view;
+    interleaved or overlapping planes would overwrite each other."""
+    shape, strides = tuple(buf.shape), tuple(buf.stride())
+    plane = 1
+    for stride, extent in sorted((st, s) for s, st in zip(shape[1:], strides[1:]) if s > 1):
+        if stride != plane:
+            return "a batch plane is not a dense byte run"
+        plane *= extent
+    if shape[0] > 1 and strides[0] < plane:
+        return f"its {plane}-byte batch planes overlap"
+    return None
+
+
+def _quant_scale_blob_reject(chain: FusionChain, outputs) -> "str | None":
+    """Check each F8_128x4 quant-scale output with ``_quant_scale_plane_reject``."""
+    bad = []
+    for spec, buf in zip(chain.outputs, outputs):
+        if not spec.is_quant_scale:
+            continue
+        qi = int(spec.source.rsplit("_", 1)[1])
+        if chain.quants[qi].scale_reorder != "F8_128x4":
+            continue
+        reason = _quant_scale_plane_reject(buf)
+        if reason is not None:
+            bad.append(f"quant scale output[{qi}] shape {tuple(buf.shape)} stride {tuple(buf.stride())}: {reason}")
+    if bad:
+        return (
+            "F8_128x4 quant scale outputs must be packed blobs (the epilogue writes each batch plane at compact offsets "
+            "from its base and does not apply the M/N strides): " + "; ".join(bad)
+        )
+    return None
+
+
+def _zero_extent_problem(m: int, n: int, k: int, block_size: "int | None" = None, source_rows: "int | None" = None) -> bool:
+    """True when a call has nothing to compute; raise when it has work the kernel cannot encode.
+
+    Each template's host encodes its TMA descriptors from the runtime extents, and
+    ``cuTensorMapEncodeTiled`` rejects a zero dimension. The DSL checks that result
+    with ``cuda_dialect_assert_success``, which aborts the process rather than
+    raising, so no zero extent may reach a launch. With M or N zero (an empty batch,
+    an expert-parallel rank that received no rows) the reduction seeds and the
+    COMBINE zero-fill are the whole result: the caller writes them and skips the
+    launch. K = 0, a block-scale K below one scale block (whose scale-factor K extent
+    rounds down to 0) and a GATHER from a token buffer with no rows would still have
+    outputs to write, so they are refused before anything is written.
+    """
+    if not (m and n):
+        return True
+    if k < (block_size or 1):
+        extent = (
+            f"block-scale K={k} is below one {block_size}-element scale block, so the scale factors have a zero K extent" if k else "K=0 is a zero K extent"
+        )
+        raise ValueError(
+            f"cudnn.frost gemm: {extent}, which the kernel's TMA descriptors cannot encode; a call with nonzero M and N needs K >= {block_size or 1}"
+        )
+    if source_rows == 0:
+        raise ValueError("cudnn.frost gemm: MoE token_index routes rows into a token buffer that has none; GATHER reads every routed row from that buffer")
+    return False
+
+
 class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
+    _validate_quant_scale_blobs = True
+    _validate_aux_layout = True
     _validate_whole_scale_blocks = True
+    _validate_launch_grid = True
+    _check_zero_extents = True
+
+    def _lower(self):
+        """The shared launch closure; a dense block-scale plan first checks its declared scale factors against the
+        call's own problem size (``_dense_sf_runtime_reject``), before any output is seeded or the kernel launched."""
+        lowered = super()._lower()
+        if lowered is None or not self.block_scale or self.config.pipeline != "sm120" or not self.recipe.sf:
+            return lowered
+        declared = _dense_sf_declared_inputs(self)
+        compiled, refuse, gave_up = self, self.explain, self.deferrals
+
+        def lowered_sf_checked(operands, graph_order=None, stream=None, workspace=None):
+            """The declared problem size skips the check: check_support judged the declaration at it."""
+            if not all(tuple(operands[i].shape) in shapes for i, shapes in declared) and _dense_sf_runtime_reject(compiled, operands, graph_order):
+                gave_up["scale-factor layout"] += 1
+                return refuse(operands, graph_order)
+            return lowered(operands, graph_order, stream=stream, workspace=workspace)
+
+        return lowered_sf_checked
+
+    def explain(self, operands, graph_order=None):
+        """Say what is wrong with a call the launch path refused, the scale-factor layout included, and raise."""
+        if self.block_scale and self.config.pipeline == "sm120":
+            _check_plan_device(self.recipe.device)
+            reason = _dense_sf_runtime_reject(self, operands, graph_order)
+            if reason is not None:
+                raise ValueError(reason)
+        return super().explain(operands, graph_order)
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -1676,9 +1857,9 @@ def _check_executable(chain: FusionChain) -> None:
 # Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
 # their float attributes to int32). The others use Float32-only CuTe DSL math
 # (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
-# log, erf, sin, cos, sqrt, pow), which raises TypeError or fails to lower; div
-# emits `/`, which the DSL lowers to an fp32 divide while the vector keeps its
-# Int32 type, so the int32 output would hold the fp32 quotient's bit pattern.
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or fails to lower. div
+# is declined here: the shared emitter now emits arith.divsi for an Int32 div,
+# but the sm120 gate (#2022) has not been validated with that path.
 _INT32_COMPUTE_OPS = frozenset(
     ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
 )
@@ -2160,6 +2341,9 @@ def _precheck_plain(
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(select_template(chain, config))
+    _grid_reason = _launch_grid_reason(chain, config, chain.matmul.N)
+    if _grid_reason is not None:
+        raise NotImplementedError(_grid_reason)
 
 
 def _check_moe_output_dtypes(chain: FusionChain, tmpl) -> None:
@@ -2219,6 +2403,146 @@ _DENSE_BLOCK_SCALE_QUANT_DECLINE = (
 )
 
 
+def _dense_sf_misread(dims, batch: int, rows: int, k: int, block_size: int) -> "str | None":
+    """Why the dense block-scale template would read an F8_128x4 scale factor laid out as ``dims`` from the wrong rows.
+
+    sm120_block_scale_matmul.py takes each SF operand as a base pointer and rebuilds its TMA view from the problem size
+    alone (``_host``: rest_k, rest_m / rest_n): ``k4`` atoms of 512 B (128 rows x 4 scales) per 128-row block, the row
+    blocks of a batch plane and then the planes back to back -- the packed blob. ``dims`` = ``(planes, rows, SF-K)``,
+    each plane padded to whole atoms, is read where it lies (``None``) only if
+    - with dim 0 counting more than one batch plane, every plane spans exactly the template's plane, and
+    - SF-K is exactly ``k4`` atoms whenever the template reads more than one row block in all (at least ``k4`` when it
+      reads one: that row block's other atoms are never read).
+    ``[1, batch x rows, SF-K]`` stacks the planes as rows, which is the template's own order. ``batch`` and ``rows`` are
+    the operand's batch and M (or N) extents, ``k`` the reduction extent."""
+    planes, sf_rows, sf_k = (int(d) for d in dims)
+    row_blocks, k4 = (rows + 127) // 128, (k // block_size + 3) // 4  # the template's rest_m / rest_n and rest_k
+    k_atoms = (sf_k + 3) // 4
+    plane_atoms = ((sf_rows + 127) // 128) * k_atoms
+    if batch > 1 and planes > 1 and plane_atoms != row_blocks * k4:
+        return f"spaces its {planes} planes {plane_atoms} atoms apart, but the template reads batch l at l x {row_blocks * k4} atoms"
+    if batch * row_blocks > 1 and k_atoms != k4:
+        return f"has {sf_k} scales along K ({k_atoms} atoms), but the template reads its {batch * row_blocks} 128-row blocks {k4} atoms apart"
+    if k_atoms < k4:
+        return f"has {sf_k} scales along K ({k_atoms} atoms), but the template reads {k4} atoms per row"
+    return None
+
+
+def _dense_sf_name(dim, kernel_a: bool, swap_ab: bool) -> "tuple[str, tuple]":
+    """``(graph role, kernel-orientation (planes, rows, SF-K))`` of the SF a kernel-coordinate chain declares as ``dim``."""
+    kernel = (int(dim[0]), int(dim[1]), int(dim[2])) if kernel_a else (int(dim[0]), int(dim[2]), int(dim[1]))
+    graph = list(dim) if not swap_ab else [dim[0], dim[2], dim[1]]
+    return f"{'SFA' if kernel_a != swap_ab else 'SFB'} {graph}", kernel
+
+
+def _dense_sf_declaration_reject(chain: FusionChain, swap_ab: bool = False) -> "str | None":
+    """Decline a declared scale-factor layout the dense block-scale template would read from the wrong rows.
+
+    A graph declares each F8_128x4 SF as ``[planes, rows, SF-K]`` (A) or ``[planes, SF-K, rows]`` (B); a declaration
+    ``_dense_sf_misread`` objects to at the declared problem size is declined here, since the declaration decides it
+    (accept means run). At the declared problem size a bound buffer is not judged by its own extents: it supplies
+    pointer, bytes and alignment, as for the backend, so a larger buffer holding the packed blob at its start is read
+    correctly by every engine (at another size, see ``_dense_sf_runtime_reject``).
+    ``chain`` is in kernel coordinates; ``swap_ab`` names the graph's tensors and extents in the message."""
+    bs, mm = chain.block_scale, chain.matmul
+    bad = []
+    for kernel_a, dim, rows, batch in ((True, bs.sfa_dim, mm.M, mm.a_batch), (False, bs.sfb_dim, mm.N, mm.b_batch)):
+        if dim is None or len(dim) != 3:
+            continue
+        name, kernel = _dense_sf_name(dim, kernel_a, swap_ab)
+        why = _dense_sf_misread(kernel, batch, rows, mm.K, bs.block_size)
+        if why is not None:
+            bad.append(f"{name} {why}")
+    if not bad:
+        return None
+    m, n = (mm.N, mm.M) if swap_ab else (mm.M, mm.N)
+    return (
+        "the sm120 dense block-scale template reads F8_128x4 scale factors as the packed blob of the problem size "
+        f"(M={m}, N={n}, K={mm.K}, block {bs.block_size}; one atom = 128 rows x 4 scales), and a declaration laid out at another "
+        "pitch would be read from the wrong rows: " + "; ".join(bad) + " -- declare SFA as [batch, M, K / block] and SFB as "
+        "[batch, K / block, N], or with those extents padded up to whole 128 x 4 atoms"
+    )
+
+
+def _dense_sf_declared_inputs(compiled) -> tuple:
+    """``((index, shapes), ...)`` for the A and B operands the problem size is read off: their storage extents, in
+    kernel and in graph order, at the problem size the plan was declared for."""
+    recipe, mm = compiled.recipe, compiled.chain.matmul
+    declared = []
+    for op, mn in ((recipe.a, mm.M), (recipe.b, mm.N)):
+        kernel = (op.batch, mn, mm.K // op.kpack)
+        graph = [0, 0, 0]
+        for axis, extent in zip(op.declared, kernel):
+            graph[axis] = extent
+        declared.append((op.index, frozenset((kernel, tuple(graph)))))
+    return tuple(declared)
+
+
+def _dense_sf_run_extents(batch: int, rows: int, k: int, block_size: int) -> frozenset:
+    """The extents of a scale factor laid out for the call itself: ``(batch, rows, SF-K)`` with rows and SF-K each
+    logical or padded to whole 128 x 4 atoms, and ``(1, batch x padded rows, padded SF-K)`` (the planes stacked as rows,
+    the template's own order); each in kernel and in graph orientation."""
+    sf_k = k // block_size
+    rows_pad, sf_k_pad = (rows + 127) // 128 * 128, (sf_k + 3) // 4 * 4
+    run = {(batch, r, s) for r in (rows, rows_pad) for s in (sf_k, sf_k_pad)} | {(1, batch * rows_pad, sf_k_pad)}
+    return frozenset(run | {(p, s, r) for p, r, s in run})
+
+
+def _dense_sf_runtime_reject(compiled, operands, graph_order=None) -> "str | None":
+    """Refuse a call at whose problem size a declared scale factor would be read from the wrong rows.
+
+    check_support judged each declared SF at the declared problem size, but one plan also serves other sizes (A / B
+    overrides on the engine path, A / B buffers of other extents on the direct one), and what the template reads follows
+    the call's M / N / K while the declared layout does not: an SFA declared [2, 256, 16] for M = 256 keeps batch 1 at
+    4096 B, where the template reads it at 2048 B once M = 100. The cuDNN backend engines that honour the declaration
+    read it at 4096 B. Such a call is refused unless the SF slot has exactly the extents of an SF laid out for this call
+    (``_dense_sf_run_extents``): an SF override to them (what FlashInfer and cuDNN's dynamic-shape test pass), or a
+    buffer bound with exactly them, which the template reads as the call's packed blob. Any other binding -- the
+    declared extents, another view of the same bytes such as (1, 512, 16) or (4, 128, 16), a flat blob -- is refused:
+    under the declaration its bytes keep batch 1 at 4096 B. Since only the slot's extents are compared, a flat or 2-D
+    buffer of exactly the run's packed bytes is refused too, although it cannot hold the declared layout (conservative).
+    A stacked declaration [1, B x rows, SF-K] has no plane pitch to check: at another M / N it is read at the call's own
+    pitch, as cuDNN engine 0 reads it (a known limit). ``None`` also when the A / B layout is refused by the launch
+    path itself, and for a call with no row, no column or no whole scale block along K: it reads no scale factor, so
+    the launch path decides it."""
+    recipe, chain = compiled.recipe, compiled.chain
+    try:
+        (m, n, k), _axes = recipe.problem(operands, graph_order)
+    except ValueError:
+        return None
+    mm, bs, swap_ab = chain.matmul, chain.block_scale, compiled.config.swap_ab
+    if (m, n, k) == (mm.M, mm.N, mm.K):
+        return None
+    if not (m and n) or k < recipe.block_size:  # reads no scale factor; the pitch rules would compare with a 0-atom plane
+        return None
+    bad, fix = [], []
+    for sf in recipe.sf:
+        dim = bs.sfa_dim if sf.is_a else bs.sfb_dim
+        if dim is None or len(dim) != 3:
+            continue
+        batch, rows = recipe.inputs[sf.operand_at].batch, (m if sf.is_a else n)
+        name, kernel = _dense_sf_name(dim, sf.is_a, swap_ab)
+        why = _dense_sf_misread(kernel, batch, rows, k, recipe.block_size)
+        if why is None:
+            continue
+        if tuple(operands[sf.index].shape) in _dense_sf_run_extents(batch, rows, k, recipe.block_size):
+            continue
+        rows_pad, sf_k_pad = (rows + 127) // 128 * 128, (k // recipe.block_size + 3) // 4 * 4
+        bad.append(f"{name} (as declared) {why}")
+        fix.append(f"{name.split()[0]} to {[batch, rows_pad, sf_k_pad] if name.startswith('SFA') else [batch, sf_k_pad, rows_pad]}")
+    if not bad:
+        return None
+    built, runs = ((mm.N, mm.M, mm.K), (n, m, k)) if swap_ab else ((mm.M, mm.N, mm.K), (m, n, k))
+    return (
+        f"block-scale F8_128x4 scale factors must be laid out for the problem size of the call: this plan was declared for "
+        f"(M, N, K) = {built} and runs {runs}, where "
+        + "; ".join(bad)
+        + " -- override "
+        + " and ".join(fix)
+        + " (padded to whole 128 x 4 atoms) along with the A / B / O overrides, or bind buffers of exactly those extents"
+    )
+
+
 def _precheck_block_scale(
     chain: FusionChain,
     config: TileConfig,
@@ -2234,6 +2558,10 @@ def _precheck_block_scale(
                 raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
     if chain.quants and config.pipeline == "sm120":
         raise NotImplementedError(_DENSE_BLOCK_SCALE_QUANT_DECLINE)
+    if config.pipeline == "sm120":
+        _sf_reason = _dense_sf_declaration_reject(chain, config.swap_ab)
+        if _sf_reason is not None:
+            raise NotImplementedError(_sf_reason)
     _tmpl = select_template(chain, config)
     if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
         raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file}.")
@@ -2245,6 +2573,9 @@ def _precheck_block_scale(
     _check_own_family(select_template(chain, config))
     _check_block_scale_geometry(chain, config)
     _check_registry_funnel(_tmpl, chain, config)
+    _grid_reason = _launch_grid_reason(chain, config, chain.matmul.N)
+    if _grid_reason is not None:
+        raise NotImplementedError(_grid_reason)
 
 
 def _precheck_moe_block_scale(
@@ -2496,6 +2827,33 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     return None
 
 
+def _launch_grid_reason(chain: FusionChain, config: TileConfig, n: int) -> "str | None":
+    """Why the dense templates cannot launch this plan at kernel-frame N = ``n``, or None.
+
+    sm120_matmul.py and sm120_block_scale_matmul.py launch one CTA per output tile on a
+    (ceil(M / cta_tile_m), ceil(N / cta_tile_n), batch * split_k_slices) grid, and the split-K
+    reducer on a (ceil(M / 4), ceil(N / reducer tile), batch) grid. CUDA caps grid.y and grid.z
+    at 65535 (grid.x at 2**31 - 1, out of reach of any M an SM120 part can hold). Batch and the
+    slice count are fixed per plan; N is checked at plan time and again on every call, which
+    can grow it.
+    """
+    batch, slices = chain.matmul.batch, config.split_k_slices
+    over = []
+    if batch * slices > 65535:
+        over.append(f"grid.z = batch={batch} * split_k_slices={slices} = {batch * slices}")
+    tile_n = config.cga_tile_mn[1]
+    if -(-n // tile_n) > 65535:
+        over.append(f"grid.y = ceil(N={n} / {tile_n}) = {-(-n // tile_n)}")
+    if config.workspace_split_k:
+        reduce_n = _splitk_reduce_tile_n(slices, _splitk_reduce_elems(chain))
+        if -(-n // reduce_n) > 65535:
+            over.append(f"split-K reducer grid.y = ceil(N={n} / {reduce_n}) = {-(-n // reduce_n)}")
+    if not over:
+        return None
+    swapped = " (N is the graph's M: this swap-AB plan runs the GEMM transposed)" if config.swap_ab else ""
+    return f"the {config.name} launch grid exceeds CUDA's 65535 limit on grid.y and grid.z: {'; '.join(over)}{swapped}"
+
+
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
@@ -2677,6 +3035,8 @@ class CompiledMoeGemm(_CompiledMoeGemm[TileConfig, GemmBinding]):
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _validate_quant_scale_blobs = True
+    _check_zero_extents = True
 
 
 def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> None:
@@ -2730,6 +3090,9 @@ def _launch_moe_swap_ab(
     scale_blob_reason = _grouped_row_quant_scale_blob_reject(chain, outputs, m, n, g)
     if scale_blob_reason is not None:
         raise ValueError(scale_blob_reason)
+    # The whole-blob _sf_blob_reject in the loop above accepts an aliasing view whose span
+    # equals its element count (e.g. a stride-0 row axis); the per-plane rule does not.
+    compiled._check_quant_scale_blobs(outputs)
     for i, spec in enumerate(chain.output_specs):
         if i in compiled.tma_slots and spec.major == "n" and n * DTYPE_BYTES[spec.dtype] % 16:
             raise ValueError("MoE weight-by-token runtime S violates the TMA token boundary alignment")
@@ -2758,8 +3121,11 @@ def _launch_moe_swap_ab(
     slots = compiled._grid_ctas * compiled._desc_slots_per_cta
     workspace = compiled._make_workspace(slots + _MOE_SCHED_COUNTER_SLOTS, workspace)
     _check_moe_combine_operands(chain, weights, tokens, offsets, weight_sf, token_sf, (token_index, token_ks, top_k_scores), outputs, k, workspace)
+    empty = _zero_extent_problem(m, n, k, chain.block_scale.block_size if chain.block_scale is not None else None, tokens[0].shape[1])
     _initialize_reduction_outputs(chain, outputs, stream)
     _initialize_combine_output(chain, outputs, stream)
+    if empty:
+        return None
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 
 
@@ -2851,9 +3217,11 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
     _compiler = sys.modules[__name__]
     _validate_runtime_quant = True
     _validate_combine = True
+    _validate_quant_scale_blobs = True
     _check_padded_operands = True
     _check_all_operands = True
     _validate_whole_scale_blocks = True
+    _check_zero_extents = True
 
 
 def _jit_moe_block_scale(

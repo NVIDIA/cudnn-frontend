@@ -13,10 +13,10 @@ from torch import Tensor
 
 from cudnn._device import device_info
 
-from ._contract import BLK_BITS, check_inputs, check_tensor, paired_backward, paired_queries
+from ._contract import check_inputs, check_tensor, ds_parts
 
 
-def _implementation(q, k, direction):
+def _implementation(q, direction):
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
     installed, version = cutedsl_state()
@@ -29,40 +29,9 @@ def _implementation(q, k, direction):
     if reason:
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
-    family = 107 if arch == 107 else 100
-    if direction == "bprop":
-        # The batched backward (12:1 pairs, 6:1 quads) is one SM100 module compiled for every architecture; 24:2 runs
-        # the single-query backward, which has a Rubin copy.
-        if paired_backward(q.shape[1], k.shape[1]):
-            family = 100
-        elif family == 100:
-            family = "100_base"
-    return importlib.import_module(f".kernels.{direction}_sm{family}", __package__), arch
-
-
-def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
-    from ._metadata import compile_kernel
-
-    ids = torch.empty(sel_blocks.shape, dtype=torch.int32, device=sel_blocks.device)
-    counts = torch.empty((sel_blocks.shape[0],), dtype=torch.int32, device=sel_blocks.device)
-    compile_kernel(arch)(sel_blocks, lo, hi, block_first, block_last, ids, counts, stream)
-    return ids, counts
-
-
-def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv):
-    if paired_backward(hq, hkv):
-        from ._metadata import compile_group_kernel
-
-        nq = paired_queries(hq, hkv)
-        total, blocks = sel_blocks.shape
-        if blocks > 1 << BLK_BITS:
-            raise NotImplementedError(f"Batched QSA backward requires NB <= {1 << BLK_BITS} for block-owner encoding")
-        groups = (total + nq - 1) // nq
-        ids = torch.empty((groups, blocks), dtype=torch.int32, device=sel_blocks.device)
-        counts = torch.empty(groups, dtype=torch.int32, device=sel_blocks.device)
-        compile_group_kernel(arch, nq, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
-        return ids, counts
-    return _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
+    # the forward has a Rubin flavor, the backward engine serves every architecture
+    name = f"fprop_sm{107 if arch == 107 else 100}" if direction == "fprop" else "bprop_sm100"
+    return importlib.import_module(f".kernels.{name}", __package__), arch
 
 
 @lru_cache(maxsize=1)
@@ -96,7 +65,7 @@ def qsa_forward(
     """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     with torch.cuda.device(q.device):
-        impl, arch = _implementation(q, k, "fprop")
+        impl, arch = _implementation(q, "fprop")
         cuda, TupleDict, raw_stream, _forward = _forward_runtime()
         stream = cuda.CUstream(raw_stream(torch)(q.device.index))
         out, out_fp32 = torch.empty_like(q), torch.empty_like(q, dtype=torch.float32)
@@ -121,30 +90,18 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
+    ds_precision: str = "fp32",
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE."""
+    """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE.
+
+    ``ds_precision`` selects how dS reaches the dQ MMAs: ``"fp32"`` feeds three bf16 parts of its fp32 value, which keeps
+    a dQ whose terms nearly cancel accurate; ``"bf16"`` rounds it once, as FlashAttention does, at a lower cost.
+    """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
+    parts = ds_parts(ds_precision)
     check_tensor("grad_out", grad_out, q.shape, q.dtype, q.device, 16)
     check_tensor("out_fp32", out_fp32, q.shape, torch.float32, q.device, 16)
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     with torch.cuda.device(q.device):
-        impl, arch = _implementation(q, k, "bprop")
-        import cutlass
-        from cuda.bindings import driver as cuda
-        from cudnn.api_base import TupleDict
-
-        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        compiled = impl.compile_kernel(cutlass.BFloat16, hq, hkv, arch)
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        scratch = {
-            "delta": torch.empty((total, hq), dtype=torch.float32, device=q.device),
-            "dq_acc": torch.empty_like(q, dtype=torch.float32),
-            "dk_acc": torch.empty_like(k, dtype=torch.float32),
-            "dv_acc": torch.empty_like(v, dtype=torch.float32),
-        }
-        ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hq, hkv)
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        impl.launch(
-            compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, block_first, block_last, dq, dk, dv, scratch, float(scale), stream, num_sms
-        )
-        return TupleDict(dq=dq, dk=dk, dv=dv)
+        impl, arch = _implementation(q, "bprop")
+        return impl.backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, float(scale), arch, dq_parts=parts)

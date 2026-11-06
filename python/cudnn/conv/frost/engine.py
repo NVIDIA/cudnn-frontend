@@ -5,8 +5,9 @@
 
 This first version intentionally serves one small envelope: a conv_fprop,
 optionally followed by one unary epilogue, with FP32 accumulation and
-channels-last 3D layouts. Input/output dtypes, input shape, and convolution
-parameters are specialized at build time.
+channels-last 3D layouts. Dense convolution uses runtime geometry and shares
+compiled artifacts across shape-specific graph plans. NVFP4 convolution retains
+its graph-specialized block-scale template.
 """
 
 from math import prod
@@ -221,7 +222,7 @@ def _check_fp32_compute_type(context: GraphContext):
 
 
 class _Sm100FrostConvPlan(CompiledPlan):
-    """A shape-specialized convolution callable plus its graph port binding. Correspond to templates.sm100_conv.py"""
+    """A convolution artifact and fixed graph bindings, with runtime geometry."""
 
     takes_variant_pack = True
 
@@ -291,7 +292,8 @@ class _Sm100FrostConvPlan(CompiledPlan):
 
         _check_channels_last_3d_layout(tuple(zip(("image", "weight", "Y"), tensors)))
 
-    def __init__(self, compiled, tensors, device: int):
+    def __init__(self, compiled, tensors, device: int, conv_params):
+        self._conv_params = tuple(tuple(cutlass.Int32(v) for v in values) for values in conv_params)
         self._compiled = compiled
         self._tensors = tuple(tensors)
         self._shapes = tuple(tuple(t.dim) for t in tensors)
@@ -335,6 +337,7 @@ class _Sm100FrostConvPlan(CompiledPlan):
             weight.permute(0, 2, 3, 4, 1),
             output.permute(0, 2, 3, 4, 1),
             _cuda.CUstream(ctx.stream or 0),
+            *self._conv_params,
         )
 
 
@@ -669,7 +672,7 @@ class FrostConvEngine(BaseEngine):
                     ab_dtype=ab_dtype,
                     c_dtype=c_dtype,
                 )
-                return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device())
+                return _Sm100FrostConvPlan(compiled, (image, weight, output), current_device(), (post_padding, pre_padding, stride, dilation))
 
 
 def FrostConvEngines(ids: dict[str, int]) -> list[BaseEngine]:

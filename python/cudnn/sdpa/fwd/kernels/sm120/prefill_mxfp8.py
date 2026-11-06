@@ -12,7 +12,7 @@ right-to-left masked KV walk and P kept in registers, with every MMA lowered to
 
 - Q/K/V arrive PRE-QUANTIZED e4m3/e5m2 with one E8M0 scale per 32 elements
   (Q/K along D, V along S) in the F8_128x4 atom order (``sdpa/kernels/_mxfp8_sf.py``).
-  There are no per-tensor descales; ``scale_softmax``, the 2**-4 P-cast
+  There are no per-tensor descales; ``scale_softmax``, the 2**-8 P-cast
   inverse and a block-scaled O's optional global ``scale_o`` are the only
   scalar factors.
 - Q scales load GMEM-direct into one 32-bit register per 128-column plane
@@ -25,7 +25,7 @@ right-to-left masked KV walk and P kept in registers, with every MMA lowered to
   word per column held across the k32 steps.
 - K B-fragments: byte-preserving ``ldmatrix.m8n8.x4.b16``; V B-fragments: the
   8-bit transposed ``ldmatrix.m16n16.x2.trans.b8``, register map (0, 2, 1, 3).
-- P: fp32 softmax output packed to the INPUT fp8 dtype with a baked 2**4 cast
+- P: fp32 softmax output packed to the INPUT fp8 dtype with a baked 2**8 cast
   bias and the unit block scale (E8M0 127); the k32 C->A fragment-column
   mismatch is an exchange inside each thread quad (two ``shfl.sync`` and one
   ``prmt`` in ``mma_pv``).
@@ -118,13 +118,15 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(d
 
 # P -> fp8 cast bias (BAKED constant). P is quantized as P * 2**P_CAST_LOG2_SCALE
 # via the exp2 bias under the unit block scale: the online softmax adopts every
-# new row max, so P <= 1 and the cast peaks at 2^4 = 16, far below the e4m3
-# maximum of 448, while flat-row entries (P ~ 1/S) sit four binades above
-# e4m3's subnormal cliff (quantization stays normal out to S ~ 2^13). row_sum
-# accumulates in the same 2^4-scaled units and is de-scaled by the EXACT 2^-4
-# before the finalize paths (sink mix, rcp, LSE, zero-row guards run on
-# bit-identical true sums); the O leg's 2^4 is cancelled by O_SCALE.
-P_CAST_LOG2_SCALE = 4.0
+# new row max, so P <= 1 and the cast peaks at 2^8 = 256, below the e4m3
+# maximum of 448. P is relative to the row max, not normalized, so in a peaked
+# long row the other keys sit far below 1/S; the cast keeps them while P * 2^8
+# reaches half of e4m3's smallest subnormal (2^-10), i.e. down to P = 2^-18,
+# about 12.5 nats below the max. row_sum accumulates in the same 2^8-scaled
+# units and is de-scaled by the EXACT 2^-8 before the finalize paths (sink mix,
+# rcp, LSE, zero-row guards run on bit-identical true sums); the O leg's 2^8 is
+# cancelled by O_SCALE.
+P_CAST_LOG2_SCALE = 8.0
 # The O factor: block scales replace the per-tensor descales, and a
 # block-scaled O multiplies in its optional global scale_o at launch. The kernel
 # takes it as a runtime ``o_scale`` argument rather than a folded constant: the
@@ -830,7 +832,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P (EX2 is
+            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^8 * P (EX2 is
             # binade-shift-exact); see P_CAST_LOG2_SCALE.
             neg_exp_max_scaled = cutlass.Float32(P_CAST_LOG2_SCALE) - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)
@@ -1547,8 +1549,8 @@ class SM120FusedMultiHeadAttentionForward:
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
-                # row_sum carries the P-cast 2^4 — take it out with the EXACT
-                # 2^-4 so every finalize path below sees the true sum.
+                # row_sum carries the P-cast 2^8 — take it out with the EXACT
+                # 2^-8 so every finalize path below sees the true sum.
                 row_sum[row_half] = row_sum[row_half] * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
                 if cutlass.const_expr(self.has_sink):

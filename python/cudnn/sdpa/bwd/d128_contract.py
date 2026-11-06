@@ -55,8 +55,17 @@ def validate_accumulation_scale(scale):
         raise ValueError("dense d128 accumulation requires scale and scale*log2(e) finite and positive in FP32") from None
 
 
-# Compute capabilities the accumulation chain (dense, THD and grouped) is qualified on.
-ACCUMULATION_CCS = ((10, 0), (10, 3))
+# The parts the accumulation chain (dense, THD and grouped) is admitted on, BY NAME: GB200 (cc 10.0, the measured part), GB300 (cc 10.3,
+# admitted 2026-10-28: the same tcgen05 / cta_group::2 / TMEM / CLC feature set) and Rubin (cc 10.7, admitted 2026-11-03: the same bodies,
+# unchanged).  The compile target follows the device in every prepared host (``--gpu-arch sm_{sm}a`` with ``sm = cc[0] * 10 + cc[1]``), so
+# admitting a part is this tuple plus the engine row's sm range -- never a copy of a kernel into another arch directory.
+ACCUMULATION_CCS = ((10, 0), (10, 3), (10, 7))
+# The text every decline off these parts carries (the graph row's declaration check and the THD / grouped standalone adapters pin ONE token).
+ACCUMULATION_PARTS = "SM100, SM103 or SM107 (cc 10.0 / 10.3 / 10.7)"
+# The dense MHA envelope of the ``sdpa_bwd_sm100_d128`` row (its ``Capabilities.sm_lo`` / ``sm_hi``, inclusive): the one-launch recompute body
+# serves every cc in it, the accumulation chain the ``ACCUMULATION_CCS`` parts only; cc 10.7 closes the range (SM108+ is declined by name
+# until a part is admitted).  Read by the engine spec and the dense adapter's ``check_support`` -- one place.
+DENSE_SM_RANGE = (100, 107)
 
 
 def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=128, d_v=128, input_bytes=2):
