@@ -17,7 +17,7 @@ from cutlass.jax import TensorSpec, cutlass_call
 
 if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
     raise ImportError(
-        "cudnn.jax requires the CuTeDSL JAX extensions (cutlass.jax), which need jax >= 0.5; " "install/upgrade jax (`pip install --group jax` from a checkout)"
+        "cudnn.jax requires jax >= 0.9.1 and the CuTeDSL JAX extensions (cutlass.jax); " "install/upgrade jax (`pip install --group jax` from a checkout)"
     )
 
 
