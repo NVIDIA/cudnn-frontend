@@ -16,13 +16,13 @@ tensor parallelism of a 2048-wide shared expert) or 128 (16-way); compute capabi
 Everything else is declined by name (`TypeError` for a dtype, `ValueError` for a shape / stride / alignment / device,
 `NotImplementedError` for the token count, the geometry, the architecture or the DSL version) before any DSL import.
 
-Launch 1 (`gate_up`, `K_SPLIT = 8` CTAs per cluster along K; 512 CTAs of 256 threads at `Geometry(8192, 256)`, 256 at
-`Geometry(8192, 128)`, four CTAs per SM at up to 16 tokens and one wave on every SM100-class part) streams its 16 KB slice
-of `W_gate_up` once by `cp.async.bulk` (one copy per row) with the row pairs `(j, I + j)` resident in one CTA, so the
-SiLU-mul sits in its epilogue; the `T` live rows of `x`'s K slice land by one bulk copy each (resident, no ring, at every
-`T`); the eight K-slice CTAs of a cluster fold their partial sums through DSMEM (`st.async`) in a fixed rank order; a warp
-per row-pair group computes its slice of the gate logit `x @ W_gate^T`, folded on the cluster leader the same way. At
-17 .. 24 tokens a CTA owns two row-pair groups (256 CTAs x 113 KB, two per SM, still one wave). Launch 2 (`down`, `H / 64`
+Launch 1 (`gate_up`, `K_SPLIT = 8` CTAs per cluster along K; 256 CTAs of 256 threads at either geometry, one wave on every
+SM100-class part: two row-pair groups per CTA at `Geometry(8192, 256)` -- 32 KB of `W_gate_up` each, two CTAs per SM -- and
+one at `Geometry(8192, 128)` -- 16 KB, four per SM at up to 16 tokens) streams its slice of `W_gate_up` once by
+`cp.async.bulk` (one copy per row) with the row pairs `(j, I + j)` resident in one CTA, so the SiLU-mul sits in its
+epilogue; the `T` live rows of `x`'s K slice land by one bulk copy each (resident, no ring, at every `T`); the eight K-slice
+CTAs of a cluster fold their partial sums through DSMEM (`st.async`) in a fixed rank order; a warp per row-pair group
+computes its slice of the gate logit `x @ W_gate^T`, folded on the cluster leader the same way. Launch 2 (`down`, `H / 64`
 CTAs) prefetches its `W_down` rows ahead of `griddepcontrol.wait`, folds the per-group gate partials into `sigmoid` and
 writes `y`. The math path is `mma.sync.m16n8k16` bf16 -> fp32 in both launches with the tokens on M (zero-padded to 16 or
 32 rows), so every output element is accumulated in a FIXED order that depends on the geometry alone: the result is

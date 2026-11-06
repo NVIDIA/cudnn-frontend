@@ -42,28 +42,28 @@ REPO = Path(__file__).resolve().parents[4]
 # ---------------------------------------------------------------------------------------------------------------------------
 def test_default_cfg_pins_k_split_per_geometry_at_one_wave():
     """K_SPLIT is a function of the geometry alone (the slice order of every output element never moves with T): 8 at both validated
-    geometries (64 x 8 = 512 CTAs of 16 KB at I 256, 32 x 8 = 256 at I 128) -- one wave at four CTAs per SM on a 148- or 152-SM part; the
-    two-tile form takes N_GROUPS 2 at I 256 (256 CTAs x 113 KB, two per SM) and 1 at I 128 (256 x 81 KB); every knob default is the measured
-    one (bulk x rows, the cluster-side gate fold, PDL off, W_PHASES 1, 64 rows)."""
-    for g, grid1 in ((GEOMETRIES[0], 512), (GEOMETRIES[1], 256)):
+    geometries -- clusters of eight, 256 CTAs either way: two row-pair groups per CTA at I 256 (32 KB of W each, two CTAs per SM at every
+    T: the measured best form), one at I 128 (16 KB, four per SM at one tile; the two-group grid of 128 would leave SMs idle); one wave on a
+    148- or 152-SM part; every knob default is the measured one (bulk x rows, the cluster-side gate fold, PDL off, W_PHASES 1, 64 rows)."""
+    for g, n, ctas in ((GEOMETRIES[0], 2, 2), (GEOMETRIES[1], 1, 4)):
         cfg = kcfg.default_cfg(g)
         assert (cfg.K_SPLIT, cfg.GRID1, cfg.GRID2, cfg.THREADS, cfg.THREADS2, cfg.N_GROUPS_EFF, cfg.co_resident_ctas1, cfg.WAVES1) == (
             8,
-            grid1,
+            256,
             128,
             256,
             256,
-            1,
-            4,
+            n,
+            ctas,
             1,
         ), g
         assert (cfg.N_GROUPS, cfg.X_BULK_ROWS, cfg.GATE_CLUSTER_FOLD, cfg.SM_COUNT) == (0, True, True, kcfg.SM100_SM_COUNT)
         assert (cfg.PDL, cfg.PDL_PAIR, cfg.PDL_RELEASE, cfg.X_STAGES, cfg.W_PHASES, cfg.ROWS_PER_CTA, cfg.MIN_CTAS_PER_SM) == (False, False, False, 0, 1, 64, 1)
         two = kcfg.form_for(cfg, 24)
-        assert (two.TOKEN_TILES, two.N_GROUPS_EFF, two.GRID1, two.co_resident_ctas1, two.WAVES1) == (2, 2 if g.INTERMEDIATE == 256 else 1, 256, 2, 1), g
+        assert (two.TOKEN_TILES, two.N_GROUPS_EFF, two.GRID1, two.co_resident_ctas1, two.WAVES1) == (2, n, 256, 2, 1), g
         for sm in (148, 152, 212):  # the same forms on every SM100-class part
             part = kcfg.default_cfg(g, sm_count=sm)
-            assert (part.N_GROUPS_EFF, kcfg.form_for(part, 24).N_GROUPS_EFF) == (1, two.N_GROUPS_EFF)
+            assert (part.N_GROUPS_EFF, kcfg.form_for(part, 24).N_GROUPS_EFF) == (n, n)
     assert kcfg.CFG == kcfg.default_cfg() and kcfg.CFG_TP16 == kcfg.default_cfg(GEOMETRIES[1])
     assert kcfg.k_split_for(kcfg.Geometry(8192, 256)) == 8 and kcfg.k_split_for(kcfg.Geometry(8192, 128)) == 8
     # the v1 arm (the class of the committed ksplit2 / ksplit4 goldens): 128 CTAs, the ring, the launch-2 gate fold
@@ -145,16 +145,17 @@ def test_smem_tables_fit_and_every_pitch_covers_the_banks(g, k_split, tiles, bul
 
 
 def test_default_form_figures_of_record():
-    """The default forms' figures of record (the kernel module's SMEM table quotes these): I 256 / K_SPLIT 8: 57,200 B at one tile (w_s 16,512,
-    x_s 16 x 2,064, red_s / mail_s 3,584, gmail_s 448, 48 B of mbarriers; four CTAs per SM, 144 B under the budget) and 113,072 B at two tiles
-    with N_GROUPS 2 (two per SM); I 128: 57,200 / 81,328 B; the v1 arm unchanged at 202,912 / 207,008 B (I 256) and 104,608 / 176,288 B (I 128)."""
+    """The default forms' figures of record (the kernel module's SMEM table quotes these): I 256 / K_SPLIT 8 / N_GROUPS 2: 81,328 B at one tile
+    (w_s 33,024, x_s 16 x 2,064, red_s / mail_s 7,168, gmail_s 896, 48 B of mbarriers; two CTAs per SM) and 113,072 B at two tiles; the
+    one-group one-tile form (the N_GROUPS 1 arm, the I 128 default) 57,200 B, four per SM with 144 B of slack; I 128: 57,200 / 81,328 B; the
+    v1 arm unchanged at 202,912 / 207,008 B (I 256) and 104,608 / 176,288 B (I 128)."""
     c1, c2 = kcfg.form_for(kcfg.CFG, 6), kcfg.form_for(kcfg.CFG, 24)
     assert kcfg.smem_table1(c1) == {
-        "w_s": (16512, 2064),
+        "w_s": (33024, 2064),
         "x_s": (33024, 2064),
-        "red_s": (3584, 16),
-        "mail_s": (3584, 16),
-        "gmail_s": (448, 4),
+        "red_s": (7168, 16),
+        "mail_s": (7168, 16),
+        "gmail_s": (896, 4),
         "mbarriers": (48, None),
     }
     assert kcfg.smem_table1(c2) == {
@@ -165,9 +166,19 @@ def test_default_form_figures_of_record():
         "gmail_s": (1792, 4),
         "mbarriers": (48, None),
     }
-    assert (c1.SMEM1_BYTES, c2.SMEM1_BYTES, c1.SMEM2_BYTES, c2.SMEM2_BYTES) == (57200, 113072, 42368, 50816)
-    assert (c1.co_resident_ctas1, c2.co_resident_ctas1, c1.KRED_BYTES, c2.KRED_BYTES) == (4, 2, 4032, 16128)
-    assert kcfg.SM100_SMEM_PER_SM_BYTES // 4 - kcfg.SMEM_CTA_RESERVE_BYTES - c1.SMEM1_BYTES == 144, "the one-tile form's slack under four per SM"
+    assert (c1.SMEM1_BYTES, c2.SMEM1_BYTES, c1.SMEM2_BYTES, c2.SMEM2_BYTES) == (81328, 113072, 42368, 50816)
+    assert (c1.co_resident_ctas1, c2.co_resident_ctas1, c1.KRED_BYTES, c2.KRED_BYTES) == (2, 2, 8064, 16128)
+    n1 = kcfg.make_cfg(N_GROUPS=1)
+    assert kcfg.smem_table1(n1) == {
+        "w_s": (16512, 2064),
+        "x_s": (33024, 2064),
+        "red_s": (3584, 16),
+        "mail_s": (3584, 16),
+        "gmail_s": (448, 4),
+        "mbarriers": (48, None),
+    }
+    assert (n1.SMEM1_BYTES, n1.co_resident_ctas1, n1.GRID1, n1.KRED_BYTES) == (57200, 4, 512, 4032)
+    assert kcfg.SM100_SMEM_PER_SM_BYTES // 4 - kcfg.SMEM_CTA_RESERVE_BYTES - n1.SMEM1_BYTES == 144, "the one-group one-tile form's slack under four per SM"
     t1, t2 = kcfg.form_for(kcfg.CFG_TP16, 6), kcfg.form_for(kcfg.CFG_TP16, 24)
     assert (t1.SMEM1_BYTES, t2.SMEM1_BYTES, t1.SMEM2_BYTES, t2.SMEM2_BYTES, t1.co_resident_ctas1, t2.co_resident_ctas1) == (57200, 81328, 21888, 26240, 4, 2)
     v1, v2 = kcfg.form_for(kcfg.CFG_V1, 6), kcfg.form_for(kcfg.CFG_V1, 24)
@@ -185,7 +196,8 @@ def test_one_wave_rule_is_the_form_axis_and_a_two_wave_default_is_the_typed_erro
     """N_GROUPS 0 picks the smallest group count that fits one wave; an explicit N_GROUPS is kept (a knob arm may choose two waves); a part
     too small for one wave under the rule declines by name."""
     assert kcfg.make_cfg(TOKEN_TILES=2).N_GROUPS_EFF == 2 and kcfg.make_cfg(TOKEN_TILES=2, N_GROUPS=1).WAVES1 == 2
-    assert kcfg.make_cfg(GEOM=GEOMETRIES[1], TOKEN_TILES=2).N_GROUPS_EFF == 1
+    assert kcfg.make_cfg(GEOM=GEOMETRIES[1], TOKEN_TILES=2).N_GROUPS_EFF == 1 and kcfg.make_cfg(GEOM=GEOMETRIES[1], TOKEN_TILES=2, N_GROUPS=2).GRID1 == 128
+    assert kcfg.make_cfg(N_GROUPS=1).WAVES1 == 1, "the one-group one-tile form fits one wave too; the rule prefers the fatter two-group CTAs"
     small = kcfg.make_cfg(TOKEN_TILES=2, SM_COUNT=64)
     assert small.N_GROUPS_EFF == 2 and small.WAVES1 == 2
     with pytest.raises(ValueError, match="needs 2 waves"):
@@ -490,7 +502,7 @@ def test_entry_reads_the_device_readings_and_picks_the_form_per_tokens():
     k = entry.SharedExpertDecode(dev)
     assert k.readings == entry.device_shared_memory(dev) and k.sm_count == torch.cuda.get_device_properties(dev).multi_processor_count
     assert k.cfg.SMEM_OPTIN_BYTES == k.readings[1] and k.cfg.SM_COUNT == k.sm_count and k.cfg_for(16).TOKEN_TILES == 1 and k.cfg_for(17).TOKEN_TILES == 2
-    assert (k.cfg_for(16).N_GROUPS_EFF, k.cfg_for(17).N_GROUPS_EFF, k.cfg_for(16).WAVES1, k.cfg_for(17).WAVES1) == (1, 2, 1, 1)
+    assert (k.cfg_for(16).N_GROUPS_EFF, k.cfg_for(17).N_GROUPS_EFF, k.cfg_for(16).WAVES1, k.cfg_for(17).WAVES1) == (2, 2, 1, 1)
     ops = make_operands(17, device=dev, seed=1)
     _run(k, ops)
     _run(k, dict(ops, x=ops["x"][:3]))
@@ -548,8 +560,8 @@ BITWISE_ARMS = [
     dict(PDL=True, PDL_PAIR=True, PDL_RELEASE=True),
     dict(N_GROUPS=1),
     dict(N_GROUPS=2),
-    dict(X_BULK_ROWS=False),
-    dict(X_BULK_ROWS=False, X_STAGES=2),
+    dict(X_BULK_ROWS=False, N_GROUPS=1),  # the ring at K_SPLIT 8 needs two waves at T 24 (the one-wave rule would decline it): an explicit N_GROUPS
+    dict(X_BULK_ROWS=False, X_STAGES=2, N_GROUPS=1),
     dict(W_PHASES=2),
     dict(ROWS_PER_CTA=32),
 ]
@@ -559,7 +571,8 @@ BITWISE_ARMS = [
 @pytest.mark.parametrize("arm", BITWISE_ARMS, ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()))
 def test_bit_neutral_knob_arms_write_the_default_bytes(arm, tokens):
     """The PDL attributes (launch 1's, launch 2's, both plus the release), one or two row-pair groups per CTA (the two-wave N_GROUPS 1 at T 24
-    included), the ring at K_SPLIT 8 (two chunks, all resident, and the minimum ring), the two W phases and the 32-row launch 2 move no fp32
+    included), the ring at K_SPLIT 8 (two chunks, all resident, and the minimum ring; two waves at T 24, chosen knowingly by the explicit
+    N_GROUPS -- the one-wave rule declines a two-wave default), the two W phases and the 32-row launch 2 move no fp32
     addition: byte-identical with the default on the same operands.  The stream is drained before a PDL launch: the caller obligation (no
     in-flight predecessor writes the weights) holds in the test as in the chain."""
     dev = _device_or_skip()

@@ -32,7 +32,8 @@ Two launches, one stream, programmatic dependent launch between them (knobs):
   ``w, w + WARPS, ..`` into ``sigmoid`` in shared memory; the epilogue writes ``y[t][n] = bf16(acc x sigmoid[t])`` for ``t < T``.
 
 Knobs (every one a ``cutlass.const_expr`` axis of the same two kernel bodies; the default is the ONE-WAVE form: launch 1 over all SMs
-(4 CTAs per SM at T <= 16, 2 at 17 .. 24) with the whole 8 MB / 4 MB weight stream and the live x rows in flight within the first microsecond):
+(two CTAs per SM at I 256, four at I 128 and T <= 16) with the whole 8 MB / 4 MB weight stream and the live x rows in flight within the first
+microsecond):
 
 * ``K_SPLIT`` (1, 2, 4, 8): CTAs per cluster over K -- a ROUNDING-ORDER axis (the slice sum ``((C_0 + C_1) + ..)`` and the gate-logit tree,
   ``GATE_PARTS`` leaves, both move with it); pinned per geometry by ``default_cfg`` (8 on the validated envelope: 512 CTAs of 16 KB at I 256,
@@ -41,9 +42,10 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same two kernel bodies; th
 * ``TOKEN_TILES`` (1, 2): m-tiles of 16 tokens -- the FORM axis the host entry picks from ``T`` (1 for ``T <= 16``, 2 for ``17 .. 24``);
   bit-neutral by the row-position invariance of the ``m16n8k16`` datapath (a token's row of the A operand is contracted on its own; the
   premise the batch-invariance cells of the determinism suite pin).
-* ``N_GROUPS`` (0 = the one-wave rule, 1, 2): row-pair groups (n8 tiles) per CTA of launch 1 -- the second FORM axis: ``0`` picks the smallest
-  of 1, 2 whose grid fits one wave (``GRID1 <= SM_COUNT x co_resident_ctas1``; 1 at ``TOKEN_TILES`` 1, 2 at ``TOKEN_TILES`` 2 and I 256).
-  Bit-neutral: the per-element chain does not depend on how many n-tiles a CTA owns.
+* ``N_GROUPS`` (0 = the one-wave rule, 1, 2): row-pair groups (n8 tiles) per CTA of launch 1 -- the second FORM axis: ``0`` picks the
+  two-group form when its grid still covers every SM in one wave (``SM_COUNT <= GRID1 <= SM_COUNT x co_resident_ctas1``: I 256, 256 CTAs
+  of 32 KB, two per SM at every T -- measured +6..+16 % over the 512-CTA one-group form at T 4-6), else the smallest group count that
+  fits one wave (I 128: 256 one-group CTAs).  Bit-neutral: the per-element chain does not depend on how many n-tiles a CTA owns.
 * ``X_BULK_ROWS`` (default on): x resident by one bulk copy per live row (no ring, ``X_STAGES`` unused); off = the v1 ``cp.async`` ring.
   Bit-neutral: who loads x and how does not enter the sum.
 * ``GATE_CLUSTER_FOLD`` (default on): the gate-logit leaves of a cluster are added on the leader in rank order and launch 2 folds
@@ -168,10 +170,15 @@ class Cfg:
 
     @property
     def N_GROUPS_EFF(self) -> int:
-        """Groups per CTA: the knob, or the one-wave rule (the smallest of 1, 2 whose grid fits ``SM_COUNT x co_resident_ctas1``; 2 when
-        neither does)."""
+        """Groups per CTA: the knob, or the one-wave rule -- the two-group form (fewer, fatter CTAs: 32 KB of W each, two per SM) when its
+        grid still places a CTA on every SM and fits one wave (measured the best form at I 256: 256 CTAs on 148-152 SMs), else the smallest
+        of 1, 2 whose grid fits one wave (I 128: 256 one-group CTAs; the two-group grid of 128 would leave SMs idle), else 2."""
         if self.N_GROUPS:
             return self.N_GROUPS
+        for n in (2, 1):
+            form = replace(self, N_GROUPS=n)
+            if self.GROUPS % n == 0 and form.GRID1 >= self.SM_COUNT and form.GRID1 <= self.SM_COUNT * form.co_resident_ctas1:
+                return n
         for n in (1, 2):
             form = replace(self, N_GROUPS=n)
             if self.GROUPS % n == 0 and form.GRID1 <= self.SM_COUNT * form.co_resident_ctas1:
@@ -670,7 +677,7 @@ def v1_cfg(geometry: Geometry = DEFAULT_GEOMETRY, **overrides) -> Cfg:
 
 
 # the module forms (the cc 10.x readings; the host entry stamps the part's)
-CFG = default_cfg()  # I 256: K_SPLIT 8, 512 CTAs x 57,200 B (4 per SM) at TOKEN_TILES 1; 256 CTAs x 113,072 B (N_GROUPS 2) at TOKEN_TILES 2
+CFG = default_cfg()  # I 256: K_SPLIT 8, N_GROUPS 2: 256 CTAs x 81,328 B (2 per SM) at TOKEN_TILES 1, 256 x 113,072 B at TOKEN_TILES 2
 CFG_TP16 = default_cfg(Geometry(8192, 128))  # I 128: K_SPLIT 8, 256 CTAs x 57,200 B; 256 x 81,328 B at TOKEN_TILES 2
 CFG_V1 = v1_cfg()  # I 256: K_SPLIT 2, 128 CTAs x 202,912 B (the v1 goldens' class)
 CFG_V1_TP16 = v1_cfg(Geometry(8192, 128))  # I 128: K_SPLIT 4, 128 CTAs x 104,608 B

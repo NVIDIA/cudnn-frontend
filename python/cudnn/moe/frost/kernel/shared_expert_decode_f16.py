@@ -108,7 +108,9 @@ BARRIER TABLE -- launch 2 (``down``), THREADS2 = 4 x ROWS_PER_CTA threads, no cl
 
 SMEM TABLES (no descriptor reads any buffer: every row pitch is 128 n + 16 B, so consecutive rows shift by 4 banks and the 8 row addresses of
 one ``ldmatrix`` phase (8 rows x 16 B) cover all 32 banks; ``cp.async`` / bulk writes land consecutive 16-B granules of ONE row per warp
-instruction: conflict-free).  Launch 1, the DEFAULT form (I 256, K_SPLIT 8; TILES 1 / N_GROUPS 1 ; TILES 2 / N_GROUPS 2; allocation order):
+instruction: conflict-free).  Launch 1 (I 256, K_SPLIT 8; the one-group one-tile form ; the two-group two-tile form; allocation order --
+the I 256 DEFAULT is two groups at every T: 81,328 B at TILES 1 (w_s 33,024 + x_s 33,024 + red_s 7,168 + mail_s 7,168 + gmail_s 896 + 48),
+113,072 B at TILES 2, two CTAs per SM; the one-group one-tile form is the I 128 default and the N_GROUPS 1 arm):
   w_s      W_ROWS = 8 N rows (row 8 n + 2 i + h: group n, pair i, h = gate / up) x pitch 2,064 B      16,512 ; 33,024 B   bulk copies (async
                                                                                                             proxy) -> ldmatrix.x2 (the mbarrier wait
                                                                                                             orders async -> generic)
@@ -123,8 +125,8 @@ instruction: conflict-free).  Launch 1, the DEFAULT form (I 256, K_SPLIT 8; TILE
   mb_w[W_PHASES], mb_x, mb_kred   u64 slots in 16-B arrays                                                              48 B
   total                                                                                              57,200 ; 113,072 B   4 ; 2 CTAs per SM (228 KB /
                                                                                                                            4 - 1 KB = 57,344 ; 115,712)
-  (``smem_table1(cfg)``'s figures, pinned by the host test ``test_default_form_figures_of_record``.  I 128: TILES 1 / N 1 57,200 B (256 CTAs,
-  4 per SM); TILES 2 / N 1 81,328 B (2 per SM).  The v1 ring arm (K_SPLIT 2, I 256): w_s 65,664 + x_s 133,120 + red_s 3,584 / 7,168 + mail_s
+  (``smem_table1(cfg)``'s figures, pinned by the host test ``test_default_form_figures_of_record``.  I 128 (N 1 at every T): TILES 1 57,200 B
+  (256 CTAs, 4 per SM); TILES 2 81,328 B (2 per SM).  The v1 ring arm (K_SPLIT 2, I 256): w_s 65,664 + x_s 133,120 + red_s 3,584 / 7,168 + mail_s
   512 / 1,024 + 32 = 202,912 / 207,008 B, one CTA per SM, unchanged.)
 Launch 2 (I 256; TPAD 16 / 32): wd_s 64 rows x pitch 528 B = 33,792 (``cp.async``, ``ldmatrix.x2``; 528 = 4 x 128 + 16); act_s TPAD x 528 =
   8,448 / 16,896 (``cp.async``, ``ldmatrix.x4``); sig_s 32 fp32 = 128; total 42,368 / 50,816 B (I 128: pitch 272 = 2 x 128 + 16; wd_s 17,408,
