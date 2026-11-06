@@ -170,7 +170,7 @@ def destroy_handle(handle):
 from .datatypes import _library_type, _is_torch_tensor
 
 __version__ = "1.33.0"
-MIN_JAX_VERSION = (0, 9, 1)
+CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
 
 
 def _tensor(
@@ -327,7 +327,7 @@ _EAGER_PUBLIC_NAMES = (
     "Handle",
     "DeviceInfo",
     "__version__",
-    "MIN_JAX_VERSION",
+    "CUTEDSL_MIN_JAX_VERSION",
     "NodeType",
     "Tensor",
     "pygraph",
@@ -800,7 +800,7 @@ def __getattr__(name: str) -> Any:
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
         # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when JAX is below MIN_JAX_VERSION).
+        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax
