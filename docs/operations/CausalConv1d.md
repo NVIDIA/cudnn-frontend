@@ -74,6 +74,8 @@ import cudnn
 y = cudnn.ops.fft_causal_conv1d(x, weight)
 ```
 
+**Minimum cuDNN version:** 9.26.0, with Frontend bindings built against cuDNN 9.26.0 or newer. With an older backend, or bindings that lack the FFT entry points, the call raises `RuntimeError` before it executes.
+
 **Args:**
 - `x` (torch.Tensor): Input tensor of shape $(B, D, L)$. Must be on CUDA.
 - `weight` (torch.Tensor): Filter tensor of shape $(D, K)$. Same dtype as `x`.
