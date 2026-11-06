@@ -824,6 +824,66 @@ class BlockScaleSpec:
 
 
 @dataclass(frozen=True)
+class GroupPartition:
+    """Partition a packed row domain, independently of routing and copy kind.
+
+    Uniform groups derive boundaries from shape. Variable groups read an
+    offsets tensor; its reference/storage belongs to the graph binding.
+    """
+
+    num_groups: int
+    rows_per_group: int | None = None
+    offset_dtype: Dtype | None = None
+    offset_alignment: int = 1
+
+    def __post_init__(self):
+        for name in ("num_groups", "offset_alignment"):
+            object.__setattr__(self, name, index(getattr(self, name)))
+        if self.num_groups < 1 or self.num_groups > (1 << 31) - 1 or self.offset_alignment < 1:
+            raise ValueError("group partition requires a positive Int32 group count and positive alignment")
+        if self.rows_per_group is not None:
+            object.__setattr__(self, "rows_per_group", index(self.rows_per_group))
+            if self.rows_per_group < 1 or self.num_groups * self.rows_per_group > (1 << 63) - 1:
+                raise ValueError("uniform group rows require positive Int64 geometry")
+            if self.offset_dtype is not None or self.offset_alignment != 1:
+                raise ValueError("uniform groups do not have an offsets tensor")
+        elif self.offset_dtype not in ("int32", "int64"):
+            raise ValueError("variable group offsets must be int32 or int64")
+
+    @classmethod
+    def uniform(cls, num_groups, rows_per_group):
+        return cls(num_groups, rows_per_group=rows_per_group)
+
+    @classmethod
+    def offsets(cls, num_groups, dtype="int32", alignment=1):
+        return cls(num_groups, offset_dtype=dtype, offset_alignment=alignment)
+
+    @property
+    def is_uniform(self):
+        return self.rows_per_group is not None
+
+    @property
+    def boundary_alignment(self):
+        return self.rows_per_group if self.is_uniform else self.offset_alignment
+
+
+@dataclass(frozen=True)
+class GroupedGemmSpec:
+    """Shared grouped scheduling: group g selects weight g % weight_groups.
+
+    Row partitioning is independent of indirect loads, scatter, and combine.
+    """
+
+    num_weight_groups: int
+    partition: GroupPartition
+
+    def __post_init__(self):
+        object.__setattr__(self, "num_weight_groups", index(self.num_weight_groups))
+        if not 1 <= self.num_weight_groups < (1 << 31) or not isinstance(self.partition, GroupPartition):
+            raise ValueError("grouped GEMM requires a positive Int32 weight group count and a GroupPartition")
+
+
+@dataclass(frozen=True)
 class MoeSpec:
     """A MoE grouped matmul forward pass: per routed group g, ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % num_experts].T``."""
 
@@ -833,11 +893,9 @@ class MoeSpec:
     num_groups: int = 0
     offset_multiple: int = 1
     top_k: int = 1
-    uniform_group_rows: int = 0  # nonzero: fixed partition, no offset tensor
+    grouped_gemm: GroupedGemmSpec | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
-        if self.uniform_group_rows < 0 or (self.uniform_group_rows and self.mode != "gather"):
-            raise ValueError("uniform group rows are supported only by row-gather lowering")
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:
@@ -850,6 +908,24 @@ class MoeSpec:
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:
             raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
+        # Preserve the existing constructor/positional ABI. Scheduling is
+        # normalized once, not reconstructed on each launch. These legacy
+        # fields remain adapters for existing MoE callers.
+        if self.grouped_gemm is None:
+            object.__setattr__(
+                self, "grouped_gemm", GroupedGemmSpec(self.num_experts, GroupPartition.offsets(self.num_groups, self.offset_dtype, self.offset_multiple))
+            )
+        elif not isinstance(self.grouped_gemm, GroupedGemmSpec):
+            raise ValueError("MoE scheduling requires a GroupedGemmSpec")
+        else:
+            grouped = self.grouped_gemm
+            if (grouped.num_weight_groups, grouped.partition.num_groups) != (self.num_experts, self.num_groups):
+                raise ValueError("MoE and grouped GEMM group counts must agree")
+            if not grouped.partition.is_uniform and (grouped.partition.offset_dtype, grouped.partition.offset_alignment) != (
+                self.offset_dtype,
+                self.offset_multiple,
+            ):
+                raise ValueError("MoE and grouped GEMM offsets declarations must agree")
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1106,11 @@ class FusionChain:
     def has_moe(self) -> bool:
         """True iff this is a MoE grouped matmul."""
         return self.moe is not None
+
+    @property
+    def grouped_gemm(self) -> GroupedGemmSpec | None:
+        """Prepared scheduling shared by MoE and ordinary gather lowering."""
+        return self.moe.grouped_gemm if self.moe is not None else None
 
     @property
     def has_mainloop_fusion_a(self) -> bool:
@@ -1278,5 +1359,9 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
         mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
         block_scale=block_scale,
-        moe=(MoeSpec if isinstance(chain.moe, MoeSwapAbSpec) else MoeSwapAbSpec)(**dataclasses.asdict(chain.moe)) if chain.has_moe else None,
+        moe=(
+            (MoeSpec if isinstance(chain.moe, MoeSwapAbSpec) else MoeSwapAbSpec)(**{f.name: getattr(chain.moe, f.name) for f in dataclasses.fields(chain.moe)})
+            if chain.has_moe
+            else None
+        ),
     )

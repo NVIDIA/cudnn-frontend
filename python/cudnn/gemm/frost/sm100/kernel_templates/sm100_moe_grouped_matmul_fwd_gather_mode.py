@@ -15,6 +15,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Callable
 
+from cudnn.gemm.frost.kernel_templates.group_partition import group_row_bounds, group_used_rows
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization import (
     dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
@@ -403,7 +404,7 @@ def _kernel(
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
     num_k_blocks = cta_tile_mnk[2] // mma_inst_shape_mnk[2]
     first_token_arr = None
-    if cutlass.const_expr(gather_group_rows == 0):
+    if cutlass.const_expr(group_rows_per_group == 0):
         first_token_arr = cutlass.make_array_view(first_token_offset)
 
     if warp_idx == scheduler_warp_id:
@@ -486,13 +487,7 @@ def _kernel(
                     my_end = cutlass.Int32(0)
                     my_tiles = cutlass.Int32(0)
                     if visit_idx < num_groups:
-                        if cutlass.const_expr(gather_group_rows > 0):
-                            my_begin = my_group * gather_group_rows
-                            my_end = my_begin + gather_group_rows
-                        else:
-                            if my_group != 0:
-                                my_begin = cutlass.Int32(first_token_arr[my_group])
-                            my_end = cutlass.Int32(first_token_arr[my_group + 1])
+                        my_begin, my_end = group_row_bounds(my_group, M, first_token_arr, group_rows_per_group)
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * clusters_along_n
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):
@@ -1056,9 +1051,7 @@ def _kernel(
         sched_full_phase = cutlass.Int32(0)
 
         # AVG uses routed rows in use; clamp empty routing to a finite divisor.
-        moe_used_rows = M
-        if cutlass.const_expr(gather_group_rows == 0):
-            moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), M), cutlass.Int64(1))
+        moe_used_rows = group_used_rows(M, num_groups, first_token_arr, group_rows_per_group)
 
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
@@ -1534,7 +1527,7 @@ def compile() -> Callable:
         )
 
     fake_first_token_offset = None
-    if gather_group_rows == 0:
+    if group_rows_per_group == 0:
         fake_first_token_offset = make_fake_compact_tensor(
             offset_cutlass_dtype,
             (cute.sym_int64(),),

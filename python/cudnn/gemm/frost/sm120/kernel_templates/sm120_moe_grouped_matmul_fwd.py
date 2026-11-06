@@ -8,6 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Callable
 
+from cudnn.gemm.frost.kernel_templates.group_partition import group_row_bounds, group_used_rows
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.tile_helpers import (
     moe_scatter_row,
@@ -256,7 +257,7 @@ def _kernel(
     # Every group is cut into the same N tiling; only its M tiling is its own.
     tiles_along_n = cute.ceil_div(cutlass.Int32(N), cgrp_tile_mnk[1])
     first_token_arr = None
-    if cutlass.const_expr(gather_group_rows == 0):
+    if cutlass.const_expr(group_rows_per_group == 0):
         first_token_arr = cutlass.make_array_view(first_token_offset)
 
     if warp_idx >= NUM_COMPUTE_WARPS:
@@ -300,18 +301,7 @@ def _kernel(
                     my_end = cutlass.Int32(0)
                     my_tiles = cutlass.Int32(0)
                     if visit_idx < num_groups:
-                        if cutlass.const_expr(gather_group_rows > 0):
-                            my_begin = my_group * gather_group_rows
-                            my_end = my_begin + gather_group_rows
-                        else:
-                            if my_group != 0:
-                                my_begin = cutlass.Int32(first_token_arr[my_group])
-                            my_end = cutlass.Int32(first_token_arr[my_group + 1])
-                        # The offsets are device data the host never checks: clamp the group into the M routed
-                        # rows, so a bad table drops rows instead of storing past the output or reading past
-                        # token_index / token_ks, and its tile count cannot go negative.
-                        my_end = cutlass.min(cutlass.max(my_end, cutlass.Int32(0)), cutlass.Int32(M))
-                        my_begin = cutlass.min(cutlass.max(my_begin, cutlass.Int32(0)), my_end)
+                        my_begin, my_end = group_row_bounds(my_group, M, first_token_arr, group_rows_per_group)
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * tiles_along_n
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):
@@ -539,9 +529,7 @@ def _kernel(
 
         # Routed rows the groups cover (the final offset, at most the capacity M): the count an
         # ungrouped AVG over tokens divides by. At least 1, so an empty routing flushes 0, not NaN.
-        moe_used_rows = M
-        if cutlass.const_expr(gather_group_rows == 0):
-            moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), M), cutlass.Int64(1))
+        moe_used_rows = group_used_rows(M, num_groups, first_token_arr, group_rows_per_group)
         _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
         red_part_seed(_red_part)
         while is_valid != 0:
@@ -968,7 +956,7 @@ def compile() -> Callable:
         )
 
     fake_first_token_offset = None
-    if gather_group_rows == 0:
+    if group_rows_per_group == 0:
         fake_first_token_offset = make_fake_compact_tensor(
             offset_cutlass_dtype,
             (cute.sym_int64(),),

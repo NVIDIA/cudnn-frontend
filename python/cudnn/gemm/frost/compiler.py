@@ -656,7 +656,7 @@ def _check_moe_combine_n(compiled, n: int) -> None:
         return
     multiple = compiled.vec_bytes_epi // DTYPE_BYTES[chain.output_dtype]
     if isinstance(chain.moe, MoeSwapAbSpec):
-        multiple = min(multiple, chain.moe.offset_multiple)
+        multiple = min(multiple, chain.grouped_gemm.partition.boundary_alignment)
     if n % multiple:
         raise ValueError(f"MoE COMBINE runtime kernel N must be divisible by {multiple} for the compiled epilogue; got N={n}")
 
@@ -704,7 +704,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             # Keep the memo local for slot-only launchers.
             pass
 
-    views = {id(t): view for t, view in b.operand_views} if compiled.chain.moe.uniform_group_rows else {}
+    views = {id(t): view for t, view in b.operand_views} if compiled.chain.grouped_gemm.partition.is_uniform else {}
 
     declared_dtypes = None
     if views:
@@ -790,7 +790,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             for spec, t in zip(compiled.chain.outputs, b.outputs)
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
-        fto = None if compiled.chain.moe.uniform_group_rows else pull(b.first_token_offset, "first_token_offset")
+        fto = None if compiled.chain.grouped_gemm.partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
         sfa = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfa_operands]
         sfb = [pull(t, "token SF") for t in b.sfb_operands]
         mm = compiled.chain.matmul
@@ -810,7 +810,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     b_bufs = [pull(t, "weight").permute(0, 2, 1) if views else _kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
-    fto = None if compiled.chain.moe.uniform_group_rows else pull(b.first_token_offset, "first_token_offset")
+    fto = None if compiled.chain.grouped_gemm.partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "token SF") for t in b.sfa_operands]
     sfb = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
@@ -999,6 +999,16 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     _desc_slots_per_cta: int = 0
     store_modes: tuple = ()
     use_tma_store: bool = False
+
+    def _group_offsets(self, offsets):
+        """Bind the prepared partition kind; never fabricate or ignore offsets."""
+        if self.chain.grouped_gemm.partition.is_uniform:
+            if offsets is not None:
+                raise ValueError("uniform grouped GEMM does not accept a first_token_offset tensor")
+            return None
+        if offsets is None:
+            raise ValueError("variable grouped GEMM requires first_token_offset")
+        return self._compiler._offset_vector(offsets)
 
     @property
     def workspace_bytes(self) -> int:
@@ -1431,7 +1441,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
     def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None):
         """Validate and launch one grouped GEMM."""
         backend = self._compiler
-        first_token_offset = backend._offset_vector(first_token_offset)
+        first_token_offset = self._group_offsets(first_token_offset)
         if len(snke) < 3:
             raise ValueError(f"MoE call needs problem_size (S, N, K[, ...]); got {snke!r}")
         S, N, K = (int(snke[0]), int(snke[1]), int(snke[2]))
@@ -1444,7 +1454,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 f"this MoE graph has {len(outputs_spec)} output(s) ({[o.source for o in outputs_spec]}); got {len(outputs)}. Pass outputs in slot order."
             )
         ranked = [("token", token, 3), ("weight", weight, 3)]
-        if not self.chain.moe.uniform_group_rows:
+        if not self.chain.grouped_gemm.partition.is_uniform:
             ranked.append(("first_token_offset", first_token_offset, 1))
         for name, t, rank in ranked:
             if len(t.shape) != rank:
@@ -1456,7 +1466,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 )
         self._check_quant_scale_blobs(outputs)
         num_experts = int(weight.shape[0])
-        num_groups = self.chain.moe.num_groups if self.chain.moe.uniform_group_rows else backend._moe_num_groups(first_token_offset, num_experts)
+        num_groups = (
+            self.chain.grouped_gemm.partition.num_groups
+            if self.chain.grouped_gemm.partition.is_uniform
+            else backend._moe_num_groups(first_token_offset, num_experts)
+        )
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -1533,7 +1547,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
     ):
         """Launch parallel grouped GEMMs."""
         backend = self._compiler
-        first_token_offset = backend._offset_vector(first_token_offset)
+        first_token_offset = self._group_offsets(first_token_offset)
         chain = self.chain
         if not isinstance(gemm_pairs, (list, tuple)) or not all((isinstance(p, (list, tuple)) and len(p) == 2 for p in gemm_pairs)):
             raise ValueError(f"multi-GEMM MoE call expects a list of (token, weight) pairs as the first argument; got {type(gemm_pairs).__name__}")
@@ -1563,7 +1577,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             raise ValueError(f"fused multi-GEMM MoE has {len(outputs_spec)} output(s); got {len(outs)}")
         out = outs[0]
         ranked = [("output", out, 3)]
-        if not chain.moe.uniform_group_rows:
+        if not chain.grouped_gemm.partition.is_uniform:
             ranked.append(("first_token_offset", first_token_offset, 1))
         for name, t, rank in ranked:
             if len(t.shape) != rank:
@@ -1584,7 +1598,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 )
         self._check_quant_scale_blobs(outs)
         num_experts = int(b_slots[0].shape[0])
-        num_groups = self.chain.moe.num_groups if self.chain.moe.uniform_group_rows else backend._moe_num_groups(first_token_offset, num_experts)
+        num_groups = (
+            self.chain.grouped_gemm.partition.num_groups
+            if self.chain.grouped_gemm.partition.is_uniform
+            else backend._moe_num_groups(first_token_offset, num_experts)
+        )
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]

@@ -30,6 +30,8 @@ from .fusion_ir import (
     IndexExpr,
     IndexMap,
     IndirectIndex,
+    GroupPartition,
+    GroupedGemmSpec,
     OperandAccess,
     MatmulSpec,
     ReductionSpec,
@@ -146,8 +148,7 @@ class _RecordedOp:
     index_expr: IndexExpr | None = None
     aux_input: int | None = None
     aux_mapping: IndexMap | None = None
-    uniform_group_rows: int = 0
-    uniform_num_groups: int = 0
+    group_partition: GroupPartition | None = None
     indirect_index: IndirectIndex | None = None
 
 
@@ -1321,8 +1322,17 @@ def _build_multi_moe_chain(
             raise ValueError("parallel MoE grouped matmuls must share the same " "first_token_offset tensor")
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
-    num_groups = moe_ops[0].uniform_num_groups or (int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0)
-    offset_multiple = moe_ops[0].uniform_group_rows or (fto_meta.alignment_value if fto_meta is not None else 1)
+    partition = moe_ops[0].group_partition
+    if any(op.group_partition != partition for op in moe_ops[1:]):
+        raise ValueError("parallel grouped GEMMs must share the same row partition")
+    if partition is None:
+        if fto_meta is None or not fto_meta.dim:
+            raise ValueError("variable grouped GEMMs require first_token_offset")
+        partition = GroupPartition.offsets(int(fto_meta.dim[0]) - 1, offset_dtype, fto_meta.alignment_value)
+    elif fto_meta is not None:
+        raise ValueError("uniform grouped GEMMs must not declare an offsets tensor")
+    num_groups = partition.num_groups
+    offset_multiple = partition.boundary_alignment
 
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
 
@@ -1424,7 +1434,7 @@ def _build_multi_moe_chain(
         block_scale_spec = _block_scale_spec(a0, b0, meta)
     mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
     gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in moe_ops)
-    if moe_ops[0].uniform_group_rows:
+    if partition.is_uniform:
         declared = [
             *gemm_out_dtypes,
             *(_resolve_out_dtype(tid, meta[tid].tensor, io_dtype, intermediate_dtype, meta) for tid in _materialized_output_ids(meta)),
@@ -1550,7 +1560,7 @@ def _build_multi_moe_chain(
             offset_dtype=offset_dtype,
             num_groups=num_groups,
             offset_multiple=offset_multiple,
-            uniform_group_rows=moe_ops[0].uniform_group_rows,
+            grouped_gemm=GroupedGemmSpec(int(E), partition),
             top_k=moe_ops[0].top_k,
         ),
         block_scale=block_scale_spec,
@@ -2589,8 +2599,7 @@ def _lower_gather_operands(ops, meta):
         inputs=[source_id, weight_id, -1],
         moe_mode="gather",
         token_index=index_id,
-        uniform_group_rows=rows,
-        uniform_num_groups=groups,
+        group_partition=GroupPartition.uniform(groups, rows),
         indirect_index=indirect,
     )
     return [routed if op.output == mm.output else op for op in remaining]

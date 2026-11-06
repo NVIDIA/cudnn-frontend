@@ -47,7 +47,9 @@ def test_frost_row_gather_lowering(prefix, broadcast, dtype):
     assert valid
     chain, binding = analyze_with_binding(g)
     assert chain.moe.mode == "gather"
-    assert chain.moe.uniform_group_rows == 37
+    assert chain.grouped_gemm.partition.rows_per_group == 37
+    assert chain.grouped_gemm.num_weight_groups == (1 if broadcast else prod(prefix))
+    assert chain.grouped_gemm.partition.offset_dtype is None
     assert chain.moe.num_groups == prod(prefix)
     assert chain.moe.num_experts == (1 if broadcast else prod(prefix))
     assert (chain.matmul.M, chain.matmul.K, chain.matmul.N) == (prod(prefix) * 37, 136, 128)
@@ -399,7 +401,7 @@ def test_frost_gather_composes_with_epilogue_and_views(source_prefix, repartitio
     assert (raw in binding.outputs) == (epilogue == "shared")
     assert chain.indirect_index.indices_ref == "indices"
     assert chain.indirect_index.source_axis == len(source_prefix)
-    assert chain.moe.uniform_group_rows == (32 if repartition else 16)
+    assert chain.grouped_gemm.partition.rows_per_group == (32 if repartition else 16)
     assert chain.matmul.M == 96
     if aux is not None:
         assert chain.aux_tensors[0].dtype == "fp32"
@@ -584,8 +586,135 @@ def test_frost_moe_gather_uses_the_same_indirect_description():
     assert access.source_axis == 1
     assert tuple(expr.evaluate((0, 29, 37)) for expr in access.indices_map.coordinates) == (0, 29, 0)
     assert binding.first_token_offset is offsets
-    assert chain.moe.uniform_group_rows == 0
+    assert not chain.grouped_gemm.partition.is_uniform
+    assert chain.grouped_gemm.partition.num_groups == 3
+    assert chain.grouped_gemm.partition.offset_dtype == "int32"
+    assert chain.grouped_gemm.num_weight_groups == 3
     assert [op.op for op in chain.ops] == ["relu"]
+
+
+@pytest.mark.parametrize("uniform", [False, True], ids=["offsets", "uniform"])
+def test_frost_grouped_spec_preserves_moe_adapter_and_swap(uniform):
+    from dataclasses import replace
+    from cudnn.gemm.frost.fusion_ir import GroupPartition, GroupedGemmSpec, MoeSpec, swap_ab
+
+    partition = GroupPartition.uniform(3, 37) if uniform else GroupPartition.offsets(3, "int64", 8)
+    grouped = GroupedGemmSpec(3, partition)
+    # Existing positional arguments keep their order; the generic descriptor
+    # is keyword-only and survives swap without becoming a nested dict.
+    moe = MoeSpec(3, "gather", "int64", 3, 8, 1, grouped_gemm=grouped)
+    chain, _ = analyze_with_binding(_graph(prefix=(3,))[0])
+    chain = replace(chain, moe=moe)
+    assert chain.grouped_gemm is grouped
+    assert swap_ab(chain).grouped_gemm is grouped
+    assert swap_ab(swap_ab(chain)).moe == moe
+    if not uniform:
+        assert MoeSpec(3, "gather", "int64", 3, 8, 1).grouped_gemm == grouped
+    from cudnn.gemm.frost.compiler import _CompiledMoeBase
+
+    executor = SimpleNamespace(chain=chain, _compiler=SimpleNamespace(_offset_vector=lambda value: value))
+    offsets = object()
+    if uniform:
+        assert _CompiledMoeBase._group_offsets(executor, None) is None
+        with pytest.raises(ValueError, match="does not accept"):
+            _CompiledMoeBase._group_offsets(executor, offsets)
+    else:
+        assert _CompiledMoeBase._group_offsets(executor, offsets) is offsets
+        with pytest.raises(ValueError, match="requires first_token_offset"):
+            _CompiledMoeBase._group_offsets(executor, None)
+
+
+@pytest.mark.parametrize(
+    "kwargs,reason",
+    [
+        ({"num_groups": 0, "rows_per_group": 3}, "group count"),
+        ({"num_groups": 2, "rows_per_group": 0}, "positive Int64"),
+        ({"num_groups": 2, "rows_per_group": 1 << 63}, "Int64"),
+        ({"num_groups": 2, "rows_per_group": 3, "offset_dtype": "int32"}, "do not have"),
+        ({"num_groups": 2, "offset_dtype": "fp32"}, "int32 or int64"),
+        ({"num_groups": 2, "offset_dtype": "int32", "offset_alignment": 0}, "alignment"),
+    ],
+)
+def test_frost_group_partition_rejects_invalid_declarations(kwargs, reason):
+    from cudnn.gemm.frost.fusion_ir import GroupPartition
+
+    with pytest.raises(ValueError, match=reason):
+        GroupPartition(**kwargs)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+@pytest.mark.parametrize("rows_per_group", [0, 5], ids=["offsets", "uniform"])
+def test_frost_group_partition_device_bounds_and_replay(dtype, rows_per_group):
+    """Same partition decoder serves fixed groups and runtime ragged offsets."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
+        pytest.skip("partition helper probe requires Hopper or newer")
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_tensor, make_fake_stream
+    from cuda.bindings import driver
+    from cudnn.gemm.frost.kernel_templates.group_partition import group_row_bounds, group_used_rows
+
+    @cute.kernel
+    def probe(offsets, output):
+        tid, _, _ = cute.arch.thread_idx()
+        if tid < 4:
+            begin, end = group_row_bounds(tid, cutlass.Int64(17), offsets, rows_per_group)
+            output[tid, 0] = begin
+            output[tid, 1] = end
+            output[tid, 2] = cutlass.Int32(group_used_rows(cutlass.Int64(17), cutlass.Int32(4), offsets, rows_per_group))
+
+    probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.jit
+    def host(offsets, output, stream):
+        probe(offsets, output).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+    dt = cutlass.Int32 if dtype == torch.int32 else cutlass.Int64
+    fake_offsets = None if rows_per_group else make_fake_tensor(dt, (5,), (1,), assumed_align=16)
+    fn = cute.compile(
+        host,
+        fake_offsets,
+        make_fake_tensor(cutlass.Int32, (4, 3), (3, 1), assumed_align=16),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+    )
+    offsets = None if rows_per_group else torch.tensor([0, 0, 7, 7, 17], device="cuda", dtype=dtype)
+    output = torch.full((4, 3), -99, device="cuda", dtype=torch.int32)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            fn(offsets, output, driver.CUstream(stream.cuda_stream))
+        with torch.cuda.graph(captured, stream=stream):
+            fn(offsets, output, driver.CUstream(stream.cuda_stream))
+        # Empty groups, malformed offsets, empty routing, and changed device
+        # offsets use the same compiled plan. Int64 is checked before narrowing.
+        scenarios = [[0, 0, 7, 7, 17], [0, 3, 8, 11, 17], [9, -3, 23, 5, 17], [0, 0, 0, 0, 0]]
+        if dtype == torch.int64:
+            scenarios.append([0, 3, 1 << 40, -(1 << 40), 17])
+        for values in scenarios:
+            if offsets is not None:
+                offsets.copy_(torch.tensor(values, device="cuda", dtype=dtype))
+            output.fill_(-99)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            bounds = []
+            for g in range(4):
+                lo, hi = (g * rows_per_group, (g + 1) * rows_per_group) if rows_per_group else (0 if g == 0 else values[g], values[g + 1])
+                hi = min(max(hi, 0), 17)
+                bounds.append([min(max(lo, 0), hi), hi, 17 if rows_per_group else max(min(max(values[-1], 0), 17), 1)])
+            torch.testing.assert_close(output, torch.tensor(bounds, device="cuda", dtype=torch.int32), rtol=0, atol=0)
+            previous = output.clone()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            assert torch.equal(output.view(torch.uint8), previous.view(torch.uint8))
+    finally:
+        captured.reset()
 
 
 def test_frost_indirect_map_matches_sparse_attention_key_and_value_views():
