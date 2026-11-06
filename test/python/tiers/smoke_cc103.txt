@@ -2,9 +2,9 @@
 # sm100 bodies compiled for sm_103a; the rules are in README.md.  The code path each id stands for is in smoke_cc103_code_paths.tsv.
 # conftest.py marks these ids `smoke`:
 #   from test/python:  pytest -m smoke <paths>      (or, without the marker: pytest -o addopts= $(grep -v '^#' tiers/smoke_cc103.txt) -- the @file form would pass these comment lines as arguments and collects nothing)
-# Not listed (24 cc 10.0 cells that skip on cc 10.3): the cc 10.7 / SM120 kernels and bindings (9); the native dense, prefill, sink and
-# split bindings, gated to SM100 (5); the gated block's dense and FP8-projection forms, admitted on (10, 0) only (9); and the FP8
-# backward graph of test_mhas_v2 at D = 144, which no engine serves on cc 10.3 with cuDNN 9.27 (1).
+# Not listed (15 cc 10.0 cells): the cc 10.7 / SM120 kernels and bindings (9); the native dense, prefill, sink and split bindings'
+# SMOKE cells (5) -- the two prefill cells are host-only binder checks (README rule 3), and the gate / quantized-gate cells need SM107
+# on a cc 10.3 part; and the FP8 backward graph of test_mhas_v2 at D = 144, which no engine serves on cc 10.3 with cuDNN 9.27 (1).
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-dense-bf16-llama_d128]
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-fp16-llama_d128]
 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-bf16-qwen_d256]
@@ -272,3 +272,14 @@ sdpa/frost/test_tile_dsl_exp2_emul.py::test_exp2_emul_pair_matches_the_model_bit
 sdpa/frost/test_tile_dsl_q_loop_bounds.py::test_q_loop_bounds_match_reference[m0-W0-br0-R0-tq64-512x512]
 sdpa/frost/test_tile_dsl_sf_layout.py::test_atom_offset_matches_the_oracle_swizzle[128-4]
 sdpa/frost/test_tile_dsl_sf_layout.py::test_helper_traces_on_int32_and_matches_the_host[16]
+# --- gated attention block (SM100 line): the dense qk_norm and dead-row arms, the DECODE forms (packed, unpacked, paged, the
+# explicit PDL switch), the EXTEND form and the FP8-projection DECODE/EXTEND cells, admitted on cc 10.3 on 2026-10-31 ---
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[1-6]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[3-6]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_decode_matches_the_oracle_at_every_group_and_s_q[2-16]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_sm100_the_explicit_pdl_switch_is_served_and_bitwise_the_plain_chain
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_sm100_extend_matrix_cell[bf16-hnd-16]
+gated_attention_block/cutedsl/test_block_serving_decode.py::test_fp8_proj_bf16_attention_decode_matches_the_oracle_at_every_group_and_s_q[1-6]
+gated_attention_block/cutedsl/test_block_serving_extend.py::test_fp8_proj_bf16_attention_extend_matrix_cell[hnd-16]
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_dead_rows_do_not_poison_the_gate
