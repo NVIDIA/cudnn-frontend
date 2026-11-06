@@ -174,7 +174,7 @@ FP8 attention whose scales are computed from the current tensors. Needs compute 
 
 - [Fwd MXFP8 SDPA](cpp/sdpa/mxfp8_fwd.cpp) and [Bwd MXFP8 SDPA](cpp/sdpa/mxfp8_bwd.cpp)
 
-MXFP8 block-scaled attention; the backward file covers MHA, GQA and MLA. Needs a data-center Blackwell GPU and cuDNN 9.7.0 or newer.
+MXFP8 block-scaled attention; the backward file covers MHA, GQA and MLA. Needs a data-center Blackwell GPU and cuDNN 9.21.0 or newer.
 
 ### Convolution fusion examples
 
@@ -202,7 +202,7 @@ Similar to dgrad was simple wgrad and scale+bias+relu+wgrad fused operation.
 
 - [Dynamic shape benchmark](cpp/convolution/conv_dynamic_shape_benchmark.cpp)
 
-Measures convolution graph API runtimes across shapes. Long-running, so it is off by default.
+Measures convolution graph API runtimes across shapes. This long-running benchmark is included in the samples executable and runs in an unfiltered invocation on supported setups; select tests explicitly to avoid running it unintentionally.
 
 ### Matmul fusion examples
 
