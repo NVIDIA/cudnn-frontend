@@ -92,8 +92,8 @@ that advances a build walk) for an UNWIRED form -- an e4m3 ``o`` without the gat
 e4m3 --, ``ValueError`` for a MALFORMED declaration, like the adapter's other operand-shape errors -- an e4m3 ``o`` without ``out_scale``,
 ``out_scale`` with a half ``o``, a scale that is not ONE contiguous fp32 element.  :attr:`SparseGqaFwdDslSm107.fused_e4m3` reads the
 resolved arm back after ``check_support``.  On the Blackwell explicit-lean parts the lean route's combine FORM follows the cc 10.7
-split-aware rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` = cc 10.0, measured on the GB200 class 2026-10-28; cc 10.3 keeps the
-module's own forms) -- :func:`_sparse_combine_decode_grid`.
+split-aware rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` = cc 10.0 / 10.3, measured on the GB200 class 2026-10-28 and on a
+GB300 2026-11-05) -- :func:`_sparse_combine_decode_grid`.
 
 THE FUSED STORE's ROUNDING CONVENTION (``out_rounding``, appended last; an OP ATTRIBUTE of the declaration, never a knob -- it changes the bytes;
 the vocabulary is ``heuristics.COMBINE_OUT_ROUNDINGS``, validated by name at construction): ``"single"`` (the default) is the convention above, ONE
@@ -135,8 +135,8 @@ split-major partial slab the tcgen05 core's split store writes, so the combine, 
 step's S_q rows ride inside the CTA, so B 1 and B 2 on two KV heads take the lean body at every served S_q 1..4), the tcgen05 core on every
 other part; an explicit ``"lean"`` is honoured where the body serves the declaration -- on the core's parts and, FOR MEASUREMENT, on the
 Blackwell parts of ``heuristics.SPARSE_LEAN_TILE_EXPLICIT_CCS`` (cc 10.0 / 10.3, outside the record's ``sm_lo .. sm_hi`` and stated by its
-``lean_explicit_ccs`` field: the lean body is
-SM100-legal and its config pins no Rubin-only size; UNMEASURED there, the AUTO reading unchanged, ``"auto"`` / ``"tcgen05"`` declined by name
+``lean_explicit_ccs`` field: the lean body is SM100-legal and its config pins no Rubin-only size; the AUTO default is not admitted there
+-- the lean tile is explicit-only on the Blackwell line, the AUTO reading unchanged --, ``"auto"`` / ``"tcgen05"`` declined by name
 through ``heuristics.sparse_tile_part_decline``) -- and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
 THD, a prefill / top-left form, no ``seq_kv_lens``, ``S_q`` past the served rows, per-row lists past one row, a group past 16, ``top_k`` below
 8, a non-default ``softmax_groups``), never a silent fallback; ``sub_tiles_per_cta`` is the lean body's pin and is refused by name where the
@@ -217,7 +217,9 @@ class SparseCapabilities:
     """What the sparse core serves -- the adapter-owned claims record (no engine row: see the module docstring).  Field names
     follow ``engines.Capabilities`` where the meaning matches; the index-list fields are this record's own."""
 
-    sm_lo: int = 107  # the CORE's parts (both bodies); the EXPLICIT lean tile is admitted on `lean_explicit_ccs` (below) too: cc 10.0 / 10.3, unmeasured
+    # the CORE's parts (both bodies); the EXPLICIT lean tile is admitted on `lean_explicit_ccs` (below) too: cc 10.0 / 10.3, the AUTO default
+    # not admitted there (the lean tile is explicit-only on the Blackwell line)
+    sm_lo: int = 107
     sm_hi: int = 119
     phase: str = "forward"
     d_shapes: frozenset = frozenset({(_D, _D)})
@@ -260,7 +262,7 @@ class SparseCapabilities:
     index_shared_list_max_tokens: int = 4  # S_q cap under list_per_sequence: the shared list's tail covers at most two blocks for S_q <= 4 (the MTP cap)
     cutedsl_min_version: Tuple[int, int, int] = (4, 8, 0)
     lean_explicit_ccs: Tuple[Tuple[int, int], ...] = (
-        SPARSE_LEAN_TILE_EXPLICIT_CCS  # appended 2026-10-28: the parts OUTSIDE sm_lo .. sm_hi (cc 10.0 / 10.3: B200 / GB200, B300) on which the EXPLICIT tile_form="lean" is admitted for measurement (unmeasured there; "auto" / "tcgen05" resolve the core and are declined by name) -- the copy sparse_tile_part_decline reads, pinned equal to sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS by the suite
+        SPARSE_LEAN_TILE_EXPLICIT_CCS  # appended 2026-10-28: the parts OUTSIDE sm_lo .. sm_hi (cc 10.0 / 10.3: B200 / GB200, B300) on which the EXPLICIT tile_form="lean" is admitted for measurement (the AUTO default not admitted there; "auto" / "tcgen05" resolve the core and are declined by name) -- the copy sparse_tile_part_decline reads, pinned equal to sparse_tile_rules.SPARSE_LEAN_TILE_EXPLICIT_CCS by the suite
     )
     gated_e4m3_out: bool = (
         True  # appended 2026-10-29: O stored as float8_e4m3fn at a static per-tensor DEQUANT scale (out_scale, a positive normal fp32 by contract) through the GATED split combine's fused entry -- a split plan with the gate, dense or paged, never THD
@@ -413,10 +415,11 @@ def _sparse_combine_decode_grid(b: int, h_q: int, s_q: int, split: int, device_c
     grid below 32 -- B 4 x S_q 4 at split 7), a deeper split past the bound keeps the AUTO entry (= the module's own forms there by
     construction).  Off cc 10.7 (the Blackwell line keeps the module's own three-way rule, measured on B200 / B300; a line the rules
     were never measured on likewise) a plan never names the walk and never compiles the AUTO entry inside the bound -- EXCEPT a LEAN plan
-    (``lean``, appended 2026-10-29: the body is the lean tile) on a part of ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0),
-    whose combine follows the cc 10.7 split-aware rule's SHAPE (``sparse_lean_combine_rule_cc``): the lean grids' two combine forms were
-    MEASURED there (the GB200 152-SM class, the table in the rules module: the decode-grid kernel 3.0-3.8 us against the module's
-    own 6.8-16.3 on the 24-96-row grids at the lean splits 17-65, the own forms ahead only on the 384-row grid below split 32), never the
+    (``lean``, appended 2026-10-29: the body is the lean tile) on a part of ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0 /
+    10.3), whose combine follows the cc 10.7 split-aware rule's SHAPE (``sparse_lean_combine_rule_cc``): the lean grids' two combine forms
+    were MEASURED there (the tables in the rules module -- the GB200 152-SM class: the decode-grid kernel 3.0-3.8 us against the module's
+    own 6.8-16.3 on the 24-96-row grids at the lean splits 17-65, the own forms ahead only on the 384-row grid below split 32; a GB300,
+    cc 10.3: the decode-grid kernel 3.0-3.4 us against 6.2-15.0 on the 8-64-row grids at the lean splits 17-65, every cell), never the
     walk (a cc 10.7 form; the lean splits are >= 9 anyway).  The tcgen05 body and every other part read as before; a caller of the former
     five-argument form (``lean`` unset) reads as before."""
     from cudnn.sdpa.fwd.heuristics import decode_combine_force_lean, decode_combine_lean_walk_selected
@@ -1234,7 +1237,7 @@ class SparseGqaFwdDslSm107:
         """The split combine entry's kernel FORM this plan compiles (``split_combine.DECODE_GRID_AUTO`` / ``DECODE_GRID_OFF`` /
         ``DECODE_GRID_LEAN_WALK``): :func:`_sparse_combine_decode_grid` on the declared ``(B, H_q, S_q)``, the split and the device --
         a plan-time fact, read after ``check_support`` (which it runs when needed); ``DECODE_GRID_OFF`` unsplit (no combine launch).  A LEAN
-        plan on cc 10.0 follows the cc 10.7 rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS``, measured there)."""
+        plan on cc 10.0 / 10.3 follows the cc 10.7 rule's shape (``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS``, measured there)."""
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
         if not self._G:
