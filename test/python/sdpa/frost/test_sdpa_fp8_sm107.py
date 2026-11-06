@@ -2337,3 +2337,16 @@ class TestNativeCausalZeroTail:
     from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
 
     test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)
+
+
+import sdpa_bwd_fp8_d192_sm107 as _d192_bwd_checks
+
+ds_knob = _d192_bwd_checks.ds_knob
+test_stage3_tile_rule_fp8_d192 = _d192_bwd_checks.test_stage3_tile_rule_fp8_d192
+
+
+@requires_rubin
+class TestNativeFp8D192Bwd:
+    """Run the D192/V128 per-tensor fp8 backward pair checks in the native CI entry."""
+
+    test_native_stage3 = staticmethod(_d192_bwd_checks.test_d192_native_stage3_matches_the_oracle_and_the_d256_row)
