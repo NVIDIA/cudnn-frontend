@@ -40,8 +40,8 @@ poisoned caller workspace/output CUDA Graph replay, ragged and empty segments, a
 exact-zero static-capacity rows for the generic and ratio-128 forward families. It does
 not yet contain the standalone/reordered/duplicated sequence comparisons or committed
 goldens required to claim batch invariance. The capacity-zero change and poisoned replay
-cases passed on an L20X (CC 9.0, CUDA 13.0, cuDNN 9.20, PyTorch 2.12.1, CUTLASS DSL
-4.8.1) and an L20C (CC 10.0, CUDA 13.0, cuDNN 9.24, PyTorch 2.14.1, CUTLASS DSL
+cases passed on an SM90 GPU (CC 9.0, CUDA 13.0, cuDNN 9.20, PyTorch 2.12.1,
+CUTLASS DSL 4.8.1) and an SM100 GPU (CC 10.0, CUDA 13.0, cuDNN 9.24, PyTorch 2.14.1, CUTLASS DSL
 4.8.1). The SM90 and SM100 forward and opt-in deterministic backward status is Replay
 only. SM103 and SM107 remain Unverified; the default atomic dAPE path is Not guaranteed
 by contract. The full CSA L0 file reported 147 passed / 71 skipped on SM90 and 217

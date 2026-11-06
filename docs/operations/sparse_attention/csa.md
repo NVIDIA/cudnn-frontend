@@ -371,7 +371,7 @@ python benchmark/csa/bench_csa_dape_deterministic.py --sm90-primary --construct-
 The first command reports eager/fused forward, backward and CUDA Graph replay timing;
 the latter two compare atomic and deterministic dAPE with JIT and allocation excluded.
 
-Measured on 1x L20X (CC 9.0, driver 570.148.08, CUDA 13.0, cuDNN 9.20, PyTorch
+Measured on one SM90 GPU (CC 9.0, driver 570.148.08, CUDA 13.0, cuDNN 9.20, PyTorch
 2.12.1, CUTLASS DSL 4.8.1); BF16 `kv`/`score`, FP32 `ape`; `ratio = 4`,
 `coff = 1`, `head_dim = 128`; median of 50 iterations after 20 warmup:
 
