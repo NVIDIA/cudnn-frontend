@@ -12,16 +12,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import jax
 import jax.numpy as jnp
 
-import cutlass.jax
 from cutlass.jax import TensorSpec, cutlass_call
-
-from cudnn import CUTEDSL_MIN_JAX_VERSION_STR
-
-if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
-    raise ImportError(
-        f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR} and the CuTeDSL JAX extensions (cutlass.jax); "
-        "install/upgrade jax (`pip install --group jax` from a checkout)"
-    )
 
 
 def row_major_desc(shape, dtype, name: str):
