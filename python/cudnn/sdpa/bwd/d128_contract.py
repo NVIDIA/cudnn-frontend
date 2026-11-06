@@ -8,6 +8,7 @@ import struct
 
 ACCUMULATION = "accumulation"
 RECOMPUTE = "recompute"
+PAIR = "pair"
 WORKSPACE_ALIGNMENT = 256
 WORKSPACE_SLACK = WORKSPACE_ALIGNMENT - 16
 ABI_VERSION = 3
@@ -66,6 +67,8 @@ ACCUMULATION_PARTS = "SM100, SM103 or SM107 (cc 10.0 / 10.3 / 10.7)"
 # serves every cc in it, the accumulation chain the ``ACCUMULATION_CCS`` parts only; cc 10.7 closes the range (SM108+ is declined by name
 # until a part is admitted).  Read by the engine spec and the dense adapter's ``check_support`` -- one place.
 DENSE_SM_RANGE = (100, 107)
+# The parts the deterministic kernel pair is measured on; elsewhere a deterministic dense MHA request keeps the recompute body.
+PAIR_CCS = ((10, 0), (10, 3))
 
 
 def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=128, d_v=128, input_bytes=2):
@@ -129,6 +132,51 @@ def workspace_layout(batch, heads, sq, d=128):
     if total > 2**63 - 1:
         raise ValueError("dense d128 workspace exceeds the signed pointer range")
     return regions, total
+
+
+PAIR_SPLITS = (1, 2, 4)
+# A q-range split's fp32 partial tile costs about this many KV steps of the dK / dV kernel to write and fold back.
+_PAIR_SPLIT_STEP_COST = 4.3
+
+
+def pair_split(batch, heads_kv, skv, sq, ratio, sms, masked=False):
+    """The q-range split of the pair's dK / dV kernel: the member of PAIR_SPLITS whose wave-quantization tail plus
+    partial traffic is lowest; 1 under a mask (its tiles are not uniform) or without a device SM count."""
+    if masked or not sms or sms <= 0:
+        return 1
+    ctas = batch * heads_kv * ((skv + 127) // 128)
+    steps = max(1, ratio * ((sq + 127) // 128))
+
+    def cost(split):
+        waves = -(-ctas * split // sms)
+        tail = (waves * sms - ctas * split) / (waves * sms)
+        return tail + _PAIR_SPLIT_STEP_COST * split / steps
+
+    return min(PAIR_SPLITS, key=lambda split: (cost(split), split))
+
+
+def pair_workspace_layout(batch, heads, sq, split=1, heads_kv=0, skv=0, d=0):
+    """The deterministic pair's scratch: the fp32 delta rows over the 128-row-rounded S_q and, under a q-range split, one
+    fp32 dV and one fp32 dK partial plane per (batch, split) over the 128-row-rounded S_kv."""
+    if any(type(n) is not int or n <= 0 for n in (batch, heads, sq)):
+        raise ValueError("dense d128 workspace dimensions must be positive integers")
+    if split not in PAIR_SPLITS or (split > 1 and any(type(n) is not int or n <= 0 for n in (heads_kv, skv, d))):
+        raise ValueError("dense d128 q-range split requires positive KV dimensions")
+    rounded = (sq + 127) // 128 * 128
+    regions = [(0, (batch, heads, rounded), (heads * rounded, rounded, 1))]
+    total = 4 * batch * heads * rounded
+    if split > 1:
+        rows = (skv + 127) // 128 * 128
+        plane = (split * batch, rows, heads_kv, d)
+        strides = (rows * heads_kv * d, heads_kv * d, d, 1)
+        part_bytes = 4 * split * batch * rows * heads_kv * d
+        regions.append((total, plane, strides))
+        regions.append((total + part_bytes, plane, strides))
+        total += 2 * part_bytes
+    total += WORKSPACE_SLACK
+    if total > 2**63 - 1:
+        raise ValueError("dense d128 workspace exceeds the signed pointer range")
+    return tuple(regions), total
 
 
 def validate_launch(pointers, spans, workspace, workspace_bytes, scale):

@@ -1156,10 +1156,13 @@ def _sm100_spec() -> EngineSpec:
     function and the blocked row count comes from the packed totals) and
     BSHD-physical io (there is no staging leg).
 
-    Everything else is declined for now and each rejection is asserted by a
-    test: DENSE padding masks (the kernel compiles a scalar length; THD threads
-    the per-sequence machinery, so this is a small follow-up on top of it),
-    bias/dbias/sink/dsink, deterministic, and decode.
+    A deterministic request is served as is: every launch of the chain owns
+    its outputs (the S / dS workspace tiles, the stage-3 GEMM tiles, the GQA
+    fold) and reduces in a fixed order, so repeated executions are bitwise
+    equal. Everything else is declined for now and each rejection is asserted
+    by a test: DENSE padding masks (the kernel compiles a scalar length; THD
+    threads the per-sequence machinery, so this is a small follow-up on top of
+    it), bias/dbias/sink/dsink, and decode.
     """
     return EngineSpec(
         name="sdpa_bwd_sm100",
@@ -1171,6 +1174,7 @@ def _sm100_spec() -> EngineSpec:
             d_envelope=True,
             d_pad_multiple=8,
             d_envelope_floor=256,  # <= 256 belongs to the d256 flavors
+            deterministic=True,  # the chain has no atomics: workspace tiles, GEMM tiles and the GQA fold each have one owner
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -1765,7 +1769,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     )
 
 
-def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts") -> bool:
+def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts", deterministic_ok: bool = False) -> bool:
     from .d128_contract import ACCUMULATION_CCS
 
     return (
@@ -1774,7 +1778,7 @@ def _d192_accumulation_serves(facts: "ga.SdpaGraphFacts") -> bool:
         and facts.h_q == facts.h_kv
         and facts.window_left is None
         and not facts.bottom_right
-        and not facts.deterministic
+        and (deterministic_ok or not facts.deterministic)
         and facts.device_cc is not None
         and tuple(facts.device_cc) in ACCUMULATION_CCS
     )
@@ -1793,6 +1797,12 @@ def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
     if _d192_accumulation_serves(facts):
         return None
     return "the d192 accumulation row serves dense MHA (192, 128) without windows on cc 10.0 / 10.3"
+
+
+def _sm100_d192_fp8_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    if _d192_accumulation_serves(facts, deterministic_ok=True):
+        return None
+    return "the d192 fp8 kernel pair serves dense MHA (192, 128) without windows on cc 10.0 / 10.3"
 
 
 def _sm100_d256_spec() -> EngineSpec:
@@ -1922,8 +1932,27 @@ def _sm107_d512_spec() -> EngineSpec:
 def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     """Pure declaration bounds shared with the dense, THD and grouped adapters."""
     grouped = facts.h_q != facts.h_kv
-    if facts.deterministic and (facts.thd or grouped):
-        return "d128 deterministic backward requires dense MHA; THD and grouped dQ accumulation is unordered"
+    if facts.deterministic and facts.thd:
+        return "d128 deterministic backward requires dense attention; THD dQ accumulation is unordered"
+    if facts.deterministic and grouped:
+        # The deterministic kernel pair serves dense GQA / MQA under the accumulation gates only; mirrors the adapter.
+        import re
+
+        from .d128_contract import PAIR_CCS, validate_accumulation_scale, validate_dense_bounds
+
+        if facts.h_kv <= 0 or facts.h_q % facts.h_kv:
+            return "d128 deterministic grouped backward requires an integral head ratio"
+        if tuple(facts.device_cc) not in PAIR_CCS:
+            return "d128 deterministic grouped backward requires SM100 or SM103 (cc 10.0 / 10.3)"
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
+        if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
+            return f"d128 deterministic grouped backward requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+        try:
+            validate_accumulation_scale(facts.d_qk**-0.5 if facts.scale is None else facts.scale)
+            validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, facts.window_left)
+        except ValueError as error:
+            return "d128 deterministic grouped: " + str(error)
+        return None
     if not facts.thd and not grouped:
         from .d128_contract import validate_dense_bounds
 
@@ -2022,7 +2051,9 @@ def _sm100_d128_spec() -> EngineSpec:
     device), DSL >= 4.8 and positive FP32 scale.  Grouped variants fold native per-Q-head dK/dV partials in FP32.  On cc
     10.7 the DSL must carry the sm_107a target (``cutedsl_arch_requirement_error`` in :func:`mismatch`, Rule 7); the row's
     placement there follows the cc 10.0 rule (``heuristics.D128_LEAD_CCS``: unwindowed d128 THD ahead of the backend, which
-    serves no such plan on cc 10.7; dense behind), measured 2026-11-03.
+    serves no such plan on cc 10.7; dense behind), measured 2026-11-03.  A dense deterministic request (MHA, GQA or MQA)
+    takes the dK/dV + dQ kernel pair under the accumulation gates on the pair's parts (``d128_contract.PAIR_CCS``); dense
+    MHA falls back to the one-launch recompute body elsewhere.
     """
     from .d128_contract import DENSE_SM_RANGE
 
@@ -2034,7 +2065,7 @@ def _sm100_d128_spec() -> EngineSpec:
             d=frozenset({64, 128}),
             causal=True,
             swa=True,
-            deterministic=True,  # dense MHA only: declaration_check selects the fixed-order recompute contract
+            deterministic=True,  # dense only: the kernel pair (MHA / GQA / MQA), recompute for MHA outside the pair envelope
             compact_bshd=True,
             thd=True,
             thd_declared_totals=True,
@@ -2144,12 +2175,13 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
             sm_hi=106,
             d=frozenset({128, 192}),
             dqk_ge_dv=True,
-            declaration_check=_sm100_d192_head_mismatch,
+            declaration_check=_sm100_d192_fp8_head_mismatch,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             is_fp8=True,
             out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             amax_dgrad=True,
             causal=True,
+            deterministic=True,  # kernel pair: each kernel owns its output tiles, the amax folds are maxima
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
         ),
