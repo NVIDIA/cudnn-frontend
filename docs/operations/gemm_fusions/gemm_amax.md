@@ -107,9 +107,12 @@ op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
 
 ### Using JAX arrays
 
+Follow the shared installation instructions ([docs](/operations/overview#installation-and-setup),
+[GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/overview.md#installation-and-setup)).
+
 Two integration levels are available:
 
-1. **`gemm_amax_jax_sm100`** (recommended for jitted programs) — an XLA custom call built on `cudnn.jax.call` (CuTeDSL's native `cutlass.jax` bridge). The kernel runs on XLA's compute stream (correctly ordered with surrounding ops), outputs are XLA-managed fresh arrays, and the call composes with `jax.jit`. No manual synchronization is needed. Requires the `jax` dependency group (`pip install --group jax`; jax >= 0.9.1).
+1. **`gemm_amax_jax_sm100`** (recommended for jitted programs) — an XLA custom call built on `cudnn.jax.call` (CuTeDSL's native `cutlass.jax` bridge). The kernel runs on XLA's compute stream (correctly ordered with surrounding ops), outputs are XLA-managed fresh arrays, and the call composes with `jax.jit`. No manual synchronization is needed.
 
 ```python
 from cudnn import gemm_amax_jax_sm100

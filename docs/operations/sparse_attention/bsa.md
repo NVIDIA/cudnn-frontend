@@ -692,8 +692,10 @@ All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
 have been removed; use the `cudnn.ops` names.
 
 The JAX implementation reuses the SM100/SM103 blk128 forward, bucketed CSR, backward preprocess,
-backward, and gradient conversion kernels. Install `jax[cuda13]>=0.9.1` alongside the
-frontend (CuTeDSL >=4.7, JAX >=0.9.1). The runtime imports no PyTorch; torch parity tests are separate.
+backward, and gradient conversion kernels. Follow the shared installation instructions
+([docs](/operations/overview#installation-and-setup),
+[GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/overview.md#installation-and-setup)).
+The runtime imports no PyTorch; torch parity tests are separate.
 
 The JAX signatures omit Torch-specific launch options and caller-provided
 output buffers. XLA owns the outputs and workspaces.

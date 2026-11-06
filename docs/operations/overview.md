@@ -91,9 +91,16 @@ The Triton NVFP4 attention QAT backward API additionally requires the
 Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
-pip install --group jax     # jax >= 0.9.1 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
+pip install --group jax     # JAX entry points via cutlass.jax, shipped with nvidia-cutlass-dsl
 ```
-(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.9.1"` directly.)
+For the published wheel, install PyTorch with `pip install torch torch-c-dlpack-ext`.
+
+All CuTeDSL JAX entry points require **JAX >=0.9.1**. Install GPU-enabled JAX separately;
+for CUDA 13:
+
+```bash
+pip install 'jax[cuda13]>=0.9.1'
+```
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 

@@ -43,11 +43,8 @@ torch; this JAX API does not expose `state_indices` or `overwrite_initial_state`
 
 ## Usage
 
-Install GPU-enabled JAX and CuTeDSL separately from the framework-neutral package:
-
-```bash
-pip install 'jax[cuda13]>=0.9.1' 'nvidia-cutlass-dsl[cu13]>=4.7.0'
-```
+Follow the shared installation instructions ([docs](/operations/overview#installation-and-setup),
+[GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/overview.md#installation-and-setup)).
 
 Other GPUs may be visible. Concrete arrays run on the GPU that holds them, and all of
 them must be on one supported GPU. Under `jax.jit` the arrays are tracers with no
