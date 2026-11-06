@@ -75,9 +75,11 @@ a row alone and inside a batch under the entry's own picks.
   no SM120 column.
 - Shared-expert decode pair (`SharedExpertDecode`): no determinism switch; the
   accumulation order of every output element is a function of the geometry
-  alone (`K_SPLIT` pinned per geometry), so a token's bytes alone equal its
-  bytes inside a batch of up to 24 tokens, across the one- and two-m-tile
-  forms; every other knob writes the default's bytes. The SM100/103 cell
+  alone (`K_SPLIT` pinned per geometry, the gate tree's shape by
+  `GATE_CLUSTER_FOLD`), so a token's bytes alone equal its bytes inside a batch
+  of up to 24 tokens, across the one- and two-m-tile forms and the one- and
+  two-group forms; every other knob writes the default's bytes, and the first
+  release's form (`v1_cfg`) keeps its own goldens as an A/B arm. The SM100/103 cell
   states its limit: verified on cc 10.3 (a GB300); cc 10.0 (and cc 10.7) run
   the same admission, unverified; SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set

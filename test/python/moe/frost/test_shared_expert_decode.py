@@ -5,7 +5,8 @@
 constants (the gate-logit partition, the SMEM tables, the ring ledger, the barrier constants) on the host, the typed declines of the host
 entry (CPU tensors), the plan-time-only compile key, the lazy export and the docs rows; on a cc 10.x device the pair against an fp64
 reference of the bf16 operands at the harness band, the padded-row hygiene, the CUDA-graph replay, and every knob arm bitwise with the
-default (the PDL arms, the ring depth, the W phases, the launch-2 row count), the K_SPLIT arms within the band (a rounding-order axis).
+default (the PDL arms, the group count, the ring, the W phases, the launch-2 row count), the K_SPLIT / gate-fold / v1 arms within the band
+(rounding-order axes).
 The operand builders, the fp64 reference, the band check, the order model and the device gate live in ``shared_expert_utils.py`` beside
 this module (shared with ``test_shared_expert_decode_determinism.py``)."""
 
@@ -39,15 +40,43 @@ REPO = Path(__file__).resolve().parents[4]
 # ---------------------------------------------------------------------------------------------------------------------------
 # host-only: the config
 # ---------------------------------------------------------------------------------------------------------------------------
-def test_default_cfg_pins_k_split_per_geometry_at_128_ctas():
-    """K_SPLIT is a function of the geometry alone (the slice order of every output element never moves with T): 2 at I 256 (64 clusters x 2),
-    4 at I 128 (32 x 4) -- 128 CTAs of launch 1 either way, one per SM on a 148- / 152-SM part."""
-    for g, s in ((GEOMETRIES[0], 2), (GEOMETRIES[1], 4)):
+def test_default_cfg_pins_k_split_per_geometry_at_one_wave():
+    """K_SPLIT is a function of the geometry alone (the slice order of every output element never moves with T): 8 at both validated
+    geometries (64 x 8 = 512 CTAs of 16 KB at I 256, 32 x 8 = 256 at I 128) -- one wave at four CTAs per SM on a 148- or 152-SM part; the
+    two-tile form takes N_GROUPS 2 at I 256 (256 CTAs x 113 KB, two per SM) and 1 at I 128 (256 x 81 KB); every knob default is the measured
+    one (bulk x rows, the cluster-side gate fold, PDL off, W_PHASES 1, 64 rows)."""
+    for g, grid1 in ((GEOMETRIES[0], 512), (GEOMETRIES[1], 256)):
         cfg = kcfg.default_cfg(g)
-        assert (cfg.K_SPLIT, cfg.GRID1, cfg.GRID2, cfg.THREADS, cfg.THREADS2) == (s, 128, 128, 256, 256), g
+        assert (cfg.K_SPLIT, cfg.GRID1, cfg.GRID2, cfg.THREADS, cfg.THREADS2, cfg.N_GROUPS_EFF, cfg.co_resident_ctas1, cfg.WAVES1) == (
+            8,
+            grid1,
+            128,
+            256,
+            256,
+            1,
+            4,
+            1,
+        ), g
+        assert (cfg.N_GROUPS, cfg.X_BULK_ROWS, cfg.GATE_CLUSTER_FOLD, cfg.SM_COUNT) == (0, True, True, kcfg.SM100_SM_COUNT)
         assert (cfg.PDL, cfg.PDL_PAIR, cfg.PDL_RELEASE, cfg.X_STAGES, cfg.W_PHASES, cfg.ROWS_PER_CTA, cfg.MIN_CTAS_PER_SM) == (False, False, False, 0, 1, 64, 1)
+        two = kcfg.form_for(cfg, 24)
+        assert (two.TOKEN_TILES, two.N_GROUPS_EFF, two.GRID1, two.co_resident_ctas1, two.WAVES1) == (2, 2 if g.INTERMEDIATE == 256 else 1, 256, 2, 1), g
+        for sm in (148, 152, 212):  # the same forms on every SM100-class part
+            part = kcfg.default_cfg(g, sm_count=sm)
+            assert (part.N_GROUPS_EFF, kcfg.form_for(part, 24).N_GROUPS_EFF) == (1, two.N_GROUPS_EFF)
     assert kcfg.CFG == kcfg.default_cfg() and kcfg.CFG_TP16 == kcfg.default_cfg(GEOMETRIES[1])
-    assert kcfg.k_split_for(kcfg.Geometry(8192, 256)) == 2 and kcfg.k_split_for(kcfg.Geometry(8192, 128)) == 4
+    assert kcfg.k_split_for(kcfg.Geometry(8192, 256)) == 8 and kcfg.k_split_for(kcfg.Geometry(8192, 128)) == 8
+    # the v1 arm (the class of the committed ksplit2 / ksplit4 goldens): 128 CTAs, the ring, the launch-2 gate fold
+    for g, s in ((GEOMETRIES[0], 2), (GEOMETRIES[1], 4)):
+        v1 = kcfg.v1_cfg(g)
+        assert (v1.K_SPLIT, v1.GRID1, v1.N_GROUPS_EFF, v1.X_BULK_ROWS, v1.GATE_CLUSTER_FOLD_EFF, v1.GATE_SLOTS) == (s, 128, 1, False, False, v1.GATE_PARTS)
+    assert kcfg.CFG_V1 == kcfg.v1_cfg() and kcfg.CFG_V1_TP16 == kcfg.v1_cfg(GEOMETRIES[1])
+
+
+def _cfg(g, k_split, tiles, **kw):
+    """A form of (geometry, K_SPLIT, TOKEN_TILES): the bulk x rows where the slice fits (K_SPLIT >= 4; K_SPLIT 2 at one tile), else the ring."""
+    bulk = kw.pop("X_BULK_ROWS", k_split >= 4 or (k_split == 2 and tiles == 1))
+    return kcfg.make_cfg(GEOM=g, K_SPLIT=k_split, TOKEN_TILES=tiles, X_BULK_ROWS=bulk, **kw)
 
 
 def test_geometry_validates_and_holds_plain_ints():
@@ -58,19 +87,22 @@ def test_geometry_validates_and_holds_plain_ints():
             kcfg.Geometry(*bad)
 
 
+@pytest.mark.parametrize("fold", (True, False), ids=("cluster-fold", "launch2-fold"))
 @pytest.mark.parametrize("g", GEOMETRIES, ids=_gid)
-@pytest.mark.parametrize("k_split", (1, 2, 4))
+@pytest.mark.parametrize("k_split", (1, 2, 4, 8))
 @pytest.mark.parametrize("tiles", (1, 2))
-def test_gate_partition_tiles_hidden_for_every_cfg(g, k_split, tiles):
-    """The audit's host pin: GATE_PARTS x GATE_COLS == H for every (geometry, K_SPLIT) the knobs produce, the fold's per-lane counts integral,
-    and warp 1's pair coverage exactly the CTA's columns (every column of H owned once across the grid)."""
-    cfg = kcfg.make_cfg(GEOM=g, K_SPLIT=k_split, TOKEN_TILES=tiles)
-    assert cfg.GATE_PARTS * cfg.GATE_COLS == g.HIDDEN and cfg.GATE_COLS % 2 == 0 and cfg.GATE_PARTS % 32 == 0
-    assert cfg.GATE_PARTS == cfg.GRID1 and cfg.GATE_PARTS_PER_LANE * 32 == cfg.GATE_PARTS
+def test_gate_partition_tiles_hidden_for_every_cfg(g, k_split, tiles, fold):
+    """The audit's host pin: GATE_PARTS x GATE_COLS == H for every (geometry, K_SPLIT) the knobs produce (the leaves independent of N_GROUPS),
+    the fold's per-lane counts integral, GATE_SLOTS = GROUPS under the cluster fold (K_SPLIT > 1) else every leaf, and the gate warps' pair
+    coverage exactly the CTA's columns (every column of H owned once across the grid)."""
+    cfg = _cfg(g, k_split, tiles, GATE_CLUSTER_FOLD=fold)
+    assert cfg.GATE_PARTS * cfg.GATE_COLS == g.HIDDEN and cfg.GATE_COLS % 2 == 0 and cfg.GATE_SLOTS % 32 == 0
+    assert cfg.GATE_PARTS == cfg.K_SPLIT * cfg.GROUPS == cfg.GRID1 * cfg.N_GROUPS_EFF and cfg.GATE_SLOTS_PER_LANE * 32 == cfg.GATE_SLOTS
+    assert cfg.GATE_SLOTS == (cfg.GROUPS if fold and k_split > 1 else cfg.GATE_PARTS) and cfg.GATE_CLUSTER_FOLD_EFF == (fold and k_split > 1)
     owned = [0] * g.HIDDEN
     for q in range(cfg.GATE_PARTS):
-        ks, c = divmod(q, cfg.CLUSTERS)
-        k0 = ks * cfg.K_SLICE + c * cfg.GATE_COLS
+        ks, grp = divmod(q, cfg.GROUPS)
+        k0 = ks * cfg.K_SLICE + grp * cfg.GATE_COLS
         for lane in range(32):
             for p in range(cfg.GATE_PAIRS_PER_LANE):
                 col = 2 * lane + 64 * p
@@ -78,15 +110,23 @@ def test_gate_partition_tiles_hidden_for_every_cfg(g, k_split, tiles):
                     owned[k0 + col] += 1
                     owned[k0 + col + 1] += 1
     assert all(v == 1 for v in owned), "every hidden column is summed exactly once across the grid"
+    for n in (1, 2) if k_split >= 4 else (1,):  # N_GROUPS moves the grid, never the leaves (two groups of a 4096-column slice do not fit)
+        assert kcfg.make_cfg(GEOM=g, K_SPLIT=k_split, TOKEN_TILES=tiles, N_GROUPS=n, X_BULK_ROWS=cfg.X_BULK_ROWS).GATE_PARTS == cfg.GATE_PARTS
 
 
+@pytest.mark.parametrize("bulk", (True, False), ids=("bulk-rows", "ring"))
 @pytest.mark.parametrize("g", GEOMETRIES, ids=_gid)
-@pytest.mark.parametrize("k_split", (1, 2, 4))
+@pytest.mark.parametrize("k_split", (1, 2, 4, 8))
 @pytest.mark.parametrize("tiles", (1, 2))
-def test_smem_tables_fit_and_every_pitch_covers_the_banks(g, k_split, tiles):
+def test_smem_tables_fit_and_every_pitch_covers_the_banks(g, k_split, tiles, bulk):
     """Every row pitch is 128 n + 16 B (the eight row addresses of one ldmatrix phase cover 32 banks); launch 1's total fits the opt-in at
-    every form, launch 2's too; the ring has at least two stages and the budget rule keeps every chunk resident where it fits."""
-    cfg = kcfg.make_cfg(GEOM=g, K_SPLIT=k_split, TOKEN_TILES=tiles)
+    every form, launch 2's too; a ring form has at least two stages and the budget rule keeps every chunk resident where it fits; a bulk
+    form that does not fit (K_SPLIT 1; K_SPLIT 2 at two tiles) is the typed decline naming the ring."""
+    if bulk and (k_split == 1 or (k_split == 2 and tiles == 2)):
+        with pytest.raises(ValueError, match="x resident.*ring form"):
+            kcfg.make_cfg(GEOM=g, K_SPLIT=k_split, TOKEN_TILES=tiles, X_BULK_ROWS=True)
+        return
+    cfg = kcfg.make_cfg(GEOM=g, K_SPLIT=k_split, TOKEN_TILES=tiles, X_BULK_ROWS=bulk)
     for name, (nbytes, pitch) in {**kcfg.smem_table1(cfg), **kcfg.smem_table2(cfg)}.items():
         assert nbytes >= 0, name
         if pitch is not None and pitch > 16:
@@ -95,50 +135,97 @@ def test_smem_tables_fit_and_every_pitch_covers_the_banks(g, k_split, tiles):
             assert len(banks) == 32, (name, pitch)
     assert sum(b for b, _ in kcfg.smem_table1(cfg).values()) == cfg.SMEM1_BYTES <= cfg.SMEM_OPTIN_BYTES
     assert sum(b for b, _ in kcfg.smem_table2(cfg).values()) == cfg.SMEM2_BYTES <= cfg.SMEM_OPTIN_BYTES
-    assert 2 <= cfg.X_STAGES_EFF <= cfg.X_CHUNKS
-    if cfg.SMEM1_FIXED_BYTES + cfg.X_CHUNKS * cfg.X_CHUNK_BYTES + kcfg.SMEM_RING_MARGIN_BYTES <= cfg.SMEM1_BUDGET_BYTES:
-        assert cfg.X_STAGES_EFF == cfg.X_CHUNKS, "the whole slice is resident when it fits"
+    assert cfg.WAVES1 >= 1 and cfg.co_resident_ctas1 >= 1
+    if bulk:
+        assert cfg.X_STAGES_EFF == 0 and cfg.X_SMEM_BYTES == cfg.X_ROWS * (cfg.K_SLICE + 8) * 2 and cfg.X_ROWS == (16 if tiles == 1 else 24)
+    else:
+        assert 2 <= cfg.X_STAGES_EFF <= cfg.X_CHUNKS
+        if cfg.SMEM1_FIXED_BYTES + cfg.X_CHUNKS * cfg.X_CHUNK_BYTES + kcfg.SMEM_RING_MARGIN_BYTES <= cfg.SMEM1_BUDGET_BYTES:
+            assert cfg.X_STAGES_EFF == cfg.X_CHUNKS, "the whole slice is resident when it fits"
 
 
 def test_default_form_figures_of_record():
-    """The default form's figures of record (I 256, K_SPLIT 2; the kernel module's SMEM table quotes these): w_s 65,664, x_s 8 x 16 x 1,040
-    (Tpad 16) / 4 x 32 x 1,040 (Tpad 32), 202,912 / 207,008 B in all, one CTA per SM; the I 128 default (K_SPLIT 4) 104,608 / 176,288 B
-    (two CTAs per SM by shared memory at Tpad 16)."""
-    c1 = kcfg.make_cfg(TOKEN_TILES=1)
-    c2 = kcfg.make_cfg(TOKEN_TILES=2)
-    assert (c1.W_SMEM_BYTES, c1.X_STAGES_EFF, c1.X_CHUNK_BYTES, c1.X_SMEM_BYTES) == (65664, 8, 16640, 133120)
-    assert (c2.X_STAGES_EFF, c2.X_CHUNK_BYTES, c2.X_SMEM_BYTES) == (4, 33280, 133120)
-    assert c1.SMEM1_BYTES == 202912 and c2.SMEM1_BYTES == 207008 and c1.SMEM2_BYTES == 42368 and c2.SMEM2_BYTES == 50816
-    assert c1.co_resident_ctas1 == 1
-    t16 = kcfg.CFG_TP16
-    assert t16.K_SPLIT == 4 and t16.X_CHUNKS == 4 and t16.X_STAGES_EFF == 4 and t16.co_resident_ctas1 == 2 and t16.SMEM1_BYTES == 104608
-    assert replace(t16, TOKEN_TILES=2).SMEM1_BYTES == 176288 and kcfg.make_cfg(GEOM=GEOMETRIES[1], K_SPLIT=4, TOKEN_TILES=2).SMEM2_BYTES == 26240
-    big = kcfg.make_cfg(K_SPLIT=4, MIN_CTAS_PER_SM=2)  # the 256-CTA arm at I 256 must co-reside twice: the budget rule halves the SM
+    """The default forms' figures of record (the kernel module's SMEM table quotes these): I 256 / K_SPLIT 8: 57,200 B at one tile (w_s 16,512,
+    x_s 16 x 2,064, red_s / mail_s 3,584, gmail_s 448, 48 B of mbarriers; four CTAs per SM, 144 B under the budget) and 113,072 B at two tiles
+    with N_GROUPS 2 (two per SM); I 128: 57,200 / 81,328 B; the v1 arm unchanged at 202,912 / 207,008 B (I 256) and 104,608 / 176,288 B (I 128)."""
+    c1, c2 = kcfg.form_for(kcfg.CFG, 6), kcfg.form_for(kcfg.CFG, 24)
+    assert kcfg.smem_table1(c1) == {
+        "w_s": (16512, 2064),
+        "x_s": (33024, 2064),
+        "red_s": (3584, 16),
+        "mail_s": (3584, 16),
+        "gmail_s": (448, 4),
+        "mbarriers": (48, None),
+    }
+    assert kcfg.smem_table1(c2) == {
+        "w_s": (33024, 2064),
+        "x_s": (49536, 2064),
+        "red_s": (14336, 16),
+        "mail_s": (14336, 16),
+        "gmail_s": (1792, 4),
+        "mbarriers": (48, None),
+    }
+    assert (c1.SMEM1_BYTES, c2.SMEM1_BYTES, c1.SMEM2_BYTES, c2.SMEM2_BYTES) == (57200, 113072, 42368, 50816)
+    assert (c1.co_resident_ctas1, c2.co_resident_ctas1, c1.KRED_BYTES, c2.KRED_BYTES) == (4, 2, 4032, 16128)
+    assert kcfg.SM100_SMEM_PER_SM_BYTES // 4 - kcfg.SMEM_CTA_RESERVE_BYTES - c1.SMEM1_BYTES == 144, "the one-tile form's slack under four per SM"
+    t1, t2 = kcfg.form_for(kcfg.CFG_TP16, 6), kcfg.form_for(kcfg.CFG_TP16, 24)
+    assert (t1.SMEM1_BYTES, t2.SMEM1_BYTES, t1.SMEM2_BYTES, t2.SMEM2_BYTES, t1.co_resident_ctas1, t2.co_resident_ctas1) == (57200, 81328, 21888, 26240, 4, 2)
+    v1, v2 = kcfg.form_for(kcfg.CFG_V1, 6), kcfg.form_for(kcfg.CFG_V1, 24)
+    assert (v1.W_SMEM_BYTES, v1.X_STAGES_EFF, v1.X_CHUNK_BYTES, v1.X_SMEM_BYTES) == (65664, 8, 16640, 133120)
+    assert (v2.X_STAGES_EFF, v2.X_CHUNK_BYTES, v2.X_SMEM_BYTES) == (4, 33280, 133120)
+    assert (v1.SMEM1_BYTES, v2.SMEM1_BYTES, v1.co_resident_ctas1, v1.GMAIL_SMEM_BYTES) == (202912, 207008, 1, 0)
+    u1 = kcfg.CFG_V1_TP16
+    assert u1.K_SPLIT == 4 and u1.X_CHUNKS == 4 and u1.X_STAGES_EFF == 4 and u1.co_resident_ctas1 == 2 and u1.SMEM1_BYTES == 104608
+    assert kcfg.form_for(u1, 24).SMEM1_BYTES == 176288
+    big = kcfg.make_cfg(K_SPLIT=4, MIN_CTAS_PER_SM=2, X_BULK_ROWS=False)  # a ring arm that must co-reside twice: the budget rule halves the SM
     assert big.co_resident_ctas1 == 2 and big.SMEM1_BUDGET_BYTES == kcfg.SM100_SMEM_PER_SM_BYTES // 2 - kcfg.SMEM_CTA_RESERVE_BYTES
 
 
+def test_one_wave_rule_is_the_form_axis_and_a_two_wave_default_is_the_typed_error():
+    """N_GROUPS 0 picks the smallest group count that fits one wave; an explicit N_GROUPS is kept (a knob arm may choose two waves); a part
+    too small for one wave under the rule declines by name."""
+    assert kcfg.make_cfg(TOKEN_TILES=2).N_GROUPS_EFF == 2 and kcfg.make_cfg(TOKEN_TILES=2, N_GROUPS=1).WAVES1 == 2
+    assert kcfg.make_cfg(GEOM=GEOMETRIES[1], TOKEN_TILES=2).N_GROUPS_EFF == 1
+    small = kcfg.make_cfg(TOKEN_TILES=2, SM_COUNT=64)
+    assert small.N_GROUPS_EFF == 2 and small.WAVES1 == 2
+    with pytest.raises(ValueError, match="needs 2 waves"):
+        kcfg.form_for(kcfg.make_cfg(SM_COUNT=64), 24)
+    with pytest.raises(ValueError, match="needs 2 waves"):
+        kcfg.default_cfg(sm_count=64)
+
+
 def test_barrier_ledger_constants_and_the_ring_walk():
-    """The barrier-table constants with their derivation, and the pure-Python ring ledger for every (X_CHUNKS, X_STAGES) the cfgs produce:
-    chunk i has landed before iteration i, and a stage is refilled only by the iteration after its last read (behind that iteration's barrier)."""
-    assert kcfg.W_MBAR_ARRIVERS == 1 and kcfg.KRED_MBAR_ARRIVERS == 1
+    """The barrier-table constants with their derivation (the W, x and kred ledgers of every form), and the pure-Python ring ledger for every
+    (X_CHUNKS, X_STAGES) the ring cfgs produce: chunk i has landed before iteration i, and a stage is refilled only by the iteration after its
+    last read (behind that iteration's barrier)."""
+    assert kcfg.W_MBAR_ARRIVERS == 1 and kcfg.X_MBAR_ARRIVERS == 1 and kcfg.KRED_MBAR_ARRIVERS == 1
     for g in GEOMETRIES:
-        for s in (1, 2, 4):
+        for s in (1, 2, 4, 8):
             for tiles in (1, 2):
                 for phases in (1, 2):
-                    cfg = kcfg.make_cfg(GEOM=g, K_SPLIT=s, TOKEN_TILES=tiles, W_PHASES=phases)
-                    assert cfg.W_PHASE_BYTES * cfg.W_PHASES == cfg.W_SLICE_BYTES == 8 * cfg.K_SLICE * 2
-                    assert cfg.W_PHASE_BYTES == 8 * cfg.W_PHASE_ROW_BYTES and cfg.W_PHASE_ROW_BYTES % 16 == 0
-                    assert cfg.KRED_BYTES == (s - 1) * tiles * 32 * 16 == cfg.MAIL_SMEM_BYTES
-                    assert cfg.X_COPIES * cfg.THREADS * 16 == cfg.TPAD * kcfg.CHUNK_K * 2
-                    assert cfg.WD_COPIES * cfg.THREADS2 * 16 == cfg.ROWS_PER_CTA * cfg.I * 2
-                    assert cfg.ACT_COPIES * cfg.THREADS2 * 16 == cfg.TPAD * cfg.I * 2
-                    assert cfg.X_PROLOGUE_GROUPS == cfg.X_STAGES_EFF - 1 and cfg.X_WAIT_PENDING == cfg.X_STAGES_EFF - 2
-                    for stages in {cfg.X_STAGES_EFF, 2, cfg.X_CHUNKS}:
-                        landed, refilled = kcfg.ring_ledger(cfg.X_CHUNKS, stages)
-                        for i in range(cfg.X_CHUNKS):
-                            assert landed[i] >= i + 1, (cfg.X_CHUNKS, stages, i)
-                            if refilled[i] >= 0:
-                                assert refilled[i] == (i - 1) % stages, (cfg.X_CHUNKS, stages, i)
+                    for bulk in (True, False):
+                        if bulk and (s == 1 or (s == 2 and tiles == 2)):
+                            continue
+                        cfg = kcfg.make_cfg(GEOM=g, K_SPLIT=s, TOKEN_TILES=tiles, W_PHASES=phases, X_BULK_ROWS=bulk)
+                        n = cfg.N_GROUPS_EFF
+                        assert cfg.W_ROWS == 8 * n <= 32 and cfg.W_PHASE_BYTES * cfg.W_PHASES == cfg.W_SLICE_BYTES == cfg.W_ROWS * cfg.K_SLICE * 2
+                        assert cfg.W_PHASE_BYTES == cfg.W_ROWS * cfg.W_PHASE_ROW_BYTES and cfg.W_PHASE_ROW_BYTES % 16 == 0
+                        assert cfg.ACC_TILES == n * tiles and cfg.MAIL_SMEM_BYTES == (s - 1) * cfg.ACC_TILES * 32 * 16
+                        assert cfg.GMAIL_SMEM_BYTES == ((s - 1) * n * cfg.TPAD * 4 if s > 1 else 0)
+                        assert cfg.KRED_BYTES == cfg.MAIL_SMEM_BYTES + cfg.GMAIL_SMEM_BYTES
+                        assert cfg.WD_COPIES * cfg.THREADS2 * 16 == cfg.ROWS_PER_CTA * cfg.I * 2
+                        assert cfg.ACT_COPIES * cfg.THREADS2 * 16 == cfg.TPAD * cfg.I * 2
+                        if bulk:
+                            assert cfg.X_ROWS <= 32 and cfg.X_ROW_BYTES == cfg.K_SLICE * 2 and cfg.X_ROW_BYTES % 16 == 0
+                            continue
+                        assert cfg.X_COPIES * cfg.THREADS * 16 == cfg.TPAD * kcfg.CHUNK_K * 2
+                        assert cfg.X_PROLOGUE_GROUPS == cfg.X_STAGES_EFF - 1 and cfg.X_WAIT_PENDING == cfg.X_STAGES_EFF - 2
+                        for stages in {cfg.X_STAGES_EFF, 2, cfg.X_CHUNKS}:
+                            landed, refilled = kcfg.ring_ledger(cfg.X_CHUNKS, stages)
+                            for i in range(cfg.X_CHUNKS):
+                                assert landed[i] >= i + 1, (cfg.X_CHUNKS, stages, i)
+                                if refilled[i] >= 0:
+                                    assert refilled[i] == (i - 1) % stages, (cfg.X_CHUNKS, stages, i)
     with pytest.raises(ValueError, match="2 <= X_STAGES"):
         kcfg.ring_ledger(8, 1)
 
@@ -148,22 +235,35 @@ def test_barrier_ledger_constants_and_the_ring_walk():
     [
         (dict(THREADS=128), "THREADS"),
         (dict(K_SPLIT=3), "K_SPLIT"),
+        (dict(K_SPLIT=16), "K_SPLIT"),
         (dict(TOKEN_TILES=3), "TOKEN_TILES"),
+        (dict(N_GROUPS=3), "N_GROUPS"),
         (dict(W_PHASES=4), "W_PHASES"),
         (dict(ROWS_PER_CTA=16), "ROWS_PER_CTA"),
         (dict(MIN_CTAS_PER_SM=3), "MIN_CTAS_PER_SM"),
-        (dict(X_STAGES=1), "X_STAGES"),
-        (dict(X_STAGES=9), "X_STAGES"),
+        (dict(SM_COUNT=0), "SM_COUNT"),
+        (dict(X_BULK_ROWS=False, K_SPLIT=2, X_STAGES=1), "X_STAGES"),
+        (dict(X_BULK_ROWS=False, K_SPLIT=2, X_STAGES=9), "X_STAGES"),
+        (dict(K_SPLIT=1, N_GROUPS=1), "x resident"),
+        (dict(K_SPLIT=2, TOKEN_TILES=2), "x resident"),
         (
-            dict(K_SPLIT=4, MIN_CTAS_PER_SM=1, X_STAGES=4, GEOM=kcfg.Geometry(8192, 256), SMEM_OPTIN_BYTES=100 * 1024, SMEM_PER_SM_BYTES=101 * 1024),
+            dict(
+                K_SPLIT=4,
+                MIN_CTAS_PER_SM=1,
+                X_STAGES=4,
+                X_BULK_ROWS=False,
+                GEOM=kcfg.Geometry(8192, 256),
+                SMEM_OPTIN_BYTES=100 * 1024,
+                SMEM_PER_SM_BYTES=101 * 1024,
+            ),
             "exceeds the per-CTA opt-in",
         ),
-        (dict(SMEM_OPTIN_BYTES=100 * 1024, SMEM_PER_SM_BYTES=101 * 1024), "X_STAGES"),
+        (dict(X_BULK_ROWS=False, K_SPLIT=2, SMEM_OPTIN_BYTES=100 * 1024, SMEM_PER_SM_BYTES=101 * 1024), "X_STAGES"),
         (dict(SMEM_OPTIN_BYTES=300 * 1024), "SMEM_OPTIN_BYTES"),
         (dict(GEOM=kcfg.Geometry(8000, 256)), "HIDDEN"),
         (dict(GEOM=kcfg.Geometry(8192, 200)), "INTERMEDIATE"),
         (dict(GEOM=kcfg.Geometry(8192, 64)), "do not split"),
-        (dict(GEOM=kcfg.Geometry(8192, 64), ROWS_PER_CTA=32, K_SPLIT=1), "GATE_PARTS"),
+        (dict(GEOM=kcfg.Geometry(8192, 64), ROWS_PER_CTA=32, K_SPLIT=1, X_BULK_ROWS=False), "GATE_SLOTS"),
         (dict(GEOM="geometry"), "GEOM"),
     ],
 )
@@ -178,15 +278,18 @@ def test_token_tiles_form_and_the_24_ceiling():
         kcfg.token_tiles_for(25)
     with pytest.raises(ValueError):
         kcfg.token_tiles_for(0)
-    assert kcfg.form_for(kcfg.CFG, 6) is kcfg.CFG and kcfg.form_for(kcfg.CFG, 24).TOKEN_TILES == 2
+    assert kcfg.form_for(kcfg.CFG, 6) is kcfg.CFG and kcfg.form_for(kcfg.CFG, 24).TOKEN_TILES == 2 and kcfg.form_for(kcfg.CFG, 24).N_GROUPS_EFF == 2
 
 
 def test_part_readings_validate():
-    assert kcfg.part_readings(*SM100_READING) == dict(SMEM_PER_SM_BYTES=SM100_READING[0], SMEM_OPTIN_BYTES=SM100_READING[1])
+    assert kcfg.part_readings(*SM100_READING) == dict(SMEM_PER_SM_BYTES=SM100_READING[0], SMEM_OPTIN_BYTES=SM100_READING[1], SM_COUNT=148)
+    assert kcfg.part_readings(*SM100_READING, 152)["SM_COUNT"] == 152
     with pytest.raises(ValueError, match="cannot exceed"):
         kcfg.part_readings(100, 200)
     with pytest.raises(ValueError, match="positive int"):
         kcfg.part_readings(0, 0)
+    with pytest.raises(ValueError, match="sm_count"):
+        kcfg.part_readings(*SM100_READING, True)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -274,9 +377,9 @@ def test_host_entry_keeps_the_cc10_readings_and_a_given_cfg_overrides_the_pick()
     assert k.cfg == kcfg.CFG and k.readings == SM100_READING and k.sm_count is None and k.geometry == kcfg.DEFAULT_GEOMETRY
     k = entry.SharedExpertDecode("cpu", geometry=GEOMETRIES[1])
     assert k.cfg == kcfg.CFG_TP16
-    arm = kcfg.make_cfg(K_SPLIT=1)
+    arm = kcfg.v1_cfg()
     k = entry.SharedExpertDecode("cpu", cfg=arm)
-    assert k.cfg == arm and k.cfg_given
+    assert k.cfg == arm and k.cfg_given and k.cfg_for(24).X_BULK_ROWS is False
     with pytest.raises(ValueError, match="one source"):
         entry.SharedExpertDecode("cpu", geometry=GEOMETRIES[1], cfg=arm)
 
@@ -386,11 +489,13 @@ def test_entry_reads_the_device_readings_and_picks_the_form_per_tokens():
     dev = _device_or_skip()
     k = entry.SharedExpertDecode(dev)
     assert k.readings == entry.device_shared_memory(dev) and k.sm_count == torch.cuda.get_device_properties(dev).multi_processor_count
-    assert k.cfg.SMEM_OPTIN_BYTES == k.readings[1] and k.cfg_for(16).TOKEN_TILES == 1 and k.cfg_for(17).TOKEN_TILES == 2
+    assert k.cfg.SMEM_OPTIN_BYTES == k.readings[1] and k.cfg.SM_COUNT == k.sm_count and k.cfg_for(16).TOKEN_TILES == 1 and k.cfg_for(17).TOKEN_TILES == 2
+    assert (k.cfg_for(16).N_GROUPS_EFF, k.cfg_for(17).N_GROUPS_EFF, k.cfg_for(16).WAVES1, k.cfg_for(17).WAVES1) == (1, 2, 1, 1)
     ops = make_operands(17, device=dev, seed=1)
     _run(k, ops)
     _run(k, dict(ops, x=ops["x"][:3]))
     assert len(k.compiled) == 2 and len(k.scratch) == 2 and k.scratch[k.cfg_for(17)]["act"].shape == (32, 256)
+    assert k.scratch[k.cfg_for(17)]["gate_part"].shape == (32, 64)
 
 
 def test_caller_owned_out_and_padded_rows_stay_untouched():
@@ -441,7 +546,10 @@ BITWISE_ARMS = [
     dict(PDL=True),
     dict(PDL_PAIR=True),
     dict(PDL=True, PDL_PAIR=True, PDL_RELEASE=True),
-    dict(X_STAGES=2),
+    dict(N_GROUPS=1),
+    dict(N_GROUPS=2),
+    dict(X_BULK_ROWS=False),
+    dict(X_BULK_ROWS=False, X_STAGES=2),
     dict(W_PHASES=2),
     dict(ROWS_PER_CTA=32),
 ]
@@ -450,9 +558,10 @@ BITWISE_ARMS = [
 @pytest.mark.parametrize("tokens", (1, 6, 24))
 @pytest.mark.parametrize("arm", BITWISE_ARMS, ids=lambda a: ",".join(f"{k}={v}" for k, v in a.items()))
 def test_bit_neutral_knob_arms_write_the_default_bytes(arm, tokens):
-    """The PDL attributes (launch 1's, launch 2's, both plus the release), the minimum ring, the two W phases and the 32-row launch 2 move no
-    fp32 addition: byte-identical with the default on the same operands.  The stream is drained before a PDL launch: the caller obligation
-    (no in-flight predecessor writes the weights) holds in the test as in the chain."""
+    """The PDL attributes (launch 1's, launch 2's, both plus the release), one or two row-pair groups per CTA (the two-wave N_GROUPS 1 at T 24
+    included), the ring at K_SPLIT 8 (two chunks, all resident, and the minimum ring), the two W phases and the 32-row launch 2 move no fp32
+    addition: byte-identical with the default on the same operands.  The stream is drained before a PDL launch: the caller obligation (no
+    in-flight predecessor writes the weights) holds in the test as in the chain."""
     dev = _device_or_skip()
     ops = make_operands(tokens, device=dev, seed=40 + tokens)
     base = _run(entry.SharedExpertDecode(dev), ops).clone()
@@ -462,16 +571,25 @@ def test_bit_neutral_knob_arms_write_the_default_bytes(arm, tokens):
     assert torch.equal(_bytes(base), _bytes(got)), f"{arm} at T {tokens}"
 
 
-@pytest.mark.parametrize("k_split", (1, 4))
-def test_k_split_arms_are_rounding_order_arms_within_the_band(k_split):
-    """K_SPLIT changes the slice sum and the gate tree (64 / 128 / 256 leaves): a rounding-order arm -- in band against the fp64 reference,
-    not bitwise with the default.  K_SPLIT 4 at I 256 is 256 CTAs: the two-per-SM budget form."""
+ORDER_ARMS = {
+    "ksplit1-ring": dict(K_SPLIT=1, X_BULK_ROWS=False),
+    "ksplit2-bulk": dict(K_SPLIT=2),
+    "ksplit4-bulk": dict(K_SPLIT=4),
+    "ksplit8-launch2-fold": dict(GATE_CLUSTER_FOLD=False),
+    "v1": None,
+}
+
+
+@pytest.mark.parametrize("arm", sorted(ORDER_ARMS))
+def test_order_arms_are_rounding_order_arms_within_the_band(arm):
+    """K_SPLIT changes the slice sum and the gate tree's leaf count (64 .. 512 leaves), GATE_CLUSTER_FOLD the gate tree's shape, the v1 arm
+    both: rounding-order arms -- in band against the fp64 reference and the order model, not bitwise with the default."""
     dev = _device_or_skip()
     ops = make_operands(6, device=dev, seed=77)
-    arm = kcfg.make_cfg(K_SPLIT=k_split, MIN_CTAS_PER_SM=2 if k_split == 4 else 1)
-    y = _run(entry.SharedExpertDecode(dev, cfg=arm), ops)
-    assert_in_band(y, reference(ops), f"K_SPLIT {k_split}")
-    assert_in_band(y, order_model(ops, arm).to(dev), f"K_SPLIT {k_split} vs the order model")
+    cfg = kcfg.v1_cfg() if ORDER_ARMS[arm] is None else kcfg.make_cfg(**ORDER_ARMS[arm])
+    y = _run(entry.SharedExpertDecode(dev, cfg=cfg), ops)
+    assert_in_band(y, reference(ops), arm)
+    assert_in_band(y, order_model(ops, cfg).to(dev), f"{arm} vs the order model")
 
 
 def test_two_tile_form_at_sixteen_tokens_writes_the_one_tile_bytes():

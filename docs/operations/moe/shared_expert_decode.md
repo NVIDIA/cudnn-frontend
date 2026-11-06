@@ -16,14 +16,17 @@ tensor parallelism of a 2048-wide shared expert) or 128 (16-way); compute capabi
 Everything else is declined by name (`TypeError` for a dtype, `ValueError` for a shape / stride / alignment / device,
 `NotImplementedError` for the token count, the geometry, the architecture or the DSL version) before any DSL import.
 
-Launch 1 (`gate_up`, `I / 4 x K_SPLIT` CTAs in clusters of `K_SPLIT` along K, 256 threads each) streams `W_gate_up`
-once by `cp.async.bulk` with the row pairs `(j, I + j)` resident in one CTA, so the SiLU-mul sits in its epilogue;
-`x` streams through a `cp.async` ring; the K-split clusters fold their partial sums through DSMEM (`st.async`); warp 1
-of every CTA computes its slice of the gate logit `x @ W_gate^T`. Launch 2 (`down`, `H / 64` CTAs) prefetches its
-`W_down` rows ahead of `griddepcontrol.wait`, folds the gate partials into `sigmoid` and writes `y`. The math path is
-`mma.sync.m16n8k16` bf16 -> fp32 in both launches with the tokens on M (zero-padded to 16 or 32 rows), so every
-output element is accumulated in a FIXED order that depends on the geometry alone: the result is bitwise
-repeatable and batch-invariant (a token's bytes alone equal its bytes inside a batch of up to 24; see
+Launch 1 (`gate_up`, `K_SPLIT = 8` CTAs per cluster along K; 512 CTAs of 256 threads at `Geometry(8192, 256)`, 256 at
+`Geometry(8192, 128)`, four CTAs per SM at up to 16 tokens and one wave on every SM100-class part) streams its 16 KB slice
+of `W_gate_up` once by `cp.async.bulk` (one copy per row) with the row pairs `(j, I + j)` resident in one CTA, so the
+SiLU-mul sits in its epilogue; the `T` live rows of `x`'s K slice land by one bulk copy each (resident, no ring, at every
+`T`); the eight K-slice CTAs of a cluster fold their partial sums through DSMEM (`st.async`) in a fixed rank order; a warp
+per row-pair group computes its slice of the gate logit `x @ W_gate^T`, folded on the cluster leader the same way. At
+17 .. 24 tokens a CTA owns two row-pair groups (256 CTAs x 113 KB, two per SM, still one wave). Launch 2 (`down`, `H / 64`
+CTAs) prefetches its `W_down` rows ahead of `griddepcontrol.wait`, folds the per-group gate partials into `sigmoid` and
+writes `y`. The math path is `mma.sync.m16n8k16` bf16 -> fp32 in both launches with the tokens on M (zero-padded to 16 or
+32 rows), so every output element is accumulated in a FIXED order that depends on the geometry alone: the result is
+bitwise repeatable and batch-invariant (a token's bytes alone equal its bytes inside a batch of up to 24; see
 [determinism](/operations/determinism)). Against an fp64 reference of the bf16 operands the output sits within the
 usual bf16 band (rel-L2 <= 2e-2).
 
@@ -41,18 +44,22 @@ y = entry(x, w_gate_up, w_down, w_gate, out)                        # out: [>= T
 The entry compiles once per (geometry, token-tile form: 1 .. 16 or 17 .. 24 tokens, x / out row strides) and
 launches both kernels on torch's current stream; `T` is a runtime argument, so one compiled form serves every
 token count of its band (a captured CUDA graph replays its own `T`). The entry owns the inter-launch scratch
-(`act` [32, I] bf16, `gate_part` [32, K_SPLIT x I / 4] fp32), allocated once per form at the first compile; build
+(`act` [32, I] bf16, `gate_part` [32, I / 4] fp32), allocated once per form at the first compile; build
 one entry per concurrently running stream.
 
-Knobs (`cudnn.moe.frost.kernel.shared_expert_decode_config.Cfg`, passed as `cfg=`; every one bit-neutral except
-`K_SPLIT`, a rounding-order axis pinned per geometry): `X_STAGES`, `W_PHASES`, `ROWS_PER_CTA`, `MIN_CTAS_PER_SM`.
+Knobs (`cudnn.moe.frost.kernel.shared_expert_decode_config.Cfg`, passed as `cfg=`): bit-neutral `N_GROUPS` (row-pair
+groups per CTA; 0 = the one-wave rule), `X_BULK_ROWS` (x resident by bulk row copies; off = the v1 `cp.async` ring),
+`X_STAGES`, `W_PHASES`, `ROWS_PER_CTA`, `MIN_CTAS_PER_SM`; rounding-order axes `K_SPLIT` (pinned per geometry) and
+`GATE_CLUSTER_FOLD` (the gate tree's shape). `shared_expert_decode_config.v1_cfg(geometry)` is the first release's form
+(K_SPLIT 2 / 4, 128 CTAs, the ring, the launch-2 gate fold), kept as an A/B arm with its own goldens.
 Launch knobs `pdl` / `pdl_pair` / `pdl_release` set the programmatic-dependent-launch attributes of launch 1 / launch 2
 and the early release; all default off. Under `pdl=True` the launch's immediate stream predecessor must not write
 `w_gate_up` / `w_gate` (they load before the kernel's `griddepcontrol.wait`); the serving chain's static weights
 satisfy it. `pdl_release=True` creates an obligation for the consumer, not for the pair: a kernel launched after
 launch 2 with the programmatic-stream-serialization attribute (e.g. a fused add of `y` into the routed output) may
 start while launch 2 runs and must issue its own `griddepcontrol.wait` before it reads `y`; a consumer launched
-without the attribute (the stock add) is unaffected.
+without the attribute (the stock add) is unaffected. Measured on a GB300 (cc 10.3), the early release is a loss in every
+form and stays off.
 
 ## Support matrix
 

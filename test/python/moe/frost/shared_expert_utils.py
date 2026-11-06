@@ -80,7 +80,7 @@ def assert_in_band(out, ref, label=""):
 def order_model(ops, cfg):
     """The readable fp32 model of the documented reduction ORDER (the kernel module's docstring): per output element, the chain of
     warp ``w``'s (chunk, step) k16 pieces inside each K slice, the warp sequence, the slice sequence; the gate logit as the GATE_PARTS-leaf
-    tree, built on the operands' device.  NOT bitwise with the tensor core (its k16 contraction order is the hardware's): a second
+    tree (the leaves folded per group on the cluster leader under ``GATE_CLUSTER_FOLD``), built on the operands' device.  NOT bitwise with the tensor core (its k16 contraction order is the hardware's): a second
     reference that states the order."""
     x = ops["x"].float()
     dev = x.device
@@ -106,12 +106,19 @@ def order_model(ops, cfg):
     for s in range(cfg.K_STEPS2):
         k0 = s * kcfg.MMA_K
         y = y + act[:, k0 : k0 + kcfg.MMA_K] @ wd[:, k0 : k0 + kcfg.MMA_K].t()
-    parts = torch.zeros(T, cfg.GATE_PARTS, device=dev)
-    for q in range(cfg.GATE_PARTS):
-        ks, c = divmod(q, cfg.CLUSTERS)
-        k0 = ks * cfg.K_SLICE + c * cfg.GATE_COLS
-        parts[:, q] = (x[:, k0 : k0 + cfg.GATE_COLS] * wg[k0 : k0 + cfg.GATE_COLS]).sum(dim=1)
-    gate = torch.sigmoid(parts.sum(dim=1, keepdim=True))
+    leaves = torch.zeros(T, cfg.GATE_PARTS, device=dev)
+    for q in range(cfg.GATE_PARTS):  # leaf q = ks x GROUPS + g: the GATE_COLS columns ks K_SLICE + g GATE_COLS ..
+        ks, g = divmod(q, cfg.GROUPS)
+        k0 = ks * cfg.K_SLICE + g * cfg.GATE_COLS
+        leaves[:, q] = (x[:, k0 : k0 + cfg.GATE_COLS] * wg[k0 : k0 + cfg.GATE_COLS]).sum(dim=1)
+    if cfg.GATE_CLUSTER_FOLD_EFF:  # slot g = the K_SPLIT leaves of group g in rank order (on the cluster leader)
+        slots = torch.zeros(T, cfg.GROUPS, device=dev)
+        for ks in range(cfg.K_SPLIT):
+            slots = slots + leaves[:, ks * cfg.GROUPS : (ks + 1) * cfg.GROUPS]
+    else:
+        slots = leaves
+    assert slots.shape[1] == cfg.GATE_SLOTS
+    gate = torch.sigmoid(slots.sum(dim=1, keepdim=True))
     return (y * gate).bfloat16()
 
 

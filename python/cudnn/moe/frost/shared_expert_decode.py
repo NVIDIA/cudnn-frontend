@@ -13,7 +13,8 @@ The op: ``y = sigmoid(x W_g^T) * ( (silu(x W_gate^T) * (x W_up^T)) W_d^T )`` for
 [2 I, H] bf16 row-major (gate rows first), ``w_down`` [H, I] bf16 row-major, ``w_gate`` [H] (or [1, H]) bf16; fp32 accumulation in a fixed
 order per output element (the kernel module's docstring), ``act`` rounded ONCE to bf16 between the launches, ``y`` once at the end.  The add
 into the routed output stays with the caller.  Served (declined otherwise, by name): ``T`` in 1 .. 24 (a RUNTIME kernel argument; the form
--- one or two 16-token m-tiles -- is the compile key's), the validated geometries H 8192 with I 256 or 128, bf16 everywhere, contiguous
+-- one or two 16-token m-tiles, and the row-pair groups per CTA the one-wave rule picks for the part's SM count -- is the compile key's), the
+validated geometries H 8192 with I 256 or 128, bf16 everywhere, contiguous
 weights, x / y rows contiguous with a 16-byte-multiple row stride, every operand on the entry's device, a compute capability 10.x part
 (12.x holds no form in its 99 KB opt-in and is declined until one is measured), a CuTe DSL >= 4.8.0.
 
@@ -21,7 +22,7 @@ Launch knobs ``pdl`` / ``pdl_pair`` / ``pdl_release`` set the config's ``PDL`` /
 programmatic-stream-serialization attribute (CALLER OBLIGATION, the config docstring: the launch's immediate stream predecessor must not
 write ``w_gate_up`` / ``w_gate``, which load before the kernel's ``griddepcontrol.wait``), ``pdl_pair`` = launch 2's (its predecessor is
 launch 1; ``w_down`` loads before the wait), ``pdl_release`` = ``griddepcontrol.launch_dependents`` at both kernels' entry.  Every default
-is off (a knob measured before it defaults on).  Workspace: the inter-launch scratch ``act`` [32, I] bf16 and ``gate_part`` [32, GATE_PARTS]
+is off (a knob measured before it defaults on).  Workspace: the inter-launch scratch ``act`` [32, I] bf16 and ``gate_part`` [32, GATE_SLOTS]
 fp32 is entry-owned, allocated once per config at the first compile (outside any capture), never on the execute path (Rule 1); the launch
 reads no device memory to the host (Rule 3).  Two entries, or one entry on two streams concurrently, must not share a scratch: build one
 entry per concurrent stream.  Eager-path host cost: the form of a token count is memoized per m-tile count (``cfg_for``: one validated
@@ -238,9 +239,9 @@ class SharedExpertDecode:
         self.part: Dict[str, int] = {}
         if self.device.type == "cuda":
             self.readings = device_shared_memory(self.device)
-            self.part = part_readings(*self.readings)
             self.sm_count = device_multiprocessor_count(self.device)
-        base = cfg if cfg is not None else default_cfg(self.geometry, *self.readings)
+            self.part = part_readings(*self.readings, self.sm_count)
+        base = cfg if cfg is not None else default_cfg(self.geometry, *self.readings, *(() if self.sm_count is None else (self.sm_count,)))
         self.cfg: Cfg = self._on_this_part(base)
         self.compiled: Dict[tuple, Any] = {}
         self.scratch: Dict[Cfg, Dict[str, Any]] = {}
@@ -248,7 +249,7 @@ class SharedExpertDecode:
         self.out_buffer = None
 
     def _on_this_part(self, cfg: Cfg) -> Cfg:
-        """``cfg`` with this part's readings, the entry's geometry and the launch knobs, validated."""
+        """``cfg`` with this part's readings (shared memory, SM count), the entry's geometry and the launch knobs, validated."""
         cfg = replace(cfg, GEOM=self.geometry, **self.part, **self.launch_fields(cfg))
         validate_cfg(cfg)
         return cfg
@@ -280,7 +281,7 @@ class SharedExpertDecode:
         return (self.cfg_for(tokens), int(x.stride(0)), int(out.stride(0)))
 
     def scratch_for(self, cfg: Cfg) -> Dict[str, Any]:
-        """The inter-launch scratch of a config (``act`` [32, I] bf16, ``gate_part`` [32, GATE_PARTS] fp32), allocated once per config at
+        """The inter-launch scratch of a config (``act`` [32, I] bf16, ``gate_part`` [32, GATE_SLOTS] fp32), allocated once per config at
         its first compile (outside any capture); rows past the call's ``T`` are never written.  ``views`` holds their DSL views (built at
         the first ``_args``; the tensors never move, so the views are static)."""
         if cfg not in self.scratch:
@@ -288,7 +289,7 @@ class SharedExpertDecode:
 
             self.scratch[cfg] = dict(
                 act=torch.zeros(SCRATCH_ROWS, cfg.I, dtype=torch.bfloat16, device=self.device),
-                gate_part=torch.zeros(SCRATCH_ROWS, cfg.GATE_PARTS, dtype=torch.float32, device=self.device),
+                gate_part=torch.zeros(SCRATCH_ROWS, cfg.GATE_SLOTS, dtype=torch.float32, device=self.device),
             )
         return self.scratch[cfg]
 

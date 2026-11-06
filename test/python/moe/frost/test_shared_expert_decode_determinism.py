@@ -5,9 +5,11 @@
 buffers, batch invariance of every token (alone at T 1 -- across the form boundary -- and inside T 6 / 24; the permuted rows; a duplicated
 token; neighbour isolation; a row-strided x / out view inside a wider slab), the two outputs of the pair (``y`` and the inter-launch
 ``act`` / ``gate_part`` scratch) compared as raw bytes, the inputs unmodified by a launch, the T 24 -> 25 boundary as the typed decline, and the goldens (one small case per geometry and form; recorded with
-``CUDNN_DETERMINISM_RECORD=<new dir>`` after the replay and the independent reference pass).  The independent reference is a separate
-check at the harness band (``test_shared_expert_decode.py``).  Row-position invariance of the ``m16n8k16`` datapath is the premise these
-cells pin (the kernel module's docstring, point 3)."""
+``CUDNN_DETERMINISM_RECORD=<new dir>`` after the replay and the independent reference pass): the default form's ``ksplit8`` sets (the rev 2
+class: eight K slices, the gate leaves folded on the cluster leader) and, on the v1 knob arm, the ``ksplit2`` / ``ksplit4`` sets recorded
+before the rev 2 change -- the arm reproducing them byte for byte is the proof that the rev 2 refactor moved no v1 addition.  The
+independent reference is a separate check at the harness band (``test_shared_expert_decode.py``).  Row-position invariance of the
+``m16n8k16`` datapath is the premise these cells pin (the kernel module's docstring, point 3)."""
 
 import pytest
 
@@ -140,13 +142,32 @@ def test_twenty_four_to_twenty_five_is_the_typed_decline():
 @pytest.mark.parametrize("g", GEOMETRIES, ids=_gid)
 def test_golden(g, tiles):
     """One small case per geometry and form: three executions, the independent reference, then the saved hashes (recorded into a NEW
-    directory with ``CUDNN_DETERMINISM_RECORD`` only after the replay and reference cells pass; a change of the pinned K_SPLIT is a new
-    golden set with a stated reason -- it moves the slice and gate trees)."""
+    directory with ``CUDNN_DETERMINISM_RECORD`` only after the replay and reference cells pass; a change of the pinned K_SPLIT or of the
+    gate tree is a new golden set with a stated reason -- the rev 2 ``ksplit8`` sets: K_SPLIT 2 / 4 -> 8 and the cluster-side gate fold)."""
     dev = _device_or_skip()
     tokens = 3 if tiles == 1 else 19
     ops = make_operands(tokens, device=dev, seed=500 + tiles, geometry=g)
     k = entry.SharedExpertDecode(dev, geometry=g)
     actual = assert_replays(lambda: run(k, ops), repeats=3)
     assert_in_band(actual["y"], reference(ops), f"{_gid(g)} golden T {tokens}")
-    assert k.cfg_for(tokens).TOKEN_TILES == tiles and k.cfg_for(tokens).K_SPLIT == kcfg.k_split_for(g)
+    form = k.cfg_for(tokens)
+    assert form.TOKEN_TILES == tiles and form.K_SPLIT == kcfg.k_split_for(g) == 8 and form.X_BULK_ROWS and form.GATE_CLUSTER_FOLD_EFF
     assert_golden(f"shared-expert-decode-{_gid(g)}-tiles{tiles}-ksplit{k.cfg.K_SPLIT}", ops, actual)
+
+
+@pytest.mark.parametrize("tiles", (1, 2))
+@pytest.mark.parametrize("g", GEOMETRIES, ids=_gid)
+def test_v1_arm_reproduces_the_v1_goldens(g, tiles):
+    """The v1 knob arm (``kcfg.v1_cfg``: K_SPLIT 2 at I 256 / 4 at I 128, the x ring, the launch-2 gate fold, one group per CTA) on the SAME
+    operands as :func:`test_golden` writes the bytes of the ``ksplit2`` / ``ksplit4`` goldens recorded before the rev 2 change: the shared
+    code paths (the mainloop, the folds, launch 2) moved no v1 addition."""
+    dev = _device_or_skip()
+    tokens = 3 if tiles == 1 else 19
+    ops = make_operands(tokens, device=dev, seed=500 + tiles, geometry=g)
+    arm = kcfg.v1_cfg(g)
+    k = entry.SharedExpertDecode(dev, cfg=arm)
+    actual = assert_replays(lambda: run(k, ops), repeats=3)
+    assert_in_band(actual["y"], reference(ops), f"{_gid(g)} v1 arm T {tokens}")
+    form = k.cfg_for(tokens)
+    assert form.TOKEN_TILES == tiles and not form.X_BULK_ROWS and not form.GATE_CLUSTER_FOLD_EFF and form.N_GROUPS_EFF == 1
+    assert_golden(f"shared-expert-decode-{_gid(g)}-tiles{tiles}-ksplit{arm.K_SPLIT}", ops, actual)
