@@ -36,7 +36,7 @@ imported from `cudnn`. The required settings below apply to this table.
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
-| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Supported | Supported |
+| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
@@ -51,7 +51,24 @@ imported from `cudnn`. The required settings below apply to this table.
   Initial/final state and state gradients use FP32.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
-  indices per query.
+  indices per query, except in SM100/SM103 plans that store dKV in
+  conflict-rank storage, which accept duplicate indices: BF16 H128 two-CTA
+  plans and generic plans for which `deterministic_dkv_mode` selects records
+  or the chain relay.
+- On SM100/SM103, `deterministic_dkv_mode` selects the sparse attention
+  backward dKV storage: `'records'` (default; conflict-rank storage where it
+  fits the shard, relay or private-plane layout, that layout elsewhere),
+  `'chain'`, or `'shards'`. Each mode is repeatable. The modes round dKV
+  differently; generic M64 plans give the same dSink bytes under every mode.
+  With any mode, as with the shard layouts alone, dKV is not batch invariant
+  once a batch spans several waves: the layout, its waves and its plane or
+  shard count follow the batch's query and KV extents. Forward results, dQ
+  and, for generic M64 plans, dSink keep their bytes while the batch keeps the
+  plan's layout. H128 two-CTA plans sum dSink in an order that follows query
+  positions, and H128 D576 plans with top-k 1024 or wider sort each query's
+  rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
+  keep the shard and relay layouts: `'records'` runs as `'shards'` and
+  `'chain'` is rejected.
 - QSA and dense indexer backward expose no determinism switch.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns

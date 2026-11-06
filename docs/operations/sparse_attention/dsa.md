@@ -316,25 +316,235 @@ full table and environment are recorded in `benchmark/dsa/README.md`.
 
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
-same-stream waves of at most 74 query tokens, with one two-CTA pair per query.
-Private FP32 accumulator slots and ordered duplicate-index writers give each
-update a fixed accumulation order. Stream ordering serializes slot reuse
-between waves, and fixed-order reductions produce `dKV` and `d_sink`. Both
-specializations keep the public workspace capacity of 128 FP32 dKV planes.
+same-stream waves with one two-CTA pair per query: D512 spreads the queries
+evenly over waves of at most 74, and D576 waves hold one query per two-SM
+cluster (at most 76) per wave round, at most 74 per round in three-round plans
+(devices with 152 or more SMs leave the remaining SMs idle there). Each wave
+accumulates dKV either in private FP32 slots or in conflict-rank storage
+(below); ordered duplicate-index writers and stream ordering between waves give
+each update a fixed accumulation order, and fixed-order reductions produce
+`dKV` and `d_sink`. With either H128 two-CTA layout, duplicate indices within a
+query row are inside the deterministic contract, as with the generic M64
+conflict-rank layouts (below) and unlike its shard and relay layouts and the
+SM90 deterministic path. The plan option `deterministic_dkv_mode` (below)
+picks the layout of H128 two-CTA plans: under `'records'` (the default) the
+plan chooses between the two layouts from the shapes, `'shards'` keeps the
+private-plane layout for every shape, and `'chain'` is rejected. The
+private-plane layouts hold 128 FP32 dKV planes for D512 and 96 for D576; H96
+D576 two-CTA plans always use their 96-plane layout. `'shards'` restores the
+private-plane layout but, for D512, not the bits of releases without
+conflict-rank storage: D512 private-plane plans stream the dK/dV round operands
+in four 32-head stages, which sums dKV in a different fixed order (dQ and
+`d_sink` are unchanged).
 
-Other deterministic envelopes with H16/H32/H64/H96/H128 use the bounded-wave
-M64 implementation. Ordinary extents select 32 dKV shards for
+**Conflict-rank dKV storage (deterministic H128 D512/D576).** Within a wave,
+the queries that select a KV row are ranked by their position in the wave. The
+query of rank `k < P` accumulates into dense FP32 plane `k` (the first write of
+a row above plane 0 stores, later ones add); higher ranks write compact
+overflow records, so every plane row and every record has a single writer per
+wave and the main kernel needs no writer ordering. A row that one query selects
+more than once takes per-slot records in every slot of that wave that selects
+it.
+A per-wave tail adds the overflow records to plane 0 in a fixed order (rank
+order, with long chains summed in fixed segments) and the per-slot records in
+(query, slot) order, with sorted slots for D576 top-k 1024 and wider; the final
+fold adds each row's used planes in plane order. Small setup kernels chained
+to the main kernels with programmatic dependent launch compute each wave's
+ranks and destination records before it runs. D512 plans with top-k 512 or
+less that keep at least three dense planes next to a doubled overflow area run
+these steps in a setup warp in each CTA of the preceding main kernel instead,
+and each wave's tail in the next main kernel's reducer warps, which shift a
+row's ranks off plane 0 while that tail is pending.
+
+- **When it is selected** — in `'records'` plans (the default; `'shards'`
+  plans keep the private-plane layout), automatically, from the KV extent and
+  the top-k width, whenever the conflict-rank workspace fits the private-plane
+  layout (D576 at top-k 128 also requires the layout sized for its expected
+  conflict load to need at most three quarters of it). Short KV extents
+  relative to the top-k width, where the private planes are already small,
+  keep the private-plane layout. The choice depends only on the batch's
+  shapes and the mode, so one problem always takes the same path.
+- **Workspace** — `scratch_workspace_bytes()` reports the selected layout; it
+  never exceeds the private-plane size of the same problem. The dense planes
+  fill a budget of about 1 GiB, but at least one plane (and the per-row state)
+  is kept, so past a few hundred thousand KV rows the workspace grows with the
+  KV extent: at `total_S_q=4096` about 2.1-2.4 GiB per million KV rows for D512
+  and 2.5-2.7 GiB for D576, about 1% of the private-plane layout (256 and
+  216 GiB per million rows). The D576 size also depends on the plan device's SM
+  count, through the cluster pairs each wave round launches: query
+  `scratch_workspace_bytes()` for the device that executes the plan, since a
+  size from a device with fewer SMs can be too small (`execute()` then rejects
+  the workspace). Every execution re-initializes the conflict-rank state it
+  reads, so one workspace can be reused across executions with different
+  `topk_idxs` and `topk_length`, and a captured plan replays new input contents
+  like the private-plane plans.
+- **Determinism** — outputs are bitwise reproducible from run to run on one
+  GPU and software runtime. Duplicate indices within a query row, `-1` and
+  out-of-range indices, and any `topk_length` are inside this contract. The
+  FP32 summation order is a fixed function of the plan and the indices: D512
+  waves follow the query count, D576 waves also the device's SM count, and D576
+  one-round plans wider than top-k 128 that would stride their waves first run
+  a probe launch that counts one wave's writers and picks strided or
+  consecutive waves from the index contents. Results are not claimed to be
+  bitwise equal across GPUs or software versions. Conflict-rank and
+  private-plane plans sum dKV and `d_sink` in different orders; their results
+  agree within FP32 rounding, not bitwise. dQ is bitwise equal in both layouts
+  except for D576 conflict-rank plans with top-k 1024 and wider, which sort
+  each query's rows by ranges of the KV extent. A sequence's dKV is not batch
+  invariant: packing it with other sequences changes the waves, the ranks and
+  the plane count that order its sums, and the sorted D576 plans also change
+  its dQ. `d_sink` follows the query positions in both layouts (see
+  [Determinism Support](/operations/determinism)).
+
+Other deterministic envelopes with H16/H32/H64/H96/H128 run the generic M64
+kernel. Its dKV storage is a plan-time choice, `deterministic_dkv_mode`
+(below): by default on SM100/SM103, conflict-rank records wherever their
+workspace does not exceed the shard or relay layout of the same plan, and that
+layout elsewhere and on other devices. H16/H32 use a masked M64 head tile.
+Deterministic H96 D576 outside the two-CTA envelope (FP16, other top-k widths,
+or other devices) runs the generic M64 kernel only with conflict-rank storage,
+so only on SM100/SM103; every other such plan composes the H64 kernel with the
+tuned H32 tail, keeps 128 FP32 dKV planes, and rejects an explicit
+`deterministic_relay_cluster_size`.
+
+**Deterministic dKV storage (`deterministic_dkv_mode`).** The option of
+`SparseAttentionBackward` and `sparse_attention_backward_wrapper` selects the
+dKV storage of deterministic SM100/SM103 plans of the generic M64 kernel as
+follows, and of the H128 two-CTA plans as described above:
+
+- `'records'` (default) — conflict-rank storage. Each query wave runs 148
+  query CTAs per head block (74 for 64 < H <= 128 when a full wave's records
+  would exceed 0.4 GiB, and for split pairs, below). Within a wave, the
+  queries that select a KV row are ranked by their wave position: rank `k`
+  below the plan's plane count `P` accumulates into dense FP32 plane `k` of
+  the row, higher ranks into slot-private overflow records, so every plane
+  row and every record has one writer per wave. Setup kernels before each
+  main kernel assign the wave's destinations and add the previous wave's
+  overflow records to plane 0 in rank order (long runs in fixed segments); a
+  row that one query selects more than once takes per-slot records, added in
+  (query, slot) order. The conversion folds each row's used planes in plane
+  order. `P` follows the expected number of writers per row and wave
+  (`W * top-k / total_S_kv` for `W` query CTAs per wave) plus a margin,
+  within about 1 GiB of planes.
+  H96/H128 run both 64-head blocks of a query as one two-CTA cluster: head
+  block 1 adds a tile after head block 0's reducer threads published their
+  adds of that tile through per-thread GPU-scope release/acquire completion
+  words. H <= 64 plans whose full-wave workspace exceeds 1.65 times the
+  larger of the half-wave workspace and 1 GiB run each query as a two-CTA
+  pair that splits its top-k tiles; the second CTA hands its FP32 dQ partial
+  to the first through the workspace. Plans with at least eight waves whose
+  KV rows fit in 48 MiB interleave the waves' queries (wave `w` of `n` holds
+  queries `w, w + n, ...`).
+- `'chain'` — the chain relay. Every head block of a wave runs in one launch
+  of 296 query positions. CTAs claim (position, head block) tickets in start
+  order and add into a shared plane row only after the row's previous chain
+  member signalled it, so each plane row accumulates in a fixed order without
+  overflow records. It applies only when the top-k width is at most 2048, the
+  plan's dense planes span at most 2^19 rows (about 174K KV rows at its floor
+  of three planes), and its workspace does not exceed the `'shards'` layout
+  (for H96 D576, the 128-plane layout of the H64 + H32 composition); every
+  other plan follows the `'records'` rule. In the table below, chain plans
+  need less workspace than records plans; which mode is faster depends on how
+  much the queries' top-k rows overlap, so profile both on the target
+  workload.
+- `'shards'` — the shard layout or the cluster relay described below, chosen
+  from the query and KV extents alone, with the kernels, workspace and
+  bitwise results of releases without this option.
+
+Further properties of the option:
+
+- **Validation** — values other than the default require `deterministic=True`
+  and unknown values are rejected. `'chain'` cannot be combined with
+  `deterministic_relay_cluster_size` and is rejected on SM90 and on the
+  two-CTA backends. On the H128 two-CTA backends `'records'` chooses between
+  conflict-rank and private-plane storage from the shapes and `'shards'`
+  selects the private-plane layout; H96 D576 two-CTA plans keep their 96-plane
+  layout under both. Under `'records'` and `'shards'`, an explicit relay size
+  selects that cluster relay. The option is part of the compiled plan and of
+  the wrapper's plan cache key.
+- **Devices** — conflict-rank storage (the `'records'` and `'chain'` layouts
+  and the H128 two-CTA conflict-rank layout) is provided on SM100 and SM103
+  (compute capability 10.0 and 10.3). On other SM100-family devices (compute
+  capability 10.7), a `'records'` plan runs as a `'shards'` plan, with the
+  same kernels, workspace and results, and `'chain'` is rejected with a
+  `ValueError` that names the compute capability.
+  `flash_attn_bwd_sm100_workspace_size()` takes the keyword-only `max_topk`,
+  `launch_pairs`, `dkv_mode` and `device_capability`: without `max_topk` it
+  returns the shard, relay or private-plane size, an upper bound for every
+  conflict-rank plan of the shape, and the default `device_capability=None`
+  sizes for an SM100/SM103 device.
+- **Workspace** — `scratch_workspace_bytes()` reports the selected layout and
+  is authoritative. It never exceeds the `'shards'` layout of the same plan
+  (for generic H96 D576 plans, the 128-plane layout of the H64 + H32
+  composition that their `'shards'` plans run). A records plan sizes a full
+  wave even when `total_S_q` is smaller, so its workspace does not shrink
+  further with the query count. Every execution re-initializes the state it
+  reads, so one workspace serves executions and CUDA Graph replays with
+  different `topk_idxs` and `topk_length`.
+- **Determinism** — each mode is bitwise reproducible from run to run on one
+  GPU and software runtime. `-1` and out-of-range indices and `topk_length`
+  values up to `topk_max` are inside the contract of every layout; records and
+  chain plans also clamp larger lengths to `topk_max`. Duplicate indices
+  within a query row are inside the contract of the records and chain layouts
+  but not of the shard and relay layouts, which the other modes also select
+  for some shapes; callers that need bitwise repeatability for every shape
+  should pass unique valid indices within each query's active top-k prefix.
+  The layouts sum dKV in different orders, so their dKV agrees within FP32
+  rounding, not bitwise. `d_sink` has the same bits under every layout of the
+  generic M64 kernel: one warp per head sums the queries in the same order (the
+  H64 + H32 composition of H96 D576 is a separate kernel). dQ does not depend on the
+  dKV layout either, except for chain plans, which gather a query's rows in
+  sorted order, and records plans with split pairs, which add two dQ partials.
+  dKV is not batch invariant once a batch spans several waves, with any layout:
+  the layout, the waves and the plane or shard count follow the batch's query
+  and KV extents. `d_sink` is: a uniform shift of the queries only rotates the
+  lanes of that warp (see [Determinism Support](/operations/determinism)).
+- **Compilation** — the wave size and the split and interleave choices are
+  compile-time constants of a records plan. For given heads, head dimension,
+  dtype, top-k width and KV extent, the wave order gives records plans two
+  compiled variants over the query count (interleaved or not), and 64-bit
+  addressing, which large query extents need, adds another; the storage a plan
+  selects depends on its query and KV extents. Each plan still compiles only
+  in `compile()`.
+- **Launches** — conflict-rank plans chain their kernels with programmatic
+  dependent launch. A records wave launches two setup kernels and its main
+  kernel; a chain wave does the same, with one more scan for the first wave,
+  and computes O.dO in its setup. Each execution adds an initialization, the
+  last wave's setup, the fold and the `d_sink` reduction (records plans also
+  launch a first-wave marking kernel and the O.dO kernel). The last grid of an
+  execution completes only after the fold, so the next launch on the stream
+  observes the final `dKV`. The 148-CTA wave matches the SM count of B200. The
+  wave and setup-grid sizes are plan constants that do not depend on the
+  device's SM count, and correctness relies only on the two CTAs of a cluster
+  being co-resident.
+
+Scratch (`scratch_workspace_bytes()`) of representative BF16 plans:
+
+| H | D_qk | Q | KV | top-k | `'shards'` | `'records'` | `'chain'` |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 576 | 128 | 32768 | 2048 | 2.250 GiB | 1.382 GiB | 1.003 GiB |
+| 64 | 576 | 16384 | 32768 | 2048 | 9.008 GiB | 1.389 GiB | 1.011 GiB |
+| 64 | 512 | 16384 | 32768 | 2048 | 8.008 GiB | 1.239 GiB | 0.963 GiB |
+| 64 | 576 | 4096 | 32768 | 512 | 9.002 GiB | 0.526 GiB | 0.505 GiB |
+| 64 | 576 | 4096 | 65536 | 2048 | 2.283 GiB | 1.387 GiB | 1.008 GiB |
+| 64 | 576 | 16384 | 131072 | 2048 | 9.258 GiB | 1.540 GiB | 0.879 GiB |
+| 64 | 576 | 16384 | 524288 | 2048 | 10.008 GiB | 1.859 GiB | 1.859 GiB (records) |
+| 64 | 576 | 16384 | 1048576 | 2048 | 20.008 GiB | 3.035 GiB | 3.035 GiB (records) |
+
+**Shard and relay layouts.** `deterministic_dkv_mode='shards'`, an explicit
+relay size, and shapes whose conflict-rank workspace would be larger use the
+bounded-wave shard layout. Ordinary extents select 32 dKV shards for
 `total_S_q <= 128`, 64 for `129..256`, and 128 for larger query batches.
 Queries run in same-stream waves with one CTA per shard; CTA lane `i` is the
-sole writer of FP32 dKV shard `i` in each wave. H16/H32 use a masked M64 head
-tile. H96/H128 split each query wave into ordered M64 head-block launches,
-preserving single-writer ownership without multiplying the number of shards.
-Kernel launch ordering serializes both head blocks and shard reuse across
-waves. The 32-shard specialization converts with one fixed-order reduction;
-the 64- and 128-shard specializations first fold groups of eight and then
-combine those groups in fixed order.
+sole writer of FP32 dKV shard `i` in each wave. H96/H128 split each query wave
+into ordered M64 head-block launches, preserving single-writer ownership
+without multiplying the number of shards. Kernel launch ordering serializes
+both head blocks and shard reuse across waves. The 32-shard specialization
+converts with one fixed-order reduction; the 64- and 128-shard
+specializations first fold groups of eight and then combine those groups in
+fixed order.
 
-If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
+If the selected shard layout would exceed 16 GiB, the generic M64 plan
 keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
 cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; larger
 queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
@@ -353,8 +563,12 @@ Disjoint sparse rows continue in parallel; the fixed rank order handles both
 low- and high-overlap top-k rows without a global semaphore dependency on
 non-resident CTAs. The selected 2, 4, 8, 16, or 32 planes are combined directly in
 the fixed-order conversion kernel, without an intermediate FP32 prefold.
+On SM100/SM103 under the default `'records'` mode, the automatic relay runs
+only where records do not apply: top-k widths above 14169 (a records wave
+counts its `148 * top-k` slots in a 21-bit field) and shapes whose records
+would need more workspace than the relay.
 Duplicate top-k indices within one query row remain outside the deterministic
-contract, as in the bounded-wave path. This condition is not checked at
+contract of the shard and relay layouts. This condition is not checked at
 runtime; callers that require bitwise repeatability must provide unique valid
 indices within each query's active top-k prefix.
 
@@ -372,12 +586,14 @@ it because its lower per-phase parallelism regresses profiled workloads. This
 is a plan-time specialization: it is part of the compile/cache key, fixes the workspace size,
 and remains unchanged during `execute()` and CUDA Graph replay. The default
 `None` preserves automatic selection. Requests on non-deterministic plans,
-non-generic backends, or shapes that do not require the large-context relay are
-rejected rather than silently ignored. An explicit choice may exceed the
+non-generic backends (including deterministic H96 D576 plans that keep the
+H64 + H32 composition), shapes that do not require the large-context relay,
+and `deterministic_dkv_mode='chain'` plans are rejected rather than silently
+ignored. An explicit choice may exceed the
 automatic policy's 32 GiB memory-first budget, so callers should always allocate
 the exact value returned by `scratch_workspace_bytes()`.
 
-For the ordinary policy, additional dKV workspace is
+For the shard layout, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
 uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
@@ -386,10 +602,17 @@ relay widths up to 32 and a 64-bit word for relay width 64. With
 `mask_word_bits` equal to 32 or 64, its FP32 storage rows are
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
 ceil(K8 / (mask_word_bits / relay_width)) * (mask_word_bits / 32) / D8)`.
-One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
+The conflict-rank layouts depend on the plane count, the wave and the top-k
+width. One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
 authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
 knob: keep the default `False` when bitwise run-to-run stability is not needed.
+
+The measurements below compare the shard and relay layouts
+(`deterministic_dkv_mode='shards'`) with the fixed 128-plane layout. The
+H128/D576 two-CTA row measures its private-plane layout, which `'shards'`
+plans keep; a default plan of that shape stores dKV in conflict-rank storage
+(0.916 GiB of scratch on a 148-SM B200; the size follows the SM count).
 
 On GB200 with BF16, `total_S_q=16384`, `top_k=2048`, `H=64`, `D_qk=576`, and
 `D_v=512`, the memory-first cluster-16 route reduces full scratch from
@@ -411,7 +634,7 @@ and this change require:
 The upstream 128-plane baseline does not fit in the test system's 185.0 GiB
 usable memory, so its 1M-KV latency cannot be measured. The following direct
 A/B covers every deterministic dispatch selected by the adaptive policy, plus
-the unchanged H128/D576 two-CTA control. All rows use BF16, D576/Dv512,
+the H128/D576 two-CTA private-plane control. All rows use BF16, D576/Dv512,
 top-k 2048, and contiguous inputs; H is 64 except for the H128 control.
 
 | Dispatch | Q | KV | Upstream scratch | This change scratch | Scratch change | Upstream latency | This change latency | Latency change |
@@ -490,6 +713,7 @@ result = DSA.sparse_attention_backward_wrapper(
     topk_length=topk_length,
     deterministic=True,  # optional; SM90/SM100 H16/H32/H64/H96/H128
     deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, 32, or 64 CTAs/group
+    deterministic_dkv_mode="records",  # optional: "chain" or "shards" (deterministic SM100/SM103 dKV storage)
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]

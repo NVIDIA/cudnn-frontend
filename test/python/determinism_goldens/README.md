@@ -20,6 +20,7 @@ pytest core/test_determinism_utils.py
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
+| `TestDSADeterministicDKV` | `sparse_attention_backward_wrapper` dKV layouts (`deterministic_dkv_mode`, SM100/SM103) | output, max logits, LSE (H128 D576: reference inputs) | dQ, dKV, dSink |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
 | `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
@@ -29,7 +30,8 @@ They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
 nonzero initial state and fixed output/final-state gradients. QSA lives in
 `QSA/cutedsl/test_qsa_determinism.py`; its public API has no determinism switch.
 It covers BF16 with 12:1, 24:2, and 6:1 query/KV head counts.
-DSA uses FP16/BF16 and enables `deterministic=True` on backward.
+DSA uses FP16/BF16 and enables `deterministic=True` on backward;
+`TestDSADeterministicDKV` also pins each SM100/SM103 dKV layout.
 
 Replay checks use fresh inputs and side-stream contention. Batch
 checks reuse exact sequence data and upstream gradients while removing,
@@ -55,8 +57,8 @@ node after parameter expansion. For example,
 Those eight executions are not eight reported tests. Backward cases also check
 the forward outputs and saved state used to compute gradients.
 
-The expanded set has **285 cases**: 279 operation cases and six harness
-controls. All 285 cases are L0,
+The expanded set has **330 cases**: 324 operation cases and six harness
+controls. All 330 cases are L0,
 including stress and boundary cases, so the default marker selects the full set.
 List the exact node IDs without executing the kernels:
 
@@ -126,10 +128,11 @@ Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 direction without a separate lookup table. A test stops at its first mismatch;
 later checks in that case are not claimed as passes.
 
-### DSA: 48 cases
+### DSA: 93 cases
 
-The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`.
-Each case checks all returned forward tensors. Backward uses deterministic
+The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`:
+48 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
+Each `TestDSA` case checks all returned forward tensors. Backward uses deterministic
 execution and checks dQ, the shared K/V latent gradient dKV, and dSink.
 The three `(heads, QK dimension, Top-K)` layouts are `(64,512,64)`,
 `(64,576,64)`, and `(128,512,128)`. The 576-wide path uses all QK dimensions
@@ -146,8 +149,9 @@ but only the first 512 KV dimensions for values.
 
 Packing shifts valid Top-K indices by the sequence's KV offset. Negative and
 out-of-bounds indices stay invalid; they must not name a neighboring KV row.
-Every active row has unique valid indices, as required by generic deterministic
-DSA backward. Duplicating a sequence creates a separate KV region.
+`TestDSA` rows have unique valid indices, as the shard and relay layouts of
+deterministic DSA backward require. Duplicating a sequence creates a separate
+KV region.
 
 dSink is one shared per-head vector, so it cannot be sliced by sequence.
 Backward batch checks isolate one target's loss: its dO stays fixed and all
@@ -155,6 +159,74 @@ other sequences receive zero dO. The complete dSink vector is then comparable
 to the target alone. Replay/reference cases also cover nonzero dO for every
 sequence. Empty-row sentinels retain their actual float dtype and raw bits;
 NaNs and non-finite outputs/gradients still fail.
+
+### DSA deterministic dKV layouts: 45 cases
+
+`TestDSADeterministicDKV` runs on SM100/SM103, where deterministic backward
+stores dKV in conflict-rank storage, and skips elsewhere: SM107 plans keep the
+shard layouts that `TestDSA` covers. Every case runs the public wrappers with
+`deterministic=True` and `deterministic_dkv_mode`, and asserts the backend and
+dKV layout each batch selects. Each layout packs two sequences; the packed
+batch spans several waves, and the KV extents keep fewer dense planes than a
+wave has queries, so shared rows also take overflow records.
+
+| Layout ID | Heads, QK dim, Top-K, dtype | Query lengths | KV lengths | Mode | Backend/layout |
+| --- | --- | --- | --- | --- | --- |
+| `records-h64-d512-k64-bf16` | 64, 512, 64, BF16 | 17, 300 | 1000, 1000 | `records` | generic M64, records |
+| `records-h64-d512-k64-fp16` | 64, 512, 64, FP16 | 17, 300 | 1000, 1000 | `records` | generic M64, records |
+| `records-h64-d576-k64-bf16` | 64, 576, 64, BF16 | 17, 300 | 1000, 1000 | `records` | generic M64, records |
+| `records-strided-h64-d512-k64-bf16` | 64, 512, 64, BF16 | 17, 1183 | 1000, 1000 | `records` | generic M64, records, strided waves |
+| `chain-h64-d512-k128-bf16` | 64, 512, 128, BF16 | 17, 300 | 2048, 2048 | `chain` | generic M64, chain relay |
+| `shards-h64-d512-k64-bf16` | 64, 512, 64, BF16 | 17, 300 | 1000, 1000 | `shards` | generic M64, shards |
+| `rank-fused-h128-d512-k128-bf16` | 128, 512, 128, BF16 | 40, 60 | 8192, 16384 | `records` | H128 D512 two-CTA, fused conflict-rank |
+| `rank-setup-h128-d512-k1024-bf16` | 128, 512, 1024, BF16 | 40, 60 | 8192, 16384 | `records` | H128 D512 two-CTA, per-wave-setup conflict-rank |
+| `rank-h128-d576-k128-bf16` | 128, 576, 128, BF16 | 17, 60 | 8192, 16384 | `records` | H128 D576 two-CTA, one-round conflict-rank |
+| `rank-sorted-h128-d576-k1024-bf16` | 128, 576, 1024, BF16 | 17, 60 | 2200, 2201 | `records` | H128 D576 two-CTA, one-round conflict-rank, sorted rows |
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_dkv_replay` | L0 | Every layout with full selections; the records BF16, chain, both H128 D512 and the D576 Top-K 128 layouts also with ragged and duplicate selections; shards also with ragged selections. Eight executions with fresh outputs, caller workspaces filled with 0x00, 0xA5 and 0xFF bytes, and side-stream work; input mutation check; numerical reference | 21 |
+| `test_dkv_neighbor_isolation` | L0 | Every layout, ragged selections; the other sequence's values, Top-K selection and lengths change while the shapes stay; every result | 10 |
+| `test_batch_invariance` | L0 | Every layout except the sorted D576 one, ragged selections; each sequence alone, packed, reversed and duplicated; forward results, dQ and, for the generic M64 layouts, dSink | 9 |
+| `test_independent_of_dkv_storage` | L0 | Same inputs under two modes: records and shards (H64; forward results, dQ, dSink), chain and shards (forward results, dSink), conflict-rank and private planes (H128 D512 Top-K 128 and 1024, D576 Top-K 128; forward results and dQ) | 5 |
+
+Ragged selections add per-query lengths with empty rows and negative and
+out-of-range indices. Duplicate selections repeat a quarter of every row's slots
+and make every query select its sequence's KV row 0 Top-K / 32 times; they
+replay the larger sequence alone, so that row is shared by every query of a
+wave. Duplicates are inside the contract of every conflict-rank layout; no
+shard case uses them. H128 D576 has no public forward kernel: its sequences
+carry reference forward results as fixed backward inputs, so these cases
+compare no forward results.
+
+Known gaps, stated rather than tolerated:
+
+- dKV is not batch invariant once a batch spans several waves, on any layout.
+  A conflict-rank layout ranks a KV row's writers by their wave position and
+  sizes its dense planes from the batch's KV extent; the shard layouts take
+  their shard count from the batch's query extent and fold shards in groups;
+  the default mode picks the layout from the batch's extents. `develop`
+  changes dKV in the same multi-wave comparisons (validation record below).
+  `test_batch_invariance` therefore does not compare dKV.
+- Generic M64 plans reduce dSink with one warp per head (lane `t` sums queries
+  `t, t + 32, ...`, then an xor butterfly); a uniform query shift only rotates
+  the lanes, so dSink is batch invariant under the measured packings and
+  records and chain plans give the shard plans' bits. H128 two-CTA plans sum
+  dSink in an order that follows query positions, in both layouts, as on
+  `develop`; their batch cases do not compare dSink.
+- H128 D576 plans with Top-K 1024 and wider sort each query's rows by ranges of
+  the batch's KV extent and alternate the walk direction between waves, so
+  their dQ is not batch invariant either and differs in bits from the
+  private-plane plans; the sorted layout has replay and neighbor cases only.
+- Not exercised: records plans with split pairs (their dQ adds two partials
+  once the batch's KV extent selects them), chain plans whose rows are shared
+  by every active query of a wave (their tile order follows those rows),
+  H128 D576 one-round plans wider than Top-K 128 that stride their waves (the
+  wave order follows the batch's indices), the few-plane H128 D512 variant,
+  H96 D576 plans and the cluster relay. The L1 bitwise tests in
+  `test_DSA_sparse_attention_backward.py` cover several of these paths.
+- These layouts have no golden records; their bits depend on the plan, and
+  for D576 on the SM count.
 
 ### DSA BF16 indexer: 46 cases
 
@@ -336,6 +408,95 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
 ```
+
+## Deterministic dKV storage validation: 2026-11-06 (UTC)
+
+Change under test: conflict-rank dKV storage for deterministic SM100/SM103 DSA
+backward, the `deterministic_dkv_mode` option, conflict-rank plans that reduce
+dSink like the shard plans, and `TestDSADeterministicDKV`. Source revision:
+<RESULT revision>. The DSA suite was rerun; the other suites were not rerun
+for this change and keep their earlier results.
+
+The default plans of these `TestDSA` cases now select conflict-rank storage,
+so their dKV bits change: `test_replay[h128-d512-k128-bf16-bprop]` and the
+skipped H128 BF16 batch and query-boundary cases (fused H128 D512 layout), and
+the packed batch of the skipped `test_query_boundary[h64-q257-bprop]`
+(records). The golden cases (H64, D512, Top-K 16, query lengths 3 and 2) keep
+the 32-shard layout; no golden record changes.
+
+Run from `test/python`:
+
+```bash
+python -c 'import cudnn; print(cudnn.__file__)'
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 --collect-only -q
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -q -rs
+```
+
+The B200 runs below omitted `CUDNN_DETERMINISM_GOLDENS` because their runtime
+has no recorded baseline; the two golden cases then skip.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| B200, SM100, 148 SMs | Torch `2.14.0a0+4fdf77b940.nv26.08`, CUDA `13.4`, driver API `13040`, cuDNN `92500`, CuTe DSL `4.8.0` (CUDA 13.4 compiler), TVM FFI `0.1.13.post3`; key `3c93e700c060c612` | **86 passed, 0 failed, 7 skipped** in 192 s: 45 of 45 `TestDSADeterministicDKV`, 41 `TestDSA`; five temporary skips, two goldens without a baseline |
+| B200, SM100, 148 SMs | Same, CuTe DSL `4.8.0` with the CUDA 12.9 compiler | Earlier revision of this change, before the dSink reduction change: **85 passed, 0 failed, 7 skipped** in 186 s |
+| SM100, recorded runtime `5f8a825586430e85` | <RESULT runtime> | <RESULT pytest summary, including both goldens> |
+| B300, SM103, 148 SMs | <RESULT runtime> | <RESULT pytest summary> |
+
+The new cases take about 140 s of a B200 run with empty compile caches,
+mostly first-use compilation of their plans.
+
+With the temporary skips removed locally (not committed), four of the five
+`TestDSA` cases fail on B200 on dKV, as on `develop`; 42 passed and the two
+goldens skipped. The H128 cases now fail at the first packed batch, because the
+conflict-rank plane count follows the batch's KV extent.
+`test_query_boundary[h64-q257-bprop]` passes on B200: the target alone selects
+shards and the packed batch selects records, whose dQ and dSink match the shard
+plans and whose dKV for this target adds the same contributions in the same
+order. The case keeps its skip: SM107 plans keep the shard layouts, where it
+failed on dKV ([SM107 validation](#sm107-validation)), and the skip set is the
+union of the recorded failures.
+
+| Skipped case | First mismatch with conflict-rank storage (B200) |
+| --- | --- |
+| `TestDSA::test_batch_invariance[h128-d512-k128-bf16-bprop]` | batch (0, 1), sequence 0 dkv: 8/164864 bytes differ |
+| `TestDSA::test_query_boundary[h64-q129-bprop]` | batch (0, 1), sequence 0 dkv: 2/99328 bytes differ |
+| `TestDSA::test_query_boundary[h64-q257-bprop]` | passes |
+| `TestDSA::test_query_boundary[h128-q74-bprop]` | batch (0, 1), sequence 0 dkv: 8/164864 bytes differ |
+| `TestDSA::test_query_boundary[h128-q75-bprop]` | batch (0, 1), sequence 0 dkv: 9/164864 bytes differ |
+
+#### Batch layouts on `develop` and with this change (B200)
+
+The same comparisons ran on `develop` (no `deterministic_dkv_mode`) and with
+this change under `'shards'`, `'records'` and `'chain'`: each sequence alone
+against its slice of the packed, reversed and duplicated batches (six
+comparisons per configuration, other sequences' dO zero), neighbor isolation,
+and replay, on FP16 and BF16. Configurations: the `TestDSA` sequences (lengths
+17 and 3) for H64 D512, H64 D576 and H128 D512; H64 D512 Top-K 64 with lengths
+17 and 300 and KV 1000 + 1000 (three records waves), and lengths 17 and 1183
+(strided records waves), full and ragged selections; the same with KV
+2048 + 2048 (Top-K 128 and 64) for the chain relay. Counts are comparisons out
+of six with any differing byte.
+
+| Configuration | `develop` | `'shards'` | `'records'` | `'chain'` |
+| --- | --- | --- | --- | --- |
+| `TestDSA` sequences, H64 D512/D576 and FP16 H128 | none differ | none differ | none differ (shard layout selected) | none differ (shard layout selected) |
+| `TestDSA` sequences, BF16 H128 D512 (two-CTA) | dKV 1, dSink 2 | dKV 1, dSink 2 | dKV 3, dSink 2 | rejected (two-CTA backend) |
+| Three waves, FP16 and BF16, full / ragged | dKV 3 / 1 | dKV 3 / 1 | dKV 3 / 3 | dKV 5 / 2-3 |
+| Strided waves, FP16 and BF16, full / ragged | dKV 3 / 1 | dKV 3 / 1 | dKV 4-5 / 3 | dKV 4-5 / 3 |
+| KV 2048 + 2048, three and strided waves, FP16 and BF16, full / ragged | not run | dKV 1-3 / 1-2 | dKV 3 / 3 | dKV 3-5 / 2-3 |
+
+Forward results, dQ, replay and neighbor isolation matched in every
+configuration. Every generic configuration kept dSink under all three modes;
+records and chain dSink is bitwise the shard plans' dSink for the same inputs.
+`develop` and `'shards'` gave the same per-comparison counts. FP16 DSA backward
+on SM100/SM103 is listed as Replay only because `develop`'s shard layouts
+already change dKV at these multi-wave shapes; the earlier Supported status
+reflected the single-wave `TestDSA` shapes only.
+
+SM107 was not run for this change: its plans keep the shard layouts that
+`TestDSA` measured on SM107, and `TestDSADeterministicDKV` skips there.
 
 ## Baseline validation: 2026-11-04
 
