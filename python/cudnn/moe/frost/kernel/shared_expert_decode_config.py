@@ -33,7 +33,8 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same two kernel bodies; th
   ``GATE_PARTS`` leaves, both move with it); pinned per geometry by ``default_cfg`` (2 at I 256: 128 CTAs of 64 KB; 4 at I 128: 128 CTAs of
   32 KB) so the slice order of every output element is a function of the geometry alone, never of ``T``.
 * ``TOKEN_TILES`` (1, 2): m-tiles of 16 tokens -- the FORM axis the host entry picks from ``T`` (1 for ``T <= 16``, 2 for ``17 .. 24``);
-  bit-neutral by the row-position-invariance premise of section 4 of the design (a token's row of the A operand is contracted on its own).
+  bit-neutral by the row-position invariance of the ``m16n8k16`` datapath (a token's row of the A operand is contracted on its own; the
+  premise the batch-invariance cells of the determinism suite pin).
 * ``X_STAGES`` (0 = the budget rule: every chunk resident when the shared memory holds them, else the deepest ring that fits; >= 2 always):
   the ``cp.async`` ring depth of launch 1.  Bit-neutral.
 * ``W_PHASES`` (1, 2): mbarriers over the W slice's K halves so the first k-steps start on the first half.  Bit-neutral.
@@ -44,8 +45,9 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same two kernel bodies; th
   writes ``x``), ``PDL_PAIR`` = launch 2's (its predecessor is launch 1), ``PDL_RELEASE`` = ``griddepcontrol.launch_dependents`` at the entry
   of both kernels.  Both kernel bodies take ``griddepcontrol.wait`` UNCONDITIONALLY (a no-op without the attribute), so one cubin serves the
   programmatic and the plain arm; the attributes are launch facts.  CALLER OBLIGATION under ``PDL``: the launch's immediate stream
-  predecessor must not write ``w_gate_up`` / ``w_gate`` (they load before the wait; the serving chain's weights are static).  Under
-  ``PDL_PAIR`` the obligation is launch 1's own (``w_down`` is static).  Every default is off: a knob measured before it defaults on.
+  predecessor must not write ``w_gate_up`` / ``w_gate`` (the bulk copies of the W slice and every lane's gate-weight words issue before
+  the wait; ``x`` is read only after it; the serving chain's weights are static).  Under ``PDL_PAIR`` the obligation is launch 1's own
+  (``w_down`` prefetches before launch 2's wait and is static).  Every default is off: a knob measured before it defaults on.
 * ``SMEM_OPTIN_BYTES`` / ``SMEM_PER_SM_BYTES``: the part's readings (the host entry replaces the cc 10.x module constants with the device's).
 """
 
@@ -124,7 +126,7 @@ class Cfg:
         return self.GEOM.HIDDEN
 
     @property
-    def I(self) -> int:  # noqa: E743 - the design's name for the intermediate width
+    def I(self) -> int:  # noqa: E743 - the intermediate width, as the op is written
         return self.GEOM.INTERMEDIATE
 
     @property

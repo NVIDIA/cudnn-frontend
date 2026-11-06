@@ -62,9 +62,15 @@ BARRIER TABLE -- launch 1 (``gate_up``), 256 threads, cluster ``(K_SPLIT, 1, 1)`
                           [ledger: committed = (X_STAGES - 1) + i, pending <= X_STAGES - 2 -> chunks <= i landed], ``bar.sync 0, 256`` [RAW:
                           everyone's copies visible; WAR: the stage refilled next, (i + X_STAGES - 1) % X_STAGES = (i - 1) % X_STAGES, was
                           last read in iteration i - 1, before THIS barrier], issue chunk i + X_STAGES - 1 if < X_CHUNKS and COMMIT (an
-                          empty group on the tail path: every thread commits on every path), compute chunk i; after the loop
-                          ``wait_group 0`` (nothing outstanding at exit, P18 rule 5).  SUM at every ``bar.sync``: 256 = the launch's threads;
-                          X_CHUNKS barriers per CTA under ``range_constexpr`` (uniform control flow, P18 rule 4).
+                          empty group on the tail path: every thread commits on every path), compute chunk i; after the loop ``wait_group 0``
+                          (nothing outstanding at exit, P18 rule 5).  The gate-logit x pairs of warp 1 (GATE_COLS columns at
+                          ``gate_chunk = (cluster x GATE_COLS) // CHUNK_K`` of the CTA's slice) are read AFTER the red_s ``bar.sync``, in one
+                          instantiation that overlaps warp 0's fold and the cluster exchange: on an ALL-RESIDENT form (X_STAGES == X_CHUNKS:
+                          stage == chunk, no stage is ever refilled, every chunk landed -- ``wait_group 0`` by every thread, then the
+                          barrier) from stage ``gate_chunk`` of x_s; on a RING form from global x (the rows the ring streamed, in L2; a
+                          per-chunk region inside the unrolled mainloop would be instantiated X_CHUNKS times -- 6x the cubin at TILES 2).  SUM at every ``bar.sync``: 256 = the launch's threads;
+                          X_CHUNKS barriers per CTA under ``range_constexpr`` (uniform control flow, P18 rule 4); the gate region holds
+                          no barrier (warp-uniform shuffles under a CTA-uniform chunk test).
   red_s publish           ``bar.sync 0, 256`` (#X_CHUNKS + 1): every thread, after warps 1 .. 7 stored their accumulators.  SUM 256.
   exit                    leader: its mb_kred wait IS the drain (every shipped byte landed before its epilogue; the bulk copies completed
                           at the mb_w waits, the cp.async groups at ``wait_group 0``); peers: ``st.async`` has a register source and nobody
@@ -96,16 +102,22 @@ instruction: conflict-free).  Launch 1 (allocation order; the defaults: K_SPLIT 
                                                                                            mb_kred wait (the SENDER's timeline): its own
                                                                                            bytes, aliases nothing
   mb_w, mb_kred  u64 slots                                                        32 B
-  total                                                                202,912 / 206,496 B <= 232,448 B opt-in (cc 10.x); one CTA per SM
-  (I 128, K_SPLIT 4: w_s 32,896 + x_s 4 x 16,640 = 66,560 (all 4 chunks resident) + red_s + mail_s 1,536 + 32 -> ~104,600 B: two CTAs per
-  SM by shared memory, 128 CTAs on 152 SMs need one.)
+  total                                                                202,912 / 207,008 B <= 232,448 B opt-in (cc 10.x); one CTA per SM
+  (the figures are ``smem_table1(cfg)``'s, pinned by the host test ``test_default_form_figures_of_record``.  I 128, K_SPLIT 4: w_s 32,896 +
+  x_s 4 x 16,640 = 66,560 (all 4 chunks resident) + red_s 3,584 + mail_s 1,536 + 32 = 104,608 B at TILES 1 -- two CTAs per SM by shared
+  memory, 128 CTAs on 152 SMs need one; TILES 2: x_s 4 x 33,280 = 133,120 + red_s 7,168 + mail_s 3,072 -> 176,288 B.)
 Launch 2 (I 256; TPAD 16 / 32): wd_s 64 rows x pitch 528 B = 33,792 (``cp.async``, ``ldmatrix.x2``; 528 = 4 x 128 + 16); act_s TPAD x 528 =
-  8,448 / 16,896 (``cp.async``, ``ldmatrix.x4``); sig_s 32 fp32 = 128; total 42,368 / 50,816 B (I 128: pitch 272 = 2 x 128 + 16).
+  8,448 / 16,896 (``cp.async``, ``ldmatrix.x4``); sig_s 32 fp32 = 128; total 42,368 / 50,816 B (I 128: pitch 272 = 2 x 128 + 16; wd_s 17,408,
+  act_s 4,352 / 8,704; total 21,888 / 26,240 B).
 
 PDL SITES (P17).  Launch 1: ``launch_dependents`` at entry under PDL_RELEASE; ``griddepcontrol.wait`` (unconditional) AFTER the mbarrier
-inits, the W expect_tx + bulk copies and BEFORE the first x ``cp.async``, the gate-logit x loads and every global write.  Launch 2:
-``launch_dependents`` at entry under PDL_RELEASE (inert for a consumer launched without the attribute); ``griddepcontrol.wait`` AFTER the
-W_d prefetch + commit and BEFORE the act copies, the gate_part loads and every global write.  Neither kernel allocates TMEM, so the
+inits, the W expect_tx + bulk copies and the ``w_gate`` word loads (every lane; parameters, never a predecessor's output -- the CALLER
+OBLIGATION of the config docstring covers ``w_gate_up`` AND ``w_gate``) and BEFORE the first x ``cp.async``, the gate-logit x reads (the
+ring's resident stage, or global x on a ring form -- both after the mainloop) and every global write.  Launch 2: ``launch_dependents`` at entry under PDL_RELEASE; ``griddepcontrol.wait`` AFTER the
+W_d prefetch + commit and BEFORE the act copies, the gate_part loads and every global write.  An early release creates an obligation for
+the CONSUMER, not for this kernel: a grid launched after launch 2 WITHOUT the programmatic-stream-serialization attribute (the stock add of
+``y`` into the routed output) is inert to it; a consumer launched WITH the attribute may start while launch 2 runs and must issue its own
+``griddepcontrol.wait`` before it reads ``y`` (or touches anything either launch reads or writes).  Neither kernel allocates TMEM, so the
 release-above-alloc deadlock class does not arise; launch 2's CTAs (<= 51 KB) cannot share an SM with a live launch-1 CTA at the default
 form (~203 KB), so under PDL_PAIR its first CTAs start on the idle SMs and the rest as launch-1 CTAs retire.
 """
@@ -125,6 +137,7 @@ from cudnn.frost.tile_dsl.tma import (
     cp_async_gather_row16,
     cp_async_wait,
     ld_global,
+    ld_shared,
     ld_shared_v4,
     mapa_u32,
     st_async_v4_f32,
@@ -296,37 +309,54 @@ def _warp0_finish(cfg: cutlass.Constexpr, acc, red_base, mail_base, mb_kred, act
         _gate_up_epilogue(cfg, acc, act, cluster, lane, T)
 
 
+def _gate_x_word(cfg, resident, xs_base, x, XS, k_base, gcol0, gate_chunk, t, trow, col):
+    """The bf16x2 word of token ``t``'s two gate columns ``gcol0 + col ..``: from the ring's resident stage ``gate_chunk`` on an all-resident
+    form (``resident``, a Python bool: one arm traces), else from global ``x`` at the CLAMPED row ``trow`` (a ring form: the stage was
+    refilled; the rows the ring streamed sit in L2)."""
+    if resident:
+        return ld_shared(xs_base + ((gate_chunk * cfg.TPAD + t) * cfg.X_PITCH_ELEMS + gcol0 % CHUNK_K + col) * 2, INT32)
+    return ld_global((x.iterator + (trow * XS + k_base + gcol0 + col)).toint(), INT32)
+
+
 @cute.jit
-def _gate_logit(cfg: cutlass.Constexpr, x: cute.Tensor, wg: cute.Tensor, gate_part: cute.Tensor, cluster, rank, lane, k_base, T, XS: cutlass.Constexpr):
-    """Warp 1 of CTA (c, ks): partial ``q = ks x CLUSTERS + c`` of the gate logit over its GATE_COLS columns ``k_base + c x GATE_COLS ..``:
-    lane ``l`` walks column pairs ``2l + 64p`` (predicated on ``< GATE_COLS``; a dead pair leaves the chain untouched = +0.0 at a fixed
-    position; its source column is clamped to a valid one), ``acc = fma(x_hi, w_hi, fma(x_lo, w_lo, acc))`` per pair in order, the 5-step
-    butterfly, lane 0 writes ``gate_part[t][q]``; after ``griddepcontrol.wait`` (x is the predecessor's output)."""
-    q = rank * cfg.CLUSTERS + cluster
-    gk0 = k_base + cluster * cfg.GATE_COLS
-    cols = []
-    lives = []
-    wlo = []
-    whi = []
-    for p in cutlass.range_constexpr(cfg.GATE_PAIRS_PER_LANE):
-        colp = lane * 2 + 64 * p
-        live = colp < cfg.GATE_COLS
-        colc = _select_i32(live, colp, INT32(0))
-        lo, hi = f16x2_to_f32(ld_global((wg.iterator + (gk0 + colc)).toint(), INT32), dtype=BF16)
-        cols.append(colc)
-        lives.append(live)
-        wlo.append(lo)
-        whi.append(hi)
+def _gate_logit(
+    cfg: cutlass.Constexpr,
+    resident: cutlass.Constexpr,
+    x_s,
+    x: cute.Tensor,
+    XS: cutlass.Constexpr,
+    k_base,
+    gcol0,
+    gate_chunk,
+    cols,
+    lives,
+    wlo,
+    whi,
+    gate_part: cute.Tensor,
+    q,
+    lane,
+    T,
+):
+    """Warp 1 of CTA (c, ks), after the mainloop: partial ``q = ks x CLUSTERS + c`` of the gate logit over the CTA's GATE_COLS gate columns
+    ``k_base + gcol0 ..`` for every one of the TPAD rows (a row past ``T`` reads the ring's zero fill, or row 0 clamped on a ring form; its
+    chain is computed and never stored).  Lane ``l`` walks its column pairs in order, ``acc = fma(x_hi, w_hi, fma(x_lo, w_lo, acc))`` per
+    pair (a dead pair leaves the chain untouched through the select), one 5-step butterfly per token -- all TPAD chains in ONE straight-line
+    block (the loads fly together, ptxas interleaves the independent shuffle chains), then lane 0 stores the live rows.  One instantiation
+    per kernel, overlapping warp 0's fold and the cluster exchange."""
+    xs_base = _smem_addr(x_s)
+    vals = []
     for t in cutlass.range_constexpr(cfg.TPAD):
-        if t < T:
-            acc = opaque_f32_zero()
-            for p in cutlass.range_constexpr(cfg.GATE_PAIRS_PER_LANE):
-                xlo, xhi = f16x2_to_f32(ld_global((x.iterator + (t * XS + gk0 + cols[p])).toint(), INT32), dtype=BF16)
-                nxt = _fma_f32(xhi, whi[p], _fma_f32(xlo, wlo[p], acc))
-                acc = _select_f32(lives[p], nxt, acc)
-            acc = _butterfly(acc)
-            if lane == 0:
-                gate_part[t * cfg.GATE_PARTS + q] = acc
+        acc = opaque_f32_zero()
+        trow = _select_i32(t < T, INT32(t), INT32(0))
+        for p in cutlass.range_constexpr(cfg.GATE_PAIRS_PER_LANE):
+            xlo, xhi = f16x2_to_f32(_gate_x_word(cfg, resident, xs_base, x, XS, k_base, gcol0, gate_chunk, t, trow, cols[p]), dtype=BF16)
+            nxt = _fma_f32(xhi, whi[p], _fma_f32(xlo, wlo[p], acc))
+            acc = _select_f32(lives[p], nxt, acc)
+        vals.append(_butterfly(acc))
+    if lane == 0:
+        for t in cutlass.range_constexpr(cfg.TPAD):
+            if t < T:
+                gate_part[t * cfg.GATE_PARTS + q] = vals[t]
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -388,17 +418,32 @@ def frost_shared_expert_gate_up(
         # right before the first cross-CTA op
         nvvm.barrier_cluster_arrive_relaxed()
 
+    # ---- the gate-logit weights (parameters, never a predecessor's output): every lane's GATE_PAIRS_PER_LANE words, BEFORE the wait;
+    # the CTA's gate columns k_base + gcol0 .. lie inside its own K slice, in ring chunk gate_chunk ----
+    gcol0 = cluster * cfg.GATE_COLS
+    gate_chunk = gcol0 // CHUNK_K
+    gate_q = rank * cfg.CLUSTERS + cluster
+    gcols = []
+    glives = []
+    wlo = []
+    whi = []
+    for p in cutlass.range_constexpr(cfg.GATE_PAIRS_PER_LANE):
+        colp = lane * 2 + 64 * p
+        live = colp < cfg.GATE_COLS
+        colc = _select_i32(live, colp, INT32(0))
+        lo, hi = f16x2_to_f32(ld_global((wg.iterator + (k_base + gcol0 + colc)).toint(), INT32), dtype=BF16)
+        gcols.append(colc)
+        glives.append(live)
+        wlo.append(lo)
+        whi.append(hi)
+
     # ---- the predecessor's output (x) is read only past this point; every global write sits below it ----
     wait_on_dependent_grids()
 
-    # ---- the x ring prologue: chunks 0 .. STAGES - 2 (X_PROLOGUE_GROUPS groups, every thread) ----
-    for c in cutlass.range_constexpr(STAGES - 1):
+    # ---- the x ring prologue: chunks 0 .. X_STAGES - 2 (X_PROLOGUE_GROUPS groups, every thread) ----
+    for c in cutlass.range_constexpr(cfg.X_PROLOGUE_GROUPS):
         _issue_x_chunk(cfg, x, x_s, c, c, k_base, tid, T, XS)
         cp_async_commit()
-
-    # ---- the gate logit partial (warp 1; overlaps the ring) ----
-    if warp == 1:
-        _gate_logit(cfg, x, wg, gate_part, cluster, rank, lane, k_base, T, XS)
 
     # ---- mainloop: warp w runs k16 steps 4w .. 4w + 3 of every chunk, one accumulator chain per (m-tile, lane) ----
     acc = []
@@ -406,9 +451,9 @@ def frost_shared_expert_gate_up(
         acc.extend(_zeros4())
     kw = warp * 4 * MMA_K  # the warp's first k column inside a chunk
     for i in cutlass.range_constexpr(cfg.X_CHUNKS):
-        cp_async_wait(STAGES - 2)
+        cp_async_wait(cfg.X_WAIT_PENDING)
         nvvm.barrier_cta_sync(0, thread_count=cfg.THREADS)
-        nxt = i + STAGES - 1
+        nxt = i + cfg.X_PROLOGUE_GROUPS
         if cutlass.const_expr(nxt < cfg.X_CHUNKS):
             _issue_x_chunk(cfg, x, x_s, nxt, nxt % STAGES, k_base, tid, T, XS)
         cp_async_commit()  # every thread, every path (an empty group on the tail)
@@ -438,6 +483,11 @@ def frost_shared_expert_gate_up(
         nvvm.barrier_cluster_wait()  # every thread: the peers' inits are published before any cross-CTA op below
     if warp == 0:
         _warp0_finish(cfg, acc, red_base, mail_base, mb_kred, act, cluster, rank, lane, T)
+    # ---- the gate logit partial (warp 1, one instantiation, overlapping warp 0's fold / cluster exchange): the x pairs from stage
+    # gate_chunk of the ring on an all-resident form (stage == chunk, nothing refilled, every chunk landed: wait_group 0 by every thread,
+    # then the barrier above), from global (L2) on a ring form ----
+    if warp == 1:
+        _gate_logit(cfg, STAGES == cfg.X_CHUNKS, x_s, x, XS, k_base, gcol0, gate_chunk, gcols, glives, wlo, whi, gate_part, gate_q, lane, T)
 
 
 frost_shared_expert_gate_up.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -494,18 +544,28 @@ def frost_shared_expert_down(
         cp_async_gather_row16(act_s.subview(row * pitch + g16 * 8), _gmem_ptr(act, srow * I + g16 * 8), live)
     cp_async_commit()
 
-    # ---- the gate fold: warp w folds tokens w, w + WARPS2, ..: lane l reads its GATE_PARTS / 32 partials in order, the butterfly, sigmoid ----
+    # ---- the gate fold: warp w folds tokens w, w + WARPS2, ..: lane l reads its GATE_PARTS / 32 partials in order (every token's loads
+    # issued up front from a CLAMPED row -- row 0 for a token past T, in-bounds in the [32, GATE_PARTS] scratch, its chain never stored),
+    # the butterfly, then lane 0 stores sigmoid of the live tokens ----
     PP = cfg.GATE_PARTS_PER_LANE
+    parts = []
     for j in cutlass.range_constexpr(cfg.TOKENS_PER_WARP2):
         t = warp + cfg.WARPS2 * j
-        if t < T:
-            base = t * cfg.GATE_PARTS + lane * PP
-            logit = gate_part[base]
-            for k in cutlass.range_constexpr(1, PP):
-                logit = logit + gate_part[base + k]
-            logit = _butterfly(logit)
-            if lane == 0:
-                sig_s[t] = sigmoid(logit)
+        tc = _select_i32(t < T, t, INT32(0))
+        base = tc * cfg.GATE_PARTS + lane * PP
+        for k in cutlass.range_constexpr(PP):
+            parts.append(gate_part[base + k])
+    logits = []
+    for j in cutlass.range_constexpr(cfg.TOKENS_PER_WARP2):
+        logit = parts[j * PP]
+        for k in cutlass.range_constexpr(1, PP):
+            logit = logit + parts[j * PP + k]
+        logits.append(_butterfly(logit))
+    if lane == 0:
+        for j in cutlass.range_constexpr(cfg.TOKENS_PER_WARP2):
+            t = warp + cfg.WARPS2 * j
+            if t < T:
+                sig_s[t] = sigmoid(logits[j])
 
     cp_async_wait(0)
     nvvm.barrier_cta_sync(0, thread_count=cfg.THREADS2)  # the ONE CTA barrier: wd_s, act_s and sig_s are published

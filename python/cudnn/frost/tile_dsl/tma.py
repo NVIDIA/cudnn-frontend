@@ -577,6 +577,15 @@ def st_global_v4(addr, values, dtype):
     )
 
 
+def ld_shared(addr, dtype):
+    """32-bit shared load: one register of ``dtype`` from the shared-window address ``addr`` (the twin of :func:`ld_global`)."""
+    return nvvm.inline_ptx(
+        f"ld.shared.{ptx_type_suffix(dtype)} $0, [$1];",
+        write_only_types=[dtype],
+        read_only_args=[addr],
+    )
+
+
 def ld_shared_v2(addr, dtype):
     """64-bit shared load: two 32-bit registers of ``dtype`` from ``addr``."""
     return nvvm.inline_ptx(
@@ -613,23 +622,19 @@ def st_shared_v4(addr, values, dtype):
 
 # ---------------------------------------------------------------------------
 # DSMEM st.async: a register value into a PEER CTA's shared memory, completing tx bytes on the peer's mbarrier.
-# Promoted from the fused GDN decode step (``linear_attention/frost/kernel/gdn_decode_fused_f16.py``: ``_mapa_u32`` / ``_st_async_f32``,
-# the one-value norm exchange of its two-CTAs-per-head form) for the shared-expert decode pair's cluster K-reduction, which ships a lane's
-# four fp32 accumulators as ONE 16-byte ``st.async.v4``.  Both the destination and the mbarrier are 32-bit shared-window addresses
-# translated by ``mapa`` (translating only the data address fires the SENDER's barrier: ``frost-tile-dsl.md`` section 4).  The sender
-# owes no drain (a register source); the RECEIVER's mbarrier wait is the drain, and it takes the cluster-scope acquire
+# The shape of the fused GDN step kernels' private ``_mapa_u32`` / ``_st_async_f32`` (``linear_attention/frost/kernel/gdn_decode_fused_f16.py``,
+# ``gdn_verify_fused_f16.py``: the one-value norm exchange of their two-CTAs-per-head forms), here as the shared helpers for the shared-expert
+# decode pair's cluster K-reduction, which ships a lane's four fp32 accumulators as ONE 16-byte ``st.async.v4``.  The GDN kernels keep their
+# own scalar copies until their next kernel change (their cubins are pinned by md5; swapping an import is that PR's job, not this one's), so
+# only the forms with a caller live here: ``mapa_u32`` and the v4 ship.  Both the destination and the mbarrier are 32-bit shared-window
+# addresses translated by ``mapa`` (translating only the data address fires the SENDER's barrier: ``frost-tile-dsl.md`` section 4).  The
+# sender owes no drain (a register source); the RECEIVER's mbarrier wait is the drain, and it takes the cluster-scope acquire
 # (``barrier.wait_cluster_acquire``).  Lane ledger: one store per calling lane -- nothing here elects.
 
 
 def mapa_u32(addr32, rank):
     """``mapa.shared::cluster.u32``: this CTA's shared-window address translated to the same offset in cluster CTA ``rank``'s window."""
     return nvvm.inline_ptx("mapa.shared::cluster.u32 $0, $1, $2;", write_only_types=[cutlass.Int32], read_only_args=[addr32, rank])
-
-
-def st_async_f32(peer_addr32, value, peer_mbar32):
-    """One fp32 into a peer CTA's shared memory, completing 4 tx bytes on the peer's mbarrier (``st.async``; the DSMEM path, not the
-    bulk-copy unit)."""
-    nvvm.inline_ptx("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];", read_only_args=[peer_addr32, value, peer_mbar32])
 
 
 def st_async_v4_f32(peer_addr32, values, peer_mbar32):

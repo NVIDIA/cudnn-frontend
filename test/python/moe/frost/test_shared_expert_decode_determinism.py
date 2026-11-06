@@ -3,22 +3,18 @@
 
 """Determinism of the shared-expert decode pair (``cudnn.SharedExpertDecode``): bitwise replay under side-stream contention on fresh
 buffers, batch invariance of every token (alone at T 1 -- across the form boundary -- and inside T 6 / 24; the permuted rows; a duplicated
-token; neighbour isolation), the two outputs of the pair (``y`` and the inter-launch ``act`` / ``gate_part`` scratch) compared as raw bytes,
-the T 24 -> 25 boundary as the typed decline, and the goldens (one small case per geometry and form; recorded with
+token; neighbour isolation; a row-strided x / out view inside a wider slab), the two outputs of the pair (``y`` and the inter-launch
+``act`` / ``gate_part`` scratch) compared as raw bytes, the inputs unmodified by a launch, the T 24 -> 25 boundary as the typed decline, and the goldens (one small case per geometry and form; recorded with
 ``CUDNN_DETERMINISM_RECORD=<new dir>`` after the replay and the independent reference pass).  The independent reference is a separate
 check at the harness band (``test_shared_expert_decode.py``).  Row-position invariance of the ``m16n8k16`` datapath is the premise these
 cells pin (the kernel module's docstring, point 3)."""
-
-from pathlib import Path
-import sys
 
 import pytest
 
 torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_shared_expert_decode import GEOMETRIES, _device_or_skip, _gid, assert_in_band, make_operands, reference  # noqa: E402
+from shared_expert_utils import GEOMETRIES, _device_or_skip, _gid, assert_in_band, make_operands, reference  # noqa: E402
 
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot  # noqa: E402
 
@@ -95,12 +91,40 @@ def test_duplicated_token_and_neighbour_isolation(g):
     mixed = torch.cat([other[:5], ops["x"][2:3], other[5:19]], dim=0).contiguous()  # 20 rows (the two-tile form), the token at row 5
     got = snapshot(run(k, dict(ops, x=mixed)))
     assert_bitwise(rows(got, 5), alone, f"{_gid(g)} neighbours redrawn, the two-tile form")
-    slab = make_operands(4, device=dev, seed=402, geometry=g, x_rows=8)["x"]  # a 4-row view of an 8-row slab, then the same rows contiguous
+    slab = make_operands(4, device=dev, seed=402, geometry=g, x_rows=8)["x"]  # a 4-row slice of an 8-row slab (row stride H), then the same rows contiguous
     view_ops = dict(ops, x=slab)
     assert slab.shape[0] == 4
     a = snapshot(run(k, view_ops))
     b = snapshot(run(k, dict(ops, x=slab.clone())))
-    assert_bitwise(a, b, f"{_gid(g)} a strided x view vs a contiguous copy")
+    assert_bitwise(a, b, f"{_gid(g)} a row slice of a taller slab vs a contiguous copy")
+
+
+@pytest.mark.parametrize("tokens", (5, 20))
+@pytest.mark.parametrize("g", GEOMETRIES, ids=_gid)
+def test_row_strided_views_write_the_contiguous_bytes_and_leave_the_inputs_unmodified(g, tokens):
+    """``x`` and ``out`` as column slices of a slab with H + 64 columns (row stride 8,256 elements, a 16-byte multiple, != H: the ``XS`` /
+    ``YS`` compile key, the footprint arithmetic of the host views and the kernel's ``t x stride`` addressing): the live rows' bytes equal
+    the contiguous run's, the slab columns past H keep their sentinel, and every input tensor holds the bytes it held before the launch."""
+    dev = _device_or_skip()
+    H = g.HIDDEN
+    ops = make_operands(tokens, device=dev, seed=600 + tokens, geometry=g)
+    k = entry.SharedExpertDecode(dev, geometry=g)
+    before = snapshot({name: ops[name] for name in ("x", "w_gate_up", "w_down", "w_gate")})
+    contiguous = snapshot(run(k, ops))
+    x_slab = torch.full((tokens, H + 64), 2.0, dtype=torch.bfloat16, device=dev)
+    x_slab[:, :H] = ops["x"]
+    out_slab = torch.full((tokens, H + 64), 1.5e30, dtype=torch.bfloat16, device=dev)
+    xv, outv = x_slab[:, :H], out_slab[:, :H]
+    assert xv.stride(0) == H + 64 and not xv.is_contiguous()
+    k(xv, ops["w_gate_up"], ops["w_down"], ops["w_gate"], outv)
+    torch.cuda.synchronize()
+    s = k.scratch[k.cfg_for(tokens)]
+    strided = {"y": outv.contiguous(), "act": s["act"][:tokens].clone(), "gate_part": s["gate_part"][:tokens].clone()}
+    assert_bitwise(snapshot(strided), contiguous, f"{_gid(g)} T {tokens}: a row-strided x / out view vs the contiguous run")
+    assert (out_slab[:, H:] == torch.tensor(1.5e30, dtype=torch.bfloat16, device=dev)).all(), "the out slab's columns past H are untouched"
+    assert (x_slab[:, H:] == 2.0).all(), "the x slab's columns past H are untouched"
+    after = snapshot({name: ops[name] for name in ("x", "w_gate_up", "w_down", "w_gate")})
+    assert_bitwise(after, before, f"{_gid(g)}: the inputs after two launches")
 
 
 def test_twenty_four_to_twenty_five_is_the_typed_decline():

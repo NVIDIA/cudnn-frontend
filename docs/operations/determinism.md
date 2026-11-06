@@ -39,7 +39,7 @@ The required settings below apply to this table.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
-| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
+| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -77,9 +77,9 @@ a row alone and inside a batch under the entry's own picks.
   accumulation order of every output element is a function of the geometry
   alone (`K_SPLIT` pinned per geometry), so a token's bytes alone equal its
   bytes inside a batch of up to 24 tokens, across the one- and two-m-tile
-  forms; every other knob writes the default's bytes. SM100/103 is verified on
-  cc 10.3 (a GB300); cc 10.0 and cc 10.7 are unverified; SM90 and SM120 are
-  declined by type.
+  forms; every other knob writes the default's bytes. The SM100/103 cell
+  states its limit: verified on cc 10.3 (a GB300); cc 10.0 (and cc 10.7) run
+  the same admission, unverified; SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query.

@@ -5,9 +5,10 @@
 constants (the gate-logit partition, the SMEM tables, the ring ledger, the barrier constants) on the host, the typed declines of the host
 entry (CPU tensors), the plan-time-only compile key, the lazy export and the docs rows; on a cc 10.x device the pair against an fp64
 reference of the bf16 operands at the harness band, the padded-row hygiene, the CUDA-graph replay, and every knob arm bitwise with the
-default (the PDL arms, the ring depth, the W phases, the launch-2 row count), the K_SPLIT arms within the band (a rounding-order axis)."""
+default (the PDL arms, the ring depth, the W phases, the launch-2 row count), the K_SPLIT arms within the band (a rounding-order axis).
+The operand builders, the fp64 reference, the band check, the order model and the device gate live in ``shared_expert_utils.py`` beside
+this module (shared with ``test_shared_expert_decode_determinism.py``)."""
 
-import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,107 +17,23 @@ import pytest
 torch = pytest.importorskip("torch")
 cudnn = pytest.importorskip("cudnn")
 
+from shared_expert_utils import (  # noqa: E402  (the operand builders, the references and the device gate shared with the determinism module)
+    GEOMETRIES,
+    SM100_READING,
+    _device_or_skip,
+    _gid,
+    assert_in_band,
+    make_operands,
+    order_model,
+    reference,
+)
+
 from cudnn.moe.frost import shared_expert_decode as entry  # noqa: E402
 from cudnn.moe.frost.kernel import shared_expert_decode_config as kcfg  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
 REPO = Path(__file__).resolve().parents[4]
-GEOMETRIES = [kcfg.Geometry(8192, 256), kcfg.Geometry(8192, 128)]
-SM100_READING = (kcfg.SM100_SMEM_PER_SM_BYTES, kcfg.SM100_SMEM_OPTIN_BYTES)  # 233,472 / 232,448
-# the harness band for a bf16 multi-stage arm against an fp32 reference (never widened): rel-L2 and the per-element budget
-BAND = dict(rel_l2=2e-2, atol_rms=2**-5, rtol=2**-6, max_frac=1e-2)
-
-
-def _gid(g):
-    return f"h{g.HIDDEN}i{g.INTERMEDIATE}"
-
-
-def make_operands(tokens=6, device="cpu", seed=0, geometry=None, x_rows=None, structured=False):
-    """x [tokens, H] (optionally inside a taller row-strided slab), W_gu [2 I, H], W_d [H, I], W_g [H], bf16, std 1 / sqrt(fan_in) for the
-    weights (the harness's synth); ``structured`` = sign-structured data (a few large entries per row) beside the random draws."""
-    g = geometry or kcfg.DEFAULT_GEOMETRY
-    H, I = g.HIDDEN, g.INTERMEDIATE
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-
-    def rn(*shape, std=1.0):
-        return (torch.randn(*shape, generator=gen) * std).to(device)
-
-    rows = x_rows or tokens
-    x = rn(rows, H).bfloat16()
-    if structured:
-        x[:, ::97] *= 8.0
-        x[:, 1::131] = -x[:, 1::131]
-    return dict(
-        x=x[:tokens],
-        w_gate_up=rn(2 * I, H, std=1.0 / math.sqrt(H)).bfloat16(),
-        w_down=rn(H, I, std=1.0 / math.sqrt(I)).bfloat16(),
-        w_gate=rn(H, std=1.0 / math.sqrt(H)).bfloat16(),
-    )
-
-
-def reference(ops):
-    """The op in fp64 from the bf16 operands (a hand-rolled fp32 reference is a TF32 reference): ``sigmoid(x Wg) * ((silu(x Wgate^T) *
-    (x Wup^T)) Wd^T)``."""
-    x = ops["x"].double()
-    I = ops["w_down"].shape[1]  # noqa: E741
-    h = x @ ops["w_gate_up"].double().t()
-    act = torch.nn.functional.silu(h[:, :I]) * h[:, I:]
-    y = act @ ops["w_down"].double().t()
-    gate = torch.sigmoid(x @ ops["w_gate"].double().reshape(-1, 1))
-    return y * gate
-
-
-def band_metrics(out, ref):
-    """The harness's comparison: rel-L2 and the fraction of elements beyond ``2^-5 rms(ref) + 2^-6 |ref|``."""
-    o, r = out.double().reshape(-1), ref.double().reshape(-1)
-    diff = (o - r).abs()
-    rel_l2 = float(diff.norm() / r.norm().clamp(min=1e-30))
-    rms = float(r.pow(2).mean().sqrt().clamp(min=1e-30))
-    frac = float((diff > BAND["atol_rms"] * rms + BAND["rtol"] * r.abs()).double().mean())
-    return rel_l2, frac
-
-
-def assert_in_band(out, ref, label=""):
-    rel_l2, frac = band_metrics(out, ref)
-    assert rel_l2 <= BAND["rel_l2"], f"{label}: rel-L2 {rel_l2:.3e} > {BAND['rel_l2']}"
-    assert frac <= BAND["max_frac"], f"{label}: {frac:.3e} of the elements beyond the element budget (> {BAND['max_frac']})"
-
-
-def order_model(ops, cfg):
-    """The readable fp32 model of the documented reduction ORDER (the kernel module's docstring): per output element, the chain of
-    warp ``w``'s (chunk, step) k16 pieces inside each K slice, the warp sequence, the slice sequence; the gate logit as the GATE_PARTS-leaf
-    tree.  NOT bitwise with the tensor core (its k16 contraction order is the hardware's): a second reference and the spec of the order."""
-    x = ops["x"].float()
-    T, H = x.shape
-    I = cfg.I  # noqa: E741
-    wgu, wd, wg = ops["w_gate_up"].float(), ops["w_down"].float(), ops["w_gate"].float()
-    h = torch.zeros(T, 2 * I)
-    for ks in range(cfg.K_SPLIT):
-        slice_sum = torch.zeros(T, 2 * I)
-        warp_parts = []
-        for w in range(cfg.WARPS):
-            acc = torch.zeros(T, 2 * I)
-            for chunk in range(cfg.X_CHUNKS):
-                for s in range(4 * w, 4 * w + 4):
-                    k0 = ks * cfg.K_SLICE + chunk * kcfg.CHUNK_K + s * kcfg.MMA_K
-                    acc = acc + x[:, k0 : k0 + kcfg.MMA_K] @ wgu[:, k0 : k0 + kcfg.MMA_K].t()
-            warp_parts.append(acc)
-        for part in warp_parts:  # ((C_0 + C_1) + C_2) + ..
-            slice_sum = slice_sum + part
-        h = h + slice_sum  # ((S_0 + S_1) + ..)
-    act = (torch.nn.functional.silu(h[:, :I]) * h[:, I:]).bfloat16().float()
-    y = torch.zeros(T, H)
-    for s in range(cfg.K_STEPS2):
-        k0 = s * kcfg.MMA_K
-        y = y + act[:, k0 : k0 + kcfg.MMA_K] @ wd[:, k0 : k0 + kcfg.MMA_K].t()
-    parts = torch.zeros(T, cfg.GATE_PARTS)
-    for q in range(cfg.GATE_PARTS):
-        ks, c = divmod(q, cfg.CLUSTERS)
-        k0 = ks * cfg.K_SLICE + c * cfg.GATE_COLS
-        parts[:, q] = (x[:, k0 : k0 + cfg.GATE_COLS] * wg[k0 : k0 + cfg.GATE_COLS]).sum(dim=1)
-    gate = torch.sigmoid(parts.sum(dim=1, keepdim=True))
-    return (y * gate).bfloat16()
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -184,8 +101,9 @@ def test_smem_tables_fit_and_every_pitch_covers_the_banks(g, k_split, tiles):
 
 
 def test_default_form_figures_of_record():
-    """The numbers the design's section 5.3 states for the default (I 256, K_SPLIT 2): w_s 65,664, x_s 8 x 16 x 1,040 (Tpad 16) / 4 x 32 x
-    1,040 (Tpad 32), ~203 / ~207 KB in all, one CTA per SM; the I 128 default (K_SPLIT 4) holds two CTAs per SM by shared memory."""
+    """The default form's figures of record (I 256, K_SPLIT 2; the kernel module's SMEM table quotes these): w_s 65,664, x_s 8 x 16 x 1,040
+    (Tpad 16) / 4 x 32 x 1,040 (Tpad 32), 202,912 / 207,008 B in all, one CTA per SM; the I 128 default (K_SPLIT 4) 104,608 / 176,288 B
+    (two CTAs per SM by shared memory at Tpad 16)."""
     c1 = kcfg.make_cfg(TOKEN_TILES=1)
     c2 = kcfg.make_cfg(TOKEN_TILES=2)
     assert (c1.W_SMEM_BYTES, c1.X_STAGES_EFF, c1.X_CHUNK_BYTES, c1.X_SMEM_BYTES) == (65664, 8, 16640, 133120)
@@ -194,6 +112,7 @@ def test_default_form_figures_of_record():
     assert c1.co_resident_ctas1 == 1
     t16 = kcfg.CFG_TP16
     assert t16.K_SPLIT == 4 and t16.X_CHUNKS == 4 and t16.X_STAGES_EFF == 4 and t16.co_resident_ctas1 == 2 and t16.SMEM1_BYTES == 104608
+    assert replace(t16, TOKEN_TILES=2).SMEM1_BYTES == 176288 and kcfg.make_cfg(GEOM=GEOMETRIES[1], K_SPLIT=4, TOKEN_TILES=2).SMEM2_BYTES == 26240
     big = kcfg.make_cfg(K_SPLIT=4, MIN_CTAS_PER_SM=2)  # the 256-CTA arm at I 256 must co-reside twice: the budget rule halves the SM
     assert big.co_resident_ctas1 == 2 and big.SMEM1_BUDGET_BYTES == kcfg.SM100_SMEM_PER_SM_BYTES // 2 - kcfg.SMEM_CTA_RESERVE_BYTES
 
@@ -416,13 +335,14 @@ def test_import_cudnn_does_not_import_the_kernel_or_torch():
 
 
 def test_docs_rows_exist_for_the_api():
-    """The determinism status page carries the API's row (SM90 unsupported, SM100/103 supported, SM107 unverified) and the goldens README its
-    suite section; the operations docs page and the navigation entry exist."""
+    """The determinism status page carries the API's row (SM90 unsupported, SM100/103 supported with the cc 10.3-verified / cc 10.0-unverified
+    limit stated in the cell, SM107 unverified) and the goldens README its suite section; the operations docs page and the navigation entry
+    exist."""
     det = (REPO / "docs" / "operations" / "determinism.md").read_text()
     row = [l for l in det.splitlines() if l.startswith("| `SharedExpertDecode`")]
     assert len(row) == 1, "one SharedExpertDecode row on the status page"
     cells = [c.strip() for c in row[0].strip("|").split("|")]
-    assert cells[3] == "Unsupported" and cells[4] == "Supported" and cells[5] == "Unverified", cells
+    assert cells[3] == "Unsupported" and cells[4].startswith("Supported (cc 10.3 verified; cc 10.0 unverified") and cells[5] == "Unverified", cells
     readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
     assert "SharedExpertDecode" in readme and "test_shared_expert_decode_determinism.py" in readme
     assert (REPO / "docs" / "operations" / "moe" / "shared_expert_decode.md").exists()
@@ -439,19 +359,6 @@ def test_order_model_matches_the_fp64_reference_in_band():
 # ---------------------------------------------------------------------------------------------------------------------------
 # device
 # ---------------------------------------------------------------------------------------------------------------------------
-def _device_or_skip():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device required")
-    dev = torch.device("cuda", torch.cuda.current_device())
-    cc = torch.cuda.get_device_capability(dev)
-    if not entry.cc_supported(cc):
-        pytest.skip(f"the shared-expert decode pair serves cc 10.x; this device is {cc[0]}.{cc[1]}")
-    msg = entry._dsl_version_error()
-    if msg is not None:
-        pytest.skip(msg)
-    return dev
-
-
 def _run(k, ops, out=None):
     y = k(ops["x"], ops["w_gate_up"], ops["w_down"], ops["w_gate"], out)
     torch.cuda.synchronize()

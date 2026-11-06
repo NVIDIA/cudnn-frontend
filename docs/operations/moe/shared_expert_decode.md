@@ -49,7 +49,10 @@ Knobs (`cudnn.moe.frost.kernel.shared_expert_decode_config.Cfg`, passed as `cfg=
 Launch knobs `pdl` / `pdl_pair` / `pdl_release` set the programmatic-dependent-launch attributes of launch 1 / launch 2
 and the early release; all default off. Under `pdl=True` the launch's immediate stream predecessor must not write
 `w_gate_up` / `w_gate` (they load before the kernel's `griddepcontrol.wait`); the serving chain's static weights
-satisfy it.
+satisfy it. `pdl_release=True` creates an obligation for the consumer, not for the pair: a kernel launched after
+launch 2 with the programmatic-stream-serialization attribute (e.g. a fused add of `y` into the routed output) may
+start while launch 2 runs and must issue its own `griddepcontrol.wait` before it reads `y`; a consumer launched
+without the attribute (the stock add) is unaffected.
 
 ## Support matrix
 

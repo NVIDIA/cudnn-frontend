@@ -24,7 +24,10 @@ launch 1; ``w_down`` loads before the wait), ``pdl_release`` = ``griddepcontrol.
 is off (a knob measured before it defaults on).  Workspace: the inter-launch scratch ``act`` [32, I] bf16 and ``gate_part`` [32, GATE_PARTS]
 fp32 is entry-owned, allocated once per config at the first compile (outside any capture), never on the execute path (Rule 1); the launch
 reads no device memory to the host (Rule 3).  Two entries, or one entry on two streams concurrently, must not share a scratch: build one
-entry per concurrent stream.
+entry per concurrent stream.  Eager-path host cost: the form of a token count is memoized per m-tile count (``cfg_for``: one validated
+``Cfg`` per form, never a re-validation per call), the compile key is computed once per call, and the DSL views of the entry-owned scratch
+are built once per form (static pointers); the per-layer operands (``x``, the three weights, ``out``) are wrapped per call -- they change
+with every layer -- and the binding checks run on every call (Rule 1 keeps the validation, not the recomputation).
 """
 
 from dataclasses import replace
@@ -44,6 +47,7 @@ from .kernel.shared_expert_decode_config import (
     default_cfg,
     form_for,
     part_readings,
+    token_tiles_for,
     validate_cfg,
 )
 
@@ -240,6 +244,7 @@ class SharedExpertDecode:
         self.cfg: Cfg = self._on_this_part(base)
         self.compiled: Dict[tuple, Any] = {}
         self.scratch: Dict[Cfg, Dict[str, Any]] = {}
+        self.forms: Dict[int, Cfg] = {}  # token-tile count -> the validated form of self.cfg
         self.out_buffer = None
 
     def _on_this_part(self, cfg: Cfg) -> Cfg:
@@ -262,8 +267,13 @@ class SharedExpertDecode:
         return fields
 
     def cfg_for(self, tokens: int) -> Cfg:
-        """The config a plan for ``tokens`` compiles with: the entry's config in the token count's form (one or two m-tiles)."""
-        return form_for(self.cfg, tokens)
+        """The config a plan for ``tokens`` compiles with: the entry's config in the token count's form (one or two m-tiles), validated
+        once per form and memoized (``token_tiles_for`` still raises the typed decline of a token count past the ceiling on every call)."""
+        tiles = token_tiles_for(tokens)
+        form = self.forms.get(tiles)
+        if form is None:
+            form = self.forms[tiles] = form_for(self.cfg, tokens)
+        return form
 
     def key(self, tokens: int, x, out) -> tuple:
         """The compile key: plan-time facts only (the form of the token count, the strides, the config -- its geometry included)."""
@@ -271,7 +281,8 @@ class SharedExpertDecode:
 
     def scratch_for(self, cfg: Cfg) -> Dict[str, Any]:
         """The inter-launch scratch of a config (``act`` [32, I] bf16, ``gate_part`` [32, GATE_PARTS] fp32), allocated once per config at
-        its first compile (outside any capture); rows past the call's ``T`` are never written."""
+        its first compile (outside any capture); rows past the call's ``T`` are never written.  ``views`` holds their DSL views (built at
+        the first ``_args``; the tensors never move, so the views are static)."""
         if cfg not in self.scratch:
             import torch
 
@@ -291,7 +302,10 @@ class SharedExpertDecode:
 
     def _args(self, cfg, x, w_gate_up, w_down, w_gate, out):
         s = self.scratch_for(cfg)
-        return [_flat(x), _flat(w_gate_up), _flat(w_down), _flat(w_gate), _flat(s["act"]), _flat(s["gate_part"]), _flat(out)]
+        views = s.get("views")
+        if views is None:
+            views = s["views"] = (_flat(s["act"]), _flat(s["gate_part"]))
+        return [_flat(x), _flat(w_gate_up), _flat(w_down), _flat(w_gate), views[0], views[1], _flat(out)]
 
     def compile(self, x, w_gate_up, w_down, w_gate, out=None) -> None:
         """Validate (typed declines, on every call), gate the DSL, trace-compile the pair's host entry for this (form, strides) once."""
@@ -310,7 +324,7 @@ class SharedExpertDecode:
 
         from .kernel import shared_expert_decode_f16 as mod
 
-        cfg = self.cfg_for(T)
+        cfg = key[0]
         args = self._args(cfg, x, w_gate_up, w_down, w_gate, out)
         with torch.cuda.device(self.device):
             self.compiled[key] = cute.compile(mod.launch, cfg, *args, T, int(x.stride(0)), int(out.stride(0)), make_fake_stream())
@@ -327,7 +341,6 @@ class SharedExpertDecode:
         key = self.key(T, x, out)
         if key not in self.compiled:
             self.compile(x, w_gate_up, w_down, w_gate, out if given else None)
-        cfg = self.cfg_for(T)
-        args = self._args(cfg, x, w_gate_up, w_down, w_gate, out)
+        args = self._args(key[0], x, w_gate_up, w_down, w_gate, out)
         self.compiled[key](*args, T, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
         return out if given else out[:T]
