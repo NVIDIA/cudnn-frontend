@@ -51,7 +51,7 @@ _LAZY_EXPORTS = {
 }
 
 # Op families are subpackages; they resolve lazily like the ops above.
-_FAMILIES = ("dsa",)
+_FAMILIES = ("dsa", "nsa")
 
 __all__ = [*_LAZY_EXPORTS, *_FAMILIES]
 
