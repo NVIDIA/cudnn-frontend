@@ -245,7 +245,7 @@ set_compute_data_type(DataType_t value)
 
 ## RMSNorm Graph API
 
-`Graph::rmsnorm(x, scale, attributes)` (Python: `graph.rmsnorm(norm_forward_phase, input, scale=None, bias=None, epsilon)`)
+`Graph::rmsnorm(x, scale, attributes)` (Python: `graph.rmsnorm(norm_forward_phase, input, scale=None, bias=None, epsilon, adaptive=False)`)
 normalizes `x` by its root mean square and multiplies by `scale`. Training also returns `INV_VARIANCE`. Its dims are `x`'s
 dims, with 1 on every axis where `scale` is not 1. Those are the normalization axes.
 
@@ -354,8 +354,8 @@ set_compute_data_type(DataType_t value)
 ### Python API
 
 - adalayernorm_backward
-    - dy
-    - x
+    - grad
+    - input
     - scale
     - mean
     - inv_variance
@@ -393,6 +393,7 @@ set_compute_data_type(DataType_t value)
 
 - instancenorm
     - norm_forward_phase
+    - adaptive (optional, bool)
     - input
     - scale
     - bias
@@ -400,6 +401,9 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
+`adaptive` is a Python-only flag for the adaptive normalization variant: for a 3-D sequence-first `input` with a
+scale of shape `(S, 1, D)` or `(1, S, D)`, it changes the inferred `mean`/`variance` dims to per-token statistics
+instead of per-channel ones. It is accepted by `rmsnorm`, `instancenorm` and `instancenorm_backward`.
 
 ## Instancenorm Backward (DIN)
 
@@ -437,5 +441,6 @@ set_compute_data_type(DataType_t value)
     - scale
     - mean
     - inv_variance
+    - adaptive (optional, bool)
     - compute_data_type
     - name
