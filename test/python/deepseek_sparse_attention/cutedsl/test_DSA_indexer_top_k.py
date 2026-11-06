@@ -293,8 +293,8 @@ def test_DSA_indexer_top_k_sm120_deterministic_smem_limit(monkeypatch, dtype, ma
 @pytest.mark.parametrize("top_k", [129, 2048])
 def test_DSA_indexer_top_k_sm120_native_boundary(dtype, num_cols, top_k):
     """Admission must reach native compilation, execution, and changed-input replay."""
-    if torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("Native SM120 boundary qualification")
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        pytest.skip("Native SM120 / SM121 boundary qualification")
     DSA = _import_dsa()
     n_rows = 6
     columns = torch.arange(num_cols, device="cuda")
@@ -350,8 +350,8 @@ def test_DSA_indexer_top_k_sm120_native_boundary(dtype, num_cols, top_k):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_DSA_indexer_top_k_sm120_default_spill(dtype):
     """Small row counts must still fit the SM120 shared-memory budget."""
-    if torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("Native SM120 spill qualification")
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        pytest.skip("Native SM120 / SM121 spill qualification")
     DSA = _import_dsa()
     num_cols, top_k = 131072, 2048
     input_values = torch.randn(3, num_cols, dtype=dtype, device="cuda")
@@ -838,7 +838,7 @@ def test_DSA_indexer_top_k_deterministic_random_exact(dtype, n_rows, num_cols, t
     input_values = torch.randn(n_rows, num_cols, dtype=dtype, device="cuda")
     seq_lens = torch.full((n_rows,), num_cols, dtype=torch.int32, device="cuda")
 
-    if torch.cuda.get_device_capability() == (12, 0) and num_cols > (16384 if dtype == torch.float32 else 32768):
+    if torch.cuda.get_device_capability() in ((12, 0), (12, 1)) and num_cols > (16384 if dtype == torch.float32 else 32768):
         with pytest.raises(RuntimeError, match="SM120 supports at most"):
             DSA.IndexerTopK(input_values, seq_lens, top_k, return_val=return_val, deterministic=True).check_support()
         return
