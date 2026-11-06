@@ -646,6 +646,13 @@ def _memo_device() -> Tuple[Optional[int], Optional[int]]:
     return ordinal(_dev.current_device), ordinal(_dev.ambient_device)
 
 
+def _locked_compile(cute, fn, args, kwargs):
+    """``cute.compile`` under :func:`dsl_compile_lock`. Two keys may miss at once, but their traces must not overlap in
+    one process (see ``_DSL_COMPILE_LOCK``); other processes are unaffected."""
+    with _DSL_COMPILE_LOCK:
+        return cute.compile(fn, *args, **kwargs)
+
+
 def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: str = "kernel", **kwargs: Any) -> Any:
     """``cute.compile(fn, *args, **kwargs)`` with a persistent object behind it.
 
@@ -668,7 +675,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
     if cache_key is None:
         _refuse_compile(symbol)
         _count("bypassed")
-        return cute.compile(fn, *args, **kwargs)
+        return _locked_compile(cute, fn, args, kwargs)
     memo_key = (*_memo_device(), cache_key, symbol, options) if memo_enabled() else None
     if memo_key is not None:
         with _LOCK:
@@ -680,7 +687,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
     compiled = _compile_persistent(fn, args, kwargs, cache_key=cache_key, symbol=symbol, options=options)
     if memo_key is not None:
         with _LOCK:
-            # Threads that raced on an empty slot each compiled once; every one of them leaves with the
+            # Threads that raced on an empty slot each compiled once (one after another); every one of them leaves with the
             # FIRST object stored, so one key means one object for the rest of the process.
             compiled = _MEMO.setdefault(memo_key, compiled)
     _record(cache_key, symbol, options)
@@ -694,14 +701,14 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
     if not enabled() or "--enable-tvm-ffi" not in options:
         _refuse_compile(symbol)
         _count("bypassed")
-        return cute.compile(fn, *args, **kwargs)
+        return _locked_compile(cute, fn, args, kwargs)
     manifest = environment_manifest()
     if any(v == "unknown" for v in manifest.values()):
         # An environment that cannot identify itself shares nothing: two
         # incompatible stacks with the same unknowns would otherwise hash alike.
         _refuse_compile(symbol)
         _count("bypassed")
-        return cute.compile(fn, *args, **kwargs)
+        return _locked_compile(cute, fn, args, kwargs)
     root = get_cache_dir()  # one root for the export and the prune that follows it
     entry = _entry_dir(root, manifest, f"{cache_key}|{symbol}|{options}")
     loaded = _try_load(entry, cache_key, symbol)
@@ -711,7 +718,8 @@ def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, ca
     with _entry_lock(root, entry):
         # Another process may have published this exact artifact while we
         # waited. Warm loads above need no lock, and different keys can compile
-        # concurrently. Keep the lock through export and reload.
+        # concurrently in different processes (within one, _locked_compile
+        # serializes the traces). Keep the lock through export and reload.
         loaded = _try_load(entry, cache_key, symbol)
         if loaded is not None:
             _count("hits")
@@ -758,7 +766,7 @@ def _compile_and_export(fn, args, kwargs, root, entry, cache_key, symbol, manife
     """Compile a miss and return its reloaded artifact when export is supported."""
     import cutlass.cute as cute
 
-    compiled = cute.compile(fn, *args, **kwargs)
+    compiled = _locked_compile(cute, fn, args, kwargs)
     _count("misses")
     execution_args = getattr(compiled, "execution_args", None)
     if getattr(execution_args, "has_pointer_address_arg_specs", False) or not hasattr(compiled, "export_to_c"):
