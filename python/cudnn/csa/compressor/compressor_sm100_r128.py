@@ -183,6 +183,10 @@ def _compressor_fwd_r128_kernel(
     W: cutlass.Constexpr = coff * d
     col = bidy * threads_x + tidx
     bb = bidx  # one output row per CTA
+    # Keep the device-side logical row count outside the staged ``col < ncol``
+    # regions.  Multi-chunk schedules consume it again after the CTA barrier, and
+    # CuTeDSL does not carry Python names defined in one staged region into another.
+    nb_valid = mCuComp[n_seq]
 
     smem = SmemAllocator()
     # Partial-merge buffer, [tchunks][threads_x][vec] per quantity; unused (0 B) when
@@ -199,7 +203,6 @@ def _compressor_fwd_r128_kernel(
         # THD segment scan (identical to compressor_sm100): rows beyond the true
         # compressed count are static-capacity padding. They publish empty partials
         # through the same CTA barriers, then tidy==0 writes an exact zero.
-        nb_valid = mCuComp[n_seq]
         seq_idx = cutlass.Int32(0)
         bis = cutlass.Int32(0)
         if bb < nb_valid:
