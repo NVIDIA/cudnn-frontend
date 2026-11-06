@@ -19,7 +19,7 @@ class SdpaBwdDslSm120Thd(SdpaBwdDslSm80):
     _native_template_overrides = (("qo_stages", 1), ("dq_smem_coalesce", False))
 
     def _check_native_device(self, capability, device):
-        self._not_implemented_error_if(capability != (12, 0), f"SM120 THD backward requires cc 12.0; got {capability} on {device}")
+        self._not_implemented_error_if(capability not in ((12, 0), (12, 1)), f"SM120 THD backward requires cc 12.0 or 12.1; got {capability} on {device}")
 
     def _check_native_tiles(self):
         self._not_implemented_error_if(

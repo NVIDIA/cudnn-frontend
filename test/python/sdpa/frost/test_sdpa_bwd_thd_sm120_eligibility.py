@@ -44,6 +44,13 @@ def test_frost_thd_sm120_declines_outside_scope(overrides, token):
     assert token.lower() in reason(**overrides).lower()
 
 
+@pytest.mark.parametrize("device_cc", [(12, 0), (12, 1)])
+def test_frost_thd_sm120_family_admission(device_cc):
+    value = d128_facts(device_cc=device_cc)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    assert engines.mismatch(spec.capabilities, value) is None
+
+
 def test_frost_dense_sm120_eligibility_unchanged():
     assert reason(thd=False, padded=False, d_qk=64, d_v=64, h_kv=1) is None
 
