@@ -99,7 +99,7 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 
 from dataclasses import dataclass, replace
 
-from .gdn_geometry import CONV_WIDTH, DEFAULT_GEOMETRY, HEAD_DIM, TICKET_STRIDE, Geometry
+from .gdn_geometry import CONV_WIDTH, DEFAULT_GEOMETRY, HEAD_DIM, Geometry
 
 # --- the DEFAULT geometry's constants (the kernel reads ``cfg.GEOM``; these name the default for callers, docs and tests) ---
 K_HEADS = DEFAULT_GEOMETRY.K_HEADS  # 16
@@ -113,6 +113,7 @@ BA_CHUNKS = DEFAULT_GEOMETRY.BA_CHUNKS_DECODE  # 5 at the default geometry (``Ge
 CONV_THREADS = 128  # one Q, one K and one V channel per thread
 RMS_LANES = 16  # the reference RMS layout: lane l of a 16-lane group holds the 8 raw q / k values of columns 8 l .. 8 l + 7
 # counts[row * 512 + kh * 32]: the reference layout of the per-(row, K head) reader ticket (holds the envelope's 16 K heads)
+TICKET_STRIDE = DEFAULT_GEOMETRY.TICKET_STRIDE  # 512 at every geometry (``gdn_geometry.TICKET_STRIDE``); the kernels and entries read it from here
 TICKET_LIMIT = DEFAULT_GEOMETRY.VK_RATIO - 1  # 2: the third reader of a K head's conv history is the last (``Cfg.TICKET_LIMIT`` per form)
 
 # bytes the conv-operand bulk copies deliver on the one mbarrier: x pieces 3 x 256, conv weights 3 x 1024, history 3 x 3 x 256

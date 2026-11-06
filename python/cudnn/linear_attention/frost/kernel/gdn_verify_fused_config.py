@@ -133,7 +133,7 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from .gdn_geometry import BA_VERIFY_CHUNK, CONV_WIDTH, DEFAULT_GEOMETRY, HEAD_DIM, TICKET_STRIDE, Geometry
+from .gdn_geometry import BA_VERIFY_CHUNK, CONV_WIDTH, DEFAULT_GEOMETRY, HEAD_DIM, Geometry
 
 # --- the DEFAULT geometry's constants (the kernel reads ``cfg.GEOM``; these name the default for callers, docs and tests) ---
 K_HEADS = DEFAULT_GEOMETRY.K_HEADS  # 16
@@ -143,6 +143,7 @@ QKV_CHANNELS = DEFAULT_GEOMETRY.QKV_CHANNELS  # 10240
 K_CHANNEL0 = DEFAULT_GEOMETRY.K_CHANNEL0  # 2048: the first K channel of the QKV slab
 V_CHANNEL0 = DEFAULT_GEOMETRY.V_CHANNEL0  # 4096: the first V channel
 OUT_ROW = DEFAULT_GEOMETRY.OUT_ROW  # 6144 outputs per token row
+TICKET_STRIDE = DEFAULT_GEOMETRY.TICKET_STRIDE  # 512 at every geometry: counts[request * 512 + kh * 32] is the per-(request, K head) reader ticket
 THREADS = 256
 WARPS = THREADS // 32
 WARPGROUP = 128
