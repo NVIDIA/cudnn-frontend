@@ -367,7 +367,7 @@ graph.sdpa(
 - `diagonal_band_left_bound` (Optional[int]): Left bound for sliding window attention. Masks columns at or before `row_idx - left_bound`.
 - `diagonal_band_right_bound` (Optional[int]): Right bound for causal masking. Set to 0 for causal mask. Masks columns beyond `row_idx + right_bound`.
 - `dropout` (Optional[tuple]): Dropout configuration. Either `(probability, seed, offset)` for Philox RNG or `(mask, scale)` for custom mask.
-- `rng_dump` (Optional[cudnn_tensor]): Debug tensor to capture the Philox RNG dropout mask.
+- `rng_dump` (Optional[cudnn_tensor]): Debug tensor with shape $(B, H_q, S_q, S_{kv})$ and fp32 data that captures the Philox dropout mask. Its entries are the binary keep mask (0.0 or 1.0); the graph multiplies kept probabilities by $1/(1-p)$ before $P @ V$, so applying the mask to the softmax probabilities needs that same scale to reproduce `o`.
 - `score_max` (Optional[cudnn_tensor]): Side output, fp32 $(B, H_q, S_q, 1)$: per query row the maximum of the (scaled) attention scores the softmax normalizes against, in natural units; with an attention sink the sink logit counts as one more column. See [Score side outputs](#score-side-outputs-score_max-score_sum_exp).
 - `score_sum_exp` (Optional[cudnn_tensor]): Side output, fp32 $(B, H_q, S_q, 1)$: per query row $\sum_j e^{s_j - \max}$, the fp32 sum of exponentials normalized by `score_max` (the softmax denominator). `stats` $= $ `score_max` $+ \ln$ `score_sum_exp`.
 - `paged_attention_k_table` (Optional[cudnn_tensor]): Page table with block offsets into the K container.
