@@ -171,6 +171,7 @@ from .datatypes import _library_type, _is_torch_tensor
 
 __version__ = "1.33.0"
 CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
+CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
 
 
 def _tensor(
@@ -328,6 +329,7 @@ _EAGER_PUBLIC_NAMES = (
     "DeviceInfo",
     "__version__",
     "CUTEDSL_MIN_JAX_VERSION",
+    "CUTEDSL_MIN_JAX_VERSION_STR",
     "NodeType",
     "Tensor",
     "pygraph",

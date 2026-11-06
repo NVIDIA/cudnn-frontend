@@ -16,10 +16,10 @@ from importlib import import_module
 
 import jax as _jax
 
-from cudnn import CUTEDSL_MIN_JAX_VERSION
+from cudnn import CUTEDSL_MIN_JAX_VERSION, CUTEDSL_MIN_JAX_VERSION_STR
 
 if _jax.version.__version_info__ < CUTEDSL_MIN_JAX_VERSION:
-    raise ImportError(f"cudnn.jax requires jax >= {'.'.join(map(str, CUTEDSL_MIN_JAX_VERSION))}; found {_jax.__version__}")
+    raise ImportError(f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR}; found {_jax.__version__}")
 
 from .call import (
     call,

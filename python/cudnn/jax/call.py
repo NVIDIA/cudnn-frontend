@@ -15,11 +15,11 @@ import jax.numpy as jnp
 import cutlass.jax
 from cutlass.jax import TensorSpec, cutlass_call
 
-from cudnn import CUTEDSL_MIN_JAX_VERSION
+from cudnn import CUTEDSL_MIN_JAX_VERSION_STR
 
 if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
     raise ImportError(
-        f"cudnn.jax requires jax >= {'.'.join(map(str, CUTEDSL_MIN_JAX_VERSION))} and the CuTeDSL JAX extensions (cutlass.jax); "
+        f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR} and the CuTeDSL JAX extensions (cutlass.jax); "
         "install/upgrade jax (`pip install --group jax` from a checkout)"
     )
 

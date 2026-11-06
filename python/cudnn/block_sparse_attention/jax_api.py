@@ -10,14 +10,11 @@ import math
 import jax
 import jax.numpy as jnp
 
-from cudnn import CUTEDSL_MIN_JAX_VERSION
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 requirement_error = cutedsl_requirement_error("JAX BSA")
 if requirement_error:
     raise ImportError(requirement_error)
-if jax.version.__version_info__ < CUTEDSL_MIN_JAX_VERSION:
-    raise ImportError(f"JAX BSA requires jax >= {'.'.join(map(str, CUTEDSL_MIN_JAX_VERSION))}")
 
 from cudnn.api_base import TupleDict
 from cudnn.jax import TensorSpec, call, zeros_init
