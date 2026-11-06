@@ -40,12 +40,13 @@ from cudnn.linear_attention.frost.kernel import gdn_verify_fused_config as kcfg 
 pytestmark = [pytest.mark.L0]
 
 # the per-rank geometries of the larger dense models: (K heads, V heads, hidden) at 16- / 8- / 4-way tensor parallelism of a hidden-8192
-# model and at 4-way of a hidden-4096 one
+# model and at 4- / 8-way of a hidden-4096 one (8-way = two trays of four GPUs serving the 397B-class checkpoint: the rehearsal geometry)
 RANK_GEOMETRIES = [
     gdn_geometry.Geometry(1, 8, 8192),
     gdn_geometry.Geometry(2, 16, 8192),
     gdn_geometry.Geometry(4, 32, 8192),
     gdn_geometry.Geometry(4, 16, 4096),
+    gdn_geometry.Geometry(2, 8, 4096),
 ]
 
 
