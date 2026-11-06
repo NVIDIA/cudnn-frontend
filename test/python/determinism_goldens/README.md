@@ -659,4 +659,4 @@ and zero-upstream-gradient QSA cases pass.
 - [Megatron module tests](https://github.com/NVIDIA/Megatron-LM/tree/main/tests/unit_tests/determinism): fixed inputs, restored state, outputs and gradients.
 - [Megatron kernel replay PR](https://github.com/NVIDIA/Megatron-LM/pull/7148): raw-byte comparison, side-stream contention, negative controls, and coverage review.
 - [Nemotron functional tests](https://github.com/NVIDIA/Megatron-LM/tree/main/tests/functional_tests/test_cases/nemotron): deterministic execution and saved regression values.
-- [Internal recipe CI](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci): follow-up integration target; its contents were not accessible during this change.
+- Internal recipe CI (not linked from this public repository): follow-up integration target; its contents were not accessible during this change.
