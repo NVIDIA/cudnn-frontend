@@ -17,4 +17,5 @@ def test_cudnn_ops_name_is_the_existing_function(name):
         existing = getattr(cudnn, name)
     except ImportError as error:
         pytest.skip(f"cudnn optional dependencies not installed: {error}")
-    assert getattr(cudnn.ops, name) is existing
+    else:
+        assert getattr(cudnn.ops, name) is existing
