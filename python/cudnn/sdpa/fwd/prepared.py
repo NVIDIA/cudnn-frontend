@@ -263,6 +263,8 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     km = api._k_mod
     compiled = api._compiled_kernel
     host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
+    if getattr(api, "bias_desc", None) is not None and hasattr(km, "_host_bias"):
+        host = km._host_bias
     if getattr(api, "packed_thd_split", False):
         host = km._host_thd_split
     raw = positional_entry(compiled)
@@ -1009,7 +1011,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     effective_scale = -scale if getattr(api, "_score_negated", False) else scale
     put("inv_scale_softmax", 1.0 / effective_scale if effective_scale != 0.0 else 1.0)
     put("scale_softmax_log2", effective_scale * math.log2(math.e))
-    put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
+    put("scale_softmax", scale)  # SM90 (including zero) and the SM120 bias host retain natural units.
     put("thd_max_sq", int(api.s_q_max))
     put("n_thd_units", 0)
     put("seq_q_lens_addr", 0)

@@ -184,15 +184,15 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
         params = inspect.signature(fn).parameters
         assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
         assert params["sf_o"].default is None
-    # Append-only public signature: sf_o closes the block-scale tail; the ragged-Q
-    # decode leg's offset operands (defaulted None) follow it.
+    # Append-only public signature: SM120's optional bias follows sf_o; SM100
+    # retains its ragged-Q, score-output and resident-block operand tail.
     exec_params = list(inspect.signature(api_cls.execute).parameters)
     tail = exec_params[exec_params.index("sf_o") :]
-    # SM100 carries the leg and, appended after it, the score side outputs and the resident-block operands (bias / kv_mask); SM120 does not.
-    assert tail in (
-        ["sf_o"],
-        ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"],
-    ), tail
+    if api_cls is SdpaFwdDslSm120:
+        assert tail == ["sf_o", "bias_tensor"], tail
+        assert inspect.signature(api_cls.execute).parameters["bias_tensor"].default is None
+    else:
+        assert tail == ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"], tail
 
 
 @pytest.mark.L0
