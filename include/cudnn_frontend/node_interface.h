@@ -4,6 +4,7 @@
  */
 
 #pragma once
+#include <numeric>
 
 #include <memory>
 #include <vector>
@@ -43,7 +44,8 @@ misaligned_stride_dimension(std::vector<int64_t> const& dim,
         return -1;
     }
     for (size_t i = 0; i < dim.size() && i < stride.size(); ++i) {
-        if (dim[i] > 1 && stride[i] != 1 && (stride[i] * element_bytes) % alignment != 0) {
+        auto const stride_multiple = alignment / std::gcd(alignment, element_bytes);
+        if (dim[i] > 1 && stride[i] != 1 && stride[i] % stride_multiple != 0) {
             return static_cast<int64_t>(i);
         }
     }
@@ -57,6 +59,7 @@ class MatmulNode;
 class MatmulFP8Node;
 class PointwiseNode;
 class ReductionNode;
+class CustomReductionNode;
 class ResampleNode;
 class ReshapeNode;
 class RngNode;
@@ -70,6 +73,21 @@ class SliceNode;
 
 // Interface for all nodes to follow.
 class INode {
+    friend class CustomReductionNode;
+    // Set on a reducer body. A node other than pointwise can run user code when it expands (a reducer, an SDPA
+    // score_mod), so a body build refuses such a node before any node expands, also on another thread.
+    bool is_reducer_body = false;
+
+    error_t
+    refuse_non_pointwise_sub_nodes() const {
+        for (auto const& sub_node : sub_nodes) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sub_node->getType() != Type::POINTWISE,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "A reducer body may contain only pointwise operations.");
+        }
+        return {error_code_t::OK, ""};
+    }
+
    public:
     // A closed set of types that are allowed to be passed by value today
     using pass_by_values_t = Tensor_attributes::pass_by_values_t;
@@ -205,8 +223,9 @@ class INode {
         MOE_GROUPED_MATMUL_BWD,
         DIAGONAL_BAND_MASK,
         SOFTMAX,
+        CUSTOM_REDUCTION,
     };
-    Type tag;
+    Type tag = Type::COMPOSITE;
 
     inline void
     matmul(std::shared_ptr<Tensor_attributes> a,
@@ -338,6 +357,9 @@ class INode {
 
     error_t
     expand_subtree() {
+        if (is_reducer_body) {
+            CHECK_CUDNN_FRONTEND_ERROR(refuse_non_pointwise_sub_nodes());
+        }
         // Validate self
         CHECK_CUDNN_FRONTEND_ERROR(pre_validate_node());
         CHECK_CUDNN_FRONTEND_ERROR(infer_properties_node());
@@ -478,6 +500,8 @@ class INode {
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>,
                                                  std::shared_ptr<Tensor_attributes>,
                                                  Reduction_attributes);
+    std::vector<std::shared_ptr<Tensor_attributes>> custom_reduction(std::vector<std::shared_ptr<Tensor_attributes>>,
+                                                                     Custom_reduction_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
     std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
     std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);

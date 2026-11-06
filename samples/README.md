@@ -20,6 +20,9 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 * [53_sdpa](python/53_sdpa_decode_with_paged_caches.ipynb)
     Shows how to run scaled dot product attention (decode phase) where the K and V caches are stored in non contiguous memory.
 
+* [71_custom_reduction_argmax](python/71_custom_reduction_argmax.ipynb)
+    Shows how to pick LLM tokens with the custom-reduction argmax helper: greedy decoding, the NaN rules, speculative-decoding verify, masked argmax and Gumbel-max sampling (cuDNN 9.29 or later, data center Blackwell).
+
 ## FROST Python Samples
 Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
 * [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul.
@@ -148,6 +151,15 @@ Showcases layer normalization with zero centered gamma usage.
 - [Layer norm with bitmask relu](cpp/norm/layernorm_bitmask_relu.cpp)
 
 Showcases layer normalization and relu with bitmask.
+
+### Custom reduction examples
+
+##### [samples/cpp/membound](cpp/membound/) shows how to use the custom reduction (cuDNN 9.29 or later, data center Blackwell).
+
+- [Custom reduction](cpp/membound/custom_reduction.cpp): a sum with a helper, mixed precisions, several streams, a body with a constant, and plan serialization.
+- [argmax and argmin rules](cpp/membound/custom_reduction_argmax.cpp): `reduction_modifiers::argmax` and `argmin` with each NaN rule, checked against a host reference.
+- [LLM token selection](cpp/membound/custom_reduction_sampling.cpp): greedy decoding, speculative-decoding verify, masked argmax and Gumbel-max sampling.
+- [XLA HLO examples](cpp/membound/custom_reduction_xla.cpp): the argmax that XLA emits, at all 31 distinct argmax operand shapes of an XLA HLO corpus, with the XLA and the torch NaN rule. The shapes and their source models are listed in [docs/operations/CustomReduction.md](../docs/operations/CustomReduction.md#xla-hlo-examples).
 
 ### Miscellaneous examples
 
