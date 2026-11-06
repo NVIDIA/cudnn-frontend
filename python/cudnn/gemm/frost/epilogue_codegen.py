@@ -574,10 +574,7 @@ def _emit_op(
             assert op.aux is not None
             rhs = f"({aux_loads[op.aux]})"
         lhs, rhs = (prev, rhs) if op.aux_on_rhs else (rhs, prev)
-        return [
-            f"{new} = cutlass.Vector(cutlass._mlir.dialects.arith.divsi("
-            f"({lhs}).ir_value(), ({rhs}).ir_value()), dtype=cutlass.Int32)"
-        ], new
+        return [f"{new} = cutlass.Vector(cutlass._mlir.dialects.arith.divsi(" f"({lhs}).ir_value(), ({rhs}).ir_value()), dtype=cutlass.Int32)"], new
 
     if op.op in {"add", "mul", "sub", "div", "max", "min", "pow", "add_square"}:
         py_op = {"add": "+", "mul": "*", "sub": "-", "div": "/"}.get(op.op)
