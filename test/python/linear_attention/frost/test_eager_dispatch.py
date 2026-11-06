@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 
-from cudnn.linear_attention.ops import gated_delta_net, kimi_delta_attention
+from cudnn.linear_attention.ops import gated_delta_net, gdn, kda, kimi_delta_attention
 
 from linear_attention.test_la import frost_la_unavailable
 
@@ -163,3 +163,23 @@ def test_profiler_sees_the_custom_ops(family):
     bwd_name = op_name[: -len("_fwd")] + "_bwd"
     assert {f"cudnn::{op_name}", f"cudnn::{bwd_name}"} <= names
     assert not [n for n in names if "Eager" in n]
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_op_and_eager_paths_share_plans(family):
+    """The custom op and the eager path call the planned forward and backward with the same arguments: one plan each."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    public, _, _, channel_gate = FAMILIES[family]
+    module = kda if family == "kda" else gdn
+    run_fwd, run_bwd = getattr(module, f"run_{family}_fwd"), getattr(module, f"run_{family}_bwd")
+    run_fwd.plans.clear()
+    run_bwd.plans.clear()
+    leaves, cu, _, (do, _) = inputs(4, False, channel_gate)
+    xs = [leaves[k].detach().requires_grad_(True) for k in ("q", "k", "v", "g", "beta")]
+    for custom_op in (True, True, False, False):
+        with PassThrough() if custom_op else contextlib.nullcontext():
+            o = public(*xs, cu, use_qk_l2norm_in_kernel=True)[0]
+            torch.autograd.grad(o, xs, do)
+    assert [type(p).__name__ for p in run_fwd.plans.values()] == ["_Plan"]
+    assert [type(p).__name__ for p in run_bwd.plans.values()] == ["_Plan"]

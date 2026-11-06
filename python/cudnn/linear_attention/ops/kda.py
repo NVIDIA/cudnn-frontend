@@ -1172,8 +1172,7 @@ def run_kda_bwd(
     return dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias
 
 
-@torch.library.custom_op("cudnn::kimi_delta_attention_bwd", mutates_args=())
-def kda_bwd(
+def dense_kda_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1202,7 +1201,8 @@ def kda_bwd(
     context: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional KDA backward: :func:`run_kda_bwd` over ``dO`` / ``d_final_state`` with broadcast (stride-0) dims
-    materialized, so the planned body sees dense gradients (``out.sum()`` hands back an expanded ``dO``)."""
+    materialized, so the planned body sees dense gradients (``out.sum()`` hands back an expanded ``dO``).  The body of
+    ``cudnn::kimi_delta_attention_bwd`` and the eager backward alike, so both reach the planned body with the same arguments (one plan)."""
     if 0 in dO.stride():
         dO = dO.contiguous()
     if d_final_state is not None and 0 in d_final_state.stride():
@@ -1235,6 +1235,9 @@ def kda_bwd(
         composed_initial_state=composed_initial_state,
         context=context,
     )
+
+
+kda_bwd = torch.library.custom_op("cudnn::kimi_delta_attention_bwd", dense_kda_bwd, mutates_args=())
 
 
 @kda_bwd.register_fake
@@ -1455,15 +1458,6 @@ FWD_ARGS = (
 )
 
 
-def eager_kda_bwd(dO, q, k, v, g, beta, cu_seqlens, scale, d_final_state=None, **options):
-    """:func:`kda_bwd`'s body without the dispatcher."""
-    if 0 in dO.stride():
-        dO = dO.contiguous()
-    if d_final_state is not None and 0 in d_final_state.stride():
-        d_final_state = d_final_state.contiguous()
-    return run_kda_bwd(dO=dO, q=q, k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens, scale=scale, d_final_state=d_final_state, **options)
-
-
 class EagerKda(torch.autograd.Function):
     """``cudnn::kimi_delta_attention_fwd`` with its registered autograd formula (:func:`kda_setup_context`,
     :func:`kda_backward`), applied directly."""
@@ -1478,7 +1472,7 @@ class EagerKda(torch.autograd.Function):
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
         # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return kda_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else eager_kda_bwd)
+        return kda_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else dense_kda_bwd)
 
 
 # ---------------------------------------------------------------------------

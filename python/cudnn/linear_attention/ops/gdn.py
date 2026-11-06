@@ -1143,8 +1143,7 @@ def run_gdn_bwd(
     return dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias
 
 
-@torch.library.custom_op("cudnn::gated_delta_net_bwd", mutates_args=())
-def gdn_bwd(
+def dense_gdn_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1172,7 +1171,8 @@ def gdn_bwd(
     context: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional GDN backward: :func:`run_gdn_bwd` over ``dO`` / ``d_final_state`` with broadcast (stride-0) dims
-    materialized, so the planned body sees dense gradients (``out.sum()`` hands back an expanded ``dO``)."""
+    materialized, so the planned body sees dense gradients (``out.sum()`` hands back an expanded ``dO``).  The body of
+    ``cudnn::gated_delta_net_bwd`` and the eager backward alike, so both reach the planned body with the same arguments (one plan)."""
     if 0 in dO.stride():
         dO = dO.contiguous()
     if d_final_state is not None and 0 in d_final_state.stride():
@@ -1204,6 +1204,9 @@ def gdn_bwd(
         composed_initial_state=composed_initial_state,
         context=context,
     )
+
+
+gdn_bwd = torch.library.custom_op("cudnn::gated_delta_net_bwd", dense_gdn_bwd, mutates_args=())
 
 
 @gdn_bwd.register_fake
@@ -1420,15 +1423,6 @@ FWD_ARGS = (
 )
 
 
-def eager_gdn_bwd(dO, q, k, v, g, beta, cu_seqlens, scale, d_final_state=None, **options):
-    """:func:`gdn_bwd`'s body without the dispatcher."""
-    if 0 in dO.stride():
-        dO = dO.contiguous()
-    if d_final_state is not None and 0 in d_final_state.stride():
-        d_final_state = d_final_state.contiguous()
-    return run_gdn_bwd(dO=dO, q=q, k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens, scale=scale, d_final_state=d_final_state, **options)
-
-
 class EagerGdn(torch.autograd.Function):
     """``cudnn::gated_delta_net_fwd`` with its registered autograd formula (:func:`gdn_setup_context`,
     :func:`gdn_backward`), applied directly."""
@@ -1443,7 +1437,7 @@ class EagerGdn(torch.autograd.Function):
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
         # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
-        return gdn_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else eager_gdn_bwd)
+        return gdn_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else dense_gdn_bwd)
 
 
 # ---------------------------------------------------------------------------
