@@ -107,7 +107,7 @@ are separate calls; the caller owns the VJP. Each has a PyTorch counterpart in
 
 | Op | PyTorch counterpart | Contract |
 | --- | --- | --- |
-| `indexer_forward_jax` | `indexer_forward` (`DSA.indexer_forward_wrapper`) | BF16 `q (B, S_q, 64, 128)`, `k (B, S_k, 1, 128)`, `weights (B, S_q, 64)`; `ratio=4`; `S_k` a multiple of 4. Returns FP32 ratio-causal scores, plus the row LSE with `return_lse=True` |
+| `indexer_forward_jax` | `indexer_forward` (`DSA.indexer_forward_wrapper`) | BF16 `q (B, S_q, 64, 128)`, `k (B, S_k, 1, 128)`, `weights (B, S_q, 64)`; `ratio=4`; `S_k` a multiple of 4. Packed THD: `q (T_q, 64, 128)`, `k (T_k, 1, 128)`, `weights (T_q, 64)` with int32 `cu_seqlens_q` / `cu_seqlens_k` and static `max_seqlen_q` / `max_seqlen_k`; scores are `(T_q, ceil4(max_seqlen_k))`, indexed by sequence-local key position. Returns FP32 ratio-causal scores, plus the row LSE with `return_lse=True` |
 | `top_k_forward_jax` | `top_k_forward` (`DSA.indexer_top_k_wrapper`) | `scores (n_rows, num_cols)` FP32/FP16/BF16, int32 `seq_lens (n_rows,)`; `top_k <= 2048`. Returns unsorted int32 column ids, `-1`-padded |
 | `indexer_backward_jax` | `indexer_backward` (`DSA.indexer_backward_wrapper`) | Top-k KL indexer loss backward; `topk=512` only. `d_k` is FP32 |
 | `dense_indexer_backward_jax` | `dense_indexer_backward` (`DSA.dense_indexer_backward_wrapper`) | Dense KL indexer loss backward from `indexer_forward_jax(..., return_lse=True)`. `d_k` is FP32 |

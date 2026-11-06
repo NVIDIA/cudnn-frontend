@@ -66,6 +66,40 @@ def test_indexer_jax_matches_native_math():
     np.testing.assert_allclose(np.asarray(got[valid]), np.asarray(ref[valid]), atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize("lengths", [(21, 33), (3, 33)])
+def test_indexer_jax_thd_matches_independent_sequences(lengths):
+    compressed = [n // 4 for n in lengths]
+    # The last prefix pair repeats: an empty sequence.
+    cu_q = jnp.array([0, lengths[0], sum(lengths), sum(lengths)], jnp.int32)
+    cu_k = jnp.array([0, compressed[0], sum(compressed), sum(compressed)], jnp.int32)
+    # One extra NaN row of capacity in each tensor must not be read.
+    key = jax.random.key(12)
+    q = jax.random.normal(key, (sum(lengths) + 1, 64, 128), jnp.bfloat16).at[-1].set(jnp.nan)
+    k = jax.random.normal(jax.random.fold_in(key, 1), (sum(compressed) + 1, 1, 128), jnp.bfloat16).at[-1].set(jnp.nan)
+    w = jax.random.normal(jax.random.fold_in(key, 2), q.shape[:2], jnp.bfloat16).at[-1].set(jnp.nan)
+    max_k = -(-max(lengths) // 4)
+    scale = 128**-0.5
+    got, lse = jax.jit(
+        lambda x, y, z: dsa.indexer_forward_jax(
+            x, y, z, sm_scale=scale, return_lse=True, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max(lengths), max_seqlen_k=max_k
+        )
+    )(q, k, w)
+    assert got.shape == (q.shape[0], -(-max_k // 4) * 4) and lse.shape == (q.shape[0],)
+
+    expected = np.full(got.shape, -np.inf, np.float32)
+    qs = ks = 0
+    for nq, nk in zip(lengths, compressed):
+        scores = indexer_scores(q[None, qs : qs + nq], k[None, ks : ks + nk, 0], w[None, qs : qs + nq], scale)[0]
+        causal = 4 * (jnp.arange(nk)[None] + 1) <= jnp.arange(nq)[:, None] + 1
+        expected[qs : qs + nq, :nk] = np.asarray(jnp.where(causal, scores, -jnp.inf))
+        qs, ks = qs + nq, ks + nk
+    valid = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(np.asarray(got)), valid)
+    np.testing.assert_allclose(np.asarray(got)[valid], expected[valid], atol=2e-5, rtol=2e-5)
+    rows = slice(0, sum(lengths))
+    np.testing.assert_allclose(np.asarray(lse)[rows], np.asarray(jax.nn.logsumexp(expected[rows], axis=-1)), atol=1e-4, rtol=1e-5)
+
+
 @pytest.mark.parametrize("dtype, num_cols", [(jnp.float32, 1003), (jnp.bfloat16, 1001)])
 def test_indexer_top_k_jax_matches_lax_top_k(dtype, num_cols):
     top_k, rows = 64, 8

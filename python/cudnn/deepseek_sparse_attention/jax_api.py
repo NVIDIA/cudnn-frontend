@@ -47,7 +47,13 @@ def check_sm100():
 
 
 @cute.jit
-def _indexer_adapter(stream, q, k, weights, scores, denom, *, kernel, sm_scale, seqlen_q, seqlen_k):
+def _indexer_adapter(stream, q, k, weights, *buffers, kernel, is_varlen, sm_scale, seqlen_q, seqlen_k):
+    # The bridge passes arrays only, so BSHD calls have no sequence-prefix operands.
+    if cutlass.const_expr(is_varlen):
+        cu_q, cu_k, scores, denom = buffers
+    else:
+        scores, denom = buffers
+        cu_q, cu_k = None, None
     kernel(
         q,
         k,
@@ -57,37 +63,81 @@ def _indexer_adapter(stream, q, k, weights, scores, denom, *, kernel, sm_scale, 
         cutlass.Float32(sm_scale),
         cutlass.Int32(seqlen_q),
         cutlass.Int32(seqlen_k),
-        None,
-        None,
+        cu_q,
+        cu_k,
         None,
         stream,
     )
 
 
-def indexer_forward_jax(q: Any, k: Any, weights: Any, *, ratio: int = 4, sm_scale: float = 1.0, return_lse: bool = False) -> Any:
-    """Compute dense ratio-causal DSv4 indexer scores using CuTeDSL.
+def indexer_forward_jax(
+    q: Any,
+    k: Any,
+    weights: Any,
+    *,
+    ratio: int = 4,
+    sm_scale: float = 1.0,
+    return_lse: bool = False,
+    cu_seqlens_q: Any = None,
+    cu_seqlens_k: Any = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+) -> Any:
+    """Compute dense ratio-causal DSv4 indexer scores using CuTeDSL, for BSHD or packed THD inputs.
 
-    With ``return_lse=True`` returns ``(scores, lse)`` where ``lse`` is the ``(B, S_q)`` FP32 log-sum-exp
-    of each row's causally valid scores (``-inf`` for rows without a valid block), as consumed by
-    :func:`dense_indexer_backward_jax`.
+    BSHD: ``q (B, S_q, 64, 128)``, ``k (B, S_k, 1, 128)``, ``weights (B, S_q, 64)``; returns ``(B, S_q, S_k)`` scores.
+
+    THD: ``q (T_q, 64, 128)``, ``k (T_k, 1, 128)``, ``weights (T_q, 64)``, matching int32 ``cu_seqlens_q`` /
+    ``cu_seqlens_k`` prefixes and static ``max_seqlen_q`` / ``max_seqlen_k``. Each sequence's positions start at
+    zero, and ``max_seqlen_k`` must cover ``ceil(max_seqlen_q / ratio)``. Returns ``(T_q, ceil4(max_seqlen_k))``
+    scores indexed by sequence-local key position. Rows past ``cu_seqlens_q[-1]`` are not written.
+
+    Invalid entries are ``-inf``. With ``return_lse=True`` returns ``(scores, lse)`` where ``lse`` (``(B, S_q)`` or
+    ``(T_q,)``) is the FP32 log-sum-exp of each row's causally valid scores (``-inf`` for rows without a valid
+    block), as consumed by :func:`dense_indexer_backward_jax`.
     """
     check_sm100()
-    if q.ndim != 4 or k.ndim != 4 or weights.ndim != 3:
-        raise ValueError("q/k/weights must use BSHD/BSHD/BSH layouts")
-    batch, seqlen_q, heads, head_dim = q.shape
-    if k.shape[0] != batch or k.shape[2:] != (1, head_dim):
-        raise ValueError(f"k must have shape ({batch}, S_k, 1, {head_dim}), got {k.shape}")
-    seqlen_k = k.shape[1]
-    if weights.shape != (batch, seqlen_q, heads):
-        raise ValueError(f"weights must have shape {(batch, seqlen_q, heads)}, got {weights.shape}")
-    if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or weights.dtype != jnp.bfloat16:
-        raise TypeError("q, k, and weights must be bfloat16")
+    if q.ndim not in (3, 4):
+        raise ValueError("q must use the BSHD or THD layout")
+    is_varlen = q.ndim == 3
+    heads, head_dim = q.shape[-2:]
     if head_dim != 128 or heads != 64 or ratio != 4:
         raise ValueError("DSv4 JAX indexer requires H=64, D=128, ratio=4")
-    if seqlen_k % 4:
-        raise ValueError("indexer K length must be a multiple of four for FP32 TMA stores")
+    if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or weights.dtype != jnp.bfloat16:
+        raise TypeError("q, k, and weights must be bfloat16")
+    if is_varlen:
+        if k.ndim != 3 or k.shape[1:] != (1, head_dim) or weights.shape != q.shape[:2]:
+            raise ValueError(f"THD k/weights must have shapes (T_k, 1, {head_dim}) / {q.shape[:2]}, got {k.shape} / {weights.shape}")
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise ValueError("THD requires cu_seqlens_q and cu_seqlens_k")
+        if cu_seqlens_q.ndim != 1 or cu_seqlens_q.size < 2 or cu_seqlens_k.shape != cu_seqlens_q.shape:
+            raise ValueError("cu_seqlens_q and cu_seqlens_k must be matching 1-D arrays of at least two prefixes")
+        if cu_seqlens_q.dtype != jnp.int32 or cu_seqlens_k.dtype != jnp.int32:
+            raise TypeError("cu_seqlens_q and cu_seqlens_k must be int32")
+        if any(not isinstance(n, int) or isinstance(n, bool) or n <= 0 for n in (max_seqlen_q, max_seqlen_k)):
+            raise ValueError("THD requires positive static int max_seqlen_q and max_seqlen_k")
+        if max_seqlen_k < -(-max_seqlen_q // ratio):
+            raise ValueError("max_seqlen_k must cover ceil(max_seqlen_q / ratio)")
+        if q.shape[0] == 0 or k.shape[0] == 0:
+            raise ValueError("THD requires nonempty q and k")
+        seqlen_q, seqlen_k = max_seqlen_q, -(-max_seqlen_k // 4) * 4
+        score_shape, lse_shape = (q.shape[0], seqlen_k), (q.shape[0],)
+        operands = (q, k, weights, cu_seqlens_q, cu_seqlens_k)
+    else:
+        if any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)):
+            raise ValueError("cu_seqlens_* and max_seqlen_* are only accepted for THD inputs")
+        batch, seqlen_q = q.shape[:2]
+        if k.ndim != 4 or k.shape[0] != batch or k.shape[2:] != (1, head_dim):
+            raise ValueError(f"k must have shape ({batch}, S_k, 1, {head_dim}), got {k.shape}")
+        if weights.shape != (batch, seqlen_q, heads):
+            raise ValueError(f"weights must have shape {(batch, seqlen_q, heads)}, got {weights.shape}")
+        seqlen_k = k.shape[1]
+        if seqlen_k % 4:
+            raise ValueError("indexer K length must be a multiple of four for FP32 TMA stores")
+        score_shape, lse_shape = (batch, seqlen_q, seqlen_k), (batch, seqlen_q)
+        operands = (q, k, weights)
 
-    key = (head_dim, heads, ratio, bool(return_lse))
+    key = (head_dim, heads, ratio, bool(return_lse), is_varlen)
     kernel = _indexer_kernels.get(key)
     if kernel is None:
         kernel = IndexerScoreUnifiedSm100(
@@ -97,7 +147,7 @@ def indexer_forward_jax(q: Any, k: Any, weights: Any, *, ratio: int = 4, sm_scal
             n_block_size=128,
             k_block_size=64,
             ratio=ratio,
-            is_varlen=False,
+            is_varlen=is_varlen,
             compute_lse=bool(return_lse),
             is_compressed_logits=False,
         )
@@ -106,15 +156,16 @@ def indexer_forward_jax(q: Any, k: Any, weights: Any, *, ratio: int = 4, sm_scal
     scores, lse = call(
         _indexer_adapter,
         output_shape_dtype=(
-            jax.ShapeDtypeStruct((batch, seqlen_q, seqlen_k), jnp.float32),
-            jax.ShapeDtypeStruct((batch, seqlen_q), jnp.float32),
+            jax.ShapeDtypeStruct(score_shape, jnp.float32),
+            jax.ShapeDtypeStruct(lse_shape, jnp.float32),
         ),
         initialized_outputs={0: neg_inf_init, 1: zeros_init},
         kernel=kernel,
+        is_varlen=is_varlen,
         sm_scale=float(sm_scale),
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
-    )(q, k, weights)
+    )(*operands)
     return (scores, lse) if return_lse else scores
 
 
