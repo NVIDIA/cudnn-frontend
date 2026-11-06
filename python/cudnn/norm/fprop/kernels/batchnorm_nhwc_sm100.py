@@ -685,7 +685,8 @@ def forward(
         rv = running_var if running_var is not None else torch.ones(C, dtype=torch.float32, device=x2d.device)
         nblk = max(1, min(_nsm() * 4 // max(1, cblks), (M + PPL - 1) // PPL))
         ce = (C, V, TPP, PPL, BT, cblks, nblk, it_ty, et, float(eps), has_beta)
-        key = ("infer", params.io_dtype) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = ("infer", params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
         args = (dyn(x2d), dyn(y2d), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(M))
         fn = _KCACHE.get(key)
         if fn is None:
@@ -724,7 +725,7 @@ def forward(
             # tcgen05_alloc leaves a garbage base address.
             smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = ce_head + (KT_occ, _UR) + ce_tail[:-2] + (smem_bytes, mbpm)
-        key = (params.io_dtype,) + ce
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(beta.stride(0), 2), min(rm.stride(0), 2), min(rv.stride(0), 2)) + ce
         fn = _KCACHE.get(key)
         mparts = _mparts(M, PPL, cblks, occ)
         # Partials [cblks, 2, mparts, C_tile]; every slot is written, so no zeroing.

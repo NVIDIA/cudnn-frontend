@@ -505,7 +505,8 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         smem_bytes = 2 * (2 * CT) * 4 + 2 * WPB * CPW * KSR * S * eb + 128
         mbpm = 2 if occ == 2 else 0
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, cparts, it_ty, et, count, has_beta, smem_bytes, mbpm)
-        key = (params.io_dtype,) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cparts * 2 * mparts * CT, torch.float32, x3d.device)
         ret = ws_zeros(ws, cparts, torch.int32, x3d.device)

@@ -147,7 +147,8 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         cutlass.Int32(spec.S),
     )
     ce = (cfg.block_threads, has_beta)
-    key = (params.io_dtype,) + ce
+    # dyn() specializes strides 0 and 1; larger strides are dynamic.
+    key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         with dsl_compile_lock():
