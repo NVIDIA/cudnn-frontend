@@ -21,6 +21,14 @@ from cudnn import CUTEDSL_MIN_JAX_VERSION, CUTEDSL_MIN_JAX_VERSION_STR
 if _jax.version.__version_info__ < CUTEDSL_MIN_JAX_VERSION:
     raise ImportError(f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR}; found {_jax.__version__}")
 
+import cutlass.jax
+
+if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
+    raise ImportError(
+        f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR} and the CuTeDSL JAX extensions (cutlass.jax); "
+        "install/upgrade jax (`pip install --group jax` from a checkout)"
+    )
+
 from .call import (
     call,
     gemm_operand_spec,
