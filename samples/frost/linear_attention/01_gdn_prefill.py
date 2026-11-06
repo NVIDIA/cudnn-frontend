@@ -74,7 +74,7 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     g_t = g.tensor([total, H], data_type=cudnn.data_type.FLOAT, name="g")
     beta_t = g.tensor([total, H], data_type=cudnn.data_type.FLOAT, name="beta")
     cu_t = g.tensor([num_seqs + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
-    O_t, fs_t, _h_t = g.gdn(
+    O_t, fs_t, _h_t, _composed = g.gdn(
         q=q_t,
         k=k_t,
         v=v_t,
