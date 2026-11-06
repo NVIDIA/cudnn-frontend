@@ -139,3 +139,27 @@ def test_jit_trace_records_the_custom_op(family):
         traced = torch.jit.trace(call, args, check_trace=False)
         assert f"cudnn::{op_name}" in {node.kind() for node in traced.graph.nodes()}
         assert torch.equal(traced(*args), call(*args))
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_profiler_sees_the_custom_ops(family):
+    """Under the autograd profiler the public op takes the custom-op path, so a trace names cudnn::<op>_fwd / _bwd as on the
+    op path, with no eager autograd node."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    public, op_name, _, channel_gate = FAMILIES[family]
+    leaves, cu, _, (do, _) = inputs(4, False, channel_gate)
+    xs = [leaves[k].detach().requires_grad_(True) for k in ("q", "k", "v", "g", "beta")]
+
+    def step():
+        o = public(*xs, cu, use_qk_l2norm_in_kernel=True)[0]
+        torch.autograd.grad(o, xs, do)
+
+    for _ in range(3):
+        step()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        step()
+    names = {e.name for e in prof.events()}
+    bwd_name = op_name[: -len("_fwd")] + "_bwd"
+    assert {f"cudnn::{op_name}", f"cudnn::{bwd_name}"} <= names
+    assert not [n for n in names if "Eager" in n]

@@ -1442,8 +1442,8 @@ class EagerGdn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
-        # differentiated (the eager body's outputs would silently carry no graph)
-        return gdn_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() else eager_gdn_bwd)
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
+        return gdn_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else eager_gdn_bwd)
 
 
 # ---------------------------------------------------------------------------
