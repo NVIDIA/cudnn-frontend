@@ -371,6 +371,20 @@ python benchmark/csa/bench_csa_dape_deterministic.py --sm90-primary --construct-
 The first command reports eager/fused forward, backward and CUDA Graph replay timing;
 the latter two compare atomic and deterministic dAPE with JIT and allocation excluded.
 
+Measured on 1x L20X (CC 9.0, driver 570.148.08, CUDA 13.0, cuDNN 9.20, PyTorch
+2.12.1, CUTLASS DSL 4.8.1); BF16 `kv`/`score`, FP32 `ape`; `ratio = 4`,
+`coff = 1`, `head_dim = 128`; median of 50 iterations after 20 warmup:
+
+| THD pack | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd | eager graph total | fused graph total | graph total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 x 8192 | 205.7 us | 40.9 us | **5.0x** | 270.0 us | 54.4 us | **5.0x** | 202.2 us | 17.9 us | **11.3x** |
+| 3 x 8192 | 222.9 us | 39.8 us | **5.6x** | 261.6 us | 57.2 us | **4.6x** | 306.4 us | 28.4 us | **10.8x** |
+
+The opt-in deterministic backward used 0.52 MiB and 1.55 MiB of caller workspace for
+the two packs. Its operation time was 35.87 us and 35.49 us, respectively, versus
+29.84 us and 35.04 us for atomic dAPE (1.20x and 1.01x). The deterministic dAPE maximum
+absolute error versus the fp64 oracle was `3.41e-6` and `5.46e-6`.
+
 Measured on 1x B200 (CC 10.0, driver 590.48.01); BF16 `kv`/`score`, FP32 `ape`; `ratio = 4`, `coff = 2`;
 THD packs of 8192-token sequences; eager baseline = the exact replaced region of
 Megatron-LM `Compressor._forward_thd` on identical inputs.

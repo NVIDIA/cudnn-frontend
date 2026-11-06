@@ -40,8 +40,8 @@ The required settings below apply to this table.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
-| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Unverified | Unverified |
-| `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Unverified | Unverified |
+| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Replay only | Unverified | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Replay only | Unverified | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Supported | Supported |
