@@ -137,6 +137,35 @@ def coop_launch_too_large(exc):
     return "COOPERATIVELAUNCHTOOLARGE" in str(exc).upper().replace("_", "")
 
 
+_DEVICE_FLOOR_ERROR = {}
+
+
+def unsupported_device_reason(device):
+    """Why the norm kernels cannot run on CUDA ``device``, or ``None``.
+
+    The kernels lower through Hopper-and-later instructions (``cp.async.bulk`` row
+    staging, mbarrier transaction counts, thread-block clusters), so on an older GPU
+    most shapes would fail inside NVVM with an opaque "unsupported operation".
+    Refusing up front gives one clear error instead. Cached per device ordinal, so a
+    call costs a dict lookup."""
+    import torch
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _DEVICE_FLOOR_ERROR:
+        major, minor = torch.cuda.get_device_capability(index)
+        _DEVICE_FLOOR_ERROR[index] = (
+            None
+            if major >= 9
+            else (
+                f"cudnn.norm needs an SM90 or newer GPU (its kernels use bulk async copies, mbarrier "
+                f"transaction counts and thread-block clusters); found SM{major}{minor}. On older GPUs, "
+                "build the normalization with the graph API (for example graph.layernorm or graph.rmsnorm), "
+                "which the cuDNN backend serves."
+            )
+        )
+    return _DEVICE_FLOOR_ERROR[index]
+
+
 _HAS_TMEM = {}
 
 

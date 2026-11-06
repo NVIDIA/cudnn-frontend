@@ -250,6 +250,12 @@ def norm_fprop(
     gamma, beta = _flat(gamma), _flat(beta)
     running_mean, running_var = _flat(running_mean), _flat(running_var)
     _require_io_dtype(x, gamma=gamma, beta=beta)
+    if x.is_cuda:
+        from ..utils import unsupported_device_reason
+
+        reason = unsupported_device_reason(x.device)
+        if reason is not None:
+            raise NotImplementedError(reason)
     io = torch_dtype_to_str(x.dtype)
 
     # Every route below views the output with the SAME expression it views x, so

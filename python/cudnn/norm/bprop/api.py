@@ -243,6 +243,12 @@ def norm_bprop(
         dy = dy.contiguous()
     gamma, mean, rstd = _flat(gamma), _flat(mean), _flat(rstd)
     _require_io_dtype(x, gamma=gamma, dy=dy)
+    if x.is_cuda:
+        from ..utils import unsupported_device_reason
+
+        reason = unsupported_device_reason(x.device)
+        if reason is not None:
+            raise NotImplementedError(reason)
     io = torch_dtype_to_str(x.dtype)
 
     # dx is viewed with the same expression as x in every route below, so it is
