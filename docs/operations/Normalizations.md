@@ -47,8 +47,14 @@ set_compute_data_type(DataType_t value)
     - in_running_var
     - epsilon
     - momentum
+    - peer_stats (optional, list)
     - compute_data_type
     - name
+
+`peer_stats` is an optional list of per-peer statistics tensors for synchronized batch normalization; the frontend
+forwards each tensor to cuDNN's peer-stat descriptor list (`CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS` for the
+forward, `CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS` for the backward). See the cuDNN API documentation for the
+expected statistics layout.
 
 ## Batchnorm Finalize
 
@@ -98,6 +104,20 @@ Batchnorm_backward_attributes&
 set_compute_data_type(DataType_t value)
 ```
 Only setting either (saved mean and inverse_variance) or (epsilon) is necessary.
+
+### Python API
+
+- batchnorm_backward
+    - grad
+    - input
+    - scale
+    - mean
+    - inv_variance
+    - peer_stats (optional, list)
+    - compute_data_type
+    - name
+
+`peer_stats` behaves as in [Batchnorm](#batchnorm).
 
 ## Generate Stats
 
