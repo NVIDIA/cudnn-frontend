@@ -13,7 +13,7 @@ It provides a **header-only C++ API** and a **Python interface** (with native Py
 
 **Links:** [Documentation](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/) · [Blog & Deep Dives](https://nvidia.github.io/cudnn-frontend/) · [PyPI](https://pypi.org/project/nvidia-cudnn-frontend/) · [Release Notes](https://github.com/NVIDIA/cudnn-frontend/releases) · [Samples](samples/)
 
-## 🚀 Latest news:
+## 🚀 Latest news
 
 We will begin open-sourcing kernels based on customer needs, with the goal to educate developers and enable them to customize as needed.
 
