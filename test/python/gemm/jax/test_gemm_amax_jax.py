@@ -247,7 +247,7 @@ def test_gemm_amax_jax_jit_sm100():
     import cutlass.jax
 
     if not cutlass.jax.is_available():
-        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.6.0 required)")
     skip_unless_sm100()
     from cudnn import gemm_amax_jax_sm100
 

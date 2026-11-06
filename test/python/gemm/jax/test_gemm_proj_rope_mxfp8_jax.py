@@ -103,7 +103,7 @@ def test_gemm_proj_rope_mxfp8_jax_jit_matches_eager(input_path):
     import cutlass.jax
 
     if not cutlass.jax.is_available():
-        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.6.0 required)")
     skip_unless_sm100()
     import cudnn
     from cudnn import gemm_proj_rope_mxfp8_jax_sm100

@@ -46,7 +46,7 @@ torch; this JAX API does not expose `state_indices` or `overwrite_initial_state`
 Install GPU-enabled JAX and CuTeDSL separately from the framework-neutral package:
 
 ```bash
-pip install 'jax[cuda13]' 'nvidia-cutlass-dsl[cu13]>=4.7.0'
+pip install 'jax[cuda13]' 'nvidia-cutlass-dsl[cu13]>=4.7.1'
 ```
 
 Other GPUs may be visible. Concrete arrays run on the GPU that holds them, and all of
@@ -189,7 +189,7 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 The suite covers forward/backward parity, state and gate gradients, repeated
 calls, packed boundaries, recurrent scans, command-buffer replay, concurrent
 dispatch and torch-free execution. Tests skip when JAX, a supported GPU or
-CuTeDSL >=4.7.0 is unavailable.
+CuTeDSL >=4.7.1 is unavailable.
 
 Run native cache and output-stride regressions from `test/python`:
 
