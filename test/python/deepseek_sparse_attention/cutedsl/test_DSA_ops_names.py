@@ -28,6 +28,7 @@ def test_cudnn_ops_dsa_name_is_the_existing_wrapper(name, module, wrapper):
         existing = getattr(importlib.import_module(module), wrapper)
     except ImportError as error:
         pytest.skip(f"cudnn optional dependencies not installed: {error}")
-    from cudnn.ops import dsa
+    else:
+        from cudnn.ops import dsa
 
-    assert getattr(dsa, name) is existing
+        assert getattr(dsa, name) is existing
