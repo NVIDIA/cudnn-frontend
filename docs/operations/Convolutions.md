@@ -90,8 +90,8 @@ Convolution dgrad computes data gradient during backpropagation.
 ### C++ API
 
 ```
-std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes> image,
-                                                  std::shared_ptr<Tensor_attributes> filter,
+std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes> dy,
+                                                  std::shared_ptr<Tensor_attributes> w,
                                                   Conv_dgrad_attributes);
 ```
 
@@ -149,8 +149,8 @@ Convolution wgrad computes weight gradient during backpropagation.
 ### C++ API
 
 ```
-std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes> image,
-                                                  std::shared_ptr<Tensor_attributes> filter,
+std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes> dy,
+                                                  std::shared_ptr<Tensor_attributes> x,
                                                   Conv_wgrad_attributes);
 ```
 
