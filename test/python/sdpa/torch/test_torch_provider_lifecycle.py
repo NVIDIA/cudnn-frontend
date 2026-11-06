@@ -12,6 +12,8 @@ import torch
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
+if torch.cuda.get_device_capability()[0] < 8:
+    pytest.skip("cuDNN SDPA (FP16 / BF16) requires SM80 or newer", allow_module_level=True)
 
 pytest.importorskip("torch.nn.attention.varlen", reason="torch.nn.attention.varlen required (torch >= 2.13)")
 
