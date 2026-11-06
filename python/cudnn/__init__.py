@@ -63,6 +63,8 @@ for _optional_symbol in [
     "gnn_mha_gat_backward",
     "gnn_mha_gat_v2_forward",
     "gnn_mha_gat_v2_backward",
+    "gnn_mha_simple_forward",
+    "gnn_mha_simple_backward",
     "fft_causal_conv1d_forward",
     "fft_causal_conv1d_backward",
     "long_fft_causal_conv1d_get_buffer_sizes",
@@ -316,6 +318,8 @@ _EAGER_PUBLIC_NAMES = (
             "gnn_mha_gat_backward",
             "gnn_mha_gat_v2_forward",
             "gnn_mha_gat_v2_backward",
+            "gnn_mha_simple_forward",
+            "gnn_mha_simple_backward",
         )
         if symbol in globals()
     ),
