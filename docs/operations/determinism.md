@@ -40,6 +40,9 @@ The required settings below apply to this table.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
+| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Unverified | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Unverified | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -75,6 +78,12 @@ a row alone and inside a batch under the entry's own picks.
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query.
 - QSA and dense indexer backward expose no determinism switch.
+- CSA compressor forward and dKV/dScore use fixed orders. Complete backward
+  determinism requires `deterministic=True`, caller-owned workspace on the class API,
+  and a prepared plan before CUDA Graph capture; the default dAPE path uses FP32
+  atomics. The current replay tests cover fixed inputs, poisoned outputs/workspace and
+  changed packed prefixes, but the determinism suite has not yet established batch
+  invariance on the listed GPUs.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.

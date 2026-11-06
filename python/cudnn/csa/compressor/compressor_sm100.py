@@ -62,10 +62,10 @@ Backward:
   untouched (the wrapper falls back to allocating zeros).
 
 Static-capacity padding (``total_comp > cu_seqlens_comp[-1]``):
-  Forward computes the padding rows exactly like the eager code: they gather the window
-  from token 0 with first-in-segment semantics (requires ``total_tokens >= ratio``, like
-  the eager gather). Backward ignores incoming gradients on padding rows (they are tail
-  padding for CUDA-graph static shapes and are not consumed downstream).
+  Forward writes exact zeros without loading APE/KV/score or evaluating softmax.
+  Backward ignores incoming gradients on padding rows (they are tail padding for
+  CUDA-graph static shapes and are not consumed downstream). This also makes a positive
+  static output capacity safe when every segment is shorter than ``ratio``.
 
 CUDA graphs:
   The launch path is capture-compatible once the kernels for a given
@@ -368,32 +368,32 @@ def _compressor_fwd_kernel(
     if col < ncol:
         cvec = col * vec  # first head-dim column of this thread's lane group
 
-        # Hoist APE loads: constant per (k, lane) across all rows.
-        ape_k = []
-        for k in cutlass.range_constexpr(win):
-            if cutlass.const_expr(coff == 2 and k < ratio):
-                colbase = cvec
-            else:
-                colbase = (d + cvec) if cutlass.const_expr(coff == 2) else cvec
-            fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
-            aoff = cute.assume((k % ratio) * W + colbase, divby=vec)
-            gA = cute.make_tensor(mAPE.iterator + aoff, cute.make_layout(vec))
-            cute.autovec_copy(gA, fr_a)
-            for j in cutlass.range_constexpr(vec):
-                ape_k.append(cutlass.Float32(fr_a[j]))
-
-        # True compressed row count; rows in [nb_valid, nb_total) are static-capacity
-        # padding and gather the window from token 0 with first-in-segment semantics,
-        # like the eager code.
+        # True compressed row count. Capacity-only rows write exact zeros without
+        # loading APE/KV/score or evaluating softmax. The predicate is uniform for
+        # every thread in a CTA because one CTA owns one output row.
         nb_valid = mCuComp[n_seq]
 
         for rr in cutlass.range_constexpr(rows_per_cta):
             bb = bidx * rows_per_cta + rr
             if bb < nb_total:
-                # Per-segment boundary scan (n_seq is small).
-                seq_idx = cutlass.Int32(0)
-                bis = cutlass.Int32(0)
+                fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                 if bb < nb_valid:
+                    # Hoist APE loads once per valid row/lane group.
+                    ape_k = []
+                    for k in cutlass.range_constexpr(win):
+                        if cutlass.const_expr(coff == 2 and k < ratio):
+                            colbase = cvec
+                        else:
+                            colbase = (d + cvec) if cutlass.const_expr(coff == 2) else cvec
+                        fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
+                        aoff = cute.assume((k % ratio) * W + colbase, divby=vec)
+                        gA = cute.make_tensor(mAPE.iterator + aoff, cute.make_layout(vec))
+                        cute.autovec_copy(gA, fr_a)
+                        for j in cutlass.range_constexpr(vec):
+                            ape_k.append(cutlass.Float32(fr_a[j]))
+
+                    # Per-segment boundary scan (n_seq is small).
+                    seq_idx = cutlass.Int32(0)
                     bis = cutlass.Int32(bb)
                     for s in cutlass.range(n_seq):
                         cs = mCuComp[s]
@@ -402,60 +402,62 @@ def _compressor_fwd_kernel(
                             if bb < ce:
                                 seq_idx = s
                                 bis = bb - cs
-                tok0 = mCu[seq_idx] + bis * ratio
+                    tok0 = mCu[seq_idx] + bis * ratio
 
-                sv = []
-                kvv = []
-                for k in cutlass.range_constexpr(win):
-                    fr_s = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                    fr_k = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                    if cutlass.const_expr(coff == 2 and k < ratio):
-                        if bis > 0:
-                            off = cute.assume((tok0 - ratio + k) * W + cvec, divby=vec)
+                    sv = []
+                    kvv = []
+                    for k in cutlass.range_constexpr(win):
+                        fr_s = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                        fr_k = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                        if cutlass.const_expr(coff == 2 and k < ratio):
+                            if bis > 0:
+                                off = cute.assume((tok0 - ratio + k) * W + cvec, divby=vec)
+                                gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
+                                gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
+                                cute.autovec_copy(gS, fr_s)
+                                cute.autovec_copy(gK, fr_k)
+                            # Same value construction as the scalar kernel: the invalid
+                            # window contributes the CONSTANT -inf score (no APE add —
+                            # APE values are not required to be finite) and a zero kv.
+                            for j in cutlass.range_constexpr(vec):
+                                v = cutlass.Float32(_NEG_INF)
+                                u = cutlass.Float32(0.0)
+                                if bis > 0:
+                                    v = cutlass.Float32(fr_s[j]) + ape_k[k * vec + j]
+                                    u = cutlass.Float32(fr_k[j])
+                                sv.append(v)
+                                kvv.append(u)
+                        else:
+                            if cutlass.const_expr(coff == 2):
+                                off = cute.assume((tok0 + k - ratio) * W + d + cvec, divby=vec)
+                            else:
+                                off = cute.assume((tok0 + k) * W + cvec, divby=vec)
                             gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
                             gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
                             cute.autovec_copy(gS, fr_s)
                             cute.autovec_copy(gK, fr_k)
-                        # Same value construction as the scalar kernel: the invalid
-                        # window contributes the CONSTANT -inf score (no APE add — APE
-                        # values are not required to be finite) and a zero kv lane.
-                        for j in cutlass.range_constexpr(vec):
-                            v = cutlass.Float32(_NEG_INF)
-                            u = cutlass.Float32(0.0)
-                            if bis > 0:
-                                v = cutlass.Float32(fr_s[j]) + ape_k[k * vec + j]
-                                u = cutlass.Float32(fr_k[j])
-                            sv.append(v)
-                            kvv.append(u)
-                    else:
-                        if cutlass.const_expr(coff == 2):
-                            off = cute.assume((tok0 + k - ratio) * W + d + cvec, divby=vec)
-                        else:
-                            off = cute.assume((tok0 + k) * W + cvec, divby=vec)
-                        gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
-                        gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
-                        cute.autovec_copy(gS, fr_s)
-                        cute.autovec_copy(gK, fr_k)
-                        for j in cutlass.range_constexpr(vec):
-                            sv.append(cutlass.Float32(fr_s[j]) + ape_k[k * vec + j])
-                            kvv.append(cutlass.Float32(fr_k[j]))
+                            for j in cutlass.range_constexpr(vec):
+                                sv.append(cutlass.Float32(fr_s[j]) + ape_k[k * vec + j])
+                                kvv.append(cutlass.Float32(fr_k[j]))
 
-                fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                for j in cutlass.range_constexpr(vec):
-                    mx = sv[j]
-                    for k in cutlass.range_constexpr(1, win):
-                        if sv[k * vec + j] > mx:
-                            mx = sv[k * vec + j]
-                    den = cutlass.Float32(0.0)
-                    ex = []
-                    for k in cutlass.range_constexpr(win):
-                        e = cute_math.exp(sv[k * vec + j] - mx)
-                        den = den + e
-                        ex.append(e)
-                    acc = cutlass.Float32(0.0)
-                    for k in cutlass.range_constexpr(win):
-                        acc = acc + _fmul_rn(kvv[k * vec + j], ex[k] / den)
-                    fr_o[j] = cutlass.BFloat16(acc)
+                    for j in cutlass.range_constexpr(vec):
+                        mx = sv[j]
+                        for k in cutlass.range_constexpr(1, win):
+                            if sv[k * vec + j] > mx:
+                                mx = sv[k * vec + j]
+                        den = cutlass.Float32(0.0)
+                        ex = []
+                        for k in cutlass.range_constexpr(win):
+                            e = cute_math.exp(sv[k * vec + j] - mx)
+                            den = den + e
+                            ex.append(e)
+                        acc = cutlass.Float32(0.0)
+                        for k in cutlass.range_constexpr(win):
+                            acc = acc + _fmul_rn(kvv[k * vec + j], ex[k] / den)
+                        fr_o[j] = cutlass.BFloat16(acc)
+                else:
+                    for j in cutlass.range_constexpr(vec):
+                        fr_o[j] = cutlass.BFloat16(0.0)
                 ooff = cute.assume(bb * d + cvec, divby=vec)
                 gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
                 cute.autovec_copy(fr_o, gO)

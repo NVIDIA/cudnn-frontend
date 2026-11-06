@@ -19,6 +19,7 @@ pytest core/test_determinism_utils.py
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
+| CSA compressor focused cases | `CSA.csa_compressor_forward_wrapper`, `CSA.csa_compressor_backward_wrapper` | BF16 pooled output, including exact-zero capacity rows | BF16 dKV/dScore, FP32 dAPE |
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
@@ -31,6 +32,16 @@ nonzero initial state and fixed output/final-state gradients. QSA lives in
 `QSA/cutedsl/test_qsa_determinism.py`; its public API has no determinism switch.
 It covers BF16 with 12:1, 24:2, and 6:1 query/KV head counts.
 DSA uses FP16/BF16 and enables `deterministic=True` on backward.
+
+CSA compressor coverage currently lives in
+`compressed_sparse_attention/cutedsl/test_CSA_compressor.py`. It checks repeated
+forward/dKV/dScore bytes, `deterministic=True` dAPE, strict torch deterministic mode,
+poisoned caller workspace/output CUDA Graph replay, ragged and empty segments, and
+exact-zero static-capacity rows for the generic and ratio-128 forward families. It does
+not yet contain the standalone/reordered/duplicated sequence comparisons or committed
+goldens required to claim batch invariance. The capacity-zero change was not executed
+on a CUDA GPU in its author environment, so all CSA determinism status cells remain
+Unverified; the default atomic dAPE path is Not guaranteed by contract.
 
 Replay checks use fresh inputs and side-stream contention. Batch
 checks reuse exact sequence data and upstream gradients while removing,
