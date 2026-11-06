@@ -549,13 +549,15 @@ PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
 ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_SMALL_SMEM_ORDER = (PAIR_NBUF2_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_FORMS = (TWO_CTA_CFG,) + BEYOND_SMALL_SMEM_ORDER
-# Past the one-CTA grid at a geometry OTHER than the default the register-capped two-CTAs-per-SM form is not picked: it is measured at
-# the default geometry only (the budget rule: a form unmeasured off the default is not picked there), and it spills where the hidden width
-# is 8192 -- on sm_100a and sm_103a alike it is spill-free at the default geometry (128 registers, 0 stack, 0 STL / LDL; hidden 5120 = two
-# full 2048-element BA chunks and a half) and at 4 / 16 / 4096 (two full chunks), but 128 registers + 56 B stack + 14 STL / 14 LDL at
-# 1 / 8 / 8192, 2 / 16 / 8192 and 4 / 32 / 8192: a hidden-width term (four full BA chunks live in the role at 8192).  The one-CTA form runs
-# in two waves instead (the same kernel body, bitwise), with the one-CTA token bound (8 on the cc 10.0 readings); at 4 / 16 / 4096 the
-# exclusion is conservative (spill-free there, unmeasured).  TWO_CTA_CFG stays available as an explicit form.
+# Past the one-CTA grid at a geometry OTHER than the default the register-capped two-CTAs-per-SM form is not picked -- the budget rule: a
+# form that spills off the default geometry is not picked there (a spill-free form keeps the default's ladder, as the decode capped forms
+# do).  It spills where the hidden width is 8192 -- on sm_100a and sm_103a alike it is spill-free at the default geometry (128 registers,
+# 0 stack, 0 STL / LDL; hidden 5120 = two full 2048-element BA chunks and a half) and at 4 / 16 / 4096 (two full chunks), but 128 registers
+# + 56 B stack + 14 STL / 14 LDL at 1 / 8 / 8192, 2 / 16 / 8192 and 4 / 32 / 8192: a hidden-width term (four full BA chunks live in the
+# role at 8192); it is also measured at the default geometry only.  The one-CTA form runs in two waves instead (the same kernel body,
+# bitwise), with the one-CTA token bound (8 on the cc 10.0 readings) -- the regime starts where ``requests x V_HEADS`` outgrows the SMs: 5
+# requests at 32 V heads, 10 at 16, 20 at 8 on 152 SMs (19 on 148); at 4 / 16 / 4096 the one off-default ladder is conservative (spill-free
+# there, unmeasured).  TWO_CTA_CFG stays available as an explicit form.
 BEYOND_FORMS_OFF_DEFAULT = (CFG,) + BEYOND_SMALL_SMEM_ORDER
 
 
@@ -632,9 +634,10 @@ def default_cfg(
 ) -> Cfg:
     """The pick per requests on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a two-argument
     call is the measured cc 10.0 pick) for ``geometry`` (the default geometry's 48 V heads per rank unless given; a rank with fewer V heads
-    moves the switches up by the same rule -- 8 V heads on 152 SMs: the pair to 9 requests, one CTA per SM to 19 -- the budget rule,
-    unmeasured there until its own cells run; past the one-CTA grid such a geometry takes the one-CTA form in two waves, never the
-    two-CTAs-per-SM form, unmeasured there and spilling at hidden 8192: ``BEYOND_FORMS_OFF_DEFAULT``).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
+    moves the switches up by the same rule -- 8 V heads on 152 SMs: the pair to 9 requests, one CTA per SM to 19 -- the budget rule, with
+    the pair pick measured against the stock chain at 1 and 4 requests on the 8- and 16-V-head shards; past the one-CTA grid -- from 5
+    requests at 32 V heads, 10 at 16, 20 at 8 on 152 SMs (19 on 148) -- such a geometry takes the one-CTA form in two waves, never the
+    two-CTAs-per-SM form, which spills at hidden 8192 and is measured at the default geometry only: ``BEYOND_FORMS_OFF_DEFAULT``).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
     the ``requests x 96`` cluster grid has an SM of its own (one request on a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA
     per SM) while every CTA of the ``requests x 48`` grid has one, ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the
     device's SMs -- on a 148- or 152-SM part the switches are between 1 request (96 cluster CTAs) and 2 (192 as a pair; 96 one-CTA CTAs),

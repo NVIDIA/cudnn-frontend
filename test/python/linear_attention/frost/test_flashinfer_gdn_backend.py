@@ -260,6 +260,10 @@ def test_dsl_gate_is_a_dsl_decline(monkeypatch, form):
 
 
 def test_row_envelope(as_sm100):
+    """The decode rows the probe serves: 65535 (CUDA's grid Y) at the default geometry and at every per-rank shard, and -- the same bound
+    the entry's ``check_binding`` applies on contiguous ``qkv`` / ``z`` -- fewer where the kernel's 32-bit row addresses bind first, once
+    ``d_model`` passes 32768 (``max_rows_for``: 63550 rows at 1 K / 8 V heads with ``d_model`` 33792), a ``shape`` decline naming the
+    geometry; the stride-dependent remainder (a fused QKVZ row view) is the entry's typed decline at ``prepare``, not the probe's."""
     assert backend.DECODE_MAX_ROWS == entry.MAX_ROWS == 65535, "one source: the entry's own bound (its check_support declines past it)"
     assert _probe("cuda:0").served and _probe("cuda:0", requests=1).served
     assert _probe("cuda:0", requests=backend.DECODE_MAX_ROWS, tokens_per_request=1).served
@@ -267,6 +271,20 @@ def test_row_envelope(as_sm100):
     assert (sup.served, sup.kind) == (False, "shape") and str(backend.DECODE_MAX_ROWS) in sup.reason, sup
     sup = _probe("cuda:0", requests=4, tokens_per_request=2)  # FlashInfer's own gate: decode takes one token per request
     assert (sup.served, sup.kind) == (False, "shape"), sup
+    for g in RANK_GEOMETRIES:  # the named shards: the grid-Y cap binds first (their widest row is at most 20480 elements)
+        assert qwen_3_5_gdn_block_support("cuda:0", g, "decode", backend.BACKEND, requests=backend.DECODE_MAX_ROWS).served, g
+        sup = qwen_3_5_gdn_block_support("cuda:0", g, "decode", backend.BACKEND, requests=backend.DECODE_MAX_ROWS + 1)
+        assert (sup.served, sup.kind) == (False, "shape") and "grid Y" in sup.reason and "65535" in sup.reason, (g, sup)
+    deep = Qwen35GdnGeometry(d_model=33792, num_v_heads=8, num_k_heads=1, head_k_dim=128, head_v_dim=128, conv_kernel=4)
+    bound = entry.max_rows_for(backend.geometry_of(deep).QKV_CHANNELS, backend.geometry_of(deep).OUT_ROW, backend.geometry_of(deep))
+    assert bound == (2**31 - 1) // 33792 == 63550 < backend.DECODE_MAX_ROWS
+    assert qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND, requests=bound).served
+    assert qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND).served, "without a requests count the geometry is served"
+    sup = qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND, requests=bound + 1)
+    assert (sup.served, sup.kind) == (False, "shape") and "32-bit arithmetic" in sup.reason and "at most 63550 rows" in sup.reason, sup
+    assert "hidden 33792" in sup.reason and "requests=63551" in sup.reason and "prepare" in sup.reason, sup
+    sup = qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND, requests=backend.DECODE_MAX_ROWS)
+    assert (sup.served, sup.kind) == (False, "shape") and "at most 63550 rows" in sup.reason, "65535 is past the geometry's bound"
 
 
 def test_verify_step_shape_envelope(as_sm100):

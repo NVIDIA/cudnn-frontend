@@ -388,7 +388,11 @@ def test_decode_ba_partition_covers_every_hidden_index_once(g):
 def test_rows_are_bounded_by_the_int32_row_address_headroom_at_wide_geometries():
     """The kernel forms its row addresses in 32-bit arithmetic: ``check_binding`` declines, by type and naming the geometry, a rows count
     whose widest row stride overflows 2^31 elements -- below ``MAX_ROWS`` only off the default geometry.  At the default geometry
-    (QKVZ row 16384) the bound is ``MAX_ROWS`` itself; at 16 K / 128 V heads with hidden 8192 and a fused QKVZ view (row 36864) it is 58254."""
+    (QKVZ row 16384) the bound is ``MAX_ROWS`` itself; at 16 K / 128 V heads with hidden 8192 and a fused QKVZ view (row 36864) it is 58254;
+    on contiguous operands it drops below ``MAX_ROWS`` only once the hidden width passes 32768 (63550 at 33792, the geometry-only bound
+    FlashInfer's probe answers).  The operands at the bound live on the ``meta`` device: ``check_binding`` reads shape, stride, dtype,
+    device and alignment only (a ``meta`` tensor's ``data_ptr`` is 0), while a real tensor at the bound holds 2^31 elements -- torch's
+    ``as_strided`` refuses a view past its storage -- 4 GiB this host tier has no use for."""
     d = kcfg.DEFAULT_GEOMETRY
     assert entry.max_rows_for(d.QKV_CHANNELS + d.OUT_ROW, d.QKV_CHANNELS + d.OUT_ROW, d) == entry.MAX_ROWS == 65535
     wide = gdn_geometry.Geometry(16, 128, 8192)
@@ -397,21 +401,36 @@ def test_rows_are_bounded_by_the_int32_row_address_headroom_at_wide_geometries()
     assert (
         (2**31 - 1) // wide.QKV_CHANNELS == 104857 > entry.MAX_ROWS == entry.max_rows_for(wide.QKV_CHANNELS, wide.OUT_ROW, wide)
     ), "contiguous x / z: the grid-Y cap binds first"
+    deep = gdn_geometry.Geometry(1, 8, 33792)  # the hidden row is the widest term: the geometry-only bound on contiguous operands
+    assert entry.max_rows_for(deep.QKV_CHANNELS, deep.OUT_ROW, deep) == (2**31 - 1) // 33792 == 63550 < entry.MAX_ROWS
+    edge = gdn_geometry.Geometry(1, 8, 32768)
+    assert entry.max_rows_for(edge.QKV_CHANNELS, edge.OUT_ROW, edge) == entry.MAX_ROWS, "32768 is the last hidden width the grid-Y cap binds at"
+
+    def meta(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16, device="meta")
+
     rows = entry.max_rows_for(slab, slab, wide) + 1
-    ops = make_operands(rows=1, geometry=wide)
+    ops = make_operands(rows=1, geometry=wide, device="meta")
     # the row count claims rows rows of the (one-row) operands: the stride check comes first, so size the strided views to hold them
-    x = torch.empty(rows, slab, dtype=torch.bfloat16)
+    x = meta(rows, slab)
     ops.update(
         rows=rows,
         x=x[:, : wide.QKV_CHANNELS],
         z=x[:, wide.QKV_CHANNELS :].view(rows, wide.V_HEADS, 128),
-        idx=torch.ones(rows, dtype=torch.int32),
-        hidden=torch.empty(rows, wide.HIDDEN, dtype=torch.bfloat16),
+        idx=torch.ones(rows, dtype=torch.int32, device="meta"),
+        hidden=meta(rows, wide.HIDDEN),
     )
     with pytest.raises(NotImplementedError, match="32-bit arithmetic: at most 58254 rows .* 36864 / 36864 .* hidden 8192; got rows=58255"):
         entry.check_binding(*_binding_args(ops), geometry=wide)
     ops["rows"] = rows - 1
     entry.check_binding(*_binding_args(ops), geometry=wide)  # the bound itself is served
+    rows = 63551
+    ops = make_operands(rows=1, geometry=deep, device="meta")
+    ops.update(rows=rows, x=meta(rows, deep.QKV_CHANNELS), z=meta(rows, deep.V_HEADS, 128), idx=torch.ones(rows, dtype=torch.int32, device="meta"))
+    with pytest.raises(NotImplementedError, match="at most 63550 rows for x / z row strides 1280 / 1024 .* hidden 33792; got rows=63551"):
+        entry.check_binding(*_binding_args(ops), geometry=deep)
+    ops.update(rows=rows - 1, hidden=meta(rows - 1, deep.HIDDEN))
+    entry.check_binding(*_binding_args(ops), geometry=deep)  # 63550 rows of contiguous operands are served
 
 
 def test_geometry_envelope_takes_any_integral_and_holds_plain_ints():

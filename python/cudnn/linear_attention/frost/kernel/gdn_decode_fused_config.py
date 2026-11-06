@@ -450,8 +450,11 @@ def default_cfg(
     device's SMs (rows 4 and up: 192 CTAs) ``CAPPED_CFG`` (two CTAs per SM, one wave) where two of its CTAs share an SM on the readings
     (``co_resident_ctas`` 2: the cc 10.0 readings), else ``CFG`` in two waves (the cc 12.0 readings: rows 1 the pair, rows 2 and up the
     one-CTA form on 170 / 188 SMs; never a cap that spills).  A geometry with fewer V heads per rank moves the switches up by the same
-    rule (8 V heads on 152 SMs: the pair to rows 9, one CTA per SM to rows 19) -- the budget rule, unmeasured there until its own
-    cells run.  A part no form fits is the typed decline (``NotImplementedError`` naming its opt-in).  ``rows`` is in the compile key
+    rule (8 V heads on 152 SMs: the pair to rows 9, one CTA per SM to rows 19) and keeps this ladder past the grid -- the budget rule picks
+    no form that spills off the default geometry, and the capped forms are spill-free at every geometry (128 / 124 registers, no stack, on
+    sm_100a and sm_103a alike), so ``CAPPED_CFG`` stays the beyond-the-grid pick: measured against the stock chain at rows 16 on the
+    16-V-head shard, its A/B against the one-CTA form in two waves owed.  A part no form fits is the typed decline (``NotImplementedError``
+    naming its opt-in).  ``rows`` is in the compile key
     and ``sm_count`` is the device's multiprocessor count, all plan-time facts (never a runtime value)."""
     if not isinstance(rows, int) or rows < 1:
         raise ValueError(f"gdn_decode_fused: rows must be a positive int, got {rows!r}")

@@ -22,7 +22,9 @@ envelope -- head dims 128 and conv kernel 4 pinned, at most 16 K heads and 128 V
 ``d_model`` 8192 with 1 K head and 8 V heads at 16-way tensor parallelism), each compiled as its own form of the same kernel body
 (``Geometry`` of ``kernel/gdn_geometry.py`` rides on the entries' ``Cfg``) -- on SM100-class (compute capability 10.x) and SM120-class
 (12.x) parts with a CuTe DSL >= 4.8.0.  The
-``decode`` form takes up to 65535 rows (one grid row per request).  The ``verify`` form takes up to 65535 requests (one grid row each) of
+``decode`` form takes up to 65535 rows (one grid row per request; fewer where the kernel's 32-bit row addresses bound the rows first --
+``gdn_decode_fused.max_rows_for``: on contiguous ``qkv`` / ``z`` once ``d_model`` passes 32768, which :func:`support` answers, or with a
+row-strided ``qkv`` / ``z`` view, a typed decline at ``prepare``).  The ``verify`` form takes up to 65535 requests (one grid row each) of
 ``tokens_per_request`` >= 2 tokens, bounded above by the shared-memory budget of the forms the entry picks for that requests count on
 THIS device (:func:`verify_max_tokens` = the entry's ``max_tokens_for``, the bound of the pick's whole ladder: the cluster pair, two CTAs
 per V head, while the ``requests x 96`` CTAs have an SM each, the one-CTA-per-SM form while the ``requests x 48`` CTAs have one, the
@@ -100,10 +102,14 @@ FORMS = (DECODE, VERIFY)
 #: carries from PR #8131 (2026-10-31) on; no tagged FlashInfer release carried it when this module was written, and FlashInfer marks the
 #: block experimental (it may change or be removed without deprecation)
 FLASHINFER_FLOOR = "FlashInfer main at or after PR #8131 (2026-10-31; no tagged release carries the block's backend registry yet)"
-#: the decode launch is grid ``(48, rows, 1)``: CUDA caps grid Y at 65535 -- the entry's own bound (``gdn_decode_fused.MAX_ROWS``; its
-#: ``check_support`` declines past it), so the probe and the direct entry answer alike
+#: the decode launch is grid ``(V_HEADS x CTAS_PER_HEAD, rows, 1)``: CUDA caps grid Y at 65535 -- the entry's own bound
+#: (``gdn_decode_fused.MAX_ROWS``; its ``check_support`` declines past it), so the probe and the direct entry answer alike.  Below it the
+#: kernel's 32-bit row addresses bound the rows (``gdn_decode_fused.max_rows_for``): :func:`support` answers the geometry-only part of that
+#: bound on contiguous ``qkv`` / ``z`` (below 65535 once ``d_model`` passes 32768: 63550 rows at 33792); a row-strided view (a fused QKVZ
+#: projection row) lowers it further, a stride the probe does not see, so the entry declines it by type at ``prepare``
 DECODE_MAX_ROWS = _decode.MAX_ROWS
-#: the verify launch is grid ``(48, requests, 1)``: the same cap, one grid row per request (``gdn_verify_fused.MAX_REQUESTS``)
+#: the verify launch is grid ``(V_HEADS x CTAS_PER_HEAD, requests, 1)``: the same cap, one grid row per request
+#: (``gdn_verify_fused.MAX_REQUESTS``; the verify kernel's row addresses are 64-bit, so no second bound)
 VERIFY_MAX_REQUESTS = _verify.MAX_REQUESTS
 #: the kernels' DEFAULT geometry (the one they were written and validated against: the block's dense-27B geometry at tensor-parallel
 #: rank 1), in FlashInfer's ``Qwen35GdnGeometry`` field names -- one of the geometries served (:func:`geometry_off` admits the envelope)
@@ -187,6 +193,16 @@ def support(device, geometry, form: str, requests: Optional[int], tokens_per_req
                 "shape",
                 f"the cuDNN Frontend GDN decode kernel launches one grid row per request, at most {DECODE_MAX_ROWS} (CUDA's grid Y limit); got "
                 f"requests={requests}",
+            )
+        g = geometry_of(geometry)
+        # the Int32 row-address bound on the geometry's own row widths (contiguous qkv / z): below DECODE_MAX_ROWS once d_model passes 32768;
+        # a row-strided qkv / z view lowers it further by a stride the probe does not see -- the entry's typed decline at prepare
+        row_max = _decode.max_rows_for(g.QKV_CHANNELS, g.OUT_ROW, g)
+        if requests is not None and requests > row_max:
+            return Qwen35GdnDecline(
+                "shape",
+                f"the cuDNN Frontend GDN decode kernel forms its row addresses in 32-bit arithmetic: at most {row_max} rows at {g.describe()} "
+                f"(fewer with a row-strided qkv / z view, declined at prepare); got requests={requests}",
             )
         try:
             # the one-CTA decode form must fit this device's per-CTA opt-in (74,848 B; every admitted part holds it): the entry's own

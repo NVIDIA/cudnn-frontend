@@ -1171,18 +1171,19 @@ def _part_form(dev, forms):
     return kcfg.first_fitting(forms, *entry.device_shared_memory(dev))
 
 
-def _fits_or_declines(dev, cfg, tokens, geometry=None):
-    """``cfg`` stamped with this part's readings when it holds ``tokens`` per request; else the typed decline is asserted (a form whose
-    shared memory the part does not hold at the minimum token count is validate_cfg's ValueError at construction, one that holds too few
-    tokens is validate_tokens' NotImplementedError at the call) and the cell is SKIPPED with that reason -- the count then shows which
-    arms ran on the part (every arm on the cc 10.0 readings; 17 of 43 on the cc 12.0 ones), and an unheld arm is never a launch."""
-    on_part = replace(cfg, **_on(entry.device_shared_memory(dev)), **({} if geometry is None else dict(GEOM=geometry)))
+def _fits_or_declines(dev, cfg, tokens):
+    """``cfg`` (a form already carrying its geometry) stamped with this part's readings when it holds ``tokens`` per request; else the
+    typed decline is asserted (a form whose shared memory the part does not hold at the minimum token count is validate_cfg's ValueError
+    at construction, one that holds too few tokens is validate_tokens' NotImplementedError at the call) and the cell is SKIPPED with that
+    reason -- the count then shows which arms ran on the part (every arm on the cc 10.0 readings; 17 of 43 on the cc 12.0 ones), and an
+    unheld arm is never a launch."""
+    on_part = replace(cfg, **_on(entry.device_shared_memory(dev)))
     try:
         kcfg.validate_cfg(on_part)
     except ValueError as exc:
         assert "does not fit" in str(exc), exc
         with pytest.raises(ValueError, match="does not fit"):
-            entry.GdnVerifyFused(dev, 1e-6, cfg=cfg, geometry=geometry)
+            entry.GdnVerifyFused(dev, 1e-6, cfg=cfg)
         pytest.skip(f"this part's shared memory does not hold the arm (declined by type at construction): {exc}")
     if tokens > on_part.max_tokens():
         with pytest.raises(NotImplementedError, match=f"at most {on_part.max_tokens()} on this part"):

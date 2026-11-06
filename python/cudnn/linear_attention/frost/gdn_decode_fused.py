@@ -73,7 +73,8 @@ NAME = "the fused GDN decode step"
 MAX_ROWS = 65535
 #: the kernel forms its row-strided addresses (``row x`` the x / z row stride, ``row x HIDDEN``, ``row x OUT_ROW``) in 32-bit arithmetic,
 #: so ``rows x`` the largest row stride must stay below 2^31 elements (:func:`max_rows_for`); the default geometry's strides never reach
-#: it below MAX_ROWS (16384 x 65535), a wide shard with a fused QKVZ view does (16 K / 128 V heads, hidden 8192: 36864 x 58256)
+#: it below MAX_ROWS (16384 x 65535), a wide shard with a fused QKVZ view does (16 K / 128 V heads, hidden 8192: a 36864-element row holds
+#: 58254 rows, 58255 is the first row count declined), and so does a hidden width past 32768 on contiguous operands (63550 rows at 33792)
 ROW_ADDRESS_LIMIT = 2**31 - 1
 
 
