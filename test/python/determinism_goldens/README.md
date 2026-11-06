@@ -696,3 +696,39 @@ and zero-upstream-gradient QSA cases pass.
 - [Megatron kernel replay PR](https://github.com/NVIDIA/Megatron-LM/pull/7148): raw-byte comparison, side-stream contention, negative controls, and coverage review.
 - [Nemotron functional tests](https://github.com/NVIDIA/Megatron-LM/tree/main/tests/functional_tests/test_cases/nemotron): deterministic execution and saved regression values.
 - Internal recipe CI (not linked from this public repository): follow-up integration target; its contents were not accessible during this change.
+
+### Hopper compact H32 sparse indexer backward
+
+Verified on 2026-11-07 with NVIDIA L20X SM90, PyTorch 2.12.1+cu130,
+cuDNN 9.20.0, and CuTe DSL 4.8.0 compiling with the CUDA 13.4 flavor.
+The source under test was develop `938f1db4` plus this change at pre-rebase
+commit `a5252d7e`; the DSA modules resolved from that source overlay. The L0
+`test_sm90_deterministic_h32_topk512` cases cover BF16 and FP32 dK,
+sparse negative IDs, replay, batch reordering with global IDs, and an
+independent gradient reference. Both the golden-recording run and the strict
+golden replay passed 2/2 cases. The committed runtime key is
+`70c200b13182bbc2`.
+
+The L0 support-envelope cells passed 24/24. Four H32 stress cases passed in
+15.13 seconds under their then-current L1 marker, covering Top-K 384/512/2048,
+both deterministic dW folds, BF16 and FP32 dK, local and global IDs, and 194
+query rows over 96 producer planes. This change promotes those four unchanged
+cells to L0. Before that marker promotion, the complete indexer-backward L0
+file finished with 39 passed, 20 expected SM100-only skips, and 67 deselected
+in 21.60 seconds. Commands run:
+
+```bash
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -k sm90_deterministic_h32_topk512 -q -rs
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -k check_support_envelope -q -rs
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L1 -k 'deterministic_reproducible_and_correct and h32' -q -rs
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -q -rs
+```
+
+The CUDA 12 compiler flavor was unavailable and remains unverified. On
+2026-11-09 the AIStudio workflow had expired before the rebased branch and the
+promoted L0 selection could be rerun. The 42 intervening develop commits did
+not change the SM90 indexer backward kernel, its API, or its tests.

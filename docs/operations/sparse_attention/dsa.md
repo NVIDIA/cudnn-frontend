@@ -959,7 +959,7 @@ indexer tower:
 `check_support` admits `D == 128`, `block_I == 128`, a positive top-k that is a
 multiple of `block_I` (callers with other logical extents pad the top-k tensors
 with `-1` indices and zero scores), and a finite `sm_scale > 0`; SM100/SM103/SM107
-additionally require `H in {32, 64}` and SM90 requires `H == 64`. `d_index_q`
+additionally require `H in {32, 64}` and SM90 supports `H == 64` plus `H == 32` in deterministic mode. `d_index_q`
 and `d_weights` are BF16; `d_index_k` is BF16 or fp32.
 
 With `deterministic=True` on SM90, SM100, SM103 or SM107, kernel 2 uses fixed
@@ -981,8 +981,8 @@ missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM90 with `H == 64` and
-SM100/SM103/SM107 with `H in {32, 64}`. All supported devices require `D == 128`,
+`deterministic=True` is request-or-fail and supports `H in {32, 64}` on
+SM90/SM100/SM103/SM107. All supported devices require `D == 128`,
 `block_I == 128`, and `topk % 128 == 0` for
 `128 <= topk <= 2048`. Each producer CTA owns one plane. SM100-family kernels
 process fixed grid-stride row stripes; SM90 submits bounded waves of at most
