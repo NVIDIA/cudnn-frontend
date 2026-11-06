@@ -34,12 +34,13 @@ pytestmark = [pytest.mark.L0]
 ROWS = 2
 SLOTS = ROWS + 1
 # the per-rank geometries of the larger dense models: (K heads, V heads, hidden) at 16- / 8- / 4-way tensor parallelism of a hidden-8192
-# model and at 4-way of a hidden-4096 one
+# model and at 4- / 8-way of a hidden-4096 one (8-way = two trays of four GPUs serving the 397B-class checkpoint: the rehearsal geometry)
 RANK_GEOMETRIES = [
     gdn_geometry.Geometry(1, 8, 8192),
     gdn_geometry.Geometry(2, 16, 8192),
     gdn_geometry.Geometry(4, 32, 8192),
     gdn_geometry.Geometry(4, 16, 4096),
+    gdn_geometry.Geometry(2, 8, 4096),
 ]
 
 
@@ -397,12 +398,12 @@ def test_rows_are_bounded_by_the_int32_row_address_headroom_at_wide_geometries()
     assert entry.max_rows_for(d.QKV_CHANNELS + d.OUT_ROW, d.QKV_CHANNELS + d.OUT_ROW, d) == entry.MAX_ROWS == 65535
     wide = gdn_geometry.Geometry(16, 128, 8192)
     slab = wide.QKV_CHANNELS + wide.OUT_ROW  # 20480 + 16384
-    assert slab == 36864 and entry.max_rows_for(slab, slab, wide) == (2**31 - 1) // 36864 == 58254
+    assert slab == 36864 and entry.max_rows_for(slab, slab, wide) == 58254  # (2**31 - 1) // 36864
     assert (
         (2**31 - 1) // wide.QKV_CHANNELS == 104857 > entry.MAX_ROWS == entry.max_rows_for(wide.QKV_CHANNELS, wide.OUT_ROW, wide)
     ), "contiguous x / z: the grid-Y cap binds first"
     deep = gdn_geometry.Geometry(1, 8, 33792)  # the hidden row is the widest term: the geometry-only bound on contiguous operands
-    assert entry.max_rows_for(deep.QKV_CHANNELS, deep.OUT_ROW, deep) == (2**31 - 1) // 33792 == 63550 < entry.MAX_ROWS
+    assert entry.max_rows_for(deep.QKV_CHANNELS, deep.OUT_ROW, deep) == 63550 < entry.MAX_ROWS  # (2**31 - 1) // 33792
     edge = gdn_geometry.Geometry(1, 8, 32768)
     assert entry.max_rows_for(edge.QKV_CHANNELS, edge.OUT_ROW, edge) == entry.MAX_ROWS, "32768 is the last hidden width the grid-Y cap binds at"
 
