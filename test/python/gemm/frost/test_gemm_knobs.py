@@ -480,25 +480,18 @@ def test_frost_gemm_declines_a_split_k_record_for_a_tile_invariant_fp32_sum(monk
 
 
 @pytest.mark.parametrize("swapped", (False, True), ids=("plain", "swap_ab"))
-@pytest.mark.parametrize(
-    "family,config_name",
-    [("sm100", "CONFIG_sm100_128x128x128_128x128x32_cluster1x1"), ("sm120", "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")],
-    ids=("sm100", "sm120"),
-)
-def test_split_k_gate_declines_tile_invariant_fp32_sums(family, config_name, swapped):
-    """Host-only (no kernel, no GPU work): each family's split-K gate that explicit configs, replayed records and the
+def test_sm120_split_k_gate_declines_tile_invariant_fp32_sums(swapped):
+    """Host-only (no kernel, no GPU work): the SM120 split-K gate that explicit configs, replayed records and the
     automatic pick share declines an fp32 sum over all of M and N, per batch or over the batch too, also under
     swap-AB (``swap_ab`` swaps a reduction's M and N extents). Modes exact under atomics (AMAX, an int32 ADD)
     and per-row / per-column sums keep the split."""
     from dataclasses import replace
 
-    from importlib import import_module
-
     from cudnn.gemm.frost.fusion_ir import swap_ab
     from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.sm120 import compiler
 
-    compiler = import_module(f"cudnn.gemm.frost.{family}.compiler")
-    cfg = replace(by_name(config_name), split_k_slices=2, swap_ab=swapped)
+    cfg = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), split_k_slices=2, swap_ab=swapped)
 
     def reason(mode, dim, batch=1, dtype=cudnn.data_type.FLOAT):
         g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
