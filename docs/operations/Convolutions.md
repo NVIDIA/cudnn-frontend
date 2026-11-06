@@ -188,4 +188,12 @@ set_convolution_mode(ConvolutionMode_t mode_)
     - compute_data_type
     - name
 
+`conv_wgrad` cannot infer the dims of the returned dW from the graph inputs; set them explicitly
+(the filter dims/strides) before marking it an output, otherwise graph construction fails with `dims not set`:
+
+```python
+dW = graph.conv_wgrad(image=X, loss=dY, padding=[1, 1], stride=[2, 2], dilation=[1, 1])
+dW.set_output(True).set_dim(list(W.get_dim())).set_stride(list(W.get_stride()))
+```
+
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
