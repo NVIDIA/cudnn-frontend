@@ -2483,3 +2483,16 @@ class TestMixedFp8Kv:
     test_compact_split = staticmethod(compact_split)
     test_dense_paged_native = staticmethod(dense_paged_native)
     test_uniform_control = staticmethod(uniform_control)
+
+
+import sdpa_bwd_fp8_d192_sm107 as _d192_bwd_checks
+
+ds_knob = _d192_bwd_checks.ds_knob
+test_stage3_tile_rule_fp8_d192 = _d192_bwd_checks.test_stage3_tile_rule_fp8_d192
+
+
+@requires_rubin
+class TestNativeFp8D192Bwd:
+    """Run the D192/V128 per-tensor fp8 backward pair checks in the native CI entry."""
+
+    test_native_stage3 = staticmethod(_d192_bwd_checks.test_d192_native_stage3_matches_the_oracle_and_the_d256_row)
