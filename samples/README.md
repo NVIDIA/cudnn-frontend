@@ -26,6 +26,8 @@ Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python A
 * [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2, GDP and Mamba-2 prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
 * [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
 
+`frost/gemm` needs a data-center Blackwell-family GPU (`100 <= SM < 120`); on other parts its scripts print `[NN] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)` and exit 0. `frost/gated_attention_block` needs Rubin (`SM 10.7`).
+
 ```
 python samples/frost/linear_attention/01_gdn_prefill.py
 ```
