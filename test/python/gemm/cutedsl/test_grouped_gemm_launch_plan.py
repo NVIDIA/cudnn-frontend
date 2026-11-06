@@ -177,3 +177,33 @@ def test_plans_can_be_turned_off(monkeypatch):
     monkeypatch.setattr(launch_plan, "ENABLED", False)
     plain = planned_wrapper("glu_")[1]
     assert launch_plan.planned(plain) is plain
+
+
+@pytest.mark.parametrize("case,module", [("gemm_bf16", "unfused"), ("glu_bf16", "glu"), ("glu_mxfp8", "glu"), ("quant_mxfp8", "quant")])
+def test_a_plan_keeps_the_api_workspace_alive(case, module, monkeypatch):
+    """A plan binds the API's workspace by address, so dropping the API (its caches cleared) must not free it under the plan."""
+    import gc
+    import importlib
+    import weakref
+
+    api = importlib.import_module(f"cudnn.gemm.cutedsl.grouped.{module}.api")
+    caches = [name for name, value in vars(api).items() if (name.startswith("_cache_of_") or name.endswith("_wrapper_memo")) and isinstance(value, dict)]
+    for name in caches:
+        monkeypatch.setattr(api, name, {})
+    kind, kwargs = CASES[case]()
+    run, plain = planned_wrapper(kind)
+    for _ in range(3):
+        run(**kwargs)
+    the_plan(run)
+    ops = [op for name in caches if name.startswith("_cache_of_") for op in getattr(api, name).values()]
+    workspaces = [weakref.ref(getattr(op, "_implementation", op)._workspace) for op in ops]
+    assert workspaces
+    for name in caches:
+        getattr(api, name).clear()
+    del ops
+    gc.collect()
+    assert all(ref() is not None for ref in workspaces)
+    assert_same_outputs(call(run, kwargs, {}), call(plain, kwargs, {}))
+    run.plans.clear()
+    gc.collect()
+    assert all(ref() is None for ref in workspaces)

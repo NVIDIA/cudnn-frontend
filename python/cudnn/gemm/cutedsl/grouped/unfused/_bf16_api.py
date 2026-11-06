@@ -424,6 +424,8 @@ class GroupedGemmBf16API(APIBase):
             options="--enable-tvm-ffi",
         )
 
+        # A launch plan binds the workspace by address and keeps only the compiled kernel alive: tie the workspace to it.
+        raw_compiled._workspace = self._workspace
         cached_n = n_value
         cached_k = k_value
         cached_b_stride = b_stride

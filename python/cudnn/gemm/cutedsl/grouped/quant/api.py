@@ -930,6 +930,8 @@ class GroupedGemmQuantSm100(APIBase):
         else:
             compile_kwargs["row_scale"] = row_scale_cute_fake
         _compiled_kernel = cute.compile(gemm_quant, **compile_kwargs)
+        # A launch plan binds the workspace by address and keeps only the compiled kernel alive: tie the workspace to it.
+        _compiled_kernel._workspace = self._workspace
 
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
 
