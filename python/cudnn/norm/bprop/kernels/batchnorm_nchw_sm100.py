@@ -34,7 +34,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nchw_sm100 import nchw_cfg
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, coop_launch_too_large
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, coop_launch_too_large, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -505,7 +505,8 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         smem_bytes = 2 * (2 * CT) * 4 + 2 * WPB * CPW * KSR * S * eb + 128
         mbpm = 2 if occ == 2 else 0
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, cparts, it_ty, et, count, has_beta, smem_bytes, mbpm)
-        key = (params.io_dtype,) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(saved_mean.stride(0), 2), min(saved_rstd.stride(0), 2)) + ce
         ws_reset(ws)  # this block is retried at a lower occupancy
         pbuf = ws_empty(ws, cparts * 2 * mparts * CT, torch.float32, x3d.device)
         ret = ws_zeros(ws, cparts, torch.int32, x3d.device)
@@ -525,8 +526,11 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         )
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_bn_bwd_nchw_host, *args, *ce, fake_stream())
-            _KCACHE[key] = fn
+            with dsl_compile_lock():
+                fn = _KCACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_bn_bwd_nchw_host, *args, *ce, fake_stream())
+                    _KCACHE[key] = fn
         try:
             fn(*args, cur_stream())
             _OCC[okey] = occ

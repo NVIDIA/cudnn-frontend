@@ -131,7 +131,7 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     cu_t = g.tensor([num_seqs + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
     a_log_t = g.tensor([H], data_type=cudnn.data_type.FLOAT, name="a_log")
     dt_bias_t = g.tensor([H, D], data_type=cudnn.data_type.FLOAT, name="dt_bias")
-    O_t, fs_t, _h_t = g.gdn2(
+    O_t, fs_t, _h_t, _composed = g.gdn2(
         q=q_t,
         k=k_t,
         v=v_t,

@@ -289,6 +289,10 @@ to_string(cudnnBackendNumericalNote_t note) {
         case CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP:
             return std::string("CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP");
 #endif
+#if defined(CUDNN_HAS_FULL_PRECISION_MATH_NUMERICAL_NOTE)
+        case CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH:
+            return std::string("CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH");
+#endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
             return std::string("UNKNOWN_NUMERICAL_NOTE");
@@ -667,6 +671,7 @@ enum class NumericalNote_t {
     WINOGRAD_TILE_6x6,
     WINOGRAD_TILE_13x13,
     STRICT_NAN_PROP,
+    FULL_PRECISION_MATH,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
@@ -682,6 +687,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
                                  {NumericalNote_t::WINOGRAD_TILE_6x6, "WINOGRAD_TILE_6x6"},
                                  {NumericalNote_t::WINOGRAD_TILE_13x13, "WINOGRAD_TILE_13x13"},
                                  {NumericalNote_t::STRICT_NAN_PROP, "STRICT_NAN_PROP"},
+                                 {NumericalNote_t::FULL_PRECISION_MATH, "FULL_PRECISION_MATH"},
                              })
 
 enum class DataType_t {
@@ -1435,6 +1441,13 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+        case NumericalNote_t::FULL_PRECISION_MATH:
+#if defined(CUDNN_HAS_FULL_PRECISION_MATH_NUMERICAL_NOTE)
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -1532,6 +1545,10 @@ convert_from_cudnn_type(cudnnBackendNumericalNote_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 90100)
         case CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP:
             return NumericalNote_t::STRICT_NAN_PROP;
+#endif
+#if defined(CUDNN_HAS_FULL_PRECISION_MATH_NUMERICAL_NOTE)
+        case CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH:
+            return NumericalNote_t::FULL_PRECISION_MATH;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -2570,6 +2587,9 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
     std::stringstream tag{""};
     ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     auto status                             = extractedEngine->get_status();
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return "INVALID_ENGINE_NAME_CFG";
+    }
 
     cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
     int64_t elemCount                         = 0;

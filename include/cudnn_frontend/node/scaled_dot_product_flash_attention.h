@@ -2336,18 +2336,24 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         int32_t const sm_version = context.get_sm_version();
         bool const use_new_knobs = detail::get_backend_version() >= 92300;
         // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
-        if (sm_version > 103 && (is_deterministic_algorithm_supported_on_blackwell)) {
-            if (use_new_knobs) {
-                return {17,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            } else {
-                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            }
+        if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
+            // Blackwell parts past cc 10.3 (cc 10.7 is the one met so far). This
+            // branch pinned backend engine 17 with the {128,128} bprop knobs
+            // (TILE_M 3, TILE_N 2, KERNEL_CFG 2, STREAM_K 0, TILE_CGA_M 0,
+            // STAGES 3 for d256 else 2; KERNEL_CFG 31 before 9.23). The loaded
+            // backend does not serve that engine on cc 10.7: cuDNN 9.24.0.43
+            // returns CUDNN_STATUS_NOT_SUPPORTED at the engine's finalize, and a
+            // pinned config that cannot finalize surfaces as a generic
+            // backend-API failure instead of a decline, so the heuristics query
+            // never runs and nothing else -- a backend plan or an opt-in
+            // frontend engine -- can serve (the same trap the (256, 512] band
+            // above declines for). The backend version that will serve engine 17
+            // on this part is not known, so the decline is keyed on the part,
+            // not on a version. Determinism does not rest on the pin: a
+            // deterministic request already expands through the dP-workspace
+            // form (dQ = dS @ K as its own matmul), the form Hopper serves from
+            // heuristics without a pin; the pin only selected an engine for it.
+            return {-1, {}};
         } else if (is_deterministic_algorithm_supported_on_blackwell) {
             if (use_new_knobs) {
                 return {5,

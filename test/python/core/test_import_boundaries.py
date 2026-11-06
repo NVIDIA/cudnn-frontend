@@ -228,7 +228,8 @@ for name in ("qsa_indexed_forward", "qsa_indexed_backward",
 for module in ("cudnn.deepseek_sparse_attention.qsa_training",
                "cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward",
                "cudnn.gated_attention_block.qsa_select",
-               "cudnn.gated_attention_block.qsa_select_paged"):
+               "cudnn.gated_attention_block.qsa_select_paged",
+               "cudnn.QSA.two_pass"):
     assert importlib.util.find_spec(module) is None, module
 """)
 

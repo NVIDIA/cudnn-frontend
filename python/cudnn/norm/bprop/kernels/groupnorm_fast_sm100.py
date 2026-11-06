@@ -39,7 +39,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -416,10 +416,14 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     dyf, xf, dxf = dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1)
     args = (dyn(dyf), dyn(xf), dyn(dxf), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (M, V, CPG, SPAN, GPS, bt, it_ty, et, spec.has_mean, has_beta, smem_bytes, fgrid, fbt)
-    key = (params.io_dtype, ctas) + ce
+    # dyn() specializes strides 0 and 1; larger strides are dynamic.
+    key = (params.io_dtype, ctas, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_fast_host, *args, *ce, fake_stream())
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(_gn_bwd_fast_host, *args, *ce, fake_stream())
+                _KCACHE[key] = fn
     fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

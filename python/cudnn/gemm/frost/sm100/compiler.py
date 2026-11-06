@@ -58,12 +58,14 @@ from ..dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
+from .epilogue_codegen import EpilogueSnippets, generate, k_pad_axes, tma_out_ready_marker, tma_out_value
 from ..fusion_ir import (
     ZERO_PRESERVING_OPS,
     FusionChain,
     MoeSwapAbSpec,
     TensorRef,
+    gemm_index,
+    is_gemm_source,
     segmented_row_scale_capacity_rows,
 )
 from ..recipe import (
@@ -756,14 +758,16 @@ def _render_tile_constants(
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
-        lines.append(f"mainloop_has_index = {any(op.index_expr is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}")
+        lines.append(
+            f"mainloop_needs_coordinates = {any(op.index_expr is not None or op.operand_access is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}"
+        )
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
         # Per-K aux indexing needs ml_L in logical order, not the physical
         # swizzled SMEM address. The K-OOB path already provides that access.
         koob_fix = (
-            any(aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
+            any(aux.coordinate_mapped or aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
             or not _mainloop_chain_zero_preserving(chain.mainloop_a_ops)
             or not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
         )
@@ -2050,6 +2054,8 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     """View a broadcast-aux runtime tensor to the fake's rank/unit-dim layout so the tvm-ffi front door's ndim/shape check accepts it."""
     if not _TVM_FFI_OK:
         return t
+    if ref.coordinate_mapped:
+        return t
     real = _aux_fake_real_axes(ref)
     if len(t.shape) == len(real):
         return t
@@ -2939,10 +2945,44 @@ def precheck_path(
         _precheck_plain(chain, config)
 
 
+# Scale-factor types without a sign bit: ``is_negative_scale`` cannot change their values.
+_SIGN_FREE_SF_DTYPES = frozenset({"fp8_e8m0", "fp8_e5m3"})
+
+
+def _check_block_scale_sign(state: dict) -> None:
+    """Decline ``block_scale_dequantize(is_negative_scale=True)`` on scale factors that can be negative.
+
+    The shared analyzer records the attribute, but no chain field carries it. The tcgen05 block-scale
+    MMA takes every scale factor as an unsigned ``.ue4m3`` / ``.ue8m0`` operand, so a block with
+    ``s < 0`` would contribute ``x * |s|`` where the attribute asks for ``x * s``. A sign-free scale
+    cannot be negative, so the attribute changes nothing there. Same rule as the sm120 tree (#2015)."""
+    meta = state["tensor_meta"]
+    for op in state["ops"]:
+        if op.cudnn_name != "block_scale_dequantize" or not op.is_negative_scale:
+            continue
+        sf = meta[op.inputs[1]]
+        if sf.dtype not in _SIGN_FREE_SF_DTYPES:
+            raise NotImplementedError(
+                f"block_scale_dequantize {op.op_name!r} sets is_negative_scale=True on its {sf.dtype} scale factors "
+                f"{sf.name!r}, which the sm100 block-scale MMA cannot honor: it reads every scale as an unsigned "
+                ".ue4m3 / .ue8m0 value, so a negative scale would be applied as its magnitude"
+            )
+
+
+def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | None]":
+    """Analyze the graph and decline attributes the sm100 templates cannot honor."""
+    from ..graph_analyzer import _analyze_state, _state_from_graph
+
+    state = _state_from_graph(graph)
+    chain, binding = _analyze_state(state)
+    _check_block_scale_sign(state)
+    return chain, binding
+
+
 def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT ``cute.compile``."""
     probe_cutedsl()
-    chain, _binding = analyze_with_binding(graph)
+    chain, _binding = _analyze_graph(graph)
     if config is None:
         config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), shapes_fixed=_graph_shapes_fixed(graph))
     probe_chain(chain, config)
@@ -2958,6 +2998,44 @@ def probe_cutedsl() -> None:
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
 
 
+# Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
+# their float attributes to int32). The others use Float32-only CuTe DSL math
+# (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or a DSL error out of
+# cute.compile instead of declining. div is served: the shared emitter emits
+# arith.divsi (signed truncating division) for an Int32 div, not the `/` that
+# lowers to a Float32 remainder.
+_INT32_COMPUTE_OPS = frozenset(
+    ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "div", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
+)
+# The epilogue converts an int32-compute op's inputs and result with a direct
+# .to() between Int32 and their declared dtype, with no Float32 detour; between
+# Int32 and a Float8 type that cast does not compile.
+_INT32_COMPUTE_NO_CAST_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp8_e8m0")
+
+
+def _check_int32_compute(chain: FusionChain) -> None:
+    """Decline an epilogue op that computes in int32 but has no int32 emitter, or
+    whose inputs or output would need an int32 <-> fp8 conversion."""
+    for i, op in enumerate(chain.ops):
+        if op.compute_dtype != "int32":
+            continue
+        if op.op not in _INT32_COMPUTE_OPS:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32, which the sm100 epilogue emits only for {', '.join(sorted(_INT32_COMPUTE_OPS))}"
+            )
+        # The values the op reads: gen_index reads only its input's shape, and aux_load has no producing input.
+        refs = [op.parent_idx_b, op.parent_idx_c] + ([] if op.op in ("gen_index", "aux_load") else [op.resolved_parent_idx(i)])
+        dtypes = [chain.gemm_out_dtype(gemm_index(ref)) if is_gemm_source(ref) else chain.ops[ref].out_dtype for ref in refs if ref is not None]
+        if op.aux is not None:
+            dtypes.append(chain.aux_by_name(op.aux).dtype)
+        fp8 = sorted({dtype for dtype in (*dtypes, op.out_dtype) if dtype in _INT32_COMPUTE_NO_CAST_DTYPES})
+        if fp8:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32 but reads or writes {' and '.join(fp8)}; the sm100 epilogue has no int32 <-> fp8 conversion"
+            )
+
+
 def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     """Check support for one fusion chain and explicit configuration."""
     if config.swap_ab:
@@ -2967,6 +3045,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_executable(chain)
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
@@ -3028,7 +3107,7 @@ def jit_from_cudnn_graph(
     config: TileConfig = DEFAULT_CONFIG,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel."""
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _analyze_graph(graph)
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 
@@ -3037,6 +3116,7 @@ def jit_from_cudnn_graph(
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
     _check_splitk_supported(chain, config)
@@ -3145,6 +3225,18 @@ def _launch_moe_swap_ab(
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 
 
+def _k_pad_launchable(chain: FusionChain, config: TileConfig, render, generate_kwargs: dict):
+    """``(launchable, axes)``: the plan's second kernel, built with the F8_128x4 K-padding stores, and the quantized axes
+    that decide it (:func:`~.epilogue_codegen.k_pad_axes`) -- or ``(None, ())`` when no output can end a scale row inside a
+    quad. The plan's first kernel is the epilogue without those stores; the launch takes this one only at extents that
+    end some scale row inside a quad, so a whole-quad call runs exactly the unpadded kernel."""
+    axes = k_pad_axes(chain)
+    if not axes:
+        return None, ()
+    src = render(chain, generate(chain, **generate_kwargs, k_padding=True), config)
+    return _import_kernel(src).compile(), axes
+
+
 def _jit_moe(
     chain: FusionChain,
     config: TileConfig,
@@ -3155,15 +3247,16 @@ def _jit_moe(
     _precheck_moe(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    snippets = generate(chain, **generate_kwargs)
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, _render_template, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
@@ -3174,6 +3267,8 @@ def _jit_moe(
         device=_plan_device(),
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         _grid_ctas=grid_ctas,
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
@@ -3188,17 +3283,18 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
     """Build exactly the reduction strategy named by the config."""
     store_modes = _store_modes(chain, config)
     use_tma = _use_tma_store_epi(chain, config)
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset({0}) if (config.workspace_split_k and use_tma) else frozenset(i for i, mode in enumerate(store_modes) if mode == "tma"),
         packed_lanes=_epi_packed_lanes(config),
         workspace_split_k=config.workspace_split_k,
     )
+    snippets = generate(chain, **generate_kwargs)
     render = _render_block_scale_template if chain.has_block_scale else _render_template
     src = render(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, render, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
         chain=chain,
@@ -3207,6 +3303,8 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
         aux_names=[aux.name for aux in chain.aux_tensors],
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         binding=binding,
         store_modes=store_modes,
         use_tma_store=use_tma,
@@ -3251,15 +3349,16 @@ def _jit_moe_block_scale(
     _tmpl = select_template(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    snippets = generate(chain, **generate_kwargs)
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, _render_block_scale_template, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
@@ -3270,6 +3369,8 @@ def _jit_moe_block_scale(
         device=_plan_device(),
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),

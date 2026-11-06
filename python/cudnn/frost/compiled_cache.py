@@ -106,6 +106,11 @@ _DIGEST_DIR = re.compile(r"[0-9a-f]{24}")  # ... and of an environment / entry d
 
 _LOG = logging.getLogger("cudnn.frost.compiled_cache")
 _LOCK = threading.Lock()
+# Serializes CuTe DSL compiles across the process: the DSL keeps its per-trace state (pending kernel launches, the
+# preprocessor session) on objects every compile shares, so two threads tracing at once corrupt each other's state
+# (``TypeError: 'NoneType' object is not iterable`` in ``_track_deferred_kernel_launches`` on 4.8.1, "Please start a
+# session before accessing session data" on 4.8.0). Reentrant: a build may compile a nested kernel.
+_DSL_COMPILE_LOCK = threading.RLock()
 _dir_override: Optional[Path] = None
 _stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0, "memo_hits": 0, "seeded": 0, "seed_rejected": 0}
 _pruned_this_process = False
@@ -123,6 +128,12 @@ _MEMO: Dict[tuple, Any] = {}
 _RECORDING = threading.local()
 # Per-thread depth of refuse_compiles() scopes; nonzero makes a cache miss raise instead of compiling.
 _REFUSING = threading.local()
+
+
+def dsl_compile_lock() -> threading.RLock:
+    """The process-wide lock a lazy ``cute.compile`` takes on a cache miss (see ``_DSL_COMPILE_LOCK``). Hold it only
+    around the compile, never around a launch: the hit path stays a dict lookup."""
+    return _DSL_COMPILE_LOCK
 
 
 # ---------------------------------------------------------------------------

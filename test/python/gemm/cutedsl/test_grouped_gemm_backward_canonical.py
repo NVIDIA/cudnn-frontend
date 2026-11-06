@@ -203,12 +203,13 @@ def test_wgrad_flat_scale_factors(monkeypatch, recipe):
 
 
 @torch_fork_set_rng(seed=0)
-def test_wgrad_rejects_malformed_flat_scale_factors(monkeypatch):
+@pytest.mark.parametrize("recipe", [{}, NVFP4_WGRAD], ids=["mxfp8", "nvfp4"])
+def test_wgrad_rejects_malformed_flat_scale_factors(monkeypatch, recipe):
     from cudnn.gemm.cutedsl.grouped.wgrad import api
 
     monkeypatch.setattr(api, "_cache_of_GroupedGemmWgradSm100Objects", {})
     monkeypatch.setattr(api, "_wgrad_wrapper_memo", {})
-    inputs = wgrad_inputs([256, 384])
+    inputs = wgrad_inputs([256, 384], **recipe)
     sfa, sfb = inputs["sfa_tensor"].reshape(-1), inputs["sfb_tensor"].reshape(-1)
 
     def strided(sf):

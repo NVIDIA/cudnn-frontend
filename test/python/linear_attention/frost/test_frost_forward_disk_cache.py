@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fresh-process FROST forward artifacts must run without invoking the compiler."""
+"""A fresh process runs the FROST forwards from the on-disk compiled cache: the cache directory the cold process filled is
+read, not rewritten, by the warm one, and both produce the same outputs."""
 
 import json
 import os
@@ -13,7 +14,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
+from linear_attention.test_la import frost_la_unavailable
 
 pytestmark = pytest.mark.L0
 
@@ -21,21 +22,11 @@ _CHILD = r"""
 import json, sys, time
 from pathlib import Path
 import torch, cudnn
-import cutlass.cute as cute
-from cudnn.frost import compiled_cache as cc
 from linear_attention.test_la import Backend, FWD_TOL, STATE_TOL, make_case, random_state, reference, pinned_op, op_args, assert_rms_close
 variant, phase, result_path, expected_module = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(expected_module).resolve(), cudnn.__file__
 dtype = torch.bfloat16
-calls = []
-compile_fn = cute.compile
-def count_compile(*args, **kwargs):
-    calls.append(getattr(args[0], '__name__', str(type(args[0]))))
-    if phase == 'warm':
-        raise AssertionError('a fresh process recompiled a cached forward: ' + calls[-1])
-    return compile_fn(*args, **kwargs)
-cute.compile = count_compile
-cc.reset_stats()
+outputs = []
 started = time.perf_counter()
 for length in (17, 128, 512):
     case = make_case(variant, dtype, seq_lens=[length, length // 2], H=4, seed=173 + length)
@@ -57,17 +48,19 @@ for length in (17, 128, 512):
         assert_rms_close('replay state', captured_state, expected[1], STATE_TOL[dtype])
     finally:
         graph.reset()
-Path(result_path).write_text(json.dumps({'stats': cc.stats(), 'compile_calls': calls, 'source': cudnn.__file__, 'case_seconds': time.perf_counter() - started}))
+    outputs += [output.double().sum().item(), state.double().sum().item()]
+Path(result_path).write_text(json.dumps({'outputs': outputs, 'source': cudnn.__file__, 'case_seconds': time.perf_counter() - started}))
 """
+
+
+def _cache_listing(root):
+    """(path, size, mtime) of every file under the cache directory."""
+    return sorted((str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns) for p in Path(root).rglob("*") if p.is_file())
 
 
 @pytest.mark.parametrize("variant", ["gdn", "gdn2", "gdp", "kda"])
 def test_frost_forward_reloads_in_a_fresh_process(tmp_path, variant):
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("FROST linear-attention forward cache qualification requires SM100/SM103")
-    if not cutedsl_state()[0]:
-        pytest.skip("CuTe DSL is not installed")
-    reason = cutedsl_requirement_error("FROST forward disk cache")
+    reason = frost_la_unavailable()
     if reason:
         pytest.skip(reason)
     source = Path(__file__).resolve().parents[4]
@@ -78,7 +71,7 @@ def test_frost_forward_reloads_in_a_fresh_process(tmp_path, variant):
     # imported from a development checkout, and add only the test helpers.
     module_path = Path(cudnn.__file__).resolve()
     env["PYTHONPATH"] = os.pathsep.join([str(module_path.parent.parent), str(source / "test/python"), env.get("PYTHONPATH", "")])
-    results = []
+    results, listings = [], []
     for phase in ("cold", "warm"):
         path = tmp_path / f"{phase}.json"
         process = subprocess.run(
@@ -86,6 +79,11 @@ def test_frost_forward_reloads_in_a_fresh_process(tmp_path, variant):
         )
         assert process.returncode == 0, process.stdout[-4000:] + process.stderr[-6000:]
         results.append(json.loads(path.read_text()))
-    print(json.dumps({"variant": variant, "cold": results[0], "warm": results[1]}))
-    assert results[0]["compile_calls"] and results[0]["stats"]["misses"] > 0, results
-    assert results[1]["compile_calls"] == [] and results[1]["stats"]["hits"] > 0, results
+        listings.append(_cache_listing(tmp_path / "cache"))
+    print(json.dumps({"variant": variant, "cold": results[0], "warm": results[1], "cache_files": len(listings[0])}))
+    names = {name for name, _, _ in listings[0]}
+    objects = [name for name in names if name.endswith("kernel.o")]
+    assert objects, "the cold process stored no compiled kernel object (kernel.o) in the cache directory"
+    assert all(name[: -len("kernel.o")] + "entry.json" in names for name in objects), "a stored kernel object lacks its entry.json commit marker"
+    assert listings[1] == listings[0], "the warm process rewrote or added cache artifacts instead of reusing them"
+    assert results[1]["outputs"] == results[0]["outputs"], "the warm process computed different outputs from the cached artifacts"

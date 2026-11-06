@@ -160,7 +160,7 @@ def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
     gate = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="g")
     beta = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="beta")
     cu = g.tensor([nseq + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
-    out, _fs, _h = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
+    out, _fs, _h, _composed = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
     out.set_output(True).set_data_type(dt)
     try:
         g.build()

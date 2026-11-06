@@ -169,6 +169,10 @@ class CompiledMamba2:
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_sm = multiprocessor_count(self.device)
+        from .common.piece_chain import build_scalar_boundary_fold, run_scalar_boundary_fold
+
+        self.build_boundary_fold, self.run_boundary_fold = build_scalar_boundary_fold, run_scalar_boundary_fold
+        self.composed_fold = None
         self.n_heads_out = HO
         self.dim_v, self.dim_k = V, K
         self.num_seqs = B
@@ -258,6 +262,9 @@ class CompiledMamba2:
         self.index_cu_seqlens = pos["cu_seqlens"]
         self.index_initial_state = pos.get("initial_state")
         self.index_dt_bias = pos.get("dt_bias")
+        self.index_preceding_state_update = pos.get("preceding_state_update")
+        self.index_preceding_transition = pos.get("preceding_transition")
+        self.index_composed = pos.get("composed_initial_state")
         self.index_d = pos.get("d")
         self.index_z = pos.get("z")
         self.index_state_indices = pos.get("state_indices")
@@ -271,6 +278,7 @@ class CompiledMamba2:
                 "gate": "g",
                 "o": "O",
                 "seed": "initial_state",
+                "composed": "composed_initial_state",
                 "seed_indices": "state_indices",
                 "final_indices": "state_indices",
                 "checkpoints": "state_checkpoints",
@@ -292,6 +300,19 @@ class CompiledMamba2:
             )
 
     def run(self, views, workspace, stream) -> None:
+        composed = views[self.index_composed] if self.index_composed is not None else None
+        if self.index_preceding_state_update is not None:
+            table = views[self.index_initial_state] if self.index_initial_state is not None else None
+            summaries = views[self.index_preceding_state_update]
+            if self.composed_fold is None:
+                self.composed_fold = self.build_boundary_fold(
+                    composed,
+                    summaries,
+                    reverse=False,
+                    device=self.device,
+                    seed_dtype=table.dtype if table is not None else None,
+                )
+            self.run_boundary_fold(self.composed_fold, table, composed, summaries, views[self.index_preceding_transition], int(stream or 0))
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
@@ -314,7 +335,7 @@ class CompiledMamba2:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.chain:
-            self.run_chain(q, k, v, g, a, dt_bias, d, z, cu, state0, state_indices, o, final_state, state_checkpoints, o_pre, region, stream)
+            self.run_chain(q, k, v, g, a, dt_bias, d, z, cu, state0, composed, state_indices, o, final_state, state_checkpoints, o_pre, region, stream)
             return
 
         buffers = dict(
@@ -330,6 +351,7 @@ class CompiledMamba2:
             o_pre=o_pre,
             cu_seqlens=cu,
             state_in=state0,
+            composed=composed,
             state_out=final_state,
             seed_indices=state_indices,
             final_indices=state_indices,
@@ -365,7 +387,7 @@ class CompiledMamba2:
             stream=stream,
         )
 
-    def run_chain(self, q, k, v, g, a, dt_bias, d, z, cu, state0, state_indices, o, final_state, state_checkpoints, o_pre, region, stream) -> None:
+    def run_chain(self, q, k, v, g, a, dt_bias, d, z, cu, state0, composed, state_indices, o, final_state, state_checkpoints, o_pre, region, stream) -> None:
         """Chain prologue, recompute summary, scalar state chain and the prefill over the pieces, launched from one compiled
         host (kernel/mamba2_chain_forward_f16.py)."""
         buffers = dict(
@@ -395,6 +417,7 @@ class CompiledMamba2:
             transition=region["transition"],
             state_x=region["state_x"],
             seed=state0,
+            composed=composed,
             seed_indices=state_indices,
             final_state=final_state,
             final_indices=state_indices,
@@ -440,7 +463,7 @@ class CompiledMamba2Bwd:
     def __init__(self, node, bwd_module, prefill_module, recompute_module):
         from .common.host import tensormap_workspace_bytes
         from .common.gate_bwd import mamba2_gate_bwd, mamba2_zgate_bwd
-        from .common.head_reduce import head_group_reduce_dot_product
+        from .common.head_reduce import head_group_reduce
         from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
         from .kernel.mamba2_chain_backward_f16 import build_chain_backward, run_chain_backward
@@ -456,7 +479,7 @@ class CompiledMamba2Bwd:
         self.run_regenerate_backward = run_regenerate_backward
         self.build_chain_backward = build_chain_backward
         self.run_chain_backward = run_chain_backward
-        self.head_group_reduce_dot_product = head_group_reduce_dot_product
+        self.head_group_reduce = head_group_reduce
         self.zgate_bwd = mamba2_zgate_bwd
         self.gate_bwd = mamba2_gate_bwd
         self.plan_name = "Mamba2FrostEngine (MAMBA2_BWD)"
@@ -492,6 +515,10 @@ class CompiledMamba2Bwd:
         self.wants_dz = "dZ" in node.outputs
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.num_sm = multiprocessor_count(self.device)
+        from .common.piece_chain import build_scalar_boundary_fold, run_scalar_boundary_fold
+
+        self.build_boundary_fold, self.run_boundary_fold = build_scalar_boundary_fold, run_scalar_boundary_fold
+        self.composed_fold = None
         self.n_heads_out = HO
         self.dim_v, self.dim_k = V, K
         self.num_seqs = B
@@ -556,6 +583,8 @@ class CompiledMamba2Bwd:
             regions += [("scheduler_recompute", off_scheduler, "int32", (2,)), ("scheduler_bwd", off_scheduler + 8, "int32", (2,))]
         self.tensormap_words = tensormap_workspace_bytes(bwd_module, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
+        if "following_state_grad" in node.inputs:
+            regions.append(("composed_dstate", layout.add(HO * V * K * 4, align=16), "float32", (1, HO, V, K)))
         if not self.reuse_series:
             # the recompute reads the prefill's K, V and checkpoint descriptor arrays
             self.recompute_tensormap_words = tensormap_workspace_bytes(prefill_module if self.chain else recompute_module, self.num_pieces) // 8
@@ -627,6 +656,9 @@ class CompiledMamba2Bwd:
         self.index_initial_state = pos.get("initial_state")
         self.index_d_final_state = pos.get("d_final_state")
         self.index_dt_bias = pos.get("dt_bias")
+        self.index_following_state_grad = pos.get("following_state_grad")
+        self.index_following_transition = pos.get("following_transition")
+        self.index_composed = pos.get("composed_initial_state")
         self.index_d = pos.get("d")
         self.index_z = pos.get("z")
         self.index_o_pre = pos.get("O_pre")
@@ -651,12 +683,16 @@ class CompiledMamba2Bwd:
         state_checkpoints = views[self.index_state_checkpoints] if self.index_state_checkpoints is not None else None
         state0 = views[self.index_initial_state] if self.index_initial_state is not None else None
         dstate_in = views[self.index_d_final_state] if self.index_d_final_state is not None else None
+        composed = views[self.index_composed] if self.index_composed is not None else None
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         d = views[self.index_d] if self.index_d is not None else None
         z = views[self.index_z] if self.index_z is not None else None
         o_pre = views[self.index_o_pre] if self.index_o_pre is not None else None
         dq = views[self.index_dq]
         dk = views[self.index_dk]
+        for port, grad, fold in (("dQ", dq, self.fold_dq), ("dK", dk, self.fold_dk)):
+            if fold and any(s % 2 for s in tuple(grad.stride())[:-1]):
+                raise ValueError(f"{self.plan_name}: buffer for {port!r} must have even outer strides (grouped B / C fold), got {tuple(grad.stride())}")
         dv = views[self.index_dv]
         dg = views[self.index_dg]
         da = views[self.index_da]
@@ -666,6 +702,19 @@ class CompiledMamba2Bwd:
         dz = views[self.index_dz] if self.index_dz is not None else None
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        dcomposed = None
+        if self.index_following_state_grad is not None:
+            dcomposed = region["composed_dstate"]
+            summaries = views[self.index_following_state_grad]
+            if self.composed_fold is None:
+                self.composed_fold = self.build_boundary_fold(
+                    dcomposed,
+                    summaries,
+                    reverse=True,
+                    device=self.device,
+                    seed_dtype=dstate_in.dtype if dstate_in is not None else None,
+                )
+            self.run_boundary_fold(self.composed_fold, dstate_in, dcomposed, summaries, views[self.index_following_transition], int(stream or 0))
 
         # ---- z gate: dO_pre = dO silu(z), dZ --------------------------------------------
         if self.has_z:
@@ -676,13 +725,59 @@ class CompiledMamba2Bwd:
         dk_out = region["dk_ho"] if self.fold_dk else dk
         skip_bwd_part = region["skip_bwd_part"] if self.skip_bwd_in_kernel else None
         if self.chain:
-            self.run_chain(q, k, v, g, a, dt_bias, d, do, cu, state0, dstate_in, state_checkpoints, dq_out, dk_out, dv, dstate0, skip_bwd_part, region, stream)
+            self.run_chain(
+                q,
+                k,
+                v,
+                g,
+                a,
+                dt_bias,
+                d,
+                do,
+                cu,
+                state0,
+                dstate_in,
+                composed,
+                dcomposed,
+                state_checkpoints,
+                dq_out,
+                dk_out,
+                dv,
+                dstate0,
+                skip_bwd_part,
+                region,
+                stream,
+            )
         else:
-            self.run_uncut(q, k, v, g, a, dt_bias, d, do, cu, state0, dstate_in, state_checkpoints, dq_out, dk_out, dv, dstate0, skip_bwd_part, region, stream)
+            self.run_uncut(
+                q,
+                k,
+                v,
+                g,
+                a,
+                dt_bias,
+                d,
+                do,
+                cu,
+                state0,
+                dstate_in,
+                composed,
+                dcomposed,
+                state_checkpoints,
+                dq_out,
+                dk_out,
+                dv,
+                dstate0,
+                skip_bwd_part,
+                region,
+                stream,
+            )
 
         # ---- the dt gate, the parameters, the D skip, the group folds -------------------------
-        self.head_group_reduce_dot_product(dq_out, q, dq if self.fold_dq else None, region["dot_q"], stream=stream)
-        self.head_group_reduce_dot_product(dk_out, k, dk if self.fold_dk else None, region["dot_k"], stream=stream)
+        if self.fold_dq:
+            self.head_group_reduce(dq_out, dq, stream=stream)
+        if self.fold_dk:
+            self.head_group_reduce(dk_out, dk, stream=stream)
         self.gate_bwd(
             region["dot_q"],
             region["dot_k"],
@@ -707,7 +802,28 @@ class CompiledMamba2Bwd:
         return None
 
     def run_chain(
-        self, q, k, v, g, a, dt_bias, d, do, cu, state0, dstate_in, state_checkpoints, dq_out, dk_out, dv, dstate0, skip_bwd_part, region, stream
+        self,
+        q,
+        k,
+        v,
+        g,
+        a,
+        dt_bias,
+        d,
+        do,
+        cu,
+        state0,
+        dstate_in,
+        composed,
+        dcomposed,
+        state_checkpoints,
+        dq_out,
+        dk_out,
+        dv,
+        dstate0,
+        skip_bwd_part,
+        region,
+        stream,
     ) -> None:
         """Chain prologue, the forward chain's three steps when regenerating (zero-state summaries, scalar chain, the series
         from the chain states), backward summary, reverse scalar chain and the bprop over the pieces, launched from one
@@ -751,8 +867,12 @@ class CompiledMamba2Bwd:
             state_dx=region["state_dx"],
             seed=state0,
             dfs=dstate_in,
+            composed=composed,
+            dcomposed=dcomposed,
             dstate0=dstate0 if self.use_dstate0 else None,
             exit_dots=region["exit_dots"],
+            dot_q=region["dot_q"],
+            dot_k=region["dot_k"],
             skip_bwd_part=skip_bwd_part,
             exit_slots=region["gate_slots"],
             exit_base=region["exit_base"],
@@ -786,7 +906,28 @@ class CompiledMamba2Bwd:
         )
 
     def run_uncut(
-        self, q, k, v, g, a, dt_bias, d, do, cu, state0, dstate_in, state_checkpoints, dq_out, dk_out, dv, dstate0, skip_bwd_part, region, stream
+        self,
+        q,
+        k,
+        v,
+        g,
+        a,
+        dt_bias,
+        d,
+        do,
+        cu,
+        state0,
+        dstate_in,
+        composed,
+        dcomposed,
+        state_checkpoints,
+        dq_out,
+        dk_out,
+        dv,
+        dstate0,
+        skip_bwd_part,
+        region,
+        stream,
     ) -> None:
         """The uncut or warmup-split bprop over the forward's series, or the regenerate path (one host: table, one
         prologue, the recompute writing the chunk-cadence series, the bprop) when the graph passed none."""
@@ -806,10 +947,14 @@ class CompiledMamba2Bwd:
                 dv=dv,
                 series=region["state_checkpoints"],
                 exit_dots=region["exit_dots"],
+                dot_q=region["dot_q"],
+                dot_k=region["dot_k"],
                 skip_bwd_part=skip_bwd_part,
                 cu_seqlens=cu,
                 state_in=None if coarse else state0,
+                composed=None if coarse else composed,
                 dstate_in=dstate_in,
+                dcomposed=dcomposed,
                 dstate0=dstate0,
                 work_items=region["work_items"],
                 work_count=region["work_count"],
@@ -858,9 +1003,12 @@ class CompiledMamba2Bwd:
             dv=dv,
             checkpoints=state_checkpoints,
             exit_dots=region["exit_dots"],
+            dot_q=region["dot_q"],
+            dot_k=region["dot_k"],
             skip_bwd_part=skip_bwd_part,
             cu_seqlens=cu,
             dstate_in=dstate_in,
+            dcomposed=dcomposed,
             dstate0=dstate0,
             work_items=region["work_items"],
             work_count=region["work_count"],

@@ -38,8 +38,8 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     bitwise against a direct call), deterministic-wrapper scratch lifetime after GC,
     allocation/synchronization-free deterministic class execution, and the loud error
     when the first call for a configuration would JIT under capture;
-  - ``check_support`` boundaries (validated envelope: compute-capability major >= 10;
-    ratio {2, 4} with coff
+  - ``check_support`` boundaries (validated envelope: SM90 or compute-capability
+    major >= 10 for ratio {2, 4}; ratio 128 remains SM100+; coff
     {1, 2}, ratio 128 with coff {1, 2} x head_dim {128, 512}; BF16 kv/score, FP32 ape,
     int32 cu_seqlens and int32 flat-offset bounds).
 
@@ -70,12 +70,16 @@ def _import_compressor():
     return compressor
 
 
-def _require_sm100():
-    """Skip the test unless an SM100-or-newer CUDA GPU is available."""
+def _require_csa_device(ratio=4):
+    """Skip unless the active GPU supports the requested compressor family."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("compute capability major >= 10 (SM100+) required")
+    capability = tuple(torch.cuda.get_device_capability())
+    if ratio in (2, 4):
+        if capability != (9, 0) and capability[0] < 10:
+            pytest.skip("ratio 2/4 requires SM90 or compute capability major >= 10")
+    elif capability[0] < 10:
+        pytest.skip(f"ratio {ratio} requires compute capability major >= 10")
 
 
 def _bwd_smem_need_and_limit(ratio, d, coff, total_comp):
@@ -316,7 +320,7 @@ _SHAPES = [
 def test_numerics_vs_references(lens, d, ratio, coff):
     """Fused fwd+bwd vs fp32-eager (bitwise dKV/dScore at ratio {2, 4}, tolerance at
     ratio=128), upstream eager, and fp64 oracle."""
-    _require_sm100()
+    _require_csa_device(ratio)
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
     _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
 
@@ -359,7 +363,7 @@ def test_numerics_vs_references(lens, d, ratio, coff):
 @pytest.mark.parametrize("coff", [1, 2])
 def test_replay_determinism(ratio, coff):
     """Forward, dKV and dScore replay bitwise identically run to run (dAPE is exempt)."""
-    _require_sm100()
+    _require_csa_device(ratio)
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 2048, 509], 128, ratio, coff)
     runs = [_run_fused(kv, score, ape, cu, cuc, total_comp, ratio, 128, coff, go) for _ in range(3)]
     for other in runs[1:]:
@@ -373,7 +377,7 @@ def test_replay_determinism(ratio, coff):
 @pytest.mark.L0
 def test_replay_determinism_r128():
     """ratio=128 mirror of test_replay_determinism (fixed chunk boundaries, no dKV/dScore atomics)."""
-    _require_sm100()
+    _require_csa_device(128)
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 2048, 509], 128, 128, 1)
     runs = [_run_fused(kv, score, ape, cu, cuc, total_comp, 128, 128, 1, go) for _ in range(3)]
     for other in runs[1:]:
@@ -428,7 +432,7 @@ def test_r128_forward_special_values_match_eager(coff, d, nb, case):
     reference's, and the finite elements must stay within the r128 tolerance contract: a NaN or +inf
     position makes its output NaN, and a -inf position gets weight 0 wherever it falls in a chunk.
     """
-    _require_sm100()
+    _require_csa_device(128)
     ratio = 128
     kv, score, ape, cu, cuc, total_comp, _ = _make_inputs([nb * ratio], d, ratio, coff)
     if case.endswith("_score"):
@@ -549,7 +553,7 @@ def test_r128_envelope_execution(coff, d, nb_rows):
     vs the fp32 eager reference, fp64-oracle parity, and 2-run bitwise determinism —
     covering the fast-exp, two-phase and vec=1 variants the (smaller) L0 shapes never
     reach."""
-    _require_sm100()
+    _require_csa_device(128)
     M = _r128_module()
     ratio = 128
     # The shape must land in the intended bucket for BOTH directions (the wrappers
@@ -610,7 +614,7 @@ _PADDING_SHAPES = [
 @pytest.mark.parametrize("lens,d,ratio,coff,pad", _PADDING_SHAPES)
 def test_static_capacity_padding(lens, d, ratio, coff, pad):
     """Static-capacity padding rows: eager-matching forward, ignored padding gradients."""
-    _require_sm100()
+    _require_csa_device(ratio)
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     capacity = total_true + pad
     gen = torch.Generator(device="cpu").manual_seed(7)
@@ -646,7 +650,7 @@ def test_static_capacity_padding(lens, d, ratio, coff, pad):
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_empty_output(coff, deterministic):
     """total_comp == 0 launches nothing and returns well-formed empty/zero tensors."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     d, ratio = 128, 4
     w = coff * d
@@ -669,7 +673,7 @@ def test_backward_wrapper_zeros_when_no_blocks(coff):
     """Multi-segment packs where NO segment reaches ratio tokens: total_comp == 0, so
     the kernel cannot launch and the wrapper must hand back exact-zero grads (the
     host-side zeros fallback behind the uninitialized-buffer optimization)."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     d, ratio = 128, 4
     w = coff * d
@@ -778,7 +782,7 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
     separate zero-fill kernels anymore), so running it into NaN-poisoned buffers must
     produce bitwise the same dKV/dScore as running it into zero-initialized buffers.
     """
-    _require_sm100()
+    _require_csa_device(ratio)
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     total_comp = total_true + pad
@@ -864,6 +868,148 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "deterministic,d,threshold,upper",
+    [
+        (False, 128, 8192, None),
+        (False, 512, 4096, 5121),
+        (True, 128, 4096, None),
+        (True, 512, 2048, None),
+    ],
+)
+def test_sm90_ratio2_backward_schedule_boundaries(monkeypatch, deterministic, d, threshold, upper):
+    """SM90 ratio-2 plans select only the measured 8/16-row capacity buckets."""
+    _require_csa_device(2)
+    compressor = _import_compressor()
+    from cudnn.csa.compressor import api as compressor_api
+    from cudnn.csa.compressor.compressor_sm100 import _bwd_rows, _validate_bwd_rows, bwd_dape_workspace_bytes
+
+    assert _bwd_rows(2, deterministic, threshold - 1, d, coff=2, is_sm90=True) == 8
+    assert _bwd_rows(2, deterministic, threshold, d, coff=2, is_sm90=True) == 16
+    assert _bwd_rows(2, deterministic, threshold * 4, d, coff=2, is_sm90=True) == (8 if upper else 16)
+    if upper is not None:
+        assert _bwd_rows(2, deterministic, upper - 1, d, coff=2, is_sm90=True) == 16
+        assert _bwd_rows(2, deterministic, upper, d, coff=2, is_sm90=True) == 8
+    assert _bwd_rows(2, deterministic, 0, d, coff=2, is_sm90=True) == 8
+    # The tuning is deliberately SM90-only and restricted to measured coff/head dims.
+    assert _bwd_rows(2, deterministic, threshold, d, coff=2, is_sm90=False) == 8
+    assert _bwd_rows(2, deterministic, threshold, 256, coff=2, is_sm90=True) == 8
+    assert _bwd_rows(2, deterministic, threshold, d, coff=1, is_sm90=True) == 8
+    with pytest.raises(ValueError, match="rows_per_cta must be one of"):
+        _validate_bwd_rows(12)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    below = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=threshold - 1, d=d, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert below.check_support()
+    assert below._rows_per_cta == 8
+    plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=threshold, d=d, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._rows_per_cta == 16
+    compiled_rows = []
+    launched_rows = []
+    monkeypatch.setattr(compressor_api, "precompile_bwd", lambda *args, **kwargs: compiled_rows.append(kwargs["rows_per_cta"]))
+    monkeypatch.setattr(compressor_api, "run_bwd", lambda *args, **kwargs: launched_rows.append(kwargs["rows_per_cta"]))
+    kv = torch.empty(2, 2 * d, dtype=torch.bfloat16, device="cuda")
+    score = torch.empty_like(kv)
+    ape = torch.empty(2, 2 * d, dtype=torch.float32, device="cuda")
+    cu = torch.zeros(3, dtype=torch.int32, device="cuda")
+    cuc = torch.zeros_like(cu)
+    grad_out = torch.empty(threshold, d, dtype=torch.bfloat16, device="cuda")
+    grad_kv = torch.empty_like(kv)
+    grad_score = torch.empty_like(score)
+    grad_ape = torch.empty_like(ape)
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if deterministic else None
+
+    def capability_must_not_be_queried(*args, **kwargs):
+        raise AssertionError("prepared compile/execute must use the plan-bound schedule")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_must_not_be_queried)
+    plan.compile()
+    assert compiled_rows == [16]
+    plan.execute(kv, score, ape, cu, cuc, grad_out, grad_kv, grad_score, grad_ape, workspace=workspace)
+    assert launched_rows == [16]
+    if deterministic:
+        assert plan.scratch_workspace_bytes() == bwd_dape_workspace_bytes(threshold, 2, d, 2, rows_per_cta=16)
+    else:
+        assert plan.scratch_workspace_bytes() == 0
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    sm100_plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=threshold, d=d, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert sm100_plan.check_support()
+    assert sm100_plan._rows_per_cta == 8
+
+    if upper is not None:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+        below_upper = compressor.CSACompressorBackward(
+            **_meta_samples(total=2, total_comp=upper - 1, d=d, ratio=2, coff=2),
+            ratio=2,
+            coff=2,
+            deterministic=deterministic,
+        )
+        assert below_upper.check_support()
+        assert below_upper._rows_per_cta == 16
+        at_upper = compressor.CSACompressorBackward(
+            **_meta_samples(total=2, total_comp=upper, d=d, ratio=2, coff=2),
+            ratio=2,
+            coff=2,
+            deterministic=deterministic,
+        )
+        assert at_upper.check_support()
+        assert at_upper._rows_per_cta == 8
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_sm90_ratio2_empty_plan_keeps_base_schedule(monkeypatch, deterministic):
+    """An empty prepared capacity keeps the base schedule and needs no workspace."""
+    _require_csa_device(2)
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=0, d=128, ratio=2, coff=2),
+        ratio=2,
+        coff=2,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._rows_per_cta == 8
+    assert plan.scratch_workspace_bytes() == 0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("d,coff", [(256, 2), (128, 1)], ids=["d256", "coff1"])
+def test_sm90_ratio2_unmeasured_plan_keeps_base_schedule(monkeypatch, deterministic, d, coff):
+    """Unmeasured head-dimension/coff plans never inherit the tuned artifact."""
+    _require_csa_device(2)
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    plan = compressor.CSACompressorBackward(
+        **_meta_samples(total=2, total_comp=16384, d=d, ratio=2, coff=coff),
+        ratio=2,
+        coff=coff,
+        deterministic=deterministic,
+    )
+    assert plan.check_support()
+    assert plan._rows_per_cta == 8
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("nb_total,expected_rows", [(65535, 8), (65536, 24)])
 def test_ratio4_deterministic_workspace_includes_hierarchical_stage(nb_total, expected_rows):
     """Ratio 4 reserves disjoint producer and stage-1 planes."""
@@ -881,7 +1027,7 @@ def test_ratio4_deterministic_workspace_includes_hierarchical_stage(nb_total, ex
 @pytest.mark.L0
 def test_ratio4_deterministic_compile_cache_separates_long_schedule(monkeypatch):
     """Plan compilation keeps the short and long producer schedules distinct."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     from cudnn.csa.compressor import compressor_sm100
 
@@ -921,9 +1067,70 @@ def test_ratio4_deterministic_compile_cache_separates_long_schedule(monkeypatch)
 
 
 @pytest.mark.L0
+def test_generic_compile_cache_ignores_packed_runtime_extents(monkeypatch):
+    """Packed totals and segment distributions reuse each bounded artifact."""
+    _require_csa_device()
+    compressor = _import_compressor()
+    from cudnn.csa.compressor import compressor_sm100
+
+    compiled = {}
+    observed = []
+
+    def fake_compile_fwd(key, args, ratio, d, coff):
+        observed.append(("fwd", ratio, d, coff))
+        compiled[key] = object()
+        return compiled[key]
+
+    def fake_compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic=False):
+        observed.append(("bwd", ratio, d, coff, rows_per_cta, bool(deterministic)))
+        compiled[key] = object()
+        return compiled[key]
+
+    def fake_reduce(device, split=False):
+        key = ("dape_reduce", bool(split), device.index)
+        if key not in compiled:
+            observed.append(("reduce", bool(split)))
+            compiled[key] = object()
+
+    monkeypatch.setattr(compressor_sm100, "_COMPILED", compiled)
+    monkeypatch.setattr(compressor_sm100, "_compile_fwd", fake_compile_fwd)
+    monkeypatch.setattr(compressor_sm100, "_compile_bwd", fake_compile_bwd)
+    monkeypatch.setattr(compressor_sm100, "precompile_dape_reduce", fake_reduce)
+
+    ratio, d, coff = 4, 128, 2
+    for lens in ([4], [5, 7], [129, 63, 1]):
+        kv, score, ape, cu, cuc, total_comp, _ = _make_inputs(lens, d, ratio, coff)
+        samples = dict(
+            sample_kv=kv.view(kv.shape[0], -1),
+            sample_score=score.view(score.shape[0], -1),
+            sample_ape=ape,
+            sample_cu_seqlens=cu,
+            sample_cu_seqlens_comp=cuc,
+            sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+            ratio=ratio,
+            coff=coff,
+        )
+        plans = (
+            compressor.CSACompressorForward(**samples),
+            compressor.CSACompressorBackward(**samples),
+            compressor.CSACompressorBackward(**samples, deterministic=True),
+        )
+        for plan in plans:
+            assert plan.check_support()
+            plan.compile()
+
+    assert observed == [
+        ("fwd", 4, 128, 2),
+        ("bwd", 4, 128, 2, 8, False),
+        ("bwd", 4, 128, 2, 8, True),
+        ("reduce", True),
+    ]
+
+
+@pytest.mark.L0
 def test_ratio4_long_deterministic_schedule_matches_reference():
     """The first 24-row bucket is deterministic and keeps the gradient contract."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     lens = [1024, 3072, 8192, 16384, 32768, 65536, 135168]
     ratio, d, coff = 4, 128, 1
@@ -960,7 +1167,7 @@ def test_ratio4_long_deterministic_schedule_matches_reference():
 @pytest.mark.parametrize("coff", [1, 2])
 def test_backward_rejects_deterministic_mode(coff):
     """The backward raises under torch.use_deterministic_algorithms (dAPE fp32 atomics)."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([512, 256], 128, 4, coff)
     total = kv.shape[0]
@@ -985,7 +1192,7 @@ def test_backward_rejects_deterministic_mode(coff):
 @pytest.mark.parametrize("coff", [1, 2])
 def test_backward_warns_in_warn_only_deterministic_mode(coff):
     """warn_only deterministic mode warns (torch semantics) and still runs the backward."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([512, 256], 128, 4, coff)
     r_ref = _run_fused(kv, score, ape, cu, cuc, total_comp, 4, 128, coff, go)
@@ -1022,7 +1229,7 @@ def test_backward_warns_in_warn_only_deterministic_mode(coff):
 )
 def test_backward_deterministic_dape(lens, d, ratio, coff):
     """The opt-in path is bitwise deterministic, accurate, and accepted by torch's strict mode."""
-    _require_sm100()
+    _require_csa_device(ratio)
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
     _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
@@ -1069,7 +1276,7 @@ def test_backward_deterministic_dape(lens, d, ratio, coff):
 @pytest.mark.parametrize("ratio,coff", [(4, 2), (128, 1)])
 def test_backward_deterministic_workspace_contract(ratio, coff):
     """The class API requires honest caller-owned scratch and fully overwrites dAPE."""
-    _require_sm100()
+    _require_csa_device(ratio)
     compressor = _import_compressor()
     d = 128
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
@@ -1185,7 +1392,7 @@ def test_backward_deterministic_workspace_contract(ratio, coff):
 @pytest.mark.parametrize("lens", [[8], [2]], ids=["nonempty", "empty"])
 def test_backward_atomic_rejects_workspace_before_launch(monkeypatch, lens):
     """An atomic plan rejects deterministic scratch before launch or stream recording."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     d, ratio, coff = 128, 4, 2
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
@@ -1228,7 +1435,7 @@ def test_backward_atomic_rejects_workspace_before_launch(monkeypatch, lens):
 @pytest.mark.parametrize("ratio", [2, 4, 128])
 def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
     """Class-API graph replays overwrite dAPE; no external zero-fill is required."""
-    _require_sm100()
+    _require_csa_device(ratio)
     compressor = _import_compressor()
     d, coff = 128, 2
     kv, score, ape, cu, cuc, total_true, go = _make_inputs([1023, 509], d, ratio, coff)
@@ -1275,7 +1482,7 @@ def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_backward_deterministic_execute_allocates_nothing_and_never_synchronizes():
     """Warm class execution uses only caller buffers and never blocks the host."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     d, ratio, coff = 128, 4, 2
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
@@ -1321,7 +1528,7 @@ def test_backward_deterministic_execute_allocates_nothing_and_never_synchronizes
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_backward_deterministic_wrapper_cuda_graph_retains_internal_workspace():
     """Captured wrapper scratch survives local-reference release, GC, and allocator churn."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     d, ratio, coff = 128, 4, 2
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
@@ -1382,7 +1589,7 @@ def test_backward_deterministic_wrapper_cuda_graph_retains_internal_workspace():
 @pytest.mark.parametrize("coff", [1, 2])
 def test_cuda_graph_capture(coff):
     """Warmup -> capture fwd+bwd -> replay; JIT under capture raises a clear error."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     ratio, d = 4, 128
     lens = [512, 256]
@@ -1500,7 +1707,7 @@ def test_cuda_graph_capture_r128():
     row capacity on the host, so capture/replay must reproduce the direct call bitwise
     on forward/dKV/dScore exactly like the ratio=4 path.
     """
-    _require_sm100()
+    _require_csa_device(128)
     compressor = _import_compressor()
     ratio, d, coff = 128, 128, 1
     lens = [640, 259]  # 5 + 2 blocks, 3-token tail
@@ -1643,7 +1850,7 @@ def _meta_samples(
 @pytest.mark.parametrize("coff", [1, 2])
 def test_check_support_accepts_envelope(ratio, coff):
     """Metadata-only samples inside the validated envelope pass check_support."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     for cls in (compressor.CSACompressorForward, compressor.CSACompressorBackward):
         api = cls(**_meta_samples(ratio=ratio, coff=coff), ratio=ratio, coff=coff)
@@ -1656,7 +1863,7 @@ def test_check_support_accepts_envelope(ratio, coff):
 @pytest.mark.parametrize("coff", [1, 2])
 def test_check_support_accepts_envelope_r128(d, coff):
     """ratio=128 envelope: coff {1, 2} x head_dim {128, 512} pass check_support."""
-    _require_sm100()
+    _require_csa_device(128)
     compressor = _import_compressor()
     for cls in (compressor.CSACompressorForward, compressor.CSACompressorBackward):
         api = cls(**_meta_samples(total=1024, d=d, ratio=128, coff=coff), ratio=128, coff=coff)
@@ -1677,7 +1884,7 @@ def test_r128_backward_shared_memory_gate_spares_empty_output(monkeypatch, deter
     empty output (every sequence shorter than the ratio) launches no kernel and still passes check_support."""
     import types
 
-    _require_sm100()
+    _require_csa_device(128)
     compressor = _import_compressor()
     from cudnn.csa.compressor import api as csa_api
     from cudnn.csa.compressor.compressor_sm100_r128 import bwd_smem_bytes_r128
@@ -1692,9 +1899,9 @@ def test_r128_backward_shared_memory_gate_spares_empty_output(monkeypatch, deter
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
-def test_check_support_accepts_compute_capability_major_10_or_newer(monkeypatch, capability):
-    """The architecture gate admits SM100, SM103, and newer major families."""
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (10, 3), (10, 7)])
+def test_check_support_accepts_generic_compressor_capabilities(monkeypatch, capability):
+    """The ratio-2/4 architecture gate admits SM90 and SM100-or-newer GPUs."""
     compressor = _import_compressor()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
     api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
@@ -1702,12 +1909,25 @@ def test_check_support_accepts_compute_capability_major_10_or_newer(monkeypatch,
 
 
 @pytest.mark.L0
-def test_check_support_rejects_compute_capability_major_below_10(monkeypatch):
-    """The architecture gate still rejects pre-SM100 devices."""
+@pytest.mark.parametrize("capability", [(8, 9), (9, 1)])
+def test_check_support_rejects_unsupported_compute_capability(monkeypatch, capability):
+    """The generic architecture gate rejects devices outside SM90/SM100+."""
+    compressor = _import_compressor()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
+    with pytest.raises(RuntimeError, match="requires SM90 or compute capability major >= 10"):
+        api.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cls_name", ["CSACompressorForward", "CSACompressorBackward"])
+def test_check_support_rejects_ratio128_on_sm90(monkeypatch, cls_name):
+    """Keep the SM100-tuned ratio-128 family closed on SM90 until separately gated."""
     compressor = _import_compressor()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
-    api = compressor.CSACompressorForward(**_meta_samples(), ratio=4, coff=2)
-    with pytest.raises(RuntimeError, match="compute capability major >= 10"):
+    cls = getattr(compressor, cls_name)
+    api = cls(**_meta_samples(total=1024, ratio=128, coff=1), ratio=128, coff=1)
+    with pytest.raises(RuntimeError, match="ratio 128 is not yet supported on SM90"):
         api.check_support()
 
 
@@ -1737,7 +1957,7 @@ def test_check_support_rejects_compute_capability_major_below_10(monkeypatch):
 )
 def test_check_support_rejects(kwargs, ctor, match):
     """check_support raises ValueError for configurations outside the envelope."""
-    _require_sm100()
+    _require_csa_device(ctor.get("ratio", 4))
     compressor = _import_compressor()
     samples = _meta_samples(**kwargs)
     api = compressor.CSACompressorForward(**samples, ratio=ctor.get("ratio", 4), coff=ctor.get("coff", 2))
@@ -1748,7 +1968,7 @@ def test_check_support_rejects(kwargs, ctor, match):
 @pytest.mark.L0
 def test_check_support_rejects_cpu_tensors():
     """CPU sample tensors are rejected with a clear error."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     samples = _meta_samples()
     samples["sample_kv"] = torch.empty(512, 256, dtype=torch.bfloat16, device="cpu")
@@ -1766,7 +1986,7 @@ def test_check_support_rejects_cpu_tensors():
 @pytest.mark.parametrize("coff", [1, 2])
 def test_class_api_matches_wrapper(coff):
     """The explicit class API produces bitwise-identical results to the wrappers."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     ratio, d = 4, 128
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
@@ -1821,7 +2041,7 @@ def test_backward_grad_ape_zeroing_contract():
     re-zero grad_ape before every execute and before every CUDA-graph replay that
     reuses the buffer. The high-level wrapper allocates a fresh zeroed buffer per call
     (and its zero-fill is captured with the kernel, so wrapper replays re-zero)."""
-    _require_sm100()
+    _require_csa_device(128)
     compressor = _import_compressor()
     ratio, d, coff = 128, 128, 1
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([640, 259], d, ratio, coff)
@@ -1882,7 +2102,7 @@ def test_backward_grad_ape_zeroing_contract():
 @pytest.mark.L0
 def test_misaligned_base_pointer_rejected():
     """Contiguous storage-offset views with unaligned base pointers raise ValueError."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     d, ratio, coff = 128, 4, 2
     w = coff * d
@@ -1906,7 +2126,7 @@ def test_explicit_stream_input_lifetime():
     operands on the external stream; otherwise the caching allocator can hand the freed
     input storage to allocations on another stream while the kernel is still pending.
     """
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     if not hasattr(torch.cuda, "_sleep"):
         pytest.skip("torch.cuda._sleep not available")
@@ -1944,12 +2164,13 @@ def test_explicit_stream_input_lifetime():
 @pytest.mark.L0
 def test_multi_device_launch():
     """Tensors on a non-current device produce correct results (device anchoring)."""
-    _require_sm100()
+    _require_csa_device()
     compressor = _import_compressor()
     if torch.cuda.device_count() < 2:
         pytest.skip("needs >= 2 visible GPUs")
-    if torch.cuda.get_device_capability(1)[0] < 10:
-        pytest.skip("second GPU is below SM100")
+    second_capability = tuple(torch.cuda.get_device_capability(1))
+    if second_capability != (9, 0) and second_capability[0] < 10:
+        pytest.skip("second GPU is outside the SM90/SM100+ envelope")
     d, ratio, coff = 128, 4, 2
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1024], d, ratio, coff, device="cuda:1")
     total = kv.shape[0]

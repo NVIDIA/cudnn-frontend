@@ -36,7 +36,7 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C), for each chain X in {H, M}
   KK (register MMA) : W_kk[BT,BT] = K decay @ K inv^T;  L = tril(W_kk, -1)   (shared by both chains)
   T_inv (register MMA) : T_inv = (I + L)^-1 blockwise, 4x4 diagonal blocks then the 4 -> 8 and 8 -> 16 corrections
   K*state GEMM   : KS_X[BT,DV] = K decay @ S_X
-  U GEMM         : U_X[BT,DV]  = T_inv @ Y_X,  Y_H = W .* V - KS_H, Y_M = 0 - KS_M
+  U GEMM         : U_X[BT,DV]  = T_inv @ Y_X,  Y_H = W .* V - KS_H, Y_M = 0 - KS_M (BF16: fp32 residual, then one Y_H rounding)
   KV update GEMM : S_upd_X[DK,DV] = K restore^T @ U_X   (H first, M second, every stage)
 
   Epilogue:
@@ -126,12 +126,13 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
     opaque_i32,
     fmul2,
-    mul_f16x2,
     opaque_f32_zero,
     opaque_i32_zero,
     fp32_to_fp16,
     sub_f16x2,
 )
+
+from ..common.residual import residual_operand
 
 USE_PDL = True
 STATE_DIMS = (64, 128)
@@ -1175,6 +1176,7 @@ def compute1_warp_group(
     mState_out,
     mTransition,
     mState_init,
+    mComposed,
     sV_raw,
     sW_raw,
     sGate_exchange_raw,
@@ -1255,19 +1257,32 @@ def compute1_warp_group(
                 seed_exchange_ptr = sGate_exchange_raw.data_ptr() + (global_chunk_base % cfg.gate_exchange_stages) * (cfg.d_k * cfg.b_t)
 
                 # ---- state seed: initial state GMEM -> packed b16 TMEM + fp32 state TMEM ----
-                if cutlass.const_expr(mState_init is not None):
-                    seed_vw = 16 // (mState_init.element_type.width // 8)
-                    seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.use_initial_state):
+                    if cutlass.const_expr(cfg.state_table):
+                        seed_vw = 16 // (mState_init.element_type.width // 8)
+                        seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
+                    if cutlass.const_expr(cfg.has_composed):
+                        is_boundary = batch_idx == cutlass.Int32(0)
+                        composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, state_gmem_row, 0))).raw_ptr()
                     for seed_half in cutlass.range_constexpr(2):
                         seed_blocks_lo = seed_half * state_blocks_per_half
                         seed_blocks_hi = seed_blocks_lo + state_blocks_per_half
                         state_vecs = []
                         for i in cutlass.range_constexpr(seed_blocks_lo, seed_blocks_hi):
                             state_block = []
-                            for g in cutlass.range_constexpr(16 // seed_vw):
-                                seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                                for t in cutlass.range_constexpr(seed_vw):
-                                    state_block.append(seed_chunk[t].to(cutlass.Float32))
+                            if cutlass.const_expr(cfg.state_table):
+                                for g in cutlass.range_constexpr(16 // seed_vw):
+                                    seed_chunk = (seed_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                                    for t in cutlass.range_constexpr(seed_vw):
+                                        state_block.append(seed_chunk[t].to(cutlass.Float32))
+                            else:
+                                for _ in cutlass.range_constexpr(16):
+                                    state_block.append(cutlass.Float32(0.0))
+                            if cutlass.const_expr(cfg.has_composed):
+                                for g in cutlass.range_constexpr(4):
+                                    composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                                    for t in cutlass.range_constexpr(4):
+                                        state_block[g * 4 + t] = composed_chunk[t] if is_boundary else state_block[g * 4 + t]
                             state_vecs.append(state_block)
                         for i in cutlass.range_constexpr(seed_blocks_lo, seed_blocks_hi):
                             state_pack = cutlass.Array(cutlass.Int32, 8, alignment=16)
@@ -1377,40 +1392,36 @@ def compute1_warp_group(
             raw_w_frag_hi = raw_w_frag_lo
             if cutlass.const_expr(cfg.d_v == 128):
                 raw_w_frag_hi = nvvm.ldmatrix(sW_ptr + v_swizzle_off_hi, 4, nvvm.MMALayout.COL)
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(cfg.use_initial_state):
                 have_state_h = seed_state
             else:
                 have_state_h = cutlass.Boolean(False)
-            state_k_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
-            state_k_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
-            for reg_idx in cutlass.range_constexpr(4):
-                state_k_pack_lo[reg_idx] = cutlass.Int32(0)
-                state_k_pack_hi[reg_idx] = cutlass.Int32(0)
+            state_k_fp32_lo = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
+            state_k_fp32_hi = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
+            state_k_zero = opaque_f32_zero()
+            for reg_idx in cutlass.range_constexpr(8):
+                state_k_fp32_lo[reg_idx] = state_k_zero
+                state_k_fp32_hi[reg_idx] = state_k_zero
             if have_state_h:
                 bars.mb_state_k_acc_h_ready.wait(state_k_acc_index_h.phase)
                 state_k_acc_index_h = advance(state_k_acc_index_h, 1)
                 state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id_h, cutlass.Float32), num=2)
-                for reg_idx in cutlass.range_constexpr(4):
-                    frag_pair = reg_idx * 2
-                    state_k_pack_lo[reg_idx] = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
+                for reg_idx in cutlass.range_constexpr(8):
+                    state_k_fp32_lo[reg_idx] = state_k_vec_lo[reg_idx]
                 if cutlass.const_expr(cfg.d_v == 128):
                     state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id_h, cutlass.Float32), num=2)
-                    for reg_idx in cutlass.range_constexpr(4):
-                        frag_pair = reg_idx * 2
-                        state_k_pack_hi[reg_idx] = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
+                    for reg_idx in cutlass.range_constexpr(8):
+                        state_k_fp32_hi[reg_idx] = state_k_vec_hi[reg_idx]
 
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
-                y_input_pack_lo[reg_idx] = sub_f16x2(
-                    mul_f16x2(raw_w_frag_lo[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype),
-                    state_k_pack_lo[reg_idx],
-                    cfg.io_dtype,
+                frag_pair = reg_idx * 2
+                y_input_pack_lo[reg_idx] = residual_operand(
+                    raw_v_frag_lo[reg_idx], state_k_fp32_lo[frag_pair], state_k_fp32_lo[frag_pair + 1], w_word=raw_w_frag_lo[reg_idx], dtype=cfg.io_dtype
                 )
-                y_input_pack_hi[reg_idx] = sub_f16x2(
-                    mul_f16x2(raw_w_frag_hi[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype),
-                    state_k_pack_hi[reg_idx],
-                    cfg.io_dtype,
+                y_input_pack_hi[reg_idx] = residual_operand(
+                    raw_v_frag_hi[reg_idx], state_k_fp32_hi[frag_pair], state_k_fp32_hi[frag_pair + 1], w_word=raw_w_frag_hi[reg_idx], dtype=cfg.io_dtype
                 )
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + input_col_id_h, cutlass.Int8), y_input_pack_lo[0:4])
             if cutlass.const_expr(cfg.d_v == 128):
@@ -1623,36 +1634,32 @@ def compute1_warp_group(
             raw_w_frag_hi = raw_w_frag_lo
             if cutlass.const_expr(cfg.d_v == 128):
                 raw_w_frag_hi = nvvm.ldmatrix(sW_ptr + v_swizzle_off_hi, 4, nvvm.MMALayout.COL)
-            state_k_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
-            state_k_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
-            for reg_idx in cutlass.range_constexpr(4):
-                state_k_pack_lo[reg_idx] = cutlass.Int32(0)
-                state_k_pack_hi[reg_idx] = cutlass.Int32(0)
+            state_k_fp32_lo = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
+            state_k_fp32_hi = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
+            state_k_zero = opaque_f32_zero()
+            for reg_idx in cutlass.range_constexpr(8):
+                state_k_fp32_lo[reg_idx] = state_k_zero
+                state_k_fp32_hi[reg_idx] = state_k_zero
             if have_state:
                 bars.mb_state_k_acc_h_ready.wait(state_k_acc_index_h.phase)
                 state_k_acc_index_h = advance(state_k_acc_index_h, 1)
                 state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id_h, cutlass.Float32), num=2)
-                for reg_idx in cutlass.range_constexpr(4):
-                    frag_pair = reg_idx * 2
-                    state_k_pack_lo[reg_idx] = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
+                for reg_idx in cutlass.range_constexpr(8):
+                    state_k_fp32_lo[reg_idx] = state_k_vec_lo[reg_idx]
                 if cutlass.const_expr(cfg.d_v == 128):
                     state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id_h, cutlass.Float32), num=2)
-                    for reg_idx in cutlass.range_constexpr(4):
-                        frag_pair = reg_idx * 2
-                        state_k_pack_hi[reg_idx] = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
+                    for reg_idx in cutlass.range_constexpr(8):
+                        state_k_fp32_hi[reg_idx] = state_k_vec_hi[reg_idx]
 
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             for reg_idx in cutlass.range_constexpr(4):
-                y_input_pack_lo[reg_idx] = sub_f16x2(
-                    mul_f16x2(raw_w_frag_lo[reg_idx], raw_v_frag_lo[reg_idx], cfg.io_dtype),
-                    state_k_pack_lo[reg_idx],
-                    cfg.io_dtype,
+                frag_pair = reg_idx * 2
+                y_input_pack_lo[reg_idx] = residual_operand(
+                    raw_v_frag_lo[reg_idx], state_k_fp32_lo[frag_pair], state_k_fp32_lo[frag_pair + 1], w_word=raw_w_frag_lo[reg_idx], dtype=cfg.io_dtype
                 )
-                y_input_pack_hi[reg_idx] = sub_f16x2(
-                    mul_f16x2(raw_w_frag_hi[reg_idx], raw_v_frag_hi[reg_idx], cfg.io_dtype),
-                    state_k_pack_hi[reg_idx],
-                    cfg.io_dtype,
+                y_input_pack_hi[reg_idx] = residual_operand(
+                    raw_v_frag_hi[reg_idx], state_k_fp32_hi[frag_pair], state_k_fp32_hi[frag_pair + 1], w_word=raw_w_frag_hi[reg_idx], dtype=cfg.io_dtype
                 )
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + input_col_id_h, cutlass.Int8), y_input_pack_lo[0:4])
             if cutlass.const_expr(cfg.d_v == 128):
@@ -1789,7 +1796,16 @@ def compute1_warp_group(
         else:
             h_vw = 16 // (mState_out.element_type.width // 8)
             h_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
-            if cutlass.const_expr(mState_init is not None):
+            if cutlass.const_expr(cfg.has_composed):
+                is_boundary = batch_idx == cutlass.Int32(0)
+                for key_dim in cutlass.range_constexpr(cfg.d_k):
+                    if row_valid_h:
+                        value = cutlass.Float32(0.0)
+                        if cutlass.const_expr(cfg.state_table):
+                            value = mState_init[batch_idx, head_o, state_gmem_row, key_dim].to(cutlass.Float32)
+                        value = mComposed[cutlass.Int32(0), head_o, state_gmem_row, key_dim] if is_boundary else value
+                        (h_dst + key_dim).store(value.to(mState_out.element_type))
+            elif cutlass.const_expr(cfg.use_initial_state):
                 seed_vw = 16 // (mState_init.element_type.width // 8)
                 seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
                 for g in cutlass.range_constexpr(cfg.d_k // seed_vw):
@@ -2009,6 +2025,7 @@ def host(
     w: cute.Tensor,
     cu_seqlens: cute.Tensor,
     initial_state: cute.Tensor | None,
+    composed: cute.Tensor | None,
     final_state: cute.Tensor,
     transition: cute.Tensor,
     work_items: cute.Tensor,
@@ -2040,6 +2057,7 @@ def host(
             w,
             cu_seqlens,
             initial_state,
+            composed,
             final_state,
             transition,
             work_items,
@@ -2070,6 +2088,7 @@ def frost_gdn2_summary(
     mW: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: cute.Tensor | None,
+    mComposed: cute.Tensor | None,
     mState_out: cute.Tensor,
     mTransition: cute.Tensor,
     mWorkItems: cute.Tensor,
@@ -2321,6 +2340,7 @@ def frost_gdn2_summary(
             mState_out,
             mTransition,
             mState_init,
+            mComposed,
             sV_raw,
             sW_raw,
             sGate_exchange_raw,
@@ -2346,6 +2366,8 @@ class Gdn2SummaryCfg:
     d_k: int
     d_v: int
     log_gate: bool = True
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
@@ -2433,12 +2455,16 @@ def build_cfg(
     d_k: int,
     d_v: int,
     log_gate: bool = True,
+    state_table: bool | None = None,
+    has_composed: bool = False,
 ) -> Gdn2SummaryCfg:
     """Build the per-compile ``Gdn2SummaryCfg`` (io_dtype in {Float16, BFloat16}); fills the derived TMEM column offsets and SMEM cosizes."""
     cfg = Gdn2SummaryCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         l2norm=l2norm,
         safe_gate=safe_gate,
         log_gate=log_gate,
@@ -2535,6 +2561,8 @@ def get_compiled_cache(
     beta_guard: bool,
     run_order: bool,
     log_gate: bool = True,
+    has_composed: bool = False,
+    state_table: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2563,6 +2591,7 @@ def compile(
     w_cute,
     cu_seqlens_cute,
     state_in_cute,
+    composed_cute=None,
     state_out_cute,
     transition_cute,
     work_items_cute,
@@ -2571,12 +2600,16 @@ def compile(
     tensormap_workspace_cute,
     stream,
     log_gate: bool = True,
+    state_table=None,
+    has_composed=False,
 ):
     """JIT-compile the fused GDN-2 summary kernel for one static config."""
     cfg = build_cfg(
         io_dtype,
         gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=state_table,
+        has_composed=has_composed,
         l2norm=l2norm,
         safe_gate=safe_gate,
         log_gate=log_gate,
@@ -2601,6 +2634,7 @@ def compile(
         w_cute,
         cu_seqlens_cute,
         state_in_cute,
+        composed_cute,
         state_out_cute,
         transition_cute,
         work_items_cute,
@@ -2642,6 +2676,7 @@ def chunk_gdn2_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    composed=None,
 ) -> None:
     """BT=16 fused GDN-2 state summary: one launch writes ``output_state`` (H) and ``output_transition`` (stored domain
     ``M_buf = M^T``, ``X_final = X_init @ M_buf + X_H``) of every work item; an empty sequence passes ``initial_state`` (or zero) through
@@ -2667,7 +2702,9 @@ def chunk_gdn2_summary(
         raise ValueError(f"w must be (total_tokens, HO, DV) in the io dtype, got {tuple(w.shape)} {w.dtype}")
     if work_items is None or work_count is None or scheduler_counter is None:
         raise ValueError("work_items, work_count and scheduler_counter are required")
-    use_initial_state = initial_state is not None
+    state_table = initial_state is not None
+    has_composed = composed is not None
+    use_initial_state = state_table or has_composed
     run_order = order_in_prologue
     if run_order and scheduler_all is None:
         raise ValueError("order in the prologue requires scheduler_all (the prologue zeroes the scheduler rings)")
@@ -2702,6 +2739,8 @@ def chunk_gdn2_summary(
         beta_guard,
         run_order,
         log_gate=log_gate,
+        has_composed=has_composed,
+        state_table=state_table,
     )
 
     if "compiled" not in cache:
@@ -2717,8 +2756,9 @@ def chunk_gdn2_summary(
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
 
         state_in_cute = None
-        if use_initial_state:
+        if state_table:
             state_in_cute = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_cute = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if has_composed else None
         state_out_cute = from_dlpack(output_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         transition_cute = from_dlpack(output_transition, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
@@ -2752,6 +2792,9 @@ def chunk_gdn2_summary(
             w_cute=w_cute,
             cu_seqlens_cute=cu_seqlens_cute,
             state_in_cute=state_in_cute,
+            composed_cute=composed_cute,
+            state_table=state_table,
+            has_composed=has_composed,
             state_out_cute=state_out_cute,
             transition_cute=transition_cute,
             work_items_cute=work_items_cute,
@@ -2819,7 +2862,8 @@ def chunk_gdn2_summary(
         beta,
         w,
         cu_seqlens,
-        initial_state if use_initial_state else None,
+        initial_state if state_table else None,
+        composed if has_composed else None,
         output_state,
         output_transition,
         work_items,
@@ -2851,6 +2895,7 @@ def run_summary(
     tensormap_workspace,
     stream,
     own_prologue=True,
+    composed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -2879,6 +2924,7 @@ def run_summary(
         w,
         cu_seqlens,
         initial_state,
+        composed,
         output_state,
         output_transition,
         work_items,

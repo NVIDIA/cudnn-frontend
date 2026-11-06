@@ -17,7 +17,7 @@ from typing import Optional
 import torch
 
 from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div
-from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100 import IndexerScoreSm100Base
 from .indexer_score_unified_sm100_mxfp4 import IndexerScoreUnifiedSm100Mxfp4
 from .indexer_score_unified_sm100_mxfp8 import IndexerScoreUnifiedSm100Mxfp8
 
@@ -37,7 +37,7 @@ class BlockScaledFormat:
     scale_dtype_name: str
     sf_vec_size: int
     elems_per_storage: int
-    kernel_cls: type[IndexerScoreUnifiedSm100]
+    kernel_cls: type[IndexerScoreSm100Base]
 
     @property
     def data_dtype(self) -> Optional[torch.dtype]:

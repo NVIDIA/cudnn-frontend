@@ -132,6 +132,30 @@ class NormGraphFacts:
     dbias_t: Any = None
 
 
+def rowwise_axes_mismatch(facts: NormGraphFacts) -> Optional[str]:
+    """Reject layerwise graph reductions the flattened row kernels cannot represent."""
+    if facts.variant not in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM) or facts.adaptive or facts.scale_t is None:
+        return None
+    x_shape = facts.x_shape
+    scale_shape = tuple(facts.scale_t.get_dim())
+    if not x_shape or len(scale_shape) > len(x_shape):
+        return "scale rank must not exceed X rank"
+    scale_shape = (1,) * (len(x_shape) - len(scale_shape)) + scale_shape
+    first = next((i for i, d in enumerate(scale_shape) if d != 1), None)
+    if first is None:
+        if x_shape[-1] != 1:
+            return "scalar scale does not identify a trailing normalization axis"
+    elif scale_shape[first:] != x_shape[first:]:
+        return "normalization axes must form a contiguous trailing suffix of X"
+    expected_stats = tuple(x if s == 1 else 1 for x, s in zip(x_shape, scale_shape))
+    for stats in (facts.mean_t, facts.inv_var_t):
+        if stats is not None:
+            dims = tuple(stats.get_dim())
+            if dims and dims != expected_stats:
+                return "saved statistics must match the scale-defined normalization axes"
+    return None
+
+
 def _norm_node(graph: "cudnn.pygraph") -> Optional[Any]:
     """The graph's sole norm node, or None if the graph is anything else."""
     try:

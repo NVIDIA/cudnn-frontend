@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from .prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand, _same_geometry
-from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+from .d128_contract import ACCUMULATION_CCS, ACCUMULATION_PARTS, validate_accumulation_scale
 from .d128_grouped_contract import (
     DENSE,
     DKV_ACCUM_DEFAULT,
@@ -52,7 +52,7 @@ def check_support(api):
     require(decline is None, decline)
     require(api.q_desc.device.type == "cuda", "Q must reside on CUDA")
     cc = compute_capability(resolve_device(api.q_desc.device))
-    require(tuple(cc) in ACCUMULATION_CCS, f"requires SM100 or SM103; got {cc}")
+    require(tuple(cc) in ACCUMULATION_CCS, f"requires {ACCUMULATION_PARTS}; got {cc}")
     require(getattr(getattr(_pybind_module, "_SdpaBwdBinder", None), "supports_zero_workspace", False), "requires prepared backward native binding support")
     require(not api.seq_q_lens_present and not api.seq_kv_lens_present, "dense padding flags are not supported; THD lengths use packed metadata")
     require(not api.causal_bottom_right, "bottom-right causal is not supported")
@@ -224,7 +224,7 @@ def compile_plan(api):
     if required != api.scratch_workspace_bytes():
         raise RuntimeError("grouped d128 compiled workspace disagrees with its advertised size")
     if api.thd:
-        from .kernels.sm100.prepared_d128_grouped_thd_host import compile_host
+        from .kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
 
         operands.extend(Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2))
         for name in api._thd_origin_dtypes:
@@ -232,7 +232,7 @@ def compile_plan(api):
             operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
         args = ((b, h, hk, bool(api.thd_stats_token_major)), api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, sm)
     else:
-        from .kernels.sm100.prepared_d128_grouped_host import compile_host
+        from .kernels.sm100.prepared_d128_host import compile_host_grouped_dense as compile_host
 
         args = (tuple(geometry), regions, dtype, api.is_causal, sm)
     form = dkv_accum(api)

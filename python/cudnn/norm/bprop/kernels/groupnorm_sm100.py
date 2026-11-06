@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import cur_stream, dyn, fake_stream
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, dsl_compile_lock
 from cudnn.norm._common_sm100 import (
     STAGE_BULK,
     STAGE_NONE,
@@ -250,7 +250,10 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_host, *args, *ce, fake_stream())
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(_gn_bwd_host, *args, *ce, fake_stream())
+                _KCACHE[key] = fn
     fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

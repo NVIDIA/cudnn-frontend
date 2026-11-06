@@ -25,7 +25,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count
+from cudnn.norm.utils import COOP_OCC_MAX, ws_bytes, ws_empty, ws_reset, ws_zeros, cur_stream, dyn, fake_stream, run_coop, sm_count, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -360,8 +360,11 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None, out_y=None, 
         key = (params.io_dtype,) + ce
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_in_fwd_nhwc_host, *args, *ce, fake_stream())
-            _KCACHE[key] = fn
+            with dsl_compile_lock():
+                fn = _KCACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_in_fwd_nhwc_host, *args, *ce, fake_stream())
+                    _KCACHE[key] = fn
         fn(*args, cur_stream())
         return y, mean, rstd
 

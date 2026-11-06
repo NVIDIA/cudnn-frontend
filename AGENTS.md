@@ -104,6 +104,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
+- [skills/determinism_tests/](skills/determinism_tests/SKILL.md) — required for new numerical APIs and changes to kernels, datatypes, or GPU targets: add and run L0 determinism tests, then update the API support page.
 
 ## Links
 
@@ -119,5 +120,16 @@ When opening a pull request, apply **at minimum one label from each group**: one
 Leave `closed-*` and `open-*` labels for maintainers; Milestone/Projects sidebar fields are set by reviewers/maintainers, not authors.
 
 ## Reviewing a PR (human or agent)
+
+### Kernel determinism and batch invariance
+
+- Use [skills/determinism_tests/SKILL.md](skills/determinism_tests/SKILL.md) when adding a numerical API or changing its kernel paths, datatypes, or GPU targets. Run the affected L0 suites and update the support page in the same PR; mark unavailable GPU coverage unverified.
+- New kernels and numerical kernel changes need forward and backward determinism tests in the same PR. Include every output, input gradient, gate gradient, and state gradient. If a direction is unsupported, name that gap in the test documentation.
+- Use raw-byte equality for replay and batch invariance. Do not replace it with a tolerance, a rounded metric, or float-value equality. Keep an independent numerical reference as a separate correctness check.
+- Build inputs once. Reuse the same values and upstream gradients after batch splitting, insertion, removal, and reordering. Restore mutable state and RNG state where used. Include ragged lengths and partial tiles; include empty sequences where supported.
+- Exercise fresh allocations, concurrent GPU work, and a shape large enough to cross scheduling boundaries. Test the public entry point with its deterministic mode enabled. Do not silently select another provider when a required plan is absent.
+- Update the applicable suite and coverage table in [test/python/determinism_goldens/README.md](test/python/determinism_goldens/README.md). A skipped GPU run is a coverage gap, not a pass. Record the GPU, runtime, command, and pytest summary.
+- Keep [docs/operations/determinism.md](docs/operations/determinism.md) as an API-by-dtype/GPU support page. Distinguish repeatability from batch invariance. Put test results and failure diagnostics in the test report above.
+- Golden changes need a stated numerical reason and a successful independent reference check. Record into a new directory, inspect the byte-hash diff, then replace the approved files. Never regenerate goldens during a normal check or hide a failure with an unbounded skip/xfail.
 
 Each Hard Rule is numbered so it can be cited by number in review comments. Before approving or requesting changes on a diff, check it against every Hard Rules section whose directory it touches: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) (all numbered Python rules, including Rule 9 on backend/FROST parity), [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) (SDPA Rules S1+), [include/cudnn_frontend/AGENTS.md](include/cudnn_frontend/AGENTS.md) (header-only, warnings-as-errors), plus the conventions in [test/AGENTS.md](test/AGENTS.md) and [samples/AGENTS.md](samples/AGENTS.md). Where a rule names a detector (grep pattern, `set_sync_debug_mode` snippet, a `RED-then-green` test), prefer running or citing it over an eyeballed read. When a review surfaces a new concrete, checkable technique or trap that these guides don't already cover, land it in the relevant `AGENTS.md` in the same PR rather than leaving it in a review comment.
