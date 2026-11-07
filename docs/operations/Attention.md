@@ -749,7 +749,7 @@ graph.sdpa_backward(
 - `v` (cudnn_tensor): The value data from the forward pass.
 - `o` (cudnn_tensor): The output data from the forward pass.
 - `dO` (cudnn_tensor): The gradient of the loss with respect to the output.
-- `stats` (cudnn_tensor): The softmax statistics tensor from the forward pass (`generate_stats=True`).
+- `stats` (cudnn_tensor): The softmax statistics tensor from the forward pass (`generate_stats=True`), in its natural-log form. `sdpa_backward` has no log2 flag: if the forward pass used `stats_use_log2=True`, rescale the tensor by `ln(2)` first — a log2 tensor passed as-is produces wrong gradients without any error.
 - `attn_scale` (Optional[Union[float, cudnn_tensor]]): The attention scale factor. Must match the forward pass.
 - `bias` (Optional[cudnn_tensor]): The bias tensor from the forward pass.
 - `dBias` (Optional[cudnn_tensor]): Output tensor to store the bias gradient.
