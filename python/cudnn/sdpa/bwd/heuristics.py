@@ -108,8 +108,18 @@ def _leads(spec: EngineSpec, facts) -> bool:
 
 
 TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
-"""Default-offered rows with no measured lead shard: ranked after the backend's block, so they serve a graph only when the
-backend declines it (a correctness fallback, not a performance claim)."""
+"""Default-offered rows with no hand-written lead shard: ranked after the backend's block, so they serve a graph only when the
+backend declines it (a correctness fallback, not a performance claim) -- except where a measured ``placement_table`` entry
+leads the graph's class (:func:`_measured_lead`)."""
+
+
+def _measured_lead(spec: EngineSpec, facts) -> bool:
+    """A trail-only row whose class a ``placement_table`` study measured as a lead goes ahead of the backend like any row. The
+    studies time full-length graphs, and ``class_key`` does not see runtime lengths, so a graph with them keeps trailing."""
+    from cudnn.sdpa import placement_table
+
+    return not facts.padded and not facts.seq_q_trim and placement_table.lookup(spec.name, facts) is True
+
 
 D128_LEAD_CCS = ((10, 0), (10, 3), (10, 7))
 """The parts where ``sdpa_bwd_sm100_d128``'s lead box (unwindowed d128 THD) applies: cc 10.0 measured (2026-10-26), cc 10.3
@@ -142,7 +152,7 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     from cudnn.engines.heuristics import BACKEND, LAST_RESORT
 
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS]
+    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and not _measured_lead(spec_of[p.engine_id], facts)]
     lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
     trail = [p for p in ours if p not in last and p not in lead]
     if last:
