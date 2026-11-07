@@ -657,6 +657,8 @@ def test_sm120_fp8_short_cache_d128_band_structure():
         dict(has_sink=True, d_qk=64, d_v=64, s_q=512, s_kv=4096, bottom_right=False),
         dict(has_sink=True, d_qk=64, d_v=64, s_q=8, s_kv=4096, causal=False, bottom_right=False),
         dict(has_sink=True, d_qk=96, d_v=96, s_q=1, s_kv=4096, causal=False),
+        dict(has_sink=True, d_qk=64, d_v=64, s_q=1, s_kv=8192, causal=True, bottom_right=False),
+        dict(has_sink=True, s_q=1, s_kv=8192, causal=True, bottom_right=False),
         dict(o_block_scale=16),
         dict(has_epilogue_gate=True),
         dict(dtype=cudnn.data_type.FP8_E5M2),

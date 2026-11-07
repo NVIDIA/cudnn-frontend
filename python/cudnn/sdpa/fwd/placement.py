@@ -930,7 +930,10 @@ def _sm120_fp8_sink_leads(facts) -> bool:
     the MTP rows; and exact d128 decode-shaped (s_q <= 16) without a window; under the masks measured there (bottom-right
     causal, or none at s_q == 1). d128 prefill and windowed d128 decode keep the backend. A hand rule because
     placement_table's class key excludes FP8 graphs (Rule S12)."""
-    if not (facts.s_q == 1 or (facts.causal and facts.bottom_right)):
+    # Measured masks only: bottom-right causal, or no mask at all at s_q == 1. A top-left causal single query over a longer
+    # cache sees only the first key, a different class the study did not time.
+    unmasked_q1 = facts.s_q == 1 and not facts.causal and facts.window_left is None
+    if not (unmasked_q1 or (facts.causal and facts.bottom_right)):
         return False
     if (facts.d_qk, facts.d_v) == (64, 64):
         short_window = facts.window_left is not None and facts.window_left < SM120_FP8_SINK_SHORT_WINDOW
