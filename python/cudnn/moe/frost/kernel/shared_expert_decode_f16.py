@@ -27,7 +27,7 @@ fixed-order k16 contraction of ONE row of A against ONE column of B:
   Under ``GATE_CLUSTER_FOLD`` (default): slot ``s_g = ((p_{0,g} + p_{1,g}) + ..) + p_{K_SPLIT-1,g}`` on the leader in rank order,
   ``gate[t] = sigmoid( butterfly_5( sequence over the lane's GROUPS / 32 slots ) )``.  The v1 path: every leaf is a slot,
   ``gate[t] = sigmoid( butterfly_5( sequence over the lane's GATE_PARTS / 32 leaves ) )``.  Both are fixed trees per token; they differ, so
-  ``GATE_CLUSTER_FOLD`` is a rounding-order axis of the gate (the v1 goldens: off; the rev 2 goldens: on).
+  ``GATE_CLUSTER_FOLD`` is a rounding-order axis of the gate (the ``ksplit2`` / ``ksplit4`` goldens: off; the ``ksplit8`` goldens: on).
 * ``y[t][n] = bf16( gate[t] x chain_{s = 0 .. I/16 - 1} mma_k16(act[t, k16(s)], W_d[n, k16(s)]) )`` -- one warp, one chain.
 
 Why T-independent and batch-invariant: (1) the grid, ``K_SPLIT``, the chunking, the warp -> k-step map and the n-tile map depend on the
@@ -61,17 +61,26 @@ BARRIER TABLE -- launch 1 (``gate_up``), 256 threads, cluster ``(K_SPLIT, 1, 1)`
                           X_ROW_BYTES = expect (T >= 1 by the host check).
   mb_kred (K_SPLIT > 1)   tx-only mbarrier on the LEADER (rank 0), init KRED_MBAR_ARRIVERS = 1 (every CTA initialises it with the same
                           constant, P8; the peers' copies are never waited).  Arrive: leader warp 0 lane 0 ``arrive.expect_tx(KRED_BYTES =
-                          (K_SPLIT - 1) x (ACC_TILES x 32 x 16 + [GATE_CLUSTER_FOLD] N_GROUPS x TPAD x 4))`` after the cluster wait; peers
-                          (rank >= 1): warp 0, ALL 32 lanes, ACC_TILES ``st.async ... complete_tx::bytes.v4.f32`` (16 B each) onto
-                          ``mapa(mail_s slot, 0)``; under GATE_CLUSTER_FOLD warps 1 + n (n < N_GROUPS), lanes t < TPAD, ONE
-                          ``st.async ... .f32`` (4 B) of leaf p[t] onto ``mapa(gmail_s[rank-1][n][t], 0)`` -- every ship after the cluster
-                          wait (P4 step 3: no cross-CTA op before every CTA's init is published), with ``mapa(mb_kred, 0)``.  Wait: leader
-                          warp 0 (32 lanes) and, under GATE_CLUSTER_FOLD, leader warps 1 + n (32 lanes each), phase 0, with the
-                          CLUSTER-scope acquire (``wait_cluster_acquire``: the peers' complete_tx releases at cluster scope; several warps
-                          may wait one phase; waiting lanes are not issuing lanes).  SUM: 1 arrive = init 1; tx = (K_SPLIT - 1) x
-                          (ACC_TILES x 32 x 16 + N_GROUPS x TPAD x 4) = expect.
+                          (K_SPLIT - 1) x (ACC_TILES x 32 x 16 + [GATE_CLUSTER_FOLD and not KRED_SPLIT] N_GROUPS x TPAD x 4))`` after the
+                          cluster wait; peers (rank >= 1): warp 0, ALL 32 lanes, ACC_TILES ``st.async ... complete_tx::bytes.v4.f32`` (16 B
+                          each) onto ``mapa(mail_s slot, 0)``; under GATE_CLUSTER_FOLD without KRED_SPLIT warps 1 + n (n < N_GROUPS), lanes
+                          t < TPAD, ONE ``st.async ... .f32`` (4 B) of leaf p[t] onto ``mapa(gmail_s[rank-1][n][t], 0)`` -- every ship after
+                          the cluster wait (P4 step 3: no cross-CTA op before every CTA's init is published), with ``mapa(mb_kred, 0)``.
+                          Wait: leader warp 0 (32 lanes) and, under GATE_CLUSTER_FOLD without KRED_SPLIT, leader warps 1 + n (32 lanes
+                          each), phase 0, with the CLUSTER-scope acquire (``wait_cluster_acquire``: the peers' complete_tx releases at
+                          cluster scope; several warps may wait one phase; waiting lanes are not issuing lanes).  SUM: 1 arrive = init 1;
+                          tx = (K_SPLIT - 1) x (ACC_TILES x 32 x 16 + [not split] N_GROUPS x TPAD x 4) = expect.
+  mb_kred_gate            (KRED_SPLIT, implies GATE_CLUSTER_FOLD and K_SPLIT > 1) tx mbarrier on the LEADER, init KRED_GATE_MBAR_ARRIVERS =
+                          N_GROUPS (the same constant in every CTA, P8).  Arrive: leader warps 1 + n, lane 0 each (``if lane == 0`` inside
+                          the warp's own arm), ``arrive.expect_tx(KRED_GATE_GROUP_BYTES = (K_SPLIT - 1) x TPAD x 4)`` after the cluster
+                          wait; peers: warps 1 + n, lanes t < TPAD, ONE ``st.async ... .f32`` of leaf p[t] onto ``mapa(gmail_s[rank-1][n][t],
+                          0)`` with ``mapa(mb_kred_gate, 0)``.  Wait: leader warps 1 + n (32 lanes each), phase 0, cluster-scope acquire.
+                          SUM: N_GROUPS arrives (one lane per gate warp) = init N_GROUPS; tx = N_GROUPS x (K_SPLIT - 1) x TPAD x 4 =
+                          GMAIL_SMEM_BYTES = the sum of the expects.  A leaf landing before its warp's expect leaves tx transiently negative
+                          (PTX permits; the mb_w pattern).  Warp 0 no longer waits for any gate leaf, the gate warps for no accumulator ship.
   init                    warp 0 lane 0: ``mbarrier.init(mb_w[p], 1)`` for every p, ``init(mb_x, 1)`` (bulk form), ``init(mb_kred, 1)``
-                          (K_SPLIT > 1), ``fence.mbarrier_init``; ``bar.warp.sync`` (warp 0: the W-issuing lanes see the inits); then
+                          (K_SPLIT > 1), ``init(mb_kred_gate, N_GROUPS)`` (KRED_SPLIT), ``fence.mbarrier_init``; ``bar.warp.sync`` (warp 0:
+                          the W-issuing lanes see the inits); then
                           ``barrier.cluster.arrive.relaxed`` by EVERY thread (P4 step 3, ``const_expr(K_SPLIT > 1)``), and
                           ``barrier.cluster.wait`` by every thread right before the first cross-CTA op (after the red_s ``bar.sync``); the
                           CTA barrier after the x issue (bulk form) / of chunk 0 (ring form) publishes the inits to the local waiters.
@@ -89,8 +98,8 @@ BARRIER TABLE -- launch 1 (``gate_up``), 256 threads, cluster ``(K_SPLIT, 1, 1)`
   red_s publish           ``bar.sync 0, 256`` (#2 bulk / #X_CHUNKS + 1 ring): every thread, after warps 1 .. 7 stored their ACC_TILES v4.
   gate region             warp 1 + n, after the red_s barrier (and the cluster wait): the x pairs of group n from x_s (bulk: row t clamped
                           to a live row; ring all-resident: stage gate_chunk; ring: global x, L2); no barrier inside (warp-uniform shuffles).
-                          The leader's gate warp adds its own leaf (a register) and the shipped ones after ITS OWN mb_kred wait: no
-                          cross-warp hand-off is owed.
+                          The leader's gate warp adds its own leaf (a register) and the shipped ones after ITS OWN mb_kred (mb_kred_gate
+                          under KRED_SPLIT) wait: no cross-warp hand-off is owed.
   exit                    leader: its mb_kred waits ARE the drain (every shipped byte landed before its epilogue; the bulk copies completed
                           at the mb_w / mb_x waits, the cp.async groups at ``wait_group 0``); peers: ``st.async`` has a register source and
                           nobody addresses a peer's SMEM, so no drain is owed (P15).
@@ -122,9 +131,14 @@ the I 256 DEFAULT is two groups at every T: 81,328 B at TILES 1 (w_s 33,024 + x_
                                                                                                                            leader warp 0 (mb_kred)
   gmail_s  [(rank - 1)][n][t] x 4 B, t < TPAD                                                               448 ;  1,792 B   PEER st.async.f32 -> leader
                                                                                                                            warp 1 + n (mb_kred)
-  mb_w[W_PHASES], mb_x, mb_kred   u64 slots in 16-B arrays                                                              48 B
+  mb_w[W_PHASES], mb_x, mb_kred   u64 slots in 16-B arrays (+ mb_kred_gate's 16 B under KRED_SPLIT)                      48 B
   total                                                                                              57,200 ; 113,072 B   4 ; 2 CTAs per SM (228 KB /
                                                                                                                            4 - 1 KB = 57,344 ; 115,712)
+  Co-residence of launch 2 beside launch 1 (233,472 B per SM, 1,024 B reserve per CTA; matters only under PDL_RELEASE, off by default --
+  with the implicit trigger a launch-2 CTA starts after a launch-1 CTA has exited): I 256 TILES 1 = two launch-1 CTAs (2 x 82,352) + one
+  launch-2 CTA (43,392) = 208,096 B; I 256 TILES 2 = two launch-1 CTAs (2 x 114,096 = 228,192) + NONE (a launch-2 CTA needs 51,840 more:
+  launch 2 waits for a launch-1 CTA to retire); I 128 TILES 1 = three launch-1 CTAs (3 x 58,224) + one launch-2 (22,912) = 197,584 B
+  (four launch-1 CTAs = 232,896 B would leave 576 B: never "4 + 1").
   (``smem_table1(cfg)``'s figures, pinned by the host test ``test_default_form_figures_of_record``.  I 128 (N 1 at every T): TILES 1 57,200 B
   (256 CTAs, 4 per SM); TILES 2 81,328 B (2 per SM).  The v1 ring arm (K_SPLIT 2, I 256): w_s 65,664 + x_s 133,120 + red_s 3,584 / 7,168 + mail_s
   512 / 1,024 + 32 = 202,912 / 207,008 B, one CTA per SM, unchanged.)
@@ -381,7 +395,7 @@ def _gate_logit(
     whi,
     gate_part: cute.Tensor,
     gmail_base,
-    mb_kred,
+    mb_gate,
     rank,
     lane,
     T,
@@ -391,8 +405,9 @@ def _gate_logit(
     ring's zero fill -- and its chain is never stored).  Lane ``l`` walks its column pairs in order, ``acc = fma(x_hi, w_hi, fma(x_lo, w_lo,
     acc))`` per pair (a dead pair leaves the chain untouched through the select), one 5-step butterfly per token -- all TPAD chains in ONE
     straight-line block.  Then: under GATE_CLUSTER_FOLD a peer ships lane t's leaf (4 B, ``st.async``) to the leader's gmail_s and the
-    leader adds the K_SPLIT leaves in rank order after its own ``mb_kred`` wait (cluster acquire) and stores slot ``g``; on the v1 path
-    lane 0 stores the leaf as slot ``ks GROUPS + g``."""
+    leader adds the K_SPLIT leaves in rank order after its own wait on ``mb_gate`` (``mb_kred``, or ``mb_kred_gate`` under KRED_SPLIT,
+    which this warp's lane 0 arms with its group's share first; cluster acquire) and stores slot ``g``; on the launch-2-fold path lane 0
+    stores the leaf as slot ``ks GROUPS + g``."""
     xs_base = _smem_addr(x_s)
     g = group0 + n
     gcol0 = g * cfg.GATE_COLS
@@ -407,17 +422,25 @@ def _gate_logit(
         vals.append(_butterfly(acc))
     if cutlass.const_expr(cfg.GATE_CLUSTER_FOLD_EFF):
         if rank == 0:
-            wait_cluster_acquire(mb_kred, 0)
+            # the leader's OWN list: this arm's folded values must not leak into the peer arm's reads through the shared list object
+            # (the same guard as _leader_finish's `mine`; the leaves `vals` stay untouched)
+            folded = []
+            for t in cutlass.range_constexpr(cfg.TPAD):
+                folded.append(vals[t])
+            if cutlass.const_expr(cfg.KRED_SPLIT_EFF):
+                if lane == 0:
+                    nvvm.mbarrier_arrive_expect_tx(mb_gate, cfg.KRED_GATE_GROUP_BYTES)
+            wait_cluster_acquire(mb_gate, 0)
             for r in cutlass.range_constexpr(1, cfg.K_SPLIT):
                 for t in cutlass.range_constexpr(cfg.TPAD):
-                    vals[t] = vals[t] + ld_shared(gmail_base + (((r - 1) * cfg.N_GROUPS_EFF + n) * cfg.TPAD + t) * 4, FP32)
+                    folded[t] = folded[t] + ld_shared(gmail_base + (((r - 1) * cfg.N_GROUPS_EFF + n) * cfg.TPAD + t) * 4, FP32)
             if lane == 0:
                 for t in cutlass.range_constexpr(cfg.TPAD):
                     if t < T:
-                        gate_part[t * cfg.GATE_SLOTS + g] = vals[t]
+                        gate_part[t * cfg.GATE_SLOTS + g] = folded[t]
         else:
             leader = opaque_i32_zero()
-            peer_mbar = mapa_u32(_smem_addr(mb_kred), leader)
+            peer_mbar = mapa_u32(_smem_addr(mb_gate), leader)
             if lane < cfg.TPAD:
                 slot = gmail_base + (((rank - 1) * cfg.N_GROUPS_EFF + n) * cfg.TPAD + lane) * 4
                 st_async_f32(mapa_u32(slot, leader), _pick_lane_value(vals, lane), peer_mbar)
@@ -471,6 +494,7 @@ def frost_shared_expert_gate_up(
     mb_w = cutlass.Array(INT64, cfg.W_PHASES, space=SMEM, alignment=16)
     mb_x = cutlass.Array(INT64, 1, space=SMEM, alignment=16) if cutlass.const_expr(BULK) else mb_w
     mb_kred = cutlass.Array(INT64, 1, space=SMEM, alignment=16) if cutlass.const_expr(S > 1) else mb_w
+    mb_kred_gate = cutlass.Array(INT64, 1, space=SMEM, alignment=16) if cutlass.const_expr(cfg.KRED_SPLIT_EFF) else mb_kred
 
     # ---- init (ONE lane), then the W slice (parameters: never a predecessor's output) -- one issuing lane per w_s row and phase ----
     if warp == 0:
@@ -481,6 +505,8 @@ def frost_shared_expert_gate_up(
                 nvvm.mbarrier_init(mb_x, X_MBAR_ARRIVERS)
             if cutlass.const_expr(S > 1):
                 nvvm.mbarrier_init(mb_kred, KRED_MBAR_ARRIVERS)
+            if cutlass.const_expr(cfg.KRED_SPLIT_EFF):
+                nvvm.mbarrier_init(mb_kred_gate, cfg.KRED_GATE_MBAR_ARRIVERS)
             nvvm.fence_mbarrier_init()
             for p in cutlass.range_constexpr(cfg.W_PHASES):
                 nvvm.mbarrier_arrive_expect_tx(mb_w.subview(p), cfg.W_PHASE_BYTES)
@@ -612,7 +638,7 @@ def frost_shared_expert_gate_up(
                 whi[n],
                 gate_part,
                 gmail_base,
-                mb_kred,
+                mb_kred_gate,
                 rank,
                 lane,
                 T,

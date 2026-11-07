@@ -48,9 +48,13 @@ token count of its band (a captured CUDA graph replays its own `T`). The entry o
 one entry per concurrently running stream.
 
 Knobs (`cudnn.moe.frost.kernel.shared_expert_decode_config.Cfg`, passed as `cfg=`): bit-neutral `N_GROUPS` (row-pair
-groups per CTA; 0 = the one-wave rule), `X_BULK_ROWS` (x resident by bulk row copies; off = the v1 `cp.async` ring),
-`X_STAGES`, `W_PHASES`, `ROWS_PER_CTA`, `MIN_CTAS_PER_SM`; rounding-order axes `K_SPLIT` (pinned per geometry) and
-`GATE_CLUSTER_FOLD` (the gate tree's shape). `shared_expert_decode_config.v1_cfg(geometry)` is the first release's form
+groups per CTA; 0 = the one-wave rule), `X_BULK_ROWS` (x resident by bulk row copies; off = the first release's `cp.async`
+ring), `X_STAGES`, `W_PHASES`, `ROWS_PER_CTA`, `MIN_CTAS_PER_SM`, `KRED_SPLIT` (the cluster-fold barrier split between the
+accumulator ships and the gate leaves; an A/B arm); rounding-order axes `K_SPLIT` (pinned per geometry -- a function of the
+geometry alone, never of the part: a part too small for the pinned form is declined by type) and `GATE_CLUSTER_FOLD` (the
+gate tree's shape). A config the entry admits serves the whole 1 .. 24 band: both token-tile forms are validated at
+construction, so a decline is raised there (`NotImplementedError` for a part fact, `ValueError` for a knob combination),
+never at a launch. `shared_expert_decode_config.v1_cfg(geometry)` is the first release's form
 (K_SPLIT 2 / 4, 128 CTAs, the ring, the launch-2 gate fold), kept as an A/B arm with its own goldens.
 Launch knobs `pdl` / `pdl_pair` / `pdl_release` set the programmatic-dependent-launch attributes of launch 1 / launch 2
 and the early release; all default off. Under `pdl=True` the launch's immediate stream predecessor must not write

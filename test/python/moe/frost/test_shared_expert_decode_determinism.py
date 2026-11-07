@@ -5,9 +5,10 @@
 buffers, batch invariance of every token (alone at T 1 -- across the form boundary -- and inside T 6 / 24; the permuted rows; a duplicated
 token; neighbour isolation; a row-strided x / out view inside a wider slab), the two outputs of the pair (``y`` and the inter-launch
 ``act`` / ``gate_part`` scratch) compared as raw bytes, the inputs unmodified by a launch, the T 24 -> 25 boundary as the typed decline, and the goldens (one small case per geometry and form; recorded with
-``CUDNN_DETERMINISM_RECORD=<new dir>`` after the replay and the independent reference pass): the default form's ``ksplit8`` sets (the rev 2
-class: eight K slices, the gate leaves folded on the cluster leader) and, on the v1 knob arm, the ``ksplit2`` / ``ksplit4`` sets recorded
-before the rev 2 change -- the arm reproducing them byte for byte is the proof that the rev 2 refactor moved no v1 addition.  The
+``CUDNN_DETERMINISM_RECORD=<new dir>`` after the replay and the independent reference pass): the default form's ``ksplit8`` sets (the
+one-wave default's class: eight K slices, the gate leaves folded on the cluster leader) and, on the first release's knob arm (``v1_cfg``),
+the ``ksplit2`` / ``ksplit4`` sets recorded with that release -- the arm reproducing them byte for byte is the proof that the one-wave
+refactor moved no first-release addition.  The
 independent reference is a separate check at the harness band (``test_shared_expert_decode.py``).  Row-position invariance of the
 ``m16n8k16`` datapath is the premise these cells pin (the kernel module's docstring, point 3)."""
 
@@ -143,7 +144,8 @@ def test_twenty_four_to_twenty_five_is_the_typed_decline():
 def test_golden(g, tiles):
     """One small case per geometry and form: three executions, the independent reference, then the saved hashes (recorded into a NEW
     directory with ``CUDNN_DETERMINISM_RECORD`` only after the replay and reference cells pass; a change of the pinned K_SPLIT or of the
-    gate tree is a new golden set with a stated reason -- the rev 2 ``ksplit8`` sets: K_SPLIT 2 / 4 -> 8 and the cluster-side gate fold)."""
+    gate tree is a new golden set with a stated reason -- the one-wave default's ``ksplit8`` sets: K_SPLIT 2 / 4 -> 8 and the cluster-side
+    gate fold)."""
     dev = _device_or_skip()
     tokens = 3 if tiles == 1 else 19
     ops = make_operands(tokens, device=dev, seed=500 + tiles, geometry=g)
@@ -159,8 +161,8 @@ def test_golden(g, tiles):
 @pytest.mark.parametrize("g", GEOMETRIES, ids=_gid)
 def test_v1_arm_reproduces_the_v1_goldens(g, tiles):
     """The v1 knob arm (``kcfg.v1_cfg``: K_SPLIT 2 at I 256 / 4 at I 128, the x ring, the launch-2 gate fold, one group per CTA) on the SAME
-    operands as :func:`test_golden` writes the bytes of the ``ksplit2`` / ``ksplit4`` goldens recorded before the rev 2 change: the shared
-    code paths (the mainloop, the folds, launch 2) moved no v1 addition."""
+    operands as :func:`test_golden` writes the bytes of the ``ksplit2`` / ``ksplit4`` goldens recorded with the first release: the shared
+    code paths (the mainloop, the folds, launch 2) moved no first-release addition."""
     dev = _device_or_skip()
     tokens = 3 if tiles == 1 else 19
     ops = make_operands(tokens, device=dev, seed=500 + tiles, geometry=g)

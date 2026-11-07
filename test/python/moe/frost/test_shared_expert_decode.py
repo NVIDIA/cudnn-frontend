@@ -29,6 +29,8 @@ from shared_expert_utils import (  # noqa: E402  (the operand builders, the refe
     reference,
 )
 
+from determinism_utils import assert_bitwise, assert_replays, snapshot  # noqa: E402
+
 from cudnn.moe.frost import shared_expert_decode as entry  # noqa: E402
 from cudnn.moe.frost.kernel import shared_expert_decode_config as kcfg  # noqa: E402
 
@@ -58,14 +60,29 @@ def test_default_cfg_pins_k_split_per_geometry_at_one_wave():
             1,
         ), g
         assert (cfg.N_GROUPS, cfg.X_BULK_ROWS, cfg.GATE_CLUSTER_FOLD, cfg.SM_COUNT) == (0, True, True, kcfg.SM100_SM_COUNT)
-        assert (cfg.PDL, cfg.PDL_PAIR, cfg.PDL_RELEASE, cfg.X_STAGES, cfg.W_PHASES, cfg.ROWS_PER_CTA, cfg.MIN_CTAS_PER_SM) == (False, False, False, 0, 1, 64, 1)
+        assert (cfg.PDL, cfg.PDL_PAIR, cfg.PDL_RELEASE, cfg.X_STAGES, cfg.W_PHASES, cfg.ROWS_PER_CTA, cfg.MIN_CTAS_PER_SM, cfg.KRED_SPLIT) == (
+            False,
+            False,
+            False,
+            0,
+            1,
+            64,
+            1,
+            False,
+        )
         two = kcfg.form_for(cfg, 24)
         assert (two.TOKEN_TILES, two.N_GROUPS_EFF, two.GRID1, two.co_resident_ctas1, two.WAVES1) == (2, n, 256, 2, 1), g
         for sm in (148, 152, 212):  # the same forms on every SM100-class part
             part = kcfg.default_cfg(g, sm_count=sm)
-            assert (part.N_GROUPS_EFF, kcfg.form_for(part, 24).N_GROUPS_EFF) == (n, n)
+            assert (part.K_SPLIT, part.N_GROUPS_EFF, kcfg.form_for(part, 24).N_GROUPS_EFF) == (8, n, n)
+        # the pin is a function of the geometry ALONE: a part too small for one wave at K_SPLIT 8 is declined by type, never served at another
+        # K_SPLIT (a different slice order = different bytes); 127 SMs still hold the I 128 two-group grid (128 CTAs) in one wave
+        with pytest.raises(ValueError, match="K_SPLIT 8.*needs [23] waves"):
+            kcfg.default_cfg(g, sm_count=63)
+        assert kcfg.default_cfg(GEOMETRIES[1], sm_count=127).K_SPLIT == 8
     assert kcfg.CFG == kcfg.default_cfg() and kcfg.CFG_TP16 == kcfg.default_cfg(GEOMETRIES[1])
     assert kcfg.k_split_for(kcfg.Geometry(8192, 256)) == 8 and kcfg.k_split_for(kcfg.Geometry(8192, 128)) == 8
+    assert kcfg.k_split_for(kcfg.Geometry(4096, 256)) == 8 and kcfg.k_split_for(kcfg.Geometry(2048, 256)) == 4, "whole 512-column chunks per slice"
     # the v1 arm (the class of the committed ksplit2 / ksplit4 goldens): 128 CTAs, the ring, the launch-2 gate fold
     for g, s in ((GEOMETRIES[0], 2), (GEOMETRIES[1], 4)):
         v1 = kcfg.v1_cfg(g)
@@ -178,6 +195,10 @@ def test_default_form_figures_of_record():
         "mbarriers": (48, None),
     }
     assert (n1.SMEM1_BYTES, n1.co_resident_ctas1, n1.GRID1, n1.KRED_BYTES) == (57200, 4, 512, 4032)
+    sp = kcfg.make_cfg(KRED_SPLIT=True)  # the split cluster-fold barrier: one more 16-B slot, the ledger split 7,168 + 896 over two barriers
+    assert kcfg.smem_table1(sp)["mbarriers"] == (64, None) and (sp.SMEM1_BYTES, sp.co_resident_ctas1) == (81344, 2)
+    assert (sp.KRED_BYTES, sp.KRED_GATE_BYTES, sp.KRED_GATE_GROUP_BYTES, sp.KRED_GATE_MBAR_ARRIVERS) == (7168, 896, 448, 2)
+    assert kcfg.make_cfg(KRED_SPLIT=True, GATE_CLUSTER_FOLD=False).KRED_SPLIT_EFF is False, "no gate ship to separate without the cluster fold"
     assert kcfg.SM100_SMEM_PER_SM_BYTES // 4 - kcfg.SMEM_CTA_RESERVE_BYTES - n1.SMEM1_BYTES == 144, "the one-group one-tile form's slack under four per SM"
     t1, t2 = kcfg.form_for(kcfg.CFG_TP16, 6), kcfg.form_for(kcfg.CFG_TP16, 24)
     assert (t1.SMEM1_BYTES, t2.SMEM1_BYTES, t1.SMEM2_BYTES, t2.SMEM2_BYTES, t1.co_resident_ctas1, t2.co_resident_ctas1) == (57200, 81328, 21888, 26240, 4, 2)
@@ -224,7 +245,11 @@ def test_barrier_ledger_constants_and_the_ring_walk():
                         assert cfg.W_PHASE_BYTES == cfg.W_ROWS * cfg.W_PHASE_ROW_BYTES and cfg.W_PHASE_ROW_BYTES % 16 == 0
                         assert cfg.ACC_TILES == n * tiles and cfg.MAIL_SMEM_BYTES == (s - 1) * cfg.ACC_TILES * 32 * 16
                         assert cfg.GMAIL_SMEM_BYTES == ((s - 1) * n * cfg.TPAD * 4 if s > 1 else 0)
-                        assert cfg.KRED_BYTES == cfg.MAIL_SMEM_BYTES + cfg.GMAIL_SMEM_BYTES
+                        assert cfg.KRED_BYTES == cfg.MAIL_SMEM_BYTES + cfg.GMAIL_SMEM_BYTES and cfg.KRED_GATE_BYTES == 0
+                        sp = replace(cfg, KRED_SPLIT=True)
+                        assert sp.KRED_BYTES == cfg.MAIL_SMEM_BYTES and sp.KRED_GATE_BYTES == cfg.GMAIL_SMEM_BYTES
+                        assert sp.KRED_GATE_MBAR_ARRIVERS * sp.KRED_GATE_GROUP_BYTES == sp.KRED_GATE_BYTES
+                        assert sp.KRED_GATE_MBAR_ARRIVERS == (n if s > 1 else 0) and sp.MBAR_SMEM_BYTES == cfg.MBAR_SMEM_BYTES + (16 if s > 1 else 0)
                         assert cfg.WD_COPIES * cfg.THREADS2 * 16 == cfg.ROWS_PER_CTA * cfg.I * 2
                         assert cfg.ACT_COPIES * cfg.THREADS2 * 16 == cfg.TPAD * cfg.I * 2
                         if bulk:
@@ -396,6 +421,25 @@ def test_host_entry_keeps_the_cc10_readings_and_a_given_cfg_overrides_the_pick()
         entry.SharedExpertDecode("cpu", geometry=GEOMETRIES[1], cfg=arm)
 
 
+def test_entry_resolves_both_forms_at_construction_and_declines_by_type():
+    """A config the entry admits serves the WHOLE band: both forms (T <= 16, 17 .. 24) are validated at construction, so no launch ever
+    meets a decline.  A ring config at K_SPLIT 8 under the one-wave rule (two waves at two tiles on every served part) is a ``ValueError`` at
+    construction -- not at ``cfg_for(17)``; the default knobs on a part too small for one wave are a ``NotImplementedError`` (a part fact);
+    an explicit ``N_GROUPS`` (a knowing two-wave knob arm) constructs and serves 24 tokens."""
+    k = entry.SharedExpertDecode("cpu")
+    assert set(k.forms) == {1, 2} and k.cfg_for(16) is k.forms[1] and k.cfg_for(17) is k.forms[2] and k.cfg_for(24) is k.forms[2]
+    assert (k.forms[1].TOKEN_TILES, k.forms[2].TOKEN_TILES, k.forms[2].N_GROUPS_EFF, k.forms[2].WAVES1) == (1, 2, 2, 1)
+    with pytest.raises(ValueError, match="cannot be served at 24 tokens on any SM100-class part.*needs 2 waves"):
+        entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(X_BULK_ROWS=False))
+    with pytest.raises(NotImplementedError, match="does not serve this part at 16 tokens .64 SMs.*needs 2 waves"):
+        entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(SM_COUNT=64))
+    assert entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(SM_COUNT=128)).forms[2].WAVES1 == 1, "two per SM on 128 SMs holds both forms"
+    arm = entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(X_BULK_ROWS=False, N_GROUPS=1))
+    assert arm.cfg_for(24).WAVES1 == 2 and arm.cfg_for(24).X_BULK_ROWS is False
+    with pytest.raises(NotImplementedError, match="at most 24"):
+        k.cfg_for(25)
+
+
 def test_pdl_launch_knobs_apply_on_top_of_the_pick():
     k = entry.SharedExpertDecode("cpu", pdl=True)
     assert (k.cfg.PDL, k.cfg.PDL_PAIR, k.cfg.PDL_RELEASE) == (True, False, False)
@@ -564,6 +608,7 @@ BITWISE_ARMS = [
     dict(X_BULK_ROWS=False, X_STAGES=2, N_GROUPS=1),
     dict(W_PHASES=2),
     dict(ROWS_PER_CTA=32),
+    dict(KRED_SPLIT=True),  # the split cluster-fold barrier (two gate warps arm mb_kred_gate at I 256): the same values land in the same slots
 ]
 
 
@@ -593,16 +638,42 @@ ORDER_ARMS = {
 }
 
 
+def _snap(k, ops):
+    """One launch into fresh buffers; ``y`` and the live rows of the inter-launch scratch, for a byte comparison."""
+    T = ops["x"].shape[0]
+    y = _run(k, ops, out=torch.empty(T, ops["x"].shape[1], dtype=torch.bfloat16, device=ops["x"].device))
+    s = k.scratch[k.cfg_for(T)]
+    return {"y": y, "act": s["act"][:T].clone(), "gate_part": s["gate_part"][:T].clone()}
+
+
 @pytest.mark.parametrize("arm", sorted(ORDER_ARMS))
 def test_order_arms_are_rounding_order_arms_within_the_band(arm):
     """K_SPLIT changes the slice sum and the gate tree's leaf count (64 .. 512 leaves), GATE_CLUSTER_FOLD the gate tree's shape, the v1 arm
-    both: rounding-order arms -- in band against the fp64 reference and the order model, not bitwise with the default."""
+    both: rounding-order arms -- in band against the fp64 reference and the order model, not bitwise with the default.  Each arm is still a
+    fixed tree: bitwise replay (three executions under side-stream contention) and batch invariance (every token of the T 6 step alone at
+    T 1 writes its in-batch bytes) are pinned here; the goldens stay the default's and the first release's."""
     dev = _device_or_skip()
     ops = make_operands(6, device=dev, seed=77)
     cfg = kcfg.v1_cfg() if ORDER_ARMS[arm] is None else kcfg.make_cfg(**ORDER_ARMS[arm])
-    y = _run(entry.SharedExpertDecode(dev, cfg=cfg), ops)
+    k = entry.SharedExpertDecode(dev, cfg=cfg)
+    batch = assert_replays(lambda: _snap(k, ops), repeats=3)
+    y = batch["y"]
     assert_in_band(y, reference(ops), arm)
     assert_in_band(y, order_model(ops, cfg).to(dev), f"{arm} vs the order model")
+    for t in range(6):
+        alone = snapshot(_snap(k, dict(ops, x=ops["x"][t : t + 1])))
+        assert_bitwise(alone, {name: value[t : t + 1] for name, value in batch.items()}, f"{arm}: token {t} alone vs inside T 6")
+
+
+@pytest.mark.parametrize("tokens", (6, 24))
+def test_kred_split_arm_is_bitwise_at_the_one_group_geometry(tokens):
+    """The split cluster-fold barrier at I 128 (one gate warp arms ``mb_kred_gate``; two at I 256 in the bit-neutral arms above): the default's bytes."""
+    dev = _device_or_skip()
+    g = GEOMETRIES[1]
+    ops = make_operands(tokens, device=dev, seed=90 + tokens, geometry=g)
+    base = _run(entry.SharedExpertDecode(dev, geometry=g), ops).clone()
+    got = _run(entry.SharedExpertDecode(dev, cfg=kcfg.make_cfg(GEOM=g, KRED_SPLIT=True)), ops)
+    assert torch.equal(_bytes(base), _bytes(got))
 
 
 def test_two_tile_form_at_sixteen_tokens_writes_the_one_tile_bytes():

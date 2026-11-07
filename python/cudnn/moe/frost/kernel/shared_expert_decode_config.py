@@ -36,9 +36,11 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same two kernel bodies; th
 microsecond):
 
 * ``K_SPLIT`` (1, 2, 4, 8): CTAs per cluster over K -- a ROUNDING-ORDER axis (the slice sum ``((C_0 + C_1) + ..)`` and the gate-logit tree,
-  ``GATE_PARTS`` leaves, both move with it); pinned per geometry by ``default_cfg`` (8 on the validated envelope: 512 CTAs of 16 KB at I 256,
-  256 at I 128) so the slice order of every output element is a function of the geometry alone, never of ``T``.  The v1 default was 2 at
-  I 256 / 4 at I 128 (128 CTAs of 64 / 32 KB): its goldens are the ``ksplit2`` / ``ksplit4`` sets, the rev 2 default's the ``ksplit8`` sets.
+  ``GATE_PARTS`` leaves, both move with it); pinned per geometry by ``k_split_for`` (8 on the validated envelope: 1024-column K slices,
+  clusters of eight) so the slice order of every output element is a function of the GEOMETRY ALONE -- never of ``T``, never of the part's
+  SM count (a part too small to hold the pinned form in one wave is declined by type, the pin does not move).  The first release's default
+  was 2 at I 256 / 4 at I 128 (128 CTAs of 64 / 32 KB; ``v1_cfg``): its goldens are the ``ksplit2`` / ``ksplit4`` sets, the ksplit8
+  default's the ``ksplit8`` sets.
 * ``TOKEN_TILES`` (1, 2): m-tiles of 16 tokens -- the FORM axis the host entry picks from ``T`` (1 for ``T <= 16``, 2 for ``17 .. 24``);
   bit-neutral by the row-position invariance of the ``m16n8k16`` datapath (a token's row of the A operand is contracted on its own; the
   premise the batch-invariance cells of the determinism suite pin).
@@ -50,8 +52,12 @@ microsecond):
   Bit-neutral: who loads x and how does not enter the sum.
 * ``GATE_CLUSTER_FOLD`` (default on): the gate-logit leaves of a cluster are added on the leader in rank order and launch 2 folds
   ``GROUPS`` slots; off = the v1 path (launch 2 folds all ``GATE_PARTS`` leaves).  A ROUNDING-ORDER axis of the gate tree (the leaf values
-  are the same; the tree over them differs): the v1 goldens are recorded with it off, the rev 2 goldens with it on.  Forced off at
-  ``K_SPLIT`` 1 (one leaf per group: the two trees coincide).
+  are the same; the tree over them differs): the ``ksplit2`` / ``ksplit4`` goldens are recorded with it off, the ``ksplit8`` goldens with it
+  on.  Forced off at ``K_SPLIT`` 1 (one leaf per group: the two trees coincide).
+* ``KRED_SPLIT`` (default off): the leader's cluster-fold barrier split in two -- ``mb_kred`` takes the accumulator ships alone (waited by
+  warp 0), ``mb_kred_gate`` the gate leaves (armed and waited by the gate warps), so warp 0's act epilogue no longer waits for the slowest
+  peer's gate leaf and the gate warps not for the accumulator ships.  Bit-neutral (no addition moves; the same values land in the same
+  slots).  Forced off without the cluster-side gate fold (no gate ship to separate).  An A/B arm until measured.
 * ``X_STAGES`` (ring form only; 0 = the budget rule: every chunk resident when the shared memory holds them, else the deepest ring that fits;
   >= 2 always): the ``cp.async`` ring depth of launch 1.  Bit-neutral.
 * ``W_PHASES`` (1, 2): mbarriers over the W slice's K halves so the first k-steps start on the first half.  Bit-neutral.
@@ -80,7 +86,6 @@ MMA_M = 16  # tokens per m-tile (mma.sync.m16n8k16)
 MMA_N = 8  # weight rows per n-tile
 MMA_K = 16  # k per mma step
 PAIRS_PER_GROUP = 4  # (gate, up) row pairs per row-pair group = one n8 tile of launch 1
-PAIRS_PER_CLUSTER = PAIRS_PER_GROUP  # the v1 name (one group per cluster), kept for the kernel module
 ROWS_PER_GROUP = 2 * PAIRS_PER_GROUP  # 8 W_gu rows per n8 tile
 MAX_K_SPLIT = 8  # the portable cluster size
 SM100_SM_COUNT = 148  # the smaller SM100-class part (cc 10.0); cc 10.3 has 152 -- the one-wave rule reads the host entry's stamp
@@ -137,6 +142,7 @@ class Cfg:
     N_GROUPS: int = 0
     X_BULK_ROWS: bool = True
     GATE_CLUSTER_FOLD: bool = True
+    KRED_SPLIT: bool = False
     X_STAGES: int = 0
     W_PHASES: int = 1
     ROWS_PER_CTA: int = 64
@@ -312,14 +318,34 @@ class Cfg:
         return (self.K_SPLIT - 1) * self.N_GROUPS_EFF * self.TPAD * 4 if self.GATE_CLUSTER_FOLD_EFF else 0
 
     @property
+    def KRED_SPLIT_EFF(self) -> bool:
+        """The split cluster-fold barrier needs a gate ship to separate (the cluster-side gate fold); off otherwise."""
+        return bool(self.KRED_SPLIT) and self.GATE_CLUSTER_FOLD_EFF
+
+    @property
     def KRED_BYTES(self) -> int:
-        """expect_tx of the leader's ``mb_kred`` = every peer's ship: the accumulator v4s and, under the cluster fold, the gate leaves."""
-        return self.MAIL_SMEM_BYTES + self.GMAIL_SMEM_BYTES
+        """expect_tx of the leader's ``mb_kred``: every peer's accumulator v4s and, under the cluster fold WITHOUT the split, the gate leaves."""
+        return self.MAIL_SMEM_BYTES + (0 if self.KRED_SPLIT_EFF else self.GMAIL_SMEM_BYTES)
+
+    @property
+    def KRED_GATE_BYTES(self) -> int:
+        """expect_tx of the leader's ``mb_kred_gate`` (the split form): every peer's gate leaves; 0 without the split."""
+        return self.GMAIL_SMEM_BYTES if self.KRED_SPLIT_EFF else 0
+
+    @property
+    def KRED_GATE_GROUP_BYTES(self) -> int:
+        """One gate warp's share of ``mb_kred_gate``'s expect: the ``K_SPLIT - 1`` peers' leaves of its group (``TPAD`` fp32 each)."""
+        return (self.K_SPLIT - 1) * self.TPAD * 4 if self.KRED_SPLIT_EFF else 0
+
+    @property
+    def KRED_GATE_MBAR_ARRIVERS(self) -> int:
+        """Init count of ``mb_kred_gate``: one arriving lane per gate warp (lane 0 of warps ``1 .. N_GROUPS``), each with its group's expect."""
+        return self.N_GROUPS_EFF if self.KRED_SPLIT_EFF else 0
 
     @property
     def MBAR_SMEM_BYTES(self) -> int:
-        """``mb_w`` (W_PHASES slots), ``mb_x`` (bulk form) and ``mb_kred`` (K_SPLIT > 1) in 16-B-aligned arrays."""
-        return (self.W_PHASES * 8 + 15) // 16 * 16 + (16 if self.X_BULK_ROWS else 0) + (16 if self.K_SPLIT > 1 else 0)
+        """``mb_w`` (W_PHASES slots), ``mb_x`` (bulk form), ``mb_kred`` (K_SPLIT > 1) and ``mb_kred_gate`` (KRED_SPLIT) in 16-B-aligned arrays."""
+        return (self.W_PHASES * 8 + 15) // 16 * 16 + (16 if self.X_BULK_ROWS else 0) + (16 if self.K_SPLIT > 1 else 0) + (16 if self.KRED_SPLIT_EFF else 0)
 
     @property
     def SMEM1_FIXED_BYTES(self) -> int:
@@ -392,11 +418,6 @@ class Cfg:
     def GATE_SLOTS_PER_LANE(self) -> int:
         """Launch 2's fold: lane ``l`` reads slots ``l x GATE_SLOTS_PER_LANE ..`` of a token (``GATE_SLOTS / 32``)."""
         return self.GATE_SLOTS // 32
-
-    @property
-    def GATE_PARTS_PER_LANE(self) -> int:
-        """The v1 name of :attr:`GATE_SLOTS_PER_LANE`."""
-        return self.GATE_SLOTS_PER_LANE
 
     # ---- launch 2: down ----
     @property
@@ -524,8 +545,14 @@ def validate_cfg(cfg: Cfg) -> None:
         raise ValueError(f"{e} GATE_COLS={cfg.GATE_COLS} must be even (one bf16x2 word per lane and pair)")
     if cfg.GATE_SLOTS % 32:
         raise ValueError(f"{e} GATE_SLOTS={cfg.GATE_SLOTS} must be a multiple of 32 (launch 2's lane fold reads GATE_SLOTS / 32 partials per lane)")
-    if cfg.KRED_BYTES != cfg.MAIL_SMEM_BYTES + cfg.GMAIL_SMEM_BYTES:
-        raise ValueError(f"{e} the mb_kred ledger {cfg.KRED_BYTES} != mail {cfg.MAIL_SMEM_BYTES} + gmail {cfg.GMAIL_SMEM_BYTES}")
+    if cfg.KRED_BYTES + cfg.KRED_GATE_BYTES != cfg.MAIL_SMEM_BYTES + cfg.GMAIL_SMEM_BYTES:
+        raise ValueError(
+            f"{e} the cluster-fold ledger mb_kred {cfg.KRED_BYTES} + mb_kred_gate {cfg.KRED_GATE_BYTES} != mail {cfg.MAIL_SMEM_BYTES} + gmail {cfg.GMAIL_SMEM_BYTES}"
+        )
+    if cfg.KRED_GATE_GROUP_BYTES * cfg.KRED_GATE_MBAR_ARRIVERS != cfg.KRED_GATE_BYTES:
+        raise ValueError(
+            f"{e} the mb_kred_gate ledger: {cfg.KRED_GATE_MBAR_ARRIVERS} arriving lanes x {cfg.KRED_GATE_GROUP_BYTES} B != {cfg.KRED_GATE_BYTES} B"
+        )
     # the pitches
     pitches = [("w_s", cfg.W_PITCH_ELEMS * 2), ("wd_s / act_s", cfg.WD_PITCH_ELEMS * 2)]
     pitches.append(("x_s", cfg.X_ROW_PITCH_ELEMS * 2) if cfg.X_BULK_ROWS else ("x_s", cfg.X_PITCH_ELEMS * 2))
@@ -575,12 +602,14 @@ def make_cfg(**overrides) -> Cfg:
     return cfg
 
 
-def k_split_for(geometry: Geometry, sm_count: int = SM100_SM_COUNT) -> int:
-    """The pinned K_SPLIT of a geometry: the largest cluster (8 on the validated envelope: 512 CTAs of 16 KB at I 256, 256 at I 128) whose
-    one-group grid fits one wave at four CTAs per SM and whose K slices are whole 512-column chunks."""
+def k_split_for(geometry: Geometry) -> int:
+    """The pinned K_SPLIT of a geometry -- a function of the GEOMETRY ALONE (the rounding class of every output element never depends on the
+    part): the largest cluster (8 on the validated envelope: 1024-column K slices) whose K slices are whole 512-column chunks and whose gate
+    leaves keep an even column count (one bf16x2 word per lane and pair).  A part too small to hold the pinned form in one wave is declined
+    by type (``validate_one_wave``), never served with another pin."""
     groups = geometry.INTERMEDIATE // PAIRS_PER_GROUP
     for s in (8, 4, 2, 1):
-        if groups * s <= 4 * sm_count and geometry.HIDDEN % (s * CHUNK_K) == 0:
+        if geometry.HIDDEN % (s * CHUNK_K) == 0 and (geometry.HIDDEN // (s * groups)) % 2 == 0:
             return s
     return 1
 
@@ -591,10 +620,11 @@ def default_cfg(
     smem_optin: int = SM100_SMEM_OPTIN_BYTES,
     sm_count: int = SM100_SM_COUNT,
 ) -> Cfg:
-    """The default form of a geometry on a part: the module defaults with the geometry's pinned ``K_SPLIT`` and the part's readings; one wave."""
+    """The default form of a geometry on a part: the module defaults with the geometry's pinned ``K_SPLIT`` and the part's readings; one wave
+    (a part whose SM count cannot hold the pinned form in one wave is the typed error of :func:`validate_one_wave`: the pin never moves)."""
     if not isinstance(geometry, Geometry):
         raise ValueError(f"{NAME}: geometry must be a Geometry, got {type(geometry).__name__}")
-    cfg = make_cfg(GEOM=geometry, K_SPLIT=k_split_for(geometry, sm_count), **part_readings(smem_per_sm, smem_optin, sm_count))
+    cfg = make_cfg(GEOM=geometry, K_SPLIT=k_split_for(geometry), **part_readings(smem_per_sm, smem_optin, sm_count))
     validate_one_wave(cfg)
     return cfg
 

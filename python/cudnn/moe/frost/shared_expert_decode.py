@@ -13,8 +13,9 @@ The op: ``y = sigmoid(x W_g^T) * ( (silu(x W_gate^T) * (x W_up^T)) W_d^T )`` for
 [2 I, H] bf16 row-major (gate rows first), ``w_down`` [H, I] bf16 row-major, ``w_gate`` [H] (or [1, H]) bf16; fp32 accumulation in a fixed
 order per output element (the kernel module's docstring), ``act`` rounded ONCE to bf16 between the launches, ``y`` once at the end.  The add
 into the routed output stays with the caller.  Served (declined otherwise, by name): ``T`` in 1 .. 24 (a RUNTIME kernel argument; the form
--- one or two 16-token m-tiles, and the row-pair groups per CTA the one-wave rule picks for the part's SM count -- is the compile key's), the
-validated geometries H 8192 with I 256 or 128, bf16 everywhere, contiguous
+-- one or two 16-token m-tiles, and the row-pair groups per CTA the one-wave rule picks for the part's SM count -- is the compile key's; BOTH
+forms of the admitted band are resolved and validated at construction, so a config the entry accepts never declines on the execute path at
+its first 17 .. 24-token call), the validated geometries H 8192 with I 256 or 128, bf16 everywhere, contiguous
 weights, x / y rows contiguous with a 16-byte-multiple row stride, every operand on the entry's device, a compute capability 10.x part
 (12.x holds no form in its 99 KB opt-in and is declined until one is measured), a CuTe DSL >= 4.8.0.
 
@@ -25,8 +26,8 @@ launch 1; ``w_down`` loads before the wait), ``pdl_release`` = ``griddepcontrol.
 is off (a knob measured before it defaults on).  Workspace: the inter-launch scratch ``act`` [32, I] bf16 and ``gate_part`` [32, GATE_SLOTS]
 fp32 is entry-owned, allocated once per config at the first compile (outside any capture), never on the execute path (Rule 1); the launch
 reads no device memory to the host (Rule 3).  Two entries, or one entry on two streams concurrently, must not share a scratch: build one
-entry per concurrent stream.  Eager-path host cost: the form of a token count is memoized per m-tile count (``cfg_for``: one validated
-``Cfg`` per form, never a re-validation per call), the compile key is computed once per call, and the DSL views of the entry-owned scratch
+entry per concurrent stream.  Eager-path host cost: the forms of the band are resolved once at construction (``forms``: one validated ``Cfg`` per m-tile count;
+``cfg_for`` is a dictionary read, never a validation per call), the compile key is computed once per call, and the DSL views of the entry-owned scratch
 are built once per form (static pointers); the per-layer operands (``x``, the three weights, ``out``) are wrapped per call -- they change
 with every layer -- and the binding checks run on every call (Rule 1 keeps the validation, not the recomputation).
 """
@@ -39,8 +40,10 @@ from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
 from .kernel.shared_expert_decode_config import (
     DEFAULT_GEOMETRY,
     MAX_TOKENS,
+    MMA_M,
     SCRATCH_ROWS,
     SERVED_GEOMETRIES,
+    SM100_SM_COUNT,
     SM100_SMEM_OPTIN_BYTES,
     SM100_SMEM_PER_SM_BYTES,
     Cfg,
@@ -50,6 +53,7 @@ from .kernel.shared_expert_decode_config import (
     part_readings,
     token_tiles_for,
     validate_cfg,
+    validate_one_wave,
 )
 
 #: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts only (validated on cc 10.3; cc 10.0 / 10.7
@@ -217,7 +221,9 @@ class SharedExpertDecode:
     without it the entry takes the geometry's default form on this part's shared-memory readings.  ``pdl`` / ``pdl_pair`` / ``pdl_release``
     are the launch knobs (None = the form's own fields; the defaults: off).  The device is resolved to a concrete CUDA ordinal at
     construction, and every operand of every compile / launch must live on exactly it.  An entry built for a non-CUDA device (host tests)
-    keeps the cc 10.x readings."""
+    keeps the cc 10.x readings.  Construction resolves and validates BOTH forms of the served band (``forms[1]`` for T <= 16, ``forms[2]``
+    for 17 .. 24): a part whose SM count cannot hold the default one-wave forms is a ``NotImplementedError`` (a part fact), a given config
+    that cannot be served in one wave under its own rule a ``ValueError`` (a knob combination) -- either raised here, never at a launch."""
 
     def __init__(
         self,
@@ -241,18 +247,44 @@ class SharedExpertDecode:
             self.readings = device_shared_memory(self.device)
             self.sm_count = device_multiprocessor_count(self.device)
             self.part = part_readings(*self.readings, self.sm_count)
-        base = cfg if cfg is not None else default_cfg(self.geometry, *self.readings, *(() if self.sm_count is None else (self.sm_count,)))
+        base = cfg if cfg is not None else self._default_cfg()
         self.cfg: Cfg = self._on_this_part(base)
+        self.forms: Dict[int, Cfg] = self._resolve_forms(self.cfg)  # token-tile count -> the validated form of self.cfg (the whole band)
         self.compiled: Dict[tuple, Any] = {}
         self.scratch: Dict[Cfg, Dict[str, Any]] = {}
-        self.forms: Dict[int, Cfg] = {}  # token-tile count -> the validated form of self.cfg
         self.out_buffer = None
+
+    def _default_cfg(self) -> Cfg:
+        """The geometry's default form on this part's readings; a part that cannot hold it in one wave is declined by type (a part fact)."""
+        try:
+            return default_cfg(self.geometry, *self.readings, *(() if self.sm_count is None else (self.sm_count,)))
+        except ValueError as e:
+            raise NotImplementedError(f"{NAME} does not serve this part: {e}") from e
 
     def _on_this_part(self, cfg: Cfg) -> Cfg:
         """``cfg`` with this part's readings (shared memory, SM count), the entry's geometry and the launch knobs, validated."""
         cfg = replace(cfg, GEOM=self.geometry, **self.part, **self.launch_fields(cfg))
         validate_cfg(cfg)
         return cfg
+
+    def _resolve_forms(self, cfg: Cfg) -> Dict[int, Cfg]:
+        """Both forms of the served band (one m-tile for T <= 16, two for 17 .. MAX_TOKENS), validated -- including the one-wave pin of a
+        form under the rule (``N_GROUPS`` 0).  A form the rule cannot place in one wave is declined HERE, typed by its cause: the part
+        (``NotImplementedError``: the same config fits one wave on the smaller SM100-class reference part, so this part's SM count is what
+        declines it) or the knob combination (``ValueError``: the config fits one wave on no served part)."""
+        forms = {}
+        for tiles, tokens in ((1, MMA_M), (2, MAX_TOKENS)):
+            try:
+                forms[tiles] = form_for(cfg, tokens)
+            except ValueError as e:
+                reference = replace(cfg, SMEM_PER_SM_BYTES=SM100_SMEM_PER_SM_BYTES, SMEM_OPTIN_BYTES=SM100_SMEM_OPTIN_BYTES, SM_COUNT=SM100_SM_COUNT)
+                try:
+                    validate_cfg(reference)
+                    validate_one_wave(replace(reference, TOKEN_TILES=tiles))
+                except ValueError:
+                    raise ValueError(f"{NAME}: the config cannot be served at {tokens} tokens on any SM100-class part: {e}") from e
+                raise NotImplementedError(f"{NAME} does not serve this part at {tokens} tokens ({cfg.SM_COUNT} SMs): {e}") from e
+        return forms
 
     def launch_fields(self, cfg: Cfg) -> Dict[str, bool]:
         """The ``PDL`` / ``PDL_PAIR`` / ``PDL_RELEASE`` fields the entry's knobs set on ``cfg``; a knob left None keeps the form's own field.
@@ -268,13 +300,9 @@ class SharedExpertDecode:
         return fields
 
     def cfg_for(self, tokens: int) -> Cfg:
-        """The config a plan for ``tokens`` compiles with: the entry's config in the token count's form (one or two m-tiles), validated
-        once per form and memoized (``token_tiles_for`` still raises the typed decline of a token count past the ceiling on every call)."""
-        tiles = token_tiles_for(tokens)
-        form = self.forms.get(tiles)
-        if form is None:
-            form = self.forms[tiles] = form_for(self.cfg, tokens)
-        return form
+        """The config a plan for ``tokens`` compiles with: the entry's config in the token count's form (one or two m-tiles), resolved and
+        validated at construction (``token_tiles_for`` still raises the typed decline of a token count past the ceiling on every call)."""
+        return self.forms[token_tiles_for(tokens)]
 
     def key(self, tokens: int, x, out) -> tuple:
         """The compile key: plan-time facts only (the form of the token count, the strides, the config -- its geometry included)."""

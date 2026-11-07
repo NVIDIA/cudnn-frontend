@@ -75,7 +75,8 @@ a row alone and inside a batch under the entry's own picks.
   no SM120 column.
 - Shared-expert decode pair (`SharedExpertDecode`): no determinism switch; the
   accumulation order of every output element is a function of the geometry
-  alone (`K_SPLIT` pinned per geometry, the gate tree's shape by
+  alone (`K_SPLIT` pinned per geometry -- never per part: a GPU too small for
+  the pinned form is declined by type -- the gate tree's shape by
   `GATE_CLUSTER_FOLD`), so a token's bytes alone equal its bytes inside a batch
   of up to 24 tokens, across the one- and two-m-tile forms and the one- and
   two-group forms; every other knob writes the default's bytes, and the first
