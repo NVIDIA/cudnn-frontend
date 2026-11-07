@@ -11,8 +11,8 @@ and grouped paths require SM100, SM103 or SM107 (cc 10.0, 10.3 or 10.7), CuTeDSL
 `sm_107a` target on cc 10.7) and positive FP32 attention scale. The same kernels serve every admitted part; the compile
 target follows the device. Grouped dense lengths must be multiples of 128;
 packed grouped lengths may have tails or empty actual sequences. Other masks,
-bias, sinks and dropout are declined. Dense MHA supports deterministic requests;
-the packed and grouped paths still decline them.
+bias, sinks and dropout are declined. Dense MHA, GQA and MQA support deterministic
+requests; the packed path still declines them.
 
 Use the ordinary cuDNN graph preparation and execution API. After building
 and selecting a plan, allocate the size reported by that plan:
@@ -32,13 +32,22 @@ The output conversion applies no extra scale. Its scratch size is
 `4 * B * H * round_up(S_q, 128) * (D + 1) + 240` bytes. The final 240 bytes cover internal
 alignment for any valid 16-byte-aligned caller workspace.
 
-Dense MHA with `use_deterministic_algorithm=True` selects the one-kernel recompute
-implementation: a single CTA owns each gradient tile and reduces in a fixed order,
-without inter-CTA atomics. It requires zero workspace and supports both unmasked
-and top-left causal attention. The choice is made when the plan is built.
+Dense MHA with `use_deterministic_algorithm=True` selects the kernel pair on cc 10.0 / 10.3
+under the CuTeDSL and positive-scale gates of the accumulation chain: the row delta,
+a key-owner kernel that accumulates dK/dV on chip and stores them, then a query-owner
+kernel that recomputes the score and score-gradient tiles and stores dQ once from its
+on-chip accumulator. Every gradient tile has one owner and a fixed summation order, so
+repeated executions return identical bits. It serves D64 and D128 in both dtypes,
+unmasked or top-left causal attention, a left sliding window, and GQA/MQA with an
+integral head ratio (the key-owner kernel walks the group's query heads, so no
+partial fold is needed), and needs `4 * B * H_q * round_up(S_q, 128) + 240` workspace
+bytes for the FP32 delta rows. Dense MHA requests outside those gates (other devices,
+older CuTeDSL, negative scales) use the one-kernel recompute implementation with zero
+workspace; grouped requests outside them are declined. The choice is made when the
+plan is built.
 
-A D128 left sliding window uses that same recompute implementation,
-whether or not determinism is requested. D64 uses native 64-wide operand/MMA tiles and gradient stores on either implementation; score and dS
+A D128 left sliding window without a deterministic request keeps the recompute
+implementation. D64 uses native 64-wide operand/MMA tiles and gradient stores on every implementation; score and dS
 tiles retain their 128-column geometry. A left window bounds both Q and KV owners' reduction
 loops and masks boundary tiles; rows containing one legal key have zero score
 gradients and contribute no dQ/dK.
@@ -69,7 +78,8 @@ Gradient outputs must not overlap each other or any input, and workspace
 must not overlap any operand. Execution binds the current buffers and stream,
 initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
-atomic accumulation does not promise bitwise repeatability.
+atomic accumulation does not promise bitwise repeatability; the deterministic kernel
+pair does.
 
 The three-kernel implementation is selected for D64, and for D128 without a window, on SM100, SM103 and SM107 when determinism is not requested. Existing support
 on other Blackwell devices in the row's range retains the previous implementation.

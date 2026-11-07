@@ -527,13 +527,19 @@ rows have exact zero score gradients and contribute no dQ/dK. Dense graph and st
 nine-buffer contract, including deterministic requests. Grouped/THD remain
 exact D128 without sliding windows.
 
-Dense MHA requests for `use_deterministic_algorithm=True` use the one-launch
-recompute implementation with zero workspace: one CTA owns each gradient tile
-and visits its reduction tiles in a fixed order, without inter-CTA accumulation.
-Other dense MHA declarations in the existing envelope retain that implementation
-for negative scales and older CuTeDSL. Unrequested determinism retains the usual
-implementation selection. THD and grouped dQ accumulation remain unordered and
-decline deterministic requests.
+Dense MHA requests for `use_deterministic_algorithm=True` take a three-launch
+kernel pair under the accumulation gates (SM100 / SM103, public CuTeDSL >= 4.8,
+positive FP32 scale): the row delta, the key-owner dK/dV kernel (the main kernel's
+rendering without its dQ reduction) and a query-owner dQ kernel that recomputes
+the score and score-gradient tiles and stores dQ once from TMEM. One owner per
+gradient tile and a fixed summation order make repeated executions bitwise equal;
+the workspace holds only the FP32 delta rows. D64 and D128 in both dtypes, unmasked or
+top-left causal attention, a left sliding window and dense GQA / MQA (the key-owner
+kernel walks the group's query heads; no partial fold) are served. Dense MHA requests
+outside those gates, negative scales and older CuTeDSL retain the one-launch
+recompute implementation with zero workspace; grouped requests outside them are
+declined. Unrequested determinism retains the usual implementation selection. THD dQ
+accumulation remains unordered and declines deterministic requests.
 Both dense paths decline declarations beyond safe Int32 tile rounding, Stats
 indexing or combined Q/KV grid bounds, or the tensor-map byte-stride range;
 the exact conservative limits are documented in the d128 backward API page.
@@ -550,13 +556,13 @@ the allocation contract. All scratch is initialized each execution.
 | Unmasked / top-left causal | ✅ |
 | IO layout | Compact BSHD rows; THD uses each port's ragged origins and ignores logical batch pitch |
 | Stats | Dense: contiguous FP32 natural-log LSE; THD: packed token-major or head-major with declared physical capacity |
-| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense recompute (D128 left window, deterministic request, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 (4 under `dkv_accum=fp32_reduce`: no fold launch) |
+| Workspace / kernel launches | MHA: dense accumulation (any lengths) / 3, dense deterministic pair (delta, dK/dV kernel, dQ kernel; `4*B*H*round_up(S_q,128) + 240` bytes) / 3, dense recompute (D128 left window without a deterministic request, deterministic request outside the accumulation gates, older CuTeDSL, negative scale) / 1, THD accumulation / 4. GQA/MQA: append native dK/dV partials and an FP32 group fold; dense / 4, THD / 5 (4 under `dkv_accum=fp32_reduce`: no fold launch) |
 | THD MHA | ✅ cc 10.0, 10.3 or 10.7, public CuTeDSL >= 4.8 (sm_107a target on cc 10.7), positive FP32 scale, positive declared capacities; actual empty sequences and tails supported |
 | GQA / MQA | ✅ BF16 only, cc 10.0, 10.3 or 10.7, public CuTeDSL >= 4.8 (sm_107a target on cc 10.7), positive FP32 scale, Hq > Hkv with integral ratio; dense Sq/Skv must be multiples of 128, THD accepts tails and empty actual sequences |
 | `cta_group::2` pair body (grouped BF16, top-left causal or unmasked, GQA / MQA; packed THD AND dense compact BSHD), selected by the per-S heuristic | ✅ **native**, cc 10.0 / 10.3 / 10.7 (the per-S threshold is PER PART -- `CTA_PAIR_MIN_SEQ[cc]`: 8192 measured on GB200 (cc 10.0, 2026-10-27, THD), carried to cc 10.3, and re-measured on a Rubin class node on cc 10.7 (2026-11-03: the pair wins the step over the one-CTA body by +7.9 / +9.9 / +12.3 % at 8K / 16K / 32K, 4K is not a win); the dense twin runs under the same threshold; the compile target follows the device): served when both declared `S_q` and `S_kv` (the batch's longest sequence per side; the dense extents) are `>= CTA_PAIR_MIN_SEQ[cc]` (`d128_grouped_2cta_contract`) and the device admits a cluster of two (occupancy query); below the threshold the one-CTA grouped body of the layout serves. The DENSE twin (`accumulation_grouped_dense_2cta`, 2026-11-03) is the THD chain over the dense bytes with synthesized metadata (uniform lengths, `cu[b] = b * S`, Stats read head-major with pitch `S_q` plus a per-sequence origin): the same five launches, the MAIN kernel byte-identical; dense keeps the grouped dense requirements (compact BSHD, contiguous Stats, `S % 128 == 0`, `dkv_accum = bf16_partials`); dK / dV are bitwise the THD chain's on the same data. Op-level field `cta_pair`: `auto` (default, the rule) / `off` (one-CTA always) / `on` (the pair at any S; a failing predicate -- layout, cc, cluster, grouped heads -- declines by name). Same contract, workspace sizing and 5 launches as the one-CTA THD GQA chain; dQ accumulation unordered either way. Placement: the dense d128 row stays BEHIND the backend (`heuristics._leads`: THD without a window only) until a placement study measures the pair on dense cells (the SDPA placement rule). Op-level field `dkv_accum` (both grouped THD bodies): `bf16_partials` (default: one bf16 partial per q head + the fp32 fold launch, a fixed summation order) / `fp32_reduce` (opt-in: fp32 accumulation across the q heads of a kv head in hardware order with one bf16 rounding at the output, four launches; a rounding change -- dK / dV are not bitwise reproducible across runs; declined by name on dense GQA, MHA and under `warp_roles="16w_fa4"`). Op-level fields `mask_form` (`fsel` default / `predicated`) and `warp_roles` (`16w` default / `16w_fa4`, an alternate role shape kept for follow-up work) select bitwise-identical dK / dV renderings of the pair body. Op-level field `tmem_map` (PART-KEYED; `None` = the part's default = `s_tail` on every part): `s_tail` (the dQ TMEM image in S^T's dead tail behind two LEADER barrier rows; the only map on cc 10.0 / 10.3) / `dq_576` (the independent dQ image at TMEM columns [512, 576) of the 576-column carve, allocated exclusive on both CTAs, the two rows deleted; selectable by name on cc 10.7 under `warp_roles="16w"` -- NOT a default: the ceiling probe of its two rows read inside noise on cc 10.7, 2026-11-03, so it is a neutral structural map kept as the base of the two-stage dS staging arm; declined by name on the 512-column parts, under `warp_roles="16w_fa4"` and with the three S-tail wait probes) -- bitwise-identical dK / dV, dQ by the fp64 gate, SMEM and workspace unchanged. Op-level field `smem_map` (PART-KEYED; `None` = `sm100`, every part's default): `sm100` (the 232448-B opt-in slab chain) / `rubin_b2` (the 327 KiB oversized carveout of cc 10.7: sQ1 x2, sDO1 x2, the two-stage sDS + XCHG staging ring with the lagging epilogue order and the LEADER row `dq_read_done`, 314368 B; selectable by name together with `tmem_map="dq_576"` under `warp_roles="16w"` x `stats_form="tma_ring"`, measured against `sm100` on cc 10.7 (2026-11-03, a Rubin class node, A/B/A both build orders): a LOSS at every cell (step -4.1..-5.0 % at 8K, -2.5..-4.1 % at 16K, -2.8..-3.9 % at 32K; the control `dq_576` x `sm100` neutral) -> below the +2.0 % MAIN-cycle threshold, kept as a selectable map, NOT a default; declined by name on the 512-column parts and under `s_tail` / `16w_fa4` / `ldg`) -- bitwise-identical dK / dV, dQ by the fp64 gate, the workspace unchanged |
 | Left sliding window | ✅ dense MHA D64/D128, with or without top-left causal |
 | Bottom-right causal, dense padding mask, right-band widening | ❌ |
-| Deterministic request | ✅ dense MHA, via fixed-order recompute; ❌ THD / GQA / MQA |
+| Deterministic request | ✅ dense MHA / GQA / MQA at D64 / D128 (unmasked, top-left causal, left window, both dtypes) via the dK/dV + dQ kernel pair, fixed-order recompute for MHA outside the accumulation gates; ❌ THD |
 | Bias / dBias, sink / dSink, dropout | ❌ |
 | Zero attention scale | ❌ |
 
@@ -681,9 +687,10 @@ D64, with or without a left sliding window, runs the FP8 accumulation chain (FP3
 scratch; GQA/MQA appends BF16 dK/dV partials per query head and a fixed-order fold).
 Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public
 CuTeDSL >= 4.8 and a finite positive scale. Declined: THD, padding, bottom-right causal,
-right-band widening, deterministic requests, a caller-provided delta, bias / dBias,
-sink / dSink, a window at D128 or D192x128, GQA/MQA at D192x128, FP16 gradients at
-grouped D64 (its dK / dV partials are BF16).
+right-band widening, deterministic requests on the D64 / D128 chain (the (192, 128) kernel
+pair honors them: each kernel owns its outputs and the amax folds are maxima), a
+caller-provided delta, bias / dBias, sink / dSink, a window at D128 or D192x128, GQA/MQA
+at D192x128, FP16 gradients at grouped D64 (its dK / dV partials are BF16).
 `test_sdpa_bwd_fp8_sm100.py` and `test_sdpa_bwd_d192_fp8_sm100.py` compare every
 served shape against an FP32 reference and pin the declines.
 
@@ -696,7 +703,8 @@ served shape against an FP32 reference and pin the declines.
 | Left sliding window | ❌ | ✅ D64 only, with or without causal | ❌ |
 | GQA / MQA (integral Hq / Hkv) | ❌ | ✅ | ❌ |
 | Native THD, independent origins and packed Stats | ✅ | ❌ | ❌ |
-| Dense padding mask, bottom-right causal, right-band widening, bias / dBias, sink / dSink, deterministic request | ❌ | ❌ | ❌ |
+| Dense padding mask, bottom-right causal, right-band widening, bias / dBias, sink / dSink | ❌ | ❌ | ❌ |
+| Deterministic request | ❌ | ❌ | ✅ |
 | Kernels | accumulation chain | kernel pair at D128; accumulation chain at D64 | kernel pair |
 
 The MXFP8 backward is a **two-kernel chain with a scale-factor repack in
@@ -765,7 +773,7 @@ MMA as d=512.
 | PackGQA (`PACK_GQA` knob: the GQA group packed into the Q tile)ᵐ | via the native d64 flavorᵗ⁰ | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | — |  —  |
 | THD prefill + PackGQA (f16/bf16, CGA2, unsplit)ᵐ | ❌ (via the d128 flavor) | ❌ | ✅ native, partial | ❌ | ❌ | ❌ | — | — |
 | Bias / dBias | ✅ᵗ⁰ / ❌ (the RESIDENT block, S_kv ≤ 256 at cga1 (≤ 320 at the 64-wide KV tile), the STREAMED ring above it at any S_kv (2 stages at TILE_N 128, 3 at 64); `kv_mask` any S_kv, bool / 16-bit / fp32 (the fp32 vector WITH a bias at TILE_N 64 only); TILE_N 128 unless the pick (the padded bias leg inside the 64-wide block's budget, the fp32 vector with a bias) or the TILE_N knob says 64; one-batch-entry item; the pre-masked tail and the quiet body) | ✅ᵗ⁰ / ❌ (TILE_N 128: the cga2 block, S_kv ≤ 128; above it the 64-wide KV tile at cga1 by the budget rule -- the block to S_kv ≤ 192, the 3-stage STREAMED ring above it at any S_kv; `kv_mask` any S_kv) | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
-| `use_deterministic_algorithm` | — | — | — | — | — | — | ❌ᵇ · ✅ᵍ |  ✅ᵇ² · ✅ᵍ  |
+| `use_deterministic_algorithm` | — | — | — | — | — | — | ✅ᵇ · ✅ᵍ |  ✅ᵇ² · ✅ᵍ  |
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ ᵗ⁰ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |  ✅ᵇ² ᵍ  |
 | Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ᵈ (decode tile) | ✅ | ❌ᵇ · ✅ᵍ |  ❌ᵇ² · ✅ᵍ  |
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ❌ (prefill tile) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
@@ -2951,7 +2959,7 @@ THD graphs.
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
-| Backward deterministic | SM100, SM103 — served by the MXFP8 row (the d = 256 chain and the D64 / D128 / (192, 128) kernel pair), the dense MHA d128 recompute body and the f16/bf16 d256 row |
+| Backward deterministic | SM100, SM103 — served by the MXFP8 row (the d = 256 chain and the D64 / D128 / (192, 128) kernel pair), the f16/bf16 d128 row (dense MHA / GQA / MQA: the dK/dV + dQ kernel pair, recompute for MHA outside its gates), the f16/bf16 d256 row, the half d512 chain and the per-tensor FP8 (192, 128) pair; declined by d128 THD, the per-tensor FP8 D64 / D128 chain and the opt-in d192 accumulation row |
 | d128 grouped `cta_group::2` pair body below `S` 8192 (THD and dense), on MHA, and on dense GQA / MQA with `S % 128 != 0` or `dkv_accum = fp32_reduce` | SM100, SM103, SM107 — the per-S heuristic (`cta_pair = auto`) serves the one-CTA grouped body of the layout below the threshold (the pair has no measured win there: the 2K / 4K cells are MEASURED as a loss for the pair on the step, -3.9 % / -3.5 %, on cc 10.0, THD; the per-part threshold is re-measured on cc 10.7 (2026-11-03: 8192 holds, the pair +7.9 / +9.9 / +12.3 % at 8K / 16K / 32K and not a win at 4K), carried as is on cc 10.3 and on dense); the pair has no MHA body; the dense twin keeps the grouped dense requirements (compact BSHD, contiguous Stats, `S % 128 == 0`, bf16 partials); `cta_pair = on` declines by name; outside the admitted parts (cc 8.x / 9.0 / 11.x / 12.x: no `cta_group::2` pair) `auto` serves the one-CTA body and `on` declines naming the cc |
 | Backward decode-shaped S_q = 1 | SM100, SM103 — served by the MXFP8 d=256 row and the dense MHA f16/bf16 d128 row |
 | MXFP8 backward: E5M2, bottom-right / band-widened masks, a sliding window at d = 256 or without the causal mask, non-BSHD strides, `amax_*` outputs | SM100, SM103 — a left window under the causal mask is served at D64 / D128 / (192, 128) |

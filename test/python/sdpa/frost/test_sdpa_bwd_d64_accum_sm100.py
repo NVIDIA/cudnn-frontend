@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 
 def test_window_and_head_dim_select_the_accumulation_route():
-    """Head dim 64 and a left window at d64 stay on the accumulation route; a d128 window and a deterministic request do not."""
+    """Head dim 64 and a left window at d64 stay on the accumulation route; a d128 window does not."""
     from cudnn.sdpa.bwd.d128_contract import workspace_layout
 
     regions, total = workspace_layout(2, 3, 300, 64)
@@ -61,7 +61,7 @@ def test_d128_window_stays_on_recompute():
 
 
 @requires_pre_rubin_blackwell
-def test_deterministic_d64_stays_on_recompute():
+def test_deterministic_d64_takes_the_pair():
     _case(dt=torch.bfloat16, d=64, causal=True, left=128, b=1, h=2, sq=257, sk=385, deterministic=True, accumulation=None)
 
 
