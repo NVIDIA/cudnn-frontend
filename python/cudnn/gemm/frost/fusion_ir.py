@@ -190,17 +190,21 @@ class IndexExpr:
 
 @dataclass(frozen=True)
 class IndexMap:
-    """Fixed-shape consumer -> producer logical coordinates, not storage strides.
+    """Fixed-shape consumer -> producer coordinates, optionally reading indices.
 
-    Integer axis references are scoped to consumer_shape. Every constructor
-    defines a map over its entire positive rectangular consumer domain; reshape
-    preserves lexicographic order, permutation preserves elements, and broadcast
-    need not be invertible. Shape products and intermediate arithmetic fit Int64.
+    Axis references are scoped to consumer_shape. Direct expressions have
+    statically checked Int64 arithmetic and producer bounds. IndexLookup values
+    require signed runtime bounds checks; an invalid access produces zero without
+    reading source storage. Strides, pointers and loader selection are not IR.
+
+    Pure views (identity, permutation, reshape, broadcast) compose with either
+    kind of map. Composition through runtime-dependent consumer coordinates is
+    not yet supported; it requires arithmetic over lookup results.
     """
 
     consumer_shape: tuple[int, ...]
     producer_shape: tuple[int, ...]
-    coordinates: tuple[IndexExpr, ...]
+    coordinates: tuple[IndexExpr | IndexLookup, ...]
 
     def __post_init__(self):
         for name in ("consumer_shape", "producer_shape"):
@@ -212,6 +216,10 @@ class IndexMap:
         if len(self.coordinates) != len(self.producer_shape):
             raise ValueError("index map requires one expression per producer axis")
         for expr, extent in zip(self.coordinates, self.producer_shape):
+            if isinstance(expr, IndexLookup):
+                if expr.indices_map.consumer_shape != self.consumer_shape:
+                    raise ValueError("index lookup domain must match the index map consumer shape")
+                continue
             if not isinstance(expr, IndexExpr) or not expr.axes <= set(range(len(self.consumer_shape))):
                 raise ValueError("index map references an axis outside its consumer domain")
             if self._upper_bound(expr) >= extent:
@@ -273,78 +281,6 @@ class IndexMap:
             consumer_shape, producer_shape, tuple(IndexExpr.constant(0) if d == 1 else IndexExpr.coordinate(i + offset) for i, d in enumerate(producer_shape))
         )
 
-    def compose(self, consumer_map):
-        """Apply consumer_map first, then this map, preserving map direction."""
-        if consumer_map.producer_shape != self.consumer_shape:
-            raise ValueError("index map composition requires matching intermediate shapes")
-        replacements = dict(enumerate(consumer_map.coordinates))
-        return IndexMap(consumer_map.consumer_shape, self.producer_shape, tuple(expr.substitute(replacements) for expr in self.coordinates))
-
-    def apply(self, coordinates):
-        """Bind graph-axis expressions to another coordinate domain."""
-        if len(coordinates) != len(self.consumer_shape):
-            raise ValueError("index map binding requires every consumer coordinate")
-        return tuple(expr.substitute(dict(enumerate(coordinates))) for expr in self.coordinates)
-
-
-@dataclass(frozen=True)
-class IndexLookup:
-    """A logical read of an index tensor; no pointer, stride or copy instruction."""
-
-    indices_ref: str
-    indices_map: IndexMap
-
-    def __post_init__(self):
-        if not isinstance(self.indices_ref, str) or not self.indices_ref or not isinstance(self.indices_map, IndexMap):
-            raise ValueError("index lookup requires a named tensor and a pure coordinate map")
-
-    @property
-    def axes(self):
-        return frozenset().union(*(expr.axes for expr in self.indices_map.coordinates))
-
-    def compose(self, consumer_map):
-        return dataclasses.replace(self, indices_map=self.indices_map.compose(consumer_map))
-
-
-@dataclass(frozen=True)
-class AccessMap:
-    """Consumer -> source coordinates, optionally dependent on index-tensor reads.
-
-    Direct coordinates retain IndexMap's static bounds guarantee. A lookup may
-    return a signed, out-of-range coordinate: its source extent is checked at
-    access lowering, and an invalid access produces zero without reading source
-    storage. Storage strides and loader selection remain outside this object.
-    """
-
-    consumer_shape: tuple[int, ...]
-    producer_shape: tuple[int, ...]
-    coordinates: tuple[IndexExpr | IndexLookup, ...]
-
-    def __post_init__(self):
-        coordinates = tuple(self.coordinates)
-        direct = []
-        for coordinate in coordinates:
-            if isinstance(coordinate, IndexLookup):
-                if coordinate.indices_map.consumer_shape != tuple(self.consumer_shape):
-                    raise ValueError("index lookup domain must match the access consumer shape")
-                direct.append(IndexExpr.constant(0))
-            elif isinstance(coordinate, IndexExpr):
-                direct.append(coordinate)
-            else:
-                raise ValueError("access coordinate must be an integer expression or index lookup")
-        # Reuse the pure map's shape, scope, arithmetic and direct-axis bounds
-        # validation. Runtime lookup values are deliberately not proved here.
-        checked = IndexMap(self.consumer_shape, self.producer_shape, tuple(direct))
-        object.__setattr__(self, "consumer_shape", checked.consumer_shape)
-        object.__setattr__(self, "producer_shape", checked.producer_shape)
-        object.__setattr__(self, "coordinates", coordinates)
-
-    @classmethod
-    def direct(cls, mapping):
-        if not isinstance(mapping, IndexMap):
-            raise ValueError("direct access requires a pure IndexMap")
-        return cls(mapping.consumer_shape, mapping.producer_shape, mapping.coordinates)
-
     @classmethod
     def take(cls, indices_ref, source_shape, indices_shape, axis):
         source_shape, indices_shape = tuple(source_shape), tuple(indices_shape)
@@ -375,13 +311,24 @@ class AccessMap:
     def indirections(self):
         return tuple((axis, coordinate) for axis, coordinate in enumerate(self.coordinates) if isinstance(coordinate, IndexLookup))
 
+    @property
+    def is_direct(self):
+        """Whether all producer coordinates can be evaluated without tensor reads."""
+        return all(isinstance(coordinate, IndexExpr) for coordinate in self.coordinates)
+
     def compose(self, consumer_map):
-        # Both direct and indirect access pull back along the same pure view.
-        direct = IndexMap(
-            self.consumer_shape, self.producer_shape, tuple(IndexExpr.constant(0) if isinstance(c, IndexLookup) else c for c in self.coordinates)
-        ).compose(consumer_map)
-        coordinates = tuple(c.compose(consumer_map) if isinstance(c, IndexLookup) else direct.coordinates[i] for i, c in enumerate(self.coordinates))
-        return AccessMap(consumer_map.consumer_shape, self.producer_shape, coordinates)
+        """Pull back every coordinate along a pure consumer view."""
+        if not isinstance(consumer_map, IndexMap):
+            raise ValueError("index map composition requires an IndexMap")
+        if consumer_map.producer_shape != self.consumer_shape:
+            raise ValueError("index map composition requires matching intermediate shapes")
+        if not consumer_map.is_direct:
+            raise ValueError("index map composition requires a direct consumer map")
+        replacements = dict(enumerate(consumer_map.coordinates))
+        coordinates = tuple(
+            coordinate.compose(consumer_map) if isinstance(coordinate, IndexLookup) else coordinate.substitute(replacements) for coordinate in self.coordinates
+        )
+        return IndexMap(consumer_map.consumer_shape, self.producer_shape, coordinates)
 
     def lower(self, coordinates, render, load_index=None):
         """One binding entry for direct expressions and logical index reads.
@@ -427,6 +374,25 @@ class AccessMap:
 
         result = self.lower(tuple(IndexExpr.constant(c) for c in coordinates), lambda expr: expr.evaluate(()), load)
         return None if invalid else result
+
+
+@dataclass(frozen=True)
+class IndexLookup:
+    """A logical read of an index tensor; no pointer, stride or copy instruction."""
+
+    indices_ref: str
+    indices_map: IndexMap
+
+    def __post_init__(self):
+        if not isinstance(self.indices_ref, str) or not self.indices_ref or not isinstance(self.indices_map, IndexMap) or not self.indices_map.is_direct:
+            raise ValueError("index lookup requires a named tensor and a direct coordinate map")
+
+    @property
+    def axes(self):
+        return frozenset().union(*(expr.axes for expr in self.indices_map.coordinates))
+
+    def compose(self, consumer_map):
+        return dataclasses.replace(self, indices_map=self.indices_map.compose(consumer_map))
 
 
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
@@ -1070,7 +1036,7 @@ class FusionChain:
     reductions: list[ReductionSpec] = field(default_factory=list)
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
     gemm_out_dtypes: tuple[Dtype, ...] = ()
-    source_access: AccessMap | None = None
+    source_access: IndexMap | None = None
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):

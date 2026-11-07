@@ -29,7 +29,6 @@ from .fusion_ir import (
     Axis,
     IndexExpr,
     IndexMap,
-    AccessMap,
     IndexLookup,
     GroupPartition,
     GroupedGemmSpec,
@@ -150,7 +149,7 @@ class _RecordedOp:
     aux_input: int | None = None
     aux_mapping: IndexMap | None = None
     group_partition: GroupPartition | None = None
-    source_access: AccessMap | None = None
+    source_access: IndexMap | None = None
 
 
 @dataclass
@@ -1318,7 +1317,7 @@ def _build_multi_moe_chain(
         routed_shape = (1, index_meta.dim[1], meta[moe_ops[0].inputs[0]].dim[-1])
         index_map = IndexMap.broadcast(index_meta.dim, routed_shape)
         source_shape = meta[moe_ops[0].inputs[0]].dim
-        indirect = AccessMap(routed_shape, source_shape, (IndexExpr.constant(0), IndexLookup(index_meta.name, index_map), IndexExpr.coordinate(2)))
+        indirect = IndexMap(routed_shape, source_shape, (IndexExpr.constant(0), IndexLookup(index_meta.name, index_map), IndexExpr.coordinate(2)))
         moe_ops = [replace(op, source_access=indirect) for op in moe_ops]
 
     # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
@@ -1678,7 +1677,7 @@ def _operand_view_index_map(shape, steps):
 def _matrix_map_coordinates(mapping):
     """Bind a logical IndexMap once; users select indices or lower storage separately."""
     coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
-    return AccessMap.direct(mapping).apply(coordinates)
+    return mapping.apply(coordinates)
 
 
 def _operand_index_expression(mapping, axis):
@@ -2558,7 +2557,7 @@ def _lower_gather_operands(ops, meta):
     gathered_shape = (*source.dim[:axis], *indices.dim, k)
     if meta[gather.output].dim != gathered_shape:
         raise ValueError(f"gather output must have shape {gathered_shape}")
-    indirect = AccessMap.take(indices.name, source.dim, indices.dim, axis)
+    indirect = IndexMap.take(indices.name, source.dim, indices.dim, axis)
     mapping = _operand_view_index_map(gathered_shape, operand_steps)
     indirect = indirect.compose(mapping)
     operand_shape = mapping.consumer_shape

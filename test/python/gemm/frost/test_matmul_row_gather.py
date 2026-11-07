@@ -328,10 +328,10 @@ def test_frost_row_gather_index_helper_on_hopper(dtype):
 @pytest.mark.parametrize("view", ["identity", "reshape", "transpose"])
 def test_frost_indirect_index_map(source_shape, axis, view):
     from itertools import product
-    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexMap
+    from cudnn.gemm.frost.fusion_ir import IndexMap
 
     indices_shape = (2, 2)
-    access = AccessMap.take("indices", source_shape, indices_shape, axis)
+    access = IndexMap.take("indices", source_shape, indices_shape, axis)
     normalized_axis = axis % len(source_shape)
     logical = access.consumer_shape
     mapping = (
@@ -718,11 +718,11 @@ def test_frost_group_partition_device_bounds_and_replay(dtype, rows_per_group):
 
 def test_frost_indirect_map_matches_sparse_attention_key_and_value_views():
     """One query/slot index relation serves both QK and PV operand layouts."""
-    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexMap
+    from cudnn.gemm.frost.fusion_ir import IndexMap
 
-    keys = AccessMap.take("topk_indices", (71, 576), (3, 5), 0)
+    keys = IndexMap.take("topk_indices", (71, 576), (3, 5), 0)
     qk_keys = keys.compose(IndexMap.permutation((3, 5, 576), (0, 2, 1)))
-    values = AccessMap.take("topk_indices", (71, 512), (3, 5), 0)
+    values = IndexMap.take("topk_indices", (71, 512), (3, 5), 0)
     for query in range(3):
         for slot in range(5):
             assert tuple(expr.evaluate((query, 575, slot)) for expr in qk_keys.indirections[0][1].indices_map.coordinates) == (query, slot)
@@ -730,13 +730,15 @@ def test_frost_indirect_map_matches_sparse_attention_key_and_value_views():
 
 
 @pytest.mark.parametrize("indirect", [False, True], ids=["direct", "indirect"])
-def test_frost_access_map_composition_and_lowering(indirect):
+def test_frost_index_map_composition_and_lowering(indirect):
     from itertools import product
-    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexExpr, IndexMap
+    from cudnn.gemm.frost.fusion_ir import IndexExpr, IndexMap
 
-    access = AccessMap.take("indices", (5, 7), (2, 3), 0) if indirect else AccessMap.direct(IndexMap.reshape((2, 3, 7), (2, 3, 7)))
+    access = IndexMap.take("indices", (5, 7), (2, 3), 0) if indirect else IndexMap.identity((2, 3, 7))
     view = IndexMap.permutation(access.consumer_shape, (0, 2, 1))
     composed = access.compose(view).compose(IndexMap.reshape(view.consumer_shape, (42,)))
+    assert access.is_direct is not indirect
+    assert composed.is_direct is not indirect
     assert composed.tensor_dependencies == (frozenset({"indices"}) if indirect else frozenset())
     assert composed.axes == frozenset({0})
     table = [[4, 0, -1], [2, 5, 4]]
@@ -752,7 +754,7 @@ def test_frost_access_map_composition_and_lowering(indirect):
     with pytest.raises(ValueError, match="consumer domain"):
         composed.evaluate((42,), reader)
     with pytest.raises(ValueError, match="producer extent"):
-        AccessMap.direct(IndexMap((2,), (1,), (IndexExpr.coordinate(0),)))
+        IndexMap((2,), (1,), (IndexExpr.coordinate(0),))
 
 
 def _materialization_graph(axis=0, *, side="a", observed=False, index_dtype=cudnn.data_type.INT64, rows=37):
@@ -860,11 +862,14 @@ def test_frost_materialized_gather_native_capture(axis, dtype, indices_dtype):
         captured.reset()
 
 
-def test_frost_access_map_multiple_index_dependencies():
-    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexExpr, IndexLookup, IndexMap
+def test_frost_index_map_multiple_index_dependencies():
+    from cudnn.gemm.frost.fusion_ir import IndexExpr, IndexLookup, IndexMap
 
     index_map = IndexMap.identity((3,))
-    access = AccessMap((3,), (5, 7), (IndexLookup("rows", index_map), IndexLookup("columns", index_map)))
+    access = IndexMap((3,), (5, 7), (IndexLookup("rows", index_map), IndexLookup("columns", index_map)))
+    assert not access.is_direct
+    assert index_map.is_direct
+    assert index_map.tensor_dependencies == frozenset()
     assert access.tensor_dependencies == frozenset({"rows", "columns"})
     assert access.axes == frozenset({0})
     tables = {"rows": [4, -1, 2], "columns": [6, 1, 7]}
@@ -874,13 +879,22 @@ def test_frost_access_map_multiple_index_dependencies():
     assert access.evaluate((2,), reader) is None
     assert access.compose(IndexMap.reshape((3,), (1, 3))).evaluate((0, 0), reader) == (4, 6)
     with pytest.raises(ValueError, match="domain"):
-        AccessMap((2,), (5,), (IndexLookup("rows", index_map),))
+        IndexMap((2,), (5,), (IndexLookup("rows", index_map),))
     with pytest.raises(ValueError, match="matching intermediate shapes"):
         access.compose(IndexMap.identity((2,)))
     with pytest.raises(ValueError, match="every consumer coordinate"):
         access.lower((), lambda expr: expr)
     bound = access.lower((IndexExpr.coordinate(0),), lambda expr: expr, lambda ref, coords, extent: (ref, coords, extent))
     assert bound == (("rows", (IndexExpr.coordinate(0),), 5), ("columns", (IndexExpr.coordinate(0),), 7))
+    with pytest.raises(ValueError, match="direct coordinate map"):
+        IndexLookup("nested", access)
+    indirect_consumer = IndexMap.take("rows", (3,), (3,), 0)
+    with pytest.raises(ValueError, match="direct consumer map"):
+        access.compose(indirect_consumer)
+    with pytest.raises(ValueError, match="direct consumer map"):
+        index_map.compose(indirect_consumer)
+    with pytest.raises(ValueError, match="producer extent"):
+        IndexMap((3,), (5, 2), (IndexLookup("rows", index_map), IndexExpr.coordinate(0)))
 
 
 def test_frost_materialized_gather_public_graph_capture():

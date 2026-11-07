@@ -15,7 +15,7 @@ from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, WorkspaceLayout
 
 from .dtypes import DTYPE_BYTES
-from .fusion_ir import AccessMap, Dtype, FusionChain
+from .fusion_ir import IndexMap, Dtype, FusionChain
 from .graph_analyzer import GemmBinding, _analyze_state, _state_from_graph
 from .layouts import checked_layout
 
@@ -27,7 +27,7 @@ class GatherStage:
     source: Tensor
     indices: Tensor
     output: Tensor
-    access: AccessMap
+    access: IndexMap
     source_stride: tuple[int, ...]
     indices_stride: tuple[int, ...]
     output_stride: tuple[int, ...]
@@ -83,7 +83,7 @@ def execution_routes(graph):
             raise NotImplementedError("materialized gather inputs must be graph inputs or earlier materialized gathers")
         if source.dtype not in _BUFFER_DTYPES or out.dtype != source.dtype or indices.dtype not in ("int32", "int64"):
             raise NotImplementedError("materialized gather supports FP16/BF16/FP32/INT32/INT64 sources and INT32/INT64 indices without casting")
-        access = AccessMap.take(indices.name, source.dim, indices.dim, dict(op.op_attrs)["axis"])
+        access = IndexMap.take(indices.name, source.dim, indices.dim, dict(op.op_attrs)["axis"])
         for item in (source, indices, out):
             if len(item.dim) != len(item.stride) or any(s < 0 for s in item.stride):
                 raise NotImplementedError("materialized gather requires nonnegative strides matching the tensor rank")
@@ -130,7 +130,7 @@ def _span(shape, stride):
 
 
 def render_gather(stage):
-    """Lower the complete AccessMap through the shared integer renderer."""
+    """Lower the complete IndexMap through the shared integer renderer."""
     from .dtypes import DTYPE_TO_CUTLASS
     from .epilogue_codegen import _render_index_expr
     from .fusion_ir import IndexExpr
