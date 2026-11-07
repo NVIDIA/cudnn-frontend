@@ -316,7 +316,8 @@ def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
         assert not family.slots[name].opt_in, name
         eid = _OFFERED[name]
         monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
-        assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["backend", "last_resort", "frost"], name
+        # d256: no study timed these head dims, so no placement_table entry lifts the row
+        assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], name
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost"]
 
@@ -341,7 +342,36 @@ def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatc
             assert order(dtype=dtype, d_qk=d, d_v=d, causal=False)[0] == "frost"
             assert order(dtype=dtype, d_qk=d, d_v=d, window_left=256)[0] == "frost"
             assert order(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8, s_q=300, s_kv=300)[0] == "frost"
-    assert order(device_cc=(12, 0)) == trails  # another part
+    assert order(device_cc=(10, 0)) == trails  # another part
+    assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
+    assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
+    assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
+    assert order(padded=True) == trails  # runtime lengths
+    assert order(seq_q_trim=True) == trails
+
+
+def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
+    """cc 12.0 has its own measured dense d64 / d128 classes for the trail-only row, separate from cc 12.1; anything outside them keeps trailing."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block, is_last_resort
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd import heuristics
+
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm120"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    facts = lambda **over: _facts(**{"device_cc": (12, 0), **over})
+    order = lambda **over: [tag(p) for p in heuristics.propose("A", facts(**over), _OFFERED)]
+    trails = ["backend", "last_resort", "frost"]
+
+    for dtype, study in ((cudnn.data_type.HALF, "sm120_bwd_f16_20261107"), (cudnn.data_type.BFLOAT16, "sm120_bwd_bf16_20261107")):
+        for d in (64, 128):
+            assert order(dtype=dtype, d_qk=d, d_v=d)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, causal=False)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, window_left=256)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8, s_q=300, s_kv=300)[0] == "frost"
+            assert pt.TABLE[pt.class_key("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d))].study == study
     assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
     assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
