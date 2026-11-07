@@ -365,6 +365,13 @@ Options:
   SM90 defaults to C16; SM100 keeps its automatic large-context policy. C32
   and C64 use two/four ordered physical C16 phases and reduce the dominant
   FP32 relay planes to four/two.
+- `--deterministic-dkv-mode` — `deterministic_dkv_mode` of deterministic
+  plans: `records` (default), `chain` or `shards` (see the deterministic dKV
+  storage section of `docs/operations/sparse_attention/dsa.md`). It selects
+  the dKV storage of SM100 generic M64 and H128 two-CTA plans (`shards` keeps
+  the two-CTA private-plane layout); `chain` is rejected on SM90, on the
+  two-CTA routes, on devices other than SM100/SM103 (where `records` runs as
+  `shards`), and together with `--deterministic-relay-cluster-size`.
 - `--warmup` / `--repeat` — iterations per config (defaults 10 / 50; the
   first warmup iteration also triggers kernel compilation).
 - `--csv` — write results to a CSV file.
@@ -443,7 +450,11 @@ gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
 Use `--deterministic-relay-cluster-size {4,8,16,32,64}` with `--deterministic on`
 to benchmark an exact relay specialization. The option applies only to
 deterministic cases when `--deterministic both` is selected; omitted means the
-automatic policy. It is valid only for large-context generic-M64 cases and may
+automatic policy. Under the default `--deterministic-dkv-mode records`,
+large-context plans whose conflict-rank records fit the relay workspace store
+dKV in records instead; the relay measurements in this section correspond to
+`--deterministic-dkv-mode shards`. The relay size option is valid only for
+large-context generic-M64 cases and may
 request more workspace than the automatic memory-first budget. The logical
 cluster-32 option uses two ordered 16-CTA hardware-cluster phases and four
 FP32 planes, halving the dominant data-plane workspace from cluster-16.
