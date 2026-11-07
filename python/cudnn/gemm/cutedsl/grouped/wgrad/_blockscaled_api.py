@@ -14,10 +14,12 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+from ..backend_utils import kernel_stream
 from ..canonical import check_sf_shape, make_flat_sf_fake
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
@@ -447,7 +449,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
         ) -> None:
-            compiled(
+            launch(
+                compiled,
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -455,7 +458,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 wgrad_tensor,
                 offsets_tensor,
                 workspace,
-                stream,
+                kernel_stream(stream),
                 global_scale_a,
                 global_scale_b,
                 None,
@@ -559,7 +562,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             global_scale_a: Optional[torch.Tensor],
             global_scale_b: Optional[torch.Tensor],
         ) -> None:
-            compiled(
+            launch(
+                compiled,
                 a_tensor,
                 b_tensor,
                 sfa_tensor,
@@ -567,7 +571,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 wgrad_ptrs.data_ptr(),
                 offsets_tensor,
                 workspace,
-                stream,
+                kernel_stream(stream),
                 global_scale_a,
                 global_scale_b,
                 cached_single_expert,

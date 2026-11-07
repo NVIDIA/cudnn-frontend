@@ -21,7 +21,7 @@ from __future__ import annotations
 
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import kernel_stream, rubin_single_group_offsets_kwarg
 from ..canonical import (
     canonical_b_fake,
     canonical_mx_fake,
@@ -47,6 +47,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 
 
@@ -987,6 +988,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 }
             )
         _compiled_kernel = cute.compile(gemm_glu, **compile_kwargs)
+        # A launch plan binds the workspace by address and keeps only the compiled kernel alive: tie the workspace to it.
+        _compiled_kernel._workspace = self._workspace
 
         # Cache workspace pointer for the tensor_api closure
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
@@ -1037,16 +1040,17 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
-                stream,
+                kernel_stream(stream),
                 linear_offset,
                 geglu_alpha,
                 glu_clamp_max,
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, scheduler_counter_tensor)
+                launch(_compiled_kernel, *kernel_args, scheduler_counter_tensor)
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     *kernel_args,
                     situ_beta1,
                     situ_beta2,
@@ -1261,16 +1265,17 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
-                stream,
+                kernel_stream(stream),
                 linear_offset,
                 geglu_alpha,
                 glu_clamp_max,
                 glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args)
+                launch(_compiled_kernel, *kernel_args)
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     *kernel_args,
                     situ_beta1,
                     situ_beta2,

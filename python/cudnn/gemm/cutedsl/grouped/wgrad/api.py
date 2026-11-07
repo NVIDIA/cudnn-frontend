@@ -14,6 +14,7 @@ import cutlass
 
 from cudnn.api_base import APIBase, TupleDict, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import planned
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -25,6 +26,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ..backend_utils import (
+    PLAN_ENV,
     GroupedGemmBackend,
     _torch_stream_context,
     backend_cache_key,
@@ -296,6 +298,7 @@ def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_out
 _wgrad_wrapper_memo: dict = {}
 
 
+@planned(env=PLAN_ENV, stream="current_stream")
 def grouped_gemm_wgrad_wrapper_sm100(
     a_tensor: torch.Tensor,
     b_tensor: torch.Tensor,

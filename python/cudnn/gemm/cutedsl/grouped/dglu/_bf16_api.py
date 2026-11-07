@@ -22,6 +22,7 @@ from cutlass.cute.runtime import make_fake_stream, make_ptr
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, align_up
 from ._workspace import validate_workspace_aliases
@@ -40,7 +41,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, kernel_stream
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
@@ -515,7 +516,8 @@ class GroupedGemmDgluBf16API(APIBase):
             activation_tensor=None,
         ) -> None:
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
-            raw_compiled(
+            launch(
+                raw_compiled,
                 a_tensor,
                 b_arg,
                 cached_n,
@@ -531,7 +533,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 dprob_tensor,
                 cutlass.Float32(linear_offset),
                 dbias_tensor,
-                stream,
+                kernel_stream(stream),
                 activation_tensor,
             )
 

@@ -16,6 +16,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
@@ -33,7 +34,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values, kernel_stream
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
@@ -371,13 +372,14 @@ class GroupedGemmWgradBf16API(APIBase):
 
         def tensor_api(a_tensor, b_tensor, output, offsets, stream) -> None:
             out_arg = output if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(output))
-            raw_compiled(
+            launch(
+                raw_compiled,
                 a_tensor,
                 b_tensor,
                 out_arg,
                 offsets,
                 cached_workspace,
-                stream,
+                kernel_stream(stream),
                 cached_single_expert,
             )
 

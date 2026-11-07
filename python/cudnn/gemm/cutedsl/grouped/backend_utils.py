@@ -26,6 +26,8 @@ class GroupedGemmBackend(str, Enum):
 # on by default; never memoized.
 DEBUG_VALIDATE_DEVICE_VALUES_ENV = "CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES"
 DEBUG_VALIDATE_DEVICE_VALUES = os.getenv(DEBUG_VALIDATE_DEVICE_VALUES_ENV, "0") == "1"
+# Read by the wrappers on every call, so part of every launch-plan key (cudnn.launch_plan.planned(env=...)).
+PLAN_ENV = ("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL")
 
 
 def _check_not_capturing(stream, what: str) -> None:
@@ -118,6 +120,12 @@ def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
         values = _host_pointer_values(ptrs)
     if any(value == 0 or value % 16 != 0 for value in values):
         raise ValueError(f"{name} entries must be non-null and 16-byte aligned")
+
+
+def kernel_stream(stream):
+    """``stream`` for a kernel launch: an int handle as a ``CUstream``. A launch plan binds a ``CUstream`` kernel argument
+    to each call's stream but records a plain int as a constant (it cannot tell a stream handle from an int argument)."""
+    return cuda.CUstream(stream) if isinstance(stream, int) else stream
 
 
 @contextmanager

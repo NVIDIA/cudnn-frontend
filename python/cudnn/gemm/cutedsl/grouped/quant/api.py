@@ -20,6 +20,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, get_device_type, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch, planned
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     cuda_is_available,
@@ -35,7 +36,15 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors, row_major_layout
+from ..backend_utils import (
+    PLAN_ENV,
+    _torch_stream_context,
+    kernel_stream,
+    rubin_single_group_offsets_kwarg,
+    wrapper_operand_meta,
+    block_scaled_sfd_tensors,
+    row_major_layout,
+)
 from ..canonical import (
     b_nkl,
     check_canonical_contiguous,
@@ -929,6 +938,8 @@ class GroupedGemmQuantSm100(APIBase):
         else:
             compile_kwargs["row_scale"] = row_scale_cute_fake
         _compiled_kernel = cute.compile(gemm_quant, **compile_kwargs)
+        # A launch plan binds the workspace by address and keeps only the compiled kernel alive: tie the workspace to it.
+        _compiled_kernel._workspace = self._workspace
 
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
 
@@ -953,7 +964,8 @@ class GroupedGemmQuantSm100(APIBase):
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             if self._is_rubin_kernel:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     a_tensor,
                     b_tensor,
                     sfb_tensor,
@@ -973,11 +985,12 @@ class GroupedGemmQuantSm100(APIBase):
                     alpha_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                     scheduler_counter_tensor,
                 )
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     a_tensor,
                     b_tensor,
                     sfb_tensor,
@@ -997,7 +1010,7 @@ class GroupedGemmQuantSm100(APIBase):
                     row_scale_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                     scheduler_counter_tensor,
                 )
 
@@ -1174,7 +1187,8 @@ class GroupedGemmQuantSm100(APIBase):
             b_ptrs_addr = int(get_data_ptr(b_ptrs_device))
             sfb_ptrs_addr = int(get_data_ptr(sfb_ptrs_device))
             if self._is_rubin_kernel:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     a_tensor,
                     b_ptrs_addr,
                     sfb_ptrs_addr,
@@ -1194,10 +1208,11 @@ class GroupedGemmQuantSm100(APIBase):
                     alpha_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                 )
             else:
-                _compiled_kernel(
+                launch(
+                    _compiled_kernel,
                     a_tensor,
                     b_ptrs_addr,
                     sfb_ptrs_addr,
@@ -1217,7 +1232,7 @@ class GroupedGemmQuantSm100(APIBase):
                     row_scale_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                 )
 
         self._compiled_kernel = tensor_api
@@ -1461,6 +1476,7 @@ def quant_run(
     return outputs
 
 
+@planned(env=PLAN_ENV, stream="current_stream")
 def grouped_gemm_quant_wrapper_sm100(
     a_tensor: torch.Tensor,
     sfa_tensor: torch.Tensor,

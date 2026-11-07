@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import kernel_stream, rubin_single_group_offsets_kwarg
 from ..canonical import (
     canonical_b_fake,
     canonical_mx_fake,
@@ -45,6 +45,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.launch_plan import launch
 from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 from cudnn.frost.workspace import Workspace, align_up
@@ -1131,9 +1132,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dprob_tensor,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
+                launch(_compiled_kernel, *kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, kernel_stream(stream))
             else:
-                _compiled_kernel(*kernel_args, dbias_tensor, stream)
+                launch(_compiled_kernel, *kernel_args, dbias_tensor, kernel_stream(stream))
 
         self._compiled_kernel = tensor_api
 
@@ -1345,9 +1346,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 dprob_tensor,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
+                launch(_compiled_kernel, *kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, kernel_stream(stream))
             else:
-                _compiled_kernel(*kernel_args, dbias_tensor, stream)
+                launch(_compiled_kernel, *kernel_args, dbias_tensor, kernel_stream(stream))
 
         self._compiled_kernel = tensor_api
 
