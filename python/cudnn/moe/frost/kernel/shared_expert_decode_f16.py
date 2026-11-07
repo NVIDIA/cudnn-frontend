@@ -571,7 +571,7 @@ def frost_shared_expert_gate_up(
 
     # ---- mainloop: warp w runs k16 steps 4w .. 4w + 3 of every 512-column chunk, one accumulator chain per (n-tile, m-tile, lane) ----
     acc = []
-    for tile in cutlass.range_constexpr(cfg.ACC_TILES):
+    for _ in cutlass.range_constexpr(cfg.ACC_TILES):  # ACC_TILES repeats; the index is not used
         acc.extend(_zeros4())
     kw = warp * 4 * MMA_K  # the warp's first k column inside a chunk
     arow = []  # bulk form: the lane's A row per m-tile, a dead row clamped to row 0 (never loaded)
@@ -727,7 +727,7 @@ def frost_shared_expert_down(
 
     # ---- the mma chain: warp w owns n-tile w over the full K = I ----
     acc = []
-    for m in cutlass.range_constexpr(TILES):
+    for _ in cutlass.range_constexpr(TILES):  # TILES repeats; the index is not used
         acc.extend(_zeros4())
     for s in cutlass.range_constexpr(cfg.K_STEPS2):
         b = _ldmatrix_b(wd_s, warp * 8, s * MMA_K, pitch, lane)
