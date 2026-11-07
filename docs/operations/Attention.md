@@ -469,8 +469,7 @@ The two optional ports expose the operands the softmax statistics are built from
 `score_max` $= \max_j s_j$ over the row's unmasked (scaled, biased) scores and `score_sum_exp` $= \sum_j e^{s_j - \max}$ as the
 fp32 sum of exponentials, so `stats` $=$ `score_max` $+ \ln$ `score_sum_exp` to fp32 rounding. `score_max` is the raw row
 maximum of the scaled scores themselves (the value a reference computes as `scores.amax(-1)`), not the $\log_2 e$-scaled
-maximum a flash-attention-style kernel carries internally: it is the same quantity cuEquivariance's `triangle_attention`
-returns as `max`, so the two compare directly. With an attention sink the
+maximum a flash-attention-style kernel carries internally, so it compares directly with a reference's row maximum. With an attention sink the
 sink logit is one more softmax column: it enters the max and contributes $e^{\text{sink} - \max}$ to the sum. `stats_use_log2`
 scales `stats` alone; the two side outputs keep their natural units. Both tensors are fp32 $(B, H_q, S_q, 1)$ in any
 non-overlapping B/H/S stride order, and either may be requested without the other and without `generate_stats`.
@@ -479,10 +478,9 @@ non-overlapping B/H/S stride order, and either may be requested without the othe
 past `seq_len_q` — follow the same convention as `O` and `stats` on this frontend's engines (`O = 0`, `stats = −inf`):
 `score_max = −inf` and `score_sum_exp = 0`; with a sink the row holds the sink's mass alone, `score_max = sink_logit`,
 `score_sum_exp = 1` (`stats = sink_logit`). Two other conventions are in circulation and matter when results are compared
-across libraries: cuEquivariance's triangle attention zeroes such rows (`o = lse = max = 0`) when the mask is given as
-per-row key lengths, while its dense-mask route leaves them un-zeroed with the model's finite mask value
-(`lse = max = −1e9`, `o` = the uniform average of `V`); eager PyTorch with a finite additive mask likewise returns the uniform
-average. Compare rows that have at least one key, and assert the degenerate rows against the convention of the implementation
+across libraries: some kernels zero such rows (`o = lse = max = 0`) when the mask is given as per-row key lengths, while a
+dense finite mask value leaves them un-zeroed (`lse = max = −1e9`, `o` = the uniform average of `V`); eager PyTorch with a finite
+additive mask likewise returns the uniform average. Compare rows that have at least one key, and assert the degenerate rows against the convention of the implementation
 under test.
 
 Under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` the FROST f16/bf16 forward engines serve both ports on their d128 prefill flavor

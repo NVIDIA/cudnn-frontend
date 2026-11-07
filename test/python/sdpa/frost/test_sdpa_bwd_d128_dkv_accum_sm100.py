@@ -8,8 +8,8 @@ the ``dkv_reduce_thd_origins`` fold launch sums the group in fp32 (five launches
 (``cp.reduce.async.bulk.tensor`` add.f32 -- the dQ slices' primitive -- from the same alias staging, two rounds per item: dV then dK), the
 fold launch gone, the bf16 convert folded into ``cast_dq_thd`` (four launches).  A ROUNDING CHANGE (the group accumulates in fp32 in a
 non-deterministic order instead of 8 bf16-rounded partials summed in a fixed order): an op ATTRIBUTE the caller sets, never a knob; dQ is
-untouched by the field.  Both bodies carry it: the 1-CTA body (``bprop_d128_accum_grouped_f16`` through ``bprop_d128_accum_thd_f16``) and
-the cta_group::2 pair body (``bprop_d128_accum_grouped_2cta_stail_f16``).
+untouched by the field.  Both bodies carry it: the 1-CTA body (the grouped THD kernel through the THD body, sections 7 / 5 of
+``kernels/sm100/bprop_d128_f16.py``) and the cta_group::2 pair body (section 8 of the same module).
 
 Host rows (no GPU): the typed domain, config = truth (the fp32 staging slots of both bodies), the default renderings of BOTH chains equal to
 their committed records with the field unset AND with ``bf16_partials`` named, the fp32 renderings' census (the reduce-adds up by the eight
@@ -83,10 +83,10 @@ _PROBE = textwrap.dedent(r"""
     specs = tuple((i, 1, H if p == "stats" else (HK if p in kv else H) * 128, "int32") for i, p in enumerate(ports))
     dtypes = tuple("int32" for _ in ports)
     if chain == "pair":
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     else:
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_thd_host import compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
     if not ptxs:
@@ -227,7 +227,7 @@ def test_dkv_accum_fp32_renders_for_sm_100a_with_the_documented_census(tmp_path,
 def test_dkv_accum_declines_by_name_at_the_pair_chain_entry():
     """A value outside the domain and the one unbuilt combination (``fp32_reduce`` under ``warp_roles = "16w_fa4"``) decline BY NAME at the pair
     chain's compile_host before any trace."""
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
 
     with pytest.raises(ValueError, match="dkv_accum must be one of"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, dkv_accum="fp32")
@@ -248,16 +248,19 @@ def test_dkv_accum_fp32_store_path_credits_the_ring_after_the_dv_reads():
     releases BEFORE the dk_full wait (its bootstrapped ring carries the dK staging's WAR edge) and its epilogue's dK round waits them before it
     stores; the pair's rounds go through the NEW row ``dvk_stage_empty`` (commit -> drain -> arrive -> the dk_full wait; the epilogue waits it
     between dv_full and dk_full) and never touch the pre-armed dq_empty ring; the pair's new row is initialised only under the field."""
-    import cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_grouped_2cta_stail_f16 as pair_body
-    import cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_thd_f16 as one_body
+    import cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 as pair_body  # one module: the THD body's helpers carry the `_thd` suffix, the pair body's are bare
+
+    one_body = pair_body
 
     one = pathlib.Path(one_body.__file__).read_text()
-    store = "\n".join(_code_lines(one[one.index("def _store_loop(") : one.index("def _scheduler_loop(")]))
+    store = "\n".join(_code_lines(one[one.index("def _store_loop_thd(") : one.index("def _scheduler_loop_thd(")]))
     fp32 = store[store.index("const_expr(dkv_fp32)") : store.index("else:", store.index("const_expr(dkv_fp32)"))]
     order = [fp32.index("tma_store_wait("), fp32.index("dq_empty[i].arrive()"), fp32.index("dk_full")]
     assert order == sorted(order), f"1-CTA: the post-dV credits must precede the dk_full wait: {order}"
-    epi = "\n".join(_code_lines(one[one.index("def _native_epilogue_fp32(") : one.index("def _epilogue_loop(")]))
-    assert epi.index("_wait(bars.dq_empty[i], empty_phase)") < epi.index("_store_dq_slice(slab, row, vals, i)"), "1-CTA: the dK round waits before it stores"
+    epi = "\n".join(_code_lines(one[one.index("def _native_epilogue_fp32(") : one.index("def _epilogue_loop_thd(")]))
+    assert epi.index("_wait_thd(bars.dq_empty[i], empty_phase)") < epi.index(
+        "_store_dq_slice_thd(slab, row, vals, i)"
+    ), "1-CTA: the dK round waits before it stores"
     pair = pathlib.Path(pair_body.__file__).read_text()
     rounds = "\n".join(_code_lines(pair[pair.index("def _dkv_fp32_reduce_rounds(") : pair.index("def _ts(")]))
     order = [rounds.index("tma_store_commit()"), rounds.index("tma_store_wait(0)"), rounds.index("dvk_stage_empty.arrive()"), rounds.index("dk_full")]
@@ -268,7 +271,10 @@ def test_dkv_accum_fp32_store_path_credits_the_ring_after_the_dv_reads():
     assert stage.rstrip().endswith("return advance(stage_state, 1)") and "dq_empty" not in stage, "pair: one dvk_stage_empty flip per item, the ring untouched"
     assert re.search(r"_native_epilogue_fp32\(", one) and re.search(r"_stage_fp32_slice\(", pair)
     init = _code_lines(pair[pair.index("def bprop_d128_accum_grouped_2cta_stail_kernel(") : pair.index("def main_thd_2cta_stail_host(")])
-    assert any("dkv_fp32 or i != DVK_STAGE_EMPTY_ROW" in ln for ln in init), "pair: the new row's init is guarded by the field (no user under the default)"
+    assert any("dkv_fp32 or i != dvk_row" in ln for ln in init), "pair: the new row's init is guarded by the field (no user under the default)"
+    assert any(
+        "dvk_row = _dvk_stage_empty_row(bars)" in ln for ln in init
+    ), "pair: the row's index follows the bundle (two rows fewer before it under tmem_map dq_576)"
 
 
 # ------------------------------------------------------------------------------------------------------------ GPU rows

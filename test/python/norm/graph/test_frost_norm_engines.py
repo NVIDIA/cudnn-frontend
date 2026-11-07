@@ -85,7 +85,9 @@ def main():
 
     D = 256
     # LayerNorm forward (real cuDNN spelling)
-    ln = _Node("LAYERNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D]), "bias": _T([D])}, {"Y": _T([8, D]), "mean": _T([8]), "inv_var": _T([8])})
+    ln = _Node(
+        "LAYERNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D]), "bias": _T([D])}, {"Y": _T([8, D]), "mean": _T([8, 1]), "inv_var": _T([8, 1])}
+    )
     f = _facts(ln)
     expect(f.variant == NV.LAYER_NORM and f.phase == "fprop", "LAYERNORM -> LN fprop")
     expect(f.normalized_shape == (D,) and f.has_beta and f.has_mean, "LN normalized_shape/flags")
@@ -95,7 +97,7 @@ def main():
     expect(fe.mismatch(fcap, f) is None, "fprop engine accepts LN")
 
     # RMSNorm forward (no bias, no mean output)
-    rms = _Node("RMSNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D])}, {"Y": _T([8, D]), "inv_var": _T([8])})
+    rms = _Node("RMSNORM", {"epsilon": 1e-5}, {"input": _T([8, D]), "scale": _T([D])}, {"Y": _T([8, D]), "inv_var": _T([8, 1])})
     fr = _facts(rms)
     expect(fr.variant == NV.RMS_NORM and not fr.has_mean and not fr.has_beta, "RMSNORM flags")
     expect(fe.mismatch(fcap, fr) is None, "fprop engine accepts RMS (same engine)")
@@ -121,7 +123,7 @@ def main():
     lnb = _Node(
         "LAYERNORM_BWD",
         {},
-        {"grad": _T([8, D]), "input": _T([8, D]), "scale": _T([D]), "mean": _T([8]), "inv_variance": _T([8])},
+        {"grad": _T([8, D]), "input": _T([8, D]), "scale": _T([D]), "mean": _T([8, 1]), "inv_variance": _T([8, 1])},
         {"DX": _T([8, D]), "DScale": _T([D]), "DBias": _T([D])},
     )
     fb = _facts(lnb)

@@ -26,7 +26,7 @@ import cuda.bindings.driver as cuda
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
 from .dense_score_recompute_sm100_mxfp8 import BwdDenseAttnScoreSm100Mxfp8
-from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100, smem_plan as bf16_indexer_smem_plan
 from ._block_scaled import (
     BLOCK_SCALED_FORMATS,
     BLOCK_SCALED_PRECISION_NAMES,
@@ -433,10 +433,15 @@ def _sparse_attn_score_recompute(
     n_block_size: int = 64,
     k_block_size: Optional[int] = None,
     topk_indices_global: bool = True,
+    pool_size: int = 0,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> torch.Tensor:
     """
     Compute sparse attention target (L1-normalized head-summed softmax) for backward.
+
+    ``pool_size`` > 0 sums each group of ``pool_size`` consecutive slots and writes
+    the pool-level target ``(bs, seqlen_q, out.shape[2])``; ``topk_length`` must then
+    be a multiple of ``pool_size`` and ``n_block_size`` 64.
 
     Args:
         q_attn: (bs, seqlen_q, n_heads_q, head_dim) [BF16], unit innermost stride
@@ -473,7 +478,14 @@ def _sparse_attn_score_recompute(
     have_topk_length = topk_length is not None
     if have_topk_length:
         _require_int32_contiguous(topk_length, "topk_length")
-    _require_fp32_output(out, "out", (bs, seqlen_q, topk))
+    if pool_size:
+        if not have_topk_length or n_block_size != 64 or pool_size not in (4, 16):
+            raise ValueError("pool_size needs topk_length, n_block_size=64 and pool_size in (4, 16)")
+        if out.dim() != 3 or out.shape[2] * pool_size > topk:
+            raise ValueError(f"pooled out must be (bs, seqlen_q, k_pools) with k_pools * {pool_size} <= {topk}, got {tuple(out.shape)}")
+        _require_fp32_output(out, "out", (bs, seqlen_q, out.shape[2]))
+    else:
+        _require_fp32_output(out, "out", (bs, seqlen_q, topk))
 
     # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
@@ -513,11 +525,11 @@ def _sparse_attn_score_recompute(
             n_block_size,
             k_block_size,
             kv_stage,
+            pool_size,
             have_topk_length,
             topk_in_smem,
             topk_indices_global,
         )
-
         if compile_key not in _sparse_attn_score_recompute.compile_cache:
             q_cute = to_cute_tensor(q_attn)
             k_cute = to_cute_tensor(k_attn)
@@ -539,8 +551,8 @@ def _sparse_attn_score_recompute(
                 have_topk_length=have_topk_length,
                 topk_in_smem=topk_in_smem,
                 topk_indices_global=topk_indices_global,
+                pool_size=pool_size,
             )
-
             _sparse_attn_score_recompute.compile_cache[compile_key] = cute.compile(
                 kernel_obj,
                 q_cute,
@@ -765,6 +777,17 @@ def _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block
 # ---- Dispatch helpers (mirror _dispatch_sparse_attn_tile_params) -------------
 
 
+def _resolve_bf16_dense_indexer_tile(m_block_size, n_block_size, head_dim, k_block_size):
+    """The BF16 kernel packs a 128-row tile (128 // qhead_per_kv_head tokens) for every head group."""
+    if m_block_size is None:
+        m_block_size = 128
+    if m_block_size != 128 or n_block_size != 128:
+        raise ValueError(f"precision='bf16' dense indexer requires m_block_size=n_block_size=128, got {m_block_size} / {n_block_size}")
+    if bf16_indexer_smem_plan(head_dim, k_block_size) is None:
+        raise ValueError(f"precision='bf16' dense indexer: head_dim={head_dim} does not fit the kernel's shared memory")
+    return m_block_size
+
+
 def _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_bytes):
     """Return m=qhpkv*2 if SMEM fits, else fall back to m=qhpkv."""
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
@@ -787,7 +810,6 @@ def _dispatch_dense_attn_tile_params(
     qhead_per_kv_head,
     *,
     precision: str = "bf16",
-    seqlen_k_hint: Optional[int] = None,
     k_block_size: Optional[int] = None,
 ):
     """Select (m_block_size, n_block_size, k_block_size) for dense attention backward.
@@ -803,11 +825,10 @@ def _dispatch_dense_attn_tile_params(
     """
     precision = precision.lower()
     if precision == "mxfp8":
-        if head_dim == 512:
-            default_k = 256 if seqlen_k_hint is not None and seqlen_k_hint >= 4096 else 128
-        else:
-            default_k = 64
-        return 128, 128, default_k if k_block_size is None else k_block_size
+        # One 128-row (token, head) tile for 64 / 128 heads; the head dim streams in fixed 128-wide chunks.
+        if k_block_size is not None and k_block_size != 128:
+            raise ValueError(f"precision='mxfp8' dense attention streams head_dim in 128-wide chunks; k_block_size must be None or 128, got {k_block_size}")
+        return 128, 128, None
     if precision != "bf16":
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
 
@@ -972,14 +993,13 @@ def _dense_indexer_score_recompute(
         if n_block_size != 128:
             raise ValueError(f"precision={precision!r} dense indexer requires n_block_size=128")
         m_block_size = 128
-        # k_block_size is locked to 64 (the D128 two-chunk plan): kv_stage is
-        # hardcoded to 24 below, which keeps K-SMEM within the SM100 budget only
-        # at k_block=64 (k_block>64 overflows SMEM; k_block<64 under-pipelines).
+        # k_block_size is locked to 64 (the D128 two-chunk plan the kernel's
+        # SMEM rings are sized for).
         k_block_size = 64 if k_block_size is None else k_block_size
         if k_block_size != 64:
             raise ValueError(f"precision={precision!r} dense indexer requires k_block_size=64; got {k_block_size}")
-    elif m_block_size is None:
-        m_block_size = qhead_per_kv_head
+    else:
+        m_block_size = _resolve_bf16_dense_indexer_tile(m_block_size, n_block_size, head_dim, k_block_size)
 
     if is_block_scaled:
         _validate_dense_block_scaled_contract(
@@ -1005,12 +1025,8 @@ def _dense_indexer_score_recompute(
     _require_fp32_output(denom_out, "denom_out", (q.shape[0],) if is_varlen else (bs, seqlen_q))
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
-        k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
-    kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
-    if is_block_scaled:
-        # K-SMEM = n_block * k_block_size(=64) * kv_stage at <= 1 byte per element;
-        # 24 fits the SM100 SMEM budget, and k_block is locked to 64 above.
-        kv_stage = 24
+        k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
+    # The SM100 indexer kernels size their own SMEM rings (split schedule / SMEM plan).
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
@@ -1033,7 +1049,6 @@ def _dense_indexer_score_recompute(
             n_block_size,
             k_block_size,
             head_dim_padded // k_block_size,
-            kv_stage,
             ratio,
             is_varlen,
             q_causal_offsets is not None,
@@ -1048,7 +1063,6 @@ def _dense_indexer_score_recompute(
             m_block_size,
             n_block_size,
             k_block_size,
-            kv_stage,
             ratio,
             is_varlen,
             q_causal_offsets is not None,
@@ -1078,7 +1092,6 @@ def _dense_indexer_score_recompute(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=k_block_size,
-                kv_stage=kv_stage,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,
@@ -1094,7 +1107,6 @@ def _dense_indexer_score_recompute(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=k_block_size,
-                kv_stage=kv_stage,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 compute_lse=True,
@@ -1315,27 +1327,14 @@ def _dense_attn_score_recompute(
 
     _require_fp32_output(out, "out", (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k))
     _require_fp32_output(denom_out, "denom_out", (q.shape[0],) if is_varlen else (bs, seqlen_q))
-    if precision == "mxfp8" and ((head_dim == 512 and qhead_per_kv_head >= 128) or (head_dim == 128 and qhead_per_kv_head == 64)):
-        with _torch_stream_context(current_stream):
-            out.zero_()
-            denom_out.zero_()
-
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-    if k_block_size is None:
-        k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=4)
-    kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=4)
     if precision == "mxfp8":
-        if head_dim == 512:
-            if k_block_size == 64:
-                kv_stage = 7
-            elif k_block_size == 256:
-                kv_stage = 3
-            elif qhead_per_kv_head >= 128:
-                kv_stage = 9
-            else:
-                kv_stage = 7
-        else:
-            kv_stage = 4
+        # The MXFP8 kernel streams the head dim in fixed 128-wide chunks and sizes its own SMEM rings.
+        kv_stage = None
+    else:
+        if k_block_size is None:
+            k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=4)
+        kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=4)
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
@@ -1356,9 +1355,6 @@ def _dense_attn_score_recompute(
             qhead_per_kv_head,
             m_block_size,
             n_block_size,
-            k_block_size,
-            head_dim_padded // k_block_size,
-            kv_stage,
             ratio,
             is_varlen,
             q_causal_offsets is not None,
@@ -1401,8 +1397,6 @@ def _dense_attn_score_recompute(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=k_block_size,
-                kv_stage=kv_stage,
                 ratio=ratio,
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,
@@ -1417,7 +1411,6 @@ def _dense_attn_score_recompute(
                 n_block_size=n_block_size,
                 k_block_size=k_block_size,
                 kv_stage=kv_stage,
-                score_type="attention",
                 ratio=ratio,
                 is_varlen=is_varlen,
             )
@@ -1664,12 +1657,10 @@ def dense_attn_score_recompute(
     head_dim = q.shape[-1]
 
     precision = _normalize_dense_precision(precision, q_scale, k_scale)
-    seqlen_k_hint = int(max_seqlen_k) if max_seqlen_k is not None else (k.shape[0] if q.ndim == 3 else k.shape[1])
     m, n, kbs = _dispatch_dense_attn_tile_params(
         head_dim,
         qhead_per_kv_head,
         precision=precision,
-        seqlen_k_hint=seqlen_k_hint,
         k_block_size=k_block_size,
     )
 

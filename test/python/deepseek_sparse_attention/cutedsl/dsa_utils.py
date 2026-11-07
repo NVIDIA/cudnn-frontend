@@ -53,6 +53,19 @@ def _require_mxfp4_indexer():
         pytest.skip(str(exc))
 
 
+def _require_sm100_indexer(precision: str):
+    """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("bf16", "mxfp8" or "mxfp4") indexer."""
+    if precision == "mxfp4":
+        _require_mxfp4_indexer()
+        return
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip(f"{precision.upper()} indexer requires an SM100-family GPU")
+    if precision == "mxfp8" and getattr(torch, "float8_e8m0fnu", None) is None:
+        pytest.skip("MXFP8 indexer requires torch.float8_e8m0fnu")
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
@@ -119,7 +132,7 @@ DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS = [
 
 DSA_INDEXER_BACKWARD_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
-    # IndexerBackward requires heads >= 64 (warp-specialized GEMM layout).
+    # H64 runs on both arches; the SM100-only compact H32 path has dedicated tests.
     pytest.mark.parametrize("qhead_per_kv_head", [64]),
     pytest.mark.parametrize("block_I", [128]),
 ]
@@ -260,6 +273,39 @@ def make_random_mxfp4(
     return packed, dequantized, scale
 
 
+def make_random_mxfp8(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MXFP8 counterpart of :func:`make_random_mxfp4`: ``(e4m3 data, dequantized FP32 value, logical E8M0 scales)``."""
+    scale = make_random_mxfp8_scale((*shape[:-1], shape[-1] // 32), device=device, seed=seed, exponent_min=-2, exponent_max=3)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + 1)
+    values = torch.randn(shape, device=device, generator=generator)
+    data = quantize_mxfp8(values * expand_mxfp8_scale(scale, shape[-1]), scale)
+    return data, data.float() * expand_mxfp8_scale(scale, shape[-1]), scale
+
+
+def make_random_indexer_input(
+    precision: str,
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Random indexer Q / K of ``precision`` ("bf16", "mxfp8" or "mxfp4"): ``(data, FP32 value, logical E8M0 scales)``,
+    the scales ``None`` for BF16."""
+    if precision == "bf16":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        data = torch.randn(shape, device=device, generator=generator).bfloat16()
+        return data, data.float(), None
+    make = {"mxfp8": make_random_mxfp8, "mxfp4": make_random_mxfp4}[precision]
+    return make(shape, device=device, seed=seed)
+
+
 def pack_mxfp8_scales_thd(
     q_scale_logical: torch.Tensor,
     k_scale_logical: torch.Tensor,
@@ -333,6 +379,11 @@ def dsa_init(
         required_major = min_compute_capability // 10
         required_minor = min_compute_capability % 10
         pytest.skip(f"DSA requires compute capability >= {required_major}.{required_minor}, " f"found SM{major}{minor}")
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if min_compute_capability >= 100 and not has_tcgen05(major):
+        # An SM100 floor means the SM100-family tcgen05 kernels; cc 12.x passes the threshold but has no tcgen05.
+        pytest.skip(f"DSA requires an SM100-family (tcgen05) device, found SM{major}{minor}")
 
     def opt(name: str, default):
         value = request.config.getoption(name, default=None)

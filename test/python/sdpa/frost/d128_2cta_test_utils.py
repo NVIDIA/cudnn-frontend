@@ -19,8 +19,9 @@ from frost_test_utils import ptx_kernel_md5s
 from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
 
 _ADAPTER_MODULE = "cudnn.sdpa.bwd.api_dsl_sm100_d128_2cta"
-_HOST_MODULE = "cudnn.sdpa.bwd.kernels.sm100.prepared_d128_grouped_2cta_host"
+_HOST_MODULE = "cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host"
 _IMPLEMENTATION = "accumulation_grouped_thd_2cta"
+_IMPLEMENTATIONS = {True: _IMPLEMENTATION, False: "accumulation_grouped_dense_2cta"}  # by the case's layout: packed | the dense compact-BSHD twin
 RECORD_ARCH = "sm_100a"  # the arch every committed rendering record is pinned on (frost_test_utils.read_kernel_record's default)
 # Exit codes of the fresh-process rows (the parents read them by name): the watchdog's HANG kill and the typed decline of the pair body.
 CHILD_EXIT_HANG = 70  # frost_test_utils.process_watchdog: os._exit(70) inside the kernel stage = HANG -> the barrier AUDIT, never a bigger budget
@@ -43,7 +44,7 @@ def _adapter_class():
 
 
 def _require_2cta():
-    """The pair-body GPU rows' part gate reads the library's own cc set (``CTA_PAIR_CCS``: the SM100 line, cc 10.0 / 10.3 -- never a copy of
+    """The pair-body GPU rows' part gate reads the library's own cc set (``CTA_PAIR_CCS``: cc 10.0 / 10.3 / 10.7 -- never a copy of
     it), so the forced two-CTA rows admit exactly the devices the library admits (#1985) and skip elsewhere.  Host rows never call it."""
     from cudnn.sdpa.bwd.d128_grouped_2cta_contract import CTA_PAIR_CCS
 
@@ -69,7 +70,8 @@ def _check_support_or_skip(api):
 def make_adapter_2cta(case, *, compile_plan=True, declaration=None, **fields):
     """The suite's adapter construction (``d128_grouped_test_utils.make_adapter``) on the 2-CTA subclass (``cta_pair = "on"``: the pair body at
     any S) plus any typed field set on the instance before ``check_support()`` (``diag_2cta`` / ``mask_form`` / ``warp_roles`` / ``dkv_accum`` /
-    ``debug_clk``); ``declaration`` selects the storage declaration helper (the grouped one by default; the MHA utils' for an MHA case)."""
+    ``debug_clk`` / ``stats_form`` / ``tmem_map``); ``declaration`` selects the storage declaration helper (the grouped one by default; the MHA utils'
+    for an MHA case)."""
     from cudnn.api_base import TensorDesc
 
     if declaration is None:
@@ -106,7 +108,7 @@ def make_adapter_2cta(case, *, compile_plan=True, declaration=None, **fields):
     _check_support_or_skip(api)
     api.compile()
     assert api._prepared.native is not None
-    assert api._prepared.artifact.implementation == _IMPLEMENTATION
+    assert api._prepared.artifact.implementation == _IMPLEMENTATIONS[thd]
     return api
 
 
@@ -149,12 +151,12 @@ os.environ["CUTE_DSL_KEEP"] = "ptx"
 os.environ["CUTE_DSL_ARCH"] = {arch!r}
 os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
 import cutlass
-from {host} import compile_host
+from {host} import compile_host_grouped_2cta as compile_host
 ports = ("q", "k", "v", "o", "do", "dq", "dk", "dv", "stats")
 B, H, HK = 2, 8, 2
 ts = lambda p: H if p == "stats" else (HK if p in ("k", "v", "dk", "dv") else H) * 128
 specs = tuple((i, 1, ts(p), "int32") for i, p in enumerate(ports))
-compile_host((B, H, HK, True), specs, tuple("int32" for _ in ports), cutlass.BFloat16, True, {sm}, **{form_kw})  # sm = the device cc as the prepared module passes it
+compile_host({config}, {specs}, {dtypes}, cutlass.BFloat16, True, {sm}, **{form_kw})  # sm = the device cc as the prepared module passes it
 ptx_file = sorted(glob.glob(os.path.join(sys.argv[1], "*.ptx")), key=os.path.getmtime)[-1]
 ptx = open(ptx_file, "rb").read()
 import hashlib
@@ -177,7 +179,8 @@ CENSUS = {
     "dsmem_ship": r"cp\.async\.bulk\.shared::cluster\.shared::cta",
     "reduce_add": r"cp\.reduce\.async\.bulk",
     "try_cancel": r"clusterlaunchcontrol\.try_cancel",
-    "tmem_alloc_cta2": r"tcgen05\.alloc\.cta_group::2",
+    "tmem_alloc_cta2": r"tcgen05\.alloc\.cta_group::2",  # the 512-column alloc (the s_tail TMEM map of every part)
+    "tmem_alloc_exclusive_cta2": r"tcgen05\.alloc\.exclusive\.cta_group::2",  # the 576-column carve of cc 10.7 under tmem_map dq_576 (`is_exclusive`)
     "local_mem": r"\.local",
     "entry": r"\.entry\s+cudnn_kernel_bprop_d128_accum_grouped_2cta_kernel",  # an earlier pair body's entry: absent from this chain
     "nanosleep": r"nanosleep\.u32",  # the test-only DEBUG_*_DELAY_US levers: absent from the default rendering
@@ -197,6 +200,7 @@ EXPECTED_BASE = {
     "reduce_add": 4,
     "try_cancel": 1,
     "tmem_alloc_cta2": 1,
+    "tmem_alloc_exclusive_cta2": 0,  # the s_tail map: a 512-column alloc; 1 (and tmem_alloc_cta2 0) under tmem_map dq_576
     "local_mem": 0,
     "entry": 1,
     "nanosleep": 0,
@@ -212,14 +216,26 @@ def _setmaxnreg_of():
     return sorted([("inc", CFG.SOFTMAX_REGS), ("inc", CFG.EPILOGUE_REGS)] + [("dec", CFG.SERVICE_REGS)] * (CFG.SERVICE_WARPS + 1))
 
 
-def render_2cta_kernels(tmp_path, form_kw, census, arch=RECORD_ARCH):
-    """Host trace-compile of the pair chain for ``arch`` (the record arch sm_100a by default; sm_103a = the GB300 target the prepared host
-    selects on cc 10.3) in a fresh process -> (PTX md5 of the module, census, [(setmaxnreg action, immediate), ...], {kernel: md5 of its `.entry`
+def render_2cta_kernels(tmp_path, form_kw, census, arch=RECORD_ARCH, *, config=None, specs=None, dtypes=None):
+    """Host trace-compile of the pair chain for ``arch`` (the record arch sm_100a by default; sm_103a / sm_107a = the GB300 / Rubin targets the
+    prepared host selects on cc 10.3 / 10.7) in a fresh process -> (PTX md5 of the module, census, [(setmaxnreg action, immediate), ...], {kernel: md5 of its `.entry`
     region} in entry order -- the per-kernel record form, frost_test_utils.ptx_kernel_md5s).  No device needed: the host's ``--gpu-arch sm_{sm}a``
-    option (the production mechanism, ``sm`` from the device cc) selects the target -- it wins over ``CUTE_DSL_ARCH``, which is set to agree."""
+    option (the production mechanism, ``sm`` from the device cc) selects the target -- it wins over ``CUTE_DSL_ARCH``, which is set to agree.
+    ``config`` / ``specs`` / ``dtypes`` override the record geometry's ``compile_host`` declaration (the packed probe: every port with an int32
+    origin) -- the dense twin renders with ``(B, H, HK, False)``, ``DENSE_ORIGIN_SPECS``, ``DENSE_ORIGIN_DTYPES`` and ``layout="dense"`` in
+    ``form_kw``; left ``None`` the call is the record's, argument for argument."""
     _adapter_class()  # the tree under test must be the one this venv imports
     sm = int(re.fullmatch(r"sm_(\d+)a", arch).group(1))  # the prepared module's `sm` (cc major * 10 + minor) -> the host's `--gpu-arch sm_{sm}a`
-    script = _RENDER.format(host=_HOST_MODULE, census=repr(census), form_kw=repr(form_kw), arch=arch, sm=sm)
+    script = _RENDER.format(
+        host=_HOST_MODULE,
+        census=repr(census),
+        form_kw=repr(form_kw),
+        arch=arch,
+        sm=sm,
+        config="(B, H, HK, True)" if config is None else repr(tuple(config)),
+        specs="specs" if specs is None else repr(tuple(specs)),
+        dtypes='tuple("int32" for _ in ports)' if dtypes is None else repr(tuple(dtypes)),
+    )
     proc = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=600, env=dict(os.environ))
     assert proc.returncode == 0 and "RENDER_OK" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-3000:]
     assert re.search(r"PTX_TARGET (\S+)", proc.stdout).group(1) == arch, proc.stdout[-500:]

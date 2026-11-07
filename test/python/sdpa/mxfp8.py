@@ -899,13 +899,15 @@ def _mxfp8_block_scaled_engine_covers(sm, o_block_scale):
 
 
 def _mxfp8_frost_row_offered(sm):
-    """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 row is a
-    default candidate; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
-    on this device: on cc 10.7 the row additionally needs a CuTe DSL build with the sm_107a target
-    (python/cudnn/AGENTS.md Rule 7 -- the public 4.7.0 wheel lacks it, and the row then declines through
-    ``cutedsl_arch_requirement_error``), so the mirror requires it too.  sf_o has no backend lowering, so a draw is
-    admitted only where a row that can serve it is actually on offer; an admitted draw the row declines is a FAILURE."""
+    """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 and SM120 rows
+    are default candidates; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
+    on this device: every row needs a CuTe DSL at the FROST floor (python/cudnn/AGENTS.md Rule 7 -- without one the row
+    declines), and on cc 10.7 the row additionally needs a build with the sm_107a target (the public 4.7.0 wheel lacks
+    it, and the row then declines through ``cutedsl_arch_requirement_error``), so the mirror requires both.  sf_o has no
+    backend lowering, so a draw is admitted only where a row that can serve it is actually on offer; an admitted draw
+    the row declines is a FAILURE."""
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
     from cudnn.sdpa.fwd import engines
 
     offered = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
@@ -914,11 +916,10 @@ def _mxfp8_frost_row_offered(sm):
         for s in engines.ENGINE_SPECS
     ):
         return False
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        return False  # no usable DSL: the row declines before any target question is asked
     if sm == 107:
-        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state
-
-        if not cutedsl_state()[0]:
-            return False  # no DSL at all: the row declines before the target question is asked
         return cutedsl_arch_requirement_error((10, 7)) is None
     return True
 

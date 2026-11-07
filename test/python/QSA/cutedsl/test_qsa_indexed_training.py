@@ -56,18 +56,12 @@ def test_indexed_packed_reference(supported_gpu, lengths):
 
 @pytest.mark.parametrize("lengths", [(3, 5, 7), (129, 133)])
 def test_indexed_six_query_heads(supported_gpu, lengths):
-    """6Q/1KV shares the kernels; its backward batches four queries per compact-ID row (12Q/1KV batches two)."""
+    """6Q/1KV runs the same forward kernels and backward engine as 12Q/1KV, with six head rows per query."""
     inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
     indices = indices_for(inputs)
     check_case(inputs, indices)
-    plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 6)
-    assert plan.paired and plan.nq == 4 and "flags" in {name for name, _, _ in plan.layouts}
-    assert dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == ((inputs["q"].shape[0] + 3) // 4, indices.shape[1])
-    paired = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop")
-    assert paired.paired and paired.nq == 2
-    out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], indices)
-    with pytest.raises(NotImplementedError, match="causal_topk requires 12Q/1KV"):
-        qsa_indexed_backward(inputs["q"], inputs["q"], inputs["k"], inputs["v"], out["out_fp32"], out["lse"], indices, selection_mode="causal_topk")
+    plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 0, 6)
+    assert plan.hq == 6 and dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == (inputs["q"].shape[0], indices.shape[1] // 4)
 
 
 def test_indexed_changed_values_replay(supported_gpu):
@@ -165,13 +159,11 @@ assert not hasattr(cudnn.DSA, "qsa_indexed_backward")
 
 @pytest.fixture
 def canonical_inputs(supported_gpu):
-    from cudnn.QSA.two_pass.api import _dsl_cuda_version
-    from QSA.cutedsl.two_pass_reference import make_inputs as canonical
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from QSA.cutedsl.qsa_index_list_reference import make_inputs as canonical
 
-    if torch.cuda.get_device_capability() == (10, 7):
-        pytest.skip("The canonical two-pass backward is currently qualified on SM100/SM103")
-    if _dsl_cuda_version()[0] < 13:
-        pytest.skip("12Q/1KV sparse two-pass requires the CUDA 13 DSL compiler")
+    if engine.dsl_cuda_major() < 13:
+        pytest.skip("12Q/1KV QSA backward requires the CUDA 13 DSL compiler")
     return canonical
 
 
@@ -191,32 +183,22 @@ def _canonical_call(inputs, **kwargs):
 
 
 @pytest.mark.parametrize("total, bounds", [(4099, None), (32769, None), (32769, [0, 3, 3, 32769])])
-def test_public_causal_topk_uses_two_pass_and_native_saved_state(canonical_inputs, monkeypatch, total, bounds):
-    from QSA.cutedsl.two_pass_reference import reference_backward, assert_grads_close
-    from cudnn.QSA.two_pass import api as two_pass
+def test_public_causal_topk_uses_native_saved_state(canonical_inputs, total, bounds):
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
 
     inputs = canonical_inputs(total, 71, h_kv=1, cu_seqlens=bounds, width=2052, saved_output_dtype=torch.float32)
     # Use saved state from the actual public forward, not a private test-only path.
     out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"])
     inputs["out"], inputs["lse"] = out["out_fp32"], out["lse"]
-    calls = []
-    original = two_pass._backward
-
-    def record(*args, **kwargs):
-        calls.append((args[3].data_ptr(), args[5].data_ptr()))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(two_pass, "_backward", record)
     actual = _canonical_call(inputs)
     expected = reference_backward(**{k: inputs[k] for k in ("q", "k", "v", "out", "dout", "lse", "topk_idxs")})
     for name, value, ref in zip(("dq", "dk", "dv"), actual, expected):
         assert_grads_close(name, value, ref)
-    assert calls == [(inputs["out"].data_ptr(), inputs["lse"].data_ptr())]
     assert tuple(actual.keys()) == ("dq", "dk", "dv")
 
 
 def test_public_causal_topk_graph_refreshes_packed_bounds(canonical_inputs):
-    from QSA.cutedsl.two_pass_reference import reference_backward, assert_grads_close
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
 
     inputs = canonical_inputs(32773, 73, h_kv=1, cu_seqlens=[0, 3, 32773], width=2052, saved_output_dtype=torch.float32)
     _canonical_call(inputs)
@@ -243,13 +225,7 @@ def test_public_causal_topk_graph_refreshes_packed_bounds(canonical_inputs):
         graph.reset()
 
 
-def test_general_selection_never_dispatches_to_two_pass(supported_gpu, monkeypatch):
-    from cudnn.QSA.two_pass import api as two_pass
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("general/empty selections reached the canonical backend")
-
-    monkeypatch.setattr(two_pass, "_backward", forbidden)
+def test_general_selection_keeps_empty_rows(supported_gpu):
     inputs = make_inputs((3, 9), 12, 1, empty=True)
     small = indices_for(inputs)
     indices = torch.full((12, 2052), -1, dtype=torch.int32, device="cuda")
@@ -271,6 +247,7 @@ def test_causal_topk_options_are_explicit_and_append_only(supported_gpu):
         ({"selection_mode": None}, "selection_mode"),
         ({"cu_seqlens": torch.tensor([0, 5], device="cuda", dtype=torch.int32)}, "require selection_mode"),
         ({"max_seq_len": 5}, "require selection_mode"),
+        ({"ds_precision": "fp16"}, "ds_precision"),
     ]:
         with pytest.raises(ValueError, match=message):
             qsa_indexed_backward(*args, **kwargs)

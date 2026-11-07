@@ -216,8 +216,9 @@ def gemm_swiglu_init(
 ):
     """Initialize configuration for GEMM SwiGLU tests."""
     major, minor = torch.cuda.get_device_capability()
-    compute_capability = major * 10 + minor
-    if compute_capability < 100:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
 
     mnkl_str = request.config.getoption("--gemm-swiglu-mnkl", default=None)

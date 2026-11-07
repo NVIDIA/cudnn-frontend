@@ -48,6 +48,25 @@ MMA_INST_K64_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
 _SUPPORTED_MAINLOOP_OPS: frozenset[str] = frozenset(UNARY_OPS) | frozenset(BINARY_OPS)
 
 
+def per_k_scale_reject(*, op, operand_dtype, load_dtype, major, scale_stride, scale_dtype, compute_dtype, out_dtype) -> str | None:
+    """Shared eligibility for the legacy unit-stride per-K loading ABI.
+
+    Graph preparation uses this before choosing the optimization; the registry
+    also checks it for callers supplying FusionChain directly.
+    """
+    checks = (
+        (op != "mul", "only mul is implemented"),
+        (operand_dtype not in ("bf16", "fp16"), "operand must be BF16 or FP16"),
+        (load_dtype is not None, "operand load casts are not implemented"),
+        (major != "k", "operand must be K-major"),
+        (scale_stride != 1, "scale K axis must have unit stride"),
+        (scale_dtype not in ("bf16", "fp16", "fp32"), "scale must be BF16, FP16 or FP32"),
+        (compute_dtype != "fp32", "multiply must compute in FP32"),
+        (out_dtype != operand_dtype, "multiply result must match the MMA operand dtype"),
+    )
+    return next((reason for rejected, reason in checks if rejected), None)
+
+
 # Dimension 1: graph type
 
 
@@ -469,23 +488,17 @@ class MainloopKernelTemplate(KernelTemplate):
 
     def _per_k_reject(self, chain: FusionChain, side: str, op) -> str | None:
         ref = chain.aux_by_name(op.aux)
-        dtype = getattr(chain.matmul, f"{side}_dtype")
-        major = getattr(chain.matmul, f"{side}_major")
-        load_dtype = getattr(chain, f"mainloop_{side}_load_dtype")
-        checks = (
-            (op.op != "mul", "only mul is implemented"),
-            (dtype not in ("bf16", "fp16"), "operand must be BF16 or FP16"),
-            (load_dtype is not None, "operand load casts are not implemented"),
-            (major != "k", "operand must be K-major"),
-            (ref.stride[ref.k_axis] != 1, "scale K axis must have unit stride"),
-            (ref.dtype not in ("bf16", "fp16", "fp32"), "scale must be BF16, FP16 or FP32"),
-            (op.compute_dtype != "fp32", "multiply must compute in FP32"),
-            (op.out_dtype != dtype, "multiply result must match the MMA operand dtype"),
+        reason = per_k_scale_reject(
+            op=op.op,
+            operand_dtype=getattr(chain.matmul, f"{side}_dtype"),
+            major=getattr(chain.matmul, f"{side}_major"),
+            load_dtype=getattr(chain, f"mainloop_{side}_load_dtype"),
+            scale_stride=ref.stride[ref.k_axis],
+            scale_dtype=ref.dtype,
+            compute_dtype=op.compute_dtype,
+            out_dtype=op.out_dtype,
         )
-        for rejected, reason in checks:
-            if rejected:
-                return f"{self.file}: per-K {side.upper()} scale {ref.name!r}: {reason}"
-        return None
+        return None if reason is None else f"{self.file}: per-K {side.upper()} scale {ref.name!r}: {reason}"
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         for side, ops in (("A", chain.mainloop_a_ops), ("B", chain.mainloop_b_ops)):
@@ -497,6 +510,22 @@ class MainloopKernelTemplate(KernelTemplate):
                 if any(op.op == "gen_index" and op.index_expr is None for op in ops):
                     return f"{self.file}: mainloop gen_index requires lowered logical coordinates"
             for op in ops:
+                if op.operand_access is not None:
+                    if self.family != "sm100":
+                        return f"{self.file}: mapped operand broadcasts require the SM100 coordinate-loading pipeline"
+                    ref = chain.aux_by_name(op.aux)
+                    if (
+                        chain.has_moe
+                        or getattr(chain.matmul, f"{side.lower()}_dtype") not in ("bf16", "fp16")
+                        or getattr(chain, f"mainloop_{side.lower()}_load_dtype") is not None
+                    ):
+                        return f"{self.file}: mapped operand broadcasts require plain BF16/FP16 operands without load casts"
+                    if (
+                        ref.dtype not in ("bf16", "fp16", "fp32")
+                        or op.compute_dtype != "fp32"
+                        or op.out_dtype != getattr(chain.matmul, f"{side.lower()}_dtype")
+                    ):
+                        return f"{self.file}: mapped operand broadcasts require FP32 compute and operand-dtype results"
                 if op.op not in _SUPPORTED_MAINLOOP_OPS:
                     return f"{self.file} cannot fuse mainloop op {op.op!r} on " f"operand {side} (supported: unary + scalar-aux binary, per-K mul)"
                 if op.aux is not None and chain.aux_by_name(op.aux).bcast_mode == "per_k":
