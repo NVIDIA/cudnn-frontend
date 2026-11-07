@@ -52,11 +52,10 @@ def checked_layout(shape, stride, *, context="strided layout", writable=False):
 
 
 def _check_nonoverlap(shape, stride, context):
-    occupied = 1
-    for step, extent in sorted((s, d) for d, s in zip(shape, stride) if d > 1):
-        if step < occupied:
-            raise ValueError(f"{context} requires non-overlapping storage")
-        occupied += (extent - 1) * step
+    from cudnn.frost.buffers import is_nonoverlapping
+
+    if not is_nonoverlapping(shape, stride):
+        raise ValueError(f"{context} requires non-overlapping storage")
 
 
 def reshape_layout(shape, stride, target):

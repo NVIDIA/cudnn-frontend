@@ -38,7 +38,7 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
         return None
     try:
         if has_gather:
-            from .materialization import available_routes
+            from .gather_execution import available_routes
 
             chains = tuple(route.chain for route in available_routes(graph))
         else:

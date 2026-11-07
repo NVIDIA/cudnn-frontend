@@ -12,7 +12,7 @@ from math import prod
 
 from cudnn.graph_types import Tensor
 from cudnn.frost import buffers
-from cudnn.frost.workspace import Workspace, WorkspaceLayout
+from cudnn.frost.execution import BufferBinding, ExecutionStep, SequentialPlan
 
 from .dtypes import DTYPE_BYTES
 from .fusion_ir import IndexMap, Dtype, FusionChain
@@ -187,127 +187,70 @@ def compile():
 """
 
 
-class MaterializedGatherPlan:
-    """Precompiled gather launches followed by the original GEMM plan.
-
-    Device intermediates and nested GEMM scratch are caller-workspace regions,
-    not plan-owned allocations. Every buffer is validated before the first write.
-    """
+class MaterializedGatherPlan(SequentialPlan):
+    """Gather-specific step preparation; shared execution owns workspace/guards."""
 
     def __init__(self, route, gemm=None):
+        from functools import partial
         from .compiler import _import_kernel
-
+        from .graph_analyzer import _map_dtype
         from cudnn.frost.device import current_device
 
         if gemm is not None and hasattr(gemm, "lowered") and gemm.lowered is None:
             raise NotImplementedError(f"materialized GEMM has no executable binding: {gemm.declined}")
-        self.device = current_device()
-        self.route, self.gemm = route, gemm
-        self.chain = route.chain
-        stages = route.gathers
-        scratch = {id(stage.output) for stage in stages if not stage.observable}
-        bound = list(route.binding.bound_tensors())
-        for stage in stages:
-            bound.extend((stage.source, stage.indices))
-            if stage.observable:
-                bound.append(stage.output)
-        bound = list({id(t): t for t in bound if id(t) not in scratch}.values())
-        self.binding = GemmBinding(a_operands=bound)
-        self._kernels = tuple(_import_kernel(render_gather(stage)).compile() for stage in stages)
-        self._layout = WorkspaceLayout()
-        self._regions = tuple(
-            (stage, self._layout.add(_span(stage.access.consumer_shape, stage.output_stride) * DTYPE_BYTES[stage.dtype]))
-            for stage in stages
-            if not stage.observable
-        )
-        self._gemm_offset = self._layout.add(int(getattr(gemm, "workspace_bytes", 0) or 0))
-        self.workspace_bytes = self._layout.size
-        self._tensors = tuple(bound)
-        from .graph_analyzer import _map_dtype
+        self.route, self.gemm, self.chain = route, gemm, route.chain
+        device = current_device()
+        declarations = {}
 
-        self._metadata = {id(t): (tuple(t.get_dim()), tuple(t.get_stride()), _BUFFER_DTYPES.get(_map_dtype(t.get_data_type()))) for t in bound}
-        for stage in stages:
-            for tensor, shape, stride, dtype in (
-                (stage.source, stage.access.producer_shape, stage.source_stride, stage.dtype),
-                (stage.indices, tuple(stage.indices.get_dim()), stage.indices_stride, stage.indices_dtype),
-                (stage.output, stage.access.consumer_shape, stage.output_stride, stage.dtype),
+        def declare(tensor, shape, strides, dtype, role):
+            declaration = BufferBinding(tensor, shape, strides, dtype, role, tensor.get_name())
+            previous = declarations.get(tensor)
+            if previous is not None and previous != declaration:
+                # An intermediate read retains the producer's storage role.
+                if role == "input" and (previous.shape, previous.strides, previous.dtype) == (shape, strides, dtype):
+                    return
+                raise ValueError("gather execution has conflicting buffer declarations")
+            declarations[tensor] = declaration
+
+        for tensor in route.binding.bound_tensors():
+            role = "output" if tensor in route.binding.outputs else "input"
+            declare(tensor, tuple(tensor.get_dim()), tuple(tensor.get_stride()), _BUFFER_DTYPES[_map_dtype(tensor.get_data_type())], role)
+        # Virtual gather values may already appear as downstream GEMM inputs.
+        for stage in route.gathers:
+            declarations.pop(stage.output, None)
+        steps = []
+        for number, stage in enumerate(route.gathers):
+            for tensor, shape, strides, dtype, role in (
+                (stage.source, stage.access.producer_shape, stage.source_stride, stage.dtype, "input"),
+                (stage.indices, tuple(stage.indices.get_dim()), stage.indices_stride, stage.indices_dtype, "input"),
+                (stage.output, stage.access.consumer_shape, stage.output_stride, stage.dtype, "output" if stage.observable else "temporary"),
             ):
-                self._metadata[id(tensor)] = (shape, stride, _BUFFER_DTYPES[dtype])
+                declare(tensor, shape, strides, _BUFFER_DTYPES[dtype], role)
+            kernel = _import_kernel(render_gather(stage)).compile()
+            keys = (stage.source, stage.indices, stage.output)
+            specs = tuple(declarations[key] for key in keys)
 
-    def __call__(self, variant_pack, workspace=None, stream=None):
-        from cuda.bindings import driver
+            def prepare_gather(values, scratch, stream, *, kernel=kernel, keys=keys, specs=specs):
+                from cuda.bindings import driver
 
-        if workspace is not None and not isinstance(workspace, Workspace):
-            workspace = Workspace(workspace, self.workspace_bytes, "materialized_gather", device=self.device)
-        if self.workspace_bytes and workspace is None:
-            raise ValueError(f"materialized gather requires a {self.workspace_bytes}-byte caller workspace")
-        values = dict(variant_pack)
-        if any(t not in values for t in self._tensors):
-            raise ValueError("materialized gather variant pack is missing a prepared operand")
-        for stage, offset in self._regions:
-            shape = stage.access.consumer_shape
-            values[stage.output] = workspace.view(offset, _BUFFER_DTYPES[stage.dtype], (_span(shape, stage.output_stride),)).metadata_view(
-                shape, stage.output_stride
-            )
-        # Fixed-shape storage specialization must not silently accept a changed
-        # stride or dtype at execute. The native pack may supply graph geometry.
-        for tensor, value in values.items():
-            expected = self._metadata.get(id(tensor))
-            if expected is not None:
-                shape, stride, dtype = expected
-                if tuple(value.shape) != shape or tuple(value.stride()) != stride or buffers.dtype_name(value) != dtype:
-                    raise ValueError(f"materialized gather {tensor.get_name()!r} binding differs from its prepared shape/stride/dtype")
-                device = value.__dlpack_device__()
-                if tuple(device) != (2, self.device):
-                    raise ValueError("materialized gather bindings must be CUDA buffers on the compiled device")
-        # Reject overlap conservatively. All inputs stay live through the gather
-        # sequence and GEMM, so graph-node order cannot make aliasing safe.
-        output_tensors = [stage.output for stage in self.route.gathers]
-        if self.gemm is not None:
-            output_tensors.extend(self.gemm.binding.outputs)
-        output_tensors = list({id(t): t for t in output_tensors}.values())
-        if self.workspace_bytes:
-            scratch_buffer = workspace.view(0, "uint8", (self.workspace_bytes,))
-            if tuple(scratch_buffer.__dlpack_device__()) != (2, self.device):
-                raise ValueError("materialized gather workspace must be on the compiled device")
-            base = buffers.data_ptr(scratch_buffer)
-            for tensor in self._tensors:
-                value = values[tensor]
-                ptr = buffers.data_ptr(value)
-                if base < ptr + _span(value.shape, value.stride()) * value.element_size() and ptr < base + self.workspace_bytes:
-                    raise ValueError("materialized gather workspace must not overlap caller operands")
-        for output_tensor in output_tensors:
-            output = values[output_tensor]
-            lo = buffers.data_ptr(output)
-            hi = lo + _span(output.shape, output.stride()) * output.element_size()
-            for tensor, value in values.items():
-                if tensor is output_tensor:
-                    continue
-                other_lo = buffers.data_ptr(value)
-                other_hi = other_lo + _span(value.shape, value.stride()) * value.element_size()
-                if lo < other_hi and other_lo < hi:
-                    raise ValueError("materialized gather outputs/workspace must not overlap other operands")
-        if self.gemm is not None:
-            validate = getattr(self.gemm, "validate_operands", None)
-            if validate is not None:
-                validate([values[tensor] for tensor in self.gemm.bound])
-        prepared = []
-        for stage in self.route.gathers:
-            carriers = []
-            for tensor in (stage.source, stage.indices, stage.output):
-                value = values[tensor]
-                shape, stride, dtype = self._metadata[id(tensor)]
-                device = value.__dlpack_device__()[1]
-                carriers.append(buffers.DeviceView(buffers.data_ptr(value), (_span(shape, stride),), dtype, device))
-            prepared.append(carriers)
-        nested = None
-        if self.gemm is not None and getattr(self.gemm, "workspace_bytes", 0):
-            nested = workspace.view(self._gemm_offset, "uint8", (self.gemm.workspace_bytes,))
-        cuda_stream = stream if isinstance(stream, driver.CUstream) else driver.CUstream(0 if stream is None else int(stream))
-        for kernel, carriers in zip(self._kernels, prepared):
-            kernel(*carriers, cuda_stream)
-        if self.gemm is not None:
-            self.gemm(values, workspace=nested, stream=stream)
+                carriers = tuple(buffers.DeviceView(buffers.data_ptr(values[key]), (spec.span,), spec.dtype, device) for key, spec in zip(keys, specs))
+                cuda_stream = stream if isinstance(stream, driver.CUstream) else driver.CUstream(0 if stream is None else int(stream))
+                return partial(kernel, *carriers, cuda_stream)
+
+            steps.append(ExecutionStep(f"gather {number}", (stage.source, stage.indices), (stage.output,), prepare_gather))
+        if gemm is not None:
+
+            def prepare_gemm(values, scratch, stream):
+                validate = getattr(gemm, "validate_operands", None)
+                if validate is not None:
+                    validate([values[tensor] for tensor in gemm.bound])
+                return partial(gemm, values, workspace=scratch, stream=stream)
+
+            output_keys = tuple(route.binding.outputs)
+            input_keys = tuple(t for t in route.binding.bound_tensors() if t not in output_keys)
+            steps.append(ExecutionStep("GEMM", input_keys, output_keys, prepare_gemm, int(getattr(gemm, "workspace_bytes", 0) or 0)))
+        super().__init__(declarations.values(), steps, device=device, owner="materialized gather")
+        self.binding = GemmBinding(a_operands=list(self.bound))
 
 
 def probe_execution_plan(graph, config=None, *, backend=None):

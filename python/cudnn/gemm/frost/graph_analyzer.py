@@ -625,7 +625,7 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
 def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     """Analyze + JIT the graph into a compiled GEMM plan."""
     if any(node.node_type.name == "GATHER" for node in graph.nodes):
-        from .materialization import build_execution_plan
+        from .gather_execution import build_execution_plan
 
         return build_execution_plan(graph, knobs=knobs)
     if not _graph_has_gemm(graph):

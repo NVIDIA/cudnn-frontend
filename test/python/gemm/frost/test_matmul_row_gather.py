@@ -871,7 +871,7 @@ def _materialization_graph(axis=0, *, side="a", observed=False, index_dtype=cudn
 
 @pytest.mark.parametrize("axis,side,observed", [(0, "a", False), (1, "a", False), (0, "b", False), (0, "a", True)])
 def test_frost_materialization_is_an_independent_route(axis, side, observed):
-    from cudnn.gemm.frost.materialization import available_routes
+    from cudnn.gemm.frost.gather_execution import available_routes
 
     graph, source, indices, weight, selected, result = _materialization_graph(axis, side=side, observed=observed)
     before = [(tuple(t.dim), tuple(t.stride), t.is_virtual) for node in graph.nodes for t in node.outputs.values()]
@@ -894,7 +894,7 @@ def test_frost_materialization_is_an_independent_route(axis, side, observed):
 def test_frost_materialized_gather_native_capture(axis, dtype, indices_dtype):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("materialized gather requires CUDA SM80 or newer")
-    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
 
     graph_dt = {torch.float16: cudnn.data_type.HALF, torch.bfloat16: cudnn.data_type.BFLOAT16, torch.float32: cudnn.data_type.FLOAT}[dtype]
     index_dt = cudnn.data_type.INT32 if indices_dtype == torch.int32 else cudnn.data_type.INT64
@@ -1032,16 +1032,18 @@ def test_frost_materialized_gather_public_graph_capture():
         cudnn.destroy_handle(handle)
 
 
-@pytest.mark.parametrize("observed", [False, True], ids=["workspace", "caller-output"])
-def test_frost_materialized_gather_gemm_transport_on_hopper(observed, monkeypatch):
+@pytest.mark.parametrize("observed,padded", [(False, False), (True, False), (False, True)], ids=["workspace", "caller-output", "padded-workspace"])
+def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, monkeypatch):
     """Runs the native gather plus a GEMM spy, not a Blackwell MMA kernel."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("materialized gather requires CUDA SM80 or newer")
-    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
     from cudnn.frost.workspace import Workspace
     from cudnn._torch_stream import stream_context
 
     graph, source, indices, weight, selected, output = _materialization_graph(observed=observed)
+    if padded:
+        selected.set_stride([selected.dim[-1] + 8, 1])
     route = available_routes(graph)[0]
     calls = []
     gemm_workspace_bytes = 128
@@ -1120,7 +1122,7 @@ def test_frost_materialized_gather_gemm_transport_on_hopper(observed, monkeypatc
 def test_frost_materialized_gather_rejects_alias_and_output_overlap():
     if not torch.cuda.is_available():
         pytest.skip("buffer binding checks require CUDA")
-    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
 
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     source = graph.tensor(dim=[5, 7], stride=[7, 1], data_type=cudnn.data_type.FLOAT, name="source")
@@ -1145,7 +1147,7 @@ def test_frost_materialized_gather_full_gemm_native_capture(side):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("full FROST GEMM fallback requires Blackwell")
     from cudnn.gemm.frost.engine import FrostGemmEngine
-    from cudnn.gemm.frost.materialization import MaterializedGatherPlan
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan
     from cudnn.engines.base import ExecutionContext, PlanConfig
 
     rows = 37 if side == "a" else 32
@@ -1199,7 +1201,7 @@ def test_frost_materialization_survives_fused_loader_decline(monkeypatch, compil
     from cudnn.gemm.frost import compiler
     from cudnn.gemm.frost.engine import FrostGemmEngine
     from cudnn.gemm.frost.heuristics import analyze_facts, recommend
-    from cudnn.gemm.frost.materialization import MaterializedGatherPlan
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan
     from cudnn.gemm.frost.tile_config import by_name
     from cudnn.engines.base import ExecutionContext, PlanConfig
 
@@ -1244,7 +1246,7 @@ def test_frost_materialization_survives_fused_loader_decline(monkeypatch, compil
 def test_frost_materialized_integer_gather_strided_output(dtype):
     if not torch.cuda.is_available():
         pytest.skip("materialized gather requires CUDA")
-    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
 
     dt = cudnn.data_type.INT32 if dtype == torch.int32 else cudnn.data_type.INT64
     graph = cudnn.pygraph(io_data_type=dt, compute_data_type=cudnn.data_type.FLOAT)
