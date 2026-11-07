@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+Paged live-page counts are scalar integer arithmetic. Preserve the existing
+`(length + page_size - 1) // page_size` expression in persistent loaders:
+CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations
+and fail with an illegal `cute.derefine`, even when both inputs are scalar.
+The page8 case in `TestNativeSingleQPaged` exercises the initial and next-work
+page counts. For an opaque compiler failure, retain the module after the
+failing pass with line information; raw pre-pass IR can point at unrelated
+constants with the same value.
+
 **Rule S1 — Respect the declared Stats (LSE) packing: packed and explicitly
 padded Stats are different contracts.**
 
@@ -992,6 +1001,23 @@ for the old message.
 
 ## Prepared THD launch bounds and setup
 
+Optional TMA descriptors at a kernel boundary must retain their grid-constant
+ABI: use `Optional[cutlass.GridConstant[TensorMap]]` when a specialization
+passes `None`. Removing the annotation can let the paged specialization pass
+while the dense TMA path traps with an illegal instruction. Run the existing
+`test_sm120_prepared_rebind_strides_and_storage` dense control alongside
+`test_sdpa_fwd_paged_sm120.py` whenever changing this boundary.
+
+Compiled host defaults must be serializable by `compiled_cache._json_plain`.
+A tuple default such as `table_strides=(0, 0)` silently prevents artifact
+persistence, even when normal execution passes. Use `None` for optional runtime
+metadata defaults and supply the actual tuple through the binder. Run
+`test_f16_host_entries_carry_only_record_reproducible_defaults` and the affected
+flavor's `TestNativeHalfStrides::test_artifact_reload`. D256 also needs
+`test_prefill_artifact_reload`: the short-Q fixture selects the separate decode
+host. The prefill test asserts its actual module; both tests forbid JIT in the
+second process and check output after replay.
+
 Ragged-offset integer widths are compiled pointer-ABI facts. Include the whole
 per-port dtype tuple in the prepared artifact key, alongside origin strides and
 multipliers. A valid second plan can otherwise read INT64 offsets as INT32 (or
@@ -1441,6 +1467,20 @@ logical scale and reject a runtime sign change. Zero is a logical zero scale,
 not a request to reuse the plan's scale. `test_graph_thd_nonpositive_scale_and_replay`
 checks zero/negative scales, keyless rows and changed-V replay.
 
+
+A paged producer that zero-fills invalid rows must not also run legacy
+compute-warp tail sanitation. Multiple compute warps can then overwrite V
+while another warp reads it through `ldmatrix`, even when the stores repeat
+zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
+and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
+For per-thread `cp.async` production, use an async-tracked mbarrier arrival
+(`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
+rather than publishing those copies with an ordinary mbarrier arrival. The
+qualified SM120 loader also retains producer-local commit/wait-group completion:
+an async-arrival-only variant passed numerics but failed the same racecheck.
+Do not remove that drain without rerunning the native sanitizer/capture cases.
+See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+and run the native paging racecheck as well as memcheck and numerical replay.
 
 Paged pool layout is per operand. A logical `(pages, heads, page_size, dim)`
 shape does not imply physical HND storage; singleton head axes can make two

@@ -270,7 +270,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         #   10 sm100_d192_d128_mxfp8
         slots={
             "sdpa_fwd_prefill_sm120": EngineSlot(5),
-            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
+            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7),
             "sdpa_fwd_prefill_sm80": EngineSlot(8),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
@@ -279,7 +279,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
-            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18, opt_in=True),
+            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18),
             # Append SM89 after the upstream slots; shipped IDs stay fixed.
             "sdpa_fwd_prefill_sm89": EngineSlot(19, opt_in=True),
         },

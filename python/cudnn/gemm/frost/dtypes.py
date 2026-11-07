@@ -188,6 +188,9 @@ def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
     vsize = vec_bytes // DTYPE_BYTES[chain.output_dtype]
     for aux in chain.aux_tensors:
         aeb = DTYPE_BYTES[aux.dtype]
+        if aux.coordinate_mapped:
+            reqs[aux.name] = aeb  # scalar strided loads; no vector alignment promise
+            continue
         if aux.bcast_mode in ("per_col", "per_elem"):
             reqs[aux.name] = min(tensor_alignment(aux.dim, aux.stride, aeb), vsize * aeb)
             if isinstance(chain.moe, MoeSwapAbSpec):

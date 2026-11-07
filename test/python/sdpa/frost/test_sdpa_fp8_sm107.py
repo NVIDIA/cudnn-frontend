@@ -2284,3 +2284,49 @@ class TestNativePagedNarrow:
 
     test_admission_and_record = staticmethod(_checks.test_admission_and_record)
     test_origins_rebind_and_replay = staticmethod(_checks.test_origins_rebind_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD256PhysicalOrigins:
+    """Exercise native unsplit physical origins from the architecture CI entry."""
+
+    from native_d256_origins_sm107_checks import test_native_d256_independent_origins
+
+    test_native_d256_independent_origins = staticmethod(test_native_d256_independent_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeSingleQ:
+    """Explicit one-Q configuration through the native CI entry."""
+
+    import native_single_q_sm107_checks as _checks
+
+    test_one_q_origins = staticmethod(_checks.test_one_q_origins)
+    test_one_q_public_identity_and_domain = staticmethod(_checks.test_one_q_public_identity_and_domain)
+    test_one_q_forced_rescale = staticmethod(_checks.test_one_q_forced_rescale)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeSingleQPaged:
+    """Exercise explicit paged one-Q topology from the architecture CI entry."""
+
+    from native_single_q_paged_sm107_checks import test_paged_one_q_origins
+
+    test_paged_one_q_origins = staticmethod(test_paged_one_q_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeCausalZeroTail:
+    """Run causal suffix and phase-reuse checks in the native CI entry."""
+
+    from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
+
+    test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)

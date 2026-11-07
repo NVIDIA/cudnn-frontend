@@ -16,7 +16,7 @@ import torch
 
 from cudnn.engines import ExecutionContext
 from cudnn.gemm.frost.engine import _FrostGemmPlan
-from cudnn.gemm.frost.fusion_ir import swap_ab
+from cudnn.gemm.frost.fusion_ir import Axis, swap_ab
 from cudnn.gemm.frost.graph_analyzer import analyze, analyze_with_binding, swap_ab_binding
 from cudnn.gemm.frost.layouts import OperandView, ViewStep, reshape_layout
 from cudnn.gemm.frost.sm100 import compiler, epilogue_codegen
@@ -93,6 +93,26 @@ def _pack(graph, tensors, buffers):
         [list(buffers[key].shape) for key in tensors],
         [list(buffers[key].stride()) for key in tensors],
     )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("position", ["plain", "before", "after"])
+def test_frost_gen_index_operand_view_coordinates(position):
+    """Indices before/after fixed reshape retain their original logical axes."""
+    graph = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=FP32, compute_data_type=FP32)
+    shape = (2, 128, 64) if position == "plain" else (2, 2, 64, 64)
+    a = graph.tensor(name="A", dim=list(shape), stride=[prod(shape[i + 1 :]) for i in range(len(shape))])
+    value = graph.gen_index(input=a, axis=1).set_data_type(BF16) if position == "before" else a
+    if position != "plain":
+        value = graph.reshape(input=value).set_dim([2, 128, 64]).set_stride([8192, 64, 1])
+    if position != "before":
+        value = graph.gen_index(input=value, axis=1).set_data_type(BF16)
+    b = graph.tensor(name="B", dim=[2, 64, 128], stride=[8192, 128, 1])
+    graph.matmul(A=value, B=b).set_output(True)
+    graph.validate()
+    chain = analyze(graph)
+    expr = chain.mainloop_a_ops[0].index_expr
+    assert expr.evaluate({Axis.BATCH: 1, Axis.M: 77, Axis.K: 17}) == (77 if position in ("plain", "after") else 77 // 64)
 
 
 @pytest.mark.L0

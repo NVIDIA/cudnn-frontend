@@ -108,7 +108,9 @@ def test_grouped_gemm_wgrad_preserves_legacy_positional_prefix(callable_obj, leg
 @pytest.mark.L0
 @pytest.mark.parametrize("discrete", [False, True], ids=["bf16-dense", "bf16-discrete"])
 def test_grouped_gemm_wgrad_wrapper_bf16(discrete):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
 
     problem = make_grouped_gemm_wgrad_bf16_problem(discrete=discrete)
@@ -1223,7 +1225,9 @@ def test_grouped_gemm_wgrad_bf16_rejects_sf_fp8_dtype_override():
     so merely adding the parameter once broke every BF16 call with a TypeError,
     which a rejection-only test would not have caught.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
     problem = make_grouped_gemm_wgrad_bf16_problem(discrete=False)
     kwargs = dict(

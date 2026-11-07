@@ -28,6 +28,7 @@ add_executable(
     serialize.cpp
     validate.cpp
     version.cpp
+    numerical_notes.cpp
     tensor.cpp
     autotune.cpp
     autotune_workspace.cpp

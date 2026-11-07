@@ -1,5 +1,41 @@
 # test — Agent Guide
 
+For new numerical APIs and kernel paths, use the
+[determinism skill](../skills/determinism_tests/SKILL.md) to add/run L0 tests and update API support.
+For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
+and the [coverage table](python/determinism_goldens/README.md).
+The shared comparator checks bytes, tensor names, shapes, and dtypes. Clone each
+result before the next launch so reused storage cannot make replay pass.
+For backward batch checks, slice fixed upstream gradients with the inputs;
+do not use a batch-mean loss. GDP expands K/V/beta by `num_householder`, while
+Q/G remain on the token axis. QSA packing must shift token and block metadata
+and retain each sequence's selection mask. Validate these mappings with all
+gradients, not only dQ/dK.
+Name parameter IDs with direction, dtype, and shape where applicable. Report
+collected cases separately from replay executions. Include tile/routing
+boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
+and isolated upstream-gradient sources when the operation supports them.
+Keep these determinism suites in L0, including stress cases.
+For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
+invalid after packing. Use unique active indices for deterministic backward.
+The sink gradient is shared across sequences: isolate the target's upstream
+gradient before comparing it across batches. Check DSA's signed infinity
+sentinels against the expected empty rows before byte comparison.
+For indexer backward, restore the score buffers that the API mutates. Keep
+`loss_coeff / query_count` and `grad_loss` fixed across batch layouts. Compare
+all three gradients and mutated scores; test BF16 and FP32 dK separately.
+Remap global Top-K IDs when batches move and preserve negative padding.
+Keep API-by-dtype/GPU support in [the status page](../docs/operations/determinism.md).
+Put test counts, commands, runtimes, and failure diagnostics in
+[the test report](python/determinism_goldens/README.md), not the status page.
+For explicitly requested temporary skips, limit them to known failing cases,
+use a `skip until fix` reason, retain the failure report, and remove them with the fix.
+For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
+bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
+Check against dequantized inputs and include a scale-only change. Keep SM90
+FP8 and SM100/SM103/SM107 MXFP8 results separate; an architecture skip is not
+a measured pass on that architecture.
+
 MXFP8 backward's element-count allowance needs the same magnitude cap as its
 row-count allowance: an isolated large error can preserve amax and still fit
 the element budget. `assert_close_mxfp8_grad` caps every extra mismatch;
@@ -122,6 +158,7 @@ child-stage evidence.
   handle, and QSA's `test_entry_points_select_the_tensors_device_with_another_device_current`
   with delayed producer-stream fills.
 - A session-scoped autouse `cudnn_handle` fixture creates one handle bound to a dedicated stream; use it instead of creating handles per-test. Tests that rebind it must save `cudnn.get_stream(cudnn_handle)` before setup and restore that exact stream in `finally`, including setup failures/skips. Restoring `torch.cuda.current_stream()` instead leaks a different stream into later tests.
+  Eager graph calls using that handle also need producer-to-handle and handle-to-reference dependencies. Wrap its stream with `torch.cuda.ExternalStream`, wait for current-stream input updates before execution, then wait for its output before the current-stream reference. The SM80 `test_public_graph_geometry_rebind_replay` follows both edges; delaying the V update exposes the old unsynchronized eager call even when capture/replay itself is ordered correctly.
 - `pytest_configure` asserts `torch.cuda.is_available()` — there is no CPU-only mode.
 - Many custom CLI options exist (`--dryrun`, `--repro`, `--seed`, `--perf`, per-op dimension overrides like `--b/--s_q`, `--nsa-*`, `--dsa-*`); check `pytest_addoption` before adding new ones.
 - **Keep `sdpa/frost/` paths contiguous on the command line.** `sdpa/frost/conftest.py` sets `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` through an autouse fixture, because the FROST manifest rows are opt-in. Interleaving a top-level path between two `sdpa/frost/` paths — `pytest sdpa/frost/test_a.py test_dispatch.py sdpa/frost/test_b.py` — silently drops that fixture for everything after the top-level file: `_frost_opt_in` is absent from `item.fixturenames` and no FROST row is offered. Any top-level file does it, not just `test_dispatch.py`, and both contiguous orders are fine. Tests that *pin* an engine then fail loudly, but a test that `pytest.skip`s when it finds no python plan goes **falsely green**. Detector, as its own plugin so no test file changes:
@@ -169,6 +206,13 @@ prefill; a short query alone does not imply the D128 decode template.
   ```
 
 ### Conventions for new tests
+
+- Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
+  for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
+  inputs. A flat (N,) fixture can be rejected before kernel execution. Preserve
+  the eligibility guard and numerical assertions; run both existing
+  `test_frost_norm_engines.py` and `test_frost_norm_engine_e2e.py` after tightening
+  graph-shape validation.
 
 - Host-only compile-cache tests that replace `cute.compile` must also isolate
   architecture-dependent compiler options evaluated before that call. Mock
@@ -506,6 +550,13 @@ S_kv=113, reuses the artifact, and checks O and Stats. Keep head counts and
 dimensions as compile-time constants: the same binder fixes those per plan.
 
 ### Sparse score-recompute resource boundaries
+
+Metadata-only support tests must mock every architecture query reached by the
+public check. Sparse score support uses both `device_capability()` and
+`torch.cuda.get_device_capability()`; mocking just one leaves SM8 hosts failing
+before the intended boundary assertion. Run the existing `public_support`
+cases in `test_DSA_sparse_score_recompute.py` on an SM8 host as the detector.
+These tests allocate tensors but do not launch the modeled SM90/SM100 kernels.
 
 Exercise non-power-of-two TMEM slot counts and partial ring wraps across
 persistent query tiles; a full-ring single-tile case misses slot aliasing and
@@ -980,6 +1031,13 @@ host slot only for FP32 partials. Compare both main and combine frames with
 the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
+
+When sharing a native backward ABI with another architecture, retain its registered
+`BwdLaunchSpec.name` or extend every name-based native guard. The fixed backward
+binder uses that name to enable gradient-overlap checks. Pin the public engine
+identity separately, verify the emitted target, and keep a real overlapping-gradient
+negative control with unchanged output/workspace sentinels. The SM120 THD cases
+in `test_sdpa_bwd_thd_sm120.py` exercise this boundary.
 
 Exercise the actual standalone adapter as well as the prepared binder. A lower-level
 frame test can miss an incompatible metadata container built by the adapter.

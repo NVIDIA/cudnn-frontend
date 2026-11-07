@@ -58,12 +58,14 @@ from ..dtypes import (
     dense_output_layout,
     tensor_alignment,
 )
-from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
+from .epilogue_codegen import EpilogueSnippets, generate, k_pad_axes, tma_out_ready_marker, tma_out_value
 from ..fusion_ir import (
     ZERO_PRESERVING_OPS,
     FusionChain,
     MoeSwapAbSpec,
     TensorRef,
+    gemm_index,
+    is_gemm_source,
     segmented_row_scale_capacity_rows,
 )
 from ..recipe import (
@@ -129,6 +131,7 @@ from ..compiler import (
     _tma_alignment_reject,
     _alignment_reject,
     _sf_blob_reject,
+    _partial_scale_block_reject,
     _grouped_row_quant_scale_blob_reject,
     _moe_dense_layout_bad,
     _moe_operand_layout_bad,
@@ -539,6 +542,45 @@ def _l2_swizzle_budget_bytes() -> int:
     return l2_swizzle_budget_bytes()
 
 
+def _async_moe_gather_smem_bytes(cfg: TileConfig, chain: FusionChain, ab_stages: int, acc_stages: int, use_tma: bool) -> int:
+    """Mirror the plain async-GATHER templates' per-CTA allocation order."""
+    size = 0
+
+    def allocate(nbytes: int, alignment: int) -> None:
+        nonlocal size
+        size = align_up(size, alignment) + nbytes
+
+    allocate(1024, 1)  # Reserved header.
+    allocate(8 * ab_stages, 8)  # AB full.
+    allocate(8 * ab_stages, 8)  # AB empty.
+    if cfg.ctas_per_mma == 2:
+        allocate(8 * ab_stages, 8)  # Local token readiness.
+    allocate(8 * acc_stages, 8)
+    allocate(8 * acc_stages, 8)
+    if cfg.ctas_per_mma == 2:
+        allocate(8, 8)  # Paired TMEM deallocation.
+    allocate(4, 4)  # TMEM pointer.
+    allocate(64, 16)  # Two eight-word scheduler slots.
+    allocate(16, 8)  # Scheduler full.
+    allocate(16, 8)  # Scheduler empty.
+    allocate(8, 16)  # Broadcast slots.
+    allocate(16, 8)  # Broadcast full.
+    if math.prod(cfg.cluster_shape) > 1:
+        allocate(8, 8)  # Broadcast acknowledgments.
+    m, n, _ = cfg.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
+    for _ in range(chain.num_a_operands):
+        allocate(m * cfg.cta_tile_k_bytes * ab_stages, 1024)
+    for _ in range(chain.num_b_operands):
+        allocate(n * cfg.cta_tile_k_bytes * ab_stages, 1024)
+    token_operands = chain.num_b_operands if isinstance(chain.moe, MoeSwapAbSpec) else chain.num_a_operands
+    for _ in range(token_operands):
+        allocate(128, 128)  # Retained token tensor-map scratch.
+    if use_tma:
+        allocate(_smem_d_bytes(cfg, chain) - 16, 1024)
+        allocate(128 * (1 if cfg.workspace_split_k else len(_tma_slots_for(chain, cfg))), 128)
+    return size
+
+
 def _render_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
@@ -603,7 +645,21 @@ def _render_tile_constants(
     b_lbo, b_sbo, b_k_step, b_tma_group_elems = _smem_desc_params(chain.matmul.b_major == "n", cta_smem_n, "N")
     a_smem_m_step_bytes = (cta_smem_m // cfg.mma_size_m) * cfg.cta_tile_k_bytes
     a_mcast_slices, b_mcast_slices, ab_empty_full_mask = _mcast_slice_plan(chain, cfg)
+    multicast_a, multicast_b = cfg.multicast_a, cfg.multicast_b
+    if tmpl.async_gather:
+        # Software token copies are local; only expert weights use multicast.
+        if isinstance(chain.moe, MoeSwapAbSpec):
+            multicast_b, b_mcast_slices = False, 1
+        else:
+            multicast_a, a_mcast_slices = False, 1
+    gather_token_rows = 0
+    if chain.has_moe and chain.moe.mode == "gather":
+        # Plain GATHER has no token SF consumer: cache only the data slice
+        # this CTA loads, including just its own N half under swapped 2-CTA MMA.
+        gather_token_rows = cta_smem_n // b_mcast_slices if isinstance(chain.moe, MoeSwapAbSpec) else cta_smem_m // a_mcast_slices
+    gather_index_bytes = 0 if tmpl.async_gather else align_up(gather_token_rows * 4, 128)
 
+    ab_stages = cfg.max_ab_stages(smem_fixed_reserve=smem_fixed_reserve)
     lines = [
         f"# Tile config: {cfg.name}",
         f"mma_inst_shape_mnk = {cfg.mma_tile_mnk(elem_bytes)}",
@@ -622,13 +678,14 @@ def _render_tile_constants(
         f"b_is_n_major = {chain.matmul.b_major == 'n'}",
         f"mma_a_major = {1 if chain.matmul.a_major == 'm' else 0}",
         f"mma_b_major = {1 if chain.matmul.b_major == 'n' else 0}",
-        f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=smem_fixed_reserve)}",
+        f"ab_stages = {ab_stages}",
         f"b_collector_ok = {_b_collector_ok(cfg)}",
-        f"multicast_a = {cfg.multicast_a}",
-        f"multicast_b = {cfg.multicast_b}",
+        f"multicast_a = {multicast_a}",
+        f"multicast_b = {multicast_b}",
         f"a_mcast_slices = {a_mcast_slices}",
         f"a_tma_box_m = {_a_tma_box_m(cfg, a_mcast_slices)}",
         f"b_mcast_slices = {b_mcast_slices}",
+        f"gather_token_rows = {gather_token_rows}",
         f"ab_empty_full_mask = {ab_empty_full_mask}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
@@ -658,6 +715,13 @@ def _render_tile_constants(
         f"mma_kind = {DTYPE_TO_MMA_KIND[mma_a_dt]}",
         *_epi_swizzle_lines(cfg, epi_store_dt, chain),
     ]
+    if tmpl.async_gather:
+        lines.extend(
+            [
+                f"num_token_operands = {chain.num_b_operands if isinstance(chain.moe, MoeSwapAbSpec) else chain.num_a_operands}",
+                f"gather_swizzle_bits = {int(math.log2(cfg.cta_tile_k_bytes // 16))}",
+            ]
+        )
     lines.append(f"tile_swizzle_n = {1 if fallback_cluster is not None else 0}")
     lines.append(f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}")
     lines.append(f"num_gemms = {chain.num_gemms}")
@@ -694,13 +758,16 @@ def _render_tile_constants(
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
+        lines.append(
+            f"mainloop_needs_coordinates = {any(op.index_expr is not None or op.operand_access is not None for op in (*chain.mainloop_a_ops, *chain.mainloop_b_ops))}"
+        )
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
         # Per-K aux indexing needs ml_L in logical order, not the physical
         # swizzled SMEM address. The K-OOB path already provides that access.
         koob_fix = (
-            any(aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
+            any(aux.coordinate_mapped or aux.bcast_mode == "per_k" for aux in chain.aux_tensors)
             or not _mainloop_chain_zero_preserving(chain.mainloop_a_ops)
             or not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
         )
@@ -743,11 +810,11 @@ def _render_tile_constants(
             cast_extra_per_stage += cfg.cta_tile_m * k_elems * DTYPE_BYTES[chain.mainloop_a_load_dtype]
         if chain.mainloop_b_cast:
             cast_extra_per_stage += smem_n * k_elems * DTYPE_BYTES[chain.mainloop_b_load_dtype]
-    if smem_d_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0:
+    if smem_d_bytes > 0 or gather_index_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0:
         try:
             new_ab = cfg.max_ab_stages(
                 smem_fixed_reserve=smem_fixed_reserve,
-                extra_smem_bytes=smem_d_bytes,
+                extra_smem_bytes=smem_d_bytes + gather_index_bytes,
                 extra_per_stage_bytes=cast_extra_per_stage + mg_extra_per_stage,
             )
         except ValueError as exc:
@@ -757,8 +824,26 @@ def _render_tile_constants(
                 ) from exc
             raise
         lines.append(
-            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage" f" + multi-GEMM {mg_extra_per_stage}B/stage"
+            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed"
+            f" + gather indices {gather_index_bytes}B fixed"
+            f" + cast LOAD {cast_extra_per_stage}B/stage"
+            f" + multi-GEMM {mg_extra_per_stage}B/stage"
         )
+        ab_stages = new_ab
+    if tmpl.async_gather:
+        # Dropping the route-index cache can make another stage fit the byte
+        # sum while individually aligned operand rings exceed real capacity.
+        # Keep the original depth when it fits, otherwise trim only as needed.
+        from ..tile_config import smem_ab_budget_bytes
+
+        budget = smem_ab_budget_bytes(0)
+        fitted_ab = ab_stages
+        while fitted_ab and _async_moe_gather_smem_bytes(cfg, chain, fitted_ab, acc_stages, use_tma) > budget:
+            fitted_ab -= 1
+        if not fitted_ab:
+            raise NotImplementedError(f"async MoE GATHER {cfg.name!r}: no AB stage fits in SMEM including buffer alignment and metadata")
+        if fitted_ab != ab_stages:
+            lines.append(f"ab_stages = {fitted_ab}  # Fit individually aligned async-GATHER buffers and metadata.")
     lines.extend(_quant_device_imports(chain))
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
     return "\n".join(lines)
@@ -1067,6 +1152,16 @@ def _render_block_scale_tile_constants(
     na, nb = chain.num_a_operands, chain.num_b_operands
     real_na = 0 if bs.fake_dequant_a else na
     real_nb = 0 if bs.fake_dequant_b else nb
+    smem_fixed_reserve = tmpl.smem_fixed_reserve
+    if tmpl.async_gather:
+        # Tensor-map slots grow with the distinct token operands and outputs.
+        # Two KiB cover the static allocation and the bounded scheduler/TMEM/
+        # barrier metadata, including both local-ready arrays at 16 AB stages.
+        # Do not charge every small graph a fixed eight-KiB header, or a narrow
+        # multi-GEMM tile can lose its last AB stage on a 227-KiB device.
+        token_descs = nb + real_nb if isinstance(chain.moe, MoeSwapAbSpec) else na + real_na
+        desc_bytes = 128 * (token_descs + len(_tma_slots_for(chain, cfg)))
+        smem_fixed_reserve = max(smem_fixed_reserve, align_up(2048 + desc_bytes, 1024))
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
     if is_sm103:
         sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
@@ -1142,9 +1237,32 @@ def _render_block_scale_tile_constants(
 
     epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else _combine_smem_bytes(chain, cfg)
     ab_reserved = epi_reserved + _cluster_split_k_smem_bytes(chain, cfg)
+    # A K tile can start inside a 16-byte SF window. Reserve enough aligned
+    # windows for every possible start, including non-power-of-two SF widths.
+    gather_sf_row_bytes = align_up(sf_k + 16 - math.gcd(sf_k, 16), 16)
+    gather_stage_bytes = 0
+    gather_scratch_before_rings = False
+    gather_token_rows = 0
+    gather_sf_rows = 0
     if chain.has_moe and chain.moe.mode == "gather":
         token_rows, token_sfs = (cta_n, real_nb) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, real_na)
-        ab_reserved += token_rows * 32 * token_sfs
+        # Local GATHER packs whole SF atoms, including zero rows beyond a
+        # narrow token tile. Four copy/pack warps each own complete 32-row strips.
+        gather_token_rows = token_rows
+        gather_sf_rows = align_up(token_rows, 128) if tmpl.async_gather else token_rows
+        if token_sfs or not tmpl.async_gather:
+            # Raw routing indices are shared; operand-specific source bounds
+            # are checked when each SF operand consumes them.
+            ab_reserved += align_up(token_rows * 4, 128)
+        # Only logical tile rows need linear scratch. The pack warps synthesize
+        # zero words for the rest of a narrow tile's 128-row SF atom.
+        scratch_bytes = token_sfs * align_up(token_rows * gather_sf_row_bytes, 128)
+        if tmpl.async_gather:
+            # Each AB slot owns its linear SF scratch until the corresponding
+            # MMA completes. One lane-level completion barrier accompanies it.
+            gather_stage_bytes = scratch_bytes + 8
+        else:
+            ab_reserved += scratch_bytes
     if is_sm103:
         sf_stages = 6
         a_chunk_bytes = cta_m * 128
@@ -1153,7 +1271,7 @@ def _render_block_scale_tile_constants(
         sfb_group_bytes = cta_n * 12
         sf_ring_bytes = sf_stages * (na * sfa_group_bytes + nb * sfb_group_bytes)
         per_ab_stage = na * a_chunk_bytes + nb * b_chunk_bytes
-        ab_stages = smem_ab_stages(per_ab_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved + sf_ring_bytes)
+        ab_stages = smem_ab_stages(per_ab_stage, smem_fixed_reserve=smem_fixed_reserve, extra_smem_bytes=ab_reserved + sf_ring_bytes)
         if ab_stages < 3:
             raise NotImplementedError(
                 f"block-scale {cfg.name!r}: only {ab_stages} 128-B AB chunk " f"stages fit in SMEM — the sm103 pipeline needs >= 3 (one " f"K-tile in flight)"
@@ -1162,25 +1280,44 @@ def _render_block_scale_tile_constants(
         budget_stages = ab_stages
     else:
         ring_stage_bytes = [sfa_smem_bytes] * real_na + [sfb_smem_bytes] * real_nb + [cta_m * a_cta_k_bytes] * na + [(cta_n // cta_group) * b_cta_k_bytes] * nb
-        ab_stages = smem_ab_stages(sum(ring_stage_bytes), smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=ab_reserved)
-        smem_budget = smem_ab_budget_bytes(tmpl.smem_fixed_reserve)
-        while ab_stages:
-            ring_bytes = 0
-            for stage_bytes in ring_stage_bytes:
-                ring_bytes = align_up(ring_bytes, 1024) + stage_bytes * ab_stages
-            if use_tma_store_epi and chain.moe is None:
-                ring_bytes = align_up(ring_bytes, 1024)
-            if ring_bytes + ab_reserved <= smem_budget:
-                break
-            ab_stages -= 1
+
+        def _fit_ab_stages(reserve: int) -> int:
+            stages = smem_ab_stages(sum(ring_stage_bytes) + gather_stage_bytes, smem_fixed_reserve=reserve, extra_smem_bytes=ab_reserved)
+            budget = smem_ab_budget_bytes(reserve)
+            while stages:
+                ring_bytes = 0
+                for stage_bytes in ring_stage_bytes:
+                    ring_bytes = align_up(ring_bytes, 1024) + stage_bytes * stages
+                if use_tma_store_epi and chain.moe is None:
+                    ring_bytes = align_up(ring_bytes, 1024)
+                if ring_bytes + ab_reserved + gather_stage_bytes * stages <= budget:
+                    break
+                stages -= 1
+            return stages
+
+        # Keep the established GATHER stage-selection headroom when it fits:
+        # filling the last few KiB with another stage can hurt producer/store
+        # balance. Actual metadata remains the capacity floor, so this tuning
+        # preference cannot exclude a narrow or multi-GEMM configuration.
+        stage_reserve = max(smem_fixed_reserve, 8192) if tmpl.async_gather else smem_fixed_reserve
+        ab_stages = _fit_ab_stages(stage_reserve)
+        if ab_stages == 0 and stage_reserve != smem_fixed_reserve:
+            ab_stages = _fit_ab_stages(smem_fixed_reserve)
         if ab_stages < 1:
             raise NotImplementedError(f"block-scale {cfg.name!r}: no AB stage fits in SMEM including buffer alignment padding")
 
-        def _desc_roots(stages: int) -> dict[str, int]:
+        def _desc_roots(stages: int, *, scratch_first: bool = False) -> dict[str, int]:
             """Mirror shared-memory allocation order for descriptor validation."""
             return _block_scale_smem_desc_roots(
-                header_bytes=tmpl.smem_fixed_reserve
-                + (epi_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES or _use_swap_bulk_combine(chain, cfg) else 0),
+                header_bytes=smem_fixed_reserve
+                + (
+                    epi_reserved
+                    if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES
+                    or (tmpl.async_gather and (cta_group == 1 or isinstance(chain.moe, MoeSwapAbSpec)))
+                    or _use_swap_bulk_combine(chain, cfg)
+                    else 0
+                )
+                + (gather_stage_bytes * stages if scratch_first else 0),
                 rings=[
                     *((f"SFA[{i}]", sfa_smem_bytes * stages) for i in range(real_na)),
                     *((f"SFB[{j}]", sfb_smem_bytes * stages) for j in range(real_nb)),
@@ -1203,6 +1340,15 @@ def _render_block_scale_tile_constants(
                 _TCGEN05_DESC_BUILD_ADDR_LIMIT,
                 desc_roots,
             )
+        if tmpl.async_gather and gather_stage_bytes:
+            # Prefer the original low-offset scratch layout: moving the SF
+            # copy/pack scratch behind large operand rings can slow that path.
+            # Keep the selected stage count and move scratch only when needed
+            # to preserve the descriptor roots' fourteen-bit address range.
+            early_roots = _desc_roots(ab_stages, scratch_first=True)
+            if max(early_roots.values()) < _TCGEN05_DESC_BUILD_ADDR_LIMIT:
+                gather_scratch_before_rings = True
+                desc_roots = early_roots
         _check_block_scale_desc_roots(cfg, ab_stages, desc_roots)
 
     out_dt = chain.output_dtype
@@ -1252,7 +1398,7 @@ def _render_block_scale_tile_constants(
         f"cgrp_tile_m = {cta_m * cfg.cga_size_m}",
         f"cgrp_tile_n = {cta_n * cfg.cga_size_n}",
         f"epi_tile_mn = {(cfg.epi_tile_m, _epi_n_for_chain(cfg, chain))}",
-        f"threads_per_cta = {cfg.threads_per_cta}",
+        f"threads_per_cta = {tmpl.warps_per_cta * 32 if tmpl.warps_per_cta is not None else cfg.threads_per_cta}",
         f"cluster_shape_mnk = {cfg.cluster_shape}",
         f"cluster_k_reduce = {cfg.cluster_k_reduce}",
         f"cluster_reduce_elems = {_cluster_split_k_chunk_elems(chain, cfg) if cfg.cluster_k_reduce else 0}",
@@ -1314,6 +1460,10 @@ def _render_block_scale_tile_constants(
         f"b_fake_dtype = {DTYPE_TO_CUTLASS[bs.b_dtype]}",
         f"a_packed_per_row = {a_packed_per_row}",
         f"b_packed_per_row = {b_packed_per_row}",
+        f"a_gather_swizzle_bits = {int(math.log2(min(a_cta_k_bytes, 128) // 16))}",
+        f"b_gather_swizzle_bits = {int(math.log2(min(b_cta_k_bytes, 128) // 16))}",
+        f"a_gather_copy_bytes = {8 if padded_fp4 and a_data_elem_bits == 4 else 16}",
+        f"b_gather_copy_bytes = {8 if padded_fp4 and b_data_elem_bits == 4 else 16}",
         f"sA_packed_elems = {sA_packed_elems}",
         f"sB_packed_elems = {sB_packed_elems}",
         f"sA_tma_bytes = {cta_m * cta_k_elems * a_data_elem_bits // 8}",
@@ -1368,6 +1518,10 @@ def _render_block_scale_tile_constants(
         f"block_size = {bs.block_size}",
         f"sf_cutlass_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype]}",
         f"sf_scales_per_inst = {scales_per_inst}",
+        f"gather_sf_row_bytes = {gather_sf_row_bytes}",
+        f"gather_scratch_before_rings = {gather_scratch_before_rings}",
+        f"gather_token_rows = {gather_token_rows}",
+        f"gather_sf_rows = {gather_sf_rows}",
         f"sf_insts_per_atom = {insts_per_word}",
         f"num_sf_atoms = {num_sf_words}",
         f"word_atoms = {word_atoms}",
@@ -1900,6 +2054,8 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     """View a broadcast-aux runtime tensor to the fake's rank/unit-dim layout so the tvm-ffi front door's ndim/shape check accepts it."""
     if not _TVM_FFI_OK:
         return t
+    if ref.coordinate_mapped:
+        return t
     real = _aux_fake_real_axes(ref)
     if len(t.shape) == len(real):
         return t
@@ -1930,6 +2086,7 @@ class CompiledFusedGemm(_CompiledFusedGemm[TileConfig, GemmBinding]):
     """Execute a compiled fused GEMM."""
 
     _compiler = sys.modules[__name__]
+    _validate_whole_scale_blocks = True
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2129,6 +2286,21 @@ def _epi_n(cfg, out_dt: str) -> int:
 
 def _epi_n_for_chain(cfg, chain: FusionChain) -> int:
     """Chain-aware drain width."""
+    from ..kernel_registry import _use_async_gather
+
+    if (
+        chain.has_block_scale
+        and _use_async_gather(chain, cfg)
+        and not isinstance(chain.moe, MoeSwapAbSpec)
+        and chain.output_dtype == "fp4_e2m1"
+        and chain.num_gemms <= 2
+        and len(chain.output_specs) == 1
+        and chain.matmul.N % 64 == 0
+        and _epi_tile_cols(cfg) % 64 == 0
+    ):
+        # A 64-column drain amortizes the SF and data stores without changing
+        # the sixteen-element quantization groups or their arithmetic.
+        return 64
     if _use_swap_bulk_combine(chain, cfg):
         # Logical token batch, staged across two 64-column TMEM loads.
         return 128
@@ -2691,6 +2863,16 @@ def _precheck_moe(
     _check_own_family(select_template(chain, config))
 
 
+def _check_whole_scale_blocks(chain: FusionChain) -> None:
+    """Decline a block-scale K that ends inside a scale block.
+
+    The fp8 TMA rule admits K % 32 == 16, but the block-scale templates size the F8_128x4
+    scale-factor view from floor(K / block_size) scales per row."""
+    reason = _partial_scale_block_reject(chain.matmul.K, chain.block_scale.block_size)
+    if reason is not None:
+        raise NotImplementedError(reason)
+
+
 def _precheck_block_scale(
     chain: FusionChain,
     config: TileConfig,
@@ -2699,6 +2881,7 @@ def _precheck_block_scale(
 
     _check_block_scale_supported(chain, config.pipeline)
     _check_input_alignment(chain)
+    _check_whole_scale_blocks(chain)
     _epi_pipelines = ("sm100",)
     if chain.reductions:
         if config.pipeline not in _epi_pipelines:
@@ -2726,6 +2909,8 @@ def _precheck_moe_block_scale(
     from ..kernel_registry import GraphType, mma_arch_reject, select_template
 
     _check_executable(chain)
+    # Ahead of mma_arch_reject, whose GATHER token-SF check would name a floor(K / block_size) shape.
+    _check_whole_scale_blocks(chain)
     reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
@@ -2760,10 +2945,44 @@ def precheck_path(
         _precheck_plain(chain, config)
 
 
+# Scale-factor types without a sign bit: ``is_negative_scale`` cannot change their values.
+_SIGN_FREE_SF_DTYPES = frozenset({"fp8_e8m0", "fp8_e5m3"})
+
+
+def _check_block_scale_sign(state: dict) -> None:
+    """Decline ``block_scale_dequantize(is_negative_scale=True)`` on scale factors that can be negative.
+
+    The shared analyzer records the attribute, but no chain field carries it. The tcgen05 block-scale
+    MMA takes every scale factor as an unsigned ``.ue4m3`` / ``.ue8m0`` operand, so a block with
+    ``s < 0`` would contribute ``x * |s|`` where the attribute asks for ``x * s``. A sign-free scale
+    cannot be negative, so the attribute changes nothing there. Same rule as the sm120 tree (#2015)."""
+    meta = state["tensor_meta"]
+    for op in state["ops"]:
+        if op.cudnn_name != "block_scale_dequantize" or not op.is_negative_scale:
+            continue
+        sf = meta[op.inputs[1]]
+        if sf.dtype not in _SIGN_FREE_SF_DTYPES:
+            raise NotImplementedError(
+                f"block_scale_dequantize {op.op_name!r} sets is_negative_scale=True on its {sf.dtype} scale factors "
+                f"{sf.name!r}, which the sm100 block-scale MMA cannot honor: it reads every scale as an unsigned "
+                ".ue4m3 / .ue8m0 value, so a negative scale would be applied as its magnitude"
+            )
+
+
+def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | None]":
+    """Analyze the graph and decline attributes the sm100 templates cannot honor."""
+    from ..graph_analyzer import _analyze_state, _state_from_graph
+
+    state = _state_from_graph(graph)
+    chain, binding = _analyze_state(state)
+    _check_block_scale_sign(state)
+    return chain, binding
+
+
 def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT ``cute.compile``."""
     probe_cutedsl()
-    chain, _binding = analyze_with_binding(graph)
+    chain, _binding = _analyze_graph(graph)
     if config is None:
         config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), shapes_fixed=_graph_shapes_fixed(graph))
     probe_chain(chain, config)
@@ -2779,6 +2998,44 @@ def probe_cutedsl() -> None:
         raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
 
 
+# Epilogue ops the shared emitter computes in Int32 (relu and leaky_relu convert
+# their float attributes to int32). The others use Float32-only CuTe DSL math
+# (floor in the comparison, logical, mod and backward step forms; exp2, rcp,
+# log, erf, sin, cos, sqrt, pow), which raises TypeError or a DSL error out of
+# cute.compile instead of declining. div is served: the shared emitter emits
+# arith.divsi (signed truncating division) for an Int32 div, not the `/` that
+# lowers to a Float32 remainder.
+_INT32_COMPUTE_OPS = frozenset(
+    ("identity", "relu", "leaky_relu", "abs", "neg", "add", "sub", "mul", "div", "max", "min", "add_square", "binary_select", "gen_index", "aux_load")
+)
+# The epilogue converts an int32-compute op's inputs and result with a direct
+# .to() between Int32 and their declared dtype, with no Float32 detour; between
+# Int32 and a Float8 type that cast does not compile.
+_INT32_COMPUTE_NO_CAST_DTYPES = ("fp8_e4m3", "fp8_e5m2", "fp8_e8m0")
+
+
+def _check_int32_compute(chain: FusionChain) -> None:
+    """Decline an epilogue op that computes in int32 but has no int32 emitter, or
+    whose inputs or output would need an int32 <-> fp8 conversion."""
+    for i, op in enumerate(chain.ops):
+        if op.compute_dtype != "int32":
+            continue
+        if op.op not in _INT32_COMPUTE_OPS:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32, which the sm100 epilogue emits only for {', '.join(sorted(_INT32_COMPUTE_OPS))}"
+            )
+        # The values the op reads: gen_index reads only its input's shape, and aux_load has no producing input.
+        refs = [op.parent_idx_b, op.parent_idx_c] + ([] if op.op in ("gen_index", "aux_load") else [op.resolved_parent_idx(i)])
+        dtypes = [chain.gemm_out_dtype(gemm_index(ref)) if is_gemm_source(ref) else chain.ops[ref].out_dtype for ref in refs if ref is not None]
+        if op.aux is not None:
+            dtypes.append(chain.aux_by_name(op.aux).dtype)
+        fp8 = sorted({dtype for dtype in (*dtypes, op.out_dtype) if dtype in _INT32_COMPUTE_NO_CAST_DTYPES})
+        if fp8:
+            raise NotImplementedError(
+                f"pointwise op {i} ({op.op!r}) computes in int32 but reads or writes {' and '.join(fp8)}; the sm100 epilogue has no int32 <-> fp8 conversion"
+            )
+
+
 def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     """Check support for one fusion chain and explicit configuration."""
     if config.swap_ab:
@@ -2788,6 +3045,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_executable(chain)
     _check_splitk_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
@@ -2849,7 +3107,7 @@ def jit_from_cudnn_graph(
     config: TileConfig = DEFAULT_CONFIG,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel."""
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _analyze_graph(graph)
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 
@@ -2858,6 +3116,7 @@ def jit_from_cudnn_graph(
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
         raise NotImplementedError(_dtype_reason)
+    _check_int32_compute(chain)
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
     _check_splitk_supported(chain, config)
@@ -2966,6 +3225,18 @@ def _launch_moe_swap_ab(
     return compiled._launch_moe(problem, offsets, workspace, (*a, *b, *sf), c, aux, stream, token_index, token_ks, top_k_scores)
 
 
+def _k_pad_launchable(chain: FusionChain, config: TileConfig, render, generate_kwargs: dict):
+    """``(launchable, axes)``: the plan's second kernel, built with the F8_128x4 K-padding stores, and the quantized axes
+    that decide it (:func:`~.epilogue_codegen.k_pad_axes`) -- or ``(None, ())`` when no output can end a scale row inside a
+    quad. The plan's first kernel is the epilogue without those stores; the launch takes this one only at extents that
+    end some scale row inside a quad, so a whole-quad call runs exactly the unpadded kernel."""
+    axes = k_pad_axes(chain)
+    if not axes:
+        return None, ()
+    src = render(chain, generate(chain, **generate_kwargs, k_padding=True), config)
+    return _import_kernel(src).compile(), axes
+
+
 def _jit_moe(
     chain: FusionChain,
     config: TileConfig,
@@ -2976,15 +3247,16 @@ def _jit_moe(
     _precheck_moe(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    snippets = generate(chain, **generate_kwargs)
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, _render_template, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
@@ -2995,6 +3267,8 @@ def _jit_moe(
         device=_plan_device(),
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         _grid_ctas=grid_ctas,
         aux_names=[aux.name for aux in chain.aux_tensors],
         binding=binding,
@@ -3009,17 +3283,18 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
     """Build exactly the reduction strategy named by the config."""
     store_modes = _store_modes(chain, config)
     use_tma = _use_tma_store_epi(chain, config)
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset({0}) if (config.workspace_split_k and use_tma) else frozenset(i for i, mode in enumerate(store_modes) if mode == "tma"),
         packed_lanes=_epi_packed_lanes(config),
         workspace_split_k=config.workspace_split_k,
     )
+    snippets = generate(chain, **generate_kwargs)
     render = _render_block_scale_template if chain.has_block_scale else _render_template
     src = render(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, render, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
         chain=chain,
@@ -3028,6 +3303,8 @@ def _compile_fused_gemm(chain: FusionChain, config: TileConfig, *, binding=None)
         aux_names=[aux.name for aux in chain.aux_tensors],
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         binding=binding,
         store_modes=store_modes,
         use_tma_store=use_tma,
@@ -3052,6 +3329,7 @@ class CompiledMoeBlockScaleGemm(_CompiledMoeBlockScaleGemm[TileConfig, GemmBindi
     """Execute a compiled grouped block-scale GEMM."""
 
     _compiler = sys.modules[__name__]
+    _validate_whole_scale_blocks = True
 
 
 def _jit_moe_block_scale(
@@ -3071,15 +3349,16 @@ def _jit_moe_block_scale(
     _tmpl = select_template(chain, config)
     store_modes = _store_modes(chain, config)
     use_tma = "tma" in store_modes
-    snippets = generate(
-        chain,
+    generate_kwargs = dict(
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
     )
+    snippets = generate(chain, **generate_kwargs)
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
+    launch_k_pad, k_pad = _k_pad_launchable(chain, config, _render_block_scale_template, generate_kwargs)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cga_size_m, config.cga_size_n
     grid_ctas = _grid_num_clusters(config) * cluster_m * cluster_n
@@ -3090,6 +3369,8 @@ def _jit_moe_block_scale(
         device=_plan_device(),
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
         _launchable=mod.compile(),
+        _launchable_k_pad=launch_k_pad,
+        k_pad_axes=k_pad,
         _grid_ctas=grid_ctas,
         binding=binding,
         vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),

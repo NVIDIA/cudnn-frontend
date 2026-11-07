@@ -319,7 +319,8 @@ only the unused relay operand remains in the kernel ABI.
   requested. An fp32 `dBias` output is
   that accumulator itself (no extra workspace, no convert kernel); an
   io-dtype output adds the `dbias_cvt` cast.
-- No dropout / ALiBi / softcap / THD
+- THD (packed / ragged): exact D128 MHA only, on SM120 and SM121; not with deterministic mode, bottom-right causal, a sliding window, or an attention sink / dSink
+- No dropout / ALiBi / softcap
 - Workspace (carved from the caller's buffer): fp32 `delta` scratch, plus
   fp32 `dq_accum` and int32 relay-counter storage (non-deterministic and
   relay-deterministic modes) or the io-dtype `B·H_q·S_q·S_kv_r128` dS buffer

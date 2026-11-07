@@ -49,11 +49,12 @@ Install cuDNN Frontend; its CuTe DSL dependencies are required and come with it:
 pip install nvidia-cudnn-frontend
 ```
 
-The allocating functions are available as lazy top-level exports, while the
-architecture-specific class APIs live under `cudnn.hstu.hstu_attention`:
+The allocating functions are exported from `cudnn.ops` (the top-level `cudnn`
+names still work), while the architecture-specific class APIs live under
+`cudnn.hstu.hstu_attention`:
 
 ```python
-from cudnn import hstu_attention_backward, hstu_attention_forward
+from cudnn.ops import hstu_attention_backward, hstu_attention_forward
 from cudnn.hstu.hstu_attention import HSTUBwdSm100, HSTUFwdSm100
 ```
 
@@ -227,6 +228,32 @@ selected by the second dimension. `page_ids` is a contiguous one-dimensional
 `torch.int32` array of shape `(B + 1,)` delimiting each sequence's slice in
 `page_ids`. Their values must already be valid for `paged_kv`; they are consumed
 on the GPU without host-side range or monotonicity checks.
+
+## JAX
+
+`cudnn.ops.hstu_attention_forward_jax` and `cudnn.ops.hstu_attention_backward_jax`
+run the same kernels on JAX arrays, eagerly or under `jax.jit`, without PyTorch.
+They take the arguments of `hstu_attention_forward` / `hstu_attention_backward`
+in the same order and return a dict: `{"o_tensor"}` and
+`{"dq_tensor", "dk_tensor", "dv_tensor"}`. There is no autodiff rule; call
+backward with the forward's inputs and options.
+
+```python
+import jax
+from cudnn.ops import hstu_attention_backward_jax, hstu_attention_forward_jax
+
+# q, k, v: packed (T, H, D) bfloat16; cu_seqlens: (B + 1,) int32
+forward = jax.jit(lambda q, k, v, cu: hstu_attention_forward_jax(q, k, v, cu, cu, max_seqlen, max_seqlen, (-1, 0), alpha))
+o = forward(q, k, v, cu_seqlens)["o_tensor"]
+grads = jax.jit(lambda do, q, k, v, cu: hstu_attention_backward_jax(do, q, k, v, cu, cu, max_seqlen, max_seqlen, (-1, 0), alpha))(do, q, k, v, cu_seqlens)
+```
+
+`cu_seqlens_*` are runtime int32 arrays and are never read on the host;
+`max_seqlen_*`, `window_size`, `alpha` and `scaling_seqlen` are static. The JAX
+ops cover the main training path: SM100/SM103, FP16/BF16, MHA, D = 32, 64 or
+128, causal, local or no mask, and `max_seqlen_q > 1`. They do not support
+D = 256, `func_tensor`, paged KV, the `max_seqlen_q == 1` decode path, `vmap`,
+sharding, or multiple processes. All arrays must be on one GPU.
 
 ## Support matrix
 

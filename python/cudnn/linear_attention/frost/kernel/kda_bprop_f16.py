@@ -148,11 +148,11 @@ from cudnn.frost.tile_dsl.pointwise import (
     ffma2,
     fmul2,
     fp32_to_fp16,
-    mul_f16x2,
     opaque_f32_zero,
     pack_u16x2,
-    sub_f16x2,
 )
+
+from ..common.residual import residual_operand, residual_pair
 
 USE_PDL = True
 
@@ -2179,6 +2179,7 @@ def compute1_warp_group(
     mDbeta,
     mDstate0,
     mDstate_in,
+    mDcomposed,
     mDstateScratch,
     sV_raw,
     sDo_raw,
@@ -2193,7 +2194,13 @@ def compute1_warp_group(
     sSteepTile_ptr,
     bars,
 ) -> None:
-    """WG1 warp role (warps 4-7): the value-side TMEM staging."""
+    """Stage value-side TMEM operands in WG1 (warps 4-7).
+
+    Regenerate Y using forward's FP32 residual/beta rule for BF16, retaining
+    the unrounded residual for dBeta. FP16 keeps its legacy rounded residual
+    and packed Y arithmetic. Projection waits, store completion and cross-warp
+    publication remain here, outside the register-only residual helpers.
+    """
     nvvm.setmaxregister(
         cfg.num_regs_compute_group_1,
         nvvm.SetMaxRegisterAction.INCREASE if cfg.num_regs_compute_group_1 >= 65536 // cfg.threads_per_cta else nvvm.SetMaxRegisterAction.DECREASE,
@@ -2256,15 +2263,29 @@ def compute1_warp_group(
                 seed_steep_ptr = sSteepTile_ptr + seed_stage * len(cfg.compute_group_0_warp_ids)
                 seed_steep_any = steep_tile_mask(cfg, seed_steep_ptr)
                 row_lo_addr = tmem_row << 16
-                seed_vw = 16 // (mDstate_in.element_type.width // 8)
-                dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.dstate_table):
+                    seed_vw = 16 // (mDstate_in.element_type.width // 8)
+                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                    composed_src = (mDcomposed.iterator + mDcomposed.layout((cutlass.Int32(0), head_idx, value_dim, 0))).raw_ptr()
                 for i in cutlass.range(cfg.d_k // 16, unroll=1):
                     seed_block = cutlass.Array(cutlass.Float32, 16, alignment=16)
-                    for g in cutlass.range_constexpr(16 // seed_vw):
-                        seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                        for t in cutlass.range_constexpr(seed_vw):
-                            dval = seed_chunk[t].to(cutlass.Float32)
-                            seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.dstate_table):
+                        for g in cutlass.range_constexpr(16 // seed_vw):
+                            seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                            for t in cutlass.range_constexpr(seed_vw):
+                                dval = seed_chunk[t].to(cutlass.Float32)
+                                seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    else:
+                        for t in cutlass.range_constexpr(16):
+                            seed_block[t] = cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.has_composed_dstate):
+                        for g in cutlass.range_constexpr(4):
+                            composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                            for t in cutlass.range_constexpr(4):
+                                cval = composed_chunk[t] if seed_true else cutlass.Float32(0.0)
+                                seed_block[g * 4 + t] = cval if is_boundary else seed_block[g * 4 + t]
                     seed_undecayed = cutlass.Array(cutlass.Float32, 16, alignment=16)
                     for j in cutlass.range_constexpr(16):
                         seed_undecayed[j] = seed_block[j]
@@ -2349,14 +2370,14 @@ def compute1_warp_group(
             bars.mb_raw_done[raw_index.idx].arrive()
 
             bars.mb_beta_ready[chunk_serial % cfg.smem_beta_stages].wait((chunk_serial // cfg.smem_beta_stages) % 2)
-            beta_pairs = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.rmem)
+            beta_fp32 = cutlass.Array(cutlass.Float32, 4, space=cutlass.AddressSpace.rmem)
             for half in cutlass.range_constexpr(2):
                 token0 = (half * 4 + (lane_idx & 3)) * 2
                 beta0 = (sBeta_ptr + token0).load().to(cutlass.Float32)
                 beta1 = (sBeta_ptr + token0 + 1).load().to(cutlass.Float32)
-                beta_pairs[half] = fp32_to_fp16(beta0, beta1, dtype=cfg.io_dtype)
-            diff_w_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
-            diff_w_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
+                beta_fp32[2 * half], beta_fp32[2 * half + 1] = beta0, beta1
+            diff_w_lo = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
+            diff_w_hi = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
             y_input_pack_lo = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             y_input_pack_hi = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.rmem)
             if chunk_idx >= FIRST_STATE_CHUNK:
@@ -2365,26 +2386,44 @@ def compute1_warp_group(
                 state_k_vec_lo = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_lo_addr + projection_col_id, cutlass.Float32), num=2)
                 for reg_idx in cutlass.range_constexpr(4):
                     frag_pair = reg_idx * 2
-                    state_k_pair = fp32_to_fp16(state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
-                    diff_pair = sub_f16x2(raw_v_frag_lo[reg_idx], state_k_pair, cfg.io_dtype)
-                    diff_w_lo[reg_idx] = diff_pair
-                    y_input_pack_lo[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], diff_pair, cfg.io_dtype)
+                    diff0, diff1 = residual_pair(raw_v_frag_lo[reg_idx], state_k_vec_lo[frag_pair], state_k_vec_lo[frag_pair + 1], dtype=cfg.io_dtype)
+                    diff_w_lo[frag_pair], diff_w_lo[frag_pair + 1] = diff0, diff1
+                    y_input_pack_lo[reg_idx] = residual_operand(
+                        raw_v_frag_lo[reg_idx],
+                        state_k_vec_lo[frag_pair],
+                        state_k_vec_lo[frag_pair + 1],
+                        beta_fp32[2 * (reg_idx // 2)],
+                        beta_fp32[2 * (reg_idx // 2) + 1],
+                        dtype=cfg.io_dtype,
+                    )
                 if cutlass.const_expr(cfg.d_v == 128):
                     state_k_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + projection_col_id, cutlass.Float32), num=2)
                     for reg_idx in cutlass.range_constexpr(4):
                         frag_pair = reg_idx * 2
-                        state_k_pair = fp32_to_fp16(state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
-                        diff_pair = sub_f16x2(raw_v_frag_hi[reg_idx], state_k_pair, cfg.io_dtype)
-                        diff_w_hi[reg_idx] = diff_pair
-                        y_input_pack_hi[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], diff_pair, cfg.io_dtype)
+                        diff0, diff1 = residual_pair(raw_v_frag_hi[reg_idx], state_k_vec_hi[frag_pair], state_k_vec_hi[frag_pair + 1], dtype=cfg.io_dtype)
+                        diff_w_hi[frag_pair], diff_w_hi[frag_pair + 1] = diff0, diff1
+                        y_input_pack_hi[reg_idx] = residual_operand(
+                            raw_v_frag_hi[reg_idx],
+                            state_k_vec_hi[frag_pair],
+                            state_k_vec_hi[frag_pair + 1],
+                            beta_fp32[2 * (reg_idx // 2)],
+                            beta_fp32[2 * (reg_idx // 2) + 1],
+                            dtype=cfg.io_dtype,
+                        )
             if chunk_idx < FIRST_STATE_CHUNK:
                 for reg_idx in cutlass.range_constexpr(4):
-                    diff_w_lo[reg_idx] = raw_v_frag_lo[reg_idx]
-                    y_input_pack_lo[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], raw_v_frag_lo[reg_idx], cfg.io_dtype)
+                    diff0, diff1 = residual_pair(raw_v_frag_lo[reg_idx], None, None, dtype=cfg.io_dtype)
+                    diff_w_lo[2 * reg_idx], diff_w_lo[2 * reg_idx + 1] = diff0, diff1
+                    y_input_pack_lo[reg_idx] = residual_operand(
+                        raw_v_frag_lo[reg_idx], None, None, beta_fp32[2 * (reg_idx // 2)], beta_fp32[2 * (reg_idx // 2) + 1], dtype=cfg.io_dtype
+                    )
                 if cutlass.const_expr(cfg.d_v == 128):
                     for reg_idx in cutlass.range_constexpr(4):
-                        diff_w_hi[reg_idx] = raw_v_frag_hi[reg_idx]
-                        y_input_pack_hi[reg_idx] = mul_f16x2(beta_pairs[reg_idx // 2], raw_v_frag_hi[reg_idx], cfg.io_dtype)
+                        diff0, diff1 = residual_pair(raw_v_frag_hi[reg_idx], None, None, dtype=cfg.io_dtype)
+                        diff_w_hi[2 * reg_idx], diff_w_hi[2 * reg_idx + 1] = diff0, diff1
+                        y_input_pack_hi[reg_idx] = residual_operand(
+                            raw_v_frag_hi[reg_idx], None, None, beta_fp32[2 * (reg_idx // 2)], beta_fp32[2 * (reg_idx // 2) + 1], dtype=cfg.io_dtype
+                        )
             nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_lo_addr + input_col_id, cutlass.Int8), y_input_pack_lo[0:4])
             if cutlass.const_expr(cfg.d_v == 128):
                 nvvm.tcgen05_st("16x128b", nvvm.make_tmem_ptr(row_hi_addr + input_col_id, cutlass.Int8), y_input_pack_hi[0:4])
@@ -2545,11 +2584,11 @@ def compute1_warp_group(
             for s in cutlass.range_constexpr(4):
                 token4[s] = cutlass.Float32(0.0)
             for j in cutlass.range_constexpr(4):
-                d0_lo, d0_hi = f16x2_to_f32(diff_w_lo[j], dtype=cfg.io_dtype)
+                d0_lo, d0_hi = diff_w_lo[2 * j], diff_w_lo[2 * j + 1]
                 slot = cutlass.const_expr(2 * (j // 2))
                 lo, hi = ffma2(dy_vec_lo[2 * j], dy_vec_lo[2 * j + 1], d0_lo, d0_hi, token4[slot], token4[slot + 1])
                 if cutlass.const_expr(cfg.d_v == 128):
-                    d1_lo, d1_hi = f16x2_to_f32(diff_w_hi[j], dtype=cfg.io_dtype)
+                    d1_lo, d1_hi = diff_w_hi[2 * j], diff_w_hi[2 * j + 1]
                     lo, hi = ffma2(dy_vec_hi[2 * j], dy_vec_hi[2 * j + 1], d1_lo, d1_hi, lo, hi)
                 token4[slot] = lo
                 token4[slot + 1] = hi
@@ -2695,7 +2734,15 @@ def compute1_warp_group(
                     for key_dim_base in cutlass.range_constexpr(0, cfg.d_k, 32):
                         for kk_i in cutlass.range_constexpr(32):
                             kd = key_dim_base + kk_i
-                            if cutlass.const_expr(cfg.use_dstate_in):
+                            if cutlass.const_expr(cfg.has_composed_dstate):
+                                if cutlass.const_expr(cfg.dstate_table):
+                                    pass_val = mDstate_in[batch_idx, head_idx, value_dim, kd].to(cutlass.Float32)
+                                else:
+                                    pass_val = cutlass.Float32(0.0)
+                                composed_val = mDcomposed[cutlass.Int32(0), head_idx, value_dim, kd]
+                                pass_val = composed_val if batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2) else pass_val
+                                mDstate0[dstate_dst, head_idx, value_dim, kd] = pass_val.to(mDstate0.element_type)
+                            elif cutlass.const_expr(cfg.use_dstate_in):
                                 mDstate0[dstate_dst, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd].to(mDstate0.element_type)
                             else:
                                 mDstate0[dstate_dst, head_idx, value_dim, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
@@ -3177,6 +3224,7 @@ def compute2_warp_group(
             bars.mb_da_diag_done[da_diag_stage].arrive()
             if cutlass.const_expr((not cfg.l2norm or split_channels) and cfg.steep_mode == STEEP_EXACT):
                 if steep_any != 0:
+                    nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_raw_done[raw_stage].arrive()
 
             # ---- dGate finalize ------------------------------------------------------
@@ -3820,6 +3868,7 @@ def host(
     cu_seqlens: cute.Tensor,
     d_initial_state: cute.Tensor | None,
     d_final_state: cute.Tensor | None,
+    dcomposed: cute.Tensor | None,
     work_items: cute.Tensor | None,
     work_count: cute.Tensor | None,
     scheduler_counter: cute.Tensor,
@@ -3853,6 +3902,7 @@ def host(
             dbeta,
             d_initial_state,
             d_final_state,
+            dcomposed,
             work_items,
             work_count,
             scheduler_counter,
@@ -3884,6 +3934,7 @@ def frost_kda_bprop(
     mDbeta: cute.Tensor,
     mDstate0: cute.Tensor | None,
     mDstate_in: cute.Tensor | None,
+    mDcomposed: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -4344,6 +4395,7 @@ def frost_kda_bprop(
             mDbeta,
             mDstate0,
             mDstate_in,
+            mDcomposed,
             mDstateScratch,
             sV_raw,
             sDo_raw,
@@ -4379,6 +4431,8 @@ class KdaBpropCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
     scheduler_stages: int = 8
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -4484,12 +4538,16 @@ def build_cfg(
     max_active_clusters: int,
     d_k: int,
     d_v: int,
+    dstate_table: bool | None = None,
+    has_composed_dstate: bool = False,
 ) -> KdaBpropCfg:
     """Derive all buffer sizes from the configured tile and ring depths."""
     cfg = KdaBpropCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         use_dstate0=use_dstate0,
         l2norm=l2norm,
         safe_gate=safe_gate,

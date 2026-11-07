@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from block_sparse_attention.cutedsl.bsa_utils import require_arch
 from cudnn import ops
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
@@ -12,8 +13,7 @@ pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclu
 
 @pytest.fixture(autouse=True)
 def hopper_only():
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("native SM90 blk128 requires Hopper")
+    require_arch(families=(9,), reason="native SM90 blk128 requires Hopper")
 
 
 def case(
@@ -180,7 +180,7 @@ def test_tails(sq, sk, variable):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-@pytest.mark.parametrize("splits", [1, 2, 7])
+@pytest.mark.parametrize("splits", [1, 2, 7, "auto"])
 def test_split_partial_gqa(rank, splits):
     check(sq=129, sk=513, variable=True, sizes_rank=rank, splits=splits, ratio=2, backward=False)
 

@@ -20,6 +20,7 @@ import cuda.bindings.driver as cuda
 from cudnn.api_base import APIBase, TupleDict
 
 from cudnn.deepseek_sparse_attention.utils.runtime import device_major
+from cudnn.tensor_adapter import has_tcgen05
 
 from ._interface import TMA_ALIGN_ELEMS, _indexer_fwd_bound, indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
@@ -107,6 +108,10 @@ class IndexerForward(APIBase):
             d != 128,
             f"IndexerForward is tuned for head_dim=128 only, got {d}",
         )
+        self._value_error_if(
+            self.m_block_size != 128,
+            f"IndexerForward packs a 128-row (token, head) tile for every head group; m_block_size must be 128, got {self.m_block_size}",
+        )
 
         qhpkv = self.qhead_per_kv_head if self.qhead_per_kv_head is not None else (h_q // h_kv)
         self._value_error_if(
@@ -147,8 +152,8 @@ class IndexerForward(APIBase):
 
         major = device_major()
         self._runtime_error_if(
-            major < 10,
-            f"IndexerForward requires SM100+ compute capability, found SM{major}",
+            not has_tcgen05(major),
+            f"IndexerForward requires SM100+ compute capability with tcgen05 (not cc 12.x), found SM{major}",
         )
 
         self.batch_size = b

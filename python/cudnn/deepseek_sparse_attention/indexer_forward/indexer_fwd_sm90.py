@@ -25,6 +25,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.experimental import primitives as nvvm
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass import Float32, Int32, Boolean, const_expr
@@ -36,6 +37,7 @@ from cudnn.deepseek_sparse_attention.utils.sm90 import mma as sm90_mma
 from cudnn.deepseek_sparse_attention.utils.sm90 import primitives as sm90_ops
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import gemm_w_idx
 
+WEIGHTS_READY_BARRIER = 9
 LSE_BARRIER_STAGE0 = 10
 LSE_BARRIER_STAGE1 = 11
 
@@ -617,6 +619,12 @@ class IndexerForwardSm90:
                     self._load_weights(mW_cur, mQScale_cur, sW, m_block, seqlen.seqlen_q, sm_scale, lane_id)
                 else:
                     self._load_weights(mW_cur, None, sW, m_block, seqlen.seqlen_q, sm_scale, lane_id)
+                # All weight-loading lanes publish before either consumer WG
+                # reads sW. The Q TMA barrier tracks only its issuing lane.
+                nvvm.barrier_cta_arrive(
+                    barrier_id=WEIGHTS_READY_BARRIER,
+                    thread_count=32 + (256 if self.use_split_q_wg else 128),
+                )
                 cute.arch.fence_view_async_shared()
                 self._issue_tma(mQ_cur, sQ_0, self.q_stages * m_block, tma_atom_Q, mbar_Q0_ptr, self.tma_copy_bytes_Q, self.q_per_stage)
                 self._issue_tma(
@@ -639,8 +647,8 @@ class IndexerForwardSm90:
                         self._issue_tma(mK_cur, sKV_0, n_block, tma_atom_K, mbar_KV0_ptr, self.tma_copy_bytes_K, self.tile_n)
                         self._load_k_scales(mKScale_cur, sKScale, Int32(0), n_block, seqlen.seqlen_k, lane_id)
                         cute.arch.fence_view_async_shared()
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(mbar_KV0_ptr)
+                        # Each lane publishes its own scale stores.
+                        cute.arch.mbarrier_arrive(mbar_KV0_ptr)
                         iter_idx = iter_idx + Int32(2)
                 else:
                     while iter_idx < n_block_max:
@@ -675,8 +683,8 @@ class IndexerForwardSm90:
                         self._issue_tma(mK_cur, sKV_1, n_block, tma_atom_K, mbar_KV1_ptr, self.tma_copy_bytes_K, self.tile_n)
                         self._load_k_scales(mKScale_cur, sKScale, Int32(1), n_block, seqlen.seqlen_k, lane_id)
                         cute.arch.fence_view_async_shared()
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(mbar_KV1_ptr)
+                        # Each lane publishes its own scale stores.
+                        cute.arch.mbarrier_arrive(mbar_KV1_ptr)
                         iter_idx = iter_idx + Int32(2)
 
                     if n_block_max >= Int32(2):
@@ -771,6 +779,7 @@ class IndexerForwardSm90:
 
             cute.arch.mbarrier_wait(mbar_Q0_ptr, q0_phase)
             cute.arch.mbarrier_wait(mbar_Q1_ptr, q1_phase)
+            nvvm.barrier_cta_sync(barrier_id=WEIGHTS_READY_BARRIER, thread_count=32 + 128)
 
             iter_idx = Int32(0)
             while iter_idx < n_block_max:
@@ -1011,6 +1020,7 @@ class IndexerForwardSm90:
                 lse_sum.fill(Float32(0.0))
 
             cute.arch.mbarrier_wait(mbar_Q_ptr, q_phase)
+            nvvm.barrier_cta_sync(barrier_id=WEIGHTS_READY_BARRIER, thread_count=32 + 256)
 
             iter_idx = Int32(0)
             while iter_idx < n_block_max:
@@ -1052,12 +1062,12 @@ class IndexerForwardSm90:
                         kv_m_lane_scale = m_base + mi * 8
                         rKScale[mi] = sKScale[stage * self.tile_n + kv_m_lane_scale]
 
+                # Every consumer lane must finish its scale reads before the
+                # producer can reuse this KV stage.
                 if stage == Int32(0):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(mbar_KVEmpty0_ptr, arrive_count=32)
+                    cute.arch.mbarrier_arrive(mbar_KVEmpty0_ptr)
                 else:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr, arrive_count=32)
+                    cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr)
 
                 if const_expr(self.use_fast_qh64_epilogue):
                     if iter_idx == Int32(0):
@@ -1325,8 +1335,9 @@ class IndexerForwardSm90:
             cute.arch.mbarrier_init(mbar_Q0_ptr, 1)
             cute.arch.mbarrier_init(mbar_Q1_ptr, 1)
             if const_expr(self.use_fp8_scales):
-                cute.arch.mbarrier_init(mbar_KV0_ptr, 2)
-                cute.arch.mbarrier_init(mbar_KV1_ptr, 2)
+                # One TMA completion plus one arrival per scale-loading lane.
+                cute.arch.mbarrier_init(mbar_KV0_ptr, 33)
+                cute.arch.mbarrier_init(mbar_KV1_ptr, 33)
             else:
                 cute.arch.mbarrier_init(mbar_KV0_ptr, 1)
                 cute.arch.mbarrier_init(mbar_KV1_ptr, 1)

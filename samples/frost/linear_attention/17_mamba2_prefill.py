@@ -76,7 +76,7 @@ def main(seq_lens=(192, 320), H: int = 2, N_state: int = 128, P: int = 64) -> No
     a_t = g.tensor([H], data_type=cudnn.data_type.FLOAT, name="a")
     dt_bias_t = g.tensor([H], data_type=cudnn.data_type.FLOAT, name="dt_bias")
     cu_t = g.tensor([num_seqs + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
-    O_t, fs_t, _ckpt_t, _pre_t = g.mamba2(
+    O_t, fs_t, _ckpt_t, _pre_t, _composed = g.mamba2(
         q=q_t,
         k=k_t,
         v=v_t,

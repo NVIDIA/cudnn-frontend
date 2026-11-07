@@ -242,8 +242,13 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     fp8 = replace(facts, is_fp8=True)
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
-    for change in (dict(has_paged_kv=True), dict(is_mxfp8=True)):
-        assert engines._prepared_decline_reason(spec.capabilities, replace(facts, **change), 1) is not None, change
+    # The SM120 paged prepared path serves only dense half D128 without splits.
+    paged = replace(facts, has_paged_kv=True)
+    assert (engines._prepared_decline_reason(spec.capabilities, paged, 1) is None) == (d == 128)
+    assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is not None
+    for change in (dict(thd=True), dict(is_fp8=True), dict(is_mxfp8=True)):
+        assert engines._prepared_decline_reason(spec.capabilities, replace(paged, **change), 1) is not None, change
+    assert engines._prepared_decline_reason(spec.capabilities, replace(facts, is_mxfp8=True), 1) is not None
 
 
 @pytest.mark.parametrize("d", [128, 256])
@@ -336,7 +341,10 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
         assert reason is None
     else:
         assert reason is not None
-        assert "prepared" in reason
+        if arch == "sm120" and feature == "paged":
+            assert "SM120 paged KV requires exact FP16/BF16 D128" in reason
+        else:
+            assert "prepared" in reason
 
 
 @pytest.mark.parametrize("d,dv", [(64, 64), (112, 96), (384, 320)])
@@ -1204,7 +1212,11 @@ def test_capabilities_positional_prefix_is_append_only():
     # divisibility rule). The canonical band set and independent-pool capability are appended in that order.
     first_appended = start + len(legacy_tail)
     assert names[first_appended : first_appended + len(appended)] == list(appended), names[start:]
-    assert names[-2:] == ["band", "independent_paged_pool_counts"], names[-3:]
+    # Pin this historical segment while permitting future fields after it.
+    band_start = names.index("band")
+    band_segment = ["band", "independent_paged_pool_counts", "warp_spec_cfgs"]
+    assert names[band_start : band_start + len(band_segment)] == band_segment, names[band_start:]
+    assert caps.warp_spec_cfgs == frozenset({0})
 
     # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
     # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the
@@ -1225,7 +1237,8 @@ def test_capabilities_positional_prefix_is_append_only():
     )
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-8:] == [
+    bwd_start = bwd_names.index("bottom_right_s_q_multiple")
+    assert bwd_names[bwd_start : bwd_start + 8] == [
         "bottom_right_s_q_multiple",
         "thd_head_stride",
         "zero_scale",
@@ -1235,6 +1248,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "independent_head_dims",
         "band",
     ], bwd_names
+    assert bwd_names[bwd_start + 8 : bwd_start + 10] == ["thd_tile_ms", "thd_tile_ns"], bwd_names
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -1459,6 +1473,49 @@ def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
             if why is not None:
                 assert "tile_n" in why
     assert min(caps.tile_ns) == 128, "the heuristics' default width stays 128 (min of the row-wide floor)"
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("policy", [0, 1])
+def test_rubin_d192_unsplit_cta_does_not_require_split_workspace_bound(monkeypatch, dtype, policy):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    facts = ga.SdpaGraphFacts(
+        b=4096,
+        h_q=32,
+        h_kv=8,
+        s_q=128,
+        s_kv=65536,
+        d_qk=192,
+        d_v=128,
+        dtype=dtype,
+        dtype_o=dtype,
+        causal=True,
+        bottom_right=True,
+        padded=True,
+        thd=True,
+        device_cc=(10, 7),
+        shape_overrides=True,
+    )
+    unsplit = engines.SdpaFwdKnobs(cga=1, split_kv=1, tile_n=128, pack_gqa=False, sched_policy=policy)
+    assert engines.mismatch(caps, facts, unsplit) is None
+    assert engines.mismatch(caps, facts, replace(unsplit, cga=2)) is None
+    # No partial workspace is needed by the unsplit plan. Split plans still
+    # require the caller's bound, and unrelated unsupported features stay out.
+    assert not engines.thd_split_domain(caps, facts)
+    assert engines.mismatch(caps, facts, replace(unsplit, split_kv=2)) is not None
+    for unsupported in (
+        replace(facts, has_epilogue_gate=True),
+        replace(facts, stats_t=SimpleNamespace(ragged_offset=None)),
+    ):
+        assert engines.mismatch(caps, unsupported, unsplit) is not None
+    bounded = replace(facts, max_total_seq_len_q=128)
+    assert engines.thd_split_domain(caps, bounded)
+    assert engines.mismatch(caps, bounded, unsplit) is None
+    assert facts.max_total_seq_len_q is None and facts.shape_overrides
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])

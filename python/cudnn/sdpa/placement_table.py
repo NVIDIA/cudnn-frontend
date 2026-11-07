@@ -340,6 +340,30 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "none", False, "mha", True): Entry(
         "always", None, "sm80_dense_prefill_r4_20261101"
     ),
+    # study sm80_f16_dense_prefill_20261106 (cuDNN 9.28.1.4; A100 80GB PCIe; dense f16 context d64 / d128, MHA and GQA 2-8x,
+    # mask-free and bottom-right causal, s_q 5-8.8k and S_kv 128-35k drawn independently, on and off the 128-key tile, h_q 4-64,
+    # b 1-16; 768 train cells, each distinct plan timed once with the plans interleaved; a 192-cell holdout off the training
+    # lattice (h_q 10-80, GQA 2-7x, b 1-12). Three classes, each on and off the tile: d64 bottom-right causal MHA and GQA, and d128
+    # mask-free MHA. The other ten f16 classes are non-monotone, regressed on the holdout, or lost their tile twin, and stay with
+    # the hand rules. SM80 had no f16 entry.)
+    ("sdpa_fwd_prefill_sm80", (8, 0), "f16", (128, 128), "prefill", "dense", "none", False, "mha", False): Entry(
+        "le", 23.02, "sm80_f16_dense_prefill_20261106"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "f16", (128, 128), "prefill", "dense", "none", False, "mha", True): Entry(
+        "le", 23.438, "sm80_f16_dense_prefill_20261106"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "ge", 9.603, "sm80_f16_dense_prefill_20261106", "q"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "ge", 6.937, "sm80_f16_dense_prefill_20261106", "q"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "ge", 7.863, "sm80_f16_dense_prefill_20261106", "q"
+    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "causal_br", False, "mha", True): Entry(
+        "ge", 8.217, "sm80_f16_dense_prefill_20261106", "q"
+    ),
     # study sm107_dense_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; dense bf16 decode and MTP, s_q 1-4: d64 with the gpt-oss
     # masks (sink, window + sink, neither), GQA 4 / 8; d256 without a sink, GQA 4-16; b 1-128, S_kv 3k-128k on and off the tile;
     # 396 train + 52 scored random holdout cells incl. groups 5, 6, 12; d256 single-row decode keeps the hand order: its

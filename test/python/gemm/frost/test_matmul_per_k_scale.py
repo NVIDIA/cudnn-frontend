@@ -57,6 +57,7 @@ def _graph(
     a_major="k",
     b_major="k",
     scale_stride=1,
+    indexed=False,
 ):
     g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tensors = {
@@ -72,6 +73,9 @@ def _graph(
         scale = g.tensor(name=f"scale_{operand}" if side == "ab" else "scale", dim=dim, stride=stride, data_type=scale_dtype)
         tensors[f"scale_{operand}"] = scale
         value = operands[operand]
+        if indexed:
+            indices = g.gen_index(input=value, axis=2 if operand == "a" else 1).set_data_type(dtype)
+            value = g.add(a=value, b=indices).set_data_type(dtype)
         if surrounding:
             value = g.cos(input=value).set_data_type(dtype)
         for _ in range(2 if repeated and operand == "a" else 1):
@@ -166,9 +170,6 @@ def test_frost_per_k_graph_and_render(options, cta_group, swapped):
 @pytest.mark.parametrize(
     "options,change,reason",
     [
-        ({"a_major": "m"}, {}, "K-major"),
-        ({"side": "b", "b_major": "n"}, {}, "K-major"),
-        ({"scale_stride": 2}, {}, "unit stride"),
         ({"K": 135}, {}, "K % 8"),
         ({}, {"compute_dtype": "int32"}, "FP32"),
         ({}, {"out_dtype": "fp32"}, "result"),
@@ -180,6 +181,13 @@ def test_frost_per_k_capability_not_ir(options, change, reason):
     if change:
         chain = replace(chain, mainloop_a_ops=[replace(chain.mainloop_a_ops[0], **change)])
     assert reason in select_template(chain, _config())._other_reject(chain, _config())
+
+
+@pytest.mark.parametrize("side", ("a", "b"))
+def test_frost_direct_per_k_ir_still_requires_k_major(side):
+    chain = analyze(_graph(side=side)[0])
+    chain = replace(chain, matmul=replace(chain.matmul, **{f"{side}_major": "m" if side == "a" else "n"}))
+    assert "K-major" in select_template(chain, _config())._other_reject(chain, _config())
 
 
 def test_frost_per_k_ir_rejects_invalid_broadcast():
@@ -352,16 +360,20 @@ def test_frost_per_k_gpu(options, cta_group, swapped):
 @pytest.mark.parametrize("side", ["a", "b"])
 @pytest.mark.parametrize("operand_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("scale_dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_frost_per_k_generated_fragment_dynamic_k(tmp_path, side, operand_dtype, scale_dtype):
+@pytest.mark.parametrize("indexed", (False, True), ids=("scale-only", "shared-index-scale"))
+def test_frost_per_k_generated_fragment_dynamic_k(tmp_path, side, operand_dtype, scale_dtype, indexed):
     """Run the emitted transform and dynamic fake ABI on Hopper or Blackwell.
 
     This isolates dtype, per-lane loads and K padding; it is NOT validation of
     the mainloop template's swizzle, synchronization or tensor-core MMA.
     """
-    chain = analyze(_graph(side=side, dtype=cudnn.data_type.BFLOAT16 if operand_dtype == torch.bfloat16 else cudnn.data_type.HALF)[0])
+    chain = analyze(_graph(side=side, dtype=cudnn.data_type.BFLOAT16 if operand_dtype == torch.bfloat16 else cudnn.data_type.HALF, indexed=indexed)[0])
     scale_type = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}[scale_dtype]
     chain = replace(chain, aux_tensors=[replace(chain.aux_tensors[0], dtype=scale_type)])
     snippet = epilogue_codegen.generate_mainloop(chain, side)
+    if indexed:
+        assert f"ml_{side}_2_gk = ml_{side}_coords_k[ml_{side}_2_lane]" in snippet
+        assert snippet.count(f"ml_{side}_coords_linear =") == 1
     fake = compiler._aux_fake_block(chain.aux_tensors, dynamic_strides=True)
     src = f"""import cutlass
 import cutlass.cute as cute
@@ -378,6 +390,8 @@ def kernel(A: cute.Tensor, scale: cute.Tensor, C: cute.Tensor):
     k_tile_idx = (tid * 8) // 64
     ml_L = (tid * 8) % 64
     k = cutlass.Int64(scale.shape[{chain.aux_tensors[0].k_axis}])
+    ml_coord_m, ml_coord_n, ml_batch = cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)
+    m, n = cutlass.Int64(128), cutlass.Int64(128)
     ml_vec_{side} = (A.iterator.raw_ptr() + tid * 8).load(count=8, alignment=16)
 {textwrap.indent(snippet, '    ')}
     (C.iterator.raw_ptr() + tid * 8).store(ml_out_{side}, alignment=16)
@@ -404,5 +418,21 @@ compiled = cute.compile(entry, fake_data, fake_scale, fake_data, options="--enab
         out.fill_(float("nan"))
         module.compiled(av, scale, out)
         ref = torch.zeros_like(out)
-        ref[:k] = (av[:k].float() * scale.reshape(-1).float()).to(operand_dtype)
+        values = av[:k]
+        if indexed:
+            indices = torch.arange(k, device="cuda").to(operand_dtype)
+            values = (values.float() + indices.float()).to(operand_dtype)
+        ref[:k] = (values.float() * scale.reshape(-1).float()).to(operand_dtype)
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("side", ("a", "b"))
+def test_frost_strided_per_k_uses_coordinate_loading(side):
+    """A failed vector-load optimization is not a broadcast semantic rejection."""
+    chain = analyze(_graph(side=side, scale_stride=2)[0])
+    op = getattr(chain, f"mainloop_{side}_ops")[0]
+    assert chain.aux_by_name(op.aux).coordinate_mapped
+    assert op.operand_access is not None and op.operand_access.axes == {Axis.K}
+    assert select_template(chain, _config())._other_reject(chain, _config()) is None
+    source = epilogue_codegen.generate_mainloop(chain, side)
+    assert ".stride[" in source

@@ -149,6 +149,7 @@ def test_public_graph_geometry_rebind_replay(d, dv, m, n, cudnn_handle, monkeypa
     assert g.get_engine_and_knobs_at_index(g._plan_index)[1] == public
     warps = 4 if m == 64 or d == 64 or d > 256 else 8
     assert observed and observed[-1] == (m, n, warps)
+    execution_stream = torch.cuda.ExternalStream(cudnn.get_stream(cudnn_handle))
     for binding in range(2):
         if binding:
             for name, old in list(case.bufs.items()):
@@ -156,7 +157,9 @@ def test_public_graph_geometry_rebind_replay(d, dv, m, n, cudnn_handle, monkeypa
                 case.bufs[name] = new
                 case.pack[case.refs[name]] = new
         case.bufs["v"].mul_(-0.7)
+        execution_stream.wait_stream(torch.cuda.current_stream())
         g.execute(case.pack, case.workspace, handle=cudnn_handle)
+        torch.cuda.current_stream().wait_stream(execution_stream)
         _check(case)
         capture = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()

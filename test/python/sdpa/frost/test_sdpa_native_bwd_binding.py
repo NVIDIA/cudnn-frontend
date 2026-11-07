@@ -32,15 +32,17 @@ _WORKSPACE = 0x700000000000
 
 def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0, workspace_bytes=4096):
     family = "sm100" if arch.startswith("sm100_d128") else arch.split("_thd")[0]
-    filename = {
-        "sm100_d128": "prepared_d128_host.py",
-        "sm100_d128_accum": "prepared_d128_accum_host.py",
-        "sm100_d128_thd": "prepared_d128_thd_host.py",
-        "sm100_d128_grouped_dense": "prepared_d128_grouped_host.py",
-        "sm100_d128_grouped_thd": "prepared_d128_grouped_thd_host.py",
-    }.get(arch, "prepared_host.py")
+    # the d128 family's pointer hosts live in ONE module (kernels/sm100/prepared_d128_host.py), one traced entry per route
+    d128_entry = {
+        "sm100_d128": "host_recompute",
+        "sm100_d128_accum": "host_accum",
+        "sm100_d128_thd": "host_thd",
+        "sm100_d128_grouped_dense": "host_grouped_dense",
+        "sm100_d128_grouped_thd": "host_grouped_thd",
+    }.get(arch)
+    filename = "prepared_d128_host.py" if d128_entry else "prepared_host.py"
     path = Path(prep.__file__).parent / "kernels" / family / filename
-    entry = "host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host"
+    entry = d128_entry or ("host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host")
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == entry)
     names = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
     # SM80 binds these four immutable launch bounds through functools.partial.

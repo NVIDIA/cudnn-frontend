@@ -86,6 +86,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_TILE_NS_BY_D_SHAPE,
     SM107_FP8_TILE_NS_BY_D_SHAPE,
     supports_native_d128_narrow_tile,
+    supports_native_d128_single_q,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
@@ -174,6 +175,8 @@ class SdpaFwdKnobs:
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
     split_kv: Optional[int] = None
+    # Warp-specialization topology: 0 = existing topology, 1 = one full Q tile.
+    warp_spec_cfg: Optional[int] = None
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -184,6 +187,7 @@ class SdpaFwdKnobs:
         ("cga", "TILE_CGA_M"),
         ("pack_gqa", "PACK_GQA"),
         ("split_kv", "SPLIT_KV"),
+        ("warp_spec_cfg", "WARP_SPEC_CFG"),
     )
 
     def to_public(self) -> dict:
@@ -610,6 +614,9 @@ class Capabilities:
                 "are never silently resolved"
             )
 
+    # Append-only public warp-topology knob domain.
+    warp_spec_cfgs: frozenset[int] = frozenset({0})
+
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     return (
@@ -946,7 +953,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
-        return "prepared SM120 does not serve paged KV"
+        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or (facts.d_qk, facts.d_v) != (128, 128) or (split_kv or 1) != 1:
+            return "SM120 paged KV requires exact FP16/BF16 D128, dense Q and split_kv=1"
     if facts.has_bias and capabilities.bias_d_shapes is None:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
@@ -1291,8 +1299,13 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         return frozenset({1})
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
         return frozenset({2 if (facts.d_qk, facts.d_v) in ((256, 256), SM100_NATIVE_D576_SHAPE) else 1})
-    if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
-        return frozenset({1, 2})
+    if capabilities.sm_lo == 107 and not facts.has_paged_kv and selected == (192, 128):
+        # An explicit unsplit request uses no partial workspace, so it does not
+        # need the split path's total-Q capacity bound for shape overrides.
+        # Keep all other flavor restrictions and the automatic domain intact.
+        domain_facts = replace(facts, shape_overrides=False) if cga == 1 and (split_kv or 1) == 1 else facts
+        if thd_split_domain(capabilities, domain_facts):
+            return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
         and selected == (128, 128)
@@ -1608,6 +1621,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.tile_n, effective_tile_ns(capabilities, facts, knobs), "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv, knobs.cga), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
+            (knobs.warp_spec_cfg, capabilities.warp_spec_cfgs, "warp_spec_cfg"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
@@ -1619,6 +1633,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not native_d192_paged_leg(capabilities, facts, knobs)
         ):
             return "native SM107 paged D192/V128 requires two CTAs and no split"
+        if knobs.warp_spec_cfg == 1 and not supports_native_d128_single_q(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            half_precision=facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16),
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=knobs.cga,
+            split_kv=knobs.split_kv or 1,
+            pack_gqa=knobs.pack_gqa,
+            tile_m=knobs.tile_m,
+            tile_n=knobs.tile_n,
+            has_bias=facts.bias_t is not None,
+            has_kv_mask=facts.kv_mask_t is not None,
+            has_gate=facts.epilogue_gate_t is not None,
+            mixed_kv=not facts.uniform_dtype,
+        ):
+            return "WARP_SPEC_CFG=1 requires native half D128 THD, CTA1 M128 N128, unsplit/unpacked, without bias, KV mask or gate"
         grid_reason = launch_grid_mismatch(capabilities, facts, knobs)
         if grid_reason is not None:
             return grid_reason
@@ -1800,7 +1831,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and (
                         (
                             (facts.is_fp8 or facts.is_mxfp8)
-                            and not supports_quantized_split_sink(device_cc=facts.device_cc, pertensor=facts.is_fp8, thd=facts.thd)
+                            and not supports_quantized_split_sink(
+                                device_cc=facts.device_cc,
+                                pertensor=facts.is_fp8,
+                                thd=facts.thd,
+                                d_shape=(facts.d_qk, facts.d_v),
+                                paged=facts.has_paged_kv,
+                            )
                         )
                         or facts.has_epilogue_gate
                         or capabilities.sm_lo not in (100, 107, 120)
@@ -1828,7 +1865,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
                 )
             ):
-                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103/SM107 per-tensor FP8 and SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
+                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103/SM107 per-tensor FP8, SM120 exact D128 dense per-tensor FP8 and SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
             if (
                 facts.has_sink
                 and (facts.is_fp8 or facts.is_mxfp8)
@@ -2287,6 +2324,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
+        if capabilities.sm_lo == 120:
+            reason = _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
+            if reason is not None:
+                return reason
+            if knobs is not None and knobs.tile_m in (16, 32):
+                return "SM120 paged KV requires a prefill tile (tile_m=64 or 128)"
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
@@ -2770,6 +2813,7 @@ def _sm107_spec() -> EngineSpec:
                 ((192, 128), frozenset({SCHED_NATURAL, SCHED_LPT})),
                 ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),
             ),
+            warp_spec_cfgs=frozenset({0, 1}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -3475,6 +3519,8 @@ def _sm120_spec() -> EngineSpec:
             bottom_right=True,
             swa=True,
             right_band_widening=True,
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128)}),
             padded=True,
             sink=True,
             stats=True,
@@ -3696,6 +3742,7 @@ def lower_dsl_prefill(
         cga=knobs.cga if knobs is not None else None,
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
+        **({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
         # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
@@ -3807,6 +3854,20 @@ def lower_dsl_prefill(
             and ((facts.d_qk, facts.d_v) == (192, 128) or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split))
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and not facts.has_paged_kv
+        )
+        or (
+            # Native D256 unsplit uses sequence-local maps for independent
+            # Q/K/V/O origins, including interior padding in every port.
+            facts.thd
+            and facts.epilogue_gate_t is None
+            and spec.name == "sdpa_fwd_prefill_sm107"
+            and facts.device_cc == (10, 7)
+            and (facts.d_qk, facts.d_v) == (256, 256)
+            and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+            and not facts.has_paged_kv
+            and not api.pack_gqa
+            and api.split_kv == 1
+            and api.cga in (None, 2)
         )
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
@@ -4177,7 +4238,9 @@ def _sm120_fp8_spec() -> EngineSpec:
     to compact storage.
     Attention sinks fold into the softmax denominator: the sink is a virtual
     column with no V row — it rescales O and enters the LSE. THD (ragged) is
-    served with token- or head-major Stats.
+    served with token- or head-major Stats. An explicit sink split is qualified
+    only for exact D128 unpadded dense graphs; its partials omit the sink and
+    the final combine folds it once.
     """
     from cudnn.sdpa.fwd.config_sm120 import GENERAL_HEAD_TILE_MAX, FP8_GENERAL_HEAD_TILES
 

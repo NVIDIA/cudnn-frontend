@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar
 
+from cudnn._device import ensure_current_context
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
 
@@ -63,22 +64,26 @@ _INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=
 
 
 def _aux_kernel_shape(aux: TensorRef) -> tuple[int | Axis, ...]:
-    """Lower logical extents to the existing minimum-rank-2 aux ABI."""
+    """Preserve mapped storage rank; legacy matrix auxiliaries use rank >= 2."""
     shape = aux.symbolic_shape
-    return (1,) * max(0, 2 - len(shape)) + shape
+    return shape if aux.coordinate_mapped else (1,) * max(0, 2 - len(shape)) + shape
 
 
 def _aux_fake_shape_code(aux: TensorRef) -> str:
     """Render lowered extents without reconstructing broadcasts."""
     symbols = {Axis.M: "sym_m", Axis.N: "sym_n", Axis.K: "sym_k", Axis.BATCH: "sym_l", Axis.GROUP: "sym_g"}
-    return "(" + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux)) + ")"
+    return (
+        "("
+        + ", ".join(symbols[extent] if isinstance(extent, Axis) else str(extent) for extent in _aux_kernel_shape(aux))
+        + (",)" if len(_aux_kernel_shape(aux)) == 1 else ")")
+    )
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
     """Check whether auxiliary strides can be encoded directly."""
     # Unit-axis strides also change when dynamic K is rebound; do not bake
     # the originally declared K-sized strides into a per-K fake tensor.
-    if aux.bcast_mode == "per_k" or len(aux.dim) not in (2, 3):
+    if aux.coordinate_mapped or aux.bcast_mode == "per_k" or len(aux.dim) not in (2, 3):
         return False
     stride1_dims = [i for i, stride in enumerate(aux.stride) if stride == 1]
     if len(stride1_dims) <= 1:
@@ -99,7 +104,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
         else:
             _rank = len(_aux_kernel_shape(aux))
-            stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + ")"
+            stride = "(" + ", ".join("cute.sym_int64()" for _ in range(_rank)) + (",)" if _rank == 1 else ")")
             lines.append(f"fake_{aux.name} = cute.runtime.make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align={_align})")
     return "\n".join(lines) if lines else "pass"
 
@@ -751,15 +756,16 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
         fto = pull(b.first_token_offset, "first_token_offset")
-        sfa = [_kernel_order(pull(t, "SFA"), t, memo) for t in b.sfa_operands]
-        sfb = [pull(t, "SFB") for t in b.sfb_operands]
+        sfa = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfa_operands]
+        sfb = [pull(t, "token SF") for t in b.sfb_operands]
         mm = compiled.chain.matmul
         _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
         token_index, token_ks = routing_indices(b_bufs)
         m = a_bufs[0].shape[1]
         n = token_index.shape[0] if token_index is not None else b_bufs[0].shape[1]
         k = a_bufs[0].shape[2] * (2 if mm.a_dtype == "fp4_e2m1" else 1)
-        reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, m, n, k)
+        # The same per-operand checks, named in the graph's frame (A = token, B = weight) as the token-by-weight plan names them.
+        reason = _tma_alignment_reject(mm.b_dtype, mm.a_dtype, "k" if mm.b_major == "k" else "m", "k" if mm.a_major == "k" else "n", n, m, k)
         if reason is not None:
             raise ValueError(reason)
         _check_moe_combine_n(compiled, n)
@@ -770,8 +776,8 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
     fto = pull(b.first_token_offset, "first_token_offset")
-    sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
+    sfa = [pull(t, "token SF") for t in b.sfa_operands]
+    sfb = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
@@ -895,15 +901,39 @@ def _import_kernel(src: str) -> object:
 class _CompiledRuntime:
     _compiler: ClassVar[Any]
     _validate_runtime_quant: ClassVar[bool] = False
+    # _CompiledFusedGemm's lowered()/explain() check each aux against the layout the family's epilogue compiled in (``_aux_layout_check``).
+    _validate_aux_layout: ClassVar[bool] = False
     _validate_combine: ClassVar[bool] = False
+    _validate_quant_scale_blobs: ClassVar[bool] = False
     # Per call: refuse a block-scale K that ends inside a scale block (_partial_scale_block_reject).
     _validate_whole_scale_blocks: ClassVar[bool] = False
+    # Each call's N is checked against the family's launch grid (``_launch_grid_reason``).
+    _validate_launch_grid: ClassVar[bool] = False
+    # Consult the family's _zero_extent_problem: skip an empty call's launch; refuse a K it cannot encode or a GATHER from an empty token buffer.
+    _check_zero_extents: ClassVar[bool] = False
     accepts_stream: ClassVar[bool] = True
 
     @property
     def tma_slots(self) -> "frozenset[int]":
         """Which dense output slots ride the TMA-C surface."""
         return frozenset((i for i, m in enumerate(self.store_modes) if m == "tma"))
+
+    def _check_quant_scale_blobs(self, outputs) -> None:
+        """Reject, before any write, an F8_128x4 quant-scale output the epilogue cannot address."""
+        if self._validate_quant_scale_blobs:
+            reason = self._compiler._quant_scale_blob_reject(self.chain, outputs)
+            if reason is not None:
+                raise ValueError(reason)
+
+
+def _k_pad_launchable_for(plan, m: int, n: int) -> Callable:
+    """The plan's kernel for kernel-frame extents ``(m, n)``. A plan whose quantized outputs can end an F8_128x4 scale
+    row inside a quad holds a second kernel that zeroes those K padding slots (``k_pad_axes``: ``(col_quant, block_size)``
+    per output; a col quant's blocks run along M, a row quant's along N); a call takes it only when some row does end
+    inside a quad, so a whole-quad call runs the kernel without the padding stores."""
+    if plan._launchable_k_pad is not None and any(((m if col_quant else n) // block_size) % 4 for col_quant, block_size in plan.k_pad_axes):
+        return plan._launchable_k_pad
+    return plan._launchable
 
 
 @dataclass
@@ -912,6 +942,8 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     config: _ConfigT
     generated_path: Path
     _launchable: Callable
+    _launchable_k_pad: "Callable | None" = None
+    k_pad_axes: tuple = ()
     _grid_ctas: int = 0
     device: int = 0
     aux_names: list = field(default_factory=list)
@@ -942,11 +974,14 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         if not isinstance(variant_pack, dict):
             raise TypeError(f"compiled kernels are called with a variant-pack dict {{cuDNN tensor | uid | name: buffer}}; got {type(variant_pack).__name__}")
         backend._check_plan_device(self.device)
+        # The launch and the output fills before it are driver calls on this thread. An autograd backward runs on
+        # a worker whose context stack can still be empty, so bind the context first.
+        ensure_current_context(stream, self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_moe(self, problem, offsets, workspace, operands, outputs, aux, stream, token_index, token_ks, top_k_scores):
         """Assemble and launch the grouped GEMM arguments."""
-        return self._launchable(
+        return _k_pad_launchable_for(self, int(problem[0]), int(problem[1]))(
             problem,
             offsets,
             workspace,
@@ -968,6 +1003,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     aux_names: list[str]
     generated_path: Path
     _launchable: Callable
+    _launchable_k_pad: "Callable | None" = None
+    k_pad_axes: tuple = ()
     block_scale: bool = False
     device: int = 0
     binding: _BindingT | None = None
@@ -1065,6 +1102,12 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
             raise NotImplementedError(f"cudnn.frost gemm: this kernel has no launch path -- {self.declined}")
         return self.lowered(operands, stream=stream, workspace=workspace)
 
+    def _check_launch_grid(self, n: int) -> None:
+        """Refuse a call whose kernel-frame N needs a launch grid CUDA rejects (the family's ``_launch_grid_reason``)."""
+        reason = self._compiler._launch_grid_reason(self.chain, self.config, n)
+        if reason is not None:
+            raise ValueError(f"cudnn.frost gemm: {reason} -- the plan was built for a smaller N; rebuild for this shape")
+
     def _lower(self):
         """Build the validated launch closure."""
         backend = self._compiler
@@ -1093,7 +1136,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         in_slots = tuple((op.index for op in r.inputs))
         ins = tuple(((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs)))
         outs = tuple(((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs))
-        auxs = tuple((x.index, x.align, x.mainloop_scale) for x in r.aux)
+        auxs = tuple((x.index, x.align, x.mainloop_scale, x.access_rule) for x in r.aux)
         sfs = tuple(((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf))
         tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = (r.shared_layout, r.seeds)
@@ -1101,6 +1144,7 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         block_size, batch = (r.block_size, r.batch)
         whole_scale_blocks = self._validate_whole_scale_blocks
         device, launchable, refuse = (r.device, self._launchable, self.explain)
+        k_pad_plan = self if self._launchable_k_pad is not None else None
         fill_word, fill_plan, apply_fill = (backend.buffers.fill_word_async, backend.buffers.strided_fill_plan, backend.buffers.apply_fill_plan)
         is_contiguous = backend.buffers.is_contiguous
         needs_workspace = bool(r.workspace_bytes)
@@ -1111,7 +1155,11 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         )
         mn_view_slots = (frozenset((o.index for o in r.outputs)) | frozenset((x.index for x in r.aux))) - packed_scale_slots
         aux_views = {id(x.ref): x.transposed for x in r.aux}
-        tail = tuple((i, ref, (swap_ab ^ aux_views.get(id(ref), False)) if ref is not None else (swap_ab and i in mn_view_slots)) for i, ref in tail)
+        tail = tuple(
+            (i, ref, (False if ref.coordinate_mapped else swap_ab ^ aux_views.get(id(ref), False)) if ref is not None else (swap_ab and i in mn_view_slots))
+            for i, ref in tail
+        )
+        checked_scale_slots = tuple(sorted(packed_scale_slots)) if self._validate_quant_scale_blobs else ()
         if split_k_slices > 1:
             cta_k_elems = backend._cta_k_elems(self.chain, self.config)
         if needs_workspace:
@@ -1119,11 +1167,17 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         quant_mn = (self.chain.matmul.M, self.chain.matmul.N) if self._validate_runtime_quant and self.chain.quants else None
         quant_reason = backend._runtime_quant_reason if quant_mn is not None else None
         quant_chain, quant_cfg = (self.chain, self.config)
+        check_grid = self._check_launch_grid if self._validate_launch_grid else None
+        zero_extent = backend._zero_extent_problem if self._check_zero_extents else None
+        aux_layouts = tuple(((x.index, backend._aux_layout_check(x.ref, swap_ab)) for x in r.aux)) if self._validate_aux_layout else ()
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None, workspace=None):
             """Validate resolved buffers and launch the already compiled GEMM plan."""
             backend._check_plan_device(device)
+            # The fills and the launch below are driver calls on this thread (an autograd worker can have no
+            # current context yet).
+            ensure_current_context(stream, device)
             original_operands = operands
             operands = r.operand_views(operands)
             vs = [operands[i] for i in in_slots]
@@ -1177,12 +1231,22 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     gave_up["output layout"] += 1
                     return refuse(original_operands, graph_order)
                 problem += (st[2], st[1], st[0]) if swap_ab and idx in mn_view_slots else (st[1], st[2], st[0])
-            for idx, align, scale_rule in auxs:
+            for idx in checked_scale_slots:
+                if backend._quant_scale_plane_reject(operands[idx]) is not None:
+                    gave_up["quant scale blob"] += 1
+                    return refuse(original_operands, graph_order)
+            for idx, align, scale_rule, access_rule in auxs:
                 v = operands[idx]
                 if scale_rule is not None:
                     scale_rule.check(v, k)
+                if access_rule is not None:
+                    access_rule.check(v, k, m, n)
                 if backend.tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
+                    return refuse(original_operands, graph_order)
+            for idx, aux_layout_reason in aux_layouts:
+                if aux_layout_reason(operands[idx], m, n) is not None:
+                    gave_up["aux layout"] += 1
                     return refuse(original_operands, graph_order)
             if sfs:
                 if whole_scale_blocks and k % block_size:
@@ -1206,10 +1270,14 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                     if tuple(vs[j].stride()) != st:
                         gave_up["operands do not share a layout"] += 1
                         return refuse(original_operands, graph_order)
-            if split_k_slices > 1:
+            # An empty problem (M or N == 0) launches nothing, so it needs no split-K shape or workspace.
+            empty = zero_extent is not None and zero_extent(m, n, k, block_size)
+            if split_k_slices > 1 and not empty:
                 backend.check_split_k_shape(k, n, batch, split_k_slices, cta_k_elems, reduce_elems if needs_workspace else 1)
+            if check_grid is not None and not empty:
+                check_grid(n)
             extra = ()
-            if needs_workspace:
+            if needs_workspace and not empty:
                 if workspace is None:
                     raise ValueError(
                         "cudnn.frost gemm: this plan needs a workspace; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
@@ -1236,7 +1304,9 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                         fill_word(ptr, count, word, stream)
                     else:
                         apply_fill(ptr, plan, word, stream)
-            return launchable(
+            if empty:
+                return None
+            return (launchable if k_pad_plan is None else _k_pad_launchable_for(k_pad_plan, m, n))(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
                 *(
@@ -1275,6 +1345,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 backend._cta_k_elems(self.chain, self.config),
                 backend._splitk_reduce_elems(self.chain) if self.config.workspace_split_k else 1,
             )
+        if self._validate_launch_grid:
+            self._check_launch_grid(int(mnk[1]))
         if self._validate_runtime_quant:
             m, n = (int(mnk[0]), int(mnk[1]))
             if self.config.swap_ab and self.chain.quants:
@@ -1297,6 +1369,9 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
                 raise ValueError(
                     f"{exc} [in the kernel frame of this swap-AB plan, which runs the graph transposed: its M = {m} and N = {n} are the graph's N and M, and its row / col quant axes the graph's col / row]"
                 ) from exc
+        self._check_quant_scale_blobs([operands[o.index] for o in recipe.outputs])
+        if self._validate_aux_layout:
+            backend._check_aux_layout(recipe, operands, int(mnk[0]), int(mnk[1]), self.config.swap_ab)
         raise RuntimeError(
             f"cudnn.frost gemm: the launch path refused this call and no rule explains why -- its per-call guards and the diagnostics here have drifted apart. Guards that fired: {dict(self.deferrals)}."
         )
@@ -1329,6 +1404,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 raise ValueError(
                     f"MoE output {spec.source!r} must have shape {backend._expected_output_shape(spec, self.chain, (S, N, K), top_k_scores)}; got {tuple(t.shape)}"
                 )
+        self._check_quant_scale_blobs(outputs)
         num_experts = int(weight.shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
         a_perm = token.permute(1, 2, 0)
@@ -1352,8 +1428,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             backend._check_moe_combine_operands(
                 self.chain, [token], [weight], first_token_offset, [], [], (token_index, token_ks, top_k_scores), outputs, K, workspace
             )
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, None, token.shape[1])
         backend._initialize_reduction_outputs(self.chain, outputs, stream)
         backend._initialize_combine_output(self.chain, outputs, stream)
+        if empty:
+            return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b), cs, (), stream, token_index, token_ks, top_k_scores)
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
@@ -1362,9 +1441,10 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, _sfa, _sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = backend._aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
+        a_role, b_role = ("weight", "token") if isinstance(self.chain.moe, backend.MoeSwapAbSpec) else ("token", "weight")
         _named = (
-            [("token", x, 16, "ptr") for x in a_bufs]
-            + [("weight", x, 16, "ptr") for x in b_bufs]
+            [(a_role, x, 16, "ptr") for x in a_bufs]
+            + [(b_role, x, 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
         )
@@ -1449,6 +1529,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 raise ValueError(
                     f"multi-GEMM MoE output {spec.source!r} must have shape {backend._expected_output_shape(spec, chain, (S, N, K), top_k_scores)}; got {tuple(ci.shape)}"
                 )
+        self._check_quant_scale_blobs(outs)
         num_experts = int(b_slots[0].shape[0])
         num_groups = backend._moe_num_groups(first_token_offset, num_experts)
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
@@ -1478,8 +1559,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + backend._MOE_SCHED_COUNTER_SLOTS, workspace)
         if self._validate_combine:
             backend._check_moe_combine_operands(chain, a_slots, b_slots, first_token_offset, [], [], (token_index, token_ks, top_k_scores), outs, K, workspace)
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, None, a_slots[0].shape[1])
         backend._initialize_reduction_outputs(chain, outs, stream)
         backend._initialize_combine_output(chain, outs, stream)
+        if empty:
+            return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (*a_wrapped, *b_wrapped), cs, aux, stream, token_index, token_ks, top_k_scores)
 
 
@@ -1525,6 +1609,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         scale_blob_reason = backend._grouped_row_quant_scale_blob_reject(self.chain, outputs, S, N, num_groups)
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
+        self._check_quant_scale_blobs(outputs)
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -1552,8 +1637,11 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             backend._check_moe_combine_operands(
                 self.chain, [token], [weight], first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outputs, K, workspace
             )
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, self.chain.block_scale.block_size, token.shape[1])
         backend._initialize_reduction_outputs(self.chain, outputs, stream)
         backend._initialize_combine_output(self.chain, outputs, stream)
+        if empty:
+            return None
         return self._launch_moe(problem_size, first_token_offset, workspace, (a, b, *sf_args), cs, (), stream, token_index, token_ks, top_k_scores)
 
     def _call_variant_pack(self, variant_pack: dict, workspace=None, stream=None):
@@ -1562,6 +1650,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, snk = backend._resolve_moe_variant_pack(self, variant_pack)
         _out_reqs = backend._output_align_reqs(self.chain, self.tma_slots, vec_bytes=self.vec_bytes_epi)
         _aux_reqs = backend._aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
+        a_role, b_role = ("weight", "token") if isinstance(self.chain.moe, backend.MoeSwapAbSpec) else ("token", "weight")
         _padded_a, _padded_b = (False, False)
         if self._check_padded_operands:
             _mixed = backend._mixed_width_operand_reject(self.chain, a_bufs, b_bufs)
@@ -1571,17 +1660,17 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
 
             _padded_a, _padded_b = sm120_padded_e2m1_sides(self.chain)
             _padded = backend._padded_e2m1_operand_reject(
-                [("token", x) for x in (a_bufs if _padded_a else ())] + [("weight", x) for x in (b_bufs if _padded_b else ())]
+                [(a_role, x) for x in (a_bufs if _padded_a else ())] + [(b_role, x) for x in (b_bufs if _padded_b else ())]
             )
             if _padded is not None:
                 raise ValueError(_padded)
         _named = (
-            [("token", x, 32 if _padded_a else 16, "ptr") for x in a_bufs]
-            + [("weight", x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
+            [(a_role, x, 32 if _padded_a else 16, "ptr") for x in a_bufs]
+            + [(b_role, x, 32 if _padded_b else 16, "ptr") for x in b_bufs]
             + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
             + [(f"aux {self.chain.aux_tensors[i].name!r}", x, _aux_reqs[self.chain.aux_tensors[i].name], "full") for i, x in enumerate(aux_bufs)]
-            + [("SFA", x, 16, "ptr") for x in sfa or []]
-            + [("SFB", x, 16, "ptr") for x in sfb or []]
+            + [(f"{a_role} SF", x, 16, "ptr") for x in sfa or []]
+            + [(f"{b_role} SF", x, 16, "ptr") for x in sfb or []]
         )
         _r = backend._alignment_reject(_named)
         if _r is not None:
@@ -1704,6 +1793,7 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         scale_blob_reason = backend._grouped_row_quant_scale_blob_reject(chain, outs, S, N, num_groups)
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
+        self._check_quant_scale_blobs(outs)
         a0, b0 = (a_slots[0][0], b_slots[0][0])
         a_stride_perms = [t.permute(1, 2, 0) for t, _sf in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t, _sf in b_slots]
@@ -1745,8 +1835,11 @@ class _CompiledMoeBlockScaleGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             tokens, weights = ([t for t, _sf in a_slots], [w for w, _sf in b_slots])
             sfs = ([sf for _t, sf in a_slots if sf is not None], [sf for _w, sf in b_slots if sf is not None])
             backend._check_moe_combine_operands(chain, tokens, weights, first_token_offset, *sfs, (token_index, token_ks, top_k_scores), outs, K, workspace)
+        empty = self._check_zero_extents and backend._zero_extent_problem(S, N, K, chain.block_scale.block_size, a0.shape[1])
         backend._initialize_reduction_outputs(chain, outs, stream)
         backend._initialize_combine_output(chain, outs, stream)
+        if empty:
+            return None
         return self._launch_moe(
             problem_size,
             first_token_offset,
@@ -1777,6 +1870,7 @@ _SHARED_EXPORTS = {
     "_CTAMMA_SUFFIX": _CTAMMA_SUFFIX,
     "_INJECT_MARKER_LINE": _INJECT_MARKER_LINE,
     "_aux_fake_shape_code": _aux_fake_shape_code,
+    "_aux_kernel_shape": _aux_kernel_shape,
     "_aux_can_use_explicit_fake_stride": _aux_can_use_explicit_fake_stride,
     "_aux_fake_block": _aux_fake_block,
     "_aux_signature_block": _aux_signature_block,
@@ -1819,6 +1913,7 @@ _SHARED_EXPORTS = {
     "_register_legacy_device_view_adapter": _register_legacy_device_view_adapter,
     "_moe_carve_workspace": _moe_carve_workspace,
     "_moe_launch_tail": _moe_launch_tail,
+    "_k_pad_launchable_for": _k_pad_launchable_for,
 }
 
 _impl = importlib.import_module(f"{__package__}.{active_family()}.compiler")
