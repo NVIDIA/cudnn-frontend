@@ -299,7 +299,7 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
 
 @pytest.mark.L0
 def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
-    """f16 d256 mask-free and MHA d64 windowed context lead on cc 8.0 from their own study; a class whose fit kept a threshold, whose tile
+    """MHA d64 windowed context leads on cc 8.0 from their own study; a class whose fit kept a threshold, whose tile
     twin did not fit `always`, or that failed qualification has no entry, and another Ampere part keeps the hand rules."""
     row = "sdpa_fwd_prefill_sm80"
 
@@ -322,9 +322,9 @@ def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
         return _facts(**base)
 
     window = dict(causal=True, bottom_right=True, window_left=256)
-    assert pt.TABLE[pt.class_key(row, prefill(256))].study == "sm80_dense_prefill_f16_20261107"
-    assert pt.lookup(row, prefill(256)) is True
-    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8, s_kv=4100)) is True  # GQA off the tile: its own class and entry
+    assert pt.lookup(row, prefill(256)) is None  # MHA failed native qualification; keep the prior rule
+    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8)) is None  # GQA also failed qualification
+    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8, s_kv=4100)) is None  # keep the tile twin on the prior rule too
     assert pt.TABLE[pt.class_key(row, prefill(64, **window))].study == "sm80_dense_prefill_f16_20261107"
     assert pt.lookup(row, prefill(64, cudnn.data_type.BFLOAT16, **window)) is True
     assert pt.TABLE[pt.class_key(row, prefill(64, cudnn.data_type.BFLOAT16, **window))].study == "sm80_dense_prefill_bf16_20261107"
