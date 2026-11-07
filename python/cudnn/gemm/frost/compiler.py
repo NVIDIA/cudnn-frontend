@@ -474,6 +474,8 @@ def _swap_mn_view(t: object) -> object:
 
 def _offset_vector(t):
     """View ``[G+1,1,1]`` offsets as a vector."""
+    if t is None:
+        return None
     shape = tuple(t.shape)
     if len(shape) == 3 and shape[1:] == (1, 1):
         return t.reshape([shape[0]])
@@ -654,7 +656,7 @@ def _check_moe_combine_n(compiled, n: int) -> None:
         return
     multiple = compiled.vec_bytes_epi // DTYPE_BYTES[chain.output_dtype]
     if isinstance(chain.moe, MoeSwapAbSpec):
-        multiple = min(multiple, chain.moe.offset_multiple)
+        multiple = min(multiple, chain.grouped_gemm.partition.boundary_alignment)
     if n % multiple:
         raise ValueError(f"MoE COMBINE runtime kernel N must be divisible by {multiple} for the compiled epilogue; got N={n}")
 
@@ -702,10 +704,43 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             # Keep the memo local for slot-only launchers.
             pass
 
+    views = {id(t): view for t, view in b.operand_views} if compiled.chain.grouped_gemm.partition.is_uniform else {}
+
+    declared_dtypes = None
+    if views:
+        declared_dtypes = {id(t): compiled.chain.matmul.a_dtype for t in b.a_operands}
+        declared_dtypes.update({id(t): compiled.chain.matmul.b_dtype for t in b.b_operands})
+        declared_dtypes.update({id(t): spec.dtype for spec, t in zip(compiled.chain.outputs, b.outputs)})
+        declared_dtypes.update({id(t): ref.dtype for ref, t in zip(compiled.chain.aux_tensors, b.aux)})
+        if b.token_index is not None:
+            declared_dtypes[id(b.token_index)] = "int32"
+
     def pull(t, role):
         if t is None or id(t) not in resolved:
             raise KeyError(f"variant pack is missing a buffer for {role}")
-        return resolved[id(t)]
+        value = resolved[id(t)]
+        if views:
+            declared_dtype = declared_dtypes[id(t)]
+            expected_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32", "int32": "int32"}.get(declared_dtype)
+            if expected_dtype is None:
+                raise ValueError(f"indirect {role} dtype {declared_dtype!r} is not supported by this binding")
+            if buffers.dtype_name(value) != expected_dtype:
+                raise ValueError(f"row gather {role} dtype does not match the prepared graph")
+            declared_device = getattr(value, "device", None)
+            if declared_device is not None and (
+                getattr(declared_device, "type", "cuda") != "cuda" or getattr(declared_device, "index", compiled.device) != compiled.device
+            ):
+                raise ValueError(f"row gather {role} is on a different device")
+            dlpack_device = getattr(value, "__dlpack_device__", None)
+            if dlpack_device is not None and tuple(dlpack_device()) != (2, compiled.device):
+                raise ValueError(f"row gather {role} is on a different device")
+            value = views[id(t)].apply(value)
+            if role == "output":
+                from .layouts import fold_batch_layout
+
+                fold_batch_layout(value.shape, value.stride(), writable=True)
+            return value
+        return value
 
     top_k_scores = None
     if compiled.chain.moe.mode == "combine":
@@ -755,7 +790,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             for spec, t in zip(compiled.chain.outputs, b.outputs)
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
-        fto = pull(b.first_token_offset, "first_token_offset")
+        fto = None if compiled.chain.grouped_gemm.partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
         sfa = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfa_operands]
         sfb = [pull(t, "token SF") for t in b.sfb_operands]
         mm = compiled.chain.matmul
@@ -772,13 +807,25 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, top_k_scores, (m, n, k)
 
     a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
+    b_bufs = [pull(t, "weight").permute(0, 2, 1) if views else _kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
-    fto = pull(b.first_token_offset, "first_token_offset")
+    fto = None if compiled.chain.grouped_gemm.partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "token SF") for t in b.sfa_operands]
     sfb = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
+    if views:
+        # Gather inputs remain live throughout the tiled GEMM; output aliasing
+        # cannot be made safe by the order of graph nodes.
+        values = [*a_bufs, *b_bufs, *aux_bufs, pull(b.token_index, "indices")]
+        for output in out_bufs:
+            olo = buffers.data_ptr(output)
+            ohi = olo + (1 + sum((d - 1) * s for d, s in zip(output.shape, output.stride()))) * output.element_size()
+            for value in (*values, *(other for other in out_bufs if other is not output)):
+                lo = buffers.data_ptr(value)
+                hi = lo + (1 + sum((d - 1) * s for d, s in zip(value.shape, value.stride()))) * value.element_size()
+                if olo < hi and lo < ohi:
+                    raise ValueError("row gather output must not overlap a source, weight, or index input")
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
     S = token_index.shape[0] if token_index is not None else a_bufs[0].shape[1]
@@ -952,6 +999,16 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
     _desc_slots_per_cta: int = 0
     store_modes: tuple = ()
     use_tma_store: bool = False
+
+    def _group_offsets(self, offsets):
+        """Bind the prepared partition kind; never fabricate or ignore offsets."""
+        if self.chain.grouped_gemm.partition.is_uniform:
+            if offsets is not None:
+                raise ValueError("uniform grouped GEMM does not accept a first_token_offset tensor")
+            return None
+        if offsets is None:
+            raise ValueError("variable grouped GEMM requires first_token_offset")
+        return self._compiler._offset_vector(offsets)
 
     @property
     def workspace_bytes(self) -> int:
@@ -1323,8 +1380,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
 
         return lowered
 
-    def explain(self, operands, graph_order=None):
-        """Say what is wrong with a call the launch path refused, and raise."""
+    def validate_operands(self, operands, graph_order=None):
+        """Validate a prepared call without reading device contents or launching."""
         backend = self._compiler
         recipe = self.recipe
         backend._check_plan_device(recipe.device)
@@ -1372,6 +1429,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         self._check_quant_scale_blobs([operands[o.index] for o in recipe.outputs])
         if self._validate_aux_layout:
             backend._check_aux_layout(recipe, operands, int(mnk[0]), int(mnk[1]), self.config.swap_ab)
+
+    def explain(self, operands, graph_order=None):
+        """Say what is wrong with a call the launch path refused, and raise."""
+        self.validate_operands(operands, graph_order)
         raise RuntimeError(
             f"cudnn.frost gemm: the launch path refused this call and no rule explains why -- its per-call guards and the diagnostics here have drifted apart. Guards that fired: {dict(self.deferrals)}."
         )
@@ -1384,7 +1445,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
     def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None, token_index=None, token_ks=None, top_k_scores=None):
         """Validate and launch one grouped GEMM."""
         backend = self._compiler
-        first_token_offset = backend._offset_vector(first_token_offset)
+        first_token_offset = self._group_offsets(first_token_offset)
         if len(snke) < 3:
             raise ValueError(f"MoE call needs problem_size (S, N, K[, ...]); got {snke!r}")
         S, N, K = (int(snke[0]), int(snke[1]), int(snke[2]))
@@ -1396,7 +1457,10 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             raise ValueError(
                 f"this MoE graph has {len(outputs_spec)} output(s) ({[o.source for o in outputs_spec]}); got {len(outputs)}. Pass outputs in slot order."
             )
-        for name, t, rank in (("token", token, 3), ("weight", weight, 3), ("first_token_offset", first_token_offset, 1)):
+        ranked = [("token", token, 3), ("weight", weight, 3)]
+        if not self.chain.grouped_gemm.partition.is_uniform:
+            ranked.append(("first_token_offset", first_token_offset, 1))
+        for name, t, rank in ranked:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
@@ -1406,7 +1470,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 )
         self._check_quant_scale_blobs(outputs)
         num_experts = int(weight.shape[0])
-        num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        num_groups = (
+            self.chain.grouped_gemm.partition.num_groups
+            if self.chain.grouped_gemm.partition.is_uniform
+            else backend._moe_num_groups(first_token_offset, num_experts)
+        )
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -1483,7 +1551,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
     ):
         """Launch parallel grouped GEMMs."""
         backend = self._compiler
-        first_token_offset = backend._offset_vector(first_token_offset)
+        first_token_offset = self._group_offsets(first_token_offset)
         chain = self.chain
         if not isinstance(gemm_pairs, (list, tuple)) or not all((isinstance(p, (list, tuple)) and len(p) == 2 for p in gemm_pairs)):
             raise ValueError(f"multi-GEMM MoE call expects a list of (token, weight) pairs as the first argument; got {type(gemm_pairs).__name__}")
@@ -1512,7 +1580,10 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         if len(outs) != len(outputs_spec):
             raise ValueError(f"fused multi-GEMM MoE has {len(outputs_spec)} output(s); got {len(outs)}")
         out = outs[0]
-        for name, t, rank in (("output", out, 3), ("first_token_offset", first_token_offset, 1)):
+        ranked = [("output", out, 3)]
+        if not chain.grouped_gemm.partition.is_uniform:
+            ranked.append(("first_token_offset", first_token_offset, 1))
+        for name, t, rank in ranked:
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for role, slots, major in (("token", a_slots, chain.matmul.a_major), ("weight", b_slots, chain.matmul.b_major)):
@@ -1531,7 +1602,11 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 )
         self._check_quant_scale_blobs(outs)
         num_experts = int(b_slots[0].shape[0])
-        num_groups = backend._moe_num_groups(first_token_offset, num_experts)
+        num_groups = (
+            self.chain.grouped_gemm.partition.num_groups
+            if self.chain.grouped_gemm.partition.is_uniform
+            else backend._moe_num_groups(first_token_offset, num_experts)
+        )
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]

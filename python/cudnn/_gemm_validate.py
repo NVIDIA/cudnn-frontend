@@ -36,6 +36,7 @@ _MOE_BWD_INPUTS = ("doutput", "token", "first_token_offset")
 COVERED_NODE_TYPES = frozenset(
     {
         NodeType.MATMUL,
+        NodeType.GATHER,
         NodeType.MOE_GROUPED_MATMUL,
         NodeType.MOE_GROUPED_MATMUL_BWD,
         NodeType.BLOCK_SCALE_DEQUANTIZE,
@@ -76,7 +77,20 @@ def validate_graph(graph) -> bool:
 
 def validate_node(node) -> None:
     """Dispatch one GEMM-family node to its rules."""
-    if node.node_type == NodeType.MATMUL:
+    if node.node_type == NodeType.GATHER:
+        from .nodes import gather_shape
+        import cudnn
+
+        _validate_required(node, "Gather", ("input", "indices"), ("OUT_0",))
+        source, indices, out = node.inputs["input"], node.inputs["indices"], node.outputs["OUT_0"]
+        expected = gather_shape(source.get_dim(), indices.get_dim(), node.params.get("axis", 0))
+        if out.get_dim() != expected:
+            raise ValueError(f"gather output shape must be {expected}; got {out.get_dim()}")
+        if indices.get_data_type() not in (cudnn.data_type.INT32, cudnn.data_type.INT64):
+            raise ValueError("gather indices must be INT32 or INT64")
+        if source.get_data_type() != out.get_data_type():
+            raise ValueError("gather preserves its input dtype")
+    elif node.node_type == NodeType.MATMUL:
         _validate_matmul(node)
     elif node.node_type == NodeType.RESHAPE:
         _validate_reshape(node)

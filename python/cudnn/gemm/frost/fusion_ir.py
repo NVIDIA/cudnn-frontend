@@ -190,17 +190,21 @@ class IndexExpr:
 
 @dataclass(frozen=True)
 class IndexMap:
-    """Fixed-shape consumer -> producer logical coordinates, not storage strides.
+    """Fixed-shape consumer -> producer coordinates, optionally reading indices.
 
-    Integer axis references are scoped to consumer_shape. Every constructor
-    defines a map over its entire positive rectangular consumer domain; reshape
-    preserves lexicographic order, permutation preserves elements, and broadcast
-    need not be invertible. Shape products and intermediate arithmetic fit Int64.
+    Axis references are scoped to consumer_shape. Direct expressions have
+    statically checked Int64 arithmetic and producer bounds. IndexLookup values
+    require signed runtime bounds checks; an invalid access produces zero without
+    reading source storage. Strides, pointers and loader selection are not IR.
+
+    Pure views (identity, permutation, reshape, broadcast) compose with either
+    kind of map. Composition through runtime-dependent consumer coordinates is
+    not yet supported; it requires arithmetic over lookup results.
     """
 
     consumer_shape: tuple[int, ...]
     producer_shape: tuple[int, ...]
-    coordinates: tuple[IndexExpr, ...]
+    coordinates: tuple[IndexExpr | IndexLookup, ...]
 
     def __post_init__(self):
         for name in ("consumer_shape", "producer_shape"):
@@ -212,6 +216,10 @@ class IndexMap:
         if len(self.coordinates) != len(self.producer_shape):
             raise ValueError("index map requires one expression per producer axis")
         for expr, extent in zip(self.coordinates, self.producer_shape):
+            if isinstance(expr, IndexLookup):
+                if expr.indices_map.consumer_shape != self.consumer_shape:
+                    raise ValueError("index lookup domain must match the index map consumer shape")
+                continue
             if not isinstance(expr, IndexExpr) or not expr.axes <= set(range(len(self.consumer_shape))):
                 raise ValueError("index map references an axis outside its consumer domain")
             if self._upper_bound(expr) >= extent:
@@ -273,18 +281,118 @@ class IndexMap:
             consumer_shape, producer_shape, tuple(IndexExpr.constant(0) if d == 1 else IndexExpr.coordinate(i + offset) for i, d in enumerate(producer_shape))
         )
 
+    @classmethod
+    def take(cls, indices_ref, source_shape, indices_shape, axis):
+        source_shape, indices_shape = tuple(source_shape), tuple(indices_shape)
+        IndexMap.identity(source_shape)
+        IndexMap.identity(indices_shape)
+        axis = index(axis)
+        if axis < 0:
+            axis += len(source_shape)
+        if not 0 <= axis < len(source_shape):
+            raise ValueError("gather axis is outside the source rank")
+        consumer_shape = (*source_shape[:axis], *indices_shape, *source_shape[axis + 1 :])
+        indices_map = IndexMap(consumer_shape, indices_shape, tuple(IndexExpr.coordinate(axis + i) for i in range(len(indices_shape))))
+        coordinates = tuple(
+            IndexLookup(indices_ref, indices_map) if i == axis else IndexExpr.coordinate(i if i < axis else i + len(indices_shape) - 1)
+            for i in range(len(source_shape))
+        )
+        return cls(consumer_shape, source_shape, coordinates)
+
+    @property
+    def axes(self):
+        return frozenset().union(*(coordinate.axes for coordinate in self.coordinates))
+
+    @property
+    def tensor_dependencies(self):
+        return frozenset(coordinate.indices_ref for coordinate in self.coordinates if isinstance(coordinate, IndexLookup))
+
+    @property
+    def indirections(self):
+        return tuple((axis, coordinate) for axis, coordinate in enumerate(self.coordinates) if isinstance(coordinate, IndexLookup))
+
+    @property
+    def is_direct(self):
+        """Whether all producer coordinates can be evaluated without tensor reads."""
+        return all(isinstance(coordinate, IndexExpr) for coordinate in self.coordinates)
+
     def compose(self, consumer_map):
-        """Apply consumer_map first, then this map, preserving map direction."""
+        """Pull back every coordinate along a pure consumer view."""
+        if not isinstance(consumer_map, IndexMap):
+            raise ValueError("index map composition requires an IndexMap")
         if consumer_map.producer_shape != self.consumer_shape:
             raise ValueError("index map composition requires matching intermediate shapes")
+        if not consumer_map.is_direct:
+            raise ValueError("index map composition requires a direct consumer map")
         replacements = dict(enumerate(consumer_map.coordinates))
-        return IndexMap(consumer_map.consumer_shape, self.producer_shape, tuple(expr.substitute(replacements) for expr in self.coordinates))
+        coordinates = tuple(
+            coordinate.compose(consumer_map) if isinstance(coordinate, IndexLookup) else coordinate.substitute(replacements) for coordinate in self.coordinates
+        )
+        return IndexMap(consumer_map.consumer_shape, self.producer_shape, coordinates)
+
+    def lower(self, coordinates, render, load_index=None):
+        """One binding entry for direct expressions and logical index reads.
+
+        render consumes a bound IndexExpr; load_index consumes a tensor name,
+        rendered index coordinates and the source-axis extent. The backend owns
+        index loading and validity predicates, never the pure expression IR.
+        """
+        if len(coordinates) != len(self.consumer_shape):
+            raise ValueError("access binding requires every consumer coordinate")
+        substitutions = dict(enumerate(coordinates))
+        result = []
+        for axis, coordinate in enumerate(self.coordinates):
+            if isinstance(coordinate, IndexLookup):
+                if load_index is None:
+                    raise ValueError("indirect access lowering requires an index reader")
+                index_coordinates = tuple(render(expr) for expr in coordinate.indices_map.apply(coordinates))
+                result.append(load_index(coordinate.indices_ref, index_coordinates, self.producer_shape[axis]))
+            else:
+                result.append(render(coordinate.substitute(substitutions)))
+        return tuple(result)
 
     def apply(self, coordinates):
-        """Bind graph-axis expressions to another coordinate domain."""
-        if len(coordinates) != len(self.consumer_shape):
-            raise ValueError("index map binding requires every consumer coordinate")
-        return tuple(expr.substitute(dict(enumerate(coordinates))) for expr in self.coordinates)
+        """Bind direct accesses using the same entry as indirect lowering."""
+        return self.lower(coordinates, lambda expression: expression)
+
+    def evaluate(self, coordinates, read_index=None):
+        """Host reference: None denotes zero-filled access with no source read."""
+        coordinates = tuple(map(index, coordinates))
+        if len(coordinates) != len(self.consumer_shape) or any(not 0 <= c < d for c, d in zip(coordinates, self.consumer_shape)):
+            raise ValueError("access coordinate is outside the consumer domain")
+        invalid = False
+
+        def load(ref, coords, extent):
+            nonlocal invalid
+            if read_index is None:
+                raise ValueError("indirect access evaluation requires an index reader")
+            value = index(read_index(ref, coords))
+            if not -(1 << 63) <= value < (1 << 63):
+                raise ValueError("index tensor value exceeds signed Int64")
+            invalid |= not 0 <= value < extent
+            return value
+
+        result = self.lower(tuple(IndexExpr.constant(c) for c in coordinates), lambda expr: expr.evaluate(()), load)
+        return None if invalid else result
+
+
+@dataclass(frozen=True)
+class IndexLookup:
+    """A logical read of an index tensor; no pointer, stride or copy instruction."""
+
+    indices_ref: str
+    indices_map: IndexMap
+
+    def __post_init__(self):
+        if not isinstance(self.indices_ref, str) or not self.indices_ref or not isinstance(self.indices_map, IndexMap) or not self.indices_map.is_direct:
+            raise ValueError("index lookup requires a named tensor and a direct coordinate map")
+
+    @property
+    def axes(self):
+        return frozenset().union(*(expr.axes for expr in self.indices_map.coordinates))
+
+    def compose(self, consumer_map):
+        return dataclasses.replace(self, indices_map=self.indices_map.compose(consumer_map))
 
 
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
@@ -780,6 +888,66 @@ class BlockScaleSpec:
 
 
 @dataclass(frozen=True)
+class GroupPartition:
+    """Partition a packed row domain, independently of routing and copy kind.
+
+    Uniform groups derive boundaries from shape. Variable groups read an
+    offsets tensor; its reference/storage belongs to the graph binding.
+    """
+
+    num_groups: int
+    rows_per_group: int | None = None
+    offset_dtype: Dtype | None = None
+    offset_alignment: int = 1
+
+    def __post_init__(self):
+        for name in ("num_groups", "offset_alignment"):
+            object.__setattr__(self, name, index(getattr(self, name)))
+        if self.num_groups < 1 or self.num_groups > (1 << 31) - 1 or self.offset_alignment < 1:
+            raise ValueError("group partition requires a positive Int32 group count and positive alignment")
+        if self.rows_per_group is not None:
+            object.__setattr__(self, "rows_per_group", index(self.rows_per_group))
+            if self.rows_per_group < 1 or self.num_groups * self.rows_per_group > (1 << 63) - 1:
+                raise ValueError("uniform group rows require positive Int64 geometry")
+            if self.offset_dtype is not None or self.offset_alignment != 1:
+                raise ValueError("uniform groups do not have an offsets tensor")
+        elif self.offset_dtype not in ("int32", "int64"):
+            raise ValueError("variable group offsets must be int32 or int64")
+
+    @classmethod
+    def uniform(cls, num_groups, rows_per_group):
+        return cls(num_groups, rows_per_group=rows_per_group)
+
+    @classmethod
+    def offsets(cls, num_groups, dtype="int32", alignment=1):
+        return cls(num_groups, offset_dtype=dtype, offset_alignment=alignment)
+
+    @property
+    def is_uniform(self):
+        return self.rows_per_group is not None
+
+    @property
+    def boundary_alignment(self):
+        return self.rows_per_group if self.is_uniform else self.offset_alignment
+
+
+@dataclass(frozen=True)
+class GroupedGemmSpec:
+    """Shared grouped scheduling: group g selects weight g % weight_groups.
+
+    Row partitioning is independent of indirect loads, scatter, and combine.
+    """
+
+    num_weight_groups: int
+    partition: GroupPartition
+
+    def __post_init__(self):
+        object.__setattr__(self, "num_weight_groups", index(self.num_weight_groups))
+        if not 1 <= self.num_weight_groups < (1 << 31) or not isinstance(self.partition, GroupPartition):
+            raise ValueError("grouped GEMM requires a positive Int32 weight group count and a GroupPartition")
+
+
+@dataclass(frozen=True)
 class MoeSpec:
     """A MoE grouped matmul forward pass: per routed group g, ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % num_experts].T``."""
 
@@ -789,6 +957,7 @@ class MoeSpec:
     num_groups: int = 0
     offset_multiple: int = 1
     top_k: int = 1
+    grouped_gemm: GroupedGemmSpec | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -803,6 +972,24 @@ class MoeSpec:
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:
             raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
+        # Preserve the existing constructor/positional ABI. Scheduling is
+        # normalized once, not reconstructed on each launch. These legacy
+        # fields remain adapters for existing MoE callers.
+        if self.grouped_gemm is None:
+            object.__setattr__(
+                self, "grouped_gemm", GroupedGemmSpec(self.num_experts, GroupPartition.offsets(self.num_groups, self.offset_dtype, self.offset_multiple))
+            )
+        elif not isinstance(self.grouped_gemm, GroupedGemmSpec):
+            raise ValueError("MoE scheduling requires a GroupedGemmSpec")
+        else:
+            grouped = self.grouped_gemm
+            if (grouped.num_weight_groups, grouped.partition.num_groups) != (self.num_experts, self.num_groups):
+                raise ValueError("MoE and grouped GEMM group counts must agree")
+            if not grouped.partition.is_uniform and (grouped.partition.offset_dtype, grouped.partition.offset_alignment) != (
+                self.offset_dtype,
+                self.offset_multiple,
+            ):
+                raise ValueError("MoE and grouped GEMM offsets declarations must agree")
 
 
 @dataclass(frozen=True)
@@ -849,6 +1036,7 @@ class FusionChain:
     reductions: list[ReductionSpec] = field(default_factory=list)
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
     gemm_out_dtypes: tuple[Dtype, ...] = ()
+    source_access: IndexMap | None = None
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):
@@ -982,6 +1170,11 @@ class FusionChain:
     def has_moe(self) -> bool:
         """True iff this is a MoE grouped matmul."""
         return self.moe is not None
+
+    @property
+    def grouped_gemm(self) -> GroupedGemmSpec | None:
+        """Prepared scheduling shared by MoE and ordinary gather lowering."""
+        return self.moe.grouped_gemm if self.moe is not None else None
 
     @property
     def has_mainloop_fusion_a(self) -> bool:
@@ -1230,5 +1423,9 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
         mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
         block_scale=block_scale,
-        moe=(MoeSpec if isinstance(chain.moe, MoeSwapAbSpec) else MoeSwapAbSpec)(**dataclasses.asdict(chain.moe)) if chain.has_moe else None,
+        moe=(
+            (MoeSpec if isinstance(chain.moe, MoeSwapAbSpec) else MoeSwapAbSpec)(**{f.name: getattr(chain.moe, f.name) for f in dataclasses.fields(chain.moe)})
+            if chain.has_moe
+            else None
+        ),
     )

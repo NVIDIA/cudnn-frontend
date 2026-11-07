@@ -31,26 +31,32 @@ def fold_batch_layout(shape, stride, *, writable=False, allow_identity_broadcast
     if max(batch, pitch, span, *shape, *stride) > (1 << 63) - 1:
         raise ValueError("matrix batch view exceeds signed 64-bit geometry")
     if writable:
-        occupied = 1
-        for s, d in sorted((s, d) for d, s in zip(shape, stride) if d > 1):
-            if s < occupied:
-                raise ValueError("matrix output view requires non-overlapping storage")
-            occupied += (d - 1) * s
+        _check_nonoverlap(shape, stride, "matrix output view")
     return (batch, *shape[-2:]), (pitch, *stride[-2:])
 
 
-def checked_layout(shape, stride, *, context="strided layout"):
+def checked_layout(shape, stride, *, context="strided layout", writable=False):
     """Validate read-only element geometry without imposing a view or layout.
 
-    Zero/overlapping strides are legal for reads. Writable overlap and affine
-    view constraints belong to the operation requesting them, not this check.
+    Zero/overlapping strides are legal for reads; writable=True additionally
+    proves nonoverlap. Affine view constraints remain operation-specific.
     """
     shape, stride = tuple(map(index, shape)), tuple(map(index, stride))
     if not shape or len(shape) != len(stride) or any(d <= 0 for d in shape) or any(s < 0 for s in stride):
         raise ValueError(f"{context} requires positive extents and nonnegative strides")
     if max(prod(shape), 1 + sum((d - 1) * s for d, s in zip(shape, stride)), *shape, *stride) > (1 << 63) - 1:
         raise ValueError(f"{context} exceeds signed 64-bit geometry")
+    if writable:
+        _check_nonoverlap(shape, stride, context)
     return shape, stride
+
+
+def _check_nonoverlap(shape, stride, context):
+    occupied = 1
+    for step, extent in sorted((s, d) for d, s in zip(shape, stride) if d > 1):
+        if step < occupied:
+            raise ValueError(f"{context} requires non-overlapping storage")
+        occupied += (extent - 1) * step
 
 
 def reshape_layout(shape, stride, target):
@@ -176,6 +182,24 @@ class OperandView:
             raise ValueError("shared reshape input requires incompatible operand views")
         paths = tuple(dict.fromkeys((self.steps, *self.alternate_steps, other.steps, *other.alternate_steps)))
         return replace(self, alternate_steps=paths[1:])
+
+    def apply(self, value):
+        """One checked metadata view, without copying or owning device storage."""
+        from cudnn.frost.buffers import DeviceView, is_contiguous
+
+        source_shape, source_stride = tuple(value.shape), tuple(value.stride())
+        shape, stride = self.layout(source_shape, source_stride)
+        if source_shape == shape and source_stride == stride:
+            return value
+        if hasattr(value, "metadata_view"):
+            return value.metadata_view(shape, stride)
+        if isinstance(value, DeviceView):
+            if not is_contiguous(shape, stride):
+                raise ValueError("strided reshape/transpose execution requires a tensor or native variant pack")
+            return value.reshape(shape)
+        if hasattr(value, "as_strided"):
+            return value.as_strided(shape, stride)
+        raise ValueError("operand views require a tensor, DeviceView or native variant pack")
 
     def check_shape(self, shape):
         if tuple(shape) != self.source_shape:
