@@ -2231,7 +2231,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
             "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
-        auto serialized_plan = j["cudnn_backend_data"];
+        auto const &serialized_plan = j["cudnn_backend_data"].get_ref<std::string const &>();
         if (device_prop != nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
         } else {
@@ -2244,7 +2244,7 @@ class Graph : public ICudnn, public INode {
 
         // Deserialize pass_by_values from JSON
         if (j.contains("pass_by_values")) {
-            auto pass_by_values_json = j["pass_by_values"];
+            auto const &pass_by_values_json = j["pass_by_values"];
             for (auto it = pass_by_values_json.begin(); it != pass_by_values_json.end(); ++it) {
                 uid_t uid                       = std::stoll(it.key());
                 pass_by_values_t value          = it.value().get<pass_by_values_t>();
@@ -2254,10 +2254,10 @@ class Graph : public ICudnn, public INode {
 
         // Deserialize workspace_modifications from JSON
         if (j.contains("workspace_modifications")) {
-            auto workspace_modifications_json = j["workspace_modifications"];
+            auto const &workspace_modifications_json = j["workspace_modifications"];
             for (auto it = workspace_modifications_json.begin(); it != workspace_modifications_json.end(); ++it) {
                 uid_t uid                                 = std::stoll(it.key());
-                auto tuple_json                           = it.value();
+                auto const &tuple_json                    = it.value();
                 auto tuple_value                          = std::make_tuple(tuple_json[0].get<int64_t>(),
                                                    tuple_json[1].get<int64_t>(),
                                                    tuple_json[2].get<std::vector<float>>());
