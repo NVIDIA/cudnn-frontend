@@ -705,7 +705,9 @@ class IndexerBackwardSm100:
         batch_size = cute.size(mQ.shape[3]) if cute.rank(mQ.shape) > 3 else 1
 
         if const_expr(self.deterministic):
-            launch_grid = (self.persistent_grid_size, 1, 1)
+            # One CTA per producer plane, never more CTAs than rows (deterministic_dk_producer_ctas): planes past the
+            # launched CTAs stay as the memset left them, and the reducer folds every plane in fixed order.
+            launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1)
         else:
             launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1) if self.use_persistent else (seqlen, batch_size, 1)
         self.kernel_gemm(
@@ -3774,7 +3776,10 @@ def _build_cute_dsl_kernel(
 
     persistent_grid_size = None
     if deterministic:
-        persistent_grid_size = deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
+        # The plane count is the compiled bound and the launch takes min(rows, planes) at run time (as the ordinary persistent
+        # path does with the SM count), so a new packed B / S_q does not recompile; the row count is still validated here.
+        deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
+        persistent_grid_size = deterministic_dk_planes
     if persistent_grid_size is None:
         persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
