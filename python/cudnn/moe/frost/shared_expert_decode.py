@@ -268,19 +268,23 @@ class SharedExpertDecode:
         return cfg
 
     def _resolve_forms(self, cfg: Cfg) -> Dict[int, Cfg]:
-        """Both forms of the served band (one m-tile for T <= 16, two for 17 .. MAX_TOKENS), validated -- including the one-wave pin of a
-        form under the rule (``N_GROUPS`` 0).  A form the rule cannot place in one wave is declined HERE, typed by its cause: the part
-        (``NotImplementedError``: the same config fits one wave on the smaller SM100-class reference part, so this part's SM count is what
-        declines it) or the knob combination (``ValueError``: the config fits one wave on no served part)."""
+        """Both forms of the served band (one m-tile for T <= 16, two for 17 .. MAX_TOKENS), validated -- the structural validator AND the
+        one-wave pin of a form under the rule (``N_GROUPS`` 0).  A form that cannot be served is declined HERE, typed by its cause: the part
+        (``NotImplementedError``: the same form validates and fits one wave on the SM100-class reference readings -- 148 SMs, the cc 10.x
+        shared memory -- so this part's readings are what decline it) or the knob combination (``ValueError``: the form is served on no
+        SM100-class part, e.g. the bulk x rows of a K_SPLIT 2 config at two tiles exceed every part's opt-in)."""
         forms = {}
         for tiles, tokens in ((1, MMA_M), (2, MAX_TOKENS)):
             try:
                 forms[tiles] = form_for(cfg, tokens)
             except ValueError as e:
-                reference = replace(cfg, SMEM_PER_SM_BYTES=SM100_SMEM_PER_SM_BYTES, SMEM_OPTIN_BYTES=SM100_SMEM_OPTIN_BYTES, SM_COUNT=SM100_SM_COUNT)
+                reference = replace(
+                    cfg, TOKEN_TILES=tiles, SMEM_PER_SM_BYTES=SM100_SMEM_PER_SM_BYTES, SMEM_OPTIN_BYTES=SM100_SMEM_OPTIN_BYTES, SM_COUNT=SM100_SM_COUNT
+                )
                 try:
                     validate_cfg(reference)
-                    validate_one_wave(replace(reference, TOKEN_TILES=tiles))
+                    if reference.N_GROUPS == 0:
+                        validate_one_wave(reference)
                 except ValueError:
                     raise ValueError(f"{NAME}: the config cannot be served at {tokens} tokens on any SM100-class part: {e}") from e
                 raise NotImplementedError(f"{NAME} does not serve this part at {tokens} tokens ({cfg.SM_COUNT} SMs): {e}") from e

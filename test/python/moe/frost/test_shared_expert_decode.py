@@ -431,6 +431,8 @@ def test_entry_resolves_both_forms_at_construction_and_declines_by_type():
     assert (k.forms[1].TOKEN_TILES, k.forms[2].TOKEN_TILES, k.forms[2].N_GROUPS_EFF, k.forms[2].WAVES1) == (1, 2, 2, 1)
     with pytest.raises(ValueError, match="cannot be served at 24 tokens on any SM100-class part.*needs 2 waves"):
         entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(X_BULK_ROWS=False))
+    with pytest.raises(ValueError, match="cannot be served at 24 tokens on any SM100-class part.*exceeds the per-CTA opt-in"):
+        entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(K_SPLIT=2))  # the bulk x rows at K_SPLIT 2 fit one tile only: a one-tile-only config
     with pytest.raises(NotImplementedError, match="does not serve this part at 16 tokens .64 SMs.*needs 2 waves"):
         entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(SM_COUNT=64))
     assert entry.SharedExpertDecode("cpu", cfg=kcfg.make_cfg(SM_COUNT=128)).forms[2].WAVES1 == 1, "two per SM on 128 SMs holds both forms"
@@ -631,7 +633,7 @@ def test_bit_neutral_knob_arms_write_the_default_bytes(arm, tokens):
 
 ORDER_ARMS = {
     "ksplit1-ring": dict(K_SPLIT=1, X_BULK_ROWS=False),
-    "ksplit2-bulk": dict(K_SPLIT=2),
+    "ksplit2-ring": dict(K_SPLIT=2, X_BULK_ROWS=False),  # the bulk x rows at K_SPLIT 2 serve one tile only (declined at construction); the ring serves the band
     "ksplit4-bulk": dict(K_SPLIT=4),
     "ksplit8-launch2-fold": dict(GATE_CLUSTER_FOLD=False),
     "v1": None,
