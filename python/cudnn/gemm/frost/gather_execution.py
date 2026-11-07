@@ -284,10 +284,11 @@ class MaterializedGatherPlan(SequentialPlan):
         if gemm is not None:
 
             def prepare_gemm(values, scratch, stream):
+                gemm_values = {tensor: values[tensor] for tensor in gemm.bound}
                 validate = getattr(gemm, "validate_operands", None)
                 if validate is not None:
-                    validate([values[tensor] for tensor in gemm.bound])
-                return partial(gemm, values, workspace=scratch, stream=stream)
+                    validate(list(gemm_values.values()))
+                return partial(gemm, gemm_values, workspace=scratch, stream=stream)
 
             output_keys = tuple(route.binding.outputs)
             input_keys = tuple(t for t in route.binding.bound_tensors() if t not in output_keys)

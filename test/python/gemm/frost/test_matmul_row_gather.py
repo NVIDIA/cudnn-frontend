@@ -285,7 +285,7 @@ def test_frost_row_gather_native_capture(prefix, broadcast, dtype, public_api):
         workspace_bytes = compiled.workspace_bytes
 
         def launch(pack, workspace):
-            compiled(pack, workspace, stream=stream.cuda_stream)
+            compiled(pack, workspace=workspace, stream=stream.cuda_stream)
 
     workspace = torch.empty(workspace_bytes, device="cuda", dtype=torch.uint8)
     pack = {source: cache, indices: ids, weight: w, out: y}
@@ -580,8 +580,8 @@ def test_frost_gather_composed_launch_uses_fixed_groups_without_allocating(epilo
     monkeypatch.setattr(cute, "compile", forbidden)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        compiled(pack, workspace, stream=stream.cuda_stream)
-        compiled(pack, workspace, stream=stream.cuda_stream)
+        compiled(pack, workspace=workspace, stream=stream.cuda_stream)
+        compiled(pack, workspace=workspace, stream=stream.cuda_stream)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     assert len(frames) == 2
@@ -621,9 +621,9 @@ def test_frost_gather_composed_native_capture(pipeline, epilogue):
     captured = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.stream(stream):
-            compiled(pack, workspace, stream=stream.cuda_stream)
+            compiled(pack, workspace=workspace, stream=stream.cuda_stream)
         with torch.cuda.graph(captured, stream=stream):
-            compiled(pack, workspace, stream=stream.cuda_stream)
+            compiled(pack, workspace=workspace, stream=stream.cuda_stream)
         for iteration in range(2):
             with torch.cuda.stream(stream):
                 x.mul_(-0.5)
@@ -1038,15 +1038,16 @@ def test_frost_materialized_gather_public_graph_capture():
     [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
     ids=["workspace", "caller-output", "padded-workspace", "source-view"],
 )
-def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, source_view, monkeypatch):
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, source_view, side):
     """Runs the native gather plus a GEMM spy, not a Blackwell MMA kernel."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("materialized gather requires CUDA SM80 or newer")
     from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
-    from cudnn.frost.workspace import Workspace
     from cudnn._torch_stream import stream_context
+    from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
 
-    graph, source, indices, weight, selected, output = _materialization_graph(observed=observed, source_view=source_view)
+    graph, source, indices, weight, selected, output = _materialization_graph(observed=observed, source_view=source_view, side=side)
     if padded:
         selected.set_stride([selected.dim[-1] + 8, 1])
     route = available_routes(graph)[0]
@@ -1063,21 +1064,35 @@ def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, so
         calls.append((gathered.data_ptr(), int(stream)))
         gathered_torch = gathered if isinstance(gathered, torch.Tensor) else torch.utils.dlpack.from_dlpack(gathered)
         with stream_context(stream, torch.cuda.current_device()):
-            torch.matmul(gathered_torch, values[weight], out=values[output])
+            lhs, rhs = (gathered_torch, values[weight]) if side == "a" else (values[weight], gathered_torch)
+            torch.matmul(lhs, rhs, out=values[output])
 
     from cudnn.frost import buffers
 
-    spy = SimpleNamespace(binding=route.binding, workspace_bytes=gemm_workspace_bytes)
-
-    # SimpleNamespace is not callable; use a tiny compiled-plan stand-in.
     class GemmSpy:
-        binding = spy.binding
-        workspace_bytes = spy.workspace_bytes
+        binding = route.binding
+        bound = tuple(binding.bound_tensors())
+        workspace_bytes = gemm_workspace_bytes
+        reject = False
+        validations = 0
 
-        def __call__(self, *args, **kwargs):
-            gemm_spy(*args, **kwargs)
+        def validate_operands(self, operands):
+            assert len(operands) == len(self.bound)
+            if self.reject:
+                raise ValueError("downstream GEMM validation failed")
+            self.validations += 1
 
-    plan = MaterializedGatherPlan(route, GemmSpy())
+        def __call__(self, values, **kwargs):
+            # Use the real resolver: a permissive spy previously hid unrelated
+            # source/index keys passed to the dense GEMM subplan.
+            resolved = resolve_variant_pack(values, self.binding)
+            assert tuple(values) == self.bound
+            assert len(resolved) == len(self.bound)
+            assert self.validations == len(calls) + 1
+            gemm_spy(values, **kwargs)
+
+    gemm = GemmSpy()
+    plan = MaterializedGatherPlan(route, gemm)
     src = torch.randn(source.dim, device="cuda", dtype=torch.bfloat16)
     ids = torch.arange(37, device="cuda", dtype=torch.int64)
     ids[0], ids[-1] = -1, 1 << 40
@@ -1106,7 +1121,8 @@ def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, so
         torch.cuda.current_stream().wait_stream(stream)
         expected = src[ids.clamp(0, 70).long()].clone()
         expected[(ids < 0) | (ids >= 71)] = 0
-        torch.testing.assert_close(out, expected @ weights, rtol=0, atol=0)
+        reference = expected @ weights if side == "a" else weights @ expected
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)
         if observed:
             torch.testing.assert_close(pack[selected], expected, rtol=0, atol=0)
         else:
@@ -1120,6 +1136,23 @@ def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, so
         with pytest.raises(ValueError, match="prepared shape/stride/dtype"):
             plan(bad_pack, workspace=ws, stream=stream.cuda_stream)
         assert torch.equal(out.view(torch.uint8), before.view(torch.uint8))
+
+        # A downstream guard must fail before the native gather writes either
+        # the caller's observable intermediate or its workspace-backed value.
+        gemm.reject = True
+        ws.fill_(0xA5)
+        if observed:
+            pack[selected].fill_(float("nan"))
+        guarded = [ws, out, *([pack[selected]] if observed else [])]
+        snapshots = [value.clone() for value in guarded]
+        call_count = len(calls)
+        stream.wait_stream(torch.cuda.current_stream())
+        with pytest.raises(ValueError, match="downstream GEMM validation failed"):
+            plan(pack, workspace=ws, stream=stream.cuda_stream)
+        torch.cuda.current_stream().wait_stream(stream)
+        assert len(calls) == call_count
+        for value, snapshot in zip(guarded, snapshots):
+            assert torch.equal(value.view(torch.uint8), snapshot.view(torch.uint8))
     finally:
         captured.reset()
 
