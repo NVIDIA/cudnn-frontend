@@ -2989,6 +2989,10 @@ def _analyze_graph(graph: cudnn.pygraph) -> "tuple[FusionChain, GemmBinding | No
 
 def probe_supported(graph: cudnn.pygraph, config: "TileConfig | None" = None) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT ``cute.compile``."""
+    if any(node.node_type.name == "GATHER" for node in graph.nodes):
+        from ..materialization import probe_execution_plan
+
+        return probe_execution_plan(graph, config, backend=sys.modules[__name__])
     probe_cutedsl()
     chain, _binding = _analyze_graph(graph)
     if config is None:
@@ -3115,7 +3119,16 @@ def jit_from_cudnn_graph(
     config: TileConfig = DEFAULT_CONFIG,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel."""
+    if any(node.node_type.name == "GATHER" for node in graph.nodes):
+        from ..materialization import build_execution_plan
+
+        return build_execution_plan(graph, config, backend=sys.modules[__name__])
     chain, binding = _analyze_graph(graph)
+    return jit_from_chain(chain, binding, config)
+
+
+def jit_from_chain(chain, binding, config=DEFAULT_CONFIG):
+    """Compile an already analyzed snapshot without reconstructing its graph."""
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 

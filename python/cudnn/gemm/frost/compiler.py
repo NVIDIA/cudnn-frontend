@@ -1380,8 +1380,8 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
 
         return lowered
 
-    def explain(self, operands, graph_order=None):
-        """Say what is wrong with a call the launch path refused, and raise."""
+    def validate_operands(self, operands, graph_order=None):
+        """Validate a prepared call without reading device contents or launching."""
         backend = self._compiler
         recipe = self.recipe
         backend._check_plan_device(recipe.device)
@@ -1429,6 +1429,10 @@ class _CompiledFusedGemm(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
         self._check_quant_scale_blobs([operands[o.index] for o in recipe.outputs])
         if self._validate_aux_layout:
             backend._check_aux_layout(recipe, operands, int(mnk[0]), int(mnk[1]), self.config.swap_ab)
+
+    def explain(self, operands, graph_order=None):
+        """Say what is wrong with a call the launch path refused, and raise."""
+        self.validate_operands(operands, graph_order)
         raise RuntimeError(
             f"cudnn.frost gemm: the launch path refused this call and no rule explains why -- its per-call guards and the diagnostics here have drifted apart. Guards that fired: {dict(self.deferrals)}."
         )

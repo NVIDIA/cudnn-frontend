@@ -29,7 +29,8 @@ from .fusion_ir import (
     Axis,
     IndexExpr,
     IndexMap,
-    IndirectIndex,
+    AccessMap,
+    IndexLookup,
     GroupPartition,
     GroupedGemmSpec,
     OperandAccess,
@@ -149,7 +150,7 @@ class _RecordedOp:
     aux_input: int | None = None
     aux_mapping: IndexMap | None = None
     group_partition: GroupPartition | None = None
-    indirect_index: IndirectIndex | None = None
+    source_access: AccessMap | None = None
 
 
 @dataclass
@@ -621,6 +622,10 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
 
 def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     """Analyze + JIT the graph into a compiled GEMM plan."""
+    if any(node.node_type.name == "GATHER" for node in graph.nodes):
+        from .materialization import build_execution_plan
+
+        return build_execution_plan(graph, knobs=knobs)
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
     from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed, jit_from_cudnn_graph, plan_config, probe_chain
@@ -1309,11 +1314,12 @@ def _build_multi_moe_chain(
             if ks_meta.dtype != "int32" or ks_meta.stride[1] != 1:
                 raise NotImplementedError(f"MoE {mode} token_ks must be INT32 with contiguous routed rows")
 
-    if moe_ops[0].moe_mode == "gather" and moe_ops[0].indirect_index is None:
+    if moe_ops[0].moe_mode == "gather" and moe_ops[0].source_access is None:
         routed_shape = (1, index_meta.dim[1], meta[moe_ops[0].inputs[0]].dim[-1])
         index_map = IndexMap.broadcast(index_meta.dim, routed_shape)
-        indirect = IndirectIndex(index_meta.name, 1, index_map)
-        moe_ops = [replace(op, indirect_index=indirect) for op in moe_ops]
+        source_shape = meta[moe_ops[0].inputs[0]].dim
+        indirect = AccessMap(routed_shape, source_shape, (IndexExpr.constant(0), IndexLookup(index_meta.name, index_map), IndexExpr.coordinate(2)))
+        moe_ops = [replace(op, source_access=indirect) for op in moe_ops]
 
     # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
     fto_id = moe_ops[0].inputs[2]
@@ -1566,7 +1572,7 @@ def _build_multi_moe_chain(
         block_scale=block_scale_spec,
         reductions=reductions,
         quants=quants,
-        indirect_index=moe_ops[0].indirect_index,
+        source_access=moe_ops[0].source_access,
     )
     output_objs.extend(reduction_objs)
     output_objs.extend(quant_scale_objs)
@@ -1672,7 +1678,7 @@ def _operand_view_index_map(shape, steps):
 def _matrix_map_coordinates(mapping):
     """Bind a logical IndexMap once; users select indices or lower storage separately."""
     coordinates = tuple(matrix_axis_index(mapping.consumer_shape, i) for i in range(len(mapping.consumer_shape)))
-    return mapping.apply(coordinates)
+    return AccessMap.direct(mapping).apply(coordinates)
 
 
 def _operand_index_expression(mapping, axis):
@@ -2552,7 +2558,7 @@ def _lower_gather_operands(ops, meta):
     gathered_shape = (*source.dim[:axis], *indices.dim, k)
     if meta[gather.output].dim != gathered_shape:
         raise ValueError(f"gather output must have shape {gathered_shape}")
-    indirect = IndirectIndex.take(indices.name, source.dim, indices.dim, axis)
+    indirect = AccessMap.take(indices.name, source.dim, indices.dim, axis)
     mapping = _operand_view_index_map(gathered_shape, operand_steps)
     indirect = indirect.compose(mapping)
     operand_shape = mapping.consumer_shape
@@ -2600,7 +2606,7 @@ def _lower_gather_operands(ops, meta):
         moe_mode="gather",
         token_index=index_id,
         group_partition=GroupPartition.uniform(groups, rows),
-        indirect_index=indirect,
+        source_access=indirect,
     )
     return [routed if op.output == mm.output else op for op in remaining]
 
@@ -2674,7 +2680,7 @@ def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
     """Lower one graph metadata snapshot."""
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
-    meta = dict(state["tensor_meta"])
+    meta = {tid: replace(m) for tid, m in state["tensor_meta"].items()}
     ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"], state["compute_dtype"])
     return _build_chain(
         ops,

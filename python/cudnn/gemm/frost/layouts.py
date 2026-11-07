@@ -31,26 +31,32 @@ def fold_batch_layout(shape, stride, *, writable=False, allow_identity_broadcast
     if max(batch, pitch, span, *shape, *stride) > (1 << 63) - 1:
         raise ValueError("matrix batch view exceeds signed 64-bit geometry")
     if writable:
-        occupied = 1
-        for s, d in sorted((s, d) for d, s in zip(shape, stride) if d > 1):
-            if s < occupied:
-                raise ValueError("matrix output view requires non-overlapping storage")
-            occupied += (d - 1) * s
+        _check_nonoverlap(shape, stride, "matrix output view")
     return (batch, *shape[-2:]), (pitch, *stride[-2:])
 
 
-def checked_layout(shape, stride, *, context="strided layout"):
+def checked_layout(shape, stride, *, context="strided layout", writable=False):
     """Validate read-only element geometry without imposing a view or layout.
 
-    Zero/overlapping strides are legal for reads. Writable overlap and affine
-    view constraints belong to the operation requesting them, not this check.
+    Zero/overlapping strides are legal for reads; writable=True additionally
+    proves nonoverlap. Affine view constraints remain operation-specific.
     """
     shape, stride = tuple(map(index, shape)), tuple(map(index, stride))
     if not shape or len(shape) != len(stride) or any(d <= 0 for d in shape) or any(s < 0 for s in stride):
         raise ValueError(f"{context} requires positive extents and nonnegative strides")
     if max(prod(shape), 1 + sum((d - 1) * s for d, s in zip(shape, stride)), *shape, *stride) > (1 << 63) - 1:
         raise ValueError(f"{context} exceeds signed 64-bit geometry")
+    if writable:
+        _check_nonoverlap(shape, stride, context)
     return shape, stride
+
+
+def _check_nonoverlap(shape, stride, context):
+    occupied = 1
+    for step, extent in sorted((s, d) for d, s in zip(shape, stride) if d > 1):
+        if step < occupied:
+            raise ValueError(f"{context} requires non-overlapping storage")
+        occupied += (extent - 1) * step
 
 
 def reshape_layout(shape, stride, target):

@@ -288,32 +288,65 @@ class IndexMap:
 
 
 @dataclass(frozen=True)
-class IndirectIndex:
-    """Override one source coordinate with a runtime index-tensor load.
-
-    indices_map maps consumer coordinates to the index tensor, not to its
-    contents. IndexExpr and IndexMap therefore remain pure integer geometry.
-    Source storage/dtype and the copy mechanism belong to the operand and
-    backend respectively; grouping/scheduling is deliberately not encoded here.
-    """
+class IndexLookup:
+    """A logical read of an index tensor; no pointer, stride or copy instruction."""
 
     indices_ref: str
-    source_axis: int
     indices_map: IndexMap
-    bounds_policy: str = "zero"
 
     def __post_init__(self):
-        if not isinstance(self.indices_ref, str) or not self.indices_ref:
-            raise ValueError("indirect index requires a named indices reference")
-        object.__setattr__(self, "source_axis", index(self.source_axis))
-        if self.source_axis < 0 or not isinstance(self.indices_map, IndexMap):
-            raise ValueError("indirect index requires a normalized source axis and an IndexMap")
-        if self.bounds_policy != "zero":
-            raise ValueError("indirect index currently supports only zero-filled out-of-bounds access")
+        if not isinstance(self.indices_ref, str) or not self.indices_ref or not isinstance(self.indices_map, IndexMap):
+            raise ValueError("index lookup requires a named tensor and a pure coordinate map")
+
+    @property
+    def axes(self):
+        return frozenset().union(*(expr.axes for expr in self.indices_map.coordinates))
+
+    def compose(self, consumer_map):
+        return dataclasses.replace(self, indices_map=self.indices_map.compose(consumer_map))
+
+
+@dataclass(frozen=True)
+class AccessMap:
+    """Consumer -> source coordinates, optionally dependent on index-tensor reads.
+
+    Direct coordinates retain IndexMap's static bounds guarantee. A lookup may
+    return a signed, out-of-range coordinate: its source extent is checked at
+    access lowering, and an invalid access produces zero without reading source
+    storage. Storage strides and loader selection remain outside this object.
+    """
+
+    consumer_shape: tuple[int, ...]
+    producer_shape: tuple[int, ...]
+    coordinates: tuple[IndexExpr | IndexLookup, ...]
+
+    def __post_init__(self):
+        coordinates = tuple(self.coordinates)
+        direct = []
+        for coordinate in coordinates:
+            if isinstance(coordinate, IndexLookup):
+                if coordinate.indices_map.consumer_shape != tuple(self.consumer_shape):
+                    raise ValueError("index lookup domain must match the access consumer shape")
+                direct.append(IndexExpr.constant(0))
+            elif isinstance(coordinate, IndexExpr):
+                direct.append(coordinate)
+            else:
+                raise ValueError("access coordinate must be an integer expression or index lookup")
+        # Reuse the pure map's shape, scope, arithmetic and direct-axis bounds
+        # validation. Runtime lookup values are deliberately not proved here.
+        checked = IndexMap(self.consumer_shape, self.producer_shape, tuple(direct))
+        object.__setattr__(self, "consumer_shape", checked.consumer_shape)
+        object.__setattr__(self, "producer_shape", checked.producer_shape)
+        object.__setattr__(self, "coordinates", coordinates)
+
+    @classmethod
+    def direct(cls, mapping):
+        if not isinstance(mapping, IndexMap):
+            raise ValueError("direct access requires a pure IndexMap")
+        return cls(mapping.consumer_shape, mapping.producer_shape, mapping.coordinates)
 
     @classmethod
     def take(cls, indices_ref, source_shape, indices_shape, axis):
-        """Describe take-style axis insertion independently of copy capability."""
         source_shape, indices_shape = tuple(source_shape), tuple(indices_shape)
         IndexMap.identity(source_shape)
         IndexMap.identity(indices_shape)
@@ -324,11 +357,76 @@ class IndirectIndex:
             raise ValueError("gather axis is outside the source rank")
         consumer_shape = (*source_shape[:axis], *indices_shape, *source_shape[axis + 1 :])
         indices_map = IndexMap(consumer_shape, indices_shape, tuple(IndexExpr.coordinate(axis + i) for i in range(len(indices_shape))))
-        return cls(indices_ref, axis, indices_map)
+        coordinates = tuple(
+            IndexLookup(indices_ref, indices_map) if i == axis else IndexExpr.coordinate(i if i < axis else i + len(indices_shape) - 1)
+            for i in range(len(source_shape))
+        )
+        return cls(consumer_shape, source_shape, coordinates)
+
+    @property
+    def axes(self):
+        return frozenset().union(*(coordinate.axes for coordinate in self.coordinates))
+
+    @property
+    def tensor_dependencies(self):
+        return frozenset(coordinate.indices_ref for coordinate in self.coordinates if isinstance(coordinate, IndexLookup))
+
+    @property
+    def indirections(self):
+        return tuple((axis, coordinate) for axis, coordinate in enumerate(self.coordinates) if isinstance(coordinate, IndexLookup))
 
     def compose(self, consumer_map):
-        """Reuse ordinary view composition around an indirect access."""
-        return dataclasses.replace(self, indices_map=self.indices_map.compose(consumer_map))
+        # Both direct and indirect access pull back along the same pure view.
+        direct = IndexMap(
+            self.consumer_shape, self.producer_shape, tuple(IndexExpr.constant(0) if isinstance(c, IndexLookup) else c for c in self.coordinates)
+        ).compose(consumer_map)
+        coordinates = tuple(c.compose(consumer_map) if isinstance(c, IndexLookup) else direct.coordinates[i] for i, c in enumerate(self.coordinates))
+        return AccessMap(consumer_map.consumer_shape, self.producer_shape, coordinates)
+
+    def lower(self, coordinates, render, load_index=None):
+        """One binding entry for direct expressions and logical index reads.
+
+        render consumes a bound IndexExpr; load_index consumes a tensor name,
+        rendered index coordinates and the source-axis extent. The backend owns
+        index loading and validity predicates, never the pure expression IR.
+        """
+        if len(coordinates) != len(self.consumer_shape):
+            raise ValueError("access binding requires every consumer coordinate")
+        substitutions = dict(enumerate(coordinates))
+        result = []
+        for axis, coordinate in enumerate(self.coordinates):
+            if isinstance(coordinate, IndexLookup):
+                if load_index is None:
+                    raise ValueError("indirect access lowering requires an index reader")
+                index_coordinates = tuple(render(expr) for expr in coordinate.indices_map.apply(coordinates))
+                result.append(load_index(coordinate.indices_ref, index_coordinates, self.producer_shape[axis]))
+            else:
+                result.append(render(coordinate.substitute(substitutions)))
+        return tuple(result)
+
+    def apply(self, coordinates):
+        """Bind direct accesses using the same entry as indirect lowering."""
+        return self.lower(coordinates, lambda expression: expression)
+
+    def evaluate(self, coordinates, read_index=None):
+        """Host reference: None denotes zero-filled access with no source read."""
+        coordinates = tuple(map(index, coordinates))
+        if len(coordinates) != len(self.consumer_shape) or any(not 0 <= c < d for c, d in zip(coordinates, self.consumer_shape)):
+            raise ValueError("access coordinate is outside the consumer domain")
+        invalid = False
+
+        def load(ref, coords, extent):
+            nonlocal invalid
+            if read_index is None:
+                raise ValueError("indirect access evaluation requires an index reader")
+            value = index(read_index(ref, coords))
+            if not -(1 << 63) <= value < (1 << 63):
+                raise ValueError("index tensor value exceeds signed Int64")
+            invalid |= not 0 <= value < extent
+            return value
+
+        result = self.lower(tuple(IndexExpr.constant(c) for c in coordinates), lambda expr: expr.evaluate(()), load)
+        return None if invalid else result
 
 
 ReductionMode = Literal["add", "amax", "max", "min", "avg", "mul", "mul_no_zeros", "norm1", "norm2"]
@@ -972,7 +1070,7 @@ class FusionChain:
     reductions: list[ReductionSpec] = field(default_factory=list)
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
     gemm_out_dtypes: tuple[Dtype, ...] = ()
-    indirect_index: IndirectIndex | None = None
+    source_access: AccessMap | None = None
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):

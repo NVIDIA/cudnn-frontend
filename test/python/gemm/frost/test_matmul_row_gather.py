@@ -328,21 +328,20 @@ def test_frost_row_gather_index_helper_on_hopper(dtype):
 @pytest.mark.parametrize("view", ["identity", "reshape", "transpose"])
 def test_frost_indirect_index_map(source_shape, axis, view):
     from itertools import product
-    from cudnn.gemm.frost.fusion_ir import IndirectIndex, IndexMap
+    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexMap
 
     indices_shape = (2, 2)
-    access = IndirectIndex.take("indices", source_shape, indices_shape, axis)
+    access = AccessMap.take("indices", source_shape, indices_shape, axis)
     normalized_axis = axis % len(source_shape)
-    logical = access.indices_map.consumer_shape
+    logical = access.consumer_shape
     mapping = (
         IndexMap.identity(logical)
         if view == "identity"
         else IndexMap.reshape(logical, (prod(logical),)) if view == "reshape" else IndexMap.permutation(logical, tuple(reversed(range(len(logical)))))
     )
     projected = access.compose(mapping)
-    assert projected.indices_ref == "indices"
-    assert projected.source_axis == normalized_axis
-    assert projected.bounds_policy == "zero"
+    assert projected.indirections[0][1].indices_ref == "indices"
+    assert projected.indirections[0][0] == normalized_axis
     for coordinates in product(*(range(d) for d in mapping.consumer_shape)):
         if view == "reshape":
             linear = coordinates[0]
@@ -351,7 +350,7 @@ def test_frost_indirect_index_map(source_shape, axis, view):
             original = tuple(reversed(coordinates))
         else:
             original = coordinates
-        actual = tuple(expr.evaluate(coordinates) for expr in projected.indices_map.coordinates)
+        actual = tuple(expr.evaluate(coordinates) for expr in projected.indirections[0][1].indices_map.coordinates)
         assert actual == original[normalized_axis : normalized_axis + len(indices_shape)]
 
 
@@ -399,8 +398,8 @@ def test_frost_gather_composes_with_epilogue_and_views(source_prefix, repartitio
     assert binding.b_operands == [weight]
     assert out in binding.outputs
     assert (raw in binding.outputs) == (epilogue == "shared")
-    assert chain.indirect_index.indices_ref == "indices"
-    assert chain.indirect_index.source_axis == len(source_prefix)
+    assert chain.source_access.indirections[0][1].indices_ref == "indices"
+    assert chain.source_access.indirections[0][0] == len(source_prefix)
     assert chain.grouped_gemm.partition.rows_per_group == (32 if repartition else 16)
     assert chain.matmul.M == 96
     if aux is not None:
@@ -581,10 +580,10 @@ def test_frost_moe_gather_uses_the_same_indirect_description():
     for node in graph.nodes:
         node.infer_properties(graph.context)
     chain, binding = analyze_with_binding(graph)
-    access = chain.indirect_index
-    assert access.indices_ref == "indices"
-    assert access.source_axis == 1
-    assert tuple(expr.evaluate((0, 29, 37)) for expr in access.indices_map.coordinates) == (0, 29, 0)
+    access = chain.source_access
+    assert access.indirections[0][1].indices_ref == "indices"
+    assert access.indirections[0][0] == 1
+    assert tuple(expr.evaluate((0, 29, 37)) for expr in access.indirections[0][1].indices_map.coordinates) == (0, 29, 0)
     assert binding.first_token_offset is offsets
     assert not chain.grouped_gemm.partition.is_uniform
     assert chain.grouped_gemm.partition.num_groups == 3
@@ -719,12 +718,446 @@ def test_frost_group_partition_device_bounds_and_replay(dtype, rows_per_group):
 
 def test_frost_indirect_map_matches_sparse_attention_key_and_value_views():
     """One query/slot index relation serves both QK and PV operand layouts."""
-    from cudnn.gemm.frost.fusion_ir import IndirectIndex, IndexMap
+    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexMap
 
-    keys = IndirectIndex.take("topk_indices", (71, 576), (3, 5), 0)
+    keys = AccessMap.take("topk_indices", (71, 576), (3, 5), 0)
     qk_keys = keys.compose(IndexMap.permutation((3, 5, 576), (0, 2, 1)))
-    values = IndirectIndex.take("topk_indices", (71, 512), (3, 5), 0)
+    values = AccessMap.take("topk_indices", (71, 512), (3, 5), 0)
     for query in range(3):
         for slot in range(5):
-            assert tuple(expr.evaluate((query, 575, slot)) for expr in qk_keys.indices_map.coordinates) == (query, slot)
-            assert tuple(expr.evaluate((query, slot, 511)) for expr in values.indices_map.coordinates) == (query, slot)
+            assert tuple(expr.evaluate((query, 575, slot)) for expr in qk_keys.indirections[0][1].indices_map.coordinates) == (query, slot)
+            assert tuple(expr.evaluate((query, slot, 511)) for expr in values.indirections[0][1].indices_map.coordinates) == (query, slot)
+
+
+@pytest.mark.parametrize("indirect", [False, True], ids=["direct", "indirect"])
+def test_frost_access_map_composition_and_lowering(indirect):
+    from itertools import product
+    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexExpr, IndexMap
+
+    access = AccessMap.take("indices", (5, 7), (2, 3), 0) if indirect else AccessMap.direct(IndexMap.reshape((2, 3, 7), (2, 3, 7)))
+    view = IndexMap.permutation(access.consumer_shape, (0, 2, 1))
+    composed = access.compose(view).compose(IndexMap.reshape(view.consumer_shape, (42,)))
+    assert composed.tensor_dependencies == (frozenset({"indices"}) if indirect else frozenset())
+    assert composed.axes == frozenset({0})
+    table = [[4, 0, -1], [2, 5, 4]]
+    reader = lambda ref, coords: table[coords[0]][coords[1]]
+    for coords in product(*(range(d) for d in composed.consumer_shape)):
+        old = (coords[0] // 21, coords[0] % 3, (coords[0] // 3) % 7)
+        assert composed.evaluate(coords, reader) == access.evaluate(old, reader)
+    if indirect:
+        with pytest.raises(ValueError, match="index reader"):
+            composed.apply((IndexExpr.coordinate(0),))
+    else:
+        assert composed.apply((IndexExpr.coordinate(0),)) == composed.lower((IndexExpr.coordinate(0),), lambda expr: expr)
+    with pytest.raises(ValueError, match="consumer domain"):
+        composed.evaluate((42,), reader)
+    with pytest.raises(ValueError, match="producer extent"):
+        AccessMap.direct(IndexMap((2,), (1,), (IndexExpr.coordinate(0),)))
+
+
+def _materialization_graph(axis=0, *, side="a", observed=False, index_dtype=cudnn.data_type.INT64, rows=37):
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    shape = (71, 128) if axis == 0 else (128, 71)
+    source = graph.tensor(dim=list(shape), stride=_stride(shape), data_type=cudnn.data_type.BFLOAT16, name="source")
+    indices = graph.tensor(dim=[rows], stride=[1], data_type=index_dtype, name="indices")
+    selected = graph.gather(source, indices, axis=axis)
+    if observed:
+        selected.set_output(True)
+    if side == "a":
+        weight_shape = (selected.dim[-1], 128)
+        weight = graph.tensor(dim=list(weight_shape), stride=_stride(weight_shape), data_type=cudnn.data_type.BFLOAT16, name="weight")
+        result = graph.matmul(selected, weight)
+    else:
+        weight_shape = (128, selected.dim[0])
+        weight = graph.tensor(dim=list(weight_shape), stride=_stride(weight_shape), data_type=cudnn.data_type.BFLOAT16, name="weight")
+        result = graph.matmul(weight, selected)
+    result.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    return graph, source, indices, weight, selected, result
+
+
+@pytest.mark.parametrize("axis,side,observed", [(0, "a", False), (1, "a", False), (0, "b", False), (0, "a", True)])
+def test_frost_materialization_is_an_independent_route(axis, side, observed):
+    from cudnn.gemm.frost.materialization import available_routes
+
+    graph, source, indices, weight, selected, result = _materialization_graph(axis, side=side, observed=observed)
+    before = [(tuple(t.dim), tuple(t.stride), t.is_virtual) for node in graph.nodes for t in node.outputs.values()]
+    routes = available_routes(graph)
+    assert len(routes) == 1  # INT64 indices deliberately decline the fused loader
+    route = routes[0]
+    assert len(route.gathers) == 1
+    assert route.gathers[0].observable == observed
+    assert route.gathers[0].access.producer_shape == tuple(source.dim)
+    assert route.binding.a_operands == ([selected] if side == "a" else [weight])
+    assert route.binding.b_operands == ([weight] if side == "a" else [selected])
+    assert route.binding.outputs == [result]
+    assert before == [(tuple(t.dim), tuple(t.stride), t.is_virtual) for node in graph.nodes for t in node.outputs.values()]
+    assert [node.node_type for node in graph.nodes] == [NodeType.GATHER, NodeType.MATMUL]
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2, -1])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_frost_materialized_gather_native_capture(axis, dtype, indices_dtype):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("materialized gather requires CUDA SM80 or newer")
+    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+
+    graph_dt = {torch.float16: cudnn.data_type.HALF, torch.bfloat16: cudnn.data_type.BFLOAT16, torch.float32: cudnn.data_type.FLOAT}[dtype]
+    index_dt = cudnn.data_type.INT32 if indices_dtype == torch.int32 else cudnn.data_type.INT64
+    graph = cudnn.pygraph(io_data_type=graph_dt, compute_data_type=cudnn.data_type.FLOAT)
+    # Strided storage, duplicate indices, negative/OOB IDs and a K tail.
+    source_value = torch.arange(3 * 5 * 14, device="cuda", dtype=torch.float32).to(dtype).reshape(3, 5, 14)[..., ::2]
+    extreme = 1 << (40 if indices_dtype == torch.int64 else 30)
+    index_storage = torch.tensor([0, 99, -extreme, 99, 1, 99, extreme, 99, 0, 99, 2, 99], device="cuda", dtype=indices_dtype)
+    indices_value = index_storage[::2].reshape(2, 3)
+    source = graph.tensor(dim=list(source_value.shape), stride=list(source_value.stride()), data_type=graph_dt, name="source")
+    indices = graph.tensor(dim=[2, 3], stride=list(indices_value.stride()), data_type=index_dt, name="indices")
+    output = graph.gather(source, indices, axis=axis).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    plan = MaterializedGatherPlan(available_routes(graph)[0])
+    assert plan.workspace_bytes == 0
+    output_value = torch.full(output.dim, float("nan"), device="cuda", dtype=dtype)
+    pack = {source: source_value, indices: indices_value, output: output_value}
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            plan(pack, stream=stream.cuda_stream)
+        with torch.cuda.graph(captured, stream=stream):
+            plan(pack, stream=stream.cuda_stream)
+        for changed in (False, True):
+            if changed:
+                source_value.add_(1)
+                indices_value.copy_(torch.roll(indices_value.flatten(), 1).reshape(2, 3))
+            output_value.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            flat_ids = indices_value.flatten().long()
+            actual_axis = axis % 3
+            valid = (flat_ids >= 0) & (flat_ids < source_value.shape[actual_axis])
+            expected = torch.index_select(source_value, actual_axis, flat_ids.clamp(0, source_value.shape[actual_axis] - 1))
+            mask_shape = [1] * 3
+            mask_shape[actual_axis] = 6
+            expected = torch.where(valid.reshape(mask_shape), expected, torch.zeros_like(expected)).reshape(output.dim)
+            torch.testing.assert_close(output_value, expected, rtol=0, atol=0)
+            previous = output_value.clone()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            assert torch.equal(output_value.view(torch.uint8), previous.view(torch.uint8))
+        bad = dict(pack)
+        bad[source] = source_value.to(torch.float64)
+        with pytest.raises(ValueError, match="prepared shape/stride/dtype"):
+            plan(bad, stream=stream.cuda_stream)
+    finally:
+        captured.reset()
+
+
+def test_frost_access_map_multiple_index_dependencies():
+    from cudnn.gemm.frost.fusion_ir import AccessMap, IndexExpr, IndexLookup, IndexMap
+
+    index_map = IndexMap.identity((3,))
+    access = AccessMap((3,), (5, 7), (IndexLookup("rows", index_map), IndexLookup("columns", index_map)))
+    assert access.tensor_dependencies == frozenset({"rows", "columns"})
+    assert access.axes == frozenset({0})
+    tables = {"rows": [4, -1, 2], "columns": [6, 1, 7]}
+    reader = lambda ref, coords: tables[ref][coords[0]]
+    assert access.evaluate((0,), reader) == (4, 6)
+    assert access.evaluate((1,), reader) is None
+    assert access.evaluate((2,), reader) is None
+    assert access.compose(IndexMap.reshape((3,), (1, 3))).evaluate((0, 0), reader) == (4, 6)
+    with pytest.raises(ValueError, match="domain"):
+        AccessMap((2,), (5,), (IndexLookup("rows", index_map),))
+    with pytest.raises(ValueError, match="matching intermediate shapes"):
+        access.compose(IndexMap.identity((2,)))
+    with pytest.raises(ValueError, match="every consumer coordinate"):
+        access.lower((), lambda expr: expr)
+    bound = access.lower((IndexExpr.coordinate(0),), lambda expr: expr, lambda ref, coords, extent: (ref, coords, extent))
+    assert bound == (("rows", (IndexExpr.coordinate(0),), 5), ("columns", (IndexExpr.coordinate(0),), 7))
+
+
+def test_frost_materialized_gather_public_graph_capture():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("materialized gather requires CUDA SM80 or newer")
+    from cudnn.gemm.frost.heuristics import analyze_facts
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    source = graph.tensor(dim=[5, 7], stride=[7, 1], data_type=cudnn.data_type.FLOAT, name="source")
+    indices = graph.tensor(dim=[3], stride=[1], data_type=cudnn.data_type.INT64, name="indices")
+    output = graph.gather(source, indices, axis=1).set_output(True)
+    graph.validate()
+    facts = analyze_facts(graph)
+    assert facts.chain is None
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    graph.check_support()
+    graph.build_plans()
+    assert graph.get_workspace_size() == 0
+    src = torch.randn(5, 7, device="cuda")
+    ids = torch.tensor([6, -1, 2], device="cuda", dtype=torch.int64)
+    out = torch.full((5, 3), float("nan"), device="cuda")
+    pack = {source: src, indices: ids, output: out}
+    handle = cudnn.create_handle()
+    stream = torch.cuda.Stream()
+    cudnn.set_stream(handle, stream.cuda_stream)
+    captured = torch.cuda.CUDAGraph()
+    try:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.execute(pack, None, handle=handle)
+        with torch.cuda.graph(captured, stream=stream):
+            graph.execute(pack, None, handle=handle)
+        src.add_(1)
+        ids.copy_(torch.tensor([1, 7, 4], device="cuda", dtype=torch.int64))
+        out.fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            captured.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+        expected = src[:, [1, 0, 4]].clone()
+        expected[:, 1] = 0
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    finally:
+        captured.reset()
+        cudnn.destroy_handle(handle)
+
+
+@pytest.mark.parametrize("observed", [False, True], ids=["workspace", "caller-output"])
+def test_frost_materialized_gather_gemm_transport_on_hopper(observed, monkeypatch):
+    """Runs the native gather plus a GEMM spy, not a Blackwell MMA kernel."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("materialized gather requires CUDA SM80 or newer")
+    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+    from cudnn.frost.workspace import Workspace
+    from cudnn._torch_stream import stream_context
+
+    graph, source, indices, weight, selected, output = _materialization_graph(observed=observed)
+    route = available_routes(graph)[0]
+    calls = []
+    gemm_workspace_bytes = 128
+
+    def gemm_spy(values, *, stream, workspace):
+        # Inspect the exact source pointer, graph-order shape and nested scratch
+        # transport without pretending to qualify the Blackwell GEMM kernel.
+        gathered = values[selected]
+        assert tuple(gathered.shape) == tuple(selected.dim)
+        assert workspace.numel() == gemm_workspace_bytes
+        assert buffers.data_ptr(workspace) % 128 == 0
+        calls.append((gathered.data_ptr(), int(stream)))
+        gathered_torch = gathered if isinstance(gathered, torch.Tensor) else torch.utils.dlpack.from_dlpack(gathered)
+        with stream_context(stream, torch.cuda.current_device()):
+            torch.matmul(gathered_torch, values[weight], out=values[output])
+
+    from cudnn.frost import buffers
+
+    spy = SimpleNamespace(binding=route.binding, workspace_bytes=gemm_workspace_bytes)
+
+    # SimpleNamespace is not callable; use a tiny compiled-plan stand-in.
+    class GemmSpy:
+        binding = spy.binding
+        workspace_bytes = spy.workspace_bytes
+
+        def __call__(self, *args, **kwargs):
+            gemm_spy(*args, **kwargs)
+
+    plan = MaterializedGatherPlan(route, GemmSpy())
+    src = torch.randn(source.dim, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(37, device="cuda", dtype=torch.int64)
+    ids[0], ids[-1] = -1, 1 << 40
+    weights = torch.randn(weight.dim, device="cuda", dtype=torch.bfloat16)
+    out = torch.full(output.dim, float("nan"), device="cuda", dtype=torch.bfloat16)
+    ws = torch.empty(plan.workspace_bytes, device="cuda", dtype=torch.uint8)
+    pack = {source: src, indices: ids, weight: weights, output: out}
+    if observed:
+        pack[selected] = torch.full(selected.dim, float("nan"), device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    captured = torch.cuda.CUDAGraph()
+    try:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            plan(pack, workspace=ws, stream=stream.cuda_stream)
+        first_ptr = calls[-1][0]
+        with torch.cuda.graph(captured, stream=stream):
+            plan(pack, workspace=ws, stream=stream.cuda_stream)
+        assert calls[-1][0] == first_ptr
+        src.add_(1)
+        ids.copy_(torch.roll(ids, 3))
+        out.fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            captured.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+        expected = src[ids.clamp(0, 70).long()].clone()
+        expected[(ids < 0) | (ids >= 71)] = 0
+        torch.testing.assert_close(out, expected @ weights, rtol=0, atol=0)
+        if observed:
+            torch.testing.assert_close(pack[selected], expected, rtol=0, atol=0)
+        else:
+            assert first_ptr == ws.data_ptr()
+        before = out.clone()
+        for bad_workspace in (None, ws[:0], ws[: plan.workspace_bytes - 1]):
+            with pytest.raises(ValueError, match="workspace"):
+                plan(pack, workspace=bad_workspace, stream=stream.cuda_stream)
+        bad_pack = dict(pack)
+        bad_pack[indices] = ids.to(torch.int32)
+        with pytest.raises(ValueError, match="prepared shape/stride/dtype"):
+            plan(bad_pack, workspace=ws, stream=stream.cuda_stream)
+        assert torch.equal(out.view(torch.uint8), before.view(torch.uint8))
+    finally:
+        captured.reset()
+
+
+def test_frost_materialized_gather_rejects_alias_and_output_overlap():
+    if not torch.cuda.is_available():
+        pytest.skip("buffer binding checks require CUDA")
+    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    source = graph.tensor(dim=[5, 7], stride=[7, 1], data_type=cudnn.data_type.FLOAT, name="source")
+    indices = graph.tensor(dim=[5], stride=[1], data_type=cudnn.data_type.INT32, name="indices")
+    output = graph.gather(source, indices, axis=0).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    plan = MaterializedGatherPlan(available_routes(graph)[0])
+    src = torch.randn(5, 7, device="cuda")
+    ids = torch.arange(5, device="cuda", dtype=torch.int32)
+    previous = src.clone()
+    with pytest.raises(ValueError, match="overlap"):
+        plan({source: src, indices: ids, output: src})
+    assert torch.equal(src, previous)
+    output.set_stride([0, 1])
+    with pytest.raises(ValueError, match="non-overlapping"):
+        available_routes(graph)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_frost_materialized_gather_full_gemm_native_capture(side):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("full FROST GEMM fallback requires Blackwell")
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+    from cudnn.gemm.frost.materialization import MaterializedGatherPlan
+    from cudnn.engines.base import ExecutionContext, PlanConfig
+
+    rows = 37 if side == "a" else 32
+    graph, source, indices, weight, selected, output = _materialization_graph(side=side, rows=rows)
+    engine = FrostGemmEngine()
+    engine.check_support(graph)
+    compiled = engine.build_plan(graph, PlanConfig(0), ExecutionContext())
+    plan = compiled._compiled
+    assert isinstance(plan, MaterializedGatherPlan)
+    src = torch.randn(source.dim, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(rows, device="cuda", dtype=torch.int64)
+    ids[0], ids[-1] = -1, 1 << 40
+    weights = torch.empty_strided(weight.dim, weight.stride, device="cuda", dtype=torch.bfloat16).normal_()
+    out = torch.full(output.dim, float("nan"), device="cuda", dtype=torch.bfloat16)
+    ws = torch.empty(compiled.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    stream = torch.cuda.Stream()
+    pack = {source: src, indices: ids, weight: weights, output: out}
+    captured = torch.cuda.CUDAGraph()
+    try:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            plan(pack, workspace=ws, stream=stream.cuda_stream)
+        with torch.cuda.graph(captured, stream=stream):
+            plan(pack, workspace=ws, stream=stream.cuda_stream)
+        for changed in (False, True):
+            if changed:
+                src.add_(1)
+                ids.copy_(torch.roll(ids, 5))
+            out.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            gathered = src[ids.clamp(0, 70)].clone()
+            gathered[(ids < 0) | (ids >= 71)] = 0
+            expected = gathered.float() @ weights.float() if side == "a" else weights.float() @ gathered.float()
+            torch.testing.assert_close(out, expected.to(torch.bfloat16), rtol=2e-2, atol=2e-2)
+            previous = out.clone()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            assert torch.equal(out.view(torch.uint8), previous.view(torch.uint8))
+    finally:
+        captured.reset()
+
+
+def test_frost_materialization_survives_fused_loader_decline(monkeypatch, compile_allocates_nothing):
+    if not torch.cuda.is_available():
+        pytest.skip("plan compilation detector requires CUDA")
+    from cudnn.gemm.frost import compiler
+    from cudnn.gemm.frost.engine import FrostGemmEngine
+    from cudnn.gemm.frost.heuristics import analyze_facts, recommend
+    from cudnn.gemm.frost.materialization import MaterializedGatherPlan
+    from cudnn.gemm.frost.tile_config import by_name
+    from cudnn.engines.base import ExecutionContext, PlanConfig
+
+    graph, *_ = _graph((2,))  # INT32 row gather: both execution routes exist.
+    facts = analyze_facts(graph)
+    assert facts.chain.has_moe and len(facts.alternatives) == 1
+    assert not facts.alternatives[0].has_moe
+    config = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+
+    def probe(chain, config):
+        if chain.has_moe:
+            raise NotImplementedError("selected indirect loader cannot serve this layout")
+
+    built = []
+
+    def jit(chain, binding, config):
+        assert not chain.has_moe
+        built.append(chain)
+        return SimpleNamespace(binding=binding, workspace_bytes=0, lowered=lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(compiler, "probe_chain", probe)
+    monkeypatch.setattr(compiler, "plan_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(compiler, "plan_configs", lambda *args, **kwargs: [config])
+    monkeypatch.setattr(compiler, "jit_from_chain", jit)
+    proposed = recommend("A", facts, {"frost_gemm": 42})
+    assert len(proposed) == 1
+    engine = FrostGemmEngine()
+    engine.check_support(graph)
+    captured = []
+    compile_allocates_nothing(SimpleNamespace(compile=lambda: captured.append(engine.build_plan(graph, PlanConfig(42), ExecutionContext()))))
+    assert len(built) == 1
+    assert isinstance(captured[0]._compiled, MaterializedGatherPlan)
+    assert captured[0].get_workspace_size() > 0
+    # The low-level compiler entry must not stop at the rejected fused analysis.
+    direct = compiler.jit_from_cudnn_graph(graph, config=config)
+    assert isinstance(direct, MaterializedGatherPlan)
+    assert direct.workspace_bytes == captured[0].get_workspace_size()
+    assert [node.node_type for node in graph.nodes] == [NodeType.GATHER, NodeType.MATMUL]
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_frost_materialized_integer_gather_strided_output(dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("materialized gather requires CUDA")
+    from cudnn.gemm.frost.materialization import MaterializedGatherPlan, available_routes
+
+    dt = cudnn.data_type.INT32 if dtype == torch.int32 else cudnn.data_type.INT64
+    graph = cudnn.pygraph(io_data_type=dt, compute_data_type=cudnn.data_type.FLOAT)
+    source = graph.tensor(dim=[7], stride=[0], data_type=dt, name="source")
+    indices = graph.tensor(dim=[2, 3], stride=[3, 1], data_type=cudnn.data_type.INT64, name="indices")
+    output = graph.gather(source, indices).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    output.set_stride([1, 2])
+    plan = MaterializedGatherPlan(available_routes(graph)[0])
+    src = torch.full((1,), (1 << 40) + 7 if dtype == torch.int64 else 7, device="cuda", dtype=dtype).expand(7)
+    ids = torch.tensor([[0, -1, 6], [7, 3, -(1 << 40)]], device="cuda", dtype=torch.int64)
+    dst = torch.full((3, 2), -99, device="cuda", dtype=dtype).T
+    stream = torch.cuda.current_stream().cuda_stream
+    plan({source: src, indices: ids, output: dst}, stream=stream)
+    expected = torch.where((ids >= 0) & (ids < 7), src[0], 0)
+    torch.testing.assert_close(dst, expected, rtol=0, atol=0)
+    previous = dst.clone()
+    plan({source: src, indices: ids, output: dst}, stream=stream)
+    assert torch.equal(dst, previous)
