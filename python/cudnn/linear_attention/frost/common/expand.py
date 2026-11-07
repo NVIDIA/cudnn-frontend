@@ -12,6 +12,7 @@ import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.device import current_device
+from cudnn import launch_plan
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global_v4
 
@@ -161,7 +162,8 @@ class PackBwdRecipe(NamedTuple):
 
 def run_pack_bwd(r, q, q_x, do, do_x, stream) -> None:
     """The lowered backward pack launch: no validation, no key build."""
-    r.compiled(
+    launch_plan.launch(
+        r.compiled,
         r.q_heads,
         r.do_heads,
         q if r.with_q else do,
@@ -226,7 +228,7 @@ class GatherDqRecipe(NamedTuple):
 
 def run_gather_dq(r, dq_x, dq, stream) -> None:
     """The lowered dQ gather launch: no validation, no key build."""
-    r.compiled(r.dq_heads, dq_x, dq, r.grid_x, cuda.CUstream(int(stream)))
+    launch_plan.launch(r.compiled, r.dq_heads, dq_x, dq, r.grid_x, cuda.CUstream(int(stream)))
 
 
 def build_gather_dq(dq_x, dq, num_householder, stream) -> GatherDqRecipe:

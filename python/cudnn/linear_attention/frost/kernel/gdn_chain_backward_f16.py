@@ -34,6 +34,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
+from cudnn import launch_plan
 
 from ..common.host import get_dtype, family_slots
 from ..common.piece_chain import dtype_name, launch_state_chain
@@ -904,7 +905,8 @@ def run_chain_backward(
     plan validated the contract at build, so nothing here raises."""
     head, tail = compiled
     cu_stream = cuda.CUstream(int(stream))
-    head(
+    launch_plan.launch(
+        head,
         int(pieces),
         int(heads_out),
         int(num_seqs),
@@ -961,7 +963,8 @@ def run_chain_backward(
         seed_checkpoints if coarse else None,
         cu_stream,
     )
-    tail(
+    launch_plan.launch(
+        tail,
         int(pieces),
         int(heads_out),
         int(num_seqs),

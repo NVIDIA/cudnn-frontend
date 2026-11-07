@@ -115,6 +115,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.runtime import from_dlpack
+from cudnn import launch_plan
 
 from ..common.thd import (
     emit_checkpoint_seq_descs,
@@ -4954,7 +4955,8 @@ def chunk_gdn_bwd(
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
-        cache["prologue"](
+        launch_plan.launch(
+            cache["prologue"],
             q,
             k,
             v,
@@ -4972,7 +4974,8 @@ def chunk_gdn_bwd(
             workspace,
             cu_stream,
         )
-    compiled(
+    launch_plan.launch(
+        compiled,
         q,
         k,
         v,
@@ -5042,7 +5045,8 @@ def run_bwd(
     nothing here raises."""
     cu_stream = cuda.CUstream(int(stream))
     if own_prologue:
-        cache["prologue"](
+        launch_plan.launch(
+            cache["prologue"],
             q,
             k,
             v,
@@ -5060,7 +5064,8 @@ def run_bwd(
             tensormap_workspace,
             cu_stream,
         )
-    cache["compiled"](
+    launch_plan.launch(
+        cache["compiled"],
         q,
         k,
         v,

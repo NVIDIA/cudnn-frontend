@@ -28,6 +28,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.compiled_cache import compile_cached
+from cudnn import launch_plan
 
 from ..common.host import get_dtype
 from ..common.state_snapshot import snapshot_states
@@ -418,7 +419,8 @@ def run_uncut_forward(
 ) -> None:
     """Replay the uncut forward: one crossing into the DSL for the prologue and prefill launches.  The plan validated the
     contract at build, so nothing here raises."""
-    compiled(
+    launch_plan.launch(
+        compiled,
         int(checkpoint_every_n_tokens),
         float(scale),
         q,

@@ -37,11 +37,13 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.launch_plan import planned
 
 from .common import (
     check_composed_state,
     check_composed_summaries,
     check_context,
+    eager_dispatch,
     execute_graph,
     make_execution_resources,
     make_summary_cache_key,
@@ -347,6 +349,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@planned
 def run_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -936,8 +939,8 @@ def build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("cudnn::kimi_delta_attention_bwd", mutates_args=())
-def kda_bwd(
+@planned
+def run_kda_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -979,11 +982,7 @@ def kda_bwd(
     none.  Returns ``(dq, dk, dv, dg, dbeta, d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
-    if 0 in dO.stride():
-        dO = dO.contiguous()
     check_dtype("dO", dO, q.dtype)
-    if d_final_state is not None and 0 in d_final_state.stride():
-        d_final_state = d_final_state.contiguous()
     HK = k.shape[1]
     HV, V = v.shape[1], v.shape[2]
     if HK not in (H, HV):
@@ -1173,6 +1172,74 @@ def kda_bwd(
     return dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias
 
 
+def dense_kda_bwd(
+    dO: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    initial_state: Optional[torch.Tensor] = None,
+    d_final_state: Optional[torch.Tensor] = None,
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+    use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    gate_lower_bound: Optional[float] = None,
+    gate_domain: str = "log",
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    plan_name: Optional[str] = None,
+    following_state_grad: Optional[torch.Tensor] = None,
+    following_transition: Optional[torch.Tensor] = None,
+    composed_initial_state: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Functional KDA backward: :func:`run_kda_bwd` over ``dO`` / ``d_final_state`` with broadcast (stride-0) dims
+    materialized, so the planned body sees dense gradients (``out.sum()`` hands back an expanded ``dO``).  The body of
+    ``cudnn::kimi_delta_attention_bwd`` and the eager backward alike, so both reach the planned body with the same arguments (one plan)."""
+    if 0 in dO.stride():
+        dO = dO.contiguous()
+    if d_final_state is not None and 0 in d_final_state.stride():
+        d_final_state = d_final_state.contiguous()
+    return run_kda_bwd(
+        dO=dO,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        initial_state=initial_state,
+        d_final_state=d_final_state,
+        state_checkpoints=state_checkpoints,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        batch_invariant=batch_invariant,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        gate_lower_bound=gate_lower_bound,
+        gate_domain=gate_domain,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        plan_name=plan_name,
+        following_state_grad=following_state_grad,
+        following_transition=following_transition,
+        composed_initial_state=composed_initial_state,
+        context=context,
+    )
+
+
+kda_bwd = torch.library.custom_op("cudnn::kimi_delta_attention_bwd", dense_kda_bwd, mutates_args=())
+
+
 @kda_bwd.register_fake
 def kda_bwd_fake(
     dO,
@@ -1283,8 +1350,8 @@ def kda_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(output[2], output[3])
 
 
-def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
-    """Apply the registered first-order KDA backward formula."""
+def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, bwd=None):
+    """Apply the registered first-order KDA backward formula; ``bwd`` replaces the raw backward op (the eager path)."""
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
@@ -1301,7 +1368,7 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
     if dO is None:
         dO = torch.zeros(q.shape[0], max(q.shape[1], v.shape[1]), v.shape[2], dtype=q.dtype, device=q.device)
     dstate_in = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
-    dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias = torch.ops.cudnn.kimi_delta_attention_bwd(
+    dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias = (bwd or torch.ops.cudnn.kimi_delta_attention_bwd)(
         dO,
         q,
         k,
@@ -1358,6 +1425,54 @@ torch.library.register_autograd(
     kda_backward,
     setup_context=kda_setup_context,
 )
+
+
+# ---------------------------------------------------------------------------
+# Eager path: the forward op and its autograd formula without the custom op's dispatch
+# ---------------------------------------------------------------------------
+
+FWD_ARGS = (
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "cu_seqlens",
+    "scale",
+    "initial_state",
+    "output_final_state",
+    "use_qk_l2norm_in_kernel",
+    "batch_invariant",
+    "use_beta_sigmoid_in_kernel",
+    "allow_neg_eigval",
+    "safe_gate",
+    "gate_lower_bound",
+    "gate_domain",
+    "a_log",
+    "dt_bias",
+    "checkpoint_every_n_tokens",
+    "checkpoint_dtype",
+    "plan_name",
+    "preceding_state_update",
+    "preceding_transition",
+)
+
+
+class EagerKda(torch.autograd.Function):
+    """``cudnn::kimi_delta_attention_fwd`` with its registered autograd formula (:func:`kda_setup_context`,
+    :func:`kda_backward`), applied directly."""
+
+    @staticmethod
+    def forward(*args):
+        return run_kda_fwd(**dict(zip(FWD_ARGS, args)))
+
+    setup_context = staticmethod(kda_setup_context)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # create_graph=True runs the backward with grad on: keep the op, whose missing double-backward formula raises when
+        # differentiated (the eager body's outputs would silently carry no graph); a profile names the op's range
+        return kda_backward(ctx, *grads, bwd=None if torch.is_grad_enabled() or torch.autograd._profiler_enabled() else dense_kda_bwd)
 
 
 # ---------------------------------------------------------------------------
@@ -1550,7 +1665,7 @@ def kimi_delta_attention(
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints, composed_initial_state = torch.ops.cudnn.kimi_delta_attention_fwd(
+        args = (
             q,
             k,
             v,
@@ -1558,23 +1673,30 @@ def kimi_delta_attention(
             beta,
             cu_seqlens,
             float(scale),
-            initial_state=initial_state,
-            output_final_state=bool(output_final_state),
-            use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
-            batch_invariant=bool(batch_invariant),
-            use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
-            allow_neg_eigval=bool(allow_neg_eigval),
-            safe_gate=bool(safe_gate),
-            gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
-            gate_domain=str(gate_domain),
-            a_log=a_log,
-            dt_bias=dt_bias,
-            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
-            checkpoint_dtype=checkpoint_dtype,
-            plan_name=plan_name,
-            preceding_state_update=preceding_state_update,
-            preceding_transition=preceding_transition,
+            initial_state,
+            bool(output_final_state),
+            bool(use_qk_l2norm_in_kernel),
+            bool(batch_invariant),
+            bool(use_beta_sigmoid_in_kernel),
+            bool(allow_neg_eigval),
+            bool(safe_gate),
+            float(gate_lower_bound) if gate_lower_bound is not None else None,
+            str(gate_domain),
+            a_log,
+            dt_bias,
+            int(checkpoint_every_n_tokens),
+            checkpoint_dtype,
+            plan_name,
+            preceding_state_update,
+            preceding_transition,
         )
+        if not eager_dispatch(args):
+            outputs = torch.ops.cudnn.kimi_delta_attention_fwd(*args)
+        elif torch.is_grad_enabled() and any(a.requires_grad for a in args if isinstance(a, torch.Tensor)):
+            outputs = EagerKda.apply(*args)
+        else:
+            outputs = run_kda_fwd(**dict(zip(FWD_ARGS, args)))
+        o, final_state, state_checkpoints, composed_initial_state = outputs
         if preceding_state_update is not None:
             return o, final_state, state_checkpoints, composed_initial_state
     if checkpoint_every_n_tokens > 0:
