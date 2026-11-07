@@ -35,8 +35,8 @@ def test_sm120_fp8_sink_split_exact_dense_domain(dtype):
         dict(has_paged_kv=True),
         dict(is_fp8=False, is_mxfp8=True),
     ):
-        row = caps if not over.get("is_mxfp8") else next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm120_mxfp8")
-        reason = mismatch(row, replace(facts, **over), knobs)
+        # Keep the per-tensor row fixed: MXFP8 has its own split domain.
+        reason = mismatch(caps, replace(facts, **over), knobs)
         assert reason is not None, over
         if "d_qk" in over or "d_v" in over:
             assert mismatch(caps, replace(facts, has_sink=False, **over), knobs) is None
