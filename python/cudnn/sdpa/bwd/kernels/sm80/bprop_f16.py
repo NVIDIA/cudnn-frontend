@@ -572,6 +572,13 @@ def _bprop_kernel(
     # valid dQ).  Under THD row_base is the packed in-sequence row (kv_base).
     kv_valid = kv_bound if cutlass.const_expr(GATE_KV) else None
     kv_rbase = kv_base if cutlass.const_expr(GATE_KV) else None
+    if cutlass.const_expr(has_seq_kv_lens and not THD_VARLEN):
+        # Dense PADDED: rows in [eff_skv, SKV) are runtime padding inside the
+        # declared S_kv, unread data like the forward's (#2135). P is already 0
+        # there, but dP = dO.V^T and dQ's dS^T.K would carry a NaN pad row into
+        # valid dQ, so the loads zero-fill them too.
+        kv_valid = cute.math.max(cutlass.Int32(0), cute.math.min(eff_skv, cutlass.Int32(SKV)))
+        kv_rbase = kv_base
     load_tile_2d(
         sK,
         k_tile_gmem,
