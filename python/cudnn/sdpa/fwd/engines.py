@@ -949,7 +949,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
-        return "prepared SM120 does not serve paged KV"
+        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or (facts.d_qk, facts.d_v) != (128, 128) or (split_kv or 1) != 1:
+            return "SM120 paged KV requires exact FP16/BF16 D128, dense Q and split_kv=1"
     if facts.has_bias and capabilities.bias_d_shapes is None:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
@@ -2313,6 +2314,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
+        if capabilities.sm_lo == 120:
+            reason = _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
+            if reason is not None:
+                return reason
+            if knobs is not None and knobs.tile_m in (16, 32):
+                return "SM120 paged KV requires a prefill tile (tile_m=64 or 128)"
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
@@ -3413,6 +3420,8 @@ def _sm120_spec() -> EngineSpec:
             bottom_right=True,
             swa=True,
             right_band_widening=True,
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128)}),
             padded=True,
             sink=True,
             stats=True,
