@@ -366,8 +366,28 @@ kv 4k-16k, decode-shaped q 2-16 over kv 8k, a 1k left window); FROST time over b
   d128 prefill, led: 0.72-1.03 / 0.67-0.91 (the 1.03 is b4 32/8 q512 over kv 4096)
   d128 prefill, S_kv <= 512, or <= 1024 mask-free: 0.94-1.16 / 0.81-1.19 on 13-60 us launches -> TRAIL
 Mean regret against the faster provider: 45 / 55 % with the backend first -> 0.2 / 0.9 %, no lead slower than
-1.03x. Graph features the harness does not build (THD, padding mask, right band, sink, block-scaled O, fused
-gate, E5M2) TRAIL until measured.
+1.03x. Graph features the harness does not build (THD, padding mask, right band, block-scaled O, fused gate,
+E5M2) TRAIL until measured.
+
+SM120 per-tensor FP8 row with a sink (``_sm120_fp8_sink_leads``): measured 2026-11-07 on an RTX PRO 6000 and an
+RTX 5090, cuDNN 9.27.0.42, dense BSHD E4M3 Q/K/V/O with unit descales, Amax_O and a per-head sink, bottom-right causal
+(no mask at s_q == 1 without a window), d64 / d128, decode-shaped s_q 1-16 and prefill s_q 32-4096 over KV 512-128k,
+with and without a 128-2000 left window, b 1-128, 7 + 6 head geometries (MHA to GQA64). Each case built once (heur A +
+FALLBACK) and timed the first FROST plan against the first backend plan, interleaved over four rounds, best kept;
+a seeded 192-case grid and a 64-case off-lattice holdout (other heads, batches, windows, unaligned KV) frozen before
+timing. FROST time over backend time (geomean, range; train + holdout), PRO 6000 / 5090:
+  d64, any s_q, window or not: 0.48 (0.09-1.33) / 0.45 (0.08-1.24) over 126 / 119 cases; the seven slower than the
+    backend (1.06-1.33x) are all 11-13 us launches under a 96-128 key left window at s_q 16-595. That band (s_q > 4,
+    window of 96-128 keys) mixes wins and losses, 0.26-1.33 with 5 / 2 of 10 slower, so it TRAILs up to the first
+    measured winning window (384 keys at s_q 6-514: 0.70-0.99 / 0.69-0.77; ``SM120_FP8_SINK_SHORT_WINDOW``, no window in
+    between was measured); s_q <= 4 under 96-128 windows ran 0.29-0.92 and keeps the lead. The cut was set after the
+    PRO 6000 holdout showed its 1.33x, so the holdout is post-selection for it.
+  d128 decode-shaped, no window: 0.52 (0.14-0.99) / 0.53 (0.14-1.04) over 32 / 29 cases
+  d128 decode-shaped, windowed: 0.52-0.63 by split but up to 1.34 -> TRAIL
+  d128 prefill: 0.83 / 0.88-0.90 mask-free, 0.98-1.10 windowed, up to 1.55 -> TRAIL
+The default ran the backend on every case; with these leads no case runs slower than the default by more than 1.04x
+(a 43 us d128 decode on the 5090), and mean regret against the faster plan goes 111 / 122 % (holdout 137 / 143 %) ->
+22 / 24 % (20 / 19 %), the remainder in the classes left trailing.
 
 SM120 MXFP8 row (``sdpa_fwd_prefill_sm120_mxfp8``, offered by default): the backend declines MXFP8
 SDPA on cc 12.x ("MXFP8 SDPA is only supported on Blackwell Data Center architectures"), so the row is the only
@@ -536,6 +556,8 @@ SM107_FP8_D128_KV_PER_Q = 64  # ... this many times the query length
 SM107_FP8_D128_MASKFREE_MAX_S_Q = 128  # mask-free chunk on the KV tile: 0.28-0.96
 SM120_FP8_SHORT_KV = 512  # cc 12.x per-tensor FP8 d128 prefill at or below this cache: 0.81-1.19 on 13-60 us launches
 SM120_FP8_MASKFREE_SHORT_KV = 1024  # ... mask-free at or below this cache: 0.93-1.16
+SM120_FP8_SINK_SHORT_WINDOW = 383  # cc 12.x FP8 d64 with a sink: a left window of at most this many keys (cuDNN length) ...
+SM120_FP8_SINK_SHORT_WINDOW_MAX_S_Q = 4  # ... past the MTP rows trails: 96-128 ran up to 1.33x, 384 is the first measured win
 
 
 def _q_tiles(facts) -> int:
@@ -902,18 +924,29 @@ def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
     )
 
 
+def _sm120_fp8_sink_leads(facts) -> bool:
+    """A dense per-tensor E4M3 graph with a sink inside the measured classes (module docstring, "SM120 per-tensor FP8 row ...
+    with a sink"): exact d64 at any s_q, window or not, except a left window of at most SM120_FP8_SINK_SHORT_WINDOW keys past
+    the MTP rows; and exact d128 decode-shaped (s_q <= 16) without a window; under the masks measured there (bottom-right
+    causal, or none at s_q == 1). d128 prefill and windowed d128 decode keep the backend. A hand rule because
+    placement_table's class key excludes FP8 graphs (Rule S12)."""
+    # Measured masks only: bottom-right causal, or no mask at all at s_q == 1. A top-left causal single query over a longer
+    # cache sees only the first key, a different class the study did not time.
+    unmasked_q1 = facts.s_q == 1 and not facts.causal and facts.window_left is None
+    if not (unmasked_q1 or (facts.causal and facts.bottom_right)):
+        return False
+    if (facts.d_qk, facts.d_v) == (64, 64):
+        short_window = facts.window_left is not None and facts.window_left < SM120_FP8_SINK_SHORT_WINDOW
+        return not (short_window and facts.s_q > SM120_FP8_SINK_SHORT_WINDOW_MAX_S_Q)
+    return (facts.d_qk, facts.d_v) == (128, 128) and facts.s_q <= DECODE_SHAPED_MAX_S_Q and facts.window_left is None
+
+
 def _place_sm120_fp8(facts) -> str:
     # Measured: cc 12.0, dense per-tensor E4M3, causal (TL / BR), mask-free or a left window.
-    if (
-        facts.thd
-        or facts.padded
-        or facts.right_band_widening
-        or facts.has_sink
-        or facts.o_block_scale
-        or facts.has_epilogue_gate
-        or facts.dtype != cudnn.data_type.FP8_E4M3
-    ):
+    if facts.thd or facts.padded or facts.right_band_widening or facts.o_block_scale or facts.has_epilogue_gate or facts.dtype != cudnn.data_type.FP8_E4M3:
         return TRAIL
+    if facts.has_sink:
+        return LEAD if _sm120_fp8_sink_leads(facts) else TRAIL
     short_kv = facts.s_kv <= SM120_FP8_SHORT_KV or (not facts.causal and facts.s_kv <= SM120_FP8_MASKFREE_SHORT_KV)
     if 64 < max(facts.d_qk, facts.d_v) <= 128 and facts.s_q > DECODE_SHAPED_MAX_S_Q and short_kv:
         return TRAIL  # d128 prefill on a short cache: 0.81-1.19 (module docstring)
