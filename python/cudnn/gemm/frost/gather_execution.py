@@ -12,12 +12,12 @@ from math import prod
 
 from cudnn.graph_types import Tensor
 from cudnn.frost import buffers
-from cudnn.frost.execution import BufferBinding, ExecutionStep, SequentialPlan
+from cudnn.frost.execution import BufferBinding, ExecutionStep, SequentialPlan, VariantPackPlan
 
 from .dtypes import DTYPE_BYTES
 from .fusion_ir import IndexMap, Dtype, FusionChain
-from .graph_analyzer import GemmBinding, _analyze_state, _state_from_graph
-from .layouts import checked_layout
+from .graph_analyzer import GemmBinding, _analyze_state, _state_from_graph, _operand_view_path, _reachable_recorded_ops
+from .layouts import OperandView, checked_layout
 
 _BUFFER_DTYPES = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32", "int32": "int32", "int64": "int64"}
 
@@ -34,6 +34,12 @@ class GatherStage:
     dtype: Dtype
     indices_dtype: Dtype
     observable: bool
+    source_view: OperandView | None = None
+    indices_view: OperandView | None = None
+
+    @property
+    def indices_shape(self):
+        return self.indices_view.target_shape if self.indices_view is not None else tuple(self.indices.get_dim())
 
 
 @dataclass(frozen=True)
@@ -78,11 +84,22 @@ def execution_routes(graph):
     if not _graph_shapes_fixed(graph):
         raise NotImplementedError("materialized gather currently requires fixed graph shapes; dynamic/override graphs need a workspace shape contract")
     meta = {tid: replace(m) for tid, m in state["tensor_meta"].items()}
+    producers = {op.output: op for op in state["ops"]}
+
+    def input_view(tid):
+        source_id, steps, _ = _operand_view_path(tid, producers, meta)
+        source = meta[source_id]
+        if not source.is_input:
+            raise NotImplementedError("materialized gather inputs must be graph inputs or earlier materialized gathers")
+        view = OperandView.prepare(source.dim, source.stride, steps) if steps else None
+        logical = replace(source, dim=view.target_shape, stride=view.target_stride) if view is not None else source
+        return logical, view
+
     stages = []
     for op in gathers:
-        source, indices, out = (meta[tid] for tid in (*op.inputs, op.output))
-        if not source.is_input or not indices.is_input:
-            raise NotImplementedError("materialized gather inputs must be graph inputs or earlier materialized gathers")
+        source, source_view = input_view(op.inputs[0])
+        indices, indices_view = input_view(op.inputs[1])
+        out = meta[op.output]
         if source.dtype not in _BUFFER_DTYPES or out.dtype != source.dtype or indices.dtype not in ("int32", "int64"):
             raise NotImplementedError("materialized gather supports FP16/BF16/FP32/INT32/INT64 sources and INT32/INT64 indices without casting")
         access = IndexMap.take(indices.name, source.dim, indices.dim, dict(op.op_attrs)["axis"])
@@ -99,12 +116,26 @@ def execution_routes(graph):
             raise NotImplementedError("materialized gather exceeds CUDA's one-dimensional grid capacity")
         observable = out.output_index is not None
         stages.append(
-            GatherStage(source.tensor, indices.tensor, out.tensor, access, source.stride, indices.stride, out.stride, source.dtype, indices.dtype, observable)
+            GatherStage(
+                source.tensor,
+                indices.tensor,
+                out.tensor,
+                access,
+                source.stride,
+                indices.stride,
+                out.stride,
+                source.dtype,
+                indices.dtype,
+                observable,
+                source_view,
+                indices_view,
+            )
         )
         meta[op.output] = replace(out, is_input=True, output_index=None)
-    remaining = [op for op in state["ops"] if op.cudnn_name != "gather"]
+    remaining = _reachable_recorded_ops([op for op in state["ops"] if op.cudnn_name != "gather"], meta)
     if remaining:
-        chain, binding = _analyze_state({**state, "ops": remaining, "tensor_meta": meta})
+        referenced = {tid for op in remaining for tid in (*op.inputs, op.output)}
+        chain, binding = _analyze_state({**state, "ops": remaining, "tensor_meta": {tid: meta[tid] for tid in referenced}})
         if chain.has_moe:
             raise NotImplementedError("materialized gather currently composes with dense GEMM plans, not grouped routing")
         if any(meta[id(t)].dtype not in _BUFFER_DTYPES for t in binding.bound_tensors()):
@@ -181,7 +212,7 @@ def launch(source, indices, output, stream):
 def compile():
     return cute.compile(launch,
         make_fake_tensor({dtype}, ({_span(stage.access.producer_shape, stage.source_stride)},), (1,), assumed_align={DTYPE_BYTES[stage.dtype]}),
-        make_fake_tensor({indices_dtype}, ({_span(stage.indices.get_dim(), stage.indices_stride)},), (1,), assumed_align={DTYPE_BYTES[stage.indices_dtype]}),
+        make_fake_tensor({indices_dtype}, ({_span(stage.indices_shape, stage.indices_stride)},), (1,), assumed_align={DTYPE_BYTES[stage.indices_dtype]}),
         make_fake_tensor({dtype}, ({_span(shape, stage.output_stride)},), (1,), assumed_align={DTYPE_BYTES[stage.dtype]}),
         make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi")
 """
@@ -203,7 +234,7 @@ class MaterializedGatherPlan(SequentialPlan):
         declarations = {}
 
         def declare(tensor, shape, strides, dtype, role):
-            declaration = BufferBinding(tensor, shape, strides, dtype, role, tensor.get_name())
+            declaration = BufferBinding(tensor, shape, strides, dtype, role, tensor.get_name(), alignment=buffers.DTYPE_ITEMSIZE[dtype])
             previous = declarations.get(tensor)
             if previous is not None and previous != declaration:
                 # An intermediate read retains the producer's storage role.
@@ -221,8 +252,20 @@ class MaterializedGatherPlan(SequentialPlan):
         steps = []
         for number, stage in enumerate(route.gathers):
             for tensor, shape, strides, dtype, role in (
-                (stage.source, stage.access.producer_shape, stage.source_stride, stage.dtype, "input"),
-                (stage.indices, tuple(stage.indices.get_dim()), stage.indices_stride, stage.indices_dtype, "input"),
+                (
+                    stage.source,
+                    stage.source_view.source_shape if stage.source_view else stage.access.producer_shape,
+                    stage.source_view.source_stride if stage.source_view else stage.source_stride,
+                    stage.dtype,
+                    "input",
+                ),
+                (
+                    stage.indices,
+                    stage.indices_view.source_shape if stage.indices_view else stage.indices_shape,
+                    stage.indices_view.source_stride if stage.indices_view else stage.indices_stride,
+                    stage.indices_dtype,
+                    "input",
+                ),
                 (stage.output, stage.access.consumer_shape, stage.output_stride, stage.dtype, "output" if stage.observable else "temporary"),
             ):
                 declare(tensor, shape, strides, _BUFFER_DTYPES[dtype], role)
@@ -295,7 +338,7 @@ def build_execution_plan(graph, config=None, *, knobs=None, backend=None):
             )
             backend.probe_chain(route.chain, selected)
             compiled = backend.jit_from_chain(route.chain, route.binding, selected)
-            return MaterializedGatherPlan(route, compiled) if route.gathers else compiled
+            return MaterializedGatherPlan(route, compiled) if route.gathers else VariantPackPlan(compiled)
         except (NotImplementedError, ValueError) as exc:
             reasons.append(str(exc))
     raise NotImplementedError("no fused or materialized gather plan: " + "; ".join(reasons))

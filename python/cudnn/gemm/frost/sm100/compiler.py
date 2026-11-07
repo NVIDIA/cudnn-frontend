@@ -3116,13 +3116,14 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
 
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
-    config: TileConfig = DEFAULT_CONFIG,
+    config: TileConfig | None = None,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel."""
     if any(node.node_type.name == "GATHER" for node in graph.nodes):
         from ..gather_execution import build_execution_plan
 
         return build_execution_plan(graph, config, backend=sys.modules[__name__])
+    config = DEFAULT_CONFIG if config is None else config
     chain, binding = _analyze_graph(graph)
     return jit_from_chain(chain, binding, config)
 

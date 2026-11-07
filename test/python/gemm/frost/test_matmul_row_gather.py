@@ -847,12 +847,13 @@ def test_frost_index_map_composition_and_lowering(indirect):
         IndexMap((2,), (1,), (IndexExpr.coordinate(0),))
 
 
-def _materialization_graph(axis=0, *, side="a", observed=False, index_dtype=cudnn.data_type.INT64, rows=37):
+def _materialization_graph(axis=0, *, side="a", observed=False, index_dtype=cudnn.data_type.INT64, rows=37, source_view=False):
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     shape = (71, 128) if axis == 0 else (128, 71)
     source = graph.tensor(dim=list(shape), stride=_stride(shape), data_type=cudnn.data_type.BFLOAT16, name="source")
     indices = graph.tensor(dim=[rows], stride=[1], data_type=index_dtype, name="indices")
-    selected = graph.gather(source, indices, axis=axis)
+    logical_source = graph.reshape(source).set_dim(list(shape)).set_stride(_stride(shape)) if source_view else source
+    selected = graph.gather(logical_source, indices, axis=axis)
     if observed:
         selected.set_output(True)
     if side == "a":
@@ -1032,8 +1033,12 @@ def test_frost_materialized_gather_public_graph_capture():
         cudnn.destroy_handle(handle)
 
 
-@pytest.mark.parametrize("observed,padded", [(False, False), (True, False), (False, True)], ids=["workspace", "caller-output", "padded-workspace"])
-def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, monkeypatch):
+@pytest.mark.parametrize(
+    "observed,padded,source_view",
+    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
+    ids=["workspace", "caller-output", "padded-workspace", "source-view"],
+)
+def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, source_view, monkeypatch):
     """Runs the native gather plus a GEMM spy, not a Blackwell MMA kernel."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("materialized gather requires CUDA SM80 or newer")
@@ -1041,7 +1046,7 @@ def test_frost_materialized_gather_gemm_transport_on_hopper(observed, padded, mo
     from cudnn.frost.workspace import Workspace
     from cudnn._torch_stream import stream_context
 
-    graph, source, indices, weight, selected, output = _materialization_graph(observed=observed)
+    graph, source, indices, weight, selected, output = _materialization_graph(observed=observed, source_view=source_view)
     if padded:
         selected.set_stride([selected.dim[-1] + 8, 1])
     route = available_routes(graph)[0]
@@ -1267,3 +1272,151 @@ def test_frost_materialized_integer_gather_strided_output(dtype):
     previous = dst.clone()
     plan({source: src, indices: ids, output: dst}, stream=stream)
     assert torch.equal(dst, previous)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+def test_frost_standalone_gather_default_direct_config(family, monkeypatch):
+    from importlib import import_module
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan
+
+    backend = import_module(f"cudnn.gemm.frost.{family}.compiler")
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    source = graph.tensor(dim=[3, 4], stride=[4, 1], data_type=cudnn.data_type.FLOAT, name="source")
+    indices = graph.tensor(dim=[2], stride=[1], data_type=cudnn.data_type.INT64, name="indices")
+    graph.gather(source, indices).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    backend.probe_supported(graph)
+    assert isinstance(backend.jit_from_cudnn_graph(graph), MaterializedGatherPlan)
+    with pytest.raises(NotImplementedError, match="standalone gather"):
+        backend.jit_from_cudnn_graph(graph, config=backend.DEFAULT_CONFIG)
+
+    # Omitted config still means the historical default for ordinary GEMMs.
+    ordinary = SimpleNamespace(nodes=[])
+    marker = object()
+    monkeypatch.setattr(backend, "_analyze_graph", lambda _: ("chain", "binding"))
+    monkeypatch.setattr(backend, "jit_from_chain", lambda chain, binding, config, **kwargs: marker if config is backend.DEFAULT_CONFIG else None)
+    assert backend.jit_from_cudnn_graph(ordinary) is marker
+
+
+@pytest.mark.parametrize("mode", ["identity", "transpose", "chain"])
+@pytest.mark.parametrize("transpose_indices", [False, True])
+def test_frost_materialized_gather_input_views_native_capture(mode, transpose_indices):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("materialized gather requires CUDA SM80 or newer")
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    source = graph.tensor(dim=[3, 4, 5], stride=[20, 5, 1], data_type=cudnn.data_type.FLOAT, name="source")
+    indices = graph.tensor(dim=[2, 3], stride=[3, 1], data_type=cudnn.data_type.INT64, name="indices")
+    if mode == "identity":
+        logical_source = graph.reshape(source).set_dim([3, 4, 5]).set_stride([20, 5, 1])
+    elif mode == "transpose":
+        logical_source = graph.transpose(source, permutation=[2, 0, 1])
+    else:
+        reshaped = graph.reshape(source).set_dim([3, 20]).set_stride([20, 1])
+        logical_source = graph.transpose(reshaped, permutation=[1, 0])
+    logical_indices = graph.transpose(indices, permutation=[1, 0]) if transpose_indices else indices
+    output = graph.gather(logical_source, logical_indices, axis=0).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    route = available_routes(graph)[0]
+    assert route.gathers[0].source is source
+    assert route.gathers[0].indices is indices
+    plan = MaterializedGatherPlan(route)
+    assert set(plan.bound) == {source, indices, output}
+    assert plan.workspace_bytes == 0
+    src = torch.arange(60, device="cuda", dtype=torch.float32).reshape(3, 4, 5)
+    ids = torch.tensor([[0, 1, -1], [2, 99, 0]], device="cuda", dtype=torch.int64)
+    out = torch.full(output.dim, float("nan"), device="cuda")
+    pack = {source: src, indices: ids, output: out}
+    stream, captured = torch.cuda.Stream(), torch.cuda.CUDAGraph()
+    try:
+        stream.wait_stream(torch.cuda.current_stream())
+        plan(pack, stream.cuda_stream)
+        with torch.cuda.graph(captured, stream=stream):
+            plan(pack, stream.cuda_stream)
+        for changed in (False, True):
+            if changed:
+                src.add_(7)
+                ids.copy_(torch.roll(ids.flatten(), 1).reshape(2, 3))
+            out.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                captured.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            viewed = src if mode == "identity" else src.permute(2, 0, 1) if mode == "transpose" else src.view(3, 20).T
+            selected_ids = ids.T if transpose_indices else ids
+            flat_ids = selected_ids.flatten()
+            expected = viewed[flat_ids.clamp(0, viewed.shape[0] - 1)]
+            valid = ((flat_ids >= 0) & (flat_ids < viewed.shape[0])).reshape(-1, *([1] * (viewed.ndim - 1)))
+            expected = torch.where(valid, expected, 0).reshape(out.shape)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        before = out.clone()
+        bad = dict(pack)
+        bad[source] = src.transpose(1, 2).contiguous().reshape(src.shape)
+        # The changed storage is still a legal binding with the original shape
+        # and strides; the plan must read the newly bound source, not cache it.
+        plan(bad, stream.cuda_stream)
+        torch.cuda.current_stream().wait_stream(stream)
+        assert not torch.equal(out, before)
+    finally:
+        captured.reset()
+
+
+@pytest.mark.parametrize("port", ["source", "indices", "output"])
+def test_frost_materialized_gather_alignment_rejects_before_enqueue(port, monkeypatch):
+    from cudnn.frost import buffers
+    from cudnn.gemm.frost import compiler
+    from cudnn.gemm.frost.gather_execution import MaterializedGatherPlan, available_routes
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    source = graph.tensor(dim=[3, 4], stride=[4, 1], data_type=cudnn.data_type.FLOAT, name="source")
+    indices = graph.tensor(dim=[2], stride=[1], data_type=cudnn.data_type.INT64, name="indices")
+    output = graph.gather(source, indices).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    calls = []
+    monkeypatch.setattr(compiler, "_import_kernel", lambda _: SimpleNamespace(compile=lambda: lambda *args: calls.append("enqueue")))
+    plan = MaterializedGatherPlan(available_routes(graph)[0])
+    pack = {}
+    for tensor, name, dt, address in (
+        (source, "source", "float32", 0x200000),
+        (indices, "indices", "int64", 0x300000),
+        (output, "output", "float32", 0x400000),
+    ):
+        code, bits = buffers.DTYPES[dt]
+        pack[tensor] = cudnn._pybind_module.make_operand_buffer(
+            address + (1 if name == port else 0), list(tensor.dim), code, bits, plan.device, list(tensor.stride)
+        )
+    # Native metadata addresses are inspected, never exported or dereferenced.
+    monkeypatch.setattr(buffers, "probe", lambda value: (value.data_ptr(), tuple(value.shape), tuple(value.stride()), buffers.dtype_name(value), plan.device))
+    with pytest.raises(ValueError, match="pointer alignment"):
+        plan(pack, 17)
+    assert calls == []
+
+
+def test_frost_fused_gather_preserves_shared_call_convention():
+    from cudnn.gemm.frost.gather_execution import build_execution_plan
+
+    graph, *_ = _graph((2,))
+    calls = []
+
+    class GroupedExecutor:
+        def __init__(self, chain, binding):
+            self.chain, self.binding, self.workspace_bytes = chain, binding, 128
+
+        def __call__(self, pack, workspace=None, stream=None):
+            calls.append((pack, workspace, stream))
+
+    backend = SimpleNamespace(
+        probe_cutedsl=lambda: None,
+        plan_config=lambda *args, **kwargs: object(),
+        probe_chain=lambda *args: None,
+        jit_from_chain=lambda chain, binding, config: GroupedExecutor(chain, binding),
+    )
+    plan = build_execution_plan(graph, backend=backend)
+    assert plan.chain.has_moe
+    assert plan.workspace_bytes == 128
+    plan("pack", 17, "workspace")
+    assert calls == [("pack", "workspace", 17)]

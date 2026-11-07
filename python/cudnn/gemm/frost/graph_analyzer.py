@@ -2478,6 +2478,44 @@ def _build_multi_gemm_chain(
     return chain, binding
 
 
+def _operand_view_path(tid, producers, meta):
+    """Trace virtual dtype-preserving views back to their storage producer."""
+    steps, outputs = [], []
+    while (op := producers.get(tid)) is not None and op.cudnn_name in ("reshape", "transpose"):
+        if _is_output(meta, tid):
+            raise NotImplementedError("operand views must be virtual")
+        if meta[tid].dtype != meta[op.inputs[0]].dtype:
+            raise ValueError("operand views must preserve dtype")
+        if op.cudnn_name == "reshape":
+            if op.reshape_mode not in ("VIEW_ONLY", "LOGICAL"):
+                raise NotImplementedError("operand reshape requires VIEW_ONLY or LOGICAL")
+            steps.append(ViewStep("reshape", meta[tid].dim, meta[tid].stride))
+        else:
+            steps.append(ViewStep("transpose", op.permutation))
+        outputs.append(tid)
+        tid = op.inputs[0]
+    return tid, tuple(reversed(steps)), tuple(outputs)
+
+
+def _reachable_recorded_ops(ops, meta):
+    """Keep the ordinary DAG below materialized input boundaries."""
+    producers, used = {op.output: op for op in ops}, set()
+
+    def visit(tid):
+        if tid in used or meta[tid].is_input:
+            return
+        used.add(tid)
+        producer = producers.get(tid)
+        if producer is not None:
+            for inp in producer.inputs:
+                visit(inp)
+
+    for op in ops:
+        if op.cudnn_name == "matmul" or _is_output(meta, op.output):
+            visit(op.output)
+    return [op for op in ops if op.output in used]
+
+
 def _prepare_operand_view(meta, tid, steps, *, writable=False):
     """Append a checked storage projection without introducing a data producer."""
     m = meta[tid]
@@ -2541,22 +2579,7 @@ def _analyze_gather_state(state):
     # Source/index producers belong to the retained gather edges, not to the
     # GEMM epilogue. Walk only the ordinary DAG downstream of those boundaries.
     remaining = [op for op in state["ops"] if op.cudnn_name != "gather"]
-    producers = {op.output: op for op in remaining}
-    used = set()
-
-    def visit(tid):
-        if tid in used or meta[tid].is_input:
-            return
-        used.add(tid)
-        producer = producers.get(tid)
-        if producer is not None:
-            for inp in producer.inputs:
-                visit(inp)
-
-    for op in remaining:
-        if op.cudnn_name == "matmul" or _is_output(meta, op.output):
-            visit(op.output)
-    remaining = [op for op in remaining if op.output in used]
+    remaining = _reachable_recorded_ops(remaining, meta)
     referenced = {tid for op in remaining for tid in (*op.inputs, op.output)}
     gemm_meta = {tid: m for tid, m in meta.items() if tid in referenced}
     chain, binding = _analyze_state({**state, "ops": remaining, "tensor_meta": gemm_meta})

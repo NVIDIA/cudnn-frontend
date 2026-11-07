@@ -299,3 +299,42 @@ def test_frost_sequence_cai_only_device_is_not_assumed_zero(metadata_probe, monk
     monkeypatch.setattr(runtime, "cudaPointerGetAttributes", lambda ptr: (runtime.cudaError_t.cudaSuccess, SimpleNamespace(device=0)))
     plan({"x": value})
     assert calls == ["enqueue"]
+
+
+def test_frost_sequence_preserves_positional_stream_and_workspace(metadata_probe):
+    events = []
+    plan = _sequence(events)
+    plan({"x": MetadataBuffer(0x200000), "y": MetadataBuffer(0x300000)}, 17, _workspace(512))
+    assert events[0][-1] == events[1][-1] == 17
+    from cudnn.frost.execution import VariantPackPlan
+
+    class LegacyExecutor:
+        workspace_bytes = 128
+
+        def __call__(self, pack, workspace=None, stream=None):
+            return pack, workspace, stream
+
+    adapted = VariantPackPlan(LegacyExecutor())
+    assert adapted.workspace_bytes == 128
+    assert adapted("pack", 19, "workspace") == ("pack", "workspace", 19)
+
+
+@pytest.mark.parametrize("key", ["x", "y"])
+def test_frost_sequence_alignment_failure_precedes_all_steps(metadata_probe, key):
+    events = []
+    plan = SequentialPlan(
+        (_binding("x", alignment=16), _binding("y", "output", alignment=4)),
+        (ExecutionStep("copy", ("x",), ("y",), lambda *_: lambda: events.append("enqueue")),),
+        device=0,
+    )
+    pack = {"x": MetadataBuffer(0x200000), "y": MetadataBuffer(0x300000)}
+    pack[key].pointer += 1
+    with pytest.raises(ValueError, match="pointer alignment"):
+        plan(pack)
+    assert events == []
+
+
+@pytest.mark.parametrize("alignment", [0, -1, 3, 1 << 63])
+def test_frost_sequence_rejects_invalid_alignment(alignment):
+    with pytest.raises(ValueError, match="alignment"):
+        _binding("x", alignment=alignment)

@@ -2864,7 +2864,7 @@ def _launch_grid_reason(chain: FusionChain, config: TileConfig, n: int) -> "str 
 
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
-    config: TileConfig = DEFAULT_CONFIG,
+    config: TileConfig | None = None,
     *,
     padded_e2m1: bool = False,
 ) -> CompiledFusedGemm:
@@ -2876,6 +2876,7 @@ def jit_from_cudnn_graph(
             raise NotImplementedError("gather execution does not support padded e2m1 operands")
 
         return build_execution_plan(graph, config, backend=sys.modules[__name__])
+    config = DEFAULT_CONFIG if config is None else config
     chain, binding = _analyze_graph(graph)
     return jit_from_chain(chain, binding, config, padded_e2m1=padded_e2m1)
 

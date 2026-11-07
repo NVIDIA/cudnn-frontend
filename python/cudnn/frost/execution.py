@@ -25,6 +25,23 @@ from .device import device_context
 from .workspace import Workspace, WorkspaceLayout, carve_plan
 
 
+class VariantPackPlan:
+    """Normalize a prepared executor's call convention without changing its ABI.
+
+    Legacy executors may order workspace and stream differently. At a shared
+    graph-plan boundary, pass them by keyword and preserve executor metadata.
+    """
+
+    def __init__(self, executor):
+        self._executor = executor
+
+    def __getattr__(self, name):
+        return getattr(self._executor, name)
+
+    def __call__(self, variant_pack, stream=None, workspace=None):
+        return self._executor(variant_pack, stream=stream, workspace=workspace)
+
+
 @dataclass(frozen=True)
 class BufferBinding:
     """Fixed physical storage for a logical value, not an operation or a view."""
@@ -35,11 +52,16 @@ class BufferBinding:
     dtype: str
     role: Literal["input", "output", "temporary", "inout"] = "input"
     label: str = "buffer"
+    alignment: int = field(default=1, kw_only=True)
     span: int = field(init=False)
     nbytes: int = field(init=False)
 
     def __post_init__(self):
         hash(self.key)
+        alignment = index(self.alignment)
+        if alignment < 1 or alignment & (alignment - 1) or alignment > (1 << 63) - 1:
+            raise ValueError("buffer binding alignment must be a positive Int64 power of two")
+        object.__setattr__(self, "alignment", alignment)
         shape, strides = tuple(map(index, self.shape)), tuple(map(index, self.strides))
         if len(shape) != len(strides) or any(d < 0 for d in shape) or any(s < 0 for s in strides):
             raise ValueError("buffer binding requires nonnegative extents and matching nonnegative strides")
@@ -117,7 +139,7 @@ class SequentialPlan:
         self._temporaries = tuple(b for b in bindings if b.role == "temporary" and b.nbytes)
         self._empty_temporaries = tuple(b for b in bindings if b.role == "temporary" and not b.nbytes)
         for binding in self._temporaries:
-            regions.append((layout.add(binding.nbytes), binding.dtype, (binding.span,)))
+            regions.append((layout.add(binding.nbytes, align=binding.alignment), binding.dtype, (binding.span,)))
         scratch_size = max(step.workspace_bytes for step in self.steps)
         if scratch_size:
             regions.append((layout.add(scratch_size), "uint8", (scratch_size,)))
@@ -126,7 +148,7 @@ class SequentialPlan:
             raise ValueError("sequential plan workspace exceeds signed Int64 geometry")
         self._carve = carve_plan(owner, regions) if regions else None
 
-    def __call__(self, variant_pack, workspace=None, stream=None):
+    def __call__(self, variant_pack, stream=None, workspace=None):
         with device_context(self.device):
             self._execute(variant_pack, workspace, stream)
 
@@ -189,6 +211,8 @@ class SequentialPlan:
                 raise ValueError(f"{self.owner}: bindings must be CUDA buffers on the compiled device")
             if ptr < 0 or ptr + binding.nbytes > 1 << 64 or (binding.nbytes and not ptr):
                 raise ValueError(f"{self.owner}: buffer address range is invalid")
+            if binding.nbytes and ptr % binding.alignment:
+                raise ValueError(f"{self.owner}: {binding.label} requires {binding.alignment}-byte pointer alignment")
             ranges[key] = (ptr, ptr + binding.nbytes)
         if workspace_buffer is not None:
             base = buffers.data_ptr(workspace_buffer)

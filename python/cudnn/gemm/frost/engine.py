@@ -58,7 +58,7 @@ class _FrostGemmPlan(CompiledPlan):
         if launch is not None:
             launch(operands, graph_order, stream=ctx.stream, workspace=workspace)
         elif workspace is not None:
-            self._compiled(dict(zip(self._tensors, operands)), workspace, stream=ctx.stream)
+            self._compiled(dict(zip(self._tensors, operands)), workspace=workspace, stream=ctx.stream)
         else:
             self._compiled(dict(zip(self._tensors, operands)), stream=ctx.stream)
 

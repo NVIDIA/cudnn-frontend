@@ -18,6 +18,7 @@ from .layouts import ViewStep
 from .graph_analyzer import (
     _is_output,
     _prepare_operand_view,
+    _operand_view_path,
     _operand_view_index_map,
     _operand_index_expression,
     _infer_bcast_mode,
@@ -52,21 +53,9 @@ def _lower_gather_operands(ops, meta):
     absorbed = {gather.output}
 
     def unwrap(tid):
-        steps = []
-        while (op := producers.get(tid)) is not None and op.cudnn_name in ("reshape", "transpose"):
-            if _is_output(meta, tid):
-                raise NotImplementedError("indirect operand views must be virtual")
-            if meta[tid].dtype != meta[op.inputs[0]].dtype:
-                raise ValueError("indirect operand views must preserve dtype")
-            if op.cudnn_name == "reshape":
-                if op.reshape_mode not in ("VIEW_ONLY", "LOGICAL"):
-                    raise NotImplementedError("indirect operand reshape requires VIEW_ONLY or LOGICAL")
-                steps.append(ViewStep("reshape", meta[tid].dim, meta[tid].stride))
-            else:
-                steps.append(ViewStep("transpose", op.permutation))
-            absorbed.add(tid)
-            tid = op.inputs[0]
-        return tid, tuple(reversed(steps))
+        source, steps, outputs = _operand_view_path(tid, producers, meta)
+        absorbed.update(outputs)
+        return source, steps
 
     operand_id, operand_steps = unwrap(mm.inputs[0])
     if operand_id != gather.output:
