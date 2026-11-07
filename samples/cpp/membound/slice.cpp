@@ -16,9 +16,7 @@ TEST_CASE("Membound slice window with step", "[membound][slice][graph]") {
     return;
 #endif
 
-    if (!is_blackwell_computing_arch()) {
-        SKIP("TensorIR MemBound engine is only supported on Blackwell (data center Blackwell)");
-    }
+    skip_if_membound_arch_unsupported();
 
 #if (CUDNN_VERSION < 92200)
     SKIP("Membound graph samples require cuDNN 9.22.0 or newer (compiled CUDNN_VERSION >= 92200).");

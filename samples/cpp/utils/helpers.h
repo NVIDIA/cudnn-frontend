@@ -99,6 +99,18 @@ is_blackwell_computing_arch() {
     return (100 <= cc && cc < 110);
 }
 
+// Sample eligibility only; the backend still validates the target and graph.
+inline void
+skip_if_membound_arch_unsupported() {
+    if (cudnnGetVersion() < 92900) {
+        if (!is_blackwell_computing_arch()) {
+            SKIP("Before cuDNN 9.29.0, the TensorIR MemBound Fusion engine requires SM100-SM109.");
+        }
+    } else if (get_compute_capability() < 80) {
+        SKIP("The TensorIR MemBound Fusion engine requires SM80 or newer.");
+    }
+}
+
 inline bool
 is_arch_supported_by_cudnn() {
     if (cudnnGetVersion() < 8600 && (is_hopper_arch() || is_ada_arch())) {

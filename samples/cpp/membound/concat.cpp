@@ -20,9 +20,7 @@ TEST_CASE("Membound concatenate on channel axis (no in-place index)", "[membound
     return;
 #endif
 
-    if (!is_blackwell_computing_arch()) {
-        SKIP("TensorIR MemBound engine is only supported on Blackwell (data center Blackwell)");
-    }
+    skip_if_membound_arch_unsupported();
 
 #if (CUDNN_VERSION < 92200)
     SKIP("Membound graph samples require cuDNN 9.22.0 or newer (compiled CUDNN_VERSION >= 92200).");
