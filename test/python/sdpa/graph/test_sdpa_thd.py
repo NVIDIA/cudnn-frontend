@@ -1117,6 +1117,105 @@ def test_sdpa_thd_large_batch(cudnn_handle):
 # Main Entry Point
 # =========================================
 
+
+@pytest.mark.L0
+def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle):
+    """Ragged-offset Stats must be written for every q head at s_q=1 with GQA.
+
+    Regression guard for the report that only the first head of each kv group
+    received its LSE entry on SM90 (the other entries kept the buffer's prior
+    contents).
+    """
+    cudnn_version = LooseVersion(cudnn.backend_version_string())
+    if cudnn_version < "9.10.0":
+        pytest.skip("THD layout requires cuDNN 9.10.0 or higher")
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("SDPA with THD layout requires SM80 or higher")
+
+    b, h_q, h_kv, s_q, s_kv, d = 1, 8, 2, 1, 300, 128
+    dtype = torch.bfloat16
+    scale = 1.0 / math.sqrt(d)
+    gen = torch.Generator(device="cuda").manual_seed(4242)
+    q = torch.randn(s_q, h_q, d, device="cuda", dtype=dtype, generator=gen)
+    k = torch.randn(s_kv, h_kv, d, device="cuda", dtype=dtype, generator=gen)
+    v = torch.randn(s_kv, h_kv, d, device="cuda", dtype=dtype, generator=gen)
+    o = torch.empty(s_q, h_q, d, device="cuda", dtype=dtype)
+    stats = torch.full((s_q, h_q), float("nan"), device="cuda", dtype=torch.float32)
+
+    seq_len_q = torch.ones(b, dtype=torch.int32, device="cuda")
+    seq_len_kv = torch.full((b,), s_kv, dtype=torch.int32, device="cuda")
+    q_off = compute_ragged_offsets(seq_len_q, h_q, d)
+    o_off = compute_ragged_offsets(seq_len_q, h_q, d)
+    kv_off = compute_ragged_offsets(seq_len_kv, h_kv, d)
+    stats_off = compute_ragged_offsets(seq_len_q, h_q, 1)
+    cu_seq_q = torch.zeros(b + 1, dtype=torch.int32, device="cuda")
+    cu_seq_q[1:] = torch.cumsum(seq_len_q, dim=0)
+    cu_seq_kv = torch.zeros(b + 1, dtype=torch.int32, device="cuda")
+    cu_seq_kv[1:] = torch.cumsum(seq_len_kv, dim=0)
+
+    graph = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        handle=cudnn_handle,
+    )
+    Q = graph.tensor(dim=(b, h_q, s_q, d), stride=(h_q * d, d, h_q * d, 1), data_type=cudnn.data_type.BFLOAT16, name="Q", uid=1)
+    RQ = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="RQ", uid=2)
+    Q.set_ragged_offset(RQ).set_ragged_offset_multiplier(h_q * d)
+    K = graph.tensor(dim=(b, h_kv, s_kv, d), stride=(h_kv * d, d, h_kv * d, 1), data_type=cudnn.data_type.BFLOAT16, name="K", uid=3)
+    RK = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="RK", uid=11)
+    K.set_ragged_offset(RK).set_ragged_offset_multiplier(h_kv * d)
+    V = graph.tensor(dim=(b, h_kv, s_kv, d), stride=(h_kv * d, d, h_kv * d, 1), data_type=cudnn.data_type.BFLOAT16, name="V", uid=4)
+    RV = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="RV", uid=12)
+    V.set_ragged_offset(RV).set_ragged_offset_multiplier(h_kv * d)
+    CQ = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="CQ", uid=5)
+    CKV = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="CKV", uid=6)
+    O, ST = graph.sdpa(
+        name="sdpa_thd_gqa_stats",
+        q=Q,
+        k=K,
+        v=V,
+        attn_scale=scale,
+        use_padding_mask=True,
+        cu_seq_len_q=CQ,
+        cu_seq_len_kv=CKV,
+        generate_stats=True,
+    )
+    O.set_output(True).set_dim((b, h_q, s_q, d)).set_stride((h_q * d, d, h_q * d, 1)).set_data_type(cudnn.data_type.BFLOAT16).set_uid(7)
+    RO = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="RO", uid=8)
+    O.set_ragged_offset(RO).set_ragged_offset_multiplier(h_q * d)
+    ST.set_output(True).set_dim((b, h_q, s_q, 1)).set_stride((h_q, 1, h_q, 1)).set_data_type(cudnn.data_type.FLOAT).set_uid(9)
+    RS = graph.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="RS", uid=10)
+    ST.set_ragged_offset(RS).set_ragged_offset_multiplier(h_q)
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+
+    workspace = torch.empty(max(int(graph.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+    cudnn.set_stream(handle=cudnn_handle, stream=stream)
+    graph.execute(
+        {1: q, 2: q_off, 3: k, 4: v, 5: cu_seq_q, 6: cu_seq_kv, 7: o, 8: o_off, 9: stats, 10: stats_off, 11: kv_off, 12: kv_off},
+        workspace,
+    )
+    torch.cuda.synchronize()
+
+    unwritten = int(torch.isnan(stats).sum().item())
+    assert unwritten == 0, f"Stats not written for {unwritten} of {stats.numel()} q-head entries"
+
+    group = h_q // h_kv
+    rows = []
+    for head in range(h_q):
+        kv_head = head // group
+        scores = (q[:, head].float() @ k[:, kv_head].float().T) * scale
+        rows.append(torch.logsumexp(scores, dim=-1))
+    ref = torch.stack(rows, dim=-1)
+    torch.testing.assert_close(stats, ref, rtol=2e-2, atol=2e-2)
+
+
 if __name__ == "__main__":
     print("This is a pytest script.")
     print("Run with: pytest -vv -s -rA test_sdpa_dynamic_shapes.py")
