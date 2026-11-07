@@ -95,6 +95,52 @@ def test_medium_fft_supported_dtypes(dtype, atol, rtol):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("path", ["medium", "long"])
+def test_fft_causal_conv1d_runs_on_a_thread_with_no_cuda_context(path):
+    """An autograd backward runs on a worker whose CUDA context stack is empty. The FFT bindings load their kernels
+    through the driver API, which needs a bound context: there they failed with status 5000 (cuModuleLoadDataEx:
+    CUDA_ERROR_INVALID_CONTEXT) even with the kernels already built on the main thread. Each primitive binds the
+    work's context first; a fresh thread making no CUDA call of its own reproduces the main thread's results."""
+    _require_fft_causal_conv1d()
+    import threading
+
+    if path == "medium":
+        x, weight = _make_inputs(1, 2, 256, 128, torch.float32)
+        grad_out = (0.1 * torch.randn(1, 2, 256, device="cuda")).to(torch.float32)
+
+        def run():
+            y = torch.ops.cudnn.fft_causal_conv1d_fwd_primitive(x, weight)
+            return [y, *torch.ops.cudnn.fft_causal_conv1d_bwd_primitive(grad_out, x, weight)]
+
+    else:
+        x, weight = _make_inputs(1, 1, 8192, 8192, torch.float64)
+        grad_out = 0.1 * torch.randn_like(x)
+
+        def run():
+            y, reserve_space = torch.ops.cudnn.long_fft_causal_conv1d_fwd_primitive(x, weight)
+            return [y, *torch.ops.cudnn.long_fft_causal_conv1d_bwd_primitive(grad_out, x, weight, reserve_space)]
+
+    expected = run()
+    torch.cuda.synchronize()
+    result, errors = [], []
+
+    def on_fresh_thread():
+        try:
+            result.extend(run())
+            torch.cuda.synchronize()
+        except BaseException as error:  # surfaced on the main thread below
+            errors.append(error)
+
+    worker = threading.Thread(target=on_fresh_thread)
+    worker.start()
+    worker.join()
+    if errors:
+        raise errors[0]
+    for got, want in zip(result, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.L0
 def test_long_fft_fake_buffer_formula_matches_backend_query():
     _require_fft_causal_conv1d()
     batch, dim, seq_len, kernel_size = 2, 3, 4096, 4096
