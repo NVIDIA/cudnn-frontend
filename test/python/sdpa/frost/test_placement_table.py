@@ -271,3 +271,27 @@ def test_cc103_d128_forward_dense_causal_gqa_entries_are_its_own():
         facts = fwd(1, 16, 2, 2048, s_q=s_q)
         assert pt.lookup(row, facts) is True
         assert pt.TABLE[pt.class_key(row, facts)].study == "sm103_d128_fwd_dense_20261031"
+
+
+@pytest.mark.L0
+def test_sm80_f16_dense_prefill_entries_are_their_own_study():
+    """The A100 f16 dense prefill classes answer from their own study (sm80_f16_dense_prefill_20261106), not the bf16 one, and
+    another Ampere part has no entry: the hand rules decide there."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def prefill(s_q, s_kv, d, h_q=16, h_kv=16, **over):
+        base = dict(b=2, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=d, d_v=d, dtype=cudnn.data_type.HALF, causal=True, bottom_right=True)
+        base.update(has_paged_kv=False, device_cc=(8, 0))
+        base.update(over)
+        return _facts(**base)
+
+    causal_d64 = prefill(1024, 1024, 64)
+    assert pt.TABLE[pt.class_key(row, causal_d64)].study == "sm80_f16_dense_prefill_20261106"
+    assert pt.lookup(row, causal_d64) is True  # d64 bottom-right causal MHA: FROST leads from 2^7.86 query tokens per request
+    long_d128 = prefill(4096, 4096, 128, causal=False, bottom_right=False)
+    assert pt.lookup(row, long_d128) is False  # d128 mask-free MHA: FROST leads only up to a cost of 2^23.02
+    assert pt.lookup(row, prefill(1024, 1024, 64, causal=False, bottom_right=False)) is None  # a class the hand rules keep
+    assert pt.lookup(row, prefill(16, 128, 128, causal=False, bottom_right=False)) is True  # small mask-free d128 MHA: FROST leads
+    bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
+    assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
+    assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
