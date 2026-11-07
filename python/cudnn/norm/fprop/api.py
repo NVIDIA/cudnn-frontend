@@ -32,6 +32,7 @@ from ..config_sm100 import (
 # kernel; GN/IN have a different affine mapping and stay on the row-reduce kernel.
 _WARP_VARIANTS = (NormVariant.LAYER_NORM, NormVariant.RMS_NORM)
 from ..dtypes import DTYPE_BYTES, torch_dtype_to_str
+from ..utils import is_aligned_contiguous_vector
 from .kernels import (
     batchnorm_nchw_sm100,
     batchnorm_nhwc_sm100,
@@ -321,7 +322,8 @@ def norm_fprop(
         om, orstd = _stat_out(out_mean, spec.R), _stat_out(out_rstd, spec.R)
 
         # Warp-per-row kernel for LN/RMS when the row fits the register budget.
-        if variant in _WARP_VARIANTS:
+        # Fast LN/RMS kernels use contiguous, 16-byte-aligned affine loads.
+        if variant in _WARP_VARIANTS and is_aligned_contiguous_vector(gamma) and is_aligned_contiguous_vector(beta):
             # A long row first: one CTA per row caps parallelism and has to stage the
             # whole row, so past ~16K elements splitting it across a CGA -- each CTA
             # reducing its slice, then a reduction through distributed shared memory --

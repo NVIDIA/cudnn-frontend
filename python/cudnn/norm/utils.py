@@ -49,6 +49,11 @@ def fake_rows(dtype, *cols, rows=None, align=16):
     return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=tuple(range(len(shape) - 1, -1, -1)), assumed_align=align)
 
 
+def is_aligned_contiguous_vector(t):
+    """Whether a vector can be used by a 16-byte bulk affine load."""
+    return t is None or (t.stride(0) == 1 and t.data_ptr() % 16 == 0)
+
+
 def sm_count():
     """Multiprocessor count of the current device (cached)."""
     global _SM_COUNT
