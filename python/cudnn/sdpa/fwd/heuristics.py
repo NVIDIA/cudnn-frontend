@@ -1567,7 +1567,8 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             # (cuDNN 9.27.0.42, bf16, bottom-right causal dense prefill, every policy of the 128x128 tile timed
             # round-robin): a 145-cell MHA grid (b 1-16, h 8-32, S 512-8192) and a 320-cell holdout off it (b 3-12,
             # h 12-40, GQA 1 / 4 / 8, S 768-6144); against LPT_L2 first, NATURAL/LPT_L2 ran 0.49x at b*h = 512 and 1.08-1.11x
-            # at b*h <= 16, and the rule took the holdout's geomean regret from 1.384 to 1.005 with no cell slower.
+            # at b*h <= 16, and the rule took the holdout's geomean regret from 1.384 to 1.005, two of 320 cells over 3 % slower
+            # (max 1.083x, within run-to-run spread).
             # RTX 5060 Ti / PRO 6000 (cc 12.0) keep the L2-budget rule: LPT_L2 measured even or ahead there.
             primary = SCHED_NATURAL
     else:
