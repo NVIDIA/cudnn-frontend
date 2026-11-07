@@ -1166,6 +1166,17 @@ def _run(k, ops, out=None, out_bf16=None):
     return k(**ops, out=out, out_bf16=out_bf16)
 
 
+def _pair_at_one_request(sm_count, readings):
+    """Whether one request picks a two-CTAs-per-head form on a part: in the pair's own regime (its ``2 x V_HEADS`` cluster CTAs have
+    an SM each), not in the one-CTA regime, and -- on a part with fewer SMs than the one-CTA grid's ``V_HEADS`` CTAs (a 36-SM part) --
+    whatever the beyond-the-grid order leads with on the part's shared memory (the 2-deep-ring pair on a 99 KB opt-in)."""
+    if 2 * kcfg.V_HEADS <= sm_count:
+        return True
+    if kcfg.V_HEADS <= sm_count:
+        return False
+    return kcfg.first_fitting(kcfg.BEYOND_FORMS, *readings).TWO_CTAS_PER_HEAD
+
+
 def _part_form(dev, forms):
     """The first of ``forms`` this device's shared memory holds (``PAIR_CFG`` / ``CFG`` on a cc 10.0 part; the 2-deep-ring pair / the
     landing-slab one-CTA form on a 99 KB opt-in): the explicit form a cell compares the pick against on THIS part."""
@@ -1231,7 +1242,7 @@ def test_entry_reads_the_device_and_picks_the_form_per_requests():
             assert (got.SMEM_PER_SM_BYTES, got.SMEM_OPTIN_BYTES) == k.readings
         assert k.max_tokens_for(requests) == kcfg.max_tokens_served(requests, k.sm_count, *k.readings)
     one = k.cfg_for(1)
-    assert one.TWO_CTAS_PER_HEAD == (kcfg.V_HEADS * 2 <= k.sm_count)  # the pair while its 96 cluster CTAs have an SM each
+    assert one.TWO_CTAS_PER_HEAD == _pair_at_one_request(k.sm_count, k.readings)  # the pair while its 96 cluster CTAs have an SM each
     assert (
         one.co_resident_ctas(6) == 1 and 2 * (one.smem_bytes(6) + kcfg.SMEM_CTA_RESERVE_BYTES) > one.SMEM_PER_SM_BYTES
     )  # one CTA per SM by shared memory at T 6
@@ -1542,7 +1553,7 @@ def test_pair_and_one_cta_forms_are_bitwise_at_one_request(tokens):
     pair_form, one_form = _part_form(dev, kcfg.PAIR_FORMS), _part_form(dev, kcfg.ONE_CTA_FORMS)
     ops = [make_operands(1, tokens, dev, seed=41, accepted="random", skip="last") for _ in range(3)]
     pick = entry.GdnVerifyFused(dev, 1e-6)
-    assert pick.cfg_for(1, tokens).TWO_CTAS_PER_HEAD == (2 * kcfg.V_HEADS <= pick.sm_count)
+    assert pick.cfg_for(1, tokens).TWO_CTAS_PER_HEAD == _pair_at_one_request(pick.sm_count, pick.readings)
     got_pick = _snapshot(pick, ops[0])
     got_pair = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=pair_form), ops[1])
     got_one = _snapshot(entry.GdnVerifyFused(dev, 1e-6, cfg=one_form), ops[2])
