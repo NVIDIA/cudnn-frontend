@@ -83,10 +83,11 @@ ACCUMULATED = ("dprob_tensor", "wgrad_tensor")  # caller tensors a call accumula
 def planned_wrapper(kind):
     """A fresh planned wrapper, so plans from other tests do not answer, and the unplanned function."""
     import cudnn
+    from cudnn.gemm.cutedsl.grouped.backend_utils import PLAN_ENV
     from cudnn.launch_plan import planned
 
     plain = inspect.unwrap(getattr(cudnn, f"grouped_gemm_{kind}wrapper_sm100"))
-    return planned(plain), plain
+    return planned(plain, env=PLAN_ENV, stream="current_stream"), plain
 
 
 def call(fn, kwargs, initial):
@@ -169,6 +170,31 @@ def test_outputs_are_allocated_on_the_launch_stream(case):
     side.wait_stream(torch.cuda.current_stream())
     planned_outputs = call(run, dict(kwargs, current_stream=cuda.CUstream(side.cuda_stream)), {})
     assert_same_outputs(planned_outputs, call(plain, dict(kwargs, current_stream=cuda.CUstream(side.cuda_stream)), {}))
+
+
+@pytest.mark.parametrize("case", ["gemm_bf16", "glu_mxfp8", "dglu_mxfp8", "quant_mxfp8_amax", "wgrad_bf16_accumulate"])
+def test_an_int_stream_is_bound_per_call(case):
+    """current_stream as an int handle, as TE passes it: a plan recorded on one stream launches its kernels on each
+    later call's stream, so they wait for an input produced on that stream."""
+    kind, kwargs = CASES[case]()
+    run, plain = planned_wrapper(kind)
+    initial = {name: kwargs[name].clone() for name in ACCUMULATED if name in kwargs}
+    recorded, other = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(recorded):
+        for _ in range(3):
+            call(run, dict(kwargs, current_stream=recorded.cuda_stream), initial)
+    the_plan(run)
+    expected = call(plain, kwargs, initial)
+    a = kwargs["a_tensor"]
+    produced = a.clone()
+    a.copy_(torch.zeros_like(a))
+    torch.cuda.synchronize()
+    with torch.cuda.stream(other):  # the same relation to torch's current stream as the recorded calls
+        torch.cuda._sleep(200_000_000)
+        a.copy_(produced)
+        planned_outputs = call(run, dict(kwargs, current_stream=other.cuda_stream), initial)
+    assert len(run.plans) == 1
+    assert_same_outputs(planned_outputs, expected)
 
 
 def test_plans_can_be_turned_off(monkeypatch):

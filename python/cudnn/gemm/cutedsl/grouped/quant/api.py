@@ -36,7 +36,15 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import PLAN_ENV, _torch_stream_context, rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors, row_major_layout
+from ..backend_utils import (
+    PLAN_ENV,
+    _torch_stream_context,
+    kernel_stream,
+    rubin_single_group_offsets_kwarg,
+    wrapper_operand_meta,
+    block_scaled_sfd_tensors,
+    row_major_layout,
+)
 from ..canonical import (
     b_nkl,
     check_canonical_contiguous,
@@ -977,7 +985,7 @@ class GroupedGemmQuantSm100(APIBase):
                     alpha_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                     scheduler_counter_tensor,
                 )
             else:
@@ -1002,7 +1010,7 @@ class GroupedGemmQuantSm100(APIBase):
                     row_scale_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                     scheduler_counter_tensor,
                 )
 
@@ -1200,7 +1208,7 @@ class GroupedGemmQuantSm100(APIBase):
                     alpha_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                 )
             else:
                 launch(
@@ -1224,7 +1232,7 @@ class GroupedGemmQuantSm100(APIBase):
                     row_scale_tensor,
                     bias_tensor,
                     prob_tensor,
-                    stream,
+                    kernel_stream(stream),
                 )
 
         self._compiled_kernel = tensor_api

@@ -122,6 +122,12 @@ def debug_validate_pointer_values(ptrs, name: str, *, stream) -> None:
         raise ValueError(f"{name} entries must be non-null and 16-byte aligned")
 
 
+def kernel_stream(stream):
+    """``stream`` for a kernel launch: an int handle as a ``CUstream``. A launch plan binds a ``CUstream`` kernel argument
+    to each call's stream but records a plain int as a constant (it cannot tell a stream handle from an int argument)."""
+    return cuda.CUstream(stream) if isinstance(stream, int) else stream
+
+
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run PyTorch work on the CUDA stream used for the kernel launch.

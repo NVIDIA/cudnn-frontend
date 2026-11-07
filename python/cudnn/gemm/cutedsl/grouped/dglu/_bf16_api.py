@@ -41,7 +41,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, kernel_stream
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
@@ -533,7 +533,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 dprob_tensor,
                 cutlass.Float32(linear_offset),
                 dbias_tensor,
-                stream,
+                kernel_stream(stream),
                 activation_tensor,
             )
 

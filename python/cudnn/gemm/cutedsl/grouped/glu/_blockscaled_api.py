@@ -21,7 +21,7 @@ from __future__ import annotations
 
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import kernel_stream, rubin_single_group_offsets_kwarg
 from ..canonical import (
     canonical_b_fake,
     canonical_mx_fake,
@@ -1040,7 +1040,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
-                stream,
+                kernel_stream(stream),
                 linear_offset,
                 geglu_alpha,
                 glu_clamp_max,
@@ -1265,7 +1265,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
-                stream,
+                kernel_stream(stream),
                 linear_offset,
                 geglu_alpha,
                 glu_clamp_max,

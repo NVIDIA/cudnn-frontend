@@ -19,6 +19,7 @@ from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tenso
 from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+from ..backend_utils import kernel_stream
 from ..canonical import check_sf_shape, make_flat_sf_fake
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
@@ -454,7 +455,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 wgrad_tensor,
                 offsets_tensor,
                 workspace,
-                stream,
+                kernel_stream(stream),
                 global_scale_a,
                 global_scale_b,
                 None,
@@ -567,7 +568,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 wgrad_ptrs.data_ptr(),
                 offsets_tensor,
                 workspace,
-                stream,
+                kernel_stream(stream),
                 global_scale_a,
                 global_scale_b,
                 cached_single_expert,

@@ -34,7 +34,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values
+from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values, kernel_stream
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
@@ -379,7 +379,7 @@ class GroupedGemmWgradBf16API(APIBase):
                 out_arg,
                 offsets,
                 cached_workspace,
-                stream,
+                kernel_stream(stream),
                 cached_single_expert,
             )
 
