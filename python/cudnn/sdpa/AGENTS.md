@@ -1137,8 +1137,8 @@ the Rule 1-2 pin for this chain).
 
 Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
 on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
-`sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
-`kernels/thd_helpers.py` or `kernels/bprop_chain_common.py` does not move the
+`sm` -- an edit confined to `bwd/kernels/sm100/prepared_host.py`,
+`bwd/kernels/thd_helpers.py` or `bwd/kernels/bprop_chain_common.py` does not move the
 key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
 testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
 confirm the key moved (the detector pair above fails on the stale host).
@@ -1391,7 +1391,7 @@ heuristics made before it, and the public knob record's round trip through
 with its margin and its process's node class, clock and control pair -- never a
 default flip from one cell. The per-rendering constants were re-measured on the
 new renderings: see the module constants' comments in
-`kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+`fwd/kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 
