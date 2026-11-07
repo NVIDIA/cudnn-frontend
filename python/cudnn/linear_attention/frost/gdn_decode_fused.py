@@ -343,6 +343,7 @@ class GdnDecodeFused:
         start = cfg if cfg is not None else (first_fitting(ONE_CTA_FORMS, *self.readings) if self.part else CFG)
         self.cfg = self._on_this_part(start)
         self.forms: Dict[Cfg, Cfg] = {}  # the picked forms on this part, by their module form
+        self.picks: Dict[tuple, Cfg] = {}  # the picks by (rows, the readings they were made on)
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[int, Dict[str, Any]] = {}
 
@@ -369,7 +370,10 @@ class GdnDecodeFused:
         CTAs share an SM on this part; ``CFG`` when there is no CUDA device to pick by)."""
         if self.cfg_given or self.sm_count is None:
             return self.cfg
-        form = default_cfg(rows, self.sm_count, *self.readings, geometry=self.geometry)
+        pick = (rows, self.sm_count, self.readings, self.geometry)
+        form = self.picks.get(pick)
+        if form is None:  # the pick is a plan-time fact: walk the ladder once per rows count and readings, not on every launch
+            form = self.picks[pick] = default_cfg(rows, self.sm_count, *self.readings, geometry=self.geometry)
         if form not in self.forms:
             self.forms[form] = self._on_this_part(form)
         return self.forms[form]
