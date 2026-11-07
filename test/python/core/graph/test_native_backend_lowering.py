@@ -231,6 +231,7 @@ def test_native_moe_grouped_matmul_lowers_to_backend():
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
 
 
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 8, reason="cuDNN SDPA (FP16 / BF16) requires SM80 or newer")
 def test_native_sdpa_fwd_lowers_to_backend():
     """sdpa (captured-op family) -> cuDNN execution parity vs torch SDPA."""
     h = _handle()
