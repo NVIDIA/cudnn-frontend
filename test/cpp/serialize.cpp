@@ -865,6 +865,165 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
     cudnnDestroy(handle);
 }
 
+// A blob that lost a key, or that carries a uid key which is not a number, must come back as
+// UNSUPPORTED_GRAPH_FORMAT. Before the guards below, a missing key reached the const operator[],
+// whose only check is a JSON_ASSERT that a Release build (NDEBUG) removes, and a bad uid key
+// reached std::stoll, which threw std::invalid_argument out of the library.
+TEST_CASE("Malformed serialized graph is rejected", "[graph][serialize][deserialize]") {
+    namespace fe = cudnn_frontend;
+
+    // A pointwise node with a scalar operand, so the blob carries pass_by_values.
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    constexpr int64_t N = 4;
+    auto X              = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("X")
+                              .set_dim({N, N, N})
+                              .set_stride({N * N, N, 1})
+                              .set_data_type(fe::DataType_t::HALF)
+                              .set_uid(1));
+    auto scalar         = graph.tensor(5.0f);
+    scalar->set_name("scalar").set_uid(2);
+    auto Y = graph.pointwise(X,
+                             scalar,
+                             fe::graph::Pointwise_attributes()
+                                 .set_name("add")
+                                 .set_mode(fe::PointwiseMode_t::ADD)
+                                 .set_compute_data_type(fe::DataType_t::FLOAT));
+    Y->set_output(true).set_data_type(fe::DataType_t::HALF).set_uid(3);
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
+
+    std::vector<uint8_t> blob;
+    REQUIRE(graph.serialize(blob).is_good());
+
+    json const base = json::from_ubjson(blob);
+
+    // The blob must be well formed to start with, else a section below would pass for the
+    // wrong reason.
+    REQUIRE(base.contains("pass_by_values"));
+    REQUIRE_FALSE(base["pass_by_values"].empty());
+
+    auto expect_rejected = [&handle](json const& j) {
+        fe::graph::Graph reloaded;
+        auto status = reloaded.deserialize(handle, j);
+        CAPTURE(status.get_message());
+        REQUIRE_FALSE(status.is_good());
+        REQUIRE(status.get_code() == fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+    };
+
+    // The positive control. Every section below reaches its guard only after the plan rebuild
+    // succeeds, so without this a broken rebuild would look like a broken guard.
+    SECTION("the unmodified blob is accepted") {
+        fe::graph::Graph ok;
+        auto status = ok.deserialize(handle, base);
+        CAPTURE(status.get_message());
+        REQUIRE(status.is_good());
+    }
+
+    // Every key the deserializer reads unconditionally. gid is reachable because the blob
+    // carries the graph structure; the guard above it tests nodes and tensors, not gid.
+    auto const required_keys = {"gid",
+                                "cudnn_backend_data",
+                                "behavior_notes",
+                                "variant_pack_uids",
+                                "variant_pack_replacements",
+                                "fe_workspace_size"};
+
+    for (auto const& key : required_keys) {
+        SECTION(std::string("a blob with no ") + key + " is rejected") {
+            json j = base;
+            REQUIRE(j.erase(key) == 1);
+            expect_rejected(j);
+        }
+    }
+
+    SECTION("a pass_by_values uid key that is not a number is rejected") {
+        json j              = base;
+        json rekeyed        = json::object();
+        auto const& pbv     = base["pass_by_values"];
+        rekeyed["bad-uid"]  = pbv.begin().value();
+        j["pass_by_values"] = rekeyed;
+        expect_rejected(j);
+    }
+
+    SECTION("a workspace_modifications uid key that is not a number is rejected") {
+        json j                                  = base;
+        j["workspace_modifications"]["bad-uid"] = json::array({0, 0, json::array({1.0})});
+        expect_rejected(j);
+    }
+
+    SECTION("a workspace_modifications entry with fewer than three elements is rejected") {
+        json j                                 = base;
+        j["workspace_modifications"]["999999"] = json::array({0, 0});
+        expect_rejected(j);
+    }
+
+    SECTION("a workspace_modifications entry that is not a list is rejected") {
+        json j                                 = base;
+        j["workspace_modifications"]["999999"] = 7;
+        expect_rejected(j);
+    }
+
+    // uid_t is signed and set_uid() takes any value, so a negative uid key is well formed.
+    // The parser must keep accepting it.
+    SECTION("a negative pass_by_values uid key is accepted") {
+        json j              = base;
+        json rekeyed        = json::object();
+        auto const& pbv     = base["pass_by_values"];
+        rekeyed["-5"]       = pbv.begin().value();
+        j["pass_by_values"] = rekeyed;
+
+        fe::graph::Graph reloaded;
+        auto status = reloaded.deserialize(handle, j);
+        CAPTURE(status.get_message());
+        REQUIRE(status.is_good());
+    }
+
+    // begin() on a scalar is not end(), so without an is_object guard the loop would run once
+    // and it.key() would throw json::invalid_iterator out of the library.
+    SECTION("a pass_by_values that is not a map is rejected") {
+        json j              = base;
+        j["pass_by_values"] = 7;
+        expect_rejected(j);
+    }
+
+    SECTION("a workspace_modifications that is not a map is rejected") {
+        json j                       = base;
+        j["workspace_modifications"] = json::array({1, 2, 3});
+        expect_rejected(j);
+    }
+
+    // A tensor entry that claims a pass-by-value and lost the value reaches the const
+    // operator[] inside from_json(json, Tensor_attributes&), whose only check is a
+    // JSON_ASSERT that NDEBUG removes.
+    SECTION("a tensor that claims a pass-by-value with no value does not crash") {
+        json j = base;
+        REQUIRE(j.contains("tensors"));
+        REQUIRE(j["tensors"].is_array());
+        bool patched = false;
+        for (auto& tensor : j["tensors"]) {
+            tensor["is_pass_by_value"] = true;
+            if (tensor.erase("pass_by_value") == 1) {
+                patched = true;
+            }
+        }
+        REQUIRE(patched);
+        // The parser has no error channel, so the contract is only that it must not read past
+        // the end of the object. Any typed outcome is acceptable.
+        fe::graph::Graph reloaded;
+        REQUIRE_NOTHROW((void)reloaded.deserialize(handle, j));
+    }
+
+    cudnnDestroy(handle);
+}
+
 // ============================================================
 // Helpers shared by handle-less deserialize tests below.
 // ============================================================
