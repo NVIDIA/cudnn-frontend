@@ -41,6 +41,14 @@ def _local_cu(bounds, slab_len, rank, device):
 
 
 def main(seq_lens=(700, 1700, 100, 500, 1096), cp_size: int = 4, H: int = 2, D: int = 128) -> None:
+    if not torch.cuda.is_available():
+        print("[22] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[22] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     torch.manual_seed(0)
     device = "cuda"
     total = sum(seq_lens)
