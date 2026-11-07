@@ -594,4 +594,55 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_bwd_sm120", (12, 1), "f16", (64, 64), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm121_bwd_fp16_20261107"),
     ("sdpa_bwd_sm120", (12, 1), "f16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm121_bwd_fp16_20261107"),
     ("sdpa_bwd_sm120", (12, 1), "f16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm121_bwd_fp16_20261107"),
+    # study sm121_window_decode_bf16_20261107 (GB10, cuDNN 9.27.0; dense BSHD single-token decode under a bottom-right left window, 192 train
+    # cases: d64 / d128, MHA / GQA, S_kv 128-128k on and off the 128-key tile, b 1-128, windows 128-4096; plus 64 off-lattice holdout cases, run
+    # once). FROST / backend is parity at the launch floor and past about 2^18 window tokens in flight, and wins by up to 6x between them, so no
+    # single threshold on the features keeps those wins at the default margin: fitted with gen.py --margin 0.25.
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (128, 128), "q1", "dense", "window", False, "gqa", False): Entry(
+        "ge", 21.687, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (128, 128), "q1", "dense", "window", False, "gqa", True): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (128, 128), "q1", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (128, 128), "q1", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (64, 64), "q1", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (64, 64), "q1", "dense", "window", False, "gqa", True): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (64, 64), "q1", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "bf16", (64, 64), "q1", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm121_window_decode_bf16_20261107"
+    ),
+    # study sm121_window_decode_f16_20261107: the f16 twin of the block above, same grid shape (192 train + 64 holdout cases, its own seed).
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (128, 128), "q1", "dense", "window", False, "gqa", False): Entry(
+        "ge", 5.5, "sm121_window_decode_f16_20261107", "rows"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (128, 128), "q1", "dense", "window", False, "gqa", True): Entry(
+        "always", None, "sm121_window_decode_f16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (128, 128), "q1", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm121_window_decode_f16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (128, 128), "q1", "dense", "window", False, "mha", True): Entry("ge", 25.97, "sm121_window_decode_f16_20261107"),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (64, 64), "q1", "dense", "window", False, "gqa", False): Entry(
+        "always", None, "sm121_window_decode_f16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (64, 64), "q1", "dense", "window", False, "gqa", True): Entry(
+        "always", None, "sm121_window_decode_f16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (64, 64), "q1", "dense", "window", False, "mha", False): Entry(
+        "ge", 7.5, "sm121_window_decode_f16_20261107", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (64, 64), "q1", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm121_window_decode_f16_20261107"
+    ),
 }

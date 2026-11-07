@@ -295,3 +295,36 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
     assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
     assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+def test_gb10_window_decode_entries_lead_the_sm120_row():
+    """Dense d64 / d128 single-token decode under a left window leads on cc 12.1 from its own studies; the decode without a
+    window, a paged cache and cc 12.0 have no entry, and the hand rule keeps them behind the backend."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row = "sdpa_fwd_prefill_sm120"
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+
+    def decode(**over):
+        base = {"b": 8, "h_q": 32, "h_kv": 8, "s_q": 1, "s_kv": 4096, "d_qk": 64, "d_v": 64, "dtype": cudnn.data_type.BFLOAT16}
+        base.update(causal=True, bottom_right=True, window_left=1024, has_paged_kv=False, device_cc=(12, 1))
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.TABLE[pt.class_key(row, decode())].study == "sm121_window_decode_bf16_20261107"
+    assert pt.TABLE[pt.class_key(row, decode(dtype=cudnn.data_type.HALF))].study == "sm121_window_decode_f16_20261107"
+    assert placement.place(spec, decode()) == placement.LEAD
+    assert placement.place(spec, decode(dtype=cudnn.data_type.HALF)) == placement.LEAD
+    assert placement.place(spec, decode(h_q=8, s_kv=4100)) == placement.LEAD  # MHA off the tile: its own class and entry
+
+    # bf16 d128 GQA on the tile keeps a cost threshold: the launch-floor cell trails, a large launch leads.
+    assert pt.lookup(row, decode(b=1, h_q=8, h_kv=1, s_kv=256, d_qk=128, d_v=128)) is False
+    assert pt.lookup(row, decode(b=64, h_q=64, h_kv=8, s_kv=65536, d_qk=128, d_v=128)) is True
+
+    assert pt.lookup(row, decode(window_left=None)) is None
+    assert placement.place(spec, decode(window_left=None)) == placement.TRAIL
+    assert pt.lookup(row, decode(has_paged_kv=True, page_size=64)) is None
+    assert pt.lookup(row, decode(device_cc=(12, 0))) is None
+    assert placement.place(spec, decode(device_cc=(12, 0))) == placement.TRAIL

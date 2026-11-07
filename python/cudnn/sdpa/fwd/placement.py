@@ -106,6 +106,9 @@ locked at 2100 / 12481 MHz, cuDNN 9.27.0.42, profiler kernel time, median of thr
 1.2%): 1.11-1.24 at b = 1 on a 4k cache, within 4% from a 64k cache, and the d256 leads at 12+ KV units
 run 1.00-1.05 -> the rule above stands.
 
+On GB10 (cc 12.1) generated ``placement_table`` entries lead dense d64 / d128 ``s_q == 1`` under a left window (study
+sm121_window_decode_*): FROST / backend 0.17-1.49 over 256 cases per dtype. The rules above were measured on the RTX PRO 6000.
+
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
 with ``b * h_q >= 512`` query rows in flight (0.25-0.95); 256 rows are parity (0.96-1.11) and fewer
