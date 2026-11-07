@@ -44,9 +44,13 @@ the only FROST d > 256 backward on cc 10.7, and the only backward at all for tha
 band there: cuDNN 9.26 builds no d > 256 backward plan on cc 10.7, so a pin by
 `startswith("sdpa_bwd_sm107_d512")` is still the honest way to measure it.
 
-There is no standalone wrapper for this pass yet; the graph API is the surface, plus the
-adapters' own `execute` for the plan facts no graph declares (per-batch KV lengths, an
-external `delta`, THD on the fp8 and MXFP8 rows — see Sequence lengths and THD below).
+There is no separate high-level standalone wrapper for the whole pass; use the graph API
+or an adapter's `execute` method. Standalone THD execution takes per-batch sequence
+lengths, and adapters may be constructed with `external_delta=True`. Graph execution
+supports ragged inputs on all three d = 256 rows when the bindings expose
+`max_total_seq_len_q` and `max_total_seq_len_kv` on the FP8 and MXFP8 nodes; older pybind
+extensions decline those graph plans. Graph plans compute `delta` internally. See
+Sequence lengths and THD below for the packed contract.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm107/`
 (`bprop_d256_f16.py`, `bprop_d256_fp8.py`, `bprop_d256_mxfp8.py`; config
@@ -101,7 +105,9 @@ fp32 tensors, `dQ/dK/dV` declared E4M3 (or bf16 / fp16), and any of
 
 One backward call is a fixed sequence of launches on the caller's stream, every
 scratch buffer carved from the caller's workspace (`graph.get_workspace_size()`
-is a build-time function of the shape).  Both rows are **prepared launches**
+is a build-time function of the shape). All three d = 256 rows
+(`sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8`, and `sdpa_bwd_sm107_mxfp8`) are
+**prepared launches**
 (`bwd/prepared_sm107.py`, `kernels/sm107/prepared_host.py`): the plan compiles
 ONE pointer-host artifact that runs the whole chain from device pointers, and
 every stage below -- the padding copies, the `seq_kv` fill and the (rare) dS zero-fill
@@ -244,8 +250,9 @@ and dQ / dK / dV BITWISE the 4x1 body's -- but measured slower than the 4x1 body
 ### The d in (256, 512] row (`sdpa_bwd_sm107_d512`; `bwd/api_dsl_sm107_d512.py`)
 
 Head dims above 256 are a different chain on this line too: the SM100
-large-head-dim backward (`bwd/api_dsl.py::SdpaBwdDslSm100`, see the SM100 ᵇ
-footnote of the support tracker) -- `delta = rowsum(dO·O)` -> a stage-2 kernel
+large-head-dim backward (`bwd/api_dsl.py::SdpaBwdDslSm100`; see the [SM100/SM103
+D512 BPROP entry in the FROST support tracker](https://github.com/NVIDIA/cudnn-frontend/blob/develop/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md#L459-L470))
+-- `delta = rowsum(dO·O)` -> a stage-2 kernel
 that writes `S` and `dS` to `[B, H_chunk, S_q, S_kv]` GMEM workspaces (heads
 chunked to a 4 GiB budget) -> `dV = Sᵀ·dO`, `dK = dSᵀ·Q`, `dQ = dS·K` as the
 `bprop_matmul_blackwell` GEMMs at the (512, 512) cluster tile -> the GQA fold --

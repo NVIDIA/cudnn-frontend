@@ -4,7 +4,8 @@ The opt-in `sdpa_bwd_sm100_d128` engine serves dense multi-head attention with
 BF16 or FP16 inputs and gradients, compact BSHD physical storage, and
 contiguous FP32 natural-log Stats. Dense MHA supports head dimensions 64 and 128,
 unmasked or top-left causal attention, and a left sliding window, including
-rectangular query and key/value lengths allowed by the shared graph contract.
+rectangular query and key/value lengths within the [dense MHA declaration
+bounds below](#dense-mha-declaration-bounds).
 Packed THD MHA supports both dtypes at D128. Dense and THD GQA/MQA support
 BF16 at D128, without sliding windows. Packed
 and grouped paths require SM100, SM103 or SM107 (cc 10.0, 10.3 or 10.7), CuTeDSL 4.8 or newer (a build with the
@@ -47,10 +48,13 @@ positions before the query, so a graph left bound of 128 corresponds to a
 standalone radius of 127. Window declarations also require
 `max(S_q,S_kv) + window_size_left + 129 <= 2**31-1`.
 
-Other dense MHA declarations in the existing envelope, including negative finite
-nonzero scales and older CuTeDSL releases, retain the one-kernel implementation with
-zero workspace. Always query the plan's size rather than assuming either
-implementation. Zero and nonfinite scales are unsupported.
+Dense MHA declarations that do not meet the three-kernel eligibility conditions,
+including negative finite nonzero scales and CuTeDSL releases older than 4.8, use
+the one-kernel recompute implementation with zero workspace. Always query the
+plan's size rather than assuming either implementation. Zero and nonfinite scales
+are unsupported.
+
+## Dense MHA declaration bounds
 
 Dense MHA declarations are bounded before either implementation is selected:
 `max(S_q,S_kv) <= 2**31-128`, `B*H*S_q <= 2**31-1`,
@@ -71,8 +75,11 @@ initializes its scratch each time, and performs no allocation, layout copy or
 device-to-host read. The plan supports CUDA-graph capture and replay. FP32 dQ
 atomic accumulation does not promise bitwise repeatability.
 
-The three-kernel implementation is selected for D64, and for D128 without a window, on SM100, SM103 and SM107 when determinism is not requested. Existing support
-on other Blackwell devices in the row's range retains the previous implementation.
+The three-kernel implementation is selected for D64, and for D128 without a
+window, on SM100, SM103 and SM107 when determinism is not requested. For other
+supported devices in the row's range, or declarations that do not meet those
+conditions, plan construction uses the one-kernel recompute implementation
+described above.
 The engine remains opt-in while performance qualification proceeds.
 
 For packed THD, declare positive `max_total_seq_len_q` and
