@@ -295,3 +295,43 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
     assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
     assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+def test_b300_dense_prefill_entries_lead_the_sm100_row():
+    """Dense prefill-phase d192 and windowed d64 lead on cc 10.3 from their own studies; other head dims, a paged cache and
+    cc 10.0 are not answered by these entries."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row = "sdpa_fwd_prefill_sm100"
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+
+    def prefill(**over):
+        base = {"b": 16, "h_q": 32, "h_kv": 4, "s_q": 65, "s_kv": 3072, "d_qk": 192, "d_v": 192, "dtype": cudnn.data_type.BFLOAT16}
+        base.update(causal=True, bottom_right=True, has_paged_kv=False, device_cc=(10, 3))
+        base.update(over)
+        return _facts(**base)
+
+    half = cudnn.data_type.HALF
+    d64 = {"d_qk": 64, "d_v": 64, "window_left": 1024}
+    assert pt.TABLE[pt.class_key(row, prefill())].study == "sm103_dense_prefill_bf16_20261107"
+    assert pt.TABLE[pt.class_key(row, prefill(dtype=half))].study == "sm103_dense_prefill_f16_20261107"
+    led = (
+        prefill(),
+        prefill(dtype=half),
+        prefill(causal=False, bottom_right=False),
+        prefill(window_left=1024),
+        prefill(s_kv=3073),
+        prefill(h_q=8, h_kv=8, **d64),
+        prefill(h_q=8, h_kv=8, s_kv=3073, **d64),
+        prefill(dtype=half, **d64),
+    )
+    for facts in led:
+        assert pt.lookup(row, facts) is True
+        assert placement.place(spec, facts) == placement.LEAD
+
+    assert pt.class_key(row, prefill(d_qk=64, d_v=64)) not in pt.TABLE  # d64 without a window
+    assert pt.class_key(row, prefill(dtype=half, d_qk=128, d_v=128)) not in pt.TABLE
+    assert pt.class_key(row, prefill(has_paged_kv=True, page_size=64)) not in pt.TABLE
+    assert pt.class_key(row, prefill(device_cc=(10, 0))) not in pt.TABLE

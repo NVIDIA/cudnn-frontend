@@ -84,6 +84,9 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   GQA2 (packed since 2026-10-09) also needs KV >= 4096: B300, 72 cases, packed 0.53-0.97 there; on a
   1-2k cache large batches lost up to 1.26x.
 
+On B300 (cc 10.3) generated ``placement_table`` entries lead dense prefill-phase d192 and windowed d64 (study sm103_dense_prefill_*),
+measured on that part; the rules above answer the rest there.
+
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
 d512 row with a 128-wide GQA group (DeepSeek-V4 "pro", 128 query heads over one KV head) loses
