@@ -319,3 +319,31 @@ def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
         assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["backend", "last_resort", "frost"], name
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost"]
+
+
+def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatch):
+    """A placement_table entry puts a trail-only row ahead of the backend on the measured part and classes; any other graph
+    keeps the row behind LAST_RESORT."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block, is_last_resort
+    from cudnn.sdpa.bwd import heuristics
+
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm120"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    order = lambda **over: [tag(p) for p in heuristics.propose("A", _facts(**{"device_cc": (12, 1), **over}), _OFFERED)]
+    trails = ["backend", "last_resort", "frost"]
+
+    for dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        for d in (64, 128):
+            assert order(dtype=dtype, d_qk=d, d_v=d)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, causal=False)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, window_left=256)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8, s_q=300, s_kv=300)[0] == "frost"
+    assert order(device_cc=(12, 0)) == trails  # another part
+    assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
+    assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
+    assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
+    assert order(padded=True) == trails  # runtime lengths
+    assert order(seq_q_trim=True) == trails
