@@ -1,9 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmark the native SM120 blk128 BF16 block-sparse attention kernel.
+"""Benchmark the native SM120 blk128 BF16 block-sparse attention kernel against PyTorch's cuDNN dense SDPA backend.
 
-Usage and requirements: test/python/block_sparse_attention/cutedsl/test_BSA_attention_forward.py.
+Requires an SM120 GPU, a CUDA-enabled PyTorch build and CuTe DSL >= 4.7.0.  With several editable checkouts, verify
+the imported kernel path first:
+
+    python -c 'import cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fa4 as k; print(k.__file__)'
+
+For a fresh single-GPU comparison (BF16 BHSD [1, 8, 142720, 128], native KV128):
+
+    CUDA_VISIBLE_DEVICES=0 python benchmark/bsa/benchmark_sm120_blk128.py \
+      --sequence 142720 --heads 8 --densities 0.15 0.20 \
+      --patterns strided local --warmup 5 --repeats 21 --fail-below-target
+
+The 4.5x gate applies to the slowest 20%-density case; a missed performance gate is not itself an accuracy failure.
+Measure on an idle GPU without a profiler.  Correctness is covered by
+``test/python/block_sparse_attention/cutedsl/test_BSA_forward.py`` (``-k sm120`` and the architecture-independent tests).
 """
 
 from __future__ import annotations
