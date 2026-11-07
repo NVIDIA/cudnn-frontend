@@ -653,6 +653,10 @@ def test_sm120_fp8_short_cache_d128_band_structure():
         dict(padded=True),
         dict(right_band_widening=True, right_bound=16),
         dict(has_sink=True),
+        dict(has_sink=True, s_q=8, s_kv=4096, bottom_right=True, window_left=511),
+        dict(has_sink=True, d_qk=64, d_v=64, s_q=512, s_kv=4096, bottom_right=False),
+        dict(has_sink=True, d_qk=64, d_v=64, s_q=8, s_kv=4096, causal=False, bottom_right=False),
+        dict(has_sink=True, d_qk=96, d_v=96, s_q=1, s_kv=4096, causal=False),
         dict(o_block_scale=16),
         dict(has_epilogue_gate=True),
         dict(dtype=cudnn.data_type.FP8_E5M2),
@@ -661,6 +665,42 @@ def test_sm120_fp8_short_cache_d128_band_structure():
 def test_sm120_fp8_placement_trails_outside_the_measured_domain(over):
     """Every graph feature the benchmark did not cover keeps the backend first."""
     assert _place_sm120(_SM120_FP8, **over) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(d_qk=64, d_v=64, s_q=1, s_kv=131072, causal=False),
+        dict(d_qk=64, d_v=64, s_q=1, s_kv=131072, bottom_right=True, window_left=127),
+        dict(d_qk=64, d_v=64, s_q=2048, s_kv=8192, bottom_right=True),
+        dict(d_qk=64, d_v=64, s_q=4, s_kv=8192, bottom_right=True, window_left=127),
+        dict(d_qk=64, d_v=64, s_q=2048, s_kv=8192, bottom_right=True, window_left=1023),
+        dict(d_qk=64, d_v=64, s_q=512, s_kv=512, bottom_right=True),
+        dict(s_q=1, s_kv=8192, causal=False),
+        dict(s_q=16, s_kv=8192, bottom_right=True),
+        dict(s_q=4, s_kv=512, bottom_right=True),
+    ],
+)
+def test_sm120_fp8_sink_leads_in_the_measured_classes(over):
+    """With a sink: exact d64 (outside short windows past the MTP rows) and exact d128 decode-shaped graphs without a window lead."""
+    assert _place_sm120(_SM120_FP8, has_sink=True, **over) == placement.LEAD
+
+
+@pytest.mark.L0
+def test_sm120_fp8_sink_band_structure():
+    """The d128 decode band reads DECODE_SHAPED_MAX_S_Q, so this pins the gate's structure, not a measured boundary."""
+    decode = placement.DECODE_SHAPED_MAX_S_Q
+    sink = dict(has_sink=True, s_kv=8192, bottom_right=True)
+    assert _place_sm120(_SM120_FP8, s_q=decode, **sink) == placement.LEAD
+    assert _place_sm120(_SM120_FP8, s_q=decode + 1, **sink) == placement.TRAIL
+    assert _place_sm120(_SM120_FP8, d_qk=64, d_v=64, s_q=decode + 1, **sink) == placement.LEAD
+    assert _place_sm120(_SM120_FP8, has_sink=True, padded=True, d_qk=64, d_v=64, s_q=1, causal=False) == placement.TRAIL
+    short, mtp = placement.SM120_FP8_SINK_SHORT_WINDOW, placement.SM120_FP8_SINK_SHORT_WINDOW_MAX_S_Q
+    d64 = dict(sink, d_qk=64, d_v=64)
+    assert _place_sm120(_SM120_FP8, s_q=mtp + 1, window_left=short - 1, **d64) == placement.TRAIL
+    assert _place_sm120(_SM120_FP8, s_q=mtp, window_left=short - 1, **d64) == placement.LEAD
+    assert _place_sm120(_SM120_FP8, s_q=mtp + 1, window_left=short, **d64) == placement.LEAD
 
 
 @pytest.mark.L0
