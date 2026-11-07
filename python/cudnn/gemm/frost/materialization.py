@@ -66,7 +66,9 @@ def execution_routes(graph):
         yield ExecutionRoute(chain, binding)
         return
     try:
-        chain, binding = _analyze_state(state)
+        from .grouped_lowering import lower_gather_state
+
+        chain, binding = lower_gather_state(state)
     except (NotImplementedError, ValueError):
         # Storage projections can decline a mathematically valid gather. The
         # unmodified snapshot below remains available to the materializer.

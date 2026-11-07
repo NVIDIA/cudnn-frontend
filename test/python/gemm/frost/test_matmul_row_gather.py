@@ -11,11 +11,16 @@ import torch
 import cudnn
 
 from cudnn._gemm_validate import validate_graph
-from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+from cudnn.gemm.frost.graph_analyzer import analyze_with_binding, _state_from_graph
+from cudnn.gemm.frost.grouped_lowering import lower_gather_state
 from cudnn.graph_types import NodeType
 from cudnn.nodes import gather_shape
 
 pytestmark = pytest.mark.L0
+
+
+def _lowered_graph(graph):
+    return lower_gather_state(_state_from_graph(graph))
 
 
 def _stride(shape):
@@ -45,11 +50,11 @@ def test_frost_row_gather_lowering(prefix, broadcast, dtype):
     g, source, indices, weight, gathered, out = _graph(prefix, broadcast=broadcast, dtype=dtype)
     valid = validate_graph(g)
     assert valid
-    chain, binding = analyze_with_binding(g)
+    chain, binding = _lowered_graph(g)
     assert chain.moe.mode == "gather"
-    assert chain.grouped_gemm.partition.rows_per_group == 37
-    assert chain.grouped_gemm.num_weight_groups == (1 if broadcast else prod(prefix))
-    assert chain.grouped_gemm.partition.offset_dtype is None
+    assert chain.group_partition.rows_per_group == 37
+    assert chain.moe.num_experts == (1 if broadcast else prod(prefix))
+    assert chain.group_partition.offset_dtype is None
     assert chain.moe.num_groups == prod(prefix)
     assert chain.moe.num_experts == (1 if broadcast else prod(prefix))
     assert (chain.matmul.M, chain.matmul.K, chain.matmul.N) == (prod(prefix) * 37, 136, 128)
@@ -64,6 +69,51 @@ def test_frost_row_gather_lowering(prefix, broadcast, dtype):
     assert gathered.get_dim() == [*prefix, 37, 136]
     assert [node.node_type for node in g.nodes] == [NodeType.GATHER, NodeType.MATMUL]
     assert not g._backend_lowerable()
+
+
+@pytest.mark.parametrize("prefix", [(), (2,), (2, 3)])
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_frost_gather_analysis_keeps_plain_gemm_semantics(prefix, broadcast):
+    graph, source, indices, weight, gathered, output = _graph(prefix, broadcast=broadcast)
+    original = tuple((node.node_type, tuple(node.inputs)) for node in graph.nodes)
+    chain, binding = analyze_with_binding(graph)
+    assert chain.moe is None
+    assert chain.group_partition is None
+    assert chain.source_access is None
+    assert (chain.matmul.batch, chain.matmul.M, chain.matmul.K, chain.matmul.N) == (prod(prefix), 37, 136, 128)
+    assert chain.matmul.b_batch == (1 if broadcast else prod(prefix))
+    assert binding.a_operands == [gathered]
+    assert binding.b_operands == [weight]
+    assert binding.gather_inputs == ((source, indices, gathered),)
+    assert binding.token_index is None
+    (spec,) = chain.gathers
+    assert spec.access.consumer_shape == (*prefix, 37, 136)
+    assert spec.access.producer_shape == (71, 136)
+    assert spec.indices == indices.get_name()
+    lowered, _ = _lowered_graph(graph)
+    assert not lowered.gathers
+    assert chain.moe is None
+    assert tuple((node.node_type, tuple(node.inputs)) for node in graph.nodes) == original
+    from cudnn.gemm.frost.kernel_registry import select_template
+    from cudnn.gemm.frost.tile_config import by_name
+
+    with pytest.raises(NotImplementedError, match="execution-route lowering"):
+        select_template(chain, by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1"))
+
+
+@pytest.mark.parametrize("axis,side", [(0, "a"), (1, "a"), (0, "b"), (1, "b")])
+def test_frost_gather_semantics_independent_of_fused_loader(axis, side):
+    graph, source, indices, weight, selected, output = _materialization_graph(axis=axis, side=side, observed=True)
+    chain, binding = analyze_with_binding(graph)
+    assert chain.moe is None
+    assert chain.group_partition is None
+    assert binding.gather_inputs == ((source, indices, selected),)
+    (spec,) = chain.gathers
+    assert spec.observable
+    assert spec.access.consumer_shape == tuple(selected.get_dim())
+    assert spec.access.producer_shape == tuple(source.get_dim())
+    assert spec.access.tensor_dependencies == frozenset({indices.get_name()})
+    assert indices.get_data_type() == cudnn.data_type.INT64
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1, -2])
@@ -105,7 +155,7 @@ def test_frost_row_gather_declines_unsupported(case, reason):
     else:
         weight.set_dim([2, 1, 136, 128]).set_stride([136 * 128, 136 * 128, 128, 1])
     with pytest.raises((ValueError, NotImplementedError), match=reason):
-        analyze_with_binding(g)
+        _lowered_graph(g)
 
 
 @pytest.mark.parametrize("pipeline", ["sm100", "sm120"])
@@ -116,7 +166,7 @@ def test_frost_row_gather_loader_selection(pipeline):
 
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1" if pipeline == "sm100" else "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     g, *_ = _graph()
-    chain, _ = analyze_with_binding(g)
+    chain, _ = _lowered_graph(g)
     template = select_template(chain, cfg)
     assert template.async_gather == (pipeline == "sm100")
     with pytest.raises(NotImplementedError, match="non-swapped"):
@@ -145,7 +195,7 @@ def test_frost_row_gather_runtime_projection_and_rejection():
     from cudnn.gemm.frost import compiler
 
     g, source, indices, weight, _, out = _graph((2, 3))
-    chain, binding = analyze_with_binding(g)
+    chain, binding = _lowered_graph(g)
     compiled = SimpleNamespace(chain=chain, binding=binding, _compiler=compiler, device=torch.cuda.current_device())
     source_buf = torch.randn(source.get_dim(), device="cuda", dtype=torch.bfloat16)
     index_buf = torch.zeros(indices.get_dim(), device="cuda", dtype=torch.int32)
@@ -393,14 +443,20 @@ def _composition_graph(*, source_prefix=(), repartition=False, epilogue="relu", 
 def test_frost_gather_composes_with_epilogue_and_views(source_prefix, repartition, epilogue):
     graph, source, indices, weight, raw, out, aux = _composition_graph(source_prefix=source_prefix, repartition=repartition, epilogue=epilogue)
     assert validate_graph(graph)
-    chain, binding = analyze_with_binding(graph)
+    logical, logical_binding = analyze_with_binding(graph)
+    assert logical.moe is None
+    assert logical.group_partition is None
+    assert logical.matmul.batch * logical.matmul.M == 96
+    assert logical.gathers[0].access.producer_shape == tuple(source.get_dim())
+    assert logical_binding.gather_inputs[0][0] is source
+    chain, binding = _lowered_graph(graph)
     assert binding.a_operands == [source]
     assert binding.b_operands == [weight]
     assert out in binding.outputs
     assert (raw in binding.outputs) == (epilogue == "shared")
     assert chain.source_access.indirections[0][1].indices_ref == "indices"
     assert chain.source_access.indirections[0][0] == len(source_prefix)
-    assert chain.grouped_gemm.partition.rows_per_group == (32 if repartition else 16)
+    assert chain.group_partition.rows_per_group == (32 if repartition else 16)
     assert chain.matmul.M == 96
     if aux is not None:
         assert chain.aux_tensors[0].dtype == "fp32"
@@ -421,7 +477,7 @@ def test_frost_gather_declines_unsupported_output_before_binding(dtype):
     graph, *_, out, _aux = _composition_graph()
     out.set_data_type(dtype)
     with pytest.raises(NotImplementedError, match="outputs only"):
-        analyze_with_binding(graph)
+        _lowered_graph(graph)
 
 
 def test_frost_gather_epilogue_runtime_binding():
@@ -430,7 +486,7 @@ def test_frost_gather_epilogue_runtime_binding():
     from cudnn.gemm.frost import compiler
 
     graph, source, indices, weight, raw, out, aux = _composition_graph(epilogue="bias", repartition=True)
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _lowered_graph(graph)
     compiled = SimpleNamespace(chain=chain, binding=binding, _compiler=compiler, device=torch.cuda.current_device())
     pack = {
         source: torch.empty(source.get_dim(), device="cuda", dtype=torch.bfloat16),
@@ -443,9 +499,44 @@ def test_frost_gather_epilogue_runtime_binding():
     assert tuple(resolved[2][0].shape) == (1, 96, 128)
     assert tuple(resolved[3][0].shape) == (1, 1, 128)
     assert resolved[3][0].data_ptr() == pack[aux].data_ptr()
+    prepared = compiled._operand_view_bindings
+    rebound = {**pack, source: torch.empty_like(pack[source]), aux: torch.empty_like(pack[aux])}
+    rebound_values = compiler._resolve_moe_variant_pack(compiled, rebound)
+    assert compiled._operand_view_bindings is prepared
+    assert rebound_values[0][0].data_ptr() == rebound[source].data_ptr()
+    assert rebound_values[3][0].data_ptr() == rebound[aux].data_ptr()
     bad = {**pack, aux: pack[aux].bfloat16()}
     with pytest.raises(ValueError, match="dtype"):
         compiler._resolve_moe_variant_pack(compiled, bad)
+
+
+def test_frost_gather_rejects_same_buffer_in_distinct_output_slots():
+    if not torch.cuda.is_available():
+        pytest.skip("runtime binding requires CUDA")
+    from cudnn.gemm.frost import compiler
+
+    graph, source, indices, weight, selected, raw = _graph((1,))
+    output = graph.relu(raw).set_output(True)
+    for node in graph.nodes:
+        node.infer_properties(graph.context)
+    chain, binding = _lowered_graph(graph)
+    compiled = SimpleNamespace(chain=chain, binding=binding, _compiler=compiler, device=torch.cuda.current_device())
+    shared = torch.empty(raw.get_dim(), device="cuda", dtype=torch.bfloat16)
+    pack = {
+        source: torch.empty(source.get_dim(), device="cuda", dtype=torch.bfloat16),
+        indices: torch.zeros(indices.get_dim(), device="cuda", dtype=torch.int32),
+        weight: torch.empty(weight.get_dim(), device="cuda", dtype=torch.bfloat16),
+        raw: shared,
+        output: shared,
+    }
+    # Both prepared output views are identity, so object identity cannot be
+    # used to skip comparisons between different graph output slots.
+    with pytest.raises(ValueError, match="another output"):
+        compiler._resolve_moe_variant_pack(compiled, pack)
+    pack[output] = torch.empty_like(shared)
+    resolved = compiler._resolve_moe_variant_pack(compiled, pack)
+    assert len(resolved[2]) == 2
+    assert {value.data_ptr() for value in resolved[2]} == {pack[raw].data_ptr(), pack[output].data_ptr()}
 
 
 @pytest.mark.parametrize("epilogue", ["bias", "shared", "index"])
@@ -458,7 +549,7 @@ def test_frost_gather_composed_launch_uses_fixed_groups_without_allocating(epilo
     from cudnn.gemm.frost.tile_config import by_name
 
     graph, source, indices, weight, raw, out, aux = _composition_graph(epilogue=epilogue, repartition=True)
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _lowered_graph(graph)
     frames = []
     compiled = compiler.CompiledMoeGemm(
         chain,
@@ -579,36 +670,35 @@ def test_frost_moe_gather_uses_the_same_indirect_description():
     graph.relu(raw).set_output(True)
     for node in graph.nodes:
         node.infer_properties(graph.context)
-    chain, binding = analyze_with_binding(graph)
+    chain, binding = _lowered_graph(graph)
     access = chain.source_access
     assert access.indirections[0][1].indices_ref == "indices"
     assert access.indirections[0][0] == 1
     assert tuple(expr.evaluate((0, 29, 37)) for expr in access.indirections[0][1].indices_map.coordinates) == (0, 29, 0)
     assert binding.first_token_offset is offsets
-    assert not chain.grouped_gemm.partition.is_uniform
-    assert chain.grouped_gemm.partition.num_groups == 3
-    assert chain.grouped_gemm.partition.offset_dtype == "int32"
-    assert chain.grouped_gemm.num_weight_groups == 3
+    assert not chain.group_partition.is_uniform
+    assert chain.group_partition.num_groups == 3
+    assert chain.group_partition.offset_dtype == "int32"
+    assert chain.moe.num_experts == 3
     assert [op.op for op in chain.ops] == ["relu"]
 
 
 @pytest.mark.parametrize("uniform", [False, True], ids=["offsets", "uniform"])
-def test_frost_grouped_spec_preserves_moe_adapter_and_swap(uniform):
+def test_frost_group_partition_preserves_moe_adapter_and_swap(uniform):
     from dataclasses import replace
-    from cudnn.gemm.frost.fusion_ir import GroupPartition, GroupedGemmSpec, MoeSpec, swap_ab
+    from cudnn.gemm.frost.fusion_ir import GroupPartition, MoeSpec, swap_ab
 
     partition = GroupPartition.uniform(3, 37) if uniform else GroupPartition.offsets(3, "int64", 8)
-    grouped = GroupedGemmSpec(3, partition)
-    # Existing positional arguments keep their order; the generic descriptor
+    # Existing positional arguments keep their order; the row partition
     # is keyword-only and survives swap without becoming a nested dict.
-    moe = MoeSpec(3, "gather", "int64", 3, 8, 1, grouped_gemm=grouped)
-    chain, _ = analyze_with_binding(_graph(prefix=(3,))[0])
+    moe = MoeSpec(3, "gather", "int64", 3, 8, 1, partition=partition)
+    chain, _ = _lowered_graph(_graph(prefix=(3,))[0])
     chain = replace(chain, moe=moe)
-    assert chain.grouped_gemm is grouped
-    assert swap_ab(chain).grouped_gemm is grouped
+    assert chain.group_partition is partition
+    assert swap_ab(chain).group_partition is partition
     assert swap_ab(swap_ab(chain)).moe == moe
     if not uniform:
-        assert MoeSpec(3, "gather", "int64", 3, 8, 1).grouped_gemm == grouped
+        assert MoeSpec(3, "gather", "int64", 3, 8, 1).partition == partition
     from cudnn.gemm.frost.compiler import _CompiledMoeBase
 
     executor = SimpleNamespace(chain=chain, _compiler=SimpleNamespace(_offset_vector=lambda value: value))

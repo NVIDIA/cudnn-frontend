@@ -932,22 +932,6 @@ class GroupPartition:
 
 
 @dataclass(frozen=True)
-class GroupedGemmSpec:
-    """Shared grouped scheduling: group g selects weight g % weight_groups.
-
-    Row partitioning is independent of indirect loads, scatter, and combine.
-    """
-
-    num_weight_groups: int
-    partition: GroupPartition
-
-    def __post_init__(self):
-        object.__setattr__(self, "num_weight_groups", index(self.num_weight_groups))
-        if not 1 <= self.num_weight_groups < (1 << 31) or not isinstance(self.partition, GroupPartition):
-            raise ValueError("grouped GEMM requires a positive Int32 weight group count and a GroupPartition")
-
-
-@dataclass(frozen=True)
 class MoeSpec:
     """A MoE grouped matmul forward pass: per routed group g, ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % num_experts].T``."""
 
@@ -957,7 +941,7 @@ class MoeSpec:
     num_groups: int = 0
     offset_multiple: int = 1
     top_k: int = 1
-    grouped_gemm: GroupedGemmSpec | None = field(default=None, kw_only=True)
+    partition: GroupPartition | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
@@ -972,24 +956,14 @@ class MoeSpec:
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:
             raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
-        # Preserve the existing constructor/positional ABI. Scheduling is
-        # normalized once, not reconstructed on each launch. These legacy
-        # fields remain adapters for existing MoE callers.
-        if self.grouped_gemm is None:
-            object.__setattr__(
-                self, "grouped_gemm", GroupedGemmSpec(self.num_experts, GroupPartition.offsets(self.num_groups, self.offset_dtype, self.offset_multiple))
-            )
-        elif not isinstance(self.grouped_gemm, GroupedGemmSpec):
-            raise ValueError("MoE scheduling requires a GroupedGemmSpec")
-        else:
-            grouped = self.grouped_gemm
-            if (grouped.num_weight_groups, grouped.partition.num_groups) != (self.num_experts, self.num_groups):
-                raise ValueError("MoE and grouped GEMM group counts must agree")
-            if not grouped.partition.is_uniform and (grouped.partition.offset_dtype, grouped.partition.offset_alignment) != (
-                self.offset_dtype,
-                self.offset_multiple,
-            ):
-                raise ValueError("MoE and grouped GEMM offsets declarations must agree")
+        # Legacy MoE arguments remain an input adapter. Backend lowering may
+        # supply uniform row geometry without fabricating an offsets tensor.
+        if self.partition is None:
+            object.__setattr__(self, "partition", GroupPartition.offsets(self.num_groups, self.offset_dtype, self.offset_multiple))
+        elif not isinstance(self.partition, GroupPartition) or self.partition.num_groups != self.num_groups:
+            raise ValueError("MoE and row partition group counts must agree")
+        elif not self.partition.is_uniform and (self.partition.offset_dtype, self.partition.offset_alignment) != (self.offset_dtype, self.offset_multiple):
+            raise ValueError("MoE and row partition offsets declarations must agree")
 
 
 @dataclass(frozen=True)
@@ -1012,6 +986,17 @@ def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool
     elif isinstance(obj, (list, tuple, set, frozenset)):
         for item in obj:
             _walk_dtype_fields(item, found, in_dtype_field=in_dtype_field)
+
+
+@dataclass(frozen=True)
+class GatherSpec:
+    """A logical gather edge, independent of row grouping and copy pipelines."""
+
+    source: str
+    indices: str
+    output: str
+    access: IndexMap
+    observable: bool = False
 
 
 @dataclass
@@ -1037,6 +1022,7 @@ class FusionChain:
     quants: list["BlockQuantizeSpec"] = field(default_factory=list)
     gemm_out_dtypes: tuple[Dtype, ...] = ()
     source_access: IndexMap | None = None
+    gathers: tuple[GatherSpec, ...] = ()
 
     def __post_init__(self) -> None:
         for i, spec in enumerate(self.output_specs):
@@ -1172,9 +1158,9 @@ class FusionChain:
         return self.moe is not None
 
     @property
-    def grouped_gemm(self) -> GroupedGemmSpec | None:
-        """Prepared scheduling shared by MoE and ordinary gather lowering."""
-        return self.moe.grouped_gemm if self.moe is not None else None
+    def group_partition(self) -> GroupPartition | None:
+        """Row geometry for a grouped backend chain, absent from plain GEMMs."""
+        return self.moe.partition if self.moe is not None else None
 
     @property
     def has_mainloop_fusion_a(self) -> bool:

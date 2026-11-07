@@ -656,7 +656,7 @@ def _check_moe_combine_n(compiled, n: int) -> None:
         return
     multiple = compiled.vec_bytes_epi // DTYPE_BYTES[chain.output_dtype]
     if isinstance(chain.moe, MoeSwapAbSpec):
-        multiple = min(multiple, chain.grouped_gemm.partition.boundary_alignment)
+        multiple = min(multiple, chain.group_partition.boundary_alignment)
     if n % multiple:
         raise ValueError(f"MoE COMBINE runtime kernel N must be divisible by {multiple} for the compiled epilogue; got N={n}")
 
@@ -704,16 +704,25 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             # Keep the memo local for slot-only launchers.
             pass
 
-    views = {id(t): view for t, view in b.operand_views} if compiled.chain.grouped_gemm.partition.is_uniform else {}
-
-    declared_dtypes = None
-    if views:
-        declared_dtypes = {id(t): compiled.chain.matmul.a_dtype for t in b.a_operands}
-        declared_dtypes.update({id(t): compiled.chain.matmul.b_dtype for t in b.b_operands})
-        declared_dtypes.update({id(t): spec.dtype for spec, t in zip(compiled.chain.outputs, b.outputs)})
-        declared_dtypes.update({id(t): ref.dtype for ref, t in zip(compiled.chain.aux_tensors, b.aux)})
-        if b.token_index is not None:
-            declared_dtypes[id(b.token_index)] = "int32"
+    # Prepared graph views are independent of uniform/variable grouping. Cache
+    # only declaration metadata, never runtime pointers, shapes or buffers.
+    prepared = getattr(compiled, "_operand_view_bindings", None)
+    if prepared is None or prepared[0] is not b or prepared[1] is not compiled.chain:
+        views = {id(t): view for t, view in b.operand_views}
+        declared_dtypes = {}
+        if views:
+            declared_dtypes = {id(t): compiled.chain.matmul.a_dtype for t in b.a_operands}
+            declared_dtypes.update({id(t): compiled.chain.matmul.b_dtype for t in b.b_operands})
+            declared_dtypes.update({id(t): spec.dtype for spec, t in zip(compiled.chain.outputs, b.outputs)})
+            declared_dtypes.update({id(t): ref.dtype for ref, t in zip(compiled.chain.aux_tensors, b.aux)})
+            if b.token_index is not None:
+                declared_dtypes[id(b.token_index)] = "int32"
+        prepared = (b, compiled.chain, views, declared_dtypes)
+        try:
+            compiled._operand_view_bindings = prepared
+        except AttributeError:
+            pass  # Slot-only adapters can still bind correctly without caching.
+    _, _, views, declared_dtypes = prepared
 
     def pull(t, role):
         if t is None or id(t) not in resolved:
@@ -790,7 +799,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             for spec, t in zip(compiled.chain.outputs, b.outputs)
         ]
         aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
-        fto = None if compiled.chain.grouped_gemm.partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
+        fto = None if compiled.chain.group_partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
         sfa = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfa_operands]
         sfb = [pull(t, "token SF") for t in b.sfb_operands]
         mm = compiled.chain.matmul
@@ -810,7 +819,7 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
     b_bufs = [pull(t, "weight").permute(0, 2, 1) if views else _kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
     out_bufs = [pull(t, "output") for t in b.outputs]
     aux_bufs = [pull(t, "aux") for t in b.aux]
-    fto = None if compiled.chain.grouped_gemm.partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
+    fto = None if compiled.chain.group_partition.is_uniform else pull(b.first_token_offset, "first_token_offset")
     sfa = [pull(t, "token SF") for t in b.sfa_operands]
     sfb = [_kernel_order(pull(t, "weight SF"), t, memo) for t in b.sfb_operands]
     _check_moe_operand_shapes(compiled.chain, a_bufs, b_bufs)
@@ -818,14 +827,14 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
         # Gather inputs remain live throughout the tiled GEMM; output aliasing
         # cannot be made safe by the order of graph nodes.
         values = [*a_bufs, *b_bufs, *aux_bufs, pull(b.token_index, "indices")]
-        for output in out_bufs:
+        for output_slot, output in enumerate(out_bufs):
             olo = buffers.data_ptr(output)
             ohi = olo + (1 + sum((d - 1) * s for d, s in zip(output.shape, output.stride()))) * output.element_size()
-            for value in (*values, *(other for other in out_bufs if other is not output)):
+            for value in (*values, *(other for slot, other in enumerate(out_bufs) if slot != output_slot)):
                 lo = buffers.data_ptr(value)
                 hi = lo + (1 + sum((d - 1) * s for d, s in zip(value.shape, value.stride()))) * value.element_size()
                 if olo < hi and lo < ohi:
-                    raise ValueError("row gather output must not overlap a source, weight, or index input")
+                    raise ValueError("row gather output must not overlap another output or a source, weight, auxiliary, or index input")
     k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
     token_index, token_ks = routing_indices(a_bufs)
     S = token_index.shape[0] if token_index is not None else a_bufs[0].shape[1]
@@ -1002,7 +1011,7 @@ class _CompiledMoeBase(_CompiledRuntime, Generic[_ConfigT, _BindingT]):
 
     def _group_offsets(self, offsets):
         """Bind the prepared partition kind; never fabricate or ignore offsets."""
-        if self.chain.grouped_gemm.partition.is_uniform:
+        if self.chain.group_partition.is_uniform:
             if offsets is not None:
                 raise ValueError("uniform grouped GEMM does not accept a first_token_offset tensor")
             return None
@@ -1458,7 +1467,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
                 f"this MoE graph has {len(outputs_spec)} output(s) ({[o.source for o in outputs_spec]}); got {len(outputs)}. Pass outputs in slot order."
             )
         ranked = [("token", token, 3), ("weight", weight, 3)]
-        if not self.chain.grouped_gemm.partition.is_uniform:
+        if not self.chain.group_partition.is_uniform:
             ranked.append(("first_token_offset", first_token_offset, 1))
         for name, t, rank in ranked:
             if len(t.shape) != rank:
@@ -1471,9 +1480,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         self._check_quant_scale_blobs(outputs)
         num_experts = int(weight.shape[0])
         num_groups = (
-            self.chain.grouped_gemm.partition.num_groups
-            if self.chain.grouped_gemm.partition.is_uniform
-            else backend._moe_num_groups(first_token_offset, num_experts)
+            self.chain.group_partition.num_groups if self.chain.group_partition.is_uniform else backend._moe_num_groups(first_token_offset, num_experts)
         )
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
@@ -1581,7 +1588,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
             raise ValueError(f"fused multi-GEMM MoE has {len(outputs_spec)} output(s); got {len(outs)}")
         out = outs[0]
         ranked = [("output", out, 3)]
-        if not chain.grouped_gemm.partition.is_uniform:
+        if not chain.group_partition.is_uniform:
             ranked.append(("first_token_offset", first_token_offset, 1))
         for name, t, rank in ranked:
             if len(t.shape) != rank:
@@ -1603,9 +1610,7 @@ class _CompiledMoeGemm(_CompiledMoeBase[_ConfigT, _BindingT]):
         self._check_quant_scale_blobs(outs)
         num_experts = int(b_slots[0].shape[0])
         num_groups = (
-            self.chain.grouped_gemm.partition.num_groups
-            if self.chain.grouped_gemm.partition.is_uniform
-            else backend._moe_num_groups(first_token_offset, num_experts)
+            self.chain.group_partition.num_groups if self.chain.group_partition.is_uniform else backend._moe_num_groups(first_token_offset, num_experts)
         )
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
         b_stride_perms = [t.permute(1, 2, 0) for t in b_slots]

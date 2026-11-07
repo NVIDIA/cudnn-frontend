@@ -755,8 +755,8 @@ def _render_tile_constants(
         mg_extra_per_stage = (mg_mn - base_mn) * cfg.cta_tile_k_bytes
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
-        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.grouped_gemm.partition.offset_dtype or 'int32']}")
-        lines.append(f"group_rows_per_group = {chain.grouped_gemm.partition.rows_per_group or 0}")
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.group_partition.offset_dtype or 'int32']}")
+        lines.append(f"group_rows_per_group = {chain.group_partition.rows_per_group or 0}")
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
         lines.append(
@@ -797,7 +797,7 @@ def _render_tile_constants(
     lines.append(f"moe_top_k = {chain.moe.top_k if chain.has_moe else 1}")
     lines.append(f"moe_combine = {chain.has_moe and chain.moe.mode == 'combine'}")
     lines.append(
-        f"moe_token_alignment = {_pow2_floor(math.gcd(chain.grouped_gemm.partition.boundary_alignment, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}"
+        f"moe_token_alignment = {_pow2_floor(math.gcd(chain.group_partition.boundary_alignment, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}"
     )
     lines.append(f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}")
     lines.append(f"epi_packed_lanes = {_epi_packed_lanes(cfg)}")
@@ -1501,7 +1501,7 @@ def _render_block_scale_tile_constants(
         f"frost_compile_options = {_frost_compile_options()!r}",
         f"n_tma_outputs = {1 if (cfg.workspace_split_k and use_tma_store_epi) else len(_tma_slots_for(chain, cfg))}",
         f"moe_aligned_offsets = {_moe_aligned_offsets(chain, cfg)}",
-        f"moe_token_alignment = {_pow2_floor(math.gcd(chain.grouped_gemm.partition.boundary_alignment, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}",
+        f"moe_token_alignment = {_pow2_floor(math.gcd(chain.group_partition.boundary_alignment, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}",
         f"epi_slot_widen = {_epi_slot_widen(chain, cfg)}",
         f"epi_stage_rows = {_epi_stage_rows(cfg)}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store_epi)}",
@@ -1588,8 +1588,8 @@ def _render_block_scale_tile_constants(
     ]
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
-        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.grouped_gemm.partition.offset_dtype or 'int32']}")
-        lines.append(f"group_rows_per_group = {chain.grouped_gemm.partition.rows_per_group or 0}")
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.group_partition.offset_dtype or 'int32']}")
+        lines.append(f"group_rows_per_group = {chain.group_partition.rows_per_group or 0}")
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
@@ -2264,7 +2264,7 @@ def _moe_aligned_offsets(chain, cfg) -> bool:
     required = cfg.cga_tile_mn[1 if isinstance(chain.moe, MoeSwapAbSpec) else 0]
     if chain.block_scale is not None:
         required = math.lcm(required, 128)
-    return chain.grouped_gemm.partition.boundary_alignment % required == 0
+    return chain.group_partition.boundary_alignment % required == 0
 
 
 _ACC_STAGES_MAX = 2
@@ -2493,13 +2493,13 @@ def _output_store_mode(
         return "stg"
 
     if isinstance(chain.moe, MoeSwapAbSpec) and out.major == "n":
-        if chain.grouped_gemm.partition.boundary_alignment * carrier % 16 or chain.matmul.N * carrier % 16:
+        if chain.group_partition.boundary_alignment * carrier % 16 or chain.matmul.N * carrier % 16:
             return "stg"
     if out.major == "m":
         if (
             chain.has_moe
             and not isinstance(chain.moe, MoeSwapAbSpec)
-            and (chain.grouped_gemm.partition.boundary_alignment * carrier % 16 or chain.matmul.M * carrier % 16)
+            and (chain.group_partition.boundary_alignment * carrier % 16 or chain.matmul.M * carrier % 16)
         ):
             return "stg"
         # A block taller than the drain emits ZERO stores.
@@ -2604,7 +2604,7 @@ def _check_block_quant_supported(
                 )
         if swapped and q.axis != 1:
             boundary = 4 * q.block_size if q.grouped_by_moe else q.block_size
-            if chain.grouped_gemm.partition.boundary_alignment % boundary or chain.matmul.N % q.block_size:
+            if chain.group_partition.boundary_alignment % boundary or chain.matmul.N % q.block_size:
                 raise NotImplementedError(
                     f"MoE token-axis block_scale_quantize requires first_token_offset value alignment divisible by {boundary} "
                     f"and S divisible by block_size={q.block_size}"
@@ -2612,7 +2612,7 @@ def _check_block_quant_supported(
         if segmented_rows:
             tokens = chain.matmul.N if swapped else chain.matmul.M
             features = chain.matmul.M if swapped else chain.matmul.N
-            required_rows = segmented_row_scale_capacity_rows(tokens, chain.grouped_gemm.partition.num_groups)
+            required_rows = segmented_row_scale_capacity_rows(tokens, chain.group_partition.num_groups)
             padded_blocks = ((features // q.block_size + 3) // 4) * 4
             if q.scale_dim is None or q.scale_dim[0] != 1 or q.scale_dim[1] < required_rows or q.scale_dim[1] % 128 or q.scale_dim[2] != padded_blocks:
                 raise NotImplementedError(
@@ -2788,7 +2788,7 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
 
     tile_m = chain.matmul.M
     if chain.moe is not None:
-        tile_m = (chain.matmul.M + chain.grouped_gemm.partition.num_groups - 1) // chain.grouped_gemm.partition.num_groups
+        tile_m = (chain.matmul.M + chain.group_partition.num_groups - 1) // chain.group_partition.num_groups
     declared_rows = chain.matmul.M if chain.moe is not None else chain.matmul.M * chain.matmul.batch
     force_cta_group = None
     if chain.num_gemms == 1 and chain.has_block_scale and chain.quants and declared_rows <= _TERMINAL_QUANT_ONE_CTA_MAX_M:
@@ -3129,6 +3129,8 @@ def jit_from_cudnn_graph(
 
 def jit_from_chain(chain, binding, config=DEFAULT_CONFIG):
     """Compile an already analyzed snapshot without reconstructing its graph."""
+    if chain.gathers:
+        raise NotImplementedError("logical gather requires execution-route lowering before GEMM compilation")
     if config.swap_ab:
         from ..fusion_ir import swap_ab
 
@@ -3194,7 +3196,7 @@ def _launch_moe_swap_ab(
             _check_block_quant_supported(runtime_chain, _epi_vec_bytes(chain, cfg), cfg)
         except NotImplementedError as exc:
             raise ValueError(str(exc)) from exc
-    if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.grouped_gemm.partition.boundary_alignment, chain.matmul.N):
+    if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.group_partition.boundary_alignment, chain.matmul.N):
         raise ValueError("MoE weight-by-token runtime S violates the compiled STG chunk alignment")
     for quant in chain.quants:
         if (m if quant.axis == 1 else n) % quant.block_size:
