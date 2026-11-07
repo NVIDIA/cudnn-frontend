@@ -27,7 +27,8 @@ The four linear-attention APIs are in `cudnn.linear_attention.ops`; bprop uses
 PyTorch autograd through the same API. The two fused GDN step entries
 (`GdnDecodeFused`, `GdnVerifyFused`) are imported from `cudnn` (lazily; also
 under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
-with no backward. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+with no backward. `SharedExpertDecode` (the shared-expert decode pair, also
+under `cudnn.moe.frost`) is the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
 The required settings below apply to this table.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
@@ -38,6 +39,7 @@ The required settings below apply to this table.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
+| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -71,6 +73,16 @@ a row alone and inside a batch under the entry's own picks.
   SM120-class parts (compute capability 12.x; verified on cc 12.0 with the
   forms a 99 KB per-CTA opt-in holds) with the same statuses; this page has
   no SM120 column.
+- Shared-expert decode pair (`SharedExpertDecode`): no determinism switch; the
+  accumulation order of every output element is a function of the geometry
+  alone (`K_SPLIT` pinned per geometry -- never per part: a GPU too small for
+  the pinned form is declined by type -- the gate tree's shape by
+  `GATE_CLUSTER_FOLD`), so a token's bytes alone equal its bytes inside a batch
+  of up to 24 tokens, across the one- and two-m-tile forms and the one- and
+  two-group forms; every other knob writes the default's bytes, and the first
+  release's form (`v1_cfg`) keeps its own goldens as an A/B arm. The SM100/103 cell
+  states its limit: verified on cc 10.3 (a GB300); cc 10.0 (and cc 10.7) run
+  the same admission, unverified; SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query.

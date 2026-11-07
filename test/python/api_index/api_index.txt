@@ -151,6 +151,7 @@ cudnn.Nvfp4AttentionQatBackward
 cudnn.RmsNormRhtAmaxSm100
 cudnn.RmsNormSiluPadSm100
 cudnn.RopeQDQInplace
+cudnn.SharedExpertDecode
 cudnn.TailRoPEForward
 cudnn.Tensor
 cudnn.Tensor.alignment_value
