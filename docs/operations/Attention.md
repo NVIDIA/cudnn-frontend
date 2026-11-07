@@ -406,7 +406,7 @@ graph.sdpa(
 
 - **Diagonal Band Right Bound** (`diagonal_band_right_bound`): Specifies that attention scores beyond column `row_idx + right_bound` are masked with negative infinity. Setting this to 0 enables causal masking.
 
-- **Diagonal Band Left Bound** (`diagonal_band_left_bound`): Specifies that attention scores at or before column `row_idx - left_bound` are masked with negative infinity. This enables sliding window attention.
+- **Diagonal Band Left Bound** (`diagonal_band_left_bound`): Specifies that attention scores at or before column `row_idx - left_bound` are masked with negative infinity. This enables sliding window attention. Note that `0` is not "no left bound": it masks every key at or before the diagonal, so with `diagonal_band_right_bound=0` every key is masked and the rows follow the empty-row convention (`O = 0`, see the `kv_mask` section). Omit the attribute to disable left masking.
 
 - **Common masking patterns**:
   - Causal mask (top-left): `diagonal_alignment=TOP_LEFT`, `right_bound=0`
