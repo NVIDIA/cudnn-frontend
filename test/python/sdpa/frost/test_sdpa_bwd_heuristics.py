@@ -348,6 +348,7 @@ def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatc
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
     assert order(padded=True) == trails  # runtime lengths
     assert order(seq_q_trim=True) == trails
+    assert order(causal=False, s_q=512, s_kv=1024)[0] == "frost"  # the GB10 studies are not square-only
 
 
 def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
@@ -372,6 +373,10 @@ def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
             assert order(dtype=dtype, d_qk=d, d_v=d, window_left=256)[0] == "frost"
             assert order(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8, s_q=300, s_kv=300)[0] == "frost"
             assert pt.TABLE[pt.class_key("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d))].study == study
+            for s_q, s_kv in ((512, 1024), (1024, 512)):  # the key does not see squareness, the guard does
+                assert pt.lookup("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv)) is True
+                assert order(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv) == trails
+            assert order(dtype=dtype, d_qk=d, d_v=d, deterministic=True) == trails  # no study timed deterministic reductions
     assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
     assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout

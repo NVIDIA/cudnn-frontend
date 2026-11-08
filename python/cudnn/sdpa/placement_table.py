@@ -174,20 +174,24 @@ def _answer(entry: Entry, facts) -> bool:
     return w >= entry.log2_work if entry.direction == "ge" else w <= entry.log2_work
 
 
-def lookup(row: str, facts) -> Optional[bool]:
+def matched_entry(row: str, facts) -> Optional[Entry]:
+    """The entry :func:`lookup` answers from: the graph's own class, else a part transfer's borrowed class."""
     key = class_key(row, facts)
     if key is None:
         return None
     entry = TABLE.get(key)
     if entry is not None:
-        return _answer(entry, facts)
+        return entry
     if key[1] not in PART_TRANSFERS:
         return None
     base, studies = PART_TRANSFERS[key[1]]
     entry = TABLE.get(key[:1] + (base,) + key[2:])
-    if entry is None or entry.study not in studies:
-        return None
-    return _answer(entry, facts)
+    return entry if entry is not None and entry.study in studies else None
+
+
+def lookup(row: str, facts) -> Optional[bool]:
+    entry = matched_entry(row, facts)
+    return None if entry is None else _answer(entry, facts)
 
 
 # ---------------------------------------------------------------------------------------------------------------- generated
