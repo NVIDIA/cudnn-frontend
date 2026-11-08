@@ -701,7 +701,10 @@ def generate(
     red_chunk = gcd(vsize, _compute_output_vec_bytes(chain) // DTYPE_BYTES[chain.output_dtype]) if isinstance(chain.moe, MoeSwapAbSpec) else vsize
     if isinstance(chain.moe, MoeSwapAbSpec) and chain.quants:
         red_chunk = gcd(red_chunk, chain.moe.offset_multiple, chain.matmul.N)
-    for red_idx, red in enumerate(chain.reductions):
+    # Under workspace split-K the main kernel stores only fp32 partials (the body is replaced below) and the reducer
+    # renders the reductions. Output 0 owns the partial store's TMA slot, so a chain whose first output is a reduction
+    # has no tap for it here.
+    for red_idx, red in enumerate(() if workspace_split_k else chain.reductions):
         red_source = _parent_value(red.source_ref)
         body_lines.extend(
             _emit_reduction_atomic(
