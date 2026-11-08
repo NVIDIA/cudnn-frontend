@@ -553,6 +553,10 @@ production kernels gain no debug knob or timing-dependent assertion.
 - Test study ownership through `class_key` and the matched entry's `study`, not a global absence of entries for another
   measured class. Square causal masks canonicalize to bottom-right; use unequal Q/KV lengths to test the top-left class.
   Re-run placement-table tests on the actual develop integration when another study lands in the same table.
+- Native default-placement qualification under `test/python/sdpa/frost` must explicitly unset
+  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` in the test body: the directory's autouse fixture enables it and ranks FROST
+  first even when a measured entry is removed. Record the actual default and candidate plan identities before timing;
+  a forced-FROST baseline cannot qualify automatic placement. `test_sdpa_fwd_placement.py` demonstrates unsetting the flag.
 - An entry answers for its whole class, so the grid must reach the class's extremes and straddle every boundary. Three
   misses each found in review or on a holdout:
   - an `always` fitted on long prefills that also claimed q = KV = 16 (FROST 2x slower there);
@@ -1137,8 +1141,8 @@ the Rule 1-2 pin for this chain).
 
 Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
 on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
-`sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
-`kernels/thd_helpers.py` or `kernels/bprop_chain_common.py` does not move the
+`sm` -- an edit confined to `bwd/kernels/sm100/prepared_host.py`,
+`bwd/kernels/thd_helpers.py` or `bwd/kernels/bprop_chain_common.py` does not move the
 key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
 testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
 confirm the key moved (the detector pair above fails on the stale host).
@@ -1391,7 +1395,7 @@ heuristics made before it, and the public knob record's round trip through
 with its margin and its process's node class, clock and control pair -- never a
 default flip from one cell. The per-rendering constants were re-measured on the
 new renderings: see the module constants' comments in
-`kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+`fwd/kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 

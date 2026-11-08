@@ -377,3 +377,35 @@ def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
     assert order(padded=True) == trails  # runtime lengths
     assert order(seq_q_trim=True) == trails
+
+
+def test_a100_backward_window_entries_lift_only_square_sm80_graphs(monkeypatch):
+    """Every cc 8.0 class with a square study entry leads on a square graph and trails on a non-square graph of the same class, which lookup still answers True for."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block, is_last_resort
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd import heuristics
+
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm80"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    facts = lambda **over: _facts(**{"device_cc": (8, 0), "window_left": 256, "bottom_right": True, **over})
+    order = lambda **over: [tag(p) for p in heuristics.propose("A", facts(**over), _OFFERED)]
+    trails = ["backend", "last_resort", "frost"]
+    dtypes = {"bf16": cudnn.data_type.BFLOAT16, "f16": cudnn.data_type.HALF}
+
+    entries = [k for k, e in pt.TABLE.items() if e.study.startswith("sm80_bwd_square_")]
+    assert entries
+    for key in entries:
+        dtype, (d, _), group, off_tile = dtypes[key[2]], key[3], key[8], key[9]
+        kv = 4096 + (37 if off_tile else 0)
+        common = dict(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8 if group == "gqa" else 32)
+        assert pt.class_key("sdpa_bwd_sm80", facts(s_q=kv, s_kv=kv, **common)) == key
+        assert order(s_q=kv, s_kv=kv, **common)[0] == "frost"
+        assert pt.class_key("sdpa_bwd_sm80", facts(s_q=512, s_kv=kv, **common)) == key  # the key does not see squareness ...
+        assert pt.lookup("sdpa_bwd_sm80", facts(s_q=512, s_kv=kv, **common)) is True
+        assert order(s_q=512, s_kv=kv, **common) == trails  # ... and the guard does
+        assert order(s_q=kv, s_kv=kv, padded=True, **common) == trails
+        assert order(s_q=kv, s_kv=kv, window_left=None, **common) == trails
+        assert order(s_q=kv, s_kv=kv, device_cc=(8, 6), **common) == trails

@@ -113,11 +113,19 @@ backend declines it (a correctness fallback, not a performance claim) -- except 
 leads the graph's class (:func:`_measured_lead`)."""
 
 
+SQUARE_ONLY_LEAD_ROWS = frozenset({"sdpa_bwd_sm80"})
+"""Trail-only rows whose studies measured square graphs only. ``class_key`` excludes squareness (Rule S12: a feature the key does not hold). A100 under a left window: every square
+holdout case ran faster than the backend, while q < kv ran up to 1.45x slower in the same classes (b12 40/8 d64 q128 kv8960, 7.0 vs 4.8 ms)."""
+
+
 def _measured_lead(spec: EngineSpec, facts) -> bool:
     """A trail-only row whose class a ``placement_table`` study measured as a lead goes ahead of the backend like any row. The
-    studies time full-length graphs, and ``class_key`` does not see runtime lengths, so a graph with them keeps trailing."""
+    studies time full-length graphs, and ``class_key`` does not see runtime lengths, so a graph with them keeps trailing. The
+    same goes for a non-square graph of a row in :data:`SQUARE_ONLY_LEAD_ROWS`."""
     from cudnn.sdpa import placement_table
 
+    if spec.name in SQUARE_ONLY_LEAD_ROWS and facts.s_q != facts.s_kv:
+        return False
     return not facts.padded and not facts.seq_q_trim and placement_table.lookup(spec.name, facts) is True
 
 
