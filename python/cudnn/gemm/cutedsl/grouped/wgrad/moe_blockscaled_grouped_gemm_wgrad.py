@@ -988,6 +988,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             )
             cute.arch.fence_proxy("async.shared", space="cta")
             sched_pipeline.producer_commit(sched_producer_state)
+            # producer_tail takes the state of the next buffer. Left on the sentinel's state, its first wait reuses the
+            # parity the sentinel's acquire passed, which never completes once every consumer has released the sentinel.
+            sched_producer_state.advance()
             sched_pipeline.producer_tail(sched_producer_state)
 
         # =================================================================
