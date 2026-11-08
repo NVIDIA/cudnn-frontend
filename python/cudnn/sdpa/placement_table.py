@@ -660,4 +660,22 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm120", (12, 1), "f16", (64, 64), "q1", "dense", "window", False, "mha", True): Entry(
         "always", None, "sm121_window_decode_f16_20261107"
     ),
+    # studies sm80_bwd_square_{bf16,f16}_20261108 (A100, cuDNN 9.27.0; dense BSHD square backward under a bottom-right left window, d64 / d128, MHA / GQA, on and off the tile,
+    # 128 train cases per dtype; gen.py --margin 0.05, keeping a class only if it and its tile twin are `always`). bwd.heuristics._measured_lead lifts only square graphs of this row.
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "gqa", False): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "bf16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm80_bwd_square_bf16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (128, 128), "prefill", "dense", "window", False, "gqa", False): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (128, 128), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (128, 128), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (128, 128), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "window", False, "gqa", False): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "window", False, "gqa", True): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry("always", None, "sm80_bwd_square_f16_20261108"),
+    ("sdpa_bwd_sm80", (8, 0), "f16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry("always", None, "sm80_bwd_square_f16_20261108"),
 }
