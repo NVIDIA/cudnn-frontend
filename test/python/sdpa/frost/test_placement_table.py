@@ -295,3 +295,41 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
     assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
     assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
+    """MHA d64 windowed context leads on cc 8.0 from their own study; a class whose fit kept a threshold, whose tile
+    twin did not fit `always`, or that failed qualification has no entry, and another Ampere part keeps the hand rules."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def prefill(d, dtype=cudnn.data_type.HALF, **over):
+        base = dict(
+            b=2,
+            h_q=16,
+            h_kv=16,
+            s_q=512,
+            s_kv=4096,
+            d_qk=d,
+            d_v=d,
+            dtype=dtype,
+            causal=False,
+            bottom_right=False,
+            has_paged_kv=False,
+            device_cc=(8, 0),
+        )
+        base.update(over)
+        return _facts(**base)
+
+    window = dict(causal=True, bottom_right=True, window_left=256)
+    assert pt.lookup(row, prefill(256)) is None  # MHA failed native qualification; keep the prior rule
+    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8)) is None  # GQA also failed qualification
+    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8, s_kv=4100)) is None  # keep the tile twin on the prior rule too
+    assert pt.TABLE[pt.class_key(row, prefill(64, **window))].study == "sm80_dense_prefill_f16_20261107"
+    assert pt.lookup(row, prefill(64, cudnn.data_type.BFLOAT16, **window)) is True
+    assert pt.TABLE[pt.class_key(row, prefill(64, cudnn.data_type.BFLOAT16, **window))].study == "sm80_dense_prefill_bf16_20261107"
+
+    assert pt.lookup(row, prefill(64, h_q=32, h_kv=8, **window)) is None  # f16 d64 windowed GQA: its on-tile class kept a threshold
+    assert pt.lookup(row, prefill(64, cudnn.data_type.BFLOAT16, h_q=32, h_kv=8, **window)) is None  # bf16 d64 windowed GQA: failed qualification
+    assert pt.lookup(row, prefill(256, causal=True, bottom_right=True)) is None  # f16 d256 causal: the off-tile class kept a threshold
+    assert pt.lookup(row, prefill(256, device_cc=(8, 6))) is None

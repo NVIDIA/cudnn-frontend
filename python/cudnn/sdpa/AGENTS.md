@@ -553,6 +553,10 @@ production kernels gain no debug knob or timing-dependent assertion.
 - Test study ownership through `class_key` and the matched entry's `study`, not a global absence of entries for another
   measured class. Square causal masks canonicalize to bottom-right; use unequal Q/KV lengths to test the top-left class.
   Re-run placement-table tests on the actual develop integration when another study lands in the same table.
+- Native default-placement qualification under `test/python/sdpa/frost` must explicitly unset
+  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` in the test body: the directory's autouse fixture enables it and ranks FROST
+  first even when a measured entry is removed. Record the actual default and candidate plan identities before timing;
+  a forced-FROST baseline cannot qualify automatic placement. `test_sdpa_fwd_placement.py` demonstrates unsetting the flag.
 - An entry answers for its whole class, so the grid must reach the class's extremes and straddle every boundary. Three
   misses each found in review or on a holdout:
   - an `always` fitted on long prefills that also claimed q = KV = 16 (FROST 2x slower there);
