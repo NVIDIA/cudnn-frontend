@@ -414,3 +414,43 @@ def test_a100_backward_window_entries_lift_only_square_sm80_graphs(monkeypatch):
         assert order(s_q=kv, s_kv=kv, padded=True, **common) == trails
         assert order(s_q=kv, s_kv=kv, window_left=None, **common) == trails
         assert order(s_q=kv, s_kv=kv, device_cc=(8, 6), **common) == trails
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("mask", ["none", "causal", "window"])
+@pytest.mark.parametrize("h_kv", [6, 2])
+def test_sm120_short_square_class_keeps_default_and_long_square_leads(monkeypatch, dtype, d, mask, h_kv):
+    """All 24 off-tile classes distinguish an unqualified first partial tile from qualified long squares."""
+    from cudnn.engines.heuristics import BACKEND
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd.heuristics import propose
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    for s in (5, 16, 63, 64, 127, 128, 129, 2037):
+        facts = _facts(dtype=dtype, d_qk=d, d_v=d, h_q=6, h_kv=h_kv, s_q=s, s_kv=s, causal=mask != "none", window_left=3 if mask == "window" else None)
+        key = pt.class_key("sdpa_bwd_sm120", facts)
+        plans = propose("A", facts, {"sdpa_bwd_sm120": 20600})
+        if s < 128:
+            assert key[4] == "prefill_short_square"
+            assert pt.lookup("sdpa_bwd_sm120", facts) is None
+            assert plans[0] is BACKEND
+        else:
+            assert key[4] == "prefill"
+            assert pt.lookup("sdpa_bwd_sm120", facts) is True
+            assert plans[0].engine_id == 20600
+
+
+@pytest.mark.parametrize("row,cc", [("sdpa_bwd_sm120", (12, 1)), ("sdpa_bwd_sm80", (8, 0)), ("sdpa_fwd_prefill_sm120", (12, 0))])
+def test_short_square_class_does_not_reclassify_other_measured_rows(row, cc):
+    from cudnn.sdpa import placement_table as pt
+
+    for s in (5, 16, 63, 127, 128, 129):
+        assert pt.class_key(row, _facts(s_q=s, s_kv=s, device_cc=cc))[4] == "prefill"
+
+
+@pytest.mark.parametrize("sq,sk,phase", [(1, 1, "q1"), (4, 4, "mtp"), (5, 7, "prefill"), (127, 128, "prefill")])
+def test_sm120_short_square_split_preserves_other_phases(sq, sk, phase):
+    from cudnn.sdpa import placement_table as pt
+
+    assert pt.class_key("sdpa_bwd_sm120", _facts(s_q=sq, s_kv=sk))[4] == phase

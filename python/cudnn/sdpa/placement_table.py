@@ -4,7 +4,9 @@
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, and whether
-S_kv is off the 128-key tile; a decode-shaped GQA graph the row cannot pack is its own group). Each entry
+S_kv is off the 128-key tile; a decode-shaped GQA graph the row cannot pack is its own group). SM120 backward on
+cc 12.0 separates square prefills below that first tile into ``prefill_short_square``; their studies cannot be
+borrowed from longer off-tile squares. Each entry
 is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work`, the
 parallel-tile count :func:`log2_tiles`, the query rows :func:`log2_q_rows` or the KV per request :func:`log2_kv`, whichever the class's data is monotone in: ``always``, ``never``, ``ge T`` (FROST leads
 from T up) or ``le T`` (FROST leads up to T). Entries are produced by ``benchmark/placement_gen`` from a training grid
@@ -79,6 +81,12 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         phase = "q1"
     elif facts.s_q <= 4:
         phase = "mtp"
+    elif row == "sdpa_bwd_sm120" and facts.device_cc == (12, 0) and facts.s_q == facts.s_kv and facts.s_q < 128:
+        # Separate the first partial 128-key placement tile from later partial tiles. On RTX 5090, short wide
+        # squares lose while long squares win; one threshold fitted to both sacrifices the long-S leads (#2349).
+        # No study has qualified this new class yet, so it falls back to the existing backend-first order.
+        # This is row/part-local: GB10 and every other row keep their existing classification and studies.
+        phase = "prefill_short_square"
     else:
         phase = "prefill"
     if facts.has_paged_kv:
