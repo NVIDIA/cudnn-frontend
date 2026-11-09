@@ -1389,8 +1389,9 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
   Sparse Attention Backward, Score Recompute, Indexer Forward, Indexer Top-K,
   and Indexer Backward support SM90 and SM100. Dense score recompute in the THD
   (`cu_seqlens`) layout is SM100+ only; SM90 serves BSHD. The combined
-  compressed-logits + Top-K forward is SM100-only; the standalone Indexer Top-K
-  remains SM90+.
+  compressed-logits + Top-K forward serves SM90 for packed THD, ratio 4, D128,
+  and 64Q/1KV; SM100+ retains its broader configurations. The standalone
+  Indexer Top-K remains SM90+.
 - **Forward scope** — Prefill only; no FP8 cache, decode, or split-KV forward
   path. SM90 uses one CTA per query and 64-head tile, padding the last head tile
   internally when H is not a multiple of 64.
