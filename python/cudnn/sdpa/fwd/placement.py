@@ -85,7 +85,8 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   1-2k cache large batches lost up to 1.26x.
 
 On B300 (cc 10.3) generated ``placement_table`` entries lead bf16 dense prefill-phase d192 and windowed d64 (study
-sm103_dense_prefill_bf16_20261107), measured on that part; the rules above answer the rest there, f16 included.
+sm103_dense_prefill_bf16_20261107), measured on that part. Windowed d192 GQA keeps the prior order after a holdout
+regression; the rules above answer the rest there, f16 included.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the

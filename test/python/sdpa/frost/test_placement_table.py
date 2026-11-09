@@ -295,7 +295,7 @@ def test_b300_dense_prefill_entries_lead_the_sm100_row():
     led = (
         prefill(),
         prefill(causal=False, bottom_right=False),
-        prefill(window_left=1024),
+        prefill(h_q=8, h_kv=8, window_left=1024),
         prefill(s_kv=3073),
         prefill(h_q=8, h_kv=8, **d64),
         prefill(h_q=8, h_kv=8, s_kv=3073, **d64),
@@ -310,6 +310,39 @@ def test_b300_dense_prefill_entries_lead_the_sm100_row():
     assert pt.class_key(row, prefill(dtype=half, d_qk=128, d_v=128)) not in pt.TABLE
     assert pt.class_key(row, prefill(has_paged_kv=True, page_size=64)) not in pt.TABLE
     assert pt.class_key(row, prefill(device_cc=(10, 0))) not in pt.TABLE
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [127, 128, 129, 45248, 45312, 45313])
+def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
+    """Withdraw both tile classes after the q19/kv45248 holdout regression.
+
+    Include both sides of the first tile boundary and long on/off-tile caches;
+    windowed MHA and non-windowed GQA remain covered by the preceding study test.
+    """
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    row = "sdpa_fwd_prefill_sm100"
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    facts = _facts(
+        b=24,
+        h_q=56,
+        h_kv=8,
+        s_q=19,
+        s_kv=s_kv,
+        d_qk=192,
+        d_v=192,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        window_left=96,
+        has_paged_kv=False,
+        device_cc=(10, 3),
+    )
+    assert pt.lookup(row, facts) is None
+    assert placement.place(spec, facts) == placement.TRAIL
 
 
 @pytest.mark.L0

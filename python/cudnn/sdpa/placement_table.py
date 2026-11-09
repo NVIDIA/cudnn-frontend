@@ -574,6 +574,8 @@ TABLE: Dict[Tuple, Entry] = {
     # cases). Only the classes gen.py --margin 0.15 fits as always on and off the tile: at 12 train cases per class thresholds did not hold under
     # cross-validation, so the rest keep the hand rules. The f16 twin is not keyed: its fresh B300 holdout (2026-11-08) had three short graphs
     # beyond noise, so f16 keeps the hand rules.
+    # Withdraw both d192 window GQA classes after the 2026-11-09 retime confirmed the q19/kv45248 holdout regression
+    # (PR #2346). The other 12 generated entries are unchanged; withdrawn classes retain the prior default route.
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm103_dense_prefill_bf16_20261107"
     ),
@@ -596,12 +598,6 @@ TABLE: Dict[Tuple, Entry] = {
         "always", None, "sm103_dense_prefill_bf16_20261107"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "none", False, "mha", True): Entry(
-        "always", None, "sm103_dense_prefill_bf16_20261107"
-    ),
-    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "window", False, "gqa", False): Entry(
-        "always", None, "sm103_dense_prefill_bf16_20261107"
-    ),
-    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "window", False, "gqa", True): Entry(
         "always", None, "sm103_dense_prefill_bf16_20261107"
     ),
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "window", False, "mha", False): Entry(
