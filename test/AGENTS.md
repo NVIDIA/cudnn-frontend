@@ -304,6 +304,16 @@ prefill; a short query alone does not imply the D128 decode template.
   support check can select a sentinel before compilation: inject a failing
   engine build and verify native fallback, failure with no alternative, and a
   successfully built OSS control. Support alone must not count as a built plan.
+- **Explicit native candidates can decline before build.** Inject a typed decline
+  from `create_execution_plan`, then check that support checking and the build
+  walk reach a later native or Python candidate, including with name filters.
+  Failure diagnostics must retain the ranked index, engine id, public knobs and
+  reason without materializing the rejected candidate again. Indexed queries
+  and filters on the built graph must inspect only the addressed candidate.
+  Keep strict pins, unexpected-error propagation and all-failed controls:
+  `core/test_dispatch.py::test_explicit_backend_decline_reaches_next_candidate`
+  and its `test_explicit_backend_*` companions are CPU detectors; they do not
+  qualify real backend configurations or GPU numerics.
 - **Heuristic tests must survive legitimate tuning changes.** Do not pin a particular
   workload's winning scheduler, packing or split count, candidate order/exact set,
   or a performance threshold. Do not turn the current measured/unmeasured shape

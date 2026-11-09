@@ -1325,6 +1325,161 @@ def test_backend_check_support_decline_still_raises_when_it_is_the_only_plan():
         g.check_support()
 
 
+class _ExplicitBackend(_FakeBackend):
+    """Append explicit configurations, with observable unsupported candidates."""
+
+    def __init__(self, rejected, check=None):
+        super().__init__(check=check)
+        self.rejected = rejected
+        self.appended = []
+        self.configs = []
+        self.built = []
+
+    def get_execution_plan_count(self):
+        return len(self.configs)
+
+    def create_execution_plan(self, engine_id, knobs):
+        self.appended.append(engine_id)
+        if engine_id in self.rejected:
+            raise self.rejected[engine_id]
+        self.configs.append((engine_id, knobs))
+
+    def build_plan_at_index(self, index):
+        engine_id, _ = self.configs[index]
+        if engine_id in self.rejected:
+            raise self.rejected[engine_id]
+        self.built.append(engine_id)
+
+    def get_workspace_size_plan_at_index(self, index, *args):
+        return 0
+
+
+def _explicit_candidates(monkeypatch, fallback="python", error=None):
+    import cudnn
+    from cudnn.engines.base import PlanConfig
+
+    g, _ = _backend_first(monkeypatch)
+    g.create_execution_plans()
+    python_plan = next(cfg for cfg in g.plans if is_python_engine(cfg.engine_id))
+    backend = _ExplicitBackend({17: error or cudnn.cudnnGraphNotSupportedError("unsupported explicit config")})
+    g._lowered_graph = backend
+    g._plans = [PlanConfig(17, {cudnn.knob_type.TILE_M: 2}), python_plan if fallback == "python" else PlanConfig(18, {})]
+    return g, backend
+
+
+@pytest.mark.parametrize("fallback", ["backend", "python"])
+@pytest.mark.parametrize("name_filter", [False, True])
+def test_explicit_backend_decline_reaches_next_candidate(monkeypatch, caplog, fallback, name_filter):
+    """Both providers remain reachable through support checking and the build walk."""
+    import logging
+
+    g, backend = _explicit_candidates(monkeypatch, fallback)
+    if name_filter:
+        g.deselect_engines(["unrelated_plan_name"])
+    caplog.set_level(logging.INFO, logger="cudnn.pygraph")
+    g.check_support()
+    assert backend.appended == [17]
+    g.build_plans()
+    assert g._is_built and g._plan_index == 1
+    # One attempt per phase; formatting the decline must never create it again.
+    assert backend.appended.count(17) == 2
+    if fallback == "backend":
+        assert backend.built == [18]
+    else:
+        assert 1 in g._compiled_plans
+    # Indexed access and filters on an already-built graph inspect the chosen
+    # entry, not a rejected configuration elsewhere in the ranked list.
+    assert g.get_workspace_size_plan_at_index(1) == 0
+    g.deselect_engines(["another_unrelated_name"])
+    g.deselect_behavior_notes([])
+    assert g._is_built and backend.appended.count(17) == 2
+    assert any("plan 0 declined at build time" in record.getMessage() for record in caplog.records)
+
+
+def test_aggregate_decline_preserves_unmaterialized_backend_alternative(monkeypatch):
+    import cudnn
+    from cudnn.engines.base import PlanConfig
+
+    g, backend = _explicit_candidates(monkeypatch, "backend")
+    backend.configs.append((17, {}))
+    backend._check = cudnn.cudnnGraphNotSupportedError("currently materialized configs unsupported")
+    g._plans[0] = PlanConfig(17, {}, cpp_index=0)
+    g.check_support()
+    g.build_plans()
+    assert backend.appended == [18]
+    assert backend.built == [18]
+    assert g._plan_index == 1
+
+
+def test_explicit_backend_name_filter_does_not_visit_unused_candidates(monkeypatch):
+    g, backend = _explicit_candidates(monkeypatch, "backend")
+    g._plans.reverse()  # the first candidate works; the unused second one declines
+    g.deselect_engines(["unrelated_plan_name"])
+    g.check_support()
+    g.build_plans()
+    assert g._is_built and g._plan_index == 0
+    assert backend.appended == backend.built == [18]
+
+
+@pytest.mark.parametrize("phase", ["check_support", "build_plans"])
+def test_explicit_backend_pin_stays_strict(monkeypatch, phase):
+    import cudnn
+
+    g, backend = _explicit_candidates(monkeypatch)
+    g.select_plan(0)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="unsupported explicit config"):
+        getattr(g, phase)()
+    assert backend.appended == [17]
+    assert not backend.built and not g._compiled_plans
+
+
+@pytest.mark.parametrize("phase", ["check_support", "build_plans"])
+def test_explicit_backend_unexpected_error_propagates(monkeypatch, phase):
+    g, backend = _explicit_candidates(monkeypatch, error=RuntimeError("unexpected provider failure"))
+    with pytest.raises(RuntimeError, match="unexpected provider failure"):
+        getattr(g, phase)()
+    assert backend.appended == [17]
+    assert not backend.built and not g._compiled_plans
+
+
+def test_explicit_backend_failures_keep_identity_without_rematerializing(monkeypatch):
+    import cudnn
+
+    g, backend = _explicit_candidates(monkeypatch, "backend")
+    backend.rejected[18] = cudnn.cudnnGraphNotSupportedError("second explicit config unsupported")
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError) as caught:
+        g.build_plans()
+    message = str(caught.value)
+    assert "[0] backend engine 17[TILE_M=2]: unsupported explicit config" in message
+    assert "[1] backend engine 18: second explicit config unsupported" in message
+    assert backend.appended == [17, 18]
+    assert not g._is_built
+
+
+def test_explicit_backend_fallback_keeps_name_exclusions(monkeypatch):
+    import cudnn
+
+    g, backend = _explicit_candidates(monkeypatch, "backend")
+    g.deselect_engines(["fake_backend_plan_"])
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="unsupported explicit config"):
+        g.build_plans()
+    assert backend.appended == [17, 18]
+    assert not backend.built and not g._is_built
+
+
+@pytest.mark.parametrize("pin_later", [False, True])
+def test_build_all_tolerates_unpinned_explicit_materialization_decline(monkeypatch, pin_later):
+    import cudnn
+
+    g, backend = _explicit_candidates(monkeypatch, "backend")
+    if pin_later:
+        g.select_plan(1)
+    g.build_plans(cudnn.build_plan_policy.ALL)
+    assert backend.appended == [17, 18]
+    assert backend.built == [18, 18]  # finalize, then restore the retained native selection
+    assert g._is_built and g._plan_index == 1
+
+
 def test_execute_time_handle_reaches_a_lazily_built_python_plan(monkeypatch):
     """A JIT engine must compile for the device/stream it will run on. When the
     backend entry declines and the walk falls through to python DURING
