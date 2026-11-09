@@ -25,14 +25,14 @@ In-CTA pipeline (DeepGEMM mqa_logits style):
 * math warpgroups split the 128 columns: warpgroup ``t`` of ``num_math_wg`` owns columns
   ``[t * cols, (t + 1) * cols)`` -- ``cols / H`` whole query tokens -- of every block.
   A block's TMEM is released once every warpgroup has loaded its columns; the next
-  block's TMEM load is issued before the previous block's head reduce finishes.  At H64,
-  each block's full barrier is probed before the previous block's head reduce, so that
-  reduce runs while the block's MMA finishes: blocks 1 and 2 resolve the probe halfway
-  through it and issue their TMEM load before its second half; block 0 is probed before
-  the previous split's last reduce and resolved at the next split's start.  A failed
-  probe falls back to a blocking wait.  The head reduce is unconditional (only the store
-  is predicated) and stores go through per-token row tensors (dense scores or the compact
-  ratio-causal candidate buffer).
+  block's TMEM load is issued before the previous block's head reduce finishes.  At H64
+  without the LSE, each block's full barrier is probed before the previous block's head
+  reduce, so that reduce runs while the block's MMA finishes: blocks 1 and 2 resolve the
+  probe halfway through it and issue their TMEM load before its second half; block 0 is
+  probed before the previous split's last reduce and resolved at the next split's start.
+  A failed probe falls back to a blocking wait.  The head reduce is unconditional (only
+  the store is predicated) and stores go through per-token row tensors (dense scores or
+  the compact ratio-causal candidate buffer).
   The optional LSE is an online (max, sum) per token, reduced across the warpgroup.
 
 ``relu(s) * w`` is evaluated as ``(s + |s|) * w / 2`` (FADD2 with an |abs| operand on
@@ -833,102 +833,6 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         return acc[0] + acc[1]
 
     @cute.jit
-    def _math_split(
-        self,
-        split,
-        lmax,
-        lsum,
-        ready0,
-        has_next,
-        wg,
-        tpw: cutlass.Constexpr[int],
-        cols: cutlass.Constexpr[int],
-        kv_offset,
-        lims,
-        rows,
-        row_base,
-        bufs,
-        rW,
-        out_scale,
-        thr_tmem_load,
-        tStS_ref,
-        T_mbar_ptr,
-        t_full_bits,
-    ):
-        """One split of this warpgroup's tokens; returns the updated online LSE state and the next split's block-0
-        probe, ``(lmax, lsum, ready0_next)``.
-
-        At H64, step ``j`` probes block ``j``'s full barrier, accumulates the first half of block ``j - 1``'s head
-        pairs, resolves the probe (a blocking wait only if it failed), loads block ``j`` from TMEM, then finishes and
-        stores block ``j - 1``, so block ``j - 1``'s reduce can overlap block ``j``'s MMA and its TMEM load.  Block 0's
-        probe is made by the previous split before its last reduce (``ready0``, False when there was none): a split
-        whose tile has a next split (``has_next``, runtime or False) probes that split's block 0 before reducing block
-        ``SPLIT - 1``.  Smaller groups wait for block ``j``, load it, then reduce block ``j - 1``: their shorter split
-        loop pays more for the probes than the overlap returns.
-        """
-        SPLIT = self.SPLIT
-        nsl = 4 // self.num_math_wg  # 32-column TMEM load slices owned by this warpgroup
-        log2_e = Float32(math.log2(math.e))
-        probe = self.qhead_per_kvhead == 64
-        npairs = self.qhead_per_kvhead // 2
-        half = npairs // 2 if probe else 0  # head pairs reduced before the block's wait resolves
-        zero2 = (Float32(0.0), Float32(0.0))
-        for j in cutlass.range_constexpr(SPLIT + 1):
-            if const_expr(j < SPLIT):
-                phase = ((t_full_bits >> j) ^ split) & Int32(1)
-            if const_expr(probe and 0 < j < SPLIT):
-                ready = cute.arch.mbarrier_try_wait(T_mbar_ptr + j, phase)
-            if const_expr(j == SPLIT):
-                # Probe block 0 of the tile's next split before reducing the last block (the probe lives across the
-                # loop back edge, so the reduce stays between it and the wait).
-                ready0_next = cutlass.Boolean(False)
-                if const_expr(probe and has_next is not False):
-                    if has_next:
-                        ready0_next = cute.arch.mbarrier_try_wait(T_mbar_ptr, (t_full_bits ^ (split + 1)) & Int32(1))
-            accs = []
-            if const_expr(j > 0):
-                for u in cutlass.range_constexpr(tpw):
-                    accs.append(self._reduce_token_part(bufs[(j - 1) % 2], rW, u, 0, half, zero2, zero2))
-            if const_expr(j < SPLIT):
-                if const_expr(not probe):
-                    cute.arch.mbarrier_wait(T_mbar_ptr + j, phase)
-                elif const_expr(j == 0):
-                    if not ready0:
-                        cute.arch.mbarrier_wait(T_mbar_ptr + j, phase)
-                else:
-                    if not ready:
-                        cute.arch.mbarrier_wait(T_mbar_ptr + j, phase)
-                _tcgen05_fence_after()
-                tStS_j = cute.make_tensor(
-                    cute.make_ptr(Float32, j * self.tmem_s_stride + wg * cols, mem_space=cute.AddressSpace.tmem, assumed_align=16), tStS_ref.layout
-                )
-                tStS_t2r = thr_tmem_load.partition_S(tStS_j)
-                for k in cutlass.range_constexpr(nsl):
-                    cute.copy(thr_tmem_load, tStS_t2r[None, k, None, None], bufs[j % 2][None, k, None, None])
-            if const_expr(j > 0):
-                # Block j - 1 is already in registers (waited by the previous step's fence).
-                pos = kv_offset + (split * SPLIT + (j - 1)) * self.n_block_size
-                for u in cutlass.range_constexpr(tpw):
-                    acc0, acc1 = self._reduce_token_part(bufs[(j - 1) % 2], rW, u, half, npairs, accs[u][0], accs[u][1])
-                    val = self._reduce_token_finish(acc0, acc1) * out_scale
-                    if pos < lims[u]:
-                        if const_expr(self.is_compressed_logits):
-                            row_base[rows[u] + pos] = val
-                        else:
-                            rows[u][pos] = val
-                        if const_expr(self.compute_lse):
-                            new_max = val if val > lmax[u] else lmax[u]
-                            lsum[u] = lsum[u] * cute.math.exp2((lmax[u] - new_max) * log2_e, fastmath=True) + cute.math.exp2(
-                                (val - new_max) * log2_e, fastmath=True
-                            )
-                            lmax[u] = new_max
-            if const_expr(j < SPLIT):
-                cute.arch.fence_view_async_tmem_load()
-                _tcgen05_fence_before()
-                cute.arch.mbarrier_arrive(T_mbar_ptr + SPLIT + j)
-        return lmax, lsum, ready0_next
-
-    @cute.jit
     def _math_tile(
         self,
         wg,
@@ -955,6 +859,8 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         mCandBatchOffsets,
     ):
         """All splits of one work tile for this warpgroup's tokens, then their LSE."""
+        SPLIT = self.SPLIT
+        nsl = 4 // self.num_math_wg  # 32-column TMEM load slices owned by this warpgroup
         out_scale = Float32(softmax_scale) * Float32(0.5) if const_expr(self.relu_fadd_all) else Float32(softmax_scale)
         log2_e = Float32(math.log2(math.e))
         lims = []
@@ -985,27 +891,71 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         lmax = [-Float32.inf for _ in range(tpw)]
         lsum = [Float32(0.0) for _ in range(tpw)]
         bufs = [cute.make_rmem_tensor(tSrS_shape, Float32), cute.make_rmem_tensor(tSrS_shape, Float32)]
-        math_split = partial(
-            self._math_split,
-            wg=wg,
-            tpw=tpw,
-            cols=cols,
-            kv_offset=kv_offset,
-            lims=lims,
-            rows=rows,
-            row_base=row_base,
-            bufs=bufs,
-            rW=rW,
-            out_scale=out_scale,
-            thr_tmem_load=thr_tmem_load,
-            tStS_ref=tStS_ref,
-            T_mbar_ptr=T_mbar_ptr,
-            t_full_bits=t_full_bits,
-        )
+        # At H64 without the LSE, step j probes block j's full barrier, accumulates the first half of block j - 1's head
+        # pairs, resolves the probe (a blocking wait only if it failed), loads block j from TMEM, then finishes and stores
+        # block j - 1, so block j - 1's reduce overlaps block j's MMA and TMEM load.  Block 0 is probed by the previous
+        # split before its last reduce.  Smaller groups, and H64 with the LSE, wait for block j, load it, then reduce
+        # block j - 1: a smaller group's shorter split loop pays more for the probes than the overlap returns, and the
+        # LSE's longer reduce leaves the MMA ahead, so its probes almost always succeed and only add work.
+        probe = self.qhead_per_kvhead == 64 and not self.compute_lse
+        npairs = self.qhead_per_kvhead // 2
+        half = npairs // 2 if probe else 0  # head pairs reduced before the block's wait resolves
+        zero2 = (Float32(0.0), Float32(0.0))
         split = Int32(0)
-        ready0 = cutlass.Boolean(False)
+        ready0 = cutlass.Boolean(False)  # this split's block-0 probe, made by the previous split
         while split < num_splits:
-            lmax, lsum, ready0 = math_split(split, lmax, lsum, ready0, split + 1 < num_splits)
+            for j in cutlass.range_constexpr(SPLIT + 1):
+                if const_expr(j < SPLIT):
+                    phase = ((t_full_bits >> j) ^ split) & Int32(1)
+                if const_expr(probe and 0 < j < SPLIT):
+                    ready = cute.arch.mbarrier_try_wait(T_mbar_ptr + j, phase)
+                if const_expr(probe and j == SPLIT):
+                    # Probe block 0 of the tile's next split before reducing the last block (the probe lives across
+                    # the loop back edge, so the reduce stays between it and the wait).
+                    ready0 = cutlass.Boolean(False)
+                    if split + 1 < num_splits:
+                        ready0 = cute.arch.mbarrier_try_wait(T_mbar_ptr, (t_full_bits ^ (split + 1)) & Int32(1))
+                accs = []
+                if const_expr(j > 0):
+                    for u in cutlass.range_constexpr(tpw):
+                        accs.append(self._reduce_token_part(bufs[(j - 1) % 2], rW, u, 0, half, zero2, zero2))
+                if const_expr(j < SPLIT):
+                    if const_expr(not probe):
+                        cute.arch.mbarrier_wait(T_mbar_ptr + j, phase)
+                    elif const_expr(j == 0):
+                        if not ready0:
+                            cute.arch.mbarrier_wait(T_mbar_ptr + j, phase)
+                    else:
+                        if not ready:
+                            cute.arch.mbarrier_wait(T_mbar_ptr + j, phase)
+                    _tcgen05_fence_after()
+                    tStS_j = cute.make_tensor(
+                        cute.make_ptr(Float32, j * self.tmem_s_stride + wg * cols, mem_space=cute.AddressSpace.tmem, assumed_align=16), tStS_ref.layout
+                    )
+                    tStS_t2r = thr_tmem_load.partition_S(tStS_j)
+                    for k in cutlass.range_constexpr(nsl):
+                        cute.copy(thr_tmem_load, tStS_t2r[None, k, None, None], bufs[j % 2][None, k, None, None])
+                if const_expr(j > 0):
+                    # Block j - 1 is already in registers (waited by the previous step's fence).
+                    pos = kv_offset + (split * SPLIT + (j - 1)) * self.n_block_size
+                    for u in cutlass.range_constexpr(tpw):
+                        acc0, acc1 = self._reduce_token_part(bufs[(j - 1) % 2], rW, u, half, npairs, accs[u][0], accs[u][1])
+                        val = self._reduce_token_finish(acc0, acc1) * out_scale
+                        if pos < lims[u]:
+                            if const_expr(self.is_compressed_logits):
+                                row_base[rows[u] + pos] = val
+                            else:
+                                rows[u][pos] = val
+                            if const_expr(self.compute_lse):
+                                new_max = val if val > lmax[u] else lmax[u]
+                                lsum[u] = lsum[u] * cute.math.exp2((lmax[u] - new_max) * log2_e, fastmath=True) + cute.math.exp2(
+                                    (val - new_max) * log2_e, fastmath=True
+                                )
+                                lmax[u] = new_max
+                if const_expr(j < SPLIT):
+                    cute.arch.fence_view_async_tmem_load()
+                    _tcgen05_fence_before()
+                    cute.arch.mbarrier_arrive(T_mbar_ptr + SPLIT + j)
             split = split + 1
         if const_expr(self.compute_lse):
             # Reduce each owned token's online (max, sum) across the warpgroup's 128 key rows.
