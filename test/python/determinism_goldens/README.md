@@ -26,6 +26,121 @@ pytest core/test_determinism_utils.py
 | `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
+| `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
+
+### Custom reduction — SM100 validation, 2026-11-09 (UTC)
+
+The new `test_custom_reduction_determinism.py` L0 suite has **seven cases**:
+argmax and argmin index projections for FP16, BF16 and FP32, plus a direct
+FP32 ADD body. These measurements are new; the earlier attention-suite
+measurements and 330-case collection record below are retained separately
+and were not rerun for this addition.
+
+Each case checks its independent Torch CPU reference, device input bytes,
+fresh-buffer replay with queued side-stream work, and a target row alone,
+packed among 32 neighbors, reordered, duplicated, and with changed neighbor
+data. Each also replays a large batch of `16 * SM_count + 1` rows: **2369 rows**
+on the measured 148-SM device, with the target at row 1184. The reduction
+extent is 257, exercising the nominal 256-element boundary. These are workload
+shapes, not measurements of the backend's tile size or physical CTA waves.
+There are 10 graph calls per case (70 per complete suite run), not 70 pytest
+cases. Actual kernel overlap is not measured.
+
+The suite orders the producing Torch stream into the actual cuDNN handle
+stream, then orders outputs back before comparisons. It preserves the handle
+stream and uses no device-wide prelaunch barrier to drain the queued noise.
+Snapshots own their storage; result comparisons check names, shapes, dtypes,
+finite values, and raw bytes without tolerance. Index inputs remain local to
+each row. No packed offsets, upstream gradients, mutable state, or custom-
+reduction backward entry point exist in these tested graphs.
+
+The index-projection graphs consume only the INT32 index. The helper's value
+stream remains internal and is not claimed as a tested output. The finite
+integer-valued inputs include repeated extrema: the target argmax is **5**
+and argmin is **7** under the Torch tie rule. The direct ADD body uses the
+same bounded data divided by eight, making all partial sums exactly
+representable in FP32; the target sum is **-41/8 (-5.125)**. This establishes
+no blanket guarantee for arbitrary user callbacks, arbitrary floating-point
+sum data, NaN/infinity policies, or unused tuple outputs. Each graph strictly
+selects a publicly enumerated native cuDNN backend plan; absence fails rather
+than falling back to another provider. No OSS CuTe DSL kernel path is qualified
+by this run.
+
+Source qualification: public parent `8202053a0eac9f224a9961c3f3150765ab3be98f`,
+frozen test SHA256
+`5e4d7d169a55829a7a4ba43e24c0c34c5f9aa991bc72c2b8be3ff930932db644`.
+The test was overlaid onto an isolated validation artifact freshly built at
+`a49f23d07c068ec8442da6241bbd755c51460624`; the compiled sources are equivalent
+to the public parent. Import resolution was asserted against that artifact's
+`/artifacts/python/cudnn`, and both the compiled-header and loaded-backend
+versions were asserted to be **92900** before execution. This is native
+artifact validation with the frozen source test, not a rebuilt module from
+the later documentation/golden addition.
+
+Runtime: GPU name reported as `NVIDIA Graphics Device`, SM100 (cc 10.0),
+148 SMs; Torch `2.14.0a0+4fdf77b940.nv26.08`, CUDA 13.4, driver API 13030,
+cuDNN 92900, nvidia-cutlass-dsl 4.7.1 and apache-tvm-ffi 0.1.13.post3.
+CuTe DSL is runtime-key metadata here; the selected numerical path is native
+cuDNN. The golden runtime key is `5592daabbefc7ee5`.
+
+| Run | Passed | Failed | Errors | Skipped | Deselected | Pytest time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| New baseline recording | 7 | 0 | 0 | 0 | 0 | 11.64 s |
+| Strict check, goldens mounted read-only and recording unset | 7 | 0 | 0 | 0 | 0 | 11.89 s |
+| Negative control: swap valid argmax/argmin factories | 0 | 6 intended reference failures | 0 | 0 | 1 | 2.38 s |
+| Negative control: replace direct ADD with legal MUL, identity 1, and a distinct body key | 0 | 1 intended reference failure | 0 | 0 | 6 | 0.81 s |
+
+Both normal runs collected all seven L0 cases, with two Torch JIT deprecation
+warnings each. The negative controls reached native execution and failed at
+the independent reference assertions, rather than compilation, support checks,
+missing goldens, or harness exceptions. The mutations were confined to isolated
+validation copies; the frozen source above was unchanged.
+
+Executed pytest commands inside the validation container, from `/tmp/tests`
+with the asserted artifact import active:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CUDNN_TEST_NO_ISOLATION=1
+export CUDNN_DETERMINISM_RECORD=/results/goldens
+unset CUDNN_DETERMINISM_GOLDENS
+python3 -m pytest -m L0 -o addopts='--tb=short --no-header' \
+  -o cache_dir=/tmp/pytest_cache --junitxml=/results/result.xml \
+  test_custom_reduction_determinism.py
+
+# Separate strict run; /goldens is the reviewed baseline, mounted read-only.
+unset CUDNN_DETERMINISM_RECORD
+export CUDNN_DETERMINISM_GOLDENS=/goldens
+python3 -m pytest -m L0 -o addopts='--tb=short --no-header' \
+  -o cache_dir=/tmp/pytest_cache --junitxml=/results/result.xml \
+  test_custom_reduction_determinism.py
+```
+
+The swapped-factory control used the same strict environment and pytest command
+with `-p det_mutation -k arg_index`; its plugin interchanged the two public
+modifier factories. The legal-MUL control used `-k direct_add` after replacing
+only the copied body's ADD with MUL, its identity with 1, and its body key with
+`test.python.custom_reduction.determinism.direct_multiply.v1`.
+
+Seven JSON files under `5592daabbefc7ee5/` are new baselines for this previously
+uncovered numerical API; no prior golden was replaced and no numerical change
+is intended. Recording followed replay and references. Independent integer
+arithmetic and IEEE byte encoding reconstructed all input, iota, and expected
+output hashes (5, 7, and -41/8), and the seven complete file SHA256 values
+remained unchanged after the strict run and when copied into this directory.
+A normal checkout check uses:
+
+```bash
+unset CUDNN_DETERMINISM_RECORD
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest test_custom_reduction_determinism.py -m L0 -q -rs
+```
+
+The two custom-reduction support rows now cover the measured SM100
+configurations only. SM103 remains explicitly unverified in the existing
+combined SM100/103 column; SM90, SM107, other hardware, other data profiles,
+and arbitrary reducers remain unverified.
 
 The four linear-attention suites live in `linear_attention/frost/test_*_determinism.py`.
 They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
