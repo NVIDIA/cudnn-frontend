@@ -917,6 +917,15 @@ unless padding is included in both the layout and resource accounting. Detector:
 `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py::test_moe_block_scale_narrow_n_routing`
 (`scatter-False-24`, including capture/replay), verified RED before the store gate.
 
+**`cute.arch.shuffle_sync_up` defaults to a clamp of 31 before CuTe DSL 4.7.0.**
+`shfl.sync.up` keeps a lane's own value when its source lane falls below the
+clamp operand, so with that default every lane reads back its own value and a
+warp prefix sum silently returns its input. Pass `mask_and_clamp=0` for a
+full-warp up-shuffle; 4.7.0 and later default to 0, so the explicit argument
+emits the same PTX there. Detector: the H128 D512 conflict-rank cases of
+`deepseek_sparse_attention/cutedsl/test_DSA_sparse_attention_backward.py` on the
+4.6.2 wheel, which give wrong dKV without the argument.
+
 For fractional-microsecond performance changes, repeat A/B with shared addresses,
 reversed construction order, and an independently compiled unchanged-source
 control. An A/A that shares one compiled kernel does not bound the variation

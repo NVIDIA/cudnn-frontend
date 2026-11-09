@@ -8,9 +8,11 @@ Gradients are generated via autograd on the gather-based forward reference.
 
 import ast
 import inspect
+import itertools
 import math
 import re
 import textwrap
+import types
 
 import pytest
 import torch
@@ -26,11 +28,20 @@ from deepseek_sparse_attention.cutedsl.dsa_utils import (
 )
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
     check_ref_dsa_sparse_attention_backward,
+    ref_dsa_sparse_attention_backward,
     ref_sparse_attention_forward_chunked,
 )
 
-# SM100-class compute capabilities routed to the H96/H128 D576 two-CTA backend.
+# SM100-class compute capabilities routed to the H96/H128 D576 two-CTA backend; conflict-rank dKV storage is
+# provided on the same devices.
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
+
+
+def _require_conflict_rank_device():
+    """Skip unless the GPU provides conflict-rank dKV storage (compute capability 10.0 or 10.3)."""
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("conflict-rank dKV storage requires compute capability 10.0 or 10.3")
 
 
 def _import_or_skip(module_name, reason="Environment not supported: cudnn[cutedsl] not installed"):
@@ -156,6 +167,7 @@ def _plan_case(
     q_cluster_mode="off",
     deterministic_relay_cluster_size=None,
     compile_plan=True,
+    deterministic_dkv_mode="records",
 ):
     """Inputs, a checked plan, caller-owned outputs, and scratch for one route."""
     from cudnn import DSA
@@ -182,6 +194,7 @@ def _plan_case(
         deterministic=deterministic,
         q_cluster_mode=q_cluster_mode,
         deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+        deterministic_dkv_mode=deterministic_dkv_mode,
     )
     assert plan.check_support()
     if compile_plan:
@@ -289,6 +302,17 @@ def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
         device_capability=(10, 7),
         deterministic=True,
     ) == ("h96_h64_h32", 64)
+    # Outside the two-CTA envelope, deterministic H96 D576 runs the generic M64 kernel only where the plan keeps
+    # dKV in conflict-rank storage; the shard layout, an explicit relay and larger records keep the composition.
+    shape = dict(max_topk=64, deterministic=True, total_s_q=300, total_s_kv=4096)
+    assert _select_sm100_backend(96, 576, **shape) == ("generic_m64", 64)
+    assert _select_sm100_backend(96, 576, **shape, dkv_mode="chain") == ("generic_m64", 64)
+    assert _select_sm100_backend(96, 576, **shape, dkv_mode="shards") == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, max_topk=64, deterministic=True, total_s_q=8, total_s_kv=256) == ("h96_h64_h32", 64)
+    assert _select_sm100_backend(96, 576, max_topk=64, deterministic=True, total_s_q=4096, total_s_kv=65536, deterministic_relay_cluster_size=8) == (
+        "h96_h64_h32",
+        64,
+    )
 
 
 @pytest.mark.L0
@@ -528,7 +552,7 @@ def test_DSA_sparse_attention_backward_deterministic_compile_cache_is_device_sco
 
     compile_artifact = interface._compile_deterministic_sm100
     compile_artifact.cache_clear()
-    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_config", lambda shards, relay_size: FakeKernel)
+    monkeypatch.setattr(interface, "_deterministic_kernel_class_for_config", lambda shards, relay_size, layout=None: FakeKernel)
     monkeypatch.setattr(interface, "_fake_compact_tensor", lambda *args, **kwargs: object())
     monkeypatch.setattr(interface.cute, "sym_int", lambda: object())
     monkeypatch.setattr(interface.cute.runtime, "make_fake_stream", lambda **kwargs: object())
@@ -1027,6 +1051,75 @@ def test_DSA_sparse_attention_backward_sm100_large_context_workspace_uses_cluste
     assert interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, deterministic=True, backend="generic_m64") == lse_odo_bytes + dkv_bytes
 
 
+def _rounding_step(values, dtype):
+    """Spacing of ``dtype`` at each ``|value|`` (one rounding step of the output format)."""
+    _, exponent = torch.frexp(values.float().abs())
+    return torch.finfo(dtype).eps * torch.pow(2.0, (exponent - 1).float())
+
+
+def _nondeterministic_outputs(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length, softmax_scale):
+    """Run the non-deterministic plan of the same inputs and return its ``(dq, dkv, d_sink)``."""
+    from cudnn import DSA
+    from cuda.bindings import driver as cuda
+
+    plan = DSA.SparseAttentionBackward(q, kv, out, dout, lse, attn_sink, topk_idxs, sample_topk_length=topk_length, softmax_scale=softmax_scale)
+    assert plan.check_support()
+    plan.compile()
+    workspace_bytes = plan.scratch_workspace_bytes()
+    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device) if workspace_bytes else None
+    dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    plan.execute(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        dq,
+        dkv,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        current_stream=stream,
+        d_sink=d_sink,
+    )
+    torch.cuda.synchronize()
+    return dq, dkv, d_sink
+
+
+def _check_ref_high_fan_in(q, kv, out, dout, lse, attn_sink, topk_idxs, outputs, *, softmax_scale, topk_length, atol=5e-2, rtol=5e-2):
+    """Reference check of deterministic outputs for inputs with high-fan-in KV rows (shared or repeated rows).
+
+    Every dKV element adds one product of BF16-rounded operands (P, dS) per (query, head, slot) that selects
+    its row. On rows with hundreds of valid slots that rounding alone can exceed ``atol + rtol * |ref|``
+    against the FP32 reference, for every dKV layout and for the non-deterministic path alike (the same
+    elements, by the same amounts, as an FP64 reference shows). dKV is therefore bounded by the error of
+    the non-deterministic plan on the same inputs: per element ``|det - ref| <= |nondet - ref| + step(|ref|)
+    + atol`` and in max-abs ``max|det - ref| <= max|nondet - ref| + step(largest |value|)``, with ``step`` one
+    rounding step of the output dtype. dQ and dSink keep the plain ``atol``/``rtol`` check.
+    """
+    dq, dkv, d_sink = outputs
+    dq_ref, dkv_ref, d_sink_ref = ref_dsa_sparse_attention_backward(q, kv, attn_sink, topk_idxs, dout, softmax_scale=softmax_scale, topk_length=topk_length)
+    torch.testing.assert_close(dq.float(), dq_ref, atol=atol, rtol=rtol, msg=lambda text: f"dQ: {text}")
+    torch.testing.assert_close(d_sink.float(), d_sink_ref, atol=atol, rtol=rtol, msg=lambda text: f"dSink: {text}")
+    nondeterministic_dkv = _nondeterministic_outputs(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length, softmax_scale)[1]
+    error = (dkv.float() - dkv_ref).abs()
+    nondeterministic_error = (nondeterministic_dkv.float() - dkv_ref).abs()
+    excess = error - (nondeterministic_error + _rounding_step(dkv_ref, dkv.dtype) + atol)
+    worst = int(excess.nan_to_num(float("inf")).argmax())
+    row, column = divmod(worst, dkv.shape[-1])
+    assert bool((excess <= 0).all()), (
+        f"dKV: {int((~(excess <= 0)).sum())} elements exceed the non-deterministic error + one rounding step + atol; worst at "
+        f"({row}, {column}): deterministic {dkv[row, column].item()}, non-deterministic {nondeterministic_dkv[row, column].item()}, "
+        f"reference {dkv_ref[row, column].item()}"
+    )
+    largest = torch.stack((dkv_ref.abs().max(), dkv.float().abs().max(), nondeterministic_dkv.float().abs().max())).max()
+    bound = nondeterministic_error.max() + _rounding_step(largest, dkv.dtype)
+    assert error.max() <= bound, f"dKV: max abs error {error.max().item()} exceeds the non-deterministic {nondeterministic_error.max().item()} + one step"
+
+
 def _exercise_deterministic_sm100_case(
     num_heads,
     head_dim,
@@ -1043,18 +1136,37 @@ def _exercise_deterministic_sm100_case(
     expected_relay_cluster_size=None,
     deterministic_relay_cluster_size=None,
     dtype=torch.bfloat16,
+    deterministic_dkv_mode="records",
+    expected_dkv_route=None,
+    duplicate_topk=False,
+    invalid_topk=False,
+    expected_backend=None,
+    high_fan_in_reference=False,
 ):
-    """Run one deterministic case against bitwise and numerical contracts."""
+    """Run one deterministic case against bitwise and numerical contracts.
+
+    ``expected_dkv_route`` checks the plan's dKV reduction (``'records'``, ``'chain'`` or ``'shards'``) and
+    ``expected_backend`` its SM100 backend. ``high_fan_in_reference`` bounds dKV by the non-deterministic
+    plan's reference error (``_check_ref_high_fan_in``) instead of the plain tolerance.
+    ``duplicate_topk`` repeats a KV row inside every other query's top-k (its gradients accumulate) and
+    ``invalid_topk`` adds negative and past-the-end indices (inactive, as in the reference).
+    """
     import cutlass
     from cudnn import DSA
     from cuda.bindings import driver as cuda
     from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import (
         _get_sm100_kernel_class,
         _select_sm100_backend,
+        effective_deterministic_dkv_mode,
         flash_attn_bwd_sm100_workspace_size,
     )
 
     _require_sm100()
+    if deterministic_dkv_mode == "chain" or expected_dkv_route in ("records", "chain"):
+        _require_conflict_rank_device()
+    device_capability = torch.cuda.get_device_capability()
+    # The plan runs 'records' as 'shards' on devices without conflict-rank storage.
+    dkv_mode = effective_deterministic_dkv_mode(deterministic_dkv_mode, True, device_capability)
     device = torch.device("cuda")
     topk = min(64 if topk is None else topk, s_kv)
     softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -1075,6 +1187,11 @@ def _exercise_deterministic_sm100_case(
         topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
     if sorted_topk:
         topk_idxs = topk_idxs.sort(dim=-1).values
+    if duplicate_topk and topk > 1:
+        topk_idxs[::2, 1] = topk_idxs[::2, 0]
+    if invalid_topk and topk > 2:
+        topk_idxs[1::3, -1] = -1
+        topk_idxs[2::3, -2] = s_kv + 3
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device) if has_topk_length else None
     if topk_length is not None and s_q > 1:
         topk_length[s_q // 2] = 0
@@ -1093,9 +1210,17 @@ def _exercise_deterministic_sm100_case(
         head_dim_v=512,
         dtype=dtype,
         max_topk=topk,
-        device_capability=torch.cuda.get_device_capability(),
+        device_capability=device_capability,
         deterministic=True,
+        total_s_q=s_q,
+        total_s_kv=s_kv,
+        deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+        dkv_mode=deterministic_dkv_mode,
     )
+    # The expected sizes below are those of the class-sized layouts. H128 two-CTA conflict-rank plans size
+    # their storage per variant and, for D576, per device wave: _check_h128_deterministic_case covers them.
+    if backend in ("h128_2cta_m64", "h128_d576_2cta_m64"):
+        assert not _h128_conflict_rank_selected(head_dim, s_kv, topk, dkv_mode), "use _check_h128_deterministic_case for H128 conflict-rank plans"
     workspace_bytes = flash_attn_bwd_sm100_workspace_size(
         s_q,
         s_kv,
@@ -1104,6 +1229,9 @@ def _exercise_deterministic_sm100_case(
         deterministic=True,
         backend=backend,
         deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+        max_topk=topk,
+        dkv_mode=deterministic_dkv_mode,
+        device_capability=device_capability,
     )
     api = DSA.SparseAttentionBackward(
         sample_q=q,
@@ -1117,10 +1245,16 @@ def _exercise_deterministic_sm100_case(
         softmax_scale=softmax_scale,
         deterministic=True,
         deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+        deterministic_dkv_mode=deterministic_dkv_mode,
     )
     assert api.check_support()
     api.compile()
     assert api.scratch_workspace_bytes() == workspace_bytes
+    assert api._backend == backend
+    if expected_backend is not None:
+        assert backend == expected_backend
+    if expected_dkv_route is not None:
+        assert api._deterministic_dkv_route() == expected_dkv_route
     expected_lse_odo_bytes = num_heads * math.ceil(s_q / 8) * 8 * 2 * torch.float32.itemsize
     kernel_cls = _get_sm100_kernel_class(
         backend,
@@ -1130,10 +1264,14 @@ def _exercise_deterministic_sm100_case(
         head_dim,
         num_heads,
         deterministic_relay_cluster_size,
+        max_topk=topk,
+        dkv_mode=dkv_mode,
     )
     if expected_relay_cluster_size is not None:
         assert kernel_cls.dkv_relay_cluster_size == expected_relay_cluster_size
-    if hasattr(kernel_cls, "_get_workspace_size_dKV_for_q"):
+    if hasattr(kernel_cls, "_get_workspace_size_dKV_for_rank"):
+        dkv_shape = kernel_cls._get_workspace_size_dKV_for_rank(s_kv, head_dim, topk, 1, cutlass.Float32, num_heads, s_q)
+    elif hasattr(kernel_cls, "_get_workspace_size_dKV_for_q"):
         dkv_shape = kernel_cls._get_workspace_size_dKV_for_q(s_q, s_kv, head_dim, num_heads, 1, cutlass.Float32)
     else:
         dkv_shape = kernel_cls._get_workspace_size_dKV(s_kv, head_dim, 1, cutlass.Float32)
@@ -1184,6 +1322,7 @@ def _exercise_deterministic_sm100_case(
                 topk_length=topk_length,
                 deterministic=True,
                 deterministic_relay_cluster_size=deterministic_relay_cluster_size,
+                deterministic_dkv_mode=deterministic_dkv_mode,
                 workspace=torch.empty(workspace_bytes - 1, dtype=torch.uint8, device=device),
             )
 
@@ -1251,6 +1390,9 @@ def _exercise_deterministic_sm100_case(
         finally:
             graph.reset()
 
+    if high_fan_in_reference:
+        _check_ref_high_fan_in(q, kv, out, dout, lse, attn_sink, topk_idxs, reference, softmax_scale=softmax_scale, topk_length=topk_length)
+        return
     check_ref_dsa_sparse_attention_backward(
         q,
         kv,
@@ -1269,22 +1411,39 @@ def _exercise_deterministic_sm100_case(
 
 @torch_fork_set_rng(seed=419)
 @pytest.mark.parametrize(
-    "num_heads,head_dim,repeats",
+    "num_heads,head_dim,repeats,deterministic_dkv_mode",
     [
-        pytest.param(16, 576, 3, marks=pytest.mark.L0, id="H16-D576-tail-smoke"),
-        pytest.param(16, 576, 1000, marks=pytest.mark.L2, id="H16-D576-repeat1000"),
-        pytest.param(32, 512, 1000, marks=pytest.mark.L2, id="H32-D512-repeat1000"),
-        pytest.param(64, 512, 1000, marks=pytest.mark.L2, id="H64-D512-repeat1000"),
-        pytest.param(64, 576, 1000, marks=pytest.mark.L2, id="H64-D576-repeat1000"),
-        pytest.param(96, 512, 1000, marks=pytest.mark.L2, id="H96-D512-repeat1000"),
-        pytest.param(96, 576, 1000, marks=pytest.mark.L2, id="H96-D576-repeat1000"),
-        pytest.param(128, 576, 1000, marks=pytest.mark.L2, id="H128-D576-repeat1000"),
+        pytest.param(16, 576, 3, "records", marks=pytest.mark.L0, id="H16-D576-tail-smoke"),
+        pytest.param(16, 576, 3, "shards", marks=pytest.mark.L0, id="H16-D576-shards-tail-smoke"),
+        pytest.param(16, 576, 1000, "records", marks=pytest.mark.L2, id="H16-D576-repeat1000"),
+        pytest.param(32, 512, 1000, "records", marks=pytest.mark.L2, id="H32-D512-repeat1000"),
+        pytest.param(64, 512, 1000, "records", marks=pytest.mark.L2, id="H64-D512-repeat1000"),
+        pytest.param(64, 576, 1000, "records", marks=pytest.mark.L2, id="H64-D576-repeat1000"),
+        pytest.param(96, 512, 1000, "records", marks=pytest.mark.L2, id="H96-D512-repeat1000"),
+        pytest.param(96, 576, 1000, "records", marks=pytest.mark.L2, id="H96-D576-repeat1000"),
+        pytest.param(128, 576, 1000, "records", marks=pytest.mark.L2, id="H128-D576-repeat1000"),
+        pytest.param(64, 576, 1000, "shards", marks=pytest.mark.L2, id="H64-D576-shards-repeat1000"),
+        pytest.param(96, 576, 1000, "shards", marks=pytest.mark.L2, id="H96-D576-shards-repeat1000"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim, repeats):
-    """Masked and multi-block heads must be bitwise reproducible."""
+def test_DSA_sparse_attention_backward_sm100_deterministic_bounded_waves(num_heads, head_dim, repeats, deterministic_dkv_mode):
+    """Masked and multi-block heads must be bitwise reproducible.
+
+    At these shapes the default plans keep dKV in conflict-rank records; ``'shards'`` plans run the
+    128-shard layout, and deterministic H96 D576 the H64 + H32 composition.
+    """
+    h96_d576_shards = deterministic_dkv_mode == "shards" and (num_heads, head_dim) == (96, 576)
     try:
-        _exercise_deterministic_sm100_case(num_heads, head_dim, 257, 256, repeats)
+        _exercise_deterministic_sm100_case(
+            num_heads,
+            head_dim,
+            257,
+            256,
+            repeats,
+            deterministic_dkv_mode=deterministic_dkv_mode,
+            expected_dkv_route=None if h96_d576_shards else deterministic_dkv_mode,
+            expected_backend="h96_h64_h32" if h96_d576_shards else "generic_m64",
+        )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
@@ -1298,6 +1457,623 @@ def test_DSA_sparse_attention_backward_sm100_d576_two_cta_repeat1000(num_heads):
         _exercise_deterministic_sm100_case(num_heads, 576, 257, 256, repeats=1000, topk=128)
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+# Deterministic H128 two-CTA KV extents per head dim and top-k width that select conflict-rank dKV
+# storage, and extents that keep the private-plane layout (checked by ``_h128_conflict_rank_selected``).
+_H128_CONFLICT_RANK_S_KV = {
+    512: {
+        "conflict_rank": {128: 4096, 512: 4096, 1024: 4096, 1152: 4096, 2048: 4096},
+        "private_plane": {128: 64, 512: 256, 1024: 512, 1152: 576, 2048: 1024},
+    },
+    576: {
+        "conflict_rank": {128: 4096, 512: 4096, 1024: 4096, 1152: 4096, 2048: 4096},
+        "private_plane": {128: 256, 512: 2048, 1024: 1024, 1152: 2048, 2048: 2048},
+    },
+}
+# Scratch bytes past ``scratch_workspace_bytes()`` that the H128 deterministic tests allocate with a
+# sentinel value and check afterwards: a launch that writes beyond the reported size changes them.
+_H128_SCRATCH_TAIL_BYTES = 1 << 20
+_H128_SCRATCH_TAIL_VALUE = 0x5A
+
+
+def _h128_conflict_rank_selected(head_dim, s_kv, topk, dkv_mode="records"):
+    """Whether the deterministic H128 two-CTA plan for this KV extent, top-k width and dKV mode uses conflict-rank dKV storage."""
+    if head_dim == 512:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+        kernel_cls = interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk, dkv_mode=dkv_mode)
+        return bool(getattr(kernel_cls, "rank_shard", False))
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    return interface._rank_shard_rounds(s_kv, topk, True, 128, dkv_mode) > 0
+
+
+def _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim):
+    """Caller scratch of the private-plane deterministic H128 layout (``max_topk`` omitted)."""
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    backend = "h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64"
+    return interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, 128, True, backend=backend)
+
+
+def _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, *, has_topk_length, invalid_entries=True):
+    """Deterministic H128 inputs with duplicate, ``-1`` and out-of-range top-k entries and edge lengths."""
+    device = "cuda"
+    q = torch.randn(s_q, 128, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(128, dtype=torch.float32, device=device)
+    if s_kv >= topk:
+        topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    else:
+        # Fewer KV rows than top-k slots: every query selects rows more than once.
+        topk_idxs = torch.randint(0, s_kv, (s_q, topk), dtype=torch.int32, device=device)
+    if invalid_entries:
+        # Every query repeats one row and carries a -1 sentinel and an out-of-range row (both inactive).
+        topk_idxs[:, 1] = topk_idxs[:, 0]
+        topk_idxs[:, 2] = -1
+        topk_idxs[:, topk - 1] = s_kv
+    topk_length = None
+    if has_topk_length:
+        topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
+        topk_length[0] = 0
+        topk_length[1 % s_q] = topk
+        topk_length[2 % s_q] = 1
+    softmax_scale = head_dim**-0.5
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out) / 10
+    return (q, kv, out, dout, lse, attn_sink, topk_idxs), topk_length, softmax_scale
+
+
+def _h128_deterministic_plan(head_dim, inputs, topk_length, softmax_scale, deterministic_dkv_mode="records"):
+    """Compile a deterministic H128 two-CTA plan and allocate its outputs and its caller scratch.
+
+    Returns ``(plan, workspace, outputs, tail)``: ``workspace`` is exactly ``scratch_workspace_bytes()``
+    long and is followed in the same allocation by ``tail``, sentinel bytes that no launch may write
+    (``_assert_h128_scratch_tail_untouched``).
+    """
+    from cudnn import DSA
+
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=True,
+        deterministic_dkv_mode=deterministic_dkv_mode,
+    )
+    assert plan.check_support()
+    plan.compile()
+    assert plan._backend == ("h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64")
+    required = plan.scratch_workspace_bytes()
+    scratch = torch.full((required + _H128_SCRATCH_TAIL_BYTES,), _H128_SCRATCH_TAIL_VALUE, dtype=torch.uint8, device=q.device)
+    outputs = (torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink))
+    return plan, scratch[:required], outputs, scratch[required:]
+
+
+def _assert_h128_scratch_tail_untouched(tail):
+    """The sentinel bytes after the reported scratch size are intact: no launch wrote past it."""
+    torch.cuda.synchronize()
+    assert bool((tail == _H128_SCRATCH_TAIL_VALUE).all()), "a launch wrote past scratch_workspace_bytes()"
+
+
+def _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream):
+    dq, dkv, d_sink = outputs
+    return plan.execute(*inputs, dq, dkv, topk_length=topk_length, softmax_scale=softmax_scale, workspace=workspace, current_stream=stream, d_sink=d_sink)
+
+
+def _require_h128_two_cta():
+    _require_sm100()
+    if torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("H128 two-CTA requires compute capability 10.0 or 10.3")
+
+
+def _check_h128_deterministic_case(head_dim, s_q, s_kv, topk, *, has_topk_length, layout, repeats, label, deterministic_dkv_mode="records"):
+    """Run one deterministic H128 two-CTA case on poisoned scratch and outputs.
+
+    Checks the dKV layout (``layout``) that the plan's ``deterministic_dkv_mode`` selects and its scratch
+    bound, the reference gradients, bitwise reruns and the sentinel tail after the scratch.
+    """
+    from cuda.bindings import driver as cuda
+
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk, deterministic_dkv_mode) == (layout == "conflict_rank")
+    inputs, topk_length, softmax_scale = _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=has_topk_length)
+    plan, workspace, outputs, tail = _h128_deterministic_plan(head_dim, inputs, topk_length, softmax_scale, deterministic_dkv_mode)
+    private_plane = _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim)
+    if layout == "conflict_rank":
+        assert workspace.numel() <= private_plane
+    else:
+        assert workspace.numel() == private_plane
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def run():
+        for buffer in (workspace, *outputs):
+            bitwise_bits(buffer).fill_(0xA5)
+        result = _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+        return tuple(tensor.clone() for tensor in result)
+
+    first = run()
+    torch.cuda.synchronize()
+    q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+    check_ref_dsa_sparse_attention_backward(
+        q, kv, attn_sink, topk_idxs, out, dout, lse, *first, softmax_scale=softmax_scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+    )
+    assert_bitwise_runs(run, repeats=repeats, label=label)
+    _assert_h128_scratch_tail_untouched(tail)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+@pytest.mark.parametrize("topk", [128, 512, 1024, 1152, 2048])
+def test_DSA_sparse_attention_backward_h128_conflict_rank_workspace_bound(head_dim, topk):
+    """Conflict-rank plans are selected only where their scratch fits the private-plane layout."""
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    backend = "h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64"
+    pair_options = (None,) if head_dim == 512 else (None, 66, 74, 76)
+    selected = 0
+    for s_kv in (64, 256, 1024, 2048, 2097, 4096, 8192, 32768, 131072, 1 << 20):
+        for s_q in (1, 75, 4096):
+            private_plane = _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim)
+            for launch_pairs in pair_options:
+                extra = {} if launch_pairs is None else {"launch_pairs": launch_pairs}
+                size = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, 128, True, backend=backend, max_topk=topk, **extra)
+                assert size <= private_plane, f"S_kv={s_kv} S_q={s_q} pairs={launch_pairs}: {size} > {private_plane}"
+                if _h128_conflict_rank_selected(head_dim, s_kv, topk):
+                    selected += 1
+                else:
+                    assert size == private_plane
+    assert selected > 0
+    if topk in _H128_CONFLICT_RANK_S_KV[head_dim]["conflict_rank"]:
+        assert _h128_conflict_rank_selected(head_dim, _H128_CONFLICT_RANK_S_KV[head_dim]["conflict_rank"][topk], topk)
+        assert not _h128_conflict_rank_selected(head_dim, _H128_CONFLICT_RANK_S_KV[head_dim]["private_plane"][topk], topk)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+@pytest.mark.parametrize("topk", [128, 512, 1024, 1152, 2048])
+def test_DSA_sparse_attention_backward_h128_shards_mode_keeps_private_plane(head_dim, topk):
+    """``deterministic_dkv_mode='shards'`` H128 two-CTA plans keep the private-plane class and workspace on every shape.
+
+    The KV extents select conflict-rank storage for the default mode, so ``'shards'`` changes the layout there.
+    """
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    d576 = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    backend = "h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64"
+    pair_options = (None,) if head_dim == 512 else (None, 66, 74, 76)
+    for s_kv in (_H128_CONFLICT_RANK_S_KV[head_dim]["conflict_rank"][topk], 32768, 1 << 20):
+        assert _h128_conflict_rank_selected(head_dim, s_kv, topk)
+        assert not _h128_conflict_rank_selected(head_dim, s_kv, topk, "shards")
+        for s_q in (1, 75, 4096):
+            private_plane = _h128_private_plane_workspace_bytes(s_q, s_kv, head_dim)
+            for launch_pairs in pair_options:
+                size = interface.flash_attn_bwd_sm100_workspace_size(
+                    s_q, s_kv, head_dim, 128, True, backend=backend, max_topk=topk, launch_pairs=launch_pairs, dkv_mode="shards"
+                )
+                assert size == private_plane, f"S_kv={s_kv} S_q={s_q} pairs={launch_pairs}: {size} != {private_plane}"
+            if head_dim == 512:
+                private_cls = interface._get_sm100_kernel_class(backend, True, s_q, s_kv, 512, 128, None)
+                assert not getattr(private_cls, "rank_shard", False)
+                assert interface._get_sm100_kernel_class(backend, True, s_q, s_kv, 512, 128, None, max_topk=topk, dkv_mode="shards") is private_cls
+            else:
+                assert d576._rank_shard_rounds(s_kv, topk, True, 128, "shards") == 0
+                assert not d576._odo_precompute(s_kv, topk, True, 128, "shards")
+                for launch_pairs in pair_options:
+                    assert d576._workspace_bytes(s_q, s_kv, True, 128, topk, launch_pairs, "shards") == private_plane
+    if head_dim == 512:
+        # The private-plane workspace of these extents exceeds Int32 offsets; the default plan's does not.
+        wide = interface._requires_wide_data_addressing
+        assert wide(160, 32768, 512, 512, 128, topk, True, backend, include_workspace=True, dkv_mode="shards")
+        assert not wide(160, 32768, 512, 512, 128, topk, True, backend, include_workspace=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sm_count", [132, 148, 152, 160, 264])
+def test_DSA_sparse_attention_backward_d576_conflict_rank_rounds_fit_ordinal_words(sm_count):
+    """Multi-round D576 conflict-rank waves keep their ordinal bits within the setup kernel's words."""
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    rank_shard = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta_rank_shard")
+
+    unclamped = interface._deterministic_compact_slots(sm_count)
+    assert interface._deterministic_compact_slots(sm_count, 0) == unclamped
+    for rounds in (1, 2, 3):
+        pairs = interface._deterministic_compact_slots(sm_count, rounds)
+        assert rank_shard.rank_ordinal_words(rounds * pairs) <= rank_shard.RANK_MAX_ORDINAL_WORDS
+        assert pairs == min(unclamped, rank_shard.rank_max_round_pairs(rounds))
+    if sm_count == 148:
+        # B200 launches 74 pairs per round whatever the round count.
+        assert all(interface._deterministic_compact_slots(sm_count, rounds) == 74 for rounds in (0, 1, 2, 3))
+    if sm_count >= 152:
+        assert interface._deterministic_compact_slots(sm_count, 3) == 74
+
+
+def _h128_kernel_geometry(kernel, *names):
+    """Evaluate a conflict-rank kernel's layout methods (``rank_geometry``, ``rank_offsets``, ...) in Python integers.
+
+    The methods run at trace time on DSL integers built from trace-time attributes, so executing their
+    source with Python ints (``cute.round_up`` and ``cutlass.const_expr`` taken by their integer
+    meaning) yields the plane count and region offsets the kernels use. Floor division differs from
+    the DSL's only for a negative plane budget, which both clamp to the same plane count. Returns an
+    object whose ``names`` are those methods bound to ``kernel``; other attributes come from ``kernel``.
+    """
+    shims = {
+        "Int32": int,
+        "Int64": int,
+        "cute": types.SimpleNamespace(round_up=lambda value, multiple: -(-value // multiple) * multiple),
+        "cutlass": types.SimpleNamespace(const_expr=lambda value: value),
+    }
+    functions = {}
+    for name in names:
+        owner = next(cls for cls in type(kernel).__mro__ if name in vars(cls))
+        class_node = ast.parse(textwrap.dedent(inspect.getsource(owner))).body[0]
+        method = next(node for node in class_node.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        method.decorator_list = []
+        namespace = {**vars(inspect.getmodule(owner)), **shims}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), f"<{owner.__name__}.{name}>", "exec"), namespace)
+        functions[name] = namespace[name]
+
+    class Geometry:
+        def __getattr__(self, attribute):
+            if attribute in functions:
+                return types.MethodType(functions[attribute], self)
+            return getattr(kernel, attribute)
+
+    return Geometry()
+
+
+# KV extents for the host-versus-kernel layout checks: about 1% apart from 1 to 4M rows, so plane-count
+# boundaries of both formulas fall between neighbouring extents.
+_H128_GEOMETRY_S_KV = sorted({int(1.01**step) for step in range(1530)} | {2097, 4097, (3 << 20) + 5})
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_d512_conflict_rank_host_layout_matches_kernel():
+    """The host D512 conflict-rank sizes equal the plane count and regions the kernels address."""
+    cutlass = _import_or_skip("cutlass")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    rank = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_2cta_rank_shard")
+    geometries = {}
+    checked = 0
+    for topk in (128, 512, 1024, 1152, 2048):
+        for s_kv in _H128_GEOMETRY_S_KV:
+            kernel_cls = interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk)
+            if not getattr(kernel_cls, "rank_shard", False):
+                continue
+            if (kernel_cls, topk) not in geometries:
+                geometries[kernel_cls, topk] = _h128_kernel_geometry(kernel_cls(cutlass.BFloat16, 512, 512, 64, topk), "rank_geometry", "rank_offsets")
+            geometry = kernel = geometries[kernel_cls, topk]
+            wave = kernel.max_query_pairs_per_wave
+            pitch, planes = geometry.rank_geometry(s_kv)
+            counters = geometry.rank_offsets(pitch, planes)[-1]
+            fused = rank.rank_merged_fused(s_kv, topk, kernel.rank_record, wave)
+            case = f"K={topk} S_kv={s_kv}"
+            assert kernel.rank_fused == fused, case
+            assert planes == rank.rank_merged_planes(s_kv, topk, kernel.rank_record, wave, fused), case
+            device_words = counters + rank.RANK_MERGED_COUNTER_WORDS
+            assert device_words == rank.rank_merged_workspace_words(s_kv, topk, kernel.rank_record, wave), case
+            _, dkv_shape = common._workspace_shapes_sm100(1, s_kv, 512, 128, True, "h128_2cta_m64", max_topk=topk)
+            assert math.prod(dkv_shape) >= 4 * device_words, case
+            checked += 1
+    assert checked > 0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sm_count", [132, 148, 152, 160])
+def test_DSA_sparse_attention_backward_d576_conflict_rank_host_layout_covers_kernel(sm_count):
+    """The host D576 conflict-rank sizes cover the plane count and regions the kernels address on a device."""
+    cutlass = _import_or_skip("cutlass")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    rank = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta_rank_shard")
+    kernels = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta")
+    geometries = {}
+    checked = 0
+    for topk in (128, 512, 1024, 1152, 2048):
+        for s_kv in _H128_GEOMETRY_S_KV:
+            rounds = interface._rank_shard_rounds(s_kv, topk, True, 128)
+            if rounds == 0:
+                continue
+            pairs = interface._deterministic_compact_slots(sm_count, rounds)
+            if (topk, rounds) not in geometries:
+                kernel = kernels.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministicRankShard(
+                    element_dtype=cutlass.BFloat16,
+                    head_dim=576,
+                    head_dim_v=512,
+                    block_tile=64,
+                    max_topk=topk,
+                    num_heads=128,
+                    compact_slots=pairs,
+                    rank_rounds=rounds,
+                )
+                geometries[topk, rounds] = _h128_kernel_geometry(kernel, "rank_geometry", "rank_offsets", "rank_sorted_base")
+            geometry = kernel = geometries[topk, rounds]
+            pitch, planes = geometry.rank_geometry(s_kv)
+            device_words = geometry.rank_offsets(pitch, planes)[6] + rank.RANK_COUNTER_REGION_WORDS
+            if kernel.rank_sorts():
+                # End of the last sorted-row parity.
+                device_words = geometry.rank_sorted_base(pitch, planes, rank.RANK_SORT_PARITIES - 1) + kernel.max_query_pairs_per_wave * topk
+            host_wave = interface._MAX_DETERMINISTIC_COMPACT_SLOTS
+            case = f"K={topk} S_kv={s_kv} SMs={sm_count}"
+            assert planes == min(rank.conflict_rank_planes(s_kv, topk, kernel.rank_record, host_wave), kernel.max_query_pairs_per_wave), case
+            assert device_words <= rank.conflict_rank_words(s_kv, topk, kernel.rank_record, host_wave, launch_pairs=pairs), case
+            _, dkv_shape = common._workspace_shapes_sm100(1, s_kv, 576, 128, True, "h128_d576_2cta_m64", max_topk=topk, launch_pairs=pairs)
+            assert math.prod(dkv_shape) >= 4 * device_words, case
+            checked += 1
+    assert checked > 0
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_d576_conflict_rank_rejects_oversized_wave():
+    """A conflict-rank class refuses a wave whose ordinal bits exceed the setup kernel's words."""
+    cutlass = _import_or_skip("cutlass")
+    kernels = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h128_d576_2cta")
+    arguments = dict(element_dtype=cutlass.BFloat16, head_dim=576, head_dim_v=512, block_tile=64, max_topk=512, num_heads=128)
+    kernels.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministicRankShard(**arguments, compact_slots=74, rank_rounds=3)
+    with pytest.raises(ValueError, match="cluster pairs per round"):
+        kernels.FlashAttentionDSABackwardSm100H128D576TwoCTADeterministicRankShard(**arguments, compact_slots=76, rank_rounds=3)
+
+
+def _h128_conflict_rank_cases():
+    cases = []
+    for head_dim in (512, 576):
+        for layout in ("conflict_rank", "private_plane"):
+            for topk in (128, 512, 1024, 1152, 2048):
+                for has_topk_length in (True, False):
+                    level = pytest.mark.L1 if has_topk_length else pytest.mark.L2
+                    case_id = f"d{head_dim}-{layout}-k{topk}-{'lengths' if has_topk_length else 'full'}"
+                    cases.append(pytest.param(head_dim, layout, topk, has_topk_length, marks=level, id=case_id))
+    return cases
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim,layout,topk,has_topk_length", _h128_conflict_rank_cases())
+@torch_fork_set_rng(seed=20261104)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_deterministic(head_dim, layout, topk, has_topk_length):
+    """Conflict-rank and private-plane H128 plans: reference gradients, bounded scratch, bitwise reruns.
+
+    Several waves (more queries than one wave's cluster pairs), duplicate rows, -1 and out-of-range
+    entries, and zero, one and full ``topk_length`` values; workspace and outputs are poisoned before
+    every launch, and the bytes after the scratch keep their sentinel.
+    """
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+
+    s_kv = _H128_CONFLICT_RANK_S_KV[head_dim][layout][topk]
+    s_q = 240 if (head_dim == 576 and topk == 512) else 160
+    _check_h128_deterministic_case(
+        head_dim, s_q, s_kv, topk, has_topk_length=has_topk_length, layout=layout, repeats=4, label=f"H128/D{head_dim} {layout} K={topk}"
+    )
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+@torch_fork_set_rng(seed=20261106)
+def test_DSA_sparse_attention_backward_h128_shards_mode_runs_private_plane(head_dim):
+    """A ``deterministic_dkv_mode='shards'`` H128 plan runs the private-plane layout where the default plan stores dKV
+    in conflict-rank storage: exact private-plane scratch, reference gradients, bitwise reruns, untouched scratch tail."""
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+
+    topk = 128
+    s_kv = _H128_CONFLICT_RANK_S_KV[head_dim]["conflict_rank"][topk]
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk)
+    _check_h128_deterministic_case(
+        head_dim,
+        160,
+        s_kv,
+        topk,
+        has_topk_length=True,
+        layout="private_plane",
+        repeats=4,
+        label=f"H128/D{head_dim} shards K={topk}",
+        deterministic_dkv_mode="shards",
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "head_dim,topk,s_q,s_kv",
+    [
+        pytest.param(512, 128, 160, 4096, id="d512-k128-fused"),
+        pytest.param(576, 1024, 10, 2097, id="d576-k1024-sorted-rows"),
+    ],
+)
+@torch_fork_set_rng(seed=20261108)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_smoke(head_dim, topk, s_q, s_kv):
+    """One conflict-rank plan per head dim at the default level.
+
+    D512: fused waves (each main kernel runs the previous wave's tail and prepares the next wave) over
+    three waves. D576: one-round waves with sorted rows, whose first main kernel reads the rows the
+    leading setup launch sorted.
+    """
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    if head_dim == 512:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+        assert interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk).rank_fused
+    else:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+        assert interface._rank_shard_rounds(s_kv, topk, True, 128) == 1
+    _check_h128_deterministic_case(head_dim, s_q, s_kv, topk, has_topk_length=True, layout="conflict_rank", repeats=2, label=f"H128/D{head_dim} smoke K={topk}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize(
+    "topk,s_q,s_kv,rounds",
+    [
+        pytest.param(512, 240, 16384, 3, id="k512-three-rounds"),
+        pytest.param(1024, 10, 65536, 1, id="k1024-one-round"),
+    ],
+)
+@torch_fork_set_rng(seed=20261109)
+def test_DSA_sparse_attention_backward_d576_conflict_rank_in_kernel_odo(topk, s_q, s_kv, rounds):
+    """D576 conflict-rank plans past the O*dO precompute budget reduce O.dO inside the main kernel."""
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+    assert interface._rank_shard_rounds(s_kv, topk, True, 128) == rounds
+    assert not interface._odo_precompute(s_kv, topk, True, 128)
+    _check_h128_deterministic_case(576, s_q, s_kv, topk, has_topk_length=True, layout="conflict_rank", repeats=3, label=f"H128/D576 in-kernel O*dO K={topk}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize(
+    "head_dim,topk,s_q,s_kv,rounds",
+    [
+        pytest.param(512, 512, 96, 4096, None, id="d512-k512"),
+        pytest.param(512, 2048, 10, 4096, None, id="d512-k2048"),
+        # One wave: 96 queries of a 222-query three-round wave (the deterministic test runs two waves).
+        pytest.param(576, 512, 96, 4096, 3, id="d576-k512-three-rounds"),
+        pytest.param(576, 1024, 10, 2097, 1, id="d576-k1024-sorted-rows"),
+        pytest.param(576, 1152, 10, 2097, 1, id="d576-k1152-sorted-rows"),
+    ],
+)
+@pytest.mark.parametrize("has_topk_length", [True, False], ids=["lengths", "full"])
+@torch_fork_set_rng(seed=20261105)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_back_to_back_inputs(head_dim, topk, s_q, s_kv, rounds, has_topk_length):
+    """Back-to-back calls with different inputs on one workspace each match their own reference.
+
+    Repeating identical inputs would mask a launch that reads the previous call's rows or records,
+    so every call takes new indices, and the last one is rerun on poisoned scratch for a bitwise check.
+    ``rounds`` is the D576 wave round count the shapes select.
+    """
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk)
+    if rounds is not None:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+        assert interface._rank_shard_rounds(s_kv, topk, True, 128) == rounds
+
+    calls = [_h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=has_topk_length) for _ in range(3)]
+    plan, workspace, outputs, tail = _h128_deterministic_plan(head_dim, *calls[0])
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    bitwise_bits(workspace).fill_(0xA5)
+    results = []
+    for inputs, topk_length, softmax_scale in calls:
+        results.append(tuple(tensor.clone() for tensor in _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)))
+    torch.cuda.synchronize()
+    for call, ((inputs, topk_length, softmax_scale), result) in enumerate(zip(calls, results)):
+        q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+        try:
+            check_ref_dsa_sparse_attention_backward(
+                q, kv, attn_sink, topk_idxs, out, dout, lse, *result, softmax_scale=softmax_scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+            )
+        except AssertionError as error:
+            raise AssertionError(f"back-to-back call {call} differs from its reference") from error
+    inputs, topk_length, softmax_scale = calls[-1]
+    bitwise_bits(workspace).fill_(0xA5)
+    rerun = _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+    torch.cuda.synchronize()
+    for name, actual, expected in zip(("dQ", "dKV", "dSink"), rerun, results[-1]):
+        assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} depends on the previous call's scratch"
+    _assert_h128_scratch_tail_untouched(tail)
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim,topk", [(512, 512), (512, 1024), (576, 512), (576, 1024)], ids=["d512-k512", "d512-k1024", "d576-k512", "d576-k1024"])
+@torch_fork_set_rng(seed=20261106)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_cuda_graph_replay(head_dim, topk):
+    """A captured conflict-rank plan replays new inputs written into the captured buffers bitwise like eager calls."""
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+
+    s_q, s_kv = 96, 4096
+    assert _h128_conflict_rank_selected(head_dim, s_kv, topk)
+    inputs, topk_length, softmax_scale = _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=True)
+    plan, workspace, outputs, tail = _h128_deterministic_plan(head_dim, inputs, topk_length, softmax_scale)
+    launch_stream = torch.cuda.Stream()
+    launch_stream.wait_stream(torch.cuda.current_stream())
+    stream = cuda.CUstream(launch_stream.cuda_stream)
+
+    with torch.cuda.stream(launch_stream):
+        _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=launch_stream):
+            _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+        for replay in range(2):
+            new_inputs, new_topk_length, _ = _h128_conflict_rank_inputs(head_dim, s_q, s_kv, topk, has_topk_length=True)
+            # The new inputs were produced on the current stream; the captured buffers are rewritten and
+            # replayed on the launch stream after them.
+            launch_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(launch_stream):
+                for buffer, value in zip(inputs, new_inputs):
+                    buffer.copy_(value)
+                topk_length.copy_(new_topk_length)
+                for buffer in (workspace, *outputs):
+                    bitwise_bits(buffer).fill_(0xA5)
+                graph.replay()
+            torch.cuda.synchronize()
+            replayed = tuple(tensor.clone() for tensor in outputs)
+            with torch.cuda.stream(launch_stream):
+                for buffer in (workspace, *outputs):
+                    bitwise_bits(buffer).fill_(0xA5)
+                eager = _h128_execute(plan, inputs, outputs, topk_length, softmax_scale, workspace, stream)
+            torch.cuda.synchronize()
+            for name, actual, expected in zip(("dQ", "dKV", "dSink"), replayed, eager):
+                assert torch.equal(bitwise_bits(actual), bitwise_bits(expected)), f"{name} graph replay {replay} differs from eager"
+            q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+            check_ref_dsa_sparse_attention_backward(
+                q, kv, attn_sink, topk_idxs, out, dout, lse, *replayed, softmax_scale=softmax_scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+            )
+        _assert_h128_scratch_tail_untouched(tail)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L2
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("head_dim,topk,s_kv", [(512, 1024, 131072), (576, 128, 131072)], ids=["d512-few-planes", "d576-two-rounds"])
+@torch_fork_set_rng(seed=20261107)
+def test_DSA_sparse_attention_backward_h128_conflict_rank_long_kv(head_dim, topk, s_kv):
+    """Long KV extents: the few-plane D512 plan and the two-round top-k 128 D576 plan stay exact and reproducible."""
+    try:
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        return pytest.skip("Environment not supported: cuda-python not installed")
+    _require_h128_two_cta()
+    if head_dim == 512:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+        assert getattr(interface._get_sm100_kernel_class("h128_2cta_m64", True, 1, s_kv, 512, 128, None, max_topk=topk), "rank_few_planes", False)
+    else:
+        interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_d576")
+        assert interface._rank_shard_rounds(s_kv, topk, True, 128) == 2
+
+    _check_h128_deterministic_case(
+        head_dim, 160, s_kv, topk, has_topk_length=True, layout="conflict_rank", repeats=3, label=f"H128/D{head_dim} long KV K={topk}"
+    )
 
 
 @pytest.mark.L2
@@ -1522,6 +2298,9 @@ def test_DSA_sparse_attention_backward_sm100_deterministic_adaptive_shards_repea
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
 
+# Conflict-rank records are the default deterministic dKV layout at these shapes. The relay tests below select
+# the shard and cluster-relay layout with deterministic_dkv_mode="shards", whose automatic relay width they check;
+# the explicit-relay tests pass deterministic_relay_cluster_size, which selects the relay in every mode but 'chain'.
 @pytest.mark.L2
 @torch_fork_set_rng(seed=421)
 def test_DSA_sparse_attention_backward_sm100_cluster8_repeat100():
@@ -1538,6 +2317,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_repeat100():
             check_graph=True,
             check_short_workspace=True,
             expected_relay_cluster_size=8,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1558,6 +2338,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_topk2048():
             has_topk_length=True,
             check_graph=True,
             expected_relay_cluster_size=8,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1585,6 +2366,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_two_head_blocks(shared_top
             shared_topk=shared_topk,
             has_topk_length=has_topk_length,
             expected_relay_cluster_size=8,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1604,6 +2386,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster8_d512():
             topk=129,
             shared_topk=True,
             expected_relay_cluster_size=8,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1692,6 +2475,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster4_repeat100():
             check_graph=True,
             check_short_workspace=True,
             expected_relay_cluster_size=4,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1713,6 +2497,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster16_repeat100():
             check_graph=True,
             check_short_workspace=True,
             expected_relay_cluster_size=16,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1741,6 +2526,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster16_boundaries(num_heads, hea
             strided_topk=not shared_topk,
             has_topk_length=has_topk_length,
             expected_relay_cluster_size=16,
+            deterministic_dkv_mode="shards",
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
@@ -1760,10 +2546,828 @@ def test_DSA_sparse_attention_backward_sm100_cluster4_fp16():
             topk=64,
             strided_topk=True,
             expected_relay_cluster_size=4,
+            deterministic_dkv_mode="shards",
             dtype=torch.float16,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+def _deterministic_case_inputs(num_heads, head_dim, s_q, s_kv, topk, *, dtype=torch.bfloat16, shared_topk=False, duplicate_topk=False, invalid_topk=False):
+    """One deterministic input set and its forward reference; ``topk_length`` holds a full and an empty row."""
+    device = torch.device("cuda")
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(s_q, num_heads, head_dim, dtype=dtype, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    if shared_topk:
+        topk_idxs = torch.randperm(s_kv, device=device)[:topk].repeat(s_q, 1).to(torch.int32)
+    else:
+        topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    if duplicate_topk and topk > 1:
+        topk_idxs[::2, 1] = topk_idxs[::2, 0]
+    if invalid_topk and topk > 2:
+        topk_idxs[1::3, -1] = -1
+        topk_idxs[2::3, -2] = s_kv + 3
+    topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
+    topk_length[0] = topk
+    if s_q > 1:
+        topk_length[s_q // 2] = 0
+    out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out)
+    return (q, kv, out, dout, lse, attn_sink, topk_idxs), topk_length, softmax_scale
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_deterministic_dkv_mode_public_contract():
+    """Records stay the default deterministic dKV mode of the plan and the wrapper."""
+    from cudnn import DSA
+
+    wrapper = inspect.signature(DSA.sparse_attention_backward_wrapper).parameters
+    plan = inspect.signature(DSA.SparseAttentionBackward).parameters
+    assert wrapper["deterministic_dkv_mode"].default == "records"
+    assert plan["deterministic_dkv_mode"].default == "records"
+    # The new option follows every positional parameter of the existing signatures.
+    assert list(wrapper)[-1] == "deterministic_dkv_mode"
+    assert list(plan)[-1] == "deterministic_dkv_mode"
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_deterministic_dkv_mode_selection():
+    """Records are the default generic M64 layout where they fit; chain mode applies where the chain relay fits."""
+    deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    select = deterministic.deterministic_kernel_class
+    records = deterministic.FlashAttentionDSABackwardSm100DeterministicRankShard
+    chain = deterministic.FlashAttentionDSABackwardSm100DeterministicRankChain
+
+    # Records whenever their workspace fits the shard or relay layout; without a top-k width the layout is unchanged.
+    assert select(300, 4096, 512, 64, max_topk=64) is records
+    assert select(300, 4096, 512, 64) is deterministic.FlashAttentionDSABackwardSm100Deterministic
+    assert select(257, 65537, 576, 64, max_topk=511) is records
+    assert select(257, 65537, 576, 64) is deterministic.FlashAttentionDSABackwardSm100DeterministicCluster8
+    # Plans whose records would be larger keep the shard layout.
+    assert select(8, 256, 512, 64, max_topk=64) is deterministic.FlashAttentionDSABackwardSm100Deterministic32
+    assert select(300, 4096, 512, 64, max_topk=2048) is deterministic.FlashAttentionDSABackwardSm100Deterministic
+    # Chain mode: the chain relay where it applies, the default selection elsewhere.
+    assert select(300, 4096, 512, 64, max_topk=64, dkv_mode="chain") is chain
+    assert select(300, 4096, 576, 96, max_topk=64, dkv_mode="chain") is chain
+    assert select(148, 278528, 512, 64, max_topk=64, dkv_mode="chain") is records
+    assert select(8, 256, 512, 64, max_topk=64, dkv_mode="chain") is deterministic.FlashAttentionDSABackwardSm100Deterministic32
+    # An explicit relay selects that relay in records mode and is rejected in chain mode.
+    assert select(257, 65537, 512, 64, deterministic_relay_cluster_size=4, max_topk=129) is deterministic.FlashAttentionDSABackwardSm100DeterministicCluster4
+    with pytest.raises(ValueError, match="cannot be combined with an explicit deterministic_relay_cluster_size"):
+        select(257, 65537, 512, 64, deterministic_relay_cluster_size=4, max_topk=129, dkv_mode="chain")
+    with pytest.raises(ValueError, match="cannot be combined with an explicit deterministic_relay_cluster_size"):
+        interface.flash_attn_bwd_sm100_workspace_size(
+            257, 65537, 512, 64, deterministic=True, backend="generic_m64", deterministic_relay_cluster_size=4, max_topk=129, dkv_mode="chain"
+        )
+    # Cache-key fields: the plane count, relay width and dKV layout reconstruct each class.
+    assert (records.num_dkv_shards, records.dkv_relay_cluster_size, records.dkv_layout) == (1, 1, "records")
+    assert (chain.num_dkv_shards, chain.dkv_relay_cluster_size, chain.dkv_layout) == (1, 1, "chain")
+    assert deterministic._deterministic_kernel_class_for_config(1, 1, "records") is records
+    assert deterministic._deterministic_kernel_class_for_config(1, 1, "chain") is chain
+    assert deterministic._deterministic_kernel_class_for_config(32, 1) is deterministic.FlashAttentionDSABackwardSm100Deterministic32
+    assert deterministic._deterministic_kernel_class_for_config(16, 8, "relay") is deterministic.FlashAttentionDSABackwardSm100DeterministicCluster8
+    for config in ((1, 1, "planes"), (32, 1, "records"), (32, 1, "relay"), (16, 8, "shards")):
+        with pytest.raises(ValueError):
+            deterministic._deterministic_kernel_class_for_config(*config)
+    # Deterministic H96 D576 outside the two-CTA envelope runs the generic kernel where conflict-rank storage applies.
+    assert interface._select_sm100_backend(96, 576, max_topk=64, deterministic=True, total_s_q=300, total_s_kv=4096) == ("generic_m64", 64)
+    assert interface._get_sm100_kernel_class("generic_m64", True, 300, 4096, 576, 96, max_topk=64) is records
+    assert interface._get_sm100_kernel_class("generic_m64", True, 300, 4096, 576, 96, max_topk=64, dkv_mode="chain") is chain
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic_dkv_mode", ["records", "chain"])
+def test_DSA_sparse_attention_backward_sm100_rank_workspace_within_shard_or_relay_layout(deterministic_dkv_mode):
+    """Neither dKV mode needs more scratch than the plan's ``'shards'`` layout.
+
+    That is the generic shard or relay layout; for chain-mode H96 D576 it is the fixed 128-plane layout of the
+    H64 + H32 composition, which runs deterministic H96 D576 outside the two-CTA envelope in ``'shards'`` mode.
+    """
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    size = interface.flash_attn_bwd_sm100_workspace_size
+    for num_heads in (16, 64, 96, 128):
+        for head_dim in (512, 576):
+            for s_q in (1, 147, 149, 300, 1037, 4096):
+                for s_kv in (100, 4096, 65537, 278528):
+                    for topk in (1, 64, 511, 2048):
+                        common = (s_q, s_kv, head_dim, num_heads)
+                        layout = size(*common, deterministic=True, backend="generic_m64")
+                        if deterministic_dkv_mode == "chain" and (num_heads, head_dim) == (96, 576):
+                            layout = size(*common, deterministic=True, backend="h96_h64_h32")
+                        actual = size(*common, deterministic=True, backend="generic_m64", max_topk=topk, dkv_mode=deterministic_dkv_mode)
+                        assert actual <= layout, f"H{num_heads} D{head_dim} S_q={s_q} S_kv={s_kv} K={topk}: {actual} > {layout}"
+
+
+def _integer_device_methods(module, class_name, names):
+    """Compile the named methods of a CuTe DSL class as plain Python over integers.
+
+    The conflict-rank geometry methods use only integer arithmetic, ``min``/``max``, ``cute.round_up`` and
+    ``const_expr``: with the DSL scalar types replaced by ``int`` they compute on the host what the kernels
+    compute for a runtime KV extent.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    device = ast.parse("class IntegerDevice:\n    pass").body[0]
+    device.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert sorted(node.name for node in device.body) == sorted(names)
+    for node in device.body:
+        node.decorator_list = []
+    scope = dict(
+        vars(module),
+        Int32=int,
+        Int64=int,
+        cute=types.SimpleNamespace(round_up=lambda value, multiple: -(-value // multiple) * multiple),
+        cutlass=types.SimpleNamespace(const_expr=bool),
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[device], type_ignores=[])), f"<{class_name} on integers>", "exec"), scope)
+    return scope["IntegerDevice"]
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_rank_device_geometry_matches_host_sizing():
+    """The kernels' plane geometry and workspace regions agree with the host functions that size the workspace.
+
+    ``rank_geometry`` repeats the host plane-count rule for the runtime KV extent (records: ``rank_m64_planes``;
+    chain: ``rank_chain_planes(..., records=False)``), and the device region offsets end where the host workspace
+    size does (records: before the split pairs' dQ partials). The device methods run here on integers.
+    """
+    shard = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_rank_shard_m64")
+    chain = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_rank_chain_m64")
+    records_device = _integer_device_methods(shard, "RankShardM64Reduction", ("rank_geometry", "rank_slot_stride", "rank_offsets", "rank_high", "rank_flags"))
+    chain_device = _integer_device_methods(
+        chain,
+        "RankChainM64Reduction",
+        (
+            "rank_geometry",
+            "rank_wave",
+            "rank_state_words",
+            "rank_offsets",
+            "rank_high",
+            "rank_chain_offsets",
+            "rank_tile_flags",
+            "rank_hot_depths",
+            "rank_hot_list",
+            "rank_hot_rows",
+            "rank_hot_slots",
+        ),
+    )
+    shapes = itertools.product((16, 64, 96, 128), (512, 576), (1, 3, 64, 127, 512, 2047, 2048), (1, 148, 149, 4096), (1, 100, 4096, 65537, 524288))
+    for num_heads, head_dim, topk, s_q, s_kv in shapes:
+        if not 0 < shard.RANK_M64_WAVE * topk < 1 << shard.RANK_M64_FIELD_BITS:
+            continue
+        case = f"H{num_heads} D{head_dim} K={topk} S_q={s_q} S_kv={s_kv}"
+        wave = shard.rank_m64_wave(num_heads, head_dim, topk, s_q, s_kv)
+        split = shard.rank_m64_split(num_heads, head_dim, topk, s_q, s_kv)
+        records = records_device()
+        records.head_dim, records.max_topk, records.q_wave_ctas = head_dim, topk, wave
+        pitch, planes = records.rank_geometry(s_kv)
+        assert (pitch, planes) == (shard.rank_m64_pitch(s_kv), shard.rank_m64_planes(s_kv, head_dim, topk, wave)), case
+        assert all(offset % 8 == 0 for offset in records.rank_offsets(pitch, planes)), case
+        end = records.rank_flags(pitch, planes) + shard.RANK_M64_FLAG_WORDS
+        if split:
+            end = (end + 3) // 4 * 4 + wave * 64 * shard.rank_m64_record(head_dim)
+        words = shard.rank_m64_workspace_words(s_kv, head_dim, topk, wave, split)
+        assert end <= words if split else end == words, case
+        relay = chain_device()
+        relay.head_dim, relay.max_topk = head_dim, topk
+        pitch, planes = relay.rank_geometry(s_kv)
+        assert (pitch, planes) == (shard.rank_m64_pitch(s_kv), chain.rank_chain_planes(s_kv, head_dim, topk, records=False)), case
+        end = relay.rank_hot_list(pitch, planes) + 2 * relay.rank_hot_rows()
+        assert end == chain.rank_chain_workspace_words(s_kv, head_dim, topk, records=False), case
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_records_plan_ignores_query_extent():
+    """A records plan's compile-time wave configuration does not follow the query count.
+
+    The wave size and the split rule depend on the head count, head dimension, top-k width and KV extent; only
+    the strided wave order switches on, once a plan has ``RANK_M64_STRIDED_MIN_WAVES`` waves.
+    """
+    shard = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_rank_shard_m64")
+    shapes = ((64, 512, 64, 4096), (64, 576, 2048, 65537), (96, 576, 64, 4096), (128, 512, 1536, 8192), (16, 576, 128, 278528), (64, 576, 2048, 278528))
+    assert shard.rank_m64_split(64, 576, 2048, 1, 278528)  # a split plan: half waves at every query count
+    for num_heads, head_dim, topk, s_kv in shapes:
+        wave = shard.rank_m64_wave(num_heads, head_dim, topk, 1, s_kv)
+        assert wave in (shard.RANK_M64_WAVE, shard.RANK_M64_WAVE // 2)
+        last_unstrided = (shard.RANK_M64_STRIDED_MIN_WAVES - 1) * wave
+        for extents in ((1, 2, wave - 1, wave, wave + 1, last_unstrided), (last_unstrided + 1, 4 * last_unstrided, 65536)):
+            keys = {
+                (shard.rank_m64_wave(num_heads, head_dim, topk, s_q, s_kv), shard.rank_m64_mode(num_heads, head_dim, topk, s_q, s_kv, wave)) for s_q in extents
+            }
+            assert len(keys) == 1, f"H{num_heads} D{head_dim} K={topk} S_kv={s_kv}: {sorted(keys)} over S_q {extents}"
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_deterministic_dkv_mode_validation():
+    """Every layer that takes the dKV mode checks it, without a GPU.
+
+    Unknown names are rejected, the non-default modes need ``deterministic=True``, ``'chain'`` is rejected on the
+    backends that never run the generic M64 kernel and together with an explicit relay width, and ``'shards'``
+    selects exactly the class a plan without a top-k width selects (the shard or cluster-relay layout).
+    """
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    deterministic = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_deterministic")
+    error = common.deterministic_dkv_mode_error
+    for mode in ("records", "chain", "shards"):
+        assert error(mode, True) is None
+    assert error("records", False) is None
+    for mode in ("chain", "shards"):
+        assert error(mode, False) == f"deterministic_dkv_mode={mode!r} requires deterministic=True"
+    for value in ("planes", "Records", None, 0):
+        assert error(value, True).startswith("deterministic_dkv_mode must be one of")
+    for backend in ("generic_m64", "h96_h64_h32"):
+        assert error("chain", True, backend) is None
+    for backend in ("h16_m128", "h32_m64", "h128_2cta_m64", "h96_d576_2cta_m64", "h128_d576_2cta_m64"):
+        assert error("chain", True, backend) == "deterministic_dkv_mode='chain' is supported only by the deterministic SM100 generic_m64 backend"
+        assert error("shards", True, backend) is None
+        assert error("records", True, backend) is None
+
+    size = interface.flash_attn_bwd_sm100_workspace_size
+    with pytest.raises(ValueError, match="deterministic_dkv_mode must be one of"):
+        size(300, 4096, 512, 64, deterministic=True, backend="generic_m64", max_topk=64, dkv_mode="planes")
+    with pytest.raises(ValueError, match="requires deterministic=True"):
+        size(300, 4096, 512, 64, deterministic=False, backend="generic_m64", max_topk=64, dkv_mode="shards")
+    for backend, num_heads in (("h128_2cta_m64", 128), ("h96_d576_2cta_m64", 96), ("h128_d576_2cta_m64", 128)):
+        with pytest.raises(ValueError, match="supported only by the deterministic SM100 generic_m64 backend"):
+            size(257, 256, 576, num_heads, deterministic=True, backend=backend, max_topk=128, dkv_mode="chain")
+        with pytest.raises(ValueError, match="supported only by the deterministic SM100 generic_m64 backend"):
+            interface._get_sm100_kernel_class(backend, True, 257, 256, 576, num_heads, max_topk=128, dkv_mode="chain")
+    with pytest.raises(ValueError, match="deterministic_dkv_mode must be one of"):
+        interface._get_sm100_kernel_class("generic_m64", True, 300, 4096, 512, 64, max_topk=64, dkv_mode="planes")
+    with pytest.raises(ValueError, match="cannot be combined with an explicit deterministic_relay_cluster_size"):
+        interface._get_sm100_kernel_class("generic_m64", True, 257, 65537, 512, 64, 8, max_topk=129, dkv_mode="chain")
+    with pytest.raises(ValueError, match="deterministic_dkv_mode must be one of"):
+        deterministic.deterministic_kernel_class(300, 4096, 512, 64, max_topk=64, dkv_mode="planes")
+    with pytest.raises(ValueError, match="deterministic_dkv_mode must be one of"):
+        deterministic.rank_dkv_route(300, 4096, 512, 64, 64, dkv_mode="planes")
+
+    select = deterministic.deterministic_kernel_class
+    for shape in ((8, 256, 512, 64), (300, 4096, 512, 64), (300, 4096, 576, 96), (257, 65537, 576, 64), (8192, 1048576, 512, 64)):
+        for topk in (64, 511, 2048):
+            assert deterministic.rank_dkv_route(*shape, topk, dkv_mode="shards") is None
+            assert select(*shape, max_topk=topk, dkv_mode="shards") is select(*shape)
+    # An explicit relay selects that relay in 'records' and 'shards' mode.
+    for mode in ("records", "shards"):
+        assert select(257, 65537, 512, 64, 16, max_topk=129, dkv_mode=mode) is deterministic.FlashAttentionDSABackwardSm100DeterministicCluster16
+    # Deterministic H96 D576 outside the two-CTA envelope: 'shards' keeps the H64 + H32 composition.
+    for mode in ("records", "shards"):
+        expected = ("generic_m64", 64) if mode == "records" else ("h96_h64_h32", 64)
+        assert interface._select_sm100_backend(96, 576, max_topk=64, deterministic=True, total_s_q=300, total_s_kv=4096, dkv_mode=mode) == expected
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_dkv_mode_rejects_before_staging(monkeypatch):
+    """Invalid dKV mode requests fail in the wrapper before it stages any input (no GPU needed)."""
+    api = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.api")
+
+    def forbidden_staging(*args, **kwargs):
+        raise AssertionError("an invalid dKV mode reached input staging")
+
+    monkeypatch.setattr(api, "contiguous_on_stream", forbidden_staging)
+    args = (torch.empty(0), None, None, None, None, None, None)
+    with pytest.raises(ValueError, match="deterministic_dkv_mode must be one of"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_dkv_mode="planes")
+    for mode in ("chain", "shards"):
+        with pytest.raises(ValueError, match=f"deterministic_dkv_mode='{mode}' requires deterministic=True"):
+            api.sparse_attention_backward_wrapper(*args, deterministic=False, deterministic_dkv_mode=mode)
+    with pytest.raises(ValueError, match="cannot be combined with an explicit deterministic_relay_cluster_size"):
+        api.sparse_attention_backward_wrapper(*args, deterministic=True, deterministic_relay_cluster_size=8, deterministic_dkv_mode="chain")
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_wrapper_caches_one_plan_per_dkv_mode(monkeypatch):
+    """The wrapper's plan cache keeps one plan per dKV mode; the default mode's key carries no mode entry."""
+    if not torch.cuda.is_available():
+        pytest.skip("Environment not supported: CUDA device required")
+    api = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.api")
+    built = []
+
+    class FakePlan:
+        """Stands in for SparseAttentionBackward: records the requested mode, compiles nothing."""
+
+        def __init__(self, **kwargs):
+            self.mode = kwargs["deterministic_dkv_mode"]
+            built.append(self.mode)
+
+        def check_support(self):
+            return True
+
+        def compile(self):
+            pass
+
+        def scratch_workspace_bytes(self):
+            return 0
+
+        def execute(self, q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv, **kwargs):
+            return dq, dkv, kwargs["d_sink"]
+
+    monkeypatch.setattr(api, "SparseAttentionBackward", FakePlan)
+    monkeypatch.setattr(api, "_cache_of_SparseAttentionBackwardObjects", {})
+    device = torch.device("cuda")
+    q = torch.zeros(2, 64, 512, dtype=torch.bfloat16, device=device)
+    inputs = (
+        q,
+        torch.zeros(64, 512, dtype=torch.bfloat16, device=device),
+        torch.zeros_like(q),
+        torch.zeros_like(q),
+        torch.zeros(2, 64, dtype=torch.float32, device=device),
+        torch.zeros(64, dtype=torch.float32, device=device),
+        torch.zeros(2, 64, dtype=torch.int32, device=device),
+    )
+    for mode in ("records", "chain", "shards") * 2:
+        api.sparse_attention_backward_wrapper(*inputs, softmax_scale=0.05, deterministic=True, deterministic_dkv_mode=mode)
+    assert built == ["records", "chain", "shards"]
+    keys = {plan.mode: key for key, plan in api._cache_of_SparseAttentionBackwardObjects.items()}
+    assert len(keys) == len(api._cache_of_SparseAttentionBackwardObjects) == 3
+    assert keys["chain"] == keys["records"] + ("chain",)
+    assert keys["shards"] == keys["records"] + ("shards",)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm90_rejects_chain_dkv_mode():
+    """SM90 has no generic M64 kernel: a chain request fails check_support instead of being ignored."""
+    _require_sm90()
+    from cudnn import DSA
+
+    device = torch.device("cuda")
+    q = torch.randn(2, 64, 512, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(64, 512, dtype=torch.bfloat16, device=device)
+    out = torch.randn(2, 64, 512, dtype=torch.bfloat16, device=device)
+    lse = torch.zeros(2, 64, dtype=torch.float32, device=device)
+    attn_sink = torch.zeros(64, dtype=torch.float32, device=device)
+    topk_idxs = torch.zeros(2, 64, dtype=torch.int32, device=device)
+    plan = DSA.SparseAttentionBackward(q, kv, out, out, lse, attn_sink, topk_idxs, softmax_scale=0.05, deterministic=True, deterministic_dkv_mode="chain")
+    with pytest.raises(ValueError, match="supported only by the deterministic SM100 generic_m64 backend"):
+        plan.check_support()
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_chain_mode_rejects_invalid_requests():
+    """Non-default modes are deterministic-only, chain mode never drops a requested relay width, and the mode name is checked."""
+    from cudnn import DSA
+
+    _require_sm100()
+    device = torch.device("cuda")
+    q = torch.randn(2, 64, 512, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(64, 512, dtype=torch.bfloat16, device=device)
+    out = torch.randn(2, 64, 512, dtype=torch.bfloat16, device=device)
+    lse = torch.zeros(2, 64, dtype=torch.float32, device=device)
+    attn_sink = torch.zeros(64, dtype=torch.float32, device=device)
+    topk_idxs = torch.zeros(2, 64, dtype=torch.int32, device=device)
+    cases = (
+        (dict(deterministic=True, deterministic_relay_cluster_size=4, deterministic_dkv_mode="chain"), "cannot be combined with an explicit"),
+        (dict(deterministic=False, deterministic_dkv_mode="chain"), "requires deterministic=True"),
+        (dict(deterministic=False, deterministic_dkv_mode="shards"), "requires deterministic=True"),
+        (dict(deterministic=True, deterministic_dkv_mode="planes"), "deterministic_dkv_mode must be one of"),
+    )
+    for options, message in cases:
+        plan = DSA.SparseAttentionBackward(q, kv, out, out, lse, attn_sink, topk_idxs, softmax_scale=0.05, **options)
+        with pytest.raises(ValueError, match=message):
+            plan.check_support()
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_conflict_rank_capabilities():
+    """Conflict-rank dKV storage is provided only on compute capability 10.0 and 10.3 (no GPU needed).
+
+    On 10.7 a deterministic ``'records'`` request resolves to ``'shards'`` (the backend, kernel class and workspace
+    of the ``'shards'`` plan) and ``'chain'`` is rejected by name of the compute capability; ``None`` stands for an
+    SM100/SM103 device, where every request is unchanged.
+    """
+    common = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100_common")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    effective, error = common.effective_deterministic_dkv_mode, common.deterministic_dkv_mode_error
+    for capability in (None, (10, 0), (10, 3)):
+        for mode in ("records", "chain", "shards"):
+            assert effective(mode, True, capability) == mode
+            assert error(mode, True, device_capability=capability) is None
+    assert effective("records", True, (10, 7)) == effective("shards", True, (10, 7)) == "shards"
+    assert effective("records", False, (10, 7)) == "records"
+    for mode in ("records", "shards"):
+        assert error(mode, True, device_capability=(10, 7)) is None
+    assert error("chain", True, device_capability=(10, 7)).endswith("found compute capability 10.7")
+
+    size = interface.flash_attn_bwd_sm100_workspace_size
+    select = interface._get_sm100_kernel_class
+    for s_q, s_kv, head_dim, num_heads, topk in ((300, 4096, 512, 64, 64), (257, 65537, 576, 64, 511), (148, 278528, 512, 64, 64)):
+        shape, options = (s_q, s_kv, head_dim, num_heads, True), dict(backend="generic_m64", max_topk=topk)
+        records, shards = size(*shape, **options), size(*shape, **options, dkv_mode="shards")
+        # These shapes store dKV in conflict-rank records on SM100/SM103.
+        assert select("generic_m64", True, s_q, s_kv, head_dim, num_heads, max_topk=topk).dkv_layout == "records"
+        assert records < shards
+        for capability in ((10, 0), (10, 3)):
+            assert size(*shape, **options, device_capability=capability) == records
+        try:
+            shards_cls = select("generic_m64", True, s_q, s_kv, head_dim, num_heads, max_topk=topk, dkv_mode="shards")
+        except RuntimeError as relay_floor:
+            # The cluster relay that some of these shapes select keeps its own CuTe DSL floor.
+            assert "cluster relay requires nvidia-cutlass-dsl" in str(relay_floor)
+            shards_cls = None
+        for mode in ("records", "shards"):
+            assert size(*shape, **options, dkv_mode=mode, device_capability=(10, 7)) == shards
+            if shards_cls is not None:
+                assert select("generic_m64", True, s_q, s_kv, head_dim, num_heads, max_topk=topk, dkv_mode=effective(mode, True, (10, 7))) is shards_cls
+        with pytest.raises(ValueError, match=r"found compute capability 10\.7"):
+            size(*shape, **options, dkv_mode="chain", device_capability=(10, 7))
+    # Deterministic H96 D576 outside the two-CTA envelope keeps the H64 + H32 composition on 10.7.
+    h96 = dict(head_dim_v=512, dtype=torch.bfloat16, max_topk=64, deterministic=True, total_s_q=300, total_s_kv=4096)
+    for capability in ((10, 0), (10, 3)):
+        assert interface._select_sm100_backend(96, 576, **h96, device_capability=capability) == ("generic_m64", 64)
+    assert interface._select_sm100_backend(96, 576, **h96, device_capability=(10, 7)) == ("h96_h64_h32", 64)
+    assert interface._select_sm100_backend(96, 576, **h96, device_capability=(10, 7), dkv_mode="shards") == ("h96_h64_h32", 64)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm107_plans_keep_shard_layouts(monkeypatch):
+    """Plans on compute capability 10.7 (mocked; nothing compiles) run ``'records'`` as ``'shards'`` and reject ``'chain'``.
+
+    The default plan's backend, dKV route, address width, scratch size and compiled configuration equal those of the
+    ``'shards'`` plan, and ``'chain'`` fails ``check_support()`` and the direct ``flash_attn_bwd_sm100`` entry with
+    an error that names the compute capability, before any compilation.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("Environment not supported: CUDA device required")
+    api = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward.api")
+    interface = _import_or_skip("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    compiled = []
+
+    def record_compile(*args, **kwargs):
+        """Record the deterministic compile signature instead of compiling."""
+        compiled.append((args, kwargs))
+        return object()
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("a 10.7 plan reached cute.compile")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
+    monkeypatch.setattr(api, "device_capability", lambda device: (10, 7))
+    monkeypatch.setattr(interface, "_device_capability", lambda device: (10, 7))
+    monkeypatch.setattr(interface, "_compile_deterministic_sm100", record_compile)
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    device = torch.device("cuda")
+    capability_error = r"found compute capability 10\.7"
+
+    for num_heads, head_dim, backend in ((64, 512, "generic_m64"), (96, 576, "h96_h64_h32")):
+        s_q, s_kv, topk, head_dim_v = 300, 4096, 64, 512
+        inputs = (
+            torch.zeros(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device),
+            torch.zeros(s_kv, head_dim, dtype=torch.bfloat16, device=device),
+            torch.zeros(s_q, num_heads, head_dim_v, dtype=torch.bfloat16, device=device),
+            torch.zeros(s_q, num_heads, head_dim_v, dtype=torch.bfloat16, device=device),
+            torch.zeros(s_q, num_heads, dtype=torch.float32, device=device),
+            torch.zeros(num_heads, dtype=torch.float32, device=device),
+            torch.zeros(s_q, topk, dtype=torch.int32, device=device),
+        )
+        plans = {}
+        for mode in ("records", "shards"):
+            plan = api.SparseAttentionBackward(*inputs, softmax_scale=0.05, deterministic=True, deterministic_dkv_mode=mode)
+            assert plan.check_support()
+            plan.compile()
+            plans[mode] = (plan, compiled[-1])
+        (records, records_compile), (shards, shards_compile) = plans["records"], plans["shards"]
+        assert records._backend == shards._backend == backend
+        assert records._deterministic_dkv_route() == shards._deterministic_dkv_route() == ("shards" if backend == "generic_m64" else None)
+        assert records._wide_addressing == shards._wide_addressing
+        assert records.scratch_workspace_bytes() == shards.scratch_workspace_bytes()
+        assert records_compile == shards_compile
+        # On SM100/SM103 the default plan of this shape stores dKV in conflict-rank records, which need less scratch.
+        sm100_records = interface.flash_attn_bwd_sm100_workspace_size(s_q, s_kv, head_dim, num_heads, True, backend="generic_m64", max_topk=topk)
+        assert sm100_records < records.scratch_workspace_bytes()
+        chain = api.SparseAttentionBackward(*inputs, softmax_scale=0.05, deterministic=True, deterministic_dkv_mode="chain")
+        with pytest.raises(ValueError, match=capability_error):
+            chain.check_support()
+        q, kv, out, dout, lse, attn_sink, topk_idxs = inputs
+        outputs = dict(dq=torch.empty_like(q), dkv=torch.empty_like(kv), d_sink=torch.empty_like(attn_sink))
+        with pytest.raises(ValueError, match=capability_error):
+            interface.flash_attn_bwd_sm100(q, kv, out, dout, lse, attn_sink, topk_idxs, deterministic=True, dkv_mode="chain", **outputs)
+
+
+@torch_fork_set_rng(seed=20261105)
+@pytest.mark.parametrize(
+    "num_heads,head_dim,s_q,s_kv,topk,options",
+    [
+        pytest.param(64, 512, 300, 4096, 64, {}, marks=pytest.mark.L1, id="d512-partial-wave"),
+        pytest.param(16, 576, 300, 4096, 64, {"check_short_workspace": True}, marks=pytest.mark.L1, id="h16-d576-padded-heads"),
+        pytest.param(64, 576, 300, 4096, 64, {"duplicate_topk": True, "invalid_topk": True}, marks=pytest.mark.L1, id="d576-duplicate-invalid"),
+        pytest.param(64, 576, 1037, 4096, 64, {"check_graph": True}, marks=pytest.mark.L1, id="d576-strided-waves-graph"),
+        pytest.param(96, 576, 300, 4096, 64, {"check_graph": True, "duplicate_topk": True}, marks=pytest.mark.L1, id="h96-d576-head-pair-graph"),
+        pytest.param(128, 512, 300, 4096, 64, {"shared_topk": True, "invalid_topk": True}, marks=pytest.mark.L1, id="h128-d512-shared-rows"),
+        pytest.param(64, 512, 300, 4096, 64, {"repeats": 100, "check_graph": True}, marks=pytest.mark.L2, id="d512-repeat100"),
+        pytest.param(64, 512, 148, 278528, 64, {"check_graph": True, "check_short_workspace": True}, marks=pytest.mark.L2, id="large-kv-records"),
+        pytest.param(64, 512, 147, 278528, 2047, {"invalid_topk": True}, marks=pytest.mark.L2, id="split-pairs"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_records_bitwise_and_graph(num_heads, head_dim, s_q, s_kv, topk, options):
+    """Default (records) plans: bitwise run-to-run, graph replay, duplicate and invalid indices, and runtime lengths."""
+    options = dict(options)
+    repeats = options.pop("repeats", 3)
+    try:
+        _exercise_deterministic_sm100_case(
+            num_heads,
+            head_dim,
+            s_q,
+            s_kv,
+            repeats,
+            topk=topk,
+            expected_dkv_route="records",
+            high_fan_in_reference=bool(options.get("shared_topk") or options.get("duplicate_topk")),
+            **options,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+@torch_fork_set_rng(seed=20261106)
+@pytest.mark.parametrize(
+    "num_heads,head_dim,s_q,s_kv,topk,expected_route",
+    [
+        pytest.param(64, 512, 300, 4096, 64, "chain", marks=pytest.mark.L1, id="chain"),
+        pytest.param(96, 576, 300, 4096, 64, "chain", marks=pytest.mark.L1, id="chain-h96-d576"),
+        pytest.param(64, 512, 128, 130, 64, "shards", marks=pytest.mark.L1, id="fallback-shards"),
+        pytest.param(64, 512, 148, 278528, 64, "records", marks=pytest.mark.L2, id="fallback-records"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_chain_mode_bitwise_and_fallback(num_heads, head_dim, s_q, s_kv, topk, expected_route):
+    """``deterministic_dkv_mode='chain'`` runs the chain relay where it applies and the default layout elsewhere."""
+    try:
+        _exercise_deterministic_sm100_case(
+            num_heads,
+            head_dim,
+            s_q,
+            s_kv,
+            repeats=3,
+            topk=topk,
+            check_graph=True,
+            check_short_workspace=True,
+            duplicate_topk=True,
+            deterministic_dkv_mode="chain",
+            expected_dkv_route=expected_route,
+            high_fan_in_reference=True,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+
+def _assert_same_partial_sums(actual, expected, msg):
+    """Require two outputs that add the same partial products in different FP32 orders to agree.
+
+    Reordering FP32 additions moves a sum far less than its final rounding, so the outputs differ by at most
+    a rounding step of the output format. The bound is ``2**-7 * max(|row|.max(), 1)`` per row of the last
+    dimension (two BF16 rounding steps at the row's largest magnitude): it holds for any fan-in, while a lost
+    or repeated contribution of the row's magnitude exceeds it.
+    """
+    actual = actual.float()
+    expected = expected.float()
+    bound = 2.0**-7 * expected.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+    excess = (actual - expected).abs() - bound
+    worst = int(excess.argmax())
+    assert excess.max() <= 0, (
+        f"{msg}: {int((excess > 0).sum())} of {excess.numel()} elements exceed the reordering bound; worst at flat index "
+        f"{worst}: {actual.flatten()[worst].item()} vs {expected.flatten()[worst].item()}"
+    )
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=20261107)
+@pytest.mark.parametrize(
+    "num_heads,head_dim,deterministic_dkv_mode,expected_route",
+    [
+        pytest.param(64, 512, "records", "records", id="records-d512"),
+        pytest.param(96, 576, "records", "records", id="records-h96-d576"),
+        pytest.param(64, 512, "chain", "chain", id="chain-d512"),
+        pytest.param(96, 576, "chain", "chain", id="chain-h96-d576"),
+        pytest.param(64, 512, "shards", "shards", id="shards-d512"),
+        pytest.param(96, 576, "shards", None, id="shards-h96-d576"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_deterministic_back_to_back_inputs(num_heads, head_dim, deterministic_dkv_mode, expected_route):
+    """Different inputs run back to back on one plan and one workspace; every call matches its own reference.
+
+    The executes of an input sequence are queued on one stream with no host synchronization in between (the
+    sync debug mode rejects any), eagerly in two orders and as one CUDA graph of two executes; every output is
+    bitwise independent of the call before it. Conflict-rank plans are also compared with the ``'shards'`` plan
+    of the same inputs, which adds the same partial products in another FP32 order. ``'shards'`` runs the
+    128-shard layout here, and the H64 + H32 composition for H96 D576.
+    """
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    if expected_route in ("records", "chain"):
+        _require_conflict_rank_device()
+    s_q, s_kv, topk = 300, 4096, 64
+    cases = [
+        _deterministic_case_inputs(num_heads, head_dim, s_q, s_kv, topk),
+        _deterministic_case_inputs(num_heads, head_dim, s_q, s_kv, topk, shared_topk=True, duplicate_topk=True),
+        _deterministic_case_inputs(num_heads, head_dim, s_q, s_kv, topk, invalid_topk=True),
+    ]
+    output_names = ("dQ", "dKV", "dSink")
+    sample, sample_length, softmax_scale = cases[0]
+    device = sample[0].device
+
+    def make_plan(mode):
+        """Build, check and compile the plan of one dKV mode with its own poisoned workspace."""
+        plan = DSA.SparseAttentionBackward(
+            *sample,
+            sample_topk_length=sample_length,
+            softmax_scale=softmax_scale,
+            deterministic=True,
+            deterministic_dkv_mode=mode,
+        )
+        assert plan.check_support()
+        plan.compile()
+        workspace = torch.full((plan.scratch_workspace_bytes(),), 0xA5, dtype=torch.uint8, device=device)
+        return plan, workspace
+
+    def poisoned_outputs(case):
+        """Fresh caller outputs of one input set, filled with a NaN pattern."""
+        (q, kv, _, _, _, attn_sink, _), _, _ = case
+        buffers = (torch.empty_like(q), torch.empty_like(kv), torch.empty_like(attn_sink))
+        for buffer in buffers:
+            buffer.view(torch.uint8).fill_(0xA5)
+        return buffers
+
+    def launch(plan, workspace, case, outputs, stream):
+        """Enqueue one execute; nothing here waits for the device."""
+        (q, kv, out, dout, lse, attn_sink, topk_idxs), topk_length, scale = case
+        dq, dkv, d_sink = outputs
+        plan.execute(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            dq,
+            dkv,
+            topk_length=topk_length,
+            softmax_scale=scale,
+            workspace=workspace,
+            current_stream=stream,
+            d_sink=d_sink,
+        )
+
+    def run_back_to_back(plan, workspace, order):
+        """Execute the input sets in ``order`` back to back on one stream; the workspace is never reset."""
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        outputs = {index: poisoned_outputs(cases[index]) for index in order}
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for index in order:
+                launch(plan, workspace, cases[index], outputs[index], stream)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        torch.cuda.synchronize()
+        return [outputs[index] for index in range(len(cases))]
+
+    plan, workspace = make_plan(deterministic_dkv_mode)
+    assert plan._deterministic_dkv_route() == expected_route
+    assert plan._backend == ("h96_h64_h32" if expected_route is None else "generic_m64")
+    first = run_back_to_back(plan, workspace, (0, 1, 2))
+    second = run_back_to_back(plan, workspace, (2, 1, 0))
+    for index, (a, b) in enumerate(zip(first, second)):
+        for name, x, y in zip(output_names, a, b):
+            assert torch.equal(bitwise_bits(x), bitwise_bits(y)), f"input set {index}: {name} depends on the previous call"
+
+    # Two executes of different inputs captured back to back in one graph replay the eager results.
+    graph_stream = torch.cuda.Stream()
+    graph_handle = cuda.CUstream(graph_stream.cuda_stream)
+    graph_outputs = [poisoned_outputs(cases[index]) for index in (0, 1)]
+    graph_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(graph_stream):
+        for index in (0, 1):
+            launch(plan, workspace, cases[index], graph_outputs[index], graph_handle)
+    torch.cuda.current_stream().wait_stream(graph_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=graph_stream):
+            for index in (0, 1):
+                launch(plan, workspace, cases[index], graph_outputs[index], graph_handle)
+        for repeat in range(2):
+            with torch.cuda.stream(graph_stream):
+                for buffer in (workspace, *graph_outputs[0], *graph_outputs[1]):
+                    buffer.view(torch.uint8).fill_(0xA5)
+                graph.replay()
+            torch.cuda.synchronize()
+            for index, buffers in enumerate(graph_outputs):
+                for name, x, y in zip(output_names, buffers, first[index]):
+                    assert torch.equal(bitwise_bits(x), bitwise_bits(y)), f"graph replay {repeat}, input set {index}: {name} differs from the eager execute"
+    finally:
+        graph.reset()
+
+    if expected_route in ("records", "chain"):
+        shards_plan, shards_workspace = make_plan("shards")
+        shards = run_back_to_back(shards_plan, shards_workspace, (0, 1, 2))
+        for index, (a, b) in enumerate(zip(first, shards)):
+            for name, x, y in zip(output_names, a, b):
+                _assert_same_partial_sums(x, y, f"input set {index}: {name} vs the 'shards' plan")
+    # Input set 1 (shared and repeated rows) has high-fan-in rows: its dKV is bounded by the non-deterministic
+    # plan's reference error; the other sets keep the plain tolerance.
+    for index, (case, result) in enumerate(zip(cases, first)):
+        (q, kv, out, dout, lse, attn_sink, topk_idxs), topk_length, scale = case
+        if index == 1:
+            _check_ref_high_fan_in(q, kv, out, dout, lse, attn_sink, topk_idxs, result, softmax_scale=scale, topk_length=topk_length)
+            continue
+        check_ref_dsa_sparse_attention_backward(
+            q, kv, attn_sink, topk_idxs, out, dout, lse, *result, softmax_scale=scale, topk_length=topk_length, atol=5e-2, rtol=5e-2
+        )
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=20261108)
+@pytest.mark.parametrize(
+    "deterministic_dkv_mode,expected_route,first_s_q,second_s_q",
+    [
+        pytest.param("records", "records", 148, 300, id="records"),
+        pytest.param("chain", "chain", 300, 600, id="chain"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_rank_artifact_is_shape_dynamic(monkeypatch, deterministic_dkv_mode, expected_route, first_s_q, second_s_q):
+    """Records and chain plans reuse one compiled artifact across query and KV extents."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_conflict_rank_device()
+    compile_artifact = interface._compile_deterministic_sm100
+    compile_artifact.cache_clear()
+    first, *_ = _plan_case(64, 512, 64, s_q=first_s_q, s_kv=4096, has_topk_length=True, deterministic=True, deterministic_dkv_mode=deterministic_dkv_mode)
+    assert first._deterministic_dkv_route() == expected_route
+    first_info = compile_artifact.cache_info()
+
+    def forbidden_compile(*args, **kwargs):
+        """Fail when a dynamic-extent cache hit unexpectedly recompiles."""
+        raise AssertionError("shape-dynamic plan unexpectedly recompiled")
+
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    second, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64, 512, 64, s_q=second_s_q, s_kv=4352, has_topk_length=True, deterministic=True, deterministic_dkv_mode=deterministic_dkv_mode
+    )
+    second_info = compile_artifact.cache_info()
+    assert second._deterministic_dkv_route() == expected_route
+    assert second._compiled_kernel is first._compiled_kernel
+    assert first_info.misses == second_info.misses == 1
+    assert second_info.hits == first_info.hits + 1
+    _assert_execute_allocates_nothing_and_never_synchronizes(second, inputs, outputs, topk_length, softmax_scale, workspace)
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=20261109)
+@pytest.mark.parametrize("head_dim", [512, 576], ids=["d512", "d576"])
+def test_DSA_sparse_attention_backward_h128_conflict_rank_artifact_is_shape_dynamic(monkeypatch, head_dim):
+    """H128 two-CTA conflict-rank plans reuse one compiled artifact across query and KV extents that keep their variant.
+
+    At top-k 128, KV extents 4096 and 4352 select the same conflict-rank variant (D512: one kernel class; D576: the
+    same wave rounds and O*dO choice), so the second plan must hit the compile cache instead of compiling.
+    """
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100 as interface
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100_d576 as d576
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_h128_two_cta()
+    topk, extents = 128, ((148, 4096), (300, 4352))
+    if head_dim == 512:
+        variants = {interface._get_sm100_kernel_class("h128_2cta_m64", True, s_q, s_kv, 512, 128, None, max_topk=topk) for s_q, s_kv in extents}
+        assert len(variants) == 1 and getattr(next(iter(variants)), "rank_shard", False)
+        compile_artifact = interface._compile_deterministic_sm100
+    else:
+        variants = {(d576._rank_shard_rounds(s_kv, topk, True, 128), d576._odo_precompute(s_kv, topk, True, 128)) for _, s_kv in extents}
+        assert len(variants) == 1 and next(iter(variants))[0] > 0
+        compile_artifact = d576._compile_d576_2cta
+    compile_artifact.cache_clear()
+    first, *_ = _plan_case(128, head_dim, topk, s_q=extents[0][0], s_kv=extents[0][1], has_topk_length=True, deterministic=True)
+    first_info = compile_artifact.cache_info()
+
+    def forbidden_compile(*args, **kwargs):
+        """Fail when a dynamic-extent cache hit unexpectedly recompiles."""
+        raise AssertionError("shape-dynamic plan unexpectedly recompiled")
+
+    monkeypatch.setattr(interface.cute, "compile", forbidden_compile)
+    second, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        128, head_dim, topk, s_q=extents[1][0], s_kv=extents[1][1], has_topk_length=True, deterministic=True
+    )
+    second_info = compile_artifact.cache_info()
+    assert first._backend == second._backend == ("h128_2cta_m64" if head_dim == 512 else "h128_d576_2cta_m64")
+    assert second._compiled_kernel is first._compiled_kernel
+    assert first_info.misses == second_info.misses == 1
+    assert second_info.hits == first_info.hits + 1
+    _assert_execute_allocates_nothing_and_never_synchronizes(second, inputs, outputs, topk_length, softmax_scale, workspace)
 
 
 @pytest.mark.L1
@@ -2079,12 +3683,16 @@ def test_DSA_sparse_attention_backward_sm100_address_class_covers_data_and_works
     assert not _requires_wide_data_addressing(safe_topk_q, *topk_limited, include_workspace=False)
     assert _requires_wide_data_addressing(safe_topk_q + 1, *topk_limited, include_workspace=False)
 
-    # Generic deterministic H64 uses 32 byte-shaped dKV planes at this Q.
-    # KV=32768 occupies exactly 2^31 bytes and remains addressable; one more
-    # row requires the dynamic Int64 workspace descriptor.
-    generic = (1, 512, 512, 64, 2048, True, "generic_m64")
+    # Generic deterministic H64 uses 32 byte-shaped dKV planes at this Q when
+    # conflict-rank records do not apply (a top-k width beyond their slot
+    # field). KV=32768 occupies exactly 2^31 bytes and remains addressable;
+    # one more row requires the dynamic Int64 workspace descriptor.
+    generic = (1, 512, 512, 64, 16384, True, "generic_m64")
     assert not _requires_wide_data_addressing(generic[0], 32768, *generic[1:], include_workspace=True)
     assert _requires_wide_data_addressing(generic[0], 32769, *generic[1:], include_workspace=True)
+    # With top-k 2048 the default records layout is smaller and keeps KV=32769 addressable.
+    records = (1, 512, 512, 64, 2048, True, "generic_m64")
+    assert not _requires_wide_data_addressing(records[0], 32769, *records[1:], include_workspace=True)
 
 
 @pytest.mark.L0
@@ -5071,9 +6679,13 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
         ):
             assert SparseAttentionBackward(**route, deterministic=True).check_support()
 
+        # Above 16 GiB of shards this shape runs the cluster relay under 'shards' or an explicit relay size.
         relay = metadata_case(257, 65537, 16, 512, 64)
-        with pytest.raises(RuntimeError, match=r"deterministic DSA backward cluster relay requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
-            SparseAttentionBackward(**relay, deterministic=True).check_support()
+        relay_floor = r"deterministic DSA backward cluster relay requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"
+        with pytest.raises(RuntimeError, match=relay_floor):
+            SparseAttentionBackward(**relay, deterministic=True, deterministic_dkv_mode="shards").check_support()
+        with pytest.raises(RuntimeError, match=relay_floor):
+            SparseAttentionBackward(**relay, deterministic=True, deterministic_relay_cluster_size=8).check_support()
 
         # Neither the relay implementation nor its version floor changes the
         # established non-deterministic backend.
@@ -5081,7 +6693,8 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract(monkeypa
 
     with monkeypatch.context() as supported_dsl:
         supported_dsl.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.7.0")))
-        assert SparseAttentionBackward(**relay, deterministic=True).check_support()
+        assert SparseAttentionBackward(**relay, deterministic=True, deterministic_dkv_mode="shards").check_support()
+        assert SparseAttentionBackward(**relay, deterministic=True, deterministic_relay_cluster_size=8).check_support()
 
     deterministic_h32 = dict(good)
     deterministic_h32["sample_q"] = q[:, :32].contiguous()
@@ -5809,6 +7422,8 @@ def test_DSA_sparse_attention_backward_sm90_relay_cuda_graph(relay_cluster_size)
         pytest.param(128, 576, 128, False, "off", "h128_d576_2cta_m64", id="h128-d576-2cta"),
         pytest.param(64, 576, 64, True, "off", "generic_m64", id="deterministic"),
         pytest.param(96, 576, 128, True, "off", "h96_d576_2cta_m64", id="deterministic-h96-d576-2cta"),
+        pytest.param(128, 512, 128, True, "off", "h128_2cta_m64", id="deterministic-h128-2cta"),
+        pytest.param(128, 576, 1024, True, "off", "h128_d576_2cta_m64", id="deterministic-h128-d576-2cta"),
         pytest.param(16, 576, 512, False, "adaptive_pair", "h16_m128", id="qcluster-h16"),
         pytest.param(32, 576, 512, False, "adaptive_pair", "h32_m64", id="qcluster-h32"),
     ],
@@ -5844,6 +7459,28 @@ def test_DSA_sparse_attention_backward_sm100_execute_allocates_nothing_and_never
     )
     assert plan._backend == expected_backend
     assert (plan._qcluster_plan is not None) == (q_cluster_mode == "adaptive_pair")
+    if deterministic and num_heads == 128:
+        # The deterministic H128 two-CTA entries run conflict-rank dKV storage (setup launches each wave).
+        assert _h128_conflict_rank_selected(head_dim, max(256, 2 * topk), topk)
+    _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=102)
+@pytest.mark.parametrize("deterministic_dkv_mode", ["records", "chain"])
+def test_DSA_sparse_attention_backward_sm100_conflict_rank_execute_allocates_nothing_and_never_synchronizes(deterministic_dkv_mode):
+    """Recipe R9 on the conflict-rank dKV routes of the deterministic generic M64 plan (records and chain)."""
+    try:
+        from cudnn import DSA  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_conflict_rank_device()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64, 512, 64, s_q=300, s_kv=4096, has_topk_length=True, deterministic=True, deterministic_dkv_mode=deterministic_dkv_mode
+    )
+    assert plan._backend == "generic_m64"
+    assert plan._deterministic_dkv_route() == deterministic_dkv_mode
     _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
 
 

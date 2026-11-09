@@ -17,7 +17,14 @@ boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
 and isolated upstream-gradient sources when the operation supports them.
 Keep these determinism suites in L0, including stress cases.
 For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
-invalid after packing. Use unique active indices for deterministic backward.
+invalid after packing. Use unique active indices for deterministic backward,
+except in cases pinned to an SM100/SM103 conflict-rank dKV layout (records,
+chain, H128 two-CTA), whose contract includes duplicates; assert the selected
+layout in such cases. dKV is not batch invariant once a batch spans several
+waves, on any layout (the shard layouts included): compare forward results, dQ
+and generic-kernel dSink across batch layouts and name the gap; H128 two-CTA
+dSink follows query positions. H128 D576 has no public forward kernel; feed
+reference forward results as fixed backward inputs.
 The sink gradient is shared across sequences: isolate the target's upstream
 gradient before comparing it across batches. Check DSA's signed infinity
 sentinels against the expected empty rows before byte comparison.
