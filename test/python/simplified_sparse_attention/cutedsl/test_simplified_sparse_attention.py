@@ -4,6 +4,7 @@
 import subprocess
 import sys
 
+import cutlass
 import pytest
 import torch
 
@@ -50,10 +51,53 @@ assert "cutlass" not in sys.modules
 assert "jax" not in sys.modules
 assert "simplified_sparse_attention" in cudnn.ops.__all__
 assert "simplified_sparse_attention_jax" in cudnn.ops.__all__
+from cudnn.simplified_sparse_attention import (
+    SimplifiedSparseAttentionMetadata,
+    simplified_sparse_attention,
+    simplified_sparse_attention_reserve,
+    simplified_sparse_attention_jax,
+)
+assert SimplifiedSparseAttentionMetadata is cudnn.ops.SimplifiedSparseAttentionMetadata
+assert simplified_sparse_attention is cudnn.ops.simplified_sparse_attention
+assert simplified_sparse_attention_reserve is cudnn.ops.simplified_sparse_attention_reserve
+assert simplified_sparse_attention_jax is cudnn.ops.simplified_sparse_attention_jax
 """,
         ],
         check=True,
     )
+
+
+@pytest.mark.parametrize("name", ["a_major", "b_major", "c_major"])
+def test_dense_tensor_layout_rejected_before_allocation(monkeypatch, name):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels.dense_gemm_sm100 import prepare_tensors
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("Allocated tensors before checking their layouts")
+
+    monkeypatch.setattr(torch, "empty", unexpected_allocation)
+    layouts = dict(a_major="k", b_major="n", c_major="n")
+    layouts[name] = "invalid"
+    with pytest.raises(ValueError, match=name):
+        prepare_tensors((16, 32, 64, 1), cutlass.BFloat16, cutlass.BFloat16, **layouts)
+
+
+@pytest.mark.parametrize("unroll,threads,blocks,expected", [(0, 512, 4, 2), (0, 1024, 2, 2), (0, 256, 1, 4), (1, 512, 4, 1), (8, 512, 4, 8)])
+@pytest.mark.parametrize("local_indices", [False, True])
+def test_prefill_constructor_settings(unroll, threads, blocks, expected, local_indices):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels.cute_dsl_filter_topk.filtered_top_k_prefill_varlen import FilteredTopKKernelVarlenPrefill
+
+    kernel = FilteredTopKKernelVarlenPrefill(
+        cutlass.Float32,
+        131072,
+        512,
+        unroll_factor=unroll,
+        num_threads=threads,
+        target_blocks_per_sm=blocks,
+        subtract_row_start=local_indices,
+    )
+    assert kernel.unroll_factor == expected
+    assert kernel.num_threads_per_cta == threads
+    assert kernel.subtract_row_start_on_output is local_indices
 
 
 def test_old_dsl_fails_before_kernel_import(monkeypatch):

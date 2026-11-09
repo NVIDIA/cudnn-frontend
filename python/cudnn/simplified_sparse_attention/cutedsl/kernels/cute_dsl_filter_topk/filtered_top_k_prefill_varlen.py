@@ -42,7 +42,6 @@ from .filtered_top_k_varlen_util import (
     _RUBIN_TOPK_ARCHITECTURES,
     FilteredTopKKernelVarlen,
     auto_tma_load,
-    auto_unroll_factor,
     compare_top_k_results,
     create_random_logits,
     get_topk_architecture_config,
@@ -143,24 +142,9 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             boundary_classify=boundary_classify,
             reg_select=reg_select,
             use_external_hist=use_external_hist,
+            subtract_row_start_on_output=subtract_row_start,
+            unroll_blocks_per_sm=target_blocks_per_sm,
         )
-
-        # Resolve the "auto" (0) unroll sentinel now that num_threads_per_cta
-        # (=512) and vec_size are set, before the kernel body reads
-        # self.unroll_factor. Prefill always runs the large-occupancy path, so
-        # blocks/SM == target_blocks_per_sm.
-        if self.unroll_factor == 0:
-            self.unroll_factor = auto_unroll_factor(
-                self.max_num_cols,
-                self.num_threads_per_cta,
-                target_blocks_per_sm,
-                self.vec_size,
-                self.dtype.width // 8,
-            )
-
-        # Output local indices (subtract row_start) by default; the SSA THD
-        # contract wants GLOBAL key coordinates -> subtract_row_start=False.
-        self.subtract_row_start_on_output = subtract_row_start
 
     def _compute_smem_input_size(self) -> int:
         return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=self._target_blocks_per_sm)

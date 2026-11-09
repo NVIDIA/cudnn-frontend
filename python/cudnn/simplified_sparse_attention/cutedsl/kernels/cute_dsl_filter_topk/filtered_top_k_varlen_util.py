@@ -343,6 +343,8 @@ class FilteredTopKKernelVarlen:
         boundary_classify: bool = False,
         reg_select: bool = False,
         use_external_hist: bool = False,
+        subtract_row_start_on_output: bool = False,
+        unroll_blocks_per_sm: int | None = None,
     ):
         """
         Args:
@@ -351,8 +353,9 @@ class FilteredTopKKernelVarlen:
                 launch bounds, and copy/atomic paths.
             unroll_factor: load-instruction unroll factor for the coarse/filter input scans,
                 one of 1/2/4/8 (1 = the original 1-in-flight baseline). ``0`` is
-                the "auto" sentinel that subclasses resolve to a concrete factor
-                via ``auto_unroll_factor`` before the kernel body is built.
+                the "auto" sentinel, resolved when unroll_blocks_per_sm is given.
+            unroll_blocks_per_sm: Occupancy used to resolve automatic unrolling.
+            subtract_row_start_on_output: Return indices relative to each row start.
             overflow_policy: Controls behavior when threshold-bin candidates exceed the
                 SMEM input buffer (filtered_topk_smem_input_size).  Only takes effect
                 when max_num_cols > filtered_topk_smem_input_size; otherwise all policies
@@ -421,18 +424,7 @@ class FilteredTopKKernelVarlen:
         # keeps identical SASS). Reuses chunk_size_per_cta / num_ctas_per_row for
         # chunk partitioning (num_ctas_per_row == ctas_per_group / cluster size).
         self.single_pass_multi_cta = single_pass_multi_cta
-        # load-instruction unroll factor for the coarse/filter input scans (memory-level
-        # parallelism). A counted cutlass.range(big_iters, unroll=unroll_factor)
-        # overlaps `unroll_factor` loads vs the 1-in-flight `while`.
-        # unroll_factor == 1 reproduces the original (unmodified) baseline;
-        # 2/4/8 are tuning points (4 profiled long_scoreboard -40%,
-        # occupancy/registers neutral). REREAD path only.
-        # unroll_factor == 0 is the "auto" sentinel: subclasses resolve it to a
-        # concrete factor via auto_unroll_factor() once num_threads_per_cta /
-        # vec_size are known, before the kernel body (which reads
-        # self.unroll_factor) is built.
         assert unroll_factor in (0, 1, 2, 4, 8), f"unroll_factor must be one of 0 (auto), 1, 2, 4, 8; got {unroll_factor}"
-        self.unroll_factor = unroll_factor
 
         # Stage 0 prototype: async TMA (cp.async.bulk / UTMALDG) load for the
         # coarse-histogram vecscan, gated by enable_tma_load so the baseline (all
@@ -531,6 +523,13 @@ class FilteredTopKKernelVarlen:
                     self.num_threads_per_cta = 512
                 else:
                     self.num_threads_per_cta = 256
+
+        # Resolve automatic unrolling after the thread and vector sizes are known.
+        self.unroll_factor = (
+            auto_unroll_factor(self.max_num_cols, self.num_threads_per_cta, unroll_blocks_per_sm, self.vec_size, self.dtype.width // 8)
+            if unroll_factor == 0 and unroll_blocks_per_sm is not None
+            else unroll_factor
+        )
 
         # reg_cache: keep the vec-aligned row segment register-resident across
         # p1 (coarse histogram) and p3 (filter/collect), turning the two full
@@ -689,9 +688,7 @@ class FilteredTopKKernelVarlen:
         self.enable_bounded_spill = (overflow_policy == "BOUNDED_SPILL") and _needs_extra
 
         self.return_val = return_val
-        # Subclasses set to True to subtract row_start from absolute indices before
-        # writing output (used in prefill where row_start may be non-zero).
-        self.subtract_row_start_on_output = False
+        self.subtract_row_start_on_output = subtract_row_start_on_output
 
         if cutlass.const_expr(self.enable_tma_load):
             # The async-TMA staging ring aliases the candidate buffer(s)

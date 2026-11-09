@@ -1351,31 +1351,32 @@ def prepare_tensors(
 
     m, n, k, l = mnkl
 
+    for name, major, allowed in (("a_major", a_major, ("k", "m")), ("b_major", b_major, ("n", "k")), ("c_major", c_major, ("n", "m"))):
+        if major not in allowed:
+            raise ValueError(f"{name} must be one of {allowed}, got {major!r}")
+
     if a_major == "k":
         a_f32 = torch.empty((l, m, k), dtype=torch.float32, device="cuda")
-    elif a_major == "m":
+    else:
         a_f32 = torch.empty((l, k, m), dtype=torch.float32, device="cuda").permute(0, 2, 1)
 
     if b_major == "n":
         b_f32 = torch.empty((l, k, n), dtype=torch.float32, device="cuda")
-    elif b_major == "k":
+    else:
         b_f32 = torch.empty((l, n, k), dtype=torch.float32, device="cuda").permute(0, 2, 1)
 
     if c_major == "n":
         c_f32 = torch.empty((l, m, n), dtype=torch.float32, device="cuda")
-    elif c_major == "m":
+    else:
         c_f32 = torch.empty((l, n, m), dtype=torch.float32, device="cuda").permute(0, 2, 1)
 
-    # Initialize tensors with either uniform random or normal distribution
     for tensor in [a_f32, b_f32, c_f32]:
         if init_random:
             tensor.random_(-2, 3)
         else:
             tensor.normal_(mean=normal_mean, std=normal_std)
 
-    # For float8 types, use uint8 as storage type to avoid dlpack limitation
-    # (dlpack doesn't support float8 types)
-    # For other types, convert to the target dtype
+    # DLPack needs uint8 storage for float8 tensors.
     a_storage_dtype = torch.uint8 if is_fp8_dtype(ab_dtype) else torch_dtype(ab_dtype)
     b_storage_dtype = torch.uint8 if is_fp8_dtype(ab_dtype) else torch_dtype(ab_dtype)
     c_storage_dtype = torch.uint8 if is_fp8_dtype(c_dtype) else torch_dtype(c_dtype)

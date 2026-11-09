@@ -826,6 +826,12 @@ Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
 
+An unused name can still hold a required shared-memory allocation. Preserve
+the allocation when a later operand aliases that storage; remove only the
+binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
+for its P operand. Its public forward/backward reference and byte-golden
+tests in `simplified_sparse_attention/cutedsl/` cover this layout.
+
 When sharing a kernel with JAX, match scratch flag storage to its native ABI.
 A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
 CuTe tensor can reject that store during lowering. The long-key cases in

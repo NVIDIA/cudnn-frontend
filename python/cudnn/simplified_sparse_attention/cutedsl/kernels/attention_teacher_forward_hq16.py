@@ -108,7 +108,8 @@ def _ssa(
     smem = utils.SmemAllocator()
     sK = smem.allocate_tensor(cutlass.BFloat16, a_l.outer, byte_alignment=1024, swizzle=a_l.inner)
     sQ = smem.allocate_tensor(cutlass.BFloat16, b_l.outer, byte_alignment=1024, swizzle=b_l.inner)
-    _pad = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout(Q_ELEMS), byte_alignment=1024)
+    # Reserve the rest of the P operand that aliases Q below.
+    smem.allocate_tensor(cutlass.BFloat16, cute.make_layout(Q_ELEMS), byte_alignment=1024)
     sIdx = smem.allocate_tensor(cutlass.Int32, cute.make_layout(TOPK), byte_alignment=16)
     sIdx1 = smem.allocate_tensor(cutlass.Int32, cute.make_layout(TOPK), byte_alignment=16)
     sRedM = smem.allocate_tensor(cutlass.Float32, cute.make_layout((HQ, 4), stride=(4, 1)), byte_alignment=16)
@@ -363,7 +364,6 @@ def _ssa(
             tv = cute.make_tensor(tptr + col, cute.make_layout((MT, 8), stride=(65536, 1)))
             cute.copy(tld, thr_ld.partition_S(tv), frg)
             mp = mp0 if hsub == 0 else mp1
-            fs = fs0 if hsub == 0 else fs1
             if s < vlen:
                 for jj in cutlass.range_constexpr(8):
                     nr[jj] = sRl[hg * 16 + hsub * 8 + jj]
@@ -603,7 +603,6 @@ def _ssa(
             tv = cute.make_tensor(tptr + col, cute.make_layout((MT, 8), stride=(65536, 1)))
             cute.copy(tld, thr_ld.partition_S(tv), frg)
             mp = mp0 if hsub == 0 else mp1
-            fs = fs0 if hsub == 0 else fs1
             if s < vlen:
                 for jj in cutlass.range_constexpr(8):
                     nr[jj] = sRl[hg * 16 + hsub * 8 + jj]

@@ -19,9 +19,6 @@ from typing import Optional
 
 import torch
 
-_BATCH = 1
-
-
 _SUPPORTED_QUERY_HEADS = (16, 32, 96)
 
 
@@ -29,9 +26,6 @@ _KV_HEADS = 1
 
 
 _HEAD_DIM = 256
-
-
-_INDEX_HEADS = 1
 
 
 _INDEX_DIM = 128

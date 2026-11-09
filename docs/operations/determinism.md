@@ -71,8 +71,7 @@ a row alone and inside a batch under the entry's own picks.
   512/1024/2048, plus an Hq16 scheduling-boundary case. Long filtered-indexer
   paths and saved internal statistics are unverified. Moving packed rows
   changes the scalar loss bytes for Hq32/top-k1024 and Hq96/top-k2048.
-  Backward dK/dV fail
-  raw-byte replay and batch invariance because it uses atomic reductions.
+  Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
 
 - Linear attention: select the FROST plan with `batch_invariant=True`.

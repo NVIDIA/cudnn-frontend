@@ -12,6 +12,8 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 
 from .cutedsl.backend import RowMetadata as SimplifiedSparseAttentionMetadata
 
+__all__ = ["SimplifiedSparseAttentionMetadata", "simplified_sparse_attention", "simplified_sparse_attention_reserve"]
+
 
 def _check_runtime():
     error = cutedsl_requirement_error("simplified_sparse_attention", floor=(4, 8, 0))

@@ -1144,3 +1144,44 @@ Tq1024/Tk4096/H16/top-k512, and 6.914 ms filtered forward at
 Tq1024/Tk131072/H32/top-k2048. These shared-GPU samples include host dispatch
 and completion waits; they are not direct speed comparisons with the earlier
 PyTorch CUDA-event measurements.
+
+### CodeQL follow-up — 2026-11-09
+
+The follow-up to `40d2377` adds explicit lazy-export declarations, rejects
+invalid GEMM layouts before allocation, and initializes top-k settings in
+the base constructor. Removing unused names preserves the Hq16 kernel's
+shared-memory reservation and arithmetic. No golden or expected-failure
+rule changed.
+
+The source-checkout L0 run on SM100 reported **148 passed, 24 xfailed,
+6 deselected, 0 failed, 0 skipped**. This includes 13 new host cases for
+invalid layouts and explicit/automatic top-k settings. The lazy-import test
+also checks all four package exports against `cudnn.ops`. Both frameworks'
+forward/backward reference, replay, batch-invariance, and golden checks ran
+with the existing scoped exceptions. Support classifications remain unchanged;
+SM103 and long-path bytewise determinism remain unverified.
+
+Runtime: Python 3.12, PyTorch 2.13.0+cu130, JAX 0.11.0, cuDNN 9.27,
+and CuTe DSL 4.8.0 with its CUDA 13.4 compiler. Imports resolved to the
+edited checkout. From `test/python`:
+
+```sh
+XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m L0 -q -s -rxX
+```
+
+CodeQL 2.27.4 with `codeql/python-queries@1.9.0` scanned all 34 operation
+modules using `python-security-and-quality.qls`. None of the 14 inline
+findings on PR #2370 remains. The scan still reports 239 other package
+diagnostics; no query or path was excluded by this fix. Pre-commit passed.
+Fern reported zero errors and one existing warning.
+
+The subsequent L1 run reported **6 passed, 172 deselected, 0 failed,
+0 skipped**. It covers PyTorch repair-state reuse, reservation, sampling,
+and diagnostics, plus both JAX long-key repair cases and their gradients.
+
+```sh
+XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+  python -m pytest simplified_sparse_attention/cutedsl -m L1 -q -s
+```
