@@ -313,58 +313,61 @@ def test_sm90_compressed_indexer_cuda_graph_replay_changed_inputs(monkeypatch):
     monkeypatch.setattr(compress_top_k_sm100.cute, "compile", forbidden)
     monkeypatch.setattr(_compressed_top_k_sm90, "_compress_cand_batch_offsets", forbidden)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        with monkeypatch.context() as capture_patch:
-            for name in ("empty", "empty_like", "zeros", "zeros_like"):
-                capture_patch.setattr(torch, name, forbidden)
-            capture_patch.setattr(torch.Tensor, "item", forbidden)
-            _invoke(packed, "bf16", buffers, stream=raw_stream)
-    with torch.cuda.stream(stream):
-        graph.replay()
-    torch.cuda.synchronize()
-    expected = snapshot(
-        {"indices": buffers["out_indices"], "logits": buffers["out_logits"], "softmax": buffers["softmax_out"], "lse": buffers["lse_out"]},
-        allowed_inf=ALLOWED_INF,
-    )
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            with monkeypatch.context() as capture_patch:
+                for name in ("empty", "empty_like", "zeros", "zeros_like"):
+                    capture_patch.setattr(torch, name, forbidden)
+                capture_patch.setattr(torch.Tensor, "item", forbidden)
+                _invoke(packed, "bf16", buffers, stream=raw_stream)
+        with torch.cuda.stream(stream):
+            graph.replay()
+        torch.cuda.synchronize()
+        expected = snapshot(
+            {"indices": buffers["out_indices"], "logits": buffers["out_logits"], "softmax": buffers["softmax_out"], "lse": buffers["lse_out"]},
+            allowed_inf=ALLOWED_INF,
+        )
 
-    with torch.cuda.stream(stream):
-        packed["q"].add_(torch.tensor(0.125, dtype=torch.bfloat16, device="cuda"))
-        buffers["cand_buffer"].fill_(torch.nan)
-        buffers["out_indices"].fill_(123456)
-        buffers["out_logits"].fill_(torch.nan)
-        buffers["softmax_out"].fill_(torch.nan)
-        buffers["lse_out"].fill_(torch.nan)
-        graph.replay()
-    torch.cuda.synchronize()
-    changed = snapshot(
-        {"indices": buffers["out_indices"], "logits": buffers["out_logits"], "softmax": buffers["softmax_out"], "lse": buffers["lse_out"]},
-        allowed_inf=ALLOWED_INF,
-    )
-    assert any(torch.count_nonzero(changed[name].view(torch.uint8) != expected[name].view(torch.uint8)).item() for name in changed)
+        with torch.cuda.stream(stream):
+            packed["q"].add_(torch.tensor(0.125, dtype=torch.bfloat16, device="cuda"))
+            buffers["cand_buffer"].fill_(torch.nan)
+            buffers["out_indices"].fill_(123456)
+            buffers["out_logits"].fill_(torch.nan)
+            buffers["softmax_out"].fill_(torch.nan)
+            buffers["lse_out"].fill_(torch.nan)
+            graph.replay()
+        torch.cuda.synchronize()
+        changed = snapshot(
+            {"indices": buffers["out_indices"], "logits": buffers["out_logits"], "softmax": buffers["softmax_out"], "lse": buffers["lse_out"]},
+            allowed_inf=ALLOWED_INF,
+        )
+        assert any(torch.count_nonzero(changed[name].view(torch.uint8) != expected[name].view(torch.uint8)).item() for name in changed)
 
-    eager_buffers = {
-        "cand_batch_offsets": offsets,
-        "cand_buffer": torch.empty_like(buffers["cand_buffer"]),
-        "out_indices": torch.empty_like(buffers["out_indices"]),
-        "out_logits": torch.empty_like(buffers["out_logits"]),
-        "softmax_out": torch.empty_like(buffers["softmax_out"]),
-        "lse_out": torch.empty_like(buffers["lse_out"]),
-    }
-    with torch.cuda.stream(stream):
-        eager = _invoke(packed, "bf16", eager_buffers, stream=raw_stream)
-    stream.synchronize()
-    assert_bitwise(snapshot(dict(eager), allowed_inf=ALLOWED_INF), changed, "captured versus eager changed inputs")
+        eager_buffers = {
+            "cand_batch_offsets": offsets,
+            "cand_buffer": torch.empty_like(buffers["cand_buffer"]),
+            "out_indices": torch.empty_like(buffers["out_indices"]),
+            "out_logits": torch.empty_like(buffers["out_logits"]),
+            "softmax_out": torch.empty_like(buffers["softmax_out"]),
+            "lse_out": torch.empty_like(buffers["lse_out"]),
+        }
+        with torch.cuda.stream(stream):
+            eager = _invoke(packed, "bf16", eager_buffers, stream=raw_stream)
+        stream.synchronize()
+        assert_bitwise(snapshot(dict(eager), allowed_inf=ALLOWED_INF), changed, "captured versus eager changed inputs")
 
-    # Replay again from the same changed stable-address operands: all bytes must repeat.
-    with torch.cuda.stream(stream):
-        for name, tensor in buffers.items():
-            if name == "cand_batch_offsets":
-                continue
-            tensor.fill_(torch.nan if tensor.dtype.is_floating_point else 123456)
-        graph.replay()
-    torch.cuda.synchronize()
-    replayed = snapshot(
-        {"indices": buffers["out_indices"], "logits": buffers["out_logits"], "softmax": buffers["softmax_out"], "lse": buffers["lse_out"]},
-        allowed_inf=ALLOWED_INF,
-    )
-    assert_bitwise(replayed, changed, "CUDA Graph replay")
+        # Replay again from the same changed stable-address operands: all bytes must repeat.
+        with torch.cuda.stream(stream):
+            for name, tensor in buffers.items():
+                if name == "cand_batch_offsets":
+                    continue
+                tensor.fill_(torch.nan if tensor.dtype.is_floating_point else 123456)
+            graph.replay()
+        torch.cuda.synchronize()
+        replayed = snapshot(
+            {"indices": buffers["out_indices"], "logits": buffers["out_logits"], "softmax": buffers["softmax_out"], "lse": buffers["lse_out"]},
+            allowed_inf=ALLOWED_INF,
+        )
+        assert_bitwise(replayed, changed, "CUDA Graph replay")
+    finally:
+        graph.reset()
