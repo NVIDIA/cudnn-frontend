@@ -389,10 +389,10 @@ DSL satisfies your kernel.**
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
   the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; both
-  QSA backward entries decline that compiler for 12Q/1KV before JIT
-  compilation, and the tests exercise the decline rather than crashing or
-  silently skipping the gate.
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8. Both
+  QSA backward entries decline that compiler for every one-KV-head geometry
+  (12Q/1KV and 6Q/1KV) before JIT compilation, and the tests exercise the
+  decline rather than crashing or silently skipping the gate.
 - **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
   and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
   and cu13 in separate environments/processes and empty, separate caches.
@@ -1135,6 +1135,7 @@ key is nonfinite: a key valid for one query can be masked for its neighbor,
 and zero dS multiplied by that key still produces NaN. A union mask alone is
 insufficient, including across an unaligned packed sequence boundary. Keep any
 nonfinite fallback entirely on device and re-evaluate it on each graph replay.
-The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
-which changes finite/nonfinite inputs under one captured graph for both shared
-and separate packed sequences.
+The detectors are `QSA/cutedsl/test_qsa_backward_sm100.py::test_sparse_pair_isolates_a_nonfinite_key_row`
+for the sparse query pairs and `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`
+for the dense kernel's query groups, which changes finite/nonfinite inputs under
+one captured graph for both shared and separate packed sequences.

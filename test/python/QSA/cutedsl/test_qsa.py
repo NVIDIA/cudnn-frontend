@@ -203,7 +203,7 @@ def test_packed_forward_backward(supported_gpu, heads, lengths):
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
 @pytest.mark.parametrize("lengths", [(8,), (3, 5, 9), (257,)])
 def test_backward_bounds_reach_keys_after_the_query(supported_gpu, heads, lengths):
-    """The selection is lo <= j <= hi, keys after the query included; the backward follows the forward's selection."""
+    """The selection is lo <= j <= hi, keys after the query included. The backward follows the forward's selection."""
     inputs = make_inputs(lengths, *heads, all_selected=True)
     end = inputs["lo"].clone()
     start = 0
@@ -219,7 +219,7 @@ def test_backward_bounds_reach_keys_after_the_query(supported_gpu, heads, length
 @pytest.mark.L0
 @pytest.mark.parametrize("lengths", [(513,), (2056,)], ids=["gated-dense", "gathered"])
 def test_six_query_heads_forward_routes(supported_gpu, lengths):
-    """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV; neither is specialised for 12 heads."""
+    """6Q/1KV takes the dense-tile route and the gathered route like 12Q/1KV. Neither is specialised for 12 heads."""
     check_case(make_inputs(lengths, 6, 1, empty=True))
 
 
@@ -257,7 +257,7 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
     inputs["v"][128:256] = magnitude
     inputs["sel_blocks"][:, :64] = 1
     inputs["hi"].fill_(255)
-    # The score changes after 128 keys; only the second set has V.
+    # The score changes after 128 keys. Only the second set has V.
     value = float(inputs["v"][128, 0, 0]) / (1.0 + math.exp(-score))
     out = torch.full(inputs["q"].shape, value, dtype=torch.float64, device=inputs["q"].device)
     lse = torch.full((heads[0], 513), math.log(128.0) + math.log1p(math.exp(score)), dtype=torch.float64, device=out.device)
@@ -269,15 +269,18 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
-@pytest.mark.parametrize("large_logits", [False, True], ids=["constant-key", "large-logits"])
-def test_backward_cancellation(supported_gpu, heads, large_logits):
+@pytest.mark.parametrize("keys", ["constant-key", "large-logits", "near-equal-keys"])
+def test_backward_cancellation(supported_gpu, heads, keys):
     skip_without_cuda13_for_12q1kv(heads[1])
     inputs = make_inputs((257,), *heads, all_selected=True)
     inputs["k"].fill_(1)
-    if large_logits:
+    if keys == "large-logits":
         inputs["q"].fill_(8)
         inputs["k"].fill_(-8)
         inputs["k"][1::2] = 8
+    elif keys == "near-equal-keys":
+        # P differs per key, so rounding P (not only dS) would leave its error in the small dQ
+        inputs["k"][1::2] = 1 + 2**-7
     # Independent saved state isolates backward precision from forward rounding.
     _, out, lse = reference(inputs)
     out, lse = out.float(), lse.float()
@@ -383,14 +386,16 @@ def test_dynamic_extents_reuse_compile(supported_gpu, monkeypatch, lengths, next
 @pytest.mark.parametrize("heads", [(12, 1), (6, 1)])
 @pytest.mark.parametrize("lengths", [(1,), (3, 5, 9), (61, 68), (257,)])
 def test_paired_backward_mask_replay(supported_gpu, heads, lengths):
-    """Replays over changed selections and bounds: batched queries with disjoint blocks, each member position of a pair
-    or quad emptied in turn (odd parity inside a quad), partial bounds, and packed boundaries inside a group."""
+    """Replays over changed selections and bounds inside the dense kernel's groups of 4 queries: neighbouring queries
+    with disjoint blocks, members emptied in turn, partial bounds, and packed boundaries inside a group. The sparse
+    query pairs past the crossover are covered in test_qsa_backward_sm100.py."""
     skip_without_cuda13_for_12q1kv(heads[1])
-    nq = 24 // heads[0]  # consecutive queries that share one 24-column tile in the paired kernels: the group the states exercise
+    # The member states empty every other query of a group with 12 heads and each query in turn with 6.
+    nq = 24 // heads[0]
     inputs = make_inputs(lengths, *heads, all_selected=True)
     selected, lower, upper = (inputs[name].clone() for name in ("sel_blocks", "lo", "hi"))
     total, blocks = selected.shape
-    # Member m of every group keeps the blocks congruent to m modulo nq: no two batched queries share a block.
+    # Query i keeps the blocks congruent to i modulo nq, so neighbouring queries share no block.
     disjoint = ((torch.arange(total)[:, None] % nq) == (torch.arange(blocks)[None] % nq)).to(selected.device)
     grad = inputs["q"].clone()
     stream = torch.cuda.Stream()
@@ -494,6 +499,8 @@ def test_reject_before_launch(supported_gpu, monkeypatch):
         qsa_forward(**inputs, block_size=8)
     with pytest.raises(ValueError, match="lse"):
         qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((17, 12), device="cuda"))
+    with pytest.raises(ValueError, match="ds_precision"):
+        qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((12, 17), device="cuda"), ds_precision="fp16")
     for heads in ((3, 1), (24, 1), (6, 2), (12, 2)):
         with pytest.raises(NotImplementedError, match="6/1, 12/1 or 24/2"):
             qsa_forward(**make_inputs((17,), *heads))
@@ -503,7 +510,9 @@ def test_reject_before_launch(supported_gpu, monkeypatch):
 @pytest.mark.parametrize("heads", [(12, 1), (6, 1)])
 @pytest.mark.parametrize("packed", [False, True])
 def test_paired_backward_nonfinite_isolation(supported_gpu, heads, packed):
-    """A selected NaN in one query must not poison a batched neighbour's masked dQ."""
+    """A selected NaN in one query must not poison the masked dQ of another query in its dense-kernel group.
+
+    test_qsa_backward_sm100.py covers the sparse query pairs past the crossover."""
     skip_without_cuda13_for_12q1kv(heads[1])
     inputs = make_inputs((3, 5) if packed else (8,), *heads, all_selected=True)
     if not packed:

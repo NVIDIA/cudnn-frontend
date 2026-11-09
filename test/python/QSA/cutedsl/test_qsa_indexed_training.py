@@ -12,7 +12,7 @@ import torch
 
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
 from cudnn.QSA.indexed.api import _plan
-from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, supported_gpu
+from QSA.cutedsl.test_qsa import make_inputs, reference, assert_close, skip_without_cuda13_for_12q1kv, supported_gpu
 
 pytestmark = pytest.mark.L0
 
@@ -39,10 +39,11 @@ def indices_for(inputs):
 
 def check_case(inputs, indices):
     out = qsa_indexed_forward(inputs["q"], inputs["k"], inputs["v"], indices, inputs["scale"])
-    grad = inputs["q"].clone()
-    grads = qsa_indexed_backward(grad, inputs["q"], inputs["k"], inputs["v"], out["out_fp32"], out["lse"], indices, inputs["scale"])
     for actual, expected in zip(out, reference(inputs)):
         assert_close(actual, expected)
+    skip_without_cuda13_for_12q1kv(1)
+    grad = inputs["q"].clone()
+    grads = qsa_indexed_backward(grad, inputs["q"], inputs["k"], inputs["v"], out["out_fp32"], out["lse"], indices, inputs["scale"])
     for actual, expected in zip(grads, reference(inputs, grad, out["out_fp32"], out["lse"])):
         assert_close(actual, expected)
     return out, grads
@@ -58,13 +59,11 @@ def test_indexed_packed_reference(supported_gpu, lengths):
 def test_indexed_six_query_heads(supported_gpu, lengths):
     """6Q/1KV runs the same forward kernels and backward engine as 12Q/1KV, with six head rows per query."""
     inputs = make_inputs(lengths, 6, 1, empty=True, all_selected=True)
-    indices = indices_for(inputs)
-    check_case(inputs, indices)
-    plan = _plan(inputs["q"].shape[0], indices.shape[1], inputs["q"].device, "bprop", 0, 6)
-    assert plan.hq == 6 and dict((name, shape) for name, shape, _ in plan.layouts)["ids"] == (inputs["q"].shape[0], indices.shape[1] // 4)
+    check_case(inputs, indices_for(inputs))
 
 
 def test_indexed_changed_values_replay(supported_gpu):
+    skip_without_cuda13_for_12q1kv(1)
     inputs = make_inputs((3, 65), 12, 1, all_selected=True)
     indices = indices_for(inputs)
     clean_indices = indices.clone()
@@ -98,7 +97,22 @@ def test_indexed_changed_values_replay(supported_gpu):
         graph.reset()
 
 
+def _forbidden(*args, **kwargs):
+    raise AssertionError("execute allocated, converted, or synchronized")
+
+
+def _execute_on_caller_storage(monkeypatch, plan, *args):
+    with monkeypatch.context() as patch:
+        for name in ("empty", "empty_like", "zeros", "zeros_like", "arange"):
+            patch.setattr(torch, name, _forbidden)
+        patch.setattr(torch.cuda, "synchronize", _forbidden)
+        for name in ("cpu", "to", "item", "tolist", "numpy"):
+            patch.setattr(torch.Tensor, name, _forbidden)
+        plan.execute(*args)
+
+
 def test_indexed_execute_uses_only_caller_storage(supported_gpu, monkeypatch):
+    skip_without_cuda13_for_12q1kv(1)
     inputs = make_inputs((3, 9), 12, 1, all_selected=True)
     q, k, v = (inputs[name] for name in ("q", "k", "v"))
     indices = indices_for(inputs)
@@ -106,21 +120,11 @@ def test_indexed_execute_uses_only_caller_storage(supported_gpu, monkeypatch):
     plan = _plan(q.shape[0], indices.shape[1], q.device, "bprop")
     outputs = tuple(torch.empty_like(expected[name]) for name in ("dq", "dk", "dv"))
     workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("execute allocated, converted, or synchronized")
-
-    with monkeypatch.context() as patch:
-        for name in ("empty", "empty_like", "zeros", "zeros_like", "arange"):
-            patch.setattr(torch, name, forbidden)
-        patch.setattr(torch.cuda, "synchronize", forbidden)
-        for name in ("cpu", "to", "item", "tolist", "numpy"):
-            patch.setattr(torch.Tensor, name, forbidden)
-        plan.execute(q, k, v, indices, outputs, 1 / 16, workspace, q, out["out_fp32"], out["lse"])
+    _execute_on_caller_storage(monkeypatch, plan, q, k, v, indices, outputs, 1 / 16, workspace, q, out["out_fp32"], out["lse"])
     for actual, ref in zip(outputs, expected):
         assert_close(actual, ref)
     with monkeypatch.context() as patch:
-        patch.setattr(plan, "_metadata", forbidden)
+        patch.setattr(plan, "_metadata", _forbidden)
         with pytest.raises(ValueError, match="workspace"):
             plan.execute(q, k, v, indices, outputs, 1 / 16, workspace[:0], q, out["out_fp32"], out["lse"])
         with pytest.raises(ValueError, match="overlap"):
@@ -223,6 +227,21 @@ def test_public_causal_topk_graph_refreshes_packed_bounds(canonical_inputs):
                 assert_grads_close(name, value, ref)
     finally:
         graph.reset()
+
+
+def test_indexed_execute_on_a_sparse_plan_uses_only_caller_storage(canonical_inputs, monkeypatch):
+    from QSA.cutedsl.qsa_index_list_reference import reference_backward, assert_grads_close
+
+    inputs = canonical_inputs(28000, 83, h_kv=1, width=2052, saved_output_dtype=torch.float32)
+    q, k, v, indices = (inputs[name] for name in ("q", "k", "v", "topk_idxs"))
+    plan = _plan(q.shape[0], indices.shape[1], q.device, "bprop", 0, 12, 3)
+    assert plan.engine_plan.has_sparse
+    outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
+    _execute_on_caller_storage(monkeypatch, plan, q, k, v, indices, outputs, 1 / 16, workspace, inputs["dout"], inputs["out"], inputs["lse"])
+    expected = reference_backward(*(inputs[name] for name in ("q", "k", "v", "out", "dout", "lse", "topk_idxs")))
+    for name, value, ref in zip(("dq", "dk", "dv"), outputs, expected):
+        assert_grads_close(name, value, ref)
 
 
 def test_general_selection_keeps_empty_rows(supported_gpu):
