@@ -17,6 +17,7 @@ import torch
 from types import SimpleNamespace
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
@@ -179,7 +180,11 @@ def _mkdata(S, N, K, E, combo):
         sfa_log = rand_e8m0((S, sf_k), dev)
         sfb0_log = rand_e8m0((E, N, sf_k), dev)
         sfb1_log = rand_e8m0((E, N, sf_k), dev)
-    sfa = torch.cat([to_blocked(sfa_log[g * group_m : (g + 1) * group_m]) for g in range(E)]).view(1, -1, 1)
+    sfa = torch.cat([to_blocked(sfa_log[g * group_m : (g + 1) * group_m]).view(torch.uint8) for g in range(E)])
+    # Runtime binding requires capacity for every legal group split, beyond this even split.
+    sfa_storage = torch.zeros(segmented_row_scale_capacity_rows(S, E) * ((sf_k + 3) // 4 * 4), dtype=torch.uint8, device=dev)
+    sfa_storage[: sfa.numel()].copy_(sfa)
+    sfa = sfa_storage.view(sfa_log.dtype).view(1, -1, 1)
     sfb0 = torch.cat([to_blocked(sfb0_log[e]) for e in range(E)]).reshape(E, sf_k, N)
     sfb1 = torch.cat([to_blocked(sfb1_log[e]) for e in range(E)]).reshape(E, sf_k, N)
     out = torch.empty(1, S, N, dtype=torch.bfloat16, device=dev)
