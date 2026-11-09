@@ -54,6 +54,7 @@ The experimental API catalog includes:
 - [Grouped GEMM + Quant (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_quant_unified)
 - [Grouped GEMM + Wgrad](/operations/Matmul/gemm_fusions/grouped_gemm_wgrad)
 - [Block Sparse Attention (BSA)](/operations/sparse_attention/bsa)
+- [Simplified Sparse Attention: attention and trainable indexer](/operations/sparse_attention/simplified_sparse_attention)
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)

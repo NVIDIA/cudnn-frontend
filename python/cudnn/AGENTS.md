@@ -381,6 +381,13 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- Pass an explicit kernel floor when qualification starts above the shared
+  helper floor. The package dependency floor and `CUTEDSL_MIN_VERSION` can
+  differ. `test_old_dsl_fails_before_kernel_import` in the simplified sparse
+  attention suite pins its 4.8 floor; a real 4.7.1 run exposed the missing
+  argument. Check PyTorch conditional-graph capability before allocating
+  filtered repair state; `test_filtered_runtime_declines_before_allocation`
+  covers a missing runtime entry.
 - A version floor does not guarantee target-architecture support. For example,
   public 4.7.0 lacks `sm_107a`; check the actual target capability before
   admitting SM107 plans. Test graph and standalone declines with the real
@@ -818,6 +825,12 @@ Keep helpers in the narrowest package shared by their users. For example,
 Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+When sharing a kernel with JAX, match scratch flag storage to its native ABI.
+A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
+CuTe tensor can reject that store during lowering. The long-key cases in
+`simplified_sparse_attention/cutedsl/test_filtered_jax.py` compile and execute
+the selector and its repair loop to cover this boundary.
 
 Loaded integer vectors can infer `Int8` while retaining no signedness metadata.
 Set the declared integer dtype on the vector wrapper before widening to INT32.

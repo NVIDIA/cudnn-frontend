@@ -899,3 +899,248 @@ python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py 
 ```
 
 The CUDA 12 compiler flavor was unavailable and remains unverified.
+
+## Simplified sparse attention — 2026-11-09
+
+The new suite is
+`simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py`.
+It tests the public `cudnn.ops.simplified_sparse_attention` call. There is no
+mode that guarantees determinism. All cases are L0 and use BF16 input,
+BF16 output/gradients, and FP32 loss. Tests check output, indexer loss,
+dQ, dK, dV, dIndexerQ, and dIndexerK. They do not expose or compare saved
+internal statistics. There are no gate or recurrent-state gradients.
+
+The initial SM100 run expanded to 16 cases: **9 passed, 7 failed, 0 skipped**.
+Forward passed all eight cases. Backward passed one small golden case and
+failed the other seven cases. Each failure stopped at dK, so it does not
+establish the status of later gradient comparisons. No backward golden is
+approved from that run. The three forward baselines passed the independent
+FP64 reference and eight fresh-allocation replays before recording. Golden
+names include the loaded DSL compiler's CUDA flavor.
+
+| Check | Shapes / variation | Result |
+| --- | --- | --- |
+| Replay | Packed lengths 65/3/17; Hq16/top-k512, Hq32/top-k1024, Hq96/top-k2048 | Forward passes; backward dK differs by 3, 1, and 1 bytes in 43,520 bytes on replay 1. |
+| Scheduling boundary | 297 queries, Hq16, top-k512; 148 SMs | Forward passes; backward dK differs by 13 of 152,064 bytes. |
+| Batch changes | Hq16/top-k512; target length65; neighbor length17; insertion, removal, reordering, duplication, changed neighbor | Forward passes; backward stops at first insertion, with 3 of 33,280 dK bytes changed. Later layouts are unmeasured for backward. |
+| Golden | Length17; same three Hq/top-k pairs | All forward cases pass. Hq16 backward passes locally; Hq32/Hq96 dK each differ by 1 of 8,704 bytes during replay. |
+
+Inputs and upstream gradients are generated once on CPU, then packed without
+new draws. Invalid rows include empty key intervals. The scalar loss uses a
+fixed denominator of 257, and batch checks isolate the target's loss and
+upstream gradient. Full empty Q/K streams are unsupported. Concurrent GPU
+work and fresh allocations vary scheduling without changing the inputs.
+
+Runtime: SM100, 148 SMs, driver 610.11 (CUDA driver API 13.3), PyTorch
+2.13.0+cu130, cuDNN 9.27.0, CuTe DSL 4.8.0 with the CUDA 13.4 native compiler,
+TVM FFI 0.1.13.post2. The integration starts from Frontend revision
+`cb5f9e54bbb1f64b9b3af2992dc5dbe95f831888`. The printed import path was the
+integration checkout, verified before testing. SM103 and long filtered-path
+determinism are unverified.
+
+Initial measurement, from `test/python`, with the runtime library path set:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=/tmp/ssa-new-goldens \
+  python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py -m L0 -q -s
+```
+
+Use a new recording directory. Inspect hashes and reference results before
+copying baselines. Normal checks leave `CUDNN_DETERMINISM_RECORD` unset:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py -m L0 -q
+```
+
+The expanded suite has 20 cases. Adding Hq32/top-k1024 and Hq96/top-k2048
+batch checks exposed two forward failures: each changes 1 of 4 scalar-loss
+bytes when the target moves to packed slot 1. The output bytes match before
+the loss comparison fails. Loss accumulation groups physical rows into warps,
+so moving a sequence can change FP32 rounding. The expanded strict forward
+run was **8 passed, 2 failed, 10 deselected**.
+
+At the requester's direction, retain kernel behavior and scope expected
+failures on SM100 to the measured dK byte mismatches and those two packed-loss
+cases. Each replay passes its numerical reference before byte comparison. Shape/dtype changes,
+non-finite results, other tensors, and other loss mismatches still fail.
+Backward golden cases remain expected failures until replay is stable and
+a baseline can be approved; an intermittent replay pass is insufficient.
+Remove these exceptions with the corresponding reduction fixes.
+
+The final installed-wheel L0 run on the same SM100 runtime reported
+**106 passed, 12 xfailed, 4 deselected, 0 failed, 0 skipped**. Of these,
+the determinism suite accounts for **8 passed and 12 xfailed**. Nine xfails
+stop at a dK byte mismatch, two at the packed scalar loss, and one at the
+unapproved backward golden after its small replay passes. Later tensor and
+layout comparisons after each mismatch remain unmeasured. Forward status
+is **Replay only**; backward is **Not guaranteed**. Expected failures do
+not improve those support claims.
+
+A final 20-case rerun with the FP64 reference checked on every replay also
+reported **8 passed, 12 xfailed**. Eight cases stopped at dK, two at packed
+loss, and two at unapproved backward goldens. Hq32's small backward replay
+passed in this run despite failing earlier; no new baseline was recorded.
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m L0 -q -s -rxX
+```
+
+The installed wheel contains all 32 Python operation modules and its source
+notice. Separate CuTe DSL 4.8.0 CUDA 12.9 compiler testing passed 17 public API
+cases, including all nine Hq/top-k forward/backward reference combinations,
+selected-support numerics, tails, invalid configurations, and capture rejection.
+This used PyTorch/cuDNN built for CUDA 13; it qualifies the DSL compiler
+flavor, not a deployment using CUDA 12 throughout. The loaded native libraries
+were `cutlass/_mlir/_mlir_libs/_cutlass_ir.cu12.cpython-312-x86_64-linux-gnu.so`
+and `cutlass/_mlir/_mlir_libs/_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so`
+in separate environments. SM103, long-path CUDA 12 compilation, and newer DSL
+versions remain unverified. The actual DSL 4.7.1 runtime rejects this API before
+kernel import. A missing PyTorch conditional-graph entry also rejects before
+filtered-state allocation; bypassing that guard makes its regression test fail.
+
+The installed-wheel L1 run passed **4 cases, 118 deselected, 0 skipped**:
+cold exact repair through the public API, changed addresses/bounds/extents,
+reserved capacity at its maxima, sampler diagnostics, and a 16,384-query
+structured-score stress case. These are numerical and storage-reuse checks,
+not bytewise determinism qualification of the long path.
+
+```sh
+python -m pytest simplified_sparse_attention/cutedsl -m L1 -q -s
+```
+
+Compute Sanitizer `synccheck` passed all three Hq16/top-k512,
+Hq32/top-k1024, and Hq96/top-k2048 public forward/backward reference cases:
+**3 passed, 15 deselected; 0 sanitizer errors**. This covers those short
+packed numerical paths, not the long filtered repair graph.
+
+```sh
+compute-sanitizer --tool synccheck --error-exitcode 86 python -m pytest \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py -m L0 -q -s \
+  -k 'public_forward_backward_reference and ((k512 and bf16-h16) or (k1024 and bf16-h32) or (k2048 and bf16-h96))'
+```
+
+## Simplified sparse attention JAX — 2026-11-09
+
+The JAX suite is
+`simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism_jax.py`.
+It exercises the public native-FFI API under `jax.jit` and `jax.vjp`, using
+JAX/JAXlib 0.11.0 on the SM100 runtime above. The source base remains
+`cb5f9e54bbb1f64b9b3af2992dc5dbe95f831888`, with this integration applied.
+
+| Suite | Forward results | Backward results | Cases |
+| --- | --- | --- | --- |
+| PyTorch determinism | BF16 output, FP32 indexer loss | BF16 dQ/dK/dV/dIndexerQ/dIndexerK | 20 |
+| JAX determinism | BF16 output, FP32 indexer loss | BF16 dQ/dK/dV/dIndexerQ/dIndexerK | 20 |
+
+Both suites check the independent FP64 reference on every replay, then compare
+raw bytes with fresh result buffers and concurrent GPU work. The JAX suite
+uses the same fixed packed data, ragged tails, insertion/removal/reordering,
+duplication, changed neighbors, and 297-query scheduling boundary. Internal
+LSE, teacher distributions, and long filtered-path determinism remain unverified.
+
+The JAX recording run reported **8 passed, 12 xfailed, 0 skipped**. Nine
+cases stopped at atomic dK, two at the known packed loss, and one at the
+unapproved backward golden. The three new forward JSON records passed their
+references and replay checks. All input and output hashes match the existing
+PyTorch goldens. Their filenames also pin JAX 0.11.0 and compiler CUDA 13.4.
+No backward baseline was recorded.
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=/tmp/ssa-jax-new-goldens \
+  python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism_jax.py -m L0 -q -s -rxX
+```
+
+A combined installed-wheel run reached three additional byte mismatches after
+dK happened to match: PyTorch H96/top-k2048 packed backward dV (1/33280 bytes),
+its backward golden replay dV (1/8704 bytes), and JAX H32/top-k1024 replay dV
+(2/43520 bytes). Each passed its independent numerical reference first. These
+are the same already-excepted backward cases; both dK and dV use FP32 atomic
+reductions. The scoped SM100 backward exception now names both gradients.
+Other tensors, non-finite values, shapes, dtypes, and reference failures still
+fail. The interrupted diagnostic run reported **104 passed, 3 failed,
+13 xfailed, 6 deselected**; it is not a qualification pass.
+
+The two JAX L1 numerical cases passed at top-k512 and top-k2048 with 129
+queries and 131,329 keys. All 129 tied rows force two exact-repair chunks;
+a second call changes indexer inputs and key bounds and includes invalid
+rows. The tests check selected scores against full FP32 top-k and compare
+output, loss, and all five gradients with an independent FP64 reference
+using the selection from that same public call. Tied selections may differ
+between calls, so a separate selector execution cannot supply its reference.
+
+Near-uniform KL is about 2.5e-6 in the tied top-k2048 case. A pure 1% relative
+loss check exposed about 2.6e-8 absolute error. A shared native attention
+probe also showed FP32 teacher-mass rounding (up to 5.3e-7), contributing
+about 1.5e-8 of loss error. The new long-path loss check uses 1% relative
+error plus an absolute budget of `16 * FP32_epsilon * loss_coeff * valid_rows /
+loss_denominator`; output and gradient tolerances remain unchanged. This
+budget applies equally to both compiler flavors. No kernel arithmetic changed.
+
+The final combined installed-wheel L0 run reported **135 passed, 24 xfailed,
+6 deselected, 0 failed, 0 skipped**. Each framework's determinism suite
+contributes 8 passes and 12 expected failures. Across both suites, 16 cases
+stop at atomic gradient differences, four at packed scalar loss, and four at
+unapproved backward goldens after small replays pass. Later comparisons after
+a mismatch remain unmeasured. The 21 JAX public API cases cover all nine
+head/top-k forward/backward combinations, selected support, tails, triangular
+metadata, zero loss coefficient, input ownership, invalid inputs, captured-input
+JIT, rejection of mixed GPU architectures, and the dense workspace index limit.
+
+```sh
+CUTE_DSL_CACHE_DIR=/tmp/ssa-cu13-cache CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m L0 -q -s -rxX
+```
+
+In a separate installed-wheel environment, CuTe DSL 4.8.0's CUDA 12.9 compiler
+passed **23 JAX cases, 0 failed, 0 skipped**: all 21 public cases plus both long
+Hq16 filtered-repair cases. The loaded native library was
+`_cutlass_ir.cu12.cpython-312-x86_64-linux-gnu.so`; the CUDA 13.4 run loaded
+`_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so`. Each flavor used a fresh
+process and its own initially empty DSL cache. PyTorch, JAX, and cuDNN still
+use CUDA 13 packages, so this is compiler compatibility, not a full CUDA 12
+deployment. CUDA 12 bytewise determinism and SM103 execution remain unverified.
+
+```sh
+CUTE_DSL_CACHE_DIR=/tmp/ssa-cu12-cache python -m pytest \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py \
+  simplified_sparse_attention/cutedsl/test_filtered_jax.py -m 'L0 or L1' -q -s
+```
+
+The final wheel includes 34 Python operation modules, its Apache-2.0 notice,
+and `contributors.md`. The inventory was compared byte for byte with the
+checkout. The final rebuild changes only the JAX docstring's description of
+the XLA repair loop relative to the full L0 run; the CUDA 12 run uses that
+rebuild. Source copyright notices remain in the released files.
+
+Compute Sanitizer **memcheck and synccheck each passed 1 JAX L1 case,
+1 deselected, with 0 reported errors** on the final rebuilt wheel. The case
+covers top-k512 cold repair in two chunks, changed inputs/bounds, selected
+scores, and all five gradients. This does not qualify every head/top-k route.
+
+```sh
+compute-sanitizer --tool memcheck --report-api-errors explicit \
+  --suppressions /tmp/cuda-binding-probe-suppression.xml --error-exitcode 86 \
+  python -m pytest simplified_sparse_attention/cutedsl/test_filtered_jax.py -m L1 -q -s -k 512
+# Repeat with --tool synccheck.
+```
+
+The initial memcheck run completed its numerical test and reported only seven
+CUDA-binding feature-probe failures, plus seven extended diagnostics: the
+bindings request CUDA API version 13041 against driver API 13030. A separate
+lazy-import test reproduced the API errors without running these kernels.
+The final run uses explicit API-error reporting and suppresses only
+`cuGetProcAddress_v2` returning `CUDA_ERROR_INVALID_VALUE` (result 1) from
+`cuda/bindings/_internal/driver*.so`. The XML record came from that import
+control and retains its binding-module stack constraint. All memory-access
+checks and other explicit API errors remain enabled; no device-access or
+barrier error was suppressed.
+
+JAX installed-wheel benchmarks (three warmups, 20 timed calls, synchronized
+wall time) measured 2.951 ms forward and 3.441 ms training at
+Tq1024/Tk4096/H16/top-k512, and 6.914 ms filtered forward at
+Tq1024/Tk131072/H32/top-k2048. These shared-GPU samples include host dispatch
+and completion waits; they are not direct speed comparisons with the earlier
+PyTorch CUDA-event measurements.
