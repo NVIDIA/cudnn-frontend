@@ -3358,8 +3358,30 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Overriding heuristics query with engine ID "
                                     << engine_id << " and user knobs " << static_cast<int>(user_knobs.size()));
 #endif
-            CHECK_CUDNN_FRONTEND_ERROR(create_execution_plan(engine_id, user_knobs));
-            return {error_code_t::OK, ""};
+            // A node pins an engine where the heuristics place the graph badly (the
+            // deterministic SDPA backward asks for the part's own bprop engine; the
+            // heuristics answer with the SM80 bprop plus a separate dQ matmul over a
+            // quadratic dS workspace, 5-26x slower on cc 10.7). Not every backend
+            // serves the pinned engine on every part, though: cuDNN 9.24.0.43 declines
+            // engine 17 on cc 10.7 at the engine's finalize. That used to surface as
+            // a generic backend-API failure, so nothing could serve the graph -- and
+            // declining the pin for the whole part instead (#2086) handed every
+            // backend the slow heuristics pick. So: try the pin; when the backend
+            // cannot create the pinned engine or its config, nothing has been
+            // enqueued yet, and the graph takes the path a graph without a pin takes
+            // -- the heuristics query below. A failure past the enqueue is a
+            // heuristics-query failure on a finalized config and still propagates.
+            int64_t const plan_count_before = get_execution_plan_count();
+            auto pinned_status              = create_execution_plan(engine_id, user_knobs);
+            if (pinned_status.is_good()) {
+                return {error_code_t::OK, ""};
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                get_execution_plan_count() != plan_count_before, pinned_status.get_code(), pinned_status.get_message());
+            CUDNN_FE_LOG_LABEL_ENDL("WARN: The backend does not serve the pinned engine ID "
+                                    << engine_id << " for this graph on this device (" << pinned_status.get_message()
+                                    << "); falling back to the heuristics query.");
+            break;
         }
     }
 

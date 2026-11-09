@@ -2323,13 +2323,13 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         // The (256, 512] band has no cuDNN backend plan at all -- only the
-        // opt-in frontend FROST engine serves it. Pinning a backend engine id
-        // here bypasses the heuristics query entirely, and the pinned config
-        // then fails to finalize with CUDNN_STATUS_NOT_SUPPORTED, which
-        // surfaces as a generic backend-API error rather than "not supported".
-        // Decline the override and let heuristics run: it returns no configs
-        // and create_execution_plans reports GRAPH_NOT_SUPPORTED, which is what
-        // a caller (and every test harness) can act on.
+        // opt-in frontend FROST engine serves it. Decline the override and let
+        // heuristics run: it returns no configs and create_execution_plans
+        // reports GRAPH_NOT_SUPPORTED, which is what a caller (and every test
+        // harness) can act on. (create_execution_plans falls back to the
+        // heuristics query itself when a pinned engine cannot be created, so
+        // this decline is a shortcut past a pin that cannot finalize, not the
+        // only thing standing between the caller and a backend-API error.)
         if (is_d512_on_blackwell) {
             return {-1, {}};
         }
@@ -2337,23 +2337,30 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         bool const use_new_knobs = detail::get_backend_version() >= 92300;
         // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
         if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
-            // Blackwell parts past cc 10.3 (cc 10.7 is the one met so far). This
-            // branch pinned backend engine 17 with the {128,128} bprop knobs
-            // (TILE_M 3, TILE_N 2, KERNEL_CFG 2, STREAM_K 0, TILE_CGA_M 0,
-            // STAGES 3 for d256 else 2; KERNEL_CFG 31 before 9.23). The loaded
-            // backend does not serve that engine on cc 10.7: cuDNN 9.24.0.43
-            // returns CUDNN_STATUS_NOT_SUPPORTED at the engine's finalize, and a
-            // pinned config that cannot finalize surfaces as a generic
-            // backend-API failure instead of a decline, so the heuristics query
-            // never runs and nothing else -- a backend plan or an opt-in
-            // frontend engine -- can serve (the same trap the (256, 512] band
-            // above declines for). The backend version that will serve engine 17
-            // on this part is not known, so the decline is keyed on the part,
-            // not on a version. Determinism does not rest on the pin: a
-            // deterministic request already expands through the dP-workspace
-            // form (dQ = dS @ K as its own matmul), the form Hopper serves from
-            // heuristics without a pin; the pin only selected an engine for it.
-            return {-1, {}};
+            // Blackwell parts past cc 10.3 (cc 10.7, the one met so far): the part's
+            // own bprop engine, 17, with the {128,128} bprop knobs. Not every backend
+            // serves it on this part -- cuDNN 9.24.0.43 declines it at the engine's
+            // finalize -- and create_execution_plans falls back to the heuristics
+            // query when the pin cannot be created, so a decline here is never
+            // needed. Declining for the whole part (#2086) made every backend take
+            // the heuristics pick, engine 7 (the SM80 bprop plus matmul_dq_sm80 over
+            // a quadratic dS workspace): 4.9x slower on d128 dense GQA and 26x on
+            // d64 sliding-window attention at s=8192 under cuDNN 9.29.0.20, which
+            // does serve engine 17 on cc 10.7. Determinism does not rest on the
+            // pin: a deterministic request already expands through the
+            // dP-workspace form (dQ = dS @ K as its own matmul); the pin selects
+            // the engine that runs it well.
+            if (use_new_knobs) {
+                return {17,
+                        {{KnobType_t::TILE_M, 3},
+                         {KnobType_t::TILE_N, 2},
+                         {KnobType_t::KERNEL_CFG, 2},
+                         {KnobType_t::STREAM_K, 0},
+                         {KnobType_t::TILE_CGA_M, 0},
+                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
+            } else {
+                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
+            }
         } else if (is_deterministic_algorithm_supported_on_blackwell) {
             if (use_new_knobs) {
                 return {5,
