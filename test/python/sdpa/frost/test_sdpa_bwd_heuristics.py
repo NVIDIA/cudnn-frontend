@@ -316,7 +316,8 @@ def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
         assert not family.slots[name].opt_in, name
         eid = _OFFERED[name]
         monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
-        assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["backend", "last_resort", "frost"], name
+        # d256: no study timed these head dims, so no placement_table entry lifts the row
+        assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], name
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost"]
 
@@ -341,7 +342,41 @@ def test_measured_lead_lifts_a_trail_only_row_only_inside_its_classes(monkeypatc
             assert order(dtype=dtype, d_qk=d, d_v=d, causal=False)[0] == "frost"
             assert order(dtype=dtype, d_qk=d, d_v=d, window_left=256)[0] == "frost"
             assert order(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8, s_q=300, s_kv=300)[0] == "frost"
-    assert order(device_cc=(12, 0)) == trails  # another part
+    assert order(device_cc=(10, 0)) == trails  # another part
+    assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
+    assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
+    assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
+    assert order(padded=True) == trails  # runtime lengths
+    assert order(seq_q_trim=True) == trails
+    assert order(causal=False, s_q=512, s_kv=1024)[0] == "frost"  # the GB10 studies are not square-only
+
+
+def test_rtx5090_backward_entries_lift_the_sm120_row_on_cc_12_0(monkeypatch):
+    """cc 12.0 has its own measured dense d64 / d128 classes for the trail-only row, separate from cc 12.1; anything outside them keeps trailing."""
+    from cudnn.engines.base import PlanConfig
+    from cudnn.engines.heuristics import is_backend_block, is_last_resort
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd import heuristics
+
+    tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    eid = _OFFERED["sdpa_bwd_sm120"]
+    monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
+    facts = lambda **over: _facts(**{"device_cc": (12, 0), **over})
+    order = lambda **over: [tag(p) for p in heuristics.propose("A", facts(**over), _OFFERED)]
+    trails = ["backend", "last_resort", "frost"]
+
+    for dtype, study in ((cudnn.data_type.HALF, "sm120_bwd_f16_20261107"), (cudnn.data_type.BFLOAT16, "sm120_bwd_bf16_20261107")):
+        for d in (64, 128):
+            assert order(dtype=dtype, d_qk=d, d_v=d)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, causal=False)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, window_left=256)[0] == "frost"
+            assert order(dtype=dtype, d_qk=d, d_v=d, h_q=32, h_kv=8, s_q=300, s_kv=300)[0] == "frost"
+            assert pt.TABLE[pt.class_key("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d))].study == study
+            for s_q, s_kv in ((512, 1024), (1024, 512)):  # the key does not see squareness, the guard does
+                assert pt.lookup("sdpa_bwd_sm120", facts(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv)) is True
+                assert order(dtype=dtype, d_qk=d, d_v=d, causal=False, s_q=s_q, s_kv=s_kv) == trails
+            assert order(dtype=dtype, d_qk=d, d_v=d, deterministic=True) == trails  # no study timed deterministic reductions
     assert order(d_qk=256, d_v=256) == trails  # head dims no study timed
     assert order(s_q=4, s_kv=4) == trails  # MTP-shaped
     assert order(thd=True, max_total_seq_len_q=512) == trails  # packed layout
@@ -379,3 +414,43 @@ def test_a100_backward_window_entries_lift_only_square_sm80_graphs(monkeypatch):
         assert order(s_q=kv, s_kv=kv, padded=True, **common) == trails
         assert order(s_q=kv, s_kv=kv, window_left=None, **common) == trails
         assert order(s_q=kv, s_kv=kv, device_cc=(8, 6), **common) == trails
+
+
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("mask", ["none", "causal", "window"])
+@pytest.mark.parametrize("h_kv", [6, 2])
+def test_sm120_short_square_class_keeps_default_and_long_square_leads(monkeypatch, dtype, d, mask, h_kv):
+    """All 24 off-tile classes distinguish an unqualified first partial tile from qualified long squares."""
+    from cudnn.engines.heuristics import BACKEND
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.bwd.heuristics import propose
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    for s in (5, 16, 63, 64, 127, 128, 129, 2037):
+        facts = _facts(dtype=dtype, d_qk=d, d_v=d, h_q=6, h_kv=h_kv, s_q=s, s_kv=s, causal=mask != "none", window_left=3 if mask == "window" else None)
+        key = pt.class_key("sdpa_bwd_sm120", facts)
+        plans = propose("A", facts, {"sdpa_bwd_sm120": 20600})
+        if s < 128:
+            assert key[4] == "prefill_short_square"
+            assert pt.lookup("sdpa_bwd_sm120", facts) is None
+            assert plans[0] is BACKEND
+        else:
+            assert key[4] == "prefill"
+            assert pt.lookup("sdpa_bwd_sm120", facts) is True
+            assert plans[0].engine_id == 20600
+
+
+@pytest.mark.parametrize("row,cc", [("sdpa_bwd_sm120", (12, 1)), ("sdpa_bwd_sm80", (8, 0)), ("sdpa_fwd_prefill_sm120", (12, 0))])
+def test_short_square_class_does_not_reclassify_other_measured_rows(row, cc):
+    from cudnn.sdpa import placement_table as pt
+
+    for s in (5, 16, 63, 127, 128, 129):
+        assert pt.class_key(row, _facts(s_q=s, s_kv=s, device_cc=cc))[4] == "prefill"
+
+
+@pytest.mark.parametrize("sq,sk,phase", [(1, 1, "q1"), (4, 4, "mtp"), (5, 7, "prefill"), (127, 128, "prefill")])
+def test_sm120_short_square_split_preserves_other_phases(sq, sk, phase):
+    from cudnn.sdpa import placement_table as pt
+
+    assert pt.class_key("sdpa_bwd_sm120", _facts(s_q=sq, s_kv=sk))[4] == phase

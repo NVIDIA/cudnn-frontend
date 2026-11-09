@@ -113,18 +113,22 @@ backend declines it (a correctness fallback, not a performance claim) -- except 
 leads the graph's class (:func:`_measured_lead`)."""
 
 
-SQUARE_ONLY_LEAD_ROWS = frozenset({"sdpa_bwd_sm80"})
-"""Trail-only rows whose studies measured square graphs only. ``class_key`` excludes squareness (Rule S12: a feature the key does not hold). A100 under a left window: every square
-holdout case ran faster than the backend, while q < kv ran up to 1.45x slower in the same classes (b12 40/8 d64 q128 kv8960, 7.0 vs 4.8 ms)."""
+SQUARE_ONLY_STUDIES = ("sm80_bwd_square_", "sm120_bwd_")
+"""Study name prefixes whose train and holdout timed square graphs only. ``class_key`` excludes squareness (Rule S12: a feature the key does not
+hold), so a non-square graph that one of their entries answers for keeps trailing. A100 under a left window: every square holdout case ran faster
+than the backend, while q < kv ran up to 1.45x slower in the same classes (b12 40/8 d64 q128 kv8960, 7.0 vs 4.8 ms). RTX 5090 (cc 12.0): the
+studies timed s_q == s_kv only, and an earlier single-timing sweep had 2 of 200 non-square d64 / d128 cases above 1.05 of the backend. The GB10
+(cc 12.1) studies are not listed: their entries keep answering for non-square graphs as merged."""
 
 
 def _measured_lead(spec: EngineSpec, facts) -> bool:
     """A trail-only row whose class a ``placement_table`` study measured as a lead goes ahead of the backend like any row. The
     studies time full-length graphs, and ``class_key`` does not see runtime lengths, so a graph with them keeps trailing. The
-    same goes for a non-square graph of a row in :data:`SQUARE_ONLY_LEAD_ROWS`."""
+    same goes for a non-square graph whose entry comes from a study in :data:`SQUARE_ONLY_STUDIES`."""
     from cudnn.sdpa import placement_table
 
-    if spec.name in SQUARE_ONLY_LEAD_ROWS and facts.s_q != facts.s_kv:
+    entry = placement_table.matched_entry(spec.name, facts)
+    if entry is not None and facts.s_q != facts.s_kv and entry.study.startswith(SQUARE_ONLY_STUDIES):
         return False
     return not facts.padded and not facts.seq_q_trim and placement_table.lookup(spec.name, facts) is True
 
