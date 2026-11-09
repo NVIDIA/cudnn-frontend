@@ -389,10 +389,10 @@ DSL satisfies your kernel.**
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
   the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; both
-  QSA backward entries decline that compiler for 12Q/1KV before JIT
-  compilation, and the tests exercise the decline rather than crashing or
-  silently skipping the gate.
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8. Both
+  QSA backward entries decline that compiler for every one-KV-head geometry
+  (12Q/1KV and 6Q/1KV) before JIT compilation, and the tests exercise the
+  decline rather than crashing or silently skipping the gate.
 - **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
   and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
   and cu13 in separate environments/processes and empty, separate caches.
@@ -941,6 +941,21 @@ proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
 
+A TMA-store epilogue must not reuse an smem output buffer while a bulk store may
+still be reading it. Every `PipelineTmaStore.producer_commit()` needs a
+`producer_acquire()` (`cp.async.bulk.wait_group.read num_stages - 1`) in the
+issuing thread before the epilogue warps write that buffer again: right after the
+commit and before the barrier (the GLU and quant epilogues), or before the next
+write into the buffer (the dGLU epilogues, the GLU-Hadamard delayed acquire).
+`producer_tail()` waits only at kernel exit. Another pipeline's acquire, such as
+the C store's, can mask a missing one, so check every compile-time configuration
+that drops that other store. Without the acquire, the block-scaled GLU kernels' D
+store silently corrupted D codes on SM107 with `generate_c=False` (#2350); the race
+is intermittent on hardware. Detectors: `gemm/cutedsl/test_tma_store_buffer_reuse.py`
+(host-only: no committed TMA store under `gemm/cutedsl` lacks an acquire) and
+`gemm/cutedsl/test_grouped_gemm_glu.py::test_rubin_mxfp8_glu_without_c_matches_with_c`
+(SM107: `generate_c=False` writes the same D bytes as `generate_c=True`).
+
 Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
 graphs from override-enabled graphs. Only fixed shapes select token widths
 8/16/32 after swapAB; overrides keep width 64 and at most 48 weight tiles.
@@ -1120,6 +1135,7 @@ key is nonfinite: a key valid for one query can be masked for its neighbor,
 and zero dS multiplied by that key still produces NaN. A union mask alone is
 insufficient, including across an unaligned packed sequence boundary. Keep any
 nonfinite fallback entirely on device and re-evaluate it on each graph replay.
-The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
-which changes finite/nonfinite inputs under one captured graph for both shared
-and separate packed sequences.
+The detectors are `QSA/cutedsl/test_qsa_backward_sm100.py::test_sparse_pair_isolates_a_nonfinite_key_row`
+for the sparse query pairs and `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`
+for the dense kernel's query groups, which changes finite/nonfinite inputs under
+one captured graph for both shared and separate packed sequences.
