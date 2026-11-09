@@ -1855,6 +1855,7 @@ def test_sdpa_fp8_bwd_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 0, "full": 1}),
         is_deterministic=RandomChoice({True: 1, False: 1}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -2234,6 +2235,7 @@ def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 0, "full": 0}),
         is_deterministic=RandomChoice({True: 1, False: 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -2525,6 +2527,7 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 0, "padded": 0, "full": 1}),
         is_deterministic=RandomChoice({True: 1, False: 0}),
         with_sink_token=RandomChoice({True : 1, False : 2}),
+        dO_type=RandomChoice({torch.float8_e5m2: 2, torch.float8_e4m3fn: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
         test.cfg.use_causal_mask = test.cfg.left_bound is None and test.cfg.right_bound == 0
