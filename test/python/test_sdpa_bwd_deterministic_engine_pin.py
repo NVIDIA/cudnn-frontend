@@ -76,13 +76,13 @@ def _mask_kwargs(case):
 
 def _forward(case, handle, q, k, v):
     """o and stats from the backend's own forward, so the backward's inputs carry its mask semantics."""
-    g = pygraph(io_data_type=DT, intermediate_data_type=F32, compute_data_type=F32)
+    g = pygraph(io_data_type=DT, intermediate_data_type=F32, compute_data_type=F32, handle=handle)
     gq, gk, gv = _tensor(g, "q", q.shape, DT), _tensor(g, "k", k.shape, DT), _tensor(g, "v", v.shape, DT)
     o, stats = g.sdpa(gq, gk, gv, generate_stats=True, attn_scale=1.0 / math.sqrt(case["d"]), **_mask_kwargs(case))
     o.set_output(True).set_data_type(DT)
     stats.set_output(True).set_data_type(F32)
     g.validate()
-    g.build_operation_graph(handle)
+    g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     g.check_support()
     g.build_plans()
@@ -99,7 +99,7 @@ class BackwardGraph:
 
     def __init__(self, case, handle):
         hq, hkv, d = case["h_q"], case["h_kv"], case["d"]
-        self.g = g = pygraph(io_data_type=DT, intermediate_data_type=F32, compute_data_type=F32)
+        self.g = g = pygraph(io_data_type=DT, intermediate_data_type=F32, compute_data_type=F32, handle=handle)
         self.q = _tensor(g, "q", (B, hq, S, d), DT)
         self.k = _tensor(g, "k", (B, hkv, S, d), DT)
         self.v = _tensor(g, "v", (B, hkv, S, d), DT)
@@ -121,7 +121,7 @@ class BackwardGraph:
         for t in (self.dQ, self.dK, self.dV):
             t.set_output(True).set_data_type(DT)
         g.validate()
-        g.build_operation_graph(handle)
+        g.build_operation_graph()
 
 
 @pytest.mark.parametrize("case", list(CASES))
