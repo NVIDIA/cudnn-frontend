@@ -29,7 +29,9 @@ PyTorch autograd through the same API. The two fused GDN step entries
 under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
 with no backward. `SharedExpertDecode` (the shared-expert decode pair, also
 under `cudnn.moe.frost`) is the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
-The required settings below apply to this table.
+The required settings below apply to this table. The `pygraph.custom_reduction`
+rows describe only the named reducer bodies and consumed graph outputs, not
+arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
@@ -55,6 +57,8 @@ The required settings below apply to this table.
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
+| `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
+| `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 
 `GdnVerifyFused` is batch-invariant under one gated-norm association only: the
 one-request pick takes the two-CTAs-per-head association (`ctas2`, 4-row
@@ -74,6 +78,15 @@ a row alone and inside a batch under the entry's own picks.
   Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
 
+- Custom reduction: these rows have no determinism switch and pin the native
+  cuDNN backend. SM100 support applies only to the suite's dense, 257-element
+  row reductions and consumed outputs. Argmax/argmin use bounded finite values
+  with ties and row-local INT32 indices; NaN/infinity behavior is unverified.
+  The direct FLOAT ADD body uses the suite's bounded multiples of one eighth,
+  whose partial sums are all exactly representable. Arbitrary floating-point
+  sum inputs, other reducer bodies, and unused tuple outputs are unverified.
+  No custom-reduction backward entry point exists. SM103, SM90, SM107, and
+  other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
