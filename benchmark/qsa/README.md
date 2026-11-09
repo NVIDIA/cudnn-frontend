@@ -33,8 +33,8 @@ The independent chunked FP32 reference checks out, out_fp32, LSE, dQ, dK and dV
 before timing. Both backward calls use the same reference FP32 output and
 natural-log LSE. Checks require matching empty-row markers, elementwise
 `atol=rtol=0.04`, and relative L2 error at most 0.025. `--directions forward`
-limits validation and timing to the three forward outputs while backward is
-under development. `--max-tokens 4096` runs a small suite.
+limits validation and timing to the three forward outputs. `--max-tokens 4096`
+runs a small suite.
 
 Primary timings are medians of synchronized wall time for full public calls.
 CUDA event medians and all raw samples are also saved. Calls include metadata,
@@ -45,16 +45,15 @@ replay. The JSON records first-call compile time, source hashes, GPU, driver,
 CUDA, PyTorch, Triton and DSL versions.
 
 Use `--components --min-tokens 4096 --max-tokens 32768` to add native compaction,
-preallocated gather-only forward, backward prep/main/finish, and combined backward
-kernel timings. Forward components do not describe the public dense route.
-These use eager launches with prebuilt IDs and buffers. Backward
-accumulators are reset before each main-kernel sample, outside its timed region.
-The isolated backward main excludes the public nonfinite scan and fallback
-dispatch. Component sums need not equal full-call timings; the full call remains primary.
+preallocated gather-only forward and preallocated full backward timings.
+Forward components do not describe the public dense route.
+These use eager launches with prebuilt IDs and buffers. The backward component
+times the engine's whole launch sequence and must match the public call.
+Component sums need not equal full-call timings; the full call remains primary.
 
 Memory fields give live bytes before each pass, peak allocated/reserved bytes,
 and peak extra allocation. At 128K, the bitmap needs 4 GiB and forward int32 IDs
-need 16 GiB. Paired Blackwell 12:1 backward uses 8 GiB for IDs. Reference saved
+need 16 GiB. Backward int32 IDs use the same `[T, NB]` layout, also 16 GiB. Reference saved
 state remains live during timing. Output and log files are kept per case and implementation.
 An illegal device access cannot invalidate another process's result. A failed
 implementation has no speedup ratio, and the command exits nonzero after the
@@ -90,10 +89,11 @@ external files unchanged, records input/source hashes, creates BF16 4Q/D128
 indexer scores, selects 512 complete causal blocks, and appends the incomplete
 tail. It does not substitute the Miles implementation for the Relax baseline.
 
-For the public bounded-workspace backward, add `--causal-topk`. This declares
+For the causal top-k indexed backward, add `--causal-topk`. This declares
 the stricter [canonical selection contract](../../docs/operations/sparse_attention/qsa_indexed.md#complete-blocks-and-causal-tails)
 and passes packed `cu_seqlens` and the maximum document length to the public
-entry point. Sparse 12Q/1KV requires the CUDA 13 CuTeDSL compiler. Add
+entry point. Both indexed modes run the same backward engine. Every one-KV-head
+backward (12Q/1KV and 6Q/1KV) requires the CUDA 13 CuTeDSL compiler. Add
 `--compare-general` to measure the default indexed backward on the same saved
 state. For example, use `--indexed --causal-topk --compare-general --lengths
 43691,43691,43690` for an unaligned packed 128K comparison.

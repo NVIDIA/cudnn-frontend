@@ -1,12 +1,14 @@
 # QSA measured results
 
-QSA forward and backward are faster than unchanged Miles in all nine regular cases on B200 and B300 SXM6 AC. All six output checks pass. The close packed 4096-token, 24-query-head case also wins when the timing order is reversed. Ratios are Miles/QSA; values above 1 favor QSA. Times are milliseconds.
+QSA forward and the previous QSA backward were faster than unchanged Miles in all nine regular cases on B200 and B300 SXM6 AC. All six output checks pass. The close packed 4096-token, 24-query-head case also wins when the timing order is reversed. Ratios are Miles/QSA; values above 1 favor QSA. Times are milliseconds.
 
 BF16 packed THD, D256, block size 4, and seed 17. The synthetic selector keeps up to 512 complete causal blocks plus the partial tail. Packed sequence ends are unaligned. These are synthetic inputs, not captured model inputs.
 
 Each implementation runs in a fresh process. Input and saved-state hashes match within each comparison. All six outputs pass an independent FP32 reference before timing; both timed backward calls use the same reference FP32 output and natural-log LSE. Separate untimed checks also validate each implementation with its own forward state. TF32 is disabled. Checks use atol=rtol=0.04 and relative L2 error <=0.025.
 
 Full public calls include validation, allocation, metadata preparation, helper kernels and casts. Regular rows use seven synchronized wall-time samples after two warmups. The close 4096/3/24:2 row uses 31 samples after five warmups in each timing order. Compilation, reference evaluation and input generation are excluded. These timings do not use graph replay. CUDA-event times, raw samples and memory measurements are retained in JSON.
+
+The Bwd columns in every table below measure the previous backward implementation. They have not been re-measured with the current backward engine.
 
 ## B200
 
@@ -40,7 +42,7 @@ Full public calls include validation, allocation, metadata preparation, helper k
 
 ## Reverse-order check
 
-For the close packed 4096/3/24:2 case, Miles runs first in a separate pair. Both directions remain faster with the same inputs and reference saved state.
+For the close packed 4096/3/24:2 case, Miles runs first in a separate pair. Both directions (the backward measured with the previous implementation) remain faster with the same inputs and reference saved state.
 
 | GPU | Fwd QSA | Fwd Miles | Ratio | Bwd QSA | Bwd Miles | Ratio |
 |---|---:|---:|---:|---:|---:|---:|
@@ -65,11 +67,11 @@ All QSA outputs pass at 131072 tokens for both head layouts. Original Miles forw
 | B300 SXM6 AC / 12:1 | 25.42 / 17.80 |
 | B300 SXM6 AC / 24:2 | 30.81 / 31.56 |
 
-At 128K, the bitmap uses 4 GiB and forward compact int32 block IDs use 16 GiB. The paired 12:1 backward uses half as many compact-index rows. Peak allocated memory includes live inputs and reference saved state. Allocator reserved bytes are recorded separately.
+At 128K, the bitmap uses 4 GiB and forward compact int32 block IDs use 16 GiB. The current backward uses the same `[T, NB]` int32 IDs, also 16 GiB. The bwd peaks above measure the previous backward implementation. Peak allocated memory includes live inputs and reference saved state. Allocator reserved bytes are recorded separately.
 
 ## Validation and environment
 
-The measured source passes strict checks on B200 and B300 SXM6 AC with actual CuTeDSL 4.8.1 and 4.7: 71 explicit cases, 36 changed-input/current-stream replay states, 12 packed cases, 50 analytic states, 49 backward oracle cases, 40 cancellation cases and 35 pair/stream states. Each passes 52 public and ancillary tests with 4.8.1. With actual 4.7, 51 tests pass and one unavailable ancillary helper test is skipped; all QSA tests pass. The final native runs on B200 and B300 SXM6 AC pass all 11 cases and the reverse-order close case. Each implementation also passes separate all-six-output checks using its own forward output and LSE before timing. These runs do not establish a clean Compute Sanitizer result.
+The measured source, which includes the previous backward implementation, passes strict checks on B200 and B300 SXM6 AC with actual CuTeDSL 4.8.1 and 4.7: 71 explicit cases, 36 changed-input/current-stream replay states, 12 packed cases, 50 analytic states, 49 backward oracle cases, 40 cancellation cases and 35 pair/stream states. Each passes 52 public and ancillary tests with 4.8.1. With actual 4.7, 51 tests pass and one unavailable ancillary helper test is skipped; all QSA tests pass. The final native runs on B200 and B300 SXM6 AC pass all 11 cases and the reverse-order close case. Each implementation also passes separate all-six-output checks using its own forward output and LSE before timing. These runs do not establish a clean Compute Sanitizer result.
 
 | Measurement device | Runtime name | SM | CUDA-visible GiB | Driver | CUDA |
 |---|---|---:|---:|---|---|

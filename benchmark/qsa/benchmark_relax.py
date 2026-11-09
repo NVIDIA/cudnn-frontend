@@ -50,8 +50,6 @@ def main():
         parser.error("Require positive packed lengths totaling at most 131072 and at least three samples and two warmups")
     if args.indexed and args.heads not in (6, 12):
         parser.error("The indexed path supports 12Q/1KV and 6Q/1KV")
-    if args.causal_topk and args.heads != 12:
-        parser.error("--causal-topk supports 12Q/1KV")
     if args.causal_topk and not args.indexed:
         parser.error("--causal-topk requires --indexed")
     if args.compare_general and not args.causal_topk:

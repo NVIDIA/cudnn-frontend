@@ -1,19 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen Sparse Attention (QSA) backward for SM100 / SM103, written with the CuTe DSL primitives.
+"""Qwen Sparse Attention (QSA) backward for SM100 / SM103 / SM107, written with the CuTe DSL primitives.
 
 The launch sequence is a dense key-tile kernel for the queries below the crossover, and for the remaining queries a
 query-major kernel (S, dP, dQ and the P / dS records of every selected block) followed by a key-major kernel that
 accumulates dK / dV from those records. The selection arrives compacted per query (``ids`` block keys, ``counts``,
-``first`` block key -> first token) with the inclusive key bounds ``lo`` / ``hi`` of ``cudnn.ops.qsa_backward``; keys
-after the query are never attended. The dense kernel masks per token through a bitmap, so a block may start anywhere
-and the bounds may cut it. A query past the dense prefix holds at most SPARSE_CAP blocks: a longer list contributes
-nothing and its dQ is NaN. A nonfinite K / V value of a masked token adds exact zeros (P and dS are selected, the dQ
-MMAs read a sanitized copy of K), one of a selected token poisons its queries.
+``first`` block key -> first token) with the inclusive key bounds ``lo`` / ``hi`` of ``cudnn.ops.qsa_backward``. A
+query sees every selected key within its bounds, keys after itself included. The dense kernel masks per token through
+a bitmap, so a block may start anywhere and the bounds may cut it. A query past the dense prefix holds at most
+SPARSE_CAP blocks: a longer list contributes nothing and its dQ is NaN. A nonfinite K / V value of a masked token
+adds exact zeros (P and dS are selected, the dQ MMAs read a sanitized copy of K), one of a selected token poisons its
+queries.
 """
 
+import hashlib
 import math
+import threading
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -26,13 +31,16 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import primitives as prims
 
 from cudnn.api_base import ws_align
+from cudnn.frost.compiled_cache import compile_cached, template_key
+
+FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 I32 = cutlass.Int32
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
 # dS^T reaches the dQ MMAs in bf16 parts of its fp32 value: three keep the cancellation of nearly equal dS rows (the
-# default), one keeps a single rounding as FlashAttention does (ds_precision="bf16", the faster option).
+# default), one rounds dS to bf16 (ds_precision="bf16", the faster option).
 DQ_PARTS_DEFAULT = 3
 
 # Geometry: GQ head rows per query in the MMA tiles, HKV in (1, 2) KV heads. The kernels take HKV and GH, the real
@@ -45,10 +53,10 @@ LOG2E = 1.4426950408889634
 
 NTHREADS = 512
 # Blocks per chunk fill 8 * CHB of the 128 MMA rows. With the K and V tiles copied on to TMEM, 12 blocks leave room
-# for a 3-stage K ring. Rows past 8 * CHB alias the next region and are masked out. With one KV head every K^T atom
-# of the dQ^T MMA holds 4 alien rows (the next 512 B, cancelled by zero dS^T rows), and 0 * NaN would poison every
-# column: the softmax warps zero the rows of the chunk the MMA must not see, and the 512 B after a stage, which its
-# last K-step reads the same way, never hold K or V (see the layout below).
+# for a 3-stage K ring with one dS^T part (2 stages with three). Rows past 8 * CHB alias the next region and are
+# masked out. With one KV head every K^T atom of the dQ^T MMA holds 4 alien rows (the next 512 B, cancelled by zero
+# dS^T rows), and 0 * NaN would poison every column: the softmax warps zero the rows of the chunk the MMA must not
+# see, and the 512 B after a stage, which its last K-step reads the same way, never hold K or V (see the layout below).
 CHB = 12
 
 # shared memory of the query-major kernel (bytes from a 1024-aligned base): [K0][pad][K1][dO][K2][Q][V][dS] with one
@@ -62,7 +70,7 @@ HALF_BLK = 2048
 K_STAGE = CHB * BLK_SMEM  # blocks sit at the 8-row-group stride of the MMA operand
 # A zero pad, dO and Q separate the K stages, so the alien rows of a stage's last K-step never hold the next chunk's
 # K (a nonfinite block there would reach the previous chunk's pair). Every region stays 1024-aligned: a stage that
-# starts 512 B into its swizzle span costs 5% on the kernel, and the budget holds one aligned pad, not three.
+# starts 512 B into its swizzle span is slower, and the budget holds one aligned pad, not three.
 QSLAB = 3072
 Q_BYTES = 4 * QSLAB  # [4 slabs][24 rows x 128 B] with SW128: rows 0-11 are KV head 0 / the first query of the pair
 OFF_K = 0
@@ -91,8 +99,6 @@ TM_VA = 320  # the chunk's V tile as the TMEM A operand of dP^T
 TM_COLS = 512
 L2_EVICT_FIRST = 0x12F0000000000000  # createpolicy encoding of the L2 evict-first priority
 
-Q_BOX_BYTES = 24 * 128
-
 
 @cute.jit
 def _wait(bar, parity):
@@ -106,6 +112,14 @@ def _st_async16(dst, v4, mbar):
     prims.inline_ptx(
         "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}}, [{$r5}];",
         read_only_args=[dst, v4[0], v4[1], v4[2], v4[3], mbar],
+    )
+
+
+@cute.jit
+def _st_async8(dst, v2, mbar):
+    prims.inline_ptx(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [{$r0}], {{$r1}, {$r2}}, [{$r3}];",
+        read_only_args=[dst, v2[0], v2[1], mbar],
     )
 
 
@@ -207,7 +221,7 @@ def _prefetch_block(tmap, tok, PAIR: cutlass.Constexpr[bool]):
 
 @cute.jit
 def _lse_rows(lse: cute.Tensor, qi, h0, GH: cutlass.Constexpr[int]):
-    # the GQ head rows of one query from the native [Hq, T] LSE, from head h0; rows past the GH real heads read +inf
+    # the GQ head rows of one query from the native [Hq, T] LSE, from head h0. Rows past the GH real heads read +inf.
     values = []
     for i in cutlass.range_constexpr(GQ):
         if cutlass.const_expr(i < GH):
@@ -219,8 +233,8 @@ def _lse_rows(lse: cute.Tensor, qi, h0, GH: cutlass.Constexpr[int]):
 
 @cute.jit
 def _delta_rows(p_delta, base, GH: cutlass.Constexpr[int]):
-    # the GQ head rows of one query's delta from flat index base (16-byte aligned when every row is a real head);
-    # rows past the GH real heads read 0
+    # the GQ head rows of one query's delta from flat index base (16-byte aligned when every row is a real head). Rows
+    # past the GH real heads read 0.
     values = []
     if cutlass.const_expr(GH == GQ):
         for c in cutlass.range_constexpr(GQ // 4):
@@ -401,7 +415,7 @@ def qsa_bwd_sparse_query_kernel(
                                             l2_cache_hint=hint_q,
                                         )
                         # this lane's block slot of the next chunk, loaded one chunk ahead with the column clamped to a
-                        # valid one (entries past nsel are replaced by the tail block below)
+                        # valid one
                         m0 = jl
                         if m0 >= nblk_l:
                             m0 = I32(0)
@@ -434,7 +448,7 @@ def qsa_bwd_sparse_query_kernel(
                         nq = nq + 1
 
         # V has only one SMEM stage.  Giving it to the otherwise-idle warp 1 prevents its empty-barrier wait from
-        # serialising warp 0's three-stage K producer, so K can run up to the actual ring depth ahead of the MMA.
+        # serialising warp 0's K producer, so K can run up to the actual ring depth ahead of the MMA.
         if warp == 1:
             gc = I32(0)
             for pp in cutlass.range(NP, unroll=1):
@@ -499,13 +513,13 @@ def qsa_bwd_sparse_query_kernel(
                         nchunks = (nblk + (CHB - 1)) // CHB
                         _wait(b_qf, nq & 1)
                         for c in cutlass.range(nchunks + 1, unroll=1):
-                            # S(c) and dP(c) only need softmax(c-1) to have read S/dP (signalled early through sde),
-                            # so softmax(c) overlaps dQ(c-1) and S/dP(c+1) on the tensor pipe.
+                            # S(c) and dP(c) only need softmax(c-2), the last reader of this S/dP buffer, to have read it
+                            # (signalled early through sde), so softmax(c) overlaps dQ(c-1) and S/dP(c+1) on the tensor pipe.
                             cgc = gc + c
                             st = cgc % NKS
                             if c < nchunks:
                                 _wait(b_kf.subview(st), (cgc // NKS) & 1)
-                                # softmax(c-1) has loaded S/dP into registers
+                                # softmax(c-2) has loaded this S/dP buffer into registers
                                 _wait(b_sde.subview(cgc & 1), ((cgc >> 1) & 1) ^ 1)
                                 prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -683,7 +697,7 @@ def qsa_bwd_sparse_query_kernel(
                         mpf = I32(0)
                     pnx = (prow_pp + mpf).load()
                     tnx = (trow_pp + mpf).load()
-                    # The 12-head softmax state stays at vector level across the chunks, built once per query; the rows
+                    # The 12-head softmax state stays at vector level across the chunks, built once per query. The rows
                     # past the GH real heads carry lse = +inf and delta = 0, so their P and dS are zero.
                     lse_v = _lse_rows(g_lse, qr, h0, GH)
                     del_v = _delta_rows(p_delta, lbase, GH)
@@ -753,7 +767,7 @@ def qsa_bwd_sparse_query_kernel(
                         prw = prob_v.to(BF16).bitcast(I32)
                         drw = ds_v.to(BF16).bitcast(I32)
                         # dS^T for the dQ MMA in DQ_PARTS bf16 parts of its fp32 value (three keep the cancellation of
-                        # nearly equal rows); the record keeps the first
+                        # nearly equal rows). The record keeps the first.
                         dvecs = []
                         res = ds_v
                         for part in cutlass.range_constexpr(DQ_PARTS):
@@ -2029,7 +2043,7 @@ def _window_host(total_count: cute.Tensor, window_count: cute.Tensor, key_counts
 # sparse_blocks[j] holds the first token of every selected block of sparse query j (and of its tail block) grouped by
 # pass p = block // RB, and sparse_pass_offsets[j, p] .. sparse_pass_offsets[j, p+1] bounds pass p's segment.
 PART_W = 516  # list row stride in int32: 512 blocks plus the tail block, rounded up to a multiple of 4 words
-POS = 64  # offset row stride in int32, a power of two well above the 11 passes of the longest sequence, so NP < POS
+POS = 64  # offset row stride in int32, a power of two above the KV passes of the longest sequence, so NP < POS
 
 # Sparse queries are split into ranges of QR queries. Every (query, selected block) pair gets a slot in a key-major
 # order: key = range * T + the block's first token, so every block of the packed buffer has its own key, and the slots
@@ -2341,7 +2355,7 @@ def qsa_bwd_bitmap_kernel(
     # Row qi of the bitmap holds one bit per sequence-relative key token a dense query attends: the tokens of its
     # selected blocks within [lo, hi] and the dense prefix, so the dense kernel tests the bit alone and a block may
     # start anywhere. A query that sees keys after itself lowers the first query group of the key tiles up to hi, so
-    # the dense kernel walks those groups; keys past the dense prefix have no bits, and selecting one leaves the
+    # the dense kernel walks those groups. Keys past the dense prefix have no bits, and selecting one leaves the
     # query's dQ NaN (the sparse path alone reaches them).
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -2540,8 +2554,9 @@ def _rot(k, off, nk):
     return r
 
 
-# Key-tile-major path for the queries below num_dense_queries. The two CTAs of a cluster split each group's work by operand, so every
-# MMA keeps M=128 and each CTA holds one [128 x 256] fp32 dV or dK accumulator in TMEM across all groups.
+# Key-tile-major path for the dense-prefix queries of each sequence. The two CTAs of a cluster split each group's work
+# by operand, so every MMA keeps M=128 and each CTA holds one [128 x 256] fp32 dV or dK accumulator in TMEM across all
+# groups.
 DP_TT = 128
 DP_G = 4  # queries per group: with 12 heads N = 48, the widest N whose S^T / dP^T, dQ^T and P / dS slices fit the TMEM columns
 DP_N = DP_G * GQ
@@ -2555,7 +2570,8 @@ DP_HS = 4 * DP_QSLAB
 DP_OFF_E = 2 * DP_KSLAB
 DP_OFF_L = DP_OFF_E + DP_NE * DP_HS
 DP_CM = 16 * 6 * 128
-DP_NX = 3  # P slots of rank 1. Rank 0 never writes its P ring, so its dS slots (R0 groups of DQ_PARTS parts) span both rings
+DP_NX = 3  # rank 1's P ring spans DP_NX * DP_CM bytes (R0 slots of PXB). Rank 0 never writes its P ring, so its dS
+# slots (R0 groups of DQ_PARTS parts) span both rings
 DP_OFF_P = DP_OFF_L + DP_NL * DP_HS
 DP_OFF_DS = DP_OFF_P + DP_NX * DP_CM
 DP_ST_W = DP_N * 128
@@ -2610,10 +2626,14 @@ def qsa_bwd_dense_pair_kernel(
     DQ_PARTS: cutlass.Constexpr[int],
 ):
     HQ = GH * HKV
+    # Rank 1 forms dS from the P that rank 0 sends. With dS in parts, a bf16 P would cap its precision, so P crosses
+    # as the top 24 bits of its fp32 value (bf16 high halves, then one byte per value).
+    P_LO = DQ_PARTS > 1
+    PXB = DP_CM + DP_CM // 2 if P_LO else DP_CM
     # Rank 0 keeps the dS parts of R0 groups in flight and issues dQ^T DQL groups late, so the dS round trip through
     # rank 1 overlaps DQL groups of its work. Rank 1 writes dS once dQ^T of the previous group has read it, so one slot
-    # holds its parts.
-    R0 = min(DP_NX, (2 * DP_NX) // DQ_PARTS)
+    # holds its parts. Rank 0 sends P(k) only after its dQ^T(k - R0), so rank 1's P ring of R0 slots is free by then.
+    R0 = min(DP_NX, (2 * DP_NX) // DQ_PARTS, (DP_NX * DP_CM) // PXB)
     DQL = R0 - 1
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -2653,16 +2673,18 @@ def qsa_bwd_dense_pair_kernel(
     if fg < g_lo:
         g_lo = fg
     # Without a sparse grid to backfill, the unit is one wave of the longest sequence's causal work per pair slot
-    # (decided on the device, where the sequences are known), raised when the tile's parts could not cover its groups
-    # otherwise. With a sparse grid, the tuned unit backfills the key-major grid.
+    # (decided on the device, where the sequences are known). With a sparse grid, the tuned unit backfills the
+    # key-major grid.
     Ut = U
     if adapt != 0:
         Ut = g_unit.iterator.raw_ptr().load()
-        need = (g_top - g_lo + nparts - 1) // nparts
-        if need > Ut:
-            Ut = need
         if Ut > U:
             Ut = U
+    # The parts must cover every group of the tile. A tile shared by two packed sequences whose first group a bound
+    # past the query lowered spans more groups than the plan's reach, so its unit grows.
+    need = (g_top - g_lo + nparts - 1) // nparts
+    if need > Ut:
+        Ut = need
     g_top = g_top - part * Ut
     g_bot = g_top - Ut
     if g_bot > g_lo:
@@ -2728,7 +2750,8 @@ def qsa_bwd_dense_pair_kernel(
                             if cutlass.const_expr(s < R0):
                                 prims.mbarrier_arrive_expect_tx(b_xr.subview(s), DQ_PARTS * DP_CM)
                         else:
-                            prims.mbarrier_arrive_expect_tx(b_xr.subview(s), DP_CM)
+                            if cutlass.const_expr(s < R0):
+                                prims.mbarrier_arrive_expect_tx(b_xr.subview(s), PXB)
                 prims.mbarrier_init(b_dqf, 1)
                 prims.mbarrier_init(b_dqe, 4)
                 prims.mbarrier_init(b_kvd, 1)
@@ -2916,6 +2939,9 @@ def qsa_bwd_dense_pair_kernel(
             c_s = scale * F32(LOG2E)
             xoff = (DP_OFF_P + (r >> 3) * 768 + (r & 7) * 16) // 4 + hf * 96
             xoffd = (DP_OFF_DS + (r >> 3) * 768 + (r & 7) * 16) // 4 + hf * 96
+            # a P slot's low bytes follow its high halves: 16 B, then 8 B, per (half, row)
+            xlo4 = (DP_OFF_P + DP_CM) // 4 + (hf * 128 + r) * 4
+            xlo2 = (DP_OFF_P + DP_CM + 4096) // 4 + (hf * 128 + r) * 2
             # Lane r writes key row tok of K (rank 0) or V (rank 1) to TMEM as packed bf16 pairs, the score MMA's A operand.
             vok = tok < T
             asrc = p_k
@@ -2988,6 +3014,7 @@ def qsa_bwd_dense_pair_kernel(
                     if prims.elect_sync():
                         prims.mbarrier_arrive(b_sr)
                     opk = []
+                    pall = []
                     for jj in cutlass.range_constexpr(2):
                         qi = g * DP_G + hf * 2 + jj
                         sel = (sw[jj] >> (bqs[jj] & 31)) & 1
@@ -3007,11 +3034,27 @@ def qsa_bwd_dense_pair_kernel(
                             if valid:
                                 pj = e
                             ow.append(pj)
+                            pall.append(pj)
                         pk = cutlass.Vector.from_elements(ow, F32).to(BF16).bitcast(I32)
                         for u in cutlass.range_constexpr(GQ // 2):
                             opk.append(pk[u])
                     ovec = cutlass.Vector.from_elements(opk, I32)
+                    xvec = ovec
+                    if cutlass.const_expr(P_LO):
+                        # truncation keeps NaN and inf intact and P = 0 exact
+                        pb = cutlass.Vector.from_elements(pall, F32).bitcast(I32)
+                        xw = []
+                        for w in cutlass.range_constexpr(GQ):
+                            xw.append(prims.prmt(pb[2 * w], 0x7632, prims.PermuteMode.DEFAULT, hi=pb[2 * w + 1]))
+                        lw = []
+                        for w in cutlass.range_constexpr(GQ // 2):
+                            t0 = prims.prmt(pb[4 * w], 0x0051, prims.PermuteMode.DEFAULT, hi=pb[4 * w + 1])
+                            t1 = prims.prmt(pb[4 * w + 2], 0x5100, prims.PermuteMode.DEFAULT, hi=pb[4 * w + 3])
+                            lw.append(prims.prmt(t0, 0x7610, prims.PermuteMode.DEFAULT, hi=t1))
+                        xvec = cutlass.Vector.from_elements(xw, I32)
+                        lvec = cutlass.Vector.from_elements(lw, I32)
                     xb = k % DP_NX
+                    xp = k % R0
                     if k >= 1:
                         # dV(k-1) has read the TMEM P^T slot
                         kp = k - 1
@@ -3026,9 +3069,12 @@ def qsa_bwd_dense_pair_kernel(
                     else:
                         prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1] + 4).as_ptr(I32), ovec[0:4])
                         prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[2]).as_ptr(I32), ovec[4:12])
-                    rb = prims.mapa(b_xr.subview(xb), peer)
+                    rb = prims.mapa(b_xr.subview(xp), peer)
                     for nc in cutlass.range_constexpr(3):
-                        _st_async16(prims.mapa(sbase + xoff + xb * (DP_CM // 4) + nc * 32, peer), ovec[nc * 4 : nc * 4 + 4], rb)
+                        _st_async16(prims.mapa(sbase + xoff + xp * (PXB // 4) + nc * 32, peer), xvec[nc * 4 : nc * 4 + 4], rb)
+                    if cutlass.const_expr(P_LO):
+                        _st_async16(prims.mapa(sbase + xlo4 + xp * (PXB // 4), peer), lvec[0:4], rb)
+                        _st_async8(prims.mapa(sbase + xlo2 + xp * (PXB // 4), peer), lvec[4:6], rb)
                     prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
                     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     prims.bar_warp_sync(0xFFFFFFFF)
@@ -3066,17 +3112,21 @@ def qsa_bwd_dense_pair_kernel(
                     if prims.elect_sync():
                         prims.mbarrier_arrive(b_sr)
                     xb = k % DP_NX
-                    _wait(b_xr.subview(xb), (k // DP_NX) & 1)
+                    xp = k % R0
+                    _wait(b_xr.subview(xp), (k // R0) & 1)
                     pin = []
                     for nc in cutlass.range_constexpr(3):
-                        pin.append((sbase + xoff + xb * (DP_CM // 4) + nc * 32).load(count=4, alignment=16))
+                        pin.append((sbase + xoff + xp * (PXB // 4) + nc * 32).load(count=4, alignment=16))
+                    if cutlass.const_expr(P_LO):
+                        lo4 = (sbase + xlo4 + xp * (PXB // 4)).load(count=4, alignment=16)
+                        lo2 = (sbase + xlo2 + xp * (PXB // 4)).load(count=2, alignment=8)
                     prims.bar_warp_sync(0xFFFFFFFF)
-                    if k + DP_NX < nk:
+                    if k + R0 < nk:
                         if warp == 4:
                             if prims.elect_sync():
-                                # arm this buffer for P(k + DP_NX): rank 0 sends it only after dS(k) (whose quadrant-0
+                                # arm this buffer for P(k + R0): rank 0 sends it only after dS(k) (whose quadrant-0
                                 # copy this warp issues after this arm) has been consumed by its dQ^T
-                                prims.mbarrier_arrive_expect_tx(b_xr.subview(xb), DP_CM)
+                                prims.mbarrier_arrive_expect_tx(b_xr.subview(xp), PXB)
                     dpk = []
                     for jj in cutlass.range_constexpr(2):
                         dw = []
@@ -3091,7 +3141,18 @@ def qsa_bwd_dense_pair_kernel(
                         for hp in cutlass.range_constexpr(GQ // 2):
                             n0 = jj * GQ + 2 * hp
                             pw = pin[n0 // 8][(n0 % 8) // 2]
-                            pv = cutlass.Vector.from_elements([pw], I32).bitcast(BF16).to(F32)
+                            if cutlass.const_expr(P_LO):
+                                if cutlass.const_expr(n0 < 16):
+                                    lw = lo4[n0 // 4]
+                                else:
+                                    lw = lo2[n0 // 4 - 4]
+                                # the value's low byte repeats its own extra byte, so P = 0 stays exact
+                                sb = (n0 % 4) * 0x11
+                                p0 = prims.prmt(lw, 0x5400 + sb, prims.PermuteMode.DEFAULT, hi=pw)
+                                p1 = prims.prmt(lw, 0x7611 + sb, prims.PermuteMode.DEFAULT, hi=pw)
+                                pv = cutlass.Vector.from_elements([p0, p1], I32).bitcast(F32)
+                            else:
+                                pv = cutlass.Vector.from_elements([pw], I32).bitcast(BF16).to(F32)
                             # a masked token has P = 0 and must give dS = 0 even when its dP is nonfinite
                             d0 = F32(0.0)
                             d1 = F32(0.0)
@@ -3101,8 +3162,7 @@ def qsa_bwd_dense_pair_kernel(
                                 d1 = pv[1] * dw[2 * hp + 1] * scale
                             dpk.append(d0)
                             dpk.append(d1)
-                    # dS^T for the dQ^T MMAs in DQ_PARTS bf16 parts of its fp32 value (three keep the cancellation of
-                    # nearly equal rows); dK takes the first
+                    # dS^T for the dQ^T MMAs in DQ_PARTS bf16 parts of its fp32 value. dK takes the first.
                     dparts = []
                     res = cutlass.Vector.from_elements(dpk, F32)
                     for part in cutlass.range_constexpr(DQ_PARTS):
@@ -3181,9 +3241,9 @@ def qsa_bwd_dense_pair_kernel(
             if prims.elect_sync():
                 prims.mbarrier_arrive(b_ks)
             stg0 = sbase + (DP_OFF_ST + qd * DP_ST_W) // 4
-            # rank 0 sends P straight into the peer (st.async) and never touches its own P buffers, so the room its dS
-            # slots leave holds a second staging box per drain warp: the reduce of group k-1 may still be reading while
-            # k is staged
+            # rank 0 sends P straight into the peer (st.async) and never touches its own P buffers. With one dS part the
+            # room its dS slots leave holds a second staging box per drain warp, so the reduce of group k-1 may still be
+            # reading while k is staged.
             STG2 = R0 * DQ_PARTS * DP_CM + 4 * DP_ST_W <= 2 * DP_NX * DP_CM
             stg1 = sbase + (DP_OFF_P + R0 * DQ_PARTS * DP_CM + qd * DP_ST_W) // 4
             for k in cutlass.range(nk, unroll=1):
@@ -3197,8 +3257,8 @@ def qsa_bwd_dense_pair_kernel(
                 prims.bar_warp_sync(0xFFFFFFFF)
                 if prims.elect_sync():
                     prims.mbarrier_arrive(b_dqe)
-                # the reduce that last used this staging box must have finished reading it. Rank 0 has two boxes,
-                # so one reduce may stay in flight, and rank 1 has one.
+                # the reduce that last used this staging box must have finished reading it. With STG2 rank 0 has two
+                # boxes, so one reduce may stay in flight. Otherwise each rank has one.
                 stg = stg0
                 if cutlass.const_expr(STG2):
                     if rank == 0:
@@ -3346,9 +3406,9 @@ SEQ_CU = 1  # the caller's cu_seqlens
 SEQ_ORIGIN = 2  # derived from the per-token sequence origins (tok_base of the bitmap API)
 
 
-def max_packed_len(hkv: int) -> int:
-    # The kernels address the [T, 12 * hkv, 256] tensors with 32-bit element offsets.
-    return (2**31 - 1) // (GQ * hkv * D)
+def max_packed_len(hkv: int, gq: int = GQ) -> int:
+    # The kernels address the [T, gq * hkv, 256] tensors with 32-bit element offsets.
+    return (2**31 - 1) // (gq * hkv * D)
 
 
 def _dense_cap(max_len: int, single: bool) -> int:
@@ -3383,7 +3443,7 @@ class LaunchPlan:
         assert hkv in (1, 2), f"{hkv} KV heads"
         assert dq_parts in (1, 3), f"{dq_parts} dS parts"
         assert gq == GQ or (gq == 6 and hkv == 1), f"{gq} query heads per KV head with {hkv} KV heads"
-        assert 1 <= T <= max_packed_len(hkv), f"sequence length {T} outside [1, {max_packed_len(hkv)}]"
+        assert 1 <= T <= max_packed_len(hkv, gq), f"sequence length {T} outside [1, {max_packed_len(hkv, gq)}]"
         HKV = hkv
         HQ = gq * hkv
         REC_W = _rec_w(hkv)
@@ -3422,7 +3482,6 @@ class LaunchPlan:
         assert self.num_passes < POS, f"sequence length {T} needs {self.num_passes} KV passes, the offset rows hold {POS - 1}"
         # Sparse queries: exactly T - dense_cap of a single sequence, up to T of packed ones (counted on the device).
         nsq = 0 if not self.has_sparse else (T - dense_cap if seq_mode == SEQ_SINGLE else T)
-        self.nsq_cap = nsq
         self.window_capacity = min(nsq, SPARSE_WINDOW_QUERIES)
         self.query_windows = tuple((lo, min(lo + SPARSE_WINDOW_QUERIES, nsq)) for lo in range(0, nsq, SPARSE_WINDOW_QUERIES))
         # the query-major kernel's item is a query, or a pair of queries with one KV head
@@ -3433,7 +3492,6 @@ class LaunchPlan:
         # a range's keys are the first tokens of the buffer, padded to the index scan's 8 keys per thread
         self.keys_per_range = (T + 7) // 8 * 8
         self.num_keys = self.num_ranges * self.keys_per_range
-        self.dense_cap = dense_cap
         self.num_pairs = self.num_ranges * RANGE_PAIRS
         self.key_name = f"key_skip{1 if T >= KEY_SKIP_MIN_T else 0}"
         self.key_ctas = num_sms
@@ -3492,29 +3550,41 @@ class LaunchPlan:
 
 
 _PLANS: dict = {}
+_PLANS_LOCK = threading.Lock()
+_PLANS_MAX = 64  # packed training changes the token and block counts every step, so the least recent plans go
 
 
-def plan_for(seq_len: int, device: torch.device, hkv: int, seq_mode: int, num_seqs: int = 1, gq: int = GQ, dq_parts: int = DQ_PARTS_DEFAULT) -> LaunchPlan:
-    """The plan of a geometry, built once per process."""
-    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index, int(gq), int(dq_parts))
-    plan = _PLANS.get(key)
-    if plan is None:
-        cc = torch.cuda.get_device_capability(device)
-        plan = LaunchPlan(
-            seq_len,
-            torch.cuda.get_device_properties(device).multi_processor_count,
-            hkv,
-            seq_mode,
-            num_seqs,
-            arch=cc[0] * 10 + cc[1],
-            gq=gq,
-            dq_parts=dq_parts,
-        )
+def plan_for(
+    seq_len: int,
+    device: torch.device,
+    hkv: int,
+    seq_mode: int,
+    num_seqs: int = 1,
+    gq: int = GQ,
+    dq_parts: int = DQ_PARTS_DEFAULT,
+    max_seq_len: Optional[int] = None,
+) -> LaunchPlan:
+    """The plan of a geometry, kept for the most recent geometries of the process."""
+    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index, int(gq), None if max_seq_len is None else int(max_seq_len), int(dq_parts))
+    with _PLANS_LOCK:
+        plan = _PLANS.pop(key, None)
+        if plan is None:
+            cc = torch.cuda.get_device_capability(device)
+            plan = LaunchPlan(
+                seq_len,
+                torch.cuda.get_device_properties(device).multi_processor_count,
+                hkv,
+                seq_mode,
+                num_seqs,
+                max_seq_len,
+                arch=cc[0] * 10 + cc[1],
+                gq=gq,
+                dq_parts=dq_parts,
+            )
+            if len(_PLANS) >= _PLANS_MAX:
+                _PLANS.pop(next(iter(_PLANS)))
         _PLANS[key] = plan
-    return plan
-
-
-_COMPILED = {}
+        return plan
 
 
 def _fake(dtype, shape, sym, align=16):
@@ -3523,8 +3593,138 @@ def _fake(dtype, shape, sym, align=16):
     return make_fake_compact_tensor(dtype, full, stride_order=order, assumed_align=align)
 
 
+@lru_cache(maxsize=None)
+def _compile_args(hkv: int, gq: int, parts: int) -> dict:
+    """Storage-free kernel signatures, reused across plans. The shared cache owns the CUDA objects."""
+    HQ = gq * hkv
+    sym_t = cute.sym_int64()
+    f_q = _fake(BF16, (None, HQ, D), sym_t)
+    f_kv = _fake(BF16, (None, hkv, D), sym_t)
+    f_out = _fake(F32, (None, HQ, D), sym_t)
+    f_lse = _fake(F32, (HQ, None), sym_t, align=4)
+    f_delta = _fake(F32, (None, HQ), sym_t)
+    f_h = _fake(F32, (None,), cute.sym_int64(divisibility=8))
+    f_dq_acc = _fake(F32, (None,), cute.sym_int64(divisibility=8))
+    f_dense_dkv = _fake(F32, (None,), cute.sym_int64(divisibility=8))
+
+    def f_ids():
+        # the compacted block keys [T, capacity]
+        return make_fake_compact_tensor(I32, (sym_t, cute.sym_int64()), stride_order=(1, 0), assumed_align=4)
+
+    def f_i():
+        # scratch int32 vectors, padded to 4 entries
+        return _fake(I32, (None,), cute.sym_int64(divisibility=4))
+
+    def f_c():
+        # caller int32 vectors of any length
+        return _fake(I32, (None,), cute.sym_int64(), align=4)
+
+    stream = make_fake_stream(use_tvm_ffi_env_stream=False)
+    dense_fakes = (
+        f_kv,
+        f_kv,
+        f_q,
+        f_q,
+        f_lse,
+        f_delta,
+        f_i(),
+        f_dq_acc,
+        f_dense_dkv,
+        f_dense_dkv,
+        f_i(),
+        f_i(),
+        f_i(),
+        f_i(),
+        f_i(),
+        I32(1),
+        I32(1),
+        I32(1),
+        I32(1),
+        I32(0),
+        F32(1),
+    )
+    fin_fakes = (f_h, f_h, f_dense_dkv, f_dense_dkv, f_dq_acc, f_kv, f_kv, f_q, I32(1))
+    builders = {
+        "seq_scan": lambda: (_seq_scan_host, f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(0), I32(0), I32(1), I32(1), stream),
+        "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), stream),
+        "prep": lambda: (
+            _prep_host,
+            f_out,
+            f_q,
+            f_delta,
+            f_h,
+            f_h,
+            f_i(),
+            f_i(),
+            f_dq_acc,
+            f_dense_dkv,
+            f_dense_dkv,
+            f_i(),
+            I32(1),
+            hkv,
+            gq,
+            stream,
+        ),
+        "bitmap": lambda: (_bitmap_host, f_ids(), f_c(), f_c(), f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), f_dq_acc, I32(1), I32(8), stream),
+        "window": lambda: (_window_host, f_i(), f_i(), f_i(), I32(0), I32(1), stream),
+        "part": lambda: (_part_host, f_ids(), f_c(), f_c(), f_dq_acc, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), I32(1), hkv, gq, stream),
+        "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
+        "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
+        "query": lambda: (
+            _sparse_query_host,
+            f_q,
+            f_kv,
+            f_kv,
+            f_q,
+            f_lse,
+            f_delta,
+            f_dq_acc,
+            f_i(),
+            f_i(),
+            f_i(),
+            f_i(),
+            f_i(),
+            f_c(),
+            f_c(),
+            f_i(),
+            I32(1),
+            I32(1),
+            F32(1),
+            hkv,
+            gq,
+            parts,
+            stream,
+        ),
+        "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, gq, parts, stream),
+        "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, gq, parts, stream),
+        "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
+        "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
+    }
+    for skip in (0, 1):
+        builders[f"key_skip{skip}"] = lambda skip=skip: (
+            _sparse_key_host,
+            f_q,
+            f_q,
+            f_i(),
+            f_i(),
+            f_i(),
+            f_i(),
+            f_h,
+            f_h,
+            f_i(),
+            f_i(),
+            I32(1),
+            I32(1),
+            skip,
+            hkv,
+            gq,
+            stream,
+        )
+    return {name: build() for name, build in builders.items()}
+
+
 def compile_kernels(plan: LaunchPlan) -> dict:
-    """Compile the launch sequence of the plan's path once per process and KV head count.
+    """Compile the launch sequence of the plan's path through the device-aware compiled cache.
 
     Every extent is symbolic, so one set of artifacts serves all sequence lengths of a path on one architecture.
     """
@@ -3533,139 +3733,10 @@ def compile_kernels(plan: LaunchPlan) -> dict:
         names += ["window", "part", "scan", "fill", "query", plan.key_name, "dense_pdl", "fin_sparse"]
     else:
         names += ["dense", "fin"]
-    hkv = plan.hkv
-    gq = plan.gq
-    parts = plan.dq_parts
-    HQ = gq * hkv
-    cache = _COMPILED.setdefault((hkv, gq, parts, plan.arch), {})
-    missing = [name for name in names if name not in cache]
-    if missing:
-        sym_t = cute.sym_int64()
-        f_q = _fake(BF16, (None, HQ, D), sym_t)
-        f_kv = _fake(BF16, (None, hkv, D), sym_t)
-        f_out = _fake(F32, (None, HQ, D), sym_t)
-        f_lse = _fake(F32, (HQ, None), sym_t, align=4)
-        f_delta = _fake(F32, (None, HQ), sym_t)
-        f_h = _fake(F32, (None,), cute.sym_int64(divisibility=8))
-        f_dq_acc = _fake(F32, (None,), cute.sym_int64(divisibility=8))
-        f_dense_dkv = _fake(F32, (None,), cute.sym_int64(divisibility=8))
-
-        def f_ids():
-            # the compacted block keys [T, capacity]
-            return make_fake_compact_tensor(I32, (sym_t, cute.sym_int64()), stride_order=(1, 0), assumed_align=4)
-
-        def f_i():
-            # scratch int32 vectors, padded to 4 entries
-            return _fake(I32, (None,), cute.sym_int64(divisibility=4))
-
-        def f_c():
-            # caller int32 vectors of any length
-            return _fake(I32, (None,), cute.sym_int64(), align=4)
-
-        stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-        dense_fakes = (
-            f_kv,
-            f_kv,
-            f_q,
-            f_q,
-            f_lse,
-            f_delta,
-            f_i(),
-            f_dq_acc,
-            f_dense_dkv,
-            f_dense_dkv,
-            f_i(),
-            f_i(),
-            f_i(),
-            f_i(),
-            f_i(),
-            I32(1),
-            I32(1),
-            I32(1),
-            I32(1),
-            I32(0),
-            F32(1),
-        )
-        fin_fakes = (f_h, f_h, f_dense_dkv, f_dense_dkv, f_dq_acc, f_kv, f_kv, f_q, I32(1))
-        builders = {
-            "seq_scan": lambda: (_seq_scan_host, f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(0), I32(0), I32(1), I32(1), stream),
-            "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), stream),
-            "prep": lambda: (
-                _prep_host,
-                f_out,
-                f_q,
-                f_delta,
-                f_h,
-                f_h,
-                f_i(),
-                f_i(),
-                f_dq_acc,
-                f_dense_dkv,
-                f_dense_dkv,
-                f_i(),
-                I32(1),
-                hkv,
-                gq,
-                stream,
-            ),
-            "bitmap": lambda: (_bitmap_host, f_ids(), f_c(), f_c(), f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), f_dq_acc, I32(1), I32(8), stream),
-            "window": lambda: (_window_host, f_i(), f_i(), f_i(), I32(0), I32(1), stream),
-            "part": lambda: (_part_host, f_ids(), f_c(), f_c(), f_dq_acc, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), I32(1), hkv, gq, stream),
-            "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
-            "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
-            "query": lambda: (
-                _sparse_query_host,
-                f_q,
-                f_kv,
-                f_kv,
-                f_q,
-                f_lse,
-                f_delta,
-                f_dq_acc,
-                f_i(),
-                f_i(),
-                f_i(),
-                f_i(),
-                f_i(),
-                f_c(),
-                f_c(),
-                f_i(),
-                I32(1),
-                I32(1),
-                F32(1),
-                hkv,
-                gq,
-                parts,
-                stream,
-            ),
-            "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, gq, parts, stream),
-            "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, gq, parts, stream),
-            "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
-            "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
-        }
-        for skip in (0, 1):
-            builders[f"key_skip{skip}"] = lambda skip=skip: (
-                _sparse_key_host,
-                f_q,
-                f_q,
-                f_i(),
-                f_i(),
-                f_i(),
-                f_i(),
-                f_h,
-                f_h,
-                f_i(),
-                f_i(),
-                I32(1),
-                I32(1),
-                skip,
-                hkv,
-                gq,
-                stream,
-            )
-        for name in missing:
-            cache[name] = cute.compile(*builders[name](), options=f"--enable-tvm-ffi --gpu-arch=sm_{plan.arch}a")
-    return {name: cache[name] for name in names}
+    key = template_key(globals(), {"hkv": plan.hkv, "gq": plan.gq, "parts": plan.dq_parts, "arch": plan.arch}, "compile_kernels")
+    args = _compile_args(plan.hkv, plan.gq, plan.dq_parts)
+    options = f"--enable-tvm-ffi --gpu-arch=sm_{plan.arch}a"
+    return {name: compile_cached(*args[name], cache_key=key, symbol=f"qsa_backward_{name}", options=options) for name in names}
 
 
 def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, dk, dv, scratch, scale, stream, cu_seqlens=None, tok_base=None):
@@ -3835,7 +3906,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
                 KR,
                 stream,
             )
-        # The dense grid backfills only the final key-major grid; compute it once.
+        # The dense grid backfills only the final key-major grid, so it launches once, after the windows.
         fns["dense_pdl"](*dense_args, stream)
         fns["fin_sparse"](*fin_args)
     else:
@@ -3851,7 +3922,7 @@ def dsl_cuda_major():
 
 
 def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch, dq_parts=DQ_PARTS_DEFAULT):
-    """``cudnn.ops.qsa_backward`` on SM100 / SM103: the compacted selection through the launch sequence above."""
+    """``cudnn.ops.qsa_backward`` on SM100 / SM103 / SM107: the compacted selection through the launch sequence above."""
     from cudnn.api_base import TupleDict, WorkspaceCarver
     from .. import _metadata
 
@@ -3863,7 +3934,7 @@ def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, blo
         )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
-    # the sequences come from tok_base on the device; there are at most as many as blocks
+    # the sequences come from tok_base on the device. There are at most as many as blocks.
     plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, dq_parts=dq_parts)
     fns = compile_kernels(plan)
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
