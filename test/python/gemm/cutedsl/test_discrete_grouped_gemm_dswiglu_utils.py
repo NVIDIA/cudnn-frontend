@@ -85,7 +85,9 @@ def discrete_dswiglu_init(
     b_major: str = "k",
 ) -> Dict[str, Any]:
     major, _ = torch.cuda.get_device_capability()
-    if major < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(major):
         pytest.skip(f"Requires SM100+, found {major}")
 
     nkl_str = request.config.getoption("--grouped-gemm-nkl", default=None)

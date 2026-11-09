@@ -17,7 +17,18 @@ import torch
 from cudnn.gemm.frost import compiler as C
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.tile_config import by_name
-from gemm_test_utils import E2M1, Plan, graph_binding, requires_sm100, requires_sm107, to_blocked, unpack_fp4, vp_bs, with_static_segmented_capacity
+from gemm_test_utils import (
+    requires_sm100_tree,
+    E2M1,
+    Plan,
+    graph_binding,
+    requires_sm100,
+    requires_sm107,
+    to_blocked,
+    unpack_fp4,
+    vp_bs,
+    with_static_segmented_capacity,
+)
 from moe_block_scale_test_utils import _build_graph
 
 pytestmark = pytest.mark.L0
@@ -28,15 +39,18 @@ _SWAPPED = "CONFIG_sm100_256x256x128_128x256x64_cluster2x1_2ctamma"
 _DTYPES = [(cudnn.data_type.BFLOAT16, torch.bfloat16), (cudnn.data_type.HALF, torch.float16), (cudnn.data_type.FLOAT, torch.float32)]
 
 
+@requires_sm100_tree
 @pytest.mark.parametrize("output_dt,_torch_dt", _DTYPES)
 def test_normal_two_cta_combine_uses_atomics(monkeypatch, output_dt, _torch_dt):
     """The SM100 memcheck failure cannot be re-admitted by output dtype or arch."""
     chain = analyze(_build_graph(2, 1026, 512, 1024, 6, output_dt=output_dt, combine_top_k=2))
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
     for arch in (100, 103, 107):
-        monkeypatch.setattr(C, "_current_arch", lambda: arch)
-        assert C._use_bulk_combine(chain, by_name(_NORMAL))
-        assert not C._use_bulk_combine(chain, by_name(_PAIR))
-        assert C._combine_smem_bytes(chain, by_name(_PAIR)) == 0
+        monkeypatch.setattr(C100, "_current_arch", lambda: arch)
+        assert C100._use_bulk_combine(chain, by_name(_NORMAL))
+        assert not C100._use_bulk_combine(chain, by_name(_PAIR))
+        assert C100._combine_smem_bytes(chain, by_name(_PAIR)) == 0
 
 
 def _make_inputs(rows, features, k, tokens, dtype, bounds, padding=0):

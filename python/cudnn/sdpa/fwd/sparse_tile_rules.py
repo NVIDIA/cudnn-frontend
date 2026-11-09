@@ -108,13 +108,13 @@ mbarrier / cluster / setmaxnreg), its config pins no Rubin-only size (40 KiB SME
 REG <= 79 at k 1 on the sm_107a trace), the split arithmetic reads the device's SM count and the DSL targets the ambient device
 (``sm_100a`` / ``sm_103a``; the compiled-plan cache keys on the device's compute capability), so the admission is a HOST rule, not a kernel
 change; the sm100 split combine reduces the slab with the gate as it does for the dense d256 decode tile on those parts -- a lean plan's
-combine FORM there is :func:`sparse_lean_combine_rule_cc`'s: on cc 10.0 the cc 10.7 split-aware rule's shape (the decode-grid kernel on the
-24-96-row grids at the lean splits; :data:`SPARSE_LEAN_COMBINE_RULE_CCS`, measured 2026-10-28), on cc 10.3 the module's own forms
-(unmeasured).  The AUTO default is UNMEASURED on these parts (2026-10-28: the explicit form admitted so the route can be measured on a
+combine FORM there is :func:`sparse_lean_combine_rule_cc`'s: on cc 10.0 and cc 10.3 the cc 10.7 split-aware rule's shape (the decode-grid
+kernel on the small grids at the lean splits; :data:`SPARSE_LEAN_COMBINE_RULE_CCS`, measured 2026-10-28 on cc 10.0 and 2026-11-05 on
+cc 10.3).  The AUTO default is UNMEASURED on these parts (2026-10-28: the explicit form admitted so the route can be measured on a
 B200-class part): the AUTO reading keeps :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (cc 10.7) and the placement rule keeps
 :data:`_SPARSE_LEAN_TILE_RULE_CC`, so ``tile_form="auto"`` / ``"tcgen05"`` on these parts resolve the tcgen05 core, which the adapter
-declines by name (:func:`sparse_tile_part_decline`: 'explicit lean tile only, unmeasured').  A measurement moves a part into the DEFAULT
-tuple with its table (the measured-default rule), never a transcription."""
+declines by name (:func:`sparse_tile_part_decline`: 'explicit lean tile only; the AUTO default not admitted there').  A measurement moves
+a part into the DEFAULT tuple with its table (the measured-default rule), never a transcription."""
 
 
 def sparse_tile_part_decline(
@@ -146,25 +146,32 @@ def sparse_tile_part_decline(
         if tile_form_requested == SPARSE_TILE_FORM_LEAN:
             return None
         return (
-            f"cc {cc[0]}.{cc[1]} serves the EXPLICIT lean tile only (tile_form='lean': admitted for measurement, UNMEASURED there -- the AUTO "
-            f"reading stays the measured part's, cc 10.7); tile_form={tile_form_requested!r} resolves the tcgen05 core, which {core}"
+            f"cc {cc[0]}.{cc[1]} serves the EXPLICIT lean tile only (tile_form='lean': admitted for measurement; the AUTO default is not "
+            f"admitted there -- the AUTO reading stays the measured part's, cc 10.7); tile_form={tile_form_requested!r} resolves the tcgen05 "
+            f"core, which {core}"
         )
     return core
 
 
-SPARSE_LEAN_COMBINE_RULE_CCS: Tuple[Tuple[int, int], ...] = ((10, 0),)
+SPARSE_LEAN_COMBINE_RULE_CCS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3))
 """The parts OUTSIDE the cc 10.7 line on which a LEAN plan's split-combine FORM follows the cc 10.7 split-aware rule's SHAPE
 (``heuristics.decode_combine_grid_selected`` evaluated at :data:`_SPARSE_LEAN_COMBINE_RULE_SOURCE_CC` through
 :func:`sparse_lean_combine_rule_cc`): the decode-grid kernel inside the combine module's bound on a small grid (<= 128 rows) from split 8
 and on a larger grid from split 32, the module's own forms otherwise; never the lean group walk (a cc 10.7 form; the lean splits are
 >= 9 anyway).  MEASURED 2026-10-28 on the GB200 class (cc 10.0, 152 SMs at the 1830 MHz lock; CUPTI medians over 50 cold-L2 replays of
-the lean chain's combine at 24 Q heads, d 256, two independent GPU-0 cells agreeing to <= 0.1 us; the oracle green before timing):
+the lean chain's combine at 24 Q heads, d 256, two independent cells on one GPU agreeing to <= 0.1 us; the oracle green before timing):
 the decode-grid kernel vs the module's own forms, us, at the lean splits 65 / 33 / 22 / 17 -- B 1 x S_q 1 (24 rows) 3.01 / 3.39 / 3.23 /
 3.52 vs 8.48 / 6.78 / 8.10 / 7.14; B 1 x S_q 4 (96 rows) 3.58 / 3.74 / 3.62 / 3.55 vs 16.22 / 10.05 / 9.41 / 6.88; B 4 x S_q 1 (96 rows)
 3.71 / 3.81 / 3.74 / 3.78 vs 8.38 / 6.82 / 8.16 / 7.65; B 4 x S_q 4 (384 rows) 8.83 / 8.93 / 8.80 / 8.80 vs 16.29 / 10.21 / 9.50 / 7.38 --
-the cc 10.7 shape names the measured winner in 15 of the 16 cells (the miss: 384 rows at split 22, the own forms 9.50 vs 8.80).  The
-measured-default rule: a part joins this tuple with its table; cc 10.3 (B300) is UNMEASURED and keeps the module's own forms, the
-tcgen05 body on every part reads as before."""
+the cc 10.7 shape names the measured winner in 15 of the 16 cells (the miss: 384 rows at split 22, the own forms 9.50 vs 8.80).
+MEASURED 2026-11-05 on a GB300 (cc 10.3, 152 SMs at a fixed 1830 MHz clock; bf16 KV, d 256, 8 / 4 / 16 query heads per KV head, S_q 1
+and 4, KV 2k -- the sweep ran KV 2k-32k, the lean tile serves the 2k cells, its identity list holding at most 2051 keys; per-kernel
+times from CUDA-graph replays, every arm checked against the fp32 reference before timing): the decode-grid kernel wins EVERY lean
+cell, 42 of 42 across the three geometries -- 3.0-3.4 us at the lean splits 65 / 33 / 17 against the module's own forms' 8.5-8.7 /
+6.4 / 6.2-7.0 on the 8-row grid (B 1 x S_q 1 x 8 heads), 15.0 / 9.2 / 6.7 at 32 rows (S_q 4), 8.5 / 6.6 / 6.9 at 32 rows (B 4) and
+14.9 / 9.3 / 6.5 at 64 rows (S_q 4 x 16 heads) -- so the lean body at 8 / 1 x KV 2k x S_q 1 is 12.8 us with the decode-grid form
+against 18.2 with the module's own forms: the cc 10.0 table's shape.  The measured-default rule: a part joins this tuple with its
+table (a part outside it keeps the module's own forms); the tcgen05 body on every part reads as before."""
 _SPARSE_LEAN_COMBINE_RULE_SOURCE_CC = (10, 7)
 """The line whose split-aware combine rule the parts above borrow (``heuristics._DECODE_COMBINE_RULE_CC``, pinned equal by the test
 suite: this module cannot import the heuristics, which import it)."""
@@ -173,7 +180,8 @@ suite: this module cannot import the heuristics, which import it)."""
 def sparse_lean_combine_rule_cc(device_cc, *, lean: bool) -> Tuple[int, int]:
     """The device whose split-aware combine-form rule a sparse plan's combine entry follows: the plan's own device, except a LEAN plan on
     a part of :data:`SPARSE_LEAN_COMBINE_RULE_CCS`, which follows :data:`_SPARSE_LEAN_COMBINE_RULE_SOURCE_CC` (cc 10.7: the rule's shape,
-    measured for the lean grids on that part -- the table above)."""
+    measured for the lean grids on each part of the tuple -- the tables above); a part outside the tuple keeps its own reading (the
+    module's own forms off cc 10.7) until measured."""
     cc = (int(device_cc[0]), int(device_cc[1]))
     if lean and cc in SPARSE_LEAN_COMBINE_RULE_CCS:
         return _SPARSE_LEAN_COMBINE_RULE_SOURCE_CC

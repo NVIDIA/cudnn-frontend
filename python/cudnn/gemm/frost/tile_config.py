@@ -786,10 +786,13 @@ def _cluster_score(M: int, N: int, cta_m: int, cta_n: int, cta_group: int, cgrp_
 # The shape envelope of the engine's device-aware planner (`planning.py`): a cost profile claims a GEMM -- and may then rank a strategy
 # other than the baseline pick `select_config` makes for it -- only with M and N inside PLANNER_MN_BOUNDS, K inside PLANNER_K_BOUNDS and
 # the batch at most PLANNER_MAX_BATCH (`planning.CostProfile`'s defaults read these three; a profile that needs other bounds declares
-# them, and the planner's own test pins every profile inside this envelope).  Outside it the baseline pick IS the plan on every part: a
-# shape-only fact a host-side resolver reads HERE, without importing the planner module -- the gated attention block's projection driver
-# names the engine's pick directly for its slabs there, and a JIT-only deployment of that driver carries this catalog, not the planner.
-# Inclusive bounds.
+# them, and the planner's own test pins every profile inside this envelope).  Outside it the baseline pick IS the plan on every part for
+# a dense 16-bit chain -- the shape-only fact a host-side resolver reads HERE, without importing the planner module: the gated attention
+# block's projection driver names the engine's pick directly for its slabs there, and a JIT-only deployment of that driver carries this
+# catalog, not the planner.  The planner's profile-free small-M rules are the bounded exception at the narrow-token end of M: block-scaled
+# fp4 GEMMs of up to 32 tokens (`planning._small_m_block_scale_config`: SM100, and CC 12.x parts no profile names) and dense fp8 GEMMs of
+# up to 16 tokens on a CC 12.x part no profile names (`planning._sm120_small_m_fp8_config`) lead with a narrow-token tile, the baseline
+# second.  Inclusive bounds.
 PLANNER_MN_BOUNDS: tuple[int, int] = (32, 4096)
 PLANNER_K_BOUNDS: tuple[int, int] = (1024, 16384)
 PLANNER_MAX_BATCH: int = 8
@@ -798,7 +801,8 @@ PLANNER_MAX_BATCH: int = 8
 def planner_may_claim(M: int, N: int, K: int, batch: int = 1) -> bool:
     """Whether a cost profile of the engine's planner could claim a ``[batch, M, K] x [batch, K, N]`` GEMM at all: the shape lies inside the
     planner envelope above.  The widest reading -- a profile also needs its part, its dtype key and an eligible graph -- so False means the
-    baseline pick is the plan everywhere, and True only that the planner MAY rank another strategy."""
+    baseline pick is the plan everywhere for a dense 16-bit chain (the profile-free small-M rules named above are the exception), and True
+    only that the planner MAY rank another strategy."""
     return (
         PLANNER_MN_BOUNDS[0] <= M <= PLANNER_MN_BOUNDS[1]
         and PLANNER_MN_BOUNDS[0] <= N <= PLANNER_MN_BOUNDS[1]

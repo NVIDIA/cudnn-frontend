@@ -108,6 +108,12 @@ def test_flex_varlen_declines_int32_span(tokens, limit_ok):
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("cudnn.flex_attention supports SM90 and newer")
     from cudnn.flex_attention.plan.validation import validate_create_mask_plan_inputs
+    from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
+
+    major, minor = torch.cuda.get_device_capability()
+    if limit_ok and major * 10 + minor not in SUPPORTED_ARCHES:
+        # The span decline comes first and holds on any part; an in-limit span goes on to the arch check (SM12x is not served).
+        pytest.skip(f"cudnn.flex_attention serves SM{', SM'.join(map(str, SUPPORTED_ARCHES))}; this device is SM{major}{minor}")
 
     heads, dim = 8, 128  # 2**21 * 8 * 128 = 2**31 elements, one past INT32_MAX
     q = None

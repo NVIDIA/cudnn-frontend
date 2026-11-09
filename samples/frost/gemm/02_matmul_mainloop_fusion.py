@@ -123,6 +123,14 @@ def _run_cos_koob(M: int, N: int, K: int) -> None:
 
 
 def main(M: int = 512, N: int = 512, K: int = 256) -> None:
+    if not torch.cuda.is_available():
+        print("[02] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[02] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     _run("abs", "none", M, N, K)  # A only
     _run("none", "relu", M, N, K)  # B only
     _run("abs", "relu", M, N, K)  # both

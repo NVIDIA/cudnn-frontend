@@ -20,6 +20,9 @@ navigation:
       - page: Python API Naming Conventions
         path: ../../operations/api_conventions.md
         slug: operations/api_conventions
+      - page: Determinism Support
+        path: ../../operations/determinism.md
+        slug: operations/determinism
       - section: Attention
         path: ../../operations/Attention.md
         slug: operations/Attention
@@ -27,9 +30,6 @@ navigation:
           - page: Gated Attention Block (SM107)
             path: ../../operations/attention/gated_attention_block.md
             slug: gated_attention_block
-          - page: Triangle Attention (SM107)
-            path: ../../operations/attention/triangle_attention.md
-            slug: triangle_attention
           - page: Compact GQA backward (SM107)
             path: ../../operations/attention/compact_gqa_backward.md
             slug: compact_gqa_backward
@@ -62,9 +62,6 @@ navigation:
               - page: Indexed QSA training
                 path: ../../operations/sparse_attention/qsa_indexed.md
                 slug: qsa_indexed
-              - page: QSA two-pass backend implementation notes
-                path: ../../operations/sparse_attention/qsa_two_pass.md
-                slug: qsa_two_pass
           - page: HSTU Attention (Blackwell SM100/SM103)
             path: ../../operations/sparse_attention/hstu_attention.md
             slug: hstu_attention
@@ -135,6 +132,9 @@ navigation:
           - page: Kimi Delta Attention in JAX
             path: ../../operations/linear_attention/kda_jax.md
             slug: kda_jax
+          - page: Fused GDN Decode / Verify Steps (FlashInfer Backend)
+            path: ../../operations/linear_attention/gdn_decode_flashinfer_backend.md
+            slug: gdn_decode_flashinfer_backend
       - section: Matmul
         path: ../../operations/Matmul.md
         slug: operations/Matmul
@@ -202,12 +202,13 @@ navigation:
               - page: DSv4.1 mHC Projection/RMS Backward (SM100/SM103)
                 path: ../../operations/gemm_fusions/mhc_projection_bwd.md
                 slug: mhc_projection_bwd
-          - page: Triangle Multiplicative Update
-            path: ../../operations/matmul/triangle_multiplicative_update.md
-            slug: triangle_multiplicative_update
-      - page: MoE Grouped Matmul
+      - section: MoE Grouped Matmul
         path: ../../operations/MoeGroupedMatmul.md
         slug: operations/MoeGroupedMatmul
+        contents:
+          - page: Shared-Expert Decode Pair (SM100-class)
+            path: ../../operations/moe/shared_expert_decode.md
+            slug: shared_expert_decode
       - section: Normalizations
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations

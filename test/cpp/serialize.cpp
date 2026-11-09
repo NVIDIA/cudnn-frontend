@@ -1770,9 +1770,10 @@ TEST_CASE("Ragged SDPA plan reloads with structural tensor metadata", "[graph][s
 }
 
 // A graph loaded via deserialize(handle, ...) might have no node subtree,
-// so serialize() must source its pass-by-value and workspace modifications from the
-// cached members instead of walking the (now empty) subtree.
-TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications", "[graph][serialize][deserialize]") {
+// so serialize() must source its pass-by-value, workspace, and alignment metadata
+// from the cached members instead of walking the (now empty) subtree.
+TEST_CASE("Plan re-serialize preserves pass-by-value, workspace, and alignment metadata",
+          "[graph][serialize][deserialize]") {
     namespace fe = cudnn_frontend;
 
     fe::graph::Graph graph;
@@ -1806,9 +1807,13 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
     REQUIRE(graph.serialize(blob, /*serialize_structure=*/false).is_good());
 
     // The fresh graph must actually carry pass-by-value data, else the test is moot.
-    json const j_fresh = json::from_ubjson(blob);
+    json j_fresh = json::from_ubjson(blob);
     REQUIRE(j_fresh.contains("pass_by_values"));
     REQUIRE_FALSE(j_fresh["pass_by_values"].empty());
+    // Pointwise does not produce an alignment record, so add a valid external HALF binding
+    // to exercise the plan loader's aligned-operands path without changing its backend plan.
+    j_fresh["aligned_operands"]["1"] = json::array({16, 2});
+    blob                             = json::to_ubjson(j_fresh);
 
     auto const expected_uids = graph.get_variant_pack_uids_sorted();
 
@@ -1828,6 +1833,7 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
     json const j_next = json::from_ubjson(next);
     REQUIRE(j_next["pass_by_values"] == j_fresh["pass_by_values"]);
     REQUIRE(j_next["workspace_modifications"] == j_fresh["workspace_modifications"]);
+    REQUIRE(j_next["aligned_operands"] == j_fresh["aligned_operands"]);
 
     cudnnDestroy(handle);
 }

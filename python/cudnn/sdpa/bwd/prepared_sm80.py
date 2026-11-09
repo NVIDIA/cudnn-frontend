@@ -3,6 +3,7 @@
 """SM80 declarations for the shared immutable backward pointer binder."""
 
 import math
+from contextlib import nullcontext
 from functools import partial
 
 from cudnn.frost.compiled_cache import positional_entry, template_key
@@ -177,6 +178,8 @@ def build_spec(api, d64_module):
 
 def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
     """Validate standalone tensor bindings before any stage touches workspace."""
+    import torch
+    from cudnn._device import ensure_current_context
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
 
     spec = api._prepared
@@ -184,8 +187,6 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
     if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < spec.workspace_bytes or ws.device != (2, spec.device_index):
         raise ValueError(f"sdpa_bwd_sm80 requires {spec.workspace_bytes} bytes of contiguous uint8 workspace on CUDA device {spec.device_index}")
     if stream is None:
-        import torch
-
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
     facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
     facts.update(zip(RO_ROLES, map(facts_of_tensor, ro_tensors or (None,) * len(RO_ROLES))))
@@ -221,4 +222,10 @@ def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
     # Stats has always been a storage binding: compact plans accept flat buffers,
     # and strided plans reinterpret the declared strides after checking capacity.
     geometry = tuple((op.shape, op.strides) if op is not None and i < 9 and i != 5 else None for i, op in enumerate(spec.operands))
-    execute(spec, facts, ws.ptr, int(stream), scale=scale, geometry=geometry)
+    # Launch from the operands' device, as the SM100 standalone path does: the default stream's handle is 0, which the
+    # driver resolves against the CALLER's current context, so a caller on another device would run the chain there.
+    stream = int(stream)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)

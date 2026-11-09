@@ -87,12 +87,15 @@ from __future__ import annotations
 
 import threading
 
+try:  # Torch is needed only by the eager wrapper; JAX imports the pure DSL kernels.
+    import torch
+except ImportError:  # pragma: no cover - exercised by JAX-only installs
+    torch = None
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.arch as cute_arch
 import cutlass.cute.math as cute_math
-import torch
 
 from cudnn._cutlass_compat import SmemAllocator
 
@@ -1156,12 +1159,25 @@ def _bwd_schedule_r128(ratio, d, coff, nb_total=None):
         raise ValueError(f"coff=2 chunks must not straddle the half-window boundary (ratio={ratio}, chunk={win // tchunks})")
     if threads_x * tchunks > 1024:
         raise ValueError(f"CTA too large: {threads_x} x {tchunks}")
-    # smem: fp32 s/e tile + bf16 kv tile + max merge + den/S' partials + den/S
-    # publish, 16 B aligned.
-    smem_bytes = win * threads_x * vec * 6 + 3 * tchunks * threads_x * vec * 4 + 2 * threads_x * vec * 4 + 64
+    smem_bytes = _bwd_smem_bytes(win, vec, tchunks, threads_x)
     if smem_bytes > 227 * 1024:
         raise ValueError(f"backward smem tile too large ({smem_bytes} B) for W={W}")
     return vec, tchunks, threads_x, fastexp, goreuse
+
+
+def _bwd_smem_bytes(win, vec, tchunks, threads_x):
+    """Shared memory of one backward CTA: fp32 s/e tile + bf16 kv tile + max merge + den/S' partials + den/S publish,
+    16 B aligned."""
+    return win * threads_x * vec * 6 + 3 * tchunks * threads_x * vec * 4 + 2 * threads_x * vec * 4 + 64
+
+
+def bwd_smem_bytes_r128(ratio, d, coff, nb_total=None):
+    """Shared memory per CTA of the ratio=128 backward under the schedule ``_bwd_schedule_r128`` picks for ``nb_total``.
+
+    The schedule only bounds it by the SM100 227 KiB ceiling; a device with less per-CTA shared memory (cc 12.x has
+    ~99 KiB) must be checked against its own limit before launch."""
+    vec, tchunks, threads_x = _bwd_schedule_r128(ratio, d, coff, nb_total)[:3]
+    return _bwd_smem_bytes(2 * ratio if coff == 2 else ratio, vec, tchunks, threads_x)
 
 
 def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
@@ -1177,10 +1193,15 @@ def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
     ~101 KB smem), 3 for coff=1 T=8, 4 for the coff=1 T=4 (d >= 512) schedule.
     Capped at 16 (beyond one wave per SM the pipeline depth stops paying).
     """
+    return bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, d, coff, _sm_count(dev))
+
+
+def bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, d, coff, sm_count):
+    """Framework-neutral form of :func:`_bwd_rows_per_cta` for a known SM count."""
     vec, tchunks, threads_x = _bwd_schedule_r128(ratio, d, coff, nb_total)[:3]
     gy = (d // vec + threads_x - 1) // threads_x
     ctas_per_sm = 2 if coff == 2 else (4 if tchunks <= 4 else 3)
-    slots = ctas_per_sm * _sm_count(dev)
+    slots = ctas_per_sm * sm_count
     return max(1, min(16, -((nb_total * gy) // -slots)))
 
 

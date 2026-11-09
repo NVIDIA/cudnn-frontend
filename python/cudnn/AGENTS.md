@@ -368,8 +368,10 @@ DSL satisfies your kernel.**
   floor. Keep the existing version gates and actionable errors.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
-  `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
-  version** — `cutedsl_requirement_error(what)` builds it. Never let the failure
+  `CUTEDSL_MIN_VERSION`; a kernel whose own floor is higher passes it as
+  `floor=`, never a second copy of the version parse) and **decline, or raise an
+  error that names the version** — `cutedsl_requirement_error(what, floor=...)`
+  builds it. Never let the failure
   surface as an `AttributeError` / `TypeError` / `ModuleNotFoundError` from
   inside the DSL, and never let it read as a missing-dependency install hint:
   the package is installed, and that `pip install` changes nothing.
@@ -386,10 +388,31 @@ DSL satisfies your kernel.**
 - Check the DSL compiler's CUDA version separately when a kernel depends on
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
-  the DSL wheel. QSA's 12Q/1KV two-pass key kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
-  `check_support` rejects that compiler before JIT compilation, and its tests
-  exercise the rejection rather than crashing or silently skipping the gate.
+  the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8. Both
+  QSA backward entries decline that compiler for every one-KV-head geometry
+  (12Q/1KV and 6Q/1KV) before JIT compilation, and the tests exercise the
+  decline rather than crashing or silently skipping the gate.
+- **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
+  and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
+  and cu13 in separate environments/processes and empty, separate caches.
+  Cover the declared dependency floor and the newer supported DSL version
+  being qualified, when different, on every claimed architecture. Exercise
+  forward/backward paths, supported dtypes, and boundary/tail cases; check
+  finite outputs and the existing accuracy contract. Import-only or
+  compile-only success does not establish numerical correctness. Unsupported
+  compiler/architecture combinations must decline before JIT and have a test
+  for that rejection. Report unavailable lanes explicitly; do not loosen
+  tolerances or skip failing supported lanes to make this matrix pass.
+- Record the source revision, installed DSL distributions, loaded native
+  compiler path and `CUDA_VERSION.major` / `.minor`, GPU/driver, framework,
+  backend/NVRTC, and pass/fail/skip counts. With DSL 4.8, the default wheel
+  installs cu12; `[cu13]` adds another flavor and the loader can select it.
+  Verify the loaded flavor rather than assuming the install command selected
+  it. A cu12 DSL run with a CUDA 13 framework/backend isolates DSL compatibility;
+  it is not qualification of a deployment using CUDA 12 throughout. The
+  [integration skill](../../skills/cutedsl-kernel-integration/SKILL.md)
+  carries the test workflow.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
@@ -894,6 +917,15 @@ unless padding is included in both the layout and resource accounting. Detector:
 `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py::test_moe_block_scale_narrow_n_routing`
 (`scatter-False-24`, including capture/replay), verified RED before the store gate.
 
+**`cute.arch.shuffle_sync_up` defaults to a clamp of 31 before CuTe DSL 4.7.0.**
+`shfl.sync.up` keeps a lane's own value when its source lane falls below the
+clamp operand, so with that default every lane reads back its own value and a
+warp prefix sum silently returns its input. Pass `mask_and_clamp=0` for a
+full-warp up-shuffle; 4.7.0 and later default to 0, so the explicit argument
+emits the same PTX there. Detector: the H128 D512 conflict-rank cases of
+`deepseek_sparse_attention/cutedsl/test_DSA_sparse_attention_backward.py` on the
+4.6.2 wheel, which give wrong dKV without the argument.
+
 For fractional-microsecond performance changes, repeat A/B with shared addresses,
 reversed construction order, and an independently compiled unchanged-source
 control. An A/A that shares one compiled kernel does not bound the variation
@@ -918,6 +950,21 @@ proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
 
+A TMA-store epilogue must not reuse an smem output buffer while a bulk store may
+still be reading it. Every `PipelineTmaStore.producer_commit()` needs a
+`producer_acquire()` (`cp.async.bulk.wait_group.read num_stages - 1`) in the
+issuing thread before the epilogue warps write that buffer again: right after the
+commit and before the barrier (the GLU and quant epilogues), or before the next
+write into the buffer (the dGLU epilogues, the GLU-Hadamard delayed acquire).
+`producer_tail()` waits only at kernel exit. Another pipeline's acquire, such as
+the C store's, can mask a missing one, so check every compile-time configuration
+that drops that other store. Without the acquire, the block-scaled GLU kernels' D
+store silently corrupted D codes on SM107 with `generate_c=False` (#2350); the race
+is intermittent on hardware. Detectors: `gemm/cutedsl/test_tma_store_buffer_reuse.py`
+(host-only: no committed TMA store under `gemm/cutedsl` lacks an acquire) and
+`gemm/cutedsl/test_grouped_gemm_glu.py::test_rubin_mxfp8_glu_without_c_matches_with_c`
+(SM107: `generate_c=False` writes the same D bytes as `generate_c=True`).
+
 Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
 graphs from override-enabled graphs. Only fixed shapes select token widths
 8/16/32 after swapAB; overrides keep width 64 and at most 48 weight tiles.
@@ -928,6 +975,17 @@ coefficients unchanged. Automatic candidates still use workspace reduction.
 The B200-targeted rule leads on SM100; other GPUs retain the existing first
 choice and include the new geometry as an autotuning candidate. A four-shape
 SM107 comparison found both wins and regressions from unconditional preference.
+On a CC 12.x part no cost profile names (`planning._calibrated`: a profile
+keyed on the part's SM version and reported name), two further profile-free
+rules lead with the auto pick second: a block-scaled fp4 x fp4 GEMM of up to
+32 tokens plans the family's 32-row tile with the tokens left on M, and a
+dense fp8 x fp8 GEMM of up to 16 tokens with K >= 2048 plans a synthesized
+16-row 1x8-warp tile; both take the one-wave split-K, and the fp8 rule
+declines where the weight tiles alone fill more than half the SMs. A cost
+profile for such a part retires both rules for it; the calibrated RTX PRO
+6000 and every SM 10.x part keep their picks. Both rules stay host-testable:
+`gemm/frost/test_tile_select_analytic.py` pins the picks, the K-floor and
+weight-grid boundaries, and the plan list through the sm120 compiler's gates.
 
 The dense SM100, mainloop-fusion, block-scale and SM103 hosts resolve the L2
 swizzle width once per call from the current logical M/N/K, then pass an Int32
@@ -1086,6 +1144,7 @@ key is nonfinite: a key valid for one query can be masked for its neighbor,
 and zero dS multiplied by that key still produces NaN. A union mask alone is
 insufficient, including across an unaligned packed sequence boundary. Keep any
 nonfinite fallback entirely on device and re-evaluate it on each graph replay.
-The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
-which changes finite/nonfinite inputs under one captured graph for both shared
-and separate packed sequences.
+The detectors are `QSA/cutedsl/test_qsa_backward_sm100.py::test_sparse_pair_isolates_a_nonfinite_key_row`
+for the sparse query pairs and `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`
+for the dense kernel's query groups, which changes finite/nonfinite inputs under
+one captured graph for both shared and separate packed sequences.

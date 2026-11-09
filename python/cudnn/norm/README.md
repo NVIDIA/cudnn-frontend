@@ -216,7 +216,8 @@ pytest test/python/norm/graph/test_frost_norm_affine.py
 
 Requires Blackwell (SM100 or SM103; Hopper SM90 through the opt-in `norm_*_sm90` rows), a CUDA 13-capable driver, and a CUTLASS DSL build
 >= 4.7.0 that exports `cutlass.experimental.primitives` (every public wheel does). The norm entry points
-reject builds without this module. Check the active environment before running:
+reject builds without this module, and `norm_fprop` / `norm_bprop` raise `NotImplementedError` on a GPU older than SM90
+(use the graph API there; the cuDNN backend serves it). Check the active environment before running:
 
 ```bash
 python -c "import cutlass.experimental.primitives"

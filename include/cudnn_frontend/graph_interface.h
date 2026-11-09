@@ -2392,7 +2392,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(order_variant_pack_replacements(metadata.replacements, ordered));
         plan_serialization_detail::validate_owned_spans(metadata, ordered);
 
-        auto serialized_plan = j["cudnn_backend_data"];
+        auto const &serialized_plan = j["cudnn_backend_data"].get_ref<std::string const &>();
         if (device_prop != nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
         } else {
@@ -3133,7 +3133,7 @@ class Graph : public ICudnn, public INode {
         for (auto const &sub_node : sub_nodes) {
             json j_sub_node;
             sub_node->serialize(j_sub_node);
-            full_json["nodes"].push_back(j_sub_node);
+            full_json["nodes"].push_back(std::move(j_sub_node));
         }
 
         j["gid"]     = full_json["gid"];
@@ -3172,41 +3172,39 @@ class Graph : public ICudnn, public INode {
             }
             auto tensor_uid = tensor_info.at("uid").get<Tensor_attributes::uid_t>();
             refs[port_name] = tensor_uid;
-            tensors.emplace(tensor_uid, tensor_info);
+            tensors.try_emplace(tensor_uid, tensor_info);
         };
         for (const auto &sub_node : full_json["nodes"]) {
-            auto short_node       = sub_node;
+            auto short_node = json::object();
+            for (auto const &field : sub_node.items()) {
+                if (field.key() != "inputs" && field.key() != "outputs") {
+                    short_node[field.key()] = field.value();
+                }
+            }
             short_node["inputs"]  = json::object();
             short_node["outputs"] = json::object();
 
             auto node_name = sub_node["tag"].get<std::string>();
             auto i         = 0;
             for (const auto &input : sub_node["inputs"]) {
-                std::string port_name;
-                json tensor_info;
-
                 if (node_name == "CONCATENATE") {
-                    port_name   = std::to_string(i);
-                    tensor_info = input;
+                    add_tensor(short_node["inputs"], std::to_string(i), input);
                     i++;
                 } else {
-                    port_name   = input[0].get<std::string>();
-                    tensor_info = input[1];
+                    add_tensor(short_node["inputs"], input[0].get<std::string>(), input[1]);
                 }
-
-                add_tensor(short_node["inputs"], port_name, tensor_info);
             }
 
             for (const auto &output : sub_node["outputs"]) {
-                auto port_name   = output[0].get<std::string>();
-                auto tensor_info = output[1];
+                auto port_name          = output[0].get<std::string>();
+                auto const &tensor_info = output[1];
                 add_tensor(short_node["outputs"], port_name, tensor_info);
             }
 
-            j["nodes"].push_back(short_node);
+            j["nodes"].push_back(std::move(short_node));
         }
-        for (auto const &tensor : tensors) {
-            j["tensors"].push_back(tensor.second);
+        for (auto &tensor : tensors) {
+            j["tensors"].push_back(std::move(tensor.second));
         }
     };
 #endif

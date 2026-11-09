@@ -77,7 +77,9 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
     ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
 )
 def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
 
     problem = make_grouped_gemm_glu_bf16_problem(discrete=discrete, b_major=b_major)
@@ -110,7 +112,9 @@ def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
 
 @pytest.mark.L0
 def test_grouped_gemm_glu_class_bf16_rejects_single_group_runtime_offsets():
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
 
     problem = make_grouped_gemm_glu_bf16_problem(discrete=False, b_major="k")
@@ -2206,7 +2210,9 @@ def test_grouped_gemm_glu_bf16_rejects_sf_fp8_dtype_override(request):
     This is what the None default buys: with an "e4m3" default the value would
     always be non-None and could not be distinguished from an explicit request.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
 
     try:
@@ -2399,3 +2405,123 @@ def test_rubin_mxfp8_clamped_geglu_quantized_output(discrete, vector_f32):
     for expert, padded in enumerate(p["aligned_m"]):
         torch.testing.assert_close(p["amax"][expert, 0], expected[start : start + padded].abs().max(), rtol=2e-5, atol=1e-7)
         start += padded
+
+
+# =============================================================================
+# Rubin TMA-store buffer reuse: generate_c=False must not change D (#2350)
+# =============================================================================
+
+# Two A/B stages instead of the stock budget: at this budget the unpatched kernel corrupted 44% of launches (#2350).
+_NO_C_SMEM_CAPACITY = 232448
+_NO_C_LAUNCHES = 16
+
+
+def _rubin_glu_kernel_factory(kernel_cls, generate_c):
+    """The block-scaled API never forwards generate_c, so the test builds the Rubin kernel itself."""
+
+    def make(**kwargs):
+        kernel = kernel_cls(**kwargs, generate_c=generate_c)
+        kernel.num_smem_capacity = _NO_C_SMEM_CAPACITY
+        return kernel
+
+    return make
+
+
+@pytest.mark.usefixtures("require_rubin_mxfp8")
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_rubin_mxfp8_glu_without_c_matches_with_c():
+    """With generate_c=False, every launch must write the same D, D_col and SFD bytes as generate_c=True.
+
+    Without the D store's producer_acquire, a later subtile overwrote sD while the bulk store issued two subtiles earlier
+    was still reading it; with generate_c=True the C store's acquire hid the race. The shape is the one #2350 measured
+    (32 experts, K=7168, N=4096 gate + up, MXFP8 with SFD, 2-CTA 256x256 tiles, dynamic scheduler). At this shared-memory
+    budget the unpatched kernel corrupted 1,568 of 3,600 launches, so 16 launches all miss it with probability about 1e-4.
+    test_tma_store_buffer_reuse.py pins the acquire in the source.
+    """
+    from cudnn import GroupedGemmGluSm100
+    from cuda.bindings import driver as cuda
+
+    n, k, experts = 4096, 7168, 32
+    ab_dtype, sf_dtype, sf_vec_size = torch.float8_e4m3fn, torch.float8_e8m0fnu, 32
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=n,
+        k=k,
+        l=experts,
+        group_m_list=[2048] * experts,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        sf_vec_size=sf_vec_size,
+        m_aligned=256,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    checked = ("d_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor")
+    golden = None
+    for generate_c in (True, False):
+        outputs = allocate_grouped_gemm_output_tensors(
+            tensor_m=inputs["tensor_m"],
+            n=n,
+            l=experts,
+            ab_dtype=ab_dtype,
+            c_dtype=torch.bfloat16,
+            d_dtype=torch.float8_e4m3fn,
+            cd_major="n",
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+        )
+        api = GroupedGemmGluSm100(
+            sample_a=inputs["a_tensor"],
+            sample_c=outputs["c_tensor"],
+            sample_d=outputs["d_tensor"],
+            sample_sfa=inputs["sfa_tensor"],
+            sample_padded_offsets=inputs["padded_offsets_tensor"],
+            sample_alpha=inputs["alpha_tensor"],
+            sample_d_col=outputs["d_col_tensor"],
+            sample_b=inputs["b_tensor"],
+            sample_sfb=inputs["sfb_tensor"],
+            sample_sfd_row=outputs["sfd_row_tensor"],
+            sample_sfd_col=outputs["sfd_col_tensor"],
+            sample_amax=outputs.get("amax_tensor"),
+            sample_norm_const=inputs.get("norm_const_tensor"),
+            sample_prob=inputs.get("prob_tensor"),
+            acc_dtype=torch.float32,
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            sf_vec_size=sf_vec_size,
+            vector_f32=True,
+            m_aligned=256,
+            discrete_col_sfd=False,
+            act_func="swiglu",
+            use_dynamic_sched=True,
+        )
+        assert api.check_support()
+        assert api._implementation._is_rubin_kernel
+        api._implementation._kernel = _rubin_glu_kernel_factory(api._implementation._kernel, generate_c)
+        api.compile()
+        for launch in range(_NO_C_LAUNCHES if not generate_c else 1):
+            for name in checked:
+                outputs[name].view(torch.uint8).fill_(0xFF)
+            api.execute(
+                a_tensor=inputs["a_tensor"],
+                c_tensor=outputs["c_tensor"],
+                d_tensor=outputs["d_tensor"],
+                sfa_tensor=inputs["sfa_tensor"],
+                padded_offsets=inputs["padded_offsets_tensor"],
+                alpha_tensor=inputs["alpha_tensor"],
+                b_tensor=inputs["b_tensor"],
+                sfb_tensor=inputs["sfb_tensor"],
+                d_col_tensor=outputs["d_col_tensor"],
+                sfd_row_tensor=outputs["sfd_row_tensor"],
+                sfd_col_tensor=outputs["sfd_col_tensor"],
+                amax_tensor=outputs.get("amax_tensor"),
+                norm_const_tensor=inputs.get("norm_const_tensor"),
+                prob_tensor=inputs.get("prob_tensor"),
+                current_stream=stream,
+            )
+            torch.cuda.synchronize()
+            if golden is None:
+                golden = {name: outputs[name].view(torch.uint8).clone() for name in checked}
+                continue
+            for name in checked:
+                differing = (outputs[name].view(torch.uint8) != golden[name]).sum().item()
+                assert differing == 0, f"generate_c=False launch {launch}: {differing} bytes of {name} differ from generate_c=True"

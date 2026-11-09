@@ -28,8 +28,8 @@ def validate_bounds(batch, heads, kv_heads, sq, skv, d_qk, d_v, cap_q, cap_kv, s
 def graph_mismatch(facts, version):
     if not facts.thd:
         return None
-    if facts.device_cc != (12, 0):
-        return "SM120 THD backward requires cc 12.0"
+    if facts.device_cc not in ((12, 0), (12, 1)):
+        return "SM120 THD backward requires cc 12.0 or 12.1"
     for enabled, label in (
         (facts.deterministic, "deterministic"),
         (facts.bottom_right, "bottom-right causal"),

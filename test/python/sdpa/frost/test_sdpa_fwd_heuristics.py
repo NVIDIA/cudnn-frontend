@@ -936,6 +936,41 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
 
 
 @pytest.mark.L0
+def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
+    """sm100 d192x128 f16/bf16 without GQA, causal: plain LPT leads while the grid is at most
+    _SM100_D192_LPT_MAX_WAVES waves of 512-row pair units; above that LPT_L2 leads, except on cc 10.3 with more
+    (batch, head) streams than SMs, where NATURAL leads; a mask-free graph proposes NATURAL alone; a GQA d192 graph
+    keeps the L2-budget rule."""
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.heuristics import _SM100_D192_LPT_MAX_WAVES, _sched_points
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    f16 = caps[engines.engine_name()]
+    d192 = dict(d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_sm_count=148)
+
+    def points(b, h, s, **over):
+        return _sched_points(f16, _facts(b=b, h_q=h, h_kv=over.pop("h_kv", h), s_q=s, s_kv=s, **d192, **over))
+
+    lpt, lpt_l2, natural = [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2]
+    assert _SM100_D192_LPT_MAX_WAVES == 12
+    for cc in ((10, 0), (10, 3)):
+        assert points(2, 64, 2048, device_cc=cc) == lpt  # 512 pair units / 74 clusters = 6.9 waves
+        assert points(1, 64, 4096, device_cc=cc) == lpt  # 6.9 waves
+        assert points(2, 96, 2048, device_cc=cc) == lpt  # 10.4 waves
+        assert points(2, 64, 4096, device_cc=cc) == lpt_l2  # 13.8 waves, 128 streams
+        assert points(1, 64, 16384, device_cc=cc) == lpt_l2  # 27.7 waves, 64 streams
+        assert points(2, 64, 2048, device_cc=cc, causal=False) == [SCHED_NATURAL]
+        assert points(2, 64, 2048, device_cc=cc, h_kv=8) == lpt_l2
+    assert points(2, 128, 2048, device_cc=(10, 0)) == lpt_l2  # 13.8 waves, 256 streams
+    assert points(2, 128, 2048, device_cc=(10, 3)) == natural
+    assert points(2, 96, 4096, device_cc=(10, 0)) == lpt_l2  # 20.8 waves, 192 streams
+    assert points(2, 96, 4096, device_cc=(10, 3)) == natural
+    plans = recommend("A", _facts(b=2, h_q=64, h_kv=64, s_q=2048, s_kv=2048, **d192), _OFFERED)
+    lead = next(p for p in plans if p.engine_id == 20500)
+    assert (lead.knobs.split_kv, lead.knobs.cga, lead.knobs.sched_policy) == (1, 2, SCHED_LPT), lead.knobs
+
+
+@pytest.mark.L0
 def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
     name = engines.engine_name(mxfp8=True)
     offered = {name: 20510}
@@ -2379,3 +2414,25 @@ def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     assert paged_thd_split_choice(rubin, f)[0] > 1
     sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
     assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))
+
+
+@pytest.mark.L0
+def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
+    """GB10 (cc 12.1, 48 SMs): a bf16 / f16 d64 / d128 causal dense prefill with more (batch, head) streams than SMs
+    leads with the NATURAL walk, the LPT variants behind it as runners; up to one stream per SM, a sliding window, an FP8
+    row and the cc 12.0 parts keep the L2-budget rule's LPT_L2."""
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+
+    def plans(**over):
+        facts = _facts(**{**dict(b=8, h_q=16, h_kv=16, s_q=2048, s_kv=2048, causal=True, bottom_right=True, device_cc=(12, 1), device_sm_count=48), **over})
+        out = recommend("A", facts, offered)
+        assert out
+        return out
+
+    many = plans()  # 128 streams on 48 SMs
+    assert many[0].knobs.sched_policy == SCHED_NATURAL, many[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in many}, [p.knobs for p in many]
+    assert plans(d_qk=64, d_v=64, h_kv=4)[0].knobs.sched_policy == SCHED_NATURAL  # GQA counts query-head streams
+    assert plans(b=3)[0].knobs.sched_policy == SCHED_LPT_L2  # 48 streams: one per SM
+    assert plans(device_cc=(12, 0), device_sm_count=188)[0].knobs.sched_policy == SCHED_LPT_L2
+    assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2

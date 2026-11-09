@@ -47,8 +47,9 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
+from cudnn.norm.strided import fake_strided_vector
 from cudnn.norm.fprop.kernels.layernorm_cga_sm100 import _MAX_CGA, _pick_cga
-from cudnn.norm.utils import ws_bytes, ws_empty, cur_stream, fake_rows, fake_stream, ffi, sm_count
+from cudnn.norm.utils import ws_bytes, ws_empty, cur_stream, fake_rows, fake_stream, ffi, sm_count, dsl_compile_lock
 
 from .layernorm_sm100 import _ln_bwd_finalize_kernel
 
@@ -408,13 +409,19 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     key = (params.io_dtype, nclusters) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        io, stat, part = cute.sym_int(), cute.sym_int(), cute.sym_int()
-        f32 = cutlass.Float32
-        fakes = (fake_rows(et, rows=io), fake_rows(et, rows=io), fake_rows(et, rows=io), fake_rows(et, rows=C))
-        fakes += (fake_rows(f32, rows=stat), fake_rows(f32, rows=stat), fake_rows(f32, rows=part), fake_rows(f32, rows=part))
-        fakes += (fake_rows(f32, rows=C), fake_rows(f32, rows=C))
-        fn = cute.compile(_ln_bwd_cga_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                io, stat, part = cute.sym_int(), cute.sym_int(), cute.sym_int()
+                f32 = cutlass.Float32
+                fakes = (fake_rows(et, rows=io), fake_rows(et, rows=io), fake_rows(et, rows=io), fake_rows(et, rows=C))
+                fakes += (fake_strided_vector(f32, rows=stat), fake_strided_vector(f32, rows=stat), fake_rows(f32, rows=part), fake_rows(f32, rows=part))
+                fakes += (fake_rows(f32, rows=C), fake_rows(f32, rows=C))
+                fn = cute.compile(_ln_bwd_cga_host, *fakes, cutlass.Int32(0), cutlass.Int32(0), *ce, fake_stream(), options="--enable-tvm-ffi")
+                _KCACHE[key] = fn
+    # RMSNorm has no mean; its compiled kernel does not read this placeholder.
+    if mean is None and not spec.has_mean:
+        mean = rstd
     operands = (dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1), gamma, mean, rstd, dgp, dbp, dgamma, dbeta)
     fn(*(ffi(t) for t in operands), R, nclusters, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

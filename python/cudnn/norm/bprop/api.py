@@ -26,6 +26,7 @@ from ..config_sm100 import (
     vector_width,
 )
 from ..dtypes import DTYPE_BYTES, torch_dtype_to_str
+from ..utils import is_aligned_contiguous_vector
 from .kernels import (
     batchnorm_nchw_sm100,
     batchnorm_nhwc_sm100,
@@ -243,6 +244,12 @@ def norm_bprop(
         dy = dy.contiguous()
     gamma, mean, rstd = _flat(gamma), _flat(mean), _flat(rstd)
     _require_io_dtype(x, gamma=gamma, dy=dy)
+    if x.is_cuda:
+        from ..utils import unsupported_device_reason
+
+        reason = unsupported_device_reason(x.device)
+        if reason is not None:
+            raise NotImplementedError(reason)
     io = torch_dtype_to_str(x.dtype)
 
     # dx is viewed with the same expression as x in every route below, so it is
@@ -338,7 +345,7 @@ def norm_bprop(
         # LN/RMS with a long row: split it across a CGA and reduce c1/c2 through
         # distributed shared memory, exactly as the forward does. Only past the
         # measured crossover -- the pipelined kernel below is better for short rows.
-        if variant in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM):
+        if variant in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM) and is_aligned_contiguous_vector(gamma):
             from .kernels import layernorm_cga_sm100
 
             if layernorm_cga_sm100.should_use(spec.M, spec.R, DTYPE_BYTES[io]):

@@ -156,6 +156,14 @@ _SM107_NO_GQA_LPT_MAX_WAVES = 24
 # Rubin half THD causal prefill on the d128 flavor without packing: LPT ahead of NATURAL up to ~10 waves (9.48 and 11.85
 # measured; 311 FI-path cells, ragged and paged, 2026-11-01). d256 measured mixed from 5 waves on and keeps NATURAL.
 _SM107_THD_LPT_MAX_WAVES = 10
+# SM100 d192x128 f16/bf16 causal without GQA (h_q == h_kv): plain LPT up to this many grid waves of 512-row 2-CTA
+# pair units (one unit per persistent cluster); above it the L2-grouped LPT walk, except
+# on cc 10.3 with more (batch, head) K/V streams than SMs, where the natural walk stays.
+_SM100_D192_PAIR_ROWS = 512
+_SM100_MEASURED_SMS = 148
+_SM100_D192_LPT_MAX_WAVES = 12
+# GB10 (cc 12.1): its SM count, the fallback where the graph facts carry none (the causal NATURAL rule in _sched_points).
+_SM121_MEASURED_SMS = 48
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -735,8 +743,8 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     Blackwell line (cc 10.0 / 10.3), whose launches keep the module's own forms, and any line the rule was
     never measured on (``_DECODE_COMBINE_RULE_CC`` is the one line it holds for); ``None`` reads the cc 10.7
     rule (the model's direct callers; a plan always names its device).  The sparse adapter's LEAN plans on the Blackwell parts of
-    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0) evaluate this rule at the measured line's cc on purpose
-    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 class; the table sits there)."""
+    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0 / 10.3) evaluate this rule at the measured line's cc on purpose
+    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 and GB300 classes; the tables sit there)."""
     if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
         return False
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
@@ -1524,16 +1532,18 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             and int(facts.h_q) == int(facts.h_kv)
             and facts.window_left is None
         ):
-            # SM100 d192x128 f16/bf16 without GQA (DeepSeek-V3 / Kimi layers):
-            # every KV head is read by one Q head, so LPT_L2 has nothing to
-            # group, and at these head counts the causal triangle spans dozens
-            # of waves, so LPT has little to balance -- the natural walk keeps
-            # a head's K/V hot in L2.  MEASURED (cuDNN 9.30 yardstick, profiler
-            # kernel sums, 2026-09-28) NATURAL / LPT_L2 / LPT of cuDNN: B300
-            # 128 heads S=2K 1.06 / 1.09 / 1.09x, S=8K 1.08 / 1.12 / 1.25x;
-            # B200 S=2K 1.03 / 1.05 / 1.06x, S=8K 1.02 / 1.02 / 1.12x, 64 heads
-            # S=4K 1.02 / 1.03 / 1.05x.  GQA d192 graphs keep the L2 rule.
-            primary = SCHED_NATURAL
+            # SM100 d192x128 f16/bf16 without GQA: the plain LPT walk while the causal grid is at most
+            # _SM100_D192_LPT_MAX_WAVES waves of 512-row pair units; above that the L2-grouped walk, except on cc 10.3
+            # with more (batch, head) K/V streams than SMs, which keeps the natural walk.
+            sm_count = int(facts.device_sm_count or _SM100_MEASURED_SMS)
+            streams = int(facts.b) * int(facts.h_q)
+            waves = (streams * -(-int(facts.s_q) // _SM100_D192_PAIR_ROWS)) / (sm_count // 2)
+            if waves <= _SM100_D192_LPT_MAX_WAVES:
+                primary = SCHED_LPT
+            elif tuple(facts.device_cc or ()) == (10, 3) and streams > sm_count:
+                primary = SCHED_NATURAL
+            else:
+                primary = SCHED_LPT_L2
         elif caps.sm_lo == 100 and _selected_d_shape(caps, facts) in ((128, 128), (64, 64)) and one_head_bytes < _SM100_D128_LPT_L2_MIN_BYTES:
             # The SM100 d128 / d64 f16 and per-tensor FP8 kernels: below a few
             # MiB per head the K/V of a head stays L2-resident under ANY walk, so
@@ -1543,6 +1553,24 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             # 1.04x vs 1.07x, S=32K packed 1.11x vs 1.07x (16 MiB/head: L2 wins);
             # e4m3 64/64 S=2K cga1 1.19x vs 1.33x, 64/8 S=2K/8K packed equal.
             primary = SCHED_LPT
+        if (
+            tuple(facts.device_cc or ()) == (12, 1)
+            and caps.sm_lo == 120
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and _selected_d_shape(caps, facts) in ((64, 64), (128, 128))
+            and facts.window_left is None
+            and int(facts.b) * int(facts.h_q) > int(facts.device_sm_count or _SM121_MEASURED_SMS)
+        ):
+            # GB10 (cc 12.1: 48 SMs, 24 MiB L2, LPDDR5X): with more (batch, head) streams than SMs the natural walk
+            # keeps each resident wave on a few heads' K/V, while both LPT walks spread it over as many heads as there
+            # are SMs -- the cc 10.3 d192 rule above, measured here on the d64 / d128 half kernels.  MEASURED on GB10
+            # (cuDNN 9.27.0.42, bf16, bottom-right causal dense prefill, every policy of the 128x128 tile timed
+            # round-robin): a 145-cell MHA grid (b 1-16, h 8-32, S 512-8192) and a 320-cell holdout off it (b 3-12,
+            # h 12-40, GQA 1 / 4 / 8, S 768-6144); against LPT_L2 first, NATURAL/LPT_L2 ran 0.49x at b*h = 512 and 1.08-1.11x
+            # at b*h <= 16, and the rule took the holdout's geomean regret from 1.384 to 1.005, two of 320 cells over 3 % slower
+            # (max 1.083x, within run-to-run spread).
+            # RTX 5060 Ti / PRO 6000 (cc 12.0) keep the L2-budget rule: LPT_L2 measured even or ahead there.
+            primary = SCHED_NATURAL
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}

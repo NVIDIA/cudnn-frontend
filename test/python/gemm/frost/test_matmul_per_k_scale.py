@@ -170,9 +170,6 @@ def test_frost_per_k_graph_and_render(options, cta_group, swapped):
 @pytest.mark.parametrize(
     "options,change,reason",
     [
-        ({"a_major": "m"}, {}, "K-major"),
-        ({"side": "b", "b_major": "n"}, {}, "K-major"),
-        ({"scale_stride": 2}, {}, "unit stride"),
         ({"K": 135}, {}, "K % 8"),
         ({}, {"compute_dtype": "int32"}, "FP32"),
         ({}, {"out_dtype": "fp32"}, "result"),
@@ -184,6 +181,13 @@ def test_frost_per_k_capability_not_ir(options, change, reason):
     if change:
         chain = replace(chain, mainloop_a_ops=[replace(chain.mainloop_a_ops[0], **change)])
     assert reason in select_template(chain, _config())._other_reject(chain, _config())
+
+
+@pytest.mark.parametrize("side", ("a", "b"))
+def test_frost_direct_per_k_ir_still_requires_k_major(side):
+    chain = analyze(_graph(side=side)[0])
+    chain = replace(chain, matmul=replace(chain.matmul, **{f"{side}_major": "m" if side == "a" else "n"}))
+    assert "K-major" in select_template(chain, _config())._other_reject(chain, _config())
 
 
 def test_frost_per_k_ir_rejects_invalid_broadcast():
@@ -420,3 +424,15 @@ compiled = cute.compile(entry, fake_data, fake_scale, fake_data, options="--enab
             values = (values.float() + indices.float()).to(operand_dtype)
         ref[:k] = (values.float() * scale.reshape(-1).float()).to(operand_dtype)
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("side", ("a", "b"))
+def test_frost_strided_per_k_uses_coordinate_loading(side):
+    """A failed vector-load optimization is not a broadcast semantic rejection."""
+    chain = analyze(_graph(side=side, scale_stride=2)[0])
+    op = getattr(chain, f"mainloop_{side}_ops")[0]
+    assert chain.aux_by_name(op.aux).coordinate_mapped
+    assert op.operand_access is not None and op.operand_access.axes == {Axis.K}
+    assert select_template(chain, _config())._other_reject(chain, _config()) is None
+    source = epilogue_codegen.generate_mainloop(chain, side)
+    assert ".stride[" in source

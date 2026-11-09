@@ -31,6 +31,8 @@ cudnn.linear_attention.ops
 cudnn.moe_ep
 cudnn.native_sparse_attention
 cudnn.ops
+cudnn.ops.dsa
+cudnn.ops.nsa
 cudnn.reduction_modifiers
 cudnn.rmsnorm_rht_amax
 cudnn.rope
@@ -39,6 +41,5 @@ cudnn.sdpa.bwd
 cudnn.sdpa.fwd
 cudnn.sdpa.fwd.torch_op
 cudnn.torch
-cudnn.triangle_attention
 cudnn.wrapper
 cudnn.yarn

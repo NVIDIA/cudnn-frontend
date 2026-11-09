@@ -88,6 +88,26 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
             pass
 
 
+@cute.jit
+def wait_cluster_acquire(mb, phase):
+    """:func:`wait` (the hint-less spin form) with a CLUSTER-scope acquire: ``mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64``.
+
+    For a barrier whose phase is completed by a PEER CTA's ``st.async ... mbarrier::complete_tx::bytes`` (or any cross-CTA DSMEM write
+    that completes tx bytes): PTX gives the complete-tx operation release semantics at CLUSTER scope, and a ``.acquire.cta`` wait does
+    not include the remote CTA's thread in its synchronizes-with relation, so this CTA's generic ``ld.shared`` of the shipped bytes is
+    formally ordered only by the cluster-scope acquire.  The GDN decode pair (``gdn_decode_fused_f16.py``, ``mb_norm``) runs the
+    ``.acquire.cta`` form bitwise in production, so this closes a formal gap, not an observed one; the shared-expert decode pair's
+    ``mb_kred`` (``moe/frost/kernel/shared_expert_decode_f16.py``) is the first caller.  One-time end-of-kernel waits only: a
+    cluster-scope acquire on a per-iteration path is a per-wait drain (``frost-tile-dsl.md`` section 3).  Same spin shape and labels as
+    :func:`wait` (``spin=True``); no ``predicate=`` (branch around it instead, see :func:`arrive_expect_tx`)."""
+    nvvm.inline_ptx(
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
+        "@P1 bra.uni DONE;\n\tbra.uni LAB_WAIT;\n\tDONE:\n\t}",
+        read_only_args=[mb, cutlass.Int32(phase)],
+    )
+
+
 # wait_poll shape: POLL_TIGHT_ITERS back-to-back test_wait's (~1 us), then a plain TIMER ``nanosleep.u32 POLL_SLEEP_NS``
 # between tests.  The sleep is the timer form (SASS NANOSLEEP), NOT the event-sleep of a parked try_wait (NANOSLEEP.SYNCS) --
 # the warp still never hands itself to the barrier unit.  MEASURED (d512 2x2 backward, B200 2026-10-01): a TIGHT test_wait
