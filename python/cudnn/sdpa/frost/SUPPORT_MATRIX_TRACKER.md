@@ -1,5 +1,13 @@
 # FROST SDPA — support matrix
 
+**SM100/SM103 D512 per-tensor FP8 paged KV:** dense Q now reads NHD or HND
+page pools directly through independent K/V block tables and runtime strides.
+The existing D512 head envelope, padding/causal/window masks, PackGQA and
+Split-KV compose with the native loader. Scalar-scaled FP8 or half outputs
+use the prepared execution contract. THD Q, block-scaled O and SM107 D512
+FP8 page pools retain their existing declines. Regression coverage includes
+`test_sdpa_prepared_fp8_paged.py` and `test_sdpa_fwd_paged_sm100.py`.
+
 **Half D192/V128 nonpaged THD origins:** SM100/SM103 and SM107 unsplit
 plans bind independent physical Q/K/V/O/Stats offsets. The two-CTA native
 bodies and existing single-CTA half path keep logical device lengths separate
@@ -173,7 +181,7 @@ mask/sink, padded-Stats and changed-length replay tests exercise this support.
 
 Paged K and V may independently use HND or NHD physical storage on every
 existing paged forward row: SM100/SM103 half D64/D128/D192x128/D256/D512,
-per-tensor FP8 D64/D128/D256, MXFP8 D128/D192x128/D256/D512; SM107 half THD
+per-tensor FP8 D64/D128/D256/D512, MXFP8 D128/D192x128/D256/D512; SM107 half THD
 D128/D256 and D256 decode, plus MXFP8 D128/D256. Each operand's declared
 layout is recorded separately in the plan and checked by its native binder.
 TMA descriptors retain the existing shared coordinate order with each pool's
@@ -769,7 +777,7 @@ MMA as d=512.
 | Ragged `S_kv` (non-multiple of 128) | ✅⁶ ᵗ⁰ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅⁶ | ✅ᵇ ᵉ ᵍ |  ✅ᵇ² ᵍ  |
 | Decode-shaped (`S_q == 1`; with sink / sliding window: ˢ) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ᵈ (decode tile) | ✅ | ❌ᵇ · ✅ᵍ |  ❌ᵇ² · ✅ᵍ  |
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ❌ (prefill tile) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
-| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | via the native d64 flavorᵗ⁰ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native 512; (256, 512] envelope) | ❌ |  ❌  |
+| Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | via the native d64 flavorᵗ⁰ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + fp8 + mxfp8 | ✅ᵖ f16 + fp8 + mxfp8 (native 512; (256, 512] envelope; FP8 dense Q only) | ❌ |  ❌  |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Index-list sparse attention (QSA: per-query lists of 4-token blocks + the open tail; frontend-only, the SM100 / SM103 / SM107 engine behind `cudnn.ops.qsa_backward` and `qsa_indexed_backward` (`QSA/kernels/bprop_sm100.py`), no graph form) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | bf16 ✅ (SM100, SM103 and SM107, cc 10.0 / 10.3 / 10.7; 24 Q / 2 KV heads, 12 Q / 1 KV head or 6 Q / 1 KV head (the two- and four-way tensor-parallel shards; the 6-head shard pads the 12-row query tiles; CuTe DSL CUDA 13 compiler required), any softmax scale, one sequence or packed sequences (`cu_seqlens` of the indexed entry, `tok_base` of the bitmap entry) of `T <= 349525` rows (`699050` at 12 / 1, `1398101` at 6 / 1); blocks may start anywhere and the key bounds may cut them, keys after the query within `hi` are attended, a query past the dense prefix holds at most 513 blocks (a longer list contributes nothing and its dQ is NaN); no context parallel or deterministic mode) |
 
@@ -908,9 +916,9 @@ On SM107, an unsplit D128 paged Q=1 graph retains the native prefill body
 with CGA1 or CGA2; only split plans select the shared ragged decode tile.
 
 ᵖ **Paged KV (issue #920): f16/bf16 on the d64 / d128 / d192×d128 / d256 / d512 flavors, per-tensor
-FP8 on the d64 / d128 / d256 flavors, MXFP8 on its four d ≥ 128 native flavors** (`Capabilities.paged_d_shapes`:
+FP8 on the d64 / d128 / d256 / d512 flavors, MXFP8 on its four d ≥ 128 native flavors** (`Capabilities.paged_d_shapes`:
 the f16/bf16 row `{(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}`, the SM100 per-tensor FP8 row
-`{(64, 64), (128, 128), (256, 256)}`, the MXFP8 row `{(128, 128), (192, 128), (256, 256), (512, 512)}`). The head-dim
+`{(64, 64), (128, 128), (256, 256), (512, 512)}`, the MXFP8 row `{(128, 128), (192, 128), (256, 256), (512, 512)}`). The head-dim
 gate is the flavor the lowering SELECTS — the smallest covering envelope — not the raw
 dims: d=64 is **native** (paged wired on the d64 flavor), d=192/192 and mixed dims such as (256, 128) or
 (64, 192) ride the d256 one, (192, 128) is **native** on d192×d128 and shapes below it
@@ -925,10 +933,12 @@ up to 128 validated) both run, with KV split as on d128, and THD queries over d5
 ride the same path. A decode-shaped paged d512 graph runs that prefill tile today (no d512
 decode tile yet — the measured gap, the default placement and the follow-up are a
 gaps-table row below). On the FP8 row the
-native d64, d128 and d256 selections are wired. D256 serves 16-aligned heads within
+native d64, d128, d256 and d512 selections are wired. D256 serves 16-aligned heads within
 (256, 256) when smaller eligible flavors do not cover them. Exact heads use rank-5
 page loads; partial K/V heads use bounded rank-4 loads. Both keep full-tile
-dimension-slab pitches, including pages shorter than the tile. A d192×d128 or d512 FP8 selection remains declined. The K and V pools may
+dimension-slab pitches, including pages shorter than the tile. D512 uses rank-4 page boxes on the role-split body,
+including its aligned (256, 512] head envelope; its paged FP8 form requires dense Q.
+A d192×d128 FP8 selection remains declined. The K and V pools may
 differ in row width (d192×d128: a 192-wide K pool and a 128-wide V pool behind
 separate block tables) and independently choose the in-page HND/NHD layout. The graph is cuDNN's own
 paged-cache contract: K/V are page pools `[num_pages, H_kv, page_size, D]` — HND

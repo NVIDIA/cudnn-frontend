@@ -3280,9 +3280,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d64/d128/d256 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
+            # the d64/d128/d256/d512 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
             # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 / d512 FP8 flavors, the d512
+            # MXFP8 siblings, the d192x128 FP8 flavor, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.  On cc 10.7: half pools serve THD queries
@@ -3309,8 +3309,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256)),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256), (512, 512)),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),
