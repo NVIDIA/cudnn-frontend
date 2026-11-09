@@ -50,11 +50,12 @@ from cutlass._mlir.dialects import llvm
 from cudnn._cutlass_compat import SmemAllocator
 from .indexer_top_k_varlen_util import atomicAdd
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_stream
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options, gpu_arch_flag
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability, device_major, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
     to_cute_tensor as _to_cute_tensor,
 )
+from cudnn.frost.capture import is_capturing
 
 # Radix configuration.
 _NUM_BINS_11 = 2048  # 11-bit levels (bin0, bin1)
@@ -812,7 +813,7 @@ def compress_stage2_topk(
     qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
     kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if kv_lens is not None else None
 
-    stream = resolve_stream(stream)
+    stream = resolve_stream(stream, device)
     compile_key = (
         bs,
         seqlen_q,
@@ -914,14 +915,14 @@ def compress_stage2_topk_varlen(
     ``compress_topk_cand_buffer_size_thd`` (consistent with cu_seqlens / ratio).  The
     interface validates metadata only and never reads these device values back to
     the host."""
-    if device_major() < 9:
-        raise RuntimeError("CuTeDSL compress stage-2 topk requires SM90+")
     if not cand_buffer.is_cuda or cand_buffer.dtype != torch.float32:
         raise ValueError("cand_buffer must be a CUDA float32 tensor")
     if not cand_buffer.is_contiguous():
         raise ValueError("cand_buffer must be contiguous")
     cand_buffer = cand_buffer.view(-1)
     device = cand_buffer.device
+    if device_capability(device)[0] < 9:
+        raise RuntimeError("CuTeDSL compress stage-2 topk requires SM90+")
     bs = cu_seqlens_q.numel() - 1
     # int64 + contiguous so the .to(torch.int64) below is a guaranteed no-op (no
     # extra alloc / copy).
@@ -971,16 +972,21 @@ def compress_stage2_topk_varlen(
 
     softmax3_cute = _out_cute(softmax3) if want_softmax else None
 
-    stream = resolve_stream(stream)
+    stream = resolve_stream(stream, device)
+    device_index = device.index
+    assert device_index is not None
+    capability = device_capability(device)
     # Layout is fully dynamic: grid (total_q, 1) and all per-batch geometry
     # (cu_seqlens, cand_batch_offsets) are read at runtime (mark_layout_dynamic),
-    # so one compile per (topk, ratio, block_threads) serves any total_q / bs /
-    # output layout — hence total_q/bs are not in the compile key
+    # so one compile per device/architecture and (topk, ratio, block_threads)
+    # serves any total_q / bs / output layout — hence total_q/bs are not in the compile key
     # (see test_indexer_fwd_dsl_compress_topk_thd_reuse).
     qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
     cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if cu_seqlens_k is not None else None
     kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if kv_lens is not None else None
     compile_key = (
+        device_index,
+        capability,
         "varlen" if kv_lens is None else "varlen_paged",
         topk,
         ratio,
@@ -990,6 +996,8 @@ def compress_stage2_topk_varlen(
         bool(deterministic),
     )
     if compile_key not in _compile_cache:
+        if is_capturing(stream):
+            raise ValueError("compressed varlen Top-K must be compiled by a warmup call before CUDA Graph capture")
         kernel_obj = CompressTopkStage2(
             topk=topk,
             ratio=ratio,
@@ -997,36 +1005,39 @@ def compress_stage2_topk_varlen(
             is_varlen=True,
             deterministic=deterministic,
         )
-        _compile_cache[compile_key] = cute.compile(
-            kernel_obj,
-            _make_i64_cand_buffer_compile_tensor(),
-            _out_cute(idx3),
-            _out_cute(val3),
+        gpu_arch = gpu_arch_flag(device)
+        with torch.cuda.device(device):
+            _compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                _make_i64_cand_buffer_compile_tensor(),
+                _out_cute(idx3),
+                _out_cute(val3),
+                cutlass.Int32(int(max_seqlen_q)),
+                cutlass.Int32(int(max_seqlen_k)),
+                stream,
+                _to_cute_tensor(cu_seqlens_q, leading_dim=0),
+                cu_k_cute,
+                _to_cute_tensor(cand_batch_offsets, leading_dim=0),
+                qco_cute,
+                softmax3_cute,
+                kvl_cute,
+                options=compile_options("--opt-level 3", gpu_arch=gpu_arch),
+            )
+    with torch.cuda.device(device):
+        _compile_cache[compile_key](
+            cand_buffer,
+            idx3,
+            val3,
             cutlass.Int32(int(max_seqlen_q)),
             cutlass.Int32(int(max_seqlen_k)),
             stream,
-            _to_cute_tensor(cu_seqlens_q, leading_dim=0),
-            cu_k_cute,
-            _to_cute_tensor(cand_batch_offsets, leading_dim=0),
-            qco_cute,
-            softmax3_cute,
-            kvl_cute,
-            options=compile_options("--opt-level 3"),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cand_batch_offsets,
+            q_causal_offsets,
+            softmax3,
+            kv_lens,
         )
-    _compile_cache[compile_key](
-        cand_buffer,
-        idx3,
-        val3,
-        cutlass.Int32(int(max_seqlen_q)),
-        cutlass.Int32(int(max_seqlen_k)),
-        stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        cand_batch_offsets,
-        q_causal_offsets,
-        softmax3,
-        kv_lens,
-    )
     if want_softmax:
         return out_indices, out_logits, out_softmax
     return out_indices, out_logits

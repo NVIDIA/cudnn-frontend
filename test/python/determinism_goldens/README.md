@@ -851,6 +851,36 @@ fail on saved FP32 output, before gradient comparison; BF16 output matches.
 Both 512-token controls pass. All-masked rows, changed-neighbor isolation,
 and zero-upstream-gradient QSA cases pass.
 
+### SM90 compact IndexerForward + Top-K validation (2026-11-09)
+
+The new packed-THD ratio-4, D128, 64Q/1KV combined path ran **9 passed, 0
+failed, 0 skipped** for BF16 and E4M3 FP8 on SM90 with Torch `2.12.1+cu130`,
+CUDA `13.0`, cuDNN `92000`, and CuTe DSL `4.8.1`. Imports resolved to the
+tested checkout. The suite covers raw-byte replay under side-stream pressure,
+batch reorder/duplication and changed-neighbor isolation, ragged/empty/short
+segments, tail rows, exact ties, compile counts, buffer-alias rejection,
+nonzero causal offsets, explicit-side-stream internal sizing, and changed-input
+CUDA Graph replay.
+Independent FP32 references validate selected indices, logits, softmax, and
+LSE, including caller-owned LSE-only output. The two existing SM90 Indexer
+Forward suites plus this suite ran **41 passed, 66 skipped**. Backward is
+outside this combined forward API.
+
+The focused suite command was:
+
+```bash
+cd test/python
+pytest -q -s deepseek_sparse_attention/cutedsl/test_DSA_indexer_compressed_sm90_determinism.py
+```
+
+### SM100 IndexerForward regression (2026-11-09)
+
+The existing compressed IndexerForward + Top-K suite ran **96 passed, 0
+failed** on SM100, including BF16/block-scaled numerics, deterministic ties,
+compile-cache reuse, preallocated buffers, and CUDA Graph cases. The general
+IndexerForward suite ran **95 passed, 3 skipped**. The tested checkout used
+Torch `2.14.1+cu130`, CUDA `13.0`, cuDNN `92400`, and CuTe DSL `4.8.1`.
+
 ## Method
 
 - [Megatron module tests](https://github.com/NVIDIA/Megatron-LM/tree/main/tests/unit_tests/determinism): fixed inputs, restored state, outputs and gradients.

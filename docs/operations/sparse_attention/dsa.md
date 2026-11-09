@@ -16,7 +16,8 @@ The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
 Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs. Sparse-attention
 forward supports SM90 and the mapped SM100-family capabilities 10.0, 10.3,
-and 10.7; the combined compressed-logits + Top-K path remains SM100-only.
+and 10.7; the combined compressed-logits + Top-K path serves a validated
+packed-THD configuration on SM90 and broader configurations on SM100+.
 Dense Indexer Forward and standalone Indexer Top-K support both architectures.
 The kernels are delivered as Python classes /
 wrappers that follow the same `APIBase` pattern as other cuDNN Frontend
@@ -35,7 +36,7 @@ The module packages the following operations:
    SM90/SM100.
 3. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask) that materializes dense scores.
-4. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
+4. **Combined Indexer Forward + Top-K** – SM90/SM100 compact score generation,
    Top-K selection, and optional Top-K softmax in one public API call.
 5. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
@@ -805,10 +806,11 @@ compressed column 0.
 - **Strided inputs** — `IndexerForward.check_support()` declines `q`/`k`/`w`
   whose innermost stride is not 1 with `NotImplementedError` (the kernel
   addresses them natively; nothing is repacked), and `execute()` raises
-  `ValueError` for such live tensors. `indexer_forward_wrapper` and
-  `indexer_forward_top_k_wrapper` make strided inputs contiguous on the launch
-  stream as a torch-op convenience, at the cost of one copy kernel per strided
-  tensor.
+  `ValueError` for such live tensors. `indexer_forward_wrapper` and the SM100
+  combined Top-K path make strided inputs contiguous on the launch stream as a
+  torch-op convenience, at the cost of one copy kernel per strided tensor. The
+  SM90 combined Top-K path is capture-oriented and declines non-contiguous
+  packed Q/K/W/scales.
 - **Scope** — FP32 weights are supported by Indexer Forward and Combined
   Indexer Forward + Top-K. The separate indexer score-recompute and backward
   APIs still require BF16 weights.
@@ -875,27 +877,46 @@ and `logits` FP32, plus `softmax` FP32 by default, without materializing dense
 scores. Pass
 `return_softmax=False` to omit `softmax`. BSHD output shape is
 `(B, S_q, top_k)`; THD output shape is `(total_q, top_k)`. Padded slots are
-`-1`/`-inf`. The selected set is Top-K, but its slot order is not guaranteed to
-be descending. Set `deterministic=True` to break exact-value ties at the K-th
-boundary toward the smallest local KV indices, making the selected set
+`-1`/`-inf`, with zero softmax. The selected set is Top-K, but its slot order
+is not guaranteed to be descending. Set `deterministic=True` to break
+exact-value ties at the K-th boundary toward the smallest local KV indices, making the selected set
 reproducible across launches. This does not sort the output slots; the default
 `False` path retains the faster scheduling-dependent tie-break.
 
-The combined compressed path is SM100-only. Both BSHD and THD support
-BF16 Q/K with BF16 or FP32 weights, and MXFP8 or MXFP4 Q/K with BF16 weights.
+The combined compressed path supports different validated rows on SM90 and
+SM100. SM90 initially supports packed THD only with `ratio=4`,
+`head_dim=128`, `H_kv=1`, `qhead_per_kv_head=64`, and contiguous inputs. Q/K
+may be BF16 with BF16 or FP32 weights, or E4M3 FP8 with FP32 per-token/head
+descales and BF16 weights. SM90 does not support BSHD, MXFP8/MXFP4, paged K,
+or explicit query microbatching in this path. SM100 retains both BSHD and THD
+with BF16 Q/K and BF16 or FP32 weights, plus MXFP8 or MXFP4 Q/K with BF16
+weights.
 `topk_indices_global=True` is the default. Optional caller-owned
 candidate/output/softmax/LSE buffers avoid per-call allocations; size the
 candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
-`compress_topk_cand_buffer_size_thd` for THD. LSE is supported for BSHD and THD
-with BF16, MXFP8, and MXFP4. Explicit microbatching is BF16 BSHD-only and cannot
+`compress_topk_cand_buffer_size_thd` for THD. SM90 LSE is supported for BF16
+and FP8; SM100 LSE is supported for BSHD and THD with BF16, MXFP8, and MXFP4.
+Explicit microbatching is BF16 BSHD-only and cannot
 be combined with LSE or explicit `q_causal_offsets`. BSHD with explicit
 `q_causal_offsets` currently computes its per-batch candidate offsets eagerly
 and is not CUDA-graph-capturable; THD capture requires the caller-provided
-offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. Compact
+offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. The same
+preallocation rule applies to SM90 capture; SM90 capture additionally requires
+`topk_indices_global=False`, because its optional local-to-global conversion is
+outside the prepared two-kernel path. Compile both kernels with an eager
+warmup before capture. Compact
 addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
 prefix are clamped to `seqlen_k_b`. THD MXFP8 and MXFP4 use the same
 caller-guaranteed device-side scale-prefix contract described in §3; the
 interface does not validate prefix values with a device-to-host copy.
+
+On SM90 the first kernel reuses the Hopper WGMMA scorer and changes only its
+output epilogue: causal-valid scores are written to the 64-bit compact
+candidate layout. The second kernel is the common SM90+ deterministic radix
+Top-K implementation. Candidate memory is still quadratic in sequence length
+(about half the dense ratio-4 causal score storage), so long-context callers
+must budget capacity explicitly; SM90 THD microbatching is not yet
+implemented.
 
 Leave `microbatch_rows=-1` to use the BSHD long-sequence memory policy; it
 enables windowing only for compatible BF16 shapes. Pass `0` to force one
