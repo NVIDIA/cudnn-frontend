@@ -275,8 +275,8 @@ def test_cc103_d128_forward_dense_causal_gqa_entries_are_its_own():
 
 @pytest.mark.L0
 def test_b300_dense_prefill_entries_lead_the_sm100_row():
-    """Dense prefill-phase d192 and windowed d64 lead on cc 10.3 from their own studies; other head dims, a paged cache and
-    cc 10.0 are not answered by these entries."""
+    """bf16 dense prefill-phase d192 and windowed d64 lead on cc 10.3 from their own study; f16, other head dims, a paged cache
+    and cc 10.0 are not answered by these entries."""
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
@@ -292,22 +292,21 @@ def test_b300_dense_prefill_entries_lead_the_sm100_row():
     half = cudnn.data_type.HALF
     d64 = {"d_qk": 64, "d_v": 64, "window_left": 1024}
     assert pt.TABLE[pt.class_key(row, prefill())].study == "sm103_dense_prefill_bf16_20261107"
-    assert pt.TABLE[pt.class_key(row, prefill(dtype=half))].study == "sm103_dense_prefill_f16_20261107"
     led = (
         prefill(),
-        prefill(dtype=half),
         prefill(causal=False, bottom_right=False),
         prefill(window_left=1024),
         prefill(s_kv=3073),
         prefill(h_q=8, h_kv=8, **d64),
         prefill(h_q=8, h_kv=8, s_kv=3073, **d64),
-        prefill(dtype=half, **d64),
     )
     for facts in led:
         assert pt.lookup(row, facts) is True
         assert placement.place(spec, facts) == placement.LEAD
 
     assert pt.class_key(row, prefill(d_qk=64, d_v=64)) not in pt.TABLE  # d64 without a window
+    assert pt.class_key(row, prefill(dtype=half)) not in pt.TABLE  # f16 keeps the hand rules
+    assert pt.class_key(row, prefill(dtype=half, **d64)) not in pt.TABLE
     assert pt.class_key(row, prefill(dtype=half, d_qk=128, d_v=128)) not in pt.TABLE
     assert pt.class_key(row, prefill(has_paged_kv=True, page_size=64)) not in pt.TABLE
     assert pt.class_key(row, prefill(device_cc=(10, 0))) not in pt.TABLE
