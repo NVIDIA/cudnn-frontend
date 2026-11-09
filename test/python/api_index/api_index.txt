@@ -101,6 +101,7 @@ cudnn.NodeType.CONCATENATE
 cudnn.NodeType.CONV_DGRAD
 cudnn.NodeType.CONV_FPROP
 cudnn.NodeType.CONV_WGRAD
+cudnn.NodeType.CUSTOM_REDUCTION
 cudnn.NodeType.GDN
 cudnn.NodeType.GDN2
 cudnn.NodeType.GDN2_BWD
@@ -301,9 +302,14 @@ cudnn.cudnnGraphNotSupportedError
 cudnn.cudnnGraphNotSupportedError.add_note
 cudnn.cudnnGraphNotSupportedError.args
 cudnn.cudnnGraphNotSupportedError.with_traceback
+cudnn.custom_reduction_identity
+cudnn.custom_reduction_identity.data_type
+cudnn.custom_reduction_identity.from_bits
+cudnn.custom_reduction_identity.raw_hex
 cudnn.data_type
 cudnn.data_type.BFLOAT16
 cudnn.data_type.BOOLEAN
+cudnn.data_type.BYTE_BOOLEAN
 cudnn.data_type.DOUBLE
 cudnn.data_type.FAST_FLOAT_FOR_FP8
 cudnn.data_type.FLOAT
@@ -320,6 +326,7 @@ cudnn.data_type.INT8
 cudnn.data_type.INT8x32
 cudnn.data_type.INT8x4
 cudnn.data_type.NOT_SET
+cudnn.data_type.UINT32
 cudnn.data_type.UINT8
 cudnn.data_type.UINT8x4
 cudnn.data_type.name
@@ -1510,6 +1517,7 @@ cudnn.pygraph.conv_wgrad
 cudnn.pygraph.cos
 cudnn.pygraph.create_execution_plan
 cudnn.pygraph.create_execution_plans
+cudnn.pygraph.custom_reduction
 cudnn.pygraph.deselect_behavior_notes
 cudnn.pygraph.deselect_engines
 cudnn.pygraph.deselect_numeric_notes
@@ -1642,6 +1650,18 @@ cudnn.reduction_mode.NORM2
 cudnn.reduction_mode.NOT_SET
 cudnn.reduction_mode.name
 cudnn.reduction_mode.value
+cudnn.reduction_modifiers
+cudnn.reduction_modifiers.ArgNanRule
+cudnn.reduction_modifiers.ArgNanRule.IGNORE_NAN
+cudnn.reduction_modifiers.ArgNanRule.TORCH
+cudnn.reduction_modifiers.ArgNanRule.XLA
+cudnn.reduction_modifiers.ArgNanRule.name
+cudnn.reduction_modifiers.ArgNanRule.value
+cudnn.reduction_modifiers.argmax
+cudnn.reduction_modifiers.argmin
+cudnn.reduction_modifiers.max
+cudnn.reduction_modifiers.min
+cudnn.reduction_modifiers.sum
 cudnn.reshape_mode
 cudnn.reshape_mode.LOGICAL
 cudnn.reshape_mode.VIEW_ONLY
@@ -1829,6 +1849,7 @@ cudnn.wrapper.cudnn
 cudnn.wrapper.data_type
 cudnn.wrapper.data_type.BFLOAT16
 cudnn.wrapper.data_type.BOOLEAN
+cudnn.wrapper.data_type.BYTE_BOOLEAN
 cudnn.wrapper.data_type.DOUBLE
 cudnn.wrapper.data_type.FAST_FLOAT_FOR_FP8
 cudnn.wrapper.data_type.FLOAT
@@ -1845,6 +1866,7 @@ cudnn.wrapper.data_type.INT8
 cudnn.wrapper.data_type.INT8x32
 cudnn.wrapper.data_type.INT8x4
 cudnn.wrapper.data_type.NOT_SET
+cudnn.wrapper.data_type.UINT32
 cudnn.wrapper.data_type.UINT8
 cudnn.wrapper.data_type.UINT8x4
 cudnn.wrapper.data_type.name

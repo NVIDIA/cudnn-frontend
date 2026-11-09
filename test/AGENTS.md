@@ -91,6 +91,11 @@ Two suites: `test/cpp` (Catch2, C++ graph API) and `test/python` (pytest). Both 
 - Catch2 v3 binary, target `tests`, built by the default CMake build (`CUDNN_FRONTEND_BUILD_TESTS=ON`) into `build/bin/tests`.
 - Run all: `./build/bin/tests`. List: `--list-tests`. One case: `./build/bin/tests "Validate conv node"`. Filter by tag: `./build/bin/tests "[serialize]"`.
 
+After changing shared graph validation, run the unfiltered `tests` and `samples` binaries;
+a feature-tagged sample run can miss existing graph callers. For pointwise arity
+changes, inspect shipped positive calls using each overload and preserve intentional
+negative tests. The INT8 convolution sample exercises unary IDENTITY.
+
 ### Plan failure diagnostics
 
 Match each rejected plan's name and position in the same diagnostic fragment.
@@ -111,7 +116,26 @@ a rejected prefix and an unbuilt suffix so pruning deterministically moves a
 valid plan to index zero; then replay its identity, append/build another config,
 and tune a serialized/reloaded plan whose engine-config list is absent.
 
+### Header and runtime version guards
+
+Keep header-version comparisons out of ordinary runtime `if` conditions. MSVC
+reports C4127 for a constant operand such as `CUDNN_VERSION < 92900` in a
+combined condition, and `/WX` makes it a build failure. Select the header
+case with `#if`/`#elif`, then check the loaded backend version in the applicable
+branch. Preserve both older-header and newer-header/older-runtime behavior,
+including the inverse guard of an old-backend refusal test. The custom-reduction
+tests and samples use this separation.
+
 ## Python tests (`test/python`)
+
+When changing direct CPython C API calls in the bindings, build with
+`CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` and import the resulting abi3 module.
+`PyFloat_AS_DOUBLE` is unavailable under `Py_LIMITED_API`; after successful
+`PyNumber_Float`, use the public `PyFloat_AsDouble` accessor. A small compile
+probe against the actual limited-API headers should fail with the old call and
+pass with the replacement. For build-flag qualification, inspect the compiler
+definitions: `CUDNN_FRONTEND_SKIP_JSON_LIB=ON` in a CMake cache alone does not
+prove that the Python module compiled with JSON disabled.
 
 When moving Python modules, build the validation wheel with fresh Python build
 output. Reusing `build/lib.*` can ship removed modules even when the source tree

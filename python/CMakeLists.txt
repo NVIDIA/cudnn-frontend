@@ -90,6 +90,7 @@ nanobind_add_module(
     properties.cpp
 
     pygraph/pygraph.cpp
+    pygraph/custom_reduction.cpp
     pygraph/norm.cpp
     pygraph/sdpa.cpp
     pygraph/pointwise.cpp

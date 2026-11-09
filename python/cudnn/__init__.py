@@ -43,6 +43,7 @@ symbols_to_import = [
     "moe_grouped_matmul_mode",
     "scalar_type",
     "reshape_mode",
+    "custom_reduction_identity",
 ]
 
 for symbol_name in symbols_to_import:
@@ -294,6 +295,7 @@ from ._pygraph import pygraph, GraphContext
 from .nodes import Node
 
 from .graph import graph, jit, graph_cache
+from . import reduction_modifiers
 
 from typing import Any
 
@@ -334,6 +336,7 @@ _EAGER_PUBLIC_NAMES = (
     "graph",
     "jit",
     "graph_cache",
+    "reduction_modifiers",
     "sdpa_capabilities",
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
