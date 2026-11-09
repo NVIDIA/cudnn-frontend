@@ -47,9 +47,9 @@ def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqle
 class _QsaIndexedPlan(APIBase):
     """Immutable geometry and compiled kernels. Execute uses caller storage only.
 
-    The backward runs the dense-prefix and two-pass kernels of ``cudnn.QSA.kernels.bprop_sm100`` behind the
-    per-query compaction, for 12 or 6 query heads per KV head, with the documents of a packed buffer described by
-    ``cu_seqlens`` when the caller has them.
+    The backward runs the dense-prefix and two-pass kernels of ``cudnn.QSA.kernels.bprop_sm100`` (those of
+    ``bprop_sm107`` on SM107 with the oversized shared memory carveout) behind the per-query compaction, for 12 or 6 query
+    heads per KV head, with the documents of a packed buffer described by ``cu_seqlens`` when the caller has them.
     """
 
     def __init__(self, total, width, device, direction, num_seqs=0, hq=12, dq_parts=1, max_seq_len=None):

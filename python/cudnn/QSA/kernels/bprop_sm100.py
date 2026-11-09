@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen Sparse Attention (QSA) backward for SM100 / SM103 / SM107, written with the CuTe DSL primitives.
+"""Qwen Sparse Attention (QSA) backward written with the CuTe DSL primitives.
 
 The launch sequence is a dense key-tile kernel for the queries below the crossover, and for the remaining queries a
 query-major kernel (S, dP, dQ and the P / dS records of every selected block) followed by a key-major kernel that
@@ -34,6 +34,7 @@ from cudnn.api_base import ws_align
 from cudnn.frost.compiled_cache import compile_cached, template_key
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+_BPROP_SM107_SOURCE_DIGEST = hashlib.sha256(Path(__file__).with_name("bprop_sm107.py").read_bytes()).hexdigest()[:16]
 
 I32 = cutlass.Int32
 F32 = cutlass.Float32
@@ -3424,7 +3425,8 @@ class LaunchPlan:
 
     ``seq_mode`` SEQ_SINGLE treats the T rows as one sequence, SEQ_CU takes the caller's ``cu_seqlens`` of ``num_seqs``
     sequences, SEQ_ORIGIN derives the sequences on the device from the per-token origins (at most ``num_seqs`` of
-    them). The per-sequence dense / sparse split is decided on the device.
+    them). The per-sequence dense / sparse split is decided on the device. ``rubin`` runs the query-major, key-major and
+    dense pair kernels of ``bprop_sm107`` (SM107 only).
     """
 
     def __init__(
@@ -3438,16 +3440,19 @@ class LaunchPlan:
         arch: int = 100,
         gq: int = GQ,
         dq_parts: int = DQ_PARTS_DEFAULT,
+        rubin: bool = False,
     ):
         T = int(seq_len)
         assert hkv in (1, 2), f"{hkv} KV heads"
         assert dq_parts in (1, 3), f"{dq_parts} dS parts"
         assert gq == GQ or (gq == 6 and hkv == 1), f"{gq} query heads per KV head with {hkv} KV heads"
         assert 1 <= T <= max_packed_len(hkv, gq), f"sequence length {T} outside [1, {max_packed_len(hkv, gq)}]"
+        assert not rubin or arch == 107, f"the SM107 kernels on SM{arch}"
         HKV = hkv
         HQ = gq * hkv
         REC_W = _rec_w(hkv)
         PAD = _pad(hkv)
+        self.rubin = bool(rubin)
         self.hkv = hkv
         self.gq = gq
         self.dq_parts = dq_parts
@@ -3570,6 +3575,13 @@ def plan_for(
         plan = _PLANS.pop(key, None)
         if plan is None:
             cc = torch.cuda.get_device_capability(device)
+            arch = cc[0] * 10 + cc[1]
+            rubin = False
+            if arch == 107:
+                from . import bprop_sm107
+
+                # without the oversized shared memory carveout the SM100 kernels serve SM107
+                rubin = bprop_sm107.supported(device.index if device.index is not None else torch.cuda.current_device())
             plan = LaunchPlan(
                 seq_len,
                 torch.cuda.get_device_properties(device).multi_processor_count,
@@ -3577,9 +3589,10 @@ def plan_for(
                 seq_mode,
                 num_seqs,
                 max_seq_len,
-                arch=cc[0] * 10 + cc[1],
+                arch=arch,
                 gq=gq,
                 dq_parts=dq_parts,
+                rubin=rubin,
             )
             if len(_PLANS) >= _PLANS_MAX:
                 _PLANS.pop(next(iter(_PLANS)))
@@ -3594,9 +3607,14 @@ def _fake(dtype, shape, sym, align=16):
 
 
 @lru_cache(maxsize=None)
-def _compile_args(hkv: int, gq: int, parts: int) -> dict:
+def _compile_args(hkv: int, gq: int, parts: int, rubin: bool) -> dict:
     """Storage-free kernel signatures, reused across plans. The shared cache owns the CUDA objects."""
     HQ = gq * hkv
+    query_host, key_host, dense_host = _sparse_query_host, _sparse_key_host, _dpair_host
+    if rubin:
+        from . import bprop_sm107
+
+        query_host, key_host, dense_host = bprop_sm107._sparse_query_host, bprop_sm107._sparse_key_host, bprop_sm107._dpair_host
     sym_t = cute.sym_int64()
     f_q = _fake(BF16, (None, HQ, D), sym_t)
     f_kv = _fake(BF16, (None, hkv, D), sym_t)
@@ -3671,7 +3689,7 @@ def _compile_args(hkv: int, gq: int, parts: int) -> dict:
         "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
         "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
         "query": lambda: (
-            _sparse_query_host,
+            query_host,
             f_q,
             f_kv,
             f_kv,
@@ -3695,14 +3713,14 @@ def _compile_args(hkv: int, gq: int, parts: int) -> dict:
             parts,
             stream,
         ),
-        "dense": lambda: (_dpair_host, *dense_fakes, 0, hkv, gq, parts, stream),
-        "dense_pdl": lambda: (_dpair_host, *dense_fakes, 1, hkv, gq, parts, stream),
+        "dense": lambda: (dense_host, *dense_fakes, 0, hkv, gq, parts, stream),
+        "dense_pdl": lambda: (dense_host, *dense_fakes, 1, hkv, gq, parts, stream),
         "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
         "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
     }
     for skip in (0, 1):
         builders[f"key_skip{skip}"] = lambda skip=skip: (
-            _sparse_key_host,
+            key_host,
             f_q,
             f_q,
             f_i(),
@@ -3733,8 +3751,13 @@ def compile_kernels(plan: LaunchPlan) -> dict:
         names += ["window", "part", "scan", "fill", "query", plan.key_name, "dense_pdl", "fin_sparse"]
     else:
         names += ["dense", "fin"]
-    key = template_key(globals(), {"hkv": plan.hkv, "gq": plan.gq, "parts": plan.dq_parts, "arch": plan.arch}, "compile_kernels")
-    args = _compile_args(plan.hkv, plan.gq, plan.dq_parts)
+    sm107_source_digest = _BPROP_SM107_SOURCE_DIGEST if plan.rubin else None
+    key = template_key(
+        globals(),
+        {"hkv": plan.hkv, "gq": plan.gq, "parts": plan.dq_parts, "arch": plan.arch, "sm107_source_digest": sm107_source_digest},
+        "compile_kernels",
+    )
+    args = _compile_args(plan.hkv, plan.gq, plan.dq_parts, plan.rubin)
     options = f"--enable-tvm-ffi --gpu-arch=sm_{plan.arch}a"
     return {name: compile_cached(*args[name], cache_key=key, symbol=f"qsa_backward_{name}", options=options) for name in names}
 

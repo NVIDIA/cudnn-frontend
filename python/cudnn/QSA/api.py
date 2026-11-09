@@ -29,7 +29,7 @@ def _implementation(q, direction):
     if reason:
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
-    # the forward has a Rubin flavor, the backward engine serves every architecture
+    # the forward has a Rubin flavor, the backward engine serves every architecture and picks its Rubin kernels itself
     name = f"fprop_sm{107 if arch == 107 else 100}" if direction == "fprop" else "bprop_sm100"
     return importlib.import_module(f".kernels.{name}", __package__), arch
 

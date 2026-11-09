@@ -89,7 +89,8 @@ not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
 On every architecture both training entries run one backward engine
-(`cudnn.QSA.kernels.bprop_sm100`): the prefix of every sequence
+(`cudnn.QSA.kernels.bprop_sm100`, with the Rubin dense pair, query-major and
+key-major kernels of `cudnn.QSA.kernels.bprop_sm107` on SM107): the prefix of every sequence
 (its first 20480 queries, or all of them below 22528 tokens) on a dense
 key-tile kernel that masks per key token through a bitmap, the remaining
 queries on a query-major pass that writes P / dS records and a key-major pass
@@ -225,12 +226,16 @@ The public functions select one of two architecture families internally:
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_qsa_bwd_*` (dense pair, query-major, key-major and index kernels) |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine, compiled for SM107) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine with its SM107 dense pair, query-major and key-major kernels) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Rubin compaction scans 16 selection bytes per lane and preserves block order.
 CuTeDSL 4.7 or newer is
-required; Rubin also requires a build with the `sm_107a` target.
+required; Rubin also requires a build with the `sm_107a` target. On SM107 the
+backward runs Rubin flavors of the dense pair, query-major and key-major kernels,
+which use the oversized shared memory carveout and a 576-column TMEM allocation
+where those pay off. A driver without the oversized carveout (older than CUDA
+13.4) runs the SM100 kernels on SM107.
 
 Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. The backward compiles different kernels below and
