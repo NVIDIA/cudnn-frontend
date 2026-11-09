@@ -48,8 +48,8 @@ The required settings below apply to this table.
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
-| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Unverified | Supported | Supported |
-| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Unverified | Replay only | Replay only |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
 
 `GdnVerifyFused` is batch-invariant under one gated-norm association only: the

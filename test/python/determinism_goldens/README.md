@@ -857,3 +857,45 @@ and zero-upstream-gradient QSA cases pass.
 - [Megatron kernel replay PR](https://github.com/NVIDIA/Megatron-LM/pull/7148): raw-byte comparison, side-stream contention, negative controls, and coverage review.
 - [Nemotron functional tests](https://github.com/NVIDIA/Megatron-LM/tree/main/tests/functional_tests/test_cases/nemotron): deterministic execution and saved regression values.
 - Internal recipe CI (not linked from this public repository): follow-up integration target; its contents were not accessible during this change.
+
+### Hopper compact H32 sparse indexer backward
+
+Verified after the rebase on 2026-11-09 with NVIDIA L20X SM90 (132 SMs),
+PyTorch 2.12.1+cu130, cuDNN 9.20.0, and CuTe DSL 4.8.0 compiling with the
+CUDA 13.4 flavor. The checkout was the exact pushed commit `f4540d88` on
+develop parent `7a68feff`. `cudnn`, the API module, and the SM90 kernel all
+resolved from `/tmp/cudnn-fe-h32-f4540d88/python`, reporting frontend version
+1.33.0; the host's installed frontend 1.31.0 was not used.
+
+The L0 `test_sm90_deterministic_h32_topk512` cases cover BF16 and FP32 dK,
+sparse negative IDs, replay, short five-query batch reordering with global
+IDs, and an independent gradient reference. Strict replay against the
+committed runtime key `70c200b13182bbc2` passed 2/2 cases in 7.63 seconds. The
+L0 support-envelope cells passed 24/24 in 0.38 seconds. Four H32 L0 stress
+cases passed in 15.25 seconds, covering Top-K 384/512/2048, both deterministic
+dW folds, BF16 and FP32 dK, local and global IDs, and 194 query rows over 96
+producer planes. Those stress cases check fixed-layout replay and the
+independent numerical reference; they do not compare batch reordering across
+the 96-plane producer boundary. Because the producer-plane assignment depends
+on the flattened batch row after that boundary, SM90 H32 is documented as
+Replay only rather than batch-invariant. The complete indexer-backward L0 file
+finished with 43 passed, 20 expected SM100-only skips, and 63 deselected in
+32.64 seconds.
+
+The RED control used parent `7a68feff` with the new test file but without the
+implementation. Both H32 core cases failed at admission with
+`SM90 IndexerBackward requires H=64, got H=32`, confirming that the green run
+exercised this change. Commands run with `PYTHONPATH` pinned to the checkout:
+
+```bash
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -k sm90_deterministic_h32_topk512 -q -rs
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -k check_support_envelope -q -rs
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -k 'deterministic_reproducible_and_correct and h32' -q -rs
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py \
+  -m L0 -q -rs
+```
+
+The CUDA 12 compiler flavor was unavailable and remains unverified.
