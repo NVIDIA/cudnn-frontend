@@ -707,14 +707,19 @@ resolved from `/tmp/cudnn-fe-h32-f4540d88/python`, reporting frontend version
 1.33.0; the host's installed frontend 1.31.0 was not used.
 
 The L0 `test_sm90_deterministic_h32_topk512` cases cover BF16 and FP32 dK,
-sparse negative IDs, replay, batch reordering with global IDs, and an
-independent gradient reference. Strict replay against the committed runtime
-key `70c200b13182bbc2` passed 2/2 cases in 7.63 seconds. The L0
-support-envelope cells passed 24/24 in 0.38 seconds. Four H32 L0 stress cases
-passed in 15.25 seconds, covering Top-K 384/512/2048, both deterministic dW
-folds, BF16 and FP32 dK, local and global IDs, and 194 query rows over 96
-producer planes. The complete indexer-backward L0 file finished with 43
-passed, 20 expected SM100-only skips, and 63 deselected in 32.64 seconds.
+sparse negative IDs, replay, short five-query batch reordering with global
+IDs, and an independent gradient reference. Strict replay against the
+committed runtime key `70c200b13182bbc2` passed 2/2 cases in 7.63 seconds. The
+L0 support-envelope cells passed 24/24 in 0.38 seconds. Four H32 L0 stress
+cases passed in 15.25 seconds, covering Top-K 384/512/2048, both deterministic
+dW folds, BF16 and FP32 dK, local and global IDs, and 194 query rows over 96
+producer planes. Those stress cases check fixed-layout replay and the
+independent numerical reference; they do not compare batch reordering across
+the 96-plane producer boundary. Because the producer-plane assignment depends
+on the flattened batch row after that boundary, SM90 H32 is documented as
+Replay only rather than batch-invariant. The complete indexer-backward L0 file
+finished with 43 passed, 20 expected SM100-only skips, and 63 deselected in
+32.64 seconds.
 
 The RED control used parent `7a68feff` with the new test file but without the
 implementation. Both H32 core cases failed at admission with
