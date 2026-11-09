@@ -569,6 +569,49 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", True): Entry(
         "always", None, "sm103_d128_fwd_dense_20261031"
     ),
+    # study sm103_dense_prefill_bf16_20261107 (B300 SXM6 1100 W, cuDNN 9.27.0; dense BSHD prefill-phase graphs, s_q >= 5, no sink: d64 / d128 / d192 x no mask /
+    # causal / causal + left window x MHA / GQA x S_kv on and off the 128-key tile, less the classes already keyed on cc 10.3; 360 train + 120 off-lattice holdout
+    # cases). Only the classes gen.py --margin 0.15 fits as always on and off the tile: at 12 train cases per class thresholds did not hold under
+    # cross-validation, so the rest keep the hand rules. The f16 twin is not keyed: its fresh B300 holdout (2026-11-08) had three short graphs
+    # beyond noise, so f16 keeps the hand rules.
+    # Withdraw both d192 window GQA classes after the 2026-11-09 retime confirmed the q19/kv45248 holdout regression
+    # (PR #2346). The other 12 generated entries are unchanged; withdrawn classes retain the prior default route.
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "none", False, "gqa", False): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "none", False, "gqa", True): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "none", False, "mha", False): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "none", False, "mha", True): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (192, 192), "prefill", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (64, 64), "prefill", "dense", "window", False, "mha", False): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 3), "bf16", (64, 64), "prefill", "dense", "window", False, "mha", True): Entry(
+        "always", None, "sm103_dense_prefill_bf16_20261107"
+    ),
     # study sm121_bwd_bf16_20261107 (GB10, cuDNN 9.27.0.42; dense BSHD squares, 288 train cases: d64 / d128, no mask / causal / causal + left window,
     # MHA / GQA, S on and off the 128-key tile, 128-16k; 96 off-lattice holdout cases: FROST / backend geomean 0.75, 0.47-0.98).
     ("sdpa_bwd_sm120", (12, 1), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", False): Entry("always", None, "sm121_bwd_bf16_20261107"),
