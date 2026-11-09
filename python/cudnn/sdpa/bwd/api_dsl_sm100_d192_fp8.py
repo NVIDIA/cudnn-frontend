@@ -118,7 +118,6 @@ class SdpaBwdDslSm100D192Fp8(SdpaBwdDsl):
         require(not self.seq_q_lens_present and not self.seq_kv_lens_present, "padding masks are not supported")
         require(not self.causal_bottom_right, "bottom-right causal is not supported")
         require(self.window_size_left is None and self.window_size_right is None, "sliding windows are not supported")
-        require(not self.deterministic, "deterministic reductions are not supported")
         require(all(d is None for d in (self.sink_desc, self.dsink_desc, self.bias_desc, self.dbias_desc)), "sink / dSink and bias / dBias are not supported")
         require(self.tile_m is None and self.tile_n is None, "the kernel has fixed tile geometry")
         for role in ROLES[:9]:
