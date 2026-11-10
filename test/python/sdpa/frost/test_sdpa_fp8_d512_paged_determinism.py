@@ -20,7 +20,7 @@ _CASES = [
 ]
 
 
-def _runner(*, split, hnd, in_key, dtype):
+def _runner(*, split, hnd, in_key, dtype, softmax_precision=None):
     # Quantize once for all batch arrangements. No requantization or scale
     # recomputation is allowed when the target sequence moves or is duplicated.
     g, vp, ws, source, tensors = paged._run_graph_fp8(
@@ -37,6 +37,7 @@ def _runner(*, split, hnd, in_key, dtype):
         out_dt=dtype,
         explicit_split=split,
         explicit_pack=True,
+        softmax_precision=softmax_precision,
         override=True,
         return_case=True,
     )
@@ -61,6 +62,7 @@ def _runner(*, split, hnd, in_key, dtype):
                 out_dt=dtype,
                 explicit_split=split,
                 explicit_pack=True,
+                softmax_precision=softmax_precision,
                 override=True,
                 return_case=True,
             )

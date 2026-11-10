@@ -1531,6 +1531,7 @@ def _run_graph_fp8(
     explicit_cga=None,
     d_v=None,
     head_padding=False,
+    softmax_precision=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1542,11 +1543,12 @@ def _run_graph_fp8(
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
+    target_engine = engine_name(arch="sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100", fp8=True)
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
     d_v = d if d_v is None else d_v
     k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, v_hnd=v_hnd, d_v=d_v, head_padding=head_padding)
-    mask_kw = {}
+    mask_kw = {} if softmax_precision is None else dict(softmax_precision=softmax_precision)
     right_bound = 0 if causal is not None else None
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
     if causal is not None:
@@ -1623,11 +1625,14 @@ def _run_graph_fp8(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if pin:
-        select_engine(g, engine_name(fp8=True))
+        select_engine(g, target_engine)
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
-        assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
+        idx = next(
+            (i for i, n in enumerate(names) if n.startswith(target_engine) and g.plans[i].knobs.split_kv == want_split),
+            None,
+        )
+        assert idx is not None, f"no {target_engine} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
     if explicit_split is not None or explicit_pack is not None or explicit_cga is not None:
         from dataclasses import replace
