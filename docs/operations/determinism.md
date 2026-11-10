@@ -88,6 +88,12 @@ The D64 mixed-storage checks also cover fixed-plan dense splits and unsplit
 THD, preserving each quantized KV payload across batch changes. D64 THD
 split with FP8 KV remains unsupported. These paging changes add no backward path.
 
+The SM107 D512/D576 split partial-store optimization preserves the existing
+O/Stats golden bytes for matching half storage and D512 mixed FP8 KV storage.
+Its checks retain a fixed split count and packing, and include partial value
+widths and empty rows. Vector stores do not change the reduction order or
+extend determinism across different plans or runtimes.
+
 The D512 FP8 paged row covers the native role-split forward path with whole-group
 PackGQA and a fixed split count (1 or 4 in its determinism suite). Its batch
 checks preserve quantized payloads and scalar scales, and compare per-sequence

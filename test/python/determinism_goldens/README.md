@@ -2711,3 +2711,34 @@ CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m pytest \
   simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py::test_batch_invariance \
   -m L0 -q -s -rxX --tb=short
 ```
+
+### SM107 D512/D576 FP32 split partial stores — 2026-11-10
+
+Aligned, D-contiguous partial rows now use 16-byte global stores. The scalar
+fallback retains per-element bounds and dead-row zero selection. Two added
+L0 paged boundary cases exercise V480 and empty V264 inside the D512 envelope.
+The independent references, rebinding and changed-input replay stay unchanged.
+
+SM107,216SM, driver620.62, Torch2.14.1+cu130, cuDNN9.30.0.3, DSL4.8.0
+with compiler13.4:98 native cases passed in158.35s, without skips. These cover
+dense/paged KV, FP16/BF16, D512/D576, packed/unpacked splits, masks/sinks,
+optional/natural/log2 Stats, physical layouts and D512 mixed E4M3/E5M2 KV.
+The12 half/mixed runtime goldens under `d634113bbc56110d` were recorded from
+the unchanged parent after its independent references and byte checks passed
+(12cases,31.06s). The candidate passed strict comparison against all12 with
+recording unset. No existing golden was replaced. An initial candidate run
+passed34 cases before stopping on the missing runtime-specific golden; it
+reported no numerical mismatch. Other GPU/runtime execution is unverified.
+
+From `test/python`, after asserting the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_d512_pack_split_sm107.py \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD576Half \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_dense_paged \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
+```
