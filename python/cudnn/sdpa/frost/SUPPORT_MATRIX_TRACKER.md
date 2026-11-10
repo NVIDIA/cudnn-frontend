@@ -336,26 +336,40 @@ overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
 tensors or tensor-launch fallback.
 Forward only; optional Stats do not provide a backward implementation. Q/K/V/O
-all use FP16 or all BF16. The D512 leg's native head tile is **(512, 512)**. Its
-envelope is floored at 256 (`d_envelope_floors`): `D_QK` and `D_V`
-independently accept positive multiples of 8 in **(256, 512]**, and the exact
-native hit always passes. Pairs inside the envelope are **envelope-served at
-the full D512 compute cost**, with TMA zero-fill and output clipping, so the
-floor caps that at 2x padding.
+all use FP16 or all BF16. The shared body has native **D128, D256 and D512**
+contraction/storage specializations. QK uses 8/16/32 k16 WGMMA steps and the
+PV warpgroups each own 64/128/256 columns, respectively. Smaller head pairs
+inside each admitted envelope pay that envelope's cost, with TMA zero-fill
+and clipped output stores:
 
-The floor is a **routing** change, not only a claim change: SM90 is the only
-cc-9.0 row, so an f16/bf16 Hopper graph with either head dim at or below 256,
-except the exact native D64 leg below, gets no FROST plan and falls back to the cuDNN backend. Unfloored,
-this row led the preference order and took such graphs at up to 64x
-zero-padding. Deliberate asymmetry: `config_sm90.head_dims_mismatch` still
-serves every multiple of 8 in `(0, 512]`; outside the exact D64 specialization,
-the standalone adapter keeps the existing full D512 envelope. Exact D64 selects
-the native body only when its feature checks pass. Otherwise, standalone
-declarations retain the existing D512 path, including sinks, window/right bands,
-device lengths, THD and PackGQA when that path supports them. The graph D64 row
-keeps its narrower admission.
+| Native tile | Graph envelope (both D_QK and D_V independently, multiple of 8) |
+|---|---|
+| D64 | exact (64,64), with the narrower feature domain below |
+| D128 | [64,128], except exact (64,64) remains on its dedicated row domain |
+| D256 | [128,256], using D128 when both dimensions fit there |
+| D512 | (256,512] |
 
-**Native D64 draft (not Hopper-qualified).** Exact `D_QK=D_V=64` dense FP16/BF16
+D192/V128 therefore uses D256; D120/V72 uses D128. Mixed pairs outside these
+bounded envelopes, such as D256/V512, remain declined. Existing placement is
+unchanged: non-D512 shapes trail the backend. Eligibility supplies a native
+candidate, without promoting it ahead of backend candidates.
+
+The standalone adapter retains every eight-aligned pair in (0,512], selecting
+the smallest covering D128/D256/D512 tile. Exact dense D64 keeps its dedicated
+body when its feature checks pass; its other standalone features use the D128
+envelope. Dense splits, partial PackGQA, masks, sinks, optional/base-2 Stats and
+unsplit THD use the shared smaller-head geometry. Paging, THD splits and THD
+PackGQA retain their existing declines.
+
+Native H100 qualification on 2026-11-10 covers 88 new feature/strict-golden
+cases in `test_sdpa_fwd_native_heads_sm90.py`: exact and eight-aligned widths,
+FP16/BF16, masks, padded/empty rows, independent THD origins and both packed
+Stats layouts, all three schedulers, partial PackGQA, poisoned split workspace,
+and changed-input/offset CUDA Graph replay. Eight golden cases additionally
+check fixed-plan repeatability and B129 reorder/duplication/neighbor isolation
+against independent FP64 references. This is forward qualification only.
+
+**Native D64 specialization.** Exact `D_QK=D_V=64` dense FP16/BF16
 MHA and unpacked GQA select `sm90/prefill_d64_f16.py`: two warpgroups (256
 threads), QK and PV both m64n64k64 (four SS k16 steps each), one shared P tile,
 and a full 64-column output fragment. No D512 zero-padding. Optional FP32 Stats
@@ -369,10 +383,10 @@ backend-first; D512 placement is unchanged.
 
 `test_sdpa_native_d64_sm90.py` separates graph-domain checks and sm_90a
 cross-compilation from actual SM90 numerical/replay tests. Cross-compilation
-on SM120 is evidence of valid target code generation only. No Hopper numerical,
-memory-safety, synchronization, capture/rebinding or performance qualification
-has been performed for this D64 body; the D512 hardware results below do not
-qualify D64. Keep this change in draft until the Hopper detectors run.
+on SM120 is evidence of valid target code generation only. Later H100 D64
+execution and prepared-body controls are recorded in the 2026-11-10 dense-split
+qualification in `test/python/determinism_goldens/README.md`; the earlier D512
+hardware results below do not independently qualify D64.
 
 H200 validation (2026-09-20, on `b100e342`; DSL 4.8.0.dev0, cuDNN 9.24.0,
 torch 2.14.0+cu130). The SM90 L0/L1 conformance suites — 21 files, not yet in
@@ -4873,10 +4887,10 @@ retain their work ordering inside each split. THD splits and PackGQA remain
 outside this admission; unsplit routes retain their existing behavior.
 
 
-SM90 D512 dense PackGQA also supports subgroups: each tile packs
+SM90 D128/D256/D512 dense PackGQA also supports subgroups: each tile packs
 `gcd(H_q/H_kv, 64)` heads per token, so G12 packs four and G128 packs 64.
 Groups with no nontrivial common factor (except MHA) remain declined.
-The declared row exposes this for the D512 envelope, with and without dense
+The declared row exposes this for the D128/D256/D512 envelopes, with and without dense
 split-KV. Native D64 remains unpacked and unsplit; THD packing remains declined.
 `test_sdpa_fwd_split_sm90.py` covers grouped KV addressing, independent strides,
 sinks, changed-length replay, multiple KV stages, and all three schedulers.

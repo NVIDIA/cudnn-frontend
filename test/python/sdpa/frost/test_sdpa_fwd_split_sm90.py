@@ -172,10 +172,10 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa, g
         (1, False, "none", 0.0, 17),
     ],
 )
-def test_split_multiple_kv_stages(dtype, sched, pack, mask, scale, splits, _heads=8):
+def test_split_multiple_kv_stages(dtype, sched, pack, mask, scale, splits, _heads=8, _d=512):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    b, h, hk, sq, sk, d = 2, _heads, 2, 70, 1025, 512
+    b, h, hk, sq, sk, d = 2, _heads, 2, 70, 1025, _d
     rng = torch.Generator().manual_seed(923)
     qc, kc, vc = (torch.randn(shape, generator=rng).to(dtype) * 0.25 for shape in ((b, sq, h, d), (b, sk, hk, d), (b, sk, hk, d)))
     q, k, v = (t.cuda().transpose(1, 2) for t in (qc, kc, vc))

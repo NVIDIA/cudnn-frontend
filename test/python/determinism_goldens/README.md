@@ -2070,3 +2070,44 @@ widths before launch; after its envelope and extension-gate correction, all
 SM120 D576 hardware execution, other runtimes and performance remain unverified.
 Targeted sanitizer and existing D512 regression results are recorded separately
 when complete; no completed result is implied by this golden qualification.
+
+
+### SM90 native D128/D256 forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_native_heads_sm90.py` adds eight L0 forward
+bytewise cases at D128 and D256, FP16/BF16, unsplit unpacked and split3
+PackGQA. A fixed CPU payload and FP64 O/Stats reference precede recording.
+The checks cover fresh storage, concurrent work, B1 versus B129, duplicated
+and reordered sequences, changed-neighbor isolation, empty neighbors and
+CUDA Graph replay, with padding, a bottom-right window and sinks. Eight new
+JSON records under `6521230c64ce3d35` were recorded into a new directory,
+then copied and strictly checked with `CUDNN_DETERMINISM_RECORD` unset.
+
+H100 NVL cc9.0, driver595.71.05, Torch2.14.1+cu130, cuDNN9.28.0.38 and
+DSL4.8/compiler12.9: all 88 new feature/strict cases pass without skips.
+The initial 64 cover numerical/mask/layout/split contracts; the final 24
+add the eight strict goldens, partial groups G12/G128, all three schedulers,
+independent THD offsets with both packed Stats layouts, and offset replay.
+Forty existing controls pass, including all eight unchanged D512 goldens,
+D64 prepared execution and standalone D64 feature envelopes.
+
+Memcheck, native-attention/combine racecheck and synccheck each pass the same
+22 cases with zero errors or race warnings. The selection is
+`thd_origin_replay or thd_physical_origins or partial_pack_replay or
+multiple_stages or (split_replay and bf16)`, under Compute Sanitizer13.4.
+Memcheck is unfiltered; the other tools use `--kernel-name kns=cudnn_kernel_`.
+The first memcheck run passed all22 tests but reported40 startup API-query
+errors: CUDA Python13.3 requested newer symbols than the13.2 driver API.
+The clean run uses cached CUDA Python13.2 with API-error reporting retained;
+no device diagnostic was suppressed. This is H100 forward qualification,
+not a backward, H200 performance, cross-runtime or cross-plan byte guarantee.
+
+Commands run from `test/python` with the isolated checkout verified:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -n0 sdpa/frost/test_sdpa_fwd_native_heads_sm90.py -m L0
+```
+
+The measured execution split this command into the initial64 feature cases
+and the final24 cases; together they cover the complete88-case collection.

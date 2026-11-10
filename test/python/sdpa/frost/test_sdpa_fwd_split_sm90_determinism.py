@@ -16,8 +16,8 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 90, reason
 
 @pytest.mark.parametrize("splits,pack_gqa", [(3, False), (17, True)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_split_forward_determinism(splits, pack_gqa, dtype, _group=4):
-    d = 512
+def test_split_forward_determinism(splits, pack_gqa, dtype, _group=4, _d=512):
+    d = _d
     h, hk, sq, sk = 2 * _group, 2, 17, 257
     rng = torch.Generator().manual_seed(941)
     records = [tuple(torch.randn(shape, generator=rng).to(dtype) * 0.25 for shape in ((h, sq, d), (hk, sk, d), (hk, sk, d))) for _ in range(3)]
