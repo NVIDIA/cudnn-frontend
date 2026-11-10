@@ -2011,12 +2011,8 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
-def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
-    """Dense paged queries stay unsupported on SM107, including quantized inputs.
-
-    The half THD extension does not admit these dense declarations. The same
-    adapter accepts them on SM100, then raises before compile on a mocked SM107.
-    """
+def test_paged_adapter_sm107_device_contract(monkeypatch, fp8):
+    """Native half D128 accepts dense Q; per-tensor FP8 D128 retains its decline."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 2, 8, 2, 16, 8
@@ -2054,8 +2050,11 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
-        _api().check_support()
+    if fp8:
+        with pytest.raises(NotImplementedError, match="Rubin paged KV"):
+            _api().check_support()
+    else:
+        assert _api().check_support()
 
 
 @pytest.mark.L0

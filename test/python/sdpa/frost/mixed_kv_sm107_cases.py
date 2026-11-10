@@ -108,10 +108,9 @@ def compact_split(qdtype, kvdtype):
 
 @_native
 @pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
-def dense_paged_decline(qdtype, kvdtype, monkeypatch, cudnn_handle):
-    # The existing SM107 half row requires THD queries for D128 paged KV.
-    with pytest.raises(NotImplementedError, match="Rubin paged KV requires THD queries"):
-        checks.check_dense_paged_rebind_capture(qdtype, kvdtype, 2, "paged", 1, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE)
+@pytest.mark.parametrize("cga,splits", [(1, 1), (2, 1), (1, 3), (2, 3)])
+def dense_paged_native(qdtype, kvdtype, cga, splits, monkeypatch, cudnn_handle):
+    checks.check_dense_paged_rebind_capture(qdtype, kvdtype, cga, "paged", splits, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, cpu_reference=True)
 
 
 @_native

@@ -55,7 +55,14 @@ arbitrary user callbacks.
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
+| FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+
+The native D128 paging row fixes the CTA width, tile width and split count per
+plan. Its standalone suite checks O/Stats bytes across repeated launches,
+reordered/duplicated batches and fresh buffers, including mixed FP8 KV storage.
+Graph qualification separately checks numerical outputs and changed-input replay.
+These paging changes add no backward path.
 
 The D512 FP8 paged row covers the native role-split forward path with whole-group
 PackGQA and a fixed split count (1 or 4 in its determinism suite). Its batch
