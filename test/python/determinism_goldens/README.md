@@ -2599,3 +2599,48 @@ and TVM FFI 0.1.13.post2. Imports resolved to the installed wheel. Its SHA256
 is `52b1d3f198e09e6ece095ceb454b9469666643c870249becf01f676137c03a86`.
 SM103 and actual multi-GPU execution remain unverified. External CUDA graph
 capture remains unsupported; the existing rejection tests still pass.
+
+Code revision: `a8300fe`. The separate installed-wheel CUDA 12.9 compiler run
+passed **62 tests, with 1 two-GPU skip**, in 336.19 s: all address/decoder
+probes, nine public Torch numerical cases, three triangular numerical/replay
+cases, the JAX version guard, all public JAX tests, both long-key JAX cases,
+and the delayed-producer reservation test. This lane uses CUDA 13 framework
+and backend packages; it does not qualify a full CUDA 12 deployment or CUDA
+12 bytewise batch invariance. Pre-commit passed. Fern reported 0 errors and
+1 existing warning.
+
+Commands from `test/python`, with the installed wheel environment active,
+`LD_LIBRARY_PATH` pointing to cuDNN 9.27, and separate DSL/driver cache paths:
+
+```sh
+# CUDA 13.4: full suite, before correcting the test's stream dependency.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest simplified_sparse_attention/cutedsl \
+  -m 'L0 or L1' -q -s -rxX --tb=short
+
+# CUDA 13.4: corrected delayed-producer test and its missing-wait control.
+python -m pytest \
+  simplified_sparse_attention/cutedsl/test_filtered_contract_cuda.py::test_reserved_state_at_its_maxima \
+  -m L1 -q -s --tb=short
+
+# CUDA 12.9: changed paths and numerical compatibility.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+python -m pytest \
+  simplified_sparse_attention/cutedsl/test_triangular_offsets.py \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_public_forward_backward_reference \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_triangular_tiles_reference_and_replay \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_jax_old_dsl_allows_inspection_but_rejects_execution \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py \
+  simplified_sparse_attention/cutedsl/test_filtered_jax.py \
+  simplified_sparse_attention/cutedsl/test_filtered_contract_cuda.py::test_reserved_state_at_its_maxima \
+  -m 'L0 or L1' -q -s --tb=short
+```
+
+From the repository root, in each DSL 4.7.1/4.8.0 environment, with
+`CUDNN_API_INDEX_PACKAGE_ROOT` set to the installed `cudnn` directory:
+
+```sh
+CUDA_VISIBLE_DEVICES='' python -m unittest discover \
+  -s test/python/api_index -p test_api_index.py -v
+```
