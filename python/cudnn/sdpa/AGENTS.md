@@ -1592,3 +1592,10 @@ a 32-column half row requires 64-byte swizzling. Keeping the old 128-byte
 swizzle can cross row boundaries even when the total allocation fits. The
 D256 cases in `test_sdpa_bwd_thd_sm120_gqa.py` exercise the native 32x32 tile
 with independent origins, GQA reduction, tails and bottom-right quiet rows.
+
+A backward gradient-column partition multiplies the physical CTA grid, not the
+logical KV tile count. Both reverse scheduling and the deterministic relay's
+last KV visitor must divide out that partition factor; counters and workspace
+must include the partition and actual Q tile. The dense deterministic cases in
+`test_sdpa_bwd_sm120_wide.py` catch a relay that otherwise waits forever for a
+nonexistent predecessor, while THD's length-derived count alone cannot catch it.

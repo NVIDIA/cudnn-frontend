@@ -37,13 +37,15 @@ def workspace_regions(api, *, symbolic=False):
     n_seq, max_sq = b, launch_bounds(api)[0]
     if api.thd:
         b, sq, skv = 1, (-1 if symbolic else api._t_q_cap), (-2 if symbolic else api._t_kv_cap)
-    qtile = 64  # Both shipped native pipelines use a 64-row Q tile.
+    geometry = dict(getattr(api, "_native_template_overrides", ()))
+    qtile = geometry.get("tile_q", 64)
+    grad_splits = geometry.get("grad_dim_splits", 1)
     shapes = (
         (b, h, sq, dq) if api._use_d64 else (b, sq, h, dq),
         (b, h, sq),
         (b, skv, h, dq) if h != hk or (api.thd and api.dk_desc.shape[-1] % 8) else None,
         (b, skv, h, dv) if h != hk or (api.thd and api.dv_desc.shape[-1] % 8) else None,
-        ((-3,) if api.thd and symbolic else (n_seq * h * ((max_sq + qtile - 1) // qtile),)) if api.deterministic else None,
+        ((-3,) if api.thd and symbolic else (n_seq * h * grad_splits * ((max_sq + qtile - 1) // qtile),)) if api.deterministic else None,
         (api._bias_batch, h, sq, skv) if api._has_bias else None,
         (h,) if api.sink_desc is not None else None,
         (THD_META_WORDS(n_seq),) if api.thd else None,
@@ -263,7 +265,7 @@ def host(
     skv, hk, dim_v = k.shape[1], k.shape[2], v.shape[3]
     if cutlass.const_expr(params.thd_varlen):
         dq_acc, dot, dk_partial, dv_partial, sem, dbias_acc, dsink_acc, meta, org = _packed_workspace(
-            workspace, regions, t_q, t_kv, n_seq * h * ((max_sq + 63) // 64), dtype
+            workspace, regions, t_q, t_kv, n_seq * h * params.grad_dim_splits * ((max_sq + params.tile_q - 1) // params.tile_q), dtype
         )
         if cutlass.const_expr(dk_partial is not None):
             dk_work = dk_partial
@@ -379,6 +381,7 @@ def host(
             cutlass.Int32((max_skv + params.tile_kv - 1) // params.tile_kv if params.thd_varlen else 0),
             cutlass.Int32(n_seq if params.thd_varlen else 0),
             stream,
+            params.grad_dim_splits,
         )
         if cutlass.const_expr(params.thd_varlen):
             out_dq, out_dv = dq.shape[-1], dv.shape[-1]

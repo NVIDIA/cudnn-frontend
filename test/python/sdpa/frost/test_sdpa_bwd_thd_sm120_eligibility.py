@@ -40,7 +40,7 @@ def test_frost_thd_sm120_admission(packing, dtype):
 @pytest.mark.parametrize(
     "overrides,token",
     [
-        ({"d_qk": 257, "d_v": 128}, "256"),
+        ({"d_qk": 257, "d_v": 128}, "8"),
         ({"d_qk": 127, "d_v": 120}, "8"),
         ({"deterministic": True}, "deterministic"),
         ({"window_left": 64}, "window"),
@@ -114,6 +114,37 @@ def test_frost_thd_sm120_q_envelope_launch_boundary(batch):
     assert "Int32" in reason(b=batch, h_q=1, h_kv=1, s_q=last_safe + 1, max_total_seq_len_q=1, max_total_seq_len_kv=1)
 
 
+@pytest.mark.parametrize("thd", [False, True])
+@pytest.mark.parametrize("dims", [(264, 8), (504, 248), (512, 512)])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_wide_native_row_and_knobs(thd, dims, deterministic):
+    from cudnn.sdpa.bwd.heuristics import default_knobs
+
+    value = facts(device_cc=(12, 0), thd=thd, d_qk=dims[0], d_v=dims[1], deterministic=deterministic, window_left=17, h_kv=1)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    assert engines.mismatch(spec.capabilities, value) is None
+    knobs = default_knobs(spec, value)
+    assert knobs.to_public() == {cudnn.knob_type.TILE_M: 16, cudnn.knob_type.TILE_N: 16}
+    assert engines.mismatch(spec.capabilities, value, knobs) is None
+    assert "16x16" in engines.mismatch(spec.capabilities, value, engines.SdpaBwdKnobs(tile_m=64, tile_n=64))
+
+
+@pytest.mark.parametrize(
+    "overrides,token", [({"d_qk": 520}, "envelope"), ({"has_bias": True}, "bias"), ({"has_sink": True}, "sink"), ({"max_total_seq_len_q": 2**21}, "Int32")]
+)
+def test_wide_bounds_decline(overrides, token):
+    args = dict(d_qk=512, d_v=512)
+    args.update(overrides)
+    assert token.lower() in reason(**args).lower()
+
+
+def test_wide_flavor_does_not_expand_sm80():
+    from cudnn.sdpa.bwd.api_dsl import _sm80_bwd_pick_flavor
+
+    with pytest.raises(ValueError, match="no flavor"):
+        _sm80_bwd_pick_flavor(512, 512)
+
+
 @pytest.mark.parametrize("batch", [2, 65535])
 def test_frost_thd_sm120_kv_envelope_launch_boundary(batch):
     from cudnn.sdpa.bwd.sm120_thd_contract import validate_bounds
@@ -125,3 +156,22 @@ def test_frost_thd_sm120_kv_envelope_launch_boundary(batch):
     with pytest.raises(ValueError, match="KV envelope"):
         validate_bounds(batch, 2, 1, 1, last_safe + 1, 64, 64, batch, batch, 64**-0.5)
     assert "KV envelope" in reason(b=batch, h_q=2, h_kv=1, s_q=1, s_kv=last_safe + 1, d_qk=64, d_v=64, max_total_seq_len_q=batch, max_total_seq_len_kv=batch)
+
+
+@pytest.mark.parametrize("batch", [2, 65535])
+def test_wide_kv_envelope_boundary(batch):
+    from cudnn.sdpa.bwd.sm120_wide_contract import validate_bounds
+
+    last_safe = (2**31 - 1) // batch
+    validate_bounds(batch, 2, 1, 1, last_safe, 512, 512, 1, 1, 512**-0.5, True)
+    with pytest.raises(ValueError, match="Int32"):
+        validate_bounds(batch, 2, 1, 1, last_safe + 1, 512, 512, 1, 1, 512**-0.5, True)
+
+
+def test_wide_deterministic_relay_index_boundary():
+    from cudnn.sdpa.bwd.sm120_wide_contract import validate_bounds
+
+    # Tiny packed capacities can coexist with a much larger sequence envelope.
+    validate_bounds(65535, 32768, 1, 1, 1, 512, 512, 1, 1, 512**-0.5, True, False)
+    with pytest.raises(ValueError, match="relay"):
+        validate_bounds(65535, 32768, 1, 1, 1, 512, 512, 1, 1, 512**-0.5, True, True)

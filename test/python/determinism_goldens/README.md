@@ -1899,3 +1899,11 @@ API-query reporting disabled (CUDA Python 13.2 probes newer APIs than the
 CUDA 13.0 driver). Racecheck reports zero errors and zero warnings.
 General deterministic backward remains unsupported because multiple KV tiles
 accumulate dQ with unordered FP32 atomics; admission tests retain that decline.
+
+SM120-family wide half backward (`sdpa-sm120-wide-bwd-d512-gqa-swa-*`):
+D512, GQA 6:2, Q17/KV19 crossing two native KV tiles, bottom-right SWA,
+FP16/BF16. The deterministic relay is exercised under fresh allocations,
+repeated calls, CUDA Graph replay, changed neighbors, duplicate/reordered
+sequences and batches 1/3/129. dQ/dK/dV are checked against independent CPU
+FP64 autograd before strict raw-byte comparison. Recorded on SM121 GB10;
+this fingerprint does not qualify SM120 hardware or low-precision backward.

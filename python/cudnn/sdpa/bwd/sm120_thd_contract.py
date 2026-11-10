@@ -31,6 +31,12 @@ def native_tiles(d_qk, d_v, tile_m=None, tile_n=None):
 
 
 def knob_mismatch(facts, requested):
+    if facts.d_qk > 256:
+        if requested and (requested.tile_m not in (None, 16) or requested.tile_n not in (None, 16)):
+            return "SM120 wide backward requires native 16x16 tiles"
+        return None
+    if requested and (requested.tile_m == 16 or requested.tile_n == 16):
+        return "SM120 16x16 backward tiles require D_QK > 256"
     if not facts.thd:
         return None
     try:
@@ -67,6 +73,10 @@ def validate_bounds(batch, heads, kv_heads, sq, skv, d_qk, d_v, cap_q, cap_kv, s
 
 
 def graph_mismatch(facts, version):
+    if facts.d_qk > 256:
+        from .sm120_wide_contract import graph_mismatch as wide_mismatch
+
+        return wide_mismatch(facts, version)
     if not facts.thd:
         return None
     if facts.device_cc not in ((12, 0), (12, 1)):

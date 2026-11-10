@@ -179,7 +179,7 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
         ((10, 7), 256, [20604]),
         ((10, 7), 128, [20609]),  # d128 on cc 10.7: the admitted d128 family row (slot 9), never the d512 row
         ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
-        ((12, 0), 512, []),
+        ((12, 0), 512, [20600]),
     ],
     ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
 )
@@ -188,7 +188,7 @@ def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(cc, d, want):
     d in (256, 512] graph lists exactly one entry with NO knobs (``{}`` is the complete record); the SM100 line keeps its
     own d512 row (20602); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
     d = 128 on cc 10.7 lists the admitted d128 family row (20609; the Rubin admission of 2026-11-03), past that row's range (cc 11.0)
-    and on SM120 no python row lists for these graphs."""
+    on SM120 the native wide row lists its 16x16 tile pair."""
     assert any(s.name == "sdpa_bwd_sm107_d512" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_d512 is not registered"
     plans = recommend("A", _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
