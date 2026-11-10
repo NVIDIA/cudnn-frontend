@@ -5462,7 +5462,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             )
             self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, p, d_qk), name="K")
             self._check_tensor_shape(self.v_desc, (self.k_desc.shape[0], h_kv, p, d_v), name="V")
-            from cudnn.sdpa.fwd.prepared import _paged_pool_layout
+            from cudnn.sdpa.fwd.config_sm100 import paged_pool_layout as _paged_pool_layout
 
             for desc in (self.k_desc, self.v_desc):
                 strides = self._paged_pool_stride(desc)
@@ -6029,7 +6029,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.paged:
             self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_q), name="K")
             self._check_tensor_shape(self.v_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_v), name="V")
-            from cudnn.sdpa.fwd.prepared import _paged_pool_layout
+            from cudnn.sdpa.fwd.config_sm100 import paged_pool_layout as _paged_pool_layout
 
             for desc in (self.k_desc, self.v_desc):
                 strides = self._paged_pool_stride(desc)
