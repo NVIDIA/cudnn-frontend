@@ -83,6 +83,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_Q_TILES as _SEQ_Q_TILES,
     GENERAL_HEAD_TILES as _SUPPORTED_HEAD_TILES,
     TemplateParams,
+    paged_head_dims_supported,
     register_budgets,
     validate_params,
 )
@@ -386,21 +387,27 @@ class SM120FusedMultiHeadAttentionForward:
             # table entry or pool payload and cp.async zero-fills their SMEM.
             src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
             lane = cute.arch.lane_idx()
-            for wave in cutlass.range_constexpr(self.kv_tile * 16 // 32):
+            head_tile = self.head_tile_v if is_v else self.head_tile_qk
+            chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
+            vectors_per_row = head_tile // 8
+            for wave in cutlass.range_constexpr(self.kv_tile * vectors_per_row // 32):
                 chunk = wave * 32 + lane
-                row = chunk // 16
-                col = (chunk % 16) * 8
+                row = chunk // vectors_per_row
+                col = (chunk % vectors_per_row) * 8
                 logical_row = seq_coord + row
-                live = cutlass.Int32(logical_row < seqlen_k)
+                # The logical width is an eight-element multiple. A complete
+                # 16-byte vector is either live or zero-filled; head padding
+                # must never read the next head or poisoned storage slack.
+                live = cutlass.Int32((logical_row < seqlen_k) & (col < pool.shape[3]))
                 offset = cutlass.Int64(0)
                 if live != 0:
                     page = cutlass.Int64(page_table[batch_idx, logical_row // self.page_size])
                     offset = page * cutlass.Int64(pool.stride[0])
                     offset += cutlass.Int64(logical_row % self.page_size) * cutlass.Int64(pool.stride[1])
                     offset += cutlass.Int64(head_idx) * cutlass.Int64(pool.stride[2]) + cutlass.Int64(col)
-                physical_row = (col // 64) * self.kv_tile + row
-                physical_col = swizzle_xor(physical_row, col % 64, 64, 2)
-                dst = s_dst.subview(physical_row * 64 + physical_col)
+                physical_row = (col // chunk_elems) * self.kv_tile + row
+                physical_col = swizzle_xor(physical_row, col % chunk_elems, chunk_elems, 2)
+                dst = s_dst.subview(physical_row * chunk_elems + physical_col)
                 prims.cp_async_shared_global(dst, src + offset, 16, prims.LoadCacheModifier.CG, cp_size=live * 16)
             # Drain this lane's copy group before publishing the tile.
             prims.cp_async_commit_group()
@@ -1860,8 +1867,8 @@ def compile(  # noqa: A001
     _cache_key = _template_key(globals(), locals(), "compile")
     if not prepared or any(st is not None for st in (q_stride, k_stride, v_stride, o_stride)):
         raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
-    if PARAMS.page_size and (d_qk, d_v) != (128, 128):
-        raise NotImplementedError("SM120 paged KV requires exact D_QK=D_V=128")
+    if PARAMS.page_size and not paged_head_dims_supported(d_qk, d_v):
+        raise NotImplementedError("SM120 paged KV requires head dims divisible by 8 through 128")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,

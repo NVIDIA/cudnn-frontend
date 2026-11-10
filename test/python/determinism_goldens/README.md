@@ -1398,6 +1398,31 @@ not `test_sdpa_fwd_dsl_sm107.py`. The shared mixed-KV class now lives in the
 selected file, with explicit L0/DSL/SM107 guards and no duplicate collector.
 The GPU counts above are direct qualification, not completed CI results.
 
+### SM120 small-head paged forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_width_determinism`
+records eight FP16/BF16 goldens for D64/V64 and D120/V88, packed and unpacked.
+CPU-seeded operands and a separate CPU-double oracle cover O and Stats, repeated
+raw bytes with queued work, reordered/duplicated batches through129 requests,
+and changed-neighbor CUDA Graph replay. Padded head columns and pool rows are
+poisoned; output gaps and strided Stats retain their canaries.
+
+Runtime key42742425a3d29d7c is RTX5080(SM120,84SM), driver615.71.10,
+cuDNN9.30.0.2, Torch2.14.1+cu130, CuTeDSL4.8.0/CUDA13.4, Python3.12.
+The full paging file passes143 cases with strict goldens; the pre-existing
+40GiB physical-wide-pool case is skipped on this16GiB GPU. This does not
+qualify wide-address execution, SM121 or RTXPRO6000 performance.
+
+Twelve cases spanning D24/V40,D64/V64,D120/V128, both half types, Q1,
+packed GQA, sinks and windows pass each of memcheck, racecheck and synccheck
+with zero findings. These runs use a task-local cuda-bindings13.2 overlay:
+the shared13.4 bindings request a driver API newer than this driver supports,
+and both the original memcheck and a handle-only control report the same14
+API-query errors. Those initial runs are not counted as sanitizer passes.
+Run from `test/python`: `python -m pytest
+sdpa/frost/test_sdpa_fwd_paged_sm120.py -m L0 -q -x`; the sanitizer selection
+is `-k 'widths and (dims6 or dims2 or dims10) and (decode or packed_sink)'`.
+
 ### Native SM107 D256 mixed FP8 KV — 2026-11-10
 
 `sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv` exposes D256 checks

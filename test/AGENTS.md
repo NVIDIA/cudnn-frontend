@@ -1315,6 +1315,15 @@ delta helper reused unchanged can make dV correct while corrupting dQ/dK.
 `test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
 plus fixed quantized inputs under changed batch sizes and graph replay.
 
+
+Paged vector loaders must derive row count and swizzle span from each operand's
+compiled head tile, while the live-vector guard uses its logical width. Fill
+padding beyond that width with NaNs and test independent QK/V widths; otherwise
+a D128-only copy loop can silently overrun the shared tile after admission is
+widened. `test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_widths` covers
+16/32/64-element swizzle spans, eight-aligned envelopes, fresh pool storage,
+independent HND/NHD tables and changed-input replay.
+
 When extending a native split kernel to paged KV, update the adapter's
 partial-format predicate together with route admission. The D256 mixed-KV
 host writes FP32 partials even when final O is half. Allocating or binding

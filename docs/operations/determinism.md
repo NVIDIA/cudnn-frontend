@@ -172,3 +172,13 @@ duplicated and129-request batches, then mutate dO and a canonical scale
 atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
+
+
+## SM120 small-head paged SDPA
+
+Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch
+invariant for the tested D64 and D120/V88 causal-window configurations, with
+and without packed GQA. RTX5080 checks compare O and Stats bytes across
+replays, reordered/duplicated batches and changed neighbors under capture.
+This is a fixed-GPU/runtime result; SM121 execution and cross-GPU bitwise
+identity are unverified. The determinism report records the exact coverage.

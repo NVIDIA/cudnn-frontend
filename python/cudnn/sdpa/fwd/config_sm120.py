@@ -22,6 +22,16 @@ SUPPORTED_HEAD_TILE_MIN = 16
 GENERAL_HEAD_TILE_MAX = 256
 SUPPORTED_HEAD_TILE_MAX = 512
 GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
+# The general half prefill loader addresses independent QK/V widths through
+# D128 directly. Larger flavors and the decode tile keep separate paging gates.
+PAGED_HEAD_TILE_MAX = 128
+PAGED_D_SHAPES = frozenset((q, v) for q in GENERAL_HEAD_TILES if q <= PAGED_HEAD_TILE_MAX for v in GENERAL_HEAD_TILES if v <= PAGED_HEAD_TILE_MAX)
+
+
+def paged_head_dims_supported(d_qk: int, d_v: int) -> bool:
+    return all(0 < d <= PAGED_HEAD_TILE_MAX and d % 8 == 0 for d in (d_qk, d_v))
+
+
 FP8_HEAD_TILE_GRANULE = 32
 FP8_GENERAL_HEAD_TILE_MAX = 256
 FP8_GENERAL_HEAD_TILES = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_GENERAL_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
@@ -321,7 +331,7 @@ def validate_params(
 
     if params.page_size:
         if not allow_paged:
-            raise NotImplementedError("SM120 paged KV is served by the exact D128 half prefill template only")
+            raise NotImplementedError("SM120 paged KV is served by the general half prefill template only")
         if params.page_size % 8 or params.page_size < 8:
             raise ValueError("SM120 paged KV requires a positive page size divisible by 8")
         if params.thd_varlen or params.split_kv != 1 or decode_tile:
