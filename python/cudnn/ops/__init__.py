@@ -33,6 +33,8 @@ _LAZY_EXPORTS = {
     "gqa_attention_forward": ("cudnn.sdpa.cake.api", "gqa_attention_forward"),
     "gqa_attention_backward": ("cudnn.sdpa.cake.api", "gqa_attention_backward"),
     "gqa_attention_workspace_size": ("cudnn.sdpa.cake.api", "gqa_attention_workspace_size"),
+    "dsa_indexer_topk_forward": ("cudnn.deepseek_sparse_attention.cake.api", "dsa_indexer_topk_forward"),
+    "dsa_indexer_topk_workspace_size": ("cudnn.deepseek_sparse_attention.cake.api", "dsa_indexer_topk_workspace_size"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
