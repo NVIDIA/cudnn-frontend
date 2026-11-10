@@ -1168,7 +1168,7 @@ branching. Dense launch/register behavior is unchanged.
 
 ### Native SM107 half D128 dense-Q paging (2026-11-10)
 
-The architecture entry `test_sdpa_fwd_dsl_sm107.py::TestNativeD128DensePaged`
+The architecture entry `test_sdpa_fwd_native_paged_sm107.py::TestNativeD128DensePaged`
 collects the shared `native_d128_dense_paged_determinism.py` checks. Six
 standalone cases pin native D128, CGA1/2, N64/N128 and split1/4, with FP16/BF16
 Q/O and matching half or E4M3/E5M2 K/V. Each case checks fixed CPU-seeded inputs,

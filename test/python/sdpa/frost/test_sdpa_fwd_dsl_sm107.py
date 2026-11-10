@@ -8875,16 +8875,3 @@ class TestD192LptContract:
 
     test_work_order = staticmethod(_checks.test_thd_work_order)
     test_admission = staticmethod(_checks.test_native_admission)
-
-
-@pytest.mark.L0
-@requires_dsl
-class TestNativeD128DensePaged:
-    import native_d128_dense_paged_sm107_checks as _checks
-
-    test_dense_replay = staticmethod(_checks.test_dense_replay)
-    test_page_boundaries = staticmethod(_checks.test_page_boundaries)
-
-    from native_d128_dense_paged_determinism import test_replay_batch_and_golden as _determinism
-
-    test_replay_batch_and_golden = staticmethod(_determinism)
