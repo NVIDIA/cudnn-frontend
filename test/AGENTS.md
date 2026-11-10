@@ -1361,3 +1361,11 @@ head-width and chunk-count guards when using that invariant: D576's three K
 chunks cannot reuse the same scheme. `TestMixedFp8Kv.test_d512_admission`
 checks the chunk counts and rejects that geometry; numerical/replay cases
 include empty KV and multiple scheduler waves.
+
+Capability-matrix fixtures must sample a shape that serves the feature under
+comparison. Adding a smaller native flavor can change sorted shape order
+without changing the larger envelope's band support. Keep the general band
+matrix on a representative full-feature shape and retain separate native
+flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
+The SM90 D64/D512 controls in `test_band_capabilities.py` and
+`test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
