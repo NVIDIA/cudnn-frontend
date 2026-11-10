@@ -251,6 +251,35 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", True): Entry(
         "ge", 8.293, "sm100_d576_dense_decode_20261030", "rows"
     ),
+    # study sm107_paged_prefill_20261109 (208-SM Rubin, cuDNN 9.30.0.2; FlashInfer's paged cudnn path, recorded graph facts; bf16
+    # D128 / D192x128 / D256 causal chunks and squares, MHA / GQA 4-8 / MQA, b 1-16, s_q 5-8192, page 16 / 64, HND / NHD; 953
+    # train cells; D128 keeps the hand-written paged rules (no feature splits its GQA class); 96 off-tile + 48 on-tile holdout cells:
+    # the entries never >5% behind the measured default, geo regret 1.00-1.02 vs 1.97-6.01; FROST also 0.03-0.61 of the backend on
+    # the dense-Q decode graph at s_q 5-16)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 9.0, "sm107_paged_prefill_20261109", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_paged_prefill_20261109"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "mha", False): Entry(
+        "ge", 9.0, "sm107_paged_prefill_20261109", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm107_paged_prefill_20261109"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_prefill_20261109"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_paged_prefill_20261109"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm107_paged_prefill_20261109"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "mha", True): Entry(
+        "always", None, "sm107_paged_prefill_20261109"
+    ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed
     # holdouts, 96-cell holdout 3; d128 GQA causal is non-monotone and keeps the hand-written order; d256 mask-free MHA,
