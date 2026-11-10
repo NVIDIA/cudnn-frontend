@@ -1270,8 +1270,8 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
     F8_128x4 descale pools paging with K/V, page_size % 128, the sink / causal / bottom-right / SWA / padding masks,
     Stats and the f16x2 exponent arm composed.  Declined, each by its own typed reason: page 64, THD queries over
     pools (stage 2), the d192x128 / d512 pools (stage 3), a block-scaled O over pools, the pre-folded scale over paged
-    KV, pools without a padding mask, and split_kv > 1 (also with a sink).  The half row keeps its THD requirement
-    and the per-tensor FP8 row serves no paged KV."""
+    KV, pools without a padding mask, and split_kv > 1 (also with a sink). The native half D128
+    row accepts dense queries, and the per-tensor FP8 row serves paged D512."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -2202,8 +2202,11 @@ def test_sm107_gate_declines_the_interactions():
     assert why is not None and "dense-only" in why, why
     paged = dict(has_paged_kv=True, padded=True, page_size=128)
     # The half row serves ungated paged THD; the gate block must decline
-    # the interaction before paged layout admission. FP8 remains nonpaged.
-    assert f16.paged_kv and not fp8.paged_kv
+    # the interaction before paged layout admission. FP8 paging is limited to D512,
+    # which has no gate; the D256 gate flavor remains nonpaged.
+    assert f16.paged_kv and fp8.paged_kv
+    assert fp8.paged_d_shapes == frozenset({(512, 512)})
+    assert (256, 256) not in fp8.paged_d_shapes
     assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(f16, _gate_facts(**paged))
     assert why is not None and "paged" in why and "gate" in why, why
