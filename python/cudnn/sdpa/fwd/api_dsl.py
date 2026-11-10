@@ -740,8 +740,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     tag = _flavor_tag(flavor)
     if rubin and not fp8 and flavor == (128, 128) and params.softmax_wgs == 1:
         return _load_kernel_template("sm107/prefill_d256_f16.py", params, "sdpa_fwd_sm107_d128_single_q")
-    if params.dtype_kv != -1 and (fp8 or flavor != (128, 128)):
-        raise ValueError("independent FP8 KV storage requires the SM100/SM107 D128 half pipeline")
+    mixed_kv_flavors = ((64, 64), (128, 128)) if rubin else ((128, 128),)
+    if params.dtype_kv != -1 and (fp8 or flavor not in mixed_kv_flavors):
+        raise ValueError("independent FP8 KV storage requires SM100 D128 or native SM107 D64/D128 half prefill")
     if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
         params = replace(params, d_flavor=192)
         return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
@@ -749,6 +750,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         rubin
         and not fp8
         and flavor == (64, 64)
+        and params.dtype_kv == -1
         and params.cta_mma == 1
         and (params.split_kv > 1 or params.decode_tile)
         and (not params.thd_varlen or params.split_kv > 1)
@@ -2532,9 +2534,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not getattr(binder, "supports_mixed_fp8_kv", False),
                 "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension",
             )
+            mixed_kv_flavors = ((64, 64), (128, 128)) if self._device_cc == (10, 7) else ((128, 128),)
             self._not_implemented_error_if(
-                major != 10 or (int(d_qk), int(d_v)) != (128, 128),
-                "mixed half-Q/FP8-KV requires native SM100/SM103/SM107 D128 prefill",
+                major != 10 or (int(d_qk), int(d_v)) not in mixed_kv_flavors,
+                "mixed half-Q/FP8-KV requires SM100/SM103 D128 or native SM107 D64/D128 prefill",
+            )
+            self._not_implemented_error_if(
+                self._device_cc == (10, 7) and (int(d_qk), int(d_v)) == (64, 64) and self.thd and self.split_kv > 1,
+                "native D64 mixed FP8 KV keeps THD execution unsplit",
             )
             self._not_implemented_error_if(
                 not self._can_prepare_dense_layout(),
@@ -3826,7 +3833,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
-        if self._fp8 or self.flavor != (64, 64):
+        if self._fp8 or getattr(self, "_mixed_fp8_kv", False) or self.flavor != (64, 64):
             return False
         if self.thd and self.packed_thd_split and not self.paged:
             return True  # D64 nonpaged split uses the same physical-width single-Q body.

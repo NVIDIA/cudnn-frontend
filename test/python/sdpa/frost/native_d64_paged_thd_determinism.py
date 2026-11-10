@@ -18,16 +18,17 @@ from sm107_half_test_utils import _rubin_only
         ("bfloat16", 1, True, 64),
     ],
 )
-def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n):
+def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n, kv_name=None):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _rubin_only()
     dtype = getattr(torch, dtype_name)
+    kv_dtype = getattr(torch, kv_name or dtype_name)
     h, kh, sq, d, page, blocks = 8, 2, 17, 64, 16, 17
     rng = torch.Generator().manual_seed(93612)
     q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
-    k = (torch.randn(89, kh, page, d, generator=rng) * 0.3).to(dtype).cuda()
-    v = (torch.randn(89, page, kh, d, generator=rng) * 0.3).to(dtype).cuda().transpose(1, 2)
+    k = (torch.randn(89, kh, page, d, generator=rng) * 0.3).to(kv_dtype).cuda()
+    v = (torch.randn(89, page, kh, d, generator=rng) * 0.3).to(kv_dtype).cuda().transpose(1, 2)
     kt = torch.stack([torch.randperm(89, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
     vt = torch.stack([torch.randperm(89, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
     qlens, klens = [17, 9, 0, 1, 16], [257, 1, 0, 33, 129]
@@ -117,4 +118,5 @@ def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n):
                 assert_bitwise({n: actual[n][offset : offset + nq] for n in target}, target, f"packed origin {offset}")
             offset += nq
     actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
-    assert_golden(f"sdpa-half-d64-thd-paged-{dtype_name}-cga{cga}-pack{int(packed)}-n{tile_n}", inputs, actual)
+    storage = f"-{kv_name}" if kv_name is not None else ""
+    assert_golden(f"sdpa-half-d64-thd-paged-{dtype_name}{storage}-cga{cga}-pack{int(packed)}-n{tile_n}", inputs, actual)

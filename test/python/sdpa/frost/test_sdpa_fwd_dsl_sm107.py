@@ -8734,6 +8734,13 @@ class TestMixedFp8Kv:
 
     from mixed_kv_sm107_cases import (
         graph_admission,
+        d64_admission,
+        d64_dense_paged,
+        d64_thd_origins,
+        d64_standalone,
+        d64_replay_batch_golden,
+        d64_thd_batch_golden,
+        d64_single_q,
         native_resources,
         dense_paged,
         paged_origins,
@@ -8748,6 +8755,13 @@ class TestMixedFp8Kv:
         uniform_control,
     )
 
+    test_d64_admission = staticmethod(d64_admission)
+    test_d64_dense_paged = staticmethod(d64_dense_paged)
+    test_d64_thd_origins = staticmethod(d64_thd_origins)
+    test_d64_standalone = staticmethod(d64_standalone)
+    test_d64_replay_batch_golden = staticmethod(d64_replay_batch_golden)
+    test_d64_thd_batch_golden = staticmethod(d64_thd_batch_golden)
+    test_d64_single_q = staticmethod(d64_single_q)
     test_graph_admission = staticmethod(graph_admission)
     test_native_resources = staticmethod(native_resources)
     test_dense_paged = staticmethod(dense_paged)

@@ -2172,6 +2172,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if not facts.uniform_dtype and not _mixed_fp8_kv(capabilities, facts):
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if _mixed_fp8_kv(capabilities, facts):
+        if facts.device_cc == (10, 7) and (facts.d_qk, facts.d_v) == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1:
+            return "native D64 mixed FP8 KV keeps THD execution unsplit"
         binder = cudnn._pybind_module._SdpaThdBinder if facts.thd else cudnn._pybind_module._SdpaDenseBinder
         if not getattr(binder, "supports_mixed_fp8_kv", False):
             return "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension"
@@ -2751,7 +2753,7 @@ def _sm107_spec() -> EngineSpec:
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}) | SM107_F16_SMALL_D_SHAPES,
             d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
-            mixed_fp8_kv_d_shapes=frozenset({(128, 128)}),
+            mixed_fp8_kv_d_shapes=frozenset({(64, 64), (128, 128)}),
             causal=True,
             bottom_right=True,
             right_band_widening=True,

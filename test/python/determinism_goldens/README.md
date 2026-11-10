@@ -1359,3 +1359,29 @@ Review closeout on SM107: the selected `test_sdpa_fp8_sm107.py` entry passes
 all 15 MXFP8 and 19 FP8 strict cases, plus the three kernel-prefix guards
 (37 total). Both new backward kernels have cuDNN symbol prefixes. Arithmetic
 and all existing golden output bytes remain unchanged.
+
+### SM107 D64 mixed FP8 K/V — 2026-11-10
+
+`test_sdpa_fwd_dsl_sm107.py::TestMixedFp8Kv` now exposes the exact-D64 mixed
+storage checks in the selected architecture entry. FP16/BF16 Q/O use E4M3/E5M2
+K/V directly. The native physical-64 prefill specialization serves dense and
+paged KV, CGA1/2, dense splits and unsplit THD; mixed THD splits decline.
+
+On SM107 with cuDNN 9.30.0.2, Torch 2.14.1+cu130 and DSL 4.8.0/CUDA 13.4,
+90 strict feature/resource/control cases pass, including eight new dense/THD
+runtime goldens and 16 existing D128 mixed-paged controls. Eight additional
+Q=1 dense/paged graph cases pass for all four Q/KV dtype combinations. Memcheck,
+synccheck and racecheck each pass 13 selected cases with zero errors/hazards.
+The public architecture entry collects all new cases. Other architectures keep
+their existing mixed-storage support; no additional GPU execution is claimed.
+
+CPU-fixed, once-quantized payloads are retained across alone/reordered/duplicated
+batches through 129 requests. Each case checks all O/Stats bytes, fresh-buffer
+replays with queued concurrent work, input preservation and an independent
+CPU-f64 numerical reference. THD changes packed origins and checks untouched
+capacity tails. Graph tests separately check independent physical offsets,
+poisoned gaps, independent HND/NHD tables and changed-input capture. Dense
+standalone tests also exercise the native split path. The initial admission
+fixture retained dense Stats while synthesizing THD facts and therefore hit an
+earlier padded-Stats decline; correcting that fixture required no kernel or
+numerical-tolerance change. All eight goldens pass strict comparison.
