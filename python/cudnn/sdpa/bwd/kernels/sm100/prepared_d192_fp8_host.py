@@ -25,11 +25,17 @@ HEAD_DIMS = (192, 128) if SPEC is None else (int(SPEC[0]), int(SPEC[1]))
 
 def _spec(dqk, dv, sm, mx, window):
     """(D_QK, D_V, exp2 FMA split, block-scale mode, window): the kernel pair a prepared host is bound to."""
-    return (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
+    base = (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
+    return base + ("sm120",) if int(sm) in (120, 121) else base
 
 
 def _kernel_hosts(spec):
     here = pathlib.Path(__file__).resolve()
+    if len(spec) == 6 and spec[5] == "sm120":
+        if spec[3]:
+            raise NotImplementedError("SM120 MXFP8 backward is not yet implemented")
+        module = load_template(str(here.parent.parent / "sm120" / "bprop_fp8.py"), spec, tag="sdpa_bwd_sm120_fp8")
+        return module.dkdv_host, module.dq_host
     if tuple(spec[:2]) == (512, 512):
         fmt = "mxfp8" if spec[3] else "fp8"
         module = load_template(str(here.with_name(f"bprop_d512_{fmt}.py")), spec, tag=f"sdpa_bwd_d512_{fmt}_w{spec[4]}")
@@ -55,10 +61,14 @@ _BIND_LOCK = threading.Lock()
 
 def _bind():
     """Bind this module's kernel pair on the first compile; the pair is fixed by ``SPEC`` and never changes."""
-    global dkdv_host, dq_host
+    global dkdv_host, dq_host, delta_host
     with _BIND_LOCK:
         if dkdv_host is None:
             dkdv_host, dq_host = _kernel_hosts(tuple(SPEC))
+            if len(SPEC) == 6 and SPEC[5] == "sm120":
+                from cudnn.sdpa.bwd.kernels.sm120.bprop_fp8 import delta_host as native_delta
+
+                delta_host = native_delta
 
 
 FP8_SCALARS = (

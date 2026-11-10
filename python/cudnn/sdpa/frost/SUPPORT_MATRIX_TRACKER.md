@@ -2742,7 +2742,7 @@ Rubin config factories. Target-SM107 numerical validation is still required.
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
-`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
+`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`, `sdpa_bwd_sm120_fp8`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
 with the same support).
@@ -2758,7 +2758,7 @@ half or FP8 K/V, packing and split. Q loads directly and O stages through the
 drained K/V slab; no global staging allocation or kernel is introduced.
 
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
-**multiples of 16** and a **64 x 64 CTA**. Half BPROP extends through D512 as described below; low-precision BPROP remains unsupported.
+**multiples of 16** and a **64 x 64 CTA**. Half and per-tensor E4M3 BPROP extend through D512 as described below; MXFP8 BPROP remains unsupported.
 
 MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
@@ -2783,34 +2783,35 @@ Tile dimensions must fit the native geometry and 99 KiB shared-memory budget;
 D128 keeps 64x64 by default, while D256 uses 32x32. Deterministic, windowed, bias and sink THD
 graphs retain typed declines. The new D_QK > 256 native route additionally supports deterministic and windowed dense/THD graphs; bias and sink remain declined on that route.
 
-| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], or D576/V512 envelope, any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 512, any ×8 |
-|---|:--:|:--:|:--:|
-| **Data types** | | | |
-| FP16 / BF16 | ✅ | — | ✅ |
-| FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ |
-| MXFP8 | — | ✅ | ❌ |
-| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
-| Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512]; or QK ∈ (512,576], V ∈ (256,512] | ×16, ≤ 512ᵃ | ×8, ≤ 512 |
-| **Layout** | | | |
-| BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D512/GQA; restrictions above) |
-| Paged KV (dense Q; prefill through D128, decode through D256, D512/D576 envelopes) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
-| `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
-| Strided / permuted Stats | ✅ | ✅ | ✅ |
-| **Masks / features** | | | |
-| Causal (top-left) | ✅ | ✅ | ✅ |
-| Causal bottom-right | ✅ | ✅ | ✅ |
-| Causal right-band widening | ✅ | ✅ | ✅ |
-| Sliding window (left) | ✅ | ✅ | ✅ |
-| Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
-| Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ (D_QK ≤ 256) |
-| Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — |
-| Bias / dBias | ❌ | ❌ | ✅ / ✅ (D_QK ≤ 256) |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
-| Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
-| Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
-| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8;<br>or D576/V512 envelope | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 512, any ×8 | BPROP FP8<br>D_V ≤ D_QK ≤ 512, ×8 |
+|---|:--:|:--:|:--:| :--: |
+| **Data types** | | | |  |
+| FP16 / BF16 | ✅ | — | ✅ | ❌ |
+| FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ | E4M3 ✅ · E5M2 ❌ |
+| MXFP8 | — | ✅ | ❌ | ❌ |
+| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — | O is E4M3; gradients E4M3/FP16/BF16 |
+| Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) | ✅ (D_QK ≥ D_V) |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512]; or QK ∈ (512,576], V ∈ (256,512] | ×16, ≤ 512ᵃ | ×8, ≤ 512 | ×8, ≤ 512; contraction rounds to 32 |
+| **Layout** | | | |  |
+| BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ compact / ❌ |
+| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D512/GQA; restrictions above) | ❌ |
+| Paged KV (dense Q; prefill through D128, decode through D256, D512/D576 envelopes) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ | ❌ |
+| `cu_seq_len_q/kv` | ✅ | ❌ | ❌ | ❌ |
+| Strided / permuted Stats | ✅ | ✅ | ✅ | ❌ |
+| **Masks / features** | | | |  |
+| Causal (top-left) | ✅ | ✅ | ✅ | ✅ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ❌ |
+| Causal right-band widening | ✅ | ✅ | ✅ | ❌ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ |
+| Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ | ❌ |
+| Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
+| Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — | ❌ |
+| Bias / dBias | ❌ | ❌ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ |
+| Deterministic (`use_deterministic_algorithm`) | — | — | ✅ | ✅ |
+| Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ | ✅ |
+| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ |
+
 
 **Native paged forward.** FP16/BF16 dense queries with independent
 QK/V head widths divisible by eight through128 (general prefill),256 (decode),
@@ -4894,3 +4895,17 @@ Detector: `test_sdpa_bwd_sm120_wide.py`. Initial SM121 qualification passes
 goldens, 73 existing native THD controls and 145 host checks. Fourteen targeted
 cases per memory/race/synchronization sanitizer are qualified separately.
 SM120 hardware execution and performance are unmeasured.
+
+
+### SM120 per-tensor FP8 backward extension
+
+`sdpa_bwd_sm120_fp8` uses native `mma.sync.m16n8k32` on SM120/SM121,
+with eight-aligned `0 < D_V <= D_QK <= 512`. The contraction rounds to 32
+columns and gradient ownership rounds to 128 columns; no 512-wide envelope
+is imposed on small widths. Dense compact BSHD E4M3 Q/K/V/O/dO, FP32 Stats,
+E4M3/FP16/BF16 gradients, all four amax outputs, GQA, top-left causal/left
+window and fixed-order deterministic gradients are implemented. THD, padding,
+bottom-right, bias, sink and MXFP8 decline. DSL 4.8.0 minimum. SM121 passes
+79 native/strict cases, including six byte goldens; ten targeted cases per
+memcheck, racecheck and synccheck pass with zero errors or race warnings.
+SM120 hardware and performance remain unmeasured; candidate placement is unchanged.

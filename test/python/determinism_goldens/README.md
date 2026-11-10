@@ -1953,6 +1953,15 @@ sequences and batches 1/3/129. dQ/dK/dV are checked against independent CPU
 FP64 autograd before strict raw-byte comparison. Recorded on SM121 GB10;
 this fingerprint does not qualify SM120 hardware or low-precision backward.
 
+### SM120 native per-tensor FP8 backward
+
+`sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_replay_batch_and_golden` adds six
+SM121/GB10 runtime-keyed records for D192/D512 and E4M3/FP16/BF16 gradients.
+Each checks dQ/dK/dV and amax_dQ/dK/dV/dP with fixed scalar scales and payloads
+across batch reorder/duplication, fresh pointers, changed-dO capture replay,
+and repeated calls. The independent FP8 numerical oracle is checked first.
+SM120 hardware and cross-runtime bit identity are not covered.
+
 ### SM120-family D576/V512 forward — SM121 qualification, 2026-11-10
 
 `sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:
