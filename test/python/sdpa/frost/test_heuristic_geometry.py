@@ -599,9 +599,11 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
     for packing in (False, True):
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
     assert effective_cgas(spec.capabilities, replace(facts, has_paged_kv=False, page_size=0), 1) == frozenset({1, 2})
-    for other in (replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
+    for other in (replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
-    # dense d128: cga1 is the shared decode tile (issue #1472); dense PAGED queries above stay on cga2 (not wired on cc 10.7)
+    # dense PAGED d128 queries admit native cga1 and cga2 since #2375
+    assert effective_cgas(spec.capabilities, replace(facts, thd=False), 1) == frozenset({1, 2})
+    # dense d128: cga1 is the shared decode tile (issue #1472)
     assert 1 in effective_cgas(spec.capabilities, replace(facts, thd=False, has_paged_kv=False, page_size=0), 1)
 
 
