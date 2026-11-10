@@ -34,7 +34,7 @@ def supported_device():
 
 def _skip_cu12(h_kv):
     # the 12Q/1KV key-major kernel crashes the CUDA 12 build of the DSL compiler, so that flavor is declined there
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     if h_kv == 1 and engine.dsl_cuda_major() < 13:
         pytest.skip("the 12Q/1KV sparse path requires the CUDA 13 build of CuTe DSL")
@@ -190,7 +190,7 @@ def test_lse_needs_only_scalar_alignment(entry, h_kv):
 @pytest.mark.parametrize("h_kv", [1, 2])
 @pytest.mark.parametrize("seq_mode", ["single", "cu", "origin"])
 def test_records_workspace_is_bounded(h_kv, seq_mode):
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     mode = {"single": engine.SEQ_SINGLE, "cu": engine.SEQ_CU, "origin": engine.SEQ_ORIGIN}[seq_mode]
     for length in (32769, 131072, 262144):
@@ -205,7 +205,7 @@ def test_records_workspace_is_bounded(h_kv, seq_mode):
 @pytest.mark.parametrize("gq", [12, 6])
 def test_plan_reaches_the_documented_length_bound(gq):
     # The public limit is T * Hq * 256 <= INT32_MAX, so 6Q/1KV reaches twice the length of 12Q/1KV.
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     limit = (2**31 - 1) // (gq * 256)
     assert engine.LaunchPlan(limit, 148, 1, engine.SEQ_CU, 3, gq=gq).seq_len == limit
@@ -239,7 +239,7 @@ def test_backward_reloads_its_compiled_kernels(monkeypatch, tmp_path):
 def test_indexed_max_seq_len_below_the_crossover_plans_no_sparse_path(monkeypatch):
     _skip_cu12(1)
     from cudnn.QSA.indexed.api import _plan
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     # the engine plan is built only when the indexed plan cache misses
     _plan.cache_clear()
@@ -383,7 +383,7 @@ def test_sparse_rows_follow_bounds_and_scale(h_kv, scale):
 def test_sparse_backward_cancellation(h_kv, keys):
     # With (nearly) equal keys the sparse queries' dQ (nearly) cancels to zero. The default's three bf16 parts of dS keep
     # it within an absolute bound that a single rounding (ds_precision="bf16") exceeds.
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     _skip_cu12(h_kv)
     seq_len = 22600
@@ -404,7 +404,7 @@ def test_sparse_backward_cancellation(h_kv, keys):
 @pytest.mark.L1
 def test_key_skip_variant_matches_reference(monkeypatch):
     # The key-major variant that skips empty K-steps serves only long sequences, which the 24Q/2KV cases stop short of.
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     monkeypatch.setattr(engine, "KEY_SKIP_MIN_T", 0)
     monkeypatch.setattr(engine, "_PLANS", {})
@@ -485,7 +485,7 @@ def test_indexed_entry_on_a_side_stream():
 def test_cuda12_compiler_declines_12q1kv(monkeypatch):
     # The 12Q/1KV key-major kernel crashes the CUDA 12 DSL compiler: both entries decline every one-KV-head flavor
     # before compiling, the 24Q/2KV flavor runs.
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     monkeypatch.setattr(engine, "dsl_cuda_major", lambda: 12)
     for h_q in (12, 6):
@@ -510,7 +510,7 @@ def test_cuda12_compiler_declines_12q1kv(monkeypatch):
 def test_bf16_ds_option_on_both_entries(h_q, h_kv, entries, monkeypatch):
     # ds_precision="bf16" rounds dS to bf16 before the dQ MMAs on the dense and the sparse paths of both entries and
     # stays within the ordinary bounds. The cancellation tests cover the accuracy the default keeps.
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     from cudnn.QSA.indexed.api import _plan
 

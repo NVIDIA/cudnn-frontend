@@ -794,21 +794,20 @@ def _sm80_d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token,
     return True
 
 
-def _sm80_bwd_pick_flavor(d_qk: int, d_v: int) -> str:
+def _sm80_bwd_pick_flavor(d_qk: int, d_v: int, flavor_dims=None) -> str:
     """Smallest BPROP flavor whose ``(D_QK, D_V)`` envelope covers
     ``(d_qk, d_v)`` (fdqk >= d_qk and fdv >= d_v); the user's heads are padded
     up to the flavor dim.  The kernel supports d_qk != d_v but requires the
     (padded) d_qk >= d_v — the flavor list guarantees this (every flavor has
     fdqk >= fdv, and a d_qk < d_v case lands on an equal-d flavor after pad)."""
-    for flavor in _SM80_BWD_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[flavor]
+    flavor_dims = _SM80_BWD_FLAVOR_DIMS if flavor_dims is None else flavor_dims
+    for flavor, (fdqk, fdv) in flavor_dims.items():
         if d_qk == fdqk and d_v == fdv:
             return flavor
-    for flavor in _SM80_BWD_SUPPORTED_FLAVORS:
-        fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[flavor]
+    for flavor, (fdqk, fdv) in flavor_dims.items():
         if d_qk <= fdqk and d_v <= fdv:
             return flavor
-    raise ValueError(f"SM80 BPROP: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); " f"supported: {_SM80_BWD_FLAVOR_DIMS}.")
+    raise ValueError(f"SM80 BPROP: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); " f"supported: {flavor_dims}.")
 
 
 @lru_cache(maxsize=128)
@@ -1260,8 +1259,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
         # The covering flavor retains D_QK >= D_V for its MMA geometry;
         # logical Q/K and V widths are independently masked inside it.
-        max_dqk = max(fdqk for fdqk, _ in _SM80_BWD_FLAVOR_DIMS.values())
-        max_dv = max(fdv for _, fdv in _SM80_BWD_FLAVOR_DIMS.values())
+        max_dqk = max(fdqk for fdqk, _ in self._native_flavor_dims.values())
+        max_dv = max(fdv for _, fdv in self._native_flavor_dims.values())
         self._value_error_if(
             d_qk > max_dqk or d_v > max_dv,
             f"SM80 BPROP: head dim (D_QK={d_qk}, D_V={d_v}) exceeds supported " f"envelope (D_QK<={max_dqk}, D_V<={max_dv}); larger heads not yet ported.",
@@ -1375,8 +1374,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._check_native_device((major, minor), device)
         self._check_native_tiles()
 
-        self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v)
-        self.flavor_d_qk, self.flavor_d_v = _SM80_BWD_FLAVOR_DIMS[self.flavor]
+        self.flavor = _sm80_bwd_pick_flavor(d_qk, d_v, self._native_flavor_dims)
+        self.flavor_d_qk, self.flavor_d_v = self._native_flavor_dims[self.flavor]
 
         # ---- mask token (same resolution as the forward adapter) ----------
         swa_left = -1 if self.window_size_left is None else int(self.window_size_left)
@@ -1450,6 +1449,8 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     def _check_native_device(self, capability, device):
         major, minor = capability
         self._value_error_if(capability != (8, 0), f"SdpaBwdDslSm80 requires SM80 (A100); found SM{major}{minor} on {device}")
+
+    _native_flavor_dims = _SM80_BWD_FLAVOR_DIMS
 
     def _check_native_tiles(self):
         self._value_error_if(self.tile_m is not None or self.tile_n is not None, "SM80 BPROP wires no tile knobs; tile_m/tile_n must be unset")

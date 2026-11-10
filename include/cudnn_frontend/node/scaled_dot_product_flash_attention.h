@@ -1194,6 +1194,25 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
     }
 };
 
+// The config a deterministic SDPA backward (half and FP8) prefers on Blackwell, which no heuristics mode proposes (see
+// INode::override_heuristics_query): the part's own bprop engine -- 5 on cc 10.0 / 10.3, 17 past them -- with the
+// {128,128} bprop tiles: TILE_M 3, TILE_N 2, KERNEL_CFG 2 (bprop warp), STREAM_K 0, TILE_CGA_M 0; before cuDNN 9.23 the
+// same kernel is KERNEL_CFG 31.
+inline std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+blackwell_deterministic_bprop_config(int32_t const sm_version, int64_t const stages) {
+    int64_t const engine_id = sm_version > 103 ? 17 : 5;
+    if (cudnn_frontend::detail::get_backend_version() >= 92300) {
+        return {engine_id,
+                {{KnobType_t::TILE_M, 3},
+                 {KnobType_t::TILE_N, 2},
+                 {KnobType_t::KERNEL_CFG, 2},
+                 {KnobType_t::STREAM_K, 0},
+                 {KnobType_t::TILE_CGA_M, 0},
+                 {KnobType_t::STAGES, stages}}};
+    }
+    return {engine_id, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, stages}}};
+}
+
 class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     using input_names  = SDPA_backward_attributes::input_names;
     using output_names = SDPA_backward_attributes::output_names;
@@ -2334,45 +2353,12 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             return {-1, {}};
         }
         int32_t const sm_version = context.get_sm_version();
-        bool const use_new_knobs = detail::get_backend_version() >= 92300;
-        // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
-        if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
-            // Blackwell parts past cc 10.3 (cc 10.7, the one met so far): the part's
-            // own bprop engine, 17, with the {128,128} bprop knobs. Not every backend
-            // serves it on this part -- cuDNN 9.24.0.43 declines it at the engine's
-            // finalize -- and create_execution_plans falls back to the heuristics
-            // query when the pin cannot be created, so a decline here is never
-            // needed. Declining for the whole part (#2086) made every backend take
-            // the heuristics pick, engine 7 (the SM80 bprop plus matmul_dq_sm80 over
-            // a quadratic dS workspace): 4.9x slower on d128 dense GQA and 26x on
-            // d64 sliding-window attention at s=8192 under cuDNN 9.29.0.20, which
-            // does serve engine 17 on cc 10.7. Determinism does not rest on the
-            // pin: a deterministic request already expands through the
-            // dP-workspace form (dQ = dS @ K as its own matmul); the pin selects
-            // the engine that runs it well.
-            if (use_new_knobs) {
-                return {17,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            } else {
-                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            }
-        } else if (is_deterministic_algorithm_supported_on_blackwell) {
-            if (use_new_knobs) {
-                return {5,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            } else {
-                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            }
+        if (is_deterministic_algorithm_supported_on_blackwell) {
+            // The heuristics propose only engine 7 here (the SM80 bprop plus matmul_dq_sm80 over a quadratic dS
+            // workspace: 4.7x slower on d128 GQA and 22x on d64 sliding-window attention at s=8192 on cc 10.7,
+            // cuDNN 9.29 and 9.30), or nothing at all for D192 / D256. Determinism does not rest on this config: a
+            // deterministic request already expands through the dP-workspace form (dQ = dS @ K as its own matmul).
+            return blackwell_deterministic_bprop_config(sm_version, is_d256_on_blackwell ? 3 : 2);
         } else if (use_sm90_ordered_dq_deterministic && sm_version >= 90 && sm_version < 100) {
             // Hopper bwd engine, 64x64 bprop tiles, ordered deterministic dQ
             // accumulation (STAGES = 4).

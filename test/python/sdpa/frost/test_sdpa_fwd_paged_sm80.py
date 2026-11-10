@@ -30,7 +30,24 @@ _POINTS = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
-def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None, graph_knobs=None):
+def test_native_paged_adapter_rebind_replay(
+    point,
+    dtype,
+    thd,
+    graph_mode,
+    cudnn_handle,
+    monkeypatch,
+    single_q=False,
+    case_index=None,
+    graph_knobs=None,
+    has_sink=False,
+    sink_endpoints=False,
+    split_kv=1,
+    sink_stride=3,
+    explicit_tiles=None,
+    pack_gqa=False,
+    heads=None,
+):
     import cutlass.cute as cute
 
     index = (_POINTS.index(point) if case_index is None else case_index) * 4 + (2 if dtype == torch.float16 else 0) + int(thd)
@@ -38,6 +55,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
     d, dv, page, klayout, vlayout, mask = point
     torch.manual_seed(721 + index)
     b, h, hk, max_sq, max_skv, tq = 3, 8, 2, 65, 129, 89
+    if heads is not None:
+        h, hk = heads
     if single_q:
         max_sq = 1
     cap = (tq + 64 if graph_mode else tq) if thd else max_sq
@@ -47,6 +66,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
     flavor = _sm80_pick_flavor(d, dv)
     fd, fv = _SM80_FLAVOR_DIMS[flavor]
     m, n, w = (32, 16, 4) if max(fd, fv) > 256 else (128, 64, 4) if fd == 64 else (64, 32 if fd == 256 else 64, 4)
+    if explicit_tiles is not None:
+        m, n = explicit_tiles
 
     def allocate():
         q = torch.randn(qbatch, cap, h, d + 8, dtype=dtype, device="cuda")[..., :d]
@@ -66,6 +87,8 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
         return [q, *pools, o, stats, klens, qlens, kt, vt], backing_o, backing_l
 
     buffers, ob, lb = allocate()
+    sink_raw = torch.empty(h * sink_stride, device="cuda", dtype=torch.float32) if has_sink else None
+    sink = sink_raw[::sink_stride] if has_sink else None
     q, k, v, o, stats, klens, qlens, kt, vt = buffers
     descs = []
     for name, tensor in zip(("q", "k", "v", "o"), (q, k, v, o)):
@@ -92,6 +115,9 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
     api = SdpaFwdDslSm80(
         *descs,
         sample_lse=lse_desc,
+        has_sink=has_sink,
+        split_kv=split_kv,
+        pack_gqa=pack_gqa,
         is_causal=causal,
         causal_bottom_right=br,
         window_size_left=31 if swa else None,
@@ -123,11 +149,13 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
         opts = {("cu_seq_len_q" if thd else "seq_len_q"): lengths[0], ("cu_seq_len_kv" if thd else "seq_len_kv"): lengths[1]}
         if thd:
             opts["max_total_seq_len_q"] = cap
+        sink_node = fe.tensor(name="sink", dim=(1, h, 1, 1), stride=(h * sink_stride, sink_stride, 1, 1), data_type=cudnn.data_type.FLOAT) if has_sink else None
         out, st = fe.sdpa(
             q=inputs[0],
             k=inputs[1],
             v=inputs[2],
             name="paged",
+            sink_token=sink_node,
             attn_scale=1 / math.sqrt(d),
             generate_stats=True,
             use_padding_mask=True,
@@ -162,10 +190,18 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
     else:
         api.compile()
         artifact = api._compiled_kernel
-        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if thd else None
+        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if api.scratch_workspace_bytes() else None
+    workspace_guard = None
+    if workspace is not None:
+        nbytes = workspace.numel()
+        workspace_guard = torch.full((nbytes + 256,), 0xA5, dtype=torch.uint8, device="cuda")
+        workspace = workspace_guard[128 : 128 + nbytes]
     for binding in range(2):
         if binding:
             buffers, ob, lb = allocate()
+            if has_sink:
+                sink_raw = torch.empty(h * sink_stride, device="cuda", dtype=torch.float32)
+                sink = sink_raw[::sink_stride]
         q, k, v, o, stats, klens, qlens, kt, vt = buffers
         graph = torch.cuda.CUDAGraph()
         origin_buffers = [torch.empty(b + 1, dtype=torch.int64, device="cuda") for _ in range(3)] if graph_mode and thd else []
@@ -185,6 +221,12 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
                     for buf, starts, stride in zip(origin_buffers, (qstarts, ostarts, lstarts), (q.stride(1), o.stride(1), stats.stride(2))):
                         buf.copy_(torch.tensor([x * stride for x in starts] + [cap * stride], dtype=torch.int64, device="cuda"))
                 q.mul_(-0.7)
+                if has_sink:
+                    sink_raw.fill_(float("nan"))
+                    sink.copy_(torch.linspace(-5 + phase, 5 + binding, h, device="cuda"))
+                    if sink_endpoints:
+                        sink[0::4] = -float("inf")
+                        sink[1::4] = float("inf")
                 k.fill_(float("nan"))
                 v.fill_(float("nan"))
                 kt.fill_(-171)
@@ -210,7 +252,12 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
                     if swa:
                         scores.masked_fill_(kp < qp - 31, -float("inf"))
                     ls = scores.logsumexp(-1)
-                    oo = torch.nan_to_num(scores.softmax(-1), nan=0) @ vv.transpose(0, 1).double().repeat_interleave(h // hk, 0)
+                    if has_sink:
+                        ls = torch.logaddexp(ls, sink.double()[:, None])
+                        weights = torch.where(torch.isfinite(ls[..., None]), torch.exp(scores - ls[..., None]), 0.0)
+                    else:
+                        weights = torch.nan_to_num(scores.softmax(-1), nan=0)
+                    oo = weights @ vv.transpose(0, 1).double().repeat_interleave(h // hk, 0)
                     refs.append((oo.transpose(0, 1), ls * (math.log2(math.e) if br else 1)))
                 ob.fill_(77)
                 lb.fill_(77)
@@ -247,6 +294,10 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
                                         ),
                                     )
                                 )
+                                if has_sink:
+                                    # Flat raw storage deliberately differs from the graph's
+                                    # strided logical sink descriptor.
+                                    vp[sink_node] = sink_raw
                                 previous = cudnn.get_stream(cudnn_handle)
                                 try:
                                     cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
@@ -260,6 +311,7 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
                                     v.transpose(1, 2),
                                     o.transpose(1, 2),
                                     stats,
+                                    sinks=sink,
                                     seq_q_lens=qlens,
                                     seq_kv_lens=klens,
                                     workspace=workspace,
@@ -270,7 +322,7 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
                         torch.cuda.set_sync_debug_mode(before)
                     assert (fe if graph_mode else api._compiled_kernel) is artifact
 
-                if not graph_mode and phase == 0 and binding == 0 and point == _POINTS[0] and dtype == torch.bfloat16:
+                if not graph_mode and not has_sink and phase == 0 and binding == 0 and point == _POINTS[0] and dtype == torch.bfloat16:
                     for bad_table in (None, kt.to(torch.int64), kt[: b - 1], kt.contiguous()):
                         with pytest.raises(ValueError):
                             api.execute(
@@ -290,6 +342,9 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
                     run()
                 else:
                     graph.replay()
+                if workspace_guard is not None:
+                    assert torch.all(workspace_guard[:128] == 0xA5)
+                    assert torch.all(workspace_guard[128 + workspace.numel() :] == 0xA5)
                 for batch, (sq, sk) in enumerate(zip(qs, ks)):
                     actual_o = o[0, ostarts[batch] : ostarts[batch] + sq] if thd else o[batch, :sq]
                     actual_l = stats[0, :, lstarts[batch] : lstarts[batch] + sq] if thd else stats[batch, :, :sq]
@@ -315,3 +370,185 @@ def test_native_paged_adapter_rebind_replay(point, dtype, thd, graph_mode, cudnn
         finally:
             graph.reset()
     assert len(observations) == 4
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("mask", ["causal", "br_swa"])
+@pytest.mark.parametrize("dims", [(64, 64), (256, 256), (576, 512)])
+def test_native_thd_paged_sink_rebind_replay(dtype, graph_mode, mask, dims, cudnn_handle, monkeypatch):
+    test_native_paged_adapter_rebind_replay(
+        (*dims, 16, "HND", "NHD", mask),
+        dtype,
+        True,
+        graph_mode,
+        cudnn_handle,
+        monkeypatch,
+        case_index=21 if mask == "causal" else 22,
+        has_sink=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("window", [None, 16], ids=["causal", "swa"])
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
+def test_native_thd_sink_determinism(dtype, window, paged):
+    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+
+    b, h, hk, d, page, cap, sq, sk = 4, 8, 2, 64, 16, 128, 17, 65
+    rng = torch.Generator().manual_seed(893)
+    records = [tuple(torch.randn(shape, generator=rng).to(dtype) * 0.25 for shape in ((sq, h, d), (sk, hk, d), (sk, hk, d))) for _ in range(3)]
+    sink_cpu = torch.linspace(-3, 3, h)
+    sink = sink_cpu.cuda()
+    q = torch.empty(1, cap, h, d, device="cuda", dtype=dtype)
+    o = torch.empty_like(q)
+    stats = torch.empty(1, h, cap, device="cuda", dtype=torch.float32)
+    npages = (sk + page - 1) // page
+    k = torch.zeros((3 * npages, page, hk, d) if paged else (1, b * sk, hk, d), device="cuda", dtype=dtype)
+    v = torch.zeros_like(k)
+    if paged:
+        for i, (_, ki, vi) in enumerate(records):
+            for pg in range(npages):
+                n = min(page, sk - pg * page)
+                k[i * npages + pg, :n].copy_(ki[pg * page : pg * page + n])
+                v[i * npages + pg, :n].copy_(vi[pg * page : pg * page + n])
+    table = torch.empty(b, npages, device="cuda", dtype=torch.int32)
+    cq = torch.empty(b + 1, device="cuda", dtype=torch.int32)
+    ck = torch.empty_like(cq)
+    descs = []
+    for name, t in (("q", q), ("k", k), ("v", v), ("o", o)):
+        view = t.transpose(1, 2)
+        shape = (b, h, sq, d) if name in ("q", "o") else (b, hk, sk, d) if not paged else tuple(view.shape)
+        descs.append(
+            TensorDesc(
+                dtype=dtype,
+                shape=shape,
+                stride=tuple(view.stride()),
+                stride_order=tuple(sorted(range(4), key=lambda i: view.stride(i))),
+                device=torch.device("cuda:0"),
+                name=name,
+            )
+        )
+    lse = TensorDesc(dtype=torch.float32, shape=(b, h, sq), stride=tuple(stats.stride()), stride_order=(2, 1, 0), device=torch.device("cuda:0"), name="lse")
+    api = SdpaFwdDslSm80(
+        *descs,
+        sample_lse=lse,
+        has_sink=True,
+        is_causal=True,
+        causal_bottom_right=window is not None,
+        window_size_left=None if window is None else window - 1,
+        thd=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+        max_total_seq_len_q=cap,
+        paged_page_size=page if paged else None,
+        paged_max_seq_len_kv=sk if paged else None,
+        paged_table_stride=tuple(table.stride()) if paged else None,
+        paged_table_v_stride=tuple(table.stride()) if paged else None,
+        tile_m=64,
+        tile_n=64,
+        sched_policy=0,
+    )
+    assert api.check_support()
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+
+    def bind(order):
+        q.zero_()
+        table.fill_(-73)
+        qprefix, kprefix = [0], [0]
+        for batch, index in enumerate(order):
+            if index >= 0:
+                q[0, qprefix[-1] : qprefix[-1] + sq].copy_(records[index][0])
+                if not paged:
+                    k[0, kprefix[-1] : kprefix[-1] + sk].copy_(records[index][1])
+                    v[0, kprefix[-1] : kprefix[-1] + sk].copy_(records[index][2])
+                table[batch].copy_(torch.arange(index * npages, (index + 1) * npages, device="cuda", dtype=torch.int32))
+            qprefix.append(qprefix[-1] + (sq if index >= 0 else 0))
+            kprefix.append(kprefix[-1] + (sk if index >= 0 else 0))
+        cq.copy_(torch.tensor(qprefix, device="cuda", dtype=torch.int32))
+        ck.copy_(torch.tensor(kprefix, device="cuda", dtype=torch.int32))
+        return qprefix
+
+    def launch(sink_value=sink):
+        api.execute(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            o.transpose(1, 2),
+            stats,
+            sinks=sink_value,
+            seq_q_lens=cq,
+            seq_kv_lens=ck,
+            workspace=workspace,
+            block_table=table if paged else None,
+            block_table_v=table if paged else None,
+        )
+
+    bind((0, -1, -1, -1))
+    o.fill_(71)
+    stats.fill_(71)
+    workspace.fill_(73)
+    for invalid in (None, sink.half(), sink[:-1], sink.cpu()):
+        with pytest.raises(ValueError):
+            launch(invalid)
+        assert torch.all(o == 71) and torch.all(stats == 71) and torch.all(workspace == 73)
+
+    def run():
+        launch()
+        return {"o": o[0, :sq], "lse": stats[0, :, :sq]}
+
+    expected = assert_replays(run, repeats=4)
+    qq, kk, vv = records[0]
+    scores = qq.double().transpose(0, 1) @ kk.double().transpose(0, 1).repeat_interleave(h // hk, 0).transpose(-1, -2) / math.sqrt(d)
+    qp = torch.arange(sq)[:, None] + (sk - sq if window is not None else 0)
+    kp = torch.arange(sk)[None, :]
+    scores.masked_fill_(kp > qp, -torch.inf)
+    if window is not None:
+        scores.masked_fill_(kp < qp - window + 1, -torch.inf)
+    lref = torch.logaddexp(scores.logsumexp(-1), sink_cpu.double()[:, None])
+    oref = (torch.exp(scores - lref[..., None]) @ vv.double().transpose(0, 1).repeat_interleave(h // hk, 0)).transpose(0, 1)
+    torch.testing.assert_close(expected["o"].cpu().double(), oref, atol=3e-3, rtol=1e-2)
+    torch.testing.assert_close(expected["lse"].cpu().double(), lref, atol=2e-3, rtol=1e-3)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            launch()
+        for order in ((0, 1, -1, -1), (1, 0, 0, -1), (1, 0, 2, 0)):
+            prefix = bind(order)
+            graph.replay()
+            for batch, index in enumerate(order):
+                if index == 0:
+                    begin = prefix[batch]
+                    actual = snapshot({"o": o[0, begin : begin + sq], "lse": stats[0, :, begin : begin + sq]})
+                    assert_bitwise(actual, expected, f"batch order {order}, target {batch}")
+        # Mutating another sequence's pages must not change either target copy.
+        (k[npages : 2 * npages] if paged else k[0, :sk]).mul_(-0.5)
+        (v[npages : 2 * npages] if paged else v[0, :sk]).add_(0.75)
+        graph.replay()
+        assert_bitwise(snapshot({"o": o[0, sq : 2 * sq], "lse": stats[0, :, sq : 2 * sq]}), expected, "changed neighbor")
+    finally:
+        graph.reset()
+    assert_golden(
+        f"sdpa-sm80-thd-{'paged' if paged else 'dense'}-sink-{str(dtype).split('.')[-1]}-window{window}",
+        {"q": qq, "k": kk, "v": vv, "sink": sink_cpu},
+        expected,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("dims", [(64, 64), (256, 256), (576, 512)])
+def test_native_thd_paged_sink_endpoints(dtype, graph_mode, dims, cudnn_handle, monkeypatch):
+    """Disabled/dominating sinks retain defined O/Stats with zero live KV."""
+    test_native_paged_adapter_rebind_replay(
+        (*dims, 16, "HND", "NHD", "causal"),
+        dtype,
+        True,
+        graph_mode,
+        cudnn_handle,
+        monkeypatch,
+        case_index=23,
+        has_sink=True,
+        sink_endpoints=True,
+    )

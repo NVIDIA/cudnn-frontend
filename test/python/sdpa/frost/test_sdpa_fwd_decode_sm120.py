@@ -298,6 +298,9 @@ def test_sm120_knob_admission_for_the_decode_tile():
     assert mismatch(half, _facts(h_q=24, h_kv=4, d_qk=256, d_v=256), knobs(16, 16)) is None
     assert mismatch(half, _facts(h_q=64, h_kv=8, d_qk=64, d_v=64), knobs(32, 32)) is None
     assert mismatch(half, _facts(has_sink=True), knobs(16, 16, split=4)) is None
+    # Unequal small widths can require a48-key stage, not only powers of two.
+    assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(16, 48, split=3)) is None
+    assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(64, 48)) is not None
     fp8 = next(s for s in _fp8_specs()).capabilities
     fp8_facts = _facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
     assert "outside this engine's domain" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
@@ -513,6 +516,7 @@ def test_decode_tile_matches_reference(h_q, h_kv, s_q, s_kv, d, tile_m, split, s
 @pytest.mark.parametrize(
     "d,d_v,split",
     [
+        pytest.param(24, 40, 3, marks=pytest.mark.L0),  # unequal tiles require a48-key K/V stage
         pytest.param(72, 72, 1, marks=pytest.mark.L0),  # head tile 80: TMA zero-fills the pad columns, one copy per swizzle chunk
         pytest.param(88, 88, 3, marks=pytest.mark.L1),  # head tile 96, 16-key stages
         pytest.param(128, 120, 2, marks=pytest.mark.L1),  # V envelope only

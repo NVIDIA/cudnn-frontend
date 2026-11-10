@@ -58,15 +58,16 @@ NGC enabled CUDA 13.3 forward compatibility (driver 610.43.02 over host kernel
 driver 580.159.03).
 
 In a separate instance of the same image, installing torch 2.14.0+cu130 and
-looseversion and running the following produced **33 passed, 2 xfailed**:
+looseversion and running the following produced **33 passed, 2 xfailed** (the BSA files were then named
+`test_BSA_attention_forward.py` and `test_BSA_attention_backward.py`):
 
 ```bash
 python -m pip install 'torch==2.14.0' --index-url https://download.pytorch.org/whl/cu130
 python -m pip install looseversion
 cd /opt/cudnn-frontend/test/python
 python -m pytest -s -q \
-  block_sparse_attention/cutedsl/test_BSA_attention_forward.py \
-  block_sparse_attention/cutedsl/test_BSA_attention_backward.py \
+  block_sparse_attention/cutedsl/test_BSA_forward.py \
+  block_sparse_attention/cutedsl/test_BSA_backward.py \
   block_sparse_attention/cutedsl/test_BSA_jax_parity.py \
   gemm/jax/test_gemm_amax_jax.py \
   gemm/jax/test_gemm_srelu_dsrelu_jax.py

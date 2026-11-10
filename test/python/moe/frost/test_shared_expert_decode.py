@@ -496,14 +496,14 @@ def test_import_cudnn_does_not_import_the_kernel_or_torch():
 
 
 def test_docs_rows_exist_for_the_api():
-    """The determinism status page carries the API's row (SM90 unsupported, SM100/103 supported with the cc 10.3-verified / cc 10.0-unverified
-    limit stated in the cell, SM107 unverified) and the goldens README its suite section; the operations docs page and the navigation entry
-    exist."""
+    """The determinism status page carries the API's row (SM90 unsupported; SM100/103 supported -- replay and batch invariance verified on
+    cc 10.0 and cc 10.3, so the cell carries no limit; SM107 unverified) and the goldens README its suite section; the operations docs page
+    and the navigation entry exist."""
     det = (REPO / "docs" / "operations" / "determinism.md").read_text()
     row = [l for l in det.splitlines() if l.startswith("| `SharedExpertDecode`")]
     assert len(row) == 1, "one SharedExpertDecode row on the status page"
     cells = [c.strip() for c in row[0].strip("|").split("|")]
-    assert cells[3] == "Unsupported" and cells[4].startswith("Supported (cc 10.3 verified; cc 10.0 unverified") and cells[5] == "Unverified", cells
+    assert cells[3] == "Unsupported" and cells[4] == "Supported" and cells[5] == "Unverified", cells
     readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
     assert "SharedExpertDecode" in readme and "test_shared_expert_decode_determinism.py" in readme
     assert (REPO / "docs" / "operations" / "moe" / "shared_expert_decode.md").exists()

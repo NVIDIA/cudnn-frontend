@@ -50,6 +50,7 @@ import cudnn
 
 from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import (
+    DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
     DTYPE_E4M3,
     DTYPE_E5M2,
@@ -659,7 +660,8 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # is the rule's host reading, the one the split model prices a launch's combine
 # by; it answers False off cc 10.7, where the module's own forms (measured on
 # B200 / B300 by their author) serve every launch.
-DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
+# DECODE_COMBINE_MAX_LEAN_BLOCKS is re-exported from the shared tile constants
+# so the reduction kernel can read the same bound without an adapter cycle.
 # The split-aware FORM rule the adapter pins a split launch's combine entry to
 # (decode_combine_grid_selected; the kernel module's own entry takes the
 # decode-grid kernel on every launch inside its bound, so the adapter forces the

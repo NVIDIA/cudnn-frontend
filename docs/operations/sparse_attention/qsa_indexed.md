@@ -46,7 +46,9 @@ and never exceed the query's absolute token ID. A tail begins at the document's
 own block origin; packed document starts need not be divisible by four. Groups
 may appear in any order and padding groups may occur between selected groups.
 Groups must not overlap or repeat within a row. These device-value relationships
-are caller contracts; execution does not read indices back to the host.
+are caller contracts; execution does not read indices back to the host. A row's
+blocks accumulate in the order of its groups, so the result bytes follow that
+order.
 
 The Relax layout with 512 complete four-token groups plus a four-slot causal
 tail fits directly, including invalid tail slots. A 2051-wide carrier must be
@@ -60,8 +62,9 @@ over them. A nonfinite K/V value of a masked token adds exact zeros, and one of
 a selected token poisons its queries. Every call rebuilds metadata, including
 during CUDA Graph replay. The backward compiles different kernels below and
 above the 22528-token dense crossover, from 196608 tokens on, and for each
-`ds_precision`. Before capture, warm up with the query head count, token
-counts, `max_seq_len` and `ds_precision` the capture will use.
+`ds_precision` and `deterministic` value. Before capture, warm up with the
+query head count, token counts, `max_seq_len`, `ds_precision` and
+`deterministic` the capture will use.
 
 The public wrappers allocate outputs and one workspace. The internal APIBase
 plan validates current storage and uses only caller-owned buffers in execute;
@@ -116,9 +119,13 @@ These device-value promises are caller contracts, not host-side checks.
 Use `general` for arbitrary selections. Passing `cu_seqlens` or `max_seq_len`
 with `general` is rejected because that mode obtains its bounds from indices.
 The keyword-only arguments preserve existing positional calls. `ds_precision`
-(`"fp32"` by default, or `"bf16"`) applies to both modes. Both modes run the
+(`"fp32"` by default, or `"bf16"`) and `deterministic` (`False` by default)
+apply to both modes. `deterministic=True` repeats the bytes when every
+document's groups lie on one four-token grid, which `causal_topk` requires and
+`general` does not check. Both modes run the
 backward engine described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)),
-which also describes `ds_precision` and gives the record and workspace sizing.
+which also describes `ds_precision` and `deterministic` and gives the record
+and workspace sizing.
 
 The 12Q/1KV and 6Q/1KV backward requires the **CUDA 13 CuTeDSL compiler** in
 addition to the CuTeDSL versions and architectures above. A CUDA 13 PyTorch

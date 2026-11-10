@@ -3,11 +3,10 @@
 
 """PyTorch integration for the cuDNN frontend Python API.
 
-On PyTorch versions with ``torch.backends.cuda.enable_cudnn_sdp_python``,
+On PyTorch versions with ``torch.nn.attention.enable_cudnn_sdp_python``,
 that switch serves PyTorch's cuDNN SDPA ops from this package:
 
-    torch.backends.cuda.enable_cudnn_sdp_python(True)
-    # or TORCH_CUDNN_SDPA_USE_PYTHON=1 for an unmodified script
+    torch.nn.attention.enable_cudnn_sdp_python(True)
 
 It calls ``install_sdpa_overrides()`` and keeps the returned handle.
 

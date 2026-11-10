@@ -4002,39 +4002,37 @@ inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
 
-    // CHECK IF NEED TO OVERRIDE HEURISTICS QUERY
+    // A node's preferred engine (INode::override_heuristics_query) goes FIRST and the heuristics' configs follow it:
+    // the deterministic SDPA backward on Blackwell needs the part's own bprop engine, which no heuristics mode proposes
+    // (they return only the SM80 bprop over a quadratic dS workspace, 5-26x slower on cc 10.7, or nothing for D192 /
+    // D256). A preference that the backend cannot create is skipped with a WARN (cuDNN 9.24.0.43 declines engine 17 on
+    // cc 10.7); one that is created but fails later leaves the heuristics' configs behind it for build_plans.
+    bool preferred_enqueued = false;
     for (auto &sub_node : sub_nodes) {
         if (auto [engine_id, user_knobs] = sub_node->override_heuristics_query(); engine_id != -1) {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: Overriding heuristics query with engine ID "
-                                    << engine_id << " and user knobs " << nlohmann::json(user_knobs).dump());
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Preferring engine ID " << engine_id << " with user knobs "
+                                                                  << nlohmann::json(user_knobs).dump()
+                                                                  << " ahead of the heuristics query");
 #else
-            CUDNN_FE_LOG_LABEL_ENDL("INFO: Overriding heuristics query with engine ID "
-                                    << engine_id << " and user knobs " << static_cast<int>(user_knobs.size()));
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Preferring engine ID " << engine_id << " with "
+                                                                  << static_cast<int>(user_knobs.size())
+                                                                  << " user knobs ahead of the heuristics query");
 #endif
-            // A node pins an engine where the heuristics place the graph badly (the
-            // deterministic SDPA backward asks for the part's own bprop engine; the
-            // heuristics answer with the SM80 bprop plus a separate dQ matmul over a
-            // quadratic dS workspace, 5-26x slower on cc 10.7). Not every backend
-            // serves the pinned engine on every part, though: cuDNN 9.24.0.43 declines
-            // engine 17 on cc 10.7 at the engine's finalize. That used to surface as
-            // a generic backend-API failure, so nothing could serve the graph -- and
-            // declining the pin for the whole part instead (#2086) handed every
-            // backend the slow heuristics pick. So: try the pin; when the backend
-            // cannot create the pinned engine or its config, nothing has been
-            // enqueued yet, and the graph takes the path a graph without a pin takes
-            // -- the heuristics query below. A failure past the enqueue is a
-            // heuristics-query failure on a finalized config and still propagates.
             int64_t const plan_count_before = get_execution_plan_count();
-            auto pinned_status              = create_execution_plan(engine_id, user_knobs);
-            if (pinned_status.is_good()) {
-                return {error_code_t::OK, ""};
+            auto preferred_status           = create_execution_plan(engine_id, user_knobs);
+            if (preferred_status.is_good()) {
+                preferred_enqueued = true;
+            } else {
+                // Nothing enqueued yet: the graph takes the path a graph without a preference takes. A failure past
+                // the enqueue is a property query on a created config and still propagates.
+                RETURN_CUDNN_FRONTEND_ERROR_IF(get_execution_plan_count() != plan_count_before,
+                                               preferred_status.get_code(),
+                                               preferred_status.get_message());
+                CUDNN_FE_LOG_LABEL_ENDL("WARN: The backend does not serve the preferred engine ID "
+                                        << engine_id << " for this graph on this device ("
+                                        << preferred_status.get_message() << "); using the heuristics query alone.");
             }
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                get_execution_plan_count() != plan_count_before, pinned_status.get_code(), pinned_status.get_message());
-            CUDNN_FE_LOG_LABEL_ENDL("WARN: The backend does not serve the pinned engine ID "
-                                    << engine_id << " for this graph on this device (" << pinned_status.get_message()
-                                    << "); falling back to the heuristics query.");
             break;
         }
     }
@@ -4064,12 +4062,20 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     // Query cuDNN heuristics for non-OPENSOURCE modes
     if (!cudnn_modes.empty()) {
         EngineConfigList op_graph_to_configs;
-        CHECK_CUDNN_FRONTEND_ERROR(detail::query_cudnn_heuristics_impl(operation_graph,
-                                                                       op_graph_to_configs,
-                                                                       cudnn_modes,
-                                                                       context.get_target_sm_count(),
-                                                                       device_properties,
-                                                                       plans.get_max_shared_mem_allowed()));
+        auto heuristics_status = detail::query_cudnn_heuristics_impl(operation_graph,
+                                                                     op_graph_to_configs,
+                                                                     cudnn_modes,
+                                                                     context.get_target_sm_count(),
+                                                                     device_properties,
+                                                                     plans.get_max_shared_mem_allowed());
+        if (heuristics_status.is_bad() && preferred_enqueued) {
+            // The heuristics have nothing for this graph (D192 / D256 deterministic backward), but the preferred config
+            // does: the plan list is that config alone.
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: The heuristics query returned no configs ("
+                                    << heuristics_status.get_message() << "); the preferred engine stands alone.");
+            return {error_code_t::OK, ""};
+        }
+        CHECK_CUDNN_FRONTEND_ERROR(heuristics_status);
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Extracting engine configs.");
 

@@ -750,8 +750,9 @@ treatment at the caller boundary.**
   -> False cell of the arch-aware probe. Renaming one means updating
   FlashInfer's fallbacks first; that test failing is the reminder. The runtime
   probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
-  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
-  cc 10.7 graph to the backend engine.
+  cc 10.7, and no DSL has a target below cc 8.0 (Rule 7): a device-blind
+  "available" is the blind spot that routes a cc 10.7 graph to the backend
+  engine.
 
 **Rule 10 — a kwarg that makes a graph ineligible for the python engines is
 read by the family's analyzer under the spelling of EVERY op that takes it.**

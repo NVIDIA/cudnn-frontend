@@ -28,7 +28,7 @@ import torch
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dense_replay(cga, packed, split, tile_n, dtype, monkeypatch):
+def test_dense_replay(cga, packed, split, tile_n, dtype, monkeypatch, head_dim=128):
     import cudnn
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
     from test_sdpa_fwd_paged_sm100 import _run_graph
@@ -40,7 +40,7 @@ def test_dense_replay(cga, packed, split, tile_n, dtype, monkeypatch):
 
     def compile_native(api):
         original(api)
-        assert api.flavor == (128, 128)
+        assert api.flavor == (head_dim, head_dim)
         assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
         assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
         assert api._k_mod.CFG.CTA_MMA == cga
@@ -51,7 +51,7 @@ def test_dense_replay(cga, packed, split, tile_n, dtype, monkeypatch):
         4,
         24,
         2,
-        128,
+        head_dim,
         16,
         64,
         [1024, 257, 65, 0],
@@ -100,7 +100,8 @@ def test_page_boundaries(dims, page, sq, cga, split, packed, policy, empty, monk
 
     def compile_native(api):
         original(api)
-        assert api.flavor == (128, 128)
+        width = 64 if max(dims) <= 64 else 128
+        assert api.flavor == (width, width)
         assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
         assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
 

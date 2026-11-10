@@ -242,10 +242,25 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     fp8 = replace(facts, is_fp8=True)
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
-    # The SM120 paged prepared path serves only dense half D128 without splits.
-    paged = replace(facts, has_paged_kv=True)
-    assert (engines._prepared_decline_reason(spec.capabilities, paged, 1) is None) == (d == 128)
-    assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is not None
+    # Prepared binding serves half through D256 and the D512 envelope;
+    # concrete tiles distinguish unsplit small prefill from decode and D512.
+    paged = replace(facts, has_paged_kv=True, padded=True, page_size=16)
+    assert engines._prepared_decline_reason(spec.capabilities, paged, 1) is None
+    assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is None
+    if d <= 128:
+        # Tile-only knobs keep the default unsplit value (None) legal.
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64)) is None
+        reason = engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, split_kv=2))
+        assert reason is not None and "decode tile" in reason
+    if d <= 256:
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=16, split_kv=2)) is None
+    if d == 256:
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, split_kv=1)) is not None
+    if d == 512:
+        for split in (1, 3):
+            assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
+        for dims in ((256, 512), (512, 256), (513, 512), (257, 512)):
+            assert engines._prepared_decline_reason(spec.capabilities, replace(paged, d_qk=dims[0], d_v=dims[1]), 1) is not None
     for change in (dict(thd=True), dict(is_fp8=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(paged, **change), 1) is not None, change
     assert engines._prepared_decline_reason(spec.capabilities, replace(facts, is_mxfp8=True), 1) is not None
@@ -342,7 +357,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
     else:
         assert reason is not None
         if arch == "sm120" and feature == "paged":
-            assert "SM120 paged KV requires exact FP16/BF16 D128" in reason
+            assert "SM120 paged KV requires FP16/BF16" in reason
         else:
             assert "prepared" in reason
 
@@ -975,7 +990,7 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     # Row claims: the MXFP8 and half rows carry the arm in every flavor; per-tensor FP8 never does (the
     # kernel folds descale_q * descale_k into the softmax scale, so the fold is a contract fork there).
     every = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    assert specs["sdpa_fwd_prefill_sm107"].capabilities.attn_scale_prefolded_d_shapes == every
+    assert specs["sdpa_fwd_prefill_sm107"].capabilities.attn_scale_prefolded_d_shapes == every | {(576, 512)}
     assert specs["sdpa_fwd_prefill_sm107_mxfp8"].capabilities.attn_scale_prefolded_d_shapes == every
     assert specs["sdpa_fwd_prefill_sm107_fp8"].capabilities.attn_scale_prefolded_d_shapes is None
     assert "not wired" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, facts)
@@ -1073,17 +1088,20 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # Capabilities.pack_gqa_partial_d_shapes as a module tuple because the
     # adapter has no engine row in hand when it validates a knob request.  Pin
     # the two together so the gate cannot drift: the f16 SM100 row declares
-    # exactly the adapter's flavors. Native SM107 admits D64, paged D192/V128 and D512;
+    # exactly the adapter's flavors. Native SM107 admits D64, paged D192/V128, D512 and D576/V512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
-    # requires whole groups. Quantized and SM120 routes retain their gates.
+    # requires whole groups. Native SM90 D512 admits gcd-based subgroups.
+    # Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     assert by_name[engines.engine_name()].pack_gqa_partial_d_shapes == frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS)
     assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
-    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512)})
-    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
+    assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512), (576, 512)})
+    native_sm90 = engines.engine_name(arch="sm90")
+    assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107, native_sm90)}
     assert all(v is None for v in others.values()), others
 
 
@@ -1879,8 +1897,32 @@ def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
     for d_qk in range(264, 513, 8):
         for d_v in range(264, 513, 8):
             assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
-    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (520, 512), (512, 520)):
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (584, 512), (512, 520)):
         assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+
+
+def test_sm120_probe_d576_envelope_pairs(monkeypatch):
+    """D576/V512 is a half-only extension; independent eight-aligned widths."""
+    from cudnn.sdpa.fwd.config_sm120 import pick_flavor, smem_bytes
+    from types import SimpleNamespace
+
+    native = cudnn._pybind_module._SdpaDenseBinder
+    flags = {name: getattr(native, name) for name in dir(native) if name.startswith("supports_")}
+    flags["supports_d576_envelope"] = True
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    for d_qk in range(520, 577, 8):
+        for d_v in range(264, 513, 8):
+            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+            assert pick_flavor(d_qk, d_v, False) == (576, 512)
+            assert pick_flavor(d_qk, d_v, True) is None
+            assert smem_bytes(d_qk, d_v, 64, 32) == 98328
+    for d_qk, d_v in ((576, 256), (584, 512), (576, 520), (516, 512)):
+        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+    flags.pop("supports_d576_envelope")
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
+    assert _SM120 not in _eligible(_mk_sm120_graph(d=520, d_v=504))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=576, d_v=512))
 
 
 def test_sm120_probe_accepts_right_band_widening(monkeypatch):
@@ -2354,10 +2396,12 @@ def test_bwd_probe_gqa(monkeypatch):
 
 
 def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
-    # Envelope: any multiple of 8 up to 256 (adapter pads); reject the rest.
+    # Eight-aligned native envelopes cover widths through 512.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert not _bwd_eligible(_mk_bwd_graph(d=100))
-    assert not _bwd_eligible(_mk_bwd_graph(d=264))
+    assert not _bwd_eligible(_mk_bwd_graph(d=520))
+    for width in (264, 504, 512):
+        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=width))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
@@ -2666,8 +2710,8 @@ def test_paged_fp8_probe_accepts_and_declines():
 
 def test_paged_quantized_rows_mismatch_reasons():
     """The row-level reasons, by field: the SM100 MXFP8 row admits F8_128x4 pools at
-    page_size % 128 only, the Rubin per-tensor FP8 row does not admit pools (its sibling
-    kernel has no PAGED_KV specialization), and the SM100 FP8 row's paged sub-gates name
+    page_size % 128 only, the Rubin per-tensor FP8 row admits dense-query D512 pools,
+    and the SM100 FP8 row's paged sub-gates name
     THD and unsupported asymmetric head dimensions."""
 
     def paged_facts(**kw):
@@ -2693,11 +2737,14 @@ def test_paged_quantized_rows_mismatch_reasons():
     fp8 = spec[engines.engine_name(fp8=True)].capabilities
     mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
     fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
-    assert fp8.paged_kv and mxfp8.paged_kv and not fp8_rubin.paged_kv
+    assert fp8.paged_kv and mxfp8.paged_kv and fp8_rubin.paged_kv
+    assert fp8_rubin.paged_d_shapes == frozenset({(512, 512)})
     assert engines.mismatch(fp8, paged_facts(is_fp8=True)) is None
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
-    assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
+    assert "d512 kernel flavors only" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
+    assert engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert "native per-tensor D128/D256 on SM100/SM103" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512, thd=True))
     for cc in ((10, 0), (10, 3)):
         for d in (128, 256):
             assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
@@ -2706,7 +2753,7 @@ def test_paged_quantized_rows_mismatch_reasons():
     # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
-    assert "wired on the d64, d128, d256 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    assert "wired on the d64, d128, d256, d512 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
@@ -3462,16 +3509,14 @@ def test_fp8_bwd_dtype_facts():
 
 @pytest.mark.parametrize("cc", [(10, 7), (10, 0), (12, 0), (8, 0)], ids=["sm107", "sm100", "sm120", "sm80"])
 def test_fp8_bwd_every_other_row_declines_by_message(monkeypatch, cc):
-    """Exactly ONE backward row serves sdpa_fp8_backward -- ``sdpa_bwd_sm107_fp8``
-    (d = 256 E4M3) on the Rubin line -- and every OTHER backward row (and every
-    forward row) declines it with a REASON on every arch.  A row in the device's
-    SM range must fall through to the quantization-family gate, not raise.
-    (Written as "no row serves it yet" in 3a816a02; the sm107 arm inverted when
-    the row registered in 54ad0710.)"""
+    """The native Rubin and SM120 rows serve D256 per-tensor FP8 backward;
+    every other backward row and every forward row declines with a reason.
+    A row in the device's SM range reaches the quantization-family gate.
+    """
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     g, _ = _mk_fp8_bwd_graph(use_causal_mask=True)
     facts = _facts(g)
-    served = {"sdpa_bwd_sm107_fp8"} if cc == (10, 7) else set()
+    served = {(10, 7): {"sdpa_bwd_sm107_fp8"}, (12, 0): {"sdpa_bwd_sm120_fp8"}}.get(cc, set())
     assert _bwd_eligible(g) == served and not _eligible(g)
     sm = cc[0] * 10 + cc[1]
     for spec in bwd_engines.ENGINE_SPECS:

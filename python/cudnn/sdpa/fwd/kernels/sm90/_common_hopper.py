@@ -61,8 +61,8 @@ def owned_row(tid, row_half: cutlass.Constexpr):
 
 
 @cute.jit
-def mma_qk(mma_params, scores, *, ab_dtype: cutlass.Constexpr):
-    """Compute one 64x64 QK tile with 32 K-major k16 SS steps.
+def mma_qk(mma_params, scores, *, ab_dtype: cutlass.Constexpr, head_tile: cutlass.Constexpr = 512):
+    """Compute one 64x64 QK tile over the native K-major contraction.
 
     ``mma_params`` supplies 16-byte-unit Q/K descriptors; wait(0) completes
     the 32-slot C fragment before it is stored in ``scores``.
@@ -71,7 +71,7 @@ def mma_qk(mma_params, scores, *, ab_dtype: cutlass.Constexpr):
     c = cutlass.Vector.from_elements((cutlass.Float32(0.0),) * 32, cutlass.Float32)
     # One group keeps the k steps in flight; wait(0) completes C before the store.
     prims.wgmma_fence_aligned()
-    for k in cutlass.range_constexpr(32):
+    for k in cutlass.range_constexpr(head_tile // 16):
         offset = (k // 4) * 512 + (k % 4) * 2
         c = wgmma_m64nNk16_f32(c, q_desc + offset, k_desc + offset, ab_dtype, accumulate=k != 0)
     prims.wgmma_commit_group_sync_aligned()
@@ -81,7 +81,7 @@ def mma_qk(mma_params, scores, *, ab_dtype: cutlass.Constexpr):
 
 @cute.jit
 def mma_pv(mma_params, p, is_first_kv_tile: cutlass.Constexpr, *, ab_dtype: cutlass.Constexpr):
-    """Compute one 64x256 O half with four k16 PV steps.
+    """Compute one native-width O half with four k16 PV steps.
 
     ``p`` is 16 RS words for WG1 or a K-major P descriptor for WG2. The
     fence/commit/wait group completes C before the output store.
@@ -149,16 +149,16 @@ def store_fragment(words: cutlass.Vector, region: cutlass.Array, tid):
 
 
 @cute.jit
-def zero_v_tail_rows(region: cutlass.Array, row_lo, tid, dtype: cutlass.Constexpr):
+def zero_v_tail_rows(region: cutlass.Array, row_lo, tid, dtype: cutlass.Constexpr, columns: cutlass.Constexpr = 256):
     """Zero rows ``[row_lo, 64)`` of one 64-row V half before PV reads it.
 
-    ``region`` is the half's four SW128 slabs (4096 elements each, row ``r`` at
+    ``region`` contains ``columns // 64`` SW128 slabs (4096 elements each, row ``r`` at
     ``64 * r``). SW128 permutes 16-byte chunks only within a 128-byte row, so whole rows
-    are cleared without the swizzle. All 128 lanes take 16 of the 2048 16-byte stores.
+    are cleared without the swizzle. All 128 lanes cover only the owned half.
     The caller owns the async-proxy fence and the warpgroup barrier before WGMMA.
     """
     zero = cutlass.Vector.from_elements(tuple(dtype(0.0) for _ in range(8)), dtype)
-    for step in cutlass.range_constexpr(16):
+    for step in cutlass.range_constexpr(columns // 16):
         index = step * cute.arch.THREADS_PER_WARPGROUP + tid
         row = (index // 8) % 64
         if row >= row_lo:

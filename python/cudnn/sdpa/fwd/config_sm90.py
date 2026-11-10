@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Kernel-facing configuration for the FROST SM90 D512 SDPA prefill template.
+"""Kernel-facing configuration for the FROST SM90 SDPA forward templates.
 
 The frozen ``TemplateParams`` record contains only graph declarations and
 selected tuning knobs. Runtime lengths, pointers, and packed token totals stay
 out of compile keys. Graph-adapter declaration logic lives with the adapter;
-this module keeps the small interface consumed by the kernel.
+this module keeps the small interface consumed by the native D64/D128/D256/D512 kernels.
 """
 
 from __future__ import annotations
@@ -21,17 +21,39 @@ SCALE_ZERO = 0
 SCALE_NEGATIVE = -1
 
 
-# The D envelope. Every WGMMA descriptor and SMEM slab is 512 columns wide, so any
-# head dim up to that tile is computed on it: the GMEM descriptors carry the actual
-# extent, loads past it zero-fill and O stores past it clip. 8 is the TMA 16-byte
-# global-stride rule at 2 bytes per element. A small D pays the full D512 tile cost;
-# this is envelope coverage, not a native small-D flavor.
+# Maximum envelope. The adapter selects native 128/256/512-column storage and
+# contraction; exact dense D64 keeps its separate body. GMEM maps carry the actual
+# extents, with zero-filled loads and clipped stores at head tails. Eight elements
+# satisfy the TMA 16-byte global-stride rule for both half types.
 D_TILE = 512
 D_ALIGN = 8
-# Fixed SM90 D512 instruction geometry, matching the FFPA donor. QK is
-# m64n64k512 and each PV half is m64n256k64; these are not tuning axes.
+# Sequence tile geometry shared by the native head widths.
 TILE_M = 64
 TILE_N = 64
+
+
+def native_d64_mismatch(
+    *,
+    thd=False,
+    sink=False,
+    pack_gqa=False,
+    q_lengths=False,
+    kv_lengths=False,
+    window_left=None,
+    window_right=None,
+    bottom_right=False,
+    s_q=0,
+    s_kv=0,
+    split_kv=1,
+):
+    """The bounded native D64 leg, shared by graph and standalone admission."""
+    if split_kv != 1:
+        return "native SM90 D64 does not support split-KV"
+    if thd or sink or pack_gqa or q_lengths or kv_lengths or window_left is not None or window_right is not None:
+        return "native SM90 D64 serves dense, unpadded, unpacked Q/K/V without sinks or window bands"
+    if bottom_right and s_q > s_kv:
+        return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    return None
 
 
 def head_dims_mismatch(d_qk, d_v) -> str | None:
@@ -91,6 +113,9 @@ class TemplateParams:
     # layout. The setup launch turns each offset into a token origin, so padded THD (gaps between
     # sequences, TE's cu_seqlens_padded) is read and written where the caller put it.
     thd_origins: tuple | None = None
+    split_kv: int = 1
+    # Native contraction/storage envelope; independent of runtime lengths.
+    head_tile: int = 512
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -125,10 +150,18 @@ BAND_COORDINATE_LIMIT = 2**30
 
 def validate_params(params: TemplateParams) -> None:
     """Validate the immutable specialization before constructing a kernel."""
+    if type(params.head_tile) is not int or params.head_tile not in (128, 256, 512):
+        raise ValueError("SM90 head_tile must be 128, 256 or 512")
+    if type(params.split_kv) is not int or not 1 <= params.split_kv <= 65535:
+        raise ValueError("SM90 split_kv must be an integer in [1, 65535]")
+    if params.thd_varlen and params.split_kv > 1:
+        raise ValueError("SM90 split-KV requires dense Q")
     if params.dtype_qkv not in (DTYPE_FP16, DTYPE_BF16):
         raise ValueError("SM90 D512 requires uniform FP16 or BF16 Q/K/V/O")
-    if params.qh_per_kh < 1 or (params.pack_gqa and TILE_M % params.qh_per_kh):
-        raise ValueError("SM90 D512 PackGQA requires a positive head ratio dividing tile_m=64")
+    from .config_sm100 import pack_gqa_supported
+
+    if params.qh_per_kh < 1 or (params.pack_gqa and not pack_gqa_supported(params.qh_per_kh, 1, TILE_M, partial=True)):
+        raise ValueError("SM90 D512 PackGQA requires a positive head ratio sharing a factor with tile_m=64")
     if params.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError("SM90 D512 supports only NATURAL/LPT/LPT_L2 single-tile scheduling")
     if params.thd_varlen and params.sched_policy != SCHED_NATURAL:

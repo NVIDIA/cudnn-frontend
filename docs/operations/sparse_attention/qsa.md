@@ -43,6 +43,7 @@ def qsa_backward(
     scale: float,
     block_size: int = 4,
     ds_precision: str = "fp32",
+    deterministic: bool = False,
 ) -> TupleDict:
     ...  # dq, dk, dv
 ```
@@ -50,6 +51,8 @@ def qsa_backward(
 `ds_precision` selects how dS reaches the dQ MMAs. `"fp32"` feeds three bf16
 parts of its fp32 value, which keeps a dQ whose terms nearly cancel accurate.
 `"bf16"` rounds dS to bf16 (on the dense prefix, P as well) at a lower cost.
+`deterministic=True` returns the same gradient bytes on every run with the
+same inputs and packed layout, at a lower speed.
 
 Both calls return a `TupleDict`. Tuple unpacking follows the order above; string
 keys have the same names. Forward and backward are explicit calls. The forward
@@ -89,14 +92,16 @@ not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
 On every architecture both training entries run one backward engine
-(`cudnn.QSA.kernels.bprop_sm100`): the prefix of every sequence
+(`cudnn.QSA._backward` launching the kernels of `cudnn.QSA.kernels.bprop_sm100`,
+and on SM107 the Rubin dense pair, query-major and key-major kernels of
+`cudnn.QSA.kernels.bprop_sm107`): the prefix of every sequence
 (its first 20480 queries, or all of them below 22528 tokens) on a dense
 key-tile kernel that masks per key token through a bitmap, the remaining
 queries on a query-major pass that writes P / dS records and a key-major pass
 that accumulates dK / dV through an inverted block-to-query index, so no
 per-pair floating-point atomics are issued. The records are bounded by query
-windows (about 0.4 GiB at 128K for 12Q/1KV, 0.8 GiB for 24Q/2KV), so the whole
-backward workspace of the bitmap entry stays about 2.7 GiB and 5.1 GiB.
+windows, so the backward workspace of the bitmap entry grows with the token
+count and not with the number of selected pairs.
 Blocks may start anywhere, the key bounds may cut them, and a query sees every
 selected key within `lo <= j <= hi`, keys after itself included. A query inside
 the dense prefix of a long sequence that selects a key past that prefix leaves
@@ -168,8 +173,9 @@ then cast output to BF16. Empty rows produce zero output and negative-infinity L
 Backward compacts the current selection, computes
 `delta = sum(grad_out * out_fp32, dim=-1)`, reconstructs probabilities from QK
 and LSE, and forms dQ/dK/dV. Accumulation uses FP32; output gradients use BF16.
-K/V gradient contributions from all query heads are summed. Floating-point
-reductions can change low bits between runs. The dense prefix of each sequence
+K/V gradient contributions from all query heads are summed. Without
+`deterministic=True`, floating-point reductions of the dense prefix can change
+low bits between runs. The dense prefix of each sequence
 runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
 on chip; the remaining queries write bf16 P / dS records that a key-major pass
 sums per block, so no per-pair floating-point atomics are issued. dS reaches
@@ -213,6 +219,15 @@ at 512 blocks. The backward caps queries past the dense prefix at 513 blocks
 Pass the same Q/K/V, selection, metadata, and scale to both calls. Casting `out`
 back to FP32 does not reconstruct `out_fp32`.
 
+With `deterministic=True` the backward returns the same `dq`, `dk` and `dv`
+bytes on every run with the same inputs and packed layout: the FP32
+accumulators of the dense prefix add in an order the layout fixes, which the
+other accumulators do in both modes while no two blocks share a token. The
+bytes follow that layout, the GPU's SM count and `ds_precision`
+([docs](/operations/determinism), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/determinism.md)).
+The ordered adds make the dense prefix slower, most with `ds_precision="bf16"`,
+and a plan without a sparse path carries two more FP32 dK / dV accumulators.
+
 ## Support and execution
 
 Supported geometry is BF16, head dimension 256, head counts 24Q/2KV, 12Q/1KV or
@@ -225,26 +240,30 @@ The public functions select one of two architecture families internally:
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_qsa_bwd_*` (dense pair, query-major, key-major and index kernels) |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine, compiled for SM107) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine with its SM107 dense pair, query-major and key-major kernels) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
-Rubin compaction scans 16 selection bytes per lane and preserves block order.
+Selection rows are compacted 16 bytes per lane on every architecture, preserving block order.
 CuTeDSL 4.7 or newer is
-required; Rubin also requires a build with the `sm_107a` target.
+required; Rubin also requires a build with the `sm_107a` target. On SM107 the
+backward runs Rubin flavors of the dense pair, query-major and key-major kernels,
+which use the oversized shared memory carveout and a 576-column TMEM allocation
+where those pay off. A driver without the oversized carveout (older than CUDA
+13.4) runs the SM100 kernels on SM107.
 
 Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. The backward compiles different kernels below and
 above the 22528-token dense crossover, from 196608 tokens on, and for each
-`ds_precision`. Before CUDA graph capture, warm up with the head geometry,
-token counts and `ds_precision` the capture will use.
+`ds_precision` and `deterministic` value. Before CUDA graph capture, warm up
+with the head geometry, token counts, `ds_precision` and `deterministic` the
+capture will use.
 Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
 `[T, NB]` compact-index buffer and int32 `[T]` counts. Backward compacts the
 selection again into the same int32 `[T, NB]` indices and `[T]` counts and adds
 one workspace: FP32 dQ / dK / dV accumulators,
 `[T, Hq]` delta, the per-token dense bitmap, the sequence tables and, past the
-dense prefix, the P / dS record windows with their inverted index (about
-0.4 GiB for 12Q/1KV, 0.8 GiB for 24Q/2KV). The dense forward route also uses
+dense prefix, the P / dS record windows with their inverted index. The dense forward route also uses
 packed token masks, tile ranges and K/V check flags. These buffers are rebuilt
 on each call.
 Full-call benchmarks must include forward preparation, compaction, backward
