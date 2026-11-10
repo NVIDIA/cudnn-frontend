@@ -549,6 +549,8 @@ def test_sm90_prepared_plan_zero_candidate_workspace_short_sequence():
     plan = _prepare_plan(packed, offsets, count)
     assert plan.get_workspace_size() == 0
     outputs = _plan_outputs(3, 8)
+    for tensor in outputs.values():
+        tensor.fill_(123456 if tensor.dtype == torch.int32 else torch.nan)
     _execute_plan(plan, packed, offsets, outputs, torch.empty(0, dtype=torch.uint8, device="cuda"))
     assert bool((outputs["out_indices"] == -1).all())
     assert bool(torch.isneginf(outputs["out_logits"]).all())
