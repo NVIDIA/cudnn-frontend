@@ -478,6 +478,12 @@ class INode {
     virtual Type
     getType() = 0;
 
+    // A backend engine config this node needs that the backend heuristics do not propose (returned first in the plan
+    // list, ahead of the heuristics' own configs; -1 = none). Keep this rare: before adding a case, check whether it
+    // can live in the Python FE heuristics (the layer that ranks backend and FROST candidates, python/cudnn/engines/
+    // and python/cudnn/sdpa/). It belongs here only when the backend omits the config outright and C++ callers, which
+    // never reach the Python layer, need it -- and only as a graph-fact rule, not a shape list. Keep it even after a
+    // backend fix: a newer frontend still meets older backends.
     virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         return {-1, {}};

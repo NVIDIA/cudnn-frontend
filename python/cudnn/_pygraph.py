@@ -1423,10 +1423,10 @@ class pygraph:
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
         # One entry per DISTINCT (engine, knobs). Graph::create_execution_plans
-        # checks override_heuristics_query() and returns before reading the mode
-        # -- deterministic SDPA backward and FP8 backward override -- so every
-        # per-mode call appends the same config. First index wins; it is the one
-        # whose mode span is real.
+        # enqueues a node's preferred config (INode::override_heuristics_query:
+        # the deterministic SDPA backward, half and FP8) ahead of each mode's
+        # configs, so every per-mode call appends it again. First index wins; it
+        # is the one whose mode span is real.
         entries, seen = [], set()
         for i in range(self._lowered_graph.get_execution_plan_count()):
             engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
