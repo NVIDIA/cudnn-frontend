@@ -841,8 +841,8 @@ _SM107_PAGED_D256_DECODE_CORNERS = [
 _SM107_PAGED_D256_MTP_CORNERS = [
     # (heads, s_q, b, declared KV, dtype, page, verdict): the MTP rows -- FlashInfer's decode graph at q_len_per_req 2-4 (the bottom-right
     # causal diagonal + the padding mask) -- are the generated table's (study sm107_paged_mtp_20261110: bf16 GQA 4-32, b 1-256, page
-    # 16 / 32 / 64, declared KV 24 to 1M). On the 128-key tile FROST leads from 2**7.5 KV tokens; off it, everywhere. The old hand box
-    # (24/2 and 32/2, page 16, b 1-128, KV 1k-128k) is inside; f16 has no entry and keeps the backend first.
+    # 16 / 32 / 64, declared KV 16 to 1M). FROST leads from 2**7.5 KV tokens on the 128-key tile and from 2**7.01 off it. The old hand
+    # box (24/2 and 32/2, page 16, b 1-128, KV 1k-128k) is inside; f16 has no entry and keeps the backend first.
     ("24/2", 2, 1, 1024, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 3, 4, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 4, 128, 131072, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
@@ -850,7 +850,8 @@ _SM107_PAGED_D256_MTP_CORNERS = [
     ("32/2", 4, 1, 131072, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 2, 1, 512, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 2, 1, 128, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # one KV tile on the tile: below the 2**7.5 threshold
-    ("24/2", 2, 1, 127, cudnn.data_type.BFLOAT16, 16, placement.LEAD),  # off the tile: always
+    ("24/2", 2, 1, 125, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # off the tile below 2**7.01 KV tokens
+    ("24/2", 2, 1, 133, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 2, 32, 262144, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 2, 256, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("16/4", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),

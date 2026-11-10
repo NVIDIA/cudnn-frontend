@@ -282,32 +282,32 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     # study sm107_paged_mtp_20261110 (208-SM Rubin, cuDNN 9.30.0.3; benchmark/attention_inference's paged generation graph: dense Q,
     # shuffled HND page pool, per-request KV, recorded graph facts; bf16 MTP rows s_q 2-4 under the bottom-right diagonal at
-    # d64 (sink, sink + window 128, neither) / d128 / d256 GQA and absorbed MLA d512 / D576xV512, plus the MLA s_q == 1 rows; GQA 4-128,
-    # b 1-256, page 16 / 32 / 64, declared KV 24 to 1M on and off the tile; 972 train + 216 holdout cells: never >5% behind the
-    # measured default, 0.11x of it (geomean). D576 s_q == 1 keeps the hand rules: on the tile it lost 1.56x on the holdout just past
-    # its threshold, and its off-tile twin goes with it)
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
-        "always", None, "sm107_paged_mtp_20261110"
-    ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    # d64 (sink, sink + window 128, neither) / d128 / d256 GQA and d512 / D576xV512 absorbed MLA and GQA; GQA 4-128, b 1-256,
+    # page 16 / 32 / 64, declared KV 16 to 1M on and off the tile; calls timed N per captured graph; 1421 train cells (incl. a
+    # consumed first holdout) + a fresh 144-cell holdout: never >5% behind the measured default. The absorbed-MLA s_q == 1 classes
+    # are not included: d512 lost 1.32x on the holdout at h_kv 2, and D576 was not measured at h_kv > 1)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry("ge", 18.793, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry("ge", 22.325, "sm107_paged_mtp_20261110"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "ge", 7.5, "sm107_paged_mtp_20261110", "kv"
     ),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 7.011, "sm107_paged_mtp_20261110", "kv"
+    ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm107_paged_mtp_20261110"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 28.098, "sm107_paged_mtp_20261110"),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 27.855, "sm107_paged_mtp_20261110"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm107_paged_mtp_20261110"
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm107_paged_mtp_20261110"),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", False): Entry("always", None, "sm107_paged_mtp_20261110"),
-    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", False): Entry("ge", 7.5, "sm107_paged_mtp_20261110", "kv"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 5.749, "sm107_paged_mtp_20261110", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", False): Entry("ge", 7.5, "sm107_paged_mtp_20261110", "kv"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", True): Entry("ge", 6.915, "sm107_paged_mtp_20261110", "kv"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", False): Entry("always", None, "sm107_paged_mtp_20261110"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
