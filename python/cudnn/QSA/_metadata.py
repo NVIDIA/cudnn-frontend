@@ -9,7 +9,7 @@ from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Int32, Int64
+from cutlass import Boolean, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cuda.bindings import driver as cuda
 
@@ -20,25 +20,18 @@ FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes() + Path(_metadat
 
 
 @cute.jit
-def _compact_chunk(sel, lo, hi, first, last, ids, row, lane, base, count, vectorized: cutlass.Constexpr):
+def _compact_chunk(sel, lo, hi, first, last, ids, row, lane, base, count):
     """Compact 16 blocks per lane in stable order."""
-    packed = None
-    if cutlass.const_expr(vectorized):
-        offset = Int64(row) * Int64(sel.shape[1]) + Int64(base)
-        packed = (sel.iterator.raw_ptr() + offset).load(count=16, alignment=1)
+    offset = Int64(row) * Int64(sel.shape[1]) + Int64(base)
+    packed = (sel.iterator.raw_ptr() + offset).load(count=16, alignment=1)
 
     low, high = lo[row], hi[row]
     chosen = []
     for item in cutlass.range_constexpr(16):
-        block = base + item
         take = Boolean(False)
-        if block < sel.shape[1]:
-            if cutlass.const_expr(vectorized):
-                marked = packed[item] != 0
-            else:
-                marked = sel[Int64(row), Int64(block)] != 0
-            if marked:
-                take = (last[block] >= low) & (first[block] <= high) & (low <= high)
+        if packed[item] != 0:
+            block = base + item
+            take = (last[block] >= low) & (first[block] <= high) & (low <= high)
         chosen.append(take)
 
     hits = Int32(0)
@@ -75,8 +68,19 @@ def _compact_row(
     count = Int32(0)
     bulk = (Int32(sel.shape[1]) // 512) * 512
     for start in cutlass.range(0, bulk, 512, unroll=1):
-        count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, start + lane * 16, count, True)
-    count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, bulk + lane * 16, count, False)
+        count = _compact_chunk(sel, lo, hi, first, last, ids, row, lane, start + lane * 16, count)
+    # The remainder is shorter than 512 blocks: one block per lane keeps every lane busy on short rows.
+    low, high = lo[row], hi[row]
+    lower_lanes = (Uint32(1) << Uint32(lane)) - Uint32(1)
+    for start in cutlass.range(bulk, Int32(sel.shape[1]), 32, unroll=1):
+        block = start + lane
+        selected = Boolean(False)
+        if block < sel.shape[1]:
+            selected = (sel[Int64(row), Int64(block)] != 0) & (last[block] >= low) & (first[block] <= high) & (low <= high)
+        ballot = Uint32(cute.arch.vote_ballot_sync(selected))
+        if selected:
+            ids[Int64(row), Int64(count + Int32(cute.arch.popc(ballot & lower_lanes)))] = block
+        count = count + Int32(cute.arch.popc(ballot))
     if lane == 0:
         counts[row] = count
 
