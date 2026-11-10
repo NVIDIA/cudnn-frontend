@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Native SM120 D128 paged pools, independent tables and device-length replay."""
+"""Native SM120 small-head paged pools, independent tables and device-length replay."""
 
 import math
 from dataclasses import replace
@@ -32,14 +32,18 @@ def _case(
     scheduler=0,
     sink_value=None,
     pool_capacity=9,
+    dims=(128, 128),
 ):
     torch.manual_seed(381)
     b, h, pages = 2, 4, 3
+    d_qk, d_v = dims
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    bufs = {"q": torch.randn(b, sq, h, 128, device="cuda", dtype=dtype).transpose(1, 2) * 0.3}
+    bufs = {"q": torch.randn(b, sq, h, d_qk, device="cuda", dtype=dtype).transpose(1, 2) * 0.3}
     for name, hnd, capacity in [("k", k_hnd, pool_capacity), ("v", v_hnd, pool_capacity)]:
-        shape = (capacity, kh, page, 128) if hnd else (capacity, page, kh, 128)
+        d = d_qk if name == "k" else d_v
+        width = d if dims == (128, 128) else d + 8
+        shape = (capacity, kh, page, width) if hnd else (capacity, page, kh, width)
         if pool_capacity > 9:
             raw = torch.empty(shape, device="cuda", dtype=dtype)
             raw[:8].normal_(std=0.3)
@@ -47,6 +51,8 @@ def _case(
             raw[1].fill_(-3.0 if name == "k" else -2.0)
         else:
             raw = torch.randn(shape, device="cuda", dtype=dtype) * 0.3
+        raw[..., d:].fill_(float("nan"))
+        raw = raw[..., :d]
         bufs[name] = raw if hnd else raw.transpose(1, 2)
         bufs[name][8 if pool_capacity > 9 else -1].fill_(float("nan"))
     bufs["kt"] = torch.tensor([[2, 5, -1], [1, 3, -1]], device="cuda", dtype=torch.int32).view(b, 1, pages, 1)
@@ -61,8 +67,8 @@ def _case(
     bufs["ql"][1] = max(1, sq // 2)
     bufs["q"][1, :, max(1, sq // 2) :].fill_(float("nan"))
     bufs["kl"] = torch.tensor([page + 3, 0], device="cuda", dtype=torch.int32).view(b, 1, 1, 1)
-    storage = torch.full((b, sq, h, 136), 123.0, device="cuda", dtype=dtype)
-    bufs["o"] = storage[..., :128].transpose(1, 2)
+    storage = torch.full((b, sq, h, d_v + 8), 123.0, device="cuda", dtype=dtype)
+    bufs["o"] = storage[..., :d_v].transpose(1, 2)
     stats_storage = torch.full((b, h, sq * 2), 777.0, device="cuda")
     bufs["stats"] = stats_storage[..., ::2]
     if sink:
@@ -82,7 +88,7 @@ def _case(
         k=nodes["k"],
         v=nodes["v"],
         generate_stats=True,
-        attn_scale=128**-0.5,
+        attn_scale=d_qk**-0.5,
         use_padding_mask=True,
         seq_len_q=nodes["ql"],
         seq_len_kv=nodes["kl"],
@@ -118,9 +124,9 @@ def _check(bufs, page, *, mask="none", stats_log2=False):
         pools = []
         for name, table in [("k", "kt"), ("v", "vt")]:
             rows = [bufs[name][int(bufs[table][batch, 0, i // page, 0]), :, i % page] for i in range(length)]
-            tensor = torch.stack(rows, dim=1).double() if rows else q.new_empty((kh, 0, 128))
+            tensor = torch.stack(rows, dim=1).double() if rows else q.new_empty((kh, 0, bufs[name].shape[-1]))
             pools.append(tensor.repeat_interleave(h // kh, dim=0))
-        scores = q[batch] @ pools[0].transpose(-1, -2) / math.sqrt(128)
+        scores = q[batch] @ pools[0].transpose(-1, -2) / math.sqrt(q.shape[-1])
         qr = torch.arange(q.shape[2], device=q.device)[:, None]
         kr = torch.arange(length, device=q.device)[None, :]
         visible = qr < qlength
@@ -135,7 +141,7 @@ def _check(bufs, page, *, mask="none", stats_log2=False):
             sink = bufs["sink"].flatten().double()[:, None, None].expand(h, q.shape[2], 1).clone()
             sink.masked_fill_((qr >= qlength)[None], -float("inf"))
             scores = torch.cat((scores, sink), dim=-1)
-            values = torch.cat((values, values.new_zeros(h, 1, 128)), dim=1)
+            values = torch.cat((values, values.new_zeros(h, 1, bufs["v"].shape[-1])), dim=1)
         ref = torch.nan_to_num(scores.softmax(-1), nan=0.0) @ values
         torch.testing.assert_close(bufs["o"][batch].double(), ref, atol=2e-3, rtol=2e-2)
         lse = scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0)
@@ -164,6 +170,7 @@ def test_sm120_frost_paged_native_rebind_replay(
     endpoints=False,
     capture_adapter=False,
     pool_capacity=9,
+    dims=(128, 128),
 ):
     import cutlass.cute as cute
 
@@ -183,6 +190,7 @@ def test_sm120_frost_paged_native_rebind_replay(
         scheduler=scheduler,
         sink_value=sink_value,
         pool_capacity=pool_capacity,
+        dims=dims,
     )
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -218,11 +226,19 @@ def test_sm120_frost_paged_native_rebind_replay(
         if iteration:
             storage = storage.clone()
             stats_storage = stats_storage.clone()
-            bufs["o"] = storage[..., :128].transpose(1, 2)
+            bufs["o"] = storage[..., : dims[1]].transpose(1, 2)
             bufs["stats"] = stats_storage[..., ::2]
             ws = ws.clone()
             for name in ("q", "k", "v", "kt", "vt", "ql", "kl") + (("sink",) if sink else ()):
-                bufs[name] = bufs[name].clone(memory_format=torch.preserve_format)
+                if name in ("k", "v") and dims != (128, 128):
+                    old = bufs[name]
+                    fresh = torch.empty_strided(old.shape, old.stride(), dtype=old.dtype, device=old.device)
+                    span = sum((n - 1) * st for n, st in zip(old.shape, old.stride())) + 1
+                    fresh.as_strided((span,), (1,)).fill_(float("nan"))
+                    fresh.copy_(old)
+                    bufs[name] = fresh
+                else:
+                    bufs[name] = bufs[name].clone(memory_format=torch.preserve_format)
             bufs["q"].mul_(0.7)
         vp = {nodes[n]: t for n, t in bufs.items()}
         g.execute(vp, ws)
@@ -281,7 +297,7 @@ def test_sm120_frost_paged_native_rebind_replay(
         finally:
             graph.reset()
         assert (ws == 113).all()
-        assert (storage[..., 128:] == 123).all()
+        assert (storage[..., dims[1] :] == 123).all()
         assert (stats_storage[..., 1::2] == 777).all()
 
 
@@ -322,7 +338,7 @@ def test_sm120_frost_paged_scope_declines_before_compile(monkeypatch):
     facts = analyze(g)
     caps = _sm120_spec().capabilities
     assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=64, tile_n=64, split_kv=1)) is None
-    for changes in ({"thd": True}, {"d_qk": 120}, {"d_v": 120}, {"is_fp8": True}, {"is_mxfp8": True}):
+    for changes in ({"thd": True}, {"d_qk": 136}, {"d_v": 136}, {"d_qk": 65}, {"is_fp8": True}, {"is_mxfp8": True}):
         assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=64, split_kv=1)) is not None
     for knobs in (SdpaFwdKnobs(tile_m=16), SdpaFwdKnobs(tile_m=32), SdpaFwdKnobs(split_kv=2)):
         assert mismatch(caps, facts, knobs) is not None
@@ -377,3 +393,174 @@ def test_sm120_frost_paged_wide_page_product(monkeypatch):
         pool_capacity=131074,
         replays=4,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(8, 8), (16, 32), (24, 40), (32, 24), (48, 56), (56, 64), (64, 64), (64, 128), (72, 120), (96, 88), (120, 128), (128, 120)])
+@pytest.mark.parametrize("mode", ["decode", "packed_sink", "band"])
+def test_sm120_frost_paged_widths(dtype, dims, mode, monkeypatch):
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        2,
+        mode != "band",
+        mode == "band",
+        16 if mode != "band" else 128,
+        monkeypatch,
+        dims=dims,
+        sq=1 if mode == "decode" else 67,
+        mask="causal" if mode == "decode" else "br_swa" if mode == "packed_sink" else "band",
+        sink=mode == "packed_sink",
+        packed=mode == "packed_sink",
+        stats_log2=mode == "band",
+        tile_m=128 if mode == "packed_sink" else 64,
+        tile_n=128 if mode == "packed_sink" else 64,
+        scheduler=0 if mode == "decode" else 1 if mode == "packed_sink" else 2,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(64, 64), (120, 88)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_sm120_frost_paged_width_determinism(dtype, dims, packed):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+
+    d, dv = dims
+    h, kh, sq, page, blocks = 4, 2, 17, 16, 5
+    rng = torch.Generator().manual_seed(13631)
+    q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
+    k = (torch.randn(37, kh, page, d, generator=rng) * 0.3).to(dtype).cuda()
+    v = (torch.randn(37, page, kh, dv, generator=rng) * 0.3).to(dtype).cuda().transpose(1, 2)
+    kt = torch.stack([torch.randperm(37, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
+    vt = torch.stack([torch.randperm(37, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
+    ql = torch.tensor([17, 1, 0, 9, 16], device="cuda", dtype=torch.int32)
+    kl = torch.tensor([67, 33, 0, 49, 1], device="cuda", dtype=torch.int32)
+    sinks = torch.linspace(-0.5, 0.5, h).cuda()
+    source = dict(q=q, k=k, v=v, kt=kt, vt=vt, ql=ql, kl=kl, sinks=sinks)
+    before = {n: t.clone() for n, t in source.items()}
+    plans = {}
+
+    def buffers(order):
+        index = torch.tensor(order, device="cuda")
+        b = len(order)
+        qb = torch.full((b, sq, h, d + 8), float("nan"), device="cuda", dtype=dtype)[..., :d].transpose(1, 2)
+        qb.copy_(q.index_select(0, index))
+        storage = torch.full((b, sq, h, dv + 8), 123.0, device="cuda", dtype=dtype)
+        return dict(
+            q=qb,
+            o=storage[..., :dv].transpose(1, 2),
+            storage=storage,
+            lse=torch.empty(b, h, sq, device="cuda"),
+            kt=kt.index_select(0, index).t().contiguous().t(),
+            vt=vt.index_select(0, index).t().contiguous().t(),
+            ql=ql.index_select(0, index),
+            kl=kl.index_select(0, index),
+        )
+
+    def check(t):
+        assert (t["storage"][..., dv:] == 123).all()
+        want_o = torch.zeros(t["o"].shape, dtype=torch.float64)
+        want_lse = torch.full(t["lse"].shape, -torch.inf, dtype=torch.float64)
+        for b, (nq, nk) in enumerate(zip(t["ql"].tolist(), t["kl"].tolist())):
+            if not nq:
+                continue
+            qq = t["q"][b, :, :nq].cpu().double()
+            kk = k[t["kt"][b].long()].cpu().transpose(0, 1).reshape(kh, blocks * page, d)[:, :nk].double().repeat_interleave(h // kh, 0)
+            vv = v[t["vt"][b].long()].cpu().transpose(0, 1).reshape(kh, blocks * page, dv)[:, :nk].double().repeat_interleave(h // kh, 0)
+            scores = qq @ kk.transpose(-1, -2) * d**-0.5
+            diagonal = torch.arange(nq)[:, None] + nk - nq
+            keys = torch.arange(nk)[None, :]
+            scores.masked_fill_((keys > diagonal) | (keys < diagonal - 21), -torch.inf)
+            scores = torch.cat((scores, sinks.cpu().double().view(h, 1, 1).expand(h, nq, 1)), -1)
+            want_o[b, :, :nq] = scores.softmax(-1)[..., :nk] @ vv
+            want_lse[b, :, :nq] = scores.logsumexp(-1)
+        torch.testing.assert_close(t["o"].cpu().double(), want_o, atol=0.003, rtol=0.02)
+        torch.testing.assert_close(t["lse"].cpu().double(), want_lse, atol=0.0006, rtol=0)
+        return {n: t[n] for n in ("o", "lse")}
+
+    def run(order, capture=False):
+        t = buffers(order)
+        b = len(order)
+        if b not in plans:
+            api = SdpaFwdDslSm120(
+                t["q"],
+                k,
+                v,
+                t["o"],
+                t["lse"],
+                is_causal=True,
+                causal_bottom_right=True,
+                window_size_left=21,
+                has_sink=True,
+                seq_q_lens_present=True,
+                seq_kv_lens_present=True,
+                paged_page_size=page,
+                paged_max_seq_len_kv=blocks * page,
+                paged_table_stride=t["kt"].stride(),
+                paged_table_v_stride=t["vt"].stride(),
+                tile_m=64,
+                tile_n=64,
+                pack_gqa=packed,
+                sched_policy=1,
+            )
+            api.check_support()
+            api.compile()
+            assert api._k_mod.__file__.endswith("sm120/prefill_f16.py")
+            assert api._k_mod.PARAMS.page_size == page
+            plans[b] = api
+        api = plans[b]
+        workspace = torch.full((max(1, api.scratch_workspace_bytes()),), 113, dtype=torch.uint8, device="cuda")
+
+        def execute():
+            api.execute(
+                t["q"],
+                k,
+                v,
+                t["o"],
+                t["lse"],
+                sinks=sinks,
+                seq_q_lens=t["ql"],
+                seq_kv_lens=t["kl"],
+                block_table=t["kt"],
+                block_table_v=t["vt"],
+                workspace=workspace,
+            )
+
+        execute()
+        result = check(t)
+        if capture:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    execute()
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+            try:
+                target = snapshot({n: result[n][:1] for n in result})
+                t["q"][1:].mul_(0.7)
+                t["ql"][1:] = 1
+                t["kl"][1:] = 17
+                t["kt"][1:].copy_(t["kt"][1:].flip(1))
+                t["vt"][1:].copy_(t["vt"][1:].flip(1))
+                t["o"].fill_(torch.nan)
+                t["lse"].fill_(torch.nan)
+                graph.replay()
+                result = check(t)
+                assert_bitwise({n: result[n][:1] for n in result}, target, "changed neighbors")
+            finally:
+                torch.cuda.synchronize()
+                graph.reset()
+        assert (workspace == 113).all()
+        assert_bitwise(source, before, "unchanged inputs")
+        return result
+
+    target = assert_replays(lambda: run([0]), repeats=4)
+    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 64 + [0] + [2] * 64):
+        actual = snapshot(run(order))
+        for row, sequence in enumerate(order):
+            if sequence == 0:
+                assert_bitwise({n: actual[n][row : row + 1] for n in target}, target, f"batch row {row}")
+    run([0, 1, 2, 3, 4], capture=True)
+    actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
+    assert_golden(f"sdpa-sm120-paged-d{d}v{dv}-{dtype}-pack{int(packed)}", before, actual)

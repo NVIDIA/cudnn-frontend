@@ -93,6 +93,8 @@ from cudnn.sdpa.fwd.config_sm120 import (
     GENERAL_HEAD_TILE_MAX as _SM120_GENERAL_HEAD_TILE_MAX,
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_Q_TILES as _SM120_SEQ_Q_TILES,
+    PAGED_D_SHAPES as _SM120_PAGED_D_SHAPES,
+    paged_head_dims_supported as _sm120_paged_head_dims_supported,
     decode_kv_stage as _sm120_decode_kv_stage,
     head_tiles as _sm120_head_tiles,
     is_decode_tile as _sm120_is_decode_tile,
@@ -950,8 +952,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
-        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or (facts.d_qk, facts.d_v) != (128, 128) or (split_kv or 1) != 1:
-            return "SM120 paged KV requires exact FP16/BF16 D128, dense Q and split_kv=1"
+        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v) or (split_kv or 1) != 1:
+            return "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128, dense Q and split_kv=1"
     if facts.has_bias and capabilities.bias_d_shapes is None:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
@@ -3466,7 +3468,7 @@ def _sm120_spec() -> EngineSpec:
             swa=True,
             right_band_widening=True,
             paged_kv=True,
-            paged_d_shapes=frozenset({(128, 128)}),
+            paged_d_shapes=_SM120_PAGED_D_SHAPES,
             padded=True,
             sink=True,
             stats=True,

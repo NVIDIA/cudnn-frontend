@@ -242,9 +242,9 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     fp8 = replace(facts, is_fp8=True)
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
-    # The SM120 paged prepared path serves only dense half D128 without splits.
+    # The SM120 paged prepared path serves dense half widths through D128 without splits.
     paged = replace(facts, has_paged_kv=True)
-    assert (engines._prepared_decline_reason(spec.capabilities, paged, 1) is None) == (d == 128)
+    assert (engines._prepared_decline_reason(spec.capabilities, paged, 1) is None) == (d <= 128)
     assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is not None
     for change in (dict(thd=True), dict(is_fp8=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(paged, **change), 1) is not None, change
@@ -342,7 +342,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
     else:
         assert reason is not None
         if arch == "sm120" and feature == "paged":
-            assert "SM120 paged KV requires exact FP16/BF16 D128" in reason
+            assert "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128" in reason
         else:
             assert "prepared" in reason
 

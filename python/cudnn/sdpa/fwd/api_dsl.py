@@ -155,6 +155,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     is_decode_tile as _sm120_is_decode_tile,
     kv_tile_preference as _sm120_kv_tile_preference,
     pick_flavor as _sm120_pick_flavor,
+    paged_head_dims_supported as _sm120_paged_head_dims_supported,
     smem_bytes as _sm120_smem_bytes,
     tile_domain as _sm120_tile_domain,
 )
@@ -5820,7 +5821,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, compiled at plan time with runtime token totals.
 
-    Exact FP16/BF16 D128 additionally accepts dense queries over independent
+    FP16/BF16 head dims divisible by 8 through D128 additionally accept dense queries over independent
     HND/NHD K/V page pools, with independent block tables and device KV lengths.
     This native paged leg is unsplit and uses the 64/128-row prefill tiles;
     it retains equal K/V page capacities and the shared page-size domain.
@@ -5879,8 +5880,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.q_desc.ndim != 4
                 or self.v_desc.ndim != 4
                 or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
-                or (self.q_desc.shape[3], self.v_desc.shape[3]) != (128, 128),
-                "SM120 paged KV requires exact D_QK=D_V=128 and FP16/BF16",
+                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3]),
+                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128",
             )
             self._not_implemented_error_if(self.tile_m in _SM120_DECODE_Q_TILES, "SM120 paged KV requires a prefill tile (tile_m=64 or 128)")
             self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
@@ -5951,7 +5952,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
             for desc in (self.k_desc, self.v_desc):
                 strides = self._paged_pool_stride(desc)
-                _paged_pool_layout(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize, strides[1] < strides[2], h_kv, self.paged_page_size, 128)
+                _paged_pool_layout(
+                    tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize, strides[1] < strides[2], h_kv, self.paged_page_size, desc.shape[3]
+                )
             s_kv = int(self.paged_max_seq_len_kv)
         else:
             self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_q), name="K")
