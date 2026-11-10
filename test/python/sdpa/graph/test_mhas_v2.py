@@ -3871,20 +3871,12 @@ def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn
 
 @_cc107_only
 @pytest.mark.L0
-def test_sdpa_paged_sink_dense_queries_decline_cc107_L0(env_info, request, cudnn_handle):
-    """The lift is THD-only: dense (BSHD, padded) paged half queries with a sink on cc 10.7 keep a typed decline naming
-    the THD requirement (pinned by engine id through create_execution_plan, so the row -- not the walk -- answers)."""
+def test_sdpa_paged_sink_dense_queries_cc107_L0(env_info, request, cudnn_handle):
+    """Native D128 now serves dense padded paged queries with a sink. Pin and execute the FROST row,
+    checking O against the harness reference instead of retaining the former THD-only refusal."""
     _require_p2_env()
     cfg = _p2_cfg(dtype=torch.bfloat16, d=128, h_q=32, h_kv=8, b=4, s_q=8, seq_len_q=[1, 4, 8, 8], s_kv=4096, seq_len_kv=[4096, 2048, 129, 16], page=16, ragged=False, poison=False)
-    cfg.softmax_precision = cudnn.data_type.FLOAT
-    graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
-    from cudnn.engines.manifest import MANIFEST
-    engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("half")]
-    graph.create_execution_plan(engine_id, {})
-    graph.select_plan(graph.get_execution_plan_count() - 1)
-    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="Rubin paged KV requires THD queries") as decline:
-        graph.check_support()
-    print(f"@@@@ P2 dense decline: {decline.value}")
+    _p2_frost(cfg, request, cudnn_handle, cga=2, pin={"TILE_CGA_M": 2, "PACK_GQA": 0, "SPLIT_KV": 1})
 
 
 # The first MULT=4 sweep failure (test340): d256 64/8, one 4-token request in a packed batch of ONE, s_q 5, page 128,
