@@ -5288,7 +5288,7 @@ _P1_ROW_LAYOUT = "k: native dense forward"
 # THD-shape clause, which sits ahead of the row's own cc 10.7 clause in engines.mismatch.
 _P1_ROW_THD_LEG = "THD (ragged) rides the packed native-tile leg on this engine"
 _P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
-_P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
+_P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.0 / 10.3 / 10.7"
 _P1_GUARD_TAIL = "the backend is not consulted for this graph"
 _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unread once the expectation is "frost")
     "paged_page64":  (dict(page=64, sq=8),                 "decline",      _P1_ROW_PAGE),  # pools page in 128-row atoms: 64 declines on the row AND the backend
