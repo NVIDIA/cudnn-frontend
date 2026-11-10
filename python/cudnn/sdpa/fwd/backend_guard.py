@@ -59,6 +59,12 @@ from typing import Dict, Optional
 # on the row: this constant lifts the GUARD, not the placement verdict (``placement._place_sm107_mxfp8``).
 SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = None
 
+# The devices the crash is measured on.  cc 10.0 and 10.3 build the plan through the SM100 decode emitter and segfault in
+# it (emit_code_native_sdpa_decode_sm100, which has no MXFP8 scale-factor path) for a dense d128 graph on every build
+# tried: 9.23.1.3, 9.26.0.51, 9.27.0.42, 9.28.0.38 and the 9.30.0.2 nightly (148-SM cc 10.0, cc 10.3 B300, 2026-11-10).
+# The backend fix routes single-query MXFP8 graphs to the prefill kernel (in review), so one FIXED_IN covers all three.
+SQ1_MXFP8_CRASH_DEVICES = frozenset({(10, 0), (10, 3), (10, 7)})
+
 
 def backend_guard(graph, facts) -> Optional[str]:
     """The reason the backend must not be consulted for ``graph`` (its SDPA facts), or None."""
@@ -66,13 +72,14 @@ def backend_guard(graph, facts) -> Optional[str]:
 
     if facts is None or facts.invalid is not None or facts.is_backward or not facts.is_mxfp8:
         return None
-    if facts.device_cc != (10, 7) or facts.s_q != 1 or facts.has_sink or facts.has_paged_kv:
+    if facts.device_cc not in SQ1_MXFP8_CRASH_DEVICES or facts.s_q != 1 or facts.has_sink or facts.has_paged_kv:
         return None
     if SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is not None and cudnn.backend_version() >= SQ1_MXFP8_PLANNING_CRASH_FIXED_IN:
         return None
     return (
         f"cuDNN {cudnn.backend_version_string()} backend crashes the process while planning or building single-query MXFP8 SDPA graphs "
-        f"on cc 10.7 without a sink token (heuristics on 9.26.0.51 and 9.27.0.28, plan build on 9.28.0: dense and THD, Stats on or off); "
+        f"on cc 10.0 / 10.3 / 10.7 without a sink token (cc 10.7: heuristics on 9.26.0.51 and 9.27.0.28, plan build on 9.28.0; "
+        f"cc 10.0 / 10.3: plan build on 9.23.1 through 9.30; dense and THD, Stats on or off); "
         f"the backend is not consulted for this graph"
     )
 

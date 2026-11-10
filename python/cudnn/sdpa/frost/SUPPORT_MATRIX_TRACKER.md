@@ -1614,7 +1614,9 @@ single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
 planning there on every known build -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = None`: cuDNN 9.28.0's heuristics
 plan the 21-contract matrix but building the backend's BHSD single-query plan killed the test process on the cc
 10.7 CI lane (2026-10-08), and the detector re-measures the matrix through plan, check_support and build on
-every run of that lane; an
+every run of that lane; the same guard covers cc 10.0 / 10.3, where the SM100 decode emitter crashes the same 18 of
+the 21 contracts (in planning on cuDNN 9.27.0.42, in the plan build on 9.30.0.2;
+`test_mhas_v2.py::test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0`, 2026-11-10); an
 explicit backend pin, `create_execution_plan` with a backend engine id, on such a graph is
 a typed decline too; `test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0`
 walks the 21-contract trigger matrix -- plan, then the backend's own plan through check_support and
