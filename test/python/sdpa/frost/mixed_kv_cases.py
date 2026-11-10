@@ -157,9 +157,11 @@ def check_dense_paged_rebind_capture(
                 is_causal=True,
                 cga=cga,
                 pack_gqa=pack,
+                split_kv=splits,
             )
             api.check_support()
             api.compile()
+            assert api.split_kv == splits
             workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
 
             def execute(t):

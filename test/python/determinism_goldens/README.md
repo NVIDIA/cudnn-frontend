@@ -1385,3 +1385,9 @@ standalone tests also exercise the native split path. The initial admission
 fixture retained dense Stats while synthesizing THD facts and therefore hit an
 earlier padded-Stats decline; correcting that fixture required no kernel or
 numerical-tolerance change. All eight goldens pass strict comparison.
+
+The shared standalone driver now forwards and asserts its requested split count.
+All eight D64 standalone split cases pass with the actual split3 plan; the earlier
+run had exercised unsplit standalone execution despite its parameter labels.
+Dense graph splits and the eight standalone replay goldens were already passed
+with their requested split counts and remain unchanged.
