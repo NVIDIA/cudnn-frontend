@@ -1925,3 +1925,37 @@ Final shared-loader regression:36 passed,303 deselected, no failures/skips in
 168.73s, including24 strict goldens (16 existing half plus8 mixed), native half
 rebinding/replay and decode ring reuse. The old half baselines are unchanged.
 The owned SM120 allocation completed normally after these checks.
+
+
+## 2026-11-10 — JAX grouped SiTU integration
+
+Added `gemm/jax/test_grouped_gemm_situ_determinism.py`: eight L0 cases covering
+forward/backward, 256/1024/32768 active rows, fresh buffers, concurrent work,
+empty experts, poisoned capacity tails, expert packing/reordering/duplication
+and changed neighbors. Active data and scale outputs use raw-byte comparisons.
+Atomic dprob is excluded from bitwise claims; canonical parity checks it
+against the Torch result numerically. General dprob determinism is not claimed.
+
+New GB200 SM100 measurements: native cuDNN/TE builds and imports passed;
+73 canonical parity/validation cases passed, two new golden recordings passed,
+and all eight strict replay/invariance/golden cases passed (zero skips).
+The companion TE integration passed 93 API/fallback tests and 12 complete
+MoE forward/backward configurations on four GB200s against an independent JAX
+reference, with unchanged tolerances. This is not full Kimi-K3 model validation.
+
+Runtime: JAX 0.12.0.dev20261014, Torch 2.16.0.dev20261030+cu130, CUDA toolkit
+13.5, CuTeDSL 4.8.0/compiler CUDA13.4; cuDNN backend 9.26 (Torch reports 9.27).
+New goldens are under runtime key `ec5f7cd6b51a0ce3`; no existing golden changed.
+They were recorded into a new candidate directory after numerical parity,
+then checked in a separate run with recording disabled. FP8 E5M2, SM103,
+cu12 and other runtime combinations remain unverified.
+
+Commands (from `test/python`, with `CUDA_VISIBLE_DEVICES=0` and
+`XLA_PYTHON_CLIENT_PREALLOCATE=false`):
+
+```bash
+python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -m L0 -q -x \
+  -k 'canonical_jax_glu_parity or canonical_jax_dglu_parity or situ or jax_glu_rejects_unsupported_options or jax_dglu_rejects_unsupported_options'
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest gemm/jax/test_grouped_gemm_situ_determinism.py -m L0 -q -x
+```

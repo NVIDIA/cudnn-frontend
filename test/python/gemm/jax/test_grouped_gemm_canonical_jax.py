@@ -28,6 +28,14 @@ pytestmark = pytest.mark.L0
 JAX_ENTRY = {"swiglu": grouped_gemm_swiglu, "dswiglu": grouped_gemm_dswiglu}
 
 
+def skip_unless_situ_supported():
+    skip_unless_sm100()
+    from cudnn.tensor_adapter import get_compute_capability
+
+    if get_compute_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("JAX SiTU-GLU requires SM100/SM103")
+
+
 def problem(backward, experts, flat_sf, bf16_prob, n=256):
     rng = np.random.default_rng(796)
     m, k = experts * 256, 256
@@ -142,16 +150,24 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, discrete_co
     assert_outputs(compiled(**inputs), reference)
 
 
-@pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
+@pytest.mark.parametrize(
+    "act_func,situ_betas",
+    [("swiglu", None), ("geglu", None), ("situglu", (4.0, 25.0)), ("situglu", (2.0, 8.0))],
+    ids=["swiglu", "geglu", "situ-k3", "situ-custom"],
+)
 @pytest.mark.parametrize("experts", [1, 4])
 @pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
-def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
+def test_canonical_jax_glu_parity(act_func, situ_betas, experts, shared_wrapper):
     skip_unless_sm100()
+    if situ_betas is not None:
+        skip_unless_situ_supported()
     import cudnn
 
     arrays = problem(False, experts, True, True, n=512)
     eager = cudnn.grouped_gemm_glu_wrapper_sm100
     options = dict(act_func=act_func, discrete_col_sfd=True, generate_c=True, d_dtype=ml_dtypes.float8_e4m3fn)
+    if situ_betas is not None:
+        options.update(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
     reference = eager(**torch_inputs(arrays), sf_vec_size=32, **{**options, "d_dtype": torch.float8_e4m3fn})
     bridge = partial(eager, sf_vec_size=32) if shared_wrapper else cudnn.grouped_gemm_glu_jax_sm100
     bridge = partial(bridge, **options)
@@ -193,16 +209,24 @@ def dglu_reference(arrays, **options):
     return cudnn.grouped_gemm_dglu_wrapper_sm100(**torch_inputs(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
 
 
-@pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
+@pytest.mark.parametrize(
+    "act_func,situ_betas",
+    [("dswiglu", None), ("dgeglu", None), ("dsituglu", (4.0, 25.0)), ("dsituglu", (2.0, 8.0))],
+    ids=["dswiglu", "dgeglu", "dsitu-k3", "dsitu-custom"],
+)
 @pytest.mark.parametrize("experts", [1, 4])
 @pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
-def test_canonical_jax_dglu_parity(act_func, experts, shared_wrapper):
+def test_canonical_jax_dglu_parity(act_func, situ_betas, experts, shared_wrapper):
     skip_unless_sm100()
+    if situ_betas is not None:
+        skip_unless_situ_supported()
     import cudnn
 
     arrays = problem(True, experts, False, False, n=512)
     arrays["beta_tensor"] = np.linspace(0.5, 1.5, experts, dtype=np.float32)
     options = dict(act_func=act_func, discrete_col_sfd=True)
+    if situ_betas is not None:
+        options.update(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
     bridge = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, sf_vec_size=32, dprob_tensor=None) if shared_wrapper else cudnn.grouped_gemm_dglu_jax_sm100
     bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn, **options)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
@@ -796,11 +820,11 @@ def test_canonical_jax_dglu_fp4(data_format, act_func, shared_wrapper):
         (True, "b_major", "n"),
         (True, "sf_fp8_dtype_override", "e5m3"),
         (True, "use_dynamic_sched", True),
-        (True, "act_func", "situglu"),
+        (True, "act_func", "invalid"),
         (False, "n", 512),
         (False, "vector_f32", True),
         (False, "use_dynamic_sched", True),
-        (False, "act_func", "situglu"),
+        (False, "act_func", "invalid"),
     ],
 )
 def test_jax_glu_rejects_unsupported_options(shared_wrapper, option, value):
@@ -1063,3 +1087,77 @@ def test_shared_wrapper_keeps_existing_defaults(backward):
         wrapper(**inputs)
     with pytest.raises(ValueError, match="FP8 output dtype"):
         wrapper(**inputs, sf_vec_size=32)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_situ_empty_expert_and_capacity_tail(backward, shared_wrapper):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 4, False, False, n=512)
+    arrays["padded_offsets"] = np.array([256, 256, 512, 768], np.int32)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    options = dict(
+        act_func="dsituglu" if backward else "situglu",
+        discrete_col_sfd=True,
+        situ_beta1=2.0,
+        situ_beta2=8.0,
+    )
+    if backward:
+        reference = dglu_reference(arrays, **options)
+        bridge = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, dprob_tensor=None) if shared_wrapper else cudnn.grouped_gemm_dglu_jax_sm100
+    else:
+        options["generate_c"] = True
+        reference = cudnn.grouped_gemm_glu_wrapper_sm100(**torch_inputs(arrays), sf_vec_size=32, d_dtype=torch.float8_e4m3fn, **options)
+        bridge = cudnn.grouped_gemm_glu_wrapper_sm100 if shared_wrapper else cudnn.grouped_gemm_glu_jax_sm100
+    compiled = jax.jit(partial(bridge, sf_vec_size=32, d_dtype=ml_dtypes.float8_e4m3fn, **options))
+    result = jax.block_until_ready(compiled(**inputs))
+    for name, expected in reference.items():
+        if expected is None:
+            assert result[name] is None
+            continue
+        actual = np.asarray(result[name])
+        expected = expected.contiguous().view(torch.uint8).cpu().numpy().view(actual.dtype).reshape(actual.shape)
+        if name == "sfd_row_tensor":
+            actual, expected = actual[:, :6], expected[:, :6]
+        elif name == "sfd_col_tensor":
+            # Discrete column scales are packed per expert, not a global scale matrix.
+            width = result["d_row_tensor" if backward else "d_tensor"].shape[1]
+            count = 768 * width // 32
+            actual, expected = actual.reshape(-1)[:count], expected.reshape(-1)[:count]
+        else:
+            actual, expected = actual[:768], expected[:768]
+        if name == "dprob_tensor":
+            np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+        else:
+            np.testing.assert_array_equal(actual.view(np.uint8), expected.view(np.uint8), err_msg=name)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("field", ["situ_beta1", "situ_beta2"])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_canonical_jax_situ_rejects_invalid_caps(backward, field, value):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 1, True, False, n=512)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
+    with pytest.raises(ValueError, match=field):
+        entry(**inputs, act_func="dsituglu" if backward else "situglu", d_dtype=ml_dtypes.float8_e4m3fn, **{field: value})
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("capability", [(9, 0), (10, 7), (12, 0)], ids=["sm90", "sm107", "sm120"])
+def test_canonical_jax_situ_rejects_unsupported_gpu(backward, capability, monkeypatch):
+    skip_unless_situ_supported()
+    import cudnn
+    from importlib import import_module
+
+    module = import_module("cudnn.gemm.cutedsl.grouped.dglu.jax_api" if backward else "cudnn.gemm.cutedsl.grouped.glu.jax_api")
+    monkeypatch.setattr(module, "get_compute_capability", lambda: capability)
+    inputs = {name: jnp.asarray(array) for name, array in problem(backward, 1, True, False, n=512).items()}
+    entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
+    with pytest.raises(ValueError, match="SM100/SM103"):
+        entry(**inputs, act_func="dsituglu" if backward else "situglu", d_dtype=ml_dtypes.float8_e4m3fn)
