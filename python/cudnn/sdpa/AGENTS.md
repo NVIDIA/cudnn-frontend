@@ -1480,6 +1480,9 @@ compute-warp tail sanitation. Multiple compute warps can then overwrite V
 while another warp reads it through `ldmatrix`, even when the stores repeat
 zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
 and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
+For dense runtime lengths and THD, give one warp ownership of that zero fill
+and synchronize all consuming warps before PV. The wide-head THD cases in
+`test_sdpa_fwd_d576_sm120.py` detect this write/read race under racecheck.
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
@@ -1492,10 +1495,16 @@ paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
 one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
 two CTAs so even compact tests exercise repeated unit transitions.
 An async-copy completion does not substitute for ownership synchronization
-of other shared buffers. The D512 warp-pair score exchange completes both
-partners' generic reads before reusing its single buffer on paged paths.
+of other shared buffers. The wide-head warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on every loader path,
+including dense and THD TMA. Their K/V handoff does not release score reads.
 `test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
 read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+`test_d576_dense_features[dims0-plain-dtype1]` and the D576 THD cases detect
+the same reuse hazard with TMA. Keep those separate from old-tool RAW reports:
+on SM121, sanitizer2025.3.1 also flags the already synchronized paged exchange;
+the identical cached binary is clean with sanitizer2026.3.0. Confirm active
+instrumentation before interpreting a newer-tool run as a pass.
 The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
 it publishes those stores with release arrivals, while uniform half retains
 copy-tracked arrivals. Do not select the publication operation by the output
@@ -1585,6 +1594,15 @@ and survive Python collection. Capture the immutable stride/index metadata
 and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
 reproduced eighteen binder leaks before this correction and runs cleanly
 afterwards; keep the pointer/stride assertions and inspect process shutdown.
+
+When two warps split a head dimension, each half must contain whole shared-memory
+swizzle chunks. A swizzle that divides the full head can still straddle the warp
+boundary (D576 has 288 columns per half). Check every aliased storage phase too:
+wide Q staging and the O epilogue can exceed different slabs even when the main
+K/V allocation fits. `test_sdpa_fwd_d576_sm120.py` exercises asymmetric envelopes,
+partial packing and persistent reuse. Keep native binder dimension admission in
+sync with the Python row and adapter, and gate new envelopes on the matching
+extension; a host eligibility pass alone does not exercise binder construction.
 
 Padded output rows require an explicit zero store. Setting a normalization
 factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
