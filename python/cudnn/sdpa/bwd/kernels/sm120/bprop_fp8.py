@@ -260,7 +260,9 @@ def delta_kernel(o, do, delta, descale_o, descale_do, amaxes: tuple):
     for step in cutlass.range_constexpr(4):
         val = val + nvvm.shfl_sync(thread_mask=0xFFFFFFFF, val=val, offset=1 << step, mask_and_clamp=0x1F, kind=nvvm.Shfl.BFLY)
     if lane == 0:
-        delta[batch, head, row] = val * _scalar(descale_o) * _scalar(descale_do)
+        if cutlass.const_expr(descale_o is not None):
+            val = val * _scalar(descale_o) * _scalar(descale_do)
+        delta[batch, head, row] = val
 
 
 delta_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

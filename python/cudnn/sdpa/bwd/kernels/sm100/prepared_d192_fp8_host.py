@@ -32,9 +32,8 @@ def _spec(dqk, dv, sm, mx, window):
 def _kernel_hosts(spec):
     here = pathlib.Path(__file__).resolve()
     if len(spec) == 6 and spec[5] == "sm120":
-        if spec[3]:
-            raise NotImplementedError("SM120 MXFP8 backward is not yet implemented")
-        module = load_template(str(here.parent.parent / "sm120" / "bprop_fp8.py"), spec, tag="sdpa_bwd_sm120_fp8")
+        fmt = "mxfp8" if spec[3] else "fp8"
+        module = load_template(str(here.parent.parent / "sm120" / f"bprop_{fmt}.py"), spec, tag=f"sdpa_bwd_sm120_{fmt}")
         return module.dkdv_host, module.dq_host
     if tuple(spec[:2]) == (512, 512):
         fmt = "mxfp8" if spec[3] else "fp8"
@@ -326,7 +325,10 @@ def host_mx(
     sf_v, sf_do, sf_dot = _view(sfv_ptr, sf_geoms[4]), _view(sfdo_ptr, sf_geoms[5]), _view(sfdot_ptr, sf_geoms[6])
     payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
     delta = _scratch(payload, regions[0])
-    dot_do_o_host(o16, do16, delta, None, None, 128, HEAD_DIMS[0], HEAD_DIMS[1], 64, False, False, stream)
+    if cutlass.const_expr(len(SPEC) == 6 and SPEC[5] == "sm120"):
+        delta_host(o16, do16, delta, None, None, None, None, None, None, stream)
+    else:
+        dot_do_o_host(o16, do16, delta, None, None, 128, HEAD_DIMS[0], HEAD_DIMS[1], 64, False, False, stream)
     dkdv_host(
         q,
         k,

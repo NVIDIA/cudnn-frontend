@@ -1961,3 +1961,14 @@ Each checks dQ/dK/dV and amax_dQ/dK/dV/dP with fixed scalar scales and payloads
 across batch reorder/duplication, fresh pointers, changed-dO capture replay,
 and repeated calls. The independent FP8 numerical oracle is checked first.
 SM120 hardware and cross-runtime bit identity are not covered.
+
+
+### SM120 native MXFP8 backward
+
+`test_sdpa_bwd_mxfp8_sm120.py::test_replay_batch_and_golden` adds four
+SM121/GB10 records for D128/D512 with FP16/BF16 gradients. Input payloads
+and all seven canonical SF tensors are reordered together, including the
+D-plane-major transposed atoms. The checks cover B1/3/4/129, fresh storage,
+repeated calls, changed-payload capture and live SF mutation. The independent
+MXFP8 numerical oracle passes before byte comparisons. SM120 hardware and
+cross-runtime identity remain unverified.
