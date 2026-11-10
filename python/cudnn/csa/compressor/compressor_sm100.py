@@ -83,13 +83,16 @@ import ctypes
 import os
 import threading
 
+try:  # Torch is needed only by the eager wrapper; JAX imports the pure DSL kernels.
+    import torch
+except ImportError:  # pragma: no cover - exercised by JAX-only installs
+    torch = None
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.base_dsl.typing as _cutlass_typing
 import cutlass.cute as cute
 import cutlass.cute.arch as cute_arch
 import cutlass.cute.math as cute_math
-import torch
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.runtime import make_ptr
 
@@ -97,10 +100,10 @@ from cudnn._cutlass_compat import SmemAllocator
 
 _ENV_FAST_LAUNCH = "CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH"
 
-# The kernels use no architecture-specific features beyond the SM100 baseline (plain
-# loads/stores, fp32 atomics, pinned mul/fma PTX), so admit SM100 and newer GPU
-# families. ``cute.compile`` resolves the concrete SASS target from the active device.
-MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
+# The generic ratio-2/4 kernels use only CUDA-core operations available on SM90
+# (plain loads/stores, fp32 atomics, barriers, and pinned mul/fma PTX).
+# ``cute.compile`` resolves the concrete SASS target from the active device.  The
+# ratio-128 family has a separately validated architecture envelope in ``api.py``.
 
 
 # =============================================================================
@@ -117,11 +120,13 @@ MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
 # torch's raw current-stream query (~0.5 us) vs `torch.cuda.current_stream` object
 # construction (~2-3 us). Same handle the slow path ends up passing. Private API: guard
 # the bind so module import survives torch builds that do not expose it.
-_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) if torch is not None else None
 if _raw_stream is None:  # pragma: no cover - older/stripped torch builds
 
     def _raw_stream(device_index=None):
         """Fallback raw-stream query via the public torch API."""
+        if torch is None:
+            raise ImportError("The eager CSA compressor launcher requires torch")
         return torch.cuda.current_stream(device_index).cuda_stream
 
 
@@ -956,12 +961,45 @@ _COMPILED = {}
 # kernel twice (the compiled-function cache itself is a plain dict guarded by the GIL).
 _COMPILE_LOCK = threading.Lock()
 _BWD_ROWS, _BWD_THREADS = 8, 128
+_BWD_ROWS_SM90_R2 = 16
 _BWD_ROWS_R4_DETERMINISTIC = 24
 _BWD_ROWS_R4_DETERMINISTIC_MIN_COMPRESSED_ROWS = 65536
+_BWD_ROWS_SM90_R2_MIN_COMPRESSED_ROWS = {
+    (False, 128): 8192,
+    (False, 512): 4096,
+    (True, 128): 4096,
+    (True, 512): 2048,
+}
+_BWD_ROWS_SM90_R2_MAX_COMPRESSED_ROWS = {
+    # Keep the d512 atomic tuning inside its measured [4096, 5121) safe bucket;
+    # larger capacities encounter unfavorable grid-wave occupancy crossovers.
+    # Deterministic reduction still benefits from rows=16 at every larger measured
+    # capacity.
+    (False, 512): 5121,
+}
+_BWD_ROWS_ALLOWED = frozenset((_BWD_ROWS, _BWD_ROWS_SM90_R2, _BWD_ROWS_R4_DETERMINISTIC))
 
 
-def _bwd_rows(ratio, deterministic, nb_total):
-    """Rows accumulated by one generic backward CTA for this plan capacity."""
+def _validate_bwd_rows(rows_per_cta):
+    """Reject schedule values outside the finite compile-artifact domain."""
+    if rows_per_cta not in _BWD_ROWS_ALLOWED:
+        raise ValueError(f"rows_per_cta must be one of {sorted(_BWD_ROWS_ALLOWED)}, got {rows_per_cta}")
+
+
+def _bwd_rows(ratio, deterministic, nb_total, d=None, coff=None, is_sm90=False):
+    """Rows accumulated by one generic backward CTA for this prepared plan.
+
+    SM90 ratio-2 plans use one additional, finite schedule bucket at the two
+    production head dimensions. All other generic configurations preserve the
+    architecture-independent schedule. Consequently ``rows_per_cta`` remains in
+    the bounded set ``{8, 16, 24}`` and runtime packed lengths never specialize an
+    artifact beyond the plan-capacity bucket.
+    """
+    if is_sm90 and ratio == 2 and coff == 2:
+        threshold = _BWD_ROWS_SM90_R2_MIN_COMPRESSED_ROWS.get((bool(deterministic), d))
+        upper = _BWD_ROWS_SM90_R2_MAX_COMPRESSED_ROWS.get((bool(deterministic), d))
+        if threshold is not None and nb_total >= threshold and (upper is None or nb_total < upper):
+            return _BWD_ROWS_SM90_R2
     if deterministic and ratio == 4 and nb_total >= _BWD_ROWS_R4_DETERMINISTIC_MIN_COMPRESSED_ROWS:
         return _BWD_ROWS_R4_DETERMINISTIC
     return _BWD_ROWS
@@ -1107,9 +1145,11 @@ def precompile_fwd(ratio, d, coff, device):
         _compile_fwd(key, args, ratio, d, coff)
 
 
-def precompile_bwd(ratio, d, coff, device, deterministic=False, nb_total=0):
+def precompile_bwd(ratio, d, coff, device, deterministic=False, nb_total=0, rows_per_cta=None):
     """Compile the backward schedule selected from the plan-time ``nb_total`` capacity."""
-    rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    if rows_per_cta is None:
+        rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    _validate_bwd_rows(rows_per_cta)
     key = ("bwd", ratio, d, coff, bool(deterministic), rows_per_cta, device.index)
     reduce_key = ("dape_reduce", ratio == 4, device.index)
     if key in _COMPILED and (not deterministic or reduce_key in _COMPILED):
@@ -1187,11 +1227,13 @@ def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_h
         _FAST.put(key, fn, args)
 
 
-def bwd_dape_workspace_bytes(nb_total, ratio, d, coff):
+def bwd_dape_workspace_bytes(nb_total, ratio, d, coff, rows_per_cta=None):
     """Caller-owned deterministic dAPE partial and reduction-stage bytes."""
     if nb_total <= 0:
         return 0
-    rows_per_cta = _bwd_rows(ratio, True, nb_total)
+    if rows_per_cta is None:
+        rows_per_cta = _bwd_rows(ratio, True, nb_total)
+    _validate_bwd_rows(rows_per_cta)
     npartials = (nb_total + rows_per_cta - 1) // rows_per_cta
     nelems = ratio * coff * d
     stage_elems = 0
@@ -1249,6 +1291,7 @@ def run_bwd(
     stream_handle=None,
     deterministic=False,
     workspace=None,
+    rows_per_cta=None,
 ):
     """Launch the backward kernel (cached fast path -> compiled slow path -> JIT).
 
@@ -1256,7 +1299,9 @@ def run_bwd(
     (for the kernel's padding-token zero sweep) is derived from ``kv``'s element count.
     """
     dev = kv.device.index
-    rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    if rows_per_cta is None:
+        rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    _validate_bwd_rows(rows_per_cta)
     key = ("bwd", ratio, d, coff, bool(deterministic), rows_per_cta, dev)
     total_tokens = kv.numel() // (coff * d)
     partial_buffer = workspace if deterministic else gape

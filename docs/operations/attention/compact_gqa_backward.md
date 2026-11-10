@@ -81,7 +81,5 @@ FE 1.29 image, configuration, and seed; only the GQA flag differs. Real rollouts
 and node allocations differ, and valid tokens increase 1.11%; timings are not
 normalized. Valid-token counts are not exact attention FLOP counts.
 
-The review fixes passed 26 VR200 tests, and the native TE integration passed
-three SM107 numerical cases before the full workload. The current develop merge
-moves the test to the CI layout and preserves the compact GQA runtime files.
-Earlier sanitizer results predate the review fixes.
+Regression coverage is maintained in [`test_compact_gqa.py`](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/sdpa/cutedsl/test_compact_gqa.py),
+and the runtime implementation is in [`python/cudnn/sdpa/bwd/compact_gqa/`](https://github.com/NVIDIA/cudnn-frontend/tree/develop/python/cudnn/sdpa/bwd/compact_gqa).

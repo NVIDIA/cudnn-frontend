@@ -192,6 +192,13 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
+            return;
+        }
         numeric_notes_vec.resize(static_cast<size_t>(elem_count));
         status = detail::get_attribute(extractedEngine_,
                                        CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
@@ -199,6 +206,13 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        numeric_notes_vec.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
+            return;
+        }
         ptrdiff_t end =
             static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
         std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
@@ -206,18 +220,19 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             std::fill_n(numeric_notes.begin() + static_cast<size_t>(elem_count),
                         numeric_notes.size() - static_cast<size_t>(elem_count),
                         CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
-        if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(this,
-                                          status,
-                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
-                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
-        }
         status = detail::get_attribute(extractedEngine_,
                                        CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
                                        CUDNN_TYPE_BEHAVIOR_NOTE,
                                        CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
+            return;
+        }
         behavior_notes_vec.resize(static_cast<size_t>(elem_count));
         status = detail::get_attribute(extractedEngine_,
                                        CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
@@ -225,7 +240,14 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        behavior_notes_vec.data());
-        end    = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
+            return;
+        }
+        end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
         std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
         runtime_compiled = status != CUDNN_STATUS_SUCCESS ||
                            std::find(behavior_notes_vec.begin(),
@@ -235,12 +257,6 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count),
                         behavior_notes.size() - static_cast<size_t>(elem_count),
                         CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
-        if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(this,
-                                          status,
-                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
-                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
-        }
     }
 
     void
@@ -523,6 +539,9 @@ class ExecutionPlanBuilder_v8 {
 
         m_execution_plan.buildTag(extractedEngine);
         m_execution_plan.fetchNotes(extractedEngine);
+        if (m_execution_plan.get_status() != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_execution_plan);
+        }
         m_execution_plan.computeWorkSpaceSize();
 
         CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
@@ -687,6 +706,9 @@ class ExecutionPlanBuilder_v8 {
 
         m_execution_plan.buildTag(extractedEngine);
         m_execution_plan.fetchNotes(extractedEngine);
+        if (m_execution_plan.get_status() != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_execution_plan);
+        }
         m_execution_plan.computeWorkSpaceSize();
 
         CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);

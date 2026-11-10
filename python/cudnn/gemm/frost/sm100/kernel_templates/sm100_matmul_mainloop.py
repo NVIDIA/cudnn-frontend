@@ -58,6 +58,26 @@ TMEM_ALLOC_BARRIER_ID = 2
 
 
 @cute.jit
+def _decode_scheduled_tile(block_m, block_n, gridx, gridy, cluster_m, cluster_n, swizzle_w):
+    """Decode one stage's work coordinates without sharing its pipeline state.
+
+    Block/CLC coordinates use the live cluster geometry. Keep preferred and
+    fallback shifts compile-time constants, then apply the common L2 raster.
+    """
+    raw_m = block_m >> _preferred_cluster_m_shift
+    raw_n = block_n >> _preferred_cluster_n_shift
+    nt_m = gridx >> _preferred_cluster_m_shift
+    nt_n = gridy >> _preferred_cluster_n_shift
+    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+            raw_m = block_m >> _fallback_cluster_m_shift
+            raw_n = block_n >> _fallback_cluster_n_shift
+            nt_m = gridx >> _fallback_cluster_m_shift
+            nt_n = gridy >> _fallback_cluster_n_shift
+    return _l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=tile_swizzle_n == 1)
+
+
+@cute.jit
 def _auto_swizzle_w(m, n, k, nt_n):
     """N-super-block width for the tile rasterization, resolved per launch."""
     if cutlass.const_expr(tile_swizzle_n > 0):
@@ -205,24 +225,7 @@ def _kernel(
             nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
         # @@TMA_STORE_ONLY:END@@
 
-    init_raw_m = bidx >> _preferred_cluster_m_shift
-    init_raw_n = bidy >> _preferred_cluster_n_shift
-    init_nt_m = gridx >> _preferred_cluster_m_shift
-    init_nt_n = gridy >> _preferred_cluster_n_shift
-    if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
-        if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-            init_raw_m = bidx >> _fallback_cluster_m_shift
-            init_raw_n = bidy >> _fallback_cluster_n_shift
-            init_nt_m = gridx >> _fallback_cluster_m_shift
-            init_nt_n = gridy >> _fallback_cluster_n_shift
-    init_tile_m, init_tile_n = _l2_swizzle_tile(
-        init_raw_m,
-        init_raw_n,
-        init_nt_m,
-        init_nt_n,
-        swizzle_w,
-        identity=tile_swizzle_n == 1,
-    )
+    init_tile_m, init_tile_n = _decode_scheduled_tile(bidx, bidy, gridx, gridy, cluster_m, cluster_n, swizzle_w)
     init_tile_l = bidz
 
     if cutlass.const_expr(cta_group == 1):
@@ -794,24 +797,7 @@ def _kernel(
             m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             cute.arch.fence_proxy("async.shared", space="cta")
             is_valid = vld
-            tma_raw_m = m_idx >> _preferred_cluster_m_shift
-            tma_raw_n = n_idx >> _preferred_cluster_n_shift
-            tma_nt_m = gridx >> _preferred_cluster_m_shift
-            tma_nt_n = gridy >> _preferred_cluster_n_shift
-            if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
-                if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                    tma_raw_m = m_idx >> _fallback_cluster_m_shift
-                    tma_raw_n = n_idx >> _fallback_cluster_n_shift
-                    tma_nt_m = gridx >> _fallback_cluster_m_shift
-                    tma_nt_n = gridy >> _fallback_cluster_n_shift
-            tile_m, tile_n = _l2_swizzle_tile(
-                tma_raw_m,
-                tma_raw_n,
-                tma_nt_m,
-                tma_nt_n,
-                swizzle_w,
-                identity=tile_swizzle_n == 1,
-            )
+            tile_m, tile_n = _decode_scheduled_tile(m_idx, n_idx, gridx, gridy, cluster_m, cluster_n, swizzle_w)
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
@@ -1086,12 +1072,12 @@ def _kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_ml = cutlass.Int32(0)
-        if cutlass.const_expr(mainloop_has_index):
+        if cutlass.const_expr(mainloop_needs_coordinates):
             tile_m, tile_n, tile_l = init_tile_m, init_tile_n, init_tile_l
         if cutlass.const_expr(split_k_slices > 1):
             tile_l = bidz  # this tile's z coord
         while is_valid != 0:
-            if cutlass.const_expr(mainloop_has_index):
+            if cutlass.const_expr(mainloop_needs_coordinates):
                 ml_coord_m = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
                 if cutlass.const_expr(cta_group == 1):
                     ml_coord_n = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
@@ -1281,18 +1267,8 @@ def _kernel(
             _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             cute.arch.fence_proxy("async.shared", space="cta")
             is_valid = vld
-            if cutlass.const_expr(mainloop_has_index):
-                ml_raw_m = _m_idx >> _preferred_cluster_m_shift
-                ml_raw_n = _n_idx >> _preferred_cluster_n_shift
-                ml_nt_m = gridx >> _preferred_cluster_m_shift
-                ml_nt_n = gridy >> _preferred_cluster_n_shift
-                if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
-                    if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                        ml_raw_m = _m_idx >> _fallback_cluster_m_shift
-                        ml_raw_n = _n_idx >> _fallback_cluster_n_shift
-                        ml_nt_m = gridx >> _fallback_cluster_m_shift
-                        ml_nt_n = gridy >> _fallback_cluster_n_shift
-                tile_m, tile_n = _l2_swizzle_tile(ml_raw_m, ml_raw_n, ml_nt_m, ml_nt_n, swizzle_w, identity=tile_swizzle_n == 1)
+            if cutlass.const_expr(mainloop_needs_coordinates):
+                tile_m, tile_n = _decode_scheduled_tile(_m_idx, _n_idx, gridx, gridy, cluster_m, cluster_n, swizzle_w)
                 tile_l = _l_idx
             if cutlass.const_expr(split_k_slices > 1):
                 tile_l = _l_idx
@@ -1437,24 +1413,7 @@ def _kernel(
             m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             cute.arch.fence_proxy("async.shared", space="cta")
             is_valid = vld
-            epi_raw_m = m_idx >> _preferred_cluster_m_shift
-            epi_raw_n = n_idx >> _preferred_cluster_n_shift
-            epi_nt_m = gridx >> _preferred_cluster_m_shift
-            epi_nt_n = gridy >> _preferred_cluster_n_shift
-            if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
-                if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                    epi_raw_m = m_idx >> _fallback_cluster_m_shift
-                    epi_raw_n = n_idx >> _fallback_cluster_n_shift
-                    epi_nt_m = gridx >> _fallback_cluster_m_shift
-                    epi_nt_n = gridy >> _fallback_cluster_n_shift
-            tile_m, tile_n = _l2_swizzle_tile(
-                epi_raw_m,
-                epi_raw_n,
-                epi_nt_m,
-                epi_nt_n,
-                swizzle_w,
-                identity=tile_swizzle_n == 1,
-            )
+            tile_m, tile_n = _decode_scheduled_tile(m_idx, n_idx, gridx, gridy, cluster_m, cluster_n, swizzle_w)
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:

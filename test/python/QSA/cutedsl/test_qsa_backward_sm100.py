@@ -1,0 +1,538 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The backward engine behind ``cudnn.ops.qsa_backward`` and ``qsa_indexed_backward`` at the lengths the bitmap suite
+does not reach: the dense / sparse crossover, KV passes, record windows, packed documents and replay."""
+
+from math import prod
+
+import pytest
+import torch
+
+from cudnn.ops import qsa_backward, qsa_forward, qsa_indexed_backward
+
+from QSA.cutedsl.qsa_index_list_reference import assert_grads_close, make_inputs, reference_backward, reference_forward
+
+SCALE = 1.0 / 16.0
+_INPUT_NAMES = ("q", "k", "v", "out", "dout", "lse", "topk_idxs")
+
+
+@pytest.fixture(autouse=True)
+def supported_device():
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+
+    cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+    if cc not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the QSA backward engine requires SM100, SM103 or SM107")
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip(cutedsl_requirement_error("QSA") or "QSA backward requires nvidia-cutlass-dsl")
+    reason = cutedsl_arch_requirement_error(cc)
+    if reason:
+        pytest.skip(reason)
+
+
+def _skip_cu12(h_kv):
+    # the 12Q/1KV key-major kernel crashes the CUDA 12 build of the DSL compiler, so that flavor is declined there
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    if h_kv == 1 and engine.dsl_cuda_major() < 13:
+        pytest.skip("the 12Q/1KV sparse path requires the CUDA 13 build of CuTe DSL")
+
+
+def _inputs(lengths, h_kv, seed, grad_scale=1.0, h_q=None):
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    return make_inputs(cu[-1], seed=seed, h_kv=h_kv, cu_seqlens=cu, width=2052, saved_output_dtype=torch.float32, grad_scale=grad_scale, h_q=h_q)
+
+
+def _miles_metadata(idx, lengths):
+    # the canonical token-id lists as the bitmap entry's Miles metadata
+    dev = idx.device
+    total = sum(lengths)
+    origins, bases, first, last = [], [], [], []
+    start, base = 0, 0
+    for length in lengths:
+        spans = torch.arange(start, start + length, 4, dtype=torch.int32, device=dev)
+        origins.append(torch.full((length,), start, dtype=torch.int32, device=dev))
+        bases.append(torch.full((length,), base, dtype=torch.int32, device=dev))
+        first.append(spans)
+        last.append((spans + 3).clamp_max(start + length - 1))
+        start += length
+        base += spans.numel()
+    lo, blk_base = torch.cat(origins), torch.cat(bases)
+    hi = torch.arange(total, dtype=torch.int32, device=dev)
+    block_first, block_last = torch.cat(first), torch.cat(last)
+    starts = idx[:, ::4].long()
+    valid = (starts >= lo[:, None]) & (starts <= hi[:, None])
+    block = blk_base[:, None] + (starts - lo[:, None]) // 4
+    sel = torch.zeros((total, base), dtype=torch.uint8, device=dev)
+    sel.scatter_reduce_(1, block.clamp(0, base - 1), valid.to(torch.uint8), reduce="amax", include_self=True)
+    return [sel, lo, hi, blk_base, lo.clone(), block_first, block_last]
+
+
+def _bitmap_backward(inputs, meta, scale=SCALE, **options):
+    return tuple(qsa_backward(inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], *meta, scale, 4, **options))
+
+
+def _indexed_backward(inputs, cu_seqlens=None, **options):
+    if cu_seqlens is not None:
+        options = dict(options, selection_mode="causal_topk", cu_seqlens=cu_seqlens)
+    return tuple(
+        qsa_indexed_backward(inputs["dout"], inputs["q"], inputs["k"], inputs["v"], inputs["out"], inputs["lse"], inputs["topk_idxs"], SCALE, **options)
+    )
+
+
+def _entry_backward(entry, inputs, lengths, **options):
+    if entry == "bitmap":
+        return _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], lengths), **options)
+    return _indexed_backward(inputs, inputs["cu_seqlens"] if len(lengths) > 1 else None, **options)
+
+
+def _check(inputs, grads, scale=SCALE):
+    expected = reference_backward(*(inputs[name] for name in _INPUT_NAMES), scale=scale)
+    for name, actual, ref in zip(("dq", "dk", "dv"), grads, expected):
+        assert_grads_close(name, actual, ref)
+
+
+LENGTHS = [
+    # L0 keeps one representative of every path and crossover, the longer sweeps run at L1
+    pytest.param(2, 1.0, marks=pytest.mark.L0),  # tail tokens only (a single token has dQ = dK = 0, which a relative bound cannot score)
+    pytest.param(5, 1.0, marks=pytest.mark.L0),  # one complete block and a tail
+    pytest.param(2051, 1.0, marks=pytest.mark.L0),  # the longest sequence whose lists are all whole causal prefixes
+    pytest.param(2052, 1.0, marks=pytest.mark.L0),  # the shortest sequence on which the last query drops a block
+    pytest.param(4099, 1.0, marks=pytest.mark.L0),  # every query in the dense kernel, sparse rows above 2050 included
+    pytest.param(16384, 1.0, marks=pytest.mark.L1),  # every query in the dense kernel with the larger dense unit
+    pytest.param(22527, 1.0, marks=pytest.mark.L1),  # the longest sequence served by the dense kernel alone
+    pytest.param(22528, 1.0, marks=pytest.mark.L0),  # the shortest sequence with a sparse remainder: a single query range on the key-major kernel
+    pytest.param(22529, 1.0, marks=pytest.mark.L1),  # one full query range and a second range holding a single query, with one KV head an unpaired item
+    pytest.param(24000, 1.0, marks=pytest.mark.L1),  # dense, query-major and key-major kernels in one KV pass and two query ranges
+    pytest.param(24000, 1e-07, marks=pytest.mark.L1),  # training-scale gradients, which rule out reduced-range accumulators
+    pytest.param(32769, 1.0, marks=pytest.mark.L1),  # two KV passes and a partial last block
+]
+
+PACKED = [
+    # L0 keeps one representative of every path and crossover, the longer sweeps run at L1
+    pytest.param(
+        (3, 2051, 22529), marks=pytest.mark.L0
+    ),  # a 3-token sequence, a whole-prefix one starting at 3 and one past the crossover (origins off the 4-token grid)
+    pytest.param((4100, 24005, 2), marks=pytest.mark.L1),  # dense, sparse with a 3525-query remainder, then 2 tokens
+    pytest.param((500, 0, 2500), marks=pytest.mark.L0),  # an empty sequence between two dense ones
+    pytest.param((1000, 2051, 2051), marks=pytest.mark.L1),  # every sequence within 2051 tokens
+    pytest.param((3, 24577, 24577), marks=pytest.mark.L1),  # several record windows and two sparse sequences with unaligned origins
+    pytest.param((1000, 22000), marks=pytest.mark.L1),  # a packed sequence just below the crossover is dense past 20480 queries while the buffer is not
+]
+
+
+@pytest.mark.parametrize("h_kv", [2, 1])
+@pytest.mark.parametrize("seq_len, grad_scale", LENGTHS)
+def test_bitmap_entry_matches_reference(seq_len, grad_scale, h_kv):
+    _skip_cu12(h_kv)
+    inputs = _inputs((seq_len,), h_kv, seed=seq_len, grad_scale=grad_scale)
+    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (seq_len,))))
+
+
+@pytest.mark.parametrize("seq_len, grad_scale", LENGTHS)
+def test_indexed_entry_matches_reference(seq_len, grad_scale):
+    _skip_cu12(1)
+    inputs = _inputs((seq_len,), 1, seed=seq_len, grad_scale=grad_scale)
+    _check(inputs, _indexed_backward(inputs))
+
+
+@pytest.mark.parametrize("h_kv", [2, 1])
+@pytest.mark.parametrize("lengths", PACKED)
+def test_bitmap_entry_packed_sequences(lengths, h_kv):
+    _skip_cu12(h_kv)
+    inputs = _inputs(lengths, h_kv, seed=sum(lengths))
+    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], lengths)))
+
+
+@pytest.mark.parametrize("described", [True, False])
+@pytest.mark.parametrize("lengths", PACKED)
+def test_indexed_entry_packed_sequences(lengths, described):
+    _skip_cu12(1)
+    # Without cu_seqlens the documents stay exact: the selection says which keys a query sees, the inverted index
+    # keys are block-start tokens, and the dense bitmap masks per token, so blocks off the 4-token grid are fine.
+    inputs = _inputs(lengths, 1, seed=sum(lengths))
+    _check(inputs, _indexed_backward(inputs, inputs["cu_seqlens"] if described else None))
+
+
+SIX_HEADS = [
+    pytest.param((24000,), marks=pytest.mark.L0),  # dense, query-major pairs and key-major kernels
+    pytest.param((3, 2051, 22529), marks=pytest.mark.L1),  # packed, origins off the 4-token grid
+    pytest.param((32769,), marks=pytest.mark.L1),  # two KV passes
+]
+
+
+@pytest.mark.parametrize("entry", ["bitmap", "indexed"])
+@pytest.mark.parametrize("lengths", SIX_HEADS)
+def test_six_query_heads_past_the_crossover(lengths, entry):
+    _skip_cu12(1)
+    inputs = _inputs(lengths, 1, seed=sum(lengths), h_q=6)
+    _check(inputs, _entry_backward(entry, inputs, lengths))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("entry, h_kv", [("indexed", 1), ("bitmap", 2)])
+def test_lse_needs_only_scalar_alignment(entry, h_kv):
+    _skip_cu12(h_kv)
+    inputs = _inputs((17,), h_kv, seed=42)
+    storage = torch.empty(inputs["lse"].numel() + 1, dtype=torch.float32, device="cuda")
+    lse = storage[1:].view_as(inputs["lse"])
+    lse.copy_(inputs["lse"])
+    inputs["lse"] = lse
+    assert lse.data_ptr() % 16 == 4
+    _check(inputs, _entry_backward(entry, inputs, (17,)))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [1, 2])
+@pytest.mark.parametrize("seq_mode", ["single", "cu", "origin"])
+def test_records_workspace_is_bounded(h_kv, seq_mode):
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    mode = {"single": engine.SEQ_SINGLE, "cu": engine.SEQ_CU, "origin": engine.SEQ_ORIGIN}[seq_mode]
+    for length in (32769, 131072, 262144):
+        plan = engine.LaunchPlan(length, 148, h_kv, mode, 3 if mode == engine.SEQ_CU else length // 4)
+        records = next(prod(shape) * dtype.itemsize for name, shape, dtype in plan.chunks if name == "pair_records")
+        assert records < 1024**3
+        if length == 131072:
+            assert plan.workspace_bytes() < (3 if h_kv == 1 else 5.5) * 1024**3
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("gq", [12, 6])
+def test_plan_reaches_the_documented_length_bound(gq):
+    # The public limit is T * Hq * 256 <= INT32_MAX, so 6Q/1KV reaches twice the length of 12Q/1KV.
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    limit = (2**31 - 1) // (gq * 256)
+    assert engine.LaunchPlan(limit, 148, 1, engine.SEQ_CU, 3, gq=gq).seq_len == limit
+
+
+@pytest.mark.L1
+def test_backward_reloads_its_compiled_kernels(monkeypatch, tmp_path):
+    # python/cudnn/AGENTS.md Rule 4: a second call reloads every kernel of the launch sequence from disk.
+    _skip_cu12(1)
+    from cudnn.frost import compiled_cache
+
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.delenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", raising=False)
+    inputs = _inputs((300,), 1, seed=3)
+    meta = _miles_metadata(inputs["topk_idxs"], (300,))
+    # an earlier test's memo would serve the first call without writing this cache directory
+    compiled_cache.clear_memo()
+    with compiled_cache.record_entries() as entries:
+        _check(inputs, _bitmap_backward(inputs, meta))
+    # the compaction and the six kernels of the dense-only launch sequence
+    assert len(entries) >= 7
+    compiled_cache.clear_memo()
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
+    before = compiled_cache.stats()["hits"]
+    with compiled_cache.refuse_compiles():
+        _check(inputs, _bitmap_backward(inputs, meta))
+    assert compiled_cache.stats()["hits"] >= before + len(entries)
+
+
+@pytest.mark.L0
+def test_indexed_max_seq_len_below_the_crossover_plans_no_sparse_path(monkeypatch):
+    _skip_cu12(1)
+    from cudnn.QSA.indexed.api import _plan
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    # the engine plan is built only when the indexed plan cache misses
+    _plan.cache_clear()
+    monkeypatch.setattr(engine, "_PLANS", {})
+    lengths = (16384, 16385)
+    inputs = _inputs(lengths, 1, seed=31)
+    with pytest.raises(ValueError, match="max_seq_len"):
+        _indexed_backward(inputs, inputs["cu_seqlens"], max_seq_len=16000)
+    _check(inputs, _indexed_backward(inputs, inputs["cu_seqlens"], max_seq_len=max(lengths)))
+    plans = [plan for key, plan in engine._PLANS.items() if key[0] == sum(lengths) and key[-2] == max(lengths)]
+    assert plans and not any(plan.has_sparse for plan in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("entry, h_kv", [("indexed", 1), ("bitmap", 1), ("bitmap", 2)])
+def test_graph_replay_rebuilds_changed_sequence_metadata(entry, h_kv):
+    _skip_cu12(h_kv)
+    # The same captured call crosses record windows for one input, has only dense queries for the next, then crosses
+    # sparse windows and sequence origins on the third. The bitmap metadata keeps its shape: every packing has 8193 blocks.
+    bounds = ((3, 32766), (16384, 16385), (2, 32767))
+    samples = [_inputs(lengths, h_kv, seed=101 + i) for i, lengths in enumerate(bounds)]
+    metas = [_miles_metadata(sample["topk_idxs"], lengths) for sample, lengths in zip(samples, bounds)]
+    static = {name: value.clone() for name, value in samples[0].items()}
+    static_meta = [tensor.clone() for tensor in metas[0]]
+
+    def run():
+        if entry == "indexed":
+            return _indexed_backward(static, static["cu_seqlens"])
+        return _bitmap_backward(static, static_meta)
+
+    run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            grads = run()
+        for sample, meta in zip(samples, metas):
+            for name in static:
+                static[name].copy_(sample[name])
+            for dst, src in zip(static_meta, meta):
+                dst.copy_(src)
+            for grad in grads:
+                grad.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            _check(sample, grads)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+def test_sparse_query_past_513_blocks_marks_dq(h_kv):
+    _skip_cu12(h_kv)
+    # A query past the dense prefix exceeds the inverted index's slot budget: it contributes nothing and its dQ is NaN.
+    # With a zero output gradient the query also contributes nothing to the reference.
+    seq_len, row = 22600, 22550
+    inputs = _inputs((seq_len,), h_kv, seed=7)
+    inputs["dout"][row] = 0
+    meta = _miles_metadata(inputs["topk_idxs"], (seq_len,))
+    meta[0][row, : row // 4 + 1] = 1
+    dq, dk, dv = _bitmap_backward(inputs, meta)
+    assert dq[row].isnan().all()
+    expected = reference_backward(*(inputs[name] for name in _INPUT_NAMES))
+    keep = torch.arange(seq_len, device=dq.device) != row
+    assert_grads_close("dq", dq[keep], expected[0][keep])
+    assert_grads_close("dk", dk, expected[1])
+    assert_grads_close("dv", dv, expected[2])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+def test_sparse_rows_reach_keys_after_the_query(h_kv):
+    _skip_cu12(h_kv)
+    # Past the dense prefix a query may select blocks after itself when hi allows. Rows whose own block is complete
+    # (query position 3 mod 4) take one block 64 tokens ahead in their tail slots and a bound covering it, so the
+    # bitmap entry and the index-list oracle see the same tokens.
+    seq_len = 24000
+    inputs = _inputs((seq_len,), h_kv, seed=3)
+    idx = inputs["topk_idxs"]
+    rows = torch.arange(20503, 23900, 700, device=idx.device)
+    future = (rows + 64) // 4 * 4
+    idx[rows, -4:] = (future[:, None] + torch.arange(4, device=idx.device)[None]).to(idx.dtype)
+    inputs["out"], lse = reference_forward(inputs["q"], inputs["k"], inputs["v"], idx, torch.float32)
+    inputs["lse"] = lse.T.contiguous()
+    meta = list(_miles_metadata(idx, (seq_len,)))
+    meta[2][rows] = (future + 3).to(meta[2].dtype)
+    meta[0][rows, future // 4] = 1
+    _check(inputs, _bitmap_backward(inputs, tuple(meta)))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+def test_dense_query_selecting_past_its_prefix_marks_dq(h_kv):
+    _skip_cu12(h_kv)
+    # A query of the dense prefix sees keys up to the end of that prefix. A selected block past it leaves the query's
+    # dQ NaN. With a zero output gradient the query contributes nothing to the reference.
+    seq_len, row, block = 24000, 100, 21000
+    inputs = _inputs((seq_len,), h_kv, seed=9)
+    inputs["dout"][row] = 0
+    meta = list(_miles_metadata(inputs["topk_idxs"], (seq_len,)))
+    meta[2][row] = seq_len - 1
+    meta[0][row, block // 4] = 1
+    dq, dk, dv = _bitmap_backward(inputs, tuple(meta))
+    assert dq[row].isnan().all()
+    expected = reference_backward(*(inputs[name] for name in _INPUT_NAMES))
+    keep = torch.arange(seq_len, device=dq.device) != row
+    assert_grads_close("dq", dq[keep], expected[0][keep])
+    assert_grads_close("dk", dk, expected[1])
+    assert_grads_close("dv", dv, expected[2])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+@pytest.mark.parametrize("scale", [0.1, -0.125])
+def test_sparse_rows_follow_bounds_and_scale(h_kv, scale):
+    _skip_cu12(h_kv)
+    # Past the dense prefix: rows emptied by their selection or their bounds, one member of a query pair or both, a lo
+    # that cuts a selected block and masks a NaN / inf token inside it, and a runtime scale other than 1/16.
+    seq_len, tok, empty = 22600, 21001, [22001, 22100, 22200, 22201]
+    inputs = _inputs((seq_len,), h_kv, seed=13)
+    idx = inputs["topk_idxs"]
+    meta = _miles_metadata(idx, (seq_len,))
+    sel, lo, hi = meta[:3]
+    sel[empty] = 0
+    lo[(idx == tok).any(dim=1)] = tok + 1
+    inputs["k"][tok] = float("nan")
+    inputs["v"][tok] = float("inf")
+    # the oracle's lists keep the selected tokens within the bounds
+    idx.masked_fill_((idx < lo[:, None]) | (idx > hi[:, None]), -1)
+    idx[empty] = -1
+    inputs["out"], lse = reference_forward(inputs["q"], inputs["k"], inputs["v"], idx, torch.float32, scale)
+    inputs["lse"] = lse.T.contiguous()
+    _check(inputs, _bitmap_backward(inputs, meta, scale), scale)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_kv", [2, 1])
+@pytest.mark.parametrize("keys", ["constant-key", "near-equal-keys"])
+def test_sparse_backward_cancellation(h_kv, keys):
+    # With (nearly) equal keys the sparse queries' dQ (nearly) cancels to zero. The default's three bf16 parts of dS keep
+    # it within an absolute bound that a single rounding (ds_precision="bf16") exceeds.
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    _skip_cu12(h_kv)
+    seq_len = 22600
+    inputs = _inputs((seq_len,), h_kv, seed=11)
+    inputs["k"].fill_(1)
+    if keys == "near-equal-keys":
+        inputs["k"][1::2] = 1 + 2**-7
+    inputs["out"], lse = reference_forward(inputs["q"], inputs["k"], inputs["v"], inputs["topk_idxs"], torch.float32)
+    inputs["lse"] = lse.T.contiguous()
+    dq = _entry_backward("bitmap" if h_kv == 2 else "indexed", inputs, (seq_len,))[0]
+    rows = torch.arange(engine.DENSE_QUERIES_MAX, seq_len, 53, device=dq.device)
+    q, out, dout, idx = (inputs[name][rows] for name in ("q", "out", "dout", "topk_idxs"))
+    expected = reference_backward(q, inputs["k"], inputs["v"], out, dout, inputs["lse"][:, rows], idx, dtype=torch.float64)[0]
+    err = (dq[rows].double() - expected).abs().max().item()
+    assert err <= 1e-5, f"sparse dQ error {err:.3e}"
+
+
+@pytest.mark.L1
+def test_key_skip_variant_matches_reference(monkeypatch):
+    # The key-major variant that skips empty K-steps serves only long sequences, which the 24Q/2KV cases stop short of.
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    monkeypatch.setattr(engine, "KEY_SKIP_MIN_T", 0)
+    monkeypatch.setattr(engine, "_PLANS", {})
+    inputs = _inputs((24000,), 2, seed=17)
+    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (24000,))))
+    assert [plan.key_name for plan in engine._PLANS.values()] == ["key_skip1"]
+
+
+@pytest.mark.L1
+def test_packed_bounds_past_the_query_cover_a_shared_key_tile():
+    _skip_cu12(1)
+    # Two dense documents share key tile 93. Bounds reaching each document's end lower the tile's first group to the
+    # first document's start, so its walk spans both documents' dense queries on a plan with a sparse grid.
+    from QSA.cutedsl.test_qsa import make_inputs as bitmap_inputs
+
+    la = lb = 12000
+    inputs = bitmap_inputs((la, lb), 12, 1, all_selected=True)
+    end = torch.full_like(inputs["hi"], la + lb - 1)
+    end[:la] = la - 1
+    inputs["hi"].copy_(end)
+    first, last = inputs["block_first"], inputs["block_last"]
+    inputs["sel_blocks"].copy_(((last[None] >= inputs["lo"][:, None]) & (first[None] <= end[:, None])).to(torch.uint8))
+    scale = inputs["scale"]
+    saved = qsa_forward(**inputs)
+    dout = torch.randn(inputs["q"].shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(7)).to(torch.bfloat16)
+    dq, dk, dv = qsa_backward(dout, out_fp32=saved["out_fp32"], lse=saved["lse"], **inputs)
+
+    q, k, v, do = (x.double() for x in (inputs["q"][:la], inputs["k"][:la, 0], inputs["v"][:la, 0], dout[:la]))
+    lse = saved["lse"].double().t()[:la]
+    delta = (do * saved["out_fp32"][:la].double()).sum(-1)
+    a0 = la // 128 * 128
+    p = torch.exp(torch.einsum("thd,jd->thj", q, k[a0:]) * scale - lse[..., None])
+    ds = p * (torch.einsum("thd,jd->thj", do, v[a0:]) - delta[..., None])
+    assert_grads_close("dk", dk[a0:la], (torch.einsum("thj,thd->jd", ds, q) * scale)[:, None])
+    assert_grads_close("dv", dv[a0:la], torch.einsum("thj,thd->jd", p, do)[:, None])
+    for row in (0, 100):
+        p = torch.exp(torch.einsum("hd,jd->hj", q[row], k) * scale - lse[row][:, None])
+        ds = p * (torch.einsum("hd,jd->hj", do[row], v) - delta[row][:, None])
+        assert_grads_close("dq", dq[row : row + 1], (torch.einsum("hj,jd->hd", ds, k) * scale)[None])
+
+
+@pytest.mark.L0
+def test_sparse_pair_isolates_a_nonfinite_key_row():
+    # Two consecutive sparse queries share one query-major item. A NaN K row selected by only the first poisons
+    # the queries selecting that block and the block's dK / dV, nothing of its partner.
+    _skip_cu12(1)
+    seq_len, owner = 22600, 22560
+    inputs = _inputs((seq_len,), 1, seed=5)
+    starts = inputs["topk_idxs"][:, ::4]
+    own = set(starts[owner].tolist()) - set(starts[owner + 1].tolist()) - {-1}
+    tok = min(own)
+    clean = _indexed_backward(inputs)
+    inputs["k"][tok : tok + 4] = float("nan")
+    dq, dk, dv = _indexed_backward(inputs)
+    selecting = (starts == tok).any(dim=1)
+    assert selecting[owner] and not selecting[owner + 1]
+    assert dq[selecting].isnan().all()
+    assert_grads_close("dq", dq[~selecting], clean[0][~selecting])
+    keys = torch.ones(seq_len, dtype=torch.bool, device=dq.device)
+    keys[tok : tok + 4] = False
+    assert_grads_close("dk", dk[keys], clean[1][keys])
+    assert_grads_close("dv", dv[keys], clean[2][keys])
+
+
+@pytest.mark.L0
+def test_indexed_entry_on_a_side_stream():
+    _skip_cu12(1)
+    inputs = _inputs((28000,), 1, seed=3)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        grads = _indexed_backward(inputs)
+    torch.cuda.current_stream().wait_stream(side)
+    _check(inputs, grads)
+
+
+@pytest.mark.L0
+def test_cuda12_compiler_declines_12q1kv(monkeypatch):
+    # The 12Q/1KV key-major kernel crashes the CUDA 12 DSL compiler: both entries decline every one-KV-head flavor
+    # before compiling, the 24Q/2KV flavor runs.
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    monkeypatch.setattr(engine, "dsl_cuda_major", lambda: 12)
+    for h_q in (12, 6):
+        inputs = _inputs((4101,), 1, seed=9, h_q=h_q)
+        with pytest.raises(NotImplementedError, match="CUDA 13 build"):
+            _indexed_backward(inputs)
+        with pytest.raises(NotImplementedError, match="CUDA 13 build"):
+            _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (4101,)))
+    inputs = _inputs((4101,), 2, seed=9)
+    _check(inputs, _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (4101,))))
+
+
+@pytest.mark.parametrize(
+    "h_q, h_kv, entries",
+    [
+        pytest.param(12, 1, ("indexed", "bitmap"), marks=pytest.mark.L0),
+        pytest.param(24, 2, ("bitmap",), marks=pytest.mark.L1),
+        pytest.param(6, 1, ("indexed", "bitmap"), marks=pytest.mark.L1),
+    ],
+    ids=["12q1kv", "24q2kv", "6q1kv"],
+)
+def test_bf16_ds_option_on_both_entries(h_q, h_kv, entries, monkeypatch):
+    # ds_precision="bf16" rounds dS to bf16 before the dQ MMAs on the dense and the sparse paths of both entries and
+    # stays within the ordinary bounds. The cancellation tests cover the accuracy the default keeps.
+    from cudnn.QSA.kernels import bprop_sm100 as engine
+
+    from cudnn.QSA.indexed.api import _plan
+
+    _skip_cu12(h_kv)
+    # the indexed entry builds its engine plan only when its own plan cache misses
+    _plan.cache_clear()
+    monkeypatch.setattr(engine, "_PLANS", {})
+    inputs = _inputs((24000,), h_kv, seed=5, h_q=h_q)
+    for entry in entries:
+        before = set(engine._PLANS)
+        _check(inputs, _entry_backward(entry, inputs, (24000,), ds_precision="bf16"))
+        # each entry plans its own sequence source, with one dS part
+        assert [key[-1] for key in set(engine._PLANS) - before] == [1]
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("h_kv, seq_len", [(1, 65536), (1, 262144), (2, 65536)])
+def test_long_sequences(seq_len, h_kv):
+    _skip_cu12(h_kv)
+    # the bitmap entry's [T, NB] metadata keeps the 24 / 2 case at 64K
+    inputs = _inputs((seq_len,), h_kv, seed=seq_len)
+    grads = _indexed_backward(inputs) if h_kv == 1 else _bitmap_backward(inputs, _miles_metadata(inputs["topk_idxs"], (seq_len,)))
+    _check(inputs, grads)

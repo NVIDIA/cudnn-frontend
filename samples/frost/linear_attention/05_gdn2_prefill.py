@@ -104,6 +104,14 @@ def _reference(q, k, v, g, beta, w, a_log, dt_bias, cu, scale):
 
 
 def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
+    if not torch.cuda.is_available():
+        print("[05] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[05] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     torch.manual_seed(0)
     device = "cuda"
     total, num_seqs = sum(seq_lens), len(seq_lens)
@@ -131,7 +139,7 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     cu_t = g.tensor([num_seqs + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
     a_log_t = g.tensor([H], data_type=cudnn.data_type.FLOAT, name="a_log")
     dt_bias_t = g.tensor([H, D], data_type=cudnn.data_type.FLOAT, name="dt_bias")
-    O_t, fs_t, _h_t = g.gdn2(
+    O_t, fs_t, _h_t, _composed = g.gdn2(
         q=q_t,
         k=k_t,
         v=v_t,

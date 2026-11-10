@@ -2330,3 +2330,78 @@ class TestNativeCausalZeroTail:
     from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
 
     test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)
+
+
+@requires_rubin
+class TestNativeD512Fp8Paged:
+    """Native page loads retain split/pack, dynamic binding and replay contracts."""
+
+    from test_sdpa_fwd_paged_sm100 import (
+        test_paged_graph_fp8_d512_boundaries as _bounds,
+        test_paged_graph_fp8_d512_head_envelope as _envelope,
+    )
+    from test_sdpa_fp8_d512_paged_determinism import (
+        test_fp8_d512_paged_replay_and_batch_invariance as _repeat,
+        test_fp8_d512_paged_golden as _golden,
+    )
+    from sdpa_fp8_d512_paged_sm107 import paged_capture, native_paged_contract, paged_half_softmax, paged_half_golden
+
+    test_boundaries = staticmethod(_bounds)
+    test_head_envelope = staticmethod(_envelope)
+    test_replay_and_batch_invariance = staticmethod(_repeat)
+    test_golden = staticmethod(_golden)
+    test_strides_and_capture = staticmethod(paged_capture)
+    test_contract = staticmethod(native_paged_contract)
+    test_half_softmax = staticmethod(paged_half_softmax)
+    test_half_golden = staticmethod(paged_half_golden)
+
+
+# D512 backward is included by this explicitly selected SM107 CI file.
+import d512_fp8_bwd_checks as d512_checks
+
+
+@requires_rubin
+class TestD512Fp8Backward:
+    @pytest.fixture
+    def d512(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import test_sdpa_bwd_fp8_sm107 as fp8
+
+        monkeypatch.setattr(fp8, "_D", 512)
+        monkeypatch.setattr(fp8, "_ENGINE", "sdpa_bwd_d512_fp8")
+        return fp8
+
+    test_unsupported_graphs_decline = staticmethod(d512_checks.test_unsupported_graphs_decline)
+    test_graph_numerics = staticmethod(d512_checks.test_graph_numerics)
+    test_replay_batch_and_golden = staticmethod(d512_checks.test_replay_batch_and_golden)
+
+
+# Architecture CI entry for the shared exact-D512 block-scale contract.
+import d512_mxfp8_bwd_checks as d512_mx_checks
+
+
+@requires_rubin
+class TestD512Mxfp8Backward:
+    @pytest.fixture
+    def d512_mx(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import test_sdpa_bwd_mxfp8_sm100 as mx
+
+        monkeypatch.setattr(mx, "_ENGINE", "sdpa_bwd_d512_mxfp8")
+        original = mx._plan_index
+        monkeypatch.setattr(mx, "_plan_index", lambda graph: original(graph, "sdpa_bwd_d512_mxfp8"))
+        return mx
+
+    test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
+    test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
+    test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)

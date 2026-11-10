@@ -132,7 +132,7 @@ To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 `deterministic_bwd`, iteration counts), and run `--config <name>`. Supported
 forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
 `indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
-head count with `d_qk` in `{512, 576}` and a deterministic mode on SM100 for
+head count with `d_qk` in `{512, 576}` and a deterministic mode on SM90/SM100 for
 H16/H32/H64/H96/H128. A QSA preset (`kind="qsa"`, `num_kv_heads`,
 `block_size=4`, `head_dim_qk = head_dim_vo = 256`) is served for 24/2, 12/1
 and 6/1 query/KV heads on SM100-family GPUs; wrap either kind in
@@ -223,9 +223,10 @@ estimate and does not guarantee allocation success.
 
 ### Compact-H32 Indexer Backward
 
-`benchmark_dsa_indexer_h32.py` measures the default SM100 indexer-backward
-wrapper with compact H32 tensors against caller-side
-`torch.nn.functional.pad` to H64. Outputs are preallocated, H64 output slicing
+`benchmark_dsa_indexer_h32.py` measures the SM100 indexer-backward wrapper
+with compact H32 tensors against caller-side `torch.nn.functional.pad` to H64
+(fp32 `d_index_k` by default; `--d-index-k-dtype bf16` measures the BF16
+scratch path with a preallocated workspace). Outputs are preallocated, H64 output slicing
 is excluded, case order is rotated, and L2 is flushed before each CUDA-event
 sample. The script validates the H64 result against the compact path before
 timing. Profile mode also exposes already-padded H64 inputs as a kernel-only
@@ -358,6 +359,19 @@ Options:
   without `topk_length` are different compiled variants; the default
   benchmarks the `topk_length` variant with every row at the full top-k
   count.
+- `--deterministic` — benchmark deterministic execution `off`, `on`, or
+  `both` (default `off`).
+- `--deterministic-relay-cluster-size` — force logical C4/C8/C16/C32/C64.
+  SM90 defaults to C16; SM100 keeps its automatic large-context policy. C32
+  and C64 use two/four ordered physical C16 phases and reduce the dominant
+  FP32 relay planes to four/two.
+- `--deterministic-dkv-mode` — `deterministic_dkv_mode` of deterministic
+  plans: `records` (default), `chain` or `shards` (see the deterministic dKV
+  storage section of `docs/operations/sparse_attention/dsa.md`). It selects
+  the dKV storage of SM100 generic M64 and H128 two-CTA plans (`shards` keeps
+  the two-CTA private-plane layout); `chain` is rejected on SM90, on the
+  two-CTA routes, on devices other than SM100/SM103 (where `records` runs as
+  `shards`), and together with `--deterministic-relay-cluster-size`.
 - `--warmup` / `--repeat` — iterations per config (defaults 10 / 50; the
   first warmup iteration also triggers kernel compilation).
 - `--csv` — write results to a CSV file.
@@ -385,6 +399,39 @@ supported DSL.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
+##### SM90 deterministic relay scheduling (2026-11-02)
+
+Measured on NVIDIA H200 (SM90) with BF16 H64/Dqk576/Dv512, KV=65536,
+top-k 2048, full runtime lengths, synthetic forward statistics, five warm-ups,
+and 20 allocation-free calls. The environment used PyTorch 2.12.1+cu130,
+CuTe DSL 4.8.1 (CUDA 13.4 lowering), and cuDNN 9.20.0. Each explicit relay
+width was run in a separate process with `--deterministic both`; the small
+non-deterministic variation between rows is measurement noise.
+
+| Q | Logical relay | Non-det ms | Det ms | Det / non-det | Non-det workspace GiB | Det workspace GiB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | C4  | 3.996 | 7.672 | 1.920x | 0.141 | 4.508 |
+| 1024 | C8  | 3.988 | 6.745 | 1.691x | 0.141 | 2.258 |
+| 1024 | C16 | 3.988 | 6.153 | 1.543x | 0.141 | 1.133 |
+| 1024 | C32 | 3.987 | **5.457** | **1.369x** | 0.141 | 0.571 |
+| 1024 | C64 | 3.983 | 9.158 | 2.299x | 0.141 | **0.290** |
+| 4096 | C4  | 15.390 | 23.904 | 1.553x | 0.143 | 4.533 |
+| 4096 | C8  | 15.331 | 23.494 | 1.532x | 0.143 | 2.283 |
+| 4096 | C16 | 15.334 | 22.686 | 1.479x | 0.143 | 1.158 |
+| 4096 | C32 | 15.362 | **20.601** | **1.341x** | 0.143 | 0.596 |
+| 4096 | C64 | 15.364 | 35.813 | 2.331x | 0.143 | **0.314** |
+| 16384 | C4  | 60.093 | 88.537 | 1.473x | 0.148 | 4.633 |
+| 16384 | C8  | 60.126 | 90.433 | 1.504x | 0.148 | 2.383 |
+| 16384 | C16 | 60.133 | 88.509 | 1.472x | 0.148 | 1.258 |
+| 16384 | C32 | 60.105 | **81.453** | **1.355x** | 0.148 | 0.695 |
+| 16384 | C64 | 60.098 | 142.370 | 2.369x | 0.148 | **0.414** |
+
+C32 is the best time/memory point in this workload: it lowers deterministic
+overhead to 1.34--1.37x while using about half the C16 workspace. C64 is the
+memory-first endpoint, but its four serialized physical C16 phases raise the
+overhead to 2.30--2.37x. C16 remains the conservative SM90 default; C32/C64
+are explicit plan-time choices.
+
 ##### SM100 deterministic relay scheduling (2026-10-30)
 
 Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the
@@ -400,6 +447,49 @@ because the earlier cluster-4 crossover did not generalize across SM100
 devices. An explicit Q=4K cluster-4 profiling experiment attributed its local
 gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
 9.696 ms; this is implementation evidence, not the portable automatic policy.
+Use `--deterministic-relay-cluster-size {4,8,16,32,64}` with `--deterministic on`
+to benchmark an exact relay specialization. The option applies only to
+deterministic cases when `--deterministic both` is selected; omitted means the
+automatic policy. Under the default `--deterministic-dkv-mode records`,
+large-context plans whose conflict-rank records fit the relay workspace store
+dKV in records instead; the relay measurements in this section correspond to
+`--deterministic-dkv-mode shards`. The relay size option is valid only for
+large-context generic-M64 cases and may
+request more workspace than the automatic memory-first budget. The logical
+cluster-32 option uses two ordered 16-CTA hardware-cluster phases and four
+FP32 planes, halving the dominant data-plane workspace from cluster-16.
+Cluster-64 is an explicit emergency memory-first option with four ordered
+16-CTA phases, two FP32 planes, and a 64-bit packed row mask; the automatic
+policy never selects it.
+On the SM100 test environment, a CP64-sized Q=16K/KV=1M H64/D576 case with
+BF16 and top-k 64 reduced complete scratch from 20.008 GiB to 11.008 GiB and
+changed warmed `execute()` latency from 10.915 ms to 8.303 ms. At
+Q=4K/KV=65537 H64/D512 and top-k 129, complete scratch fell from 1.033 GiB to
+0.533 GiB and latency changed from 2.101 ms to 2.052 ms. Both measurements use
+three timed calls after warm-up; the option remains workload-specific rather
+than part of the automatic policy.
+
+An explicit cluster-64 experiment shows the remaining tradeoff. All rows use
+the same SM100 BF16 input generator and ten warm-ups; top-k 129 and 64 use 50
+timed calls, while top-k 2048 uses 30.
+
+| Shape | Top-k | Logical CTAs/group | Workspace GiB | Latency ms | TFLOPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4096 / KV65537 / H64 / D512 | 129 | 16 | 1.033 | 2.095 | 82.64 |
+| Q4096 / KV65537 / H64 / D512 | 129 | 32 | 0.533 | **2.050** | **84.47** |
+| Q4096 / KV65537 / H64 / D512 | 129 | 64 | **0.283** | 3.478 | 49.78 |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 16 | 20.008 | 11.129 | 33.19 |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 32 | 11.008 | **8.258** | **44.73** |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 64 | **6.508** | 10.971 | 33.67 |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 16 | 20.008 | 73.000 | 161.92 |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 32 | 11.008 | **68.901** | **171.55** |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 64 | **6.508** | 126.322 | 93.57 |
+
+Cluster-64 saves another 40.9% of complete CP64-sized scratch relative to
+cluster-32, but regresses latency by 32.9% at top-k 64 and 83.3% at top-k
+2048. Four serialized phases expose only 32 CTAs per phase, compared with two
+64-CTA phases for cluster-32, and the row protocol uses 64-bit rather than
+32-bit atomics. Prefer cluster-32 unless the 11.008 GiB allocation does not fit.
 The optimized trace has no separate dKV prefold kernel; fixed-order conversion
 takes 1.452 ms and workspace clearing 0.658 ms.
 

@@ -84,6 +84,9 @@ def _cdiv(a: int, b: int) -> int:
 class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     """d=128 / d=256 block-scale MXFP8 backward on Blackwell (see the module docstring)."""
 
+    _HEAD_PAIRS = _HEAD_PAIRS
+    _PAIR_ROUTE = _PAIR_ROUTE
+
     def __init__(
         self,
         sample_q,
@@ -209,8 +212,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         the gate. ValueError, never assert.
         """
         self._value_error_if(
-            (self.head_dim_qk, self.head_dim_v) not in _HEAD_PAIRS,
-            f"SM100 MXFP8 bwd: (d_qk, d_v) must be one of {_HEAD_PAIRS}; got ({self.head_dim_qk}, {self.head_dim_v})",
+            (self.head_dim_qk, self.head_dim_v) not in self._HEAD_PAIRS,
+            f"SM100 MXFP8 bwd: (d_qk, d_v) must be one of {self._HEAD_PAIRS}; got ({self.head_dim_qk}, {self.head_dim_v})",
         )
         self._value_error_if(self.h_kv < 1 or self.h_q % self.h_kv != 0, f"SM100 MXFP8 bwd: h_q ({self.h_q}) must be a multiple of h_kv ({self.h_kv})")
         self._value_error_if(self.dtype != torch.float8_e4m3fn, f"SM100 MXFP8 bwd: the kernels consume E4M3 payloads only; got {self.dtype}")
@@ -257,7 +260,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             self._value_error_if(have != want, f"SM100 MXFP8 bwd: {name} has {have} bytes; the F8_128x4 layout for this shape needs {want}")
         self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, "SM100 MXFP8 bwd: padding masks (seq lens) are not implemented")
         self._value_error_if(
-            self.window_size_left is not None and not self._pair_route(), f"SM100 MXFP8 bwd: sliding window is served at (d_qk, d_v) in {_PAIR_ROUTE} only"
+            self.window_size_left is not None and not self._pair_route(), f"SM100 MXFP8 bwd: sliding window is served at (d_qk, d_v) in {self._PAIR_ROUTE} only"
         )
         self._value_error_if(self.window_size_left is not None and not self.is_causal, "SM100 MXFP8 bwd: a sliding window requires the causal mask")
         self._value_error_if(
@@ -282,7 +285,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return int(get_workspace_size(self.s_q_max, self.head_dim_qk, self.h_q, self.batch_size, cutlass.Float32))
 
     def _pair_route(self) -> bool:
-        return (self.head_dim_qk, self.head_dim_v) in _PAIR_ROUTE
+        return (self.head_dim_qk, self.head_dim_v) in self._PAIR_ROUTE
 
     def _window(self) -> int:
         return 0 if self.window_size_left is None else int(self.window_size_left) + 1

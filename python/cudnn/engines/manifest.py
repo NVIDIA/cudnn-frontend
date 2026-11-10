@@ -270,7 +270,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         #   10 sm100_d192_d128_mxfp8
         slots={
             "sdpa_fwd_prefill_sm120": EngineSlot(5),
-            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
+            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7),
             "sdpa_fwd_prefill_sm80": EngineSlot(8),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
@@ -279,7 +279,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
-            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18, opt_in=True),
+            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
@@ -306,6 +306,8 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_d128_fp8": EngineSlot(11, opt_in=True),
             "sdpa_bwd_sm100_d192": EngineSlot(12, opt_in=True),
             "sdpa_bwd_sm100_d192_fp8": EngineSlot(13, opt_in=True),
+            "sdpa_bwd_d512_fp8": EngineSlot(14, opt_in=True),
+            "sdpa_bwd_d512_mxfp8": EngineSlot(15, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick

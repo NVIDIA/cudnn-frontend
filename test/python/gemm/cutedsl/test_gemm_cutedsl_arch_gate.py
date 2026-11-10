@@ -39,6 +39,17 @@ def test_no_cutedsl_gemm_gate_admits_cc12_by_threshold():
     assert len(gated) >= 24, sorted(str(p.relative_to(_CUTEDSL_GEMM)) for p in gated)
 
 
+def test_no_cutedsl_gemm_test_skip_admits_cc12_by_threshold():
+    """The tests' own SM100 skips go through has_tcgen05 too. With a bare threshold a cc 12.x device passes the skip, and the
+    API's check_support() then raises the gate's RuntimeError, so the test fails instead of being skipped."""
+    bare = re.compile(r"\b(?:compute_capability|major \* 10 \+ minor) *< *100\b|(?:\bmajor|capability(?:\(\))?\[0\]) *< *10\b")
+    here = Path(__file__).resolve()
+    offenders = [
+        f"{p.name}:{n}" for p in sorted(here.parent.glob("*.py")) if p != here for n, line in enumerate(p.read_text().splitlines(), 1) if bare.search(line)
+    ]
+    assert not offenders, offenders
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_gemm_amax_check_support_declines_cc12(monkeypatch):
     """A cc 12.0 device is declined by check_support() with the gate's RuntimeError, before any kernel is built."""

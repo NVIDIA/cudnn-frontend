@@ -47,8 +47,14 @@ set_compute_data_type(DataType_t value)
     - in_running_var
     - epsilon
     - momentum
+    - peer_stats (optional, list)
     - compute_data_type
     - name
+
+`peer_stats` is an optional list of per-peer statistics tensors for synchronized batch normalization; the frontend
+forwards each tensor to cuDNN's peer-stat descriptor list (`CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS` for the
+forward, `CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS` for the backward). See the cuDNN API documentation for the
+expected statistics layout.
 
 ## Batchnorm Finalize
 
@@ -98,6 +104,20 @@ Batchnorm_backward_attributes&
 set_compute_data_type(DataType_t value)
 ```
 Only setting either (saved mean and inverse_variance) or (epsilon) is necessary.
+
+### Python API
+
+- batchnorm_backward
+    - grad
+    - input
+    - scale
+    - mean
+    - inv_variance
+    - peer_stats (optional, list)
+    - compute_data_type
+    - name
+
+`peer_stats` behaves as in [Batchnorm Forward](#batchnorm-forward).
 
 ## Generate Stats
 
@@ -225,7 +245,7 @@ set_compute_data_type(DataType_t value)
 
 ## RMSNorm Graph API
 
-`Graph::rmsnorm(x, scale, attributes)` (Python: `graph.rmsnorm(norm_forward_phase, input, scale=None, bias=None, epsilon)`)
+`Graph::rmsnorm(x, scale, attributes)` (Python: `graph.rmsnorm(norm_forward_phase, input, scale=None, bias=None, epsilon, adaptive=False)`)
 normalizes `x` by its root mean square and multiplies by `scale`. Training also returns `INV_VARIANCE`. Its dims are `x`'s
 dims, with 1 on every axis where `scale` is not 1. Those are the normalization axes.
 
@@ -334,8 +354,8 @@ set_compute_data_type(DataType_t value)
 ### Python API
 
 - adalayernorm_backward
-    - dy
-    - x
+    - grad
+    - input
     - scale
     - mean
     - inv_variance
@@ -373,6 +393,7 @@ set_compute_data_type(DataType_t value)
 
 - instancenorm
     - norm_forward_phase
+    - adaptive (optional, bool)
     - input
     - scale
     - bias
@@ -380,6 +401,12 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
+`adaptive` is a Python-only flag for adaptive InstanceNorm. The input must be channels-first contiguous
+(`[N, C, L]`, `[N, C, H, W]` or `[N, C, D, H, W]`), and `scale`/optional `bias` must be per sample and channel
+with singleton spatial dimensions -- `[N, C, 1]`, `[N, C, 1, 1]`, `[N, C, 1, 1, 1]`; the statistics have that
+same shape and the reduction runs over the spatial axes. Adaptive InstanceNorm is served by Python engines only
+(`adaptive=False` keeps backend eligibility). For the adaptive LayerNorm/RMSNorm layouts (`[B, S, D]` / `[S, B, D]`
+with `[B, 1, D]` / `[1, B, D]` scale) see the norm guide (`python/cudnn/norm/README.md`).
 
 ## Instancenorm Backward (DIN)
 
@@ -417,5 +444,6 @@ set_compute_data_type(DataType_t value)
     - scale
     - mean
     - inv_variance
+    - adaptive (optional, bool)
     - compute_data_type
     - name

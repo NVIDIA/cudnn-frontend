@@ -266,7 +266,7 @@ def test_serialize_both_graph_and_kernel_cache(cudnn_handle):
     graph.build([cudnn.heur_mode.FALLBACK])
     build_time_ms = (time.time() - start_time) * 1000
     assert build_time_ms <= EXECUTION_TIME_LIMIT_MS, f"Graph build time {build_time_ms:.2f}ms exceeded limit of {EXECUTION_TIME_LIMIT_MS}ms"
-    A_gpu, B_gpu, C_expected, C_actual = create_tensors(8, 64, 128)
+    A_gpu, B_gpu, C_expected, C_actual = create_tensors(16, 64, 256)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
     graph.execute({0: A_gpu, 1: B_gpu, 2: C_actual}, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()

@@ -12,12 +12,12 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver, ws_align
 from cudnn._torch_stream import stream_context
-from cudnn.QSA._contract import check_tensor, paired_backward, paired_queries
+from cudnn.QSA._contract import check_tensor, ds_parts
 
 QUERY_HEADS = (6, 12)  # per single KV head: the four-way and two-way tensor-parallel shards of the 24Q/2KV model
 
 
-def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None):
+def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqlens=None):
     if not isinstance(q, torch.Tensor) or not q.is_cuda or q.ndim != 3:
         raise ValueError("q must be a CUDA tensor with shape [T, Hq, 256]")
     total, hq = q.shape[0], q.shape[1]
@@ -37,36 +37,34 @@ def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None):
         check_tensor("grad_out", grad, q.shape, torch.bfloat16, q.device, 16)
         check_tensor("out_fp32", out32, q.shape, torch.float32, q.device, 16)
         check_tensor("lse", lse, (hq, total), torch.float32, q.device)
+    if cu_seqlens is not None:
+        if not isinstance(cu_seqlens, torch.Tensor) or cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError("cu_seqlens must be a 1-D int32 tensor of at least 2 sequence bounds")
+        check_tensor("cu_seqlens", cu_seqlens, (cu_seqlens.shape[0],), torch.int32, q.device)
     return total, width
 
 
 class _QsaIndexedPlan(APIBase):
-    """Immutable geometry and compiled kernels; execute uses caller storage only."""
+    """Immutable geometry and compiled kernels. Execute uses caller storage only.
 
-    def __init__(self, total, width, device, direction, hq=12):
+    The backward runs the dense-prefix and two-pass kernels of ``cudnn.QSA.kernels.bprop_sm100`` (those of
+    ``bprop_sm107`` on SM107 with the oversized shared memory carveout) behind the per-query compaction, for 12 or 6 query
+    heads per KV head, with the documents of a packed buffer described by ``cu_seqlens`` when the caller has them.
+    """
+
+    def __init__(self, total, width, device, direction, num_seqs=0, hq=12, dq_parts=1, max_seq_len=None):
         with torch.cuda.device(device):
             super().__init__()
         self.total, self.width, self.device, self.direction, self.hq = total, width, device, direction, hq
-        # The backward batches consecutive queries (two at 12:1, four at 6:1) with owner bits in the compact IDs.
-        self.paired = direction == "bprop" and paired_backward(hq, 1)
-        self.nq = paired_queries(hq, 1) if self.paired else 1
-        groups = (total + self.nq - 1) // self.nq
+        self.dq_parts = dq_parts
+        self.num_seqs = num_seqs
+        self.max_seq_len = max_seq_len
         self.layouts = [
-            ("ids", (groups, self.nq * (width // 4)), torch.int32),
-            ("counts", (groups,), torch.int32),
+            ("ids", (total, width // 4), torch.int32),
+            ("counts", (total,), torch.int32),
             *((name, (total,), torch.int32) for name in ("lo", "hi", "first", "last")),
         ]
-        if direction == "bprop":
-            self.layouts.extend(
-                [
-                    ("delta", (total, hq), torch.float32),
-                    ("dq_acc", (total, hq, 256), torch.float32),
-                    ("dk_acc", (total, 1, 256), torch.float32),
-                    ("dv_acc", (total, 1, 256), torch.float32),
-                ]
-            )
-            if self.paired:
-                self.layouts.append(("flags", (((total * 256 + 1023) // 1024) * 4 + 1,), torch.int32))
+        self.engine_plan = None
         self.workspace_bytes = sum(ws_align(math.prod(shape) * dtype.itemsize) for _, shape, dtype in self.layouts)
 
     def check_support(self):
@@ -85,6 +83,17 @@ class _QsaIndexedPlan(APIBase):
             raise NotImplementedError(reason)
         self.arch = cc[0] * 10 + cc[1]
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        if self.direction == "bprop":
+            from cudnn.QSA.kernels import bprop_sm100 as engine
+
+            if engine.dsl_cuda_major() < 13:
+                # the 12Q/1KV key-major kernel crashes the CUDA 12 DSL compiler
+                raise NotImplementedError(
+                    "Indexed QSA backward requires the CUDA 13 build of CuTe DSL: install 'nvidia-cutlass-dsl[cu13]>=4.7.0' with a CUDA 13 compatible driver"
+                )
+            mode = engine.SEQ_CU if self.num_seqs else engine.SEQ_SINGLE
+            self.engine_plan = engine.plan_for(self.total, self.device, 1, mode, max(self.num_seqs, 1), self.hq, self.dq_parts, self.max_seq_len)
+            self.workspace_bytes += self.engine_plan.workspace_bytes()
         self._is_supported = True
         return True
 
@@ -96,28 +105,34 @@ class _QsaIndexedPlan(APIBase):
         from . import _metadata
 
         with torch.cuda.device(self.device):
-            module = f"{self.direction}_sm100"
-            if self.direction == "fprop" and self.arch == 107 and self.total >= 32768 and self.hq == 12:
-                module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
-            elif self.direction == "bprop" and not self.paired:
-                module = "bprop_sm107" if self.arch == 107 else "bprop_sm100_base"
-            self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
-            self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
-            self._metadata = _metadata.compile_metadata(self.arch, self.nq, self.width // 4)
+            self._metadata = _metadata.compile_metadata(self.arch, self.width // 4)
+            if self.direction == "fprop":
+                module = "fprop_sm100"
+                if self.arch == 107 and self.total >= 32768 and self.hq == 12:
+                    module = "fprop_n64_sm107"  # specialised for 12 heads per KV head
+                self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
+                self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
+            else:
+                from cudnn.QSA.kernels import bprop_sm100 as engine
+
+                self.impl = engine
+                self._compiled_kernel = engine.compile_kernels(self.engine_plan)
 
     def scratch_workspace_bytes(self):
         return self.workspace_bytes
 
-    def execute(self, q, k, v, indices, outputs, scale, workspace, grad=None, out32=None, lse=None, current_stream=None):
+    def execute(self, q, k, v, indices, outputs, scale, workspace, grad=None, out32=None, lse=None, current_stream=None, cu_seqlens=None):
         if self._compiled_kernel is None:
             raise RuntimeError("Indexed QSA plan must be compiled before execute")
         if self.direction == "bprop" and grad is None:
             raise ValueError("grad_out, out_fp32 and lse are required for backward")
-        if self.direction == "fprop" and any(value is not None for value in (grad, out32, lse)):
+        if self.direction == "fprop" and any(value is not None for value in (grad, out32, lse, cu_seqlens)):
             raise ValueError("forward does not accept backward saved state")
-        total, width = _validate(q, k, v, indices, scale, grad, out32, lse)
+        total, width = _validate(q, k, v, indices, scale, grad, out32, lse, cu_seqlens)
         if (total, width, q.shape[1], q.device) != (self.total, self.width, self.hq, self.device):
             raise ValueError("Inputs must match the compiled token count, index width, query heads and device")
+        if (0 if cu_seqlens is None else cu_seqlens.shape[0] - 1) != self.num_seqs:
+            raise ValueError("cu_seqlens must match the compiled sequence count")
         if len(outputs) != 3:
             raise ValueError("Indexed QSA requires three preallocated outputs")
         specifications = (
@@ -130,7 +145,7 @@ class _QsaIndexedPlan(APIBase):
         if not isinstance(workspace, torch.Tensor) or workspace.device != q.device:
             raise ValueError(f"workspace must be a torch.Tensor on {q.device}")
         carver = WorkspaceCarver(workspace, self.workspace_bytes, "Indexed QSA")
-        inputs = (q, k, v, indices) + (() if grad is None else (grad, out32, lse))
+        inputs = (q, k, v, indices) + (() if grad is None else (grad, out32, lse)) + (() if cu_seqlens is None else (cu_seqlens,))
         span = lambda tensor: (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size())
         overlaps = lambda a, b: a[0] < b[1] and b[0] < a[1]
         ws_span = (workspace.data_ptr(), workspace.data_ptr() + self.workspace_bytes)
@@ -147,33 +162,35 @@ class _QsaIndexedPlan(APIBase):
             self._metadata(indices, *metadata, stream)
             if self.direction == "fprop":
                 self.impl.launch(self._compiled_kernel, q, k, v, *outputs, *metadata, float(scale), stream)
-            elif not self.paired:
-                self.impl.launch(self._compiled_kernel, grad, q, k, v, out32, lse, *metadata, *outputs, scratch, float(scale), stream, self.sms)
             else:
-                self._compiled_kernel["dispatch"](
+                ids, counts, lo, hi, first, _ = metadata
+                engine_scratch = self.engine_plan.carve(carver)
+                self.impl.launch(
+                    self.engine_plan,
+                    self._compiled_kernel,
                     q,
                     k,
                     v,
-                    grad,
                     out32,
+                    grad,
                     lse,
-                    scratch["delta"],
-                    scratch["dq_acc"],
-                    scratch["dk_acc"],
-                    scratch["dv_acc"],
-                    *metadata,
+                    ids,
+                    counts,
+                    first,
+                    lo,
+                    hi,
                     *outputs,
-                    scratch["flags"],
+                    engine_scratch,
                     float(scale),
-                    self.sms,
                     stream,
+                    cu_seqlens=cu_seqlens,
                 )
         return outputs
 
 
 @lru_cache(maxsize=32)
-def _plan(total, width, device, direction, hq=12):
-    plan = _QsaIndexedPlan(total, width, device, direction, hq)
+def _plan(total, width, device, direction, num_seqs=0, hq=12, dq_parts=1, max_seq_len=None):
+    plan = _QsaIndexedPlan(total, width, device, direction, num_seqs, hq, dq_parts, max_seq_len)
     plan.check_support()
     plan.compile()
     return plan
@@ -182,7 +199,7 @@ def _plan(total, width, device, direction, hq=12):
 def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     """Return ``(out, out_fp32, lse)`` from complete four-token groups and a tail."""
     total, width = _validate(q, k, v, indices, scale)
-    plan = _plan(total, width, q.device, "fprop", q.shape[1])
+    plan = _plan(total, width, q.device, "fprop", 0, q.shape[1])
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(q, dtype=torch.float32), torch.empty((q.shape[1], total), dtype=torch.float32, device=q.device))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
@@ -190,44 +207,42 @@ def qsa_indexed_forward(q, k, v, indices, scale=1 / 16):
     return TupleDict(zip(("out", "out_fp32", "lse"), outputs))
 
 
-def qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None):
+def qsa_indexed_backward(
+    grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, *, selection_mode="general", cu_seqlens=None, max_seq_len=None, ds_precision="fp32"
+):
     """Return BF16 ``(dq, dk, dv)`` using forward's FP32 output and LSE.
 
-    ``general`` preserves arbitrary group ordering, padding holes and empty rows.
-    ``causal_topk`` declares the finite-input, top-512 complete four-token blocks
-    plus causal-tail contract described in ``docs/operations/sparse_attention/qsa_indexed.md``.
-    Its packed form requires device int32 ``cu_seqlens``; ``max_seq_len`` is an
-    optional host upper bound. Values stay on the device and are caller contracts.
+    ``general`` preserves arbitrary group ordering, padding holes and empty rows and treats the rows as one sequence,
+    which stays exact for packed documents (the selection says which keys a query sees) but serves only the first
+    document on the dense prefix path. ``causal_topk`` declares the top-512 complete four-token blocks plus causal-tail
+    contract described in ``docs/operations/sparse_attention/qsa_indexed.md``. Its packed form takes device int32
+    ``cu_seqlens`` (``[B + 1]`` prefix sums) and an optional host ``max_seq_len`` bound. Both modes run the same engine.
+    ``ds_precision`` is ``"fp32"`` (three bf16 parts of dS reach the dQ MMAs, keeping a dQ whose terms nearly cancel
+    accurate) or ``"bf16"`` (dS, and on the dense prefix P, rounded to bf16 at a lower cost).
     """
     if not isinstance(selection_mode, str) or selection_mode not in ("general", "causal_topk"):
         raise ValueError("selection_mode must be 'general' or 'causal_topk'")
+    parts = ds_parts(ds_precision)
     if selection_mode == "general" and (cu_seqlens is not None or max_seq_len is not None):
         raise ValueError("cu_seqlens and max_seq_len require selection_mode='causal_topk'; general selection encodes its bounds in indices")
     if grad_out is None:
         raise ValueError("grad_out is required")
-    total, width = _validate(q, k, v, indices, scale, grad_out, out_fp32, lse)
+    total, width = _validate(q, k, v, indices, scale, grad_out, out_fp32, lse, cu_seqlens)
     if selection_mode == "causal_topk":
-        if q.shape[1] != 12:
-            raise NotImplementedError("causal_topk requires 12Q/1KV; 6Q/1KV uses selection_mode='general'")
         if width != 2052 or scale != 1 / 16:
             raise NotImplementedError("causal_topk requires index width 2052 and scale=1/16")
         if max_seq_len is not None and (type(max_seq_len) is not int or not 1 <= max_seq_len <= total):
             raise ValueError(f"max_seq_len must be a host integer in [1, {total}]")
         if cu_seqlens is None and max_seq_len is not None and max_seq_len != total:
             raise ValueError("Without cu_seqlens, max_seq_len must equal the single sequence's token count")
-        if cu_seqlens is not None:
-            if not isinstance(cu_seqlens, torch.Tensor) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
-                raise ValueError("cu_seqlens must have shape [B + 1] with B >= 1")
-            check_tensor("cu_seqlens", cu_seqlens, cu_seqlens.shape, torch.int32, q.device)
-        # Explicit selection semantics admit this backend; tensor shape alone
-        # must never route general selections (notably empty rows) into it.
-        from cudnn.QSA.two_pass.api import _backward
-
-        with torch.cuda.device(q.device):
-            return _backward(q, k, v, out_fp32, grad_out, lse, indices, softmax_scale=scale, cu_seqlens=cu_seqlens, max_seq_len=max_seq_len)
-    plan = _plan(total, width, q.device, "bprop", q.shape[1])
+        # the bound sizes the plan, so one the documents cannot fit under would overrun its buffers
+        if cu_seqlens is not None and max_seq_len is not None and max_seq_len * (cu_seqlens.shape[0] - 1) < total:
+            raise ValueError("max_seq_len times the number of documents in cu_seqlens must be at least the token count")
+    num_seqs = 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    # a bound below the crossover on every document plans no sparse path
+    plan = _plan(total, width, q.device, "bprop", num_seqs, q.shape[1], parts, max_seq_len if num_seqs else None)
     with torch.cuda.device(q.device):
         outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
         workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
-        plan.execute(q, k, v, indices, outputs, scale, workspace, grad_out, out_fp32, lse)
+        plan.execute(q, k, v, indices, outputs, scale, workspace, grad_out, out_fp32, lse, cu_seqlens=cu_seqlens)
     return TupleDict(zip(("dq", "dk", "dv"), outputs))

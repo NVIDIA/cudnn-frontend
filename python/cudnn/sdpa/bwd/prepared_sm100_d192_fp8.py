@@ -46,7 +46,18 @@ def compile_plan(api):
     regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max)
 
     with torch.cuda.device(device):
-        entry = compile_host(tuple(geometry), regions, grad_dtype, api.is_causal, cc[0] * 10 + cc[1], requested)
+        entry = compile_host(
+            tuple(geometry),
+            regions,
+            grad_dtype,
+            api.is_causal,
+            cc[0] * 10 + cc[1],
+            requested,
+            api.head_dim_qk,
+            api.head_dim_v,
+            api.h_q // api.h_kv,
+            0 if api.window_size_left is None else api.window_size_left + 1,
+        )
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError(f"{api._NAME} requires a positional tvm-ffi entry")

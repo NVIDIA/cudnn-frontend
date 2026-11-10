@@ -309,7 +309,9 @@ def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_smoke(request, monk
 @pytest.mark.L0
 @torch_fork_set_rng(seed=8)
 def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_row_scale(request, monkeypatch):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("Row-scale fusion is not supported on SM107.")
@@ -556,7 +558,9 @@ def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
 @pytest.mark.parametrize("d_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("enable_bias", [False, True], ids=["no_bias", "bias"])
 def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale_small_k(d_dtype, enable_bias, request):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("Row-scale fusion is not supported on SM107.")
@@ -725,7 +729,9 @@ def test_grouped_gemm_quant_wrapper_with_bias_sm100(use_dynamic_sched, request):
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
 
     cfg = grouped_gemm_quant_init(

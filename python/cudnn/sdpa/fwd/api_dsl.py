@@ -49,6 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
     validate_params as _sm90_validate_params,
 )
+from cudnn.sdpa.fwd.config_sm107 import supports_native_small_half_dense_paged
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
@@ -302,6 +303,7 @@ _SM100_MXFP8_KERNEL_FILES = {
 # version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
 # same reason engines.py keeps one row per ARCH LINE.
 _SM107_KERNEL_FILES = {
+    SM100_NATIVE_D576_SHAPE: "sm107/prefill_d512_f16_2x2.py",
     (512, 512): "sm107/prefill_d512_f16.py",
     (256, 256): "sm107/prefill_d256_f16.py",
     (192, 128): "sm107/prefill_d192_d128_f16.py",
@@ -688,7 +690,7 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
 # claims): HALF = the f16x2 exponent arm of the FP8 / MXFP8 kernels; the pre-folded scale = the MXFP8 and half
 # kernels' arm (per-tensor FP8 is declined on contract, see check_support).
 _SM107_HALF_SOFTMAX_FLAVORS = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-_SM107_PREFOLDED_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+_SM107_PREFOLDED_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE})
 
 
 def softmax_arms_of(k_mod, *, has_lse: bool) -> str:
@@ -800,7 +802,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
             # so a caller that pairs the (32, 32) key with a default record (the SASS probes, a test's bare
             # TemplateParams()) traces the 32-wide geometry and never the d128 one under a d32 tag.
             params = replace(params, d_flavor=flavor[0])
-        if not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
+        if not fp8 and flavor == SM100_NATIVE_D576_SHAPE:
+            params = replace(params, d_flavor=576, mma_2x2=True)
+        if not fp8 and flavor in ((512, 512), SM100_NATIVE_D576_SHAPE) and getattr(params, "mma_2x2", False):
             # The 2x2-datapath d512 sibling on cc 10.7 (the record is what routes): a distinct file and tag, so the
             # role-split and the 2x2 specializations coexist in one process, as on the SM100 arm below.
             filename = _SM107_D512_2X2_KERNEL_FILE
@@ -2215,6 +2219,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
         )
 
+    def _rubin_native_small_half_dense_paged_leg(self) -> bool:
+        return supports_native_small_half_dense_paged(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged)
+
     def _rubin_native_d256_split_leg(self) -> bool:
         return supports_native_d256_dense_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, pack_gqa=self.pack_gqa)
 
@@ -2712,9 +2719,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 for f in tuple(sorted(_SM100_DENSE_ONLY_D_SHAPES)) + _SM100_FLAVORS
                 if f not in _SM100_DENSE_ONLY_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM100_SMALL_D_CGAS[f]))
             )
-        # This exact half-precision shape is specific to the SM100 line; do
-        # not widen the shared flavor pool inherited by Rubin and FP8.
-        if not self._fp8 and self._device_cc != (10, 7) and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
+        # The native exact half D576 shape uses the architecture-specific 2x2
+        # body; quantized and THD contracts remain independently gated.
+        if not self._fp8 and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
             _flavor_pool += (SM100_NATIVE_D576_SHAPE,)
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.flavor == SM100_NATIVE_D576_SHAPE:
@@ -2791,6 +2798,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
                 or self._rubin_native_d512_leg()
+                or self._rubin_native_small_half_dense_paged_leg()
                 or self._rubin_native_d192_paged_leg()
                 or self._rubin_native_d64_pack_leg()
                 or self._rubin_shared_thd_pack_leg()
@@ -3280,15 +3288,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d64/d128/d256 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
+            # the d64/d128/d256/d512 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
             # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 / d512 FP8 flavors, the d512
+            # MXFP8 siblings, the d192x128 FP8 flavor, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.  On cc 10.7: half pools serve THD queries
             # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
-            # (the sm107 siblings' own PAGED_KV loader); per-tensor FP8 pools and dense
-            # half queries are not wired (engines.mismatch's Rubin clause is the twin).
+            # (the sm107 siblings' own PAGED_KV loader). Native per-tensor FP8 D512 serves
+            # dense Q over pools; other FP8 flavors retain their paging decline.
+            # Native half D64/D128 also serves dense Q
+            # directly, including split/PackGQA; engines.mismatch shares its admission predicate.
             # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and
             # folds the sink per Q row, so a decode-shaped half d256 graph is served paged on
             # cc 10.7 whatever its THD-ness or sink -- the same exception engines.mismatch makes
@@ -3297,8 +3307,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._device_cc == (10, 7)
                 and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256)))
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
-                and not self._rubin_native_d192_paged_leg(),
-                "Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256, and decode-shaped half D256 graphs on the decode tile (per-tensor FP8 pools and other dense half queries are not wired)",
+                and not self._rubin_native_d192_paged_leg()
+                and not self._rubin_native_small_half_dense_paged_leg()
+                and not self._rubin_native_d512_leg()
+                and not self._rubin_native_d64_pack_leg()
+                and not (self._fp8 and self._pertensor and not self.thd and self.flavor == (512, 512)),
+                "Rubin paged KV serves half THD queries, native half D64/D128/D192/D512, MXFP8 D128/D256, per-tensor FP8 D512 with dense Q, and decode-shaped half D256",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd and not (self._pertensor and self._device_cc in ((10, 0), (10, 3)) and self.flavor in SM100_PAGED_FP8_THD_SHAPES),
@@ -3309,8 +3323,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256)),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256), (512, 512)),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),
@@ -3403,6 +3417,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and self.pack_gqa
                 and not _rubin_decode_tile
                 and not self._rubin_native_d512_leg()
+                and not self._rubin_native_small_half_dense_paged_leg()
                 and not self._rubin_native_d64_pack_leg()
                 and not (
                     self.thd_decode_leg
@@ -3410,7 +3425,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_PACK_GQA_SHAPES)
                     or self._rubin_shared_dense_leg()
                 ),
-                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged THD, a dense D64/D128 half graph, native dense D512 half, or the d256 decode tile",
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D64/D128/D192x128/D256, half D128 paged queries, a dense D64/D128 half graph, native dense D512 half, or the d256 decode tile",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
@@ -3498,7 +3513,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._not_implemented_error_if(
             self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
-            "native D64 THD requires nonpaged half-precision plans, with one CTA for split execution",
+            "native D64 THD requires half inputs; paged plans are unsplit and nonpaged splits require one CTA",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`
@@ -4165,7 +4180,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
             # New native packed/split plans require this body even if the
             # legacy unpacked A/B seam selects the role-split implementation.
-            two_by_two = two_by_two or (self._rubin_native_d512_leg() and (self.pack_gqa or self.split_kv > 1))
+            two_by_two = two_by_two or (self._rubin_native_d512_leg() and (self.paged or self.pack_gqa or self.split_kv > 1))
             if two_by_two:
                 params = replace(params, mma_2x2=True)
         return params
@@ -5785,6 +5800,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, compiled at plan time with runtime token totals.
 
+    Exact FP16/BF16 D128 additionally accepts dense queries over independent
+    HND/NHD K/V page pools, with independent block tables and device KV lengths.
+    This native paged leg is unsplit and uses the 64/128-row prefill tiles;
+    it retains equal K/V page capacities and the shared page-size domain.
+
     Half and per-tensor FP8 THD and zero-copy dense plans use a
     prepared pointer entry: pointers, sequence lengths and Int64 strides bind
     at execute without tensor reconstruction. Head geometry and scheduler
@@ -5833,7 +5853,30 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.pv_bf16,
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
         )
-        self._not_implemented_error_if(self.paged, "paged KV is served by the SM100 f16/bf16 engine only")
+        if self.paged:
+            self._not_implemented_error_if(self.thd or self.split_kv != 1, "SM120 paged KV requires dense Q and split_kv=1")
+            self._not_implemented_error_if(
+                self.q_desc.ndim != 4
+                or self.v_desc.ndim != 4
+                or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
+                or (self.q_desc.shape[3], self.v_desc.shape[3]) != (128, 128),
+                "SM120 paged KV requires exact D_QK=D_V=128 and FP16/BF16",
+            )
+            self._not_implemented_error_if(self.tile_m in _SM120_DECODE_Q_TILES, "SM120 paged KV requires a prefill tile (tile_m=64 or 128)")
+            self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
+            self._value_error_if(
+                self.paged_max_seq_len_kv is None or not 0 < self.paged_max_seq_len_kv < 2**31,
+                "SM120 paged KV requires a positive int32 paged_max_seq_len_kv",
+            )
+            p = self.paged_page_size
+            self._not_implemented_error_if(
+                p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0),
+                "SM120 paged KV requires a page size divisible by 8 that divides 128 or is a multiple of 128",
+            )
+            self._not_implemented_error_if(
+                any(desc is not None for desc in (self.bias_desc, self.kv_mask_desc, self.score_max_desc, self.score_sum_exp_desc)),
+                "SM120 paged KV does not serve bias, kv_mask or score side outputs",
+            )
         self._not_implemented_error_if(self.gate_desc is not None, "epilogue gate fusion is served by the SM107 d256 SDPA engines only")
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
@@ -5881,8 +5924,18 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         b, h_q, s_q, d_q = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
         d_v = self.v_desc.shape[3]
-        self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_q), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        if self.paged:
+            self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_q), name="K")
+            self._check_tensor_shape(self.v_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_v), name="V")
+            from cudnn.sdpa.fwd.prepared import _paged_pool_layout
+
+            for desc in (self.k_desc, self.v_desc):
+                strides = self._paged_pool_stride(desc)
+                _paged_pool_layout(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize, strides[1] < strides[2], h_kv, self.paged_page_size, 128)
+            s_kv = int(self.paged_max_seq_len_kv)
+        else:
+            self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_q), name="K")
+            self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
         if self.lse_desc is not None:
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
@@ -6226,6 +6279,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
             negate_scores=self._score_negated,
+            page_size=self.paged_page_size,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
@@ -6296,8 +6350,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sf_k: Optional[torch.Tensor] = None,
         sf_v: Optional[torch.Tensor] = None,
         sf_o: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization.
+
+        ``block_table`` / ``block_table_v``: paged plans bind int32
+        ``(B, max_pages)`` tables (rank-4 graph carriers are accepted too).
+        The V table defaults to the K table; each pool retains its own layout.
 
         ``sf_o``: the block-scaled O scale-factor buffer (FP8 or MXFP8 with
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
@@ -6330,6 +6390,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             not self.has_sink and sinks is not None,
             "this specialization was compiled without sink support; construct the API with has_sink=True",
         )
+        self._value_error_if(not self.paged and (block_table is not None or block_table_v is not None), "page tables require a paged plan")
+        if self.paged:
+            self._value_error_if(block_table is None, "paged KV requires block_table")
+            block_table_v = block_table if block_table_v is None else block_table_v
         self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
         self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
@@ -6396,7 +6460,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 _ensure_current_context(stream_int, q_tensor.device.index)
                 execute_native_dense_tensors(
                     self._dense_spec,
-                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
+                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, block_table, block_table_v, None),
                     current_stream,
                     scale_softmax_log2,
                     ws_ptr,
@@ -6485,7 +6549,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         return n
 
     def _can_prepare_layout(self):
-        operands = (self.q_desc, self.k_desc, self.v_desc) + (() if self.split_kv > 1 else (self.o_desc,))
+        operands = (self.q_desc,) + (() if self.paged else (self.k_desc, self.v_desc)) + (() if self.split_kv > 1 else (self.o_desc,))
         return self.thd or all(self._prepared_operand_layout(desc) is not None for desc in operands)
 
     def _can_prepare_fp8(self):

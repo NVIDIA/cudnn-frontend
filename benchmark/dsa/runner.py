@@ -216,7 +216,7 @@ class DsaBenchmarkRunner:
             elif r.skipped:
                 logger.info(f"  -> SKIPPED (unsupported): {r.error_message}")
             else:
-                logger.warning(f"  -> FAILED: {(r.error_message or '').splitlines()[-1][:200]}")
+                logger.warning(f"  -> FAILED: {((r.error_message or '').strip().splitlines() or ['(no error message)'])[-1][:200]}")
         return results
 
     def results_to_dataframe(self, results: List[BenchmarkResult]):

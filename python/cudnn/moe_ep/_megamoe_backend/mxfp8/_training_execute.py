@@ -186,6 +186,9 @@ def launch_training_forward(
         if not isinstance(weights, MoeEpNativeForwardWeights):
             raise TypeError("contiguous training requires MoeEpNativeForwardWeights")
         kernel_weights = forward_native_to_kernel(weights)
+    if config.fc2_in_kernel_topk_reduce:
+        # The kernel accumulates every peer's routes straight into out.output, so each call starts from zero.
+        out.output[:token_count].zero_()
     inputs = Mxfp8LaunchInputs(
         activation=activation_data,
         activation_sf=activation_sf,

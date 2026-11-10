@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-import torch
+from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
@@ -1390,6 +1390,8 @@ def create_random_logits(
     Returns:
         Tensor of shape (num_rows, max_row_length) with random values and -inf padding
     """
+    import torch  # lazy: the JAX path imports this module without torch installed
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     num_rows = row_starts.shape[0]
@@ -1446,6 +1448,8 @@ def compare_top_k_results(
     Returns:
         True if results match within tolerance, False otherwise
     """
+    import torch  # lazy: the JAX path imports this module without torch installed
+
     num_rows = cuda_indices.shape[0]
 
     # Calculate valid lengths for each row (vectorized)

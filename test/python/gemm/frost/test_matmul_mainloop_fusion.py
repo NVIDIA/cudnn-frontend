@@ -668,7 +668,7 @@ def test_analyzer_scalar_aux_mainloop() -> None:
     assert all(t.bcast_mode == "scalar" for t in chain.aux_tensors)
 
 
-def test_analyzer_rejects_per_row_mainloop_aux() -> None:
+def test_analyzer_maps_per_row_mainloop_aux() -> None:
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -677,11 +677,16 @@ def test_analyzer_rejects_per_row_mainloop_aux() -> None:
     A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
     B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
     rv = g.tensor(name="rv", dim=[1, 256, 1], stride=[256, 1, 1])  # per-row of A
-    As = g.mul(a=A, b=rv, name="rowscale")
+    As = g.mul(a=A, b=rv, name="rowscale").set_data_type(cudnn.data_type.BFLOAT16)
     C = g.matmul(A=As, B=B, name="mm")
     C.set_output(True)
-    with pytest.raises(ValueError, match="SCALAR"):
-        analyze(g)
+    chain = analyze(g)
+    op = chain.mainloop_a_ops[0]
+    assert chain.aux_by_name(op.aux).coordinate_mapped
+    assert op.operand_access is not None
+    from cudnn.gemm.frost.fusion_ir import Axis
+
+    assert op.operand_access.coordinates[1].axes == {Axis.M}
 
 
 def _run_scaled(scale_a, scale_b, cfg_name, M, N, K, av=2.0, bv=0.5):
