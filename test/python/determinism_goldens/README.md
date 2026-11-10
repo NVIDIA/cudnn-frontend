@@ -2111,3 +2111,58 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 
 The measured execution split this command into the initial64 feature cases
 and the final24 cases; together they cover the complete88-case collection.
+
+### Native SM90 paged KV forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm90.py` adds 31 L0 cases for dense-query
+FP16/BF16 paging through the native D128/D256/D512 bodies. Coverage includes
+page sizes 8/16/32/64/128/192/256, independent K/V pool layouts and table
+pitches, fresh pointers, changed-table CUDA Graph replay, poisoned padding,
+base-2 Stats, sinks, split3, all three schedulers and partial GQA groups
+G12/G128. Standalone head boundaries include D8/V512 and D512/V8; graph
+head envelopes retain their existing limits. THD paging and Hopper backward
+remain unsupported.
+
+Six new golden records under `6521230c64ce3d35` cover D128, D192/V128 and
+D512 in both dtypes. Each compares O and Stats with an independent FP64
+reference, then checks raw bytes across fresh storage, concurrent work,
+B1/B129, reordered/duplicated sequences, changed neighbors and captured
+replay. Recording into a new directory passed all six cases; the subsequent
+strict run left recording unset and used the committed files.
+
+H100 NVL cc9.0, driver 595.71.05, Torch 2.14.1+cu130, cuDNN 9.28.0.38 and
+DSL 4.8/compiler 12.9: the strict run passed 172 cases, 68 deselected,
+zero failures/skips, in 266.05 seconds. These are 23 new paging cases and
+149 existing native binding/head controls. The six standalone head-boundary
+cases and two partial-PackGQA cases also passed under each sanitizer,
+completing all 31 new cases.
+
+Memcheck, racecheck and synccheck each passed 24 selected cases with zero
+errors or hazards: eight BF16 page-replay cases, six standalone boundaries,
+two partial groups and eight existing D64 graph controls. The runs were
+split into 22 cases and the final two partial groups. Memcheck was unfiltered;
+racecheck and synccheck used `--kernel-name kns=cudnn_kernel_`. CUDA Python
+13.2 matched the driver API and API-error reporting stayed enabled.
+
+The first two control runs exposed a prototype nonpaged host-ABI mismatch:
+the common frame binds K table strides as `(0, 0)` and V table strides as
+`None`. The final host specialization preserves that distinction. A first
+recording command incorrectly combined recording and checking modes and
+stopped before writing; the clean recording and strict run above supersede it.
+These results qualify H100 forward correctness and per-plan determinism;
+H200 execution, other runtimes and performance remain unmeasured.
+
+Reproduction commands from `test/python` (the measured runs split the suite
+between strict and sanitizer selections):
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -n0 sdpa/frost/test_sdpa_fwd_paged_sm90.py -m L0
+
+compute-sanitizer --tool memcheck --error-exitcode 91 \
+  python -m pytest -q -n0 \
+    sdpa/frost/test_sdpa_fwd_paged_sm90.py \
+    sdpa/frost/test_sdpa_native_d64_sm90.py \
+    -k '(paged_replay and bf16) or standalone_page_head_boundaries or paged_partial_pack_groups or graph_uses_prepared_native_body'
+```
