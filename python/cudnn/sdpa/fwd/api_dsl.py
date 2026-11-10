@@ -5590,6 +5590,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
         self.params = Sm90TemplateParams(
             dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
+            head_tile=next(width for width in (128, 256, 512) if max(d_qk, d_v) <= width),
             **band,
             thd_varlen=self.thd,
             has_lse=self.lse_desc is not None or self.split_kv > 1,
