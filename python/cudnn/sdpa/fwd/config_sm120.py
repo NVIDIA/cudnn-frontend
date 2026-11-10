@@ -331,11 +331,11 @@ def validate_params(
 
     if params.page_size:
         if not allow_paged:
-            raise NotImplementedError("SM120 paged KV is served by the general half prefill template only")
+            raise NotImplementedError("SM120 paged KV is served by the general half prefill and decode templates only")
         if params.page_size % 8 or params.page_size < 8:
             raise ValueError("SM120 paged KV requires a positive page size divisible by 8")
-        if params.thd_varlen or params.split_kv != 1 or decode_tile:
-            raise NotImplementedError("SM120 paged KV serves dense queries with unsplit prefill tiles only")
+        if params.thd_varlen or (params.split_kv != 1 and not decode_tile):
+            raise NotImplementedError("SM120 paged KV serves dense queries; split KV requires a decode tile")
         if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
             raise NotImplementedError("SM120 paged KV serves FP16/BF16 only")
 
@@ -373,8 +373,8 @@ def validate_params(
         raise ValueError(f"SM120 SDPA: this template's q_tile must be one of {q_tiles}; got {params.q_tile}")
     if decode_tile:
         # The decode tile's KV tile is its stage width (decode_kv_stage), fixed by the head tiles.
-        if params.kv_tile not in (16, 32, 64):
-            raise ValueError(f"SM120 SDPA: the decode tile's kv_tile is its stage width (16, 32 or 64); got {params.kv_tile}")
+        if params.kv_tile not in (16, 32, 48, 64):
+            raise ValueError(f"SM120 SDPA: the decode tile's kv_tile is its stage width (16, 32, 48 or 64); got {params.kv_tile}")
         if params.thd_varlen:
             raise ValueError("SM120 SDPA: the decode tile is dense-only (THD keeps the prefill templates)")
         if params.sched_policy != SCHED_NATURAL:
