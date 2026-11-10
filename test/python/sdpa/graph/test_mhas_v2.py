@@ -5448,7 +5448,7 @@ for name, kwargs in {items!r}:
 """
 
 
-def _p1_crash_probe(items, timeout=2400):
+def _p1_crash_probe(items, timeout=2400, row=None):
     """Walk the (name, kwargs) contracts in child interpreters, resuming after every crash: {name: (rc, text, stage)} where rc
     is 0 (text = the RESULT line), 139 / -11 (the child died on this contract; text = the child's last lines, stage = the
     last STAGE it printed: "plan" when none, else "support" after "planned" or "build" after "supported") or the child's
@@ -5461,7 +5461,7 @@ def _p1_crash_probe(items, timeout=2400):
     start = 0
     while start < len(items):
         batch = items[start:]
-        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, row=_cc107_engine("mxfp8"))
+        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, row=row or _cc107_engine("mxfp8"))
         p = subprocess.run([sys.executable, "-c", script], cwd=paths[1], capture_output=True, text=True, timeout=timeout)
         lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip() and "RuntimeWarning" not in l and "AttrBuilder" not in l]
         seen, stage = 0, "plan"
@@ -5506,15 +5506,34 @@ def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     record (the re-measure procedure sits next to the constant).  At or above the recorded version no contract may crash,
     and the per-contract, per-stage record under "measured" in the run summary is the qualification of that record.
     cc 10.7 only; kept in the FULL tier because it is the tripwire that retires the guard."""
-    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
-
     if not _device_is_cc107():
         pytest.skip("the backend planning crash is a cc 10.7 measurement")
+    _assert_sq1_mxfp8_crash_guard_is_current(request, _cc107_engine("mxfp8"), "cc 10.7")
+
+
+@pytest.mark.L0
+def test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0(request):
+    """The cc 10.0 / 10.3 twin of the cc 10.7 detector: the same trigger matrix and version bound, with the SM100 MXFP8
+    row barred.  There the backend's plan build segfaults in the SM100 decode emitter."""
+    try:
+        cc = torch.cuda.get_device_capability()
+    except Exception:
+        cc = None
+    if cc not in ((10, 0), (10, 3)):
+        pytest.skip("the cc 10.0 / 10.3 single-query MXFP8 crash measurement")
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _assert_sq1_mxfp8_crash_guard_is_current(request, engine_name(arch="sm100", mxfp8=True), f"cc {cc[0]}.{cc[1]}")
+
+
+def _assert_sq1_mxfp8_crash_guard_is_current(request, row, device_label):
+    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
+
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
-    control = _p1_crash_probe([("sink_control", _P1_CRASH_CONTROL)])["sink_control"]
+    control = _p1_crash_probe([("sink_control", _P1_CRASH_CONTROL)], row=row)["sink_control"]
     assert control[0] == 0 and control[1].startswith("BUILT"), f"the sink control must plan and build on the backend (rc {control[0]}):\n{control[1]}"
-    results = _p1_crash_probe(list(_P1_CRASH_MATRIX.items()))
+    results = _p1_crash_probe(list(_P1_CRASH_MATRIX.items()), row=row)
     summary = {name: _p1_crash_verdict(rc, text.splitlines()[-1] if rc == 0 else text, stage) for name, (rc, text, stage) in results.items()}
     crashed = sorted(name for name, (rc, _, _) in results.items() if rc in (139, -11))
     errored = {name: text for name, (rc, text, _) in results.items() if rc not in (0, 139, -11)}
@@ -5524,7 +5543,7 @@ def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     # The per-contract record is the qualification of the constant: into the run's terminal summary (CI log) through
     # frost_routing.measured -- a passed test's captured stdout never reaches that log.
     frost_routing.measured(
-        f"cc 10.7 single-query MXFP8 backend plan / support / build with the guard disabled, cuDNN {version}",
+        f"{device_label} single-query MXFP8 backend plan / support / build with the guard disabled, cuDNN {version}",
         f"sink_control={_p1_crash_verdict(*control)} " + " ".join(f"{name}={verdict}" for name, verdict in summary.items()),
     )
     if fixed_in is None or cudnn.backend_version() < fixed_in:

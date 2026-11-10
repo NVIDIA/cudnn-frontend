@@ -24,7 +24,7 @@ from frost_test_utils import requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107_mxfp8"
-_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
+_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.0 / 10.3 / 10.7"
 _TAIL = "the backend is not consulted for this graph"
 _FAMILY = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
 
@@ -145,11 +145,14 @@ def test_guard_names_the_backend_and_the_reason_on_the_measured_domain(crashing_
         dict(b=1, h_q=1, h_kv=1, s_kv=128),
         dict(d_qk=256, d_v=256),
         dict(d_qk=192, d_v=128),
+        dict(device_cc=(10, 0), device_sm_count=148),
+        dict(device_cc=(10, 3), device_sm_count=148),
     ],
     ids=lambda over: ",".join(f"{k}={v}" for k, v in over.items()) or "base",
 )
 def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(crashing_backend, over):
-    """The measured crash domain: dense and THD, Stats on or off, every O dtype, both inputs, every head dim alike."""
+    """The measured crash domain: dense and THD, Stats on or off, every O dtype, both inputs, every head dim alike, on cc 10.7
+    and on cc 10.0 / 10.3 (the SM100 decode emitter)."""
     assert backend_guard(None, _facts(**over)) is not None
 
 
@@ -161,9 +164,9 @@ def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(crashing_backe
         dict(s_q=4096),
         dict(has_sink=True),
         dict(has_paged_kv=True, page_size=128, padded=True),
-        dict(device_cc=(10, 0)),
-        dict(device_cc=(10, 3)),
+        dict(device_cc=(9, 0)),
         dict(device_cc=(10, 8)),
+        dict(device_cc=(12, 0)),
         dict(device_cc=None),
         dict(is_mxfp8=False, is_fp8=True),
         dict(is_mxfp8=False, dtype=cudnn.data_type.BFLOAT16, dtype_o=None),
