@@ -19,8 +19,11 @@ heads selecting D512 retain the envelope. THD paging remains declined.
 FP16/BF16 matching Q/K/V/O, independent table contents, HND/NHD pool layouts,
 page8-1024, masks/windows/sinks, CGA1/2, N64/N128 and partial PackGQA compose.
 Dense plans support split-KV; paged THD remains unsplit. Smaller aligned dense
-heads use the D64 envelope; THD retains its exact-width rule. Mixed FP8 KV
-retains its D128-only contract. No staging copy or candidate ranking change.
+heads use the D64 envelope; THD retains its exact-width rule. Exact D64 also supports E4M3/E5M2 K/V with half Q/O: converted loads use the
+native physical-64 prefill body, including CGA1 dense splits. Unsplit THD
+retains independent origins and packed Stats; mixed D64 THD splits decline
+before lowering. Mixed storage does not use a smaller-head envelope.
+No staging copy or candidate ranking change.
 
 **SM107 half D128 dense-Q paging:** dense queries bind directly to the native
 D128 page-table loader, with no THD conversion or staging copy. FP16/BF16 Q/O
@@ -54,7 +57,7 @@ origin contract. Native regressions are collected by `TestD192PhysicalOrigins`
 in both architecture CI entries.
 
 **Independent FP8 KV storage:** the SM100/SM103 and SM107 half forward rows serve exact
-D128 Q/K/V through plain `sdpa()` with BF16 or FP16 Q/O and matching E4M3 or
+D128 Q/K/V, plus native exact D64 on SM107, through plain `sdpa()` with BF16 or FP16 Q/O and matching E4M3 or
 E5M2 K/V. K/V are loaded and converted on chip; Q retains its original half
 precision, with no per-tensor descales or materialized half KV copy. Dense and
 paged KV retain each row's existing D128 prefill/decode selection and split-KV
@@ -67,7 +70,10 @@ single-Q mixed tile uses two converted KV stages plus a raw FP8 slab; uniform
 half keeps its three stages. The native SM107 D128 prefill body retains its
 existing converted K/V ring and adds one raw FP8 staging slab; dense/paged/THD
 and packed/unpacked plans retain the half row's existing route and split domain.
-Other native flavors/architecture lines remain unsupported for mixed storage.
+SM107 D64 uses the same converted-load protocol at physical width64 for dense
+and paged KV, including unsplit THD. Its dense split plans stay on the native
+prefill body; its THD splits decline. Other native flavors/architecture lines
+remain unsupported for mixed storage.
 D128 nonpaged THD split also honors independent physical Q/K/V/O/Stats origins
 for uniform half and mixed KV; partial storage keeps its compact indexing.
 Single-Q ragged split reads the declared device Q lengths (ordinary or cumulative)

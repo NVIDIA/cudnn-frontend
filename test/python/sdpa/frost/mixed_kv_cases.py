@@ -8,7 +8,7 @@ import pytest
 import torch
 
 
-def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 0)):
+def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 0), head_dim=128):
     import cudnn
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd import engines
@@ -16,7 +16,8 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     io, kv = getattr(cudnn.data_type, qdtype), getattr(cudnn.data_type, kvdtype)
     graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    dim, stride = (2, 8, 256, 128), (256 * 8 * 128, 128, 8 * 128, 1)
+    d = head_dim
+    dim, stride = (2, 8, 256, d), (256 * 8 * d, d, 8 * d, 1)
     q, k, v = (graph.tensor(dim=dim, stride=stride, data_type=t) for t in (io, kv, kv))
     o, stats = graph.sdpa(q=q, k=k, v=v, generate_stats=True, attn_scale=128**-0.5, use_causal_mask=True)
     o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(io)
@@ -33,13 +34,26 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
         assert reason and "dtypes" in reason
         changed.set_data_type(original)
     # Eight half elements align Q, but only sixteen FP8 elements align K.
-    k.set_stride((256 * 8 * 136, 136, 8 * 136, 1))
+    k.set_stride((256 * 8 * (d + 8), d + 8, 8 * (d + 8), 1))
     _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
     assert reason and "without a copy" in reason
+    return spec, facts
 
 
 def check_dense_paged_rebind_capture(
-    qdtype, kvdtype, cga, layout, splits, entry, monkeypatch, cudnn_handle, engine_name="sdpa_fwd_prefill_sm100", pack=True, cpu_reference=False
+    qdtype,
+    kvdtype,
+    cga,
+    layout,
+    splits,
+    entry,
+    monkeypatch,
+    cudnn_handle,
+    engine_name="sdpa_fwd_prefill_sm100",
+    pack=True,
+    cpu_reference=False,
+    head_dim=128,
+    q_tokens=None,
 ):
     import cudnn
     from cudnn.engines.manifest import family_for
@@ -58,6 +72,9 @@ def check_dense_paged_rebind_capture(
     hnd = kvdtype == torch.float8_e5m2
     page = 128 if hnd else 8
     b, sq, sk, hq, hk, d = (9, 17, 384 if hnd else 264, 16, 4, 128) if paged else (2, 193, 257, 8, 2, 128)
+    d = head_dim
+    if q_tokens is not None:
+        sq = q_tokens
     blocks = sk // page if paged else 0
     pages = b * blocks
     initial_lengths = [257, 0, 145, 1, 129, 33, 257, 17, 65] if paged else [sk] * b
@@ -140,9 +157,11 @@ def check_dense_paged_rebind_capture(
                 is_causal=True,
                 cga=cga,
                 pack_gqa=pack,
+                split_kv=splits,
             )
             api.check_support()
             api.compile()
+            assert api.split_kv == splits
             workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
 
             def execute(t):
@@ -151,7 +170,7 @@ def check_dense_paged_rebind_capture(
         assert loaded and loaded[-1].MIXED_FP8_KV
         expected_file = (
             "sm100/decode_d128_f16.py"
-            if cga == 1 and not (engine_name.endswith("sm107") and paged)
+            if cga == 1 and not (engine_name.endswith("sm107") and (paged or head_dim == 64))
             else ("sm107/prefill_d128_f16.py" if engine_name.endswith("sm107") else "sm100/prefill_d128_f16.py")
         )
         assert loaded[-1].__file__.endswith(expected_file)
