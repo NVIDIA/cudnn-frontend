@@ -737,3 +737,30 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
     assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+
+
+# Architecture CI entry for the shared exact-D512 block-scale contract.
+import d512_mxfp8_bwd_checks as d512_mx_checks
+
+
+@pytest.mark.L0
+class TestD512Mxfp8Backward:
+    @pytest.fixture
+    def d512_mx(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import sys
+
+        mx = sys.modules[__name__]
+        monkeypatch.setattr(mx, "_ENGINE", "sdpa_bwd_d512_mxfp8")
+        original = mx._plan_index
+        monkeypatch.setattr(mx, "_plan_index", lambda graph: original(graph, "sdpa_bwd_d512_mxfp8"))
+        return mx
+
+    test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
+    test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
+    test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)

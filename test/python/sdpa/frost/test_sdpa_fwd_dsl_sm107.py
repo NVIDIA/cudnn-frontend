@@ -253,7 +253,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
 # at 2/300 and the hint-less spin at 74/200 on such a barrier, the poll ran 200/200 + 300/300 (d512 bwd lane, 2026-10-01).
 # POLL_CROSS_PAIR_WAITS is a correctness constant pinned True by the module itself, never the SPIN_RING_WAITS perf lever:
 # (poll-site count, targets).
-_D512_2X2_CROSS_PAIR_WAITS = (10, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
+_D512_2X2_CROSS_PAIR_WAITS = (11, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go", "mb_bias_full", "mb_bias_empty")
 
 
@@ -661,7 +661,7 @@ _D512_2X2_ARRIVE_SITE_PINS = {
     "mb_tmem_dealloc.arrive": 1,
     "mb_tmem_dealloc.arrive_on_peer": 1,
     "mb_q_empty.arrive": 1,
-    "mb_bmm1_done[": 1,
+    "mb_bmm1_done[": 2,  # mutually exclusive two-chunk D512 and three-chunk D576 final releases
     "mb_bmm2_done[": 2,  # per-iteration (last N-block) + empty-tile commit
 }
 
@@ -951,9 +951,9 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         facts = _f16_facts(d_qk=d, d_v=d, thd=True, padded=True, has_paged_kv=True, page_size=16)
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
+        assert (engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is None) == (d == 128)
         # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
-        # at every cluster width the leg admits -- while dense paged queries and sink x split-KV keep their declines.
+        # at every cluster width the leg admits; dense D128 uses its native page loader too.
         sink = dataclasses.replace(facts, has_sink=True)
         gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
         assert engines.mismatch(caps, sink, knobs) is None, d
@@ -961,7 +961,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         if d == 128:
             for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
                 assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
-        assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
+        assert (engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs) is None) == (d == 128)
         assert engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2)) is not None
 
 
@@ -1270,8 +1270,8 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
     F8_128x4 descale pools paging with K/V, page_size % 128, the sink / causal / bottom-right / SWA / padding masks,
     Stats and the f16x2 exponent arm composed.  Declined, each by its own typed reason: page 64, THD queries over
     pools (stage 2), the d192x128 / d512 pools (stage 3), a block-scaled O over pools, the pre-folded scale over paged
-    KV, pools without a padding mask, and split_kv > 1 (also with a sink).  The half row keeps its THD requirement
-    and the per-tensor FP8 row serves no paged KV."""
+    KV, pools without a padding mask, and split_kv > 1 (also with a sink). The native half D128
+    row accepts dense queries, and the per-tensor FP8 row serves paged D512."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -1312,10 +1312,12 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
         reason = engines.mismatch(caps, paged(**kw))
         assert reason is not None and needle in reason, (kw, reason)
     assert engines.mismatch(caps, paged(has_sink=True), SdpaFwdKnobs(split_kv=2)) is not None
-    # The half row: dense paged queries stay declined on cc 10.7 (THD queries are its paged form).
+    # The half D128 row now admits dense queries through the native page loader.
     half = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
-    assert half is not None and "THD queries" in half, half
-    assert not _caps("sdpa_fwd_prefill_sm107_fp8").paged_kv
+    assert half is None, half
+    fp8 = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert fp8.paged_kv
+    assert fp8.paged_d_shapes == frozenset({(512, 512)})
 
 
 def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
@@ -2200,8 +2202,11 @@ def test_sm107_gate_declines_the_interactions():
     assert why is not None and "dense-only" in why, why
     paged = dict(has_paged_kv=True, padded=True, page_size=128)
     # The half row serves ungated paged THD; the gate block must decline
-    # the interaction before paged layout admission. FP8 remains nonpaged.
-    assert f16.paged_kv and not fp8.paged_kv
+    # the interaction before paged layout admission. FP8 paging is limited to D512,
+    # which has no gate; the D256 gate flavor remains nonpaged.
+    assert f16.paged_kv and fp8.paged_kv
+    assert fp8.paged_d_shapes == frozenset({(512, 512)})
+    assert (256, 256) not in fp8.paged_d_shapes
     assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(f16, _gate_facts(**paged))
     assert why is not None and "paged" in why and "gate" in why, why
@@ -8742,7 +8747,7 @@ class TestMixedFp8Kv:
         single_q_unsplit,
         single_q_sink,
         compact_split,
-        dense_paged_decline,
+        dense_paged_native,
         uniform_control,
     )
 
@@ -8757,7 +8762,7 @@ class TestMixedFp8Kv:
     test_single_q_unsplit = staticmethod(single_q_unsplit)
     test_single_q_sink = staticmethod(single_q_sink)
     test_compact_split = staticmethod(compact_split)
-    test_dense_paged_decline = staticmethod(dense_paged_decline)
+    test_dense_paged_native = staticmethod(dense_paged_native)
     test_uniform_control = staticmethod(uniform_control)
 
 

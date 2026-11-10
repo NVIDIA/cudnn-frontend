@@ -13,9 +13,11 @@
 
 Every ``cache_key`` string and tvm-ffi ``symbol`` is unchanged (the compiled-plan cache keys and symbols are ABI).  The four contracts'
 ``ABI_VERSION`` / ``MAPS_PER_SEQUENCE`` / ``thd_workspace_offsets`` carry different values per route and are imported under route-qualified
-names.  The module is template-loaded for the d64 flavours (``FROST_TEMPLATE_PARAMS``), so every import is absolute.
+names.  The module is template-loaded for the d64 flavours (``FROST_TEMPLATE_PARAMS``: a head dimension, or ``(head_dim, ratio, split)`` for
+the deterministic pair), so every import is absolute.
 """
 
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -65,7 +67,7 @@ from cudnn.sdpa.bwd.d128_grouped_contract import thd_workspace_offsets as groupe
 from cudnn.sdpa.bwd.d128_thd_contract import ABI_VERSION as THD_ABI_VERSION
 from cudnn.sdpa.bwd.d128_thd_contract import MAPS_PER_SEQUENCE as THD_MAPS_PER_SEQUENCE
 from cudnn.sdpa.bwd.d128_thd_contract import ORIGIN_PORTS, workspace_offsets
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import cast_dq_host, delta_zero_host
+from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import cast_dq_host, delta_only_host, delta_zero_host, fold_dkv_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_accum as accumulation_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_grouped_dense as grouped_dense_chain_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_grouped_thd as grouped_thd_chain_host
@@ -78,7 +80,8 @@ from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_thd_2cta as grouped
 # ======================================================================================================================
 """Pointer entry for the single-launch dense d128 backward kernel."""
 
-HEAD_DIM = globals().get("FROST_TEMPLATE_PARAMS", 128)
+_TEMPLATE = globals().get("FROST_TEMPLATE_PARAMS", 128)
+HEAD_DIM = int(_TEMPLATE) if isinstance(_TEMPLATE, int) else int(_TEMPLATE[0])
 
 
 @cute.jit
@@ -224,6 +227,98 @@ def compile_host_accum(geometry, regions, dtype, causal, sm, window=0):
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=repr(("sdpa_bwd_sm100_d128_accumulation", DENSE_ABI_VERSION, geometry, regions, str(dtype), bool(causal), sm, int(window), HEAD_DIM)),
         symbol="frost_sdpa_bwd_sm100_d128_accumulation_prepared",
+    )
+
+
+# ======================================================================================================================
+# route pair: the deterministic dK / dV + dQ kernel pair of the dense d64 / d128 route
+# ======================================================================================================================
+"""One pointer entry for the deterministic chain: delta, the dK / dV rendering of the accumulation kernel, the dQ kernel."""
+
+PAIR_RATIO = 1 if isinstance(_TEMPLATE, int) or len(_TEMPLATE) < 2 else int(_TEMPLATE[1])
+PAIR_SPLIT = 1 if isinstance(_TEMPLATE, int) or len(_TEMPLATE) < 3 else int(_TEMPLATE[2])
+_PAIR_BIND_LOCK = threading.Lock()
+pair_dkdv_host = pair_dq_host = None
+
+
+def _bind_pair():
+    """Bind the kernel pair of this head dimension, group ratio and split on the first compile; it never changes afterwards."""
+    global pair_dkdv_host, pair_dq_host
+    with _PAIR_BIND_LOCK:
+        if pair_dkdv_host is None:
+            kernels = Path(__file__).with_name("bprop_d128_f16.py")
+            pair_dkdv_host = load_template(
+                str(kernels), (HEAD_DIM, False, PAIR_RATIO, PAIR_SPLIT), tag=f"sdpa_bwd_d{HEAD_DIM}_g{PAIR_RATIO}_s{PAIR_SPLIT}_dkdv"
+            ).host_accum
+            pair_dq_host = load_template(str(kernels.with_name("bprop_d128_dq_f16.py")), HEAD_DIM, tag=f"sdpa_bwd_d{HEAD_DIM}_dq").host
+
+
+@cute.jit
+def host_pair(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    lse_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    workspace: cutlass.Int64,
+    scale: cutlass.Float32,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    causal: cutlass.Constexpr[bool],
+    stream: driver.CUstream,
+    window: cutlass.Constexpr[int] = 0,
+):
+    q = _view(q_ptr, geometry[0])
+    k = _view(k_ptr, geometry[1])
+    v = _view(v_ptr, geometry[2])
+    o = _view(o_ptr, geometry[3])
+    do = _view(do_ptr, geometry[4])
+    lse = _view(lse_ptr, geometry[5])
+    dq = _view(dq_ptr, geometry[6])
+    dk = _view(dk_ptr, geometry[7])
+    dv = _view(dv_ptr, geometry[8])
+    payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
+    delta = _scratch_fp32_region(payload, regions[0])
+    delta_only_host(o, do, delta, stream)
+    if cutlass.const_expr(PAIR_SPLIT > 1):
+        dv_part = _scratch_fp32_region(payload, regions[1])
+        dk_part = _scratch_fp32_region(payload, regions[2])
+        pair_dkdv_host(q, k, v, do, lse, delta, None, dk_part, dv_part, scale, causal, stream, window)
+        fold_dkv_host(dv_part, dv, PAIR_SPLIT, stream)
+        fold_dkv_host(dk_part, dk, PAIR_SPLIT, stream)
+    else:
+        pair_dkdv_host(q, k, v, do, lse, delta, None, dk, dv, scale, causal, stream, window)
+    pair_dq_host(q, k, v, do, lse, delta, dq, scale, causal, stream, window, PAIR_RATIO)
+
+
+def compile_host_pair(geometry, regions, dtype, causal, sm, window=0, ratio=1, split=1):
+    """Compile from declarations only; addresses and scale remain runtime slots."""
+    head_dim = geometry[0][0][3]
+    if (head_dim, int(ratio), int(split)) != (HEAD_DIM, PAIR_RATIO, PAIR_SPLIT):
+        module = load_template(__file__, (head_dim, int(ratio), int(split)), tag=f"sdpa_bwd_d{head_dim}_g{int(ratio)}_s{int(split)}_pair_host")
+        return module.compile_host_pair(geometry, regions, dtype, causal, sm, window, ratio, split)
+    _bind_pair()
+    types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3
+    args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
+    return compile_cached(
+        host_pair,
+        *args,
+        cutlass.Int64(0),
+        cutlass.Float32(1),
+        geometry,
+        regions,
+        bool(causal),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        int(window),
+        options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
+        cache_key=repr(
+            ("sdpa_bwd_sm100_d128_pair", DENSE_ABI_VERSION, geometry, regions, str(dtype), bool(causal), sm, int(window), HEAD_DIM, PAIR_RATIO, PAIR_SPLIT)
+        ),
+        symbol="frost_sdpa_bwd_sm100_d128_pair_prepared",
     )
 
 

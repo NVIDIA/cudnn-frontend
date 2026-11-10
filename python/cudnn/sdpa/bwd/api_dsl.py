@@ -2170,7 +2170,6 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             f"{self._NAME}: {', '.join(invalid)} requires "
             + ("compact BSHD-physical packed strides" if self.thd else "non-overlapping dense strides with D stride 1 and 16-byte outer pitches"),
         )
-        self._value_error_if(self.deterministic, "SM100 bwd: deterministic mode is not implemented")
         return True
 
     def scratch_workspace_bytes(self) -> int:

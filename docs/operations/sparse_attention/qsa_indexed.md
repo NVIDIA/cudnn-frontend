@@ -8,22 +8,23 @@ for block selection, bitmap training and the backward engine.
 indices directly. The implementation lives in `cudnn.QSA.indexed` and shares
 QSA's attention kernels. It supports BF16
 12Q/1KV and 6Q/1KV (one KV head shared by twelve or six query heads) with head
-dimension 256 on SM100/SM103/SM107 with CuTeDSL >= 4.8 (the backward needs the
-CUDA 13 build of the DSL).
+dimension 256 on SM100/SM103 with CuTeDSL >= 4.7 and on SM107 with
+CuTeDSL >= 4.8 (the backward needs the CUDA 13 build of the DSL).
 
 ```python
 from cudnn.ops import qsa_indexed_forward, qsa_indexed_backward
 
 out, out_fp32, lse = qsa_indexed_forward(q, k, v, indices, scale=1 / 16)
-dq, dk, dv = qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16, cu_seqlens=None)
+dq, dk, dv = qsa_indexed_backward(grad_out, q, k, v, out_fp32, lse, indices, scale=1 / 16)
 ```
 
 These explicit calls return `TupleDict` objects in the order shown. They do not
 register an autograd function. Save the original FP32 output and natural-log
-LSE; casting the BF16 output back to FP32 is insufficient. `cu_seqlens` (int32
-`[B + 1]` prefix sums) describes the documents of a packed buffer to the
-backward; without it the rows are one sequence, which stays exact for packed
-documents but serves only the first document on the dense prefix path.
+LSE; casting the BF16 output back to FP32 is insufficient. Packed documents
+reach the backward through `cu_seqlens` (int32 `[B + 1]` prefix sums) and
+`max_seq_len` with `selection_mode="causal_topk"` (below). Without `cu_seqlens`
+the rows are one sequence, which stays exact for packed documents but serves
+only the first document on the dense prefix path.
 
 | Tensor | Shape | Dtype |
 |---|---|---|
@@ -54,9 +55,13 @@ rows produce zero output/gradients and negative-infinity LSE. Selection is not
 differentiated. Pass the same selection and scale to forward and backward.
 
 A GPU hash table compacts the selected starts. Backward runs the engine
-described in [QSA](qsa.md) over them; a nonfinite K/V value of a masked
-token adds exact zeros, one of a selected token poisons its queries. Every call
-rebuilds metadata, including during CUDA Graph replay. Warm up before capture.
+described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md))
+over them. A nonfinite K/V value of a masked token adds exact zeros, and one of
+a selected token poisons its queries. Every call rebuilds metadata, including
+during CUDA Graph replay. The backward compiles different kernels below and
+above the 22528-token dense crossover, from 196608 tokens on, and for each
+`ds_precision`. Before capture, warm up with the query head count, token
+counts, `max_seq_len` and `ds_precision` the capture will use.
 
 The public wrappers allocate outputs and one workspace. The internal APIBase
 plan validates current storage and uses only caller-owned buffers in execute;
@@ -102,22 +107,23 @@ the following stricter input contract; it is never inferred from tensor shapes:
   absolute packed token IDs; block origins restart at each document boundary.
   Without `cu_seqlens`, all `T` tokens are one document.
 - Optional `max_seq_len` is a host integer in `[1, T]` bounding every document
-  length. It defaults to `T`. Every replay must respect this bound. The kernel
+  length. It defaults to `T`. A bound below the 22528-token dense crossover
+  plans no sparse path, so the workspace is smaller and no sparse launches run.
+  Every document of every replay must respect this bound. The kernel
   rereads device `cu_seqlens` on replay; boundaries are not cached.
 
 These device-value promises are caller contracts, not host-side checks.
 Use `general` for arbitrary selections. Passing `cu_seqlens` or `max_seq_len`
 with `general` is rejected because that mode obtains its bounds from indices.
-The keyword-only arguments preserve existing positional calls; `ds_precision`
-(`"fp32"` by default, `"bf16"` for the single rounding of [QSA](qsa.md)) applies
-to both modes. Both modes run
-the backward engine described in [QSA](qsa.md), which also gives the record and
-workspace sizing.
+The keyword-only arguments preserve existing positional calls. `ds_precision`
+(`"fp32"` by default, or `"bf16"`) applies to both modes. Both modes run the
+backward engine described in QSA ([docs](/operations/sparse_attention/qsa), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa.md)),
+which also describes `ds_precision` and gives the record and workspace sizing.
 
-12Q/1KV backward requires the **CUDA 13 CuTeDSL compiler** in addition to
-CuTeDSL >= 4.8 and SM100/SM103/SM107. A CUDA 13 PyTorch build alone does not
-establish the DSL compiler version; unsupported compiler builds are rejected
-before kernel compilation.
+The 12Q/1KV and 6Q/1KV backward requires the **CUDA 13 CuTeDSL compiler** in
+addition to the CuTeDSL versions and architectures above. A CUDA 13 PyTorch
+build alone does not establish the DSL compiler version; unsupported compiler
+builds are rejected before kernel compilation.
 
 The indexed entry is useful when a producer already has token IDs. Use the unchanged Relax
 comparison in `benchmark/qsa/benchmark_relax.py` for the intended workload;

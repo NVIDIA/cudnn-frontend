@@ -29,7 +29,7 @@ def _implementation(q, direction):
     if reason:
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
-    # the forward has a Rubin flavor, the backward engine serves every architecture
+    # the forward has a Rubin flavor, the backward engine serves every architecture and picks its Rubin kernels itself
     name = f"fprop_sm{107 if arch == 107 else 100}" if direction == "fprop" else "bprop_sm100"
     return importlib.import_module(f".kernels.{name}", __package__), arch
 
@@ -95,7 +95,7 @@ def qsa_backward(
     """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE.
 
     ``ds_precision`` selects how dS reaches the dQ MMAs: ``"fp32"`` feeds three bf16 parts of its fp32 value, which keeps
-    a dQ whose terms nearly cancel accurate; ``"bf16"`` rounds it once, as FlashAttention does, at a lower cost.
+    a dQ whose terms nearly cancel accurate. ``"bf16"`` rounds dS (and on the dense prefix P) to bf16 at a lower cost.
     """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     parts = ds_parts(ds_precision)

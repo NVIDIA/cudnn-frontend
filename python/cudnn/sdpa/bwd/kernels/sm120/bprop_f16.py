@@ -82,6 +82,7 @@ from cudnn.sdpa.bwd.kernels.sm120._common import (
     mma_bstream,
     pack_half2,
     tile_ptr,
+    zero_tile_rows,
 )
 from cudnn.sdpa.bwd.kernels.sm120.bprop_chain_f16 import SM120DetDqGemmKernel
 
@@ -357,8 +358,9 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         if self.dbias_present and not self.bias_present:
             raise ValueError("dbias_present requires bias_present")
         self.bias_dtype = cutlass.Float32 if bias_is_fp32 else in_dtype
-        # sink LSE is finite on padded rows; trim them explicitly (LSE := +inf, P = 0)
-        self.trim_q_rows = bool(sink_present) and self.seq_q_lens_present
+        # Padded rows' LSE is unread data (finite with a sink, possibly NaN in the
+        # runtime padding); trim them explicitly (LSE := +inf, P = 0)
+        self.trim_q_rows = self.seq_q_lens_present
         # use padded head dim for compute
         self.d_qk_orig = int(head_dim_qk)
         self.d_v_orig = int(head_dim_v) or int(head_dim_qk)
@@ -780,6 +782,12 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 pass
             while not prims.mbarrier_try_wait_parity(k_mbar, cutlass.Int32(0)):
                 pass
+            if cutlass.const_expr(self.seq_kv_lens_present):
+                # K/V rows past seq_len_kv[b] are unread data; zero them before
+                # dP = dO*V^T and dQ = dS*K multiply them by P = 0.
+                if kv_base + KV_TILE > seqlen_kv:
+                    zero_tile_rows(sK, seqlen_kv - kv_base, lane, rows=KV_TILE, cols=D_QK, chunk_elems=CHUNK_ELEMS, dtype=io_dtype)
+                    zero_tile_rows(sV, seqlen_kv - kv_base, lane, rows=KV_TILE, cols=D_V, chunk_elems=CHUNK_ELEMS, dtype=io_dtype)
 
             # V -> registers.
             v_persist = cutlass.Array(cutlass.Int32, D_V_CHUNKS * V_ROW_BLOCKS * 4, alignment=16)
@@ -841,6 +849,14 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                     if warp == 0:
                         prims.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.barrier(barrier_id=3, number_of_threads=288)
+                if cutlass.const_expr(self.seq_q_lens_present):
+                    # Q/dO rows past seq_len_q[b] (only in the first, highest
+                    # block) are unread data; zero them before dK += dS^T*Q and
+                    # dV += P^T*dO, and order the stores before TMA reuses them.
+                    if q_row0 + Q_TILE > seqlen_q:
+                        zero_tile_rows(sQ_stage, seqlen_q - q_row0, lane, rows=Q_TILE, cols=D_QK, chunk_elems=CHUNK_ELEMS, dtype=io_dtype)
+                        zero_tile_rows(sdO_stage, seqlen_q - q_row0, lane, rows=Q_TILE, cols=D_V, chunk_elems=CHUNK_ELEMS, dtype=io_dtype)
+                        cute.arch.fence_proxy("async.shared", space="cta")
 
                 # dP_sum per-thread loads (delta buffer is 128-rounded).
                 # det_2k prefetches the next block's delta alongside its LSE
@@ -849,7 +865,12 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                     for row_blk in cutlass.range_constexpr(SDP_ROW_BLOCKS):
                         for hf in cutlass.range_constexpr(2):
                             r_loc = wm_sdp * 16 + row_blk * 16 * WM_SDP + g_lane + hf * 8
-                            delta_r[row_blk * 2 + hf] = (delta_ptr + delta_base + q_row0 + r_loc).load()
+                            d_val = (delta_ptr + delta_base + q_row0 + r_loc).load()
+                            if cutlass.const_expr(self.seq_q_lens_present):
+                                # A padded row's delta sums unread dO * O; P = 0 there.
+                                if q_row0 + r_loc >= seqlen_q:
+                                    d_val = cutlass.Float32(0.0)
+                            delta_r[row_blk * 2 + hf] = d_val
 
                 # GEMM 1: acc_s = Q @ K^T.
                 for i in cutlass.range_constexpr(SDP_ROW_BLOCKS * SDP_COL_FRAGS * 4):

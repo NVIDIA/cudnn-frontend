@@ -29,7 +29,9 @@ PyTorch autograd through the same API. The two fused GDN step entries
 under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
 with no backward. `SharedExpertDecode` (the shared-expert decode pair, also
 under `cudnn.moe.frost`) is the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
-The required settings below apply to this table.
+The required settings below apply to this table. The `pygraph.custom_reduction`
+rows describe only the named reducer bodies and consumed graph outputs, not
+arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
@@ -43,14 +45,36 @@ The required settings below apply to this table.
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
-| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Supported | Supported |
+| `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
-| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Unverified | Supported | Supported |
-| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Unverified | Replay only | Replay only |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
+| `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
+| `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
+| `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
+| FROST native D576/V512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
+| FROST native D512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
+| FROST native D64 dense/THD paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
+| FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
+| `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+
+The native D128 paging row fixes the CTA width, tile width and split count per
+plan. Its standalone suite checks O/Stats bytes across repeated launches,
+reordered/duplicated batches and fresh buffers, including mixed FP8 KV storage.
+Graph qualification separately checks numerical outputs and changed-input replay.
+These paging changes add no backward path.
+
+The D512 FP8 paged row covers the native role-split forward path with whole-group
+PackGQA and a fixed split count (1 or 4 in its determinism suite). Its batch
+checks preserve quantized payloads and scalar scales, and compare per-sequence
+O and Stats. Amax is a whole-batch reduction: repeated calls compare its bytes,
+while changed batches check its numerical value against the full batch reference.
+The paging addition does not add an FP8 paged backward path.
 
 `GdnVerifyFused` is batch-invariant under one gated-norm association only: the
 one-request pick takes the two-CTAs-per-head association (`ctas2`, 4-row
@@ -62,6 +86,15 @@ a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
 
+- Custom reduction: these rows have no determinism switch and pin the native
+  cuDNN backend. SM100 support applies only to the suite's dense, 257-element
+  row reductions and consumed outputs. Argmax/argmin use bounded finite values
+  with ties and row-local INT32 indices; NaN/infinity behavior is unverified.
+  The direct FLOAT ADD body uses the suite's bounded multiples of one eighth,
+  whose partial sums are all exactly representable. Arbitrary floating-point
+  sum inputs, other reducer bodies, and unused tuple outputs are unverified.
+  No custom-reduction backward entry point exists. SM103, SM90, SM107, and
+  other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
@@ -85,7 +118,24 @@ a row alone and inside a batch under the entry's own picks.
   the same admission, unverified; SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
-  indices per query.
+  indices per query, except in SM100/SM103 plans that store dKV in
+  conflict-rank storage, which accept duplicate indices: BF16 H128 two-CTA
+  plans and generic plans for which `deterministic_dkv_mode` selects records
+  or the chain relay.
+- On SM100/SM103, `deterministic_dkv_mode` selects the sparse attention
+  backward dKV storage: `'records'` (default; conflict-rank storage where it
+  fits the shard, relay or private-plane layout, that layout elsewhere),
+  `'chain'`, or `'shards'`. Each mode is repeatable. The modes round dKV
+  differently; generic M64 plans give the same dSink bytes under every mode.
+  With any mode, as with the shard layouts alone, dKV is not batch invariant
+  once a batch spans several waves: the layout, its waves and its plane or
+  shard count follow the batch's query and KV extents. Forward results, dQ
+  and, for generic M64 plans, dSink keep their bytes while the batch keeps the
+  plan's layout. H128 two-CTA plans sum dSink in an order that follows query
+  positions, and H128 D576 plans with top-k 1024 or wider sort each query's
+  rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
+  keep the shard and relay layouts: `'records'` runs as `'shards'` and
+  `'chain'` is rejected.
 - QSA and dense indexer backward expose no determinism switch.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
@@ -102,3 +152,20 @@ pooled DSA, and distributed execution are outside this status page's scope.
 
 See the [test report](https://github.com/Anerudhan/cudnn-frontend/blob/feat/attention-determinism-tests/test/python/determinism_goldens/README.md)
 for the covered configurations, validation runtimes, and supporting measurements.
+
+
+The D512 per-tensor FP8 backward pair uses fixed query/key owners and reduces
+GQA heads in ascending order. Its bounded dense BSHD suite preserves all FP8
+payloads, scalar scales, O, Stats and upstream gradients across batch changes;
+it compares dQ/dK/dV bytes and whole-batch Amax reductions. Cases include
+left windows, repeated/reordered/duplicated batches through 129 requests and
+changed-input CUDA Graph replay. The deterministic flag selects the same
+arithmetic. This qualification does not add MXFP8 or packed backward support.
+
+The D512 MXFP8 backward pair uses the same fixed owner order, consuming
+canonical E8M0 scale bytes and independently quantized columnwise payloads.
+Its FP16/BF16 checks preserve these exact bytes across singleton, reordered,
+duplicated and129-request batches, then mutate dO and a canonical scale
+atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
+SM103 execution remains unverified. The deterministic flag does not select
+a different reduction. THD and other unsupported graph forms are unchanged.

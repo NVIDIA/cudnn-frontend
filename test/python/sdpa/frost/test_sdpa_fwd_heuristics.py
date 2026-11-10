@@ -2414,3 +2414,25 @@ def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     assert paged_thd_split_choice(rubin, f)[0] > 1
     sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
     assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))
+
+
+@pytest.mark.L0
+def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
+    """GB10 (cc 12.1, 48 SMs): a bf16 / f16 d64 / d128 causal dense prefill with more (batch, head) streams than SMs
+    leads with the NATURAL walk, the LPT variants behind it as runners; up to one stream per SM, a sliding window, an FP8
+    row and the cc 12.0 parts keep the L2-budget rule's LPT_L2."""
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+
+    def plans(**over):
+        facts = _facts(**{**dict(b=8, h_q=16, h_kv=16, s_q=2048, s_kv=2048, causal=True, bottom_right=True, device_cc=(12, 1), device_sm_count=48), **over})
+        out = recommend("A", facts, offered)
+        assert out
+        return out
+
+    many = plans()  # 128 streams on 48 SMs
+    assert many[0].knobs.sched_policy == SCHED_NATURAL, many[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in many}, [p.knobs for p in many]
+    assert plans(d_qk=64, d_v=64, h_kv=4)[0].knobs.sched_policy == SCHED_NATURAL  # GQA counts query-head streams
+    assert plans(b=3)[0].knobs.sched_policy == SCHED_LPT_L2  # 48 streams: one per SM
+    assert plans(device_cc=(12, 0), device_sm_count=188)[0].knobs.sched_policy == SCHED_LPT_L2
+    assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2

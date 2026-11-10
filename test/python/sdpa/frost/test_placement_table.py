@@ -49,7 +49,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
-        assert phase in ("q1", "mtp", "prefill") and layout in ("dense", "paged", "thd", "thd_ragged")
+        assert phase in ("q1", "mtp", "prefill", "prefill_short_square") and layout in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked")
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
@@ -274,6 +274,78 @@ def test_cc103_d128_forward_dense_causal_gqa_entries_are_its_own():
 
 
 @pytest.mark.L0
+def test_b300_dense_prefill_entries_lead_the_sm100_row():
+    """bf16 dense prefill-phase d192 and windowed d64 lead on cc 10.3 from their own study; f16, other head dims, a paged cache
+    and cc 10.0 are not answered by these entries."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row = "sdpa_fwd_prefill_sm100"
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+
+    def prefill(**over):
+        base = {"b": 16, "h_q": 32, "h_kv": 4, "s_q": 65, "s_kv": 3072, "d_qk": 192, "d_v": 192, "dtype": cudnn.data_type.BFLOAT16}
+        base.update(causal=True, bottom_right=True, has_paged_kv=False, device_cc=(10, 3))
+        base.update(over)
+        return _facts(**base)
+
+    half = cudnn.data_type.HALF
+    d64 = {"d_qk": 64, "d_v": 64, "window_left": 1024}
+    assert pt.TABLE[pt.class_key(row, prefill())].study == "sm103_dense_prefill_bf16_20261107"
+    led = (
+        prefill(),
+        prefill(causal=False, bottom_right=False),
+        prefill(h_q=8, h_kv=8, window_left=1024),
+        prefill(s_kv=3073),
+        prefill(h_q=8, h_kv=8, **d64),
+        prefill(h_q=8, h_kv=8, s_kv=3073, **d64),
+    )
+    for facts in led:
+        assert pt.lookup(row, facts) is True
+        assert placement.place(spec, facts) == placement.LEAD
+
+    assert pt.class_key(row, prefill(d_qk=64, d_v=64)) not in pt.TABLE  # d64 without a window
+    assert pt.class_key(row, prefill(dtype=half)) not in pt.TABLE  # f16 keeps the hand rules
+    assert pt.class_key(row, prefill(dtype=half, **d64)) not in pt.TABLE
+    assert pt.class_key(row, prefill(dtype=half, d_qk=128, d_v=128)) not in pt.TABLE
+    assert pt.class_key(row, prefill(has_paged_kv=True, page_size=64)) not in pt.TABLE
+    assert pt.class_key(row, prefill(device_cc=(10, 0))) not in pt.TABLE
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [127, 128, 129, 45248, 45312, 45313])
+def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
+    """Withdraw both tile classes after the q19/kv45248 holdout regression.
+
+    Include both sides of the first tile boundary and long on/off-tile caches;
+    windowed MHA and non-windowed GQA remain covered by the preceding study test.
+    """
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    row = "sdpa_fwd_prefill_sm100"
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    facts = _facts(
+        b=24,
+        h_q=56,
+        h_kv=8,
+        s_q=19,
+        s_kv=s_kv,
+        d_qk=192,
+        d_v=192,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        window_left=96,
+        has_paged_kv=False,
+        device_cc=(10, 3),
+    )
+    assert pt.lookup(row, facts) is None
+    assert placement.place(spec, facts) == placement.TRAIL
+
+
+@pytest.mark.L0
 def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     """The A100 f16 dense prefill classes answer from their own study (sm80_f16_dense_prefill_20261106), not the bf16 one, and
     another Ampere part has no entry: the hand rules decide there."""
@@ -295,3 +367,70 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
     assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
     assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
+    """MHA d64 windowed context leads on cc 8.0 from their own study; a class whose fit kept a threshold, whose tile
+    twin did not fit `always`, or that failed qualification has no entry, and another Ampere part keeps the hand rules."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def prefill(d, dtype=cudnn.data_type.HALF, **over):
+        base = dict(
+            b=2,
+            h_q=16,
+            h_kv=16,
+            s_q=512,
+            s_kv=4096,
+            d_qk=d,
+            d_v=d,
+            dtype=dtype,
+            causal=False,
+            bottom_right=False,
+            has_paged_kv=False,
+            device_cc=(8, 0),
+        )
+        base.update(over)
+        return _facts(**base)
+
+    window = dict(causal=True, bottom_right=True, window_left=256)
+    assert pt.lookup(row, prefill(256)) is None  # MHA failed native qualification; keep the prior rule
+    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8)) is None  # GQA also failed qualification
+    assert pt.lookup(row, prefill(256, h_q=32, h_kv=8, s_kv=4100)) is None  # keep the tile twin on the prior rule too
+    assert pt.TABLE[pt.class_key(row, prefill(64, **window))].study == "sm80_dense_prefill_f16_20261107"
+    assert pt.lookup(row, prefill(64, cudnn.data_type.BFLOAT16, **window)) is True
+    assert pt.TABLE[pt.class_key(row, prefill(64, cudnn.data_type.BFLOAT16, **window))].study == "sm80_dense_prefill_bf16_20261107"
+
+    assert pt.lookup(row, prefill(64, h_q=32, h_kv=8, **window)) is None  # f16 d64 windowed GQA: its on-tile class kept a threshold
+    assert pt.lookup(row, prefill(64, cudnn.data_type.BFLOAT16, h_q=32, h_kv=8, **window)) is None  # bf16 d64 windowed GQA: failed qualification
+    assert pt.lookup(row, prefill(256, causal=True, bottom_right=True)) is None  # f16 d256 causal: the off-tile class kept a threshold
+    assert pt.lookup(row, prefill(256, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(32, 8), (32, 32)], ids=["gqa", "mha"])
+def test_sm107_paged_prefill_entries_lead_their_classes(heads):
+    """Study sm107_paged_prefill_20261109 (Rubin, FlashInfer's paged path): D192/V128 leads on the 128-key tile from 512 KV
+    tokens and always off it; D256 leads everywhere. D128, f16, a window, a mask-free graph and another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm107"
+    h_q, h_kv = heads
+
+    def paged(d=(192, 128), **over):
+        base = dict(b=4, h_q=h_q, h_kv=h_kv, s_q=128, s_kv=512, d_qk=d[0], d_v=d[1], causal=True, bottom_right=True)
+        base.update(thd=True, max_total_seq_len_q=4 * 128, device_cc=(10, 7))
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, paged()).study == "sm107_paged_prefill_20261109"
+    assert pt.lookup(row, paged(s_kv=384)) is False  # on the tile below 512 KV the backend keeps the lead
+    assert pt.lookup(row, paged(s_kv=512)) is True
+    assert pt.lookup(row, paged(s_kv=385)) is True  # off the tile: always
+    assert pt.matched_entry(row, paged(s_kv=385)).study == "sm107_paged_prefill_20261109"
+    for s_kv in (256, 257, 65536):
+        assert pt.lookup(row, paged(d=(256, 256), s_kv=s_kv)) is True
+        assert pt.matched_entry(row, paged(d=(256, 256), s_kv=s_kv)).study == "sm107_paged_prefill_20261109"
+    assert pt.lookup(row, paged(d=(128, 128))) is None
+    assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, paged(window_left=128)) is None
+    assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
+    assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study

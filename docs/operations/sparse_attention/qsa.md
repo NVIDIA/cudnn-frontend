@@ -47,9 +47,9 @@ def qsa_backward(
     ...  # dq, dk, dv
 ```
 
-`ds_precision` selects how dS reaches the dQ MMAs: `"fp32"` feeds three bf16
-parts of its fp32 value, which keeps a dQ whose terms nearly cancel accurate;
-`"bf16"` rounds it once, as FlashAttention does, at a lower cost.
+`ds_precision` selects how dS reaches the dQ MMAs. `"fp32"` feeds three bf16
+parts of its fp32 value, which keeps a dQ whose terms nearly cancel accurate.
+`"bf16"` rounds dS to bf16 (on the dense prefix, P as well) at a lower cost.
 
 Both calls return a `TupleDict`. Tuple unpacking follows the order above; string
 keys have the same names. Forward and backward are explicit calls. The forward
@@ -89,24 +89,26 @@ not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
 On every architecture both training entries run one backward engine
-(`cudnn.QSA.kernels.bprop_sm100`): the prefix of every sequence
+(`cudnn.QSA.kernels.bprop_sm100`, with the Rubin dense pair, query-major and
+key-major kernels of `cudnn.QSA.kernels.bprop_sm107` on SM107): the prefix of every sequence
 (its first 20480 queries, or all of them below 22528 tokens) on a dense
 key-tile kernel that masks per key token through a bitmap, the remaining
 queries on a query-major pass that writes P / dS records and a key-major pass
 that accumulates dK / dV through an inverted block-to-query index, so no
 per-pair floating-point atomics are issued. The records are bounded by query
-windows (about 2.7 GiB of scratch at 128K for 12Q/1KV, 5.1 GiB for 24Q/2KV).
+windows (about 0.4 GiB at 128K for 12Q/1KV, 0.8 GiB for 24Q/2KV), so the whole
+backward workspace of the bitmap entry stays about 2.7 GiB and 5.1 GiB.
 Blocks may start anywhere, the key bounds may cut them, and a query sees every
-selected key within `lo <= j <= hi`, keys after itself included; a query inside
+selected key within `lo <= j <= hi`, keys after itself included. A query inside
 the dense prefix of a long sequence that selects a key past that prefix leaves
-its dQ NaN. A query past the
+its dQ NaN and contributes nothing to those keys' dK / dV. A query past the
 dense prefix holds at most 513 selected blocks (top-512 and the causal tail);
 a longer list contributes nothing and leaves that query's dQ NaN. The one-KV-head
 flavors (12Q/1KV and 6Q/1KV) need the CUDA 13 build of CuTe DSL; 6Q/1KV runs the
 same kernels with six real head rows in the 12-row query tiles, so it costs as much as 12Q/1KV.
 The bitmap entry reads the sequences from `tok_base`;
 `qsa_indexed_backward` describes packed documents through
-`selection_mode="causal_topk"` with `cu_seqlens` ([details](/operations/sparse_attention/qsa/qsa_indexed#complete-blocks-and-causal-tails))
+`selection_mode="causal_topk"` with `cu_seqlens` ([docs](/operations/sparse_attention/qsa/qsa_indexed#complete-blocks-and-causal-tails), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/sparse_attention/qsa_indexed.md#complete-blocks-and-causal-tails))
 and otherwise treats the rows as one sequence, which stays exact for packed
 documents (the selection decides which keys a query sees) but serves only the
 first document on the dense prefix path.
@@ -172,13 +174,13 @@ reductions can change low bits between runs. The dense prefix of each sequence
 runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
 on chip; the remaining queries write bf16 P / dS records that a key-major pass
 sums per block, so no per-pair floating-point atomics are issued. dS reaches
-the dQ MMAs as three bf16 parts of its fp32 value, or rounded once to bf16
-with `ds_precision="bf16"`. A nonfinite
-K / V value of a masked token adds exact zeros; one of a selected token poisons
-the queries that select it and that block's dK / dV, nothing else (a
-nonfinite Q or dO value can also reach the dQ of the query pair processed just
-before it). Every content-dependent decision is made on the device, so CUDA
-graph replay follows the current inputs.
+the dQ MMAs as three bf16 parts of its fp32 value. With `ds_precision="bf16"`
+dS is rounded to bf16, and on the dense prefix P is as well. A nonfinite
+K / V value of a masked token adds exact zeros. One of a selected token poisons
+the queries that select it and that block's dK / dV, nothing else. A nonfinite
+Q or dO value is not contained: it can also reach the dQ of neighboring sparse
+queries and the dK / dV of keys it does not select. Every content-dependent
+decision is made on the device, so CUDA graph replay follows the current inputs.
 
 For each query head and its shared KV head, the backward equations are:
 
@@ -206,9 +208,9 @@ full score or probability matrices.
 | Backward | Final cast | BF16 `dq`, `dk`, `dv` |
 
 The selection bitmap must include any desired causal tail. The implementation
-does not add a tail automatically. The forward does not truncate selection at
-512 blocks; the backward attends keys up to the query only and caps queries past
-the dense prefix at 513 blocks (above).
+does not add a tail automatically. The forward does not truncate the selection
+at 512 blocks. The backward caps queries past the dense prefix at 513 blocks
+(above).
 Pass the same Q/K/V, selection, metadata, and scale to both calls. Casting `out`
 back to FP32 does not reconstruct `out_fp32`.
 
@@ -224,19 +226,27 @@ The public functions select one of two architecture families internally:
 | Family | Forward kernel | Backward kernel |
 |---|---|---|
 | Blackwell SM100/SM103 | `cudnn_frost_qsa_fprop_sm100` | `cudnn_qsa_bwd_*` (dense pair, query-major, key-major and index kernels) |
-| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine, compiled for SM107) |
+| Rubin SM107 | `cudnn_frost_qsa_fprop_sm107` | `cudnn_qsa_bwd_*` (the same engine with its SM107 dense pair, query-major and key-major kernels) |
 
 Kernel symbols are implementation details; Rubin kernels compile for SM107.
 Rubin compaction scans 16 selection bytes per lane and preserves block order.
 CuTeDSL 4.7 or newer is
-required; Rubin also requires a build with the `sm_107a` target.
+required; Rubin also requires a build with the `sm_107a` target. On SM107 the
+backward runs Rubin flavors of the dense pair, query-major and key-major kernels,
+which use the oversized shared memory carveout and a 576-column TMEM allocation
+where those pay off. A driver without the oversized carveout (older than CUDA
+13.4) runs the SM100 kernels on SM107.
 
 Calls allocate outputs and scratch on the input device and enqueue work on its
-current PyTorch CUDA stream. Warm up the chosen head geometry before CUDA graph
-capture. Compiled kernels reuse symbolic token and block extents; metadata is
+current PyTorch CUDA stream. The backward compiles different kernels below and
+above the 22528-token dense crossover, from 196608 tokens on, and for each
+`ds_precision`. Before CUDA graph capture, warm up with the head geometry,
+token counts and `ds_precision` the capture will use.
+Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
-`[T, NB]` compact-index buffer and int32 `[T]` counts. Backward uses the same
-compact indices and counts plus one workspace: FP32 dQ / dK / dV accumulators,
+`[T, NB]` compact-index buffer and int32 `[T]` counts. Backward compacts the
+selection again into the same int32 `[T, NB]` indices and `[T]` counts and adds
+one workspace: FP32 dQ / dK / dV accumulators,
 `[T, Hq]` delta, the per-token dense bitmap, the sequence tables and, past the
 dense prefix, the P / dS record windows with their inverted index (about
 0.4 GiB for 12Q/1KV, 0.8 GiB for 24Q/2KV). The dense forward route also uses
@@ -244,4 +254,5 @@ packed token masks, tile ranges and K/V check flags. These buffers are rebuilt
 on each call.
 Full-call benchmarks must include forward preparation, compaction, backward
 preparation, and final gradient casts.
-At `T=131072` and `NB=32768`, the forward compact-index buffer alone uses 16 GiB.
+At `T=131072` and `NB=32768`, the compact-index buffer alone uses 16 GiB in
+each call.

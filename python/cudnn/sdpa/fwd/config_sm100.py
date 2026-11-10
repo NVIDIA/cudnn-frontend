@@ -604,7 +604,9 @@ def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
     return tuple(device_cc or ()) == (10, 7) and not pertensor and not thd and not paged and (split_kv or 1) == 1
 
 
-def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False, d512_partial_pack_wired: bool = False) -> None:
+def _validate_params(
+    flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False, d512_partial_pack_wired: bool = False, d512_paged_2x2_wired: bool = False
+) -> None:
     if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
         # The loader routes an index-list record (qsa_block_topk != 0) to the cc 10.7 sparse kernel
         # (config_sm107.make_cfg_d256_sparse); a dense template must never consume one -- it would read K/V densely and
@@ -792,7 +794,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             raise ValueError(f"{flavor}: mma_2x2 selects the d512 2x2-datapath kernel; the other flavors do not consume it")
         if fp8:
             raise ValueError("d512: mma_2x2 is wired for BF16/FP16 inputs only (the fp8 / mxfp8 d512 kernels stay role-split)")
-        if k.paged_kv and k.d_flavor != 576:
+        if k.paged_kv and k.d_flavor != 576 and not d512_paged_2x2_wired:
             raise ValueError("d512: mma_2x2 does not serve paged KV; the three-chunk d576 specialization is required")
         if k.pack_gqa and not d512_partial_pack_wired and (k.qh_per_kh <= 0 or _D512_2X2_TILE_M % k.qh_per_kh != 0):
             raise ValueError(f"d512: mma_2x2 packs whole GQA groups into its {_D512_2X2_TILE_M}-row tile; qh_per_kh ({k.qh_per_kh}) must divide it")

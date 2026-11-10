@@ -130,6 +130,13 @@ def test_norm_public_apis_reject_cpu_inputs():
 
 
 @pytest.mark.L0
+def test_rms_norm_rejects_missing_weight():
+    input = torch.randn(2, 64, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="requires a weight"):
+        rms_norm(input, None)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("op_name", ["layer_norm", "rms_norm"])
 def test_norm_public_apis_reject_zero_rows(op_name):
     input = torch.empty(0, 64, device="cuda", dtype=torch.float16)
