@@ -44,6 +44,7 @@ def test_native_paged_adapter_rebind_replay(
     sink_endpoints=False,
     split_kv=1,
     sink_stride=3,
+    explicit_tiles=None,
 ):
     import cutlass.cute as cute
 
@@ -61,6 +62,8 @@ def test_native_paged_adapter_rebind_replay(
     flavor = _sm80_pick_flavor(d, dv)
     fd, fv = _SM80_FLAVOR_DIMS[flavor]
     m, n, w = (32, 16, 4) if max(fd, fv) > 256 else (128, 64, 4) if fd == 64 else (64, 32 if fd == 256 else 64, 4)
+    if explicit_tiles is not None:
+        m, n = explicit_tiles
 
     def allocate():
         q = torch.randn(qbatch, cap, h, d + 8, dtype=dtype, device="cuda")[..., :d]

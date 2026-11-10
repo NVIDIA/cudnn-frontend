@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason
 
 @pytest.mark.parametrize("d,splits", [(128, 3), (512, 17)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_split_forward_determinism(d, splits, dtype):
+def test_split_forward_determinism(d, splits, dtype, tile_m=None, tile_n=None, golden_suffix=""):
     h, hk, sq, sk = 8, 2, 17, 257
     rng = torch.Generator().manual_seed(941)
     records = [tuple(torch.randn(shape, generator=rng).to(dtype) * 0.25 for shape in ((h, sq, d), (hk, sk, d), (hk, sk, d))) for _ in range(3)]
@@ -39,6 +39,8 @@ def test_split_forward_determinism(d, splits, dtype):
             sample_lse=lse,
             split_kv=splits,
             sched_policy=0,
+            tile_m=tile_m,
+            tile_n=tile_n,
             has_sink=True,
             seq_q_lens_present=True,
             seq_kv_lens_present=True,
@@ -112,6 +114,6 @@ def test_split_forward_determinism(d, splits, dtype):
         v[0].add_(0.75)
         graph.replay()
         assert_bitwise(snapshot({"o": o[128], "lse": lse[128]}), expected, "changed neighbor")
-        assert_golden(f"sdpa-sm80-dense-d{d}-split{splits}-{str(dtype).split('.')[-1]}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+        assert_golden(f"sdpa-sm80-dense-d{d}-split{splits}-{str(dtype).split('.')[-1]}{golden_suffix}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
     finally:
         graph.reset()

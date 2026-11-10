@@ -201,6 +201,13 @@ compared byte for byte. This is forward-only qualification of this fixed
 GPU/runtime; THD split-KV remains unsupported and cross-runtime identity is
 not claimed.
 
+The measured dense split coverage also includes small native tiles:
+D64 at M16/N16, D128 at M16/N32 and M32/N16, and D256 at M16/N16,
+in FP16/BF16 with fixed split3. These configurations preserve O/Stats bytes
+under replay, batch reordering/duplication and changed neighbors. This
+extends the tested forward configuration set; it does not require equality
+between different tile sizes or split counts.
+
 ## SM120 small-head paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch

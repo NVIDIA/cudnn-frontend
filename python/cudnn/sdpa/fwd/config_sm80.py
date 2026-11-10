@@ -74,7 +74,7 @@ def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[i
     cfg = FLAVOR_CFGS[pick_flavor(d_qk, d_v)]
     if cfg.D_QK > 256 or cfg.D_V > 256:
         return frozenset({32}), frozenset({16})
-    return frozenset({64, 128}), frozenset({32, 64} if cfg == QWEN_CFG else {64, 128})
+    return frozenset({16, 32, 64, 128}), frozenset({16, 32, 64} if cfg == QWEN_CFG else {16, 32, 64, 128})
 
 
 # ---------------------------------------------------------------------------
@@ -165,11 +165,11 @@ def validate_params(p: TemplateParams) -> None:
     if p.split_kv > 1 and p.thd_varlen:
         raise ValueError("sm80: split-KV currently requires dense Q")
     wide = p.d_qk > 256 or p.d_v > 256
-    tile_ns = (16,) if wide else (32, *_SM80_SEQ_TILES_N) if (p.d_qk, p.d_v) == (256, 256) else _SM80_SEQ_TILES_N
+    tile_ns = (16,) if wide else (16, 32, *_SM80_SEQ_TILES_N)
     if p.tile_n not in tile_ns:
         raise ValueError(f"sm80: tile_n must be one of {tile_ns}; got {p.tile_n}")
-    if p.num_warps not in (4, 8):
-        raise ValueError(f"sm80: num_warps must be 4 or 8; got {p.num_warps}")
+    if p.num_warps not in (1, 2, 4, 8):
+        raise ValueError(f"sm80: num_warps must be 1, 2, 4 or 8; got {p.num_warps}")
     row_warps = p.num_warps // (2 if wide else 1)
     if p.tile_m % (row_warps * 16) != 0:
         raise ValueError(f"sm80: tile_m ({p.tile_m}) must be a multiple of row_warps*16 ({row_warps * 16})")

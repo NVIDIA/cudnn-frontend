@@ -65,7 +65,20 @@ def _facts(d=192, dv=128, mode="dense", causal=False):
     )
 
 
-@pytest.mark.parametrize("d,dv,m,n", _POINTS + [(48, 32, 64, 128), (96, 80, 64, 64), (136, 112, 64, 128), (248, 200, 64, 32)])
+@pytest.mark.parametrize(
+    "d,dv,m,n",
+    _POINTS
+    + [
+        (48, 32, 16, 16),
+        (128, 128, 16, 32),
+        (192, 128, 32, 32),
+        (256, 256, 16, 16),
+        (48, 32, 64, 128),
+        (96, 80, 64, 64),
+        (136, 112, 64, 128),
+        (248, 200, 64, 32),
+    ],
+)
 @pytest.mark.parametrize("mode", ["dense", "thd", "paged"])
 def test_explicit_graph_geometry(d, dv, m, n, mode):
     facts = _facts(d, dv, mode)
@@ -77,8 +90,8 @@ def test_explicit_graph_geometry(d, dv, m, n, mode):
 @pytest.mark.parametrize(
     "d,dv,kw,label",
     [
-        (192, 128, {"tile_m": 32}, "tile_m"),
-        (192, 128, {"tile_n": 32}, "tile_n"),
+        (192, 128, {"tile_m": 8}, "tile_m"),
+        (192, 128, {"tile_n": 8}, "tile_n"),
         (256, 256, {"tile_n": 128}, "tile_n"),
         (248, 200, {"tile_n": 128}, "tile_n"),
         (512, 512, {"tile_m": 64}, "tile_m"),
@@ -156,7 +169,7 @@ def test_public_graph_geometry_rebind_replay(d, dv, m, n, cudnn_handle, monkeypa
     case = _case(d, dv, sq=192, layout="gapped", stats=m != 128, causal=scheduler == 2, graph_knobs=public)
     g = case.graph
     assert g.get_engine_and_knobs_at_index(g._plan_index)[1] == public
-    warps = 4 if m == 64 or d == 64 or d > 256 else 8
+    warps = m // 16 if m in (16, 32) and d <= 256 else 4 if m == 64 or d == 64 or d > 256 else 8
     assert observed and observed[-1] == (m, n, warps)
     execution_stream = torch.cuda.ExternalStream(cudnn.get_stream(cudnn_handle))
     for binding in range(2):
