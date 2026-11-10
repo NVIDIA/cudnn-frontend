@@ -61,6 +61,8 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         nonpositive_scale: bool = False,
         has_tile_order: bool = False,
         row_aware_boxes: Optional[bool] = None,
+        lean_consumer_loop: Optional[bool] = None,
+        window_prefetch: Optional[bool] = None,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -107,6 +109,23 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             row_aware_boxes = has_block_sizes and num_splits == 1
         assert not row_aware_boxes or (has_block_sizes and num_splits == 1), "row_aware_boxes needs block sizes and the non-split kernel"
         self.row_aware_boxes = row_aware_boxes
+        # Lean consumer loop (P10; non-split kernel): the O rescale between the QK[j] and PV[j-1] issues is skipped by one
+        # warp vote when no row of the warp changed its running max (its ratio is then exactly 1.0, so the skip is
+        # bit-exact), and the partial-block mask compares each column against one per-thread limit instead of
+        # rebuilding every column coordinate. Off, the kernel keeps its code; the split kernel and the FP8, blk128 and
+        # KPage kernels (which share this file's helpers) are unchanged either way.
+        if lean_consumer_loop is None:
+            lean_consumer_loop = num_splits == 1
+        assert not lean_consumer_loop or num_splits == 1, "lean_consumer_loop is only for the non-split kernel"
+        self.lean_consumer_loop = lean_consumer_loop
+        # Windowed list prefetch (P10; with row-aware boxes): lane l of every warp keeps the list index and the block size
+        # of step 32w + l for the current window and the next one, and a step reads idx[j+1]/bsz[j+1] with two warp
+        # shuffles; one coalesced index load and one size gather per 32 steps replace the per-step load pair, whose
+        # uniform-register conversion ptxas scheduled right after the load (a long-scoreboard stall at every loop top).
+        if window_prefetch is None:
+            window_prefetch = self.row_aware_boxes
+        assert not window_prefetch or self.row_aware_boxes, "window_prefetch builds on row_aware_boxes"
+        self.window_prefetch = window_prefetch
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -219,6 +238,12 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         tSrK = tiled_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK))
         tSrS = cute.make_rmem_tensor(thr_mma_qk.partition_shape_C((self.tile_shape_qk[0], self.tile_shape_qk[1])), self.acc_dtype)
         tScS = thr_mma_qk.partition_C(cS)
+        tScS0 = None
+        if cutlass.const_expr(self.lean_consumer_loop):
+            # Thread 0's coordinate partition: its column of accumulator element (m, n) is a trace-time constant, and every
+            # thread's column is that constant plus the thread's own first column (the wgmma C layout only adds
+            # (lane % 4) * 2 to a column), so the mask compares one per-thread limit against immediates (mask_from_limit).
+            tScS0 = tiled_mma_qk.get_slice(0).partition_C(cS)
 
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         tOrV = tiled_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sV))
@@ -280,6 +305,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 tSrK=tSrK,
                 tSrS=tSrS,
                 tScS=tScS,
+                tScS0=tScS0,
                 tOrV=tOrV,
                 tOrO=tOrO,
                 tOrP=tOrP,
@@ -381,6 +407,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         mV_slice: Optional[cute.Tensor] = None,
         sK: Optional[cute.Tensor] = None,
         sV: Optional[cute.Tensor] = None,
+        tScS0: Optional[cute.Tensor] = None,
     ):
         """QK[j] and PV[j-1] in flight together; wait_group(1) retires QK[j] before softmax[j].
 
@@ -393,9 +420,23 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         lengthening warp 0's path. The prologue's K[0]/V[0] and step 1's V[1] (slot 1's first fill) are full 64-row loads,
         so every row of K and of both V slots always holds finite data from an earlier block of this CTA, and a shorter
         load only shrinks the written row range (see load_kv_block).
+
+        Lean consumer loop (self.lean_consumer_loop): the O rescale runs only when a warp vote says some row's ratio is not
+        1.0 (rescale_o_if_needed), and a partial block is masked by comparing a per-thread limit against the static column
+        offsets of thread 0 (mask_from_limit) instead of rebuilding the 16 column coordinates per step.
+
+        Windowed prefetch (self.window_prefetch): win_idx0/win_bsz0 hold, in lane l, idx/bsz of step 32w + l of the window
+        that contains step j+1, win_idx1/win_bsz1 the next window. Step j shuffles idx[j+1]/bsz[j+1] out of lane (j+1) % 32;
+        when (j+1) % 32 == 0 the windows rotate and the index of the window after it is loaded (one lane per step, clamped
+        to slot 0 past the start of the list), and one step later its sizes are gathered, so neither load is waited for
+        in the step that issues it. The prologue loads the first two windows before the K[0] wait.
         """
         # Every PV accumulates into O (zero-initialized): set once, so no MMA atom is loop-carried.
         tiled_mma_pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+        if cutlass.const_expr(self.lean_consumer_loop):
+            # This thread's first score column: the mask limit is varblk - col0, compared against thread 0's static columns.
+            tScS_mn = cute.make_tensor(tScS.iterator, layout_acc_mn(tiled_mma_qk, tScS.layout))
+            col0 = tScS_mn[0, 0][1]
         # The list base address is loop-invariant, but ptxas rematerializes it every iteration (4 LDC.64 +
         # CTAID reads + an IMAD chain). Routed through a warp shuffle it stays in registers (seen in SASS, not guaranteed).
         gIdx = hoist_list_base(gIndices)
@@ -409,7 +450,16 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         if num_n_tiles > 1:
             n_tile_idx_next = gIndices[num_n_tiles - 2]
         varblk = self.block_len(n_tile_idx, gBSZ, seqlen, num_compute_tiles)
-        if cutlass.const_expr(self.row_aware_boxes):
+        if cutlass.const_expr(self.window_prefetch):
+            # Windows 0 (steps 0..31) and 1 (steps 32..63): lane l holds step 32w + l, i.e. list slot N-1-32w-l (clamped).
+            lane = cute.arch.lane_idx()
+            win_idx0 = gIdx[self.clamp_slot(num_n_tiles - 1 - lane)]
+            win_idx1 = gIdx[self.clamp_slot(num_n_tiles - 33 - lane)]
+            win_bsz0 = self.block_len(win_idx0, gBsz, seqlen, num_compute_tiles)
+            win_bsz1 = self.block_len(win_idx1, gBsz, seqlen, num_compute_tiles)
+            n_tile_idx_next = cute.arch.shuffle_sync_op(win_idx0, 1)
+            varblk_next = cute.arch.shuffle_sync_op(win_bsz0, 1)
+        elif cutlass.const_expr(self.row_aware_boxes):
             # idx[1], idx[2] and bsz[1], bsz[2]: all issued before the K[0] wait, so they land under the first TMA latency.
             # The prefetched index is always read from a valid slot (clamped at 0) and never merged with a "no block"
             # marker: the step counter says whether a block exists, and an unused value costs one unused load, while a
@@ -425,7 +475,11 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         cute.nvgpu.warpgroup.commit_group()
         cute.nvgpu.warpgroup.wait_group(0)
 
-        if cutlass.const_expr(self.row_aware_boxes):
+        if cutlass.const_expr(self.window_prefetch):
+            # The shuffled idx[1] is a clamped read when the list has one block: the count guards the issue.
+            if warp_idx == 1 and num_n_tiles > 1:
+                self.load_kv_block(varblk_next, n_tile_idx_next, tma_atoms_K_part, tma_atom_K, tKgK, tKsK, mK_slice, sK.iterator, K_barrier[0], 0, True)
+        elif cutlass.const_expr(self.row_aware_boxes):
             if warp_idx == 1 and n_tile_idx_next >= 0:
                 self.load_kv_block(varblk_next, n_tile_idx_next, tma_atoms_K_part, tma_atom_K, tKgK, tKsK, mK_slice, sK.iterator, K_barrier[0], 0, True)
         else:
@@ -436,7 +490,10 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         self.prescale(tSrS, score_scale)
         # Full KV tiles need no mask; the CTA-uniform branch skips per-element selects.
         if varblk < self.tile_size:
-            mask(tiled_mma_qk, tSrS, tScS, varblk)
+            if cutlass.const_expr(self.lean_consumer_loop):
+                mask_from_limit(tiled_mma_qk, tSrS, tScS0, varblk - col0)
+            else:
+                mask(tiled_mma_qk, tSrS, tScS, varblk)
         get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
         inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
         cute.autovec_copy(make_acc_into_op(tSrS, tiled_mma_pv.tv_layout_A, self.K_dtype), tOrP)
@@ -450,7 +507,20 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         for n_tile_ind in cutlass.range(num_n_tiles - 2, -1, -1):
             step = num_n_tiles - 1 - n_tile_ind
             n_tile_idx = n_tile_idx_next
-            if cutlass.const_expr(self.row_aware_boxes):
+            if cutlass.const_expr(self.window_prefetch):
+                # bsz[j] was shuffled last step; idx[j+1]/bsz[j+1] (the K[j+1] issue below, V[j+1] and the mask of step j+1)
+                # come out of lane (j+1) % 32 of the current window, which rotates when step j+1 opens a new window.
+                varblk = varblk_next
+                nxt_lane = (step + 1) % 32
+                if nxt_lane == 0:
+                    win_idx0 = win_idx1
+                    win_bsz0 = win_bsz1
+                    win_idx1 = gIdx[self.clamp_slot(n_tile_ind - 33 - lane)]
+                elif nxt_lane == 1:
+                    win_bsz1 = self.block_len(win_idx1, gBsz, seqlen, num_compute_tiles)
+                n_tile_idx_next = cute.arch.shuffle_sync_op(win_idx0, nxt_lane)
+                varblk_next = cute.arch.shuffle_sync_op(win_bsz0, nxt_lane)
+            elif cutlass.const_expr(self.row_aware_boxes):
                 # bsz[j] and bsz[j+1] are in registers (loaded two and one steps ago); only idx[j+2] is fetched here.
                 varblk = varblk_next
                 varblk_next = varblk_next2
@@ -480,7 +550,10 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             gemm_zero_acc(tiled_mma_qk, tSrQ, tSrK, tSrS)
             cute.nvgpu.warpgroup.commit_group()
 
-            rescale_o_for_next_acc(tiled_mma_pv, tOrO, alpha)
+            if cutlass.const_expr(self.lean_consumer_loop):
+                rescale_o_if_needed(tiled_mma_pv, tOrO, alpha)
+            else:
+                rescale_o_for_next_acc(tiled_mma_pv, tOrO, alpha)
             V_barrier[0].wait(index=1 - v_slot, phase=((step - 1) // 2) % 2)
             cute.nvgpu.warpgroup.fence()  # O was rescaled after the QK[j] fence
             cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV[None, None, None, 1 - v_slot], tOrO)
@@ -498,14 +571,17 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                     K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
                     cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
-            if cutlass.const_expr(self.row_aware_boxes):
+            if cutlass.const_expr(self.row_aware_boxes and not self.window_prefetch):
                 # bsz[j+2]: idx[j+2] (fetched at the top of this step) has landed by now; the K[j+2] issue of step j+1
                 # consumes it, so the load has the softmax below to complete.
                 varblk_next2 = self.block_len(n_tile_idx_next2, gBsz, seqlen, num_compute_tiles)
 
             self.prescale(tSrS, score_scale)
             if varblk < self.tile_size:
-                mask(tiled_mma_qk, tSrS, tScS, varblk)
+                if cutlass.const_expr(self.lean_consumer_loop):
+                    mask_from_limit(tiled_mma_qk, tSrS, tScS0, varblk - col0)
+                else:
+                    mask(tiled_mma_qk, tSrS, tScS, varblk)
             prev_ratio = get_prev_ratio_and_update_max_and_rescale_sum(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
             inc_softmax_ffma(tiled_mma_qk, tSrS, max_m, sum_m, scale_softmax_log2e)
 
@@ -516,7 +592,10 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
 
         # ---- drain: PV[N-1] ----
         last = num_n_tiles - 1
-        rescale_o_for_next_acc(tiled_mma_pv, tOrO, alpha)
+        if cutlass.const_expr(self.lean_consumer_loop):
+            rescale_o_if_needed(tiled_mma_pv, tOrO, alpha)
+        else:
+            rescale_o_for_next_acc(tiled_mma_pv, tOrO, alpha)
         V_barrier[0].wait(index=last % 2, phase=(last // 2) % 2)
         cute.nvgpu.warpgroup.fence()
         cute.gemm(tiled_mma_pv, tOrO, tOrP, tOrV[None, None, None, last % 2], tOrO)
@@ -1206,6 +1285,25 @@ def mask(
 
 
 @cute.jit
+def mask_from_limit(
+    qk_tiled_mma: cute.TiledMma,
+    tSrS: cute.ThrMma,
+    tScS0: cute.Tensor,
+    lim: cutlass.Int32,
+):
+    """mask() with lim = varblk - (this thread's first column): the thread's column n is masked iff its offset from that
+    first column, which is thread 0's column of element (0, n) and a trace-time constant (tScS0 = thread 0's coordinate
+    partition), is >= lim. One compare against an immediate per column instead of a rebuilt coordinate per column."""
+    tSrS_mn = cute.make_tensor(tSrS.iterator, layout_acc_mn(qk_tiled_mma, tSrS.layout))
+    tScS0_mn = cute.make_tensor(tScS0.iterator, layout_acc_mn(qk_tiled_mma, tScS0.layout))
+
+    for n in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[1])):
+        should_mask = lim <= tScS0_mn[0, n][1]
+        for m in cutlass.range_constexpr(cute.size(tSrS_mn, mode=[0])):
+            tSrS_mn[m, n] = -cutlass.Float32.inf if should_mask else tSrS_mn[m, n]
+
+
+@cute.jit
 def get_prev_ratio_and_update_max_and_rescale_sum(
     qk_tiled_mma: cute.TiledMma,
     tSrS: cute.ThrMma,
@@ -1263,6 +1361,21 @@ def rescale_o_for_next_acc(
     for m in cutlass.range_constexpr(cute.size(tOrO_mn, mode=[0])):
         for n in cutlass.range_constexpr(cute.size(tOrO_mn, mode=[1])):
             tOrO_mn[m, n] *= prev_ratio_m[m]
+
+
+@cute.jit
+def rescale_o_if_needed(
+    pv_tiled_mma: cute.TiledMma,
+    tOrO: cute.ThrMma,
+    prev_ratio_m: cute.Tensor,
+):
+    """rescale_o_for_next_acc behind one warp vote: a row whose max did not change has ratio exactly 1.0, and x * 1.0 == x,
+    so when every row of the warp has ratio 1.0 the 64 FMULs are skipped bit-exactly (the vote keeps the branch uniform)."""
+    needs_rescale = cutlass.Boolean(False)
+    for m in cutlass.range_constexpr(cute.size(prev_ratio_m)):
+        needs_rescale = needs_rescale | (prev_ratio_m[m] != 1.0)
+    if cute.arch.vote_any_sync(needs_rescale):
+        rescale_o_for_next_acc(pv_tiled_mma, tOrO, prev_ratio_m)
 
 
 @cute.jit
