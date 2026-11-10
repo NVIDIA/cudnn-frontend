@@ -5,6 +5,8 @@ cudnn.BlockScaledTensor
 cudnn.CSA
 cudnn.CSACompressorBackward
 cudnn.CSACompressorForward
+cudnn.CUTEDSL_MIN_JAX_VERSION
+cudnn.CUTEDSL_MIN_JAX_VERSION_STR
 cudnn.CausalConv3dWithCacheSm100
 cudnn.CompactGqaBackward
 cudnn.Conv3dBiasResidualPadSm100
