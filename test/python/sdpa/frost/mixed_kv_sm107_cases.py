@@ -40,7 +40,13 @@ def native_resources(q, kv, cga):
         validate_smem(mixed, "mixed-control", arch=limited, qo_alias=False, kv_copy_bytes=raw)
     small, _ = cfg.make_cfg_d64(params)
     assert small.TILE_K == small.TILE_O == 64 and small.DTYPE_KV == kv
-    for factory in (cfg.make_cfg_d32, cfg.make_cfg_d192, cfg.make_cfg_d256):
+    if cga == 2:
+        wide, _ = cfg.make_cfg_d256(params)
+        assert wide.DTYPE_KV == kv and wide.TILE_K == wide.TILE_O == 256
+    else:
+        with pytest.raises(ValueError, match="independent FP8 KV"):
+            cfg.make_cfg_d256(params)
+    for factory in (cfg.make_cfg_d32, cfg.make_cfg_d192):
         with pytest.raises(ValueError, match="independent FP8 KV"):
             factory(params)
 
@@ -252,3 +258,64 @@ def d64_single_q(qdtype, kvdtype, layout, monkeypatch, cudnn_handle):
     checks.check_dense_paged_rebind_capture(
         qdtype, kvdtype, 1, layout, 3, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=True, cpu_reference=True, head_dim=64, q_tokens=1
     )
+
+
+@_native
+@pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
+@pytest.mark.parametrize("splits", [1, 3])
+@torch_fork_set_rng(seed=40141)
+def d256_standalone(qdtype, kvdtype, splits, monkeypatch, cudnn_handle):
+    checks.check_dense_paged_rebind_capture(
+        qdtype, kvdtype, 2, "dense", splits, "standalone", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=False, cpu_reference=True, head_dim=256
+    )
+
+
+@_native
+@pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
+@pytest.mark.parametrize("layout,splits", [("dense", 1), ("dense", 3), ("paged", 1), ("paged", 3)])
+@torch_fork_set_rng(seed=40142)
+def d256_dense_paged(qdtype, kvdtype, layout, splits, monkeypatch, cudnn_handle):
+    checks.check_dense_paged_rebind_capture(
+        qdtype, kvdtype, 2, layout, splits, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=False, cpu_reference=True, head_dim=256
+    )
+
+
+@_native
+@pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
+@pytest.mark.parametrize("layout", ["dense", "paged"])
+@torch_fork_set_rng(seed=40143)
+def d256_single_q(qdtype, kvdtype, layout, monkeypatch, cudnn_handle):
+    checks.check_dense_paged_rebind_capture(
+        qdtype, kvdtype, 2, layout, 3, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=False, cpu_reference=True, head_dim=256, q_tokens=1
+    )
+
+
+@_native
+@pytest.mark.parametrize(
+    "qdtype,kvdtype,split", [("bfloat16", "float8_e4m3fn", 1), ("float16", "float8_e5m2", 1), ("bfloat16", "float8_e5m2", 4), ("float16", "float8_e4m3fn", 4)]
+)
+def d256_replay_batch_golden(qdtype, kvdtype, split):
+    import native_d128_dense_paged_determinism as replay_checks
+
+    replay_checks.test_replay_batch_and_golden(qdtype, kvdtype, 2, split, 128, head_dim=256, pack=False)
+
+
+@pytest.mark.parametrize("qdtype,kvdtype", [("HALF", "FP8_E4M3"), ("BFLOAT16", "FP8_E5M2")])
+def d256_admission(qdtype, kvdtype, monkeypatch):
+    from cudnn.sdpa.fwd import engines, config_sm107
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    spec, facts = checks.check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 7), head_dim=256, cga=2)
+    for changed, knobs in [
+        (facts, engines.SdpaFwdKnobs(cga=1)),
+        (facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=True)),
+        (replace(facts, thd=True, stats_t=None), engines.SdpaFwdKnobs(cga=2)),
+        (replace(facts, has_epilogue_gate=True), engines.SdpaFwdKnobs(cga=2)),
+    ]:
+        assert engines.mismatch(spec.capabilities, changed, knobs)
+    for dim in (192, 248, 264, 512):
+        assert engines.mismatch(spec.capabilities, replace(facts, d_qk=dim, d_v=dim), engines.SdpaFwdKnobs(cga=2))
+    params = TemplateParams(dtype_qkv=2, dtype_kv=0, cta_mma=2)
+    for change in (dict(cta_mma=1), dict(pack_gqa=True), dict(thd_varlen=True), dict(epilogue_gate=True)):
+        with pytest.raises(ValueError, match="independent FP8 KV"):
+            config_sm107.make_cfg_d256(replace(params, **change))

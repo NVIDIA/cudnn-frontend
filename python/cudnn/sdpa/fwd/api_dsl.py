@@ -740,9 +740,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     tag = _flavor_tag(flavor)
     if rubin and not fp8 and flavor == (128, 128) and params.softmax_wgs == 1:
         return _load_kernel_template("sm107/prefill_d256_f16.py", params, "sdpa_fwd_sm107_d128_single_q")
-    mixed_kv_flavors = ((64, 64), (128, 128)) if rubin else ((128, 128),)
+    mixed_kv_flavors = ((64, 64), (128, 128), (256, 256)) if rubin else ((128, 128),)
     if params.dtype_kv != -1 and (fp8 or flavor not in mixed_kv_flavors):
-        raise ValueError("independent FP8 KV storage requires SM100 D128 or native SM107 D64/D128 half prefill")
+        raise ValueError("independent FP8 KV storage requires SM100 D128 or native SM107 D64/D128/D256 half prefill")
     if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
         params = replace(params, d_flavor=192)
         return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
@@ -784,7 +784,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and flavor == (256, 256) and params.thd_varlen and not params.paged_kv and params.split_kv > 1:
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed_split")
-    if rubin and not fp8 and params.paged_kv and flavor == (256, 256):
+    if rubin and not fp8 and params.paged_kv and flavor == (256, 256) and params.dtype_kv == -1:
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen and not params.paged_kv and not params.ragged_q:
         # Dense d128 half at TILE_CGA_M=1 on cc 10.7: the shared 128-row DECODE tile (CfgD128Decode, 224 KiB, inside the
@@ -2225,7 +2225,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return supports_native_small_half_dense_paged(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged)
 
     def _rubin_native_d256_split_leg(self) -> bool:
-        return supports_native_d256_dense_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, pack_gqa=self.pack_gqa)
+        return supports_native_d256_dense_split(
+            self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, pack_gqa=self.pack_gqa
+        ) or (self._device_cc == (10, 7) and self._mixed_fp8_kv and self.flavor == (256, 256) and not self.thd and not self.pack_gqa and self.cga == 2)
 
     def _rubin_native_d512_leg(self) -> bool:
         return supports_native_d512_dense_pack_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, cga=self.cga)
@@ -2534,10 +2536,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not getattr(binder, "supports_mixed_fp8_kv", False),
                 "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension",
             )
-            mixed_kv_flavors = ((64, 64), (128, 128)) if self._device_cc == (10, 7) else ((128, 128),)
+            self._not_implemented_error_if(
+                (int(d_qk), int(d_v)) == (256, 256) and (self.cga != 2 or self.thd or self.pack_gqa or self.gate_desc is not None),
+                "native mixed D256 requires dense Q, two CTAs, no packing and no gate",
+            )
+            mixed_kv_flavors = ((64, 64), (128, 128), (256, 256)) if self._device_cc == (10, 7) else ((128, 128),)
             self._not_implemented_error_if(
                 major != 10 or (int(d_qk), int(d_v)) not in mixed_kv_flavors,
-                "mixed half-Q/FP8-KV requires SM100/SM103 D128 or native SM107 D64/D128 prefill",
+                "mixed half-Q/FP8-KV requires SM100/SM103 D128 or native SM107 D64/D128/D256 prefill",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7) and (int(d_qk), int(d_v)) == (64, 64) and self.thd and self.split_kv > 1,
@@ -3316,6 +3322,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
                 and not self._rubin_native_d192_paged_leg()
                 and not self._rubin_native_small_half_dense_paged_leg()
+                and not (self._mixed_fp8_kv and self.flavor == (256, 256))
                 and not self._rubin_native_d512_leg()
                 and not self._rubin_native_d64_pack_leg()
                 and not (self._fp8 and self._pertensor and not self.thd and self.flavor == (512, 512)),
@@ -3723,7 +3730,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``b`` / ``s_kv`` are the launch size the Blackwell line's wide-tile route reads
         (config_sm100.d256_wide_decode_launch); without them only the 16-column tile is
         routed there."""
-        if self._fp8 or self.thd or self.flavor != (256, 256):
+        if self._fp8 or self._mixed_fp8_kv or self.thd or self.flavor != (256, 256):
             return 0
         if self.softmax_scale_prefolded:
             # Not wired on the decode tile (the scale is applied in-kernel): the d256
