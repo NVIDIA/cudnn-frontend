@@ -12,9 +12,10 @@ from cudnn.frost.device import current_device, device_context
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 
 from ..graph_analyzer import to_buffer_dtype
+from .common import CakeLinearPlan, ffi_view
 
 
-class GdnCakePlan:
+class GdnCakePlan(CakeLinearPlan):
     plan_name = "gdn_cake_det"
 
     def __init__(self, facts, node):
@@ -79,46 +80,14 @@ class GdnCakePlan:
         self.region_names = tuple(r[0] for r in regions)
         self.carve = carve_plan(self.plan_name, [r[1:] for r in regions])
 
-    def workspace_bytes(self):
-        return self.workspace_size
-
-    def bind(self, names):
-        self.names = tuple(names)
-
-    def _validate(self, operands, workspace):
-        spans = []
-        for name, value in operands.items():
-            shape, dtype = self.geometry[name]
-            if tuple(value.shape) != shape or buffers.dtype_name(value) != dtype:
-                raise ValueError(f"{self.plan_name}: {name} must have shape {shape} and dtype {dtype}")
-            if not buffers.is_contiguous(value.shape, value.stride()):
-                raise ValueError(f"{self.plan_name}: {name} must be contiguous")
-            ptr = value.data_ptr()
-            if ptr == 0 or ptr % 16:
-                raise ValueError(f"{self.plan_name}: {name} must be nonnull and 16-byte aligned")
-            if tuple(value.__dlpack_device__()) != (2, self.device):
-                raise ValueError(f"{self.plan_name}: {name} must be on cuda:{self.device}")
-            spans.append((name, ptr, ptr + math.prod(shape) * buffers.DTYPE_ITEMSIZE[dtype]))
-        ws = workspace.view(0, "uint8", (self.workspace_size,))
-        spans.append(("workspace", ws.data_ptr(), ws.data_ptr() + self.workspace_size))
-        for i, (name, start, end) in enumerate(spans):
-            for other, lo, hi in spans[:i]:
-                if start < hi and lo < end and (name in self.outputs or other in self.outputs or "workspace" in (name, other)):
-                    raise ValueError(f"{self.plan_name}: {name} overlaps {other}")
-
     def run(self, views, workspace, stream):
         import tvm_ffi
 
         x = dict(zip(self.names, views))
         self._validate(x, workspace)
 
-        # Native OperandBuffer advertises a default producer stream to TVM-FFI.
-        # DLPack-only views retain the explicitly selected execution stream.
-        def ffi_view(value):
-            return buffers.DeviceView(value.data_ptr(), value.shape, buffers.dtype_name(value), self.device)
-
-        x = {name: ffi_view(value) for name, value in x.items()}
-        s = dict(zip(self.region_names, map(ffi_view, workspace.carve(self.carve))))
+        x = {name: ffi_view(value, self.device) for name, value in x.items()}
+        s = dict(zip(self.region_names, (ffi_view(value, self.device) for value in workspace.carve(self.carve))))
         h, hv, nc, n = self.h, self.hv, self.nc, self.n
 
         def launch(stage, grid, *args):

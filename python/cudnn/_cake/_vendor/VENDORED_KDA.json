@@ -1,0 +1,82 @@
+{
+  "repository": "https://github.com/radixark/miles-ext-kernels",
+  "commit": "f55fb99674be5edb0e1f6a0e4d6a911335da86ce",
+  "packages": {
+    "cake_kda_det_train": {
+      "cake_revision": "24adea6f2a14be9773102c4e74c229764093cc11",
+      "files": {
+        ".gitignore": "e5fd70b13ee2e116ccd3094d1035544ee7f627ed",
+        "build.json": "4fb44148a098c20bfc0ca547876e8095bd593e6a",
+        "cake_backend.py": "a4af4789e89c5236d5590919ed2fee1b4ba748ca",
+        "cake_build.py": "00756137eb159e30a77907eda84fd245123d87ea",
+        "cake_jit.py": "8e12a828e10dbda27979b8593e3afc69b53c82dd",
+        "csrc/cake_ffi_checks.h": "129288f9432e054dc51b77d93194fb0f2ec20d9c",
+        "csrc/cake_kda_det_train_036e1c7e1dfc95a88aae_binding.cu": "ac2b9235860c483f1260b53fa80892aaae63961f",
+        "csrc/cake_kda_det_train_036e1c7e1dfc95a88aae_kernel.cu": "32c019f22231de6137d0311b7e82a36dc9c06341",
+        "csrc/cake_kda_det_train_1f9c46f98f4290ee26df_binding.cu": "24b8db6e5a722259ca98d3aaafb37efad4d67329",
+        "csrc/cake_kda_det_train_1f9c46f98f4290ee26df_kernel.cu": "0435e72a716edf13b099762af7b6da7b999a23dd",
+        "csrc/cake_kda_det_train_3712054f19d4180caa28_binding.cu": "11c9b1052998908d1fbb88b66512767848d3a569",
+        "csrc/cake_kda_det_train_3712054f19d4180caa28_kernel.cu": "d5af47b1ee1db62c3e1d53682f3b2ccc63f8db41",
+        "csrc/cake_kda_det_train_4734a5d4f63d815ec086_binding.cu": "f76ca65cb5456efe093ee4fd8c358a442e8b746e",
+        "csrc/cake_kda_det_train_4734a5d4f63d815ec086_kernel.cu": "da7770805fb2568198086475e2525f70fc62d6e5",
+        "csrc/cake_kda_det_train_47a9c058e6d6c78c166d_binding.cu": "61e1022269d8e599cff2536a852ae9416ba4c972",
+        "csrc/cake_kda_det_train_47a9c058e6d6c78c166d_kernel.cu": "2a2b178330320871a5bd53fc8122d94e13937d60",
+        "csrc/cake_kda_det_train_4cce3cc5bc6210c95ce3_binding.cu": "7b5939cd4c2a81fd42da8dbeb7ea565839a3e0fd",
+        "csrc/cake_kda_det_train_4cce3cc5bc6210c95ce3_kernel.cu": "c97525899cb990168f0f7413048f05c7cc297cf5",
+        "csrc/cake_kda_det_train_54786ffd01bd9b6bb416_binding.cu": "ee4c02870ee9c931d03230a8108881c0d587d639",
+        "csrc/cake_kda_det_train_54786ffd01bd9b6bb416_kernel.cu": "cc293b1672b57e92a33dfd77f58d19a04e533575",
+        "csrc/cake_kda_det_train_5fcc76904e5e2dd891de_binding.cu": "aac60d29446062383d0011fc7e58fbc52940ed9a",
+        "csrc/cake_kda_det_train_5fcc76904e5e2dd891de_kernel.cu": "e610693047a0eb1ba813fe79b9793f761a7535f6",
+        "csrc/cake_kda_det_train_827dd9ceb9a75ea0330c_binding.cu": "09a846ef17783029d8cb92515eb0659f443e430a",
+        "csrc/cake_kda_det_train_827dd9ceb9a75ea0330c_kernel.cu": "64264b108f24fcebcd0834d4ff07ee02b6ed8e5c",
+        "csrc/cake_kda_det_train_86df3294f866784ca973_binding.cu": "58013459ea04e2bfb642f0edf28226b0e03c9aa2",
+        "csrc/cake_kda_det_train_86df3294f866784ca973_kernel.cu": "3839b23578d8ca8e3179a5eb4cfd462441733a46",
+        "csrc/cake_kda_det_train_8d99ea1be1c1fef432a5_binding.cu": "17b2538f107ad8ee4de5a45acf9df954c0595d06",
+        "csrc/cake_kda_det_train_8d99ea1be1c1fef432a5_kernel.cu": "73f1d958d35a3dcd47ec40a72dec827d6032745c",
+        "csrc/cake_kda_det_train_90153af20fdef34c6cb3_binding.cu": "9979c55c8660155129d11cfa5c32376ba1ce40bf",
+        "csrc/cake_kda_det_train_90153af20fdef34c6cb3_kernel.cu": "c13a9f097197eab3b7ef4fa584d8573426a66872",
+        "csrc/cake_kda_det_train_a557058a8aeca49a6402_binding.cu": "4052d880c90b03f71816b73aaf0bbc10daee9e2d",
+        "csrc/cake_kda_det_train_a557058a8aeca49a6402_kernel.cu": "bb0f75bd28d247a16bb9d334de9f88bd83f3431f",
+        "csrc/cake_kda_det_train_b2e877c538b6ab7317e9_binding.cu": "579d2188c9c1e97904a1a60a3162c76a2622f671",
+        "csrc/cake_kda_det_train_b2e877c538b6ab7317e9_kernel.cu": "cb8e378361996d4caffbf180b2e011ea7289eff8",
+        "csrc/cake_kda_det_train_c9395e21a813579c4bfc_binding.cu": "8eca746c166ff438259dd5b2a13ed2d1ddd80d39",
+        "csrc/cake_kda_det_train_c9395e21a813579c4bfc_kernel.cu": "22d5c3b7ce1304f8fe6c099c65c99e6516a9c25a",
+        "csrc/cake_kda_det_train_d7656e2b58b9bab49495_binding.cu": "6f00d0d4865403be181bb449836677fffef3b49e",
+        "csrc/cake_kda_det_train_d7656e2b58b9bab49495_kernel.cu": "493ea3c21cdd02a8a8c05adb2a37c0ab3d3ed961",
+        "csrc/cake_kda_det_train_eac26fffb3df8780302c_binding.cu": "b39907781c714acab6756f49ffd883710aace9dc",
+        "csrc/cake_kda_det_train_eac26fffb3df8780302c_kernel.cu": "bb4ae6b2d9f7c376c255631ed73cef64568d9f62",
+        "csrc/cake_kda_det_train_f1777a88a21b832b29ee_binding.cu": "9c0cfaf3fda9aa48b9889a5b04323bbbffc5c635",
+        "csrc/cake_kda_det_train_f1777a88a21b832b29ee_kernel.cu": "f055e9e85e7016488a390a5f5fd6893ef3a23c15"
+      },
+      "source": {
+        "commit": "f5ab85cc77edbd0257b0145eefe0113074dc6ee2",
+        "kind": "flashinfer",
+        "path": "flashinfer/experimental/cake/cake_kda_det_train",
+        "repo": "https://github.com/flashinfer-ai/flashinfer"
+      },
+      "local_files": [
+        "__init__.py"
+      ],
+      "selected_records": [
+        "bwd_prep_g8_replay",
+        "dhu_v1_replay",
+        "dhu_v1_wt_replay",
+        "dhu_v2t_replay",
+        "dqkg_int_davq",
+        "fwd_intra",
+        "fwdh_o_v1",
+        "fwdh_o_v2",
+        "fwdh_v1",
+        "fwdh_v2h",
+        "fwdh_wy",
+        "fwdh_wy_bwd_replay",
+        "gate_epilogue",
+        "glm_intra",
+        "table",
+        "table_v2",
+        "wy_bwd_replay",
+        "wy_fwd"
+      ]
+    }
+  }
+}
