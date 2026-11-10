@@ -1609,6 +1609,15 @@ must include the partition and actual Q tile. The dense deterministic cases in
 `test_sdpa_bwd_sm120_wide.py` catch a relay that otherwise waits forever for a
 nonexistent predecessor, while THD's length-derived count alone cannot catch it.
 
+
+FP8 `mma.sync` A/B operands must be registers, including compile-time-dead
+head or sequence tails. A DSL inline-PTX input can fold to literal `0` even
+when its Python type is `Int32`; ptxas rejects `mma ... {0,0}`. Keep the zero
+opaque through a register `mov`, as `_zero_word` in SM120 FP8 backward does.
+The small SQ19/SKV37/D64 case in `test_sdpa_bwd_fp8_sm120.py` reaches both
+fully dead score columns and gradient columns; retain the failing PTX when
+diagnosing this so register-type guesses do not replace the actual operand.
+
 When two warps split a head dimension, each half must contain whole shared-memory
 swizzle chunks. A swizzle that divides the full head can still straddle the warp
 boundary (D576 has 288 columns per half). Check every aliased storage phase too:

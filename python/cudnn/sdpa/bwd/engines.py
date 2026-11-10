@@ -48,6 +48,7 @@ _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
 _D512_FP8 = "SdpaBwdDslD512Fp8"
 _D512_MXFP8 = "SdpaBwdDslD512Mxfp8"
+_SM120_FP8 = "SdpaBwdDslSm120Fp8"
 
 
 def _adapter(name: str):
@@ -94,6 +95,10 @@ def _adapter(name: str):
 
 
 def _fp8_adapter(name: str):
+    if name == _SM120_FP8:
+        from cudnn.sdpa.bwd.api_dsl_sm120_fp8 import SdpaBwdDslSm120Fp8
+
+        return SdpaBwdDslSm120Fp8
     if name == _D512_FP8:
         from cudnn.sdpa.bwd.api_dsl_d512_fp8 import SdpaBwdDslD512Fp8
 
@@ -2281,6 +2286,45 @@ def _d512_mxfp8_spec() -> EngineSpec:
     )
 
 
+def _sm120_fp8_mismatch(facts, version):
+    from .sm120_fp8_contract import environment_error, validate_bounds
+
+    error = environment_error(facts.device_cc, version)
+    if error is not None:
+        return error
+    try:
+        validate_bounds(facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.d_qk, facts.d_v, facts.scale, facts.window_left)
+    except ValueError as error:
+        return str(error)
+    return None
+
+
+def _sm120_fp8_spec():
+    return EngineSpec(
+        name="sdpa_bwd_sm120_fp8",
+        capabilities=Capabilities(
+            sm_lo=120,
+            sm_hi=121,
+            d=frozenset({512}),
+            d_envelope=True,
+            d_pad_multiple=8,
+            dqk_ge_dv=True,
+            declaration_check=_sm120_fp8_mismatch,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_fp8=True,
+            out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            amax_dgrad=True,
+            causal=True,
+            swa=True,
+            gqa=True,
+            deterministic=True,
+            compact_bshd=True,
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd_fp8, api_type=_SM120_FP8),
+    )
+
+
 ENGINE_SPECS = (
     _sm120_spec(),
     _sm80_spec(),
@@ -2298,6 +2342,7 @@ ENGINE_SPECS = (
     _sm100_d128_fp8_spec(),
     _d512_fp8_spec(),
     _d512_mxfp8_spec(),
+    _sm120_fp8_spec(),
 )
 
 __all__ = [

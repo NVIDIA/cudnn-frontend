@@ -288,6 +288,19 @@ That limited coverage passes on SM121 (GB10); SM120 remains unverified.
 It does not extend the deterministic contract to multiple KV tiles. This change adds
 no forward kernel.
 
+## SM120 per-tensor FP8 backward
+
+The native E4M3 backward engine assigns each gradient row and column partition
+to one fixed query/key owner. Key owners visit GQA heads in ascending order;
+there are no gradient atomic reductions. The bounded SM121 (GB10) suite
+preserves dQ/dK/dV and all four amax outputs across repeated execution, fresh
+storage, duplicated/reordered batches of 1, 3, 4 and 129 members, and changed
+input capture replay. Six runtime-keyed goldens cover D192 and D512 with
+E4M3, FP16 and BF16 gradients. Scalar scales and input payloads remain fixed
+for batch comparisons. This qualifies the tested runtime and dense BSHD
+contract; SM120 hardware, MXFP8, THD and cross-runtime bit identity remain
+unverified.
+
 ## SM120 wide half backward
 
 For eight-aligned `256 < D_QK <= 512` and `0 < D_V <= D_QK`, the native
