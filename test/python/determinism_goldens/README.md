@@ -1300,3 +1300,56 @@ and diagnostics, plus both JAX long-key repair cases and their gradients.
 XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
   python -m pytest simplified_sparse_attention/cutedsl -m L1 -q -s
 ```
+
+### Host concurrency and export follow-up — 2026-11-09
+
+The follow-up to `80de1aa` serializes each stream's shared-scratch enqueue
+sequence for dense indexing, filtered indexing/reservation, and H16 backward.
+Filtered-state retirement also protects its shared host list. No kernel
+arithmetic, golden, or expected-failure rule changed.
+
+The six new public-API cases pause a host thread after writing shared scores
+or filtered inputs. Another thread then enters with opposite indexer queries.
+They cover default, shared side, and separate streams at Tq8/Hq16/top-k512,
+with Tk1024 and Tk131072. The independent expected attention outputs are all
+ones and all zeros. Concurrent output and scalar-loss bytes must match the
+sequential results; separate-stream calls must complete while the first is
+paused.
+
+With the original `80de1aa` kernels, these cases reported **4 failed,
+2 passed, 31 deselected**: both shared-stream modes corrupted all 32,768
+output elements in the first call, on both indexer paths. With the fix,
+the six cases and the Torch-only import check reported **7 passed,
+30 deselected, 0 failed, 0 skipped**. The import check blocks JAX in a fresh
+interpreter; the JAX export assertion now lives in the optional JAX suite.
+
+```sh
+python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py \
+  -m L0 -q -s -k 'host_threads_share_stream or lazy_imports'
+```
+
+The rebuilt `nvidia_cudnn_frontend-1.33.0-cp312-cp312-linux_x86_64.whl`
+has SHA256 `55db69c2370f8bdc0fdd294c7a8352790011c0d54cd8ee1c71c6ada153a8eade`.
+All 35 operation Python modules, `NOTICE`, and `contributors.md` match the
+edited checkout byte for byte. The installed-wheel API-index check reported
+**11 passed**, including the runtime baseline with six intentional additions
+and no removals.
+
+The installed-wheel L0 and L1 run reported **161 passed, 24 xfailed,
+0 failed, 0 skipped, 0 deselected** in 750.39 seconds. It includes all six
+concurrency cases, both frameworks' numerical and determinism suites, and
+all six long-sequence cases. Existing expected failures and goldens are
+unchanged. SM100 forward remains replay-only and backward remains not
+guaranteed; SM103, long-path batch invariance, and saved internal statistics
+remain unverified.
+
+Runtime: SM100 (148 SMs), driver 610.11, Python 3.12.12,
+PyTorch 2.13.0+cu130, JAX/JAXlib 0.11.0, cuDNN 9.27.0, CuTe DSL 4.8.0
+with the CUDA 13.4 compiler, and TVM FFI 0.1.13.post2. Imports resolved to
+the installed wheel. From `test/python`:
+
+```sh
+XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m 'L0 or L1' -q -s -rxX
+```

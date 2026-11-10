@@ -86,6 +86,10 @@ Reserve on the stream that will run attention. Calls above the reservation
 can grow storage and rebuild the internal repair graph. Short-key paths do
 not need persistent repair storage.
 
+PyTorch host threads that share a stream serialize access to cached scratch,
+including reserve and H16 backward calls. Separate streams keep separate
+state. These locks do not synchronize the GPU.
+
 **External CUDA graph capture is unsupported**, including after reservation
 or warmup. The public API rejects capture before launching work. Internal
 conditional CUDA graphs repair filtered rows; they do not provide capture

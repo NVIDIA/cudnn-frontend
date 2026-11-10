@@ -40,6 +40,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
+from ._stream_lock import serialize_workspace
+
 BF16 = cutlass.BFloat16
 F16 = cutlass.Float16
 TF32 = cutlass.TFloat32
@@ -1388,6 +1390,7 @@ def _validate_16byte_token_rows(q, k, v):
 
 
 @torch.no_grad()
+@serialize_workspace
 def run(
     q,
     k,

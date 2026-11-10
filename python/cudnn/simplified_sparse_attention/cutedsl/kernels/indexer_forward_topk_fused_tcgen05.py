@@ -31,6 +31,7 @@ import math
 import os
 import time
 from contextlib import contextmanager
+from threading import Lock
 
 import cutlass
 import cutlass.cute as cute
@@ -45,6 +46,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
 from ._cuda_preload import preload_tvm_ffi_cuda as _preload_tvm_ffi_cuda
+from ._stream_lock import serialize_workspace, stream_lock
 from .cute_dsl_filter_topk.filtered_top_k_varlen_util import (
     _SSA_LOG2E,
     _ssa_block_reduce_max,
@@ -3676,6 +3678,7 @@ _state_filtered = {}
 _compiled_filtered = {}
 _compiled_k1 = {}
 _retired_filtered = []
+_retired_filtered_lock = Lock()
 
 
 def _k1_compiled(compile_key, dev, topk, tcap, query_capacity, query_len, key_pad, q, k, starts, ends):
@@ -3821,7 +3824,8 @@ def _release_retired_filtered():
     # Growing storage replaces graph-owned addresses. Keep the old graph and
     # tensors alive until all preceding caller-stream work has completed.
     # query() is nonblocking; this list is empty on normal steady-state hits.
-    _retired_filtered[:] = [(done, state) for done, state in _retired_filtered if not done.query()]
+    with _retired_filtered_lock:
+        _retired_filtered[:] = [(done, state) for done, state in _retired_filtered if not done.query()]
 
 
 def _conditional_graph_body():
@@ -4135,15 +4139,15 @@ def _filtered_state(dev, dtype, topk, query_len, key_len, exact=False):
             **compiled,
         )
         if previous_state is not None:
-            # Calls on one caller stream are ordered, including its waits for
-            # repair and output copies. Keep old graph addresses alive until
-            # that preceding work is done; never synchronize the host here.
+            # The stream lock orders repair waits and output copies. Retain
+            # old graph addresses until that work completes, without a sync.
             st["fallback_stats"].copy_(previous_state["fallback_stats"])
             if flag_kinds is not None:
                 st["flag_kinds"].copy_(previous_state["flag_kinds"])
             retired_done = torch.cuda.Event()
             retired_done.record(caller_stream)
-            _retired_filtered.append((retired_done, previous_state))
+            with _retired_filtered_lock:
+                _retired_filtered.append((retired_done, previous_state))
         _state_filtered[cache_key] = st
         _filtered_cache_event(
             "state",
@@ -4558,6 +4562,7 @@ def _run_fused_filtered_impl(
 
 
 @torch.no_grad()
+@serialize_workspace
 def run_fused_filtered(
     q_idx,
     k_idx,
@@ -4586,5 +4591,6 @@ def reserve_fused_filtered(max_query_len, max_key_len, topk):
     reallocate nor recapture. A larger call still grows the state.
     """
     dev = torch.device("cuda", torch.cuda.current_device())
-    st, cache_key = _filtered_state(dev, torch.bfloat16, topk, max_query_len, max_key_len, exact=True)
-    _filtered_repair_graph(st, os.environ.get("SSA_FILTERED_SELECT", "compact"), topk, cache_key, max_query_len, max_key_len)
+    with stream_lock(dev):
+        st, cache_key = _filtered_state(dev, torch.bfloat16, topk, max_query_len, max_key_len, exact=True)
+        _filtered_repair_graph(st, os.environ.get("SSA_FILTERED_SELECT", "compact"), topk, cache_key, max_query_len, max_key_len)

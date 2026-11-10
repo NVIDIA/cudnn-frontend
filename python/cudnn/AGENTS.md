@@ -304,6 +304,12 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **Stream order does not serialize host calls.** Two host threads can enqueue
+  A's producer, B's producer, then A's consumer on one stream. Cached scratch
+  needs a lock through the final queued read, including reserve/growth, or
+  storage owned by each call. Keep separate streams independent. Detector:
+  `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_host_threads_share_stream`
+  pauses between scratch writes and reads in the dense and filtered paths.
 - **The device is implicit state exactly like the stream.** A `torch.empty`
   (or any allocator call) without a device context silently allocates on the
   *current* GPU, not the input tensor's — wrap execute-path allocations in

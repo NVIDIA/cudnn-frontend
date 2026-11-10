@@ -18,6 +18,8 @@ import torch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
+from ._stream_lock import serialize_workspace
+
 BF16 = cutlass.BFloat16
 F32 = cutlass.Float32
 I32 = cutlass.Int32
@@ -360,6 +362,7 @@ def reserve(max_query_len, max_key_len, topk, *, triangular=False):
 
 
 @torch.no_grad()
+@serialize_workspace
 def run(
     q_idx,
     k_idx,
@@ -474,9 +477,7 @@ def run(
     # shapes rather than recompiling for every document-boundary layout.
     dev = q.device
     stream_id = torch.cuda.current_stream(dev).cuda_stream
-    # The materialized score workspace is mutable scratch.  Separate streams
-    # may execute concurrently, so sharing one shape-keyed workspace would
-    # race even though calls on one stream remain ordered.
+    # Each stream owns scratch; serialize_workspace protects its full enqueue.
     cache_key = (dev.index, stream_id, query_pad, key_pad, triangular, use_dg)
     st = _state.get(cache_key)
     if st is None:

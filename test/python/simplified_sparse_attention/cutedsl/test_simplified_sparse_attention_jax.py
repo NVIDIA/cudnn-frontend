@@ -17,6 +17,12 @@ from test_simplified_sparse_attention import supported_gpu
 pytestmark = [pytest.mark.L0, pytest.mark.usefixtures("supported_gpu")]
 
 
+def test_public_jax_export():
+    from cudnn.simplified_sparse_attention import simplified_sparse_attention_jax as package_export
+
+    assert package_export is simplified_sparse_attention_jax
+
+
 def jax_inputs(inputs):
     tensors, metadata, upstream = inputs
     values = tuple(jax.dlpack.from_dlpack(t) for t in tensors)

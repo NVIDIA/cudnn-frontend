@@ -3,12 +3,15 @@
 
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, get_ident
 
 import cutlass
 import pytest
 import torch
 
-from cudnn.ops import simplified_sparse_attention, simplified_sparse_attention_reserve
+from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention, simplified_sparse_attention_reserve
+from determinism_utils import assert_bitwise
 from ssa_reference import check_reference, pack, run, sample
 
 pytestmark = pytest.mark.L0
@@ -37,6 +40,97 @@ def test_public_forward_backward_reference(heads, topk):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.usefixtures("supported_gpu")
+@pytest.mark.parametrize("key_length", [1024, 131072], ids=["dense", "filtered-repair"])
+@pytest.mark.parametrize("stream_mode", ["default", "shared-side", "separate"])
+def test_host_threads_share_stream(monkeypatch, key_length, stream_mode):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import cute_dsl_filter_topk as selector
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import indexer_forward_topk_fused_tcgen05 as filtered
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import indexer_forward_topk_tcgen05 as indexer
+
+    q = torch.zeros((8, 16, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((key_length, 1, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    v[: key_length // 2] = 1
+    iq = torch.ones((8, 128), device="cuda", dtype=torch.bfloat16)
+    ik = torch.ones((key_length, 128), device="cuda", dtype=torch.bfloat16)
+    ik[key_length // 2 :] = -1
+    queries = (iq, -iq)
+    metadata = SimplifiedSparseAttentionMetadata(
+        torch.zeros(8, device="cuda", dtype=torch.int32),
+        torch.full((8,), key_length, device="cuda", dtype=torch.int32),
+        torch.ones(8, device="cuda", dtype=torch.bool),
+        torch.ones(1, device="cuda"),
+        False,
+        False,
+    )
+    stream = torch.cuda.default_stream() if stream_mode == "default" else torch.cuda.Stream()
+    streams = (stream, torch.cuda.Stream() if stream_mode == "separate" else stream)
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+
+    def invoke(i):
+        with torch.cuda.stream(streams[i]):
+            result = simplified_sparse_attention(q, k, v, queries[i], ik, metadata, 512)
+            return {name: tensor.detach().clone() for name, tensor in result.items()}
+
+    expected = [invoke(i) for i in range(2)]
+    for stream in streams:
+        stream.synchronize()
+    for i, result in enumerate(expected):
+        torch.testing.assert_close(result["output"], torch.full_like(q, 1 - i), rtol=0, atol=0)
+        assert torch.isfinite(result["indexer_loss"]).all()
+
+    paused, release, second_entered, second_done = (Event() for _ in range(4))
+    first_thread = []
+    original_run = indexer.run
+
+    def enter(*args, **kwargs):
+        if get_ident() != first_thread[0]:
+            second_entered.set()
+        return original_run(*args, **kwargs)
+
+    # Pause after writing shared scores or filtered inputs, before consuming them.
+    module, name = (selector, "cute_dsl_topk_prefill_wrapper") if key_length == 1024 else (filtered, "_filtered_repair_graph")
+    original_consume = getattr(module, name)
+
+    def consume(*args, **kwargs):
+        if get_ident() == first_thread[0]:
+            paused.set()
+            assert release.wait(30), "First caller was not released"
+        return original_consume(*args, **kwargs)
+
+    def worker(i):
+        if i == 0:
+            first_thread.append(get_ident())
+        try:
+            return invoke(i)
+        finally:
+            if i == 1:
+                second_done.set()
+
+    monkeypatch.setattr(indexer, "run", enter)
+    monkeypatch.setattr(module, name, consume)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker, 0)
+        try:
+            assert paused.wait(30), "First caller did not reach shared scratch"
+            second = pool.submit(worker, 1)
+            assert second_entered.wait(30), "Second caller did not enter the indexer"
+            # An unlocked caller overwrites scratch while the first is paused.
+            if stream_mode == "separate":
+                assert second_done.wait(30), "Separate streams were serialized"
+            else:
+                second_done.wait(1)
+        finally:
+            release.set()
+        actual = [first.result(timeout=30), second.result(timeout=30)]
+    for stream in streams:
+        stream.synchronize()
+    for result, reference in zip(actual, expected):
+        assert_bitwise(result, reference)
+
+
 def test_lazy_imports():
     subprocess.run(
         [
@@ -44,6 +138,14 @@ def test_lazy_imports():
             "-c",
             """
 import sys
+import importlib.abc
+
+class NoJax(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "jax" or fullname.startswith("jax."):
+            raise ModuleNotFoundError("JAX is not installed", name=fullname)
+
+sys.meta_path.insert(0, NoJax())
 import cudnn.ops
 import cudnn.simplified_sparse_attention
 assert "torch" not in sys.modules
@@ -55,12 +157,11 @@ from cudnn.simplified_sparse_attention import (
     SimplifiedSparseAttentionMetadata,
     simplified_sparse_attention,
     simplified_sparse_attention_reserve,
-    simplified_sparse_attention_jax,
 )
 assert SimplifiedSparseAttentionMetadata is cudnn.ops.SimplifiedSparseAttentionMetadata
 assert simplified_sparse_attention is cudnn.ops.simplified_sparse_attention
 assert simplified_sparse_attention_reserve is cudnn.ops.simplified_sparse_attention_reserve
-assert simplified_sparse_attention_jax is cudnn.ops.simplified_sparse_attention_jax
+assert "jax" not in sys.modules
 """,
         ],
         check=True,
