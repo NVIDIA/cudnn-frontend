@@ -1381,23 +1381,33 @@ def _sdpa_kernel(
         sink_log2_h = cutlass.Float32(Pointer(_sink_ptr, dtype=sinks.element_type)[cutlass.Int64(head_idx) * cutlass.Int64(sinks.stride[0])])
         if cutlass.const_expr(PARAMS.sink_natural):
             sink_log2_h = sink_log2_h * cutlass.Float32(1.4426950408889634)
-        for m_block in cutlass.range_constexpr(m_blocks):
-            sk_o_base = m_block * SV_N_FRAGS * 4
-            sk_lo = m_block * 2
-            sk_hi = m_block * 2 + 1
-            m_top_lift = cutlass.Float32(cute.math.max(row_max[sk_lo], sink_log2_h, ftz=True))
-            m_bot_lift = cutlass.Float32(cute.math.max(row_max[sk_hi], sink_log2_h, ftz=True))
-            os_top = cute.math.exp2(row_max[sk_lo] - m_top_lift, fastmath=True)
-            os_bot = cute.math.exp2(row_max[sk_hi] - m_bot_lift, fastmath=True)
-            row_sum[sk_lo] = row_sum[sk_lo] * os_top + cute.math.exp2(sink_log2_h - m_top_lift, fastmath=True)
-            row_sum[sk_hi] = row_sum[sk_hi] * os_bot + cute.math.exp2(sink_log2_h - m_bot_lift, fastmath=True)
-            row_max[sk_lo] = m_top_lift
-            row_max[sk_hi] = m_bot_lift
-            for n in cutlass.range_constexpr(SV_N_FRAGS):
-                O_acc[sk_o_base + n * 4 + 0] = O_acc[sk_o_base + n * 4 + 0] * os_top
-                O_acc[sk_o_base + n * 4 + 1] = O_acc[sk_o_base + n * 4 + 1] * os_top
-                O_acc[sk_o_base + n * 4 + 2] = O_acc[sk_o_base + n * 4 + 2] * os_bot
-                O_acc[sk_o_base + n * 4 + 3] = O_acc[sk_o_base + n * 4 + 3] * os_bot
+        # Sink endpoints have no finite exponential origin. A disabled sink
+        # leaves empty rows at max=-inf/sum=0; a dominating sink owns all mass.
+        # Finite logits retain the established arithmetic and rounding order.
+        if sink_log2_h == cutlass.Float32.inf:
+            for i in cutlass.range_constexpr(m_blocks * 2):
+                row_max[i] = cutlass.Float32.inf
+                row_sum[i] = cutlass.Float32(1.0)
+            for i in cutlass.range_constexpr(m_blocks * SV_N_FRAGS * 4):
+                O_acc[i] = cutlass.Float32(0.0)
+        elif sink_log2_h != -cutlass.Float32.inf:
+            for m_block in cutlass.range_constexpr(m_blocks):
+                sk_o_base = m_block * SV_N_FRAGS * 4
+                sk_lo = m_block * 2
+                sk_hi = m_block * 2 + 1
+                m_top_lift = cutlass.Float32(cute.math.max(row_max[sk_lo], sink_log2_h, ftz=True))
+                m_bot_lift = cutlass.Float32(cute.math.max(row_max[sk_hi], sink_log2_h, ftz=True))
+                os_top = cute.math.exp2(row_max[sk_lo] - m_top_lift, fastmath=True)
+                os_bot = cute.math.exp2(row_max[sk_hi] - m_bot_lift, fastmath=True)
+                row_sum[sk_lo] = row_sum[sk_lo] * os_top + cute.math.exp2(sink_log2_h - m_top_lift, fastmath=True)
+                row_sum[sk_hi] = row_sum[sk_hi] * os_bot + cute.math.exp2(sink_log2_h - m_bot_lift, fastmath=True)
+                row_max[sk_lo] = m_top_lift
+                row_max[sk_hi] = m_bot_lift
+                for n in cutlass.range_constexpr(SV_N_FRAGS):
+                    O_acc[sk_o_base + n * 4 + 0] = O_acc[sk_o_base + n * 4 + 0] * os_top
+                    O_acc[sk_o_base + n * 4 + 1] = O_acc[sk_o_base + n * 4 + 1] * os_top
+                    O_acc[sk_o_base + n * 4 + 2] = O_acc[sk_o_base + n * 4 + 2] * os_bot
+                    O_acc[sk_o_base + n * 4 + 3] = O_acc[sk_o_base + n * 4 + 3] * os_bot
 
     # ---- LSE output: lse[r] = scale * m_max[r] + ln(row_sum[r]) ----------
     # row_max stores the pre-scaled max (m * scale_log2), so scale*m_max =

@@ -1316,6 +1316,12 @@ delta helper reused unchanged can make dV correct while corrupting dQ/dK.
 `test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
 plus fixed quantized inputs under changed batch sizes and graph replay.
 
+Test sink logits at both infinities with a live Q and **zero KV iterations**.
+An all-masked tile whose loop still runs can seed different row state and miss
+`-inf - (-inf)` in the final fold. The disabled sink must retain O=0/LSE=-inf;
+a dominating +inf sink must produce O=0/LSE=+inf.
+`test_native_thd_paged_sink_endpoints` checks both in each native SM80 body.
+
 A graph sink descriptor can be strided while its variant-pack carrier is flat.
 Pass the declared head pitch to the native THD host; standalone views derive
 their own pitch. Validate current sink presence, dtype, device and storage span

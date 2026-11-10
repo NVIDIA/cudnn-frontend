@@ -31,7 +31,7 @@ _POINTS = [
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_native_paged_adapter_rebind_replay(
-    point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None, graph_knobs=None, has_sink=False
+    point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None, graph_knobs=None, has_sink=False, sink_endpoints=False
 ):
     import cutlass.cute as cute
 
@@ -198,6 +198,9 @@ def test_native_paged_adapter_rebind_replay(
                 if has_sink:
                     sink_raw.fill_(float("nan"))
                     sink.copy_(torch.linspace(-5 + phase, 5 + binding, h, device="cuda"))
+                    if sink_endpoints:
+                        sink[0::4] = -float("inf")
+                        sink[1::4] = float("inf")
                 k.fill_(float("nan"))
                 v.fill_(float("nan"))
                 kt.fill_(-171)
@@ -225,7 +228,7 @@ def test_native_paged_adapter_rebind_replay(
                     ls = scores.logsumexp(-1)
                     if has_sink:
                         ls = torch.logaddexp(ls, sink.double()[:, None])
-                        weights = torch.exp(scores - ls[..., None])
+                        weights = torch.where(torch.isfinite(ls[..., None]), torch.exp(scores - ls[..., None]), 0.0)
                     else:
                         weights = torch.nan_to_num(scores.softmax(-1), nan=0)
                     oo = weights @ vv.transpose(0, 1).double().repeat_interleave(h // hk, 0)
@@ -501,4 +504,22 @@ def test_native_thd_sink_determinism(dtype, window, paged):
         f"sdpa-sm80-thd-{'paged' if paged else 'dense'}-sink-{str(dtype).split('.')[-1]}-window{window}",
         {"q": qq, "k": kk, "v": vv, "sink": sink_cpu},
         expected,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("dims", [(64, 64), (256, 256), (576, 512)])
+def test_native_thd_paged_sink_endpoints(dtype, graph_mode, dims, cudnn_handle, monkeypatch):
+    """Disabled/dominating sinks retain defined O/Stats with zero live KV."""
+    test_native_paged_adapter_rebind_replay(
+        (*dims, 16, "HND", "NHD", "causal"),
+        dtype,
+        True,
+        graph_mode,
+        cudnn_handle,
+        monkeypatch,
+        case_index=23,
+        has_sink=True,
+        sink_endpoints=True,
     )
