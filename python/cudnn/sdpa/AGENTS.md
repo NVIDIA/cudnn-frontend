@@ -1585,3 +1585,12 @@ and survive Python collection. Capture the immutable stride/index metadata
 and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
 reproduced eighteen binder leaks before this correction and runs cleanly
 afterwards; keep the pointer/stride assertions and inspect process shutdown.
+
+When two warps split a head dimension, each half must contain whole shared-memory
+swizzle chunks. A swizzle that divides the full head can still straddle the warp
+boundary (D576 has 288 columns per half). Check every aliased storage phase too:
+wide Q staging and the O epilogue can exceed different slabs even when the main
+K/V allocation fits. `test_sdpa_fwd_d576_sm120.py` exercises asymmetric envelopes,
+partial packing and persistent reuse. Keep native binder dimension admission in
+sync with the Python row and adapter, and gate new envelopes on the matching
+extension; a host eligibility pass alone does not exercise binder construction.

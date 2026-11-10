@@ -1880,3 +1880,17 @@ Final shared-loader regression:36 passed,303 deselected, no failures/skips in
 168.73s, including24 strict goldens (16 existing half plus8 mixed), native half
 rebinding/replay and decode ring reuse. The old half baselines are unchanged.
 The owned SM120 allocation completed normally after these checks.
+
+### SM120-family D576/V512 forward — qualification pending, 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:
+eight uniform-half paged, four mixed-FP8 paged, and six dense/split/THD.
+They hold split and packing fixed, preserve CPU-seeded inputs, compare O/Stats
+against FP64, and check duplicated/reordered batches up to B129 and changed
+neighbors under capture. No strict golden result is claimed yet.
+
+Initial GB10/SM121 feature run passes FP16/BF16 exact D576/V512 paging.
+An expanded run passes four cases before three asymmetric envelope cases
+are rejected by the old native binder head-dimension guard, before launch.
+The binder envelope and matching-extension admission were corrected; target
+qualification is in progress. This is not SM120 performance or backward evidence.

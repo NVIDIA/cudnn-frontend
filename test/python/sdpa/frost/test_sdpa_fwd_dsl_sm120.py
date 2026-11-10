@@ -1389,7 +1389,7 @@ def test_dsl_sm120_flavor_routing():
         _api(512, 512, tile_m=128).check_support()  # the 128 x 512 O staging tile alone is 128 KiB
     with pytest.raises(NotImplementedError, match="no kernel"):
         _api(128, 128, tile_n=32).check_support()  # kv_tile 32 is the d512 flavor's alone
-    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (520, 512), (512, 520)):
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (584, 512), (512, 520)):
         with pytest.raises(ValueError, match="both head dimensions"):
             _api(d_qk, d_v).check_support()
     # The general template still takes the knobs.
@@ -1412,7 +1412,7 @@ def test_dsl_sm120_d512_template_rejects_dims_and_tiles_outside_its_table():
 
     cc = torch.cuda.get_device_capability()
     module = api_dsl._load_sm120_kernel_module(D512_FLAVOR, TemplateParams(q_tile=64, kv_tile=32))
-    for d_qk, d_v in ((256, 256), (256, 512), (512, 256), (520, 512), (512, 520)):
+    for d_qk, d_v in ((256, 256), (256, 512), (512, 256), (584, 512), (512, 520)):
         with pytest.raises(ValueError, match="head dim"):
             module.compile(compute_capability=cc, b=1, qh=1, kh=1, sq=128, skv=128, d_qk=d_qk, d_v=d_v, has_lse=False)
     module = api_dsl._load_sm120_kernel_module(D512_FLAVOR, TemplateParams(q_tile=64, kv_tile=64))
