@@ -15,7 +15,7 @@ requirement_error = cutedsl_requirement_error("JAX norm tests", floor=(4, 7, 1))
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
-jax = pytest.importorskip("jax", minversion="0.6.0")
+jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 
 from cudnn.ops import layer_norm_forward_jax, rms_norm_forward_jax
