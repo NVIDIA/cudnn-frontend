@@ -466,7 +466,7 @@ assert _TMEM_SG1_COLS <= 576, f"sg1 O TMEM overflow: {_TMEM_SG1_COLS} > 576"
 # | mb_tma_o_full[c]         | N_O_CHUNKS (=8)  | COMPUTE_LANES (=128)       | sg1 corr (all-thread) : arrive per chunk        | sg1 TMA-STG (per-chunk TMA)           | local; not bootstrapped                             |
 # | mb_tma_o_empty           | 1                | ONE_WARP (=32)             | sg1 TMA-STG warp : arrive after STG drain       | sg1 corr (next-tile O staging reuse)  | local; pre-arm via PipelineState(0,1)               |
 # | mb_empty_mainloop        | 1                | TWO_LANES_TOTAL (=2)       | sg1 corr (both CTAs, elect) : arrive_on_peer→leader| sg1 MMA leader (empty-kv branch)   | cga2 leader-waited                                  |
-# | mb_tmem_dealloc          | 1                | ONE_LANE                   | both sgs compute (elect) : arrive_on_peer→partner| both sgs MMA (alloc/dealloc fence)   | local; not bootstrapped                             |
+# | mb_tmem_dealloc          | 1                | 2*ONE_LANE (=2)            | both sgs compute (elect, after the 128-thread reader join): arrive + arrive_on_peer→partner | both sgs MMA (alloc/dealloc fence)   | local; not bootstrapped                             |
 # ============================================================================
 class Bars(NamedTuple):
     """DSv4 role-split mbarrier inventory (Rubin SM107 baseline)."""
@@ -584,7 +584,9 @@ def _make_dsv4_bars(CFG, N_O_CHUNKS: int):
         mb_tma_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         # Teardown
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=TWO_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
-        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.THREAD),
+        # Rule S16: one local and one peer credit, each posted by an elected lane after its CTA's 128-thread reader join
+        # (see the end of _compute_warp_group).
+        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=2 * CFG.ONE_LANE, producer=Producer.THREAD),
     )
 
 
@@ -1979,10 +1981,18 @@ def _compute_warp_group(
                     bars.mb_stats_xfer_empty.wait(stats_xfer_empty_phase)
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-        # Each CTA's compute warp fires 1 elect-arrive_on_peer to its cga2
-        # partner → 1 arrive per CTA (init = ONE_LANE matches).
+        # The elected credits release TMEM for all four local compute warps.
+        # Join every reader after its final tcgen05.wait::ld; a faster lead
+        # warp must not let the MMA pair deallocate a lagging warp's O tail.
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=128)
+        # Each MMA warp waits for BOTH reader groups (Rule S16). A peer-only
+        # credit leaves its own CTA's readers unguarded when the other CTA
+        # finishes first; tcgen05.dealloc is not a reader join for the issuing CTA.
         peer_cta = cta_id_x ^ cutlass.Int32(1)
-        bars.mb_tmem_dealloc.arrive_on_peer(peer_cta, pred=is_lead_warp & nvvm.elect_sync())
+        if is_lead_warp:
+            if nvvm.elect_sync():
+                bars.mb_tmem_dealloc.arrive_on_peer(peer_cta)
+                bars.mb_tmem_dealloc.arrive()
 
 
 # ============================================================================
