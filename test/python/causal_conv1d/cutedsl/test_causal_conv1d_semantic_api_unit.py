@@ -43,6 +43,7 @@ def test_signature_matches_consumed_semantics_and_hides_backend_lifecycle():
         "initial_states",
         "return_final_states",
         "final_states_out",
+        "backend",
     )
     for name in (
         "seq_idx",
@@ -50,8 +51,10 @@ def test_signature_matches_consumed_semantics_and_hides_backend_lifecycle():
         "initial_states",
         "return_final_states",
         "final_states_out",
+        "backend",
     ):
         assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["backend"].default == "auto"
     for forbidden in (
         "wrapper",
         "sm100",
