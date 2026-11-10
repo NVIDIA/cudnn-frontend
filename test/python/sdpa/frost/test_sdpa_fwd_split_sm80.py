@@ -113,39 +113,42 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        execute()
-        with torch.cuda.graph(graph, stream=stream):
+    try:
+        with torch.cuda.stream(stream):
             execute()
-    torch.cuda.current_stream().wait_stream(stream)
-    baseline = None
-    for poison in (0, 255, 127):
-        ws.fill_(poison)
-        ob.fill_(77)
-        lb.fill_(77)
-        graph.replay()
-        torch.cuda.synchronize()
-        actual = (o.cpu(), None if lse is None else lse.cpu())
-        if baseline is not None:
-            assert torch.equal(actual[0].view(torch.uint8), baseline[0].view(torch.uint8))
-            if lse is not None:
-                assert torch.equal(actual[1].view(torch.uint8), baseline[1].view(torch.uint8))
-        baseline = actual
-        for batch, (nq, nk) in enumerate(zip((sq, 3, 0), (sk, 0, 17))):
-            qq = qc[batch, :nq, :, :d].transpose(0, 1).double()
-            kk = kc[batch, :, :nk, :d].double().repeat_interleave(h // hk, 0)
-            vv = vc[batch, :nk, :, :dv].transpose(0, 1).double().repeat_interleave(h // hk, 0)
-            scores = qq @ kk.transpose(-1, -2) / math.sqrt(d)
-            qp = torch.arange(nq)[:, None] + nk - nq
-            kp = torch.arange(nk)[None, :]
-            scores.masked_fill_((kp > qp) | (kp < qp - 31), -float("inf"))
-            logsum = torch.logaddexp(scores.logsumexp(-1), sink.cpu().double()[:, None])
-            weights = torch.where(torch.isfinite(logsum[..., None]), torch.exp(scores - logsum[..., None]), 0.0)
-            ref = weights @ vv
-            torch.testing.assert_close(actual[0][batch, :, :nq].double(), ref, atol=4e-3, rtol=1e-2)
-            assert torch.all(actual[0][batch, :, nq:] == 0)
-            if lse is not None:
-                torch.testing.assert_close(actual[1][batch, :, :nq].double(), logsum * math.log2(math.e), atol=2e-3, rtol=1e-3)
-                assert torch.all(actual[1][batch, :, nq:] == -float("inf"))
-        assert torch.all(ob[..., dv:] == 77)
-        assert torch.all(lb[..., 1::2] == 77)
+            with torch.cuda.graph(graph, stream=stream):
+                execute()
+        torch.cuda.current_stream().wait_stream(stream)
+        baseline = None
+        for poison in (0, 255, 127):
+            ws.fill_(poison)
+            ob.fill_(77)
+            lb.fill_(77)
+            graph.replay()
+            torch.cuda.synchronize()
+            actual = (o.cpu(), None if lse is None else lse.cpu())
+            if baseline is not None:
+                assert torch.equal(actual[0].view(torch.uint8), baseline[0].view(torch.uint8))
+                if lse is not None:
+                    assert torch.equal(actual[1].view(torch.uint8), baseline[1].view(torch.uint8))
+            baseline = actual
+            for batch, (nq, nk) in enumerate(zip((sq, 3, 0), (sk, 0, 17))):
+                qq = qc[batch, :nq, :, :d].transpose(0, 1).double()
+                kk = kc[batch, :, :nk, :d].double().repeat_interleave(h // hk, 0)
+                vv = vc[batch, :nk, :, :dv].transpose(0, 1).double().repeat_interleave(h // hk, 0)
+                scores = qq @ kk.transpose(-1, -2) / math.sqrt(d)
+                qp = torch.arange(nq)[:, None] + nk - nq
+                kp = torch.arange(nk)[None, :]
+                scores.masked_fill_((kp > qp) | (kp < qp - 31), -float("inf"))
+                logsum = torch.logaddexp(scores.logsumexp(-1), sink.cpu().double()[:, None])
+                weights = torch.where(torch.isfinite(logsum[..., None]), torch.exp(scores - logsum[..., None]), 0.0)
+                ref = weights @ vv
+                torch.testing.assert_close(actual[0][batch, :, :nq].double(), ref, atol=4e-3, rtol=1e-2)
+                assert torch.all(actual[0][batch, :, nq:] == 0)
+                if lse is not None:
+                    torch.testing.assert_close(actual[1][batch, :, :nq].double(), logsum * math.log2(math.e), atol=2e-3, rtol=1e-3)
+                    assert torch.all(actual[1][batch, :, nq:] == -float("inf"))
+            assert torch.all(ob[..., dv:] == 77)
+            assert torch.all(lb[..., 1::2] == 77)
+    finally:
+        graph.reset()

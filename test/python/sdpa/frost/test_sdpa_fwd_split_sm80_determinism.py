@@ -94,21 +94,24 @@ def test_split_forward_determinism(d, splits, dtype):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        launch()
-    torch.cuda.current_stream().wait_stream(stream)
-    for order in ([0] + [-1] * 128, [1, 0, 0] + [-1] * 126, [1, 2] * 64 + [0]):
-        bind(order)
-        ws.fill_(127)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            launch()
+        torch.cuda.current_stream().wait_stream(stream)
+        for order in ([0] + [-1] * 128, [1, 0, 0] + [-1] * 126, [1, 2] * 64 + [0]):
+            bind(order)
+            ws.fill_(127)
+            graph.replay()
+            for batch, index in enumerate(order):
+                if index == 0:
+                    assert_bitwise(snapshot({"o": o[batch], "lse": lse[batch]}), expected, f"batch slot {batch}")
+            empty = [i for i, x in enumerate(order) if x < 0]
+            if empty:
+                assert torch.all(o[empty] == 0) and torch.all(lse[empty] == -torch.inf)
+        k[0].mul_(-0.5)
+        v[0].add_(0.75)
         graph.replay()
-        for batch, index in enumerate(order):
-            if index == 0:
-                assert_bitwise(snapshot({"o": o[batch], "lse": lse[batch]}), expected, f"batch slot {batch}")
-        empty = [i for i, x in enumerate(order) if x < 0]
-        if empty:
-            assert torch.all(o[empty] == 0) and torch.all(lse[empty] == -torch.inf)
-    k[0].mul_(-0.5)
-    v[0].add_(0.75)
-    graph.replay()
-    assert_bitwise(snapshot({"o": o[128], "lse": lse[128]}), expected, "changed neighbor")
-    assert_golden(f"sdpa-sm80-dense-d{d}-split{splits}-{str(dtype).split('.')[-1]}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+        assert_bitwise(snapshot({"o": o[128], "lse": lse[128]}), expected, "changed neighbor")
+        assert_golden(f"sdpa-sm80-dense-d{d}-split{splits}-{str(dtype).split('.')[-1]}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+    finally:
+        graph.reset()
