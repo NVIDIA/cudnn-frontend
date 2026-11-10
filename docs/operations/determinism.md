@@ -280,3 +280,13 @@ fresh storage, duplicated/reordered batches and changed-neighbor capture.
 That limited coverage passes on SM121 (GB10); SM120 remains unverified.
 It does not extend the deterministic contract to multiple KV tiles. This change adds
 no forward kernel.
+
+## SM120 D576 forward
+
+D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in
+the tested FP16/BF16 configurations on GB10 (SM121), including half-Q with
+FP8 E4M3/E5M2 paged KV. Split count and packing stay fixed across batch
+reordering, duplication and changed-neighbor capture replay. Compact THD
+repacking follows changed lengths; independent physical gaps are outside this
+path's contract. SM120 hardware execution and other runtimes remain unverified.
+This qualification adds no backward support.

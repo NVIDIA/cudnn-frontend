@@ -1897,8 +1897,32 @@ def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
     for d_qk in range(264, 513, 8):
         for d_v in range(264, 513, 8):
             assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
-    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (520, 512), (512, 520)):
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (584, 512), (512, 520)):
         assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+
+
+def test_sm120_probe_d576_envelope_pairs(monkeypatch):
+    """D576/V512 is a half-only extension; independent eight-aligned widths."""
+    from cudnn.sdpa.fwd.config_sm120 import pick_flavor, smem_bytes
+    from types import SimpleNamespace
+
+    native = cudnn._pybind_module._SdpaDenseBinder
+    flags = {name: getattr(native, name) for name in dir(native) if name.startswith("supports_")}
+    flags["supports_d576_envelope"] = True
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    for d_qk in range(520, 577, 8):
+        for d_v in range(264, 513, 8):
+            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+            assert pick_flavor(d_qk, d_v, False) == (576, 512)
+            assert pick_flavor(d_qk, d_v, True) is None
+            assert smem_bytes(d_qk, d_v, 64, 32) == 98328
+    for d_qk, d_v in ((576, 256), (584, 512), (576, 520), (516, 512)):
+        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+    flags.pop("supports_d576_envelope")
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
+    assert _SM120 not in _eligible(_mk_sm120_graph(d=520, d_v=504))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=576, d_v=512))
 
 
 def test_sm120_probe_accepts_right_band_widening(monkeypatch):
