@@ -126,7 +126,12 @@ LEAD. d64 with a sink wins from 32 KV units (0.06-0.98) and a single SWA query r
 1.09-1.49 (dense ``s_q >= 2`` is 0.88-1.06 parity) -> TRAIL. d128 ``s_q == 1`` still loses (1.48 dense, 1.88
 paged geo) -> TRAIL. THD, MHA, d64 without a sink, a window off the d64 sink graph and block-scaled O were not measured
 -> TRAIL, as do other O dtypes than E4M3 and caches below 1k. FROST declines paged d256 today, so leading it
-changes nothing.
+changes nothing. d512 MTP rows (``2 <= s_q <= 16`` under the bottom-right diagonal, dense unpadded E4M3 KV,
+MLA-absorbed ``h_kv`` 1 and GQA 4-8; measured 2026-11-09 against cuDNN 9.30.0.2 on a B100, 456 cases, b 1-64, KV
+256-128k): FROST 0.00-0.89 of the backend except one request of 8-32 query heads over a 256 / 1k cache (1.07-1.62)
+-> LEAD outside that floor (``SM100_FP8_D512_MTP_FLOOR_*``). A 48-cell random hold-out and a 64-cell B300 (cc 10.3)
+set around the floor were never behind the default; every B300 loss (1.07-1.76) sits inside the floor. Paged,
+padded, mask-free, windowed and MHA d512 MTP were not measured -> TRAIL.
 Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
 submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
 host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 query heads wins both at
@@ -543,6 +548,10 @@ SM103_FP8_D192_LONG_CHUNK_MIN_S_Q = 512  # cc 10.3 causal d192 chunks from this 
 SM103_FP8_D192_LONG_CHUNK_MIN_S_KV = 4096  # shorter KV caches retain the existing query-tile policy
 FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
 SM100_FP8_DECODE_MIN_KV = 1024  # the measured decode caches: 4k / 64k grid, 1k-128k hold-out
+# d512 MTP keeps the backend below both floors: one request of 8-32 query heads over a 256 / 1k cache loses 1.07-1.62, while
+# 64 heads or 8 requests (0.12-0.69) and a 2k cache (0.43-0.89) win. Each floor sits halfway (log2) to the first win.
+SM100_FP8_D512_MTP_FLOOR_HEADS = 45  # b * h_q
+SM100_FP8_D512_MTP_FLOOR_KV = 1448
 SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
@@ -830,8 +839,15 @@ def _sm100_fp8_decode_leads(facts) -> bool:
     sink_d64 = shape == (64, 64) and facts.has_sink
     if facts.thd or facts.o_block_scale or facts.has_epilogue_gate or not facts.h_kv or facts.h_q <= facts.h_kv:
         return False
-    if facts.dtype != cudnn.data_type.FP8_E4M3 or facts.dtype_o != cudnn.data_type.FP8_E4M3 or facts.s_kv < SM100_FP8_DECODE_MIN_KV:
-        return False  # measured E4M3 in and out, from a 1k cache
+    if facts.dtype != cudnn.data_type.FP8_E4M3 or facts.dtype_o != cudnn.data_type.FP8_E4M3:
+        return False  # measured E4M3 in and out
+    if shape == (512, 512):
+        # MTP rows only: dense unpadded KV under the bottom-right causal diagonal, as the d512 study measured
+        measured = facts.s_q >= 2 and facts.causal and facts.bottom_right and not (facts.has_paged_kv or facts.padded or facts.right_band_widening)
+        floor = facts.b * facts.h_q < SM100_FP8_D512_MTP_FLOOR_HEADS and facts.s_kv < SM100_FP8_D512_MTP_FLOOR_KV
+        return measured and facts.window_left is None and not facts.has_sink and not floor
+    if facts.s_kv < SM100_FP8_DECODE_MIN_KV:
+        return False  # measured from a 1k cache
     if facts.right_band_widening:
         return False  # measured causal (diagonal right bound 0) or mask-free
     if (facts.window_left is not None and not sink_d64) or (facts.has_sink and not sink_d64):

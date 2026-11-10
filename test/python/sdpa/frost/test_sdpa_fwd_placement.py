@@ -1221,6 +1221,36 @@ def test_sm100_fp8_decode_shaped_gqa_leads_inside_the_measured_box():
 
 
 @pytest.mark.L0
+def test_sm100_fp8_d512_mtp_leads_outside_its_small_work_floor():
+    """SM100 per-tensor FP8 d512 MTP rows (2 <= s_q <= 16 under the bottom-right diagonal, dense unpadded E4M3 KV, MLA-absorbed or GQA)
+    lead except one request of <= 32 query heads over a short cache (module docstring). Before the rule every one trailed."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100_fp8")
+    base = dict(b=128, h_q=128, h_kv=1, s_q=2, s_kv=131072, d_qk=512, d_v=512, causal=True, bottom_right=True, device_cc=(10, 0), device_sm_count=148)
+
+    def place(**over):
+        return placement.place(spec, _facts(**{**base, **_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, **over}))
+
+    assert place() == placement.LEAD  # a DSv4 MTP row of the nightly: the backend default 1.71 s, FROST 4 ms
+    assert place(b=1, h_q=8, s_q=16, s_kv=2048) == placement.LEAD
+    assert place(b=1, h_q=32, h_kv=4, s_q=16, s_kv=2048) == placement.LEAD  # GQA 0.89
+    assert place(b=1, h_q=64, s_kv=256) == placement.LEAD  # 0.63
+    assert place(b=8, h_q=8, s_kv=256) == placement.LEAD  # 0.65
+    assert place(b=1, h_q=8, s_kv=256) == placement.TRAIL  # 1.21
+    assert place(b=1, h_q=32, s_q=16, s_kv=1024) == placement.TRAIL  # 1.47
+    assert place(b=1, h_q=44, s_kv=1447) == placement.TRAIL
+    assert place(b=1, h_q=45, s_kv=1447) == placement.LEAD
+    assert place(b=1, h_q=44, s_kv=1448) == placement.LEAD
+    assert place(causal=False, bottom_right=False) == placement.TRAIL  # mask-free MTP not measured
+    assert place(has_paged_kv=True, padded=True, page_size=64) == placement.TRAIL  # paged not measured
+    assert place(padded=True) == placement.TRAIL  # per-request lengths not measured
+    assert place(window_left=128) == placement.TRAIL
+    assert place(h_kv=128) == placement.TRAIL  # MHA not measured
+    assert place(dtype_o=cudnn.data_type.BFLOAT16) == placement.TRAIL
+
+
+@pytest.mark.L0
 def test_square_causal_places_the_same_from_either_corner():
     """A square causal mask covers the same tiles anchored top-left or bottom-right, so both get one verdict."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
