@@ -130,8 +130,11 @@ changes nothing. d512 MTP rows (``2 <= s_q <= 16`` under the bottom-right diagon
 MLA-absorbed ``h_kv`` 1 and GQA 4-8; measured 2026-11-09 against cuDNN 9.30.0.2 on a B100, 456 cases, b 1-64, KV
 256-128k): FROST 0.00-0.89 of the backend except one request of 8-32 query heads over a 256 / 1k cache (1.07-1.62)
 -> LEAD outside that floor (``SM100_FP8_D512_MTP_FLOOR_*``). A 48-cell random hold-out and a 64-cell B300 (cc 10.3)
-set around the floor were never behind the default; every B300 loss (1.07-1.76) sits inside the floor. Paged,
-padded, mask-free, windowed and MHA d512 MTP were not measured -> TRAIL.
+set around the floor were never behind the default; every B300 loss (1.07-1.76) sits inside the floor. Paged d512
+(dense Q over E4M3 page pools with per-request lengths, native since #2372; 2026-11-10, B100, cuDNN 9.30.0.2, 264
+cases + a 48-cell hold-out with uneven lengths): the same floor holds (its only losses 1.50, b1 16/1 KV 1k q 8 / 16;
+elsewhere 0.003-0.82), and the one mask-free row has no backend plan -> LEAD. Padded dense, mask-free MTP, windowed
+and MHA d512 MTP were not measured -> TRAIL.
 Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
 submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
 host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 query heads wins both at
@@ -274,7 +277,7 @@ arch range) TRAIL until measured.
 SM107 per-tensor FP8 row (``sdpa_fwd_prefill_sm107_fp8``, offered by default since 2026-10-16): LEAD on exact
 cc 10.7 at exact d256 / d512, dense, E4M3, causal (top-left or bottom-right) or mask-free, Stats on or off; TRAIL
 for one KV tile with at most 8 Q tiles, for d192, for d128 outside the chunk arm below, and for every feature the A/B did not cover (THD, paged
-KV, padding mask, window, right band, sink, block-scaled O, fused gate, E5M2). Measured 2026-10-16 on a 216-SM
+KV, padding mask, window, right band, sink, block-scaled O, fused gate, E5M2), except paged D512 decode below. Measured 2026-10-16 on a 216-SM
 cc 10.7 board, cuDNN 9.27.0.42 GA, ab.py (same graph, Amax_S virtual), CUDA-graph replay, two rounds with the
 arm order swapped, warm and cold L2; FROST time over backend time on the led graphs:
   d256: 0.24-0.96 (75 cases), hold-out 0.16-0.84 (12); eager, S_kv < 1024: 0.45-0.96 (35)
@@ -285,6 +288,11 @@ arm order swapped, warm and cold L2; FROST time over backend time on the led gra
 Mean regret against the faster provider on d256 / d512: 67-152 % (backend only) -> 0-1.3 %, no lead slower than
 1.03x warm or cold. The hold-out set was visible when the head-dim split was chosen; the KV-tile floor was fitted
 on the other sets.
+
+Paged D512 decode / MTP (dense Q over E4M3 page pools with per-request lengths, native since #2374; GQA / MLA-absorbed,
+one mask-free row or s_q 2-16 under the bottom-right diagonal; 2026-11-10, 208-SM, cuDNN 9.30.0.2, 264 cases b 1-128,
+KV 1k-64k, page 16 / 64, plus a 48-cell hold-out with uneven lengths): FROST 0.001-0.89 of the backend at s_q 2-16,
+and the backend has no plan for one row -> LEAD; the hold-out never fell behind the default.
 
 d128 chunks (2026-10-22, same board and harness): LEAD when the GQA group is a power of two (the Q tile packs it) and
 either bottom-right causal with s_q <= 512 and S_kv >= 8192, or S_kv >= 4096 and S_kv >= 64 s_q; or mask-free with
@@ -842,10 +850,14 @@ def _sm100_fp8_decode_leads(facts) -> bool:
     if facts.dtype != cudnn.data_type.FP8_E4M3 or facts.dtype_o != cudnn.data_type.FP8_E4M3:
         return False  # measured E4M3 in and out
     if shape == (512, 512):
-        # MTP rows only: dense unpadded KV under the bottom-right causal diagonal, as the d512 study measured
-        measured = facts.s_q >= 2 and facts.causal and facts.bottom_right and not (facts.has_paged_kv or facts.padded or facts.right_band_widening)
-        floor = facts.b * facts.h_q < SM100_FP8_D512_MTP_FLOOR_HEADS and facts.s_kv < SM100_FP8_D512_MTP_FLOOR_KV
-        return measured and facts.window_left is None and not facts.has_sink and not floor
+        # Measured: dense unpadded KV, or paged KV with per-request lengths; MTP rows under the bottom-right causal diagonal,
+        # and the one mask-free paged row, which has no backend plan
+        kv_measured = facts.padded == facts.has_paged_kv
+        mtp = facts.s_q >= 2 and facts.causal and facts.bottom_right
+        paged_row = facts.has_paged_kv and facts.s_q == 1 and not facts.causal
+        floor = mtp and facts.b * facts.h_q < SM100_FP8_D512_MTP_FLOOR_HEADS and facts.s_kv < SM100_FP8_D512_MTP_FLOOR_KV
+        masks_measured = not facts.right_band_widening and facts.window_left is None and not facts.has_sink
+        return kv_measured and (mtp or paged_row) and masks_measured and not floor
     if facts.s_kv < SM100_FP8_DECODE_MIN_KV:
         return False  # measured from a 1k cache
     if facts.right_band_widening:
@@ -900,8 +912,30 @@ def _place_sm100_fp8(caps: Capabilities, facts) -> str:
     return LEAD if tiles <= CHUNKED_MAX_Q_TILES or facts.s_q <= FP8_D128_ANY_TILES_MAX_S_Q else TRAIL
 
 
+def _sm107_fp8_paged_d512_decode(facts) -> bool:
+    """cc 10.7 per-tensor FP8 paged D512 decode / MTP rows over E4M3 page pools with a dense Q (module docstring, "SM107
+    per-tensor FP8 row"): one mask-free row or MTP rows under the bottom-right diagonal, GQA / MLA-absorbed."""
+    rows = (facts.s_q == 1 and not facts.causal) or (2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q and facts.causal and facts.bottom_right)
+    return (
+        facts.device_cc == (10, 7)
+        and facts.has_paged_kv
+        and facts.padded
+        and not facts.thd
+        and (facts.d_qk, facts.d_v) == (512, 512)
+        and rows
+        and bool(facts.h_kv)
+        and facts.h_q > facts.h_kv
+        and facts.window_left is None
+        and not (facts.right_band_widening or facts.has_sink or facts.o_block_scale or facts.has_epilogue_gate)
+        and facts.dtype == cudnn.data_type.FP8_E4M3
+        and facts.dtype_o == cudnn.data_type.FP8_E4M3
+    )
+
+
 def _place_sm107_fp8(caps: Capabilities, facts) -> str:
-    # Measured: exact cc 10.7, dense per-tensor E4M3, causal (TL / BR) or mask-free, Stats on or off.
+    # Measured: exact cc 10.7, dense per-tensor E4M3, causal (TL / BR) or mask-free, Stats on or off; and paged D512 decode.
+    if _sm107_fp8_paged_d512_decode(facts):
+        return LEAD
     if (
         facts.device_cc != (10, 7)
         or facts.thd
@@ -975,7 +1009,7 @@ def _place_sm120_fp8(facts) -> str:
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
     # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else stays backend-first.
-    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) not in caps.d_shapes:
+    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):
         return TRAIL
     if facts.s_q == 1 and facts.b * facts.h_q < SM90_SQ1_MIN_Q_ROWS:
         return TRAIL

@@ -434,7 +434,8 @@ def _sm120_gqa6_facts(**over):
 def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     """Every SM120 template packs any GQA group up to the tile (the rows past (tile_m // G) * G are dead), at
     D=128, 256 and 512, and declines a group past the tile. An unset tile_m is the adapter's own Q tile: 64 rows on
-    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. Every other row requires divisibility."""
+    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. SM100/SM90 retain a divisor-based packing rule; SM80 packs consecutive query/head rows across tile boundaries.
+    """
     from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
     from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
@@ -464,8 +465,9 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
     assert caps.pack_gqa_requires_divisible is False
-    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm80"):
+    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90"):
         assert _sm120_spec(other).capabilities.pack_gqa_requires_divisible, other
+    assert _sm120_spec("sdpa_fwd_prefill_sm80").capabilities.pack_gqa_requires_divisible is False
 
 
 @pytest.mark.L0
@@ -1698,8 +1700,8 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too). Partial
     groups (96/8) also run on native cga=2; shared cga=1 retains its divisibility rule. Dense d256 packs within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    admits both native prefill widths and unsplit packing, and dense PAGED queries -- not wired on
-    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    admits both native prefill widths and unsplit packing, and dense PAGED queries admit native cga=1 and cga=2
+    since #2375 (the native D128 loader reads dense Q over page pools)."""
     from dataclasses import replace
 
     from cudnn.sdpa.fwd.engines import effective_cgas
@@ -1727,7 +1729,7 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     assert engines.mismatch(caps, thd, pack) is None
     assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
     assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
-    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+    assert effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True)) == frozenset({1, 2})  # #2375
 
 
 @pytest.mark.L0

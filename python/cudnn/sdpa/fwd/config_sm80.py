@@ -74,7 +74,7 @@ def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[i
     cfg = FLAVOR_CFGS[pick_flavor(d_qk, d_v)]
     if cfg.D_QK > 256 or cfg.D_V > 256:
         return frozenset({32}), frozenset({16})
-    return frozenset({64, 128}), frozenset({32, 64} if cfg == QWEN_CFG else {64, 128})
+    return frozenset({16, 32, 64, 128}), frozenset({16, 32, 64} if cfg == QWEN_CFG else {16, 32, 64, 128})
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,10 @@ class TemplateParams:
     score_sign: int = 1
     # Zero retains contiguous K/V; positive values select device page tables.
     paged_page_size: int = 0
+    # Independent KV ranges write split-major partials for the shared reduction.
+    split_kv: int = 1
+    # Q heads sharing one KV head occupy consecutive MMA rows.
+    pack_g: int = 1
 
 
 def score_sign(scale: float) -> int:
@@ -158,12 +162,18 @@ def kernel_scale(scale: float) -> float:
 def validate_params(p: TemplateParams) -> None:
     """Raising validator — a failure here means the capability row or the
     adapter lied about what this template can serve (README Rule 2)."""
+    if p.pack_g < 1 or (p.pack_g > 1 and p.thd_varlen):
+        raise ValueError("sm80: PackGQA requires a positive head group and dense Q")
+    if not 1 <= p.split_kv <= 65535:
+        raise ValueError("sm80: split_kv must be in [1, 65535]")
+    if p.split_kv > 1 and p.thd_varlen:
+        raise ValueError("sm80: split-KV currently requires dense Q")
     wide = p.d_qk > 256 or p.d_v > 256
-    tile_ns = (16,) if wide else (32, *_SM80_SEQ_TILES_N) if (p.d_qk, p.d_v) == (256, 256) else _SM80_SEQ_TILES_N
+    tile_ns = (16,) if wide else (16, 32, *_SM80_SEQ_TILES_N)
     if p.tile_n not in tile_ns:
         raise ValueError(f"sm80: tile_n must be one of {tile_ns}; got {p.tile_n}")
-    if p.num_warps not in (4, 8):
-        raise ValueError(f"sm80: num_warps must be 4 or 8; got {p.num_warps}")
+    if p.num_warps not in (1, 2, 4, 8):
+        raise ValueError(f"sm80: num_warps must be 1, 2, 4 or 8; got {p.num_warps}")
     row_warps = p.num_warps // (2 if wide else 1)
     if p.tile_m % (row_warps * 16) != 0:
         raise ValueError(f"sm80: tile_m ({p.tile_m}) must be a multiple of row_warps*16 ({row_warps * 16})")

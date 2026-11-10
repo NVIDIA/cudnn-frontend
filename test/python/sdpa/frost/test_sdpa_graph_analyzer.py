@@ -242,10 +242,25 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     fp8 = replace(facts, is_fp8=True)
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
-    # The SM120 paged prepared path serves dense half widths through D128 without splits.
-    paged = replace(facts, has_paged_kv=True)
-    assert (engines._prepared_decline_reason(spec.capabilities, paged, 1) is None) == (d <= 128)
-    assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is not None
+    # Prepared binding serves half through D256 and the D512 envelope;
+    # concrete tiles distinguish unsplit small prefill from decode and D512.
+    paged = replace(facts, has_paged_kv=True, padded=True, page_size=16)
+    assert engines._prepared_decline_reason(spec.capabilities, paged, 1) is None
+    assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is None
+    if d <= 128:
+        # Tile-only knobs keep the default unsplit value (None) legal.
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64)) is None
+        reason = engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, split_kv=2))
+        assert reason is not None and "decode tile" in reason
+    if d <= 256:
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=16, split_kv=2)) is None
+    if d == 256:
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, split_kv=1)) is not None
+    if d == 512:
+        for split in (1, 3):
+            assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
+        for dims in ((256, 512), (512, 256), (513, 512), (257, 512)):
+            assert engines._prepared_decline_reason(spec.capabilities, replace(paged, d_qk=dims[0], d_v=dims[1]), 1) is not None
     for change in (dict(thd=True), dict(is_fp8=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(paged, **change), 1) is not None, change
     assert engines._prepared_decline_reason(spec.capabilities, replace(facts, is_mxfp8=True), 1) is not None
@@ -342,7 +357,7 @@ def test_prepared_fp8_override_capability_envelope(dtype_o, feature, d_qk, d_v, 
     else:
         assert reason is not None
         if arch == "sm120" and feature == "paged":
-            assert "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128" in reason
+            assert "SM120 paged KV requires FP16/BF16" in reason
         else:
             assert "prepared" in reason
 
@@ -1075,7 +1090,8 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # the two together so the gate cannot drift: the f16 SM100 row declares
     # exactly the adapter's flavors. Native SM107 admits D64, paged D192/V128, D512 and D576/V512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
-    # requires whole groups. Quantized and SM120 routes retain their gates.
+    # requires whole groups. Native SM90 D512 admits gcd-based subgroups.
+    # Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
@@ -1083,7 +1099,9 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
     assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512), (576, 512)})
-    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107)}
+    native_sm90 = engines.engine_name(arch="sm90")
+    assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107, native_sm90)}
     assert all(v is None for v in others.values()), others
 
 

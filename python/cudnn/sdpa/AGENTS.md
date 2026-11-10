@@ -1486,6 +1486,23 @@ rather than publishing those copies with an ordinary mbarrier arrival. The
 qualified SM120 loader also retains producer-local commit/wait-group completion:
 an async-arrival-only variant passed numerics but failed the same racecheck.
 Do not remove that drain without rerunning the native sanitizer/capture cases.
+For a persistent CTA that reinitializes its K/V barriers between work units,
+keep the same producer arrival count at initial launch and every rearm. D512
+paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
+one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
+two CTAs so even compact tests exercise repeated unit transitions.
+An async-copy completion does not substitute for ownership synchronization
+of other shared buffers. The D512 warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on paged paths.
+`test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
+read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
+it publishes those stores with release arrivals, while uniform half retains
+copy-tracked arrivals. Do not select the publication operation by the output
+MMA type: it must follow the producer's actual storage operation. The exhaustive
+`test_sm120_mixed_paged_conversion_all_encodings` also checks the supported
+compiler floor; a direct packed BF16 conversion can require a newer PTX ISA
+than the installed DSL compiler even when the GPU supports the operation.
 See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 and run the native paging racecheck as well as memcheck and numerical replay.
 
@@ -1553,3 +1570,30 @@ half-precision resident-arm selector; explicit-only per-tensor widths belong
 in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
 `test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
 first-half tails as well as tile multiples, while admitting an explicit N64.
+
+Shared kernel geometry constants must live below the heuristics/adapter layer.
+Importing heuristics from split-combine creates a cycle when an adapter imports
+that reducer. Re-export shared constants from heuristics when callers already
+use those names, preserving their values and policy. The cold-interpreter
+`test_split_combine_import_without_heuristics` blocks heuristics imports while
+loading both the reducer and SM80 prepared host; a warmed test process can hide
+this dependency.
+
+Test launch recorders retained by a native binder must not capture the owning
+API or prepared spec. That reference cycle can cross a non-GC nanobind object
+and survive Python collection. Capture the immutable stride/index metadata
+and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
+reproduced eighteen binder leaks before this correction and runs cleanly
+afterwards; keep the pointer/stride assertions and inspect process shutdown.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.

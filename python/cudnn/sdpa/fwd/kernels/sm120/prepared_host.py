@@ -378,6 +378,7 @@ def compile_host(
     has_amax=False,
     scale_o_in_combine=False,
     sfo_geometry=None,
+    kv_dtype=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -393,8 +394,8 @@ def compile_host(
     return compile_cached(
         fp8_host if fp8 else (paged_host if getattr(kernel, "page_size", 0) else host),
         ptr(dtype),
-        ptr(dtype),
-        ptr(dtype),
+        ptr(dtype if kv_dtype is None else kv_dtype),
+        ptr(dtype if kv_dtype is None else kv_dtype),
         ptr(output_dtype if fp8 else dtype),
         ptr(cutlass.Float32, 4) if has_lse else None,
         ptr(cutlass.Float32, 4),

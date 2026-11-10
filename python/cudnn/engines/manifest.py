@@ -119,6 +119,12 @@ class EngineFamily:
     # reason instead of a dead process. None: the backend is always queried. Rare by contract: a
     # documented backend defect on a measured domain, never placement policy.
     backend_guard: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_engine_guard(graph, facts) -> Dict[int, str]``: backend engines
+    # (global ids) that must not run this graph, each with the reason (an engine that returns a wrong result on
+    # a measured domain). Planning drops their configs from the backend's list and an explicit pin of one is a
+    # typed decline; the backend's other engines stay. None: no engine is excluded. Same contract as
+    # backend_guard: a documented backend defect on a measured domain, never placement policy.
+    backend_engine_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -287,6 +293,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
         backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
+        backend_engine_guard=("cudnn.sdpa.fwd.backend_guard", "backend_engine_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -424,6 +431,12 @@ def resolve_backend_guard(family: EngineFamily):
     """The family's backend-query guard, or None (see EngineFamily.backend_guard)."""
 
     return _resolve(family, family.backend_guard, "backend_guard")
+
+
+def resolve_backend_engine_guard(family: EngineFamily):
+    """The family's backend-engine guard, or None (see EngineFamily.backend_engine_guard)."""
+
+    return _resolve(family, family.backend_engine_guard, "backend_engine_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

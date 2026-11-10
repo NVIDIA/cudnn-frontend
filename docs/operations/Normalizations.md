@@ -119,6 +119,52 @@ Only setting either (saved mean and inverse_variance) or (epsilon) is necessary.
 
 `peer_stats` behaves as in [Batchnorm Forward](#batchnorm-forward).
 
+## Batchnorm Inference
+
+The batchnorm inference operation applies precomputed statistics (the forward phase is `NormFwdPhase_t::INFERENCE`):
+
+$$ Y = scale*(X - mean)*inv\_variance + bias $$
+
+It computes no statistics and updates no running statistics.
+
+### C++ API
+
+```
+std::shared_ptr<Tensor_attributes> batchnorm_inference(std::shared_ptr<Tensor_attributes> x,
+                                                       std::shared_ptr<Tensor_attributes> mean,
+                                                       std::shared_ptr<Tensor_attributes> inv_variance,
+                                                       std::shared_ptr<Tensor_attributes> scale,
+                                                       std::shared_ptr<Tensor_attributes> bias,
+                                                       Batchnorm_inference_attributes);
+```
+The return value is `Y`. When they are not set, Y's dims and strides are inferred from X. `mean`, `inv_variance`, `scale` and `bias` are per-channel tensors of shape `[1, C, 1, 1]`.
+
+Batchnorm inference attributes is a lightweight structure with setters:
+```
+Batchnorm_inference_attributes&
+set_name(std::string const&)
+
+Batchnorm_inference_attributes&
+set_compute_data_type(DataType_t value)
+```
+
+### Python API
+
+- batchnorm_inference
+    - input
+    - mean
+    - inv_variance
+    - scale
+    - bias
+    - compute_data_type
+    - name
+
+### Supported graphs
+
+The backend engines serve this node inside the fused training pattern batchnorm inference -> `relu_backward` -> `batchnorm_backward`, which needs cuDNN 8.9.4 or newer. The examples are `samples/cpp/norm/batchnorm.cpp` ("BN_inference DRelu DBN Graph") and `test/python/norm/graph/test_batchnorm.py::test_bn_infer_drelu_dbn`.
+
+A graph that holds only batchnorm inference, or batchnorm inference followed by a forward `relu`, is declined with `cudnnGraphNotSupportedError`. This was measured with cuDNN 9.27 on SM90 and SM103, using fp16 channels-last X and fp32 per-channel tensors.
+
 ## Generate Stats
 
 The Genstats operation computes the sum and sum of squares per-channel dimension.

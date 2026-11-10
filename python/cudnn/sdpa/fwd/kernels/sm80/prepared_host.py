@@ -12,6 +12,7 @@ from cuda.bindings import driver
 from cudnn.frost.compiled_cache import compile_cached, positional_entry, template_key
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_NONE, MASK_SWA
 from .packed_init import FROST_SOURCE_DIGEST as _INIT_DIGEST, zero_outputs
+from cudnn.sdpa.fwd.kernels.sm100.split_combine import _launch_combine, DECODE_GRID_OFF
 
 
 @cute.jit
@@ -46,6 +47,7 @@ def _host(
     paged_v: Optional[cute.Pointer] = None,
     paged_geometry: cutlass.Constexpr = None,
     max_skv: cutlass.Constexpr = 0,
+    workspace: Optional[cute.Pointer] = None,
 ):
     # Reuse the template configuration without a redundant dataclass argument;
     # compiled_cache can then export and reload the pointer-only call ABI.
@@ -53,12 +55,22 @@ def _host(
     sq, d = geometry[0][0][1], geometry[0][0][3]
     skv = max_skv if cutlass.const_expr(params.paged_page_size > 0) else geometry[1][0][1]
     mask = (MASK_CAUSAL if params.is_causal else MASK_NONE) | (MASK_SWA if params.has_swa else 0)
+    o_view, stats_view = _view(o, geometry[3]), _view(stats, geometry[4])
+    if cutlass.const_expr(params.split_kv > 1):
+        b, sq, h, dv = geometry[3][0]
+        count = params.split_kv * b * sq * h * dv
+        # Match scratch_workspace_bytes / ws_align: the caller reserves
+        # 128-byte aligned slabs, which need not be 256-byte aligned.
+        stats_offset = ((count * 2 + 127) // 128) * 128
+        partial_o = _view(cute.recast_ptr(workspace, dtype=dtype), ((params.split_kv * b, sq, h, dv), (sq * h * dv, h * dv, dv, 1)))
+        partial_stats = _view(cute.recast_ptr(workspace + stats_offset, dtype=cutlass.Float32), ((params.split_kv * b, h, sq), (h * sq, sq, 1)))
+        o_view, stats_view = partial_o, partial_stats
     module._sdpa_host(
         _view(q, geometry[0]),
         _view(k, geometry[1]),
         _view(v, geometry[2]),
-        _view(o, geometry[3]),
-        _view(stats, geometry[4]),
+        o_view,
+        stats_view,
         _view(seq_kv, geometry[5]),
         _view(seq_q, geometry[6]),
         _view(sink, geometry[7]),
@@ -72,7 +84,7 @@ def _host(
         params.d_qk,
         params.d_v,
         dtype,
-        sq % params.tile_m == 0 and skv % params.tile_n == 0,
+        (sq * params.pack_g) % params.tile_m == 0 and skv % params.tile_n == 0,
         d == params.d_qk,
         mask,
         swa_window,
@@ -100,6 +112,29 @@ def _host(
         _view(paged_v, paged_geometry[1]) if cutlass.const_expr(paged_geometry is not None) else None,
     )
 
+    if cutlass.const_expr(params.split_kv > 1):
+        _launch_combine(
+            partial_o,
+            partial_stats,
+            _view(o, geometry[3]),
+            _view(stats, geometry[4]),
+            None,
+            None,
+            (b, h, sq, dv),
+            cutlass.Int32(params.split_kv),
+            params.stats_log2,
+            None,
+            None,
+            None,
+            (1, 1, 1),
+            (0, 0),
+            None,
+            DECODE_GRID_OFF,
+            stream,
+            _view(sink, geometry[7]),
+            _view(seq_q, geometry[6]) if cutlass.const_expr(params.has_sink) else None,
+        )
+
 
 @cute.jit
 def host(
@@ -122,6 +157,30 @@ def host(
     stream: driver.CUstream,
 ):
     _host(q, k, v, o, stats, seq_kv, seq_q, sink, bias, scale_log2, inv_scale, module, geometry, dtype, swa_window, right_bound, stream)
+
+
+@cute.jit
+def split_host(
+    q: cute.Pointer,
+    k: cute.Pointer,
+    v: cute.Pointer,
+    o: cute.Pointer,
+    stats: Optional[cute.Pointer],
+    seq_kv: Optional[cute.Pointer],
+    seq_q: Optional[cute.Pointer],
+    sink: Optional[cute.Pointer],
+    bias: Optional[cute.Pointer],
+    scale_log2: cutlass.Float32,
+    inv_scale: cutlass.Float32,
+    module: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    swa_window: cutlass.Constexpr[int],
+    right_bound: cutlass.Constexpr[int],
+    stream: driver.CUstream,
+    workspace: Optional[cute.Pointer] = None,
+):
+    _host(q, k, v, o, stats, seq_kv, seq_q, sink, bias, scale_log2, inv_scale, module, geometry, dtype, swa_window, right_bound, stream, workspace=workspace)
 
 
 @cute.jit
@@ -172,6 +231,56 @@ def paged_host(
     )
 
 
+@cute.jit
+def split_paged_host(
+    q: cute.Pointer,
+    k: cute.Pointer,
+    v: cute.Pointer,
+    o: cute.Pointer,
+    stats: Optional[cute.Pointer],
+    seq_kv: Optional[cute.Pointer],
+    seq_q: Optional[cute.Pointer],
+    sink: Optional[cute.Pointer],
+    bias: Optional[cute.Pointer],
+    paged_k: cute.Pointer,
+    paged_v: cute.Pointer,
+    scale_log2: cutlass.Float32,
+    inv_scale: cutlass.Float32,
+    module: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    swa_window: cutlass.Constexpr,
+    right_bound: cutlass.Constexpr,
+    max_skv: cutlass.Constexpr,
+    stream: driver.CUstream,
+    workspace: Optional[cute.Pointer] = None,
+):
+    _host(
+        q,
+        k,
+        v,
+        o,
+        stats,
+        seq_kv,
+        seq_q,
+        sink,
+        bias,
+        scale_log2,
+        inv_scale,
+        module,
+        geometry[:9],
+        dtype,
+        swa_window,
+        right_bound,
+        stream,
+        paged_k,
+        paged_v,
+        geometry[9:],
+        max_skv,
+        workspace,
+    )
+
+
 def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bound, cache_key, max_skv=None):
     dtype = cutlass.BFloat16 if params.io_bf16 else cutlass.Float16
     types = [dtype] * 4 + [cutlass.Float32, cutlass.Int32, cutlass.Int32, cutlass.Float32, cutlass.Float32 if params.bias_is_fp32 else dtype]
@@ -197,6 +306,7 @@ def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bou
         right_bound,
         *((max_skv,) if params.paged_page_size else ()),
         driver.CUstream(0),
+        *((cute.runtime.make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),) if params.split_kv > 1 else ()),
         # Dense SM80 and SM89 plans share this artifact. Compile the common
         # SM80 ISA even when the first plan is built on Ada (DSL floor 4.7.x
         # otherwise selects the current device's target implicitly).
@@ -207,7 +317,7 @@ def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bou
 
 
 def compile_host(module, params, geometry, swa_window, right_bound, cache_key, max_skv=None):
-    entry = paged_host if params.paged_page_size else host
+    entry = (split_paged_host if params.paged_page_size else split_host) if params.split_kv > 1 else (paged_host if params.paged_page_size else host)
     return _compile_pointer_host(entry, module, params, geometry, swa_window, right_bound, cache_key, max_skv)
 
 

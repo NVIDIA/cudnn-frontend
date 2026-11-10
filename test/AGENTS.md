@@ -1316,6 +1316,19 @@ delta helper reused unchanged can make dV correct while corrupting dQ/dK.
 `test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
 plus fixed quantized inputs under changed batch sizes and graph replay.
 
+Test sink logits at both infinities with a live Q and **zero KV iterations**.
+An all-masked tile whose loop still runs can seed different row state and miss
+`-inf - (-inf)` in the final fold. The disabled sink must retain O=0/LSE=-inf;
+a dominating +inf sink must produce O=0/LSE=+inf.
+`test_native_thd_paged_sink_endpoints` checks both in each native SM80 body.
+
+A graph sink descriptor can be strided while its variant-pack carrier is flat.
+Pass the declared head pitch to the native THD host; standalone views derive
+their own pitch. Validate current sink presence, dtype, device and storage span
+before length metadata writes. `test_native_thd_paged_sink_rebind_replay` keeps
+poisoned sink slack, fresh pointers and changed-input capture; the SM80 sink
+determinism suite checks unchanged outputs and scratch on rejected bindings.
+
 Paged vector loaders must derive row count and swizzle span from each operand's
 compiled head tile, while the live-vector guard uses its logical width. Fill
 padding beyond that width with NaNs and test independent QK/V widths; otherwise
@@ -1323,6 +1336,15 @@ a D128-only copy loop can silently overrun the shared tile after admission is
 widened. `test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_widths` covers
 16/32/64-element swizzle spans, eight-aligned envelopes, fresh pool storage,
 independent HND/NHD tables and changed-input replay.
+
+SM120 decode stage width can be48 for unequal QK/V tiles (for example32/48).
+When adding a decode domain, intersect the capability row and template guard
+with `config_sm120.decode_kv_stage`, including48; rounding every stage to a
+power of two silently removes valid head-width pairs. The native paging suite
+covers D24/V40 at this stage width with split/unsplit execution.
+A paged ring-loader check must use more K/V stages per split than ring slots.
+Page-boundary tests shorter than the ring cannot detect missing producer waits
+on slot reuse; keep changed-table/length replay and racecheck on a multi-wrap case.
 
 When extending a native split kernel to paged KV, update the adapter's
 partial-format predicate together with route admission. The D256 mixed-KV
@@ -1353,3 +1375,11 @@ that adapter's width and declared-stride restrictions before plan construction.
 The SM89 regression `test_sm89_probe_matches_native_width_and_stride_contract`
 keeps aligned d32/d64 controls and rejects d33 and a 65-element sequence stride.
 A staging-era capability envelope must not survive removal of the staging path.
+
+Capability-matrix fixtures must sample a shape that serves the feature under
+comparison. Adding a smaller native flavor can change sorted shape order
+without changing the larger envelope's band support. Keep the general band
+matrix on a representative full-feature shape and retain separate native
+flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
+The SM90 D64/D512 controls in `test_band_capabilities.py` and
+`test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
