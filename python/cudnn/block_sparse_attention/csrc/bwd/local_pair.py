@@ -4,7 +4,8 @@
 """Match KV neighborhoods in groups of eight and partition common/residual edges.
 
 Duplicate edges disable pairing for their eight-KV group, preserving multiset
-semantics through the regular path. All metadata is rebuilt on every call.
+semantics through the regular path. The default backward rebuilds all of this metadata on every call;
+``block_sparse_attention_prepare_backward`` builds it once for reuse across backward calls.
 """
 
 from typing import Optional
