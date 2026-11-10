@@ -193,3 +193,8 @@ replay/batch goldens for FP16/BF16 D64/V64 and D120/V88 with split1/3.
 The split count is held fixed across batch changes; the common fixed-order
 combine folds the sink once. This does not claim equality across different
 split counts or between the prefill and decode arithmetic orders.
+
+The native SM120 paged decode contract also covers independent eight-aligned
+QK/V widths through256 on M16/M32 tiles. The D256 and D192/V128 cases retain
+CPU-seeded inputs, eager/captured byte comparisons, batch invariance and
+runtime-keyed golden outputs in `test_sm120_frost_paged_wide_decode_determinism`.

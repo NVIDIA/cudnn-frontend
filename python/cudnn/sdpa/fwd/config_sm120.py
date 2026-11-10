@@ -23,13 +23,14 @@ GENERAL_HEAD_TILE_MAX = 256
 SUPPORTED_HEAD_TILE_MAX = 512
 GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
 # The general half prefill loader addresses independent QK/V widths through
-# D128 directly. Larger flavors and the decode tile keep separate paging gates.
+# D128 directly. Decode serves the full general head-dim envelope through D256.
 PAGED_HEAD_TILE_MAX = 128
-PAGED_D_SHAPES = frozenset((q, v) for q in GENERAL_HEAD_TILES if q <= PAGED_HEAD_TILE_MAX for v in GENERAL_HEAD_TILES if v <= PAGED_HEAD_TILE_MAX)
+PAGED_D_SHAPES = frozenset((q, v) for q in GENERAL_HEAD_TILES for v in GENERAL_HEAD_TILES)
 
 
-def paged_head_dims_supported(d_qk: int, d_v: int) -> bool:
-    return all(0 < d <= PAGED_HEAD_TILE_MAX and d % 8 == 0 for d in (d_qk, d_v))
+def paged_head_dims_supported(d_qk: int, d_v: int, *, decode: bool = False) -> bool:
+    maximum = GENERAL_HEAD_TILE_MAX if decode else PAGED_HEAD_TILE_MAX
+    return all(0 < d <= maximum and d % 8 == 0 for d in (d_qk, d_v))
 
 
 FP8_HEAD_TILE_GRANULE = 32

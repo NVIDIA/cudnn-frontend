@@ -1469,6 +1469,28 @@ Original GPT-OSS Q1/KV131072/D64 full and SWA128 graphs execute through ordinary
 OPENSOURCE candidates (M16/N32, split8 and split1 respectively), without a
 candidate or ranking patch. The bounded timing run is not performance qualification.
 
+### Native SM120 wide paged decode — 2026-11-10
+
+`test_sm120_frost_paged_wide_decode_determinism` adds eight records for
+D256/V256 on M16 and D192/V128 on M32, both half dtypes and split1/3.
+The existing independent CPU-double oracle, CPU-seeded inputs, eager/captured
+byte checks, queued work and reordered/duplicated batches through129 all pass
+before recording. Runtime key42742425a3d29d7c identifies the same RTX5080
+qualification environment as the small-head records; exact runtime details
+remain in private evidence. Existing goldens are unchanged.
+
+Fifty-six feature cases cover independent eight-aligned QK/V widths through256,
+including D136/V8 and D8/V192, plus asymmetric D248/V256 and D256/V248 tails.
+Two compact multi-wrap cases verify that every producer reuses ring slots;
+one host admission detector retains the prefill128 and decode256 boundaries.
+The wide tests explicitly request legal native plans because ordinary
+candidate generation does not propose decode tiles for every longer Q.
+This qualifies native capability, not that candidate ranking or performance.
+SM121 remains unexecuted. Memcheck, racecheck and synccheck each pass10cases
+with zero findings, including the two multi-wrap cases. Reproduce with
+`-k 'wide_decode_ring_pipeline or (wide_decode and not determinism and
+(dims0 or dims6) and dtype0)'` on `test_sdpa_fwd_paged_sm120.py`.
+
 ### Native SM107 D256 mixed FP8 KV — 2026-11-10
 
 `sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv` exposes D256 checks

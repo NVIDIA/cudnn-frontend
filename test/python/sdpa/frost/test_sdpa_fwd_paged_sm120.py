@@ -35,6 +35,7 @@ def _case(
     dims=(128, 128),
     split_kv=1,
     h=4,
+    explicit_plan=False,
 ):
     torch.manual_seed(381)
     b, pages = 2, 3
@@ -106,10 +107,18 @@ def _case(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    selected = select_engine(g, engine_name(arch="sm120"))
-    g.create_execution_plan(
-        selected.engine_id, replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
-    )
+    if explicit_plan:
+        from cudnn.engines.manifest import engines_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        # Native qualification may request a legal tile that the ranking does
+        # not propose for this Q length. Keep ordinary-candidate tests separate.
+        selected = next(engine for engine in engines_for(g) if engine.name == engine_name(arch="sm120"))
+        knobs = SdpaFwdKnobs(cga=1, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
+    else:
+        selected = select_engine(g, engine_name(arch="sm120"))
+        knobs = replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
+    g.create_execution_plan(selected.engine_id, knobs)
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -178,6 +187,7 @@ def test_sm120_frost_paged_native_rebind_replay(
     dims=(128, 128),
     split_kv=1,
     h=4,
+    explicit_plan=False,
 ):
     import cutlass.cute as cute
 
@@ -200,6 +210,7 @@ def test_sm120_frost_paged_native_rebind_replay(
         dims=dims,
         split_kv=split_kv,
         h=h,
+        explicit_plan=explicit_plan,
     )
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -584,7 +595,7 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
 @pytest.mark.parametrize("dims", [(24, 40), (64, 64), (120, 88), (128, 128), (8, 8), (16, 32)])
 @pytest.mark.parametrize("tile_m", [16, 32])
 @pytest.mark.parametrize("split_kv", [1, 3])
-def test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch):
+def test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch, *, explicit_plan=False):
     from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, head_tile
 
     test_sm120_frost_paged_native_rebind_replay(
@@ -606,6 +617,7 @@ def test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch):
         replays=4,
         endpoints=True,
         capture_adapter=split_kv > 1,
+        explicit_plan=explicit_plan,
     )
 
 
@@ -673,14 +685,14 @@ def test_sm120_frost_paged_decode_ring_reuse(tile_m, dims, split_kv, monkeypatch
 
 
 @pytest.mark.parametrize("tile_m,dims,split_kv,page", [(16, (64, 64), 3, 2048), (32, (120, 88), 1, 1024)])
-def test_sm120_frost_paged_decode_ring_pipeline(tile_m, dims, split_kv, page):
+def test_sm120_frost_paged_decode_ring_pipeline(tile_m, dims, split_kv, page, *, explicit_plan=False):
     from cudnn.sdpa.fwd.config_sm120 import decode_kv_groups, decode_kv_stage, decode_slots_per_group, head_tile
 
     dq, dv = (head_tile(d, 16) for d in dims)
     stage = decode_kv_stage(dq, dv)
     assert math.ceil((page + 3) / stage) // split_kv > decode_kv_groups(tile_m) * decode_slots_per_group(dq, dv, tile_m)
     g, nodes, bufs, ws, storage, stats_storage = _case(
-        torch.bfloat16, 2, page, True, False, dims=dims, tile_m=tile_m, tile_n=stage, split_kv=split_kv, sq=1, packed=True
+        torch.bfloat16, 2, page, True, False, dims=dims, tile_m=tile_m, tile_n=stage, split_kv=split_kv, sq=1, packed=True, explicit_plan=explicit_plan
     )
     # A compact grid keeps sanitizer instrumentation bounded while every
     # producer still reuses a slot after its prior consumer releases it.
@@ -691,3 +703,41 @@ def test_sm120_frost_paged_decode_ring_pipeline(tile_m, dims, split_kv, page):
     assert (ws[g.get_workspace_size() :] == 113).all()
     assert (storage[..., dims[1] :] == 123).all()
     assert (stats_storage[..., 1::2] == 777).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(136, 8), (8, 192), (192, 128), (128, 192), (248, 256), (256, 248), (256, 256)])
+@pytest.mark.parametrize("tile_m", [16, 32])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_wide_decode(dtype, dims, tile_m, split_kv, monkeypatch):
+    test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch, explicit_plan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tile_m,dims", [(16, (256, 256)), (32, (192, 128))])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_wide_decode_determinism(dtype, tile_m, dims, split_kv):
+    test_sm120_frost_paged_decode_determinism(dtype, tile_m, dims, split_kv)
+
+
+@pytest.mark.parametrize("tile_m,dims,split_kv,page", [(16, (256, 256), 3, 1024), (32, (248, 192), 1, 512)])
+def test_sm120_frost_paged_wide_decode_ring_pipeline(tile_m, dims, split_kv, page):
+    test_sm120_frost_paged_decode_ring_pipeline(tile_m, dims, split_kv, page, explicit_plan=True)
+
+
+def test_sm120_frost_paged_wide_decode_admission():
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.graph_analyzer import analyze
+
+    g, _, _, _, _, _ = _case(torch.float16, 2, 16, True, False, dims=(256, 256), tile_m=16, tile_n=16, sq=1, explicit_plan=True)
+    facts = analyze(g)
+    caps = _sm120_spec().capabilities
+    assert mismatch(caps, facts) is None
+    for tile_m in (16, 32):
+        for split in (1, 3):
+            assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=16, split_kv=split)) is None
+    for tile_m in (64, 128):
+        reason = mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=64, split_kv=1))
+        assert reason is not None and "decode tile" in reason
+    for dims in ((264, 256), (256, 264), (249, 256)):
+        assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=16, tile_n=16)) is not None
