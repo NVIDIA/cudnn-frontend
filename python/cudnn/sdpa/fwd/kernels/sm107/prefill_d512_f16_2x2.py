@@ -86,7 +86,7 @@ from cudnn.sdpa.fwd.config_sm107 import make_cfg_d512_2x2, SMEM_USABLE_BYTES, TC
 # arm, 2 = bring-up / bitwise-twin arm) is a second loader-style global, NOT a knob: a test that
 # wants the 2-CTA arm execs this file with it set, exactly as the loader sets FROST_TEMPLATE_PARAMS.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(mma_2x2=True))
-CGA_M_ARM: int = int(globals().get("FROST_D512_2X2_CGA_M", 4))
+CGA_M_ARM: int = int(globals().get("FROST_D512_2X2_CGA_M", 2 if PARAMS.d_flavor == 576 else 4))
 CFG, _TMA = make_cfg_d512_2x2(PARAMS, cga_m=CGA_M_ARM)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
@@ -113,8 +113,8 @@ _require(isinstance(CFG, CfgD512X2), f"expected a CfgD512X2, got {type(CFG).__na
 DESC_VERSION: int = 1
 _require(CFG.DESC_VERSION == DESC_VERSION, f"Cfg.DESC_VERSION {CFG.DESC_VERSION} disagrees with the module constant {DESC_VERSION}")
 _require(
-    d512_2x2_p_ring_start_bytes(CFG) >= TCGEN05_V0_ADDR_LIMIT,
-    f"the P ring starts at {d512_2x2_p_ring_start_bytes(CFG)} B, below the version-0 window: DESC_VERSION=1 would then be a silent widening",
+    d512_2x2_p_ring_start_bytes(CFG) + CFG.XFER_STAGES * CFG.TILE_M * CFG.TILE_N * CFG.BPE > TCGEN05_V0_ADDR_LIMIT,
+    f"the full P ring starting at {d512_2x2_p_ring_start_bytes(CFG)} B fits the version-0 window: DESC_VERSION=1 would then be a silent widening",
 )
 # Retry form of the per-KV-iteration RING waits (k/v/q _full/_empty, bmm1_done / bmm2_ready / bmm2_done / p_full,
 # stat_*, o_empty, empty_mainloop): every such site is spelled ``.wait(..., spin=SPIN_RING_WAITS)``; the waits a warp
@@ -241,7 +241,7 @@ _require(
 # ---------------------------------------------------------------------------- geometry (elements)
 qBufferElems = CFG.TILE_M * CFG.TILE_K  # 64 x 512 resident Q
 K_SUB_ROWS = CFG.TILE_N // CFG.CTA_MMA  # this CTA's 64 kv rows of a K tile
-K_SUB_COLS = CFG.TILE_K // 2  # one d-half sub-chunk = 256 d
+K_SUB_COLS = CFG.TILE_K // CFG.N_BMM1_CHUNKS  # D512: two256; D576: three192
 kSubElems = K_SUB_ROWS * K_SUB_COLS  # 32 KiB
 V_SUB_COLS = CFG.TILE_O // CFG.CTA_MMA // CFG.N_BMM2_CHUNKS  # this CTA's 128 d_v cols of one N-block
 vSubElems = CFG.TILE_N * V_SUB_COLS  # 128 kv rows x 128 d_v = 32 KiB
@@ -787,7 +787,7 @@ def _tma_issue_k(
     """Both 32 KiB d-half sub-chunks of K tile ``kv_loop`` (this CTA's 64 kv rows): wait the slot, leader expect_tx of
     the PAIR's 64 KiB, issue my share (2 of 4 subtiles to me + twin under KV_SHARE=2, all 4 own-bit otherwise)."""
     kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
-    for dh in cutlass.range_constexpr(2):
+    for dh in cutlass.range_constexpr(CFG.N_BMM1_CHUNKS):
         _poll_wait(bars.mb_k_empty[k_state.idx].smem_ptr, k_state.phase)
         bars.mb_k_full[k_state.idx].arrive(n_bytes=kSubTransactionBytes, pred=is_leader & nvvm.elect_sync())
         if cutlass.const_expr(PAGED_KV):
@@ -1215,10 +1215,13 @@ def _mma_warp_quiet(tmem_ptr_i32, bars):
 
 
 @cute.jit
-def _bmm1_issue(bmm1_desc, desc_Q_lo, desc_Q_hi, sK, tmem_S, k_state, bars, mcast_mask, kv_empty_mask, parity_rt):
-    """S[parity] = Q K^T as two K=256 d-half sub-chunk calls (16 k-steps each, bitwise identical to
-    one K=512 chain: probe ss_slabs S3).  After dh=0 the K slot is released; after dh=1 bmm1_done[p]
-    (pair) and the second slot.  Returns the advanced K ring state."""
+def _bmm1_issue(bmm1_desc, desc_Q_lo, desc_Q_hi, desc_Q_tail, sK, tmem_S, k_state, bars, mcast_mask, kv_empty_mask, parity_rt):
+    """S[parity] = Q K^T in two K=256 or three K=192 chunks.
+
+    Release each K slot after its MMA and signal bmm1_done only after the final
+    chunk. The D512 chain remains bitwise identical to one K=512 call (probe
+    ss_slabs S3). Returns the advanced K ring state.
+    """
     _poll_wait(bars.mb_k_full[k_state.idx].smem_ptr, k_state.phase)
     mma_ss(bmm1_desc, desc_Q_lo, sK[k_state.idx].desc(), tmem_S, accumulate=False)
     elect_p = nvvm.elect_sync()
@@ -1228,9 +1231,17 @@ def _bmm1_issue(bmm1_desc, desc_Q_lo, desc_Q_hi, sK, tmem_S, k_state, bars, mcas
     _poll_wait(bars.mb_k_full[k_state.idx].smem_ptr, k_state.phase)
     mma_ss(bmm1_desc, desc_Q_hi, sK[k_state.idx].desc(), tmem_S, accumulate=True)
     elect_p = nvvm.elect_sync()
-    bars.mb_bmm1_done[parity_rt].arrive(cta_group=CFG.CTA_MMA, mcast_mask=mcast_mask, pred=elect_p)
+    if cutlass.const_expr(CFG.N_BMM1_CHUNKS == 2):
+        bars.mb_bmm1_done[parity_rt].arrive(cta_group=CFG.CTA_MMA, mcast_mask=mcast_mask, pred=elect_p)
     bars.mb_k_empty[k_state.idx].arrive(cta_group=CFG.CTA_MMA, mcast_mask=kv_empty_mask, pred=elect_p)
     k_state = advance(k_state, CFG.STAGES_K_SUB)
+    if cutlass.const_expr(CFG.N_BMM1_CHUNKS == 3):
+        _poll_wait(bars.mb_k_full[k_state.idx].smem_ptr, k_state.phase)
+        mma_ss(bmm1_desc, desc_Q_tail, sK[k_state.idx].desc(), tmem_S, accumulate=True)
+        elect_tail = nvvm.elect_sync()
+        bars.mb_bmm1_done[parity_rt].arrive(cta_group=CFG.CTA_MMA, mcast_mask=mcast_mask, pred=elect_tail)
+        bars.mb_k_empty[k_state.idx].arrive(cta_group=CFG.CTA_MMA, mcast_mask=kv_empty_mask, pred=elect_tail)
+        k_state = advance(k_state, CFG.STAGES_K_SUB)
     return k_state
 
 
@@ -1332,6 +1343,9 @@ def _mma_warp_group(
     # 17 LDL unanchored -> 27 / 31 anchored.  Do not anchor these.
     desc_Q_lo = sQ[0].desc()
     desc_Q_hi = sQ[0].shifted(K_SUBTILES_PER_SUB * Q_SUBTILE_STRIDE_ELEMS).desc()
+    desc_Q_tail = desc_Q_hi
+    if cutlass.const_expr(CFG.N_BMM1_CHUNKS == 3):
+        desc_Q_tail = sQ[0].shifted(2 * K_SUBTILES_PER_SUB * Q_SUBTILE_STRIDE_ELEMS).desc()
 
     q_super_idx, _hd, batch_idx, split_idx = _decode_initial_split(
         sched.bidx_init, sched.bidy_init, sched.bidz_init, cta_id_x, n_q_supers, n_qh, n_batch, seq_kv_lens_tensor, qh_per_kh, seqlen_kv
@@ -1378,6 +1392,7 @@ def _mma_warp_group(
                 bmm1_desc,
                 desc_Q_lo,
                 desc_Q_hi,
+                desc_Q_tail,
                 sK,
                 tmem_raw.subview(cutlass.Int32(LAYOUT.S_ACC_OFF) + parity_lo_rt * cutlass.Int32(LAYOUT.S_ACC_COLS)),
                 k_state,
@@ -1397,6 +1412,7 @@ def _mma_warp_group(
                     bmm1_desc,
                     desc_Q_lo,
                     desc_Q_hi,
+                    desc_Q_tail,
                     sK,
                     tmem_raw.subview(cutlass.Int32(LAYOUT.S_ACC_OFF) + parity_next_rt * cutlass.Int32(LAYOUT.S_ACC_COLS)),
                     k_state,

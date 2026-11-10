@@ -2340,10 +2340,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if (
             capabilities.sm_lo == 107
             and not (facts.is_fp8 or facts.is_mxfp8)
-            and _selected_d_shape(capabilities, facts, knobs) == (512, 512)
+            and _selected_d_shape(capabilities, facts, knobs) in ((512, 512), SM100_NATIVE_D576_SHAPE)
             and not native_d512_dense_leg(capabilities, facts, knobs)
         ):
-            return "native SM107 half paged D512 requires dense Q and two-CTA MMA"
+            return "native SM107 half paged D512/D576 requires dense Q and two-CTA MMA"
         if capabilities.sm_lo == 120:
             reason = _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
             if reason is not None:
@@ -2748,7 +2748,8 @@ def _sm107_spec() -> EngineSpec:
             # is the other half of this claim, and _pick_flavor lands a d=192
             # graph on the NATIVE kernel rather than the d256 envelope.  The two
             # small shapes are the d128 file's 32- and 64-wide tiles.
-            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}) | SM107_F16_SMALL_D_SHAPES,
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}) | SM107_F16_SMALL_D_SHAPES,
+            d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             mixed_fp8_kv_d_shapes=frozenset({(128, 128)}),
             causal=True,
@@ -2778,24 +2779,24 @@ def _sm107_spec() -> EngineSpec:
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
             paged_kv=True,
-            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}),
             decode=True,  # stated, not inherited: S_q == 1 is served; on d256 by the decode tile (see the docstring)
             # FLOAT only: the half kernels run the f32 exponent (a HALF request declines here, never
             # in the adapter); the pre-folded scale is a neutral arm of every half prefill body.
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
-            attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}),
             pack_gqas=frozenset({False, True}),
             # (256, 256) = the d256 DECODE tile's whole-group packing (dense or paged, whatever tile_m) and the
             # paged THD d256 prefill's PackGQA (CGA2, unsplit); mismatch declines a packed dense d256 graph the
             # tile does not serve (the dense d256 prefill kernel runs unpacked).
-            pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}),
             # Native D64 packs gcd(G,128); D512 2x2 tiles pack gcd(G,64).
-            # THD and paged D512 retain their declines.
-            pack_gqa_partial_d_shapes=frozenset({(64, 64), (192, 128), (512, 512)}),
+            # Wide half THD remains declined; dense paging uses the native 2x2 body.
+            pack_gqa_partial_d_shapes=frozenset({(64, 64), (192, 128), (512, 512), SM100_NATIVE_D576_SHAPE}),
             thd_pack_gqa_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             split_kv_supported=True,
             # (256, 256) = native dense unpacked prefill, paged THD packed split and dense / paged decode split.
-            split_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            split_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor

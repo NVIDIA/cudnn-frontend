@@ -45,3 +45,18 @@ class TestNativeD512HalfPaged:
     test_boundaries = staticmethod(_checks.test_boundaries)
     test_determinism = staticmethod(_checks.test_determinism)
     test_admission_and_config_boundaries = staticmethod(_checks.test_admission_and_config_boundaries)
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeD576Half:
+    import native_d576_sm107_checks as _checks
+
+    test_shared_mla_record = staticmethod(_checks.test_shared_mla_record)
+
+    test_admission = staticmethod(_checks.test_admission)
+
+    test_paged = staticmethod(_checks.test_dense)
+    test_nonpaged = staticmethod(_checks.test_nonpaged)
+    test_boundaries = staticmethod(_checks.test_boundaries)
+    test_determinism = staticmethod(_checks.test_determinism)

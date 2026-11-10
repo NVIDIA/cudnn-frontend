@@ -253,7 +253,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
 # at 2/300 and the hint-less spin at 74/200 on such a barrier, the poll ran 200/200 + 300/300 (d512 bwd lane, 2026-10-01).
 # POLL_CROSS_PAIR_WAITS is a correctness constant pinned True by the module itself, never the SPIN_RING_WAITS perf lever:
 # (poll-site count, targets).
-_D512_2X2_CROSS_PAIR_WAITS = (10, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
+_D512_2X2_CROSS_PAIR_WAITS = (11, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go", "mb_bias_full", "mb_bias_empty")
 
 
@@ -661,7 +661,7 @@ _D512_2X2_ARRIVE_SITE_PINS = {
     "mb_tmem_dealloc.arrive": 1,
     "mb_tmem_dealloc.arrive_on_peer": 1,
     "mb_q_empty.arrive": 1,
-    "mb_bmm1_done[": 1,
+    "mb_bmm1_done[": 2,  # mutually exclusive two-chunk D512 and three-chunk D576 final releases
     "mb_bmm2_done[": 2,  # per-iteration (last N-block) + empty-tile commit
 }
 

@@ -18,17 +18,18 @@ _CASES = [
 ]
 
 
-def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
+def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _rubin_only()
     dtype, kv_dtype = getattr(torch, dtype_name), getattr(torch, kv_name)
     h, kh, sq, d, page, blocks = 8, 2, 17, head_dim, 16, 17
+    dv = d if value_dim is None else value_dim
     rng = torch.Generator().manual_seed(73461)
     q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
     # Independent pool layouts and aligned interior head padding.
     k = (torch.randn(89, kh, page, d + 16, generator=rng) * 0.3).to(kv_dtype).cuda()[..., :d]
-    v = (torch.randn(89, page, kh, d + 16, generator=rng) * 0.3).to(kv_dtype).cuda()[..., :d].transpose(1, 2)
+    v = (torch.randn(89, page, kh, dv + 16, generator=rng) * 0.3).to(kv_dtype).cuda()[..., :dv].transpose(1, 2)
     kt = torch.stack([torch.randperm(89, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
     vt = torch.stack([torch.randperm(89, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
     ql = torch.tensor([17, 1, 0, 9, 16], device="cuda", dtype=torch.int32)
@@ -44,8 +45,8 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
         # Native descriptors must preserve head padding and the declared BSHD order.
         qb = torch.empty(b, sq, h, d + 8, device="cuda", dtype=dtype)[..., :d].transpose(1, 2)
         qb.copy_(q.index_select(0, index))
-        ob_storage = torch.full((b, sq, h, d + 16), -123.0, device="cuda", dtype=dtype)
-        ob = ob_storage[..., :d].transpose(1, 2)
+        ob_storage = torch.full((b, sq, h, dv + 16), -123.0, device="cuda", dtype=dtype)
+        ob = ob_storage[..., :dv].transpose(1, 2)
         return dict(
             q=qb,
             k=k,
@@ -61,7 +62,7 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
         )
 
     def reference(t):
-        assert torch.all(t["o_storage"][..., d:] == -123), "output padding overwritten"
+        assert torch.all(t["o_storage"][..., dv:] == -123), "output padding overwritten"
         expected_o = torch.zeros_like(t["o"], device="cpu", dtype=torch.float64)
         expected_lse = torch.full(t["lse"].shape, -torch.inf, dtype=torch.float64)
         for i, (nq, nk) in enumerate(zip(t["ql"].tolist(), t["kl"].tolist())):
@@ -69,7 +70,7 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
                 continue
             qq = t["q"][i, :, :nq].cpu().double()
             kk = t["k"][t["kt"][i].long()].cpu().transpose(0, 1).reshape(kh, page * blocks, d)[:, :nk].double().repeat_interleave(h // kh, 0)
-            vv = t["v"][t["vt"][i].long()].cpu().transpose(0, 1).reshape(kh, page * blocks, d)[:, :nk].double().repeat_interleave(h // kh, 0)
+            vv = t["v"][t["vt"][i].long()].cpu().transpose(0, 1).reshape(kh, page * blocks, dv)[:, :nk].double().repeat_interleave(h // kh, 0)
             scores = qq @ kk.transpose(-1, -2) * d**-0.5
             diagonal = torch.arange(nq)[:, None] + nk - nq
             keys = torch.arange(nk)[None, :]
@@ -107,9 +108,9 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
             )
             api.check_support()
             api.compile()
-            kernel = "prefill_d512_f16_2x2.py" if head_dim == 512 else "prefill_d128_f16.py"
+            kernel = "prefill_d512_f16_2x2.py" if head_dim >= 512 else "prefill_d128_f16.py"
             assert api._k_mod.__file__.endswith(f"sm107/{kernel}")
-            assert api.flavor == (head_dim, head_dim)
+            assert api.flavor == (head_dim, dv)
             assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
             plans[b] = api
         return plans[b]
@@ -166,8 +167,8 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
 
 
 @pytest.mark.parametrize("dtype_name,kv_name,cga,split,tile_n", _CASES)
-def test_replay_batch_and_golden(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
-    run, inputs = _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=head_dim)
+def test_replay_batch_and_golden(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None):
+    run, inputs = _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=head_dim, value_dim=value_dim)
     target = assert_replays(lambda: run([0]), repeats=4)
     for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 64 + [0] + [2] * 64):
         actual = snapshot(run(order))
