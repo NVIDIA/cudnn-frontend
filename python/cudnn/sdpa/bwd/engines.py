@@ -35,6 +35,7 @@ from cudnn.sdpa import graph_analyzer as ga
 # importing them here would drag the CuTe DSL into every support check.
 _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
+_SM90 = "SdpaBwdDslSm90"
 _SM100 = "SdpaBwdDslSm100"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
@@ -90,6 +91,10 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_sm107_d512
 
         return api_dsl_sm107_d512.SdpaBwdDslSm107D512
+    if name == _SM90:
+        from cudnn.sdpa.bwd.api_dsl_sm90 import SdpaBwdDslSm90
+
+        return SdpaBwdDslSm90
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
@@ -1131,6 +1136,55 @@ def _sm80_spec() -> EngineSpec:
             strided_stats=True,
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM80),
+    )
+
+
+def _sm90_spec() -> EngineSpec:
+    """SM90 (Hopper) backward row: the SM80 prepared chain around a
+    warpgroup-MMA main kernel (``bwd/api_dsl_sm90.py``,
+    ``bwd/kernels/sm90/bprop_f16.py``).  Same graph contract as the SM80 row
+    (declared strides, THD with ragged offsets, GQA, the causal family and
+    windows, padding, sinks, deterministic dQ) for head dims up to 128 (the D64
+    and D128 envelopes); bias / dBias are SM80-only and declined.  cc 9.0
+    exactly: the kernel is built for the Hopper warpgroup MMA.  Trails the
+    backend (``heuristics.TRAIL_ONLY_ROWS``) until a measured holdout says
+    otherwise.
+    """
+    from cudnn.sdpa.native_sm80 import graph_mismatch
+
+    return EngineSpec(
+        name="sdpa_bwd_sm90",
+        capabilities=Capabilities(
+            zero_scale=True,
+            sm_lo=90,
+            sm_hi=90,
+            d=frozenset({128}),
+            d_envelope=True,  # the D64 / D128 envelopes; masked native loads
+            d_pad_multiple=8,
+            declaration_check=graph_mismatch,
+            independent_head_dims=True,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            deterministic=True,
+            dbias=False,
+            dsink=True,
+            bias=False,
+            right_band_widening=True,
+            seq_q_trim=False,
+            swa=True,
+            padded=True,
+            sink=True,
+            thd=True,
+            thd_declared_totals=True,
+            thd_head_stride=True,
+            thd_ragged_offsets=True,
+            decode=False,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            strided_stats=True,
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM90),
     )
 
 
@@ -2374,6 +2428,7 @@ ENGINE_SPECS = (
     _d512_mxfp8_spec(),
     _sm120_fp8_spec(),
     _sm120_mxfp8_spec(),
+    _sm90_spec(),
 )
 
 __all__ = [

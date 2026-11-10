@@ -1045,10 +1045,13 @@ def _sm80_bwd_sched_policy(*, is_causal: bool, deterministic: bool, thd: bool = 
     return _BWD_SCHED_LPT_L2 if (is_causal and not deterministic) else _BWD_SCHED_NATURAL
 
 
-def _load_sm80_bwd_module(params):
-    """Load one uniquely named backward kernel module per parameter set."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", _SM80_BWD_KERNEL_FILE)
-    return load_template(path, params, tag="sdpa_bwd_sm80")
+def _load_sm80_bwd_module(params, kernel_file: str = _SM80_BWD_KERNEL_FILE):
+    """Load one uniquely named backward kernel module per parameter set.
+
+    ``kernel_file`` selects a main kernel that keeps the SM80 template ABI
+    (``sm90/bprop_f16.py`` serves the SM90 row on the same chain)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", kernel_file)
+    return load_template(path, params, tag="sdpa_bwd_" + kernel_file.split("/")[0])
 
 
 class SdpaBwdDslSm80(SdpaBwdDsl):
@@ -1505,7 +1508,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 bool(self.s_q_max % self._params.tile_q or self.s_k_max % self._params.tile_kv),
                 "SM80 bprop: RoPE requires S_q/S_kv tile-aligned",
             )
-        self._kmod = _load_sm80_bwd_module(self._params)
+        self._kmod = _load_sm80_bwd_module(self._params, getattr(self, "_bwd_kernel_file", _SM80_BWD_KERNEL_FILE))
         d64 = _sm80_bwd_kernel_mod("d64") if self._use_d64 else None
         from .prepared_sm80 import build_spec
 
