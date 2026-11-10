@@ -152,6 +152,7 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
                 vp[tensors[name]] = buffers[name]
             if thd:
                 offsets[name] = (torch.arange(b + 1, device="cuda", dtype=torch.int64) * length * heads * dim).view(-1, 1, 1, 1)
+                buffers["off_" + name] = offsets[name]
                 off = g.tensor_like(offsets[name], name="off_" + name)
                 vp[off] = offsets[name]
                 if name != "o":
@@ -184,6 +185,7 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
             raw_lse = torch.full((b, sq, h), float("nan"), device="cuda")
             buffers["lse"] = raw_lse.transpose(1, 2)
             offsets["lse"] = (torch.arange(b + 1, device="cuda", dtype=torch.int64) * sq * h).view(-1, 1, 1, 1)
+            buffers["off_lse"] = offsets["lse"]
             off = g.tensor_like(offsets["lse"], name="off_lse")
             vp[off] = offsets["lse"]
             lse.set_ragged_offset(off)
@@ -223,6 +225,7 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
     torch.testing.assert_close(expected["lse"][0].cpu().double(), ref_lse, atol=0.0006, rtol=0)
     for order in ([1, 0, 0, 2], [1, 2] * 64 + [0]):
         buffers, launch = prepare(order)
+        replay_inputs = {name: buffers[name].clone() for name in ("q", "k", "v")} if thd else None
         launch()
         captured = torch.cuda.CUDAGraph()
         with torch.cuda.graph(captured):
@@ -233,17 +236,31 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
                 torch.cuda.set_sync_debug_mode("default")
         try:
             for scale in (0.5, -0.75):
-                buffers["k"][0].mul_(scale)
-                buffers["v"][0].add_(scale)
+                empty_neighbor = thd and scale > 0
                 if thd:
-                    buffers["ql"][0] = 0
-                    buffers["kl"][0] = 0
+                    # SM120 THD uses compact prefixes. When a neighbor becomes
+                    # empty, repack subsequent sequences; fixed physical gaps
+                    # are a separate contract this row does not implement.
+                    for name in ("q", "k", "v"):
+                        if empty_neighbor:
+                            buffers[name][:-1].copy_(replay_inputs[name][1:])
+                        else:
+                            buffers[name].copy_(replay_inputs[name])
+                    buffers["ql"][0] = 0 if empty_neighbor else sq
+                    buffers["kl"][0] = 0 if empty_neighbor else sk
+                    prefix = (torch.arange(len(order) + 1, device="cuda", dtype=torch.int64) - int(empty_neighbor)).clamp_min_(0)
+                    for name, span in (("q", sq * h * dq), ("k", sk * hk * dq), ("v", sk * hk * dv), ("o", sq * h * dv), ("lse", sq * h)):
+                        buffers["off_" + name].copy_((prefix * span).view(-1, 1, 1, 1))
+                if not empty_neighbor:
+                    buffers["k"][0].mul_(scale)
+                    buffers["v"][0].add_(scale)
                 buffers["o"].fill_(float("nan"))
                 buffers["lse"].fill_(float("nan"))
                 captured.replay()
                 for row, record in enumerate(order):
                     if record == 0:
-                        assert_bitwise(snapshot({name: buffers[name][row : row + 1] for name in expected}), expected, f"batch row {row}")
+                        physical_row = row - int(empty_neighbor)
+                        assert_bitwise(snapshot({name: buffers[name][physical_row : physical_row + 1] for name in expected}), expected, f"batch row {row}")
         finally:
             torch.cuda.synchronize()
             captured.reset()
