@@ -2795,7 +2795,7 @@ graphs retain typed declines. Dense support below remains unchanged.
 | Sliding window (left) | ✅ | ✅ | ✅ |
 | Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
 | Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ |
-| Base-2 stats (`stats_use_log2`) | ❔ | ❔ | — |
+| Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — |
 | Bias / dBias | ❌ | ❌ | ✅ / ✅ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
 | Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
@@ -2843,8 +2843,10 @@ rebinding, capture/replay, sink endpoints, physical page-offset products above
 Base-2 stats are wired into all four f16 templates (the decode tile included) and
 the FP8 and MXFP8 templates, including the final Split-KV combine. `sdpa_mxfp8` graphs take no
 `stats_use_log2` input, so only the direct adapter reaches the MXFP8 wiring.
-Target-SM120 numerical validation remains required; local SM80/SM100 results do
-not validate these kernels.
+Validated on SM120 (RTX 5090, cc 12.0) by `test_sdpa_stats_log2_sm120.py`: f16/bf16 on the
+general (D64/D128), D256 and D512 (D320 envelope and native D512) templates, `S_q == 1` and
+prefill, causal and not, unsplit and through the split combine; per-tensor FP8 at D64-D512,
+unsplit and split. MXFP8 stays unvalidated (no graph input), and no cc 12.1 device was run.
 
 **Split-KV with an attention sink (FP16/BF16).** The general, D=256, D=512 and
 decode half templates write sink-free partials under a split and the split combine
