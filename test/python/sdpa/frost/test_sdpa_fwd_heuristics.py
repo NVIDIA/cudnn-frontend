@@ -1698,8 +1698,8 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too). Partial
     groups (96/8) also run on native cga=2; shared cga=1 retains its divisibility rule. Dense d256 packs within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    admits both native prefill widths and unsplit packing, and dense PAGED queries -- not wired on
-    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    admits both native prefill widths and unsplit packing, and dense PAGED queries admit native cga=1 and cga=2
+    since #2375 (the native D128 loader reads dense Q over page pools)."""
     from dataclasses import replace
 
     from cudnn.sdpa.fwd.engines import effective_cgas
@@ -1727,7 +1727,7 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     assert engines.mismatch(caps, thd, pack) is None
     assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
     assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
-    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+    assert effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True)) == frozenset({1, 2})  # #2375
 
 
 @pytest.mark.L0
