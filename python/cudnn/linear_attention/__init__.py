@@ -80,6 +80,7 @@ def KdaEngines(ids):
     """The KDA family: frost, cuTile, the CAKE C16 training route, and the Hopper sm90 path."""
     return _collect(
         ids,
+        ("kda_cake_det", "cudnn.linear_attention.cake.kda_det_engine", "KdaCakeDetEngine"),
         ("kda_frost", "cudnn.linear_attention.frost.kda_engine", "KdaFrostEngine"),
         ("kda_cutile", "cudnn.linear_attention.cutile.kda_engine", "KdaCuTileEngine"),
         ("kda_summary_frost", "cudnn.linear_attention.frost.kda_engine", "KdaSummaryFrostEngine"),

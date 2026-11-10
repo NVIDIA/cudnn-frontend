@@ -201,3 +201,4 @@ Methods:
 - Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).
 
 - [Cake GDN training](cake_gdn.md): opt-in packed BF16 forward and backward.
+- [Cake chunk-64 KDA training](cake_kda.md): opt-in serial forward and backward.
