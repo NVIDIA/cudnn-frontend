@@ -142,7 +142,7 @@ graphs). The graph-level contract and the masked-row conventions of the other
 implementations are in `docs/operations/Attention.md`.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm90`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
 declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
 running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
@@ -335,7 +335,7 @@ Dense and THD execute through the shared prepared pointer binder; graph shape/st
 overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
 tensors or tensor-launch fallback.
-Forward only; optional Stats do not provide a backward implementation. Q/K/V/O
+The backward is a separate row (`sdpa_bwd_sm90`, below). Q/K/V/O
 all use FP16 or all BF16. The shared body has native **D128, D256 and D512**
 contraction/storage specializations. QK uses 8/16/32 k16 WGMMA steps and the
 PV warpgroups each own 64/128/256 columns, respectively. Smaller head pairs
@@ -543,6 +543,39 @@ TFLOPS against 55–57, 18.8–20.3 % SOL. Gemma4 full attention (b=1, 32/4 head
 causal), same lengths: 5.46 / 5.72 / 5.78 / 5.72x, 491–577 TFLOPS against
 90–100, 45.8–53.9 % SOL. The windowed shape's lower SOL is per-CTA fixed cost
 over its three KV tiles.
+
+### SM90 backward (`sdpa_bwd_sm90`)
+
+Engine: `sdpa_bwd_sm90`, manifest slot 18 of `frost_sdpa_bwd` (public ID 20618),
+cc 9.0 exactly, `opt_in=True` like the other new backward rows: it is offered
+only under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. Default enablement (for
+example as a `TRAIL_ONLY_ROWS` fallback behind the backend) is a separate
+decision. The adapter (`bwd/api_dsl_sm90.py`)
+subclasses the SM80 adapter: preprocess, dQ fp32 accumulator and cast, GQA
+partial reduction, dSink, the deterministic dQ relay, THD origins and the
+shared native binder (prepared spec `sdpa_bwd_sm80`) are the SM80 chain. Only
+the main kernel is new: `bwd/kernels/sm90/bprop_f16.py`, 64 x 64 tiles, two
+warpgroups, `cp.async` into SW128 slabs and WGMMA (Sᵀ / dPᵀ SS, dV / dK RS from
+the C fragments, dQ SS with an MN-major dSᵀ A operand).
+
+Served: FP16/BF16 with D_QK, D_V up to 128 (D64 and D128 envelopes, multiples
+of 8, independent), MHA/GQA/MQA, no mask, top-left and bottom-right causal,
+left windows and right bands, padding masks, sinks/dSink, zero scale,
+deterministic dQ, dense declared strides and THD (both Stats packings,
+ragged offsets). Declined with typed reasons: bias/dBias, RoPE, head dims
+above 128, tiles other than 64 x 64, and S_q = 1 (decode), as on SM80.
+
+Validated on GH200 (cuDNN 9.27, DSL 4.8.1): `test_sdpa_bwd_dsl_sm90.py`;
+the 512-config `test_mhas_v2.py::test_sdpa_random_bwd_L0` under the FROST opt-in
+(232 passed, 280 waived, 0 failed; `sdpa_bwd_sm90` served 104 of the graphs);
+a 64-case feature matrix against an fp64 reference and the SM80 chain (dK/dV
+bitwise equal to SM80, dQ within atomic-order rounding).
+
+**Measured** (GH200, bf16, graph API, median of 40): the row is a correctness
+fallback, not a performance claim. Against the backend it is 1.6-3.8x slower:
+97-153 TFLOPS vs 158-586 (D128 S=4096 non-causal 148 vs 545; D64 S=1024 causal
+97 vs 158). The kernel has no TMA, no producer warpgroup and no deeper Q/dO
+pipeline yet; those, and a measured placement, are the follow-ups.
 
 ---
 
