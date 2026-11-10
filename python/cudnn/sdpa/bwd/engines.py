@@ -1279,6 +1279,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
             name=name,
         )
 
+    amaxes = dict(amax_dQ=facts.amax_dq_t, amax_dK=facts.amax_dk_t, amax_dV=facts.amax_dv_t)
     fp8, half = facts.dtype, facts.dtype_o
     stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
     api = _mxfp8_adapter(api_type)(
@@ -1321,6 +1322,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         # The THD plan-time facts, shared with the half lowering (one derivation, one constructor contract; the SM100 MXFP8 row
         # declines THD at eligibility, the SM107 one serves it).
         **_thd_ctor_facts(facts, stats_geom),
+        **({"amax_requested": tuple(name for name, tensor in amaxes.items() if tensor is not None)} if spec.capabilities.amax_dgrad else {}),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -1349,6 +1351,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         sf_k_T=facts.sf_k_T_t,
         sf_dO=facts.sf_dO_t,
         sf_dO_T=facts.sf_dO_T_t,
+        **amaxes,
     )
 
     from types import SimpleNamespace
@@ -2343,6 +2346,7 @@ def _sm120_mxfp8_spec():
             declaration_check=_sm120_fp8_mismatch,
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             is_mxfp8=True,
+            amax_dgrad=True,
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             swa=True,

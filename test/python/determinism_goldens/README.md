@@ -1991,6 +1991,51 @@ python -m pytest -q -n0 sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py
 
 This change adds no forward kernel; existing forward coverage is unchanged.
 
+#### Optional MXFP8 gradient amax outputs — 2026-11-10
+
+`test_sdpa_bwd_mxfp8_sm120_amax.py` adds fourteen L0 cases: all eight
+subsets of amax_dQ/dK/dV, two standalone binding cases, and four D128/D512
+FP16/BF16 batch/replay goldens. Each requested scalar is the global maximum
+absolute FP32 gradient accumulator before conversion to the gradient dtype.
+The independent MXFP8 numerical reference passes before byte comparisons;
+the amax comparison bounds only the final FP16/BF16 rounding.
+
+The four records under runtime key `d2d1094fc872ddba` preserve all parent
+MXFP8 input and gradient hashes, adding the three FP32 maxima. Coverage
+includes B1/3/4/129, reorder/duplication, fresh pointers, NaN/Inf output
+poisoning, workspace poisoning and changed-dO capture replay. Global amax
+must compose as the maximum of singleton values; it is not a per-sequence
+output invariant to adding arbitrary neighbors. Standalone checks also
+require invalid optional bindings to leave outputs and workspace untouched,
+followed by successful execution on the same plan.
+
+Recorded on GB10 SM121, driver 580.126.20, Torch
+2.9.0a0+50eac811a6.nv25.09/cu130, cuDNN9.13, DSL4.8/compiler12.9 and
+tvm-ffi0.1.14.post1. SM120 hardware and cross-runtime bit identity remain
+unverified. This extension changes no forward kernel or existing golden.
+Fresh-process strict qualification passes all 148 cases: 14 in this extension,
+55 existing MXFP8 cases and 79 existing per-tensor FP8 cases, with no skips.
+All four new records retain the parent's input and gradient hashes. Host
+admission/specialization checks pass 95 cases; 12 native SM100 D128/D192/D512
+controls also pass with the shared prepared ABI. The amax-enabled D128 and
+D512 kernels cross-compile for SM120; this is not hardware qualification.
+Twelve representative cases pass each of memcheck, racecheck and synccheck,
+with zero device errors or race warnings. Compute Sanitizer 2026.3.0 instruments
+all kernels; API-query reporting is disabled for the recorded CUDA Python
+13.2/driver13.0 startup mismatch. The first standalone fixture incorrectly
+equated graph `left_bound=9` with `window_size_left=9`; it now uses eight
+positions to the left plus the diagonal. No kernel change or golden rerecording
+was needed for that fixture correction.
+
+From `test/python`, after verifying the isolated import path:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -q -n0 sdpa/frost/test_sdpa_bwd_mxfp8_sm120_amax.py
+```
+
 ### SM120-family D576/V512 forward — SM121 qualification, 2026-11-10
 
 `sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:

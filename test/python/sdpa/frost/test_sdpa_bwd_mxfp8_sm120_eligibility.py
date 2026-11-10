@@ -41,7 +41,6 @@ def test_graph_admission(monkeypatch, cc, dims, deterministic):
         dict(d=63),
         dict(d=64, dv=128),
         dict(with_sink=True),
-        dict(declare_amax=True),
         dict(use_causal_mask_bottom_right=True),
         dict(right_bound=3),
         dict(use_padding_mask=True, seq_len_dims=(1, 1, 1, 1)),
@@ -64,3 +63,8 @@ def test_arch_and_version_decline(monkeypatch, cc, version):
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", version)))
     assert mx._decline_reason() is not None
+
+
+@pytest.mark.parametrize("requested", [True, ("amax_dQ",), ("amax_dK",), ("amax_dV",)])
+def test_amax_outputs_admitted(requested):
+    assert mx._decline_reason(d=192, dv=128, declare_amax=requested) is None
