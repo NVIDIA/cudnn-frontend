@@ -84,13 +84,22 @@ def test_explicit_graph_geometry(d, dv, m, n, mode):
         (512, 512, {"tile_m": 64}, "tile_m"),
         (576, 512, {"tile_n": 64}, "tile_n"),
         (192, 128, {"cga": 2}, "cga"),
-        (192, 128, {"split_kv": 2}, "split"),
         (192, 128, {"pack_gqa": True}, "pack_gqa"),
     ],
 )
 def test_unsupported_geometry_declines(d, dv, kw, label):
     reason = engines.mismatch(_CAPS, _facts(d, dv), engines.SdpaFwdKnobs(**kw))
     assert reason is not None and label in reason
+
+
+@pytest.mark.parametrize("mode", ["dense", "paged", "thd"])
+def test_split_geometry_requires_dense_queries(mode):
+    knobs = engines.SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1, sched_policy=0, split_kv=2)
+    reason = engines.mismatch(_CAPS, _facts(mode=mode), knobs)
+    if mode == "thd":
+        assert reason is not None and "split" in reason
+    else:
+        assert reason is None
 
 
 @pytest.mark.parametrize("mode", ["dense", "thd", "paged"])
