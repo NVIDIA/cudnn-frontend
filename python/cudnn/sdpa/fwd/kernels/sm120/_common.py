@@ -16,6 +16,8 @@ from typing import Type
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import Pointer
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
+from cudnn.sdpa.fwd.kernels._mixed_kv import _packed_asm
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 
 from cutlass.experimental import primitives as prims
@@ -103,9 +105,8 @@ def sfo_atom_offset(plane, r, c, cols):
 
 
 @cute.jit
-def load_paged_half_tile(
-    s_dst: cutlass.Array,
-    mbar: cutlass.Array,
+def copy_paged_half_tile(
+    s_dst,
     pool: cute.Tensor,
     page_table,
     batch_idx: cutlass.Int32,
@@ -117,10 +118,15 @@ def load_paged_half_tile(
     head_tile: cutlass.Constexpr[int],
     chunk_elems: cutlass.Constexpr[int],
 ) -> None:
-    """One producer warp copies a paged half tile and publishes 32 arrivals."""
-    # Read the caller's table in the attention CTA. Each 16-byte copy
-    # lands directly in the existing MMA tile; dead rows never read a
-    # table entry or pool payload and cp.async zero-fills their SMEM.
+    """One producer warp fills a half MMA tile from half or FP8 page storage.
+
+    The caller owns publication: cp.async arrivals for half copies, ordinary
+    release arrivals for the FP8 widening stores. Dead rows/columns read no
+    table or payload. Eight-element chunks fit the half SMEM swizzle.
+    """
+    # Read the caller's table in the attention CTA. Each half vector lands
+    # directly in the existing MMA tile; dead rows never read a table entry
+    # or pool payload. Copies and widening both zero-fill those SMEM rows.
     src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
     lane = cute.arch.lane_idx()
     vectors_per_row = head_tile // 8
@@ -141,12 +147,36 @@ def load_paged_half_tile(
             offset += cutlass.Int64(head_idx) * cutlass.Int64(pool.stride[2]) + cutlass.Int64(col)
         physical_row = (col // chunk_elems) * kv_tile + row
         physical_col = swizzle_xor(physical_row, col % chunk_elems, chunk_elems, 2)
-        dst = s_dst.subview(physical_row * chunk_elems + physical_col)
-        prims.cp_async_shared_global(dst, src + offset, 16, prims.LoadCacheModifier.CG, cp_size=live * 16)
-    # Drain this lane's copy group before publishing the tile.
-    prims.cp_async_commit_group()
-    prims.cp_async_wait_group(0)
-    # Each lane contributes one async-tracked arrival after its copies
-    # complete. The init count already includes all 32 lanes (.noinc).
-    # Ordinary mbarrier arrivals do not publish prior cp.async writes.
-    prims.cp_async_mbarrier_arrive(mbar, noinc=True)
+        dst = s_dst + physical_row * chunk_elems + physical_col
+        if cutlass.const_expr(pool.element_type in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+            inline_ptx(_packed_asm(pool.element_type, s_dst.dtype, global_src=True), read_only_args=[src + offset, dst, live])
+        else:
+            prims.cp_async_shared_global(dst, src + offset, 16, prims.LoadCacheModifier.CG, cp_size=live * 16)
+
+
+@cute.jit
+def load_paged_half_tile(
+    s_dst: cutlass.Array,
+    mbar: cutlass.Array,
+    pool: cute.Tensor,
+    page_table,
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    seq_coord: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    page_size: cutlass.Constexpr[int],
+    kv_tile: cutlass.Constexpr[int],
+    head_tile: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
+) -> None:
+    """Fill one paged half tile, then publish all 32 producer arrivals."""
+    copy_paged_half_tile(s_dst.data_ptr(), pool, page_table, batch_idx, head_idx, seq_coord, seqlen_k, page_size, kv_tile, head_tile, chunk_elems)
+    if cutlass.const_expr(pool.element_type in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+        # Ordinary release arrivals publish the generic widening stores.
+        prims.mbarrier_arrive(mbar)
+    else:
+        prims.cp_async_commit_group()
+        prims.cp_async_wait_group(0)
+        # Async-tracked arrivals publish cp.async writes; .noinc accounts
+        # for the 32 lanes already counted by barrier initialization/rearm.
+        prims.cp_async_mbarrier_arrive(mbar, noinc=True)

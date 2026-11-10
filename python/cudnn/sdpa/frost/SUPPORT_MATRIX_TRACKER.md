@@ -2783,7 +2783,7 @@ graphs retain typed declines. Dense support below remains unchanged.
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, exact D128 MHA; restrictions above) |
-| Paged KV (dense Q; prefill through D128, decode through D256, D512 envelope) | ✅ FP16/BF16; tile/split limits below | ❌ | ❌ |
+| Paged KV (dense Q; prefill through D128, decode through D256, D512 envelope) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |
 | **Masks / features** | | | |
@@ -2823,7 +2823,12 @@ with optional split and PackGQA. Q retains its TMA staging; one producer warp
 loads paged K/V into the shared tile and publishes32 copy-tracked arrivals
 per operand, including after persistent-unit barrier reinitialization.
 Paged general prefill above128, asymmetric widths straddling256, widths
-above512, THD Q and quantization remain declined. Existing mask,
+above512 and THD Q remain declined. FP16/BF16 Q/O may also use matching
+E4M3 or E5M2 K/V page storage over the same head envelopes. The producer
+widens eight cache values directly into each half shared vector and publishes
+generic stores with release arrivals. This plain `sdpa` cache contract has no
+scalar descales, block scales or separate conversion launch. Mixed dense K/V
+and FP8 Q paging remain declined. Existing mask,
 sink, packing and Stats semantics compose without a heuristic change. Paged
 sink endpoints retain O=0 / Stats=+inf for a +inf sink, and O=0 / Stats=-inf
 for a keyless row with a -inf sink.

@@ -74,7 +74,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3, DTYPE_E5M2
 from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
@@ -126,6 +126,7 @@ validate_params(PARAMS, allow_paged=True, allow_paged_split=True)
 _host = _paged_host if PARAMS.page_size else _dense_host
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+KV_STORAGE_DTYPE = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_E5M2: cutlass.Float8E5M2}.get(PARAMS.dtype_kv, STORAGE_DTYPE)
 
 # THD only: pull units from a device-side counter over a machine-sized grid
 # instead of launching the plan-time envelope as a padded rectangle. The
@@ -1779,7 +1780,7 @@ class SM120FusedMultiHeadAttentionForward:
         # The epilogue stages O through sAux (in two rounds) while the K/V
         # storage may already be receiving the next unit's Q tile.
         sKV = cutlass.Array(
-            k.dtype,
+            self.in_dtype,
             self.k_tile_elems + self.v_tile_elems,
             space=cutlass.AddressSpace.smem,
             alignment=128,
@@ -2263,4 +2264,6 @@ def compile(  # noqa: A001
         qh_per_kh=qh // kh,
         page_size=PARAMS.page_size,
     )
-    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)
+    return _compile_prepared_host(
+        kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0, kv_dtype=KV_STORAGE_DTYPE
+    )

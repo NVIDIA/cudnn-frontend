@@ -1832,3 +1832,51 @@ A broader ten-case run then passed numerically while reporting 80 grouped
 score-exchange races. An explicit warp-pair read-completion barrier fixes the
 single-buffer reuse: its failing split/packed control and the full ten-case
 racecheck now report zero errors. The dense TMA path retains its prior handoff.
+
+### SM120 half Q/O with paged FP8 K/V — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mixed_fp8_determinism`
+adds eight L0 forward goldens on RTX5080 (84 SMs): D64 prefill and D128/D256
+paged decode plus D512, each with FP16/E4M3 and BF16/E5M2 Q/KV types. Packing
+is fixed; split is one for D64 and three for the other shapes. Raw quantized
+cache payloads stay fixed across fresh buffers, eager/captured replay,
+reordered/duplicated batches up to B129, empty neighbors and changed neighbor
+contents. Independent FP64 O/Stats references and input/output canaries are
+checked before byte comparisons. This is plain `sdpa` cache storage, with no
+scalar descales or quantized Q/O contract.
+
+Torch2.14.1+cu130, cuDNN9.30.0.2, CuTeDSL4.8.0 (CUDA12.9 compiler),
+CUDA driver13.5 and tvm-ffi0.1.14.post1 use runtime key `1858cfcbf6876f83`.
+Eight records were appended from a new directory after successful recording;
+the separate strict run passes all eight (331 deselected, no failures/skips).
+No old golden was regenerated. The 27 feature/conversion/candidate checks
+also pass: both half types and both FP8 formats, independent HND/NHD pools,
+head envelopes, masked dead page/head tails, pointer/length rebinding, packed
+splits, persistent reuse, normal graph candidates and all 256 FP8 encodings.
+Finite conversion results, including signed zeros, match their references
+byte-for-byte. Direct packed FP8-to-BF16 conversion failed with the CUDA12.9
+compiler; the global loader now widens through FP16 exactly, then converts to
+BF16. Existing shared-memory FP8 conversion code generation is preserved.
+
+Compute Sanitizer13.4 runs ten E5M2 FP16/BF16 feature cases each under
+memcheck, racecheck and synccheck: all pass with zero errors (racecheck zero
+warnings). Memcheck is unfiltered; racecheck/synccheck select native
+`cudnn_kernel_` kernels. Full host graph analyzer:628 passed. Earlier failures
+were retained: one incorrect test page-size argument; one BF16 assembly
+failure after a FP16 pass; three longer-Q cases blocked because the explicit
+plan helper first required a heuristics proposal. The helper now reaches the
+explicit plan directly; three separate ordinary-candidate cases remain active.
+
+From `test/python`, run `python -m pytest -n0 -m L0 -q
+sdpa/frost/test_sdpa_fwd_paged_sm120.py -k mixed` with
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`; leave recording unset. The sanitizer
+selection is `-k "mixed_fp8 and not determinism and kv_dtype1"`.
+SM121, other runtimes and backward remain unverified; mixed dense KV and
+THD queries remain unsupported on this new SM120 path. Cross-split or
+cross-packing byte identity is not claimed.
+
+Final shared-loader regression:36 passed,303 deselected, no failures/skips in
+168.73s, including24 strict goldens (16 existing half plus8 mixed), native half
+rebinding/replay and decode ring reuse. The old half baselines are unchanged.
+The owned SM120 allocation completed normally after these checks.

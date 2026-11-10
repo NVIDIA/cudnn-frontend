@@ -306,8 +306,10 @@ class TemplateParams:
     # attn_scale < 0: the kernel negates Q as it loads it and runs at |attn_scale|, so the raw-score row max still
     # bounds P (#1435). APPEND-ONLY, default False.
     negate_scores: bool = False
-    # Native exact-D128 dense-query page loads; zero retains the dense ABI.
+    # Native dense-query page loads; zero retains the dense ABI.
     page_size: int = 0
+    # Independent FP8 cache storage, widened by native paged half loaders.
+    dtype_kv: int = -1
 
 
 def validate_params(
@@ -332,6 +334,12 @@ def validate_params(
     ``DECODE_Q_TILES`` at its stage-width KV tile; every other template is
     built for the ``SEQ_Q_TILES``.
     """
+
+    if params.dtype_kv != -1:
+        if params.dtype_kv not in (DTYPE_E4M3, DTYPE_E5M2):
+            raise ValueError("SM120 mixed KV requires E4M3 or E5M2 cache storage")
+        if not params.page_size or params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+            raise NotImplementedError("SM120 mixed FP8 KV requires paged storage with FP16/BF16 Q/O")
 
     if params.page_size:
         if not allow_paged:

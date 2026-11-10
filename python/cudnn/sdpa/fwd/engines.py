@@ -555,7 +555,8 @@ class Capabilities:
     # Native flavors with dense Q only. Unlike thd_d_shapes, this preserves
     # the THD envelope of every other flavor on the row. Append-only.
     thd_excluded_d_shapes: frozenset[tuple[int, int]] = frozenset()
-    # Exact native shapes with half Q/O and independent FP8 K/V storage.
+    # Native shapes with half Q/O and independent FP8 K/V storage. SM120
+    # paged loads also use the row's existing eight-aligned head envelopes.
     # This is plain sdpa: no FP8-Q quantization or scalar-descale contract.
     mixed_fp8_kv_d_shapes: frozenset[tuple[int, int]] = frozenset()
     # Pure declaration constraints, shared with the standalone adapter.
@@ -622,7 +623,14 @@ def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> boo
         and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
         and facts.kv_dtype in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
         and facts.uniform_qo_dtype
-        and (facts.d_qk, facts.d_v) in capabilities.mixed_fp8_kv_d_shapes
+        and (
+            (facts.d_qk, facts.d_v) in capabilities.mixed_fp8_kv_d_shapes
+            or (
+                capabilities.sm_lo == 120
+                and _selected_d_shape(capabilities, facts) in capabilities.mixed_fp8_kv_d_shapes
+                and _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True)
+            )
+        )
     )
 
 
@@ -2210,10 +2218,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if not facts.uniform_dtype and not _mixed_fp8_kv(capabilities, facts):
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if _mixed_fp8_kv(capabilities, facts):
-        if (facts.d_qk, facts.d_v) == (512, 512) and (facts.thd or facts.has_epilogue_gate or (knobs is not None and knobs.cga not in (None, 2))):
+        if capabilities.sm_lo == 120 and (not facts.has_paged_kv or facts.thd):
+            return "SM120 mixed FP8 KV requires paged storage with dense Q"
+        if (
+            capabilities.sm_lo in (100, 107)
+            and (facts.d_qk, facts.d_v) == (512, 512)
+            and (facts.thd or facts.has_epilogue_gate or (knobs is not None and knobs.cga not in (None, 2)))
+        ):
             return "native mixed D512 requires dense Q, two CTAs and no gate"
-        if (facts.d_qk, facts.d_v) == (256, 256) and (
-            facts.thd or facts.has_epilogue_gate or (knobs is not None and (knobs.cga not in (None, 2) or knobs.pack_gqa))
+        if (
+            capabilities.sm_lo in (100, 107)
+            and (facts.d_qk, facts.d_v) == (256, 256)
+            and (facts.thd or facts.has_epilogue_gate or (knobs is not None and (knobs.cga not in (None, 2) or knobs.pack_gqa)))
         ):
             return "native mixed D256 requires dense Q, two CTAs, no gate and no packing"
         if facts.device_cc == (10, 7) and (facts.d_qk, facts.d_v) == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1:
@@ -3513,6 +3529,7 @@ def _sm120_spec() -> EngineSpec:
             right_band_widening=True,
             paged_kv=True,
             paged_d_shapes=_SM120_PAGED_D_SHAPES,
+            mixed_fp8_kv_d_shapes=_SM120_PAGED_D_SHAPES,
             padded=True,
             sink=True,
             stats=True,

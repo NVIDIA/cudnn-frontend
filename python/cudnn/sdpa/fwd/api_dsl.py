@@ -6064,6 +6064,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        self._mixed_fp8_kv = not self._fp8 and self.k_desc.dtype in _SM100_FP8_DTYPES
+        if self._mixed_fp8_kv:
+            import cudnn
+
+            self._not_implemented_error_if(not self.paged or self.thd, "SM120 mixed FP8 KV requires paged storage with dense Q")
+            self._not_implemented_error_if(
+                not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_mixed_fp8_kv", False),
+                "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension",
+            )
         # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
         # Block-scaled O (sf_o): FP8 inputs, d_v = 128, dense/unsplit/unpacked; the
@@ -6141,9 +6150,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             else:
                 self._check_dtype(
                     desc,
-                    self.dtype,
+                    self.k_desc.dtype if self._mixed_fp8_kv and desc is not self.o_desc else self.dtype,
                     name=desc.name,
-                    extra_error_msg=f"{desc.name} must match Q",
+                    extra_error_msg=f"{desc.name} must match the compiled Q/O or K/V storage dtype",
                 )
             self._value_error_if(
                 desc.device != self.q_desc.device,
@@ -6357,6 +6366,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             split_kv=self.split_kv,
             negate_scores=self._score_negated,
             page_size=self.paged_page_size,
+            dtype_kv=_SM120_DTYPE_QKV_CODE[self.k_desc.dtype] if self._mixed_fp8_kv else -1,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
