@@ -60,6 +60,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         allow_empty_block_nums: bool = False,
         nonpositive_scale: bool = False,
         has_tile_order: bool = False,
+        row_aware_boxes: Optional[bool] = None,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -99,6 +100,13 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         # start first and the grid's tail is short rows. Off, the kernel keeps the identity order and its code.
         assert not has_tile_order or num_splits == 1, "tile_order is only for the non-split kernel"
         self.has_tile_order = has_tile_order
+        # Row-count-aware K/V boxes (P4; non-split kernel with block sizes): a KV block with v valid rows is loaded with a
+        # 16 * ceil(v / 16)-row TMA box per swizzle plane instead of all 64 rows, which cuts the L2->SMEM fill bytes the
+        # forward is bound by. MMA shapes, the mask and the split kernel are unchanged; off, the kernel keeps its code.
+        if row_aware_boxes is None:
+            row_aware_boxes = has_block_sizes and num_splits == 1
+        assert not row_aware_boxes or (has_block_sizes and num_splits == 1), "row_aware_boxes needs block sizes and the non-split kernel"
+        self.row_aware_boxes = row_aware_boxes
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -120,6 +128,12 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_O: cute.CopyAtom,
+        tma_atom_K16: Optional[cute.CopyAtom],
+        tma_atom_K32: Optional[cute.CopyAtom],
+        tma_atom_K48: Optional[cute.CopyAtom],
+        tma_atom_V16: Optional[cute.CopyAtom],
+        tma_atom_V32: Optional[cute.CopyAtom],
+        tma_atom_V48: Optional[cute.CopyAtom],
         blocksparse_indices_q2k: cute.Tensor,
         blocksparse_num_blocks_q2k: cute.Tensor,
         blocksparse_varblk: cute.Tensor,
@@ -158,6 +172,9 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
 
             if cutlass.const_expr(self.use_tma_o):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_O)
+            if cutlass.const_expr(self.row_aware_boxes):
+                for atom in (tma_atom_K16, tma_atom_K32, tma_atom_K48, tma_atom_V16, tma_atom_V32, tma_atom_V48):
+                    cute.nvgpu.cpasync.prefetch_descriptor(atom)
 
         op = pipeline.PipelineOp.TmaLoad
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -270,6 +287,12 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 sum_m=sum_m,
                 scale_softmax_log2e=scale_softmax_log2e,
                 score_scale=score_scale,
+                tma_atoms_K_part=(tma_atom_K16, tma_atom_K32, tma_atom_K48),
+                tma_atoms_V_part=(tma_atom_V16, tma_atom_V32, tma_atom_V48),
+                mK_slice=mK_slice,
+                mV_slice=mV_slice,
+                sK=sK,
+                sV=sV,
             )
         else:
             # Empty row: Q was still loaded. Let it land before its SMEM is reused for O staging or the
@@ -352,19 +375,49 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         sum_m: cute.Tensor,
         scale_softmax_log2e: cutlass.Float32,
         score_scale: cutlass.Float32,
+        tma_atoms_K_part=None,
+        tma_atoms_V_part=None,
+        mK_slice: Optional[cute.Tensor] = None,
+        mV_slice: Optional[cute.Tensor] = None,
+        sK: Optional[cute.Tensor] = None,
+        sV: Optional[cute.Tensor] = None,
     ):
-        """QK[j] and PV[j-1] in flight together; wait_group(1) retires QK[j] before softmax[j]."""
+        """QK[j] and PV[j-1] in flight together; wait_group(1) retires QK[j] before softmax[j].
+
+        Row-aware boxes (self.row_aware_boxes): K[j+1] and V[j] are loaded with 16 * ceil(valid / 16) rows, so the issue
+        path needs the next block's size ahead of time: the list index is fetched two steps ahead (idx[j+2] at the top of
+        step j) and the block sizes two steps ahead as well (bsz[j+2] = gBSZ[idx[j+2]] after the K issue of step j, once
+        that index has landed; bsz[j+1] is consumed by the K[j+1] issue of step j and by the V[j+1] issue and mask of step j+1).
+        Warp 0 issues V[j] at the top of the step (as without row-aware boxes) and warp 1 issues K[j+1] after wait_group(1),
+        so the two issues (each a box selection plus one two-plane copy) overlap on different warps instead of both
+        lengthening warp 0's path. The prologue's K[0]/V[0] and step 1's V[1] (slot 1's first fill) are full 64-row loads,
+        so every row of K and of both V slots always holds finite data from an earlier block of this CTA, and a shorter
+        load only shrinks the written row range (see load_kv_block).
+        """
         # Every PV accumulates into O (zero-initialized): set once, so no MMA atom is loop-carried.
         tiled_mma_pv.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
         # The list base address is loop-invariant, but ptxas rematerializes it every iteration (4 LDC.64 +
         # CTAID reads + an IMAD chain). Routed through a warp shuffle it stays in registers (seen in SASS, not guaranteed).
         gIdx = hoist_list_base(gIndices)
+        if cutlass.const_expr(self.row_aware_boxes):
+            # The block-size base address is loop-invariant as well; the size load after the K issue below would otherwise
+            # rebuild it from the CTA id every step (9 instructions in every warp).
+            gBsz = hoist_list_base(gBSZ)
         # ---- prologue: QK[0] and softmax[0]; O is still zero, so it needs no rescale ----
         n_tile_idx = n_tile_idx_
         n_tile_idx_next = -1
         if num_n_tiles > 1:
             n_tile_idx_next = gIndices[num_n_tiles - 2]
         varblk = self.block_len(n_tile_idx, gBSZ, seqlen, num_compute_tiles)
+        if cutlass.const_expr(self.row_aware_boxes):
+            # idx[1], idx[2] and bsz[1], bsz[2]: all issued before the K[0] wait, so they land under the first TMA latency.
+            # The prefetched index is always read from a valid slot (clamped at 0) and never merged with a "no block"
+            # marker: the step counter says whether a block exists, and an unused value costs one unused load, while a
+            # -1/loaded select made ptxas materialize the index as a uniform register right after its load (a
+            # long-scoreboard stall at the top of every step).
+            n_tile_idx_next2 = gIndices[self.clamp_slot(num_n_tiles - 3)]
+            varblk_next = self.block_len(self.clamp_slot(n_tile_idx_next), gBsz, seqlen, num_compute_tiles)
+            varblk_next2 = self.block_len(n_tile_idx_next2, gBsz, seqlen, num_compute_tiles)
 
         K_barrier[0].wait(index=0, phase=0)
         cute.nvgpu.warpgroup.fence()
@@ -372,9 +425,13 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         cute.nvgpu.warpgroup.commit_group()
         cute.nvgpu.warpgroup.wait_group(0)
 
-        if warp_idx == 0 and n_tile_idx_next >= 0:
-            K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
-            cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+        if cutlass.const_expr(self.row_aware_boxes):
+            if warp_idx == 1 and n_tile_idx_next >= 0:
+                self.load_kv_block(varblk_next, n_tile_idx_next, tma_atoms_K_part, tma_atom_K, tKgK, tKsK, mK_slice, sK.iterator, K_barrier[0], 0, True)
+        else:
+            if warp_idx == 0 and n_tile_idx_next >= 0:
+                K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
+                cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
 
         self.prescale(tSrS, score_scale)
         # Full KV tiles need no mask; the CTA-uniform branch skips per-element selects.
@@ -393,15 +450,30 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         for n_tile_ind in cutlass.range(num_n_tiles - 2, -1, -1):
             step = num_n_tiles - 1 - n_tile_ind
             n_tile_idx = n_tile_idx_next
-            n_tile_idx_next = -1
-            if n_tile_ind > 0:
-                n_tile_idx_next = gIdx[n_tile_ind - 1]
-            varblk = self.block_len(n_tile_idx, gBSZ, seqlen, num_compute_tiles)
+            if cutlass.const_expr(self.row_aware_boxes):
+                # bsz[j] and bsz[j+1] are in registers (loaded two and one steps ago); only idx[j+2] is fetched here.
+                varblk = varblk_next
+                varblk_next = varblk_next2
+                n_tile_idx_next = n_tile_idx_next2
+                n_tile_idx_next2 = gIdx[self.clamp_slot(n_tile_ind - 2)]
+            else:
+                n_tile_idx_next = -1
+                if n_tile_ind > 0:
+                    n_tile_idx_next = gIdx[n_tile_ind - 1]
+                varblk = self.block_len(n_tile_idx, gBSZ, seqlen, num_compute_tiles)
 
             v_slot = step % 2  # V ring: V[j] fills slot j%2, whose barrier phase is (j//2)%2
             if warp_idx == 0:
-                V_barrier[0].arrive_and_expect_tx(index=v_slot, tx_count=self.tma_copy_bytes["V"])
-                cute.copy(tma_atom_V, tVgV[None, n_tile_idx], tVsV[None, v_slot], tma_bar_ptr=V_barrier[0].get_barrier(v_slot))
+                if cutlass.const_expr(self.row_aware_boxes):
+                    # Step 1 is slot 1's first fill: load all 64 rows so its stale rows are finite from then on.
+                    v_valid = varblk if step > 1 else cutlass.Int32(self.tile_size)
+                    v_base = sV.iterator + v_slot * (self.tile_shape_pv[1] * self.tile_shape_pv[2])
+                    self.load_kv_block(
+                        v_valid, n_tile_idx, tma_atoms_V_part, tma_atom_V, tVgV, tVsV[None, v_slot], mV_slice, v_base, V_barrier[0], v_slot, False
+                    )
+                else:
+                    V_barrier[0].arrive_and_expect_tx(index=v_slot, tx_count=self.tma_copy_bytes["V"])
+                    cute.copy(tma_atom_V, tVgV[None, n_tile_idx], tVsV[None, v_slot], tma_bar_ptr=V_barrier[0].get_barrier(v_slot))
 
             K_barrier[0].wait(index=0, phase=step % 2)  # one K slot: its phase flips every step
             cute.nvgpu.warpgroup.fence()
@@ -415,9 +487,21 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(1)  # QK[j] retired, PV[j-1] may still run
 
-            if warp_idx == 0 and n_tile_idx_next >= 0:
-                K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
-                cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+            if cutlass.const_expr(self.row_aware_boxes):
+                # Warp 1 issues K[j+1] (the barrier's arrival count is 1, any warp may arrive): warp 0 carries the V issue
+                # at the top of the step, so the two issues overlap on different warps and the step time stays the slowest
+                # warp's softmax chain plus ONE issue.
+                if warp_idx == 1 and n_tile_ind > 0:
+                    self.load_kv_block(varblk_next, n_tile_idx_next, tma_atoms_K_part, tma_atom_K, tKgK, tKsK, mK_slice, sK.iterator, K_barrier[0], 0, True)
+            else:
+                if warp_idx == 0 and n_tile_idx_next >= 0:
+                    K_barrier[0].arrive_and_expect_tx(index=0, tx_count=self.tma_copy_bytes["K"])
+                    cute.copy(tma_atom_K, tKgK[None, n_tile_idx_next], tKsK, tma_bar_ptr=K_barrier[0].get_barrier(0))
+
+            if cutlass.const_expr(self.row_aware_boxes):
+                # bsz[j+2]: idx[j+2] (fetched at the top of this step) has landed by now; the K[j+2] issue of step j+1
+                # consumes it, so the load has the softmax below to complete.
+                varblk_next2 = self.block_len(n_tile_idx_next2, gBsz, seqlen, num_compute_tiles)
 
             self.prescale(tSrS, score_scale)
             if varblk < self.tile_size:
@@ -454,6 +538,74 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             if n_tile_idx == num_compute_tiles - 1:
                 varblk = seqlen - n_tile_idx * self.tile_size
         return varblk
+
+    @cute.jit
+    def clamp_slot(self, slot):
+        """A list slot (or block index) prefetched past the start of the list reads entry 0 instead; its value is never used."""
+        return slot if slot >= 0 else cutlass.Int32(0)
+
+    @cute.jit
+    def load_kv_block(
+        self,
+        valid: cutlass.Int32,
+        n_tile_idx: cutlass.Int32,
+        atoms_part,
+        atom_full: cute.CopyAtom,
+        tg_full: cute.Tensor,
+        ts_full: cute.Tensor,
+        g2d: cute.Tensor,
+        s_base: cute.Pointer,
+        barrier,
+        index,
+        k_major: cutlass.Constexpr[bool],
+    ):
+        """Issue the K (k_major) or V TMA load of KV block n_tile_idx with 16 * ceil(valid / 16) rows (one warp calls this).
+
+        A count outside 1..48 takes the unchanged full-tile atom and its pre-partitioned tensors; otherwise atoms_part
+        (16/32/48 rows) load the same tile layout cut at `rows` rows: one box per swizzle plane (cols = 128 B of elements),
+        plane p of K holding the columns [p * cols, (p + 1) * cols) and plane p of V the value dims [p * cols, (p + 1) * cols)
+        at p * 64 * cols elements of the tile (the tile_to_shape order of the smem layouts); expect_tx is the loaded bytes.
+        Rows >= 16 * ceil(valid / 16) of the buffer keep what an earlier load of this CTA left there (finite gmem data:
+        the first load into every buffer is a full one). This is exact: a column of S depends only on its own K row and
+        every column >= valid is set to -inf by the mask, so P is exactly 0 there, and 0 x finite V rows adds exactly 0
+        to O; the row max and row sum see the same -inf / 0 as with a full load.
+        """
+        rows16 = cute.arch.make_warp_uniform((valid + 15) >> 4)
+        dim = self.tile_shape_qk[2] if cutlass.const_expr(k_major) else self.tile_shape_pv[1]
+        row_bytes = dim * ((self.K_dtype if cutlass.const_expr(k_major) else self.V_dtype).width // 8)
+        if rows16 >= 4 or rows16 <= 0:
+            barrier.arrive_and_expect_tx(index=index, tx_count=self.tile_size * row_bytes)
+            cute.copy(atom_full, tg_full[None, n_tile_idx], ts_full, tma_bar_ptr=barrier.get_barrier(index))
+        else:
+            barrier.arrive_and_expect_tx(index=index, tx_count=rows16 * (16 * row_bytes))
+            if rows16 == 3:
+                self.issue_rows(atoms_part[2], 48, n_tile_idx, g2d, s_base, barrier.get_barrier(index), k_major)
+            elif rows16 == 2:
+                self.issue_rows(atoms_part[1], 32, n_tile_idx, g2d, s_base, barrier.get_barrier(index), k_major)
+            else:
+                self.issue_rows(atoms_part[0], 16, n_tile_idx, g2d, s_base, barrier.get_barrier(index), k_major)
+
+    @cute.jit
+    def issue_rows(self, atom, rows: cutlass.Constexpr[int], n_tile_idx, g2d: cute.Tensor, s_base: cute.Pointer, bar_ptr, k_major: cutlass.Constexpr[bool]):
+        """One copy (one box per swizzle plane) of the first `rows` rows of KV block n_tile_idx into the K (k_major) or V tile at s_base."""
+        if cutlass.const_expr(k_major):
+            dest = cute.make_tensor(s_base, self.kv_rows_layout_k(rows))
+            tile = cute.local_tile(cute.domain_offset((n_tile_idx * self.tile_size, 0), g2d), (rows, self.tile_shape_qk[2]), (0, 0))
+        else:
+            dest = cute.make_tensor(s_base, self.kv_rows_layout_v(rows))
+            tile = cute.local_tile(cute.domain_offset((0, n_tile_idx * self.tile_size), g2d), (self.tile_shape_pv[1], rows), (0, 0))
+        dst, src = cute.nvgpu.cpasync.tma_partition(atom, 0, cute.make_layout(1), cute.group_modes(dest, 0, 2), cute.group_modes(tile, 0, 2))
+        cute.copy(atom, src, dst, tma_bar_ptr=bar_ptr)
+
+    def kv_rows_layout_k(self, rows: int):
+        """The K tile layout (tile_to_shape of the swizzle atom: rows at stride cols, planes at stride 64 * cols) cut at `rows` rows."""
+        cols, planes = self.kv_plane_cols_k, self.tile_shape_qk[2] // self.kv_plane_cols_k
+        return cute.make_layout((rows, (cols, planes)), stride=(cols, (1, self.tile_size * cols)))
+
+    def kv_rows_layout_v(self, rows: int):
+        """The V slot layout (value dims at stride 1 within a plane, planes at stride 64 * cols, rows at stride cols) cut at `rows` rows."""
+        cols, planes = self.kv_plane_cols_v, self.tile_shape_pv[1] // self.kv_plane_cols_v
+        return cute.make_layout(((cols, planes), rows), stride=((1, self.tile_size * cols), cols))
 
     @cute.kernel
     def kernel_split(
@@ -789,6 +941,21 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
             (self.tile_shape_pv[1], self.tile_shape_pv[2]),
             num_multicast=1,
         )
+        # Row-aware boxes (P4): atoms that load the first 16/32/48 rows of a KV block into the same tile layouts (one box
+        # per swizzle plane, as the atoms above and as the KPage forward's 16-row pages); the 64-row load keeps the atoms above.
+        tma_atoms_K_part = (None, None, None)
+        tma_atoms_V_part = (None, None, None)
+        if cutlass.const_expr(self.row_aware_boxes):
+            self.kv_plane_cols_k = swizzle_plane_cols(hopper_helpers.get_smem_layout_atom(K_layout, self.K_dtype, self.tile_shape_qk[2]), self.K_dtype)
+            self.kv_plane_cols_v = swizzle_plane_cols(hopper_helpers.get_smem_layout_atom(V_layout, self.V_dtype, self.tile_shape_pv[1]), self.V_dtype)
+            atoms_k, atoms_v = [], []
+            for rows in (16, 32, 48):
+                k_box = cute.make_composed_layout(self.K_smem_layout.inner, 0, self.kv_rows_layout_k(rows))
+                atoms_k.append(cute.nvgpu.cpasync.make_tiled_tma_atom(tma_copy_op, mK, k_box, (rows, self.tile_shape_qk[2]), num_multicast=1)[0])
+                v_box = cute.make_composed_layout(self.V_smem_layout.inner, 0, self.kv_rows_layout_v(rows))
+                atoms_v.append(cute.nvgpu.cpasync.make_tiled_tma_atom(tma_copy_op, mV, v_box, (self.tile_shape_pv[1], rows), num_multicast=1)[0])
+            tma_atoms_K_part = tuple(atoms_k)
+            tma_atoms_V_part = tuple(atoms_v)
 
         tma_copy_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_O, tma_tensor_O = (
@@ -819,6 +986,8 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 tma_atom_K,
                 tma_atom_V,
                 tma_atom_O,
+                *tma_atoms_K_part,
+                *tma_atoms_V_part,
                 blocksparse_indices_q2k,
                 blocksparse_num_blocks_q2k,
                 blocksparse_varblk,
@@ -869,6 +1038,14 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
 # =============================================================================
 # Local CuTe helpers
 # =============================================================================
+
+
+def swizzle_plane_cols(atom_kind, dtype) -> int:
+    """Elements per swizzle plane (128/64/32 B) of a wgmma smem layout atom: the inner extent of its TMA box."""
+    kind = cute.nvgpu.warpgroup.SmemLayoutAtomKind
+    bits = {kind.K_SW128: 1024, kind.MN_SW128: 1024, kind.K_SW64: 512, kind.MN_SW64: 512, kind.K_SW32: 256, kind.MN_SW32: 256}
+    assert atom_kind in bits, f"row-aware boxes need a swizzled smem layout atom, got {atom_kind}"
+    return bits[atom_kind] // dtype.width
 
 
 def convert_c_layout_to_a_layout(c, a):
