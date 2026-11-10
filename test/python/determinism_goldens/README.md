@@ -1108,3 +1108,60 @@ python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py 
 ```
 
 The CUDA 12 compiler flavor was unavailable and remains unverified.
+
+
+### 2026-11-09: native SM107 per-tensor FP8 paged D512
+
+`TestNativeD512Fp8Paged` in `sdpa/frost/test_sdpa_fp8_sm107.py` exercises
+the native SM107 role-split kernel and the shared prepared binding. The
+implementation was based on `fc4490c88557` (the SM100/SM103 paging addition),
+with matching FE 1.33.0 bindings rebuilt for Python 3.12.12. Runtime:
+Torch 2.14.1+cu130, cuDNN 9.30.0.2, CuTe DSL 4.8.0 (CUDA 13.4 compiler).
+The imported package was the isolated qualification source, not an editable
+installation of another checkout.
+
+Coverage includes E4M3/E5M2 inputs, BF16/FP16/scalar-FP8 outputs, FLOAT and
+HALF softmax, page8/16/32/64/128/256, independent K/V page tables and pool
+layouts, runtime strides, fresh buffers, changed-page/scale capture replay,
+empty and partial pages, causal/windows/sinks, split1/4, whole-group packing,
+and the aligned D384/V320 envelope with poisoned storage padding. Capability
+checks retain the smaller FP8 flavors', half/MXFP8 D512 and THD-Q declines.
+
+Six golden records in `0972294c7bd4a660/` cover four FLOAT and two HALF
+softmax configurations. Quantized payloads and scale bytes stay fixed across
+sequences alone, reordered, duplicated and mixed with changed neighbors,
+including 129-request multi-wave batches. O/Stats are compared as raw bytes
+per sequence; whole-batch Amax is compared on identical repeated batches and
+against the independent numerical reference, not misclassified as a per-row
+output. Inputs and prepared owners are checked for unintended mutation.
+
+Commands from the isolated `test/python` directory:
+
+```bash
+# After independent-reference/replay qualification, record into a fresh directory:
+CUDNN_DETERMINISM_RECORD=/path/to/new-records python -m pytest \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Paged -k golden -q
+# Inspect/copy the six JSON records, then leave RECORD unset:
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Paged -q
+```
+
+Measured: 31 feature/strict-golden cases passed, with no failures or skips.
+The existing native D512 Pack/Split suites additionally passed 32 selected
+FLOAT-softmax controls (`-k 'not rebind_and_replay and not half_adapter'`).
+One earlier HALF-adapter control reached its reference's FP64 `torch.exp2`
+and failed because the installed NVRTC rejected the SM107 target; this
+reference-environment failure is retained, not counted as a kernel pass.
+The new HALF paging, replay and batch-invariance checks pass independently.
+
+Compute Sanitizer 13.4.92: eight boundary/head-envelope cases under memcheck,
+the same eight under synccheck, and two page8/page128 persistent cases under
+racecheck; no memory/synchronization errors or race hazards. The older
+13.2 sanitizer reported an unsupported device and is not a qualifying run.
+No backward capability or other architecture's status is inferred from this
+SM107 execution. No heuristics ranking changed.
+
+The paged launch's generated SM107 cubin was also checked with nvdisasm
+13.5.37: exactly one `USETMAXREG.DEALLOC` at 40 registers and one
+`USETMAXREG.TRY_ALLOC` at 240. All four service warps release before role
+branching. Dense launch/register behavior is unchanged.

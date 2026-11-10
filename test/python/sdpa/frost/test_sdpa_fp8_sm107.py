@@ -2330,3 +2330,27 @@ class TestNativeCausalZeroTail:
     from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
 
     test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)
+
+
+@requires_rubin
+class TestNativeD512Fp8Paged:
+    """Native page loads retain split/pack, dynamic binding and replay contracts."""
+
+    from test_sdpa_fwd_paged_sm100 import (
+        test_paged_graph_fp8_d512_boundaries as _bounds,
+        test_paged_graph_fp8_d512_head_envelope as _envelope,
+    )
+    from test_sdpa_fp8_d512_paged_determinism import (
+        test_fp8_d512_paged_replay_and_batch_invariance as _repeat,
+        test_fp8_d512_paged_golden as _golden,
+    )
+    from sdpa_fp8_d512_paged_sm107 import paged_capture, native_paged_contract, paged_half_softmax, paged_half_golden
+
+    test_boundaries = staticmethod(_bounds)
+    test_head_envelope = staticmethod(_envelope)
+    test_replay_and_batch_invariance = staticmethod(_repeat)
+    test_golden = staticmethod(_golden)
+    test_strides_and_capture = staticmethod(paged_capture)
+    test_contract = staticmethod(native_paged_contract)
+    test_half_softmax = staticmethod(paged_half_softmax)
+    test_half_golden = staticmethod(paged_half_golden)
