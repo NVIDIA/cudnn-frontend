@@ -129,6 +129,8 @@ DSA.sparse_attention_forward_wrapper
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
 DSA.indexer_forward_top_k_wrapper
+DSA.IndexerForwardTopKPlan
+DSA.prepare_indexer_forward_top_k
 DSA.compress_topk_cand_buffer_size
 DSA.compress_topk_cand_buffer_size_thd
 
@@ -909,6 +911,64 @@ addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
 prefix are clamped to `seqlen_k_b`. THD MXFP8 and MXFP4 use the same
 caller-guaranteed device-side scale-prefix contract described in §3; the
 interface does not validate prefix values with a device-to-host copy.
+
+For an explicit CUDA Graph lifecycle on SM90, use
+`DSA.prepare_indexer_forward_top_k`. It compiles both stages without launching
+them and returns an `IndexerForwardTopKPlan` with a caller-owned byte-workspace
+contract:
+
+```python
+cand_batch_offsets, candidate_capacity = DSA.compress_topk_cand_buffer_size_thd(
+    cu_seqlens_q, cu_seqlens_k, ratio=4, q_causal_offsets=q_causal_offsets
+)  # preparation only; keep this outside capture
+
+plan = DSA.prepare_indexer_forward_top_k(
+    q, k, w,
+    cu_seqlens_q, cu_seqlens_k, cand_batch_offsets,
+    top_k=512,
+    max_seqlen_q=max_q,
+    max_seqlen_k=max_k,
+    max_candidate_count=candidate_capacity,
+    sample_q_causal_offsets=q_causal_offsets,
+    deterministic=True,
+    return_softmax=True,
+)
+workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=q.device)
+
+plan.execute(
+    q, k, w,
+    cu_seqlens_q, cu_seqlens_k, cand_batch_offsets,
+    topk_indices, topk_logits,
+    workspace=workspace,
+    q_causal_offsets=q_causal_offsets,
+    softmax_out=topk_softmax,
+)
+```
+
+The plan deliberately fixes only the CUDA Graph capacities: Q/K storage
+extents, prefix tensor lengths (segment capacity), maximum per-segment Q/K
+lengths, output shape, and candidate-workspace capacity. Prefix,
+`q_causal_offsets`, and `cand_batch_offsets` contents remain device runtime
+data and may be updated in place between replays. Their addresses and shapes
+must remain fixed; Q/K prefix totals must continue to equal the fixed Q/K
+storage extents, every segment must stay within the declared maxima, and the
+final candidate offset must not exceed `max_candidate_count`. The plan never
+reads these values to the host. It returns local per-segment KV ids.
+Preparation owns compiled artifacts but no device allocation; execution uses
+only the caller's inputs, outputs, and workspace and does not consult the
+process-global compile cache. The same plan can serve concurrent calls when
+each call has independent outputs and workspace. The caller must order input
+and metadata updates before the selected stream and retain every binding until
+that stream finishes.
+
+This first plan is intentionally not a general scheduler: it accepts the same
+contiguous packed-THD segments as the SM90 combined kernel and does not model
+CP ranks, zigzag order, arbitrary Q/K storage windows, or index maps. A caller
+such as Megatron owns those policies and lowers them into packed prefixes and
+causal offsets. Use a separate graph/capacity bucket when storage extents,
+segment capacity, maximum lengths, or output addresses change. A workspace may
+be shared by serialized same-stream users only when no graph can replay them
+concurrently and no later consumer reads its candidate scratch.
 
 On SM90 the first kernel reuses the Hopper WGMMA scorer and changes only its
 output epilogue: causal-valid scores are written to the 64-bit compact

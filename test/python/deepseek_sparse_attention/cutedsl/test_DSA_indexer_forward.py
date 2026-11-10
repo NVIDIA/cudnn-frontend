@@ -68,6 +68,26 @@ def test_DSA_indexer_forward_api_is_split_from_top_k():
     assert "indexer_forward_top_k_wrapper" in dsa.__all__
     assert "indexer_forward_top_k_wrapper" in indexer_forward.__all__
     assert DSA.indexer_forward_top_k_wrapper is indexer_forward.indexer_forward_top_k_wrapper
+    assert "IndexerForwardTopKPlan" in dsa.__all__
+    assert "prepare_indexer_forward_top_k" in indexer_forward.__all__
+    assert DSA.IndexerForwardTopKPlan is indexer_forward.IndexerForwardTopKPlan
+    assert DSA.prepare_indexer_forward_top_k is indexer_forward.prepare_indexer_forward_top_k
+
+
+@pytest.mark.L0
+def test_DSA_prepared_indexer_plan_rejects_non_sm90_architecture():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() == (9, 0):
+        pytest.skip("a non-SM90 CUDA device is required")
+    from cudnn import DSA
+
+    q = torch.empty((1, 64, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((1, 64), dtype=torch.bfloat16, device="cuda")
+    cu = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    offsets = torch.zeros(2, dtype=torch.int64, device="cuda")
+    plan = DSA.IndexerForwardTopKPlan(q, k, w, cu, cu, offsets, top_k=1, max_seqlen_q=1, max_seqlen_k=1, max_candidate_count=0)
+    with pytest.raises(RuntimeError, match="supports SM90 only"):
+        plan.check_support()
 
 
 def _allocate_inputs(cfg, weight_dtype=torch.bfloat16):

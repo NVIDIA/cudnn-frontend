@@ -28,6 +28,46 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
+
+`test_DSA_indexer_compressed_sm90_determinism.py` now covers the public
+`DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` path for
+BF16 and per-token E4M3 FP8. The direct plan cases compare indices, logits,
+selected-logit softmax and LSE as raw bytes across fixed-input replays with
+queued side-stream work, and compare each preserved sequence alone, packed
+with empty/ragged neighbors, reordered and duplicated. They also run the
+existing independent FP32 reference. Exact ties, unsupported specializations,
+zero-candidate rows and caller-buffer sentinels are covered by adjacent L0
+cases. The CUDA Graph case mutates packed prefixes, causal offsets and
+candidate offsets at stable addresses, poisons outputs and workspace, and
+compares repeated replay bytes with an independently invoked eager wrapper.
+
+The plan adds no new arithmetic body: it retains the already-qualified SM90
+compact scorer and deterministic radix Top-K launchables. Therefore no new
+runtime golden was recorded; the direct raw-byte equality to the existing
+public wrapper and its independent reference is the numerical A/B arm. This
+is forward-only API coverage; there is no prepared backward entry point.
+SM100/103 and SM107 are rejected by the plan contract.
+
+Measured on an SM90 validation host with Torch 2.12.1+cu130, CUDA 13.0,
+cuDNN backend 92000 and `nvidia-cutlass-dsl[cu13]` 4.8.1 (CUDA 13.4 DSL
+compiler). Imports resolved to the synchronized validation checkout. The
+focused SM90 run passed all prepared-plan, combined-SM90 and API-export cases;
+the post-rebase run passed 20 cases with 134 deselected and no failures in
+13.10 s. On the separate SM100 validation host, the complete existing
+compressed-indexer L0 file passed 96 cases with 16 marker-deselected cases;
+the architecture-admission/API-export focus passed 2 cases. These SM100
+results are compatibility evidence for the shared stage-2 host refactor, not
+support for the SM90-only plan. The final SM90 command, run from
+`test/python`, was:
+
+```bash
+CUDNN_TEST_TIMEOUT=1800 CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -q -s \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_compressed_sm90_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py \
+  -k "prepared_plan or sm90_compressed or api_is_split_from_top_k"
+```
+
 ### Custom reduction — SM100 validation, 2026-11-09 (UTC)
 
 The new `test_custom_reduction_determinism.py` L0 suite has **seven cases**:
