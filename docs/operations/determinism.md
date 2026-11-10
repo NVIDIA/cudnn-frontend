@@ -43,7 +43,7 @@ arbitrary user callbacks.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
-| `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
+| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -147,7 +147,15 @@ a row alone and inside a batch under the entry's own picks.
   rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
   keep the shard and relay layouts: `'records'` runs as `'shards'` and
   `'chain'` is rejected.
-- QSA and dense indexer backward expose no determinism switch.
+- QSA backward (`qsa_backward`, `qsa_indexed_backward`): set
+  `deterministic=True`. `dq`, `dk` and `dv` then repeat for fixed inputs and a
+  fixed packed layout: every FP32 accumulation adds in an order the layout
+  fixes. The bytes change with the packed layout (key tiles, query groups,
+  query ranges and KV passes are positions in the packed buffer), with
+  `max_seq_len`, with the GPU's SM count and with `ds_precision`. Every
+  document must use one four-token block grid, and a row must not repeat a
+  block.
+- Dense indexer backward exposes no determinism switch.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.

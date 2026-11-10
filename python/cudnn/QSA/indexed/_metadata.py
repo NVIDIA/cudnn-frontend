@@ -18,52 +18,59 @@ FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 @cute.kernel
 def frost_qsa_indexed_metadata(indices, ids, counts, lo, hi, first, last, TABLE: cutlass.Constexpr[int]):
     # one CTA per query: its distinct causal group starts, deduplicated through a shared-memory hash table, written
-    # in table order as the query's block ids
+    # in column order as the query's block ids, which the insertion race must not reorder
     tid = Int32(cute.arch.thread_idx()[0])
     row = Int32(cute.arch.block_idx()[0])
     total = Int32(indices.shape[0])
     capacity = Int32(indices.shape[1] // 4)
     smem = SmemAllocator()
     keys = smem.allocate_tensor(Int32, cute.make_layout(TABLE), byte_alignment=128)
+    cols = smem.allocate_tensor(Int32, cute.make_layout(TABLE), byte_alignment=128)
     prefix = smem.allocate_tensor(Int32, cute.make_layout(9), byte_alignment=16)
     for slot in cutlass.range(tid, TABLE, 256):
         keys[slot] = Int32(-1)
+        cols[slot] = capacity
     if tid < 9:
         prefix[tid] = Int32(0)
     if tid == 0:
         lo[row], hi[row], first[row] = Int32(0), row, row
         last[row] = cute.math.min(row + 3, total - 1)
     cute.arch.sync_threads()
-    for block in cutlass.range(tid, capacity, 256):
-        start = indices[Int64(row), Int64(block) * 4]
-        if start >= 0 and start <= row:
-            # Mix higher bits too: starts in one packed sequence share their low two bits.
-            hashed = Uint32(start) * Uint32(2654435761)
-            slot = Int32((hashed ^ (hashed >> 16)) & Uint32(TABLE - 1))
-            inserted = Int32(0)
-            probe = Int32(0)
-            while inserted == 0 and probe < TABLE:
-                old = cute.arch.atomic_cas((keys.iterator + slot).llvm_ptr, cmp=Int32(-1), val=start, sem="relaxed", scope="cta")
-                if old == -1 or old == start:
-                    inserted = Int32(1)
-                else:
-                    slot = (slot + 1) & Int32(TABLE - 1)
-                    probe += 1
-    cute.arch.sync_threads()
     lane, warp = tid % 32, tid // 32
     lower = (Uint32(1) << Uint32(lane)) - Uint32(1)
-    for base in cutlass.range(0, TABLE, 256, unroll=1):
-        slot = base + tid
-        key = keys[slot]
-        ballot = Uint32(cute.arch.vote_ballot_sync(key >= 0))
+    for base in cutlass.range(0, capacity, 256, unroll=1):
+        block = base + tid
+        start = Int32(-1)
+        slot = Int32(0)
+        inserted = Int32(0)
+        if block < capacity:
+            start = indices[Int64(row), Int64(block) * 4]
+            if start >= 0 and start <= row:
+                # Mix higher bits too: starts in one packed sequence share their low two bits.
+                hashed = Uint32(start) * Uint32(2654435761)
+                slot = Int32((hashed ^ (hashed >> 16)) & Uint32(TABLE - 1))
+                probe = Int32(0)
+                while inserted == 0 and probe < TABLE:
+                    old = cute.arch.atomic_cas((keys.iterator + slot).llvm_ptr, cmp=Int32(-1), val=start, sem="relaxed", scope="cta")
+                    if old == -1 or old == start:
+                        inserted = Int32(1)
+                    else:
+                        slot = (slot + 1) & Int32(TABLE - 1)
+                        probe += 1
+                if inserted != 0:
+                    cute.arch.atomic_min((cols.iterator + slot).llvm_ptr, block, sem="relaxed", scope="cta")
+        cute.arch.sync_threads()
+        # a later round only holds higher columns, so the start's lowest column is known now
+        won = inserted != 0 and cols[slot] == block
+        ballot = Uint32(cute.arch.vote_ballot_sync(won))
         if lane == 0:
             prefix[warp + 1] = Int32(cute.arch.popc(ballot))
         cute.arch.sync_threads()
         offset = prefix[0]
         for other in cutlass.range(warp, unroll=1):
             offset += prefix[other + 1]
-        if key >= 0:
-            ids[Int64(row), Int64(offset + Int32(cute.arch.popc(ballot & lower)))] = key
+        if won:
+            ids[Int64(row), Int64(offset + Int32(cute.arch.popc(ballot & lower)))] = start
         cute.arch.sync_threads()
         if tid == 0:
             for other in cutlass.range_constexpr(8):

@@ -59,7 +59,9 @@ def _host(
     if cutlass.const_expr(params.split_kv > 1):
         b, sq, h, dv = geometry[3][0]
         count = params.split_kv * b * sq * h * dv
-        stats_offset = ((count * 2 + 255) // 256) * 256
+        # Match scratch_workspace_bytes / ws_align: the caller reserves
+        # 128-byte aligned slabs, which need not be 256-byte aligned.
+        stats_offset = ((count * 2 + 127) // 128) * 128
         partial_o = _view(cute.recast_ptr(workspace, dtype=dtype), ((params.split_kv * b, sq, h, dv), (sq * h * dv, h * dv, dv, 1)))
         partial_stats = _view(cute.recast_ptr(workspace + stats_offset, dtype=cutlass.Float32), ((params.split_kv * b, h, sq), (h * sq, sq, 1)))
         o_view, stats_view = partial_o, partial_stats

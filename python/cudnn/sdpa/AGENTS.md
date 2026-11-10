@@ -1603,3 +1603,15 @@ K/V allocation fits. `test_sdpa_fwd_d576_sm120.py` exercises asymmetric envelope
 partial packing and persistent reuse. Keep native binder dimension admission in
 sync with the Python row and adapter, and gate new envelopes on the matching
 extension; a host eligibility pass alone does not exercise binder construction.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.

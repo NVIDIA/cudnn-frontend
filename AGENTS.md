@@ -101,7 +101,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 
 ## Agent skills
 
-Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
+Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills` and by Codex via `.agents/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
 - [skills/determinism_tests/](skills/determinism_tests/SKILL.md) — required for new numerical APIs and changes to kernels, datatypes, or GPU targets: add and run L0 determinism tests, then update the API support page.
