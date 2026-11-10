@@ -153,7 +153,7 @@ def _conditional_flags(items: Iterable[dict[str, Any]], cuda: tuple[int, int]) -
 
 
 def cache_dir() -> Path:
-    """``$TVM_FFI_CACHE_DIR`` (tvm-ffi's own cache variable), else ``~/.cache/tvm-ffi``, + ``miles_ext_kernels``."""
+    """Return the ``cudnn_cake`` directory under the configured TVM-FFI cache."""
     root = os.environ.get("TVM_FFI_CACHE_DIR", str(Path("~/.cache/tvm-ffi").expanduser()))
     return Path(root).expanduser() / "cudnn_cake"
 
