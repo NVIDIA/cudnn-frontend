@@ -1094,11 +1094,14 @@ class _PbLayout:
 
 @cute.jit
 def _active_key(p_active, n0, KR, i):
-    # item i of the key-major kernel: range 0's active keys come first, range 1's start at KR
-    off = i
+    # Item i of the key-major kernel: the n0 active tokens as keys of range 0, then the same tokens as keys of range 1.
+    # n0 is a multiple of the grid, so a CTA walks the same tokens in both ranges and their adds keep one order.
+    key = I32(0)
     if i >= n0:
-        off = i - n0 + KR
-    return (p_active + off).load()
+        key = (p_active + (i - n0)).load() + KR
+    else:
+        key = (p_active + i).load()
+    return key
 
 
 @cute.kernel
@@ -1493,6 +1496,9 @@ def qsa_bwd_sparse_key_kernel(
             if i + nctas < Ktot:
                 k_nx = _active_key(p_active, n0, KR, i + nctas)
                 n_nx = (p_key_pair_counts + k_nx).load()
+            if i == n0 + bid:
+                # range 1 adds to the rows range 0's reduces of this warp wrote: those must have completed
+                prims.cp_async_bulk_wait_group(0)
             if n > 0:
                 tok = w % KR
                 ab = ia & 1
@@ -1612,11 +1618,13 @@ def qsa_bwd_prep_kernel(
     g_dense_dk_acc: cute.Tensor,
     g_dense_dv_acc: cute.Tensor,
     g_dense_hi: cute.Tensor,
+    g_dense_sync: cute.Tensor,
     T: I32,
     nz: I32,
     nsel: I32,
     n_key_pair_counts: I32,
     n_dense_dkv: I32,
+    n_dense_sync: I32,
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
 ):
@@ -1678,6 +1686,9 @@ def qsa_bwd_prep_kernel(
     for it in cutlass.range(bid * PREP_THREADS + tidx, n_dense_dkv // 8, nb * PREP_THREADS, unroll=1):
         (p_dense_dk_acc + it * 8).store(zf, alignment=16)
         (p_dense_dv_acc + it * 8).store(zf, alignment=16)
+    p_dense_sync = g_dense_sync.iterator.raw_ptr()
+    for it in cutlass.range(bid * PREP_THREADS + tidx, n_dense_sync // 4, nb * PREP_THREADS, unroll=1):
+        (p_dense_sync + it * 4).store(zi, alignment=16)
 
 
 qsa_bwd_prep_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1696,6 +1707,7 @@ def _prep_host(
     dense_dk_acc: cute.Tensor,
     dense_dv_acc: cute.Tensor,
     dense_hi: cute.Tensor,
+    dense_sync: cute.Tensor,
     nblocks: I32,
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
@@ -1715,11 +1727,13 @@ def _prep_host(
         dense_dk_acc,
         dense_dv_acc,
         dense_hi,
+        dense_sync,
         I32(T),
         I32(nz),
         I32(dense_block_bitmap.shape[0]),
         I32(key_pair_counts.shape[0]),
         I32(dense_dk_acc.shape[0]),
+        I32(dense_sync.shape[0]),
         HKV,
         GH,
     ).launch(grid=(nblocks, 1, 1), block=(PREP_THREADS, 1, 1), stream=stream)
@@ -1848,6 +1862,7 @@ def qsa_bwd_seq_scan_kernel(
     unit_fixed: I32,
     HKV: I32,
     num_sms: I32,
+    nparts: I32,
 ):
     # one CTA: the sequence bounds (mode 0 one sequence, 1 the caller's cu_seqlens, 2 derived from the per-token
     # origins tok_base, a sequence starting wherever the origin changes), the dense unit (unit_fixed, or from the
@@ -1913,6 +1928,18 @@ def qsa_bwd_seq_scan_kernel(
         unit = unit_fixed
         if unit == 0:
             unit = _dense_unit(max_len, HKV, num_sms)
+            if nparts > 0:
+                # Ordered bands are one unit in every key tile, so nparts of them must cover the groups a tile reaches.
+                reach = (DP_TT + _dense_queries(max_len) + (DP_G - 1)) // DP_G
+                cover = (reach + (nparts - 1)) // nparts
+                if cover > unit:
+                    unit = cover
+                # A tile's bands add their dK / dV one after another, so a band is no shorter than the bands are many.
+                side = I32(1)
+                while side * side < reach:
+                    side = side + 1
+                if side > unit:
+                    unit = side
         g_dense_unit.iterator.raw_ptr().store(unit)
     for d in cutlass.range(e0, e1, unroll=1):
         (p_base + d).store(acc)
@@ -1937,9 +1964,10 @@ def _seq_scan_host(
     unit_fixed: I32,
     HKV: I32,
     num_sms: I32,
+    nparts: I32,
     stream: cuda_driver.CUstream,
 ):
-    qsa_bwd_seq_scan_kernel(cu, tok_base, nseq, dense_unit, seq_sparse_base, sparse_count, T, B, mode, unit_fixed, HKV, num_sms).launch(
+    qsa_bwd_seq_scan_kernel(cu, tok_base, nseq, dense_unit, seq_sparse_base, sparse_count, T, B, mode, unit_fixed, HKV, num_sms, nparts).launch(
         grid=(1, 1, 1), block=(SCAN_T, 1, 1), stream=stream
     )
 
@@ -2005,11 +2033,18 @@ def _seq_fill_host(
 
 
 @cute.kernel
-def qsa_bwd_window_kernel(total_count: cute.Tensor, window_count: cute.Tensor, key_counts: cute.Tensor, offset: I32, capacity: I32):
+def qsa_bwd_window_kernel(
+    total_count: cute.Tensor, window_count: cute.Tensor, key_counts: cute.Tensor, key_query_bits: cute.Tensor, offset: I32, capacity: I32
+):
     # The window's query count is rebuilt on the device for every call and replay, and the key counts of the inverted
-    # index start from zero.
+    # index start from zero. So do the query bits, which only the keys the previous window counted hold.
     tid = cute.arch.block_idx()[0] * 256 + cute.arch.thread_idx()[0]
     if tid < cute.size(key_counts):
+        if (offset == 0) | (key_counts[tid] != 0):
+            row = key_query_bits.iterator.raw_ptr() + tid * QB
+            zero4 = cutlass.Vector.from_elements([I32(0)] * 4, I32)
+            for w in cutlass.range_constexpr(QB // 4):
+                (row + w * 4).store(zero4, alignment=16)
         key_counts[tid] = I32(0)
     if tid == 0:
         count = total_count[0] - offset
@@ -2024,8 +2059,16 @@ qsa_bwd_window_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _window_host(total_count: cute.Tensor, window_count: cute.Tensor, key_counts: cute.Tensor, offset: I32, capacity: I32, stream: cuda_driver.CUstream):
-    qsa_bwd_window_kernel(total_count, window_count, key_counts, offset, capacity).launch(
+def _window_host(
+    total_count: cute.Tensor,
+    window_count: cute.Tensor,
+    key_counts: cute.Tensor,
+    key_query_bits: cute.Tensor,
+    offset: I32,
+    capacity: I32,
+    stream: cuda_driver.CUstream,
+):
+    qsa_bwd_window_kernel(total_count, window_count, key_counts, key_query_bits, offset, capacity).launch(
         grid=(cute.ceil_div(cute.size(key_counts), 256), 1, 1), block=(256, 1, 1), stream=stream
     )
 
@@ -2039,12 +2082,13 @@ POS = 64  # offset row stride in int32, a power of two above the KV passes of th
 
 # Sparse queries are split into ranges of QR queries. Every (query, selected block) pair gets a slot in a key-major
 # order: key = range * T + the block's first token, so every block of the packed buffer has its own key, and the slots
-# of a key are contiguous (key_slot_offsets[key] .. + key_pair_counts[key]). The query-major kernel writes the pair's
-# P / dS record (bf16, [4 tokens][12 * HKV heads] each, see _rec_w) into its slot, and the key-major kernel walks the
-# keys holding a record, compacted into active_keys by the index scan.
+# of a key are contiguous (key_slot_offsets[key] .. + key_pair_counts[key]) in the order of its queries. The query-major
+# kernel writes the pair's P / dS record (bf16, [4 tokens][12 * HKV heads] each, see _rec_w) into its slot, and the
+# key-major kernel walks the tokens holding a record in either range, compacted into active_keys by the index scan.
 SPARSE_WINDOW_QUERIES = 4096  # Reuse at most two ranges of P/dS records, including for packed inputs.
 QR = 2048  # queries per range: a range's Q / dO rows stay L2 resident while the key-major kernel walks its keys
 QR_SH = 11  # log2(QR)
+QB = QR // 32  # int32 words of a key's query bits
 RANGE_PAIRS = 513 * QR  # slots per range: every query has 512 blocks and at most one tail block
 
 
@@ -2065,6 +2109,7 @@ def qsa_bwd_partition_kernel(
     g_sparse_blocks: cute.Tensor,
     g_sparse_pass_offsets: cute.Tensor,
     g_key_pair_counts: cute.Tensor,
+    g_key_query_bits: cute.Tensor,
     cap: I32,
     RB: I32,
     NP: I32,
@@ -2072,9 +2117,9 @@ def qsa_bwd_partition_kernel(
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
 ):
-    # per-query block lists split by KV pass, plus the per-key pair counts of the inverted index, whose key is the
-    # block's first token within the query's range. An empty row only needs its dQ zeroed. A row past SPARSE_CAP
-    # blocks exceeds the slot budget of a range: it contributes nothing and its dQ is NaN.
+    # per-query block lists split by KV pass, plus the per-key pair counts and query bits of the inverted index, whose
+    # key is the block's first token within the query's range. An empty row only needs its dQ zeroed. A row past
+    # SPARSE_CAP blocks exceeds the slot budget of a range: it contributes nothing and its dQ is NaN.
     HQ = GH * HKV
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -2085,6 +2130,7 @@ def qsa_bwd_partition_kernel(
     p_sparse_blocks = g_sparse_blocks.iterator.raw_ptr()
     p_sparse_pass_offsets = g_sparse_pass_offsets.iterator.raw_ptr()
     p_key_pair_counts = g_key_pair_counts.iterator.raw_ptr()
+    p_key_query_bits = g_key_query_bits.iterator.raw_ptr()
     if j < g_sparse_count.iterator.raw_ptr().load():
         qi = (g_sparse_queries.iterator.raw_ptr() + j).load()
         n = (g_counts.iterator.raw_ptr() + qi).load()
@@ -2100,6 +2146,7 @@ def qsa_bwd_partition_kernel(
             for v in cutlass.range(lane, HQ * D // 8, 32, unroll=1):
                 (p_dq_acc + (qi * (HQ * D) + v * 8)).store(zf, alignment=16)
         kb = (j >> QR_SH) * KR
+        jr = j & (QR - 1)
         lt = (I32(1) << lane) - I32(1)
         off = I32(0)
         if lane == 0:
@@ -2120,14 +2167,20 @@ def qsa_bwd_partition_kernel(
                 bal = prims.vote_sync(0xFFFFFFFF, inp, prims.VoteSync.BALLOT)
                 if inp:
                     (p_sparse_blocks + (j * PART_W + off + cute.arch.popc(bal & lt))).store(tok)
-                    prims.red(
-                        prims.ReductionOp.ADD,
-                        prims.ReductionType.U32,
-                        p_key_pair_counts + (kb + tok),
-                        I32(1),
-                        mem_order=prims.MemOrder.RELAXED,
-                        mem_scope=prims.MemScope.GPU,
+                    bit = I32(1) << (jr & 31)
+                    seen = prims.atomicrmw(
+                        "or", p_key_query_bits + ((kb + tok) * QB + (jr >> 5)), bit, mem_order=prims.MemOrder.RELAXED, syncscope=prims.MemScope.GPU
                     )
+                    # a row repeating a first token (no valid block layout does) counts it once, so every slot of the key is written
+                    if (seen & bit) == 0:
+                        prims.red(
+                            prims.ReductionOp.ADD,
+                            prims.ReductionType.U32,
+                            p_key_pair_counts + (kb + tok),
+                            I32(1),
+                            mem_order=prims.MemOrder.RELAXED,
+                            mem_scope=prims.MemScope.GPU,
+                        )
                 off = off + cute.arch.popc(bal)
             if lane == 0:
                 (p_sparse_pass_offsets + (j * POS + pp + 1)).store(off)
@@ -2147,6 +2200,7 @@ def _part_host(
     sparse_blocks: cute.Tensor,
     sparse_pass_offsets: cute.Tensor,
     key_pair_counts: cute.Tensor,
+    key_query_bits: cute.Tensor,
     nsq_cap: I32,
     RB: I32,
     NP: I32,
@@ -2166,6 +2220,7 @@ def _part_host(
         sparse_blocks,
         sparse_pass_offsets,
         key_pair_counts,
+        key_query_bits,
         I32(cap),
         RB,
         NP,
@@ -2180,27 +2235,27 @@ def qsa_bwd_index_scan_kernel(
     g_window_count: cute.Tensor,
     g_key_pair_counts: cute.Tensor,
     g_key_slot_offsets: cute.Tensor,
-    g_key_slot_cursors: cute.Tensor,
     g_active_keys: cute.Tensor,
     g_active_count: cute.Tensor,
     KR: I32,
     NR: I32,
+    nctas: I32,
 ):
     # one CTA per range over tiles of 8 * SCAN_T keys, a thread holding 8 consecutive keys (two 16-byte vectors, so
-    # a warp's loads coalesce): slot offsets = the range's slot base + exclusive scan of its key counts, cursors
-    # start there, and the keys holding a record are compacted into the range's segment of the key-major kernel's
-    # item list (active_keys[r * KR ..], active_count[r])
+    # a warp's loads coalesce): slot offsets = the range's slot base + exclusive scan of its key counts. Range 0's CTA
+    # also compacts the tokens holding a record in either range into the key-major kernel's item list, padded with
+    # the never-selected token KR - 1 to a multiple of that kernel's grid (active_count[0], and [1] with two ranges).
     tidx, _, _ = cute.arch.thread_idx()
     r, _, _ = cute.arch.block_idx()
     sm = cutlass.Array(I32, 64, space=cutlass.AddressSpace.smem, alignment=16)
     sp = sm.data_ptr()
     p_key_pair_counts = g_key_pair_counts.iterator.raw_ptr()
     p_key_slot_offsets = g_key_slot_offsets.iterator.raw_ptr()
-    p_key_slot_cursors = g_key_slot_cursors.iterator.raw_ptr()
     p_active = g_active_keys.iterator.raw_ptr()
     zero4 = cutlass.Vector.from_elements([I32(0)] * 4, I32)
     kb = r * KR
-    pos = kb
+    ko = (NR - 1 - r) * KR  # the other range, or this one again when it is alone
+    pos = I32(0)
     if g_window_count.iterator.raw_ptr().load() > 0:
         acc = r * RANGE_PAIRS
         for t0 in cutlass.range(0, KR, 8 * SCAN_T, unroll=1):
@@ -2208,15 +2263,19 @@ def qsa_bwd_index_scan_kernel(
             inr = e < KR
             ca = zero4
             cb = zero4
+            ua = zero4
+            ub = zero4
             if inr:
                 ca = (p_key_pair_counts + (kb + e)).load(count=4, alignment=16)
                 cb = (p_key_pair_counts + (kb + e + 4)).load(count=4, alignment=16)
+                ua = (p_key_pair_counts + (ko + e)).load(count=4, alignment=16)
+                ub = (p_key_pair_counts + (ko + e + 4)).load(count=4, alignment=16)
             s = ca[0] + ca[1] + ca[2] + ca[3] + cb[0] + cb[1] + cb[2] + cb[3]
             live = I32(0)
             for u in cutlass.range_constexpr(4):
-                if ca[u] > 0:
+                if (ca[u] | ua[u]) > 0:
                     live = live + 1
-                if cb[u] > 0:
+                if (cb[u] | ub[u]) > 0:
                     live = live + 1
             off, tot_s, lpos, tot_l = _cta_scan2(sp, tidx, s, live)
             if inr:
@@ -2226,29 +2285,33 @@ def qsa_bwd_index_scan_kernel(
                 for u in cutlass.range_constexpr(4):
                     offs.append(a)
                     a = a + ca[u]
-                    if ca[u] > 0:
-                        (p_active + p).store(kb + e + u)
+                    if (ca[u] | ua[u]) > 0:
+                        if r == 0:
+                            (p_active + p).store(e + u)
                         p = p + 1
-                ov = cutlass.Vector.from_elements(offs, I32)
-                (p_key_slot_offsets + (kb + e)).store(ov, alignment=16)
-                (p_key_slot_cursors + (kb + e)).store(ov, alignment=16)
+                (p_key_slot_offsets + (kb + e)).store(cutlass.Vector.from_elements(offs, I32), alignment=16)
                 offs = []
                 for u in cutlass.range_constexpr(4):
                     offs.append(a)
                     a = a + cb[u]
-                    if cb[u] > 0:
-                        (p_active + p).store(kb + e + 4 + u)
+                    if (cb[u] | ub[u]) > 0:
+                        if r == 0:
+                            (p_active + p).store(e + 4 + u)
                         p = p + 1
-                ov = cutlass.Vector.from_elements(offs, I32)
-                (p_key_slot_offsets + (kb + e + 4)).store(ov, alignment=16)
-                (p_key_slot_cursors + (kb + e + 4)).store(ov, alignment=16)
+                (p_key_slot_offsets + (kb + e + 4)).store(cutlass.Vector.from_elements(offs, I32), alignment=16)
             acc = acc + tot_s
             pos = pos + tot_l
-    if tidx == 0:
-        p_count = g_active_count.iterator.raw_ptr()
-        (p_count + r).store(pos - kb)
-        if NR == 1:
-            (p_count + 1).store(I32(0))
+    if r == 0:
+        padded = (pos + nctas - 1) // nctas * nctas
+        if tidx < padded - pos:
+            (p_active + (pos + tidx)).store(KR - 1)
+        if tidx == 0:
+            p_count = g_active_count.iterator.raw_ptr()
+            p_count.store(padded)
+            second = I32(0)
+            if NR == 2:
+                second = padded
+            (p_count + 1).store(second)
 
 
 qsa_bwd_index_scan_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -2259,14 +2322,14 @@ def _scan_host(
     window_count: cute.Tensor,
     key_pair_counts: cute.Tensor,
     key_slot_offsets: cute.Tensor,
-    key_slot_cursors: cute.Tensor,
     active_keys: cute.Tensor,
     active_count: cute.Tensor,
     KR: I32,
     NR: I32,
+    nctas: I32,
     stream: cuda_driver.CUstream,
 ):
-    qsa_bwd_index_scan_kernel(window_count, key_pair_counts, key_slot_offsets, key_slot_cursors, active_keys, active_count, KR, NR).launch(
+    qsa_bwd_index_scan_kernel(window_count, key_pair_counts, key_slot_offsets, active_keys, active_count, KR, NR, nctas).launch(
         grid=(NR, 1, 1), block=(SCAN_T, 1, 1), stream=stream
     )
 
@@ -2277,29 +2340,45 @@ def qsa_bwd_index_fill_kernel(
     g_sparse_count: cute.Tensor,
     g_sparse_blocks: cute.Tensor,
     g_sparse_pass_offsets: cute.Tensor,
-    g_key_slot_cursors: cute.Tensor,
+    g_key_slot_offsets: cute.Tensor,
+    g_key_query_bits: cute.Tensor,
     g_sparse_block_slots: cute.Tensor,
     g_slot_queries: cute.Tensor,
     NP: I32,
     KR: I32,
 ):
-    # one warp per sparse query claims a slot for every pair: sparse_block_slots (aligned with sparse_blocks) -> slot, slot_queries[slot] = query
+    # one warp per sparse query gives every pair its slot: sparse_block_slots (aligned with sparse_blocks) -> slot, slot_queries[slot] = query.
+    # The slot is the key's first plus its set query bits below the query's, so a key's slots follow its queries on every run.
     tidx, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     lane = tidx % 32
     j = bid * 8 + tidx // 32
     p_sparse_blocks = g_sparse_blocks.iterator.raw_ptr()
     p_sparse_pass_offsets = g_sparse_pass_offsets.iterator.raw_ptr()
-    p_key_slot_cursors = g_key_slot_cursors.iterator.raw_ptr()
+    p_key_slot_offsets = g_key_slot_offsets.iterator.raw_ptr()
+    p_key_query_bits = g_key_query_bits.iterator.raw_ptr()
     p_sparse_block_slots = g_sparse_block_slots.iterator.raw_ptr()
     p_slot_queries = g_slot_queries.iterator.raw_ptr()
     if j < g_sparse_count.iterator.raw_ptr().load():
         qi = (g_sparse_queries.iterator.raw_ptr() + j).load()
         kb = (j >> QR_SH) * KR
+        jw = (j & (QR - 1)) >> 5
+        below = (I32(1) << (j & 31)) - I32(1)
         tot = (p_sparse_pass_offsets + (j * POS + NP)).load()
         for L in cutlass.range(lane, tot, 32, unroll=1):
-            blk = (p_sparse_blocks + (j * PART_W + L)).load()
-            pos = prims.atomicrmw("add", p_key_slot_cursors + (kb + blk), I32(1), mem_order=prims.MemOrder.RELAXED, syncscope=prims.MemScope.GPU)
+            key = kb + (p_sparse_blocks + (j * PART_W + L)).load()
+            row = p_key_query_bits + key * QB
+            pos = (p_key_slot_offsets + key).load()
+            for w4 in cutlass.range(0, jw // 4 + 1, unroll=1):
+                bits = (row + w4 * 4).load(count=4, alignment=16)
+                for e in cutlass.range_constexpr(4):
+                    word = w4 * 4 + e
+                    mask = I32(-1)
+                    if word == jw:
+                        mask = below
+                    if word > jw:
+                        mask = I32(0)
+                    pos = pos + cute.arch.popc(bits[e] & mask)
             (p_sparse_block_slots + (j * PART_W + L)).store(pos)
             (p_slot_queries + pos).store(qi)
 
@@ -2313,7 +2392,8 @@ def _fill_host(
     sparse_count: cute.Tensor,
     sparse_blocks: cute.Tensor,
     sparse_pass_offsets: cute.Tensor,
-    key_slot_cursors: cute.Tensor,
+    key_slot_offsets: cute.Tensor,
+    key_query_bits: cute.Tensor,
     sparse_block_slots: cute.Tensor,
     slot_queries: cute.Tensor,
     nsq_cap: I32,
@@ -2322,7 +2402,7 @@ def _fill_host(
     stream: cuda_driver.CUstream,
 ):
     qsa_bwd_index_fill_kernel(
-        sparse_queries, sparse_count, sparse_blocks, sparse_pass_offsets, key_slot_cursors, sparse_block_slots, slot_queries, NP, KR
+        sparse_queries, sparse_count, sparse_blocks, sparse_pass_offsets, key_slot_offsets, key_query_bits, sparse_block_slots, slot_queries, NP, KR
     ).launch(grid=((nsq_cap + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream)
 
 
@@ -2587,6 +2667,167 @@ def _dense_rows_load(dst, tmap, s, hk, g, bar, GH: cutlass.Constexpr[int]):
             prims.cp_async_bulk_tensor_shared_cta_global(dst + (qq * GQ * 128) // 4, tmap.get_ptr(), (s * 64, hk * GH, g * DP_G + qq), bar)
 
 
+# In the deterministic mode (DET) the pairs that add to one fp32 row add in a fixed order. A pair runs the unit of the
+# ticket it draws at its start and waits only for lower tickets, which already run, so no dispatch order deadlocks.
+DP_SYNC = 32  # dense_sync words per unit after the ticket counter's line, 16 per rank
+DP_SYNC_DQ = 0  # + drain warp: the groups whose dQ^T reduce has completed
+DP_SYNC_KV = 4  # + softmax warp: set once the warp's dK / dV rows are flushed
+DP_SYNC_TICKET = 15  # of the physical pair: the ticket it drew
+DP_KV_ORDER = 4  # words of a unit's flush order in shared memory
+
+
+@cute.jit
+def _unit_ticket(band, tile, hk, ntiles, HKV: cutlass.Constexpr[int]):
+    return (band * ntiles + tile) * HKV + hk
+
+
+@cute.jit
+def _dense_ticket(g_dense_sync, bid, tidx):
+    # One ticket per pair: rank 0 draws it and the cluster barrier orders its store before the peer's load.
+    p_count = g_dense_sync.iterator.raw_ptr()
+    p_ticket = p_count + (DP_SYNC + (bid >> 1) * DP_SYNC + DP_SYNC_TICKET)
+    if ((bid & 1) == 0) & (tidx == 0):
+        p_ticket.store(prims.atomicrmw("add", p_count, I32(1), mem_order=prims.MemOrder.RELAXED, syncscope=prims.MemScope.GPU))
+    prims.barrier_cluster_arrive()
+    prims.barrier_cluster_wait()
+    return p_ticket.load()
+
+
+@cute.jit
+def _tile_groups(p_dense_hi, p_first_group, tile, ntiles, T, lane):
+    # The dense query groups [g_lo, g_top) of a key tile, empty outside the grid. They end at the largest dense limit
+    # among the sequences holding its tokens, and a bound past the query lowers the first one.
+    a0 = tile * DP_TT
+    dh = I32(0)
+    g_lo = a0 // DP_G
+    if (tile >= 0) & (tile < ntiles):
+        for u in cutlass.range_constexpr(DP_TT // 32):
+            tt = a0 + u * 32 + lane
+            if tt < T:
+                x = (p_dense_hi + tt).load()
+                if x > dh:
+                    dh = x
+        fg = (p_first_group + tile).load()
+        if fg < g_lo:
+            g_lo = fg
+    dh = cute.arch.warp_reduction_max(dh)
+    g_top = (dh + (DP_G - 1)) // DP_G
+    g_cap = (T + (DP_G - 1)) // DP_G
+    if g_top > g_cap:
+        g_top = g_cap
+    if a0 >= dh:
+        g_top = g_lo
+    return g_lo, g_top
+
+
+@cute.jit
+def _band_groups(t_lo, t_top, band, Ut, nparts):
+    # Band `band` of a tile's groups [t_lo, t_top): Ut groups each from the top. The lowest band takes the rest, which
+    # only a tile shared by two sequences with bounds past the query has (the plan's bands cover a causal tile).
+    hi = t_top - band * Ut
+    lo = t_lo
+    if band < nparts - 1:
+        if hi - Ut > lo:
+            lo = hi - Ut
+    return lo, hi
+
+
+@cute.jit
+def _wait_above(ptr, value):
+    # The word only grows, so one acquire load after the relaxed polls still orders the writer's adds before ours.
+    x = prims.load_ext(ptr, order=prims.MemOrder.RELAXED, scope=prims.MemScope.GPU)
+    while x <= value:
+        x = prims.load_ext(ptr, order=prims.MemOrder.RELAXED, scope=prims.MemScope.GPU)
+    return prims.load_ext(ptr, order=prims.MemOrder.ACQUIRE, scope=prims.MemScope.GPU)
+
+
+@cute.jit
+def _publish(ptr, value):
+    # The release store orders this thread's adds, and those of the threads it met at a barrier, before the acquire
+    # load of the waiting pair.
+    prims.store_ext(value.ir_value(), ptr, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
+
+
+@cute.jit
+def _kv_order(p_order, band, tile, hk, rank, pr, g_lo, t_lo, ntiles, HKV: cutlass.Constexpr[int]):
+    # The two top bands add at once (two adds onto zero commute), the next ones follow the band above, and the lowest,
+    # which may be short, adds to the sparse accumulator alone. Shared memory keeps the order out of the group loop's registers.
+    off = rank * 16 + DP_SYNC_KV
+    after = I32(-1)
+    first = I32(-1)
+    low = I32(0)
+    if band > 1:
+        if g_lo > t_lo:
+            after = _unit_ticket(band - 1, tile, hk, ntiles, HKV) * DP_SYNC + off
+            if band == 2:
+                first = _unit_ticket(I32(0), tile, hk, ntiles, HKV) * DP_SYNC + off
+        else:
+            low = I32(1)
+    p_order.store(after)
+    (p_order + 1).store(first)
+    (p_order + 2).store(low)
+    (p_order + 3).store(pr * DP_SYNC + off)
+
+
+@cute.jit
+def _kv_turn(p_order, p_sync, slot, lane, p_dense, p_sparse, PDL: cutlass.Constexpr[int]):
+    after = p_order.load()
+    if after >= 0:
+        # the warp follows its twin of the band above, the third band both of the first two
+        if lane == 0:
+            _wait_above(p_sync + (after + slot), I32(0))
+            first = (p_order + 1).load()
+            if first >= 0:
+                _wait_above(p_sync + (first + slot), I32(0))
+        prims.bar_warp_sync(0xFFFFFFFF)
+    pdst = p_dense
+    if (p_order + 2).load() != 0:
+        pdst = p_sparse
+        if cutlass.const_expr(PDL > 0):
+            # the key-major grid this launch backfills adds to the sparse accumulator first
+            if lane == 0:
+                prims.griddepcontrol("wait")
+            prims.bar_warp_sync(0xFFFFFFFF)
+    return pdst
+
+
+@cute.jit
+def _kv_done(p_order, p_sync, slot, lane):
+    prims.bar_warp_sync(0xFFFFFFFF)
+    if lane == 0:
+        _publish(p_sync + ((p_order + 3).load() + slot), I32(1))
+
+
+@cute.jit
+def _dq_turn(p_sync, slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV: cutlass.Constexpr[int]):
+    # The previous tile adds group g to dQ first, as step kn of its band bn, whose progress as last read is np_seen.
+    if (g >= n_lo) & (g < n_top):
+        bn = (n_top - 1 - g) // Ut
+        if bn > nparts - 1:
+            bn = nparts - 1
+        if bn != nb_seen:
+            nb_seen = bn
+            np_seen = I32(0)
+        kn = n_top - bn * Ut - 1 - g
+        nu = _unit_ticket(bn, tile - 1, hk, ntiles, HKV)
+        # A lower ticket already runs. Tables no valid input gives must not end in a wait on a unit that never starts.
+        if (np_seen <= kn) & (nu < pr):
+            np_seen = _wait_above(p_sync + (nu * DP_SYNC + slot), kn)
+        # the acquire load ordered that reduce before this thread, the fence orders this thread's reduce after it
+        prims.fence_proxy(prims.Proxy.ASYNC_GLOBAL)
+    return nb_seen, np_seen
+
+
+@cute.jit
+def _dq_done(p_sync, pr, slot, k, lane):
+    # A completed reduce is visible to this thread alone. The fence and the release store order it before the acquire
+    # load of the next tile.
+    prims.cp_async_bulk_wait_group(0)
+    if lane == 0:
+        prims.fence_proxy(prims.Proxy.ASYNC_GLOBAL)
+        _publish(p_sync + (pr * DP_SYNC + slot), k + 1)
+
+
 @cute.kernel
 def qsa_bwd_dense_pair_kernel(
     tma_kd: cutlass.GridConstant[cuda.TensorMap],
@@ -2605,6 +2846,9 @@ def qsa_bwd_dense_pair_kernel(
     g_dense_hi: cute.Tensor,
     g_unit: cute.Tensor,
     g_first_group: cute.Tensor,
+    g_dense_sync: cute.Tensor,
+    g_sparse_dk_acc: cute.Tensor,
+    g_sparse_dv_acc: cute.Tensor,
     T: I32,
     NW: I32,
     ntiles: I32,
@@ -2616,6 +2860,7 @@ def qsa_bwd_dense_pair_kernel(
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
     DQ_PARTS: cutlass.Constexpr[int],
+    DET: cutlass.Constexpr[int],
 ):
     HQ = GH * HKV
     # Rank 1 forms dS from the P that rank 0 sends. With dS in parts, a bf16 P would cap its precision, so P crosses
@@ -2633,6 +2878,8 @@ def qsa_bwd_dense_pair_kernel(
     lane = tidx % 32
     rank = bid & 1
     pr = bid >> 1
+    if cutlass.const_expr(DET):
+        pr = _dense_ticket(g_dense_sync, bid, tidx)
     if cutlass.const_expr(HKV == 2):
         hk = pr & 1
         rest = pr >> 1
@@ -2641,29 +2888,13 @@ def qsa_bwd_dense_pair_kernel(
         rest = pr
     # the pair's key tile and unit. Key tokens and query rows are positions in the packed buffer, the per-token tables
     # give every query its sequence start and dense limit.
-    part = rest // ntiles
-    tile = rest - part * ntiles
+    band = rest // ntiles
+    tile = rest - band * ntiles
     a0 = tile * DP_TT
     p_seq_start = g_seq_start.iterator.raw_ptr()
     p_dense_hi = g_dense_hi.iterator.raw_ptr()
-    # the dense queries this key tile can reach end at the largest dense limit among the sequences holding its tokens
-    dh = I32(0)
-    for u in cutlass.range_constexpr(DP_TT // 32):
-        tt = a0 + u * 32 + lane
-        if tt < T:
-            x = (p_dense_hi + tt).load()
-            if x > dh:
-                dh = x
-    dh = cute.arch.warp_reduction_max(dh)
-    g_cap = (T + (DP_G - 1)) // DP_G
-    g_top = (dh + (DP_G - 1)) // DP_G
-    if g_top > g_cap:
-        g_top = g_cap
-    g_lo = a0 // DP_G
-    # queries before the tile that see keys in it (bounds past themselves) lower the first group to walk
-    fg = (g_first_group.iterator.raw_ptr() + tile).load()
-    if fg < g_lo:
-        g_lo = fg
+    p_first_group = g_first_group.iterator.raw_ptr()
+    t_lo, t_top = _tile_groups(p_dense_hi, p_first_group, tile, ntiles, T, lane)
     # Without a sparse grid to backfill, the unit is one wave of the longest sequence's causal work per pair slot
     # (decided on the device, where the sequences are known). With a sparse grid, the tuned unit backfills the
     # key-major grid.
@@ -2672,21 +2903,22 @@ def qsa_bwd_dense_pair_kernel(
         Ut = g_unit.iterator.raw_ptr().load()
         if Ut > U:
             Ut = U
-    # The parts must cover every group of the tile. A tile shared by two packed sequences whose first group a bound
-    # past the query lowered spans more groups than the plan's reach, so its unit grows.
-    need = (g_top - g_lo + nparts - 1) // nparts
-    if need > Ut:
-        Ut = need
-    g_top = g_top - part * Ut
-    g_bot = g_top - Ut
-    if g_bot > g_lo:
-        g_lo = g_bot
+    if cutlass.const_expr(not DET):
+        # The parts must cover every group of the tile. A tile shared by two packed sequences whose first group a bound
+        # past the query lowered spans more groups than the plan's reach, so its unit grows.
+        need = (t_top - t_lo + nparts - 1) // nparts
+        if need > Ut:
+            Ut = need
+    g_lo, g_top = _band_groups(t_lo, t_top, band, Ut, nparts)
     nk = g_top - g_lo
-    if a0 >= dh:
-        nk = I32(0)
     if nk > 0:
         off = (tile * 3) % nk
         peer = rank ^ 1
+        if cutlass.const_expr(DET):
+            # tiles add to a group's dQ in order, so every tile walks its groups from the top
+            off = I32(0)
+            p_sync = g_dense_sync.iterator.raw_ptr() + DP_SYNC
+            n_lo, n_top = _tile_groups(p_dense_hi, p_first_group, tile - 1, ntiles, T, lane)
 
         smem = cutlass.Array(I32, DP_SMEM // 4, space=cutlass.AddressSpace.smem, alignment=1024)
         b_tile = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
@@ -2706,6 +2938,8 @@ def qsa_bwd_dense_pair_kernel(
         b_kvd = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
         b_ks = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
         tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
+        if cutlass.const_expr(DET):
+            kv_order = cutlass.Array(I32, DP_KV_ORDER, space=cutlass.AddressSpace.smem, alignment=16)
 
         sbase = smem.data_ptr()
         if cutlass.const_expr(GH < GQ):
@@ -2715,6 +2949,8 @@ def qsa_bwd_dense_pair_kernel(
                 (sbase + DP_OFF_E // 4 + it * 4).store(zq, alignment=16)
         if warp == 0:
             if prims.elect_sync():
+                if cutlass.const_expr(DET):
+                    _kv_order(kv_order.data_ptr(), band, tile, hk, rank, pr, g_lo, t_lo, ntiles, HKV)
                 prims.prefetch_tensormap(tma_kd.get_ptr())
                 prims.prefetch_tensormap(tma_qd.get_ptr())
                 prims.prefetch_tensormap(tma_dod.get_ptr())
@@ -3187,12 +3423,17 @@ def qsa_bwd_dense_pair_kernel(
                     prims.bar_warp_sync(0xFFFFFFFF)
                     if prims.elect_sync():
                         prims.mbarrier_arrive(b_pf.subview(xb))
-            _wait(b_kvd, 0)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            obase = (tok * HKV + hk) * D + hf * 128
             pdst = p_dense_dv_acc
             if rank == 1:
                 pdst = p_dense_dk_acc
+            if cutlass.const_expr(DET):
+                p_sparse = g_sparse_dv_acc.iterator.raw_ptr()
+                if rank == 1:
+                    p_sparse = g_sparse_dk_acc.iterator.raw_ptr()
+                pdst = _kv_turn(kv_order.data_ptr(), p_sync, warp - 4, lane, pdst, p_sparse, PDL)
+            _wait(b_kvd, 0)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+            obase = (tok * HKV + hk) * D + hf * 128
             for c8 in cutlass.range_constexpr(4):
                 vv = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_KV + hf * 128 + c8 * 32).as_ptr(F32), num=32)
                 prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
@@ -3206,6 +3447,8 @@ def qsa_bwd_dense_pair_kernel(
                             mem_order=prims.MemOrder.RELAXED,
                             mem_scope=prims.MemScope.GPU,
                         )
+            if cutlass.const_expr(DET):
+                _kv_done(kv_order.data_ptr(), p_sync, warp - 4, lane)
         elif warp >= 12:
             qd = warp - 12
             # Zero the nonfinite values of the SMEM K tile, the A operand of dQ^T: a masked token then adds exact
@@ -3238,6 +3481,10 @@ def qsa_bwd_dense_pair_kernel(
             # reading while k is staged.
             STG2 = R0 * DQ_PARTS * DP_CM + 4 * DP_ST_W <= 2 * DP_NX * DP_CM
             stg1 = sbase + (DP_OFF_P + R0 * DQ_PARTS * DP_CM + qd * DP_ST_W) // 4
+            if cutlass.const_expr(DET):
+                dq_slot = rank * 16 + DP_SYNC_DQ + qd
+                nb_seen = I32(-1)
+                np_seen = I32(0)
             for k in cutlass.range(nk, unroll=1):
                 g = g_top - 1 - _rot(k, off, nk)
                 _wait(b_dqf, k & 1)
@@ -3271,6 +3518,8 @@ def qsa_bwd_dense_pair_kernel(
                 prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                 prims.bar_warp_sync(0xFFFFFFFF)
                 if lane == 0:
+                    if cutlass.const_expr(DET):
+                        nb_seen, np_seen = _dq_turn(p_sync, dq_slot, g, n_lo, n_top, Ut, nparts, tile, hk, pr, nb_seen, np_seen, ntiles, HKV)
                     if cutlass.const_expr(GH == GQ):
                         prims.cp_async_bulk_tensor_reduce(tma_dq.get_ptr(), stg, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GQ, g * DP_G])
                     else:
@@ -3280,6 +3529,8 @@ def qsa_bwd_dense_pair_kernel(
                                 tma_dq.get_ptr(), stg + qq * GQ * 32, prims.TMARedux.ADD, [rank * 128 + qd * 32, hk * GH, g * DP_G + qq]
                             )
                 prims.cp_async_bulk_commit_group()
+                if cutlass.const_expr(DET):
+                    _dq_done(p_sync, pr, dq_slot, k, lane)
             prims.cp_async_bulk_wait_group(0)
 
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -3320,6 +3571,9 @@ def _dpair_host(
     dense_hi: cute.Tensor,
     unit: cute.Tensor,
     first_group: cute.Tensor,
+    dense_sync: cute.Tensor,
+    sparse_dk_acc: cute.Tensor,
+    sparse_dv_acc: cute.Tensor,
     NW: I32,
     ntiles: I32,
     U: I32,
@@ -3330,6 +3584,7 @@ def _dpair_host(
     HKV: cutlass.Constexpr[int],
     GH: cutlass.Constexpr[int],
     DQ_PARTS: cutlass.Constexpr[int],
+    DET: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ):
     HQ = GH * HKV
@@ -3366,6 +3621,9 @@ def _dpair_host(
         dense_hi,
         unit,
         first_group,
+        dense_sync,
+        sparse_dk_acc,
+        sparse_dv_acc,
         I32(T),
         NW,
         ntiles,
@@ -3377,6 +3635,7 @@ def _dpair_host(
         HKV,
         GH,
         DQ_PARTS,
+        DET,
     ).launch(grid=(nparts * ntiles * 2 * HKV, 1, 1), block=(DP_THREADS, 1, 1), cluster=(2, 1, 1), stream=stream, use_pdl=(PDL == 1))
 
 
