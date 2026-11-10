@@ -2686,3 +2686,30 @@ def test_native_d192_fp8_graph_rebind_and_replay(ds_knob, grad_dtype, cudnn_hand
     pack.update({ports[name]: value.view(1, 1, 1, 1) for name, value in direct.amax_t.items()})
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     _check_fp8_graph_rebind_and_zero_do(graph, pack, workspace, ports, cudnn_handle)
+
+
+# Keep this feature in the existing explicit SM107 CI entry. Shared functions
+# take the row fixture instead of importing this module, avoiding an import cycle.
+import d512_fp8_bwd_checks as d512_checks
+
+
+@requires_rubin
+class TestD512Fp8Backward:
+    @pytest.fixture
+    def d512(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import sys
+
+        fp8 = sys.modules[__name__]
+        monkeypatch.setattr(fp8, "_D", 512)
+        monkeypatch.setattr(fp8, "_ENGINE", "sdpa_bwd_d512_fp8")
+        return fp8
+
+    test_unsupported_graphs_decline = staticmethod(d512_checks.test_unsupported_graphs_decline)
+    test_graph_numerics = staticmethod(d512_checks.test_graph_numerics)
+    test_replay_batch_and_golden = staticmethod(d512_checks.test_replay_batch_and_golden)
