@@ -1587,6 +1587,11 @@ def _sdpa_kernel(
             o_off = o_base + n_frag * 4
             h_top = fp32_to_fp16(O_acc[o_off + 0] * inv_l_top, O_acc[o_off + 1] * inv_l_top, dtype=io_dtype)
             h_bot = fp32_to_fp16(O_acc[o_off + 2] * inv_l_bot, O_acc[o_off + 3] * inv_l_bot, dtype=io_dtype)
+            if cutlass.const_expr(has_seq_len_q):
+                # Multiplying a NaN accumulator by zero still produces NaN.
+                # Select the actual stored bits for nonexistent query rows.
+                h_top = cutlass.Int32(arith.select((_row_top_abs < eff_sq).ir_value(), h_top.ir_value(), cutlass.Int32(0).ir_value()))
+                h_bot = cutlass.Int32(arith.select((_row_bot_abs < eff_sq).ir_value(), h_bot.ir_value(), cutlass.Int32(0).ir_value()))
             # chunk_idx for col = n_frag*8 + 2p (2p ∈ {0,2,4,6} < 8) is n_frag.
             swz_chunk_top = cutlass.Int32(n_frag) ^ swz_top_mask
             swz_chunk_bot = cutlass.Int32(n_frag) ^ swz_bot_mask

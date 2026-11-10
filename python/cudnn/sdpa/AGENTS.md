@@ -1585,3 +1585,15 @@ and survive Python collection. Capture the immutable stride/index metadata
 and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
 reproduced eighteen binder leaks before this correction and runs cleanly
 afterwards; keep the pointer/stride assertions and inspect process shutdown.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.

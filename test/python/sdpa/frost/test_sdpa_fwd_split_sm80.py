@@ -153,3 +153,26 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa=Fa
             assert torch.all(lb[..., 1::2] == 77)
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_split_workspace_128_byte_alignment(dtype, graph_mode, pack_gqa, cudnn_handle, monkeypatch):
+    # 2 splits * B3 * Q65 * H3 * D200 * 2 bytes has a 128-byte aligned
+    # partial-O extent which is not 256-byte aligned. Guard the exact advertised
+    # workspace during independent page-table rebinding and graph replay.
+    knobs = {cudnn.knob_type.SPLIT_KV: 2, cudnn.knob_type.SCHED_POLICY: 0, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
+    _paged_probe(
+        (200, 200, 16, "HND", "NHD", "br_swa"),
+        dtype,
+        False,
+        graph_mode,
+        cudnn_handle,
+        monkeypatch,
+        case_index=103,
+        split_kv=2,
+        graph_knobs=knobs,
+        pack_gqa=pack_gqa,
+        heads=(3, 1),
+    )
