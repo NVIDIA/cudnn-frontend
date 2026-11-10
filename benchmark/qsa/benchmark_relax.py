@@ -50,8 +50,6 @@ def main():
         parser.error("Require positive packed lengths totaling at most 131072 and at least three samples and two warmups")
     if args.indexed and args.heads not in (6, 12):
         parser.error("The indexed path supports 12Q/1KV and 6Q/1KV")
-    if args.causal_topk and args.heads != 12:
-        parser.error("--causal-topk supports 12Q/1KV")
     if args.causal_topk and not args.indexed:
         parser.error("--causal-topk requires --indexed")
     if args.compare_general and not args.causal_topk:
@@ -67,7 +65,7 @@ def main():
     reference = load(Path(__file__).with_name("reference.py"), "qsa_independent_reference")
     from benchmark_qsa import tensor_hash, file_hash, save
     from cudnn.ops import qsa_forward, qsa_backward, qsa_indexed_forward, qsa_indexed_backward
-    from cudnn.QSA.kernels.bprop_sm100 import dsl_cuda_major
+    from cudnn.QSA._backward import dsl_cuda_major
 
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K"] = "32"
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES"] = "3"

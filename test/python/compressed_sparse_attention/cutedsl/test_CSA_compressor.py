@@ -790,6 +790,7 @@ def test_r128_envelope_execution(coff, d, nb_rows):
 
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([nb_rows * ratio], d, ratio, coff)
     assert total_comp == nb_rows
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     r1 = _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go)
     r2 = _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go)
     # Bitwise run-to-run determinism holds in EVERY bucket (incl. fast exp/two-phase).

@@ -276,9 +276,10 @@ def _envelope_case(capability, error=None, *, id, deterministic=False, dsl=None,
 @pytest.mark.parametrize(
     "capability,deterministic,dsl,h,d,block_I,topk,sm_scale,error",
     [
-        # Admitted: SM90 H64; SM100/SM103/SM107 H64 and compact H32; deterministic on both families.
+        # Admitted: SM90 H64 and deterministic H32; SM100/SM103/SM107 H64 and compact H32; deterministic on both families.
         _envelope_case((9, 0), id="sm90-h64"),
         _envelope_case((9, 0), deterministic=True, id="deterministic-sm90"),
+        _envelope_case((9, 0), deterministic=True, h=32, topk=512, id="deterministic-sm90-h32-topk512"),
         _envelope_case((10, 0), id="sm100-h64"),
         _envelope_case((10, 0), h=32, id="sm100-h32"),
         _envelope_case((10, 3), id="sm103-h64"),
@@ -929,29 +930,55 @@ def test_DSA_indexer_backward_deterministic_contract(dk_dtype, repeats, topk_ind
     )
 
 
-@pytest.mark.L1
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("dk_dtype", [torch.bfloat16, torch.float32], ids=["bf16-dk", "fp32-dk"])
+def test_sm90_deterministic_h32_topk512(dk_dtype):
+    """Replay compact H32 with invalid block IDs; packing must preserve each gradient."""
+    _require_indexer_backward_gpu()
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 compact H32 kernel")
+    from determinism_utils import assert_golden, assert_replays
+    from deepseek_sparse_attention.cutedsl.test_DSA_indexer_determinism import backward_reference, backward_run, backward_sample, batch, check_batch
+
+    samples = [backward_sample("sparse", queries=5, keys=521, heads=32, topk=512, invalid=True, seed=91 + i) for i in range(2)]
+    inputs = batch(samples)
+
+    def run(values):
+        return backward_run(values, "sparse", dk_dtype, global_indices=True)
+
+    actual = assert_replays(lambda: run(inputs))
+    backward_reference(inputs, actual, "sparse")
+    assert_golden(f"dsa-indexer-sm90-h32-topk512-{str(dk_dtype).removeprefix('torch.')}", inputs, actual)
+    check_batch(samples, run)
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.parametrize(
     "h,b,s_q,s_kv,topk,dk_planes,dk_dtype,topk_indices_global",
     [
+        pytest.param(32, 1, 3, 384, 384, 96, torch.float32, False, marks=pytest.mark.L0, id="h32-private-fold-topk384"),
         # Compact H32: with 96 planes, 194 rows make producer zero revisit its plane twice.
-        pytest.param(32, 2, 97, 512, 512, 96, torch.float32, False, id="h32-topk512-fp32-local-ids"),
-        pytest.param(32, 2, 97, 512, 512, 96, torch.bfloat16, True, id="h32-topk512-bf16-global-ids"),
-        pytest.param(32, 2, 97, 2048, 2048, 96, torch.float32, True, id="h32-topk2048-fp32-global-ids"),
+        pytest.param(32, 2, 97, 512, 512, 96, torch.float32, False, marks=pytest.mark.L0, id="h32-topk512-fp32-local-ids"),
+        pytest.param(32, 2, 97, 512, 512, 96, torch.bfloat16, True, marks=pytest.mark.L0, id="h32-topk512-bf16-global-ids"),
+        pytest.param(32, 2, 97, 2048, 2048, 96, torch.float32, True, marks=pytest.mark.L0, id="h32-topk2048-fp32-global-ids"),
         # Larger compile-time grids; the last case has one more row than planes,
         # so plane zero is reused before the fixed-order reducer converts it.
-        pytest.param(64, 1, 128, 128, 128, 128, torch.float32, False, id="planes128-single-row-stripe"),
-        pytest.param(64, 1, 148, 128, 128, 148, torch.float32, False, id="planes148-single-row-stripe"),
-        pytest.param(64, 1, 149, 128, 128, 148, torch.bfloat16, False, id="planes148-bf16-reused-plane"),
+        pytest.param(64, 1, 128, 128, 128, 128, torch.float32, False, marks=pytest.mark.L1, id="planes128-single-row-stripe"),
+        pytest.param(64, 1, 148, 128, 128, 148, torch.float32, False, marks=pytest.mark.L1, id="planes148-single-row-stripe"),
+        pytest.param(64, 1, 149, 128, 128, 148, torch.bfloat16, False, marks=pytest.mark.L1, id="planes148-bf16-reused-plane"),
         # Pin the deterministic dW strategy boundary: topk384 keeps the
         # private-slot fold; topk512 selects the lane-quad fold and crosses a
         # 96-plane wave boundary.
-        pytest.param(64, 1, 2, 512, 384, 96, torch.float32, False, id="dw-private-fold-topk384"),
-        pytest.param(64, 1, 97, 512, 512, 96, torch.float32, False, id="dw-quad-fold-topk512-multi-wave"),
+        pytest.param(64, 1, 2, 512, 384, 96, torch.float32, False, marks=pytest.mark.L1, id="dw-private-fold-topk384"),
+        pytest.param(64, 1, 97, 512, 512, 96, torch.float32, False, marks=pytest.mark.L1, id="dw-quad-fold-topk512-multi-wave"),
         # Large top-k and repeated producer-row handoffs (193 rows over 96 planes).
-        pytest.param(64, 1, 2, 1024, 1024, 96, torch.float32, False, id="short-topk1024"),
-        pytest.param(64, 1, 2, 2048, 2048, 96, torch.float32, False, id="short-topk2048"),
-        pytest.param(64, 1, 193, 2048, 896, 96, torch.float32, False, id="multi-wave-topk896"),
-        pytest.param(64, 1, 193, 2048, 2048, 96, torch.float32, False, id="multi-wave-topk2048"),
+        pytest.param(64, 1, 2, 1024, 1024, 96, torch.float32, False, marks=pytest.mark.L1, id="short-topk1024"),
+        pytest.param(64, 1, 2, 2048, 2048, 96, torch.float32, False, marks=pytest.mark.L1, id="short-topk2048"),
+        pytest.param(64, 1, 193, 2048, 896, 96, torch.float32, False, marks=pytest.mark.L1, id="multi-wave-topk896"),
+        pytest.param(64, 1, 193, 2048, 2048, 96, torch.float32, False, marks=pytest.mark.L1, id="multi-wave-topk2048"),
     ],
 )
 @torch_fork_set_rng(seed=1711)
@@ -966,8 +993,6 @@ def test_DSA_indexer_backward_deterministic_reproducible_and_correct(h, b, s_q, 
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_indexer_backward_gpu()
-    if torch.cuda.get_device_capability()[0] == 9 and h != 64:
-        pytest.skip("SM90 deterministic IndexerBackward requires H=64")
 
     cfg = dict(b=b, s_q=s_q, s_kv=s_kv, head_dim=128, qhead_per_kv_head=h, topk=topk)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)

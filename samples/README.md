@@ -68,12 +68,15 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 * [70_boolean_cmp_logic](python/70_boolean_cmp_logic.ipynb)
     Boolean comparison and logic fusion. The cuDNN graph cells need a data-center Blackwell GPU.
 
+* [71_custom_reduction_argmax](python/71_custom_reduction_argmax.ipynb)
+    Shows how to pick LLM tokens with the custom-reduction argmax helper: greedy decoding, the NaN rules, speculative-decoding verify, masked argmax and Gumbel-max sampling (cuDNN 9.29 or later, data center Blackwell).
+
 * [gemm_swiglu_mlp_fusion.py](python/gemm_swiglu_mlp_fusion.py)
     The dense bf16 SwiGLU-MLP autograd op (`cudnn.gemm.ops.swiglu_mlp`): gate and up GEMMs, SiLU and multiply fused into one forward kernel. Needs an SM100 or newer (Blackwell) GPU.
 
 ## FROST Python Samples
 Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
-* [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul.
+* [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul. Needs a data-center Blackwell-family GPU (`100 <= SM < 120`); on other parts the scripts print `[NN] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)` and exit 0.
 * [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2, GDP and Mamba-2 prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
 * [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
 
@@ -267,6 +270,15 @@ Showcases layer normalization with zero centered gamma usage.
 - [Layer norm with bitmask relu](cpp/norm/layernorm_bitmask_relu.cpp)
 
 Showcases layer normalization and relu with bitmask.
+
+### Custom reduction examples
+
+##### [samples/cpp/membound](cpp/membound/) shows how to use the custom reduction (cuDNN 9.29 or later, data center Blackwell).
+
+- [Custom reduction](cpp/membound/custom_reduction.cpp): a sum with a helper, mixed precisions, several streams, a body with a constant, and plan serialization.
+- [argmax and argmin rules](cpp/membound/custom_reduction_argmax.cpp): `reduction_modifiers::argmax` and `argmin` with each NaN rule, checked against a host reference.
+- [LLM token selection](cpp/membound/custom_reduction_sampling.cpp): greedy decoding, speculative-decoding verify, masked argmax and Gumbel-max sampling.
+- [XLA HLO examples](cpp/membound/custom_reduction_xla.cpp): the argmax that XLA emits, at all 31 distinct argmax operand shapes of an XLA HLO corpus, with the XLA and the torch NaN rule. The shapes and their source models are listed in [docs/operations/CustomReduction.md](../docs/operations/CustomReduction.md#xla-hlo-examples).
 
 ### Miscellaneous examples
 

@@ -113,7 +113,7 @@ def test_row_pitch_off_the_alignment_is_declined_by_the_native_lowering(directio
     try:
         g = _forward_graph(68)[0] if direction == "forward" else _backward_graph(68)[0]
     except Exception as error:  # noqa: BLE001 -- the graph-level error names the native decline
-        assert "stride 68 of dimension 1 is 136 bytes" in str(error), str(error)
+        assert "stride 68 of dimension 1" in str(error) and "16-byte alignment" in str(error), str(error)
         return
     assert all(is_python_engine(plan.engine_id) for plan in g.plans), [plan.engine_id for plan in g.plans]
 
@@ -206,7 +206,7 @@ def test_override_stride_off_the_alignment_is_refused_before_launch():
     o = _storage(68, fill=float("nan"))
     overrides = dict(override_uids=[t.get_uid() for t in ports], override_shapes=[[B, H, S, D]] * 4, override_strides=[_strides(68)] * 4)
     workspace = torch.empty(max(int(g.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
-    with pytest.raises(Exception, match="override stride 68 of dimension 1 is 136 bytes"):
+    with pytest.raises(Exception, match=r"override stride 68 of dimension 1 .*16-byte alignment"):
         g.execute(dict(zip(ports, (q, k, v, o))), workspace, **overrides)
     torch.cuda.synchronize()
     assert torch.isnan(o).all(), "the kernel ran on a refused variant pack"

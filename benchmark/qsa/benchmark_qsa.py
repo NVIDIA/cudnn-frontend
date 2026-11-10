@@ -171,7 +171,7 @@ def native_components(inputs, backward_inputs, args):
     if args.directions != "both":
         return result
     from cudnn.api_base import WorkspaceCarver
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
 
     backward_ids, backward_counts = _metadata.compact(*compact_args, arch, stream)
     result["backward_compact_with_allocation"] = timed(lambda: _metadata.compact(*compact_args, arch, stream))

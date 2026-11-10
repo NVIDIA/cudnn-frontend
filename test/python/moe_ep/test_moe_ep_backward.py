@@ -2575,6 +2575,56 @@ def test_stateless_training_ep1_poisoned_capacity_matches_reference(
         assert_grouped_matches(captured_grouped, grouped_expected)
 
 
+@pytest.mark.L0
+def test_training_forward_in_kernel_topk_reduce_does_not_accumulate_across_calls():
+    from cudnn import MoeEpTuningConfig
+
+    device = _sm107_device()
+    base_args = make_forward_inputs(device)
+    args = (
+        base_args[0].dequantize(torch.bfloat16).contiguous(),
+        base_args[1],
+        base_args[2],
+        base_args[3],
+        base_args[4].float().contiguous(),
+    )
+    token_count = args[0].shape[0]
+    grad_output = _grad_output(device, token_count, seed=20260902)
+    expected = _fixed_training_reference(
+        args,
+        grad_output,
+        combine_format="bf16",
+        gate_up_clamp=None,
+        max_tokens_per_rank=token_count,
+        physical_recv_pool_rows=256,
+    )
+    source_weights = _fixed_training_weights(args)
+
+    # In-kernel top-k reduction needs BF16 combine and output, apply_topk_in_fc1 and token_back_mode="epi_warps".
+    with MoeEp(
+        _training_public_config(
+            top_k=args[3].shape[1],
+            max_tokens_per_rank=token_count,
+            physical_recv_pool_rows=256,
+            combine_format="bf16",
+            output_format="bf16",
+            apply_topk_in_fc1=True,
+            training_forward_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True),
+        )
+    ) as op:
+        requirements = op.prepare_training(device=device)
+        forward_staging, _ = _allocate_training_weight_staging(source_weights)
+        native_forward = op.pack_forward_weights(source_weights[0], out=forward_staging)
+        forward_out, _ = _allocate_stateless_training_outputs(requirements, device, op.training_symmetric_buffers())
+
+        def run():
+            return op.training_forward(args[0], args[3], args[4], weights=native_forward, out=forward_out)
+
+        # BF16 atomics make the reduction order-dependent: check each call against the reference, not against call 1.
+        _assert_matches_reference(run(), expected[0])
+        _assert_matches_reference(run(), expected[0])
+
+
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("token_count", (1, 127, 128, 129))

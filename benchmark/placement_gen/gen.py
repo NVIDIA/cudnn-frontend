@@ -21,6 +21,7 @@ the class (add a key field) rather than fitting around it.
 from __future__ import annotations
 
 import argparse
+import ast
 import collections
 import json
 import math
@@ -91,7 +92,20 @@ def _facts_training(c, s):
     )
 
 
-ADAPTERS = {"inference": _facts_inference, "training": _facts_training}
+def _facts_recorded(c, s):
+    """The graph facts the study driver read from the FE graph itself (``case["facts"]``, e.g. FlashInfer's own
+    declaration): nothing is reconstructed from case fields. dtype names and tuples were stored as their repr."""
+    kw = {}
+    for name, v in c["facts"].items():
+        if isinstance(v, str) and v.startswith("data_type."):
+            v = getattr(cudnn.data_type, v.split(".", 1)[1])
+        elif isinstance(v, str) and v.startswith("("):
+            v = ast.literal_eval(v)
+        kw[name] = v
+    return SdpaGraphFacts(**kw)
+
+
+ADAPTERS = {"inference": _facts_inference, "training": _facts_training, "recorded": _facts_recorded}
 
 
 def load(path):

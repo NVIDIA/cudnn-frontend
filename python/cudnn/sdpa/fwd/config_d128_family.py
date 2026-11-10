@@ -1093,10 +1093,15 @@ def validate_small_tile_masks(cfg, flavor: str) -> None:
             (
                 not (
                     int(getattr(cfg, "DEAD_SUBTILE_QUIET", 0)) == 1
-                    and (int(getattr(cfg, "N_CHUNK", 0)) or cfg.PACK_GQA or cfg.THD_VARLEN or int(getattr(cfg, "EPILOGUE_GATE", 0)))
+                    and (
+                        int(getattr(cfg, "N_CHUNK", 0))
+                        or cfg.PACK_GQA
+                        or (cfg.THD_VARLEN and (cfg.TILE_K != 64 or getattr(cfg, "PAGED_KV", False) or cfg.SPLIT_KV > 1))
+                        or int(getattr(cfg, "EPILOGUE_GATE", 0))
+                    )
                 ),
-                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without PackGQA, THD or the gated "
-                f"epilogue -- the quiet body replicates its live body's barrier sequence (the plain row mapping's on the Rubin file, the -inf body's "
+                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without PackGQA or the gated "
+                f"epilogue (THD requires non-paged, unsplit D64) -- the quiet body replicates its live body's barrier sequence (the plain row mapping's on the Rubin file, the -inf body's "
                 f"with the ring handshake on the SM100 file; each factory admits the half its file renders) (got N_CHUNK={getattr(cfg, 'N_CHUNK', 0)}, "
                 f"PACK_GQA={cfg.PACK_GQA}, THD_VARLEN={cfg.THD_VARLEN}, EPILOGUE_GATE={getattr(cfg, 'EPILOGUE_GATE', 0)})",
             ),

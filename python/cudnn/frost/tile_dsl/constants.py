@@ -12,6 +12,11 @@ SCHED_NATURAL = 0
 SCHED_LPT = 1
 SCHED_LPT_L2 = 2
 
+# Shared split-combine geometry. Kernel modules must not import the higher
+# level heuristics/adapter layer merely to read this bound. Heuristics
+# re-exports it and retains the architecture-specific placement policy.
+DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
+
 DTYPE_E4M3 = 0
 DTYPE_E5M2 = 1
 DTYPE_BF16 = 2

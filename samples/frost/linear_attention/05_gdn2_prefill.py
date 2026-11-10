@@ -104,6 +104,14 @@ def _reference(q, k, v, g, beta, w, a_log, dt_bias, cu, scale):
 
 
 def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
+    if not torch.cuda.is_available():
+        print("[05] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[05] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     torch.manual_seed(0)
     device = "cuda"
     total, num_seqs = sum(seq_lens), len(seq_lens)

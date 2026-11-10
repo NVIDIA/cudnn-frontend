@@ -434,7 +434,8 @@ def _sm120_gqa6_facts(**over):
 def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     """Every SM120 template packs any GQA group up to the tile (the rows past (tile_m // G) * G are dead), at
     D=128, 256 and 512, and declines a group past the tile. An unset tile_m is the adapter's own Q tile: 64 rows on
-    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. Every other row requires divisibility."""
+    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. SM100/SM90 retain a divisor-based packing rule; SM80 packs consecutive query/head rows across tile boundaries.
+    """
     from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
     from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
@@ -464,8 +465,9 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
     assert caps.pack_gqa_requires_divisible is False
-    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm80"):
+    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90"):
         assert _sm120_spec(other).capabilities.pack_gqa_requires_divisible, other
+    assert _sm120_spec("sdpa_fwd_prefill_sm80").capabilities.pack_gqa_requires_divisible is False
 
 
 @pytest.mark.L0
@@ -1698,8 +1700,8 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too). Partial
     groups (96/8) also run on native cga=2; shared cga=1 retains its divisibility rule. Dense d256 packs within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    admits both native prefill widths and unsplit packing, and dense PAGED queries -- not wired on
-    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    admits both native prefill widths and unsplit packing, and dense PAGED queries admit native cga=1 and cga=2
+    since #2375 (the native D128 loader reads dense Q over page pools)."""
     from dataclasses import replace
 
     from cudnn.sdpa.fwd.engines import effective_cgas
@@ -1727,7 +1729,7 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     assert engines.mismatch(caps, thd, pack) is None
     assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
     assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
-    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+    assert effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True)) == frozenset({1, 2})  # #2375
 
 
 @pytest.mark.L0
@@ -2414,3 +2416,25 @@ def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     assert paged_thd_split_choice(rubin, f)[0] > 1
     sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
     assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))
+
+
+@pytest.mark.L0
+def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
+    """GB10 (cc 12.1, 48 SMs): a bf16 / f16 d64 / d128 causal dense prefill with more (batch, head) streams than SMs
+    leads with the NATURAL walk, the LPT variants behind it as runners; up to one stream per SM, a sliding window, an FP8
+    row and the cc 12.0 parts keep the L2-budget rule's LPT_L2."""
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+
+    def plans(**over):
+        facts = _facts(**{**dict(b=8, h_q=16, h_kv=16, s_q=2048, s_kv=2048, causal=True, bottom_right=True, device_cc=(12, 1), device_sm_count=48), **over})
+        out = recommend("A", facts, offered)
+        assert out
+        return out
+
+    many = plans()  # 128 streams on 48 SMs
+    assert many[0].knobs.sched_policy == SCHED_NATURAL, many[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in many}, [p.knobs for p in many]
+    assert plans(d_qk=64, d_v=64, h_kv=4)[0].knobs.sched_policy == SCHED_NATURAL  # GQA counts query-head streams
+    assert plans(b=3)[0].knobs.sched_policy == SCHED_LPT_L2  # 48 streams: one per SM
+    assert plans(device_cc=(12, 0), device_sm_count=188)[0].knobs.sched_policy == SCHED_LPT_L2
+    assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2

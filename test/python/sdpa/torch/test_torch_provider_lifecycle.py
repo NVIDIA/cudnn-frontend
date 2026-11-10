@@ -32,6 +32,8 @@ def _python_fwd_calls_for_one_sdpa():
 
 @pytest.mark.L0
 def test_remove_restores_builtin_kernels():
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("cuDNN SDPA (FP16 / BF16) requires SM80 or newer")
     if _python_fwd_calls_for_one_sdpa() != 0:
         pytest.skip("overrides already installed in this process")
     overrides = sdpa_provider.install_sdpa_overrides()
@@ -51,10 +53,10 @@ def test_registry_left_alone_when_torch_has_the_switch(monkeypatch):
     registered = []
     monkeypatch.setattr(attention, "register_flash_attention_impl", lambda name, **kw: registered.append(name))
 
-    monkeypatch.setattr(torch.backends.cuda, "enable_cudnn_sdp_python", lambda enabled: None, raising=False)
+    monkeypatch.setattr(attention, "enable_cudnn_sdp_python", lambda enabled: None, raising=False)
     sdpa_provider._register_with_torch()
     assert registered == []
 
-    monkeypatch.delattr(torch.backends.cuda, "enable_cudnn_sdp_python")
+    monkeypatch.delattr(attention, "enable_cudnn_sdp_python")
     sdpa_provider._register_with_torch()
     assert registered == ["CUDNN"]

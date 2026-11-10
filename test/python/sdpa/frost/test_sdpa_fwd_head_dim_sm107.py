@@ -181,7 +181,7 @@ _LEGS = (
     # a cga1 request at D = 128 is SERVED on the d128 flavor since the shared SM100 decode tile was compiled for cc 10.7 (issue #1472)
     (None, dict(), dict(cga=1), dict(cga=1), {8: 32, 24: 32, 32: 32, 48: 64, 64: 64, 128: 128}),
     ("THD", dict(thd=True, padded=True), None, dict(thd=True), {8: None, 24: None, 32: None, 48: None, 64: 64, 128: 128}),
-    ("THD", dict(has_paged_kv=True, padded=True, page_size=128, thd=True), None, None, {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
+    ("THD", dict(has_paged_kv=True, padded=True, page_size=128, thd=True), None, None, {8: None, 24: None, 32: None, 48: None, 64: 64, 128: 128}),
     # Dense PackGQA uses the native D64 tile for logical widths up to 64.
     ("PackGQA", dict(h_kv=2), dict(pack_gqa=True), dict(h_kv=2, pack_gqa=True), {8: 64, 24: 64, 32: 64, 48: 64, 64: 64, 128: 128}),
 )
@@ -192,8 +192,8 @@ _DECLINE_WORDS = {"THD": "THD", "PackGQA": "PackGQA", None: "cga"}
 def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     """Graph, adapter and config agree on each tile's native feature domain.
 
-    D64 carries THD, PackGQA and dense splitting; score outputs use D128. Combined THD
-    and paged requests remain declined, and D32 retains its dense-only domain.
+    D64 carries THD, PackGQA, paging and dense splitting; score outputs use D128.
+    Exact D64 supports combined THD/paging; D32 retains its dense-only domain.
     """
     from cudnn.sdpa.fwd import engines, heuristics
     from cudnn.sdpa.fwd.config_sm107 import sm107_f16_tile_width, sm107_small_tile_leg
@@ -202,7 +202,7 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     caps = _caps()
     spec = {s.name: s for s in engines.ENGINE_SPECS}[_ROW]
     assert caps.dense_only_d_shapes == frozenset({(32, 32)})
-    assert dict(caps.native_legs_by_d_shape)[(64, 64)] == frozenset({"THD", "PackGQA", "split-KV"})
+    assert dict(caps.native_legs_by_d_shape)[(64, 64)] == frozenset({"THD", "PackGQA", "split-KV", "paged KV"})
     assert sm107_small_tile_leg() is None and sm107_small_tile_leg(split_kv=1, pack_gqa=False) is None
     for kw, name in (
         (dict(thd=True), "THD"),

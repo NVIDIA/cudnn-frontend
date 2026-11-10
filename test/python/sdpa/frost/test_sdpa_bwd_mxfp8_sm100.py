@@ -737,3 +737,61 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
     assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+
+
+# Architecture CI entry for the shared exact-D512 block-scale contract.
+import d512_mxfp8_bwd_checks as d512_mx_checks
+
+
+@pytest.mark.L0
+class TestD512Mxfp8Backward:
+    @pytest.fixture
+    def d512_mx(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import sys
+
+        mx = sys.modules[__name__]
+        monkeypatch.setattr(mx, "_ENGINE", "sdpa_bwd_d512_mxfp8")
+        original = mx._plan_index
+        monkeypatch.setattr(mx, "_plan_index", lambda graph: original(graph, "sdpa_bwd_d512_mxfp8"))
+        return mx
+
+    test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
+    test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
+    test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("sq,causal", [(257, True), (257, False), (264, True)])
+def test_delta_workspace_padding_does_not_feed_dkdv(d, sq, causal):
+    """The dKdV TMA sees the eight-row scratch extent, including Q-tail padding."""
+    case = _run(d=d, hq=8, hkv=2, sq=sq, skv=256, causal=causal)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    replay = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(replay, stream=stream):
+            case.graph.execute(case.pack, case.workspace)
+        torch.cuda.current_stream().wait_stream(stream)
+        for captured in (False, True):
+            for sentinel in (0, 255, 127):
+                case.workspace.fill_(sentinel)
+                for name in ("dq", "dk", "dv"):
+                    case.pack[case.refs[name]].fill_(float("nan"))
+                if captured:
+                    replay.replay()
+                else:
+                    case.graph.execute(case.pack, case.workspace)
+                torch.cuda.synchronize()
+                for name, expected in zip(("dq", "dk", "dv"), case.expected):
+                    actual = case.pack[case.refs[name]]
+                    assert not actual.isnan().any(), f"{name}: scratch pattern {sentinel}, captured={captured} contaminated the gradient"
+                    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
+    finally:
+        replay.reset()

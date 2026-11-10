@@ -498,6 +498,9 @@ class GdnVerifyFused:
         start = cfg if cfg is not None else (first_fitting(ONE_CTA_FORMS, *self.readings) if self.part else CFG)
         self.cfg = self._on_this_part(start)
         self.forms: Dict[Tuple[Cfg, int], Cfg] = {}  # the resolved forms on this part, by (module form, requests)
+        # the picks by (requests, tokens) and the readings they were made on: ``default_cfg`` walks the regime's ladder (every form's
+        # shared-memory bound), a plan-time fact that ``__call__`` would otherwise recompute on every launch
+        self.picks: Dict[tuple, Cfg] = {}
         self.compiled: Dict[tuple, Any] = {}
         self.buffers: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
@@ -528,7 +531,13 @@ class GdnVerifyFused:
         if tokens is not None and not isinstance(tokens, int):
             raise ValueError(f"{NAME}: tokens must be an int or None, got {tokens!r}")
         want = None if tokens is None else max(tokens, TOKENS_MIN)
-        form = self.cfg if (self.cfg_given or self.sm_count is None) else default_cfg(requests, self.sm_count, *self.readings, want, self.geometry)
+        if self.cfg_given or self.sm_count is None:
+            form = self.cfg
+        else:
+            pick = (requests, want, self.sm_count, self.readings, self.geometry)
+            form = self.picks.get(pick)
+            if form is None:
+                form = self.picks[pick] = default_cfg(requests, self.sm_count, *self.readings, want, self.geometry)
         key = (form, requests)
         if key not in self.forms:
             self.forms[key] = resolve_cfg(self._on_this_part(form), requests)

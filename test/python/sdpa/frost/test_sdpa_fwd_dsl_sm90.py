@@ -128,12 +128,15 @@ def test_dsl_sm90_graph_singleton_strides(sm100, monkeypatch, dtype, singleton_s
         compile_api(api)
         spec = api._dense_spec
         launch = spec.fn
+        # Retain immutable frame metadata, not api/spec: the native binder owns
+        # this recorder, so capturing its owning spec creates an uncollectable cycle.
+        index, strides = spec.index, api._strides
 
         def checked_launch(*args):
             # Check the positional pointer frame, including singleton canonicalization.
-            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), api._strides):
-                assert args[spec.index[name + "_ptr"]] == original.data_ptr()
-                assert args[spec.index[name + "_strides"]] == (expected[0], expected[2], expected[1])
+            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), strides):
+                assert args[index[name + "_ptr"]] == original.data_ptr()
+                assert args[index[name + "_strides"]] == (expected[0], expected[2], expected[1])
             launches.append(True)
             return launch(*args)
 
@@ -460,7 +463,7 @@ def test_sm90_template_d_envelope_rejects(bad):
     ("over", "why"),
     [
         pytest.param(dict(dtype_qkv=0), "uniform FP16 or BF16", id="dtype"),
-        pytest.param(dict(pack_gqa=True, qh_per_kh=3), "ratio dividing tile_m=64", id="pack-ratio"),
+        pytest.param(dict(pack_gqa=True, qh_per_kh=3), "ratio sharing a factor with tile_m=64", id="pack-ratio"),
         pytest.param(dict(sched_policy=SCHED_LPT_L2 + 1), "NATURAL/LPT/LPT_L2", id="sched"),
         pytest.param(dict(thd_varlen=True, seq_kv_lens_present=True, sched_policy=SCHED_LPT), "natural single-tile work decoder", id="thd-sched"),
         pytest.param(dict(scale_mode=2), "scale mode must be positive, zero, or negative", id="scale-mode"),
@@ -554,7 +557,7 @@ def test_sm90_declines_pv_bf16():
         pytest.param(dict(dtype=torch.float32), "Q/K/V/O other than FP16/BF16", id="qkv-dtype"),
         pytest.param(dict(dtype_o=torch.bfloat16), "an output dtype different from Q", id="o-dtype"),
         pytest.param(dict(softmax_precision=cudnn.data_type.BFLOAT16), "non-FP32 softmax precision", id="softmax-precision"),
-        pytest.param(dict(split_kv=2), "does not support split-KV", id="split-kv"),
+        pytest.param(dict(split_kv=2, thd=True), "does not support THD split-KV", id="thd-split-kv"),
         pytest.param(dict(tile_m=128), "tiles other than 64/64", id="tile"),
         pytest.param(dict(cga=2), "CGA other than 1", id="cga"),
         pytest.param(dict(sched_policy=SCHED_LPT_L2 + 1), "only NATURAL/LPT/LPT_L2", id="sched"),
@@ -654,7 +657,8 @@ def test_sm90_every_candidate_is_valid():
         assert plans and len(plans) <= _MAX_SETS_PER_ENGINE and len({p.knobs for p in plans}) == len(plans), plans
         for knobs in (p.knobs for p in plans):
             assert engines.mismatch(_caps(_ROW), facts, knobs) is None, knobs
-            assert (knobs.tile_m, knobs.tile_n, knobs.cga, knobs.split_kv) == (64, 64, 1, 1), knobs
+            assert (knobs.tile_m, knobs.tile_n, knobs.cga) == (64, 64, 1), knobs
+            assert 1 <= knobs.split_kv <= 65535 and (not facts.thd or knobs.split_kv == 1), knobs
             assert knobs.sched_policy in policies and knobs.pack_gqa in packs, knobs
 
 

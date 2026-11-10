@@ -38,7 +38,7 @@ TEST_CASE("Conv with Int8 datatypes", "[conv][graph][caching]") {
 
         if (include_identity) {
             auto identity = fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::IDENTITY);
-            Y             = graph->pointwise(conv_output, conv_output, identity);
+            Y             = graph->pointwise(conv_output, identity);
         }
 
         Y->set_output(true).set_data_type(fe::DataType_t::INT32);

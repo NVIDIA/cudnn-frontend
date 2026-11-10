@@ -821,6 +821,24 @@ def test_one_operator_switches_mxfp8_and_plain_weight_families():
 
 
 @pytest.mark.L0
+def test_in_kernel_topk_reduce_does_not_accumulate_across_calls():
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    device = _sm107_device()
+    args = make_forward_inputs(device)
+    expected = _reference_forward(args)
+
+    with MoeEp(
+        _moe_ep_config(
+            **_forward_config(),
+            inference_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True),
+        )
+    ) as op:
+        _assert_matches_reference(op(*args), expected)
+        _assert_matches_reference(op(*args), expected)
+
+
+@pytest.mark.L0
 def test_nondefault_inference_tuning_reuses_runtime_workspace():
     from cudnn import MoeEp, MoeEpTuningConfig
 
@@ -1221,6 +1239,7 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
         "output_data": torch.empty(capacity * hidden * 2, dtype=torch.uint8),
         "kernel_shared_workspace": torch.empty(128, dtype=torch.uint8),
     }
+    symmetric["output_data"].fill_(0xAB)
     local = {
         "topk_idx": torch.empty(capacity * top_k * 4, dtype=torch.uint8),
         "overflow_flag": torch.empty(4, dtype=torch.uint8),
@@ -1275,6 +1294,10 @@ def test_inference_activation_scale_uses_unpadded_prefix(monkeypatch):
     assert launch.overflow_ok is not None
     assert launch.overflow_ok.dtype is torch.bool
     assert launch.overflow_ok.data_ptr() == local["overflow_ok"].data_ptr()
+    # The in-kernel reduction accumulates into output_data: the active rows start from zero, the rest is left alone.
+    output_bytes = symmetric["output_data"].view(capacity, hidden * 2)
+    assert (output_bytes[: request.token_count] == 0).all()
+    assert (output_bytes[request.token_count :] == 0xAB).all()
 
 
 @pytest.mark.L0

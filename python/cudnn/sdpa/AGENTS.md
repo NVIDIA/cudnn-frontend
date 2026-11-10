@@ -550,9 +550,16 @@ production kernels gain no debug knob or timing-dependent assertion.
   qualified on a frozen holdout that exercises every class it covers and is used once. Write a hand rule in `placement.py` only for what the table cannot express (a
   non-monotone class the generator reports, or a feature the class key excludes), and say why in the rule.
 - A class the generator reports as NON-MONOTONE needs a finer key, not a hand-tuned region around its points.
+- A refinement can be local to the affected row and part. Keep existing keys for unrelated studies; an unqualified
+  new class gets no entry and retains its prior default route. Check both sides of the first placement-tile boundary
+  and retain long off-tile controls (`test_sm120_short_square_class_keeps_default_and_long_square_leads`).
 - Test study ownership through `class_key` and the matched entry's `study`, not a global absence of entries for another
   measured class. Square causal masks canonicalize to bottom-right; use unequal Q/KV lengths to test the top-left class.
   Re-run placement-table tests on the actual develop integration when another study lands in the same table.
+- Native default-placement qualification under `test/python/sdpa/frost` must explicitly unset
+  `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` in the test body: the directory's autouse fixture enables it and ranks FROST
+  first even when a measured entry is removed. Record the actual default and candidate plan identities before timing;
+  a forced-FROST baseline cannot qualify automatic placement. `test_sdpa_fwd_placement.py` demonstrates unsetting the flag.
 - An entry answers for its whole class, so the grid must reach the class's extremes and straddle every boundary. Three
   misses each found in review or on a holdout:
   - an `always` fitted on long prefills that also claimed q = KV = 16 (FROST 2x slower there);
@@ -1001,6 +1008,13 @@ for the old message.
 
 ## Prepared THD launch bounds and setup
 
+Optional TMA descriptors at a kernel boundary must retain their grid-constant
+ABI: use `Optional[cutlass.GridConstant[TensorMap]]` when a specialization
+passes `None`. Removing the annotation can let the paged specialization pass
+while the dense TMA path traps with an illegal instruction. Run the existing
+`test_sm120_prepared_rebind_strides_and_storage` dense control alongside
+`test_sdpa_fwd_paged_sm120.py` whenever changing this boundary.
+
 Compiled host defaults must be serializable by `compiled_cache._json_plain`.
 A tuple default such as `table_strides=(0, 0)` silently prevents artifact
 persistence, even when normal execution passes. Use `None` for optional runtime
@@ -1130,8 +1144,8 @@ the Rule 1-2 pin for this chain).
 
 Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
 on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
-`sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
-`kernels/thd_helpers.py` or `kernels/bprop_chain_common.py` does not move the
+`sm` -- an edit confined to `bwd/kernels/sm100/prepared_host.py`,
+`bwd/kernels/thd_helpers.py` or `bwd/kernels/bprop_chain_common.py` does not move the
 key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
 testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
 confirm the key moved (the detector pair above fails on the stale host).
@@ -1384,7 +1398,7 @@ heuristics made before it, and the public knob record's round trip through
 with its margin and its process's node class, clock and control pair -- never a
 default flip from one cell. The per-rendering constants were re-measured on the
 new renderings: see the module constants' comments in
-`kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+`fwd/kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 
@@ -1461,6 +1475,37 @@ not a request to reuse the plan's scale. `test_graph_thd_nonpositive_scale_and_r
 checks zero/negative scales, keyless rows and changed-V replay.
 
 
+A paged producer that zero-fills invalid rows must not also run legacy
+compute-warp tail sanitation. Multiple compute warps can then overwrite V
+while another warp reads it through `ldmatrix`, even when the stores repeat
+zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
+and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
+For per-thread `cp.async` production, use an async-tracked mbarrier arrival
+(`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
+rather than publishing those copies with an ordinary mbarrier arrival. The
+qualified SM120 loader also retains producer-local commit/wait-group completion:
+an async-arrival-only variant passed numerics but failed the same racecheck.
+Do not remove that drain without rerunning the native sanitizer/capture cases.
+For a persistent CTA that reinitializes its K/V barriers between work units,
+keep the same producer arrival count at initial launch and every rearm. D512
+paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
+one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
+two CTAs so even compact tests exercise repeated unit transitions.
+An async-copy completion does not substitute for ownership synchronization
+of other shared buffers. The D512 warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on paged paths.
+`test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
+read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
+it publishes those stores with release arrivals, while uniform half retains
+copy-tracked arrivals. Do not select the publication operation by the output
+MMA type: it must follow the producer's actual storage operation. The exhaustive
+`test_sm120_mixed_paged_conversion_all_encodings` also checks the supported
+compiler floor; a direct packed BF16 conversion can require a newer PTX ISA
+than the installed DSL compiler even when the GPU supports the operation.
+See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+and run the native paging racecheck as well as memcheck and numerical replay.
+
 Paged pool layout is per operand. A logical `(pages, heads, page_size, dim)`
 shape does not imply physical HND storage; singleton head axes can make two
 layout kinds both report `is_contiguous()`. Validate each runtime pool against
@@ -1525,3 +1570,18 @@ half-precision resident-arm selector; explicit-only per-tensor widths belong
 in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
 `test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
 first-half tails as well as tile multiples, while admitting an explicit N64.
+
+Shared kernel geometry constants must live below the heuristics/adapter layer.
+Importing heuristics from split-combine creates a cycle when an adapter imports
+that reducer. Re-export shared constants from heuristics when callers already
+use those names, preserving their values and policy. The cold-interpreter
+`test_split_combine_import_without_heuristics` blocks heuristics imports while
+loading both the reducer and SM80 prepared host; a warmed test process can hide
+this dependency.
+
+Test launch recorders retained by a native binder must not capture the owning
+API or prepared spec. That reference cycle can cross a non-GC nanobind object
+and survive Python collection. Capture the immutable stride/index metadata
+and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
+reproduced eighteen binder leaks before this correction and runs cleanly
+afterwards; keep the pointer/stride assertions and inspect process shutdown.

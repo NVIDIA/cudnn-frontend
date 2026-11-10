@@ -1184,7 +1184,7 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
 }
 
 void
-init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
+init_pygraph_sdpa_submodule(PyGraphClass& m) {
     m.def("sdpa",
           &PyGraph::sdpa,
           py::arg("q"),

@@ -16,7 +16,8 @@ buffer exposes the DRAM latency of each tile.
 This tile holds a unit's packed rows in ``q_tile`` (16 or 32) rows and puts the
 warps on the KEY axis instead:
 
-- one producer warp streams ``kv_stage``-key K/V stages through a TMA ring
+- one producer warp streams ``kv_stage``-key K/V stages through a ring
+  (TMA for dense K/V, direct paged copies for page pools)
   (one full and one empty mbarrier per slot), so several stages of every CTA
   are in flight while its consumers compute;
 - four consumer warps form ``q_tile // 16`` M-groups x ``kv_groups`` key
@@ -41,6 +42,7 @@ Constraints:
 - head dims multiples of 8 up to 256; the kernel compiles at head tiles rounded
   up to 16 and TMA zero-fills the pad columns (the head-dim ENVELOPE)
 - dense BSHD storage with the head dim innermost (no THD), SCHED_NATURAL
+- optional independent paged K/V pools for eight-aligned head dims through256
 - top-left / bottom-right causal, right-band widening, left sliding window,
   per-batch lengths, per-Q-head sinks, natural-log or log2 LSE
 """
@@ -56,10 +58,11 @@ import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3, DTYPE_E5M2
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    copy_paged_half_tile,
     ceil_div,
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
@@ -79,22 +82,25 @@ from cudnn.sdpa.fwd.config_sm120 import (
     decode_slots_per_group,
     decode_stage_bytes,
     head_tile,
+    paged_head_dims_supported,
     register_budgets,
     validate_params,
 )
 
-from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, compile_host as _compile_prepared_host  # noqa: F401  (_host: the prepared binder's entry)
+from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _dense_host, paged_host as _paged_host, compile_host as _compile_prepared_host
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults on the 16-row tile.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(q_tile=16, kv_tile=16))
-validate_params(PARAMS, decode_tile=True)
+validate_params(PARAMS, decode_tile=True, allow_paged=True)
+_host = _paged_host if PARAMS.page_size else _dense_host
 
 # The decode tile masks every stage against the true KV length (the K-tail
 # columns read TMA zero-fill), independently of padding flags.
 PREPARED_KV_TAIL_NATIVE = True
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+KV_STORAGE_DTYPE = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_E5M2: cutlass.Float8E5M2}.get(PARAMS.dtype_kv, STORAGE_DTYPE)
 
 
 def round_up_head_tile(d: int) -> int:
@@ -129,6 +135,7 @@ class SM120DecodeForward:
         qh_per_kh: int = 1,
         stats_log2: bool = False,
         negate_scores: bool = False,
+        page_size: int = 0,
     ):
         """Initialize the decode tile configuration.
 
@@ -154,6 +161,7 @@ class SM120DecodeForward:
         :param stats_log2: Write the (unsplit) LSE scaled by log2(e).
         :param negate_scores: attn_scale < 0: negate Q as it loads and run at
             |attn_scale| (#1435).
+        :param page_size: Tokens per physical KV page, or zero for dense KV.
         """
         if q_tile not in DECODE_Q_TILES:
             raise ValueError(f"q_tile ({q_tile}) must be one of {DECODE_Q_TILES}")
@@ -176,6 +184,7 @@ class SM120DecodeForward:
         self.split_kv = split_kv
         self.stats_log2 = stats_log2
         self.negate_scores = negate_scores
+        self.page_size = page_size
         # The prepared host builds THD views and LSE layouts from these; the
         # decode tile is dense-only.
         self.thd_varlen = False
@@ -247,6 +256,33 @@ class SM120DecodeForward:
 
         self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems = get_swizzle(self.head_tile_qk)
         self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems = get_swizzle(self.head_tile_v)
+
+    @cute.jit
+    def load_paged_kv_region(
+        self,
+        s_dst: cute.Pointer,
+        pool: cute.Tensor,
+        page_table: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        seq_coord: cutlass.Int32,
+        seqlen_k: cutlass.Int32,
+        is_v: cutlass.Constexpr[bool],
+    ) -> None:
+        """All producer lanes fill one ring region; the caller publishes K and V together."""
+        copy_paged_half_tile(
+            s_dst,
+            pool,
+            page_table,
+            batch_idx,
+            head_idx,
+            seq_coord,
+            seqlen_k,
+            self.page_size,
+            self.kv_stage,
+            self.head_tile_v if is_v else self.head_tile_qk,
+            self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
+        )
 
     @cute.jit
     def load_kv_region(
@@ -586,9 +622,11 @@ class SM120DecodeForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
-        tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_k_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
+        tma_v_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
         softmax_scale_log2: cutlass.Float32,
+        block_table: Optional[cute.Tensor],
+        block_table_v: Optional[cute.Tensor],
     ) -> None:
         """SM120 SDPA decode tile: one CTA per (Q tile, batch x split, packed head).
 
@@ -608,7 +646,7 @@ class SM120DecodeForward:
         lane = tidx % cute.arch.WARP_SIZE
         warp = cute.arch.warp_idx()
 
-        ring = cutlass.Array(k.dtype, self.ring_elems, space=cutlass.AddressSpace.smem, alignment=DECODE_REGION_ALIGN)
+        ring = cutlass.Array(self.in_dtype, self.ring_elems, space=cutlass.AddressSpace.smem, alignment=DECODE_REGION_ALIGN)
         full_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         empty_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         ring_ptr = ring.data_ptr()
@@ -617,10 +655,11 @@ class SM120DecodeForward:
 
         if warp == self.load_warp_id:
             if prims.elect_sync():
-                prims.prefetch_tensormap(tma_k_desc.get_ptr())
-                prims.prefetch_tensormap(tma_v_desc.get_ptr())
+                if cutlass.const_expr(self.page_size == 0):
+                    prims.prefetch_tensormap(tma_k_desc.get_ptr())
+                    prims.prefetch_tensormap(tma_v_desc.get_ptr())
                 for s in cutlass.range_constexpr(self.num_stages):
-                    prims.mbarrier_init(full_ptr + s, 1)
+                    prims.mbarrier_init(full_ptr + s, 32 if self.page_size else 1)
                     # Every lane of every consumer warp of the stage's key group
                     # arrives, each after its own last ldmatrix of the stage.
                     prims.mbarrier_init(empty_ptr + s, self.m_groups * cute.arch.WARP_SIZE)
@@ -688,8 +727,9 @@ class SM120DecodeForward:
         # /////////////////////////////////////////////////////////////////////
         if warp == self.load_warp_id:
             prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
-            k_tx = tma_k_desc.global_tx_bytes() * (self.k_tma_swizzle_chunks if k_envelope else 1)
-            v_tx = tma_v_desc.global_tx_bytes() * (self.v_tma_swizzle_chunks if v_envelope else 1)
+            if cutlass.const_expr(self.page_size == 0):
+                k_tx = tma_k_desc.global_tx_bytes() * (self.k_tma_swizzle_chunks if k_envelope else 1)
+                v_tx = tma_v_desc.global_tx_bytes() * (self.v_tma_swizzle_chunks if v_envelope else 1)
             t = cutlass.Int32(0)
             while t < n_stages:
                 use = t // cutlass.Int32(self.kv_groups)
@@ -701,12 +741,33 @@ class SM120DecodeForward:
                         pass
                 seq_coord = (stage_lo + t) * cutlass.Int32(self.kv_stage)
                 s_k = ring_ptr + slot * cutlass.Int32(self.stage_elems)
-                if prims.elect_sync():
-                    prims.mbarrier_arrive_expect_tx(full_ptr + slot, k_tx + v_tx)
-                    self.load_kv_region(s_k, tma_k_desc, full_ptr + slot, batch_idx, kv_head_idx, seq_coord, is_v=False, envelope=k_envelope)
-                    self.load_kv_region(
-                        s_k + cutlass.Int32(self.k_region_elems), tma_v_desc, full_ptr + slot, batch_idx, kv_head_idx, seq_coord, is_v=True, envelope=v_envelope
+                if cutlass.const_expr(self.page_size > 0):
+                    self.load_paged_kv_region(s_k, k, block_table, batch_idx, kv_head_idx, seq_coord, seqlen_k, is_v=False)
+                    self.load_paged_kv_region(
+                        s_k + cutlass.Int32(self.k_region_elems), v, block_table_v, batch_idx, kv_head_idx, seq_coord, seqlen_k, is_v=True
                     )
+                    if cutlass.const_expr(k.dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+                        # All 32 lanes release their generic widening stores.
+                        prims.mbarrier_arrive(full_ptr + slot)
+                    else:
+                        prims.cp_async_commit_group()
+                        prims.cp_async_wait_group(0)
+                        # Async arrivals publish the half cp.async copies.
+                        prims.cp_async_mbarrier_arrive(full_ptr + slot, noinc=True)
+                else:
+                    if prims.elect_sync():
+                        prims.mbarrier_arrive_expect_tx(full_ptr + slot, k_tx + v_tx)
+                        self.load_kv_region(s_k, tma_k_desc, full_ptr + slot, batch_idx, kv_head_idx, seq_coord, is_v=False, envelope=k_envelope)
+                        self.load_kv_region(
+                            s_k + cutlass.Int32(self.k_region_elems),
+                            tma_v_desc,
+                            full_ptr + slot,
+                            batch_idx,
+                            kv_head_idx,
+                            seq_coord,
+                            is_v=True,
+                            envelope=v_envelope,
+                        )
                 t += 1
 
         # /////////////////////////////////////////////////////////////////////
@@ -797,7 +858,12 @@ class SM120DecodeForward:
                         # O := 0 / LSE := -inf, not exp(-inf - -inf) = NaN.
                         inv = cutlass.Float32(0.0)
                         lse_val = -cutlass.Float32.inf
-                        if new_max > -cutlass.Float32.inf:
+                        has_weight = new_max > -cutlass.Float32.inf
+                        if cutlass.const_expr(self.page_size > 0):
+                            if sink_logit == cutlass.Float32.inf:
+                                lse_val = cutlass.Float32.inf
+                            has_weight = has_weight & (new_max < cutlass.Float32.inf)
+                        if has_weight:
                             alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
                             new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
                             inv = alpha / new_sum
@@ -868,6 +934,8 @@ class SM120DecodeForward:
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
         prepared: cutlass.Constexpr[bool] = False,
+        block_table: Optional[cute.Tensor] = None,
+        block_table_v: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch the decode tile; same ABI as the SM120 prefill templates (the
         THD arguments are unused: the decode tile is dense-only).
@@ -921,8 +989,13 @@ class SM120DecodeForward:
                 swizzle=swizzle,
             )
 
-        tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
-        tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
+        tma_k_desc = None
+        tma_v_desc = None
+        if cutlass.const_expr(self.page_size == 0):
+            tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
+            tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
+        elif cutlass.const_expr(block_table is None or block_table_v is None):
+            raise ValueError("SM120 paged decode requires both page tables")
         n_q_tiles = ceil_div(q.shape[1], self.tokens_per_tile)
         n_head = q.shape[2] // self.group
         self.kernel(
@@ -937,6 +1010,8 @@ class SM120DecodeForward:
             tma_k_desc,
             tma_v_desc,
             softmax_scale_log2,
+            block_table,
+            block_table_v,
         ).launch(
             grid=(n_q_tiles, q.shape[0] * self.split_kv, n_head),
             block=(self.threads_per_cta, 1, 1),
@@ -974,6 +1049,8 @@ def compile(  # noqa: A001
         raise ValueError("the SM120 decode tile binds runtime strides through the prepared pointer entry only")
     if PARAMS.thd_varlen or lse_head_major or lse_padded_rows:
         raise ValueError("the SM120 decode tile is dense-only")
+    if PARAMS.page_size and not paged_head_dims_supported(d_qk, d_v, decode=True):
+        raise NotImplementedError("SM120 paged KV requires head dims divisible by 8 through 256")
     kernel = SM120DecodeForward(
         in_dtype=STORAGE_DTYPE,
         is_causal=PARAMS.window_right is not None,
@@ -991,9 +1068,10 @@ def compile(  # noqa: A001
         qh_per_kh=qh // kh,
         stats_log2=PARAMS.stats_log2,
         negate_scores=PARAMS.negate_scores,
+        page_size=PARAMS.page_size,
     )
     if kernel.kv_stage != PARAMS.kv_tile:
         raise ValueError(
             f"the decode tile's kv_tile is its stage width {kernel.kv_stage} at head tiles ({kernel.head_tile_qk}, {kernel.head_tile_v}); got {PARAMS.kv_tile}"
         )
-    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key)
+    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, kv_dtype=KV_STORAGE_DTYPE)
