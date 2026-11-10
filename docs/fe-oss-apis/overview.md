@@ -176,3 +176,5 @@ Methods:
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
 - Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).
+
+- [Cake deterministic DSA and Lightning indexer](dsa_deterministic.md)
