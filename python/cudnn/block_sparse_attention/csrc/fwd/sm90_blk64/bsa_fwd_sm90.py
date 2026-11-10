@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 
@@ -58,6 +59,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         num_splits: cutlass.Constexpr[int] = 1,
         allow_empty_block_nums: bool = False,
         nonpositive_scale: bool = False,
+        has_tile_order: bool = False,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
@@ -92,6 +94,11 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         # softmax_scale <= 0 (or NaN): max(scale * S) is not scale * max(S), and a masked -inf times the
         # scale is not -inf. The scale then multiplies the scores before the masks and the softmax uses 1.
         self.nonpositive_scale = nonpositive_scale
+        # Longest-list-first CTA order (variable row lengths, non-split kernel only): CTA x of head h processes
+        # Q tile blocksparse_tile_order[x, h, b], a per-(b, h) permutation built on the host, so the long rows
+        # start first and the grid's tail is short rows. Off, the kernel keeps the identity order and its code.
+        assert not has_tile_order or num_splits == 1, "tile_order is only for the non-split kernel"
+        self.has_tile_order = has_tile_order
 
     def check_dim(self, tensor: cute.Tensor | list[cute.Tensor], mode: int):
         if isinstance(tensor, list):
@@ -116,6 +123,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         blocksparse_indices_q2k: cute.Tensor,
         blocksparse_num_blocks_q2k: cute.Tensor,
         blocksparse_varblk: cute.Tensor,
+        blocksparse_tile_order: Optional[cute.Tensor],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         Q_smem_layout: cute.ComposedLayout,
@@ -134,6 +142,10 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         work_desc = self.get_work_desc()
+        if cutlass.const_expr(self.has_tile_order):
+            # One LDG per CTA before anything that depends on the Q tile; the shuffle keeps the index uniform.
+            qo_tile_idx = cute.arch.make_warp_uniform(blocksparse_tile_order[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx])
+            work_desc = BatchedStaticWorkDesc(qo_tile_idx, work_desc.qo_head_idx, work_desc.kv_head_idx, work_desc.batch_idx)
         seqlen = mK.shape[0]
         num_compute_tiles = cute.ceil_div(seqlen, self.tile_size)
 
@@ -642,6 +654,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         blocksparse_num_blocks_q2k: cute.Tensor,  # (q, nheads, batch)
         blocksparse_varblk: cute.Tensor,
         blocksparse_split_offsets: cute.Tensor,  # (num_splits + 1, q, nheads, batch)
+        blocksparse_tile_order: cute.Tensor,  # (q, nheads, batch): Q tile of CTA (x, h, b); read only when has_tile_order
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -809,6 +822,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
                 blocksparse_indices_q2k,
                 blocksparse_num_blocks_q2k,
                 blocksparse_varblk,
+                blocksparse_tile_order if self.has_tile_order else None,
                 tiled_mma_qk,
                 tiled_mma_pv,
                 self.Q_smem_layout,

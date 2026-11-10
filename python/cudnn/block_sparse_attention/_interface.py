@@ -804,6 +804,9 @@ def _bsa_attn_fwd_sm90_blk64(
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.shape[:3] == (batch, num_q_heads, num_q_blocks)
 
+    # Variable row lengths (non-split): each head runs its Q tiles longest list first, so the grid's tail is
+    # short rows (P7). Fixed counts and split-KV keep the identity order.
+    has_tile_order = q2k_block_nums is not None and not is_split_kv
     if q2k_block_nums is None:
         assert block_sparse_num >= 1
         q2k_block_nums = torch.full(
@@ -816,6 +819,9 @@ def _bsa_attn_fwd_sm90_blk64(
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch, num_q_heads, num_q_blocks)
         q2k_block_nums = q2k_block_nums.contiguous()
+    # Stable descending argsort per (b, h): equal lengths keep their natural order (adjacent tiles share K/V in
+    # L2). Issued here so its small kernels run while the host prepares the launch.
+    tile_order = torch.argsort(q2k_block_nums, dim=-1, descending=True, stable=True).to(torch.int32) if has_tile_order else None
 
     has_block_sizes = block_sizes is not None
     if has_block_sizes:
@@ -871,6 +877,7 @@ def _bsa_attn_fwd_sm90_blk64(
     lse_t = lse.permute(2, 1, 0)
     q2k_t = q2k_block_index.permute(3, 2, 1, 0)
     q2k_nums_t = q2k_block_nums.permute(2, 1, 0)
+    tile_order_t = tile_order.permute(2, 1, 0) if has_tile_order else q2k_nums_t
     split_offsets_t = split_offsets.permute(3, 2, 1, 0) if split_offsets is not None else None
     if has_block_sizes:
         block_sizes_t = block_sizes_bh.permute(2, 1, 0)
@@ -902,6 +909,7 @@ def _bsa_attn_fwd_sm90_blk64(
         if split_offsets_t is not None
         else q2k_nums_cute
     )
+    tile_order_cute = _to_cute_tensor(tile_order_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False) if has_tile_order else q2k_nums_cute
 
     # NaN takes the masking-safe nonpositive path as well (as on SM100).
     nonpositive_scale = not (float(softmax_scale) > 0.0)
@@ -918,6 +926,7 @@ def _bsa_attn_fwd_sm90_blk64(
         num_splits=kv_splits,
         allow_empty_block_nums=allow_empty_block_nums,
         nonpositive_scale=nonpositive_scale,
+        has_tile_order=has_tile_order,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -933,6 +942,7 @@ def _bsa_attn_fwd_sm90_blk64(
             kv_splits,
             allow_empty_block_nums,
             nonpositive_scale,
+            has_tile_order,
         ),
         (
             q_t,
@@ -944,8 +954,9 @@ def _bsa_attn_fwd_sm90_blk64(
             q2k_nums_t,
             block_sizes_t if has_block_sizes else q2k_nums_t,
             split_offsets_t if split_offsets_t is not None else q2k_nums_t,
+            tile_order_t,
         ),
-        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0),
+        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0, 0),
     )
     args = (
         q_cute,
@@ -957,6 +968,7 @@ def _bsa_attn_fwd_sm90_blk64(
         q2k_nums_cute,
         block_sizes_cute,
         split_offsets_cute,
+        tile_order_cute,
         softmax_scale,
     )
     if compile_key not in bsa_attn_fwd.compile_cache:
