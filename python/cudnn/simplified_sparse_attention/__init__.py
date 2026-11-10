@@ -7,10 +7,16 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .api import SimplifiedSparseAttentionMetadata, simplified_sparse_attention, simplified_sparse_attention_reserve
+    from .api import SimplifiedSparseAttentionMetadata, dense_indexer_kl, simplified_sparse_attention, simplified_sparse_attention_reserve
     from .jax_api import simplified_sparse_attention_jax
 
-__all__ = ["SimplifiedSparseAttentionMetadata", "simplified_sparse_attention", "simplified_sparse_attention_reserve", "simplified_sparse_attention_jax"]
+__all__ = [
+    "SimplifiedSparseAttentionMetadata",
+    "dense_indexer_kl",
+    "simplified_sparse_attention",
+    "simplified_sparse_attention_reserve",
+    "simplified_sparse_attention_jax",
+]
 
 
 def __getattr__(name):

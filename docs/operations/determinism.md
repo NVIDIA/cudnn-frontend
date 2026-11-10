@@ -46,6 +46,8 @@ arbitrary user callbacks.
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `dense_indexer_kl`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
+| `dense_indexer_kl`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -77,6 +79,13 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
+  repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
+  rows move. The fused CuTe path also changes scalar loss and saved gradient
+  bytes across runs through atomic reductions. Only indexer Q/K receive
+  gradients; the teacher stays frozen. Tiny single-row goldens do not qualify
+  larger reductions. CPU and other GPUs are not qualified for determinism.
 
 - Simplified sparse attention (PyTorch and JAX): no deterministic mode. The SM100 forward
   result covers short packed sequences with Hq 16/32/96 and top-k

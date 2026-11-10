@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention, simplified_sparse_attention_reserve
+from cudnn.ops import SimplifiedSparseAttentionMetadata, dense_indexer_kl, simplified_sparse_attention, simplified_sparse_attention_reserve
 
 
 def main():
@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--topk", type=int, choices=(512, 1024, 2048), default=512)
     parser.add_argument("--mode", choices=("forward", "training"), default="training")
     parser.add_argument("--framework", choices=("torch", "jax"), default="torch")
+    parser.add_argument("--phase", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--phase1-backend", choices=("torch", "cutedsl"), default="cutedsl")
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--reserve", action="store_true")
@@ -33,6 +35,8 @@ def main():
         parser.error("This causal benchmark requires query-length <= key-length")
     if args.framework == "jax" and args.reserve:
         parser.error("JAX owns its scratch; --reserve applies only to PyTorch")
+    if args.phase == 1 and (args.framework != "torch" or args.reserve):
+        parser.error("Phase 1 supports PyTorch without --reserve")
     torch.manual_seed(17)
     training = args.mode == "training"
     tq, tk, h = args.query_length, args.key_length, args.heads
@@ -57,6 +61,37 @@ def main():
         if training:
             return torch.autograd.grad((output, loss), tensors, (upstream, loss_grad))
         return output, loss
+
+    if args.phase == 1:
+        q, k, _, iq, ik = tensors
+        # Teacher attention is supplied by the model, outside the timed KL call.
+        with torch.no_grad():
+            lse = torch.empty((tq, h), device=q.device, dtype=torch.float32)
+            positions = torch.arange(tk, device=q.device)
+            for begin in range(0, tq, 32):
+                end = min(begin + 32, tq)
+                scores = q[begin:end].float() @ k[:, 0].float().T / 16
+                scores.masked_fill_(positions >= metadata.key_ends[begin:end, None, None], -torch.inf)
+                lse[begin:end] = scores.logsumexp(-1)
+            del scores
+
+        def run():
+            loss = dense_indexer_kl(
+                q,
+                k,
+                iq,
+                ik,
+                key_starts=metadata.key_starts,
+                key_ends=metadata.key_ends,
+                query_valid=metadata.query_valid,
+                loss_denominator=metadata.loss_denominator,
+                teacher_softmax_scale=1 / 16,
+                student_softmax_scale=128**-0.5,
+                loss_coeff=0.1,
+                teacher_lse=lse,
+                use_kf=args.phase1_backend == "cutedsl",
+            )
+            return torch.autograd.grad(loss, (iq, ik)) if training else (loss,)
 
     jax_version = ""
     if args.framework == "jax":
@@ -119,7 +154,9 @@ def main():
         query_length=tq,
         key_length=tk,
         heads=h,
-        topk=args.topk,
+        topk=args.topk if args.phase == 2 else "",
+        phase=args.phase,
+        phase1_backend=args.phase1_backend if args.phase == 1 else "",
         mode=args.mode,
         cuda_graph=False,
         milliseconds=milliseconds,

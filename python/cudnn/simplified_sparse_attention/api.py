@@ -11,8 +11,9 @@ from cudnn._tupledict import TupleDict
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 from .cutedsl.backend import RowMetadata as SimplifiedSparseAttentionMetadata
+from .cutedsl.phase1 import dense_indexer_kl
 
-__all__ = ["SimplifiedSparseAttentionMetadata", "simplified_sparse_attention", "simplified_sparse_attention_reserve"]
+__all__ = ["SimplifiedSparseAttentionMetadata", "dense_indexer_kl", "simplified_sparse_attention", "simplified_sparse_attention_reserve"]
 
 
 def _check_runtime():

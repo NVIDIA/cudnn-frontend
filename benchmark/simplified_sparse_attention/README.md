@@ -30,6 +30,19 @@ External CUDA graph capture is unsupported. PyTorch's internal conditional
 repair graphs do not make the public call capture compatible. JAX uses an XLA
 repair loop and opts its FFI calls out of CUDA command-buffer capture.
 
+For Phase 1 indexer warmup, select the fused kernel or the chunked PyTorch path:
+
+```sh
+python benchmark/simplified_sparse_attention/benchmark_simplified_sparse_attention.py \
+  --phase 1 --phase1-backend cutedsl --query-length 65 --key-length 4097 --heads 32 --mode training
+```
+
+`--phase1-backend torch` selects the chunked path. Phase 1 timing excludes
+teacher attention/LSE preparation and includes the scalar KL plus precomputed
+indexer gradients. Training also applies the upstream loss gradient.
+`topk` and reservation do not apply; Phase 1 has no JAX entry point or external
+CUDA graph support. Peak memory still includes benchmark input allocations.
+
 Measured on 2026-11-09 with the installed frontend 1.33.0 wheel, SM100
 (148 SMs), driver 610.11, PyTorch 2.13.0+cu130, cuDNN 9.27.0, and
 CuTe DSL 4.8.0 compiling with CUDA 13.4. Each case used three warmups and

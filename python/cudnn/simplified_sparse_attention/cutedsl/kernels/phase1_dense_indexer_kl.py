@@ -1165,6 +1165,9 @@ def _fused(
 
 
 # ---------------------------------------------------------------------------
+_fused.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _oracle(
     gQ: cute.Tensor,
@@ -1321,6 +1324,9 @@ def _oracle(
 
 
 # ---------------------------------------------------------------------------
+_oracle.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _launch_fast(
     pQ: cute.Tensor,
@@ -1564,7 +1570,7 @@ def run(
             cap = 4
         nsplit = max(1, min(cap, nktile // 4, 2048 // max(1, ntile)))
     # NSPLIT is a compile-time argument and must be part of the code-cache key.
-    key = (HQ, oracle, nsplit, nc)
+    key = (q.device.index, HQ, oracle, nsplit, nc)
     fn = _CACHE.get(key)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     args = (

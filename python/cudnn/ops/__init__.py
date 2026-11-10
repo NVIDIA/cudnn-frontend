@@ -15,6 +15,7 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "dense_indexer_kl": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl"),
     "simplified_sparse_attention": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention"),
     "simplified_sparse_attention_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_jax"),
     "SimplifiedSparseAttentionMetadata": ("cudnn.simplified_sparse_attention.api", "SimplifiedSparseAttentionMetadata"),

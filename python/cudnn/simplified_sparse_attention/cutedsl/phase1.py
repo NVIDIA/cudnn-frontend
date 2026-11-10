@@ -18,6 +18,8 @@ from typing import Optional, Union
 
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
 _KF_SUPPORTED_QUERY_HEADS = (16, 32, 96)
 _KF_TEACHER_DIM = 256
 _KF_INDEXER_DIM = 128
@@ -26,8 +28,11 @@ _FLASH_ATTN4_VARLEN = None
 
 
 def _phase1_kf_kernel_module():
-    """Import the optional CuTe winner only after its path is selected."""
+    """Check the DSL version before importing the selected CuTe kernel."""
     global _KF_KERNEL
+    error = cutedsl_requirement_error("dense_indexer_kl", floor=(4, 8, 0))
+    if error:
+        raise ImportError(error)
     if _KF_KERNEL is None:
         _KF_KERNEL = importlib.import_module(f"{__package__}.kernels.phase1_dense_indexer_kl")
     return _KF_KERNEL
@@ -589,8 +594,6 @@ def _validate_phase1_kf_inputs(
         raise NotImplementedError("SSA Phase-1 KF requires all inputs on one CUDA device")
     if torch.cuda.get_device_capability(query.device) not in ((10, 0), (10, 3)):
         raise NotImplementedError("SSA Phase-1 KF supports SM100 and SM103 only; got capability " f"{torch.cuda.get_device_capability(query.device)}")
-    if torch.cuda.is_current_stream_capturing():
-        raise NotImplementedError("SSA Phase-1 KF compilation is not CUDA-graph safe")
 
     expected_teacher_scale = 1.0 / math.sqrt(_KF_TEACHER_DIM)
     expected_student_scale = 1.0 / math.sqrt(_KF_INDEXER_DIM)
@@ -647,10 +650,7 @@ class _SSAPhase1KFIndexerKL(torch.autograd.Function):
         unit_grad_k = torch.empty(k_idx.shape, dtype=torch.float32, device=k_idx.device)
         torch.cuda.nvtx.range_push("ssa.phase1.dense_indexer_kl.kf")
         try:
-            # The CuTe entry point consumes raw device buffers through DLPack.
-            # This custom Function owns autograd for q_idx/k_idx and Phase 1
-            # intentionally does not differentiate the frozen teacher q/k, so
-            # do not leak PyTorch's requires_grad metadata across that ABI.
+            # The teacher is frozen; this Function owns indexer autograd.
             _phase1_kf_kernel_module().run(
                 query.detach(),
                 key.unsqueeze(1).detach(),
@@ -716,8 +716,7 @@ def dense_indexer_kl(
     """Evaluate the packed Phase-1 teacher/student KL without dense materialization.
 
     Args:
-        query: CP-local teacher query containing every teacher head,
-            [Tq,Hq,D] or B=1 SBHD. The caller currently enforces TP1.
+        query: Teacher query containing every head, [Tq,Hq,D] or [Tq,1,Hq,D].
         key: Globally ordered MQA teacher key, [Tk,1,D] or B=1 SBHD.
         q_idx: CP-local one-head indexer query.
         k_idx: Globally ordered one-head indexer key.
@@ -732,12 +731,22 @@ def dense_indexer_kl(
         key_chunk_size: Maximum global key rows materialized at once.
         teacher_lse: Natural-log dense-teacher LSE from the paired attention
             call. Required only when ``use_kf`` is true.
-        use_kf: Select the SM103 Kernel Factory winner instead of the tiled
-            PyTorch reference/fallback.
+        use_kf: Select the fused SM100/SM103 CuTe kernel. Requires BF16
+            inputs, Hq in {16,32,96}, D=256, and indexer dimension 128.
+            False selects the chunked PyTorch implementation.
 
     Returns:
         Scalar local KL contribution normalized by the global denominator.
+
+    Autograd returns gradients only for indexer Q/K. The teacher and its
+    LSE are detached. Both paths allocate scratch and precompute gradients
+    during forward. External CUDA graph capture and higher-order gradients
+    are unsupported. Atomic reductions in the fused path can vary by run.
     """
+    if query.is_cuda:
+        with torch.cuda.device(query.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise NotImplementedError("dense_indexer_kl does not support external CUDA graph capture.")
     query, key, q_idx, k_idx = _canonicalize_inputs(query, key, q_idx, k_idx)
     query_length = query.size(0)
     key_length = key.size(0)
@@ -760,8 +769,8 @@ def dense_indexer_kl(
             raise ValueError("every valid query row must have non-empty key support")
         if not bool((denominator > 0).all()):
             raise ValueError("SSA Phase-1 loss denominator must be positive")
-    query_chunk_size = min(query_length, query_chunk_size or 256)
-    key_chunk_size = min(key_length, key_chunk_size or 1024)
+    query_chunk_size = min(query_length, 256 if query_chunk_size is None else query_chunk_size)
+    key_chunk_size = min(key_length, 1024 if key_chunk_size is None else key_chunk_size)
     if query_chunk_size <= 0 or key_chunk_size <= 0:
         raise ValueError("SSA Phase-1 chunk sizes must be positive")
     if use_kf:
@@ -783,18 +792,19 @@ def dense_indexer_kl(
             float(teacher_softmax_scale),
             float(student_softmax_scale),
         )
-        return _SSAPhase1KFIndexerKL.apply(
-            query,
-            key,
-            q_idx,
-            k_idx,
-            teacher_lse,
-            starts,
-            ends,
-            valid,
-            denominator,
-            float(loss_coeff),
-        )
+        with torch.cuda.device(query.device):
+            return _SSAPhase1KFIndexerKL.apply(
+                query,
+                key,
+                q_idx,
+                k_idx,
+                teacher_lse,
+                starts,
+                ends,
+                valid,
+                denominator,
+                float(loss_coeff),
+            )
     return _SSAPhase1DenseIndexerKL.apply(
         query,
         key,

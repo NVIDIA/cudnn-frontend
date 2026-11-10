@@ -71,6 +71,51 @@ attention reads K/V. Q, indexer Q/K, and metadata must already be ready on
 the input device's current stream. The caller must keep K/V storage alive
 on both producer and consumer streams.
 
+## Phase 1: dense indexer warmup
+
+`dense_indexer_kl` trains the indexer against the frozen dense teacher over
+every permitted key. It is available from both `cudnn.ops` and
+`cudnn.simplified_sparse_attention`. It returns a scalar tensor, with gradients
+only for indexer Q and K; teacher Q/K and `teacher_lse` receive no gradients.
+
+```python
+from cudnn.ops import dense_indexer_kl
+
+indexer_loss = dense_indexer_kl(
+    q, k, q_idx, k_idx,
+    key_starts=key_starts, key_ends=key_ends, query_valid=query_valid,
+    loss_denominator=denominator,
+    teacher_softmax_scale=1 / 16,
+    student_softmax_scale=128 ** -0.5,
+    loss_coeff=0.1,
+    teacher_lse=teacher_lse,
+    use_kf=True,
+)
+indexer_loss.backward()
+```
+
+`use_kf=True` selects the fused CuTe kernel on SM100/SM103: BF16 Q/K and
+indexer inputs, Hq 16/32/96, teacher dimension 256, and indexer dimension 128.
+The scales must match the example. Supply contiguous FP32 natural-log
+`teacher_lse` of shape `[Tq, Hq]` from dense attention with the same Q/K,
+scale, and key bounds. All teacher heads must be present. The kernel
+normalizes their summed probabilities before computing KL against the
+indexer softmax. No `topk` selection occurs in Phase 1.
+
+The default `use_kf=False` selects the chunked PyTorch implementation and
+does not require `teacher_lse`. Its optional `query_chunk_size` and
+`key_chunk_size` bound temporary score tiles; defaults are 256 and 1024.
+These options do not tune the fused kernel. Both paths accept packed THD
+and batch-one SBHD tensors. Metadata uses the bounds and padding contract
+above; `loss_denominator` is a positive scalar or one-element tensor.
+
+Both paths allocate scratch and compute indexer gradients during forward.
+The returned loss already includes `loss_coeff / loss_denominator`.
+Higher-order derivatives and external CUDA graph capture are unsupported,
+including after warmup. The fused path uses atomic reductions and has no
+deterministic mode. Phase 1 currently exposes a PyTorch API; the JAX API
+below covers Phase 2 sparse attention.
+
 ## Workspace and CUDA graphs
 
 The convenience API allocates outputs, saved autograd state, and scratch.

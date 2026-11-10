@@ -155,13 +155,17 @@ assert "simplified_sparse_attention" in cudnn.ops.__all__
 assert "simplified_sparse_attention_jax" in cudnn.ops.__all__
 from cudnn.simplified_sparse_attention import (
     SimplifiedSparseAttentionMetadata,
+    dense_indexer_kl,
     simplified_sparse_attention,
     simplified_sparse_attention_reserve,
 )
 assert SimplifiedSparseAttentionMetadata is cudnn.ops.SimplifiedSparseAttentionMetadata
+assert dense_indexer_kl is cudnn.ops.dense_indexer_kl
 assert simplified_sparse_attention is cudnn.ops.simplified_sparse_attention
 assert simplified_sparse_attention_reserve is cudnn.ops.simplified_sparse_attention_reserve
 assert "jax" not in sys.modules
+assert "flash_attn" not in sys.modules
+assert "cudnn.simplified_sparse_attention.cutedsl.kernels.phase1_dense_indexer_kl" not in sys.modules
 """,
         ],
         check=True,

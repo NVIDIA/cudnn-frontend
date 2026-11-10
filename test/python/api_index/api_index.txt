@@ -1436,6 +1436,7 @@ cudnn.ops.block_sparse_attention_fp8_forward
 cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
+cudnn.ops.dense_indexer_kl
 cudnn.ops.dsa
 cudnn.ops.dsa.compressor_backward
 cudnn.ops.dsa.compressor_backward_jax
