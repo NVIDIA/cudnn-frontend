@@ -2768,7 +2768,9 @@ Nonuniform and empty Q/KV lengths retain exact zero-gradient semantics, and
 metadata/scratch live in caller workspace. Both positive packed capacities
 must be declared; each capacity times H times the padded head width must be below 2^31 for
 native launch counts. Sequence envelopes are at most 2^31-64 and batch/head
-counts at most 65535. Mask-free, top-left and bottom-right causal THD are admitted.
+counts at most 65535. Both `B * max_SQ` and `B * max_SKV` must be below 2^31
+for origin-aware delta/cast and GQA reduction launches, independently of packed
+capacity. Mask-free, top-left and bottom-right causal THD are admitted.
 Tile dimensions must fit the native geometry and 99 KiB shared-memory budget;
 D128 keeps 64x64 by default, while D256 uses 32x32. Deterministic, windowed, bias and sink THD
 graphs retain typed declines. Dense support below remains unchanged.

@@ -53,6 +53,10 @@ def validate_bounds(batch, heads, kv_heads, sq, skv, d_qk, d_v, cap_q, cap_kv, s
     # envelope, not the packed capacity (which can stay tiny for empty rows).
     if batch * sq >= 2**31:
         raise ValueError("SM120 THD backward batch times Q envelope exceeds the Int32 launch range")
+    # Independent dK/dV origins reduce GQA partials with one block for every
+    # (sequence, KV row), even when packed token capacity is much smaller.
+    if batch * skv >= 2**31:
+        raise ValueError("SM120 THD backward batch times KV envelope exceeds the Int32 launch range")
     if cap_q is None or cap_kv is None or min(cap_q, cap_kv) <= 0:
         raise ValueError("SM120 THD backward requires positive declared packed capacities")
     # Native scratch/reduction launch counts use Int32 element counts;

@@ -112,3 +112,16 @@ def test_frost_thd_sm120_q_envelope_launch_boundary(batch):
     with pytest.raises(ValueError, match="Int32"):
         validate_bounds(batch, 1, 1, last_safe + 1, 1, 128, 128, 1, 1, 128**-0.5)
     assert "Int32" in reason(b=batch, h_q=1, h_kv=1, s_q=last_safe + 1, max_total_seq_len_q=1, max_total_seq_len_kv=1)
+
+
+@pytest.mark.parametrize("batch", [2, 65535])
+def test_frost_thd_sm120_kv_envelope_launch_boundary(batch):
+    from cudnn.sdpa.bwd.sm120_thd_contract import validate_bounds
+
+    # Few live tokens do not shrink the origin-aware GQA reduction grid.
+    last_safe = (2**31 - 1) // batch
+    validate_bounds(batch, 2, 1, 1, last_safe, 64, 64, batch, batch, 64**-0.5)
+    assert reason(b=batch, h_q=2, h_kv=1, s_q=1, s_kv=last_safe, d_qk=64, d_v=64, max_total_seq_len_q=batch, max_total_seq_len_kv=batch) is None
+    with pytest.raises(ValueError, match="KV envelope"):
+        validate_bounds(batch, 2, 1, 1, last_safe + 1, 64, 64, batch, batch, 64**-0.5)
+    assert "KV envelope" in reason(b=batch, h_q=2, h_kv=1, s_q=1, s_kv=last_safe + 1, d_qk=64, d_v=64, max_total_seq_len_q=batch, max_total_seq_len_kv=batch)
