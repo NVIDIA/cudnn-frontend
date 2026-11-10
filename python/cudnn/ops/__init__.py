@@ -15,6 +15,8 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "dsa_indexer_topk_forward": ("cudnn.deepseek_sparse_attention.cake.api", "dsa_indexer_topk_forward"),
+    "dsa_indexer_topk_workspace_size": ("cudnn.deepseek_sparse_attention.cake.api", "dsa_indexer_topk_workspace_size"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
