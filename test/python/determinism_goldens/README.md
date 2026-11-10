@@ -46,19 +46,28 @@ wide generic layouts, and both supported ratio-128 head dimensions; and six
 replay-plus-reference goldens for generic ratio-2, generic ratio-4 overlap, and the
 dedicated ratio-128 path. Batch cases compare a fixed sequence alone, before and after
 different-size neighbors, duplicated, and beside changed neighbor data. The ratio-128
-case crosses its small/default forward schedule boundary. Backward isolates the fixed
-sequence's upstream gradient and checks BF16 dKV/dScore plus FP32 dAPE bytes.
+case crosses its small/default forward schedule boundary. The ratio-128 `coff=2`,
+head-dimension-512 forward boundary remains a non-strict xfail with its raw-byte
+assertion intact because CI observed a batch-size-dependent byte; all other cases remain
+ordinary assertions. Backward isolates the fixed sequence's upstream gradient and checks
+BF16 dKV/dScore plus FP32 dAPE bytes.
 
 At revision `dcb7bddaa358`, the new SM100 run (CUDA 13.0, cuDNN 9.24, PyTorch
 2.14.1, CUTLASS DSL 4.8.1) reported 18/18 batch cases, 5/5 replay cases, and 6/6
 golden/reference cases passed. The SM103 run (CUDA 13.0, cuDNN 9.20, PyTorch
 2.12.1, CUTLASS DSL 4.7.1) reported the same 29 passes. The two committed runtime
 baselines use keys `842e0ee8788d6de6` and `4e05d04e8e72ed1b`; identical inputs
-produced identical output hashes across the two recorded runtimes. These results establish
-forward and opt-in deterministic backward as Supported in the combined SM100/103 column.
-The earlier capacity-zero and poisoned replay cases passed on SM90, but SM90 batch
-invariance and goldens remain unverified; SM107 is also unverified. The default atomic
-dAPE path remains Not guaranteed by contract.
+produced identical output hashes across the two recorded runtimes. Current-head CI pipeline
+80937667 later observed one of 1024 BF16 output bytes differ in
+`r128-c2-d512-small-to-default-fprop` when the target moved from the standalone small
+schedule into a default-schedule batch. A fresh local rerun passed, so the failure is
+environment-sensitive but still disproves the broader forward batch-invariance claim; the
+raw-byte assertion is retained as a non-strict xfail. Forward is Replay only in the combined
+SM100/103 column. All nine deterministic-backward batch cases passed on both recorded
+runtimes, so opt-in deterministic backward remains Supported. The earlier capacity-zero and
+poisoned replay cases passed on SM90, but SM90 batch invariance and goldens remain
+unverified; SM107 is also unverified. The default atomic dAPE path remains Not guaranteed
+by contract.
 
 At revision `bca6dcd50b81`, the requested `@cudnn-ci-bot run python/misc` pipeline
 reported 147 passed / 71 skipped / 0 failed CSA cases on SM90, 218 passed / 0 skipped /

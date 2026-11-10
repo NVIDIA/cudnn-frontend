@@ -40,7 +40,7 @@ The required settings below apply to this table.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
-| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Supported | Unverified |
+| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -81,12 +81,15 @@ a row alone and inside a batch under the entry's own picks.
 - CSA compressor forward and dKV/dScore use fixed orders. Complete backward
   determinism requires `deterministic=True`, caller-owned workspace on the class API,
   and a prepared plan before CUDA Graph capture; the default dAPE path uses FP32
-  atomics. On SM100 and SM103, fixed-sequence batch comparisons cover ratios 2, 4,
-  and 128, both overlap forms, scalar and wide generic layouts, both ratio-128 head
-  dimensions, reordered and duplicated sequences, changed neighbors, and a ratio-128
-  schedule-boundary crossing. Replay and committed goldens cover the generic ratio-2,
-  generic ratio-4 overlap, and dedicated ratio-128 numerical paths. SM90 and SM107
-  remain unverified for batch invariance.
+  atomics. On SM100 and SM103, deterministic backward fixed-sequence batch comparisons
+  cover ratios 2, 4, and 128, both overlap forms, scalar and wide generic layouts, both
+  ratio-128 head dimensions, reordered and duplicated sequences, changed neighbors,
+  and a ratio-128 schedule-boundary crossing. Forward passes the same comparisons except
+  for the ratio-128 `coff=2`, head-dimension-512 small/default schedule boundary: SM100 CI
+  observed a one-byte output difference when the fixed sequence moved from the small
+  batch schedule to the default schedule. Forward is therefore Replay only. Replay and
+  committed goldens cover the generic ratio-2, generic ratio-4 overlap, and dedicated
+  ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
