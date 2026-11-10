@@ -1322,6 +1322,10 @@ D192 controls with the shared delta/prepared host. On both SM100 and SM107,
 all nine numerical cases pass memcheck, synccheck and racecheck with zero
 errors or hazards. SM103 compiles all three gradient types but is unverified
 at execution. The existing SM107 CI entry exposes the same shared checks as
-`test_sdpa_bwd_fp8_sm107.py::TestD512Fp8Backward`; the new D512 entry runs on
+`test_sdpa_fp8_sm107.py::TestD512Fp8Backward`; the new D512 entry runs on
 SM100/SM103 only, so directory sweeps do not duplicate the Rubin cases. Original16k-SWA geometry has a full structured oracle
 on SM107; it is not a full random-matrix oracle or a performance result.
+
+Review closeout: the SM107 D512 FP8 class moved into the actual selected
+`test_sdpa_fp8_sm107.py` entry; direct collection of the former backward file
+was not CI inclusion. The new kernel now carries its required cuDNN prefix.

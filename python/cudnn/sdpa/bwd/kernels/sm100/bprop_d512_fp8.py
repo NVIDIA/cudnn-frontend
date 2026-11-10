@@ -289,6 +289,9 @@ def kernel(
         nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem, cutlass.Float32), cutlass.Int32(512), group=nvvm.CTAGroup.CTA_1)
 
 
+kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def host(
     q: cute.Tensor,
