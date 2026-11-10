@@ -2751,6 +2751,12 @@ D512 FP16/BF16 FPROP (`sm120/prefill_d512_f16.py`) supports **both D_QK and D_V
 in (256, 512]**, in multiples of 8. It uses a 64 x 32 CTA and 512 x 512 head
 tiles: (512, 512) is **native**; smaller shapes are **envelope-served** by
 zero-padding, with the same MMA and on-chip storage cost.
+The same half template also serves **native D576/V512**, with eight-aligned
+QK in (512,576] and V in (256,512] envelope-served at that tile cost. Dense
+and THD retain their existing layout/mask contracts; dense-Q paging includes
+half or FP8 K/V, packing and split. Q loads directly and O stages through the
+drained K/V slab; no global staging allocation or kernel is introduced.
+
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 **multiples of 16** and a **64 x 64 CTA**. BPROP remains limited to 256.
 
@@ -2777,7 +2783,7 @@ Tile dimensions must fit the native geometry and 99 KiB shared-memory budget;
 D128 keeps 64x64 by default, while D256 uses 32x32. Deterministic, windowed, bias and sink THD
 graphs retain typed declines. Dense support below remains unchanged.
 
-| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 256, any ×8 |
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], or D576/V512 envelope, any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
 | **Data types** | | | |
 | FP16 / BF16 | ✅ | — | ✅ |
@@ -2785,11 +2791,11 @@ graphs retain typed declines. Dense support below remains unchanged.
 | MXFP8 | — | ✅ | ❌ |
 | O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
 | Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, ≤ 512ᵃ | ×8, ≤ 256 |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512]; or QK ∈ (512,576], V ∈ (256,512] | ×16, ≤ 512ᵃ | ×8, ≤ 256 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D256/GQA; restrictions above) |
-| Paged KV (dense Q; prefill through D128, decode through D256, D512 envelope) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
+| Paged KV (dense Q; prefill through D128, decode through D256, D512/D576 envelopes) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |
 | **Masks / features** | | | |

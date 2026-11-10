@@ -90,6 +90,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
+    WIDE_F16_FLAVORS,
     GENERAL_HEAD_TILE_MAX as _SM120_GENERAL_HEAD_TILE_MAX,
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_Q_TILES as _SM120_SEQ_Q_TILES,
@@ -628,7 +629,7 @@ def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> boo
             or (
                 capabilities.sm_lo == 120
                 and _selected_d_shape(capabilities, facts) in capabilities.mixed_fp8_kv_d_shapes
-                and _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True)
+                and _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True, d576=True)
             )
         )
     )
@@ -960,8 +961,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
-        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True):
-            return "SM120 paged KV requires FP16/BF16 dense Q with head dims through 256 or both in (256, 512], divisible by 8"
+        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True, d576=True):
+            return "SM120 paged KV requires FP16/BF16 dense Q with head dims through 256 or D512/D576-V512 wide envelopes, divisible by 8"
     if facts.has_bias and capabilities.bias_d_shapes is None:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
@@ -2139,6 +2140,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    if (
+        capabilities.sm_lo == 120
+        and not facts.thd
+        and facts.d_qk > 512
+        and (facts.d_qk, facts.d_v) != SM100_NATIVE_D576_SHAPE
+        and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_d576_envelope", False)
+    ):
+        return "SM120 D576 envelope requires the matching native cuDNN Frontend extension"
     if _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE and not getattr(
         cudnn._pybind_module._SdpaDenseBinder, "supports_native_d576", False
     ):
@@ -2414,11 +2423,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 knobs is not None
                 and (knobs.split_kv or 1) > 1
                 and knobs.tile_m not in (16, 32)
-                and _selected_d_shape(capabilities, facts, knobs) != D512_FLAVOR
+                and _selected_d_shape(capabilities, facts, knobs) not in WIDE_F16_FLAVORS
             ):
-                return "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or the D512 tile"
-            if knobs is not None and knobs.tile_m not in (16, 32) and not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, d512=True):
-                return "SM120 paged KV head dims above 128 require a decode tile (tile_m=16 or 32) or the D512 tile"
+                return "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or a D512/D576 tile"
+            if knobs is not None and knobs.tile_m not in (16, 32) and not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, d512=True, d576=True):
+                return "SM120 paged KV head dims above 128 require a decode tile (tile_m=16 or 32) or a D512/D576 tile"
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
@@ -3509,7 +3518,7 @@ def _sm80_spec() -> EngineSpec:
 
 
 def _sm120_spec() -> EngineSpec:
-    from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, GENERAL_HEAD_TILE_MAX, GENERAL_HEAD_TILES
+    from cudnn.sdpa.fwd.config_sm120 import GENERAL_HEAD_TILE_MAX, GENERAL_HEAD_TILES
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
@@ -3519,9 +3528,9 @@ def _sm120_spec() -> EngineSpec:
             phase="prefill",
             # The general template picks its Q/K and V head tiles independently,
             # so the native shapes are the cross product of the supported tiles;
-            # the d512 flavor (sm120/prefill_d512_f16.py) adds its (512, 512).
-            d_shapes=frozenset((tq, tv) for tq in GENERAL_HEAD_TILES for tv in GENERAL_HEAD_TILES) | {D512_FLAVOR},
-            d_envelope_floors=((D512_FLAVOR, GENERAL_HEAD_TILE_MAX),),
+            # the wide template adds native (512, 512) and (576, 512) head tiles.
+            d_shapes=frozenset((tq, tv) for tq in GENERAL_HEAD_TILES for tv in GENERAL_HEAD_TILES) | WIDE_F16_FLAVORS,
+            d_envelope_floors=tuple((shape, GENERAL_HEAD_TILE_MAX) for shape in sorted(WIDE_F16_FLAVORS)),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
