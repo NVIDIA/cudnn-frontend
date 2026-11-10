@@ -1814,3 +1814,21 @@ sdpa/frost/test_sdpa_fwd_paged_sm120.py -k "d512_determinism or paged_width_dete
 with `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
 `CUBLAS_WORKSPACE_CONFIG=:4096:8`. Recording used separate new directories;
 normal comparison leaves `CUDNN_DETERMINISM_RECORD` unset.
+
+The complete paging regression passes 144 cases, including all sixteen strict
+goldens on this runtime. Final D512 qualification passes 49 cases: the 25 new
+feature/admission/golden cases, existing dense/THD controls and two new dense
+infinite-sink endpoint checks. After the last paged-only score-buffer barrier
+fix, all 25 new cases pass again (279 deselected, no failures or skips).
+Ten BF16 feature/endpoint cases pass each of Compute Sanitizer 13.4 memcheck,
+racecheck and synccheck with zero reported errors; racecheck also reports zero
+warnings. Memcheck is unfiltered; racecheck/synccheck select the native
+`cudnn_kernel_` kernels. These are forward-path checks, not backward coverage.
+
+Retained controls distinguish numerical success from synchronization safety.
+The redundant paged V-tail stores passed numerics but produced 288 racecheck
+errors; skipping those stores on paged input makes the identical case clean.
+A broader ten-case run then passed numerically while reporting 80 grouped
+score-exchange races. An explicit warp-pair read-completion barrier fixes the
+single-buffer reuse: its failing split/packed control and the full ten-case
+racecheck now report zero errors. The dense TMA path retains its prior handoff.

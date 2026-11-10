@@ -1491,6 +1491,11 @@ keep the same producer arrival count at initial launch and every rearm. D512
 paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
 one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
 two CTAs so even compact tests exercise repeated unit transitions.
+An async-copy completion does not substitute for ownership synchronization
+of other shared buffers. The D512 warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on paged paths.
+`test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
+read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
 See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 and run the native paging racecheck as well as memcheck and numerical replay.
 

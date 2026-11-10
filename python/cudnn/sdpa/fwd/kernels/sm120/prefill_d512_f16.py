@@ -33,9 +33,8 @@ The kernel implements key optimizations including:
 - Twelve of each warp's sixteen Q d-fragments live in registers, the other four
   in shared memory and are reloaded once per KV tile
 - One fp32 partial-S exchange per KV tile between the two warps of a slab,
-  single-buffered: the write follows the V-tile wait, and the next V tile is
-  issued only after every warp has consumed the current one, so the partner
-  has always finished reading before the buffer is rewritten
+  single-buffered: dense TMA orders reuse through the V-tile handoff; paged
+  copies use an explicit warp-pair barrier after both partners finish reading
 - Lazy O rescale: the running row max only moves when a tile raises it by more
   than ``RESCALE_THRESHOLD``, so most KV tiles skip the O correction
 - Online softmax fused into the main loop, with per-lane registers and intra-warp
@@ -957,10 +956,10 @@ class SM120FusedMultiHeadAttentionForward:
         Each warp publishes its partial scores in its own ``sX`` slots
         (``[warp][k_frag][lane][4]``, one 16-byte store per fragment), meets its
         partner on the slab's named barrier, and adds the partner's slots in
-        place. The buffer is single-buffered: the caller runs this after the V
-        tile's mbarrier wait, and the next V tile is issued only after every
-        warp has consumed the current one, so the partner has finished reading
-        this tile's partials before anyone writes the next tile's.
+        place. The buffer is single-buffered. Dense TMA orders its reuse
+        through the V-tile producer/consumer handoff. Paged cp.async barriers
+        publish only the copies, so an explicit pair barrier completes the
+        generic shared reads before either partner overwrites its slots.
 
         :param basic_params: Lane mapping, warp-pair indices, and ``sX``.
         :param s_regs: This warp's partial QK scores; the full scores on return.
@@ -983,6 +982,11 @@ class SM120FusedMultiHeadAttentionForward:
             partner = (partner_base + k_frag * 32 * 4).load(count=4, alignment=16).bitcast(cutlass.Float32)
             for i in cutlass.range_constexpr(4):
                 s_regs[s_off + i] = s_regs[s_off + i] + partner[i]
+        if cutlass.const_expr(self.page_size > 0):
+            # The cp.async arrival publishes the page copies, not the generic
+            # shared reads from this exchange. Complete both partner reads
+            # explicitly before either warp reuses the single-buffered sX.
+            prims.barrier_cta_sync(self.bar_pair_base + basic_params.slab, thread_count=self.HEAD_SPLIT * cute.arch.WARP_SIZE)
 
     @cute.jit
     def compute_one_kv_tile(
