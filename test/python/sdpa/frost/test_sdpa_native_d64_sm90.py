@@ -57,8 +57,9 @@ def test_native_d64_declines_unimplemented_graph_features(extra):
     assert engines.mismatch(_caps(), _facts(d_qk=64, d_v=64, device_cc=(9, 0), **extra)) is not None
 
 
-def test_native_d64_declines_pack_gqa():
-    assert engines.mismatch(_caps(), _facts(d_qk=64, d_v=64, device_cc=(9, 0)), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+@pytest.mark.parametrize("knobs", [engines.SdpaFwdKnobs(pack_gqa=True), engines.SdpaFwdKnobs(split_kv=3)])
+def test_native_d64_declines_unimplemented_knobs(knobs):
+    assert engines.mismatch(_caps(), _facts(d_qk=64, d_v=64, device_cc=(9, 0)), knobs) is not None
 
 
 def test_native_d64_exports_the_prepared_pointer_contract():
@@ -102,6 +103,7 @@ def test_native_d64_exports_the_prepared_pointer_contract():
         pytest.param(dict(is_causal=True, window_size_left=16), "d512", id="window"),
         pytest.param(dict(seq_q_lens_present=True, seq_kv_lens_present=True), "d512", id="lengths"),
         pytest.param(dict(pack_gqa=True), "d512", id="pack-gqa"),
+        pytest.param(dict(split_kv=3), "d512", id="split-kv"),
         pytest.param(dict(thd=True), "d512", id="thd"),
         pytest.param(dict(is_causal=True, window_size_right=8), "d512", id="right-band"),
     ],
@@ -222,6 +224,14 @@ def test_native_d512_cross_compile_control(tmp_path, dtype):
 def _cross_compile(tmp_path, dtype, case, flavor):
     probe = r"""
 import glob, os, pathlib, re, sys
+# The child must compile the same source as the parent even with an editable
+# installation elsewhere. PYTHONPATH alone cannot override its finder.
+sys.meta_path[:] = [f for f in sys.meta_path if "__editable__" not in getattr(f, "__module__", "")]
+sys.path.insert(0, sys.argv[5])
+if os.environ.get("FE_TEST_CUDA_BINDINGS"):
+    sys.path.insert(0, os.environ["FE_TEST_CUDA_BINDINGS"])
+import cudnn
+assert pathlib.Path(cudnn.__file__).resolve().is_relative_to(pathlib.Path(sys.argv[5]).resolve()), cudnn.__file__
 os.environ["CUTE_DSL_ARCH"] = "sm_90a"
 os.environ["CUTE_DSL_DUMP_DIR"] = sys.argv[1]
 os.environ["CUTE_DSL_KEEP"] = "ptx,cubin"
@@ -261,7 +271,11 @@ assert re.search(r"setmaxnreg\.inc\.sync\.aligned\.u32\s+" + ("200" if d == 64 e
 print("NATIVE_HOPPER_COMPILE_OK", flavor, len(paths))
 """
     result = subprocess.run(
-        [sys.executable, "-c", probe, str(tmp_path), str(dtype), case, flavor], capture_output=True, text=True, timeout=300, env=dict(os.environ)
+        [sys.executable, "-c", probe, str(tmp_path), str(dtype), case, flavor, str(Path(cudnn.__file__).resolve().parents[1])],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=dict(os.environ),
     )
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-6000:]
     assert f"NATIVE_HOPPER_COMPILE_OK {flavor}" in result.stdout

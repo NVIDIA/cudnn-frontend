@@ -1561,3 +1561,10 @@ use those names, preserving their values and policy. The cold-interpreter
 `test_split_combine_import_without_heuristics` blocks heuristics imports while
 loading both the reducer and SM80 prepared host; a warmed test process can hide
 this dependency.
+
+Test launch recorders retained by a native binder must not capture the owning
+API or prepared spec. That reference cycle can cross a non-GC nanobind object
+and survive Python collection. Capture the immutable stride/index metadata
+and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
+reproduced eighteen binder leaks before this correction and runs cleanly
+afterwards; keep the pointer/stride assertions and inspect process shutdown.
