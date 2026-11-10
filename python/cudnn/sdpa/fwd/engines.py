@@ -1191,6 +1191,10 @@ def launch_grid_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts",
     batch, heads = facts.b * (knobs.split_kv or 1), facts.h_q
     if max(batch, heads) <= _GRID_YZ_MAX:
         return None
+    if capabilities.sm_lo == 80 and (knobs.split_kv or 1) > 1:
+        if max(facts.b, heads, knobs.split_kv) <= _GRID_YZ_MAX:
+            return None
+        return "SM80 split-KV requires batch, heads and split count each at most 65535"
     if packed_thd_split(capabilities, facts, knobs):
         # The packed combine launches ((t_q+3)//4, heads, 1) and the split attention a flat grid.
         if heads <= _GRID_YZ_MAX:
@@ -1878,11 +1882,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                             )
                         )
                         or facts.has_epilogue_gate
-                        or capabilities.sm_lo not in (100, 107, 120)
+                        or capabilities.sm_lo not in (80, 100, 107, 120)
                     )
                 )
                 or (
                     facts.padded
+                    and capabilities.sm_lo != 80
                     and not facts.has_paged_kv
                     and not packed_split
                     and not native_fp8_padded_split
@@ -1890,12 +1895,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 )
                 or (
                     facts.seq_q_trim
+                    and capabilities.sm_lo != 80
                     and not (facts.padded and (native_fp8_padded_split or _selected_d_shape(capabilities, facts, knobs) == SM100_NATIVE_D576_SHAPE))
                 )
                 # A split sink over padded query lengths also needs the native dense binder that hands the combine the Q lengths (a padded
                 # row must stay O := 0 / LSE := -inf): an older extension declines it here rather than at the spec build.
                 or (
                     facts.has_sink
+                    and capabilities.sm_lo != 80
                     and not packed_split
                     and not facts.thd
                     and facts.padded
@@ -1903,7 +1910,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False)
                 )
             ):
-                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103/SM107 per-tensor FP8, SM120 exact D128 dense per-tensor FP8 and SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
+                return "split_kv > 1 serves sink-free dense graphs (sinks also split on SM100/SM103/SM107 per-tensor FP8, SM120 exact D128 dense per-tensor FP8 and SM80/SM100/SM107/SM120 half), the decode tile's ragged-Q leg, or supported native packed splits"
             if (
                 facts.has_sink
                 and (facts.is_fp8 or facts.is_mxfp8)
@@ -3451,6 +3458,7 @@ def _sm80_spec() -> EngineSpec:
             # One live query uses the same predicated native forward body.
             # Dense, THD and paged inputs retain their own addressing contracts.
             decode=True,
+            split_kv_supported=True,
             # The kernels implement the dense padded-Q trim natively
             # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
             # are written explicitly by the kernel (O := 0, LSE := -inf).

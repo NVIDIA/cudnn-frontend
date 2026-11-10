@@ -281,9 +281,15 @@ def _sdpa_kernel(
     #   block.  Best for larger SQ where K/V GMEM footprint exceeds L2.
     if cutlass.const_expr(sched_policy == SCHED_DEFAULT):
         bx, by, bz = cute.arch.block_idx()
-        q_tile_idx = bx
-        head_idx = by
-        batch_idx = bz
+        if cutlass.const_expr(PARAMS.split_kv > 1):
+            q_tiles = (Q.shape[1] + tile_m - 1) // tile_m
+            q_tile_idx = bx % q_tiles
+            head_idx = (bx // q_tiles) % Q.shape[2]
+            batch_idx = bx // (q_tiles * Q.shape[2])
+        else:
+            q_tile_idx = bx
+            head_idx = by
+            batch_idx = bz
     else:
         bx, _, _ = cute.arch.block_idx()
         SQ_for_decode = Q.shape[1]
@@ -400,6 +406,8 @@ def _sdpa_kernel(
     K_view = cutlass.make_array_view(K)
     V_view = cutlass.make_array_view(V)
     O_view = cutlass.make_array_view(O)
+    split_idx = cute.arch.block_idx()[2] if cutlass.const_expr(PARAMS.split_kv > 1) else cutlass.Int32(0)
+    output_batch_idx = batch_idx + split_idx * Q.shape[0]
 
     # Shapes (B, S, H, D).  GQA/MQA: H_q (Q heads) may exceed H_kv (K/V
     # heads) when H_q % H_kv == 0.  ``heads_per_kv`` Q-heads share each
@@ -465,7 +473,7 @@ def _sdpa_kernel(
         V_BATCH_OFF = sequence_base(ragged_v, batch_idx, kv_seq_origin * V_ROW_STRIDE_E, origin_batch_strides[2], origin_multipliers[2])
     else:
         Q_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(Q.stride[0])
-        O_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(O.stride[0])
+        O_BATCH_OFF = cutlass.Int64(output_batch_idx) * cutlass.Int64(O.stride[0])
         K_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(K.stride[0])
         V_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(V.stride[0])
     Q_BASE = Q_BATCH_OFF + cutlass.Int64(q_row_base) * Q_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(Q.stride[2])
@@ -482,7 +490,7 @@ def _sdpa_kernel(
             LSE_BASE = LSE_BATCH_OFF + cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(q_row_base) * LSE_S_STRIDE_E
         else:
             LSE_BASE = (
-                cutlass.Int64(batch_idx) * cutlass.Int64(LSE.stride[0])
+                cutlass.Int64(output_batch_idx) * cutlass.Int64(LSE.stride[0])
                 + cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1])
                 + cutlass.Int64(q_row_base) * LSE_S_STRIDE_E
             )
@@ -640,6 +648,16 @@ def _sdpa_kernel(
             kv_left.ir_value(),
         )
     )
+
+    # Partition the already clipped tile interval. Every split owns its
+    # complete partial row, including empty intervals; no scratch clear or
+    # atomics are needed. Runtime lengths and masks retain their own bounds.
+    if cutlass.const_expr(PARAMS.split_kv > 1):
+        split_tiles = (kv_right - kv_left + PARAMS.split_kv - 1) // PARAMS.split_kv
+        split_left = kv_left + split_idx * split_tiles
+        kv_left = cutlass.Int32(arith.select((split_left < kv_right).ir_value(), split_left.ir_value(), kv_right.ir_value()))
+        split_right = split_left + split_tiles
+        kv_right = cutlass.Int32(arith.select((split_right < kv_right).ir_value(), split_right.ir_value(), kv_right.ir_value()))
 
     # ---- INTERIOR vs BOUNDARY iter split for mask pre-pass ---------------
     # ``compute_kv_loop_bounds`` already trims fully-masked iters off the
@@ -1492,7 +1510,7 @@ def _sdpa_kernel(
     # denominator.  os == 1 whenever sink <= max (the common case), so the
     # O rescale is a no-op there; for a fully-masked row (max = -inf) os = 0
     # zeroes O and the denominator becomes exp2(0) = 1 → O = 0, lse = sink.
-    if cutlass.const_expr(has_sink):
+    if cutlass.const_expr(has_sink and PARAMS.split_kv == 1):
         _sink_ptr = cutlass.make_array_view(sinks).data_ptr()
         sink_log2_h = cutlass.Float32(Pointer(_sink_ptr, dtype=sinks.element_type)[cutlass.Int64(head_idx) * cutlass.Int64(sinks.stride[0])])
         if cutlass.const_expr(PARAMS.sink_natural):
@@ -1565,7 +1583,7 @@ def _sdpa_kernel(
                 lse_top = cutlass.Float32(arith.select((trim_top < eff_sq).ir_value(), lse_top.ir_value(), _ninf.ir_value()))
                 lse_bot = cutlass.Float32(arith.select((trim_bot < eff_sq).ir_value(), lse_bot.ir_value(), _ninf.ir_value()))
             # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
-            if cutlass.const_expr(PARAMS.stats_log2):
+            if cutlass.const_expr(PARAMS.stats_log2 and PARAMS.split_kv == 1):
                 lse_top = lse_top * cutlass.Float32(1.4426950408889634)
                 lse_bot = lse_bot * cutlass.Float32(1.4426950408889634)
             lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top) * LSE_S_STRIDE_E
@@ -1790,6 +1808,8 @@ def _sdpa_host(
     #   * SCHED_LPT / SCHED_LPT_L2 → 1-D grid, kernel does the decode.
     if cutlass.const_expr(THD_VARLEN):
         grid = (thd_q_tiles, cutlass.Int32(H), thd_n_batch)
+    elif cutlass.const_expr(PARAMS.split_kv > 1):
+        grid = (q_tiles * H * B, 1, PARAMS.split_kv)
     elif cutlass.const_expr(sched_policy == SCHED_DEFAULT):
         grid = (q_tiles, H, B)
     else:

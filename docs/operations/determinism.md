@@ -193,6 +193,14 @@ with dense and paged K/V. This qualification uses a fixed GPU and runtime;
 it does not imply identical bytes across GPU or software versions. Detailed
 coverage is recorded in the determinism test report.
 
+Native SM80 dense-query split-KV forward is also repeatable and batch invariant
+for the tested D128 and D512 FP16/BF16 configurations with fixed split counts.
+The checks include padded lengths, sinks, causal windows, reordered/duplicated
+batches and changed neighbors under CUDA Graph replay. O and FP32 Stats are
+compared byte for byte. This is forward-only qualification of this fixed
+GPU/runtime; THD split-KV remains unsupported and cross-runtime identity is
+not claimed.
+
 ## SM120 small-head paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch

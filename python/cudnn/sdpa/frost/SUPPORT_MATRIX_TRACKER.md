@@ -4822,3 +4822,15 @@ candidate-ranking change is introduced.
 entry. Its checks include Q1/Q16 at H128:1, independent HND/NHD pools,
 changed-input capture, independent CPU-double O/Stats references and four
 fixed-input raw-byte replay/batch goldens.
+
+### SM80 dense-Q split-KV
+
+The native half row admits split-KV with dense Q and dense or paged K/V,
+including padded Q/KV lengths, sinks, masks, strided outputs and optional Stats.
+Both native bodies partition the masked KV-tile interval and write every partial
+row, including empty ranges. The existing deterministic combine folds a sink
+once and writes the declared output strides. Half partials and natural-log LSE
+live in caller workspace; final Stats may be natural or base two. No input
+staging, workspace memset or atomics are introduced. All existing schedulers
+retain their work ordering inside each split. THD splits and PackGQA remain
+outside this admission; unsplit routes retain their existing behavior.

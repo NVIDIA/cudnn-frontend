@@ -144,6 +144,8 @@ class TemplateParams:
     score_sign: int = 1
     # Zero retains contiguous K/V; positive values select device page tables.
     paged_page_size: int = 0
+    # Independent KV ranges write split-major partials for the shared reduction.
+    split_kv: int = 1
 
 
 def score_sign(scale: float) -> int:
@@ -158,6 +160,10 @@ def kernel_scale(scale: float) -> float:
 def validate_params(p: TemplateParams) -> None:
     """Raising validator — a failure here means the capability row or the
     adapter lied about what this template can serve (README Rule 2)."""
+    if not 1 <= p.split_kv <= 65535:
+        raise ValueError("sm80: split_kv must be in [1, 65535]")
+    if p.split_kv > 1 and p.thd_varlen:
+        raise ValueError("sm80: split-KV currently requires dense Q")
     wide = p.d_qk > 256 or p.d_v > 256
     tile_ns = (16,) if wide else (32, *_SM80_SEQ_TILES_N) if (p.d_qk, p.d_v) == (256, 256) else _SM80_SEQ_TILES_N
     if p.tile_n not in tile_ns:

@@ -7110,9 +7110,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._rope_max_s and (self.seq_kv_lens_present or self.seq_q_lens_present),
             "SM80 SDPA: RoPE fusion is dense-unpadded-only",
         )
+        self._value_error_if(not 1 <= self.split_kv <= 65535, "SM80 split_kv must be in [1, 65535]")
+        self._not_implemented_error_if(self.split_kv > 1 and max(b, h_qo) > 65535, "SM80 split-KV requires batch and heads each at most 65535")
         self._not_implemented_error_if(
-            self.split_kv > 1,
-            "SM80 SDPA has no split-KV path (no partial slabs, no combine kernel)",
+            self.split_kv > 1 and self.thd,
+            "SM80 split-KV requires dense Q (dense or paged K/V)",
         )
         self._value_error_if(
             self.softmax_precision is not None,
@@ -7264,6 +7266,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sink_natural=True,
             score_sign=_sm80_cfg.score_sign(self.scale_softmax),
             paged_page_size=self.paged_page_size,
+            split_kv=self.split_kv,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if self.thd:
@@ -7321,12 +7324,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
 
     def scratch_workspace_bytes(self) -> int:
-        """Dense native IO needs no scratch; packed IO reserves length metadata."""
+        """Split partials and packed length metadata use caller-owned scratch."""
         self._ensure_support_checked()
         if self.thd:
             from cudnn.frost.tile_dsl.thd import THD_META_WORDS
 
             return ws_align(THD_META_WORDS(self.batch_size) * 4)
+        if self.split_kv > 1:
+            rows = self.split_kv * self.batch_size * self.h_q * self.s_q_max
+            return ws_align(rows * self.head_dim_v * 2) + ws_align(rows * 4)
         return 0
 
     def _execute_thd(
@@ -7625,7 +7631,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             with context:
                 stream = self._get_default_stream(current_stream)
                 _ensure_current_context(int(stream), device.index)
-                execute_tensors(self._sm80_spec, buffers, int(stream), scale=scale_softmax)
+                execute_tensors(self._sm80_spec, buffers, int(stream), scale=scale_softmax, workspace=workspace)
             self._logger.debug("execute completed")
             return
 
