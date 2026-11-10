@@ -2757,18 +2757,20 @@ MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 16**; both head dims in (256, 512] run `sm120/prefill_d512_mxfp8.py`, the d512
 FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.
 
-On **SM120 / SM121 (cc 12.0 / 12.1)**, FP16/BF16 backward also serves native **exact D128
-MHA THD**, with independent device ragged offsets for Q/K/V/O/dO/dQ/dK/dV
+On **SM120 / SM121 (cc 12.0 / 12.1)**, FP16/BF16 backward also serves native
+**THD through D256**, including GQA/MQA and eight-aligned `0 < D_V <= D_QK <= 256`,
+with independent device ragged offsets for Q/K/V/O/dO/dQ/dK/dV
 and packed token-major or head-major Stats. This reuses the row-predicated
-`cp.async` / `mma.sync` packed compute with a fixed 64x64 tile, one Q/dO
+`cp.async` / `mma.sync` packed compute with a 32/64-row tile, one Q/dO
 stage and direct FP32 dQ atomic accumulation to fit SM120 shared memory.
 It is not a TMA optimization or a performance claim; placement is unchanged.
 Nonuniform and empty Q/KV lengths retain exact zero-gradient semantics, and
 metadata/scratch live in caller workspace. Both positive packed capacities
-must be declared; each capacity times H times 128 must be below 2^31 for
+must be declared; each capacity times H times the padded head width must be below 2^31 for
 native launch counts. Sequence envelopes are at most 2^31-64 and batch/head
-counts at most 65535. Only mask-free and top-left causal THD are admitted;
-Other head widths, GQA, deterministic, windowed, bias and sink THD
+counts at most 65535. Mask-free, top-left and bottom-right causal THD are admitted.
+Tile dimensions must fit the native geometry and 99 KiB shared-memory budget;
+D128 keeps 64x64 by default, while D256 uses 32x32. Deterministic, windowed, bias and sink THD
 graphs retain typed declines. Dense support below remains unchanged.
 
 | Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 256, any ×8 |
@@ -2782,7 +2784,7 @@ graphs retain typed declines. Dense support below remains unchanged.
 | Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, ≤ 512ᵃ | ×8, ≤ 256 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, exact D128 MHA; restrictions above) |
+| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D256/GQA; restrictions above) |
 | Paged KV (dense Q; prefill through D128, decode through D256, D512 envelope) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |

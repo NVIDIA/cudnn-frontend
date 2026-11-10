@@ -252,3 +252,14 @@ runtime goldens accompany the independent numerical checks. This is
 forward-only evidence; SM121 and other runtimes remain unverified.
 
 SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.
+
+## SM120 packed backward
+
+The native FP16/BF16 THD backward path through D256/GQA retains unordered
+FP32 dQ atomic accumulation. General deterministic backward and batch
+invariance are unsupported by this path; deterministic-mode graphs decline.
+The bounded single-KV-tile test compares dQ/dK/dV bytes across replays,
+fresh storage, duplicated/reordered batches and changed-neighbor capture.
+That limited coverage passes on SM121 (GB10); SM120 remains unverified.
+It does not extend the deterministic contract to multiple KV tiles. This change adds
+no forward kernel.
