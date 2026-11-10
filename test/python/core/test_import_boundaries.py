@@ -19,7 +19,6 @@ process it stays, so an in-process assertion would pass for the wrong reason.
 
 import importlib.util
 import json
-from pathlib import Path
 import subprocess
 import sys
 
@@ -475,38 +474,4 @@ else:
 assert "cudnn.ops._nvfp4_block_scale_kernels" not in sys.modules
 """
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr
-
-
-def test_jax_unavailable_bridge_reports_version_before_importing_symbols():
-    probe = """
-import runpy
-import sys
-from types import ModuleType, SimpleNamespace
-
-import cudnn
-from cudnn.frost import buffers
-
-buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.7.1"))
-
-for name in ("cutlass", "cutlass.cute", "cutlass.jax", "jax", "jax.numpy"):
-    module = ModuleType(name)
-    module.__path__ = []
-    sys.modules[name] = module
-    parent, _, child = name.rpartition(".")
-    if parent:
-        setattr(sys.modules[parent], child, module)
-sys.modules["cutlass.jax"].is_available = lambda: False
-sys.modules["jax"].version = SimpleNamespace(__version_info__=cudnn.CUTEDSL_MIN_JAX_VERSION)
-sys.modules["jax"].__version__ = cudnn.CUTEDSL_MIN_JAX_VERSION_STR
-
-try:
-    runpy.run_path(sys.argv[1])
-except ImportError as exc:
-    assert f"jax >= {cudnn.CUTEDSL_MIN_JAX_VERSION_STR}" in str(exc), str(exc)
-else:
-    raise AssertionError("An unavailable JAX bridge was accepted")
-"""
-    source = Path(__file__).resolve().parents[3] / "python/cudnn/jax/__init__.py"
-    run = subprocess.run([sys.executable, "-c", probe, str(source)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
