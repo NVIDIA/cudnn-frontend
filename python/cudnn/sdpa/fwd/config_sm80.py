@@ -146,6 +146,8 @@ class TemplateParams:
     paged_page_size: int = 0
     # Independent KV ranges write split-major partials for the shared reduction.
     split_kv: int = 1
+    # Q heads sharing one KV head occupy consecutive MMA rows.
+    pack_g: int = 1
 
 
 def score_sign(scale: float) -> int:
@@ -160,6 +162,8 @@ def kernel_scale(scale: float) -> float:
 def validate_params(p: TemplateParams) -> None:
     """Raising validator — a failure here means the capability row or the
     adapter lied about what this template can serve (README Rule 2)."""
+    if p.pack_g < 1 or (p.pack_g > 1 and p.thd_varlen):
+        raise ValueError("sm80: PackGQA requires a positive head group and dense Q")
     if not 1 <= p.split_kv <= 65535:
         raise ValueError("sm80: split_kv must be in [1, 65535]")
     if p.split_kv > 1 and p.thd_varlen:

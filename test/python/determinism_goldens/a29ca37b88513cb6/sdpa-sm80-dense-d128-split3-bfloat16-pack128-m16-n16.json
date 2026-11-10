@@ -1,0 +1,72 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "6d12d6c1bc722624d4114a5a184a2c5eed0c3f7a7fbecc159e9d870db21eddc8",
+      "shape": [
+        2,
+        257,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "5eb801e36c6c3fba494aad0244cff830e358641ec4c560b4c042f07754f8f5ee",
+      "shape": [
+        256,
+        17,
+        128
+      ]
+    },
+    "sink": {
+      "dtype": "torch.float32",
+      "sha256": "e449c3276b6147d4a72ff0b4e5dd3e8b3a7893b572414dddc282624af3caf0e7",
+      "shape": [
+        256
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "9f2bbc9e93242f2921a3874728367b8ad90427b47b48bb1c567f732051d2c70d",
+      "shape": [
+        2,
+        257,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "d2057470d7fc16e8ecf2f6014844434c93a22af534b19aba5ec9e7987a09f620",
+      "shape": [
+        256,
+        17
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "118304405e0a3430cd41ccb8566404320f6d13360792085d86fa8f7ef0d021ca",
+      "shape": [
+        256,
+        17,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92800,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA A100-PCIE-40GB",
+    "sm": [
+      8,
+      0
+    ],
+    "sm_count": 108,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}
