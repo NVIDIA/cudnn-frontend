@@ -9,6 +9,8 @@ These suites check six attention families and the DSA indexer APIs. Run from `te
 ```bash
 pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0
+pytest compressed_sparse_attention/cutedsl/test_CSA_compressor.py -m L0 \
+  -k 'batch_invariance or replay_determinism or determinism_golden'
 pytest core/test_determinism_utils.py
 ```
 
@@ -37,15 +39,25 @@ CSA compressor coverage currently lives in
 `compressed_sparse_attention/cutedsl/test_CSA_compressor.py`. It checks repeated
 forward/dKV/dScore bytes, `deterministic=True` dAPE, strict torch deterministic mode,
 poisoned caller workspace/output CUDA Graph replay, ragged and empty segments, and
-exact-zero static-capacity rows for the generic and ratio-128 forward families. It does
-not yet contain the standalone/reordered/duplicated sequence comparisons or committed
-goldens required to claim batch invariance. The capacity-zero change and poisoned replay
-cases passed on an SM90 GPU (CC 9.0, CUDA 13.0, cuDNN 9.20, PyTorch 2.12.1,
-CUTLASS DSL 4.8.1) and an SM100 GPU (CC 10.0, CUDA 13.0, cuDNN 9.24, PyTorch 2.14.1,
-CUTLASS DSL 4.8.1). Forward and opt-in deterministic backward remain Unverified on
-SM90, SM100, SM103, and SM107 because batch invariance has not been established; their
-successful replay results do not by themselves qualify as Replay only. The default
-atomic dAPE path is Not guaranteed by contract.
+exact-zero static-capacity rows for the generic and ratio-128 forward families. The
+focused determinism set has 23 L0 cases: five replay cases; twelve forward/deterministic-
+backward batch cases spanning ratios 2, 4, and 128 with both `coff` values; and six
+replay-plus-reference goldens for generic ratio-2, generic ratio-4 overlap, and the
+dedicated ratio-128 path. Batch cases compare a fixed sequence alone, before and after
+different-size neighbors, duplicated, and beside changed neighbor data. The ratio-128
+case crosses its small/default forward schedule boundary. Backward isolates the fixed
+sequence's upstream gradient and checks BF16 dKV/dScore plus FP32 dAPE bytes.
+
+At revision `70e7eb77d997`, the new SM100 run (CUDA 13.0, cuDNN 9.24, PyTorch
+2.14.1, CUTLASS DSL 4.8.1) reported 12/12 batch cases, 5/5 replay cases, and 6/6
+golden/reference cases passed. The SM103 run (CUDA 13.0, cuDNN 9.20, PyTorch
+2.12.1, CUTLASS DSL 4.7.1) reported the same 23 passes. The two committed runtime
+baselines use keys `842e0ee8788d6de6` and `4e05d04e8e72ed1b`; identical inputs
+produced identical output hashes across the two recorded runtimes. These results establish
+forward and opt-in deterministic backward as Supported in the combined SM100/103 column.
+The earlier capacity-zero and poisoned replay cases passed on SM90, but SM90 batch
+invariance and goldens remain unverified; SM107 is also unverified. The default atomic
+dAPE path remains Not guaranteed by contract.
 
 At revision `bca6dcd50b81`, the requested `@cudnn-ci-bot run python/misc` pipeline
 reported 147 passed / 71 skipped / 0 failed CSA cases on SM90, 218 passed / 0 skipped /
