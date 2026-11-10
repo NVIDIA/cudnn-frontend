@@ -4750,6 +4750,18 @@ THD, padding, BR/right-band, sink/bias, Amax outputs and noncompact layouts
 remain declined. SM100 and SM107 numerical/replay/batch checks pass; SM103
 execution remains unverified. The row is opt-in and requires CuTeDSL4.8.0.
 
+### SM80 native THD forward with attention sinks
+
+The half-precision SM80 row admits attention sinks with native THD Q and dense
+or paged K/V. The existing native kernel folds the FP32 sink in its denominator;
+the graph/standalone adapter now passes its pointer and head stride instead of
+rejecting the combination. Graph declarations own the head stride even when the
+variant-pack carrier is flat. Standalone sinks accept `(H_q,)` or
+`(1,H_q,1,1)` views. Current dtype, device, presence and exposed storage are
+validated before metadata or output writes. No sink conversion or staging copy
+is inserted. THD bias and RoPE remain declined, and the natural scheduler
+restriction is unchanged. Qualification is recorded in the determinism report.
+
 ### Native SM107 mixed FP8 KV at exact D256/V256
 
 `sdpa_fwd_prefill_sm107` accepts FP16/BF16 Q/O with E4M3/E5M2 K/V at

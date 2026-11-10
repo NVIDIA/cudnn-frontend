@@ -1316,6 +1316,12 @@ delta helper reused unchanged can make dV correct while corrupting dQ/dK.
 `test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
 plus fixed quantized inputs under changed batch sizes and graph replay.
 
+A graph sink descriptor can be strided while its variant-pack carrier is flat.
+Pass the declared head pitch to the native THD host; standalone views derive
+their own pitch. Validate current sink presence, dtype, device and storage span
+before length metadata writes. `test_native_thd_paged_sink_rebind_replay` keeps
+poisoned sink slack, fresh pointers and changed-input capture; the SM80 sink
+determinism suite checks unchanged outputs and scratch on rejected bindings.
 
 Paged vector loaders must derive row count and swizzle span from each operand's
 compiled head tile, while the live-vector guard uses its logical width. Fill

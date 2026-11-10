@@ -2143,8 +2143,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return reason
         if (facts.seq_q_t is None and facts.cu_seq_q_t is None) or (facts.seq_kv_t is None and facts.cu_seq_kv_t is None):
             return "SM80 THD forward requires Q and KV lengths (seq_len_* or cu_seq_len_*)"
-        if facts.has_bias or facts.has_sink:
-            return "SM80 THD forward does not support bias or sink fusion"
+        if facts.has_bias:
+            return "SM80 THD forward does not support bias fusion"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
@@ -3726,6 +3726,9 @@ def lower_dsl_prefill(
         **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
     if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+        # Graph carriers expose raw storage; the declaration owns the sink's
+        # head pitch, independently of the carrier's observed dimensions.
+        api._thd_sink_stride = int(facts.sink_t.get_stride()[1]) if facts.has_sink else None
         # No ragged declaration means the port keeps its dense batch pitch.
         api._thd_origin_batch_strides = tuple(
             int(t.get_stride()[0]) if t is not None and getattr(t, "ragged_offset", None) is None and not (facts.has_paged_kv and i in (1, 2)) else None

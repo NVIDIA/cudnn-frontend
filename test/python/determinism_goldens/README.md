@@ -1416,6 +1416,36 @@ not `test_sdpa_fwd_dsl_sm107.py`. The shared mixed-KV class now lives in the
 selected file, with explicit L0/DSL/SM107 guards and no duplicate collector.
 The GPU counts above are direct qualification, not completed CI results.
 
+### SM80 native THD sink forward
+
+The native adapter passes sink pointers and head strides through the existing
+THD host for dense and paged K/V. `test_sdpa_fwd_paged_sm80.py` covers FP16/BF16,
+strided sink declarations with flat graph carriers, HND/NHD independent pools,
+new storage, dynamic lengths/origins and changed-sink CUDA Graph replay. Invalid
+sink bindings are checked before output or metadata writes.
+
+The determinism cases use CPU-generated fixed operands and an independent CPU
+FP64 sink reference, repeat under concurrent scheduling work, compare target
+sequences alone, with neighbors, reordered and duplicated, and mutate neighbor
+pages under capture. On A100 with cuDNN 9.28.0.38, Torch 2.14.1+cu130 and CuTe DSL 4.8.0/CUDA 12.9,
+all 96 cases in this file pass: 64 existing controls, 24 sink cases covering
+D64/D256/D576x512 and eight strict dense/paged runtime goldens. The four initial
+paged and the eight expanded dense/paged golden-recording cases passed before
+the strict run. These are SM80 execution results only; no other GPU is claimed.
+
+Compute Sanitizer 13.4.92 memcheck, racecheck and synccheck each pass eight
+D64 graph/standalone FP16/BF16 mask cases with zero findings. These runs use
+cuda-bindings 13.2.0 compatible with the installed driver. The initial run
+with bindings 13.4.3 reported API-version query errors before attention; an
+exact-source create/destroy-handle control reproduced them. That initial run
+is not counted as a sanitizer pass. No suppression is used in the clean runs.
+
+Commands from `test/python`: `python -m pytest sdpa/frost/test_sdpa_fwd_paged_sm80.py -m L0 -q -x`
+with `CUDNN_DETERMINISM_GOLDENS` pointing to the committed golden directory.
+Sanitizers select `native_thd_paged_sink_rebind_replay and dims0` from the same
+file, with `--error-exitcode 91`. Pre-commit passes; Fern has zero errors and
+one existing redirect warning.
+
 ### SM120 small-head paged forward — 2026-11-10
 
 `sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_width_determinism`
