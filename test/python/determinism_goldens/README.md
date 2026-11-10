@@ -1329,3 +1329,28 @@ on SM107; it is not a full random-matrix oracle or a performance result.
 Review closeout: the SM107 D512 FP8 class moved into the actual selected
 `test_sdpa_fp8_sm107.py` entry; direct collection of the former backward file
 was not CI inclusion. The new kernel now carries its required cuDNN prefix.
+
+### D512 MXFP8 backward — 2026-11-10
+
+`TestD512Mxfp8Backward` is collected by the existing SM100 and SM107 MXFP8
+architecture entries. The shared `d512_mxfp8_bwd_checks.py` has six independent
+reference cases, seven graph declines and two raw-byte golden/batch cases.
+CPU-seeded inputs are quantized once; SF bytes are reordered in their canonical
+rowwise/columnwise layout with the corresponding payloads. Singletons,
+reordered/duplicated batches through129, fresh buffers, concurrent work,
+repeat launches, sync-debug execution and captured dO/SF mutations are checked.
+Neither the MXFP8 reference nor its cosine tolerance is changed.
+
+Both SM100 and SM107 pass all15 recording cases. Two goldens per runtime cover
+FP16/BF16 gradients under the same runtime keys as the D512 per-tensor FP8
+qualification above. SM103 execution is unverified. ExactD512 MHA/GQA/SWA uses
+only FP32 row-delta scratch and reads canonical scales without repacking.
+
+Final strict checks:15 pass on SM107;39 pass on SM100 comprising15 MXFP8,
+19 per-tensor D512 FP8 (all prior golden bytes unchanged) and5 existing
+D128/D192 MXFP8 controls. On each architecture, all6 new numerical cases
+pass memcheck, synccheck and racecheck without errors or hazards. SM103
+compiles both gradient types; no execution result is inferred. Original
+B2/H64:1/S16384/window128 passes a full structured output oracle and changed-
+input capture on SM107 with8,388,848bytes of scratch. This is not a full
+random-matrix oracle or a performance result.
