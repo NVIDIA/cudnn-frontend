@@ -919,7 +919,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.combine = None
     s.combine_q_lens = False
     if s.split > 1:
-        from cudnn.sdpa.fwd.api_dsl import ws_align
+        from cudnn.sdpa.fwd.workspace import ws_align
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn import _pybind_module
 

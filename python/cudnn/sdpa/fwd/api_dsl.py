@@ -16,6 +16,7 @@ from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from cudnn.sdpa.fwd.workspace import ws_align
 from types import SimpleNamespace
 from typing import Hashable, Iterator, Optional
 
@@ -397,7 +398,6 @@ _SM120_DTYPE_QKV_CODE = {
 # used so the per-sequence O TMA descriptors carved for the THD path satisfy
 # the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
-_WS_ALIGN = 128
 
 
 @contextmanager
@@ -454,11 +454,6 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
-
-
-def ws_align(nbytes: int) -> int:
-    """Round a scratch-chunk size up to the carve alignment (128 B)."""
-    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
 
 
 class WorkspaceCarver:
