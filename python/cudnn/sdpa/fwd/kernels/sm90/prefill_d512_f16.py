@@ -62,6 +62,7 @@ from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.scheduler import SCHED_LPT_L2, SCHED_NATURAL, lpt_l2_tile_coords, lpt_tile_coords
 from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF, thd_port_origin
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
+from cudnn.sdpa.fwd.config_sm100 import pack_gqa_group_size
 from cudnn.sdpa.fwd.config_sm90 import (
     D_TILE,
     SCALE_POSITIVE,
@@ -124,9 +125,9 @@ class Bars(NamedTuple):
     - ``mb_tma_v_empty``: the 8 warps of WG1 and WG2, each after its PV half.
     - ``mb_p_xfer_{full,empty}``: the P_STAGES-deep P ring; WG1's 4 warps publish, WG2's
       4 release.
-    - ``mb_alpha_xfer_{full,empty}``: one alpha pair per non-first KV tile, WG1's 4
-      warps -> WG2's 4.
-    - ``mb_inv_sum_xfer_full``: WG1's 4 warps publish the inverse row sums once per work
+    - ``mb_alpha_xfer_{full,empty}``: one alpha pair per non-first KV tile, all 128 threads in WG1
+      publish and all 128 in WG2 release.
+    - ``mb_inv_sum_xfer_full``: WG1's 128 threads publish the inverse row sums once per work
       tile, so it has no EMPTY partner.
 
     Consumers wait FULL from phase 0, producers EMPTY from phase 1, which passes at once
@@ -220,12 +221,12 @@ class SM90FusedMultiHeadAttentionForward:
             ``sinks`` operand.
         :param thd_varlen: THD (ragged / packed) mode. Q/K/V/O and LSE are packed
             batch-1 views, and ``__call__`` first launches the shared THD setup kernel.
-        :param pack_gqa: Pack ``Q_TILE // qh_per_kh`` tokens x ``qh_per_kh`` query heads
-            sharing one KV head into each Q tile: row ``r`` is token ``r // qh_per_kh``,
-            head ``r % qh_per_kh``.
+        :param pack_gqa: Pack ``gcd(Q_TILE, qh_per_kh)`` query heads per token.
+            Each work head owns one subgroup, and adjacent subgroups may share
+            a KV head (e.g. two 64-head subgroups for a 128:1 MQA group).
         :param qh_per_kh: The GQA ratio, refused unless ``h_q == h_kv * qh_per_kh``. Q
             head ``h`` reads KV head ``h // qh_per_kh``. Under ``pack_gqa`` it must
-            divide ``Q_TILE``.
+            share a factor with ``Q_TILE``.
         :param scale_mode: The sign of the softmax scale: ``SCALE_POSITIVE``,
             ``SCALE_ZERO`` or ``SCALE_NEGATIVE``. Each sign compiles its own probability
             path, and a negative scale anchors each row at its minimum raw score. The
@@ -272,8 +273,8 @@ class SM90FusedMultiHeadAttentionForward:
 
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
-        # Rows of a Q tile per token (PackGQA packs qh_per_kh heads per token).
-        self.heads_per_tile = qh_per_kh if pack_gqa else 1
+        # Split a GQA group into equal subgroups that divide the 64-row tile.
+        self.heads_per_tile = pack_gqa_group_size(qh_per_kh, self.Q_TILE, partial=True) if pack_gqa else 1
         self.scale_mode = scale_mode
         # The anchor is the raw-score extremum that maximizes the scaled score: the
         # maximum for a non-negative scale, the minimum for a negative one, with the
@@ -683,6 +684,8 @@ class SM90FusedMultiHeadAttentionForward:
             if local_tid % 4 == 0:
                 for row_half in cutlass.range_constexpr(2):
                     sAlpha_xfer_raw.subview(2 * owned_row(local_tid, row_half)).store(softmax_params.alpha[row_half])
+            # Every participating lane arrives directly: the release/acquire
+            # edge includes every factor writer, without elected-lane relay.
             bars.mb_alpha_xfer_full.arrive()
             alpha_state = advance(alpha_state, 1)
         # Both consumers read P in RS operand order: word 2*k_frag+row_half is score
@@ -741,6 +744,7 @@ class SM90FusedMultiHeadAttentionForward:
             # All four lanes consume the same pair, at the existing alpha handoff.
             row0_slot, row1_slot = (sAlpha_xfer_raw.subview(2 * owned_row(local_tid, row_half)) for row_half in range(2))
             alpha = cutlass.Vector.from_elements((row0_slot.load(), row1_slot.load()), cutlass.Float32)
+            # Release only after every lane has completed both factor reads.
             bars.mb_alpha_xfer_empty.arrive()
             alpha_state = advance(alpha_state, 1)
         # A single-shot probe of this V generation, not a wait loop: a miss falls back
@@ -936,7 +940,7 @@ class SM90FusedMultiHeadAttentionForward:
             kv_right = kv_right - skip
             iterations = cute.math.min(span, iterations - skip)
             output_batch = batch + split * self.b
-        kv_head = head if self.pack_gqa else head // self.qh_per_kh
+        kv_head = head * self.heads_per_tile // self.qh_per_kh
         q_output_limit = cutlass.Int32(self.s_q) if cutlass.const_expr(self.dense_q_lengths) else q_len
         work = SimpleNamespace(
             batch=batch,

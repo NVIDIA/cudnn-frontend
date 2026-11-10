@@ -236,4 +236,4 @@ QK/V widths through256 on M16/M32 tiles. The D256 and D192/V128 cases retain
 CPU-seeded inputs, eager/captured byte comparisons, batch invariance and
 runtime-keyed golden outputs in `test_sm120_frost_paged_wide_decode_determinism`.
 
-SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.
+SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.

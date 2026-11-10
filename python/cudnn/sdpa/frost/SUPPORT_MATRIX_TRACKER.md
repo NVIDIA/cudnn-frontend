@@ -4844,3 +4844,12 @@ live in caller workspace; final Stats may be natural or base two. No input
 staging, workspace memset or atomics are introduced. All existing schedulers
 retain their work ordering inside each split. THD splits and PackGQA remain
 outside this admission; unsplit routes retain their existing behavior.
+
+
+SM90 D512 dense PackGQA also supports subgroups: each tile packs
+`gcd(H_q/H_kv, 64)` heads per token, so G12 packs four and G128 packs 64.
+Groups with no nontrivial common factor (except MHA) remain declined.
+The declared row exposes this for the D512 envelope, with and without dense
+split-KV. Native D64 remains unpacked and unsplit; THD packing remains declined.
+`test_sdpa_fwd_split_sm90.py` covers grouped KV addressing, independent strides,
+sinks, changed-length replay, multiple KV stages, and all three schedulers.

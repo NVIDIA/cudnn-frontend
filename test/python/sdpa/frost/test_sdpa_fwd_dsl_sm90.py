@@ -128,12 +128,15 @@ def test_dsl_sm90_graph_singleton_strides(sm100, monkeypatch, dtype, singleton_s
         compile_api(api)
         spec = api._dense_spec
         launch = spec.fn
+        # Retain immutable frame metadata, not api/spec: the native binder owns
+        # this recorder, so capturing its owning spec creates an uncollectable cycle.
+        index, strides = spec.index, api._strides
 
         def checked_launch(*args):
             # Check the positional pointer frame, including singleton canonicalization.
-            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), api._strides):
-                assert args[spec.index[name + "_ptr"]] == original.data_ptr()
-                assert args[spec.index[name + "_strides"]] == (expected[0], expected[2], expected[1])
+            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), strides):
+                assert args[index[name + "_ptr"]] == original.data_ptr()
+                assert args[index[name + "_strides"]] == (expected[0], expected[2], expected[1])
             launches.append(True)
             return launch(*args)
 
@@ -460,7 +463,7 @@ def test_sm90_template_d_envelope_rejects(bad):
     ("over", "why"),
     [
         pytest.param(dict(dtype_qkv=0), "uniform FP16 or BF16", id="dtype"),
-        pytest.param(dict(pack_gqa=True, qh_per_kh=3), "ratio dividing tile_m=64", id="pack-ratio"),
+        pytest.param(dict(pack_gqa=True, qh_per_kh=3), "ratio sharing a factor with tile_m=64", id="pack-ratio"),
         pytest.param(dict(sched_policy=SCHED_LPT_L2 + 1), "NATURAL/LPT/LPT_L2", id="sched"),
         pytest.param(dict(thd_varlen=True, seq_kv_lens_present=True, sched_policy=SCHED_LPT), "natural single-tile work decoder", id="thd-sched"),
         pytest.param(dict(scale_mode=2), "scale mode must be positive, zero, or negative", id="scale-mode"),

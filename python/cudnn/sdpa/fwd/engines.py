@@ -1623,6 +1623,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
         why = native_d64_mismatch(
+            split_kv=(knobs.split_kv or 1) if isinstance(knobs, SdpaFwdKnobs) else 1,
             thd=facts.thd,
             sink=facts.has_sink,
             pack_gqa=bool(knobs.pack_gqa) if isinstance(knobs, SdpaFwdKnobs) else False,
@@ -4348,6 +4349,7 @@ def _sm90_spec() -> EngineSpec:
             tile_ns=frozenset({TILE_N}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_partial_d_shapes=frozenset({(D_TILE, D_TILE)}),
             pack_gqa_d_shapes=frozenset({(D_TILE, D_TILE)}),
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
         ),

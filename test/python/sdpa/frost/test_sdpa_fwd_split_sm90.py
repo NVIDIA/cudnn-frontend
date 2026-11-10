@@ -15,13 +15,13 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 90, reason
 @pytest.mark.parametrize("stats_log2", [False, True])
 @pytest.mark.parametrize("pack_gqa", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
-def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa, graph_mode, cudnn_handle):
+def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa, graph_mode, cudnn_handle, _heads=8):
     """Every scratch row is written before reduction, under replay and empty KV."""
     import math
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     d, dv = dims
-    b, h, hk, sq, sk = 3, 8, 2, 5, 129
+    b, h, hk, sq, sk = 3, _heads, 2, 5, 129
     gen = torch.Generator().manual_seed(321)
     qc = torch.randn((b, sq, h, d + 8), generator=gen, dtype=dtype)
     kc = torch.randn((b, hk, sk, d + 8), generator=gen, dtype=dtype)
@@ -33,7 +33,7 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa, g
     o = ob[..., :dv].transpose(1, 2)
     lb = torch.full((b, h, sq * 2), 77.0, device="cuda")
     lse = lb[..., ::2] if stats_log2 else None
-    sink = torch.tensor([-float("inf"), float("inf"), -3, 2, -float("inf"), float("inf"), -2, 3], device="cuda")
+    sink = torch.tensor([-float("inf"), float("inf"), -3, 2, -float("inf"), float("inf"), -2, 3] * (h // 8), device="cuda")
     qlens = torch.tensor([sq, 3, 0], dtype=torch.int32, device="cuda")
     klens = torch.tensor([sk, 0, 17], dtype=torch.int32, device="cuda")
     api = SdpaFwdDslSm90(
@@ -172,10 +172,10 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa, g
         (1, False, "none", 0.0, 17),
     ],
 )
-def test_split_multiple_kv_stages(dtype, sched, pack, mask, scale, splits):
+def test_split_multiple_kv_stages(dtype, sched, pack, mask, scale, splits, _heads=8):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    b, h, hk, sq, sk, d = 2, 8, 2, 70, 1025, 512
+    b, h, hk, sq, sk, d = 2, _heads, 2, 70, 1025, 512
     rng = torch.Generator().manual_seed(923)
     qc, kc, vc = (torch.randn(shape, generator=rng).to(dtype) * 0.25 for shape in ((b, sq, h, d), (b, sk, hk, d), (b, sk, hk, d)))
     q, k, v = (t.cuda().transpose(1, 2) for t in (qc, kc, vc))
@@ -263,3 +263,15 @@ def test_split_launch_domain():
     assert engines.launch_grid_mismatch(caps, SimpleNamespace(b=65535, h_q=1), knobs) is None
     for batch, heads, splits in ((65536, 1, 3), (1, 65536, 3), (1, 1, 65536)):
         assert "65535" in engines.launch_grid_mismatch(caps, SimpleNamespace(b=batch, h_q=heads), replace(knobs, split_kv=splits))
+
+
+@pytest.mark.parametrize("group", [12, 128])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_partial_pack_graph_binding(group, graph_mode, cudnn_handle):
+    test_dense_split_partial_initialization((512, 512), torch.bfloat16, True, True, graph_mode, cudnn_handle, _heads=2 * group)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group,splits,sched,mask", [(12, 1, 2, "causal"), (128, 3, 1, "br_window"), (128, 17, 0, "none")])
+def test_partial_pack_multiple_stages(dtype, group, splits, sched, mask):
+    test_split_multiple_kv_stages(dtype, sched, True, mask, -0.125, splits, _heads=2 * group)

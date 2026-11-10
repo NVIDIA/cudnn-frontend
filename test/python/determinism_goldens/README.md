@@ -1752,6 +1752,39 @@ confirms the producer and combine are included; the first audit hit the
 The standalone audit passes one additional graph/capture case. No sanitizer
 finding was suppressed or converted into a pass.
 
-### SM90 D512 dense split forward
+### SM90 D512 dense split and partial PackGQA forward — 2026-11-10
 
-`sdpa/frost/test_sdpa_fwd_split_sm90_determinism.py` adds four L0 forward-only cases: FP16/BF16, split3 unpacked and split17 PackGQA. CPU-seeded inputs retain an independent FP64 numerical reference; fixed-plan checks cover fresh-buffer replay, concurrent work, B129 reorder/duplicates/empty neighbors and changed-neighbor CUDA Graph replay. New H100 records are appended; existing goldens stay unchanged. The record run passed all four cases; strict replay and source/runtime details are recorded with the qualification. No equality across split counts, packing choices or runtimes is claimed.
+`sdpa/frost/test_sdpa_fwd_split_sm90_determinism.py` adds eight L0
+forward-only cases: FP16/BF16, split3 unpacked and split17 full PackGQA,
+plus split3 partial groups G12/G128. CPU-seeded inputs retain an independent
+FP64 numerical reference. Fixed-plan checks cover fresh-buffer replay,
+concurrent work, B129 reorder/duplicates/empty neighbors and changed-neighbor
+CUDA Graph replay. Eight H100 records are appended under runtime key
+`6521230c64ce3d35`; existing goldens are unchanged. No equality across split
+counts, packing choices or runtimes is claimed.
+
+The final combined run covers 449 cases: all 57 split/partial-packing
+features, eight strict goldens, existing D512 paths and the newly landed D64
+route. Initially 434 pass; one old error-message expectation and 14 child
+compilation probes fail. The probes imported an unrelated editable install;
+they now remove that finder, bind the parent's package directory and assert
+the source path. Twelve D64 cross-compilation probes pass on A100 (compiler
+checks only), then two D512 probes plus twelve template-validation cases pass
+on H100. Thus all 15 initial failures are addressed without repeating the
+unchanged native numerical suite. Eighteen existing singleton-stride tests
+also exposed a recorder/API/spec reference cycle; retaining only frame
+metadata removes all eighteen shutdown leak diagnostics, with eighteen
+focused passes before and after the test-only correction.
+
+On H100, unfiltered memcheck and native-producer/combine-filtered racecheck
+and synccheck each pass 21 cases with zero diagnostics. The selection is
+`(dtype0 and (multiple_kv or (dense_split_partial and dims0) or
+partial_pack_multiple)) or partial_pack_graph`, with `--error-exitcode 91`.
+The latter tools use `--kernel-name kns=cudnn_kernel_`; independent framework
+reference kernels are excluded, while the attention producer and shared
+combine are included. An earlier racecheck failed on both the original
+unsplit parent and split prototype. Direct per-thread arrivals with matching
+counts now order the shared alpha/inverse-factor handoff; intermediate
+named-barrier experiments were discarded. Numerical success alone was not
+used to waive the initial sanitizer diagnostics. This is fixed-GPU/runtime
+forward qualification, not backward or default-dispatch performance.

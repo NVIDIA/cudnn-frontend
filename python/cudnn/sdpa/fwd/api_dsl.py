@@ -5572,14 +5572,16 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             "SM90 SDPA: THD walks its live units with the natural single-tile work decoder; SCHED_LPT and SCHED_LPT_L2 are dense-only",
         )
         self._not_implemented_error_if(
-            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M), "SM90 D512 PackGQA requires a head ratio dividing tile_m=64"
+            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M, partial=True),
+            "SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64",
         )
 
         self._value_error_if(type(self.split_kv) is not int or not 1 <= self.split_kv <= 65535, "SM90 split_kv must be an integer in [1, 65535]")
         self._not_implemented_error_if(self.split_kv > 1 and max(b, h_q) > 65535, "SM90 split combine requires batch and heads at most 65535")
         if self.split_kv > 1:
-            packed_heads = h_kv if self.pack_gqa else h_q
-            tokens_per_tile = _SM90_TILE_M // (h_q // h_kv if self.pack_gqa else 1)
+            pack_g = pack_gqa_group_size(h_q // h_kv, _SM90_TILE_M, partial=True) if self.pack_gqa else 1
+            packed_heads = h_q // pack_g
+            tokens_per_tile = _SM90_TILE_M // pack_g
             units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
         self.params = Sm90TemplateParams(
@@ -5602,6 +5604,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
             why = native_d64_mismatch(
+                split_kv=self.split_kv,
                 thd=self.thd,
                 sink=self.has_sink,
                 pack_gqa=self.pack_gqa,
