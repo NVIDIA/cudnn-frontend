@@ -434,3 +434,58 @@ def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     assert pt.lookup(row, paged(window_left=128)) is None
     assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
     assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, heads, mask",
+    [
+        ((64, 64), (64, 8), dict(has_sink=True)),
+        ((64, 64), (64, 8), dict(has_sink=True, window_left=128)),
+        ((64, 64), (32, 4), {}),
+        ((128, 128), (32, 4), {}),
+        ((256, 256), (16, 1), {}),
+        ((512, 512), (128, 1), {}),
+        ((576, 512), (96, 1), {}),
+    ],
+    ids=["d64_sink", "d64_sink_window", "d64", "d128", "d256", "d512", "d576"],
+)
+def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask):
+    """Study sm107_paged_mtp_20261110 (Rubin, the inference benchmark's paged generation graph): the bf16 MTP rows (s_q 2-4 under the
+    bottom-right diagonal) lead on and off the 128-key tile, d256 on the tile from 2**7.5 KV tokens. Without the diagonal, f16, and
+    another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def mtp(**over):
+        base = dict(b=4, h_q=heads[0], h_kv=heads[1], s_q=3, s_kv=8192, d_qk=d[0], d_v=d[1], causal=True, bottom_right=True)
+        base.update(device_cc=(10, 7), page_size=16, padded=True, **mask)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (8192, 8191, 1048576):
+        assert pt.lookup(row, mtp(s_kv=s_kv)) is True
+        assert pt.matched_entry(row, mtp(s_kv=s_kv)).study == "sm107_paged_mtp_20261110"
+    assert pt.lookup(row, mtp(s_kv=128)) is (d != (256, 256))  # d256 on the tile: the backend keeps one KV tile
+    assert pt.lookup(row, mtp(causal=False, bottom_right=False, window_left=None)) is None
+    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, mtp(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+@pytest.mark.L0
+def test_sm107_paged_mla_decode_entries_lead_from_their_cost_threshold():
+    """Study sm107_paged_mtp_20261110's absorbed-MLA d512 single-row decode (s_q == 1, no mask): FROST leads from a cost threshold on
+    and off the tile (DSv4 serving cells at 128k KV are above it), short caches of a few heads keep the backend. D576 has no entry:
+    on the tile it lost 1.56x on the holdout just past its threshold, and the off-tile twin went with it."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def q1(d=(512, 512), **over):
+        base = dict(b=1, h_q=16, h_kv=1, s_q=1, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (131072, 131071):
+        assert pt.lookup(row, q1(b=128, s_kv=s_kv)) is True
+        assert pt.matched_entry(row, q1(b=128, s_kv=s_kv)).study == "sm107_paged_mtp_20261110"
+        assert pt.lookup(row, q1((576, 512), b=128, s_kv=s_kv)) is None
+    for s_kv in (1024, 1023):
+        assert pt.lookup(row, q1(s_kv=s_kv)) is False
