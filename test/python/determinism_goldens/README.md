@@ -1195,3 +1195,36 @@ dense packing/split replay cases. Compute Sanitizer13.4.92: memcheck7,
 synccheck7 and racecheck4 passed, zero diagnostics. The final published tests
 also pass the smallest D32 head envelope boundary separately (1 case).
 Other GPU results are not inferred from this native SM107 qualification.
+
+### Native SM107 half D64 dense/THD paging (2026-11-10)
+
+`test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged` qualifies physical D64
+operands/MMA/output on the native D128-family kernel file. Parent D64 dense
+paging selects the D128 envelope; parent THD D64 paging is declined. The new
+route supports matching FP16/BF16 Q/K/V/O, CGA1/2, packed/unpacked execution,
+N64/N128 and dense split-KV. Paged THD remains unsplit; mixed FP8 KV stays D128.
+
+Eight fixed-CPU-payload goldens cover four dense and four compact-THD plans.
+The dense checks reuse the D128 fixture at D64; THD additionally changes the
+target sequence's packed origin across unrelated neighbors. Both verify
+independent CPU-double references, O/Stats byte identity with fresh buffers,
+queued stream work, repeated/reordered/duplicated batches through129 requests,
+input preservation and untouched capacity/padding. Separate numerical graph
+checks change page tables, lengths and tensor bindings under CUDA capture.
+
+The current-parent suite passes105 cases without failures/skips:56 new D64
+checks (32 dense,8 THD origins,8 goldens,7 boundaries,1 admission),46 D128
+controls with unchanged golden bytes and3 architecture metadata controls.
+Pages8–1024, Q1/2/17/129/257, partial head envelopes, empty/tail KV, asymmetric
+pool layouts, partial GQA, windows and sinks are included. The existing THD
+stage assertion is corrected for D64's fixed four-stage K/V ring.
+
+Runtime: SM107216SM, driver630.10, cuDNN9.30.0.2, Torch2.14.1+cu130,
+DSL4.8.0/CUDA13.4 and matching FE1.33 bindings. Goldens use runtime key
+`0972294c7bd4a660`. No qualification of another architecture is implied.
+
+Compute Sanitizer13.4.92:7 page-boundary memcheck cases,8 THD synccheck cases
+and8 THD racecheck cases pass with zero diagnostics. No backward path changes.
+
+Additional nonpaged D64 controls pass30 cases:22 dense split/replay and8
+independent THD-origin cases.

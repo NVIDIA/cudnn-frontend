@@ -49,7 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
     validate_params as _sm90_validate_params,
 )
-from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_paged
+from cudnn.sdpa.fwd.config_sm107 import supports_native_small_half_dense_paged
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_native_d128_dense_partial_pack, supports_native_d128_narrow_tile, supports_native_d512_dense_pack_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
@@ -2216,8 +2216,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
         )
 
-    def _rubin_native_d128_dense_paged_leg(self) -> bool:
-        return supports_native_d128_dense_paged(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged)
+    def _rubin_native_small_half_dense_paged_leg(self) -> bool:
+        return supports_native_small_half_dense_paged(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged)
 
     def _rubin_native_d256_split_leg(self) -> bool:
         return supports_native_d256_dense_split(self.flavor, device_cc=self._device_cc, fp8=self._fp8, thd=self.thd, paged=self.paged, pack_gqa=self.pack_gqa)
@@ -2795,7 +2795,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _partial = (
                 (not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS)
                 or self._rubin_native_d512_leg()
-                or self._rubin_native_d128_dense_paged_leg()
+                or self._rubin_native_small_half_dense_paged_leg()
                 or self._rubin_native_d192_paged_leg()
                 or self._rubin_native_d64_pack_leg()
                 or self._rubin_shared_thd_pack_leg()
@@ -3294,7 +3294,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader). Native per-tensor FP8 D512 serves
             # dense Q over pools; other FP8 flavors retain their paging decline.
-            # Native half D128 also serves dense Q
+            # Native half D64/D128 also serves dense Q
             # directly, including split/PackGQA; engines.mismatch shares its admission predicate.
             # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and
             # folds the sink per Q row, so a decode-shaped half d256 graph is served paged on
@@ -3305,9 +3305,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256)))
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
                 and not self._rubin_native_d192_paged_leg()
-                and not self._rubin_native_d128_dense_paged_leg()
+                and not self._rubin_native_small_half_dense_paged_leg()
+                and not self._rubin_native_d64_pack_leg()
                 and not (self._fp8 and self._pertensor and not self.thd and self.flavor == (512, 512)),
-                "Rubin paged KV serves half THD queries, native dense half D128/D192, MXFP8 D128/D256, per-tensor FP8 D512 with dense Q, and decode-shaped half D256",
+                "Rubin paged KV serves half THD queries, native half D64/D128/D192, MXFP8 D128/D256, per-tensor FP8 D512 with dense Q, and decode-shaped half D256",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd and not (self._pertensor and self._device_cc in ((10, 0), (10, 3)) and self.flavor in SM100_PAGED_FP8_THD_SHAPES),
@@ -3412,7 +3413,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and self.pack_gqa
                 and not _rubin_decode_tile
                 and not self._rubin_native_d512_leg()
-                and not self._rubin_native_d128_dense_paged_leg()
+                and not self._rubin_native_small_half_dense_paged_leg()
                 and not self._rubin_native_d64_pack_leg()
                 and not (
                     self.thd_decode_leg
@@ -3508,7 +3509,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._not_implemented_error_if(
             self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
-            "native D64 THD requires nonpaged half-precision plans, with one CTA for split execution",
+            "native D64 THD requires half inputs; paged plans are unsplit and nonpaged splits require one CTA",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`
