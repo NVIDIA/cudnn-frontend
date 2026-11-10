@@ -1926,6 +1926,25 @@ Final shared-loader regression:36 passed,303 deselected, no failures/skips in
 rebinding/replay and decode ring reuse. The old half baselines are unchanged.
 The owned SM120 allocation completed normally after these checks.
 
+## SM120 THD D256/GQA backward qualification
+
+`test_sdpa_bwd_thd_sm120_gqa.py` compares dQ/dK/dV with independent CPU FP64
+autograd, including per-port origins, GQA, bottom-right quiet rows and empty
+sequences. Its L0 single-KV-tile byte checks preserve fixed inputs/upstream
+gradients across fresh storage, concurrent work, B1/B3/B129, duplicates,
+reordering and changed-neighbor capture. On GB10/SM121 (driver 580.142,
+Torch 2.9.0a0+50eac811a6.nv25.09/cu130, cuDNN 9.13.0, DSL 4.8.0/compiler 12.9),
+both FP16/BF16 cases pass recording and fresh-process strict checks, using
+runtime key `d2d1094fc872ddba`. All three gradients match their independent
+reference. SM120 remains unverified.
+Final combined execution passes 73 cases (40 new and 33 existing D128),
+including the two strict goldens; 123 host checks pass. Five cases each pass
+memcheck, racecheck and synccheck using CUDA 13.4 sanitizer 2026.3.0 with
+API-query reporting disabled (CUDA Python 13.2 probes newer APIs than the
+CUDA 13.0 driver). Racecheck reports zero errors and zero warnings.
+General deterministic backward remains unsupported because multiple KV tiles
+accumulate dQ with unordered FP32 atomics; admission tests retain that decline.
+
 ### SM120-family D576/V512 forward — SM121 qualification, 2026-11-10
 
 `sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:

@@ -1,0 +1,101 @@
+{
+  "inputs": {
+    "do": {
+      "dtype": "torch.bfloat16",
+      "sha256": "87d170d738e9d2cfc1de5af620dbd6d3db3c38b120af0983ebef1feece1d70e0",
+      "shape": [
+        17,
+        6,
+        256
+      ]
+    },
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "80a2b3abf6a7cf081865fe2b42b57063ac922e53393d7a393e2af144e9e6c25c",
+      "shape": [
+        19,
+        2,
+        256
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "2971c2fef03f882b45e2978302fdafd0de8718c3686d5c6457441d8d17385097",
+      "shape": [
+        17,
+        6,
+        256
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "1c4e9b1b7688d0a1c736059af1c516314f48bef9466dcce650a926b54f470c05",
+      "shape": [
+        17,
+        6,
+        256
+      ]
+    },
+    "stats": {
+      "dtype": "torch.float32",
+      "sha256": "366a52e5875f5bd1d81c7da2698a0fd94f8a4ebe65b88d842c709dbfff491499",
+      "shape": [
+        17,
+        6
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "f6245d1a64be8f8017b350f117df4fe33365d3a72b12336031096adf8872efdc",
+      "shape": [
+        19,
+        2,
+        256
+      ]
+    }
+  },
+  "outputs": {
+    "dk": {
+      "dtype": "torch.bfloat16",
+      "sha256": "6fc4ef31e670e5f5e41a311e552e9e29eb8a84dab2f580784958cec52cf35a57",
+      "shape": [
+        19,
+        2,
+        256
+      ]
+    },
+    "dq": {
+      "dtype": "torch.bfloat16",
+      "sha256": "9064fa4c8a796ae1e44933b7d3d824fadcfe6c621d2c2f362601e0e43c6bd17a",
+      "shape": [
+        17,
+        6,
+        256
+      ]
+    },
+    "dv": {
+      "dtype": "torch.bfloat16",
+      "sha256": "054e5e10cfc5fa8a1a4f40606654497f15064fdc738330427c65ff57f5c9faf4",
+      "shape": [
+        19,
+        2,
+        256
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13000,
+    "cudnn": 91300,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA GB10",
+    "sm": [
+      12,
+      1
+    ],
+    "sm_count": 48,
+    "torch": "2.9.0a0+50eac811a6.nv25.09",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

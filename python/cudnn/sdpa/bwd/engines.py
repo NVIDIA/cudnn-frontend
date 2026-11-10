@@ -349,6 +349,9 @@ class Capabilities:
     # dense sibling. Empty retains the row's existing dense domain.
     thd_tile_ms: frozenset[int] = frozenset()
     thd_tile_ns: frozenset[int] = frozenset()
+    # Joint geometry/resource constraints that independent knob domains cannot
+    # express. Declaration-only, with the same resolved geometry as lowering.
+    knob_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
 
     def __post_init__(self) -> None:
         """Single normalization layer: legacy mask flags -> canonical band set."""
@@ -575,6 +578,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if reason is not None:
             return reason
 
+    if capabilities.knob_check is not None:
+        reason = capabilities.knob_check(facts, requested)
+        if reason is not None:
+            return reason
+
     if facts.has_dsink and not facts.has_sink:
         return "dSink_token output requires a sink_token input"
     if facts.s_q == 1 and not capabilities.decode:
@@ -668,7 +676,7 @@ class EngineSpec:
 
 
 def _sm120_spec() -> EngineSpec:
-    from .sm120_thd_contract import graph_mismatch
+    from .sm120_thd_contract import graph_mismatch, knob_mismatch
 
     return EngineSpec(
         name="sdpa_bwd_sm120",
@@ -698,9 +706,10 @@ def _sm120_spec() -> EngineSpec:
             thd_declared_totals=True,
             thd_ragged_offsets=True,
             thd_head_stride=True,
-            thd_tile_ms=frozenset({64}),
-            thd_tile_ns=frozenset({64}),
+            thd_tile_ms=frozenset({32, 64}),
+            thd_tile_ns=frozenset({32, 64}),
             declaration_check=graph_mismatch,
+            knob_check=knob_mismatch,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
         ),

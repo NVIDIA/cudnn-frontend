@@ -109,7 +109,7 @@ from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor, swizzle_xor_128b  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA, compute_q_loop_bounds, q_tile_kv_hi  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
@@ -999,16 +999,16 @@ def _bprop_kernel(
                 # transpose); swizzled per (q, kv) so the dQ ldmatrix is conflict-free.
                 q0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
                 q1 = q0 + cutlass.Int32(1)
-                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q0, kv_row_g, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor(q0, kv_row_g, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds0.to(io_dtype)
                 )
-                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q1, kv_row_g, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor(q1, kv_row_g, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds1.to(io_dtype)
                 )
-                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q0, kv_row_g8, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor(q0, kv_row_g8, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds2.to(io_dtype)
                 )
-                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q1, kv_row_g8, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor(q1, kv_row_g8, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds3.to(io_dtype)
                 )
 
@@ -1041,9 +1041,7 @@ def _bprop_kernel(
             col = kc * 16 + a_col * 8
             for mb in cutlass.range_constexpr(DQ_M_BLOCKS):
                 row = cutlass.Int32(mb * M_STRIDE) + warp_local * 16 + a_row
-                vv = nvvm.ldmatrix(
-                    sdST.subview(row * cutlass.Int32(tile_kv) + swizzle_xor_128b(row, col, elem_bytes=_ELEM_BYTES)).data_ptr(), 4, nvvm.MMALayout.ROW
-                )
+                vv = nvvm.ldmatrix(sdST.subview(row * cutlass.Int32(tile_kv) + swizzle_xor(row, col, tile_kv, _ELEM_BYTES)).data_ptr(), 4, nvvm.MMALayout.ROW)
                 adst[mb * 4 + 0] = vv[0]
                 adst[mb * 4 + 1] = vv[1]
                 adst[mb * 4 + 2] = vv[2]
