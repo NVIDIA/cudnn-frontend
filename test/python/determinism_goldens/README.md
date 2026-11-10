@@ -11,6 +11,7 @@ pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determi
   deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0
 pytest compressed_sparse_attention/cutedsl/test_CSA_compressor.py -m L0 \
   -k 'batch_invariance or replay_determinism or determinism_golden'
+pytest block_sparse_attention/cutedsl/test_BSA_determinism.py -m L0
 pytest core/test_determinism_utils.py
 ```
 
@@ -33,6 +34,7 @@ pytest core/test_determinism_utils.py
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
+| `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
 
 ### SM120 wide partial PackGQA — validation, 2026-11-11 (UTC)
 
@@ -317,6 +319,161 @@ LSE and negative-infinity max logits for empty rows. DSA also checks the exact
 empty-row locations. Snapshots own their storage. Helper controls reject
 changed signed zeros, NaN payloads, missing gradients, wrong infinity signs,
 and golden mutations.
+
+## Block-sparse attention blk64 — SM90 and SM103 validation, 2026-11-10 (UTC)
+
+Change under test: the SM90 blk64 forward and backward kernels of the
+`xshang/bsa-sm90-blk64-perf` branch (12 kernel commits on `develop`; the suite
+and this record are the branch's following commit; the runs below used the
+branch on `develop` `a1e86b04`, and the branch was then rebased onto
+`56c9609a`, `393b1699` and `7ab3ffd7`; the first two leave the BSA package
+unchanged and the third touches only its JAX wrapper `jax_api.py`, not the kernels) and
+the new `block_sparse_attention/cutedsl/test_BSA_determinism.py` suite
+([30 cases](#block-sparse-attention-blk64-30-cases)), which drives the blk64
+API on SM90 and, through the same API, the SM100/SM103 blk64 path. The other
+determinism suites were not rerun. Both GPUs ran the pure-Python kernels from a
+source checkout through a Slurm wrapper that points `import cudnn` at
+`<src>/python` and stubs the nanobind module (`cudnn._compiled_module`, which
+the BSA kernels never call), so the runtime records report cuDNN backend
+`92600` from that stub; the test banners confirmed imports from the checkout
+under test.
+
+- H100: `NVIDIA H100 80GB HBM3`, SM90, 132 SMs, driver 615.71.10 (driver API
+  13040); Torch `2.15.0+cu132`, CUDA 13.2, CuTe DSL `4.8.1` (CUDA 13.4
+  compiler), TVM FFI `0.1.15.post1`, Python 3.12.5. Runtime key
+  `f2590ab8d14a5923` ([goldens](f2590ab8d14a5923), four records).
+- B300: `NVIDIA B300 SXM6 AC`, SM103, 148 SMs, the same driver and software.
+  Runtime key `d6ab5c84009f8fa5` ([goldens](d6ab5c84009f8fa5), three records;
+  the FP16 golden skips by contract). B200 (SM100) and SM107 were unavailable
+  and stay unverified.
+
+Source under test: the final runs executed the committed test file byte for
+byte (SHA256
+`b1a3a413d46c8ce5a45ca1d54a5d077f9d298f9c99b576ad517caee931c09553`, git blob
+`ee63b87a`, which `git rev-parse HEAD:test/python/block_sparse_attention/cutedsl/test_BSA_determinism.py`
+prints on the PR head) and read the committed goldens; their checkout was a
+working-tree snapshot of the PR head whose only difference from the committed
+tree is the text of this record, filled in from their logs afterwards. The
+earlier runs listed below executed unpublished working-tree revisions of the
+suite that are not on the branch (their job logs name them). Those revisions
+differ from the committed file as follows: none had the FP16 `kv_splits=2`
+and FP16 KV-tail cases, the batch-invariance cases of the `kv_splits=2` and
+FP16 fixed-count configurations, the API-rejection check in front of the
+contract skips, or the `measured` channel (all added after review); in
+addition, revision 1 monkeypatched the TF32 flag and passed `block_sizes=None`
+in the KV-tail case, and revision 2 still passed `block_sizes=None` there.
+Their backward cases are the committed ones.
+
+Run from `test/python` (the wrapper adds `-rA --durations=20`):
+
+```bash
+python -c 'import cudnn; print(cudnn.__file__)'
+python -m pytest -m L0 --collect-only -q block_sparse_attention/cutedsl/test_BSA_determinism.py
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -m L0 block_sparse_attention/cutedsl/test_BSA_determinism.py
+```
+
+The goldens were recorded first into a new directory
+(`CUDNN_DETERMINISM_RECORD=<new dir>` with `-k golden` and
+`CUDNN_DETERMINISM_GOLDENS` unset), after their cases passed three executions
+and the FP32 reference; the hashes were inspected (every input hash is
+byte-identical between the two GPUs, every output hash differs between them,
+as different kernels require) and the files placed. The golden cases and
+their recorded tensors are the same in every revision, so the records were
+not regenerated; the strict runs read the placed records with recording
+unset.
+
+| GPU | Run | Result |
+| --- | --- | --- |
+| H100 | committed test file, `--collect-only -q` | 30 node IDs (job 5779013) |
+| H100 | committed test file, strict check | 30 passed, 0 skipped, 0 failed in 36.83 s (job 5779012); the run's `measured` summary printed the seven backward records |
+| B300 | committed test file, strict check | 17 passed, 13 skipped (contract), 0 failed in 206.98 s (job 5779014; 167 s of it was the first case's one-time DSL initialization on that node) and, repeated on a second B300 node, 17 passed, 13 skipped, 0 failed in 62.06 s (job 5779135); both runs' `measured` summaries printed the five backward records |
+| H100 | revision 1, first full run, no golden baseline | 20 passed, 4 skipped (goldens without a baseline), 24 errors in 33.99 s (job 5775580; 24 cases). Every error was the `api` fixture's teardown: pytest 9's `monkeypatch` records `torch.backends.cuda.matmul.allow_tf32` as unset and cannot delete it. Fixed with an explicit save/restore; no check changed |
+| H100 | revision 1, golden recording (`-k golden`) | 4 passed, 20 deselected in 17.46 s (job 5775581) |
+| H100 | revision 2, strict check | 24 passed, 0 skipped in 33.52 s (job 5775738) |
+| H100 | revision 3, strict check | 24 passed, 0 skipped, 0 failed in 30.88 s (job 5776744). A first attempt (job 5776567) landed on a node whose GPU reported itself busy or unavailable and errored every case at CUDA stream creation in the conftest; it was repeated on another node |
+| B300 | revision 2, golden recording (`-k golden`) | 3 passed, 1 skipped (FP16 golden: contract), 20 deselected in 47.67 s (job 5775739) |
+| B300 | revision 2, full run, no golden baseline | 12 passed, 11 skipped, **1 failed** in 60.40 s (job 5775740): `TestBlk64Forward::test_replay[fprop-bf16-variable-kvtail-512tiles]` passed eight bitwise replays, then failed the FP32 reference (5881 of 4194304 output elements, max difference 0.21); see below |
+| B300 | revision 3, strict check | 16 passed, 8 skipped (contract), 0 failed in 233.47 s (job 5776786; 174 s of it was the first case's one-time DSL initialization on that node, the same suite ran in 60 s on another B300). A first attempt (job 5776568) hung at the Python import step on another node for ten minutes and was cancelled |
+
+On the committed suite B300 skips thirteen cases by contract: the nine FP16
+forward cases (four replay, four batch, the golden; the SM100/SM103 blk64
+forward serves BF16 only) and the four prepared-route cases
+(`block_sparse_attention_prepare_backward` serves SM90 only), each after the
+API rejected a tiny instance of the configuration (`skip_by_contract`,
+`NotImplementedError` naming BF16 or the SM90-only clause). The earlier
+revisions had three FP16 forward cases and no rejection check, so they
+skipped eight; revision 2's full run without a baseline also skipped its
+three golden comparisons.
+
+### The B300 reference failure: a partial final KV block without `block_sizes`
+
+That case ran 512 query tiles over a 2543-token KV length (a 47-row final
+block) with `block_sizes=None`. A diagnostic on the same inputs (job 5775845;
+identical results on `develop` `a1e86b04`, job 5775846) confined the mismatch
+to the two query tiles whose active list is exactly the final block (counts 1),
+with the LSE of every tile attending that block off by up to 0.27. It is
+independent of CLC scheduling and of the poison value in inactive list slots,
+isolating one tile reproduces it, the same shape without a KV tail is clean,
+and explicit `block_sizes` with a 47-row final block removes it entirely (0
+differing rows). Code reading agrees: the SM100/SM103 blk64 forward only
+switches to an exact KV layout for a partial tail and does not mask the tail
+rows, so TMA's zero-filled rows join the softmax with logit 0, while the SM90
+kernel masks the tail from the KV length. This is inside the documented caller
+contract ("Provide `block_sizes` whenever a referenced final block is only
+partially valid", `docs/operations/sparse_attention/bsa.md`) and pre-exists
+this change. The suite's KV-tail case now passes `block_sizes` with the
+shortened final block on every GPU; the `block_sizes=None` tail form stays
+covered numerically on SM90 by `test_BSA_forward.py`
+(`test_sm90_blk64_partial_kv_blocks`, the short-last-tile case). It is a
+numerical-contract observation, not a determinism result: the case replayed
+bitwise before failing the reference.
+
+### Measured backward bytes
+
+Every backward case passed its FP32 reference, its route assertions and its
+empty-row checks on both GPUs; the regular route's dK/dV over prepared
+metadata replayed bitwise (asserted; SM90 only). The other gradients are
+measured, not asserted. Each cell gives the range of differing bytes over the
+seven replays (fresh buffers, side-stream work) or over the five batch
+comparisons (packed, reversed, duplicated twice, changed neighbors), against
+the first execution or the batch element alone. The replay comparisons cover
+the packed batch (1572864 bytes per gradient), the batch comparisons the
+target's slice (524288 bytes per gradient). A zero means no byte differed in
+that run; it is not a guarantee. The table keeps the strict run of revision 3
+(same backward cases) beside the final runs as an earlier measurement: the
+counts move from run to run, the picture does not.
+
+| GPU | Run | Route | Replay dQ | Replay dK | Replay dV | Batch dQ | Batch dK | Batch dV |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| H100 | job 5779012 (final) | `regular` | 3-7 | 12-37 | 2-21 | 2-5 | 12-18 | 3-9 |
+| H100 | job 5779012 (final) | `grouped` | 3-11 | 0-19 | 0-11 | — | — | — |
+| H100 | job 5779012 (final) | `paired` | 0-1 | 1-3 | 1-3 | 0-1 | 0-2 | 0 |
+| H100 | job 5779012 (final) | `prepared-regular` | 2-6 | 0 (asserted) | 0 (asserted) | — | — | — |
+| H100 | job 5779012 (final) | `prepared-paired` | 0-6 | 0-1 | 1-3 | — | — | — |
+| H100 | job 5776744 (revision 3) | `regular` | 6-10 | 28-38 | 15-23 | 3-5 | 10-15 | 3-6 |
+| H100 | job 5776744 (revision 3) | `grouped` | 6-9 | 10-23 | 8-12 | — | — | — |
+| H100 | job 5776744 (revision 3) | `paired` | 0-1 | 1-3 | 1 | 0-1 | 0-1 | 0 |
+| H100 | job 5776744 (revision 3) | `prepared-regular` | 5-7 | 0 (asserted) | 0 (asserted) | — | — | — |
+| H100 | job 5776744 (revision 3) | `prepared-paired` | 0-1 | 0-1 | 0-2 | — | — | — |
+| B300 | job 5779014 (final) | `regular` | 6-9 | 11-23 | 5-9 | 0-2 | 13-20 | 2-9 |
+| B300 | job 5779014 (final) | `grouped` | 7-13 | 9-18 | 2-10 | — | — | — |
+| B300 | job 5779014 (final) | `paired` | 0-2 | 0-5 | 0-4 | 0 | 0-2 | 0 |
+| B300 | job 5779135 (final, second node) | `regular` | 10-15 | 34-41 | 23-27 | 0-2 | 7-23 | 1-8 |
+| B300 | job 5779135 (final, second node) | `grouped` | 4-16 | 1-14 | 0-13 | — | — | — |
+| B300 | job 5779135 (final, second node) | `paired` | 0-2 | 2-5 | 1-3 | 0 | 0-4 | 0 |
+| B300 | job 5776786 (revision 3) | `regular` | 7-9 | 11-18 | 8-15 | 0-4 | 11-19 | 5-8 |
+| B300 | job 5776786 (revision 3) | `grouped` | 5-11 | 2-17 | 0-10 | — | — | — |
+| B300 | job 5776786 (revision 3) | `paired` | 1-4 | 0-4 | 0-3 | 0 | 0-3 | 0 |
+
+The default regular route rebuilds the K-to-Q CSR on every call, and its
+scatter kernel appends each query block behind an atomic cursor, so a KV
+block's query list is accumulated in a call-dependent order; the prepared
+route reuses one CSR, and its direct dK/dV stores then replay bitwise while
+dQ (reduce-added across the KV-block CTAs) still differs. The paired kernel's
+first arriver stores dK/dV and later arrivers reduce-add; the grouped route
+reduce-adds dK/dV through the FP32 workspace.
 
 ## D512 FP8 paged forward — SM100 validation, 2026-11-09 (UTC)
 
@@ -979,6 +1136,65 @@ including their own saved golden. Each device skips the other precision group.
 The [API-by-dtype results](#api-and-datatype-results) keep these gaps separate
 from measured results. FP8/MXFP8 backward is not
 supported by these DSA attention/indexer APIs and has no positive test cases.
+
+### Block-sparse attention blk64: 30 cases
+
+The suite lives in `block_sparse_attention/cutedsl/test_BSA_determinism.py`
+and is collected separately from the 330-case attention set above
+(`pytest -m L0 block_sparse_attention/cutedsl/test_BSA_determinism.py --collect-only -q`
+lists 30 node IDs). It drives the public `block_sparse_attention_forward`,
+`block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
+entry points with `sparse_block_size=64`: the SM90 blk64 kernels, and the
+SM100/SM103 blk64 path through the same API. Head dimension 128, MHA, BHSD.
+A sequence is one batch element with its own KV block lists and counts;
+`block_sizes` is shared by the batch, inactive list slots hold a poison index.
+Every call runs on clones, checks the output names, that no input byte changed,
+that `-inf` LSE appears exactly on the empty query rows (whose O and dQ must be
+zero), and writes gradients into fresh NaN-poisoned caller buffers.
+
+Four forward configurations run in both datatypes (BF16 and FP16), each for
+replay and for batch invariance, so every configuration the support page
+names carries both kinds of evidence per datatype: `fixed-full` (fixed counts;
+8 x 8 blocks, four-block lists, three batch elements, two heads),
+`variable-partial` (variable counts with empty rows, random partial KV block
+sizes), `fixed-partial-split2` (fixed counts, partial blocks, `kv_splits=2`)
+and `variable-kvtail-512tiles` (512 query tiles: B2 H4 x 64 tiles, 40 KV
+blocks, ten-block lists, a 47-token KV tail marked by `block_sizes`).
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `TestBlk64Forward::test_replay` | L0 | The four configurations in BF16 and FP16: eight executions with fresh buffers and side-stream work, input mutation check, FP32 reference | 8 |
+| `TestBlk64Forward::test_batch_invariance` | L0 | The four configurations in BF16 and FP16: a batch element alone against its slice of the packed, reversed, duplicated and neighbor-duplicated batches, with reversed heads, and with changed neighbor data and masks (shared block sizes) | 8 |
+| `TestBlk64Forward::test_golden` | L0 | BF16, FP16: B1 H2, three query blocks (one empty), four KV blocks (sizes 64/40/64/23), two-block lists; three executions, reference, saved hashes | 2 |
+| `TestBlk64Backward::test_replay` | L0 | Routes `regular` (one query group: direct dK/dV stores), `grouped` (`bucket_size_blocks=5`: four query groups, FP32 dK/dV workspace), `paired` (paired-KV kernel, task gate forced to 0, four query groups), `prepared-regular` and `prepared-paired` (SM90: `block_sparse_attention_prepare_backward` + `metadata=`); B3 H2, 16 x 16 blocks, six-block lists with empty rows and partial blocks; eight executions, dispatcher decisions asserted, FP32 reference, empty-row dQ zero; dQ/dK/dV bytes measured, asserted only for the prepared-regular dK/dV | 5 |
+| `TestBlk64Backward::test_batch_invariance` | L0 | `regular` and `paired`: a batch element alone against the packed, reversed, duplicated and changed-neighbor batches; forward results asserted bitwise, gradients measured, route asserted | 2 |
+| `TestBlk64Backward::test_prepared_parity` | L0 | SM90: prepared against default route on the regular and paired kernels, within the FP32 reduce-add noise (atol/rtol 1e-2), reused object, reference | 2 |
+| `TestBlk64Backward::test_zero_upstream_gradient` | L0 | Eight executions with zero dO on the regular route; every gradient exactly zero, bitwise | 1 |
+| `TestBlk64Backward::test_golden` | L0 | `regular` (fixed counts: B1 H2, two query blocks attending disjoint KV block pairs) and `paired` (variable counts, a third empty query block, head 1 attends one block) on order-free patterns; three executions bitwise, reference, SM90 prepared route bitwise equal, saved hashes | 2 |
+
+On SM100/SM103 the nine FP16 forward cases (four replay, four batch, the
+golden) and the four prepared-route cases skip by contract: the blk64 forward
+there serves BF16 only, and `block_sparse_attention_prepare_backward` serves
+SM90 only. Each skip is gated on the API itself (`skip_by_contract`): the case
+first makes a tiny FP16 forward call or prepare call and requires the
+documented rejection (`NotImplementedError` naming BF16, or the SM90-only
+clause); a call the API accepts fails the case, so a widened contract cannot
+keep skipping silently while the support page goes stale.
+
+Known gap, stated rather than tolerated: the backward reduce-adds dQ in FP32
+across the CTAs of a query block's KV blocks (`cp.reduce.async.bulk.add.f32`),
+the FP32 dK/dV workspace and the paired kernel's later arrivers reduce-add
+dK/dV the same way, and the K-to-Q CSR build orders each KV block's query list
+with an atomic cursor, so even the direct dK/dV stores of the single-group
+route accumulate in a call-dependent order. The backward replay and batch
+cases record the differing byte counts of dQ, dK and dV (`record_property`,
+the captured output, and the run's `measured` terminal summary through
+`frost_routing.measured`, which reaches the CI job log of a passing run) and
+assert bytes only where the arithmetic is order-free: the prepared regular
+route's dK/dV (one CSR build, one owner CTA per KV block, direct stores) and
+the golden patterns (one query block per KV block, at most two reduce-adds
+onto zero per dQ tile). The measured counts are in the dated record above; a
+small golden establishes bytes for its pattern and nothing more.
 
 ## Golden checks
 

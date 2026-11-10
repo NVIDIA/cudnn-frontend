@@ -32,6 +32,9 @@ under `cudnn.moe.frost`), `AttentionGateQuantDecode` (the attention gate +
 quantize decode step, also under `cudnn.attention_gate.frost`) and
 `Fp8ProjectionDecode` (the FP8 projection for decode rows, also under
 `cudnn.gemm`) are the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
+`block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
+are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
@@ -71,6 +74,9 @@ arbitrary user callbacks.
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
+| `block_sparse_attention_forward` (blk64, `sparse_block_size=64`) | fprop | BF16 | Supported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
+| `block_sparse_attention_forward` (blk64, `sparse_block_size=64`) | fprop | FP16 | Supported | Unsupported (the SM100/SM103 blk64 forward serves BF16 only) | Unverified |
+| `block_sparse_attention_backward` (blk64, `sparse_block_size=64`; the default route and, on SM90, the `metadata=` route of `block_sparse_attention_prepare_backward`) | bprop | BF16 | Not guaranteed | Not guaranteed (cc 10.3 measured; cc 10.0 unverified; the prepared route is SM90-only) | Unverified |
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | FROST native D512 dense-Q split forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
@@ -270,11 +276,35 @@ a row alone and inside a batch under the entry's own picks.
   inputs are unsupported on all listed GPUs.
 - DSA sparse/dense indexer backward requires BF16 Q/K/weights and supports
   BF16 or FP32 dK. FP8/MXFP8 inputs are unsupported on all listed GPUs.
+- Block-sparse attention blk64: no determinism switch. The rows cover
+  `sparse_block_size=64` with head dimension 128, MHA and BHSD tensors: fixed
+  and variable block counts (`q2k_block_nums`; empty query blocks with
+  `allow_empty_block_nums=True` give O = 0 and LSE = -inf), partial KV blocks
+  (`block_sizes`), a KV length that is not a multiple of 64 (`block_sizes`
+  marking the final block, as the API requires) and `kv_splits=2`; every
+  forward configuration is measured for repeatability and for batch
+  invariance in each datatype its row supports. SM90 requires `S_q` to be a
+  multiple of 64. The forward computes each query tile in one CTA with no
+  cross-CTA reduction (split KV combines FP32 partials in a fixed order). The
+  backward (BF16 only) reduce-adds dQ in FP32 across the CTAs of a query
+  block's KV blocks; dK/dV are reduce-added the same way through the FP32
+  workspace (several query groups or a KV tail) and by the
+  paired-KV kernel's later arrivers; and the K-to-Q CSR build orders each KV
+  block's query list with an atomic cursor, so even the direct dK/dV stores of
+  the single-group route accumulate in a call-dependent order. dQ, dK and dV
+  are therefore not repeatable on any route, as `bsa.md` documents for its FP32
+  atomics; an empty query block's dQ is zero. One narrow, verified exception on
+  SM90: with prepared metadata (`block_sparse_attention_prepare_backward`,
+  SM90 only) the single-group, whole-block route builds its CSR once and its dK
+  and dV replay bitwise while dQ still differs; this does not raise the row's
+  status. GQA/MQA, head dimensions 64 and 96, BSHD, the blk128 paths, KPage and
+  FP8 are outside these rows.
 - Use a compatible CuTe DSL runtime, including `sm_107a` support for SM107.
 
 Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
 separate Top-K generation, THD dense indexer backward, score recompute,
-pooled DSA, and distributed execution are outside this status page's scope.
+pooled DSA, distributed execution, and the block-sparse attention blk128,
+KPage and FP8 paths are outside this status page's scope.
 
 See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md)
 for the covered configurations, validation runtimes, and supporting measurements.
