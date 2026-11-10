@@ -191,6 +191,11 @@ def test_native_paged_adapter_rebind_replay(
         api.compile()
         artifact = api._compiled_kernel
         workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if api.scratch_workspace_bytes() else None
+    workspace_guard = None
+    if workspace is not None:
+        nbytes = workspace.numel()
+        workspace_guard = torch.full((nbytes + 256,), 0xA5, dtype=torch.uint8, device="cuda")
+        workspace = workspace_guard[128 : 128 + nbytes]
     for binding in range(2):
         if binding:
             buffers, ob, lb = allocate()
@@ -337,6 +342,9 @@ def test_native_paged_adapter_rebind_replay(
                     run()
                 else:
                     graph.replay()
+                if workspace_guard is not None:
+                    assert torch.all(workspace_guard[:128] == 0xA5)
+                    assert torch.all(workspace_guard[128 + workspace.numel() :] == 0xA5)
                 for batch, (sq, sk) in enumerate(zip(qs, ks)):
                     actual_o = o[0, ostarts[batch] : ostarts[batch] + sq] if thd else o[batch, :sq]
                     actual_l = stats[0, :, lstarts[batch] : lstarts[batch] + sq] if thd else stats[batch, :, :sq]
