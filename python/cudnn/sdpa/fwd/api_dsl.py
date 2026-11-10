@@ -6066,11 +6066,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
         self._mixed_fp8_kv = not self._fp8 and self.k_desc.dtype in _SM100_FP8_DTYPES
         if self._mixed_fp8_kv:
-            import cudnn
+            from cudnn import _pybind_module
 
             self._not_implemented_error_if(not self.paged or self.thd, "SM120 mixed FP8 KV requires paged storage with dense Q")
             self._not_implemented_error_if(
-                not getattr(cudnn._pybind_module._SdpaDenseBinder, "supports_mixed_fp8_kv", False),
+                not getattr(_pybind_module._SdpaDenseBinder, "supports_mixed_fp8_kv", False),
                 "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension",
             )
         # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
