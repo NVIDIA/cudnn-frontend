@@ -200,6 +200,7 @@ from typing import NamedTuple, Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+from cutlass.experimental import primitives as prims
 import torch
 
 from cudnn._cutlass_compat import SmemAllocator
@@ -891,6 +892,18 @@ UNION_MSG_BYTES = MSG_WORDS * 4  # one CTA's union message (1 KB); the union exc
 
 
 @cute.jit
+def _wait_cluster_acquire(mb, parity):
+    """The wait of every exchange below: the peers' ``st.async`` complete this CTA's word with ``complete_tx``, a RELEASE at CLUSTER
+    scope, and the ``.acquire.cta`` of ``cute.arch.mbarrier_wait`` does not synchronize with a release by a thread of another CTA, so
+    this CTA's reads of the shipped slots were not ordered after the peers' writes.  A relaxed try-wait at CLUSTER scope followed by
+    ``fence.acquire.sync_restrict::shared::cluster.cluster`` acquires at the scope of the release, restricted to the shared::cluster
+    writes the barrier covers (cheaper than ``mbarrier.try_wait.parity.acquire.cluster``)."""
+    while not prims.mbarrier_try_wait_parity(mb, parity, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
+
+@cute.jit
 def _merge_hist(s_hist, hbuf: cutlass.Constexpr[int], s_rs, s_mslice, s_merged, mb_rs, mb_ag, parity, rank, C: cutlass.Constexpr[int], tidx):
     """The cluster-wide sum of the C local histograms into every CTA's ``s_merged``: a REDUCE-SCATTER (thread ``t`` pushes its four bins
     ``4t .. 4t + 3`` to the peer that owns that slice of bins, 16 B by ``st.async`` completing the peer's ``mb_rs``; every CTA then sums
@@ -911,7 +924,7 @@ def _merge_hist(s_hist, hbuf: cutlass.Constexpr[int], s_rs, s_mslice, s_merged, 
     cute.arch.store_async_dsmem(dst, (v0, v1, v2, v3), mb_rs, q)
     if tidx == zero:
         cute.arch.mbarrier_arrive_and_expect_tx(mb_rs, HIST_XCHG_BYTES)
-    cute.arch.mbarrier_wait(mb_rs, parity)
+    _wait_cluster_acquire(mb_rs, parity)
     if tidx < cutlass.Int32(bins_per_peer):
         acc = zero
         for j in cutlass.range_constexpr(C):
@@ -932,7 +945,7 @@ def _merge_hist(s_hist, hbuf: cutlass.Constexpr[int], s_rs, s_mslice, s_merged, 
     cute.arch.store_async_dsmem(dst2, (w0, w1, w2, w3), mb_ag, q)
     if tidx == zero:
         cute.arch.mbarrier_arrive_and_expect_tx(mb_ag, HIST_XCHG_BYTES)
-    cute.arch.mbarrier_wait(mb_ag, parity)
+    _wait_cluster_acquire(mb_ag, parity)
 
 
 @cute.kernel
@@ -1058,7 +1071,7 @@ def frost_qsa_topk_decode_cluster(
             cute.arch.store_async_dsmem(s_xmax.iterator + rank, kmax_l.to(cutlass.Int32), mb_max, tidx)
         if tidx == zero:
             cute.arch.mbarrier_arrive_and_expect_tx(mb_max, C * XCHG_WORD_BYTES)
-        cute.arch.mbarrier_wait(mb_max, 0)
+        _wait_cluster_acquire(mb_max, 0)
         kmax = cutlass.Uint32(0)
         for j in cutlass.range_constexpr(C):
             vj = s_xmax[j].to(cutlass.Uint32)
@@ -1139,7 +1152,7 @@ def frost_qsa_topk_decode_cluster(
                 cute.arch.store_async_dsmem(dstu, (m0, m1, m2, m3), mb_un, q)
             if tidx == zero:
                 cute.arch.mbarrier_arrive_and_expect_tx(mb_un, C * UNION_MSG_BYTES)
-            cute.arch.mbarrier_wait(mb_un, 0)
+            _wait_cluster_acquire(mb_un, 0)
             # the union's counts: every CTA derives the same decision
             total = zero
             overflow = cutlass.Boolean(False)
@@ -1308,7 +1321,7 @@ def frost_qsa_topk_decode_cluster(
             cute.arch.store_async_dsmem(s_cnt.iterator + rank, ctot, mb_cnt, tidx)
         if tidx == zero:
             cute.arch.mbarrier_arrive_and_expect_tx(mb_cnt, C * XCHG_WORD_BYTES)
-        cute.arch.mbarrier_wait(mb_cnt, 0)
+        _wait_cluster_acquire(mb_cnt, 0)
         sel_lt = zero
         for j in cutlass.range_constexpr(C):
             cj = s_cnt[j]
