@@ -826,12 +826,15 @@ def _bsa_attn_fwd_sm90_blk64(
     has_block_sizes = block_sizes is not None
     if has_block_sizes:
         assert block_sizes.dtype == torch.int32
+        # The kernel reads block sizes with plain loads, so 1-D and 2-D inputs are broadcast as stride-0 views
+        # instead of being expanded into a fresh (batch, heads, kv_blocks) copy (one extra kernel) on every call.
+        block_sizes = maybe_contiguous(block_sizes)
         if block_sizes.ndim == 1:
             assert block_sizes.shape == (num_kv_blocks,)
-            block_sizes_bh = block_sizes[None, None, :].expand(batch, num_q_heads, -1).contiguous()
+            block_sizes_bh = block_sizes[None, None, :].expand(batch, num_q_heads, -1)
         elif block_sizes.ndim == 2:
             assert block_sizes.shape == (batch, num_kv_blocks)
-            block_sizes_bh = block_sizes[:, None, :].expand(-1, num_q_heads, -1).contiguous()
+            block_sizes_bh = block_sizes[:, None, :].expand(-1, num_q_heads, -1)
         else:
             assert block_sizes.shape == (batch, num_q_heads, num_kv_blocks)
             block_sizes_bh = block_sizes.contiguous()
@@ -877,58 +880,19 @@ def _bsa_attn_fwd_sm90_blk64(
     lse_t = lse.permute(2, 1, 0)
     q2k_t = q2k_block_index.permute(3, 2, 1, 0)
     q2k_nums_t = q2k_block_nums.permute(2, 1, 0)
+    # An unused block-size, split-offset or tile-order slot aliases the counts tensor; the kernel never reads it
+    # through that slot.
+    block_sizes_t = block_sizes_bh.permute(2, 1, 0) if has_block_sizes else q2k_nums_t
+    split_offsets_t = split_offsets.permute(3, 2, 1, 0) if split_offsets is not None else q2k_nums_t
     tile_order_t = tile_order.permute(2, 1, 0) if has_tile_order else q2k_nums_t
-    split_offsets_t = split_offsets.permute(3, 2, 1, 0) if split_offsets is not None else None
-    if has_block_sizes:
-        block_sizes_t = block_sizes_bh.permute(2, 1, 0)
-
-    q_cute = _to_cute_tensor(q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
-    k_cute = _to_cute_tensor(k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
-    v_cute = _to_cute_tensor(v_t, assumed_align=128, leading_dim=0, enable_tvm_ffi=False)
-    out_cute = _to_cute_tensor(out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
-    lse_cute = _to_cute_tensor(lse_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False)
-    q2k_cute = _to_cute_tensor(q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
-    q2k_nums_cute = _to_cute_tensor(q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
-    block_sizes_cute = (
-        _to_cute_tensor(
-            block_sizes_t,
-            assumed_align=None,
-            leading_dim=0,
-            enable_tvm_ffi=False,
-        )
-        if has_block_sizes
-        else q2k_nums_cute
-    )
-    split_offsets_cute = (
-        _to_cute_tensor(
-            split_offsets_t,
-            assumed_align=None,
-            leading_dim=0,
-            enable_tvm_ffi=False,
-        )
-        if split_offsets_t is not None
-        else q2k_nums_cute
-    )
-    tile_order_cute = _to_cute_tensor(tile_order_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False) if has_tile_order else q2k_nums_cute
+    tensors = (q_t, k_t, v_t, out_t, lse_t, q2k_t, q2k_nums_t, block_sizes_t, split_offsets_t, tile_order_t)
+    # The launch records no autograd and DLPack export rejects tensors that require grad, so detach such views.
+    tensors = tuple(t.detach() if t.requires_grad else t for t in tensors)
+    leading_dims = (1, 1, 0, 1, 0, 0, 0, 0, 0, 0)
 
     # NaN takes the masking-safe nonpositive path as well (as on SM100).
-    nonpositive_scale = not (float(softmax_scale) > 0.0)
-    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
-    fwd_kernel = BlockSparseAttnForwardSm90Blk64(
-        gqa_ratio=gqa_ratio,
-        head_dim=head_dim,
-        value_dim=v.shape[-1],
-        blocksparse_blocksize_q=SM90_FWD_BLOCK_SIZE,
-        blocksparse_blocksize_k=SM90_FWD_BLOCK_SIZE,
-        dtype=torch2cute_dtype_map[q.dtype],
-        acc_dtype=cutlass.Float32,
-        has_block_sizes=has_block_sizes,
-        num_splits=kv_splits,
-        allow_empty_block_nums=allow_empty_block_nums,
-        nonpositive_scale=nonpositive_scale,
-        has_tile_order=has_tile_order,
-    )
-
+    softmax_scale = float(softmax_scale)
+    nonpositive_scale = not (softmax_scale > 0.0)
     compile_key = _dynamic_tensors_compile_key(
         "sm90_blk64_fwd",
         (
@@ -944,42 +908,40 @@ def _bsa_attn_fwd_sm90_blk64(
             nonpositive_scale,
             has_tile_order,
         ),
-        (
-            q_t,
-            k_t,
-            v_t,
-            out_t,
-            lse_t,
-            q2k_t,
-            q2k_nums_t,
-            block_sizes_t if has_block_sizes else q2k_nums_t,
-            split_offsets_t if split_offsets_t is not None else q2k_nums_t,
-            tile_order_t,
-        ),
-        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0, 0),
+        tensors,
+        leading_dims=leading_dims,
     )
-    args = (
-        q_cute,
-        k_cute,
-        v_cute,
-        out_cute,
-        lse_cute,
-        q2k_cute,
-        q2k_nums_cute,
-        block_sizes_cute,
-        split_offsets_cute,
-        tile_order_cute,
-        softmax_scale,
-    )
-    if compile_key not in bsa_attn_fwd.compile_cache:
-        bsa_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fwd_kernel,
-            *args,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+    compiled = bsa_attn_fwd.compile_cache.get(compile_key)
+    if compiled is None:
+        # Only a cache miss builds the kernel object and the CuTe tensor views; every call hands the torch tensors
+        # straight to the tvm-ffi entry point (the SM90 blk128 forward pattern), which keys the layout classes above.
+        fwd_kernel = BlockSparseAttnForwardSm90Blk64(
+            gqa_ratio=gqa_ratio,
+            head_dim=head_dim,
+            value_dim=v.shape[-1],
+            blocksparse_blocksize_q=SM90_FWD_BLOCK_SIZE,
+            blocksparse_blocksize_k=SM90_FWD_BLOCK_SIZE,
+            dtype=torch2cute_dtype_map[q.dtype],
+            acc_dtype=cutlass.Float32,
+            has_block_sizes=has_block_sizes,
+            num_splits=kv_splits,
+            allow_empty_block_nums=allow_empty_block_nums,
+            nonpositive_scale=nonpositive_scale,
+            has_tile_order=has_tile_order,
         )
+        aligns = (128, 128, 128, 128, 4, None, None, None, None, None)
+        compiled = cute.compile(
+            fwd_kernel,
+            *(_to_cute_tensor(t, assumed_align=align, leading_dim=dim) for t, align, dim in zip(tensors, aligns, leading_dims)),
+            softmax_scale,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options="--enable-tvm-ffi",
+        )
+        bsa_attn_fwd.compile_cache[compile_key] = compiled
 
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
     with torch.cuda.nvtx.range("bsa_attn_fwd_sm90_blk64_kernel"):
-        bsa_attn_fwd.compile_cache[compile_key](*args, current_stream)
+        compiled(*tensors, softmax_scale, current_stream)
 
     if is_split_kv:
         return _combine_blk64_kv_bucketed_partials(q, out, lse, kv_splits)
