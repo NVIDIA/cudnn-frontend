@@ -26,8 +26,8 @@ def rubin():
 @pytest.mark.parametrize("lengths", [(4099,), (3, 2051, 22529)])
 def test_sm107_kernels_match_the_sm100_kernels(rubin, monkeypatch, lengths, h_kv, group, ds_precision):
     # the dense pair kernel alone, then all three kernels with packed documents off the 4-token grid
-    from cudnn.QSA.kernels import bprop_sm100 as engine
-    from cudnn.QSA.kernels import bprop_sm107
+    from cudnn.QSA import _backward as engine
+    from cudnn.QSA.kernels import bprop_sm100, bprop_sm107
 
     _skip_cu12(h_kv)
     monkeypatch.setattr(ref, "GROUP", group)
@@ -47,13 +47,13 @@ def test_sm107_kernels_match_the_sm100_kernels(rubin, monkeypatch, lengths, h_kv
     sm107 = _bitmap_backward(inputs, meta, ds_precision=ds_precision)
     assert engine._PLANS and all(plan.rubin for plan in engine._PLANS.values())
     assert (rubin_hosts if sum(lengths) > 22527 else {bprop_sm107._dpair_host}) <= set(hosts)
-    assert {engine._sparse_query_host, engine._sparse_key_host, engine._dpair_host}.isdisjoint(hosts)
+    assert {bprop_sm100._sparse_query_host, bprop_sm100._sparse_key_host, bprop_sm100._dpair_host}.isdisjoint(hosts)
     hosts.clear()
     monkeypatch.setattr(engine, "_PLANS", {})
     monkeypatch.setattr(bprop_sm107, "supported", lambda device_index: False)
     sm100 = _bitmap_backward(inputs, meta, ds_precision=ds_precision)
     assert engine._PLANS and not any(plan.rubin for plan in engine._PLANS.values())
-    assert engine._dpair_host in hosts and rubin_hosts.isdisjoint(hosts)
+    assert bprop_sm100._dpair_host in hosts and rubin_hosts.isdisjoint(hosts)
     _check(inputs, sm107)
     _check(inputs, sm100)
     for name, actual, expected in zip(("dq", "dk", "dv"), sm107, sm100):

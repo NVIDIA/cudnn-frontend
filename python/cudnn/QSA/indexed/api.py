@@ -47,9 +47,9 @@ def _validate(q, k, v, indices, scale, grad=None, out32=None, lse=None, cu_seqle
 class _QsaIndexedPlan(APIBase):
     """Immutable geometry and compiled kernels. Execute uses caller storage only.
 
-    The backward runs the dense-prefix and two-pass kernels of ``cudnn.QSA.kernels.bprop_sm100`` (those of
-    ``bprop_sm107`` on SM107 with the oversized shared memory carveout) behind the per-query compaction, for 12 or 6 query
-    heads per KV head, with the documents of a packed buffer described by ``cu_seqlens`` when the caller has them.
+    The backward runs the dense-prefix and two-pass launch sequence of ``cudnn.QSA._backward`` behind the per-query
+    compaction, for 12 or 6 query heads per KV head, with the documents of a packed buffer described by ``cu_seqlens``
+    when the caller has them.
     """
 
     def __init__(self, total, width, device, direction, num_seqs=0, hq=12, dq_parts=1, max_seq_len=None):
@@ -84,7 +84,7 @@ class _QsaIndexedPlan(APIBase):
         self.arch = cc[0] * 10 + cc[1]
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         if self.direction == "bprop":
-            from cudnn.QSA.kernels import bprop_sm100 as engine
+            from cudnn.QSA import _backward as engine
 
             if engine.dsl_cuda_major() < 13:
                 # the 12Q/1KV key-major kernel crashes the CUDA 12 DSL compiler
@@ -113,7 +113,7 @@ class _QsaIndexedPlan(APIBase):
                 self.impl = importlib.import_module(f"cudnn.QSA.kernels.{module}")
                 self._compiled_kernel = self.impl.compile_kernel(cutlass.BFloat16, self.hq, 1, self.arch)
             else:
-                from cudnn.QSA.kernels import bprop_sm100 as engine
+                from cudnn.QSA import _backward as engine
 
                 self.impl = engine
                 self._compiled_kernel = engine.compile_kernels(self.engine_plan)

@@ -163,7 +163,7 @@ assert not hasattr(cudnn.DSA, "qsa_indexed_backward")
 
 @pytest.fixture
 def canonical_inputs(supported_gpu):
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
     from QSA.cutedsl.qsa_index_list_reference import make_inputs as canonical
 
     if engine.dsl_cuda_major() < 13:

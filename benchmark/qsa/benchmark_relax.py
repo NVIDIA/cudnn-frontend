@@ -65,7 +65,7 @@ def main():
     reference = load(Path(__file__).with_name("reference.py"), "qsa_independent_reference")
     from benchmark_qsa import tensor_hash, file_hash, save
     from cudnn.ops import qsa_forward, qsa_backward, qsa_indexed_forward, qsa_indexed_backward
-    from cudnn.QSA.kernels.bprop_sm100 import dsl_cuda_major
+    from cudnn.QSA._backward import dsl_cuda_major
 
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K"] = "32"
     os.environ["RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES"] = "3"
