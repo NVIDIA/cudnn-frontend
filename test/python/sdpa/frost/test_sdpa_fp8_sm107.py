@@ -2389,7 +2389,6 @@ import d512_mxfp8_bwd_checks as d512_mx_checks
 class TestD512Mxfp8Backward:
     @pytest.fixture
     def d512_mx(self, monkeypatch):
-        import torch
         from cudnn.frost.buffers import cutedsl_state
         from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
 
