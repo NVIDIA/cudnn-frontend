@@ -31,7 +31,19 @@ _POINTS = [
 @pytest.mark.parametrize("thd", [False, True])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_native_paged_adapter_rebind_replay(
-    point, dtype, thd, graph_mode, cudnn_handle, monkeypatch, single_q=False, case_index=None, graph_knobs=None, has_sink=False, sink_endpoints=False
+    point,
+    dtype,
+    thd,
+    graph_mode,
+    cudnn_handle,
+    monkeypatch,
+    single_q=False,
+    case_index=None,
+    graph_knobs=None,
+    has_sink=False,
+    sink_endpoints=False,
+    split_kv=1,
+    sink_stride=3,
 ):
     import cutlass.cute as cute
 
@@ -68,8 +80,8 @@ def test_native_paged_adapter_rebind_replay(
         return [q, *pools, o, stats, klens, qlens, kt, vt], backing_o, backing_l
 
     buffers, ob, lb = allocate()
-    sink_raw = torch.empty(h * 3, device="cuda", dtype=torch.float32) if has_sink else None
-    sink = sink_raw[::3] if has_sink else None
+    sink_raw = torch.empty(h * sink_stride, device="cuda", dtype=torch.float32) if has_sink else None
+    sink = sink_raw[::sink_stride] if has_sink else None
     q, k, v, o, stats, klens, qlens, kt, vt = buffers
     descs = []
     for name, tensor in zip(("q", "k", "v", "o"), (q, k, v, o)):
@@ -97,6 +109,7 @@ def test_native_paged_adapter_rebind_replay(
         *descs,
         sample_lse=lse_desc,
         has_sink=has_sink,
+        split_kv=split_kv,
         is_causal=causal,
         causal_bottom_right=br,
         window_size_left=31 if swa else None,
@@ -128,7 +141,7 @@ def test_native_paged_adapter_rebind_replay(
         opts = {("cu_seq_len_q" if thd else "seq_len_q"): lengths[0], ("cu_seq_len_kv" if thd else "seq_len_kv"): lengths[1]}
         if thd:
             opts["max_total_seq_len_q"] = cap
-        sink_node = fe.tensor(name="sink", dim=(1, h, 1, 1), stride=(h * 3, 3, 1, 1), data_type=cudnn.data_type.FLOAT) if has_sink else None
+        sink_node = fe.tensor(name="sink", dim=(1, h, 1, 1), stride=(h * sink_stride, sink_stride, 1, 1), data_type=cudnn.data_type.FLOAT) if has_sink else None
         out, st = fe.sdpa(
             q=inputs[0],
             k=inputs[1],
@@ -169,13 +182,13 @@ def test_native_paged_adapter_rebind_replay(
     else:
         api.compile()
         artifact = api._compiled_kernel
-        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if thd else None
+        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda") if api.scratch_workspace_bytes() else None
     for binding in range(2):
         if binding:
             buffers, ob, lb = allocate()
             if has_sink:
-                sink_raw = torch.empty(h * 3, device="cuda", dtype=torch.float32)
-                sink = sink_raw[::3]
+                sink_raw = torch.empty(h * sink_stride, device="cuda", dtype=torch.float32)
+                sink = sink_raw[::sink_stride]
         q, k, v, o, stats, klens, qlens, kt, vt = buffers
         graph = torch.cuda.CUDAGraph()
         origin_buffers = [torch.empty(b + 1, dtype=torch.int64, device="cuda") for _ in range(3)] if graph_mode and thd else []

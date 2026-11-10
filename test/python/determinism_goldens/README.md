@@ -1588,3 +1588,41 @@ Compute Sanitizer13.4.92 memcheck, racecheck and synccheck each pass eight
 representative dense/paged split/unsplit cases with zero errors/hazards.
 Sanitizer selection is `test_d512_dense_paged and (qdtype0 or qdtype3)` with
 `--error-exitcode 91`. No SM100 kernel execution or mixed-D576 support is claimed.
+
+
+### Native SM80 split-KV forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py` qualifies FP16/BF16
+D128 with split 3 and D512 with split 17 on A100. Four new fixed-input goldens
+compare O and FP32 Stats byte for byte under fresh-buffer replay with concurrent
+work, reordered/duplicated batches through 129, empty neighbors and
+changed-neighbor CUDA Graph replay. Independent CPU-double references and
+input-preservation checks pass before recording. Split count is fixed within
+each comparison; equality across split counts is not claimed.
+
+Runtime key `a29ca37b88513cb6` identifies the A100 qualification environment;
+complete runtime details are retained in private evidence. Four recording
+cases pass, followed by 112 strict cases (the 108 existing SM80 paging/sink
+cases plus the four new goldens). The final source then passes 36 numerical
+split cases plus the four strict goldens, with no failures or skips. These
+cover dense/paged KV, both half types, D64 through D576/V512, graph and
+standalone entry points, strided outputs, sink endpoints, padding, optional
+Stats, both Stats log bases, poisoned partials and changed bindings. Two
+additional split cases reload compiled artifacts with compilation forbidden.
+No existing golden was regenerated.
+
+Compute Sanitizer memcheck, racecheck and synccheck each pass eight cases
+with zero errors/hazards: paged D64/D256/D576 in graph and standalone modes,
+and dense D512 with absent or base-two Stats. The selection is
+`-k '(paged_split_rebind and dtype0 and (dims0 or dims3 or dims5)) or
+(dense_split_partial_initialization and dtype1 and dims1)'`, with
+`--error-exitcode 91`. The unchanged common combine separately passes 12
+infinite-sink endpoint controls on SM100; its production source is unchanged.
+
+Run from `test/python`: `CUBLAS_WORKSPACE_CONFIG=:4096:8
+CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens python -m pytest
+sdpa/frost/test_sdpa_fwd_paged_sm80.py
+sdpa/frost/test_sdpa_fwd_split_sm80.py
+sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py -m L0 -n 0 -q`.
+Forward only; THD split and packing remain unsupported. This does not
+qualify another GPU, default plan ranking, or serving performance.
