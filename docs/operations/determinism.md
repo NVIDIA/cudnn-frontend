@@ -100,5 +100,5 @@ Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
 fused/separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, and distributed execution are outside this status page's scope.
 
-See the [test report](../../test/python/determinism_goldens/README.md)
+See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md)
 for the covered configurations, validation runtimes, and supporting measurements.
