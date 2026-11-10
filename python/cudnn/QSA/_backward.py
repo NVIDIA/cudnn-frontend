@@ -29,6 +29,7 @@ from .kernels.bprop_sm100 import (
     D,
     DENSE_QUERIES_MAX,
     DP_G,
+    DP_SYNC,
     DP_TT,
     DP_U_MAX,
     DQ_PARTS_DEFAULT,
@@ -38,6 +39,7 @@ from .kernels.bprop_sm100 import (
     PART_W,
     POS,
     PREP_ROWS,
+    QB,
     QR,
     RANGE_PAIRS,
     SPARSE_FOLD,
@@ -108,6 +110,7 @@ class LaunchPlan:
         gq: int = GQ,
         dq_parts: int = DQ_PARTS_DEFAULT,
         rubin: bool = False,
+        deterministic: bool = False,
     ):
         T = int(seq_len)
         assert hkv in (1, 2), f"{hkv} KV heads"
@@ -120,6 +123,7 @@ class LaunchPlan:
         REC_W = _rec_w(hkv)
         PAD = _pad(hkv)
         self.rubin = bool(rubin)
+        self.deterministic = bool(deterministic)
         self.hkv = hkv
         self.gq = gq
         self.dq_parts = dq_parts
@@ -148,7 +152,12 @@ class LaunchPlan:
         self.num_sms = num_sms
         # the groups a key tile can reach: the dense queries of the sequences holding its tokens
         reach = (DP_TT + dense_cap + DP_G - 1) // DP_G
+        if self.deterministic and not self.has_sparse:
+            # A tile's bands add their dK / dV one after another, so a band is no shorter than the bands are many.
+            self.dense_unit = max(self.dense_unit, math.isqrt(reach - 1) + 1)
         self.dense_parts = (reach + self.dense_unit - 1) // self.dense_unit
+        # the ticket counter's line, then one line per ordered dense unit
+        dense_sync_size = (1 + (self.dense_parts * self.dense_tiles * HKV if self.deterministic else 0)) * DP_SYNC
         self.pass_tokens = KV_PASS
         self.num_passes = (T + self.pass_tokens - 1) // self.pass_tokens
         assert self.num_passes < POS, f"sequence length {T} needs {self.num_passes} KV passes, the offset rows hold {POS - 1}"
@@ -161,31 +170,35 @@ class LaunchPlan:
         # inverted index of the sparse queries: ranges of QR queries, one key per (range, block), one slot per pair
         self.num_ranges = (self.window_capacity + QR - 1) // QR
         assert self.num_ranges <= 2, "the key-major kernel walks the active keys of at most two ranges"
-        # a range's keys are the first tokens of the buffer, padded to the index scan's 8 keys per thread
-        self.keys_per_range = (T + 7) // 8 * 8
+        # A range's keys are the first tokens of the buffer, padded to the index scan's 8 keys per thread, with at least
+        # one key past the buffer: no block starts there, so it pads the key-major kernel's item list.
+        self.keys_per_range = (T + 8) // 8 * 8
         self.num_keys = self.num_ranges * self.keys_per_range
         self.num_pairs = self.num_ranges * RANGE_PAIRS
         self.key_name = f"key_skip{1 if T >= KEY_SKIP_MIN_T else 0}"
         self.key_ctas = num_sms
-        nz = T * HKV * D if self.has_sparse else 0
+        # the sparse accumulators also take the lowest of a key tile's ordered dense bands
+        self.sum_sparse = self.has_sparse or self.deterministic
+        nz = T * HKV * D if self.sum_sparse else 0
         dense_dkv_size = T * HKV * D + 64
         keys = (self.num_keys + 31) // 16 * 16
-        prep_vecs = max(T * HQ // PREP_ROWS, nz // 8, (self.nsel + 4) // 4, keys // 4, T * HQ * D // 8, dense_dkv_size // 8)
+        prep_vecs = max(T * HQ // PREP_ROWS, nz // 8, (self.nsel + 4) // 4, keys // 4, T * HQ * D // 8, dense_dkv_size // 8, dense_sync_size // 4)
         self.prep_blocks = min(num_sms * 8, (prep_vecs + 255) // 256)
         self.fin_blocks = min(num_sms * 8, (T * HKV * D // 8 + 255) // 256)
         sp = self.has_sparse
         cu_len = {SEQ_SINGLE: 4, SEQ_CU: 0, SEQ_ORIGIN: (T + 1 + 3) // 4 * 4}[seq_mode]
         T4 = (T + 3) // 4 * 4
         # Without the sparse path its buffers shrink to nothing, except the dK/dV accumulators, which keep one
-        # never-read PAD chunk that both kernels alias.
+        # never-read PAD chunk that both kernels alias unless the dense bands write them.
         self.chunks = [
             ("delta", (T, HQ), torch.float32),
             ("sparse_dk_acc", (nz + PAD,), torch.float32),
-            ("sparse_dv_acc", (nz + PAD if sp else 0,), torch.float32),
+            ("sparse_dv_acc", (nz + PAD if self.sum_sparse else 0,), torch.float32),
             ("dense_block_bitmap", (self.nsel + 4,), torch.int32),
             ("dq_acc", (T * HQ * D,), torch.float32),
             ("dense_dk_acc", (dense_dkv_size,), torch.float32),
             ("dense_dv_acc", (dense_dkv_size,), torch.float32),
+            ("dense_sync", (dense_sync_size,), torch.int32),
             ("seq_lens", (cu_len,), torch.int32),
             ("seq_sparse_base", ((self.seq_count + 3) // 4 * 4,), torch.int32),
             ("sparse_count", (4,), torch.int32),
@@ -202,8 +215,9 @@ class LaunchPlan:
             ("sparse_block_slots", (self.window_capacity * PART_W + 16 if sp else 0,), torch.int32),
             ("key_pair_counts", (keys if sp else 0,), torch.int32),
             ("key_slot_offsets", (keys if sp else 0,), torch.int32),
-            ("key_slot_cursors", (keys if sp else 0,), torch.int32),
-            ("active_keys", (keys if sp else 0,), torch.int32),
+            ("key_query_bits", (keys * QB if sp else 0,), torch.int32),
+            # the tokens of one range, padded to a multiple of the key-major grid
+            ("active_keys", ((self.keys_per_range + self.key_ctas + 3) // 4 * 4 if sp else 0,), torch.int32),
             ("slot_queries", ((self.num_pairs + 31) // 16 * 16 if sp else 0,), torch.int32),
             ("pair_records", (self.num_pairs * REC_W + 16 if sp else 0,), torch.int32),
         ]
@@ -215,9 +229,10 @@ class LaunchPlan:
         """Scratch views from a ``cudnn.api_base.WorkspaceCarver`` over the caller's workspace."""
         scratch = {name: carver.take(math.prod(shape), dtype).view(shape) for name, shape, dtype in self.chunks if math.prod(shape)}
         if not self.has_sparse:
-            scratch["sparse_dv_acc"] = scratch["sparse_dk_acc"]
             scratch["key_pair_counts"] = scratch["dense_block_bitmap"][self.nsel :]
             scratch["sparse_queries"] = scratch["seq_sparse_base"]
+        if not self.sum_sparse:
+            scratch["sparse_dv_acc"] = scratch["sparse_dk_acc"]
         return scratch
 
 
@@ -235,9 +250,20 @@ def plan_for(
     gq: int = GQ,
     dq_parts: int = DQ_PARTS_DEFAULT,
     max_seq_len: Optional[int] = None,
+    deterministic: bool = False,
 ) -> LaunchPlan:
     """The plan of a geometry, kept for the most recent geometries of the process."""
-    key = (int(seq_len), hkv, seq_mode, int(num_seqs), device.index, int(gq), None if max_seq_len is None else int(max_seq_len), int(dq_parts))
+    key = (
+        int(seq_len),
+        hkv,
+        seq_mode,
+        int(num_seqs),
+        device.index,
+        int(gq),
+        bool(deterministic),
+        None if max_seq_len is None else int(max_seq_len),
+        int(dq_parts),
+    )
     with _PLANS_LOCK:
         plan = _PLANS.pop(key, None)
         if plan is None:
@@ -260,6 +286,7 @@ def plan_for(
                 gq=gq,
                 dq_parts=dq_parts,
                 rubin=rubin,
+                deterministic=deterministic,
             )
             if len(_PLANS) >= _PLANS_MAX:
                 _PLANS.pop(next(iter(_PLANS)))
@@ -274,7 +301,7 @@ def _fake(dtype, shape, sym, align=16):
 
 
 @lru_cache(maxsize=None)
-def _compile_args(hkv: int, gq: int, parts: int, rubin: bool) -> dict:
+def _compile_args(hkv: int, gq: int, parts: int, rubin: bool, det: int) -> dict:
     """Storage-free kernel signatures, reused across plans. The shared cache owns the CUDA objects."""
     HQ = gq * hkv
     query_host, key_host, dense_host = _sparse_query_host, _sparse_key_host, _dpair_host
@@ -321,6 +348,9 @@ def _compile_args(hkv: int, gq: int, parts: int, rubin: bool) -> dict:
         f_i(),
         f_i(),
         f_i(),
+        f_i(),
+        f_h,
+        f_h,
         I32(1),
         I32(1),
         I32(1),
@@ -330,7 +360,7 @@ def _compile_args(hkv: int, gq: int, parts: int, rubin: bool) -> dict:
     )
     fin_fakes = (f_h, f_h, f_dense_dkv, f_dense_dkv, f_dq_acc, f_kv, f_kv, f_q, I32(1))
     builders = {
-        "seq_scan": lambda: (_seq_scan_host, f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(0), I32(0), I32(1), I32(1), stream),
+        "seq_scan": lambda: (_seq_scan_host, f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(0), I32(0), I32(1), I32(1), I32(1), stream),
         "seq_fill": lambda: (_seq_fill_host, f_c(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), stream),
         "prep": lambda: (
             _prep_host,
@@ -345,16 +375,36 @@ def _compile_args(hkv: int, gq: int, parts: int, rubin: bool) -> dict:
             f_dense_dkv,
             f_dense_dkv,
             f_i(),
+            f_i(),
             I32(1),
             hkv,
             gq,
             stream,
         ),
         "bitmap": lambda: (_bitmap_host, f_ids(), f_c(), f_c(), f_c(), f_c(), f_i(), f_i(), f_i(), f_i(), f_dq_acc, I32(1), I32(8), stream),
-        "window": lambda: (_window_host, f_i(), f_i(), f_i(), I32(0), I32(1), stream),
-        "part": lambda: (_part_host, f_ids(), f_c(), f_c(), f_dq_acc, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), I32(1), hkv, gq, stream),
-        "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), stream),
-        "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
+        "window": lambda: (_window_host, f_i(), f_i(), f_i(), f_i(), I32(0), I32(1), stream),
+        "part": lambda: (
+            _part_host,
+            f_ids(),
+            f_c(),
+            f_c(),
+            f_dq_acc,
+            f_i(),
+            f_i(),
+            f_i(),
+            f_i(),
+            f_i(),
+            f_i(),
+            I32(1),
+            I32(1),
+            I32(1),
+            I32(1),
+            hkv,
+            gq,
+            stream,
+        ),
+        "scan": lambda: (_scan_host, f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
+        "fill": lambda: (_fill_host, f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), f_i(), I32(1), I32(1), I32(1), stream),
         "query": lambda: (
             query_host,
             f_q,
@@ -380,8 +430,8 @@ def _compile_args(hkv: int, gq: int, parts: int, rubin: bool) -> dict:
             parts,
             stream,
         ),
-        "dense": lambda: (dense_host, *dense_fakes, 0, hkv, gq, parts, stream),
-        "dense_pdl": lambda: (dense_host, *dense_fakes, 1, hkv, gq, parts, stream),
+        "dense": lambda: (dense_host, *dense_fakes, 0, hkv, gq, parts, det, stream),
+        "dense_pdl": lambda: (dense_host, *dense_fakes, 1, hkv, gq, parts, det, stream),
         "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
         "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
     }
@@ -417,22 +467,24 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     if plan.has_sparse:
         names += ["window", "part", "scan", "fill", "query", plan.key_name, "dense_pdl", "fin_sparse"]
     else:
-        names += ["dense", "fin"]
-    key = template_key(
-        globals(),
-        {
-            "hkv": plan.hkv,
-            "gq": plan.gq,
-            "parts": plan.dq_parts,
-            "arch": plan.arch,
-            "sources": SOURCE_DIGESTS,
-            "sm107": _SM107_SOURCE_DIGEST if plan.rubin else None,
-        },
-        "compile_kernels",
-    )
-    args = _compile_args(plan.hkv, plan.gq, plan.dq_parts, plan.rubin)
+        names += ["dense", "fin_sparse" if plan.sum_sparse else "fin"]
+    config = {
+        "hkv": plan.hkv,
+        "gq": plan.gq,
+        "parts": plan.dq_parts,
+        "arch": plan.arch,
+        "sources": SOURCE_DIGESTS,
+        "sm107": _SM107_SOURCE_DIGEST if plan.rubin else None,
+    }
+    key = template_key(globals(), config, "compile_kernels")
+    # only the dense pair kernel has an ordered form
+    dense_key = template_key(globals(), {**config, "deterministic": True}, "compile_kernels") if plan.deterministic else key
+    args = _compile_args(plan.hkv, plan.gq, plan.dq_parts, plan.rubin, int(plan.deterministic))
     options = f"--enable-tvm-ffi --gpu-arch=sm_{plan.arch}a"
-    return {name: compile_cached(*args[name], cache_key=key, symbol=f"qsa_backward_{name}", options=options) for name in names}
+    return {
+        name: compile_cached(*args[name], cache_key=dense_key if name.startswith("dense") else key, symbol=f"qsa_backward_{name}", options=options)
+        for name in names
+    }
 
 
 def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, dk, dv, scratch, scale, stream, cu_seqlens=None, tok_base=None):
@@ -463,6 +515,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         plan.dense_unit if plan.has_sparse else 0,
         HKV,
         plan.num_sms,
+        plan.dense_parts if plan.deterministic else 0,
         stream,
     )
     fns["seq_fill"](cu, s["nseq"], s["seq_sparse_base"], s["seq_start"], s["dense_hi"], s["sparse_queries"], s["first_group"], T, stream)
@@ -478,6 +531,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         s["dense_dk_acc"],
         s["dense_dv_acc"],
         s["dense_hi"],
+        s["dense_sync"],
         plan.prep_blocks,
         stream,
     )
@@ -500,6 +554,9 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         s["dense_hi"],
         s["dense_unit"],
         s["first_group"],
+        s["dense_sync"],
+        s["sparse_dk_acc"],
+        s["sparse_dv_acc"],
         plan.nw,
         plan.dense_tiles,
         plan.dense_unit,
@@ -524,7 +581,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
         KR = plan.keys_per_range
         for qlo, qhi in plan.query_windows:
             queries = s["sparse_queries"][qlo : (qhi + 3) // 4 * 4]
-            fns["window"](s["sparse_count"], window_count, s["key_pair_counts"], qlo, qhi - qlo, stream)
+            fns["window"](s["sparse_count"], window_count, s["key_pair_counts"], s["key_query_bits"], qlo, qhi - qlo, stream)
             fns["part"](
                 ids,
                 counts,
@@ -535,6 +592,7 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
                 s["sparse_blocks"],
                 s["sparse_pass_offsets"],
                 s["key_pair_counts"],
+                s["key_query_bits"],
                 qhi - qlo,
                 plan.pass_tokens,
                 plan.num_passes,
@@ -545,11 +603,11 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
                 window_count,
                 s["key_pair_counts"],
                 s["key_slot_offsets"],
-                s["key_slot_cursors"],
                 s["active_keys"],
                 s["active_count"],
                 KR,
                 plan.num_ranges,
+                plan.key_ctas,
                 stream,
             )
             fns["fill"](
@@ -557,7 +615,8 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
                 window_count,
                 s["sparse_blocks"],
                 s["sparse_pass_offsets"],
-                s["key_slot_cursors"],
+                s["key_slot_offsets"],
+                s["key_query_bits"],
                 s["sparse_block_slots"],
                 s["slot_queries"],
                 qhi - qlo,
@@ -604,10 +663,9 @@ def launch(plan, fns, q, k, v, out, dout, lse, ids, counts, first, lo, hi, dq, d
             )
         # The dense grid backfills only the final key-major grid, so it launches once, after the windows.
         fns["dense_pdl"](*dense_args, stream)
-        fns["fin_sparse"](*fin_args)
     else:
         fns["dense"](*dense_args, stream)
-        fns["fin"](*fin_args)
+    fns["fin_sparse" if plan.sum_sparse else "fin"](*fin_args)
 
 
 def dsl_cuda_major():
@@ -617,7 +675,9 @@ def dsl_cuda_major():
     return CUDA_VERSION.major
 
 
-def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch, dq_parts=DQ_PARTS_DEFAULT):
+def backward(
+    grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch, dq_parts=DQ_PARTS_DEFAULT, deterministic=False
+):
     """``cudnn.ops.qsa_backward`` on SM100 / SM103 / SM107: the compacted selection through the launch sequence above."""
     from cudnn.api_base import TupleDict, WorkspaceCarver
     from . import _metadata
@@ -631,7 +691,9 @@ def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, blo
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
     # the sequences come from tok_base on the device. There are at most as many as blocks.
-    plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, dq_parts=dq_parts)
+    plan = plan_for(
+        total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, dq_parts=dq_parts, deterministic=deterministic
+    )
     fns = compile_kernels(plan)
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
     scratch = plan.carve(WorkspaceCarver(workspace, plan.workspace_bytes(), "qsa_backward"))

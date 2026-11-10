@@ -91,12 +91,17 @@ def qsa_backward(
     scale: float,
     block_size: int = 4,
     ds_precision: str = "fp32",
+    deterministic: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE.
 
     ``ds_precision`` selects how dS reaches the dQ MMAs: ``"fp32"`` feeds three bf16 parts of its fp32 value, which keeps
     a dQ whose terms nearly cancel accurate. ``"bf16"`` rounds dS (and on the dense prefix P) to bf16 at a lower cost.
+    ``deterministic=True`` adds the gradients of the dense prefix in a fixed order, at a lower speed, so the same inputs
+    and packed layout return the same bytes on every run.
     """
+    if not isinstance(deterministic, bool):
+        raise ValueError("deterministic must be a bool")
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     parts = ds_parts(ds_precision)
     check_tensor("grad_out", grad_out, q.shape, q.dtype, q.device, 16)
@@ -104,4 +109,21 @@ def qsa_backward(
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     with torch.cuda.device(q.device):
         impl, arch = _implementation(q, "bprop")
-        return impl.backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, float(scale), arch, dq_parts=parts)
+        return impl.backward(
+            grad_out,
+            q,
+            k,
+            v,
+            out_fp32,
+            lse,
+            sel_blocks,
+            lo,
+            hi,
+            tok_base,
+            block_first,
+            block_last,
+            float(scale),
+            arch,
+            dq_parts=parts,
+            deterministic=deterministic,
+        )
