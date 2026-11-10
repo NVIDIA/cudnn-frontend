@@ -7,6 +7,8 @@ Duplicate edges disable pairing for their eight-KV group, preserving multiset
 semantics through the regular path. All metadata is rebuilt on every call.
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -160,8 +162,9 @@ class LocalPairPartition8:
         residuals: cute.Tensor,
         bucket_size: cutlass.Constexpr,
         stream: cuda.CUstream,
+        records: Optional[cute.Tensor] = None,
     ):
-        self.partition(bits, partners, offsets, indices, residuals, bucket_size).launch(
+        self.partition(bits, partners, offsets, indices, residuals, bucket_size, records).launch(
             grid=(cute.ceil_div(bits.shape[2], 2) * offsets.shape[2], bits.shape[1], bits.shape[0]),
             block=(32, 1, 1),
             stream=stream,
@@ -176,6 +179,7 @@ class LocalPairPartition8:
         indices: cute.Tensor,
         residuals: cute.Tensor,
         bucket_size: cutlass.Constexpr,
+        records: Optional[cute.Tensor] = None,
     ):
         lane, _, _ = cute.arch.thread_idx()
         task, h, b = cute.arch.block_idx()
@@ -183,6 +187,13 @@ class LocalPairPartition8:
         pair_slot = task % tasks_per_group
         group = task // tasks_per_group
         first_k = partners[b, h, bits.shape[2] + pair_slot]
+        if cutlass.const_expr(records is not None):
+            # Resolved task record for the SM90 paired backward (BlockSparseAttnBackwardSm90Blk128._task):
+            # [kv0, kv1, begin0, len0, begin1, res0, b_ok, steps]; an owner slot past the KV blocks is an empty task.
+            rec_kv0 = cute.min(first_k, bits.shape[2] - 1)
+            rec_kv1 = rec_kv0
+            rec_begin0, rec_len0, rec_begin1, rec_res0 = Int32(0), Int32(0), Int32(0), Int32(0)
+            rec_b_ok, rec_steps = Int32(0), Int32(0)
         start = (first_k // 8) * 8
         partner0 = partners[b, h, start]
         partner1 = Int32(-1)
@@ -221,6 +232,11 @@ class LocalPairPartition8:
                 residuals[b, h, group, first_k] = residual0
                 if has_second:
                     residuals[b, h, group, second_k] = residual1
+            if cutlass.const_expr(records is not None):
+                rec_b_ok = Int32(second_k > first_k and second_k < bits.shape[2])
+                rec_kv1 = second_k if rec_b_ok != 0 else first_k
+                rec_begin0, rec_len0, rec_begin1, rec_res0 = begin0, end0 - begin0, begin1, residual0
+                rec_steps = rec_len0 + (residual1 if rec_b_ok != 0 else Int32(0))
             if common_count > 0:
                 running0 = begin0
                 running1 = begin1
@@ -263,3 +279,13 @@ class LocalPairPartition8:
                             running1 = running
                         else:
                             running_common = running
+        if cutlass.const_expr(records is not None):
+            if lane == 0:
+                records[b, h, group, pair_slot, 0] = rec_kv0
+                records[b, h, group, pair_slot, 1] = rec_kv1
+                records[b, h, group, pair_slot, 2] = rec_begin0
+                records[b, h, group, pair_slot, 3] = rec_len0
+                records[b, h, group, pair_slot, 4] = rec_begin1
+                records[b, h, group, pair_slot, 5] = rec_res0
+                records[b, h, group, pair_slot, 6] = rec_b_ok
+                records[b, h, group, pair_slot, 7] = rec_steps

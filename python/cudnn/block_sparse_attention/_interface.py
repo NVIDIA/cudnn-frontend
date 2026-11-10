@@ -3306,6 +3306,8 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
                 torch.empty((batch_size, num_heads, pair_count), dtype=torch.int32, device=q.device),
                 torch.empty((batch_size, num_heads, num_kv_blocks + pair_count), dtype=torch.int32, device=q.device),
                 torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device),
+                # Per (pair, Q group) task record written by the partition kernel and read by the main kernel's _task.
+                torch.empty((batch_size, num_heads, num_q_groups, pair_count, 8), dtype=torch.int32, device=q.device),
             )
         # NaN takes the masking-safe nonpositive path as well (as on SM100).
         scale_nonpositive = not (softmax_scale > 0)

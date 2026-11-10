@@ -63,6 +63,7 @@ class MixedKvBackwardSm90:
         duplicates: cute.Tensor,
         flags: cute.Tensor,
         residuals: cute.Tensor,
+        tasks: cute.Tensor,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -76,7 +77,7 @@ class MixedKvBackwardSm90:
         )
         self.matcher(bits, duplicates, flags, owners, residuals[None, None, 0, None], stream)
         self.refiner(bits, duplicates, flags, owners, residuals[None, None, 0, None], stream)
-        self.partition(bits, flags, offsets, indices, residuals, self.bucket_size, stream)
+        self.partition(bits, flags, offsets, indices, residuals, self.bucket_size, stream, tasks)
 
         # Public BSA tensors are BHSD; the SM90 kernels use BSHD stride views.
         def _bhsd_to_bshd(t):
@@ -104,6 +105,7 @@ class MixedKvBackwardSm90:
             indices,
             flags,
             residuals,
+            tasks,
             stream=stream,
         )
         regular._postprocess_call(mdQaccum, mdQ, softmax_scale, stream)

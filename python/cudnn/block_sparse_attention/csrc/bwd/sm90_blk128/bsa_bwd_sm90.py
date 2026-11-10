@@ -656,6 +656,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -702,6 +703,8 @@ class BlockSparseAttnBackwardSm90Blk128:
             pair_flags = cute.make_tensor(pair_flags.iterator, pair_flags.layout)
         if const_expr(pair_residuals is not None):
             pair_residuals = cute.make_tensor(pair_residuals.iterator, pair_residuals.layout)
+        if const_expr(pair_tasks is not None):
+            pair_tasks = cute.make_tensor(pair_tasks.iterator, pair_tasks.layout)
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
 
         self.num_mma_threads = self.num_threads - 128
@@ -826,6 +829,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             bucketed_k2q_indices,
             pair_flags,
             pair_residuals,
+            pair_tasks,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -874,187 +878,197 @@ class BlockSparseAttnBackwardSm90Blk128:
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # prefetch TMA descriptors
-        if warp_idx == 0:
-            for atom in [tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV]:
-                if const_expr(atom is not None):
-                    cpasync.prefetch_descriptor(atom)
-
-        smem = SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-
-        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
-        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE)
-        pipeline_Q = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_Q.data_ptr(),
-            num_stages=self.Q_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["Q"],
-            defer_sync=True,
-        )
-        pipeline_dO = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_dO.data_ptr(),
-            num_stages=self.dO_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["dO"],
-            defer_sync=True,
-        )
-        # Statistics have their own producer and ring ownership; Q/dO release
-        # cannot authorize overwriting vectors still being read by a compute WG.
-        pipeline_stats = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_stats.data_ptr(),
-            num_stages=self.Q_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=2 * self.tile_m * Float32.width // 8,
-            defer_sync=False,
-        )
-
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sP = None
-        sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
-        sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
-        sLSE = storage.sLSE.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
-        sdPsum = storage.sdPsum.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
-
-        SeqlenInfoCls = partial(
-            SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
-            tile_m=self.tile_m,
-            tile_n=self.tile_n,
-        )
-        AttentionMaskCls = partial(
-            AttentionMask,
-            self.tile_m,
-            self.tile_n,
-            swap_AB=True,
-        )
-        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
-
-        if warp_idx < 4:
-            cute.arch.setmaxregister_decrease(self.num_producer_regs)
+        # Paired mode: on the production shape 69% of the (KV pair, head, Q group) tasks have no edges, yet every CTA
+        # paid the whole prologue (descriptor prefetch, mbarrier init + fence + CTA barrier, setmaxnreg, accumulator
+        # zeroing) while it held its SM alone. Read the task record once and let the whole CTA leave before any of it.
+        # The test depends only on the block index and on metadata the partition kernel completed before sum_OdO
+        # (which waited on it) released this grid, so it is CTA-uniform and needs no griddepcontrol wait. The direct_kv
+        # path keeps writing zeros for empty tiles and is not gated.
+        has_work = True
+        if const_expr(self.paired):
+            n_block, head_idx, batch_idx, q_group = TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
+            _, _, _, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            has_work = steps > 0
+        if has_work:
+            # prefetch TMA descriptors
             if warp_idx == 0:
-                self.load(
-                    mQ,
-                    mK,
-                    mV,
-                    mdO,
+                for atom in [tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV]:
+                    if const_expr(atom is not None):
+                        cpasync.prefetch_descriptor(atom)
+
+            smem = SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+
+            pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+            pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE)
+            pipeline_Q = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_Q.data_ptr(),
+                num_stages=self.Q_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=self.tma_copy_bytes["Q"],
+                defer_sync=True,
+            )
+            pipeline_dO = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_dO.data_ptr(),
+                num_stages=self.dO_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=self.tma_copy_bytes["dO"],
+                defer_sync=True,
+            )
+            # Statistics have their own producer and ring ownership; Q/dO release
+            # cannot authorize overwriting vectors still being read by a compute WG.
+            pipeline_stats = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_stats.data_ptr(),
+                num_stages=self.Q_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=2 * self.tile_m * Float32.width // 8,
+                defer_sync=False,
+            )
+
+            sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+            sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            sP = None
+            sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+            sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
+            sLSE = storage.sLSE.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
+            sdPsum = storage.sdPsum.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
+
+            SeqlenInfoCls = partial(
+                SeqlenInfoQK.create,
+                seqlen_q_static=mQ.shape[0],
+                seqlen_k_static=mK.shape[0],
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+            )
+            AttentionMaskCls = partial(
+                AttentionMask,
+                self.tile_m,
+                self.tile_n,
+                swap_AB=True,
+            )
+            TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
+
+            if warp_idx < 4:
+                cute.arch.setmaxregister_decrease(self.num_producer_regs)
+                if warp_idx == 0:
+                    self.load(
+                        mQ,
+                        mK,
+                        mV,
+                        mdO,
+                        sQ,
+                        sK,
+                        sV,
+                        sdO,
+                        tma_atom_Q,
+                        tma_atom_K,
+                        tma_atom_V,
+                        tma_atom_dO,
+                        pipeline_Q,
+                        pipeline_dO,
+                        SeqlenInfoCls,
+                        TileSchedulerCls,
+                        bucketed_k2q_offsets,
+                        bucketed_k2q_indices,
+                        pair_flags,
+                        pair_residuals,
+                        pair_tasks,
+                    )
+                if warp_idx == 1:
+                    self.dQaccum_store(
+                        mdQaccum,
+                        sdQaccum,
+                        TileSchedulerCls,
+                        SeqlenInfoCls,
+                        bucketed_k2q_offsets,
+                        bucketed_k2q_indices,
+                        pair_flags,
+                        pair_residuals,
+                        pair_tasks,
+                    )
+                if warp_idx == 2:
+                    self.load_stats(
+                        mLSE,
+                        mdPsum,
+                        sLSE,
+                        sdPsum,
+                        pipeline_stats,
+                        SeqlenInfoCls,
+                        TileSchedulerCls,
+                        bucketed_k2q_offsets,
+                        bucketed_k2q_indices,
+                        pair_flags,
+                        pair_residuals,
+                        pair_tasks,
+                    )
+            else:
+                tidx, _, _ = cute.arch.thread_idx()
+                tidx = tidx - 128
+                mma_args = (
+                    tiled_mma_SdP,
+                    tiled_mma_dK,
+                    tiled_mma_dV,
+                    tiled_mma_dQ,
+                    mdK,
+                    mdV,
+                    mdQaccum,
                     sQ,
                     sK,
                     sV,
                     sdO,
-                    tma_atom_Q,
-                    tma_atom_K,
-                    tma_atom_V,
-                    tma_atom_dO,
-                    pipeline_Q,
-                    pipeline_dO,
-                    SeqlenInfoCls,
-                    TileSchedulerCls,
-                    bucketed_k2q_offsets,
-                    bucketed_k2q_indices,
-                    pair_flags,
-                    pair_residuals,
-                )
-            if warp_idx == 1:
-                self.dQaccum_store(
-                    mdQaccum,
-                    sdQaccum,
-                    TileSchedulerCls,
-                    SeqlenInfoCls,
-                    bucketed_k2q_offsets,
-                    bucketed_k2q_indices,
-                    pair_flags,
-                    pair_residuals,
-                )
-            if warp_idx == 2:
-                self.load_stats(
-                    mLSE,
-                    mdPsum,
+                    sP,
+                    sdS,
                     sLSE,
                     sdPsum,
+                    sdQaccum,
+                    pipeline_Q,
+                    pipeline_dO,
                     pipeline_stats,
+                    tidx,
+                    tma_atom_dK,
+                    tma_atom_dV,
+                    r2s_tiled_copy_dQaccum,
+                    softmax_scale_log2,
+                    softmax_scale,
                     SeqlenInfoCls,
+                    AttentionMaskCls,
                     TileSchedulerCls,
                     bucketed_k2q_offsets,
                     bucketed_k2q_indices,
+                    mBlockSizes,
                     pair_flags,
                     pair_residuals,
+                    pair_tasks,
                 )
-        else:
-            tidx, _, _ = cute.arch.thread_idx()
-            tidx = tidx - 128
-            mma_args = (
-                tiled_mma_SdP,
-                tiled_mma_dK,
-                tiled_mma_dV,
-                tiled_mma_dQ,
-                mdK,
-                mdV,
-                mdQaccum,
-                sQ,
-                sK,
-                sV,
-                sdO,
-                sP,
-                sdS,
-                sLSE,
-                sdPsum,
-                sdQaccum,
-                pipeline_Q,
-                pipeline_dO,
-                pipeline_stats,
-                tidx,
-                tma_atom_dK,
-                tma_atom_dV,
-                r2s_tiled_copy_dQaccum,
-                softmax_scale_log2,
-                softmax_scale,
-                SeqlenInfoCls,
-                AttentionMaskCls,
-                TileSchedulerCls,
-                bucketed_k2q_offsets,
-                bucketed_k2q_indices,
-                mBlockSizes,
-                pair_flags,
-                pair_residuals,
-            )
-            cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
-            self.mma(*mma_args)
+                cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
+                self.mma(*mma_args)
 
     @cute.jit
-    def _task(self, offsets, flags, residuals, n_block, q_group, head_idx, batch_idx):
+    def _task(self, offsets, flags, residuals, tasks, n_block, q_group, head_idx, batch_idx):
         """Return the KV64 blocks of the two compute WGs, the CSR position of their Q walk and its number of Q64 steps."""
         if const_expr(self.paired):
-            # The owner's CSR list is [first-only | common]; the partner's list starts with its second-only edges.
-            # Fallback groups (duplicates) pair consecutive blocks with no common edges, as the partition kernel does.
-            nk = cute.size(offsets.shape[0]) - 1
-            first = flags[batch_idx, head_idx, nk + n_block]
-            owner_ok = first < nk
-            first = cute.min(first, nk - 1)
-            group = first // 8 * 8
-            fallback = flags[batch_idx, head_idx, group] < 0 and flags[batch_idx, head_idx, cute.min(group + 1, nk - 1)] < 0
-            second = flags[batch_idx, head_idx, first]
-            second = first + 1 if fallback else second
-            b_ok = owner_ok and second > first and second < nk
-            second = cute.min(cute.max(second, 0), nk - 1)
-            begin0 = offsets[first, q_group, (head_idx, batch_idx)]
-            len0 = offsets[first + 1, q_group, (head_idx, batch_idx)] - begin0
-            res0 = residuals[batch_idx, head_idx, q_group, first]
-            begin1 = offsets[second, q_group, (head_idx, batch_idx)]
-            res1 = residuals[batch_idx, head_idx, q_group, second] if b_ok else Int32(0)
-            len0 = len0 if owner_ok else Int32(0)
-            steps = len0 + res1
-            return first, second if b_ok else first, (begin0, len0, begin1, res0, b_ok), steps
+            # The partition kernel resolved this (pair, Q group) task into one record [kv0, kv1, begin0, len0, begin1,
+            # res0, b_ok, steps] (LocalPairPartition8.partition): the owner's CSR list is [first-only | common] and the
+            # partner's starts with its second-only edges. Eight independent loads of one 32-byte record replace three
+            # dependent rounds through flags/offsets/residuals (~1,100 cycles on every CTA's critical path).
+            kv0 = tasks[batch_idx, head_idx, q_group, n_block, 0]
+            kv1 = tasks[batch_idx, head_idx, q_group, n_block, 1]
+            begin0 = tasks[batch_idx, head_idx, q_group, n_block, 2]
+            len0 = tasks[batch_idx, head_idx, q_group, n_block, 3]
+            begin1 = tasks[batch_idx, head_idx, q_group, n_block, 4]
+            res0 = tasks[batch_idx, head_idx, q_group, n_block, 5]
+            b_ok = tasks[batch_idx, head_idx, q_group, n_block, 6] != 0
+            steps = tasks[batch_idx, head_idx, q_group, n_block, 7]
+            return kv0, kv1, (begin0, len0, begin1, res0, b_ok), steps
         begin = offsets[n_block, q_group, (head_idx, batch_idx)]
         steps = (offsets[n_block + 1, q_group, (head_idx, batch_idx)] - begin) * 2
         return n_block * 2, n_block * 2 + 1, begin, steps
@@ -1101,6 +1115,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
@@ -1132,7 +1147,9 @@ class BlockSparseAttnBackwardSm90Blk128:
                 load_dO, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO)
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
 
-                kv0, kv1, k2q_begin, total_steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, n_block, q_group, head_idx, batch_idx)
+                kv0, kv1, k2q_begin, total_steps = self._task(
+                    bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx
+                )
                 process_tile = total_steps > Int32(0)
 
                 if process_tile:
@@ -1168,7 +1185,21 @@ class BlockSparseAttnBackwardSm90Blk128:
                 work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
-    def load_stats(self, mLSE, mdPsum, sLSE, sdPsum, pipeline_stats, SeqlenInfoCls, TileSchedulerCls, offsets, indices, pair_flags=None, pair_residuals=None):
+    def load_stats(
+        self,
+        mLSE,
+        mdPsum,
+        sLSE,
+        sdPsum,
+        pipeline_stats,
+        SeqlenInfoCls,
+        TileSchedulerCls,
+        offsets,
+        indices,
+        pair_flags=None,
+        pair_residuals=None,
+        pair_tasks=None,
+    ):
         # Preprocess writes the padded statistics and clears dQaccum. This wait
         # precedes every statistics transaction published to the compute WGs.
         cute.arch.griddepcontrol_wait()
@@ -1182,7 +1213,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             gdPsum = cute.local_tile(mdPsum[None, head_idx, batch_idx], (self.tile_m,), (None,))
             load_LSE = copy_utils.tma_producer_copy_fn(copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE), pipeline_stats)
             load_delta = copy_utils.tma_producer_copy_fn(copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum), pipeline_stats)
-            _, _, begin, steps = self._task(offsets, pair_flags, pair_residuals, n_block, q_group, head_idx, batch_idx)
+            _, _, begin, steps = self._task(offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
             for step in cutlass.range(steps, unroll=1):
                 m_block = self._m_block(indices, begin, step, head_idx, batch_idx)
                 if m_block * self.tile_m < seqlen.seqlen_q:
@@ -1236,6 +1267,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         mBlockSizes: Optional[cute.Tensor] = None,
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
     ):
         # Both WGs execute all five GEMMs. S/dP/dKV split the KV rows;
         # dQ splits the head dimension and reduces the entire KV128 tile.
@@ -1273,7 +1305,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             tLSEsLSE = layout_utils.mma_partition_C_vec(sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=False)
             tdPsums = layout_utils.mma_partition_C_vec(sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=False)
             mask = AttentionMaskCls(seqlen)
-            kv0, kv1, begin, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, n_block, q_group, head_idx, batch_idx)
+            kv0, kv1, begin, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
             # In paired mode WG w owns KV64 block kv_w: its S rows are mask columns [64 w, 64 w + 64) of the tile.
             mask_n_block = n_block
             if const_expr(self.paired):
@@ -1532,13 +1564,14 @@ class BlockSparseAttnBackwardSm90Blk128:
         bucketed_k2q_indices: cute.Tensor,
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
     ):
         scheduler = TileSchedulerCls()
         work = scheduler.initial_work_tile_info()
         if work.is_valid_tile:
             n_block, head_idx, batch_idx, q_group = work.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            _, _, begin, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, n_block, q_group, head_idx, batch_idx)
+            _, _, begin, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
             gdQ = cute.local_tile(mdQaccum[None, head_idx, batch_idx], (self.tile_m * self.tile_hdim,), (None,))
             for step in cutlass.range(steps, unroll=1):
                 m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
