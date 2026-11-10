@@ -1390,7 +1390,7 @@ def test_dsl_sm120_flavor_routing():
     with pytest.raises(NotImplementedError, match="no kernel"):
         _api(128, 128, tile_n=32).check_support()  # kv_tile 32 is the d512 flavor's alone
     for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (584, 512), (512, 520)):
-        with pytest.raises(ValueError, match="both head dimensions"):
+        with pytest.raises(ValueError, match="head dimensions must fit a supported wide flavor"):
             _api(d_qk, d_v).check_support()
     # The general template still takes the knobs.
     api = _api(128, 128, tile_m=64, tile_n=64)
