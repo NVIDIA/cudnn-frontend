@@ -341,6 +341,7 @@ prefill; a short query alone does not imply the D128 decode template.
   count that selects it; a declaration-time flag derived from such a resolver is re-read where it is consumed (the block re-reads
   `capture_safe` at `compile()`), so the two cannot disagree across devices.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
+- **Poison caller workspace, including physical padding.** A TMA descriptor can expose aligned scratch rows beyond the logical sequence. Initialize workspace bytes to both zero and `0xff`, poison outputs, and compare eager and captured results against the same reference. Numerically masked rows still need defined intermediates: `0 * NaN` remains NaN. A clean initcheck result is insufficient when the caller initialized those stale bytes itself (`test_delta_workspace_padding_does_not_feed_dkdv`).
 - **A harness mirror of an engine's admission rule includes the engine's DSL target gate.** `sdpa/mxfp8.py::block_scaled_o_draw` admits a block-scaled O draw where the FROST MXFP8 row would serve it, and an admitted draw the row then declines FAILS the test (the `sf_o` output has no backend lowering), so the mirror must agree with the row on every gate. When the cc 10.7 row became a default candidate (PR #1478) the mirror asked the manifest but not `cutedsl_arch_requirement_error`: on a cc 10.7 host with the public CuTe DSL 4.7.0 (no `sm_107a`) the row declines through that gate while the mirror admitted the draw, so every flag-less d128 block-scaled draw of `test_sdpa_mxfp8_fwd_L0` would have failed where develop ran the backend on the folded draw (verified host-side with the target modelled absent). Model the target on both sides: `sdpa/test_mxfp8_block_scaled_fold.py::test_cc107_default_admission_needs_the_sm_107a_dsl_target` pins the fold with `buffers._cutedsl_has_sm107` patched absent and present.
 - **A version-bounded backend workaround ships with the detector that re-measures it.** A constant such as `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN` is a measurement, and nothing in an ordinary test run would ever notice the backend getting fixed (the guard keeps it from being asked). `sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0` runs the trigger matrix one interpreter per contract with the guard disabled in the child (the constant set to 0 there; a crash is the child's rc 139, never the runner's) plus a control contract the backend is known to plan, and fails with the version to record once the installed backend plans the matrix cleanly -- or, above a recorded version, once it crashes again. Spawn the children with the test module's own directory and `test/python` on their `sys.path`; they inherit neither pytest's path setup nor its fixtures.
 - Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
@@ -1314,6 +1315,30 @@ chunk and include the full declared O/dO width in the delta pass. A small-head
 delta helper reused unchanged can make dV correct while corrupting dQ/dK.
 `test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
 plus fixed quantized inputs under changed batch sizes and graph replay.
+
+Paged vector loaders must derive row count and swizzle span from each operand's
+compiled head tile, while the live-vector guard uses its logical width. Fill
+padding beyond that width with NaNs and test independent QK/V widths; otherwise
+a D128-only copy loop can silently overrun the shared tile after admission is
+widened. `test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_widths` covers
+16/32/64-element swizzle spans, eight-aligned envelopes, fresh pool storage,
+independent HND/NHD tables and changed-input replay.
+
+When extending a native split kernel to paged KV, update the adapter's
+partial-format predicate together with route admission. The D256 mixed-KV
+host writes FP32 partials even when final O is half. Allocating or binding
+half partials can corrupt O while memcheck still reports zero errors.
+`TestMixedFp8Kv.test_d256_dense_paged` checks numerical O/Stats for split
+and unsplit paging, and `test_d256_standalone` pins the FP32 partial ABI.
+
+
+A raw-copy barrier reused across operand sub-chunks needs a phase invariant
+across calls and empty work items. Native mixed D512 issues exactly two K
+or two V chunks per call, so its local phase returns to zero. Keep the exact
+head-width and chunk-count guards when using that invariant: D576's three K
+chunks cannot reuse the same scheme. `TestMixedFp8Kv.test_d512_admission`
+checks the chunk counts and rejects that geometry; numerical/replay cases
+include empty KV and multiple scheduler waves.
 
 ### Mixed-family shared-artifact qualification
 

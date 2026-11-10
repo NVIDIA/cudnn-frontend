@@ -89,8 +89,9 @@ not make QSA and DeepSeek attention interchangeable. Numerical rounding and
 top-k tie rules must also be checked before replacing an external selector.
 
 On every architecture both training entries run one backward engine
-(`cudnn.QSA.kernels.bprop_sm100`, with the Rubin dense pair, query-major and
-key-major kernels of `cudnn.QSA.kernels.bprop_sm107` on SM107): the prefix of every sequence
+(`cudnn.QSA._backward` launching the kernels of `cudnn.QSA.kernels.bprop_sm100`,
+and on SM107 the Rubin dense pair, query-major and key-major kernels of
+`cudnn.QSA.kernels.bprop_sm107`): the prefix of every sequence
 (its first 20480 queries, or all of them below 22528 tokens) on a dense
 key-tile kernel that masks per key token through a bitmap, the remaining
 queries on a query-major pass that writes P / dS records and a key-major pass

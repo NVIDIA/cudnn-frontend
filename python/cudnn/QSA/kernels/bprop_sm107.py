@@ -3,8 +3,8 @@
 
 """SM107 (Rubin) query-major, key-major and dense pair kernels of the Qwen Sparse Attention (QSA) backward.
 
-``bprop_sm100`` compiles them in place of its own on SM107 when ``supported``. Each kernel is its SM100 twin, which
-documents the shared logic, with these changes:
+``cudnn.QSA._backward`` compiles them in place of the SM100 kernels on SM107 when ``supported``. Each kernel is its
+SM100 twin in ``bprop_sm100``, which documents the shared logic, with these changes:
 
 - The oversized shared memory carveout (up to 327 KiB per CTA, leaving 8 KB of L1) holds a third K stage and a second
   buffer of the three dS^T parts in the query-major kernel, and a fifth stage of the key-major kernel with two KV heads.

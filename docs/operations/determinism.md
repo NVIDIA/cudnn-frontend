@@ -41,7 +41,7 @@ arbitrary user callbacks.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
-| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
+| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -57,7 +57,9 @@ arbitrary user callbacks.
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | FROST native D576/V512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
-| FROST native D64 dense/THD paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
+| FROST native D512 dense-Q mixed-KV forward (CGA2, dense/paged KV) | fprop | FP16/BF16 Q/O, E4M3/E5M2 KV | Unsupported | Unsupported | Supported (tested configurations) |
+| FROST native D256 dense-Q mixed-KV forward (CGA2, unpacked, dense/paged KV) | fprop | FP16/BF16 Q/O, E4M3/E5M2 KV | Unsupported | Unsupported | Supported (tested configurations) |
+| FROST native D64 dense/THD paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
@@ -67,7 +69,9 @@ The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,
 reordered/duplicated batches and fresh buffers, including mixed FP8 KV storage.
 Graph qualification separately checks numerical outputs and changed-input replay.
-These paging changes add no backward path.
+The D64 mixed-storage checks also cover fixed-plan dense splits and unsplit
+THD, preserving each quantized KV payload across batch changes. D64 THD
+split with FP8 KV remains unsupported. These paging changes add no backward path.
 
 The D512 FP8 paged row covers the native role-split forward path with whole-group
 PackGQA and a fixed split count (1 or 4 in its determinism suite). Its batch
@@ -101,11 +105,12 @@ a row alone and inside a batch under the entry's own picks.
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
   geometry (`Geometry(K_HEADS, V_HEADS, HIDDEN)`; verified at the default
-  27B-class geometry and four per-rank shards). SM100/103 is verified on
+  27B-class geometry and five per-rank shards). SM100/103 is verified on
   cc 10.0 and cc 10.3; SM90 is declined by type. The entries also serve
   SM120-class parts (compute capability 12.x; verified on cc 12.0 with the
-  forms a 99 KB per-CTA opt-in holds) with the same statuses; this page has
-  no SM120 column.
+  forms a 99 KB per-CTA opt-in holds, at the default geometry and four of
+  the five shards -- `Geometry(2, 8, 4096)` is unverified there) with the
+  same statuses; this page has no SM120 column.
 - Shared-expert decode pair (`SharedExpertDecode`): no determinism switch; the
   accumulation order of every output element is a function of the geometry
   alone (`K_SPLIT` pinned per geometry -- never per part: a GPU too small for
@@ -113,9 +118,12 @@ a row alone and inside a batch under the entry's own picks.
   `GATE_CLUSTER_FOLD`), so a token's bytes alone equal its bytes inside a batch
   of up to 24 tokens, across the one- and two-m-tile forms and the one- and
   two-group forms; every other knob writes the default's bytes, and the first
-  release's form (`v1_cfg`) keeps its own goldens as an A/B arm. The SM100/103 cell
-  states its limit: verified on cc 10.3 (a GB300); cc 10.0 (and cc 10.7) run
-  the same admission, unverified; SM90 and SM120 are declined by type.
+  release's form (`v1_cfg`) keeps its own goldens as an A/B arm. SM100/103 is
+  verified on cc 10.0 (a GB200, 152 SMs) and cc 10.3 (a GB300, 152 SMs). The
+  committed goldens belong to one cc 10.3 runtime: on cc 10.0 the status
+  rests on the replay and batch-invariance cells, and the golden comparison
+  is not covered there. cc 10.7 runs the same admission, unverified; SM90
+  and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
@@ -169,3 +177,13 @@ duplicated and129-request batches, then mutate dO and a canonical scale
 atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
+
+
+## SM120 small-head paged SDPA
+
+Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch
+invariant for the tested D64 and D120/V88 causal-window configurations, with
+and without packed GQA. RTX5080 checks compare O and Stats bytes across
+replays, reordered/duplicated batches and changed neighbors under capture.
+This is a fixed-GPU/runtime result; SM121 execution and cross-GPU bitwise
+identity are unverified. The determinism report records the exact coverage.

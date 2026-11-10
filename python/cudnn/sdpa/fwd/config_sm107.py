@@ -1711,8 +1711,16 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     kernels (per-tensor FP8 and MXFP8) do; the d192xd128 siblings share the d128
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
-    if k.dtype_kv != -1 and not (flavor == "sm107 d128" and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
-        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D128 pipeline")
+    if k.dtype_kv != -1 and not (
+        flavor in ("sm107 d64", "sm107 d128", "sm107 d256", "sm107 d512")
+        and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16)
+        and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    ):
+        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D64/D128/D256/D512 pipeline")
+    if flavor == "sm107 d512" and k.dtype_kv != -1 and (not k.mma_2x2 or k.cta_mma != 2 or k.thd_varlen or k.epilogue_gate or k.d_flavor != 512):
+        raise ValueError("sm107 d512: independent FP8 KV requires exact D512 dense Q, the native 2x2 body and no gate")
+    if flavor == "sm107 d256" and k.dtype_kv != -1 and (k.cta_mma != 2 or k.thd_varlen or k.pack_gqa or k.epilogue_gate):
+        raise ValueError("sm107 d256: independent FP8 KV requires dense Q, two CTAs, no packing and no gate")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template
@@ -1756,7 +1764,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # descriptors to a packed total), unsplit and unpacked, and a page is a whole number of 128-row F8_128x4 SF atom
     # sets (the SF pools page with K/V; a 64-row page cannot hold one).
     if k.paged_kv:
-        if flavor not in _PAGED_KV_FLAVORS_SM107:
+        if flavor not in _PAGED_KV_FLAVORS_SM107 and not (flavor == "sm107 d256" and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
             raise ValueError(
                 f"{flavor}: paged_kv is not wired on this Rubin flavor (the cc 10.7 PAGED_KV specialization lives in "
                 f"sm107/prefill_d128_f16.py, sm107/prefill_d128_mxfp8.py, sm107/prefill_d256_mxfp8.py and per-tensor sm107/prefill_d512_fp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
@@ -1767,6 +1775,10 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             half_2x2 = k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.mma_2x2 and k.cta_mma == 2
             if (k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and not half_2x2) or k.thd_varlen:
                 raise ValueError(f"{flavor}: paged KV requires dense Q, with per-tensor FP8 or native two-CTA half 2x2 inputs")
+            p = k.page_size
+            if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
+                raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
+        elif flavor == "sm107 d256" and k.dtype_kv != -1:
             p = k.page_size
             if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
                 raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
@@ -2035,6 +2047,8 @@ class CfgD192(CfgD128):
 class CfgD256(_CfgSm107):
     """d_qk = d_v = 256. Q-union-O SMEM alias, single softmax warpgroup, a
     Q.K(i+1) -> S.V(i) lookahead MMA stream with two parity S_acc TMEM slots."""
+
+    DTYPE_KV: int = -1
 
 
 @dataclass(frozen=True)
@@ -2641,6 +2655,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     other_regs = 40
 
     cfg = CfgD256(
+        DTYPE_KV=params.dtype_kv,
         TILE_M=128,
         TILE_N=tile_n,
         TILE_K=tile_k,
@@ -2906,7 +2921,7 @@ def make_cfg_d512(params: TemplateParams):
     # The 2x2-datapath record (TemplateParams.mma_2x2, appended, default False) is read through getattr so a
     # record built before the field existed takes the role-split arm unchanged (the config_sm100 dispatch, mirrored).
     if getattr(params, "mma_2x2", False):
-        return make_cfg_d512_2x2(params, cga_m=2 if params.d_flavor == 576 else 4)
+        return make_cfg_d512_2x2(params, cga_m=2 if params.d_flavor == 576 or params.dtype_kv != -1 else 4)
     return _make_cfg_d512_family(params, flavor="sm107 d512", mxfp8=False)
 
 
@@ -2983,6 +2998,11 @@ def _validate_cfg_d512_2x2_sm107(cfg: CfgD512X2, flavor: str) -> None:
     _validate_dtype_k_step(cfg, flavor)
 
 
+@dataclass(frozen=True)
+class CfgD512Mixed(CfgD512X2):
+    DTYPE_KV: int = -1
+
+
 def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD512X2, TmaIters]:
     """The Rubin 2x2-datapath d512 configuration (``TemplateParams.mma_2x2``).
 
@@ -2997,7 +3017,18 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     _validate_params("sm107 d512", params, split_wired=True)
     # Share the half geometry guards with SM100. This native twin additionally
     # supports paged 2x2 loads, packed subgroups and the pre-folded scale.
-    _validate_params_sm100("d512", params, scale_prefolded_wired=True, d512_partial_pack_wired=True, d512_paged_2x2_wired=True)
+    mixed_kv = params.dtype_kv != -1
+    if mixed_kv and cga_m != 2:
+        raise ValueError(f"{flavor}: mixed FP8 KV requires one CTA pair (CGA_M=2)")
+    # Apply the common half-geometry checks after the native storage contract
+    # above. This does not admit mixed storage in the SM100 kernel.
+    _validate_params_sm100(
+        "d512",
+        dataclasses_replace(params, dtype_kv=-1) if mixed_kv else params,
+        scale_prefolded_wired=True,
+        d512_partial_pack_wired=True,
+        d512_paged_2x2_wired=True,
+    )
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: BF16/FP16 inputs only")
     if params.cta_mma != 2:
@@ -3006,7 +3037,7 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     n_pairs = cga_m // CfgD512X2.CTA_MMA
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
-    base = CfgD512X2(
+    base = (CfgD512Mixed if mixed_kv else CfgD512X2)(
         TILE_K=576 if params.d_flavor == 576 else 512,
         N_BMM1_CHUNKS=3 if params.d_flavor == 576 else 2,
         PAGED_KV=int(params.paged_kv),
@@ -3045,6 +3076,8 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         QH_PER_KH=int(params.qh_per_kh),
         PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=True),
     )
+    if mixed_kv:
+        base = dataclasses_replace(base, DTYPE_KV=params.dtype_kv)
     # DESC_VERSION is DERIVED from the layout the fields above describe, never set by hand.
     cfg = dataclasses_replace(base, DESC_VERSION=_d512_2x2_desc_version_for(base))
     _validate_cfg_d512_2x2_sm107(cfg, flavor)

@@ -93,6 +93,8 @@ from cudnn.sdpa.fwd.config_sm120 import (
     GENERAL_HEAD_TILE_MAX as _SM120_GENERAL_HEAD_TILE_MAX,
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_Q_TILES as _SM120_SEQ_Q_TILES,
+    PAGED_D_SHAPES as _SM120_PAGED_D_SHAPES,
+    paged_head_dims_supported as _sm120_paged_head_dims_supported,
     decode_kv_stage as _sm120_decode_kv_stage,
     head_tiles as _sm120_head_tiles,
     is_decode_tile as _sm120_is_decode_tile,
@@ -805,6 +807,7 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
         capabilities.sm_lo in (100, 107)
         and capabilities.sm_hi <= _BLACKWELL[1]
         and not (facts.is_fp8 or facts.is_mxfp8)
+        and facts.uniform_dtype
         and not facts.thd
         and gate_ok
         and not facts.attn_scale_prefolded
@@ -953,8 +956,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
-        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or (facts.d_qk, facts.d_v) != (128, 128) or (split_kv or 1) != 1:
-            return "SM120 paged KV requires exact FP16/BF16 D128, dense Q and split_kv=1"
+        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v) or (split_kv or 1) != 1:
+            return "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128, dense Q and split_kv=1"
     if facts.has_bias and capabilities.bias_d_shapes is None:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
@@ -1922,6 +1925,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 and _selected_d_shape(capabilities, facts, knobs) == (256, 256)
                 and not packed_split
                 and not decode_tile
+                and not _mixed_fp8_kv(capabilities, facts)
                 and not _config_sm107.supports_native_d256_dense_split(
                     _selected_d_shape(capabilities, facts, knobs),
                     device_cc=facts.device_cc,
@@ -2182,6 +2186,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if not facts.uniform_dtype and not _mixed_fp8_kv(capabilities, facts):
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if _mixed_fp8_kv(capabilities, facts):
+        if (facts.d_qk, facts.d_v) == (512, 512) and (facts.thd or facts.has_epilogue_gate or (knobs is not None and knobs.cga not in (None, 2))):
+            return "native mixed D512 requires dense Q, two CTAs and no gate"
+        if (facts.d_qk, facts.d_v) == (256, 256) and (
+            facts.thd or facts.has_epilogue_gate or (knobs is not None and (knobs.cga not in (None, 2) or knobs.pack_gqa))
+        ):
+            return "native mixed D256 requires dense Q, two CTAs, no gate and no packing"
+        if facts.device_cc == (10, 7) and (facts.d_qk, facts.d_v) == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1:
+            return "native D64 mixed FP8 KV keeps THD execution unsplit"
         binder = cudnn._pybind_module._SdpaThdBinder if facts.thd else cudnn._pybind_module._SdpaDenseBinder
         if not getattr(binder, "supports_mixed_fp8_kv", False):
             return "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension"
@@ -2374,6 +2386,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not capabilities.is_fp8
             and not facts.thd
             and not native_small_half_dense_paged_leg(capabilities, facts, knobs)
+            and not (_mixed_fp8_kv(capabilities, facts) and (facts.d_qk, facts.d_v) == (256, 256))
             and not native_d512_dense_leg(capabilities, facts, knobs)
             and not d256_decode_tile_served(capabilities, facts, knobs)
             and not native_d192_paged_leg(capabilities, facts, knobs)
@@ -2761,7 +2774,7 @@ def _sm107_spec() -> EngineSpec:
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE}) | SM107_F16_SMALL_D_SHAPES,
             d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
-            mixed_fp8_kv_d_shapes=frozenset({(128, 128)}),
+            mixed_fp8_kv_d_shapes=frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
             causal=True,
             bottom_right=True,
             right_band_widening=True,
@@ -3554,7 +3567,7 @@ def _sm120_spec() -> EngineSpec:
             swa=True,
             right_band_widening=True,
             paged_kv=True,
-            paged_d_shapes=frozenset({(128, 128)}),
+            paged_d_shapes=_SM120_PAGED_D_SHAPES,
             padded=True,
             sink=True,
             stats=True,

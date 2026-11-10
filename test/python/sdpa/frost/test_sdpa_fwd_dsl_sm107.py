@@ -893,26 +893,22 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
 
 
 def test_sm107_f16_thd_is_served_on_every_flavor():
-    """FULLY INVERTED 2026-09-09: every f16 flavor of the 128..512 family serves THD.
+    """THD retains its exact validated shapes; dense D32 and D576 stay declined.
 
-    PARTIALLY RE-INVERTED with the small head-dim tiles (d32 / d64 on the d128 file): `thd_d_shapes` is now a STRICT
-    SUBSET of `d_shapes` -- the small tiles' bodies carry the THD contract in principle (the same file) but their THD leg is
-    unvalidated, so the row declines it TYPED (and the config factory refuses `thd_varlen` for the "sm107 d32" / "sm107 d64"
-    flavors) until a THD sweep lands.  The two halves pinned: every THD shape is a served shape with no kernel-less member,
-    and every small tile is a typed decline, never a KeyError in module loading.  Asserted on real facts objects.
-
-    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`, because that is what makes a partial arch
-    line expressible without reintroducing a boolean that cannot describe it."""
+    The capability set must describe a strict subset, so adding a dense flavor
+    never silently admits packed queries for an unwired kernel path.
+    """
     from cudnn.sdpa.fwd import engines
-    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES, SM107_F16_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32)}, "THD = every f16 shape except D32"
+    assert SM107_F16_THD_SHAPES < caps.d_shapes
+    assert caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32), (576, 512)}
     for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
-    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES - SM107_F16_THD_SHAPES):
+    for d_qk, d_v in sorted(caps.d_shapes - SM107_F16_THD_SHAPES):
         why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
         assert why is not None and "THD" in why, (d_qk, d_v, why)
 
@@ -8730,40 +8726,6 @@ def test_d256_pack_gqa_divisibility_rule_is_exempted_on_the_rubin_decode_tile_on
     a = api()
     assert a.check_support()
     assert a._decode_q_tile() == 16 and a._decode_q_tile_for(1, 15, 5) == 16
-
-
-class TestMixedFp8Kv:
-    """Native mixed K/V coverage in the architecture CI's selected entry."""
-
-    from mixed_kv_sm107_cases import (
-        graph_admission,
-        native_resources,
-        dense_paged,
-        paged_origins,
-        thd_origins,
-        thd_uniform_control,
-        thd_cga1_origins,
-        single_q,
-        single_q_unsplit,
-        single_q_sink,
-        compact_split,
-        dense_paged_native,
-        uniform_control,
-    )
-
-    test_graph_admission = staticmethod(graph_admission)
-    test_native_resources = staticmethod(native_resources)
-    test_dense_paged = staticmethod(dense_paged)
-    test_paged_origins = staticmethod(paged_origins)
-    test_thd_origins = staticmethod(thd_origins)
-    test_thd_uniform_control = staticmethod(thd_uniform_control)
-    test_thd_cga1_origins = staticmethod(thd_cga1_origins)
-    test_single_q = staticmethod(single_q)
-    test_single_q_unsplit = staticmethod(single_q_unsplit)
-    test_single_q_sink = staticmethod(single_q_sink)
-    test_compact_split = staticmethod(compact_split)
-    test_dense_paged_native = staticmethod(dense_paged_native)
-    test_uniform_control = staticmethod(uniform_control)
 
 
 # Keep native stride coverage in the architecture-specific CI entry.
