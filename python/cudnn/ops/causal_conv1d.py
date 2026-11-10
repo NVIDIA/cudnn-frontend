@@ -9,6 +9,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from cudnn._device import ensure_current_context
+
 _TORCH_DTYPE_TO_CUDNN = {
     torch.float32: 0,  # CUDNN_DATA_FLOAT
     torch.float64: 1,  # CUDNN_DATA_DOUBLE
@@ -95,8 +97,10 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
 
     import cudnn
 
+    stream = torch.cuda.current_stream().cuda_stream
+    ensure_current_context(stream, x.device.index)
     cudnn.causal_conv1d_forward(
-        torch.cuda.current_stream().cuda_stream,
+        stream,
         x.data_ptr(),
         weight.data_ptr(),
         bias.data_ptr(),
@@ -168,8 +172,10 @@ def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, ac
 
     import cudnn
 
+    stream = torch.cuda.current_stream().cuda_stream
+    ensure_current_context(stream, x.device.index)
     cudnn.causal_conv1d_backward(
-        torch.cuda.current_stream().cuda_stream,
+        stream,
         x.data_ptr(),
         weight.data_ptr(),
         bias.data_ptr(),
@@ -827,8 +833,10 @@ def _nwh_fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str)
 
     import cudnn
 
+    stream = torch.cuda.current_stream().cuda_stream
+    ensure_current_context(stream, x.device.index)
     cudnn.causal_conv1d_nwh_forward(
-        torch.cuda.current_stream().cuda_stream,
+        stream,
         x.data_ptr(),
         weight.data_ptr(),
         bias.data_ptr(),
@@ -900,8 +908,10 @@ def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor
 
     import cudnn
 
+    stream = torch.cuda.current_stream().cuda_stream
+    ensure_current_context(stream, x.device.index)
     cudnn.causal_conv1d_nwh_backward(
-        torch.cuda.current_stream().cuda_stream,
+        stream,
         x.data_ptr(),
         weight.data_ptr(),
         bias.data_ptr(),
@@ -1049,8 +1059,10 @@ def _b2b_fwd_primitive(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, s
 
     import cudnn
 
+    stream = torch.cuda.current_stream().cuda_stream
+    ensure_current_context(stream, x.device.index)
     cudnn.b2b_causal_conv1d_forward(
-        torch.cuda.current_stream().cuda_stream,
+        stream,
         x.data_ptr(),
         weights_proj.data_ptr(),
         weights_mixer.data_ptr(),
@@ -1149,8 +1161,10 @@ def _b2b_bwd_primitive(
 
     import cudnn
 
+    stream = torch.cuda.current_stream().cuda_stream
+    ensure_current_context(stream, x.device.index)
     cudnn.b2b_causal_conv1d_backward(
-        torch.cuda.current_stream().cuda_stream,
+        stream,
         x.data_ptr(),
         weights_proj.data_ptr(),
         weights_mixer.data_ptr(),
