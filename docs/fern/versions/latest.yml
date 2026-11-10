@@ -52,6 +52,9 @@ navigation:
           - page: Native Sparse Attention (NSA)
             path: ../../operations/sparse_attention/nsa.md
             slug: nsa
+          - page: Simplified Sparse Attention
+            path: ../../operations/sparse_attention/simplified_sparse_attention.md
+            slug: simplified_sparse_attention
           - page: DeepSeek Sparse Attention (DSA)
             path: ../../operations/sparse_attention/dsa.md
             slug: dsa

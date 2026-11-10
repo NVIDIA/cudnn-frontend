@@ -304,6 +304,12 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **Stream order does not serialize host calls.** Two host threads can enqueue
+  A's producer, B's producer, then A's consumer on one stream. Cached scratch
+  needs a lock through the final queued read, including reserve/growth, or
+  storage owned by each call. Keep separate streams independent. Detector:
+  `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_host_threads_share_stream`
+  pauses between scratch writes and reads in the dense and filtered paths.
 - **The device is implicit state exactly like the stream.** A `torch.empty`
   (or any allocator call) without a device context silently allocates on the
   *current* GPU, not the input tensor's — wrap execute-path allocations in
@@ -381,6 +387,13 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- Pass an explicit kernel floor when qualification starts above the shared
+  helper floor. The package dependency floor and `CUTEDSL_MIN_VERSION` can
+  differ. `test_old_dsl_fails_before_kernel_import` in the simplified sparse
+  attention suite pins its 4.8 floor; a real 4.7.1 run exposed the missing
+  argument. Check PyTorch conditional-graph capability before allocating
+  filtered repair state; `test_filtered_runtime_declines_before_allocation`
+  covers a missing runtime entry.
 - A version floor does not guarantee target-architecture support. For example,
   public 4.7.0 lacks `sm_107a`; check the actual target capability before
   admitting SM107 plans. Test graph and standalone declines with the real
@@ -819,6 +832,23 @@ Keep helpers in the narrowest package shared by their users. For example,
 Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Widen operands before triangular workspace products, in both producer and
+consumer. Widening an already-overflowed offset cannot recover it. Derive tile
+decoder bounds from the input extent. `test_triangular_offsets.py` compiles the
+actual address expressions and checks large offsets without dereferencing them.
+
+An unused name can still hold a required shared-memory allocation. Preserve
+the allocation when a later operand aliases that storage; remove only the
+binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
+for its P operand. Its public forward/backward reference and byte-golden
+tests in `simplified_sparse_attention/cutedsl/` cover this layout.
+
+When sharing a kernel with JAX, match scratch flag storage to its native ABI.
+A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
+CuTe tensor can reject that store during lowering. The long-key cases in
+`simplified_sparse_attention/cutedsl/test_filtered_jax.py` compile and execute
+the selector and its repair loop to cover this boundary.
 
 Loaded integer vectors can infer `Int8` while retaining no signedness metadata.
 Set the declared integer dtype on the vector wrapper before widening to INT32.

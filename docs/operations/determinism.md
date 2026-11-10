@@ -42,6 +42,12 @@ arbitrary user callbacks.
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
+| `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `dense_indexer_kl`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
+| `dense_indexer_kl`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
@@ -98,6 +104,25 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
+  repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
+  rows move. The fused CuTe path also changes scalar loss and saved gradient
+  bytes across runs through atomic reductions. Only indexer Q/K receive
+  gradients; the teacher stays frozen. Tiny single-row goldens do not qualify
+  larger reductions. CPU and other GPUs are not qualified for determinism.
+
+- Simplified sparse attention (PyTorch and JAX): no deterministic mode. The SM100 forward
+  result covers short packed sequences with Hq 16/32/96 and top-k
+  512/1024/2048, plus an Hq16 scheduling-boundary case. Long filtered-indexer
+  batch invariance and saved internal statistics are unverified. PyTorch host-thread
+  isolation is checked for dense and filtered repair calls on shared and separate streams.
+  Triangular two-tile forward replay is checked at all three head counts.
+  Moving packed rows changes the scalar loss bytes for Hq32/top-k1024 and
+  Hq96/top-k2048. CI also found this for PyTorch Hq16/top-k512.
+  Its approved exception covers only the observed one-byte packed forward loss mismatch on SM100.
+  Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
+  Numerical agreement does not establish bitwise determinism.
 
 - Custom reduction: these rows have no determinism switch and pin the native
   cuDNN backend. SM100 support applies only to the suite's dense, 257-element
