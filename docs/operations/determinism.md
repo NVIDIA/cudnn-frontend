@@ -41,7 +41,7 @@ arbitrary user callbacks.
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
-| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported (cc 10.3 verified; cc 10.0 unverified) | Unverified |
+| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -105,11 +105,12 @@ a row alone and inside a batch under the entry's own picks.
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
   geometry (`Geometry(K_HEADS, V_HEADS, HIDDEN)`; verified at the default
-  27B-class geometry and four per-rank shards). SM100/103 is verified on
+  27B-class geometry and five per-rank shards). SM100/103 is verified on
   cc 10.0 and cc 10.3; SM90 is declined by type. The entries also serve
   SM120-class parts (compute capability 12.x; verified on cc 12.0 with the
-  forms a 99 KB per-CTA opt-in holds) with the same statuses; this page has
-  no SM120 column.
+  forms a 99 KB per-CTA opt-in holds, at the default geometry and four of
+  the five shards -- `Geometry(2, 8, 4096)` is unverified there) with the
+  same statuses; this page has no SM120 column.
 - Shared-expert decode pair (`SharedExpertDecode`): no determinism switch; the
   accumulation order of every output element is a function of the geometry
   alone (`K_SPLIT` pinned per geometry -- never per part: a GPU too small for
@@ -117,9 +118,12 @@ a row alone and inside a batch under the entry's own picks.
   `GATE_CLUSTER_FOLD`), so a token's bytes alone equal its bytes inside a batch
   of up to 24 tokens, across the one- and two-m-tile forms and the one- and
   two-group forms; every other knob writes the default's bytes, and the first
-  release's form (`v1_cfg`) keeps its own goldens as an A/B arm. The SM100/103 cell
-  states its limit: verified on cc 10.3 (a GB300); cc 10.0 (and cc 10.7) run
-  the same admission, unverified; SM90 and SM120 are declined by type.
+  release's form (`v1_cfg`) keeps its own goldens as an A/B arm. SM100/103 is
+  verified on cc 10.0 (a GB200, 152 SMs) and cc 10.3 (a GB300, 152 SMs). The
+  committed goldens belong to one cc 10.3 runtime: on cc 10.0 the status
+  rests on the replay and batch-invariance cells, and the golden comparison
+  is not covered there. cc 10.7 runs the same admission, unverified; SM90
+  and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
