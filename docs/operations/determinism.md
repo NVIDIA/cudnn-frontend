@@ -281,6 +281,23 @@ That limited coverage passes on SM121 (GB10); SM120 remains unverified.
 It does not extend the deterministic contract to multiple KV tiles. This change adds
 no forward kernel.
 
+## SM120 wide half backward
+
+For eight-aligned `256 < D_QK <= 512` and `0 < D_V <= D_QK`, the native
+FP16/BF16 backward path supports `use_deterministic_algorithm=True` on the
+FE graph (`deterministic=True` on the standalone adapter). A fixed-order
+relay orders dQ accumulation independently for each gradient-column partition;
+dK/dV have fixed output owners. Dense and THD layouts, MHA/GQA/MQA,
+padding, top-left/bottom-right causal masks and left/right windows are
+supported; bias and sink are outside this wide path.
+
+The measured D512 configurations preserve dQ/dK/dV raw bytes across repeat
+execution, fresh pointers, batch reordering/duplication and changed-neighbor
+CUDA Graph replay on SM121 (GB10). Independent native SM120 (RTX 5080)
+validation also covers the wide deterministic path. These are runtime-specific
+results; they do not guarantee bitwise identity across GPUs or software
+versions, or extend the generally unordered through-D256 THD path above.
+
 ## SM120 D576 forward
 
 D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in

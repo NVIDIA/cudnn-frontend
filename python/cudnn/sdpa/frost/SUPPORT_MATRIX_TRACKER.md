@@ -2758,7 +2758,7 @@ half or FP8 K/V, packing and split. Q loads directly and O stages through the
 drained K/V slab; no global staging allocation or kernel is introduced.
 
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
-**multiples of 16** and a **64 x 64 CTA**. BPROP remains limited to 256.
+**multiples of 16** and a **64 x 64 CTA**. Half BPROP extends through D512 as described below; low-precision BPROP remains unsupported.
 
 MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
@@ -2781,9 +2781,9 @@ for origin-aware delta/cast and GQA reduction launches, independently of packed
 capacity. Mask-free, top-left and bottom-right causal THD are admitted.
 Tile dimensions must fit the native geometry and 99 KiB shared-memory budget;
 D128 keeps 64x64 by default, while D256 uses 32x32. Deterministic, windowed, bias and sink THD
-graphs retain typed declines. Dense support below remains unchanged.
+graphs retain typed declines. The new D_QK > 256 native route additionally supports deterministic and windowed dense/THD graphs; bias and sink remain declined on that route.
 
-| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], or D576/V512 envelope, any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 256, any ×8 |
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], or D576/V512 envelope, any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 512, any ×8 |
 |---|:--:|:--:|:--:|
 | **Data types** | | | |
 | FP16 / BF16 | ✅ | — | ✅ |
@@ -2791,10 +2791,10 @@ graphs retain typed declines. Dense support below remains unchanged.
 | MXFP8 | — | ✅ | ❌ |
 | O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
 | Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512]; or QK ∈ (512,576], V ∈ (256,512] | ×16, ≤ 512ᵃ | ×8, ≤ 256 |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512]; or QK ∈ (512,576], V ∈ (256,512] | ×16, ≤ 512ᵃ | ×8, ≤ 512 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D256/GQA; restrictions above) |
+| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D512/GQA; restrictions above) |
 | Paged KV (dense Q; prefill through D128, decode through D256, D512/D576 envelopes) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |
@@ -2804,9 +2804,9 @@ graphs retain typed declines. Dense support below remains unchanged.
 | Causal right-band widening | ✅ | ✅ | ✅ |
 | Sliding window (left) | ✅ | ✅ | ✅ |
 | Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
-| Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ |
+| Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ (D_QK ≤ 256) |
 | Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — |
-| Bias / dBias | ❌ | ❌ | ✅ / ✅ |
+| Bias / dBias | ❌ | ❌ | ✅ / ✅ (D_QK ≤ 256) |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
 | Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
@@ -4877,3 +4877,20 @@ The declared row exposes this for the D512 envelope, with and without dense
 split-KV. Native D64 remains unpacked and unsplit; THD packing remains declined.
 `test_sdpa_fwd_split_sm90.py` covers grouped KV addressing, independent strides,
 sinks, changed-length replay, multiple KV stages, and all three schedulers.
+
+### SM120 native half wide backward
+
+The existing `sdpa_bwd_sm120` row additionally serves eight-aligned
+`256 < D_QK <= 512`, `0 < D_V <= D_QK` through a native 512/512 envelope.
+Its mma.sync chain uses 16x16 tiles, one Q/dO stage and two independent gradient
+column partitions; no tensor staging is added. Dense and THD GQA, causal,
+bottom-right, SWA, padding and deterministic dQ share that geometry. Each
+partition has its own deterministic relay. Workspace remains linear in tokens.
+Bias and sink operands remain explicitly declined on this wide route pending
+qualification; the established <=D256 routes retain their existing domains.
+
+Detector: `test_sdpa_bwd_sm120_wide.py`. Initial SM121 qualification passes
+66 native graph/standalone cases, including two strict deterministic dQ/dK/dV
+goldens, 73 existing native THD controls and 145 host checks. Fourteen targeted
+cases per memory/race/synchronization sanitizer are qualified separately.
+SM120 hardware execution and performance are unmeasured.

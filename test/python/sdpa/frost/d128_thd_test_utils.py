@@ -14,7 +14,7 @@ D = 128
 SCALE = D**-0.5
 
 
-def reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk=D, d_v=D, kv_heads=None, bottom_right=False):
+def reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk=D, d_v=D, kv_heads=None, bottom_right=False, window_left=None):
     """FP64 autograd on CPU, independently for each sequence.
 
     Inputs are rounded to the caller's storage dtype before the oracle sees
@@ -39,7 +39,10 @@ def reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk=D, d_v
             if causal:
                 keep = torch.arange(nk)[None, :] <= torch.arange(nq)[:, None] + (nk - nq if bottom_right else 0)
                 scores = scores.masked_fill(~keep, float("-inf"))
-            if bottom_right:
+            if window_left is not None:
+                anchor = torch.arange(nq)[:, None] + (nk - nq if bottom_right else 0)
+                scores = scores.masked_fill(torch.arange(nk)[None, :] < anchor - window_left, float("-inf"))
+            if bottom_right or window_left is not None:
                 live = torch.isfinite(scores).any(dim=-1, keepdim=True)
                 probs = torch.softmax(torch.where(live, scores, 0.0), dim=-1)
                 probs = torch.where(live, probs, 0.0)
@@ -75,6 +78,8 @@ def make_case(
     kv_heads=None,
     bottom_right=False,
     sequences=None,
+    window_left=None,
+    deterministic=False,
 ):
     """Each port has independent origins, including a nonzero first origin.
 
@@ -90,7 +95,7 @@ def make_case(
     envelope = envelope or (max(max(lens_q), 1), max(max(lens_kv), 1))
     assert max(lens_q) <= envelope[0] and max(lens_kv) <= envelope[1]
     kv_heads = heads if kv_heads is None else kv_heads
-    seqs = reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk, d_v, kv_heads, bottom_right) if sequences is None else sequences
+    seqs = reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk, d_v, kv_heads, bottom_right, window_left) if sequences is None else sequences
     assert len(seqs) == len(lens_q)
     origins, ends = {}, {}
     for index, role in enumerate(ROLES):
@@ -166,6 +171,8 @@ def make_case(
         dtype=dtype,
         causal=causal,
         bottom_right=bottom_right,
+        window_left=window_left,
+        deterministic=deterministic,
         stats_layout=stats_layout,
         offset_dtype=offset_dtype,
         units=units,
@@ -213,6 +220,8 @@ def make_adapter(case, api_type=None, *, tile_m=None, tile_n=None):
         tile_m=tile_m,
         tile_n=tile_n,
         is_causal=case.causal,
+        deterministic=getattr(case, "deterministic", False),
+        window_size_left=getattr(case, "window_left", None),
         causal_bottom_right=getattr(case, "bottom_right", False),
         scale_softmax=case.scale,
         thd=True,
@@ -273,6 +282,8 @@ def make_graph(case, engine_name="sdpa_bwd_sm100_d128", engine_id=20609):
         dO=refs["do"],
         stats=refs["stats"],
         attn_scale=case.scale,
+        use_deterministic_algorithm=getattr(case, "deterministic", False),
+        diagonal_band_left_bound=None if getattr(case, "window_left", None) is None else case.window_left + 1,
         use_causal_mask=case.causal and not getattr(case, "bottom_right", False),
         use_causal_mask_bottom_right=getattr(case, "bottom_right", False),
         use_padding_mask=True,

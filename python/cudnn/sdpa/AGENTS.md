@@ -1602,6 +1602,13 @@ swizzle can cross row boundaries even when the total allocation fits. The
 D256 cases in `test_sdpa_bwd_thd_sm120_gqa.py` exercise the native 32x32 tile
 with independent origins, GQA reduction, tails and bottom-right quiet rows.
 
+A backward gradient-column partition multiplies the physical CTA grid, not the
+logical KV tile count. Both reverse scheduling and the deterministic relay's
+last KV visitor must divide out that partition factor; counters and workspace
+must include the partition and actual Q tile. The dense deterministic cases in
+`test_sdpa_bwd_sm120_wide.py` catch a relay that otherwise waits forever for a
+nonexistent predecessor, while THD's length-derived count alone cannot catch it.
+
 When two warps split a head dimension, each half must contain whole shared-memory
 swizzle chunks. A swizzle that divides the full head can still straddle the warp
 boundary (D576 has 288 columns per half). Check every aliased storage phase too:

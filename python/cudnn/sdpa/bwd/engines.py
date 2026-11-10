@@ -684,7 +684,7 @@ def _sm120_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             # Any head size multipled of 8
-            d=frozenset(_SM120_HEAD_DIMS),
+            d=frozenset((*_SM120_HEAD_DIMS, 512)),
             d_envelope=True,  # any multiple of 8 computes on the next native size (TMA zero-fill)
             d_pad_multiple=8,
             dqk_ge_dv=True,
@@ -706,12 +706,12 @@ def _sm120_spec() -> EngineSpec:
             thd_declared_totals=True,
             thd_ragged_offsets=True,
             thd_head_stride=True,
-            thd_tile_ms=frozenset({32, 64}),
-            thd_tile_ns=frozenset({32, 64}),
+            thd_tile_ms=frozenset({16, 32, 64}),
+            thd_tile_ns=frozenset({16, 32, 64}),
             declaration_check=graph_mismatch,
             knob_check=knob_mismatch,
-            tile_ms=frozenset(_SM120_Q_TILES),
-            tile_ns=frozenset(_SM120_KV_TILES),
+            tile_ms=frozenset((*_SM120_Q_TILES, 16)),
+            tile_ns=frozenset((*_SM120_KV_TILES, 16)),
         ),
         lower=lower_dsl_bwd,
     )
@@ -836,7 +836,11 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    if api_type == _SM120 and thd:
+    if api_type == _SM120 and facts.d_qk > 256:
+        from .api_dsl_sm120_wide import SdpaBwdDslSm120Wide
+
+        adapter_cls = SdpaBwdDslSm120Wide
+    elif api_type == _SM120 and thd:
         from .api_dsl_sm120_thd import SdpaBwdDslSm120Thd
 
         adapter_cls = SdpaBwdDslSm120Thd
