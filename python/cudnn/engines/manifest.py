@@ -201,7 +201,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "gdn",
         "cudnn.linear_attention",
         "GdnEngines",
-        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2)},
+        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2), "gdn_cake_det": EngineSlot(3, opt_in=True)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(

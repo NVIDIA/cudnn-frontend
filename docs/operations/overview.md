@@ -199,3 +199,5 @@ Methods:
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
 - Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).
+
+- [Cake GDN training](cake_gdn.md): opt-in packed BF16 forward and backward.
