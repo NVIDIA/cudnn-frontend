@@ -1926,6 +1926,26 @@ Final shared-loader regression:36 passed,303 deselected, no failures/skips in
 rebinding/replay and decode ring reuse. The old half baselines are unchanged.
 The owned SM120 allocation completed normally after these checks.
 
+## SM90 dense backward qualification (`sdpa_bwd_sm90`, 2026-11-10)
+
+`sdpa/frost/test_sdpa_bwd_sm90_determinism.py` runs the graph API with
+`use_deterministic_algorithm=True` on a causal GQA sequence (4 query / 2 KV
+heads, S_q = S_kv = 200, four KV tiles with a tail) for D64/D128 and FP16/BF16.
+Each case checks the target's dQ/dK/dV against the FP64 reference once, then
+compares raw bytes across three fixed-input replays with queued side-stream
+work, B1/B3/B129 batches with duplicated and reordered copies, and a CUDA Graph
+replay after the neighbor's inputs change at stable addresses. On one GH200
+(driver 13020, Torch 2.14.0+cu130, cuDNN 92700, `nvidia-cutlass-dsl` 4.8.1),
+all four cases pass recording and a fresh-process strict check against the
+committed goldens (runtime key `c079e9b62638eb64`). Run from `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest sdpa/frost/test_sdpa_bwd_sm90_determinism.py -m L0 -q
+```
+
+The non-deterministic mode (unordered FP32 dQ atomics) is not covered.
+
 ## SM120 THD D256/GQA backward qualification
 
 `test_sdpa_bwd_thd_sm120_gqa.py` compares dQ/dK/dV with independent CPU FP64

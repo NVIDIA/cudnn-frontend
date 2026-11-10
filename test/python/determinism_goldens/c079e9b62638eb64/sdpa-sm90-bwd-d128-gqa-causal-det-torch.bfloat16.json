@@ -1,0 +1,108 @@
+{
+  "inputs": {
+    "do": {
+      "dtype": "torch.bfloat16",
+      "sha256": "01768d9421092bd62484024af61498bcc937844cbdcb5c26755c91077eb1427a",
+      "shape": [
+        1,
+        4,
+        200,
+        128
+      ]
+    },
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "d8ff7b6ab606d00510f7f168ee4749bc5a5e1b813a0cc2e15d2c005dab4ec3f4",
+      "shape": [
+        1,
+        2,
+        200,
+        128
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "d9752ea347eadb939fafabc34e7d65f9bcda730c47600765fc9e8ea3eb52faca",
+      "shape": [
+        1,
+        4,
+        200,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "9f43a10092a6cd5fc7c585fdec66f1629ef7275d4412870b9e8aabb8aa365db5",
+      "shape": [
+        1,
+        4,
+        200,
+        128
+      ]
+    },
+    "stats": {
+      "dtype": "torch.float32",
+      "sha256": "168f62c78ac4684cfbc6afddda5ca4cf0da3852e7768d4de49d6c2be4acb8260",
+      "shape": [
+        1,
+        4,
+        200,
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "ccb5780e606814072334bd58fe00990e4822716e68c0fa5a9fce245a5444ff77",
+      "shape": [
+        1,
+        2,
+        200,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "dk": {
+      "dtype": "torch.bfloat16",
+      "sha256": "02a0a7746d8d0f2ff5986e77d04d74e9660b1ff1a90fc31176c8204c2bf89e58",
+      "shape": [
+        2,
+        200,
+        128
+      ]
+    },
+    "dq": {
+      "dtype": "torch.bfloat16",
+      "sha256": "78fff159618961d9a697d52956cb213c42c2c4a3b7fe3a5d678b991603b2dacb",
+      "shape": [
+        4,
+        200,
+        128
+      ]
+    },
+    "dv": {
+      "dtype": "torch.bfloat16",
+      "sha256": "2b309a8cf1270c4200726916d5db4a23d90e0fdd16d732420e94df5727e4f508",
+      "shape": [
+        2,
+        200,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92700,
+    "cutlass": "4.8.1",
+    "gpu": "NVIDIA GH200 480GB",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.15.post2"
+  },
+  "schema": 1
+}

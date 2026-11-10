@@ -70,7 +70,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
-| `pygraph.sdpa_backward` with `use_deterministic_algorithm=True`, FROST `sdpa_bwd_sm90` | bprop | FP16, BF16 | Replay only (tested configurations) | Unsupported | Unsupported |
+| `pygraph.sdpa_backward` with `use_deterministic_algorithm=True`, FROST `sdpa_bwd_sm90` | bprop | FP16, BF16 | Supported (tested configurations) | Unsupported | Unsupported |
 
 The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,
@@ -277,6 +277,19 @@ for FP16/BF16, with unsplit unpacked and split3 PackGQA plans. The tested declar
 include padding, a bottom-right causal window and sinks. This is fixed-plan,
 fixed-runtime forward qualification; THD batch invariance and backward remain
 outside this addition.
+
+## SM90 SDPA backward
+
+With `use_deterministic_algorithm=True`, the native FP16/BF16 `sdpa_bwd_sm90`
+row (opt-in: `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`) orders the dQ accumulation across KV tiles with the SM80 relay; dK/dV are
+written once per CTA and GQA partials are reduced in a fixed order. The L0
+suite `test_sdpa_bwd_sm90_determinism.py` compares dQ/dK/dV bytes for a
+causal GQA sequence spanning four KV tiles (D64 and D128) across fixed-input
+replays under concurrent work, B1/B3/B129 batches with duplicated and
+reordered copies, and a CUDA Graph replay after a neighbor changes; all pass
+on GH200, with runtime goldens. Without the deterministic flag, dQ uses
+unordered FP32 atomics and no byte identity is claimed. THD, padding, windows
+and sinks share the arithmetic but are not part of this byte coverage.
 
 ## SM120 packed backward
 
