@@ -41,12 +41,16 @@ exact-zero static-capacity rows for the generic and ratio-128 forward families. 
 not yet contain the standalone/reordered/duplicated sequence comparisons or committed
 goldens required to claim batch invariance. The capacity-zero change and poisoned replay
 cases passed on an SM90 GPU (CC 9.0, CUDA 13.0, cuDNN 9.20, PyTorch 2.12.1,
-CUTLASS DSL 4.8.1) and an SM100 GPU (CC 10.0, CUDA 13.0, cuDNN 9.24, PyTorch 2.14.1, CUTLASS DSL
-4.8.1). The SM90 and SM100 forward and opt-in deterministic backward status is Replay
-only. SM103 and SM107 remain Unverified; the default atomic dAPE path is Not guaranteed
-by contract. The full CSA L0 file reported 147 passed / 71 skipped on SM90 and 217
-passed / 1 skipped on SM100; the separate SM100 ratio-128 contract gate passed all 21
-cases and every shipped forward/backward schedule.
+CUTLASS DSL 4.8.1) and an SM100 GPU (CC 10.0, CUDA 13.0, cuDNN 9.24, PyTorch 2.14.1,
+CUTLASS DSL 4.8.1). Forward and opt-in deterministic backward remain Unverified on
+SM90, SM100, SM103, and SM107 because batch invariance has not been established; their
+successful replay results do not by themselves qualify as Replay only. The default
+atomic dAPE path is Not guaranteed by contract.
+
+At revision `bca6dcd50b81`, the requested `@cudnn-ci-bot run python/misc` pipeline
+reported 147 passed / 71 skipped / 0 failed CSA cases on SM90, 218 passed / 0 skipped /
+0 failed on SM100, and 218 passed / 0 skipped / 0 failed on SM107. The separate SM100
+ratio-128 contract gate passed all 21 cases and every shipped forward/backward schedule.
 
 Replay checks use fresh inputs and side-stream contention. Batch
 checks reuse exact sequence data and upstream gradients while removing,
