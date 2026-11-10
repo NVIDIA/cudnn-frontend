@@ -2111,3 +2111,45 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 
 The measured execution split this command into the initial64 feature cases
 and the final24 cases; together they cover the complete88-case collection.
+
+### SM107 single-sequence physical-origin setup — 2026-11-10
+
+`sdpa/frost/test_sdpa_single_sequence_setup_sm107.py` adds14 L0 cases for
+uniform FP16/BF16 D64/D128, nonpaged and unsplit. Eight physical-origin cases
+exercise both CTA group sizes, packing, independent INT32/INT64 element
+origins and multipliers, token/head-major Stats, changed token strides,
+rebound addresses, retained CUDA Graph replay, keyless rows and empty work.
+Four byte tests use fixed CPU payloads and independent CPU FP64 O/Stats
+references before recording. They compare fresh storage/concurrent work,
+poisoned-workspace replay, B1 against B3/B5/B129, duplicate/reordered/empty
+sequences and changed-neighbor isolation. Two additional tests force the
+specialized template with runtime B4 and check the generic setup branch.
+Stats negative infinity is permitted only as the keyless-row sentinel; the
+reference and canaries still check its location and all other output values.
+
+SM107 / driver620.62 / Torch2.14.1+cu130 / cuDNN9.30.0.2 /
+DSL4.8 compiler13.4:14new cases passed, four new runtime goldens under
+`aa97de087283f297` were recorded, then all42 strict/control cases passed
+(14new+20dead-subtile+8existing D64 physical-origin controls), without skips.
+The strict run had recording unset and used the copied golden directory.
+Memcheck/racecheck/synccheck each passed10physical-origin/runtime-guard cases
+with zero errors or hazards. Memcheck was unfiltered; race/sync used
+`--kernel-name kns=cudnn_kernel_`; API-error reporting remained enabled.
+The generic multi-sequence setup body is AST-identical to the prior source.
+This qualifies the setup path, not new arithmetic, other GPUs, split/paged
+specializations or cross-runtime/cross-plan byte invariance.
+
+From `test/python`, after asserting the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q sdpa/frost/test_sdpa_single_sequence_setup_sm107.py \
+  sdpa/frost/test_sdpa_thd_dead_subtile_sm107.py \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD64Half::test_independent_origins
+```
+
+The initial collection attempt used an unavailable xdist option and performed
+no tests. The first byte-test attempt rejected the legitimate keyless Stats
+sentinel under the name `stats`; explicitly declaring its allowed negative
+infinity fixed the harness, with no kernel or tolerance change. All14 cases
+then completed and were checked again in the42-case strict run.

@@ -1008,6 +1008,16 @@ for the old message.
 
 ## Prepared THD launch bounds and setup
 
+A single-sequence setup specialization must check the invocation's runtime
+batch, even when its template was selected from a one-sequence declaration.
+Each independent descriptor writer must read its own lengths and physical
+origin; removing barriers while retaining cross-warp metadata reads is unsafe.
+`test_single_sequence_runtime_batch_guard` forces the specialized template on
+four sequences, with changing offsets and empty replay, to exercise the generic
+branch. The paired physical-origin tests cover both offset integer widths and
+changed token strides. Preserve the ordinary setup for PDL releases and compact
+single-map consumers unless those contracts are independently qualified.
+
 Optional TMA descriptors at a kernel boundary must retain their grid-constant
 ABI: use `Optional[cutlass.GridConstant[TensorMap]]` when a specialization
 passes `None`. Removing the annotation can let the paged specialization pass
