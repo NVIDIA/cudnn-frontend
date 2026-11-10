@@ -2372,10 +2372,12 @@ def test_bwd_probe_gqa(monkeypatch):
 
 
 def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
-    # Envelope: any multiple of 8 up to 256 (adapter pads); reject the rest.
+    # Eight-aligned native envelopes cover widths through 512.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert not _bwd_eligible(_mk_bwd_graph(d=100))
-    assert not _bwd_eligible(_mk_bwd_graph(d=264))
+    assert not _bwd_eligible(_mk_bwd_graph(d=520))
+    for width in (264, 504, 512):
+        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=width))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
