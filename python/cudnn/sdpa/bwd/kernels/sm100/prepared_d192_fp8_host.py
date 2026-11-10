@@ -30,8 +30,9 @@ def _spec(dqk, dv, sm, mx, window):
 
 def _kernel_hosts(spec):
     here = pathlib.Path(__file__).resolve()
-    if tuple(spec[:2]) == (512, 512) and not spec[3]:
-        module = load_template(str(here.with_name("bprop_d512_fp8.py")), spec, tag=f"sdpa_bwd_d512_fp8_w{spec[4]}")
+    if tuple(spec[:2]) == (512, 512):
+        fmt = "mxfp8" if spec[3] else "fp8"
+        module = load_template(str(here.with_name(f"bprop_d512_{fmt}.py")), spec, tag=f"sdpa_bwd_d512_{fmt}_w{spec[4]}")
         return module.dkdv_host, module.dq_host
     tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}"
     dkdv = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), spec, tag=f"{tag}_dkdv").host

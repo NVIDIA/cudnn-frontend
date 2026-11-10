@@ -47,6 +47,7 @@ _SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
 _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
 _D512_FP8 = "SdpaBwdDslD512Fp8"
+_D512_MXFP8 = "SdpaBwdDslD512Mxfp8"
 
 
 def _adapter(name: str):
@@ -111,6 +112,10 @@ def _fp8_adapter(name: str):
 
 
 def _mxfp8_adapter(name: str):
+    if name == _D512_MXFP8:
+        from cudnn.sdpa.bwd.api_dsl_d512_mxfp8 import SdpaBwdDslD512Mxfp8
+
+        return SdpaBwdDslD512Mxfp8
     if name == _SM100_MXFP8:
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
@@ -2223,6 +2228,46 @@ def _d512_fp8_spec() -> EngineSpec:
     )
 
 
+def _d512_mxfp8_mismatch(facts, version):
+    error = _d512_fp8_environment_mismatch(facts, version)
+    if error is not None:
+        return error
+    if facts.window_left is not None and facts.s_q > facts.s_kv + facts.window_left:
+        return "D512 MXFP8 window requires every query row to keep a key"
+    if facts.scale is not None and not (math.isfinite(facts.scale) and facts.scale > 0):
+        return "D512 MXFP8 backward requires a finite positive attn_scale"
+    return None
+
+
+def _d512_mxfp8_spec() -> EngineSpec:
+    return EngineSpec(
+        name="sdpa_bwd_d512_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=107,
+            d=frozenset({512}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            is_mxfp8=True,
+            causal=True,
+            swa=True,
+            gqa=True,
+            deterministic=True,
+            compact_bshd=True,
+            layouts=frozenset({"bshd"}),
+            tile_ms=frozenset({128}),
+            tile_ns=frozenset({128}),
+            declaration_check=_d512_mxfp8_mismatch,
+            band=band.BandSupport(
+                right=frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}),
+                left=frozenset({band.LEFT_NONE, band.LEFT_WINDOW}),
+                window_right=frozenset({band.RIGHT_CAUSAL}),
+            ),
+        ),
+        lower=partial(lower_dsl_bwd_mxfp8, api_type=_D512_MXFP8),
+    )
+
+
 ENGINE_SPECS = (
     _sm120_spec(),
     _sm80_spec(),
@@ -2239,6 +2284,7 @@ ENGINE_SPECS = (
     _sm107_d192_spec(),
     _sm100_d128_fp8_spec(),
     _d512_fp8_spec(),
+    _d512_mxfp8_spec(),
 )
 
 __all__ = [

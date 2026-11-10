@@ -627,3 +627,11 @@ plan creation.
   partials bf16; under THD: the packed scale-factor staging copies at the plan's
   tile capacity and the per-sequence SF tile prefixes). Use
   `graph.get_workspace_size()`.
+
+The separate opt-in `sdpa_bwd_d512_mxfp8` row supplies D512 block-scale
+backward on SM100/SM103/SM107 with CuTeDSL4.8.0. It consumes canonical
+F8_128x4 E8M0 scales and separately quantized Q_T/K_T/dO_T payloads directly,
+produces FP16/BF16 gradients, and keeps only FP32 row-delta scratch. Its
+compact dense MHA/GQA contract includes unmasked/top-left causal attention
+and causal left windows whose query rows retain a key. Deterministic
+execution uses fixed gradient owners. It does not produce Amax outputs.

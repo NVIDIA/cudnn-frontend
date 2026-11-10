@@ -61,6 +61,7 @@ arbitrary user callbacks.
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
 The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,
@@ -160,3 +161,11 @@ it compares dQ/dK/dV bytes and whole-batch Amax reductions. Cases include
 left windows, repeated/reordered/duplicated batches through 129 requests and
 changed-input CUDA Graph replay. The deterministic flag selects the same
 arithmetic. This qualification does not add MXFP8 or packed backward support.
+
+The D512 MXFP8 backward pair uses the same fixed owner order, consuming
+canonical E8M0 scale bytes and independently quantized columnwise payloads.
+Its FP16/BF16 checks preserve these exact bytes across singleton, reordered,
+duplicated and129-request batches, then mutate dO and a canonical scale
+atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
+SM103 execution remains unverified. The deterministic flag does not select
+a different reduction. THD and other unsupported graph forms are unchanged.

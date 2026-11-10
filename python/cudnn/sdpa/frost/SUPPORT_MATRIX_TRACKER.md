@@ -4725,3 +4725,18 @@ GQA heads reduce in fixed order. Scratch contains FP32 delta rows only.
 THD, padding masks, bottom-right alignment, right-band widening, sinks and
 bias remain unsupported. Graph numerical and raw-byte replay/batch checks pass on SM100 and SM107.
 SM103 execution remains unverified; the row remains opt-in.
+
+
+### D512 MXFP8 backward (2026-11-10)
+
+`sdpa_bwd_d512_mxfp8` adds exact D512 compact BSHD E4M3 payloads with
+canonical F8_128x4 E8M0 scales and FP16/BF16 O/dO/gradients. Q_T/K_T/dO_T
+are the independently quantized columnwise payloads. The native pair reads
+all seven canonical scale tensors directly; no SF repack or input staging
+is required. Full512 QK/dOV contractions precede128-column gradient stores.
+Fixed owner/GQA order supports deterministic execution with FP32 delta-row
+scratch only. Dense/unmasked and top-left causal MHA/GQA/MQA are supported;
+a left window requires causal masking and every query row to retain a key.
+THD, padding, BR/right-band, sink/bias, Amax outputs and noncompact layouts
+remain declined. SM100 and SM107 numerical/replay/batch checks pass; SM103
+execution remains unverified. The row is opt-in and requires CuTeDSL4.8.0.
