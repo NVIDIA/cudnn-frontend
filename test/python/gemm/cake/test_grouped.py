@@ -61,7 +61,8 @@ def test_reference_and_repeatability(device, operation, dtype, m, n, k):
     plan, a, b, offsets, out, scratch, boundaries = _case(device, operation, m, n, k, dtype)
     plan.execute(a, b, offsets, out=out, workspace=scratch)
     reference = _reference(operation, a, b, boundaries)
-    torch.testing.assert_close(out.double(), reference, atol=0.008, rtol=0.008)
+    tol = 0.008 if dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(out.double(), reference, atol=tol, rtol=tol)
     previous = out.clone()
     scratch.fill_(137)
     plan.execute(a, b, offsets, out=out, workspace=scratch)
@@ -123,3 +124,24 @@ def test_sources_match_pinned_record():
     record = json.loads((vendor / "VENDORED_MOE_GROUPED_GEMM.json").read_text())
     for name, expected in record["files"].items():
         assert hashlib.sha256((vendor / "cake_moe_grouped_gemm_det_train" / name).read_bytes()).hexdigest() == expected
+
+
+def test_public_paired_api_and_preflight(device, monkeypatch):
+    from cudnn.ops import ragged_grouped_gemm_forward, ragged_grouped_gemm_backward
+
+    _, x, weight, offsets, _, _, boundaries = _case(device, "fwd")
+    out = ragged_grouped_gemm_forward(x, weight, offsets)["out"]
+    grad = torch.randn_like(out) * 0.125
+    result = ragged_grouped_gemm_backward(grad, x, weight, offsets, weight_gradient_dtype=torch.float32)
+    torch.testing.assert_close(out.double(), _reference("fwd", x, weight, boundaries), atol=0.008, rtol=0.008)
+    torch.testing.assert_close(result["dx"].double(), _reference("dgrad", grad, weight, boundaries), atol=0.008, rtol=0.008)
+    torch.testing.assert_close(result["dw"].double(), _reference("wgrad", grad, x, boundaries), atol=2e-5, rtol=2e-5)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("backward launched before validating both gradients")
+
+    monkeypatch.setattr(RaggedGroupedGemmPlan, "execute", forbidden)
+    with pytest.raises(ValueError, match="forward dimensions"):
+        ragged_grouped_gemm_backward(grad, x[:, :128], weight, offsets)
+    with pytest.raises(ValueError, match="only wgrad"):
+        ragged_grouped_gemm_backward(grad, x, weight, offsets, weight_gradient_dtype=torch.float64)

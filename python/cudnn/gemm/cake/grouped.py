@@ -181,21 +181,35 @@ class RaggedGroupedGemmPlan:
         return out
 
 
-def _run(operation, a, b, offsets, output_dtype=None):
+def _prepare(operation, a, b, offsets, output_dtype=None):
     plan = RaggedGroupedGemmPlan(operation, a, b, offsets, output_dtype=output_dtype)
     with torch.cuda.device(a.device):
         out = torch.empty(plan.output_shape, dtype=plan.output_dtype, device=a.device)
         workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=a.device)
-        return plan.execute(a, b, offsets, out=out, workspace=workspace)
+        return plan, out, workspace
 
 
 def ragged_grouped_gemm_forward(x, weight, offsets):
     """Return BF16 expert projections for int32 cumulative end offsets."""
-    return TupleDict(out=_run("fwd", x, weight, offsets))
+    plan, out, workspace = _prepare("fwd", x, weight, offsets)
+    return TupleDict(out=plan.execute(x, weight, offsets, out=out, workspace=workspace))
 
 
 def ragged_grouped_gemm_backward(grad_output, x, weight, offsets, *, weight_gradient_dtype=None):
     """Return deterministic input and weight gradients."""
-    dx = _run("dgrad", grad_output, weight, offsets)
-    dw = _run("wgrad", grad_output, x, offsets, weight_gradient_dtype)
+    for tensor in (grad_output, x, weight, offsets):
+        _signature(tensor)
+    if x.ndim != 2 or grad_output.ndim != 2 or weight.ndim != 3 or offsets.ndim != 1:
+        raise ValueError("backward requires x[M,K], grad_output[M,N], weight[E,N,K], and offsets[E]")
+    if (
+        grad_output.shape != (x.shape[0], weight.shape[1])
+        or x.shape[1] != weight.shape[2]
+        or offsets.numel() != weight.shape[0]
+        or any(t.device != x.device or t.dtype != x.dtype for t in (grad_output, weight))
+    ):
+        raise ValueError("backward operands must match the forward dimensions, device, and dtype")
+    dx_plan, dx, dx_workspace = _prepare("dgrad", grad_output, weight, offsets)
+    dw_plan, dw, dw_workspace = _prepare("wgrad", grad_output, x, offsets, weight_gradient_dtype)
+    dx_plan.execute(grad_output, weight, offsets, out=dx, workspace=dx_workspace)
+    dw_plan.execute(grad_output, x, offsets, out=dw, workspace=dw_workspace)
     return TupleDict(dx=dx, dw=dw)
