@@ -303,6 +303,11 @@ the kernel that reads it).
   enter `tvm_ffi.use_raw_stream` with the execution stream. Test capture and
   replay with changed inputs on an explicit nondefault stream; an empty graph
   exposes this failure even when eager output tests pass.
+- **Native Cake bindings need explicit DLTensor strides, including contiguous buffers.**
+  Their TMA setup reads stride metadata directly. XLA bridges must supply it and
+  use XLA-owned scratch on the XLA stream. Exercise complete forward/backward
+  chains: a simple head reduction can pass while a TMA stage crashes. The LM-head
+  and mHC JAX suites cover these chains with changed-input replay.
 - **Consumers too, not just producers**: anything reading what the kernel
   wrote (`amax_o.div_()`, an O scratch copy-back) belongs on the launch
   stream for the same reason.

@@ -47,3 +47,33 @@ BF16 logits and BF16 logit gradients, as defined by the pinned kernels.
 Sources/build records come from
 [miles-ext-kernels f55fb996](https://github.com/radixark/miles-ext-kernels/tree/f55fb99674be5edb0e1f6a0e4d6a911335da86ce).
 The copied-file record is `cudnn/_cake/_vendor/VENDORED_LM_HEAD.json`.
+
+## JAX
+
+`cudnn.ops.lm_head_logprob_jax(x, weight, labels)` returns FP32 log-probabilities
+and supports `jax.jit` and first-order reverse-mode differentiation. Inputs
+retain the plan's BF16 shapes. Enable `jax_enable_x64` before creating int64
+labels; label values must be vocabulary indices or `-100` (ignored).
+
+```python
+import jax
+from cudnn.ops import lm_head_logprob_jax
+
+jax.config.update("jax_enable_x64", True)
+labels = jax.numpy.asarray(label_ids, dtype=jax.numpy.int64)
+logp = jax.jit(lm_head_logprob_jax)(x, weight, labels)
+dx, dw = jax.grad(lambda x, w: -lm_head_logprob_jax(x, w, labels).sum(),
+                  argnums=(0, 1))(x, weight)
+```
+
+AD returns BF16 gradients matching the inputs. For FP32 gradients, call
+`lm_head_logprob_forward_jax(x, weight, labels)` to obtain `(logp, lse)`, then
+`lm_head_logprob_backward_jax(x, weight, labels, lse, dlogp)` to obtain `(dx, dw)`.
+
+XLA owns outputs and scratch. A native FFI handler launches Cake on XLA's CUDA
+stream; no Python callback or framework tensor conversion runs during execution.
+Prepared native plans live for the process so compiled executables remain valid.
+The initial contract requires one SM100 GPU in one process. Forward-mode AD,
+higher derivatives, `vmap`, and cross-process export of compiled executables
+are unsupported. Preparation currently requires PyTorch for the shared Cake
+planner. A C++17 compiler and the CUDA toolkit are needed for the bridge.

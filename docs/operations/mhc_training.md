@@ -55,3 +55,48 @@ values on the host. Captured input values may change; keep all captured storage
 alive. Native plans retain no caller tensor storage. These APIs use explicit
 backward and have no autograd or cuDNN graph-engine registration. Nondeterministic
 mHC variants and gradient accumulation are not exposed.
+
+### JAX
+
+`mhc_jax` runs the same native Cake kernels under `jax.jit` and first-order
+reverse-mode differentiation. Pass the external branch as a static callable and
+its trainable arrays as explicit arguments:
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.ops import mhc_jax, mhc_head_forward_jax
+
+def branch(u, weight):
+    return jnp.tanh(u.astype(jnp.float32) * weight).astype(jnp.bfloat16)
+
+@jax.jit
+def loss(x, fn, scale, base, weight):
+    y = mhc_jax(x, fn, scale, base, branch, weight)
+    head, = mhc_head_forward_jax(y)
+    return jnp.sum(head.astype(jnp.float32))
+
+grads = jax.grad(loss, argnums=(0, 1, 2, 3, 4))(x, fn, scale, base, weight)
+```
+
+The branch must return BF16 `[T,H]`. Its arguments may be JAX pytrees. Backward
+runs native backward-prepare, the branch VJP, then native backward-finish. This
+keeps the single BF16 rounding of the combined input gradient. Pass trainable
+branch parameters explicitly; differentiating arrays captured in a closure is
+unsupported. The branch is recomputed for its VJP.
+
+Explicit JIT-compatible stages are `mhc_prepare_jax`, `mhc_finish_jax`,
+`mhc_backward_prepare_jax`, and `mhc_backward_finish_jax`. They take the same
+input arrays and scalar options as their Torch peers and return plain tuples in
+the same order. Use `mhc_jax` for automatic differentiation across these stages.
+`mhc_head_forward_jax` supports automatic differentiation;
+`mhc_head_backward_jax` exposes its explicit gradient. Both return one-element
+tuples.
+
+JAX owns output and scratch buffers, and the native XLA FFI handler launches on
+the XLA stream. Building the bridge requires a C++17 host compiler. Compiled
+executables are process-local; cross-process export is unsupported. There are no Python execution callbacks or tensor conversions to
+Torch. The pinned native package still uses Torch for build-time device queries.
+Scalar options are static under JIT. Forward-mode AD, higher derivatives, vmap,
+sharding, and multi-process execution are unsupported. Device support and input
+geometry match the native APIs above.
