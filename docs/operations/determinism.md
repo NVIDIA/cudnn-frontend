@@ -88,6 +88,12 @@ The D64 mixed-storage checks also cover fixed-plan dense splits and unsplit
 THD, preserving each quantized KV payload across batch changes. D64 THD
 split with FP8 KV remains unsupported. These paging changes add no backward path.
 
+The SM107 D512/D576 split partial-store optimization preserves the existing
+O/Stats golden bytes for matching half storage and D512 mixed FP8 KV storage.
+Its checks retain a fixed split count and packing, and include partial value
+widths and empty rows. Vector stores do not change the reduction order or
+extend determinism across different plans or runtimes.
+
 The D512 FP8 paged row covers the native role-split forward path with whole-group
 PackGQA and a fixed split count (1 or 4 in its determinism suite). Its batch
 checks preserve quantized payloads and scalar scales, and compare per-sequence
@@ -388,3 +394,13 @@ reordering, duplication and changed-neighbor capture replay. Compact THD
 repacking follows changed lengths; independent physical gaps are outside this
 path's contract. SM120 hardware execution and other runtimes remain unverified.
 This qualification adds no backward support.
+
+Native SM107 half D64/D128 single-sequence THD origin setup retains forward
+O/Stats byte and batch invariance on the qualified runtime. Independent
+physical origins, changed strides/addresses, empty and keyless replay and the
+runtime multi-sequence fallback, including one capacity-4096 plan alternating
+between single and multiple sequences through shape overrides, are covered by
+`test_sdpa_single_sequence_setup_sm107.py`. The setup optimization is limited
+to nonpaged, unsplit uniform FP16/BF16; other supported paths retain their
+existing setup. Measurement details and runtime goldens are in the coverage
+report. This adds no backward or cross-runtime byte guarantee.

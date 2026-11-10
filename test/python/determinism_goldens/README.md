@@ -2153,6 +2153,52 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 The measured execution split this command into the initial64 feature cases
 and the final24 cases; together they cover the complete88-case collection.
 
+
+### SM107 single-sequence physical-origin setup — 2026-11-10
+
+`sdpa/frost/test_sdpa_single_sequence_setup_sm107.py` adds14 L0 cases for
+uniform FP16/BF16 D64/D128, nonpaged and unsplit. Eight physical-origin cases
+exercise both CTA group sizes, packing, independent INT32/INT64 element
+origins and multipliers, token/head-major Stats, changed token strides,
+rebound addresses, retained CUDA Graph replay, keyless rows and empty work.
+Four byte tests use fixed CPU payloads and independent CPU FP64 O/Stats
+references before recording. They compare fresh storage/concurrent work,
+poisoned-workspace replay, B1 against B3/B5/B129, duplicate/reordered/empty
+sequences and changed-neighbor isolation. Each byte test now reuses one
+capacity-4096 plan through public shape overrides, then returns to B1 after
+multi-sequence bindings. Two additional tests use runtime B4 and check the
+generic setup branch without forcing a specialization.
+Stats negative infinity is permitted only as the keyless-row sentinel; the
+reference and canaries still check its location and all other output values.
+
+SM107 / driver620.62 / Torch2.14.1+cu130 / cuDNN9.30.0.2 /
+DSL4.8 compiler13.4:14new cases passed, four new runtime goldens under
+`aa97de087283f297` were recorded, then all42 strict/control cases passed
+(14new+20dead-subtile+8existing D64 physical-origin controls), without skips.
+The strict run had recording unset and used the copied golden directory.
+The final capacity-4096 qualification repeated all42strict/control cases
+(63.83s). Memcheck/racecheck/synccheck each passed all14new cases
+with zero errors or hazards. Memcheck was unfiltered; race/sync used
+`--kernel-name kns=cudnn_kernel_`; API-error reporting remained enabled.
+The generic multi-sequence setup body is AST-identical to the prior source.
+This qualifies the setup path, not new arithmetic, other GPUs, split/paged
+specializations or cross-runtime/cross-plan byte invariance.
+
+From `test/python`, after asserting the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q sdpa/frost/test_sdpa_single_sequence_setup_sm107.py \
+  sdpa/frost/test_sdpa_thd_dead_subtile_sm107.py \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD64Half::test_independent_origins
+```
+
+The initial collection attempt used an unavailable xdist option and performed
+no tests. The first byte-test attempt rejected the legitimate keyless Stats
+sentinel under the name `stats`; explicitly declaring its allowed negative
+infinity fixed the harness, with no kernel or tolerance change. All14 cases
+then completed and were checked again in the42-case strict run.
+
 ## Simplified sparse attention — 2026-11-09
 
 The new suite is
@@ -2710,4 +2756,35 @@ No kernel, numerical tolerance or golden changed.
 CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m pytest \
   simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py::test_batch_invariance \
   -m L0 -q -s -rxX --tb=short
+```
+
+### SM107 D512/D576 FP32 split partial stores — 2026-11-10
+
+Aligned, D-contiguous partial rows now use 16-byte global stores. The scalar
+fallback retains per-element bounds and dead-row zero selection. Two added
+L0 paged boundary cases exercise V480 and empty V264 inside the D512 envelope.
+The independent references, rebinding and changed-input replay stay unchanged.
+
+SM107,216SM, driver620.62, Torch2.14.1+cu130, cuDNN9.30.0.3, DSL4.8.0
+with compiler13.4:98 native cases passed in158.35s, without skips. These cover
+dense/paged KV, FP16/BF16, D512/D576, packed/unpacked splits, masks/sinks,
+optional/natural/log2 Stats, physical layouts and D512 mixed E4M3/E5M2 KV.
+The12 half/mixed runtime goldens under `d634113bbc56110d` were recorded from
+the unchanged parent after its independent references and byte checks passed
+(12cases,31.06s). The candidate passed strict comparison against all12 with
+recording unset. No existing golden was replaced. An initial candidate run
+passed34 cases before stopping on the missing runtime-specific golden; it
+reported no numerical mismatch. Other GPU/runtime execution is unverified.
+
+From `test/python`, after asserting the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_d512_pack_split_sm107.py \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD576Half \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_dense_paged \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
 ```

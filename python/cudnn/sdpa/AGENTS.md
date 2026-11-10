@@ -1013,6 +1013,18 @@ for the old message.
 
 ## Prepared THD launch bounds and setup
 
+A single-sequence setup specialization must check the invocation's runtime
+batch. A declared batch capacity can exceed the invocation (FlashInfer uses
+4096), so do not gate this runtime optimization on a one-sequence declaration.
+Each independent descriptor writer must read its own lengths and physical
+origin; removing barriers while retaining cross-warp metadata reads is unsafe.
+`test_single_sequence_runtime_batch_guard` runs four sequences, with changing
+offsets and empty replay, to exercise the generic branch.
+`test_single_sequence_batch_bytes` reuses one capacity-4096 plan across
+B1/B3/B5/B129 and back to B1 through public shape overrides. The paired physical-origin tests cover both offset integer widths and
+changed token strides. Preserve the ordinary setup for PDL releases and compact
+single-map consumers unless those contracts are independently qualified.
+
 Optional TMA descriptors at a kernel boundary must retain their grid-constant
 ABI: use `Optional[cutlass.GridConstant[TensorMap]]` when a specialization
 passes `None`. Removing the annotation can let the paged specialization pass

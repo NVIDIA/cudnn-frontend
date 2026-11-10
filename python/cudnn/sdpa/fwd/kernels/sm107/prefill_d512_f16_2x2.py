@@ -177,6 +177,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import mma_ss, desc_opaque
 from cudnn.frost.tile_dsl.tma import (
+    st_global_v4,
     tma_load_tile,
     tma_load_subtiles,
     tma_store_tile,
@@ -2114,11 +2115,35 @@ def _correction_warp_group(
                 o_scaled = o_fp32 * beta
                 col_base = half_h * cutlass.Int32(LAYOUT.O_COLS) + cutlass.Int32(b * O_EPI_BLOCK_COLS)
                 if _valid32:
-                    _row_out = _op32[_o_b32, q_row_global, row_head_idx, :]
-                    for _j in cutlass.range_constexpr(O_EPI_BLOCK_COLS):
-                        col = col_base + cutlass.Int32(_j)
-                        if col < cutlass.Int32(_d_v32):
-                            _row_out[col] = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_j].ir_value()))
+                    # Each lane owns a different packed head/row. Four scalar stores would
+                    # revisit the same sectors; write the contiguous 16-byte segment once.
+                    # Raw callers can bind unaligned or strided partials, so retain the
+                    # bounded scalar path and each element's dead-row zero selection.
+                    if cutlass.const_expr(_d_v32 % 4 == 0 and o_partial_f32.stride[3] == 1):
+                        row_ptr = _op32.data_ptr((_o_b32, q_row_global, row_head_idx, 0))
+                        if (row_ptr.toint(cutlass.Int64) & cutlass.Int64(15)) == 0:
+                            for group in cutlass.range_constexpr(O_EPI_BLOCK_COLS // 4):
+                                col = col_base + cutlass.Int32(group * 4)
+                                if col < cutlass.Int32(_d_v32):
+                                    values = [
+                                        cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[group * 4 + j].ir_value()))
+                                        for j in range(4)
+                                    ]
+                                    st_global_v4(row_ptr.toint(cutlass.Int64) + cutlass.Int64(col) * cutlass.Int64(4), values, cutlass.Float32)
+                        else:
+                            for _j in cutlass.range_constexpr(O_EPI_BLOCK_COLS):
+                                col = col_base + cutlass.Int32(_j)
+                                if col < cutlass.Int32(_d_v32):
+                                    _op32[_o_b32, q_row_global, row_head_idx, col] = cutlass.Float32(
+                                        arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_j].ir_value())
+                                    )
+                    else:
+                        for _j in cutlass.range_constexpr(O_EPI_BLOCK_COLS):
+                            col = col_base + cutlass.Int32(_j)
+                            if col < cutlass.Int32(_d_v32):
+                                _op32[_o_b32, q_row_global, row_head_idx, col] = cutlass.Float32(
+                                    arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_j].ir_value())
+                                )
                 if cutlass.const_expr(b % 2 == 1):
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_o_full[half_h * cutlass.Int32(N_O_CHUNKS // 2) + cutlass.Int32(b // 2)].arrive()
