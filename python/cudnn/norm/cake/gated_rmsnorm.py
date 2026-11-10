@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+from cudnn._buffer_utils import check_buffers_disjoint
 from cudnn._tupledict import TupleDict
 
 
@@ -32,15 +33,6 @@ def _tensor(tensor, name, shape, dtype, device, *, contiguous=False):
             raise ValueError(f"{name} must be contiguous")
     elif tensor.stride(-1) != 1 or any(stride < 0 or stride % 16 for stride, size in zip(tensor.stride()[:-1], shape[:-1]) if size > 1):
         raise ValueError(f"{name} must have unit last stride and outer strides divisible by 16")
-
-
-def _no_overlap(outputs, inputs):
-    import torch
-
-    for index, (name, tensor) in enumerate(outputs):
-        for other_name, other in inputs + outputs[:index]:
-            if torch._C._overlaps(tensor, other):
-                raise ValueError(f"{name} must not overlap {other_name}")
 
 
 class GatedRMSNormPlan:
@@ -106,7 +98,7 @@ class GatedRMSNormPlan:
 
         values = self._inputs(x, z, weight)
         _tensor(out, "out", self.shape, torch.bfloat16, self.device, contiguous=True)
-        _no_overlap([("out", out)], [("x", x), ("z", z), ("weight", weight)])
+        check_buffers_disjoint([("out", out)], [("x", x), ("z", z), ("weight", weight)])
         values["y"] = out
         with torch.cuda.device(self.device), stream_context(stream, self.device):
             self._run(0, values)
@@ -124,7 +116,7 @@ class GatedRMSNormPlan:
         if not isinstance(workspace, torch.Tensor) or workspace.numel() * workspace.element_size() < self.get_workspace_size():
             raise ValueError(f"workspace needs at least {self.get_workspace_size()} bytes")
         _tensor(workspace, "workspace", tuple(workspace.shape), torch.float32, self.device, contiguous=True)
-        _no_overlap(
+        check_buffers_disjoint(
             [("grad_x", grad_x), ("grad_z", grad_z), ("grad_weight", grad_weight), ("workspace", workspace)],
             [("grad_out", grad_out), ("x", x), ("z", z), ("weight", weight)],
         )
@@ -155,6 +147,8 @@ def gated_rmsnorm_forward(x, z, weight, eps=1e-6, *, stream=None):
     with torch.cuda.device(x.device), stream_context(stream, x.device):
         out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
         plan.forward(x, z, weight, out, stream=stream)
+        for tensor in (x, z, weight):
+            tensor.record_stream(torch.cuda.current_stream(x.device))
     return TupleDict(output=out)
 
 
@@ -170,4 +164,6 @@ def gated_rmsnorm_backward(grad_out, x, z, weight, eps=1e-6, *, stream=None):
         dw = torch.empty(128, dtype=torch.float32, device=x.device)
         workspace = torch.empty(plan.get_workspace_size() // 4, dtype=torch.float32, device=x.device)
         plan.backward(grad_out, x, z, weight, dx, dz, dw, workspace, stream=stream)
+        for tensor in (grad_out, x, z, weight):
+            tensor.record_stream(torch.cuda.current_stream(x.device))
     return TupleDict(grad_x=dx, grad_z=dz, grad_weight=dw)
