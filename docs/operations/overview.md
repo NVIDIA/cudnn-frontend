@@ -71,6 +71,7 @@ The experimental API catalog includes:
 - [SDPA Backward (SM120)](/operations/Attention/sdpa_bwd_sm120)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](/operations/Attention/sdpa_bwd_sm107)
 - [Compact GQA Backward (SM107)](/operations/Attention/compact_gqa_backward)
+- [Packed GQA training (Cake)](/operations/gqa_training)
 - [NVFP4 Attention QAT Backward](/operations/Attention/nvfp4_attention_qat_backward)
 - [RMSNorm + SiLU](/operations/Normalizations/rmsnorm_silu)
 - [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](/operations/Convolutions/conv3d_postops)
