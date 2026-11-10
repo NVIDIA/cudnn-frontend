@@ -122,7 +122,6 @@ torch = [
 # including block sparse attention.
 jax = [
     "jax>=0.9.1",
-    "nvidia-cutlass-dsl[cu13]>=4.7.1",
 ]
 
 [build-system]
