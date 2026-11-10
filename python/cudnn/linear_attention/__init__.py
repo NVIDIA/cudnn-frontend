@@ -72,6 +72,7 @@ def GdnEngines(ids):
         ("gdn_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnFrostEngine"),
         ("gdn_cutile", "cudnn.linear_attention.cutile.gdn_engine", "GdnCuTileEngine"),
         ("gdn_summary_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnSummaryFrostEngine"),
+        ("gdn_cake_det", "cudnn.linear_attention.cake.gdn_engine", "GdnCakeDetEngine"),
     )
 
 

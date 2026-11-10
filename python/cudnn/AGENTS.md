@@ -282,6 +282,12 @@ the kernel that reads it).
   fallback allocations, cached-dummy first use) inside
   `_torch_stream_context(current_stream, device)` — see the fp8/mxfp8 amax
   resets and both `_execute_thd` paths in `sdpa/fwd/api_dsl.py`.
+- **TVM-FFI can override an explicit stream from the producer's DLPack exchange API.**
+  `OperandBuffer.current_work_stream` reports the default stream. For Cake
+  launches, pass DLPack-only `DeviceView` wrappers over validated buffers and
+  enter `tvm_ffi.use_raw_stream` with the execution stream. Test capture and
+  replay with changed inputs on an explicit nondefault stream; an empty graph
+  exposes this failure even when eager output tests pass.
 - **Consumers too, not just producers**: anything reading what the kernel
   wrote (`amax_o.div_()`, an O scratch copy-back) belongs on the launch
   stream for the same reason.
