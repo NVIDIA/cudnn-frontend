@@ -2162,7 +2162,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._device_cc == (10, 7)
             and not self._fp8
             and self.flavor in _SM107_F16_SMALL_D_SHAPES
-            and not self.thd
+            and (not self.thd or (self.flavor == (64, 64) and not self.paged and self.split_kv == 1))
             and not self.pack_gqa
             and self.gate_desc is None
             and self.bias_desc is None
@@ -2195,7 +2195,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_kv_mask=self.kv_mask_desc is not None,
             padded=self._kv_padded(),
             tile_n=self._effective_tile_n(),
-            s_q=int(self.q_desc.shape[2]),
+            # THD descriptors carry an envelope; each item uses its device-side Q length.
+            s_q=None if self.thd else int(self.q_desc.shape[2]),
             # the eligible plans (the f16/bf16 small tiles without a bias on cc 10.7) run at cga1 unless the TILE_CGA_M knob asks for 2 --
             # the cta_mma arm of template_params()
             cga=int(self.cga) if self.cga is not None else 1,

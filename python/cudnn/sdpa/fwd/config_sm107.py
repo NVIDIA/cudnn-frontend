@@ -2364,11 +2364,18 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     if dead_subtile_quiet not in DEAD_SUBTILE_QUIET_FORMS:
         raise ValueError(f"{flavor}: dead_subtile_quiet must be 0 (the full body on a dead sub-tile) or 1 (the quiet body); got {dead_subtile_quiet}")
     if dead_subtile_quiet == 1 and (
-        bias_mode or pair or tile_k > 64 or mxfp8 or params.dtype_qkv <= _DTYPE_E5M2 or params.pack_gqa or params.thd_varlen or params.epilogue_gate
+        bias_mode
+        or pair
+        or tile_k > 64
+        or mxfp8
+        or params.dtype_qkv <= _DTYPE_E5M2
+        or params.pack_gqa
+        or (params.thd_varlen and (tile_k != 64 or params.paged_kv or (params.split_kv or 1) > 1))
+        or params.epilogue_gate
     ):
         raise ValueError(
             f"{flavor}: dead_subtile_quiet=1 (the dead-sub-tile quiet body) is wired on the f16/bf16 32- / 64-wide tiles' one-batch-entry item "
-            f"without a bias, PackGQA, THD or the gated epilogue only; got bias_mode={bias_mode}, n_chunk={n_chunk}, TILE_K={tile_k}, "
+            f"without a bias, PackGQA or the gated epilogue; THD requires non-paged, unsplit D64; got bias_mode={bias_mode}, n_chunk={n_chunk}, TILE_K={tile_k}, "
             f"dtype_qkv={params.dtype_qkv}, pack_gqa={params.pack_gqa}, thd_varlen={params.thd_varlen}, epilogue_gate={params.epilogue_gate}"
         )
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
