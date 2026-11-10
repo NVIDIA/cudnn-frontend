@@ -28,6 +28,51 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
+
+`test_DSA_indexer_compressed_sm90_determinism.py` now covers the public
+`DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` path for
+BF16 and per-token E4M3 FP8. The direct plan cases compare indices, logits,
+selected-logit softmax and LSE as raw bytes across fixed-input replays with
+queued side-stream work, and compare each preserved sequence alone, packed
+with empty/ragged neighbors, reordered and duplicated. They also run the
+existing independent FP32 reference. Exact ties, unsupported specializations,
+zero-candidate rows and caller-buffer sentinels are covered by adjacent L0
+cases. The CUDA Graph case mutates packed prefixes, causal offsets and
+candidate offsets at stable addresses, poisons outputs and workspace, and
+compares repeated replay bytes with an independently invoked eager wrapper.
+
+The plan adds no new arithmetic body: it retains the already-qualified SM90
+compact scorer and deterministic radix Top-K launchables. Therefore no new
+runtime golden was recorded; the direct raw-byte equality to the existing
+public wrapper and its independent reference is the numerical A/B arm. This
+is forward-only API coverage; there is no prepared backward entry point.
+SM100/103 and SM107 are rejected by the plan contract.
+
+Measured on an SM90 validation host with Torch 2.12.1+cu130, CUDA 13.0,
+cuDNN backend 92000 and `nvidia-cutlass-dsl[cu13]` 4.8.1 (CUDA 13.4 DSL
+compiler). Imports resolved to the synchronized validation checkout. The
+focused SM90 run passed all prepared-plan, combined-SM90 and API-export cases;
+the post-rebase run passed 23 collected cases with 134 deselected and no
+failures in 13.59 s. Three of those pytest cases capture CUDA Graphs. They
+contain six explicit `graph.replay()` call sites and issue seven replay
+invocations in the focused run because the Megatron-like helper replays both
+its initial and changed payloads. Fixed-input replay loops inside the other
+cases are kernel invocations, not additional pytest cases. On the separate
+SM100 validation host, the complete existing
+compressed-indexer L0 file passed 96 cases with 16 marker-deselected cases;
+the architecture-admission/API-export focus passed 2 cases. These SM100
+results are compatibility evidence for the shared stage-2 host refactor, not
+support for the SM90-only plan. The final SM90 command, run from
+`test/python`, was:
+
+```bash
+CUDNN_TEST_TIMEOUT=1800 CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -q -s \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_compressed_sm90_determinism.py \
+  deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py \
+  -k "prepared_plan or sm90_compressed or api_is_split_from_top_k"
+```
+
 ### Custom reduction — SM100 validation, 2026-11-09 (UTC)
 
 The new `test_custom_reduction_determinism.py` L0 suite has **seven cases**:
@@ -1618,3 +1663,265 @@ Compute Sanitizer13.4.92 memcheck, racecheck and synccheck each pass eight
 representative dense/paged split/unsplit cases with zero errors/hazards.
 Sanitizer selection is `test_d512_dense_paged and (qdtype0 or qdtype3)` with
 `--error-exitcode 91`. No SM100 kernel execution or mixed-D576 support is claimed.
+
+
+### Native SM80 split-KV forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py` qualifies FP16/BF16
+D128 with split 3 and D512 with split 17 on A100. Four new fixed-input goldens
+compare O and FP32 Stats byte for byte under fresh-buffer replay with concurrent
+work, reordered/duplicated batches through 129, empty neighbors and
+changed-neighbor CUDA Graph replay. Independent CPU-double references and
+input-preservation checks pass before recording. Split count is fixed within
+each comparison; equality across split counts is not claimed.
+
+Runtime key `a29ca37b88513cb6` identifies the A100 qualification environment;
+complete runtime details are retained in private evidence. Four recording
+cases pass, followed by 112 strict cases (the 108 existing SM80 paging/sink
+cases plus the four new goldens). The final source then passes 36 numerical
+split cases plus the four strict goldens, with no failures or skips. These
+cover dense/paged KV, both half types, D64 through D576/V512, graph and
+standalone entry points, strided outputs, sink endpoints, padding, optional
+Stats, both Stats log bases, poisoned partials and changed bindings. Two
+additional split cases reload compiled artifacts with compilation forbidden.
+No existing golden was regenerated.
+
+Compute Sanitizer memcheck, racecheck and synccheck each pass eight cases
+with zero errors/hazards: paged D64/D256/D576 in graph and standalone modes,
+and dense D512 with absent or base-two Stats. The selection is
+`-k '(paged_split_rebind and dtype0 and (dims0 or dims3 or dims5)) or
+(dense_split_partial_initialization and dtype1 and dims1)'`, with
+`--error-exitcode 91`. The unchanged common combine separately passes 12
+infinite-sink endpoint controls on SM100; its production source is unchanged.
+
+Run from `test/python`: `CUBLAS_WORKSPACE_CONFIG=:4096:8
+CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens python -m pytest
+sdpa/frost/test_sdpa_fwd_paged_sm80.py
+sdpa/frost/test_sdpa_fwd_split_sm80.py
+sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py -m L0 -n 0 -q`.
+Forward only; THD split and packing remain unsupported. This does not
+qualify another GPU, default plan ranking, or serving performance.
+
+
+### Native SM80 small query/KV tiles — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_small_tiles_sm80.py` exercises explicit M16/M32
+query tiles and N16/N32 KV stages without changing default candidate policy.
+Eight new runtime goldens cover D64 M16/N16, D128 M16/N32 and M32/N16,
+and D256 M16/N16 in both half types, all at split 3. The reused split
+qualification preserves CPU-fixed inputs through fresh-buffer replay with
+concurrent work, reordered/duplicated batches through 129 and changed-neighbor
+CUDA Graph replay. O and FP32 Stats pass independent CPU-double references
+before their raw bytes are recorded. No old golden is regenerated.
+
+A100, runtime key `a29ca37b88513cb6`: 64 numerical feature cases and eight
+recording cases pass. Features include dense/THD queries, independent paged
+K/V, dense-Q splitting, eight-aligned head envelopes, sinks including infinity
+endpoints, padded/empty rows, strided outputs, pointer rebinding and capture.
+The host geometry suite passes 96 cases while leaving default candidate
+choices implicit. These are forward-only results on this GPU/runtime.
+
+The new D192/M128/N16 case exposed a copy-wave divisibility restriction.
+The SM80 loader now chooses a whole subset of CTA threads for each operand,
+so dense and paged vector copies still fill complete tiles. Existing tile
+geometries retain all their copy threads. The first 64-case attempt stopped
+after five passes at this compile-time rejection. A subsequent DSL-control-flow
+error was resolved by keeping the static configuration diagnostic outside
+the dynamic lane guard; both failed attempts remain in private evidence.
+The final 64 cases pass after that repair.
+
+Run from `test/python`: `python -m pytest
+sdpa/frost/test_sdpa_fwd_small_tiles_sm80.py -m L0 -n 0 -q` with
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` for strict comparison.
+The standard golden workflow remains required on a different runtime.
+
+
+The strict follow-up passes 120 cases: 108 existing paging/sink cases,
+four original split goldens and eight new small-tile goldens. Memcheck,
+racecheck and synccheck each pass 12 cases with zero errors/hazards,
+covering standalone/graph and dense/THD query forms over paged KV at
+D48/V32 M16/N16, D192/V128 M128/N16 and D256 M16/N16.
+Sanitizer selection is `-k 'paged_rebind and dtype0 and
+(48-32-16-16 or 192-128-128-16 or 256-256-16-16)'` with
+`--error-exitcode 91`. Runtime details and initial failures remain in
+private evidence; no unsupported GPU or default performance claim is made.
+
+Two additional dense D192/V128 M16/N16 and M128/N16 graph cases pass
+numerical, fresh-binding and replay checks. Each also passes memcheck,
+racecheck and synccheck with zero diagnostics, bringing the sanitizer scope
+to 14 cases per tool. These controls exercise the nonpaged copy path with
+all CTA threads and with the reduced copy-thread subset.
+
+
+### Native SM80 PackGQA forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_pack_gqa_sm80.py` qualifies native FP16/BF16
+packed-head forward on A100. Ten new CPU-seeded goldens cover D64/group3
+unsplit M16/N16, D128/group12 split3 M32/N32, D128/group128 split3 M16/N16,
+D256/group8 unsplit M16/N32 and D512/group3 split17 M32/N16. These include
+head groups crossing tile boundaries. Independent CPU FP64 references, fresh
+buffers and concurrent-work replay pass before recording. O and FP32 Stats
+are byte-compared alone, in reordered/duplicated batches through129 and under
+changed-neighbor CUDA Graph replay. Runtime key `a29ca37b88513cb6` identifies
+the qualification environment; exact runtime details remain in private evidence.
+No old golden was regenerated. This is forward-only, with fixed knobs and
+runtime; THD PackGQA remains unsupported.
+
+The native feature run passes64paged graph/standalone cases across both half
+types, split/unsplit, independent HND/NHD pools, masks, sink endpoints,
+strided canaries, fresh pointers and changed device lengths under capture.
+The route assertion observes the packed head count in the compiled template.
+Eight dense split partial-initialization cases and six dense bias/sink replay
+cases pass. The first launch attempt lacked the isolated worktree's compiled
+Python extension and stopped during import; no kernel executed in that attempt.
+
+From `test/python`, run `python -m pytest -n 0 -m L0 -q
+sdpa/frost/test_sdpa_fwd_pack_gqa_sm80.py`, with
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` for strict comparisons. Other runtimes
+require the usual separate golden-recording workflow.
+
+
+The strict follow-up passes132cases:108existing paging/sink cases,
+four original split goldens, eight small-tile goldens, ten new PackGQA goldens,
+and two packed split artifact-reload cases with compilation forbidden on the
+second plan. All108host geometry/admission cases pass, plus the direct THD
+PackGQA rejection. Memcheck passes18cases with zero errors. The initial unfiltered racecheck was interrupted after five passes because
+instrumenting the independent Torch reference dominated runtime; its log is
+retained. Final racecheck and synccheck each pass22cases with zero errors or
+warnings, retaining all18original cases and adding four G128 single-query
+cases. These runs use `--kernel-name kns=cudnn_kernel_` to check every native
+producer/combine and exclude reference kernels. A full launched-name audit
+confirms the producer and combine are included; the first audit hit the
+100-message printing limit, so the completed audit uses `--print-limit 0`.
+The standalone audit passes one additional graph/capture case. No sanitizer
+finding was suppressed or converted into a pass.
+
+### SM90 D512 dense split and partial PackGQA forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_split_sm90_determinism.py` adds eight L0
+forward-only cases: FP16/BF16, split3 unpacked and split17 full PackGQA,
+plus split3 partial groups G12/G128. CPU-seeded inputs retain an independent
+FP64 numerical reference. Fixed-plan checks cover fresh-buffer replay,
+concurrent work, B129 reorder/duplicates/empty neighbors and changed-neighbor
+CUDA Graph replay. Eight H100 records are appended under runtime key
+`6521230c64ce3d35`; existing goldens are unchanged. No equality across split
+counts, packing choices or runtimes is claimed.
+
+The final combined run covers 449 cases: all 57 split/partial-packing
+features, eight strict goldens, existing D512 paths and the newly landed D64
+route. Initially 434 pass; one old error-message expectation and 14 child
+compilation probes fail. The probes imported an unrelated editable install;
+they now remove that finder, bind the parent's package directory and assert
+the source path. Twelve D64 cross-compilation probes pass on A100 (compiler
+checks only), then two D512 probes plus twelve template-validation cases pass
+on H100. Thus all 15 initial failures are addressed without repeating the
+unchanged native numerical suite. Eighteen existing singleton-stride tests
+also exposed a recorder/API/spec reference cycle; retaining only frame
+metadata removes all eighteen shutdown leak diagnostics, with eighteen
+focused passes before and after the test-only correction.
+
+On H100, unfiltered memcheck and native-producer/combine-filtered racecheck
+and synccheck each pass 21 cases with zero diagnostics. The selection is
+`(dtype0 and (multiple_kv or (dense_split_partial and dims0) or
+partial_pack_multiple)) or partial_pack_graph`, with `--error-exitcode 91`.
+The latter tools use `--kernel-name kns=cudnn_kernel_`; independent framework
+reference kernels are excluded, while the attention producer and shared
+combine are included. An earlier racecheck failed on both the original
+unsplit parent and split prototype. Direct per-thread arrivals with matching
+counts now order the shared alpha/inverse-factor handoff; intermediate
+named-barrier experiments were discarded. Numerical success alone was not
+used to waive the initial sanitizer diagnostics. This is fixed-GPU/runtime
+forward qualification, not backward or default-dispatch performance.
+
+
+### SM120 D512 paged forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_d512_determinism`
+adds eight L0 forward cases: FP16/BF16, unpacked/PackGQA and split1/3 at
+D512/V512, M64/N32. CPU-seeded inputs and an independent FP64 O/Stats reference
+precede byte checks and golden recording. Tests include fresh storage,
+concurrent work, B129 reorder/duplicates/empty neighbors, changed-neighbor
+CUDA Graph replay, input immutability and output canaries. Split and packing
+choices stay fixed within each comparison; cross-configuration identity is
+not claimed.
+
+RTX5080 (84 SMs), CUDA driver13.5, Torch2.14.1+cu130, cuDNN9.30.0.2,
+CuTe DSL4.8.0 and tvm-ffi0.1.14.post1 use runtime key `1858cfcbf6876f83`.
+Eight new records are appended without replacing existing baselines.
+Eight existing D64/D120-V88 paging cases also pass and gain records for this
+runtime: their input and output hashes exactly match the older driver13.4
+records under `42742425a3d29d7c`. This observed equality does not establish
+a cross-runtime guarantee. SM121 and backward remain unverified by these runs.
+
+From `test/python`, run `python -m pytest -n 0 -m L0 -q
+sdpa/frost/test_sdpa_fwd_paged_sm120.py -k "d512_determinism or paged_width_determinism"`
+with `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`. Recording used separate new directories;
+normal comparison leaves `CUDNN_DETERMINISM_RECORD` unset.
+
+The complete paging regression passes 144 cases, including all sixteen strict
+goldens on this runtime. Final D512 qualification passes 49 cases: the 25 new
+feature/admission/golden cases, existing dense/THD controls and two new dense
+infinite-sink endpoint checks. After the last paged-only score-buffer barrier
+fix, all 25 new cases pass again (279 deselected, no failures or skips).
+Ten BF16 feature/endpoint cases pass each of Compute Sanitizer 13.4 memcheck,
+racecheck and synccheck with zero reported errors; racecheck also reports zero
+warnings. Memcheck is unfiltered; racecheck/synccheck select the native
+`cudnn_kernel_` kernels. These are forward-path checks, not backward coverage.
+
+Retained controls distinguish numerical success from synchronization safety.
+The redundant paged V-tail stores passed numerics but produced 288 racecheck
+errors; skipping those stores on paged input makes the identical case clean.
+A broader ten-case run then passed numerically while reporting 80 grouped
+score-exchange races. An explicit warp-pair read-completion barrier fixes the
+single-buffer reuse: its failing split/packed control and the full ten-case
+racecheck now report zero errors. The dense TMA path retains its prior handoff.
+
+### SM120 half Q/O with paged FP8 K/V — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_mixed_fp8_determinism`
+adds eight L0 forward goldens on RTX5080 (84 SMs): D64 prefill and D128/D256
+paged decode plus D512, each with FP16/E4M3 and BF16/E5M2 Q/KV types. Packing
+is fixed; split is one for D64 and three for the other shapes. Raw quantized
+cache payloads stay fixed across fresh buffers, eager/captured replay,
+reordered/duplicated batches up to B129, empty neighbors and changed neighbor
+contents. Independent FP64 O/Stats references and input/output canaries are
+checked before byte comparisons. This is plain `sdpa` cache storage, with no
+scalar descales or quantized Q/O contract.
+
+Torch2.14.1+cu130, cuDNN9.30.0.2, CuTeDSL4.8.0 (CUDA12.9 compiler),
+CUDA driver13.5 and tvm-ffi0.1.14.post1 use runtime key `1858cfcbf6876f83`.
+Eight records were appended from a new directory after successful recording;
+the separate strict run passes all eight (331 deselected, no failures/skips).
+No old golden was regenerated. The 27 feature/conversion/candidate checks
+also pass: both half types and both FP8 formats, independent HND/NHD pools,
+head envelopes, masked dead page/head tails, pointer/length rebinding, packed
+splits, persistent reuse, normal graph candidates and all 256 FP8 encodings.
+Finite conversion results, including signed zeros, match their references
+byte-for-byte. Direct packed FP8-to-BF16 conversion failed with the CUDA12.9
+compiler; the global loader now widens through FP16 exactly, then converts to
+BF16. Existing shared-memory FP8 conversion code generation is preserved.
+
+Compute Sanitizer13.4 runs ten E5M2 FP16/BF16 feature cases each under
+memcheck, racecheck and synccheck: all pass with zero errors (racecheck zero
+warnings). Memcheck is unfiltered; racecheck/synccheck select native
+`cudnn_kernel_` kernels. Full host graph analyzer:628 passed. Earlier failures
+were retained: one incorrect test page-size argument; one BF16 assembly
+failure after a FP16 pass; three longer-Q cases blocked because the explicit
+plan helper first required a heuristics proposal. The helper now reaches the
+explicit plan directly; three separate ordinary-candidate cases remain active.
+
+From `test/python`, run `python -m pytest -n0 -m L0 -q
+sdpa/frost/test_sdpa_fwd_paged_sm120.py -k mixed` with
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`; leave recording unset. The sanitizer
+selection is `-k "mixed_fp8 and not determinism and kv_dtype1"`.
+SM121, other runtimes and backward remain unverified; mixed dense KV and
+THD queries remain unsupported on this new SM120 path. Cross-split or
+cross-packing byte identity is not claimed.
+
+Final shared-loader regression:36 passed,303 deselected, no failures/skips in
+168.73s, including24 strict goldens (16 existing half plus8 mixed), native half
+rebinding/replay and decode ring reuse. The old half baselines are unchanged.
+The owned SM120 allocation completed normally after these checks.

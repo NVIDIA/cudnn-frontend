@@ -25,10 +25,12 @@ GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX 
 # The general half prefill loader addresses independent QK/V widths through
 # D128 directly. Decode serves the full general head-dim envelope through D256.
 PAGED_HEAD_TILE_MAX = 128
-PAGED_D_SHAPES = frozenset((q, v) for q in GENERAL_HEAD_TILES for v in GENERAL_HEAD_TILES)
+PAGED_D_SHAPES = frozenset((q, v) for q in GENERAL_HEAD_TILES for v in GENERAL_HEAD_TILES) | {(512, 512)}
 
 
-def paged_head_dims_supported(d_qk: int, d_v: int, *, decode: bool = False) -> bool:
+def paged_head_dims_supported(d_qk: int, d_v: int, *, decode: bool = False, d512: bool = False) -> bool:
+    if d512 and all(GENERAL_HEAD_TILE_MAX < d <= D512_FLAVOR[0] and d % 8 == 0 for d in (d_qk, d_v)):
+        return True
     maximum = GENERAL_HEAD_TILE_MAX if decode else PAGED_HEAD_TILE_MAX
     return all(0 < d <= maximum and d % 8 == 0 for d in (d_qk, d_v))
 
@@ -313,8 +315,10 @@ class TemplateParams:
     # attn_scale < 0: the kernel negates Q as it loads it and runs at |attn_scale|, so the raw-score row max still
     # bounds P (#1435). APPEND-ONLY, default False.
     negate_scores: bool = False
-    # Native exact-D128 dense-query page loads; zero retains the dense ABI.
+    # Native dense-query page loads; zero retains the dense ABI.
     page_size: int = 0
+    # Independent FP8 cache storage, widened by native paged half loaders.
+    dtype_kv: int = -1
 
 
 def validate_params(
@@ -324,6 +328,7 @@ def validate_params(
     allow_right_band: bool = True,
     decode_tile: bool = False,
     allow_paged: bool = False,
+    allow_paged_split: bool = False,
 ) -> None:
     """Validate the SM120 template specialization.
 
@@ -339,13 +344,19 @@ def validate_params(
     built for the ``SEQ_Q_TILES``.
     """
 
+    if params.dtype_kv != -1:
+        if params.dtype_kv not in (DTYPE_E4M3, DTYPE_E5M2):
+            raise ValueError("SM120 mixed KV requires E4M3 or E5M2 cache storage")
+        if not params.page_size or params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+            raise NotImplementedError("SM120 mixed FP8 KV requires paged storage with FP16/BF16 Q/O")
+
     if params.page_size:
         if not allow_paged:
-            raise NotImplementedError("SM120 paged KV is served by the general half prefill and decode templates only")
+            raise NotImplementedError("SM120 paged KV requires a page-capable half template")
         if params.page_size % 8 or params.page_size < 8:
             raise ValueError("SM120 paged KV requires a positive page size divisible by 8")
-        if params.thd_varlen or (params.split_kv != 1 and not decode_tile):
-            raise NotImplementedError("SM120 paged KV serves dense queries; split KV requires a decode tile")
+        if params.thd_varlen or (params.split_kv != 1 and not (decode_tile or allow_paged_split)):
+            raise NotImplementedError("SM120 paged KV serves dense queries; split KV requires a decode or D512 tile")
         if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
             raise NotImplementedError("SM120 paged KV serves FP16/BF16 only")
 

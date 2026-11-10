@@ -43,7 +43,7 @@ arbitrary user callbacks.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
-| `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
+| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -52,11 +52,14 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
+| `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Unsupported | Unsupported |
+| `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
+| FROST native D512 dense-Q split forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
 | FROST native D576/V512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D512 dense-Q mixed-KV forward (CGA2, dense/paged KV) | fprop | FP16/BF16 Q/O, E4M3/E5M2 KV | Unsupported | Unsupported | Supported (tested configurations) |
@@ -146,7 +149,15 @@ a row alone and inside a batch under the entry's own picks.
   rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
   keep the shard and relay layouts: `'records'` runs as `'shards'` and
   `'chain'` is rejected.
-- QSA and dense indexer backward expose no determinism switch.
+- QSA backward (`qsa_backward`, `qsa_indexed_backward`): set
+  `deterministic=True`. `dq`, `dk` and `dv` then repeat for fixed inputs and a
+  fixed packed layout: every FP32 accumulation adds in an order the layout
+  fixes. The bytes change with the packed layout (key tiles, query groups,
+  query ranges and KV passes are positions in the packed buffer), with
+  `max_seq_len`, with the GPU's SM count and with `ds_precision`. Every
+  document must use one four-token block grid, and a row must not repeat a
+  block.
+- Dense indexer backward exposes no determinism switch.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
@@ -155,6 +166,13 @@ a row alone and inside a batch under the entry's own picks.
   for the documented tie policy. Its indices, logits, optional selected-logit
   softmax, and optional LSE passed SM90 replay, batch reorder/duplication,
   changed-neighbor isolation, and exact-tie tests.
+- The prepared SM90 Indexer Forward + Top-K plan has the same numerical and
+  shape limits as that combined path and also requires caller-owned outputs
+  and candidate workspace. Its retained scorer and radix Top-K artifacts pass
+  direct fixed-input replay, packed batch reorder/duplication, changed-neighbor
+  isolation, independent reference checks, and changed-metadata CUDA Graph
+  replay. It is a forward-only execution surface; there is no corresponding
+  prepared backward API. Other architectures are rejected by contract.
 - DSA sparse attention forward/backward accepts FP16/BF16 inputs. FP8/MXFP8
   inputs are unsupported on all listed GPUs.
 - DSA sparse/dense indexer backward requires BF16 Q/K/weights and supports
@@ -193,7 +211,29 @@ with dense and paged K/V. This qualification uses a fixed GPU and runtime;
 it does not imply identical bytes across GPU or software versions. Detailed
 coverage is recorded in the determinism test report.
 
-## SM120 small-head paged SDPA
+Native SM80 dense-query split-KV forward is also repeatable and batch invariant
+for the tested D128 and D512 FP16/BF16 configurations with fixed split counts.
+The checks include padded lengths, sinks, causal windows, reordered/duplicated
+batches and changed neighbors under CUDA Graph replay. O and FP32 Stats are
+compared byte for byte. This is forward-only qualification of this fixed
+GPU/runtime; THD split-KV remains unsupported and cross-runtime identity is
+not claimed.
+
+The measured dense split coverage also includes small native tiles:
+D64 at M16/N16, D128 at M16/N32 and M32/N16, and D256 at M16/N16,
+in FP16/BF16 with fixed split3. These configurations preserve O/Stats bytes
+under replay, batch reordering/duplication and changed neighbors. This
+extends the tested forward configuration set; it does not require equality
+between different tile sizes or split counts.
+
+Dense-query native PackGQA forward is repeatable and batch invariant in the
+tested FP16/BF16 D64, D128, D256 and D512 configurations, including head groups
+that cross tile boundaries, unsplit and fixed-split plans. O and FP32 Stats
+retain bytewise identity under replay, reordered/duplicated batches and changed
+neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
+this forward result does not establish a backward or cross-runtime guarantee.
+
+## SM120 paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch
 invariant for the tested D64 and D120/V88 causal-window configurations, with
@@ -212,3 +252,20 @@ The native SM120 paged decode contract also covers independent eight-aligned
 QK/V widths through256 on M16/M32 tiles. The D256 and D192/V128 cases retain
 CPU-seeded inputs, eager/captured byte comparisons, batch invariance and
 runtime-keyed golden outputs in `test_sm120_frost_paged_wide_decode_determinism`.
+
+The D512 native paged envelope additionally has fixed-runtime FP16/BF16
+replay and batch-invariance checks on RTX5080, with and without PackGQA,
+and with split counts one and three held fixed. The M64/N32 path preserves
+O and Stats bytes through fresh buffers, batch reordering/duplication and
+changed-neighbor CUDA Graph replay. The independent numerical checks include
+empty Q/KV, causal windows and attention sinks. SM121 and other runtimes
+remain unverified; this is forward-only qualification.
+
+The native paged path with half Q/O and FP8 E4M3/E5M2 K/V also preserves
+O and Stats bytes in the tested D64/D128/D256/D512 configurations on RTX5080.
+Quantized cache payloads and split/packing choices stay fixed across batch
+reordering, duplication and changed-neighbor capture replay. Eight new
+runtime goldens accompany the independent numerical checks. This is
+forward-only evidence; SM121 and other runtimes remain unverified.
+
+SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.

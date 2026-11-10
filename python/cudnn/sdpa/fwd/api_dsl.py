@@ -2163,7 +2163,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._device_cc == (10, 7)
             and not self._fp8
             and self.flavor in _SM107_F16_SMALL_D_SHAPES
-            and not self.thd
+            and (not self.thd or (self.flavor == (64, 64) and not self.paged and self.split_kv == 1))
             and not self.pack_gqa
             and self.gate_desc is None
             and self.bias_desc is None
@@ -2196,7 +2196,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_kv_mask=self.kv_mask_desc is not None,
             padded=self._kv_padded(),
             tile_n=self._effective_tile_n(),
-            s_q=int(self.q_desc.shape[2]),
+            # THD descriptors carry an envelope; each item uses its device-side Q length.
+            s_q=None if self.thd else int(self.q_desc.shape[2]),
             # the eligible plans (the f16/bf16 small tiles without a bias on cc 10.7) run at cga1 unless the TILE_CGA_M knob asks for 2 --
             # the cta_mma arm of template_params()
             cga=int(self.cga) if self.cga is not None else 1,
@@ -5402,7 +5403,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
 
 
 class SdpaFwdDslSm90(SdpaFwdDsl):
-    """Compile and execute native dense or packed SM90 D512 forward attention.
+    """Compile native dense D64 or dense/packed D512 SM90 forward attention.
 
     Q, K, V and O keep their declared strides: the kernel binds native TMA
     views over caller storage, with no BSHD gather. Dtype, shape, band,
@@ -5417,6 +5418,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
     def _initialize_implementation(self) -> None:
         """Initialize prepared-launch and packed-Stats plan metadata."""
         self._dense_spec = self._thd_spec = None
+        self._native_d64 = False
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
 
@@ -5430,7 +5432,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         if too_old is not None:
             raise ImportError(too_old)
         self._logger.debug("Entering check_support")
-        self._not_implemented_error_if(buffers.current_sm() != 90, "SM90 D512 SDPA requires a Hopper SM90 device")
+        self._not_implemented_error_if(buffers.current_sm() != 90, "SM90 SDPA requires a Hopper SM90 device")
         self._device_cc = (9, 0)
 
         # Contradictory declarations first.
@@ -5479,7 +5481,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 "non-FP32 softmax precision",
             ),
             (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 kernels only)"),
-            (self.split_kv != 1, "split-KV"),
+            (self.thd and self.split_kv > 1, "THD split-KV"),
             (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
             (self.cga not in (None, 1), "CGA other than 1"),
             (self.q_desc.dtype not in (torch.float16, torch.bfloat16), "Q/K/V/O other than FP16/BF16"),
@@ -5572,23 +5574,53 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             "SM90 SDPA: THD walks its live units with the natural single-tile work decoder; SCHED_LPT and SCHED_LPT_L2 are dense-only",
         )
         self._not_implemented_error_if(
-            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M), "SM90 D512 PackGQA requires a head ratio dividing tile_m=64"
+            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M, partial=True),
+            "SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64",
         )
 
+        self._value_error_if(type(self.split_kv) is not int or not 1 <= self.split_kv <= 65535, "SM90 split_kv must be an integer in [1, 65535]")
+        self._not_implemented_error_if(self.split_kv > 1 and max(b, h_q) > 65535, "SM90 split combine requires batch and heads at most 65535")
+        if self.split_kv > 1:
+            pack_g = pack_gqa_group_size(h_q // h_kv, _SM90_TILE_M, partial=True) if self.pack_gqa else 1
+            packed_heads = h_q // pack_g
+            tokens_per_tile = _SM90_TILE_M // pack_g
+            units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
+            self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
         self.params = Sm90TemplateParams(
             dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
             **band,
             thd_varlen=self.thd,
-            has_lse=self.lse_desc is not None,
+            has_lse=self.lse_desc is not None or self.split_kv > 1,
             has_sink=self.has_sink,
             stats_log2=self.stats_log2,
             pack_gqa=self.pack_gqa,
             qh_per_kh=h_q // h_kv,
+            split_kv=self.split_kv,
             sched_policy=sched,
             scale_mode=scale_mode,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
         )
+        self._native_d64 = False
+        if (d_qk, d_v) == (64, 64):
+            from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
+
+            why = native_d64_mismatch(
+                split_kv=self.split_kv,
+                thd=self.thd,
+                sink=self.has_sink,
+                pack_gqa=self.pack_gqa,
+                q_lengths=self.seq_q_lens_present,
+                kv_lengths=self.seq_kv_lens_present,
+                window_left=self.params.window_left,
+                window_right=self.params.window_right,
+                bottom_right=self.causal_bottom_right,
+                s_q=s_q,
+                s_kv=s_kv,
+            )
+            # The standalone adapter already serves these richer declarations
+            # on the D512 envelope; only select D64 inside its native subset.
+            self._native_d64 = why is None
         self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max = b, h_q, h_kv, s_q, s_kv
         self.head_dim_qk, self.head_dim_v = d_qk, d_v
         self.dtype = self.q_desc.dtype
@@ -5609,15 +5641,23 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # (row, multiplier, token stride, bits) entry becomes the template's (bits, multiplier).
             self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
             _sm90_validate_params(self.params)
-        self._k_mod = template = _load_kernel_template("sm90/prefill_d512_f16.py", self.params, tag="sdpa_fwd_sm90_d512")
+        flavor = "d64" if self._native_d64 else "d512"
+        self._k_mod = template = _load_kernel_template(f"sm90/prefill_{flavor}_f16.py", self.params, tag=f"sdpa_fwd_sm90_{flavor}")
+        strides, lse_stride = self._strides, self._lse_stride
+        if self.split_kv > 1:
+            # The producer TMA maps describe split-major partials; final layouts
+            # remain in the shared combine spec.
+            h, sq, dv = self.h_q, self.s_q_max, self.head_dim_v
+            strides = (*strides[:3], (sq * h * dv, dv, h * dv, 1))
+            lse_stride = (h * sq, sq, 1)
         self._compiled_kernel = template.compile(
             self.batch_size,
             self.h_q,
             self.h_kv,
             self.s_q_max,
             self.s_k_max,
-            *self._strides,
-            self._lse_stride,
+            *strides,
+            lse_stride,
             target="sm_90a",
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
@@ -5632,10 +5672,10 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """THD: the metadata, then the tensor maps (and, with physical offsets, the per-port origins),
-        bound as ``seq_kv_lens``; a dense plan needs none."""
+        bound as ``seq_kv_lens``; a dense split plan holds O/Stats partials."""
         self._ensure_support_checked()
         if not self.thd:
-            return 0
+            return self._split_workspace_bytes() if self.split_kv > 1 else 0
         from cudnn.sdpa.fwd.config_sm90 import thd_meta_words
 
         return thd_meta_words(self.batch_size, getattr(self, "_thd_origin_specs", None) is not None) * 4
@@ -5697,7 +5737,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             execute_native_thd_tensors(spec, buffers, ws_ptr, stream, scale, lse_bhs_geometry=lse_geometry)
         else:
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None)
-            execute_native_dense_tensors(spec, buffers, stream, scale)
+            ws_ptr = 0
+            if self.split_kv > 1:
+                if workspace is None:
+                    raise ValueError("SM90 split-KV requires caller-owned workspace")
+                if workspace.device != q_tensor.device or not workspace.is_contiguous():
+                    raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
+                ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90 (split)")
+            execute_native_dense_tensors(spec, buffers, stream, scale, ws_ptr)
         self._logger.debug("execute completed")
 
     def _thd_plan(self):
@@ -5883,12 +5930,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.q_desc.ndim != 4
                 or self.v_desc.ndim != 4
                 or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
-                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES),
-                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill or 256 for decode",
+                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES, d512=True),
+                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill, 256 for decode, or both in (256, 512]",
             )
             self._not_implemented_error_if(
-                self.split_kv > 1 and self.tile_m not in _SM120_DECODE_Q_TILES,
-                "SM120 paged KV split requires a decode tile (tile_m=16 or 32)",
+                self.split_kv > 1
+                and self.tile_m not in _SM120_DECODE_Q_TILES
+                and _sm120_pick_flavor(int(self.q_desc.shape[3]), int(self.v_desc.shape[3]), False) != _SM120_D512_FLAVOR,
+                "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or the D512 tile",
             )
             self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
             self._value_error_if(
@@ -6016,6 +6065,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
+        self._mixed_fp8_kv = not self._fp8 and self.k_desc.dtype in _SM100_FP8_DTYPES
+        if self._mixed_fp8_kv:
+            from cudnn import _pybind_module
+
+            self._not_implemented_error_if(not self.paged or self.thd, "SM120 mixed FP8 KV requires paged storage with dense Q")
+            self._not_implemented_error_if(
+                not getattr(_pybind_module._SdpaDenseBinder, "supports_mixed_fp8_kv", False),
+                "mixed half-Q/FP8-KV requires the matching native cuDNN Frontend extension",
+            )
         # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
         # Block-scaled O (sf_o): FP8 inputs, d_v = 128, dense/unsplit/unpacked; the
@@ -6093,9 +6151,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             else:
                 self._check_dtype(
                     desc,
-                    self.dtype,
+                    self.k_desc.dtype if self._mixed_fp8_kv and desc is not self.o_desc else self.dtype,
                     name=desc.name,
-                    extra_error_msg=f"{desc.name} must match Q",
+                    extra_error_msg=f"{desc.name} must match the compiled Q/O or K/V storage dtype",
                 )
             self._value_error_if(
                 desc.device != self.q_desc.device,
@@ -6244,8 +6302,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 "SM120 split_kv > 1 with an attention sink requires FP16/BF16 or exact D128 dense per-tensor FP8/MXFP8",
             )
             self._value_error_if(
-                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and decode_tile),
-                "split_kv > 1 with device lengths requires the native paged decode tile",
+                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and (decode_tile or self.flavor == _SM120_D512_FLAVOR)),
+                "split_kv > 1 with device lengths requires a native paged decode or D512 tile",
             )
         self._value_error_if(
             self.softmax_precision is not None,
@@ -6320,6 +6378,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             split_kv=self.split_kv,
             negate_scores=self._score_negated,
             page_size=self.paged_page_size,
+            dtype_kv=_SM120_DTYPE_QKV_CODE[self.k_desc.dtype] if self._mixed_fp8_kv else -1,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
@@ -6815,7 +6874,9 @@ def _sm80_load_kernel_module(flavor: str, params):
 
     from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import FROST_SOURCE_DIGEST as ragged_origin_digest
 
-    return load_template(path, params, tag=f"sm80_{stem}", extra_key=f"{paged_load_digest}:{ragged_origin_digest}")
+    from cudnn.sdpa.fwd.kernels.sm80.gqa import FROST_SOURCE_DIGEST as gqa_digest
+
+    return load_template(path, params, tag=f"sm80_{stem}", extra_key=f"{paged_load_digest}:{ragged_origin_digest}:{gqa_digest}")
 
 
 def _sm80_sched_policy_int(token: str) -> int:
@@ -7101,9 +7162,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._rope_max_s and (self.seq_kv_lens_present or self.seq_q_lens_present),
             "SM80 SDPA: RoPE fusion is dense-unpadded-only",
         )
+        self._not_implemented_error_if(self.pack_gqa and self.thd, "SM80 PackGQA requires dense Q")
+        self._value_error_if(not 1 <= self.split_kv <= 65535, "SM80 split_kv must be in [1, 65535]")
+        self._not_implemented_error_if(self.split_kv > 1 and max(b, h_qo) > 65535, "SM80 split-KV requires batch and heads each at most 65535")
         self._not_implemented_error_if(
-            self.split_kv > 1,
-            "SM80 SDPA has no split-KV path (no partial slabs, no combine kernel)",
+            self.split_kv > 1 and self.thd,
+            "SM80 split-KV requires dense Q (dense or paged K/V)",
         )
         self._value_error_if(
             self.softmax_precision is not None,
@@ -7134,6 +7198,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             tile_m_default = 64
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
         self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
+        if self.flavor not in ("wide512", "mla576") and self.kernel_tile_m in (16, 32):
+            self.kernel_num_warps = self.kernel_tile_m // 16
         # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
         # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
         if short_d256 and self.kernel_tile_m == 64:
@@ -7255,6 +7321,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sink_natural=True,
             score_sign=_sm80_cfg.score_sign(self.scale_softmax),
             paged_page_size=self.paged_page_size,
+            split_kv=self.split_kv,
+            pack_g=self.h_q // self.h_kv if self.pack_gqa else 1,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if self.thd:
@@ -7312,12 +7380,15 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
 
     def scratch_workspace_bytes(self) -> int:
-        """Dense native IO needs no scratch; packed IO reserves length metadata."""
+        """Split partials and packed length metadata use caller-owned scratch."""
         self._ensure_support_checked()
         if self.thd:
             from cudnn.frost.tile_dsl.thd import THD_META_WORDS
 
             return ws_align(THD_META_WORDS(self.batch_size) * 4)
+        if self.split_kv > 1:
+            rows = self.split_kv * self.batch_size * self.h_q * self.s_q_max
+            return ws_align(rows * self.head_dim_v * 2) + ws_align(rows * 4)
         return 0
 
     def _execute_thd(
@@ -7616,7 +7687,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             with context:
                 stream = self._get_default_stream(current_stream)
                 _ensure_current_context(int(stream), device.index)
-                execute_tensors(self._sm80_spec, buffers, int(stream), scale=scale_softmax)
+                execute_tensors(self._sm80_spec, buffers, int(stream), scale=scale_softmax, workspace=workspace)
             self._logger.debug("execute completed")
             return
 
