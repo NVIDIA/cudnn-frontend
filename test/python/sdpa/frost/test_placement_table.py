@@ -405,3 +405,32 @@ def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
     assert pt.lookup(row, prefill(64, cudnn.data_type.BFLOAT16, h_q=32, h_kv=8, **window)) is None  # bf16 d64 windowed GQA: failed qualification
     assert pt.lookup(row, prefill(256, causal=True, bottom_right=True)) is None  # f16 d256 causal: the off-tile class kept a threshold
     assert pt.lookup(row, prefill(256, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(32, 8), (32, 32)], ids=["gqa", "mha"])
+def test_sm107_paged_prefill_entries_lead_their_classes(heads):
+    """Study sm107_paged_prefill_20261109 (Rubin, FlashInfer's paged path): D192/V128 leads on the 128-key tile from 512 KV
+    tokens and always off it; D256 leads everywhere. D128, f16, a window, a mask-free graph and another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm107"
+    h_q, h_kv = heads
+
+    def paged(d=(192, 128), **over):
+        base = dict(b=4, h_q=h_q, h_kv=h_kv, s_q=128, s_kv=512, d_qk=d[0], d_v=d[1], causal=True, bottom_right=True)
+        base.update(thd=True, max_total_seq_len_q=4 * 128, device_cc=(10, 7))
+        base.update(over)
+        return _facts(**base)
+
+    assert pt.matched_entry(row, paged()).study == "sm107_paged_prefill_20261109"
+    assert pt.lookup(row, paged(s_kv=384)) is False  # on the tile below 512 KV the backend keeps the lead
+    assert pt.lookup(row, paged(s_kv=512)) is True
+    assert pt.lookup(row, paged(s_kv=385)) is True  # off the tile: always
+    assert pt.matched_entry(row, paged(s_kv=385)).study == "sm107_paged_prefill_20261109"
+    for s_kv in (256, 257, 65536):
+        assert pt.lookup(row, paged(d=(256, 256), s_kv=s_kv)) is True
+        assert pt.matched_entry(row, paged(d=(256, 256), s_kv=s_kv)).study == "sm107_paged_prefill_20261109"
+    assert pt.lookup(row, paged(d=(128, 128))) is None
+    assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, paged(window_left=128)) is None
+    assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
+    assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study
