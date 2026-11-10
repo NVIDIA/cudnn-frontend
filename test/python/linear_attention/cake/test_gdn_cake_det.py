@@ -12,6 +12,17 @@ from linear_attention.reference_gdn import gdn_reference, rms_ratio
 pytestmark = [pytest.mark.L0]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def release_gdn_plans():
+    yield
+    import gc
+    from cudnn.linear_attention.ops import gdn
+
+    for cache in (gdn.fprop_cache, gdn.bprop_cache, gdn.summary_cache):
+        cache.clear()
+    gc.collect()
+
+
 @pytest.fixture(autouse=True)
 def cake_available(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
