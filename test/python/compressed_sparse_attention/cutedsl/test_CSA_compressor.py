@@ -58,6 +58,8 @@ import gc
 import pytest
 import torch
 
+from determinism_utils import assert_bitwise, snapshot
+
 
 def _import_compressor():
     """Import ``cudnn.csa.compressor``, skipping only on a missing cutedsl stack."""
@@ -238,6 +240,130 @@ def _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go):
         grads["grad_score"].view_as(score),
         grads["grad_ape"],
     )
+
+
+def _make_batch_invariance_sample(length, d, ratio, coff, ape, seed):
+    """Build one reusable sequence whose bytes survive every batch repacking."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    width = coff * d
+    blocks = length // ratio
+    return {
+        "kv": torch.randn(length, 1, width, generator=generator, dtype=torch.float32).to(torch.bfloat16).cuda(),
+        "score": (torch.randn(length, 1, width, generator=generator, dtype=torch.float32).mul_(1.5)).to(torch.bfloat16).cuda(),
+        "ape": ape,
+        "grad_out": torch.randn(blocks, 1, d, generator=generator, dtype=torch.float32).to(torch.bfloat16).cuda(),
+        "length": length,
+        "blocks": blocks,
+    }
+
+
+def _pack_batch_invariance_samples(samples, d, active_backward_position=None):
+    """Pack reusable samples, isolating one sequence's backward gradient source."""
+    lengths = [sample["length"] for sample in samples]
+    blocks = [sample["blocks"] for sample in samples]
+    token_prefix = [0]
+    comp_prefix = [0]
+    for length, count in zip(lengths, blocks):
+        token_prefix.append(token_prefix[-1] + length)
+        comp_prefix.append(comp_prefix[-1] + count)
+
+    kv = torch.cat([sample["kv"] for sample in samples])
+    score = torch.cat([sample["score"] for sample in samples])
+    cu = torch.tensor(token_prefix, dtype=torch.int32, device="cuda")
+    cuc = torch.tensor(comp_prefix, dtype=torch.int32, device="cuda")
+    grad_parts = [
+        sample["grad_out"] if position == active_backward_position else torch.zeros_like(sample["grad_out"]) for position, sample in enumerate(samples)
+    ]
+    grad_out = torch.cat(grad_parts) if comp_prefix[-1] else torch.empty(0, 1, d, dtype=torch.bfloat16, device="cuda")
+    return kv, score, cu, cuc, grad_out, token_prefix, comp_prefix
+
+
+def _run_batch_invariance_target(samples, target_position, d, ratio, coff, backward):
+    """Run one batch layout and return only the fixed target sequence's results."""
+    compressor = _import_compressor()
+    active = target_position if backward else None
+    kv, score, cu, cuc, grad_out, token_prefix, comp_prefix = _pack_batch_invariance_samples(samples, d, active)
+    total_tokens = token_prefix[-1]
+    total_comp = comp_prefix[-1]
+    ape = samples[target_position]["ape"]
+
+    if not backward:
+        out = compressor.csa_compressor_forward_wrapper(
+            kv.view(total_tokens, -1),
+            score.view(total_tokens, -1),
+            ape,
+            cu,
+            cuc,
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            total_comp=total_comp,
+        )["out"]
+        begin, end = comp_prefix[target_position : target_position + 2]
+        return snapshot({"out": out[begin:end]})
+
+    grads = compressor.csa_compressor_backward_wrapper(
+        kv.view(total_tokens, -1),
+        score.view(total_tokens, -1),
+        ape,
+        cu,
+        cuc,
+        grad_out.view(total_comp, d),
+        ratio=ratio,
+        head_dim=d,
+        coff=coff,
+        deterministic=True,
+    )
+    begin, end = token_prefix[target_position : target_position + 2]
+    return snapshot(
+        {
+            "grad_kv": grads["grad_kv"][begin:end],
+            "grad_score": grads["grad_score"][begin:end],
+            "grad_ape": grads["grad_ape"],
+        }
+    )
+
+
+_BATCH_INVARIANCE_CASES = [
+    pytest.param(2, 1, 257, 1024, 1, id="r2-c1"),
+    pytest.param(2, 2, 257, 1024, 1, id="r2-c2"),
+    pytest.param(4, 1, 513, 2048, 3, id="r4-c1"),
+    pytest.param(4, 2, 513, 2048, 3, id="r4-c2"),
+    # 128 compressed neighbor rows plus the target cross the dedicated forward's
+    # small/default schedule boundary without making this L0 probe resource-heavy.
+    pytest.param(128, 1, 129, 16384, 127, id="r128-c1-small-to-default"),
+    pytest.param(128, 2, 129, 16384, 127, id="r128-c2-small-to-default"),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop-deterministic"])
+@pytest.mark.parametrize("ratio,coff,target_length,large_length,short_length", _BATCH_INVARIANCE_CASES)
+def test_batch_invariance(backward, ratio, coff, target_length, large_length, short_length):
+    """A fixed sequence has identical bytes alone, reordered, duplicated, or beside changed neighbors."""
+    _require_csa_device(ratio)
+    d = 128
+    ape_generator = torch.Generator(device="cpu").manual_seed(20261110)
+    ape = torch.randn(ratio, coff * d, generator=ape_generator, dtype=torch.float32).mul_(0.25).cuda()
+    target = _make_batch_invariance_sample(target_length, d, ratio, coff, ape, 20261111)
+    large = _make_batch_invariance_sample(large_length, d, ratio, coff, ape, 20261112)
+    short = _make_batch_invariance_sample(short_length, d, ratio, coff, ape, 20261113)
+    expected = _run_batch_invariance_target([target], 0, d, ratio, coff, backward)
+
+    layouts = [
+        ([large, target, short], (1,)),
+        ([short, target, large], (1,)),
+        ([target, target], (0, 1)),
+    ]
+    for samples, positions in layouts:
+        for position in positions:
+            actual = _run_batch_invariance_target(samples, position, d, ratio, coff, backward)
+            assert_bitwise(actual, expected, f"ratio={ratio} coff={coff} batch position={position}")
+
+    changed_large = _make_batch_invariance_sample(large_length, d, ratio, coff, ape, 20261114)
+    changed_short = _make_batch_invariance_sample(short_length, d, ratio, coff, ape, 20261115)
+    actual = _run_batch_invariance_target([changed_large, target, changed_short], 1, d, ratio, coff, backward)
+    assert_bitwise(actual, expected, f"ratio={ratio} coff={coff} changed neighbors")
 
 
 def _assert_grads_vs_fp32(gkv, gs, ref_kv, ref_s, ratio):
