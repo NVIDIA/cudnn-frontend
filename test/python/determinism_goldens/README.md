@@ -1397,3 +1397,32 @@ CI-route correction: the pinned SM107 pipeline selects `test_sdpa_fp8_sm107.py`,
 not `test_sdpa_fwd_dsl_sm107.py`. The shared mixed-KV class now lives in the
 selected file, with explicit L0/DSL/SM107 guards and no duplicate collector.
 The GPU counts above are direct qualification, not completed CI results.
+
+### Native SM107 D256 mixed FP8 KV — 2026-11-10
+
+`sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv` exposes D256 checks
+through the explicitly selected architecture CI entry. FP16/BF16 Q/O with
+E4M3/E5M2 KV use the native two-CTA D256 prefill pipeline, dense Q and no
+packing. Dense/paged KV, Q=1 and split1/3/4 are covered. Four committed
+goldens preserve CPU-fixed quantized inputs across fresh-buffer replay,
+queued work, reordered/duplicated batches through129, independent HND/NHD
+pools, zero-length sequences, sinks, bottom-right/window masks and changed
+capture replay. Independent CPU-double O/Stats references and input/output
+padding canaries accompany raw-byte comparisons.
+
+SM107208SM, driver630.10, cuDNN9.30.0.2, Torch2.14.1+cu130,
+CuTeDSL4.8.0/CUDA13.4, runtime key2916acaa3402817b:44 feature/resource/golden
+checks pass strictly, with no failures/skips; six existing uniform-half D256
+gate/THD controls also pass. Compute Sanitizer13.4.92 memcheck, racecheck and
+synccheck each pass eight dense/paged split/unsplit cases with zero diagnostics.
+Run from `test/python`: `python -m pytest
+sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv -m L0 -q -x
+-k 'd256 or native_resources'`. Sanitizer runs select
+`test_d256_dense_paged and (qdtype0 or qdtype3)` with `--error-exitcode 91`.
+Two additional host admission checks cover unsupported combinations.
+
+Qualification found a paged split ABI mismatch: the adapter excluded paging
+from its FP32-partial predicate while the native host wrote FP32. The fix
+retains the native partial format for both layouts; no numerical comparator
+or tolerance changed. Earlier failing probes remain in the private report.
+Forward only; other GPU mixed-D256 routes are not admitted.

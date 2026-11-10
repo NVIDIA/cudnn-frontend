@@ -8,7 +8,7 @@ import pytest
 import torch
 
 
-def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 0), head_dim=128):
+def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 0), head_dim=128, cga=1):
     import cudnn
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd import engines
@@ -23,19 +23,19 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(io)
     stats.set_output(True).set_dim((2, 8, 256, 1)).set_stride((2048, 256, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
-    facts, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
+    facts, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
     assert reason is None, reason
     assert facts.kv_dtype == kv and facts.uniform_qo_dtype and not facts.uniform_dtype
     assert not facts.is_fp8 and not facts.is_mxfp8
     for changed, expected in ((v, io), (o, cudnn.data_type.FLOAT)):
         original = changed.get_data_type()
         changed.set_data_type(expected)
-        _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
+        _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
         assert reason and "dtypes" in reason
         changed.set_data_type(original)
     # Eight half elements align Q, but only sixteen FP8 elements align K.
     k.set_stride((256 * 8 * (d + 8), d + 8, 8 * (d + 8), 1))
-    _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=1))
+    _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
     assert reason and "without a copy" in reason
     return spec, facts
 
@@ -162,6 +162,8 @@ def check_dense_paged_rebind_capture(
             api.check_support()
             api.compile()
             assert api.split_kv == splits
+            if engine_name.endswith("sm107") and head_dim == 256 and splits > 1:
+                assert api._fp32_partial_split()
             workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
 
             def execute(t):
@@ -173,6 +175,8 @@ def check_dense_paged_rebind_capture(
             if cga == 1 and not (engine_name.endswith("sm107") and (paged or head_dim == 64))
             else ("sm107/prefill_d128_f16.py" if engine_name.endswith("sm107") else "sm100/prefill_d128_f16.py")
         )
+        if engine_name.endswith("sm107") and head_dim == 256:
+            expected_file = "sm107/prefill_d256_f16.py"
         assert loaded[-1].__file__.endswith(expected_file)
         assert loaded[-1].CFG.CTA_MMA == cga and loaded[-1].KV_STORAGE_DTYPE.width == 8
 

@@ -1712,9 +1712,11 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     config family but accept DTYPE_O 0..3 only, so a flavor-name test
     ("d128" in flavor) would let them through to a specialization error."""
     if k.dtype_kv != -1 and not (
-        flavor in ("sm107 d64", "sm107 d128") and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)
+        flavor in ("sm107 d64", "sm107 d128", "sm107 d256") and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)
     ):
-        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D64/D128 pipeline")
+        raise ValueError(f"{flavor}: independent FP8 KV storage requires the native SM107 half-input D64/D128/D256 pipeline")
+    if flavor == "sm107 d256" and k.dtype_kv != -1 and (k.cta_mma != 2 or k.thd_varlen or k.pack_gqa or k.epilogue_gate):
+        raise ValueError("sm107 d256: independent FP8 KV requires dense Q, two CTAs, no packing and no gate")
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm107/decode_d256_f16.py
         # (make_cfg_d256_decode at the end of this module); a Rubin prefill template
@@ -1758,7 +1760,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # descriptors to a packed total), unsplit and unpacked, and a page is a whole number of 128-row F8_128x4 SF atom
     # sets (the SF pools page with K/V; a 64-row page cannot hold one).
     if k.paged_kv:
-        if flavor not in _PAGED_KV_FLAVORS_SM107:
+        if flavor not in _PAGED_KV_FLAVORS_SM107 and not (flavor == "sm107 d256" and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
             raise ValueError(
                 f"{flavor}: paged_kv is not wired on this Rubin flavor (the cc 10.7 PAGED_KV specialization lives in "
                 f"sm107/prefill_d128_f16.py, sm107/prefill_d128_mxfp8.py, sm107/prefill_d256_mxfp8.py and per-tensor sm107/prefill_d512_fp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
@@ -1769,6 +1771,10 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             half_2x2 = k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.mma_2x2 and k.cta_mma == 2
             if (k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and not half_2x2) or k.thd_varlen:
                 raise ValueError(f"{flavor}: paged KV requires dense Q, with per-tensor FP8 or native two-CTA half 2x2 inputs")
+            p = k.page_size
+            if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
+                raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
+        elif flavor == "sm107 d256" and k.dtype_kv != -1:
             p = k.page_size
             if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
                 raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
@@ -2037,6 +2043,8 @@ class CfgD192(CfgD128):
 class CfgD256(_CfgSm107):
     """d_qk = d_v = 256. Q-union-O SMEM alias, single softmax warpgroup, a
     Q.K(i+1) -> S.V(i) lookahead MMA stream with two parity S_acc TMEM slots."""
+
+    DTYPE_KV: int = -1
 
 
 @dataclass(frozen=True)
@@ -2643,6 +2651,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     other_regs = 40
 
     cfg = CfgD256(
+        DTYPE_KV=params.dtype_kv,
         TILE_M=128,
         TILE_N=tile_n,
         TILE_K=tile_k,

@@ -4746,3 +4746,18 @@ a left window requires causal masking and every query row to retain a key.
 THD, padding, BR/right-band, sink/bias, Amax outputs and noncompact layouts
 remain declined. SM100 and SM107 numerical/replay/batch checks pass; SM103
 execution remains unverified. The row is opt-in and requires CuTeDSL4.8.0.
+
+### Native SM107 mixed FP8 KV at exact D256/V256
+
+`sdpa_fwd_prefill_sm107` accepts FP16/BF16 Q/O with E4M3/E5M2 K/V at
+exact D256/V256, dense Q, CGA2 and unpacked GQA. Dense and paged KV support
+unsplit and split execution, including Q=1, independent HND/NHD pools,
+per-batch lengths, causal/bottom-right windows and sinks. The native D256
+half pipeline widens FP8 in shared memory without a global staging copy.
+Split partials use FP32 for both dense and paged KV. THD, CGA1, PackGQA,
+epilogue gates and other mixed head dimensions retain their existing declines.
+Uniform-half D256 keeps its existing routes. Candidate ranking is unchanged.
+
+The selected SM107 CI entry exposes `TestMixedFp8Kv.test_d256_*`; independent
+O/Stats references, changed-input graph replay, fixed-input batch/replay
+goldens and three sanitizer tools qualify the native path.

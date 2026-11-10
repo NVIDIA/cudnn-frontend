@@ -2414,7 +2414,12 @@ class TestMixedFp8Kv:
     """Native mixed K/V coverage in the architecture CI's selected entry."""
 
     from mixed_kv_sm107_cases import (
+        d256_admission,
         graph_admission,
+        d256_standalone,
+        d256_single_q,
+        d256_replay_batch_golden,
+        d256_dense_paged,
         d64_admission,
         d64_dense_paged,
         d64_thd_origins,
@@ -2436,6 +2441,11 @@ class TestMixedFp8Kv:
         uniform_control,
     )
 
+    test_d256_dense_paged = staticmethod(d256_dense_paged)
+    test_d256_single_q = staticmethod(d256_single_q)
+    test_d256_replay_batch_golden = staticmethod(d256_replay_batch_golden)
+    test_d256_admission = staticmethod(d256_admission)
+    test_d256_standalone = staticmethod(d256_standalone)
     test_d64_admission = staticmethod(d64_admission)
     test_d64_dense_paged = staticmethod(d64_dense_paged)
     test_d64_thd_origins = staticmethod(d64_thd_origins)
