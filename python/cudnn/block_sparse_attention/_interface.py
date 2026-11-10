@@ -3235,7 +3235,14 @@ def _sm90_blk64_bwd_metadata(
 
     pair_words = (num_q_blocks + 31) // 32
     pair_count = (num_kv_blocks + 1) // 2
-    pair_bytes = batch_size * num_heads * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks) * 4
+    # Bytes of the pairing metadata the gate weighs: bitsets, duplicates, flags and owners, residuals, the (pair, Q group)
+    # task records and the per-KV64-block dK/dV arrival bookkeeping.
+    pair_bytes = (
+        batch_size
+        * num_heads
+        * (num_kv_blocks * pair_words + 2 * pair_count + num_kv_blocks + num_q_groups * num_kv_blocks + 8 * num_q_groups * pair_count + 2 * num_kv_blocks)
+        * 4
+    )
     # On SM90 fixed-count lists pair as well (measured faster on long video masks): a full per-row
     # count describes the same edges, so build it whenever the task count could pass the gate.
     pair_nums = q2k_block_nums
