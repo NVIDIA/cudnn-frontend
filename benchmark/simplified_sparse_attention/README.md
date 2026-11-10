@@ -68,3 +68,14 @@ not direct speed comparisons with the PyTorch CUDA-event samples above.
 | 1024 / 4096 | 16 / 512 | Forward | 2.951 |
 | 1024 / 4096 | 16 / 512 | Forward + backward | 3.441 |
 | 1024 / 131072 | 32 / 2048 | Forward | 6.914 |
+
+Phase 1 samples at `b1a9c4a`, with the installed wheel on the SM100 runtime
+above (CUDA 13.4 compiler), three warmups and 20 timed calls:
+
+| Query / key rows | Heads | Backend | Mode | Latency (ms) | Peak allocated memory (MiB) |
+| --- | --- | --- | --- | --- | --- |
+| 65 / 4097 | 32 | CuTe | Forward + backward | 0.722 | 45.2 |
+| 65 / 4097 | 32 | PyTorch chunked | Forward + backward | 6.320 | 76.6 |
+
+These single-run samples exclude teacher LSE preparation and use a shared GPU.
+They do not qualify SM103 performance or CUDA graph capture.

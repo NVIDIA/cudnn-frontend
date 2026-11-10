@@ -1503,3 +1503,106 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest simplified_sparse_attention/cutedsl -m 'L0 or L1' -q -s -rxX
 ```
+
+## Phase 1 dense indexer KL public exports (2026-11-09)
+
+Revision `b1a9c4a`, based on `55b9180`. The installed wheel exposes
+`dense_indexer_kl` through both `cudnn.ops` and
+`cudnn.simplified_sparse_attention`. The API retains the scalar loss and
+indexer-only autograd contract. `use_kf=False` selects chunked PyTorch;
+`use_kf=True` selects the supplied-LSE CuTe kernel. Both reject external
+CUDA graph capture. No kernel arithmetic or deterministic mode was added.
+
+The new suites collect 64 L0 cases: 32 numerical/contract cases and 32
+forward/backward determinism cases. Numerical coverage uses an independent
+FP64 full-softmax teacher and autograd for the student. It checks all three
+head counts, query/key tails (3/17, 65/257), and split-key work (33/4097).
+The loss uses coefficient 0.17 and fixed denominator 71; backward uses a
+fixed upstream gradient of 0.7. Loss tolerance is `rtol=2e-4, atol=2e-7`;
+BF16 gradient tolerance is `rtol=0.02, atol=2e-6`.
+
+Replay compares raw bytes of the loss, BF16 indexer gradients, and saved
+FP32 gradients with fresh allocations and concurrent GPU work. The stress
+case has `32 * (SM_count + 1)` query rows (4,768 here), crossing CTA scheduling
+waves. Packed checks preserve inputs, scaling, and upstream gradients across
+neighbor insertion/removal, reordering, duplication, and changed neighbors.
+Only the target contributes to the scalar loss. Inputs are checked for
+mutation, outputs for finiteness, and teacher Q/K for absent gradients.
+Contract tests cover invalid metadata, chunk sizes, fused dtype/head/scale/LSE
+requirements, old-DSL rejection before kernel import, capture rejection, and
+side-stream forward/backward without host synchronization.
+
+Before exceptions, the initial runs reported **40 passed, 10 failed,
+8 deselected**, followed by **6 passed, 2 failed, 24 deselected** for stress
+and golden recording. All numerical checks passed. The 12 bytewise failures
+were approved as scoped expected failures:
+
+- Fused H32 tail forward/backward replay: scalar loss differs by one byte.
+- Fused H96 split-key backward replay: saved FP32 indexer gradients differ.
+- Fused scheduling stress, both directions: scalar loss differs by one byte.
+- Packed PyTorch backward at H16/H32/H96 and fused backward at H32/H96:
+  loss or saved gradient bytes differ.
+- Packed H96 forward, both paths: scalar loss differs by one byte.
+
+Exceptions match only these named cases on SM100 and raw-byte mismatch
+messages for loss/indexer gradients. Numerical, non-finite, mutation,
+shape/dtype, and unrelated failures remain strict. A case stops at its first
+byte mismatch; later comparisons in that case are unmeasured. Remove each
+exception when its replay and batch checks are fixed. Intermittent passes do
+not establish determinism.
+
+Runtime: SM100, 148 SMs, driver 610.11 / CUDA driver API 13.3; Python 3.12.12,
+frontend 1.33.0, PyTorch 2.13.0+cu130, cuDNN 9.27.0, CuTe DSL 4.8.0,
+TVM FFI 0.1.13.post2. Separate environments loaded
+`_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so` with compiler CUDA 13.4
+and `_cutlass_ir.cu12.cpython-312-x86_64-linux-gnu.so` with compiler CUDA 12.9.
+Each installed-wheel lane used a fresh process and separate empty DSL/driver
+cache directories. Imports resolved to the corresponding environment's
+`site-packages/cudnn`, not the editable checkout.
+
+| Check | Result |
+| --- | --- |
+| Installed wheel, CUDA 13.4, Phase 1 plus nine Phase 2 numerical cases and both framework export checks | 63 passed, 12 xfailed; 0 failed/skipped/deselected, 102.49 s |
+| Installed wheel, CUDA 12.9, all Phase 1 cases | 54 passed, 10 xfailed; 0 failed/skipped/deselected, 43.82 s |
+| Editable source, Phase 1, lazy exports, and three kernel-prefix checks | 56 passed, 12 xfailed; 0 failed/skipped/deselected, 54.12 s |
+| Installed-wheel API inventory | 11 passed; one added name, no removals |
+| Wheel contents | All 35 operation Python modules, NOTICE, and contributors.md match the checkout bytes |
+| Formatting / docs | Pre-commit passed; Fern: 0 errors, 1 existing warning |
+
+The two H32 fused replay cases passed in the CUDA 12 run; their known
+exceptions remain. Four one-row forward/backward goldens were recorded in a
+new directory for each compiler flavor after reference and replay checks.
+The eight committed files have identical input and output hashes across
+flavors for the same backend/direction. No existing golden was replaced.
+These tiny cases cover the scalar oracle and PyTorch path; the fused fast
+path has no stable golden because larger reductions fail replay.
+
+Wheel: `nvidia_cudnn_frontend-1.33.0-cp312-cp312-linux_x86_64.whl`.
+SHA256: `4a3bb8627750be8121c8436647dd4ff5d9b8dd10803f6603cf6fe3e745871208`.
+The CUDA 12 compiler lane uses CUDA 13 framework/backend packages; it does
+not qualify a full CUDA 12 deployment. SM103, other GPUs, newer DSL releases,
+and multi-device execution remain unverified. Phase 1 has no JAX entry point.
+Phase 2's earlier full-suite results above remain historical measurements.
+
+Commands from `test/python`, with the installed cuDNN library directory on
+`LD_LIBRARY_PATH` and separate fresh `CUTE_DSL_CACHE_DIR`/`CUDA_CACHE_PATH`
+values per compiler lane:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+../../../.venv-wheel/bin/python -m pytest \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl.py \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_lazy_imports \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_public_forward_backward_reference \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py::test_public_jax_export \
+  -m L0 -q -s -rxX --tb=short
+
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+../../../.venv-cu12/bin/python -m pytest \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl.py \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  -m L0 -q -s -rxX --tb=short
+```
