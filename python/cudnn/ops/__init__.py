@@ -15,6 +15,13 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "mhc_workspace_size": ("cudnn.mhc.api", "mhc_workspace_size"),
+    "mhc_prepare": ("cudnn.mhc.api", "mhc_prepare"),
+    "mhc_finish": ("cudnn.mhc.api", "mhc_finish"),
+    "mhc_backward_prepare": ("cudnn.mhc.api", "mhc_backward_prepare"),
+    "mhc_backward_finish": ("cudnn.mhc.api", "mhc_backward_finish"),
+    "mhc_head_forward": ("cudnn.mhc.api", "mhc_head_forward"),
+    "mhc_head_backward": ("cudnn.mhc.api", "mhc_head_backward"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
