@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Dense D_QK = 192 / D_V = 128 per-tensor FP8 delta and amax reset."""
+"""Dense per-tensor FP8 delta and amax reset for D_V = 128 or 512."""
 
 from typing import Optional
 
@@ -51,7 +51,8 @@ def dot_do_o_d192_fp8_kernel(
         _reset(amax_dp)
     row = cutlass.Int64(block) * ROWS_PER_CTA + cutlass.Int64(tid // LANES_PER_ROW)
     lane = tid % LANES_PER_ROW
-    column = cutlass.Int64(lane) * ELEMENTS_PER_LANE
+    elements = ELEMENTS_PER_LANE * (o.shape[3] // 128)
+    column = cutlass.Int64(lane) * elements
     valid = row < cutlass.Int64(o.shape[1])
     io_row = cutlass.Int64(arith.select(valid.ir_value(), row.ir_value(), cutlass.Int64(o.shape[1] - 1).ir_value()))
     o_offset = (
@@ -63,15 +64,17 @@ def dot_do_o_d192_fp8_kernel(
     delta_offset = (
         cutlass.Int64(batch) * cutlass.Int64(delta.stride[0]) + cutlass.Int64(head) * cutlass.Int64(delta.stride[1]) + row * cutlass.Int64(delta.stride[2])
     )
-    do_values = (do.iterator.raw_ptr() + do_offset).load(count=ELEMENTS_PER_LANE, alignment=8)
-    o_values = (o.iterator.raw_ptr() + o_offset).load(count=ELEMENTS_PER_LANE, alignment=8)
+    do_values = (do.iterator.raw_ptr() + do_offset).load(count=elements, alignment=8)
+    o_values = (o.iterator.raw_ptr() + o_offset).load(count=elements, alignment=8)
     pairs = []
-    for j in cutlass.range_constexpr(ELEMENTS_PER_LANE // 2):
+    for j in cutlass.range_constexpr(elements // 2):
         high = cute.math.mul(do_values[2 * j + 1].to(cutlass.Float32), o_values[2 * j + 1].to(cutlass.Float32), rounding=RN, ftz=True)
         pairs.append(cute.math.fma(do_values[2 * j].to(cutlass.Float32), o_values[2 * j].to(cutlass.Float32), high, rounding=RN, ftz=True))
     dot = cute.math.add(pairs[0], pairs[1], rounding=RN, ftz=True)
     dot = cute.math.add(dot, pairs[2], rounding=RN, ftz=True)
     dot = cute.math.add(dot, pairs[3], rounding=RN, ftz=True)
+    for j in cutlass.range_constexpr(4, elements // 2):
+        dot = cute.math.add(dot, pairs[j], rounding=RN, ftz=True)
     for step in cutlass.range_constexpr(4):
         peer = nvvm.shfl_sync(thread_mask=0xFFFFFFFF, val=dot, offset=1 << (3 - step), mask_and_clamp=0x1F, kind=nvvm.Shfl.BFLY)
         dot = cute.math.add(dot, peer, rounding=RN, ftz=True)

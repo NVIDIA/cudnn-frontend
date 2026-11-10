@@ -40,9 +40,20 @@ native backend plan there (cuDNN engine 5 on B200 / 9.26).
 A fifth engine, `sdpa_bwd_sm107_d512` (bf16 / fp16, cc 10.7 - 11.9, default behind the
 backend, 2026-10-01), serves **d in (256, 512]** (multiples of 8, envelope-served on
 512-wide tiles) on the same line -- see "The d in (256, 512] row" below.  It is
-the only FROST d > 256 backward on cc 10.7, and the only backward at all for that
-band there: cuDNN 9.26 builds no d > 256 backward plan on cc 10.7, so a pin by
+the half-precision FROST d > 256 backward on cc 10.7. cuDNN 9.26 builds no
+d > 256 backward plan on cc 10.7, so a pin by
 `startswith("sdpa_bwd_sm107_d512")` is still the honest way to measure it.
+
+The opt-in `sdpa_bwd_d512_fp8` pair serves exact D512 per-tensor E4M3
+`sdpa_fp8_backward` graphs on SM100, SM103 and SM107. Inputs use compact BSHD
+storage, with FP32 Stats and the standard tensor descales/scales; gradients
+may be E4M3, FP16 or BF16. It supports MHA/GQA/MQA, top-left causal or
+unmasked attention, and a left sliding window. The deterministic flag keeps
+the same fixed ownership and GQA reduction order. Scratch contains only
+FP32 delta rows, padded to 128 queries; no full score or dS matrix is stored.
+THD, padding masks, bottom-right alignment, right-band widening, bias, sinks
+and MXFP8 remain outside this pair's contract. Numerical and bitwise tests
+have run on SM100 and SM107; SM103 execution remains unverified.
 
 There is no separate high-level standalone wrapper for the whole pass; use the graph API
 or an adapter's `execute` method. Standalone THD execution takes per-batch sequence

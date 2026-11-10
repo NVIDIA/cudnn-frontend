@@ -60,6 +60,7 @@ arbitrary user callbacks.
 | FROST native D64 dense/THD paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
 The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,
@@ -150,3 +151,12 @@ pooled DSA, and distributed execution are outside this status page's scope.
 
 See the [test report](https://github.com/Anerudhan/cudnn-frontend/blob/feat/attention-determinism-tests/test/python/determinism_goldens/README.md)
 for the covered configurations, validation runtimes, and supporting measurements.
+
+
+The D512 per-tensor FP8 backward pair uses fixed query/key owners and reduces
+GQA heads in ascending order. Its bounded dense BSHD suite preserves all FP8
+payloads, scalar scales, O, Stats and upstream gradients across batch changes;
+it compares dQ/dK/dV bytes and whole-batch Amax reductions. Cases include
+left windows, repeated/reordered/duplicated batches through 129 requests and
+changed-input CUDA Graph replay. The deterministic flag selects the same
+arithmetic. This qualification does not add MXFP8 or packed backward support.

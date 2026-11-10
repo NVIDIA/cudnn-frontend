@@ -30,6 +30,9 @@ def _spec(dqk, dv, sm, mx, window):
 
 def _kernel_hosts(spec):
     here = pathlib.Path(__file__).resolve()
+    if tuple(spec[:2]) == (512, 512) and not spec[3]:
+        module = load_template(str(here.with_name("bprop_d512_fp8.py")), spec, tag=f"sdpa_bwd_d512_fp8_w{spec[4]}")
+        return module.dkdv_host, module.dq_host
     tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}"
     dkdv = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), spec, tag=f"{tag}_dkdv").host
     dq = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), spec, tag=f"{tag}_dq").host
@@ -228,11 +231,11 @@ def host(
     )
 
 
-def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=192, dv=128, ratio=1):
+def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=192, dv=128, ratio=1, window=0):
     """Compile from declarations only; addresses and scale remain runtime slots."""
-    spec = _spec(dqk, dv, sm, False, 0)
+    spec = _spec(dqk, dv, sm, False, window)
     if spec != SPEC:
-        return _specialized(spec).compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk, dv, ratio)
+        return _specialized(spec).compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk, dv, ratio, window)
     _bind()
     head_dims = spec[:2]
     types = [cutlass.Float8E4M3FN] * 5 + [cutlass.Float32] + [grad_dtype] * 3
@@ -251,7 +254,19 @@ def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=repr(
-            ("sdpa_bwd_sm100_d192_fp8", ABI_VERSION, geometry, regions, str(grad_dtype), bool(causal), sm, tuple(amax_requested), head_dims, int(ratio))
+            (
+                "sdpa_bwd_sm100_d192_fp8",
+                ABI_VERSION,
+                geometry,
+                regions,
+                str(grad_dtype),
+                bool(causal),
+                sm,
+                tuple(amax_requested),
+                head_dims,
+                int(ratio),
+                int(window),
+            )
         ),
         symbol="frost_sdpa_bwd_sm100_d192_fp8_prepared",
     )

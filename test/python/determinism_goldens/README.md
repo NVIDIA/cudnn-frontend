@@ -1304,3 +1304,28 @@ zero diagnostics:7 page-boundary memcheck cases,3 shared-record memcheck cases,
 Sanitizers select `test_boundaries`, `test_shared_mla_record` or `test_paged`
 from that same class with `--error-exitcode 99`. Pre-commit passes; Fern has
 zero errors and its existing unauthenticated-redirect warning.
+
+### D512 per-tensor FP8 backward — 2026-11-10
+
+`sdpa/frost/test_sdpa_bwd_d512_fp8.py` covers graph numerical references and
+raw-byte replay/batch invariance for E4M3, FP16 and BF16 gradients. Dense
+BSHD E4M3 inputs use independent Q/K/V/O/dO tensor scales, left windows,
+GQA and tail tiles. Three golden cases per runtime preserve the quantized
+inputs while running alone, reordered, duplicated and in batches through129.
+All gradients and four Amax outputs are compared; changed-input capture and
+sync-debug execution run on the same plans. Nine numerical cases and three
+recording cases pass on SM100(148SM, cuDNN9.28.0.38, Torch2.14.1+cu130,
+DSL4.8.0/CUDA12.9) and SM107(208SM, cuDNN9.30.0.2, same Torch,
+DSL4.8.0/CUDA13.4). The 19-case strict suite passes on each runtime,
+including all six committed goldens. SM100 additionally passes ten existing
+D192 controls with the shared delta/prepared host. On both SM100 and SM107,
+all nine numerical cases pass memcheck, synccheck and racecheck with zero
+errors or hazards. SM103 compiles all three gradient types but is unverified
+at execution. The existing SM107 CI entry exposes the same shared checks as
+`test_sdpa_fp8_sm107.py::TestD512Fp8Backward`; the new D512 entry runs on
+SM100/SM103 only, so directory sweeps do not duplicate the Rubin cases. Original16k-SWA geometry has a full structured oracle
+on SM107; it is not a full random-matrix oracle or a performance result.
+
+Review closeout: the SM107 D512 FP8 class moved into the actual selected
+`test_sdpa_fp8_sm107.py` entry; direct collection of the former backward file
+was not CI inclusion. The new kernel now carries its required cuDNN prefix.

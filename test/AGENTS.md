@@ -1306,3 +1306,11 @@ it still needs version1. `TestNativeD576Half.test_admission` and the existing
 SM107 descriptor/ledger tests cover this geometry. For absorbed MLA, exercise
 V as a512-column view of the576-wide K record so tests retain the real physical
 stride and alias, including changed-input capture replay.
+
+
+For a tiled large-head backward kernel, keep the contraction width separate
+from the output-column tile. Validate a nonzero gradient in every output
+chunk and include the full declared O/dO width in the delta pass. A small-head
+delta helper reused unchanged can make dV correct while corrupting dQ/dK.
+`test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
+plus fixed quantized inputs under changed batch sizes and graph replay.

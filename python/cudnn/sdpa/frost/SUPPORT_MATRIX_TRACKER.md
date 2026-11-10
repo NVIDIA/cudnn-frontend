@@ -4714,3 +4714,14 @@ THD Q, half D512 pools and MXFP8 D512 pools remain declined.
 Detector: `TestNativeD512Fp8Paged` in `test_sdpa_fp8_sm107.py`. Target GPU
 qualification passes 31 feature/golden cases, 32 dense controls, memcheck8,
 synccheck8 and racecheck2; this addition changes no heuristics ranking.
+
+
+### D512 per-tensor FP8 backward (2026-11-10)
+
+`sdpa_bwd_d512_fp8` adds exact D512 dense BSHD E4M3 Q/K/V/O/dO with
+E4M3, FP16 or BF16 gradients, top-left causal or unmasked attention,
+optional left window, and MHA/GQA/MQA. Each output tile has one owner;
+GQA heads reduce in fixed order. Scratch contains FP32 delta rows only.
+THD, padding masks, bottom-right alignment, right-band widening, sinks and
+bias remain unsupported. Graph numerical and raw-byte replay/batch checks pass on SM100 and SM107.
+SM103 execution remains unverified; the row remains opt-in.
