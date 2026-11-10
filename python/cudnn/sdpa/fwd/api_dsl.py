@@ -149,6 +149,8 @@ from cudnn.sdpa.fwd.config_sm120 import (
     TemplateParams as Sm120TemplateParams,
     D256_FLAVOR as _SM120_D256_FLAVOR,
     D512_FLAVOR as _SM120_D512_FLAVOR,
+    D576_FLAVOR as _SM120_D576_FLAVOR,
+    WIDE_F16_FLAVORS as _SM120_WIDE_F16_FLAVORS,
     DECODE_Q_TILES as _SM120_DECODE_Q_TILES,
     decode_kv_stage as _sm120_decode_kv_stage,
     head_tiles as _sm120_head_tiles,
@@ -376,6 +378,7 @@ _SM100_TILE_N = 128
 _SM120_KERNEL_FILES = {
     _SM120_D256_FLAVOR: "sm120/prefill_d256_f16.py",
     _SM120_D512_FLAVOR: "sm120/prefill_d512_f16.py",
+    _SM120_D576_FLAVOR: "sm120/prefill_d512_f16.py",
     None: "sm120/prefill_f16.py",
 }
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
@@ -5929,14 +5932,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.q_desc.ndim != 4
                 or self.v_desc.ndim != 4
                 or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
-                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES, d512=True),
-                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill, 256 for decode, or both in (256, 512]",
+                or not _sm120_paged_head_dims_supported(
+                    self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES, d512=True, d576=True
+                ),
+                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill, 256 for decode, or D512/D576-V512 wide envelopes",
             )
             self._not_implemented_error_if(
                 self.split_kv > 1
                 and self.tile_m not in _SM120_DECODE_Q_TILES
-                and _sm120_pick_flavor(int(self.q_desc.shape[3]), int(self.v_desc.shape[3]), False) != _SM120_D512_FLAVOR,
-                "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or the D512 tile",
+                and _sm120_pick_flavor(int(self.q_desc.shape[3]), int(self.v_desc.shape[3]), False) not in _SM120_WIDE_F16_FLAVORS,
+                "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or a D512/D576 tile",
             )
             self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
             self._value_error_if(
@@ -6075,6 +6080,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
         # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
+        if self.flavor == _SM120_D576_FLAVOR and not self.thd and (int(d_q), int(d_v)) != _SM120_D576_FLAVOR:
+            from cudnn import _pybind_module
+
+            self._not_implemented_error_if(
+                not getattr(_pybind_module._SdpaDenseBinder, "supports_d576_envelope", False),
+                "SM120 D576 envelope requires the matching native cuDNN Frontend extension",
+            )
         # Block-scaled O (sf_o): FP8 inputs, d_v = 128, dense/unsplit/unpacked; the
         # FP4 (NVFP4) O is per-tensor FP8 only.
         self._dtype_o_code = _SM120_DTYPE_QKV_CODE.get(self.o_desc.dtype)
@@ -6098,12 +6110,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
             self._sfo_geometry = self._sf_o_geometry(self.o_block_scale, int(d_v))
         # Head dims above the general template's cap exist only where a flavor's
-        # tiles reach (d512: both dims in (256, 512]), so the flavor sets the cap.
+        # tiles reach; wide half flavors also include D576/V512.
         head_tile_max = _SM120_FP8_GENERAL_HEAD_TILE_MAX if self._fp8 else _SM120_GENERAL_HEAD_TILE_MAX
         if self.flavor is not None:
             head_tile_max = max(head_tile_max, *self.flavor)
         above_cap = (
-            f" (above {_SM120_GENERAL_HEAD_TILE_MAX}, both head dimensions must be in ({_SM120_GENERAL_HEAD_TILE_MAX}, {_SM120_D512_FLAVOR[0]}])"
+            f" (above {_SM120_GENERAL_HEAD_TILE_MAX}, head dimensions must fit a supported wide flavor)"
             if max(int(d_q), int(d_v)) > _SM120_GENERAL_HEAD_TILE_MAX
             else ""
         )
@@ -6127,7 +6139,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self._not_implemented_error_if(self._fp8, "the SM120 decode tile (tile_m 16 / 32) serves FP16/BF16 only")
             self._not_implemented_error_if(self.thd, "the SM120 decode tile (tile_m 16 / 32) is dense-only (THD keeps the prefill templates)")
             self._not_implemented_error_if(
-                self.flavor == _SM120_D512_FLAVOR, f"the SM120 decode tile serves head dims up to {_SM120_GENERAL_HEAD_TILE_MAX}; got {(int(d_q), int(d_v))}"
+                self.flavor in _SM120_WIDE_F16_FLAVORS,
+                f"the SM120 decode tile serves head dims up to {_SM120_GENERAL_HEAD_TILE_MAX}; got {(int(d_q), int(d_v))}",
             )
             self._value_error_if(
                 self.sched_policy not in (None, SCHED_NATURAL), f"the SM120 decode tile runs SCHED_NATURAL only; got sched_policy={self.sched_policy}"
@@ -6290,8 +6303,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 "SM120 split_kv > 1 with an attention sink requires exact D128 dense per-tensor FP8 or FP16/BF16",
             )
             self._value_error_if(
-                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and (decode_tile or self.flavor == _SM120_D512_FLAVOR)),
-                "split_kv > 1 with device lengths requires a native paged decode or D512 tile",
+                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and (decode_tile or self.flavor in _SM120_WIDE_F16_FLAVORS)),
+                "split_kv > 1 with device lengths requires a native paged decode or D512/D576 tile",
             )
         self._value_error_if(
             self.softmax_precision is not None,
@@ -6403,7 +6416,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 if (self._prepared_fp8 or self._prepared_mxfp8)
                 else {}
             ),
-            persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor == _SM120_D512_FLAVOR else 0,
+            persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor in _SM120_WIDE_F16_FLAVORS else 0,
         )
         if self.thd:
             self._thd_spec = build_thd_spec(self, scale_softmax=None)
