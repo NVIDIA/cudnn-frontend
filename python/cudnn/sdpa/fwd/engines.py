@@ -1239,6 +1239,16 @@ def sm100_nonpaged_d128_thd_single_cta_leg(capabilities: Capabilities, facts: "g
     )
 
 
+def native_d128_dense_paged_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
+    return capabilities.sm_lo == 107 and _config_sm107.supports_native_d128_dense_paged(
+        _selected_d_shape(capabilities, facts, knobs),
+        device_cc=facts.device_cc,
+        fp8=facts.is_fp8 or facts.is_mxfp8,
+        thd=facts.thd,
+        paged=facts.has_paged_kv,
+    )
+
+
 def native_d192_paged_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
     return capabilities.sm_lo == 107 and _config_sm107.supports_native_d192_paged(
         _selected_d_shape(capabilities, facts, knobs),
@@ -1307,11 +1317,12 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         and selected == (128, 128)
         and not (capabilities.is_fp8 or capabilities.is_mxfp8)
         and not rubin_dense_d128_shared_leg(capabilities, facts, _knobs)
+        and not native_d128_dense_paged_leg(capabilities, facts, _knobs)
     ):
         # cc 10.7 half row: the (128, 128) cga1 entry of cgas_by_d_shape names the shared SM100 DECODE tile compiled for
         # cc 10.7 (issue #1472), a DENSE half leg (rubin_dense_d128_shared_leg): a ragged graph outside the single-CTA
-        # legs above keeps the cga2 prefill pipeline (the tile has no THD_VARLEN leg), dense paged queries are not wired
-        # on cc 10.7, the pre-folded scale lives in the Rubin sibling only, and quantized facts never ride this row.
+        # legs above keeps the cga2 prefill pipeline. Native dense paged D128 has its own domain;
+        # the pre-folded scale lives in the Rubin sibling only, and quantized facts never ride this row.
         # Narrow the DOMAIN so neither a proposal nor a pin reaches the tile.
         return frozenset({2})
     if capabilities.sm_lo == 107 and capabilities.is_mxfp8 and selected == (256, 256):
@@ -1996,6 +2007,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 _pg_tile_m = max(capabilities.tile_ms)
             _partial = (
                 pack_gqa_partial(capabilities, facts, knobs)
+                or native_d128_dense_paged_leg(capabilities, facts, knobs)
                 or ragged_pack
                 or supports_paged_d128_partial_pack_gqa(
                     (facts.d_qk, facts.d_v),
@@ -2325,19 +2337,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
         # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/decode_d256_f16.py)
         # walks the block table itself and folds the sink per Q row, so a decode-shaped half d256
-        # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries are
-        # otherwise not wired on cc 10.7; the MXFP8 row answers through its own flags above.
+        # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries
+        # also use native half D128; the MXFP8 row answers through its own flags above.
         # api_dsl.check_support mirrors this (rule 8b).
         if (
             capabilities.sm_lo == 107
             and not capabilities.is_mxfp8
             and not capabilities.is_fp8
             and not facts.thd
+            and not native_d128_dense_paged_leg(capabilities, facts, knobs)
             and not d256_decode_tile_served(capabilities, facts, knobs)
             and not native_d192_paged_leg(capabilities, facts, knobs)
         ):
             # knobs None = the facts-only question: SOME packing rides the tile (the packed form alone past 32 unpacked rows)
-            return "Rubin paged KV requires THD queries, native half D192/V128 with two CTAs and no split, or a decode-shaped half D256 graph"
+            return "Rubin paged KV requires THD queries, native dense half D128, native half D192/V128 with two CTAs and no split, or a decode-shaped half D256 graph"
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
         # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
         # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these

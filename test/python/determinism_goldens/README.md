@@ -1165,6 +1165,36 @@ The paged launch's generated SM107 cubin was also checked with nvdisasm
 `USETMAXREG.TRY_ALLOC` at 240. All four service warps release before role
 branching. Dense launch/register behavior is unchanged.
 
+### Native SM107 half D128 dense-Q paging (2026-11-10)
+
+The architecture entry `test_sdpa_fwd_native_paged_sm107.py::TestNativeD128DensePaged`
+collects the shared `native_d128_dense_paged_determinism.py` checks. Six
+standalone cases pin native D128, CGA1/2, N64/N128 and split1/4, with FP16/BF16
+Q/O and matching half or E4M3/E5M2 K/V. Each case checks fixed CPU-seeded inputs,
+fresh buffers, queued independent work, reordered/duplicated batches and129
+requests, then records O and FP32 Stats only after the independent CPU-double
+reference and byte comparisons pass. Changed-input CUDA capture mutates Q,
+Q/KV lengths and independent K/V table contents. Poisoned output/workspace,
+output-padding canaries and input-byte preservation are checked. K/V physical
+layouts differ; table strides match but are non-contiguous. Equal pool
+capacities and matching table strides retain the existing half binder contract.
+
+Graph tests separately cover partial GQA, page8–1024, short and prefill-shaped
+queries, all-empty KV, head envelopes, sinks/windows and changed-input replay.
+The new mixed-KV graph checks use the same independent double reference on CPU:
+this runtime's Torch eager outer-product specialization invokes an older Triton
+ptxas that does not recognize SM107. The native kernel remains on the GPU; no
+kernel output, test tolerance or admission is substituted to accommodate it.
+
+Runtime: SM107216SM, driver630.10, Python3.12.12, Torch2.14.1+cu130,
+cuDNN9.30.0.2, CuTeDSL4.8.0/CUDA13.4 compiler, matching rebuilt FE1.33 bindings.
+Final strict suite:61 passed, zero failures/skips, including all six goldens.
+Related controls:23 passed (metadata and existing THD N64), plus24 L1 native
+dense packing/split replay cases. Compute Sanitizer13.4.92: memcheck7,
+synccheck7 and racecheck4 passed, zero diagnostics. The final published tests
+also pass the smallest D32 head envelope boundary separately (1 case).
+Other GPU results are not inferred from this native SM107 qualification.
+
 ## Simplified sparse attention — 2026-11-09
 
 The new suite is
