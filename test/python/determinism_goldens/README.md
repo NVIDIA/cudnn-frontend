@@ -2788,3 +2788,39 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
 ```
+
+### SM120 half THD physical origins — 2026-11-10
+
+`test_sdpa_fwd_thd_origins_sm120.py` adds 24 L0 functional cases covering
+FP16/BF16, token/head Stats, D64/D128/D192-V128/D256/D512/D576-V512.
+Each compares against an independent FP64 reference, protects padding
+canaries and checks mixed-width/multiplier origins, fresh pitches/pointers,
+empty and keyless transitions under retained capture. Exact-byte checks
+cover repeat execution, batch reorder/duplication, a sequence alone and
+changed neighbors. Twelve separate golden cases finish those checks before
+recording. No prior golden or tolerance is replaced.
+
+RTX PRO 6000 SM120 (188 SMs), driver 595.84.01, Torch 2.14.0+cu130,
+cuDNN 9.24.0.43, DSL 4.8.0 / compiler 13.4, cuda-bindings 13.0.3:
+51 functional cases passed, including6 native/reference adapter-fallback,
+3 bounded-batch and18 dense half/per-tensor-FP8 host controls. All 12 new
+goldens under `812f98809d9324c5` recorded and strictly checked. Six memcheck
+cases passed with 0 errors. Racecheck then reported 628 errors in V-tail
+sanitization; synccheck did not run. The follow-up gives one warp ownership and synchronizes the compute group.
+Complete compact D64/D256 controls report 88/226 race errors on the original
+source and zero on the repair; their reference and retained replay checks
+pass in both arms. The final run passes 73 functional/golden cases in 183.14 s
+and 15 memcheck cases in 6.97 s with zero errors, preserving all 12 golden
+hashes. Racecheck passes the same 15 cases in 62.93 s with zero errors/warnings;
+synccheck passes 15 in 3.79 s with zero errors. The original FlashInfer issue
+regression also passes all three default FROST cases and all three backend
+controls after the synchronization repair. Earlier script quoting, fixture
+multiplier, cache-directory and node-local-reuse failures happened outside
+this successful final run; they are not counted as GPU passes.
+SM121 and other runtimes remain unverified for independent physical gaps.
+
+```bash
+# From test/python after checking the isolated import path.
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -m L0 sdpa/frost/test_sdpa_fwd_thd_origins_sm120.py
+```

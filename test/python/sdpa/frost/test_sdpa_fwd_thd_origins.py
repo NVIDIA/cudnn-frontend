@@ -72,7 +72,7 @@ def test_independent_thd_origins_rebind_and_capture(
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
     # +16 head padding must represent integral compact and gapped token origins.
     qk_multiplier = 16 if d_qk in (64, 192, 576) or engine_name.endswith("sm120") else d_qk
-    multipliers = (heads * qk_multiplier, qk_multiplier, 1, d_v, 1)
+    multipliers = (heads * qk_multiplier, qk_multiplier, 1, 16 if engine_name.endswith("sm120") else d_v, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
     q_lengths, kv_lengths = q_lengths[:batch], kv_lengths[:batch]
     log2_stats = stats_layout == "head"

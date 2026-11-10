@@ -391,8 +391,9 @@ D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in
 the tested FP16/BF16 configurations on GB10 (SM121), including half-Q with
 FP8 E4M3/E5M2 paged KV. Split count and packing stay fixed across batch
 reordering, duplication and changed-neighbor capture replay. Compact THD
-repacking follows changed lengths; independent physical gaps are outside this
-path's contract. SM120 hardware execution and other runtimes remain unverified.
+repacking follows changed lengths; this earlier qualification covered compact
+origins only. Independent physical gaps on SM120 are covered below; their
+execution on SM121 and other runtimes remains unverified.
 This qualification adds no backward support.
 
 Native SM107 half D64/D128 single-sequence THD origin setup retains forward
@@ -404,3 +405,17 @@ between single and multiple sequences through shape overrides, are covered by
 to nonpaged, unsplit uniform FP16/BF16; other supported paths retain their
 existing setup. Measurement details and runtime goldens are in the coverage
 report. This adds no backward or cross-runtime byte guarantee.
+
+## SM120 half THD physical origins
+
+Native FP16/BF16 THD forward preserves O/Stats bytes across repeat execution,
+batch reordering, duplicated sequences, a sequence alone, changed neighbors,
+fresh pointers and retained CUDA Graph replay in the tested RTX PRO 6000
+configurations. Q/K/V/O/Stats each retain their own physical offset, pitch
+and capacity; token-major and head-major Stats are both covered. Tested
+head shapes are D64, D128, D192/V128, D256, D512 and D576/V512.
+
+These are fixed-runtime forward results with the selected plan held fixed.
+SM121 physical-gap execution, FP8/MXFP8 origins and backward are not qualified
+by this suite. See the coverage report for numerical, golden and sanitizer
+results; passing byte comparisons alone do not establish race freedom.

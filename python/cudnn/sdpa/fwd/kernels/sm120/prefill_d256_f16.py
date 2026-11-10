@@ -850,16 +850,20 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+            # One compute warp owns shared V-tail stores; all PV readers
+            # must wait for those stores, even when every writer stores zero.
+            if basic_params.q_warp_row0 == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs)
         if basic_params.q_warp_row0 == 0:
             prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
