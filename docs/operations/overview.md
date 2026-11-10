@@ -79,6 +79,8 @@ The experimental API catalog includes:
 
 - [Ragged grouped GEMM training](/operations/gemm_fusions/ragged_grouped_gemm)
 
+- [Cake dense GEMM training](/operations/gemm_fusions/cake_dense_gemm)
+
 ## Installation and setup
 
 All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. Except on Windows ARM64, `nvidia-cutlass-dsl[cu13]>=4.8.0` and `apache-tvm-ffi` are required dependencies, so the CuTeDSL runtime comes with the base install (and the DSL pulls `cuda-python` in transitively):

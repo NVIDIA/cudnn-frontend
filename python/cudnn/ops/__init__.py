@@ -22,6 +22,8 @@ _LAZY_EXPORTS = {
     "simplified_sparse_attention_reserve": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_reserve"),
     "ragged_grouped_gemm_forward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_forward"),
     "ragged_grouped_gemm_backward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_backward"),
+    "dense_gemm_forward": ("cudnn.gemm.cake.dense", "dense_gemm_forward"),
+    "dense_gemm_backward": ("cudnn.gemm.cake.dense", "dense_gemm_backward"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
