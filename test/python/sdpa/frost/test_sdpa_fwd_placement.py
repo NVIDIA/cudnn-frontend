@@ -842,7 +842,8 @@ _SM107_PAGED_D256_MTP_CORNERS = [
     # (heads, s_q, b, declared KV, dtype, page, verdict): the MTP rows -- FlashInfer's decode graph at q_len_per_req 2-4 (the bottom-right
     # causal diagonal + the padding mask) on 24/2 and 32/2: the tile 0.01-0.31 of the backend on every measured cell (b 1-128 x KV 1k-128k,
     # page 16 bf16), so LEAD over the whole measured box incl. its 2-unit corner; outside it (another geometry -- incl. 12/1 and 16/1, the
-    # same groups unmeasured at s_q > 1 -- s_q 5, KV below 1k or past 128k, more than 256 units, page 32, f16) the backend stays first.
+    # same groups unmeasured at s_q > 1 -- KV below 1k or past 128k, more than 256 units, page 32, f16) the backend stays first. From s_q 5
+    # the graph is the paged prefill class, which the generated table answers (test_sm107_paged_d256_past_the_mtp_rows_...).
     ("24/2", 2, 1, 1024, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 3, 4, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 4, 128, 131072, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
@@ -852,7 +853,6 @@ _SM107_PAGED_D256_MTP_CORNERS = [
     ("24/2", 2, 1, 512, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("24/2", 2, 32, 262144, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("24/2", 2, 256, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
-    ("24/2", 5, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("16/4", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("64/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
     ("12/1", 2, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # group 12 on the unmeasured 12/1 geometry at s_q > 1
@@ -919,6 +919,23 @@ def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv,
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [(256, 256), (192, 128)])
+@pytest.mark.parametrize("s_q", [5, 8, 16])
+def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
+    """Past the MTP rows (s_q >= 5) FlashInfer's paged decode graph with the bottom-right diagonal is the paged prefill class, which
+    study sm107_paged_prefill_20261109 leads: on this dense-Q graph FROST measured 0.03-0.61 of the backend's plan at s_q 5 / 8 / 16 (216
+    cells, d256 and D192xV128, 208-SM cc 10.7, cuDNN 9.30.0.2), as on the THD prefill graph the study fit. Without the diagonal, or with a
+    window, the graph is another class and keeps the backend first."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    shape = dict(b=32, s_q=s_q, s_kv=8192, d_qk=d[0], d_v=d[1])
+    assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, **shape)) == placement.LEAD
+    assert placement.place(spec, _sm107_paged_d256_decode_facts(**shape)) == placement.TRAIL
+    assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "outside",
     [
@@ -927,7 +944,6 @@ def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv,
         dict(has_paged_kv=False, page_size=0, padded=False),  # a dense d256 cache at s_q == 1 was measured against the prefill body only
         dict(padded=False),  # a paged decode WITHOUT per-request KV lengths: every band cell carried the padding mask -> unmeasured
         dict(s_q=2),  # two query tokens WITHOUT the diagonal: not FlashInfer's MTP graph, unmeasured (the MTP band keys on the diagonal)
-        dict(s_q=5, causal=True, bottom_right=True),  # past the MTP rows' envelope (a third token unit): the prefill kernel serves it
         dict(h_q=64, b=4, s_kv=8192),  # group 32 one step below its band (2**16 tokens in flight holds the parity cell)
         dict(h_q=64, page_size=32),  # group 32 at page 32: measured on 24/2 only, not on 64/2
         dict(h_q=4),  # group 2: not measured
@@ -952,7 +968,6 @@ def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv,
         "dense",
         "unpadded",
         "q2_no_diagonal",
-        "mtp_q5",
         "g32_below_band",
         "g32_page32",
         "g2",
