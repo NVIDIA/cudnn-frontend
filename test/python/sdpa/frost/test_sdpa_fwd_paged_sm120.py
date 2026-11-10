@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Native SM120 small-head paged pools, independent tables and device-length replay."""
+"""Native SM120 paged pools, independent tables and device-length replay."""
 
 import math
 from dataclasses import replace
@@ -236,7 +236,8 @@ def test_sm120_frost_paged_native_rebind_replay(
     api.check_support()
     api.compile()
     assert api.compute_capability in ((12, 0), (12, 1))
-    assert api._k_mod.__file__.endswith("/sm120/decode_f16.py" if tile_m in (16, 32) else "/sm120/prefill_f16.py")
+    kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 else "prefill_f16.py")
+    assert api._k_mod.__file__.endswith("/sm120/" + kernel_file)
     assert api._k_mod.PARAMS.split_kv == split_kv
     assert api._k_mod.PARAMS.page_size == page
     assert api._k_mod._host.__name__ == "paged_host"
@@ -524,11 +525,12 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
                 tile_n=tile_n,
                 split_kv=split_kv,
                 pack_gqa=packed,
-                sched_policy=0 if tile_m in (16, 32) else 1,
+                sched_policy=0 if tile_m in (16, 32) or split_kv > 1 else 1,
             )
             api.check_support()
             api.compile()
-            assert api._k_mod.__file__.endswith("sm120/decode_f16.py" if tile_m in (16, 32) else "sm120/prefill_f16.py")
+            kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 else "prefill_f16.py")
+            assert api._k_mod.__file__.endswith("sm120/" + kernel_file)
             assert api._k_mod.PARAMS.split_kv == split_kv
             assert api._k_mod.PARAMS.page_size == page
             plans[b] = api
@@ -587,7 +589,7 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
                 assert_bitwise({n: actual[n][row : row + 1] for n in target}, target, f"batch row {row}")
     run([0, 1, 2, 3, 4], capture=True)
     actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
-    suffix = f"-decode{tile_m}-split{split_kv}" if tile_m in (16, 32) else ""
+    suffix = f"-decode{tile_m}-split{split_kv}" if tile_m in (16, 32) else (f"-d512-split{split_kv}" if min(dims) > 256 else "")
     assert_golden(f"sdpa-sm120-paged-d{d}v{dv}-{dtype}-pack{int(packed)}{suffix}", before, actual)
 
 
@@ -741,3 +743,95 @@ def test_sm120_frost_paged_wide_decode_admission():
         assert reason is not None and "decode tile" in reason
     for dims in ((264, 256), (256, 264), (249, 256)):
         assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=16, tile_n=16)) is not None
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dims,mask,packed,splits,page,sq,sink",
+    [
+        ((512, 512), "none", False, 1, 16, 1, False),
+        ((512, 512), "none", True, 3, 128, 7, True),
+        ((264, 504), "band", False, 1, 8, 67, False),
+        ((504, 264), "br_swa", True, 3, 256, 37, True),
+        ((512, 512), "none", False, 1, 128, 257, True),
+        ((512, 512), "br_swa", False, 3, 16, 129, True),
+    ],
+    ids=["plain", "split_pack", "q_envelope", "v_envelope", "reuse", "empty_splits"],
+)
+def test_sm120_frost_paged_d512(dtype, dims, mask, packed, splits, page, sq, sink, monkeypatch):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    # A small persistent grid forces K/V barrier reinitialization and Q-slab
+    # reuse even in the compact sanitizer geometry.
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda self, device: 2)
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        2,
+        True,
+        False,
+        page,
+        monkeypatch,
+        dims=dims,
+        mask=mask,
+        sink=sink,
+        packed=packed,
+        stats_log2=splits > 1,
+        tile_m=64,
+        tile_n=32,
+        sq=sq,
+        h=12,
+        split_kv=splits,
+        replays=4,
+        capture_adapter=splits > 1,
+        explicit_plan=True,
+    )
+
+
+@pytest.mark.parametrize("sink_value", [-float("inf"), float("inf")])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_d512_sink_limits(sink_value, split_kv, monkeypatch):
+    test_sm120_frost_paged_native_rebind_replay(
+        torch.bfloat16,
+        2,
+        False,
+        True,
+        16,
+        monkeypatch,
+        dims=(512, 512),
+        tile_m=64,
+        tile_n=32,
+        split_kv=split_kv,
+        sq=7,
+        sink=True,
+        packed=True,
+        sink_value=sink_value,
+        endpoints=True,
+        replays=4,
+        capture_adapter=split_kv > 1,
+        explicit_plan=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_d512_determinism(dtype, packed, split_kv):
+    test_sm120_frost_paged_width_determinism(dtype, (512, 512), packed, tile_m=64, tile_n=32, split_kv=split_kv)
+
+
+def test_sm120_frost_paged_d512_admission():
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.graph_analyzer import analyze
+
+    # Ordinary graph candidates must expose the newly legal native path.
+    g, _, _, _, _, _ = _case(torch.float16, 2, 16, True, False, dims=(512, 512), tile_m=64, tile_n=32, sq=1)
+    facts, caps = analyze(g), _sm120_spec().capabilities
+    for dims in ((512, 512), (264, 504), (504, 264)):
+        for split in (1, 3):
+            assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
+    for dims in ((264, 256), (256, 512), (520, 512), (257, 512)):
+        assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+    for changes in ({"thd": True}, {"is_fp8": True}, {"is_mxfp8": True}):
+        assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+    for tile_m, tile_n in ((16, 16), (32, 16), (64, 64), (128, 32)):
+        assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n)) is not None

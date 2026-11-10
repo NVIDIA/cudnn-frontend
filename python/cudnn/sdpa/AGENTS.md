@@ -1486,6 +1486,11 @@ rather than publishing those copies with an ordinary mbarrier arrival. The
 qualified SM120 loader also retains producer-local commit/wait-group completion:
 an async-arrival-only variant passed numerics but failed the same racecheck.
 Do not remove that drain without rerunning the native sanitizer/capture cases.
+For a persistent CTA that reinitializes its K/V barriers between work units,
+keep the same producer arrival count at initial launch and every rearm. D512
+paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
+one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
+two CTAs so even compact tests exercise repeated unit transitions.
 See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 and run the native paging racecheck as well as memcheck and numerical replay.
 

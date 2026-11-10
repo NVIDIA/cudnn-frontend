@@ -952,8 +952,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     ):
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
-        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True):
-            return "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 256 and dense Q"
+        if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True):
+            return "SM120 paged KV requires FP16/BF16 dense Q with head dims through 256 or both in (256, 512], divisible by 8"
     if facts.has_bias and capabilities.bias_d_shapes is None:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
@@ -2394,10 +2394,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             reason = _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
             if reason is not None:
                 return reason
-            if knobs is not None and (knobs.split_kv or 1) > 1 and knobs.tile_m not in (16, 32):
-                return "SM120 paged KV split requires a decode tile (tile_m=16 or 32)"
-            if knobs is not None and knobs.tile_m not in (16, 32) and not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v):
-                return "SM120 paged KV head dims above 128 require a decode tile (tile_m=16 or 32)"
+            if (
+                knobs is not None
+                and (knobs.split_kv or 1) > 1
+                and knobs.tile_m not in (16, 32)
+                and _selected_d_shape(capabilities, facts, knobs) != D512_FLAVOR
+            ):
+                return "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or the D512 tile"
+            if knobs is not None and knobs.tile_m not in (16, 32) and not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, d512=True):
+                return "SM120 paged KV head dims above 128 require a decode tile (tile_m=16 or 32) or the D512 tile"
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
