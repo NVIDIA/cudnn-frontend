@@ -352,7 +352,8 @@ This qualification adds no backward support.
 Native SM107 half D64/D128 single-sequence THD origin setup retains forward
 O/Stats byte and batch invariance on the qualified runtime. Independent
 physical origins, changed strides/addresses, empty and keyless replay and the
-runtime multi-sequence fallback are covered by
+runtime multi-sequence fallback, including one capacity-4096 plan alternating
+between single and multiple sequences through shape overrides, are covered by
 `test_sdpa_single_sequence_setup_sm107.py`. The setup optimization is limited
 to nonpaged, unsplit uniform FP16/BF16; other supported paths retain their
 existing setup. Measurement details and runtime goldens are in the coverage

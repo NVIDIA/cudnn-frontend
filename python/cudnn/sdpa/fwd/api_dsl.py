@@ -4083,21 +4083,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     self.thd
                     and not self.thd_decode_leg
                     and not self._fp8
-                    # Qualified prefill variants: shared SM100 D128, native
-                    # Rubin D128 paging and native D64/D128 physical origins.
-                    and (
-                        (
-                            self.flavor == (128, 128)
-                            and ((self._device_cc == (10, 0) and self.dtype == torch.bfloat16) or (self._device_cc == (10, 7) and self.paged))
-                        )
-                        or (
-                            self._device_cc == (10, 7)
-                            and self.flavor in ((64, 64), (128, 128))
-                            and not self.paged
-                            and not self._mixed_fp8_kv
-                            and self.split_kv == 1
-                        )
-                    )
+                    and self.flavor == (128, 128)
+                    # Qualified prefill variants of the shared template.
+                    # Other variants keep their existing compiled record.
+                    and ((self._device_cc == (10, 0) and self.dtype == torch.bfloat16) or (self._device_cc == (10, 7) and self.paged))
                 )
             )
             and self.batch_size == 1,

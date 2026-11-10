@@ -5693,7 +5693,9 @@ def _host(
                 paged=PAGED_KV,
                 rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
                 release_dependents=THD_SETUP_PDL,
-                single_batch_fast=PARAMS.thd_batch_one and not PAGED_KV and PARAMS.dtype_kv < 0 and CFG.SPLIT_KV == 1,
+                # Runtime B selects the fast branch, including plans whose declared
+                # capacity is larger than the current invocation.
+                single_batch_fast=not PAGED_KV and PARAMS.dtype_kv < 0 and CFG.SPLIT_KV == 1,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_o_descs_kernel(

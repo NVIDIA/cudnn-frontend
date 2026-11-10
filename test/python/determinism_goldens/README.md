@@ -2122,8 +2122,10 @@ rebound addresses, retained CUDA Graph replay, keyless rows and empty work.
 Four byte tests use fixed CPU payloads and independent CPU FP64 O/Stats
 references before recording. They compare fresh storage/concurrent work,
 poisoned-workspace replay, B1 against B3/B5/B129, duplicate/reordered/empty
-sequences and changed-neighbor isolation. Two additional tests force the
-specialized template with runtime B4 and check the generic setup branch.
+sequences and changed-neighbor isolation. Each byte test now reuses one
+capacity-4096 plan through public shape overrides, then returns to B1 after
+multi-sequence bindings. Two additional tests use runtime B4 and check the
+generic setup branch without forcing a specialization.
 Stats negative infinity is permitted only as the keyless-row sentinel; the
 reference and canaries still check its location and all other output values.
 
@@ -2132,7 +2134,8 @@ DSL4.8 compiler13.4:14new cases passed, four new runtime goldens under
 `aa97de087283f297` were recorded, then all42 strict/control cases passed
 (14new+20dead-subtile+8existing D64 physical-origin controls), without skips.
 The strict run had recording unset and used the copied golden directory.
-Memcheck/racecheck/synccheck each passed10physical-origin/runtime-guard cases
+The final capacity-4096 qualification repeated all42strict/control cases
+(63.83s). Memcheck/racecheck/synccheck each passed all14new cases
 with zero errors or hazards. Memcheck was unfiltered; race/sync used
 `--kernel-name kns=cudnn_kernel_`; API-error reporting remained enabled.
 The generic multi-sequence setup body is AST-identical to the prior source.

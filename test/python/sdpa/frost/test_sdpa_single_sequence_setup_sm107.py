@@ -24,7 +24,6 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
     def compile_native(api):
         original(api)
         assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
-        assert api._k_mod.PARAMS.thd_batch_one
         observed.append(api.batch_size)
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
@@ -66,6 +65,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n):
     preserved = snapshot(source)
     qlens, klens = [129, 17, 0, 1], [257, 33, 0, 0]
     plans = {}
+    declared_batch = 4096
 
     def run(order):
         b = len(order)
@@ -85,8 +85,10 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n):
             for sequence, start in zip(order, origins[name]):
                 count = qlens[sequence] if name == "q" else klens[sequence]
                 flat[name][start : start + count].copy_(source[name][sequence, :count])
-        if b not in plans:
-            graph = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        if not plans:
+            graph = cudnn.pygraph(
+                io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True
+            )
             nodes = {name: graph.tensor_like(t) for name, t in values.items() if name not in ("o", "stats")}
             for name in ("q", "k", "v"):
                 nodes[name].set_ragged_offset(nodes["off_" + name])
@@ -105,6 +107,12 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n):
             nodes["stats"].set_output(True).set_dim((b, h, capacity, 1)).set_stride((capacity * h, 1, h, 1)).set_data_type(
                 cudnn.data_type.FLOAT
             ).set_ragged_offset(nodes["off_stats"])
+            # FlashInfer declares a large batch capacity and executes smaller
+            # batches through the same plan. Do not specialize on this envelope.
+            for name, node in nodes.items():
+                shape = list(node.get_dim())
+                shape[0] = declared_batch + int(name.startswith("off_"))
+                node.set_dim(shape)
             graph.validate()
             graph.build_operation_graph()
             graph.create_execution_plan(
@@ -123,17 +131,26 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n):
             assert compiled._prepared.spec.origin_specs is not None
             mod = compiled._compiled.kernel_module
             assert mod.__file__.endswith("sm107/prefill_d128_f16.py")
-            assert bool(mod.PARAMS.thd_batch_one) == (b == 1)
-            plans[b] = graph, nodes
-        graph, nodes = plans[b]
+            assert compiled._prepared.spec.b == declared_batch
+            plans["shared"] = graph, nodes
+        graph, nodes = plans["shared"]
         pack = {nodes[name]: value for name, value in values.items()}
         ws = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
-        graph.execute(pack, ws)
+        shapes = {name: list(value.shape) for name, value in values.items()}
+        strides = {name: list(value.stride()) for name, value in values.items()}
+        shapes["stats"] = [b, h, capacity, 1]
+        strides["stats"] = [capacity * h, 1, h, 1]
+        overrides = dict(
+            override_uids=[nodes[name].get_uid() for name in values],
+            override_shapes=[shapes[name] for name in values],
+            override_strides=[strides[name] for name in values],
+        )
+        graph.execute(pack, ws, **overrides)
         expected_bytes = snapshot({name: values[name] for name in ("o", "stats")}, allowed_inf={"stats": -torch.inf})
         capture = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.graph(capture):
-                graph.execute(pack, ws)
+                graph.execute(pack, ws, **overrides)
             values["o"].fill_(-17)
             values["stats"].fill_(-29)
             ws.fill_(255)
@@ -184,29 +201,24 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n):
     assert_bitwise({name: actual[name][qlens[1] :] for name in alone}, alone, "changed neighbor")
     source["q"][1].copy_(neighbor)
     preserved = snapshot(source)
+    assert_bitwise(run([0]), alone, "single sequence after multi-sequence bindings")
     assert_golden(f"sdpa-sm107-single-sequence-d{dim}-{dtype_name}-cga{cga}-pack{int(packed)}-n{tile_n}", source, alone, allowed_inf={"stats": -torch.inf})
 
 
 @pytest.mark.parametrize("dim", [64, 128])
 def test_single_sequence_runtime_batch_guard(dim, monkeypatch):
-    from dataclasses import replace
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
     from test_sdpa_fwd_thd_origins import test_independent_thd_origins_rebind_and_capture
 
-    params = SdpaFwdDslSm100.template_params
     compile_plan = SdpaFwdDslSm100.compile
     seen = []
 
-    def force_single(api):
-        return replace(params(api), thd_batch_one=True)
-
     def compiled(api):
         compile_plan(api)
-        assert api.batch_size == 4 and api._k_mod.PARAMS.thd_batch_one
+        assert api.batch_size == 4
         assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
         seen.append(api.batch_size)
 
-    monkeypatch.setattr(SdpaFwdDslSm100, "template_params", force_single)
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compiled)
     test_independent_thd_origins_rebind_and_capture(dim, "bfloat16", "token", True, False, 1, engine_name="sdpa_fwd_prefill_sm107", cga=1)
     assert seen
