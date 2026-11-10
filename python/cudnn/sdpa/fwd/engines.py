@@ -2331,6 +2331,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if (
             capabilities.sm_lo == 107
             and not capabilities.is_mxfp8
+            and not capabilities.is_fp8
             and not facts.thd
             and not d256_decode_tile_served(capabilities, facts, knobs)
             and not native_d192_paged_leg(capabilities, facts, knobs)
@@ -3048,13 +3049,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Native per-tensor FP8 page pools on SM100/103: D64, D128 and
-            # D256 use independent K/V block tables and pool strides. Dense Q,
+            # Native per-tensor FP8 page pools on SM100/103: D64, D128,
+            # D256 and D512 use independent K/V block tables and pool strides. Dense Q,
             # scalar-scaled O, padding/causal/windows, sink and legal KV splits
-            # compose with the loader. THD Q, block-scaled O and the Rubin
-            # siblings retain their existing declines.
-            paged_kv=not rubin_row,
-            paged_d_shapes=None if rubin_row else frozenset({(64, 64), (128, 128), (256, 256)}),
+            # compose with the loader. Native Rubin serves dense-Q D512 pools
+            # through its role-split pipeline. THD D512 and block-scaled O decline.
+            paged_kv=True,
+            paged_d_shapes=frozenset({(512, 512)}) if rubin_row else frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
             # Multi-wave launches are served: the former single_wave_only gate
             # (wrong O past one wave) was removed after the kernel's TMEM stats
             # race was fixed with the mb_stats_read barrier (verified on the

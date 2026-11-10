@@ -3280,15 +3280,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
-            # the d64/d128/d256 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
+            # the d64/d128/d256/d512 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
             # the unwired SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
-            # MXFP8 siblings, the d192x128 / d512 FP8 flavors, the d512
+            # MXFP8 siblings, the d192x128 FP8 flavor, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.  On cc 10.7: half pools serve THD queries
             # (native D128 or the remaining shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
-            # (the sm107 siblings' own PAGED_KV loader); per-tensor FP8 pools and dense
-            # half queries are not wired (engines.mismatch's Rubin clause is the twin).
+            # (the sm107 siblings' own PAGED_KV loader). Native per-tensor FP8 D512 serves
+            # dense Q over pools; other FP8 flavors retain their paging decline.
             # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and
             # folds the sink per Q row, so a decode-shaped half d256 graph is served paged on
             # cc 10.7 whatever its THD-ness or sink -- the same exception engines.mismatch makes
@@ -3297,8 +3297,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self._device_cc == (10, 7)
                 and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256)))
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
-                and not self._rubin_native_d192_paged_leg(),
-                "Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256, and decode-shaped half D256 graphs on the decode tile (per-tensor FP8 pools and other dense half queries are not wired)",
+                and not self._rubin_native_d192_paged_leg()
+                and not (self._fp8 and self._pertensor and not self.thd and self.flavor == (512, 512)),
+                "Rubin paged KV serves half THD queries, native half D192/V128, MXFP8 D128/D256, per-tensor FP8 D512 with dense Q, and decode-shaped half D256",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd and not (self._pertensor and self._device_cc in ((10, 0), (10, 3)) and self.flavor in SM100_PAGED_FP8_THD_SHAPES),
@@ -3309,8 +3310,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256)),
-                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self._pertensor and self.flavor not in ((128, 128), (64, 64), (256, 256), (512, 512)),
+                f"paged KV for per-tensor FP8 is wired on the d64 / d128 / d256 / d512 flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             self._not_implemented_error_if(
                 self._fp8 and not self._pertensor and self.flavor == (64, 64),

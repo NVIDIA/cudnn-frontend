@@ -69,7 +69,7 @@ def test_prepared_fp8_paged_rebind(d, hnd, split, in_key, dtype, monkeypatch):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [128, 256, 512])
 def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, d, monkeypatch):
     import cutlass.cute as cute
 
@@ -111,6 +111,7 @@ def test_prepared_fp8_paged_strides_and_capture(hnd, split, dtype, d, monkeypatc
             with torch.cuda.graph(graph, stream=stream):
                 g.execute(vp, ws, **overrides)
         torch.cuda.current_stream().wait_stream(stream)
+        bufs["k_table"].copy_(bufs["k_table"].flip(2))
         bufs["descale_v"].mul_(0.5)
         bufs["scale_o"].fill_(1.9)
         bufs["o"].fill_(float("nan"))

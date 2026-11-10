@@ -55,6 +55,19 @@ def test_replay_detects_changed_gradient_with_reused_storage():
         checks.assert_replays(launch, repeats=1)
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fp8_snapshot_checks_finiteness_without_changing_payload(dtype):
+    values = torch.tensor([0.0, -0.0, 1.0, -2.0]).to(dtype)
+    saved = checks.snapshot({"out": values})
+    assert saved["out"].dtype == dtype
+    checks.assert_bitwise(saved, {"out": values})
+    values.view(torch.uint8)[0] = 128
+    with pytest.raises(AssertionError, match="bytes differ"):
+        checks.assert_bitwise(saved, {"out": values})
+    with pytest.raises(AssertionError, match="non-finite"):
+        checks.snapshot({"out": torch.tensor([float("nan")]).to(dtype)})
+
+
 def test_infinity_sentinels_are_explicit_and_keep_sign_and_nan_checks(tmp_path, monkeypatch):
     outputs = {"lse": torch.tensor([torch.inf]), "max_logits": torch.tensor([-torch.inf])}
     allowed = {"lse": torch.inf, "max_logits": -torch.inf}

@@ -166,6 +166,100 @@ empty-row locations. Snapshots own their storage. Helper controls reject
 changed signed zeros, NaN payloads, missing gradients, wrong infinity signs,
 and golden mutations.
 
+## D512 FP8 paged forward — SM100 validation, 2026-11-09 (UTC)
+
+This addition covers `pygraph.sdpa_fp8` through the FROST SM100/SM103 D512
+forward body, with dense Q and native paged K/V. It adds no backward path.
+Numerics are unchanged from the existing D512 FP8 arithmetic; the new
+eligibility and page addressing had no earlier golden. No existing golden
+was replaced.
+
+The eight L0 determinism cases in
+`sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py` comprise four replay/batch
+cases and four corresponding goldens: E4M3→BF16, E4M3→E4M3, E5M2→FP16 and
+E5M2→E5M2, with split counts 1/4, NHD/HND pools and PackGQA. Each target's
+quantized Q/K/V and FP32 scale bytes stay fixed across batches of 1, 3, 5
+and 129 requests, reordered/duplicated targets and changed neighbors. Every
+call binds fresh buffers and workspace. Repeated calls include queued work
+on a separate stream; actual overlap is not measured. O and Stats are compared
+per sequence; Amax is compared on repeated identical batches and checked
+against the whole-batch numerical reference otherwise. Input bytes must remain
+unchanged. The independent reference dequantizes the operands and computes
+attention in Torch; it is separate from raw-byte comparisons.
+
+The adjacent paging tests cover page sizes 8/16/32/64/128/256, query lengths
+1/2/16/257, empty and partial KV pages, Q trimming, causal/window masks,
+sinks with and without split, separate K/V tables and independently selected
+pool layouts, D384/V320 head padding, runtime stride rebinding and changed
+page/scalar CUDA Graph replay. Dense/THD controls exercise the existing
+unpaged D512 implementation.
+
+Measured on an SM100 development GPU with 148 SMs, driver API 13020,
+Torch 2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 (CUDA 12.9 compiler),
+TVM FFI 0.1.14.post1, Python 3.10.12, and FE `868b3ca` plus this patch.
+Imports resolved to the isolated checkout's `python/cudnn`. SM103 was
+unavailable and remains unverified. SM90/SM107 do not admit this D512 FP8
+paged path. Source qualification does not establish cross-GPU byte equality.
+
+| Run | Passed | Failed | Skipped |
+| --- | --- | --- | --- |
+| Prepared D128/D256/D512 replay, four D512 batch cases, admission, comparator controls | 37 | 0 | 0 |
+| New goldens recorded into an empty candidate directory after reference/replay | 4 | 0 | 0 |
+| Strict golden check plus final page-boundary/envelope cases, recording unset | 16 | 0 | 0 |
+| Existing dense/THD D512 capture and graph split controls | 40 | 0 | 0 |
+| Compute Sanitizer memcheck, final page-boundary/envelope cases | 8 | 0 | 0 |
+| Compute Sanitizer synccheck, same cases | 8 | 0 | 0 |
+| Compute Sanitizer racecheck, page8 single-Q and page128 persistent/window cases | 2 | 0 | 0 |
+
+These rows describe separate runs; shared cases are not additional coverage.
+The first D512 prepared paging case fails on the unchanged parent because
+there is no FROST candidate. During test development, shrinking a declared
+split-plan batch was rejected by its existing contract; the batch tests now
+build a plan for each batch size. Torch's absent FP8 `isfinite` implementation
+also required the shared snapshot helper to promote only its finiteness
+predicate, while preserving original FP8 snapshots and byte comparisons.
+Two comparator controls cover payload preservation, signed zero and NaN
+rejection. Neither issue was waived with a skip or weakened byte comparison.
+
+Run from `test/python`, with `PYTHONPATH` pointing to the checkout:
+
+```bash
+python -m pytest sdpa/frost/test_sdpa_prepared_fp8_paged.py::test_prepared_fp8_paged_strides_and_capture \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_d512_paged_replay_and_batch_invariance \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_declines_off_contract \
+  core/test_determinism_utils.py -x -q
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_d512_boundaries \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_d512_head_envelope -x -q
+python -m pytest sdpa/frost/test_sdpa_prepared_fp8.py::test_prepared_fp8_capture_replay_reads_current_scales \
+  sdpa/frost/test_sdpa_fp8_d512_graph_split.py -k 512 -x -q
+```
+
+Memcheck and synccheck each report **0 errors**; racecheck reports **0 hazards**
+(0 errors, 0 warnings) for its two selected boundary cases. Their process uses isolated
+`cuda-bindings==13.2.0`, matching driver API 13020, with all API diagnostics
+enabled. An initial memcheck with the environment's 13.4.1 bindings reported
+40 API-resolution errors (13.3/13.4 requests to the 13.2 driver), while its
+8 numerical tests passed; it was not counted as a clean sanitizer run.
+No kernel memory error was reported. Reproduce with the runtime above:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 99 python -m pytest \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_d512_boundaries \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_d512_head_envelope -x -q
+# Repeat with --tool synccheck. For racecheck, add -k '8-1-1-True or 128-257'.
+```
+
+The paged kernel launch explicitly retains its register split. The emitted
+SM100 SASS contains `USETMAXREG.TRY_ALLOC` with 240 registers and
+`USETMAXREG.DEALLOC` with 40; the original launch without the occupancy hint
+had no register-split instructions. Dense launch geometry is unchanged.
+
+The four new records are under runtime key `ef27de8cf1fd96d2`. Recording used
+`CUDNN_DETERMINISM_RECORD` with a new temporary directory and `-k golden`;
+the separate strict run used the committed records with recording unset.
+
 ## How to read the test cases
 
 A **suite** is one operation's test class. A **case** is one collected pytest
@@ -1014,6 +1108,62 @@ python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py 
 ```
 
 The CUDA 12 compiler flavor was unavailable and remains unverified.
+
+### 2026-11-09: native SM107 per-tensor FP8 paged D512
+
+`TestNativeD512Fp8Paged` in `sdpa/frost/test_sdpa_fp8_sm107.py` exercises
+the native SM107 role-split kernel and the shared prepared binding. The
+implementation was based on `fc4490c88557` (the SM100/SM103 paging addition),
+with matching FE 1.33.0 bindings rebuilt for Python 3.12.12. Runtime:
+Torch 2.14.1+cu130, cuDNN 9.30.0.2, CuTe DSL 4.8.0 (CUDA 13.4 compiler).
+The imported package was the isolated qualification source, not an editable
+installation of another checkout.
+
+Coverage includes E4M3/E5M2 inputs, BF16/FP16/scalar-FP8 outputs, FLOAT and
+HALF softmax, page8/16/32/64/128/256, independent K/V page tables and pool
+layouts, runtime strides, fresh buffers, changed-page/scale capture replay,
+empty and partial pages, causal/windows/sinks, split1/4, whole-group packing,
+and the aligned D384/V320 envelope with poisoned storage padding. Capability
+checks retain the smaller FP8 flavors', half/MXFP8 D512 and THD-Q declines.
+
+Six golden records in `0972294c7bd4a660/` cover four FLOAT and two HALF
+softmax configurations. Quantized payloads and scale bytes stay fixed across
+sequences alone, reordered, duplicated and mixed with changed neighbors,
+including 129-request multi-wave batches. O/Stats are compared as raw bytes
+per sequence; whole-batch Amax is compared on identical repeated batches and
+against the independent numerical reference, not misclassified as a per-row
+output. Inputs and prepared owners are checked for unintended mutation.
+
+Commands from the isolated `test/python` directory:
+
+```bash
+# After independent-reference/replay qualification, record into a fresh directory:
+CUDNN_DETERMINISM_RECORD=/path/to/new-records python -m pytest \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Paged -k golden -q
+# Inspect/copy the six JSON records, then leave RECORD unset:
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Paged -q
+```
+
+Measured: 31 feature/strict-golden cases passed, with no failures or skips.
+The existing native D512 Pack/Split suites additionally passed 32 selected
+FLOAT-softmax controls (`-k 'not rebind_and_replay and not half_adapter'`).
+One earlier HALF-adapter control reached its reference's FP64 `torch.exp2`
+and failed because the installed NVRTC rejected the SM107 target; this
+reference-environment failure is retained, not counted as a kernel pass.
+The new HALF paging, replay and batch-invariance checks pass independently.
+
+Compute Sanitizer 13.4.92: eight boundary/head-envelope cases under memcheck,
+the same eight under synccheck, and two page8/page128 persistent cases under
+racecheck; no memory/synchronization errors or race hazards. The older
+13.2 sanitizer reported an unsupported device and is not a qualifying run.
+No backward capability or other architecture's status is inferred from this
+SM107 execution. No heuristics ranking changed.
+
+The paged launch's generated SM107 cubin was also checked with nvdisasm
+13.5.37: exactly one `USETMAXREG.DEALLOC` at 40 registers and one
+`USETMAXREG.TRY_ALLOC` at 240. All four service warps release before role
+branching. Dense launch/register behavior is unchanged.
 
 ## Simplified sparse attention — 2026-11-09
 
