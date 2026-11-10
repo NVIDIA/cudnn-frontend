@@ -2204,8 +2204,7 @@ cases, including all nine Hq/top-k forward/backward reference combinations,
 selected-support numerics, tails, invalid configurations, and capture rejection.
 This used PyTorch/cuDNN built for CUDA 13; it qualifies the DSL compiler
 flavor, not a deployment using CUDA 12 throughout. The loaded native libraries
-were `cutlass/_mlir/_mlir_libs/_cutlass_ir.cu12.cpython-312-x86_64-linux-gnu.so`
-and `cutlass/_mlir/_mlir_libs/_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so`
+were the cu12 and cu13 compiler extensions under `cutlass/_mlir/_mlir_libs/`
 in separate environments. SM103, long-path CUDA 12 compilation, and newer DSL
 versions remain unverified. The actual DSL 4.7.1 runtime rejects this API before
 kernel import. A missing PyTorch conditional-graph entry also rejects before
@@ -2307,9 +2306,8 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 
 In a separate installed-wheel environment, CuTe DSL 4.8.0's CUDA 12.9 compiler
 passed **23 JAX cases, 0 failed, 0 skipped**: all 21 public cases plus both long
-Hq16 filtered-repair cases. The loaded native library was
-`_cutlass_ir.cu12.cpython-312-x86_64-linux-gnu.so`; the CUDA 13.4 run loaded
-`_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so`. Each flavor used a fresh
+Hq16 filtered-repair cases. The loaded native libraries under `cutlass/_mlir/_mlir_libs/` used the cu12
+and cu13 flavors, respectively. Each flavor used a fresh
 process and its own initially empty DSL cache. PyTorch, JAX, and cuDNN still
 use CUDA 13 packages, so this is compiler compatibility, not a full CUDA 12
 deployment. CUDA 12 bytewise determinism and SM103 execution remain unverified.
@@ -2499,9 +2497,9 @@ not establish determinism.
 
 Runtime: SM100, 148 SMs, driver 610.11 / CUDA driver API 13.3; Python 3.12.12,
 frontend 1.33.0, PyTorch 2.13.0+cu130, cuDNN 9.27.0, CuTe DSL 4.8.0,
-TVM FFI 0.1.13.post2. Separate environments loaded
-`_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so` with compiler CUDA 13.4
-and `_cutlass_ir.cu12.cpython-312-x86_64-linux-gnu.so` with compiler CUDA 12.9.
+TVM FFI 0.1.13.post2. Separate environments loaded native compiler extensions from
+`cutlass/_mlir/_mlir_libs/`: the cu13 flavor reported compiler CUDA 13.4
+and the cu12 flavor reported compiler CUDA 12.9.
 Each installed-wheel lane used a fresh process and separate empty DSL/driver
 cache directories. Imports resolved to the corresponding environment's
 `site-packages/cudnn`, not the editable checkout.
@@ -2537,7 +2535,7 @@ values per compiler lane:
 ```sh
 CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
-../../../.venv-wheel/bin/python -m pytest \
+python -m pytest \
   simplified_sparse_attention/cutedsl/test_dense_indexer_kl.py \
   simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
   simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_lazy_imports \
@@ -2547,8 +2545,57 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 
 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
-../../../.venv-cu12/bin/python -m pytest \
+python -m pytest \
   simplified_sparse_attention/cutedsl/test_dense_indexer_kl.py \
   simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
   -m L0 -q -s -rxX --tb=short
 ```
+
+## Simplified sparse attention: offset and CI regressions (2026-11-10)
+
+The triangular score producer and top-k consumer now widen operands before
+workspace products. The tile decoder derives its upper bound from the query
+extent. `test_triangular_offsets.py` extracts the production expressions and
+checks them with fixed-width host scalars and native CuTe probes. Rows span
+0 through 262143, including the 64K overflow boundary; decoder cases cover
+1, 512, 1024, 1025 and 2048 blocks. The probes write offsets to small output
+arrays and never dereference the large addresses.
+
+The unfixed code produced **13 failed, 12 passed** in the 25-case regression
+selection. The fixed code produced **25 passed** on SM100 with the CUDA 13.4
+compiler. This selection also checks that public JAX exports remain inspectable
+with a modeled DSL 4.7.1 while execution still rejects before kernel import,
+and that all Torch/JAX test transfers enter the tensor's device context.
+Three public triangular cases additionally passed numerical forward/backward
+checks and forward replay across two tiles, for H16/K512, H32/K1024 and
+H96/K2048. These checks do not establish backward determinism.
+
+CI also measured a one-byte scalar-loss mismatch for packed H16/K512 forward
+on SM100 with PyTorch 2.14.0a0 and CUDA 13.4. It passed numerical checks before
+failing byte comparison. The earlier local H16 pass does not establish batch
+invariance; the support page retains the replay-only status.
+
+The installed-wheel API-index suite passed all 11 tests with actual DSL 4.7.1
+and all 11 with DSL 4.8.0. Direct execution under 4.7.1 still raises the
+4.8 requirement before loading SSA kernel modules. No API baseline names were
+removed. The guard-word scan passed all 214 rules on the tracked source tree.
+The rebuilt wheel contains all 35 operation Python modules, NOTICE and
+contributors.md with bytes identical to the checkout.
+
+The full installed-wheel CUDA 13.4 run reported **242 passed, 1 failed,
+1 skipped, 34 xfailed** in 833.79 s. Its sole failure was a test-side stream
+race in `test_reserved_state_at_its_maxima`: the side stream consumed zero
+queries before the caller stream finished producing them. The test now waits
+on the producer and delays that producer to expose a missing dependency.
+It passed in 23.69 s; removing only the wait failed again in 24.52 s. No
+kernel, tolerance or expected-failure rule changed for this test repair.
+The skipped case needs two GPUs; its device-context control passed on this
+single-GPU host. All existing goldens remain unchanged. The H16 CI packed-loss
+case remains a strict byte comparison.
+
+Runtime: SM100, 148 SMs, driver 610.11, frontend 1.33.0, Python 3.12.12,
+PyTorch 2.13.0+cu130, JAX/JAXlib 0.11.0, cuDNN 9.27.0, CuTe DSL 4.8.0
+and TVM FFI 0.1.13.post2. Imports resolved to the installed wheel. Its SHA256
+is `52b1d3f198e09e6ece095ceb454b9469666643c870249becf01f676137c03a86`.
+SM103 and actual multi-GPU execution remain unverified. External CUDA graph
+capture remains unsupported; the existing rejection tests still pass.

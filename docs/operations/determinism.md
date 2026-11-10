@@ -114,7 +114,9 @@ a row alone and inside a batch under the entry's own picks.
   512/1024/2048, plus an Hq16 scheduling-boundary case. Long filtered-indexer
   batch invariance and saved internal statistics are unverified. PyTorch host-thread
   isolation is checked for dense and filtered repair calls on shared and separate streams.
-  Moving packed rows changes the scalar loss bytes for Hq32/top-k1024 and Hq96/top-k2048.
+  Triangular two-tile forward replay is checked at all three head counts.
+  Moving packed rows changes the scalar loss bytes for Hq32/top-k1024 and
+  Hq96/top-k2048. CI also found this for PyTorch Hq16/top-k512.
   Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
 

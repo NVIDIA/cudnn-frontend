@@ -638,7 +638,7 @@ def _bwd_kernel(
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_mbarrier_arrive_noinc(mbar + 4)
 
-            trDPc = thr_s.partition_S(_dp_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
+            tr_dp_column = thr_s.partition_S(_dp_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
             trSc = thr_s.partition_S(_p_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
             tr_PcD = thr_pst.partition_D(_p_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
             for j in cutlass.range_constexpr(HQ // 8):
@@ -649,7 +649,7 @@ def _bwd_kernel(
                     rPsum = cute.make_rmem_tensor(tr_cPst[None, None, 0].shape, F32)
                     oPd = cute.make_rmem_tensor(cute.make_layout((1, 8)), BF16)
                     cute.copy(cp_s, trSc[None, None, j], rSd)
-                    cute.copy(cp_s, trDPc[None, None, j], rDPd)
+                    cute.copy(cp_s, tr_dp_column[None, None, j], rDPd)
                     for e in cutlass.range_constexpr(0, 8, 2):
                         h0 = j * 8 + e
                         h1 = h0 + 1
@@ -990,7 +990,7 @@ def _bwd_kernel(
 
             # ---- cached exact-FP32 P / dS ----
             trPc = thr_s.partition_S(_p_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
-            trDPc = thr_s.partition_S(_dp_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
+            tr_dp_column = thr_s.partition_S(_dp_tile(tmem_ptr, tS_f.layout, c)[(None, None), 0, 0])
             if tidx == 0:
                 sPath[1] = I32(0)
                 sPath[2] = I32(0)
@@ -1001,7 +1001,7 @@ def _bwd_kernel(
                     rP = cute.make_rmem_tensor(tr_cS[None, None, 0].shape, F32)
                     rDP = cute.make_rmem_tensor(tr_cS[None, None, 0].shape, F32)
                     cute.copy(cp_s, trPc[None, None, j], rP)
-                    cute.copy(cp_s, trDPc[None, None, j], rDP)
+                    cute.copy(cp_s, tr_dp_column[None, None, j], rDP)
                     oS = cute.make_rmem_tensor(cute.make_layout((1, 8)), F16)
                     oSB = cute.make_rmem_tensor(cute.make_layout((1, 8)), BF16)
                     oSBL = cute.make_rmem_tensor(cute.make_layout((1, 8)), BF16)

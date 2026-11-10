@@ -3968,7 +3968,7 @@ class GvrTopkRegKernel:
                         if mc <= qc:
                             quad = cutlass.Int32(1)
                     if quad == cutlass.Int32(1):
-                        # O(mc^2) index-tie-broken rank
+                        # O(mc^2) rank with index tie order
                         i = tid
                         while i < mc:
                             uq = cutlass.Uint32(ck[i])
@@ -5988,7 +5988,7 @@ class GvrRegClusKernel:
                     if degen == cutlass.Int32(0):
                         if mc <= cutlass.Int32(QUADC__regclus):
                             # (1) quad-96: all candidates LOCAL (96 < CMPC),
-                            # O(mc^2) slot-order tie-broken rank
+                            # O(mc^2) rank with slot tie order
                             i = tid
                             while i < mc:
                                 uq = cutlass.Uint32(s_ck[i])

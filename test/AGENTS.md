@@ -1288,6 +1288,11 @@ Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
 both packings classify the same element, but the token-major binder requires
 exact strides, so the wrapper must retain the head-major ABI for unused pitches.
 
+For Torch/JAX DLPack transfers, select the tensor's CUDA device during conversion
+and restore the caller's device afterward. Cover values, metadata, gradients and
+reverse transfers. The simplified sparse attention JAX suite checks the context
+guard and runs with another GPU current when two devices are available.
+
 For JAX device-target admission, test zero-argument JIT closures that capture every
 operand as well as fully and partially traced inputs. Concrete captured arrays do
 not pin execution placement; detect the active trace independently of operand

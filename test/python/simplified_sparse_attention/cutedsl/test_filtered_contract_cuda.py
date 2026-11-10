@@ -253,6 +253,7 @@ def test_reserved_state_at_its_maxima():
     def select(q_idx, stream):
         ids = torch.empty((tq, topk), dtype=torch.int32, device=device)
         prob = torch.empty((tq, topk), dtype=torch.float32, device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             fused.run_fused_filtered(q_idx, k, ids, prob, starts, ends)
         torch.cuda.synchronize(device)
@@ -267,7 +268,12 @@ def test_reserved_state_at_its_maxima():
     # Distinct scores: slack-free storage selects what headroom storage selects.
     torch.testing.assert_close(select(q, reserved), select(q, plain), rtol=0, atol=0)
     # Zero indexer queries tie every score, so every row takes exact repair.
-    ids, _ = select(torch.zeros_like(q), reserved)
+    tied_q = q.clone()
+    torch.cuda.synchronize(device)
+    # Delay the producer so a missing side-stream wait reads the prior scores.
+    torch.cuda._sleep(50_000_000)
+    tied_q.zero_()
+    ids, _ = select(tied_q, reserved)
     assert int(state["flags"][0].item()) == tq
     assert fused._state_filtered[key] is state and state["fallback_graphs"]["compact"] is graph
     assert bool(((ids >= starts[:, None]) & (ids < ends[:, None])).all().item())

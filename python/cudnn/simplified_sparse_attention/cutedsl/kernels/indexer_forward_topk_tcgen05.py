@@ -49,10 +49,10 @@ def _score_kernel_tcgen05(
     n_tile: cutlass.Constexpr = BLK,
 ):
     # tri_rows: mS is the flat triangular ROW-CONTIGUOUS workspace the
-    # vendored DKG top-k consumes: global row r = bi*BLK+rr starts at element
+    # vendored top-k consumes: global row r = bi*BLK+rr starts at element
     # tri(bi)*BLK*BLK + rr*(bi+1)*BLK and is fully linear (CP1 causal square).
     # rect: mS is a plain row-major dense (q_pad, k_pad) fp32 workspace (CP /
-    # Tq != Tk path; DKG consumes it as a standard 2D input). Launched on a
+    # Tq != Tk path). Top-k consumes it as a standard 2D input. Launched on a
     # 2D grid (k_nblk, q_nblk); k_pad is derived from grid_dim.
     # neither: legacy block-compressed (nblocks, BLK, BLK) layout.
     tidx, _, _ = cute.arch.thread_idx()
@@ -82,15 +82,15 @@ def _score_kernel_tcgen05(
         blk, _, _ = cute.arch.block_idx()
         # ---- triangular unravel: blk -> (bi, bj), bj <= bi ----
         lo = I32(0)
-        hi = I32(1023)  # upper bound on bi; plain binary search
+        hi = I32(cute.size(mQ, mode=[0]) // BLK - 1)
         while lo < hi:
             mid = (lo + hi + I32(1)) // 2
-            if (mid * (mid + I32(1))) // 2 <= blk:
+            if (cutlass.Int64(mid) * (mid + I32(1))) // 2 <= blk:
                 lo = mid
             else:
                 hi = mid - I32(1)
         bi = lo
-        bj = blk - (bi * (bi + I32(1))) // 2
+        bj = I32(cutlass.Int64(blk) - (cutlass.Int64(bi) * (bi + I32(1))) // 2)
 
     smem = utils.SmemAllocator()
     # one raw 64KB region: Q tile (32KB) + K tile (32KB); after the MMA
@@ -191,7 +191,7 @@ def _score_kernel_tcgen05(
         # rect: n_tile == 256. Stage each 128x128 fp32 half (the TMEM column
         # halves have exactly a 128-wide accumulator's layout at col offsets
         # 0/128 -- the spmm dual-accumulator trick), then TMA-bulk-store it.
-        # The DKG dense_gemm sweep on this exact problem shape measured the
+        # The dense_gemm sweep on this exact problem shape measured the
         # store path as THE bottleneck: 128x256+TMA 308us vs 1371us without
         # (N=32K); plain vec4 stores from smem cost us 464us.
         tSh_f = S_mma_h.make_fragment_C(S_mma_h.partition_shape_C((BLK, BLK)))
@@ -242,8 +242,8 @@ def _score_kernel_tcgen05(
         # tile (bi, bj) lands at rows base(bi) + rr*(bi+1)*BLK, col bj*BLK.
         # Consecutive threads cover consecutive float4s of one row-slice
         # (32 threads x 16B = 512B contiguous) -> fully coalesced.
-        row_stride = (bi + I32(1)) * I32(BLK)
-        base_elems = (bi * (bi + I32(1)) // 2) * I32(BLK * BLK) + bj * I32(BLK)
+        row_stride = (cutlass.Int64(bi) + 1) * BLK
+        base_elems = (cutlass.Int64(bi) * (bi + 1) // 2) * (BLK * BLK) + cutlass.Int64(bj) * BLK
         for i in cutlass.range_constexpr(BLK * BLK // 4 // THREADS_SCORE):
             idx = i * THREADS_SCORE + tidx
             rr = idx // (BLK // 4)
@@ -268,8 +268,8 @@ def _score_kernel_tcgen05(
     tmem.free(tmem_ptr)
 
 
-class SimplifiedSparseScoreDkg:
-    """Score-only launcher feeding the vendored DKG top-k: triangular
+class SimplifiedSparseScore:
+    """Score-only launcher feeding the vendored top-k: triangular
     row-contiguous workspace for the CP1 causal square, plain row-major dense
     for the rectangular CP path."""
 
@@ -312,7 +312,7 @@ class SimplifiedSparseScoreDkg:
             )
         else:
             # rect: 128x256 MMA tiles + TMA-store epilogue (128x128 fp32
-            # halves) -- the winning config from the DKG dense_gemm sweep on
+            # halves) -- the winning config from the dense_gemm sweep on
             # this problem shape (2737us vs our 4753us at Tk=256K).
             NT = 256
             S_mma_w = sm100_utils.make_trivial_tiled_mma(BF16, BF16, OperandMajorMode.K, OperandMajorMode.K, F32, tcgen05.CtaGroup.ONE, (BLK, NT))
@@ -377,7 +377,7 @@ def run(
     topk_impl: str = None,
     topk_overflow_policy: str = "REREAD_ALWAYS",
 ):
-    """Rectangular SSA indexer: tcgen05 score + DKG top-k.
+    """Rectangular SSA indexer: tcgen05 score + top-k.
 
     Same contract as the baseline module: local Q rows against globally
     addressed K with explicit per-row ``[start, end)`` bounds; selected IDs
@@ -403,7 +403,7 @@ def run(
     if fusion not in ("auto", "off", "filtered"):
         raise ValueError(f"unknown fusion: {fusion}")
     if topk_overflow_policy != "REREAD_ALWAYS":
-        raise ValueError("SSA DKG top-k requires topk_overflow_policy='REREAD_ALWAYS'; " "the conditional REREAD overflow branch is not exact")
+        raise ValueError("SSA top-k requires topk_overflow_policy='REREAD_ALWAYS'; " "the conditional REREAD overflow branch is not exact")
     if fusion == "auto":
         fusion = "filtered" if not triangular and k_idx.shape[0] >= _FILTERED_MIN_KEYS else "off"
     if fusion == "filtered":
@@ -412,7 +412,7 @@ def run(
         return run_fused_filtered(q_idx, k_idx, topk_indices, predict, key_starts, key_ends)
 
     # score_impl knob: "native" (default; the hand-written tcgen05 kernel) or
-    # "dense_gemm" (vendored DKG DenseGemmKernel at the sweep-winning config
+    # "dense_gemm" (vendored DenseGemmKernel at the sweep-winning config
     # 128x256 + TMA store; rect only). Env SSA_SCORE_IMPL overrides when the
     # caller does not pass the kwarg (the caller does not).
     if score_impl is None:
@@ -501,7 +501,7 @@ def run(
             stream = _cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             score_compiled = cute.compile(gemm, a_c, b_c, c_c, stream, lambda x: x * SCALE)
         else:
-            op = SimplifiedSparseScoreDkg(query_pad, key_pad, triangular)
+            op = SimplifiedSparseScore(query_pad, key_pad, triangular)
             score_compiled = cute.compile(
                 op,
                 from_dlpack(q, assumed_align=16, enable_tvm_ffi=True),
@@ -537,26 +537,20 @@ def run(
         topk_input = st["ws"]
     else:
         # standard 2D row-major input; slice off the padded query rows so the
-        # DKG grid matches query_len exactly (the slice stays compact)
+        # grid matches query_len exactly (the slice stays compact)
         topk_input = st["ws"][:query_len]
-    # topk_impl knob: "dkg" (vendored DKG filtered top-k), "gvr" (vendored GVR
-    # self-sampling top-k -- exact, fully on-device via gvr_sort_predict), or
-    # "auto" (default) remains on DKG. The direct GVR kernel shifts each row's
-    # fp32 base by key_starts[r] before float4 loads, so arbitrary packed-THD
-    # starts can violate its 16-byte alignment requirement. There is no
-    # synchronization-free host predicate that can prove every device start
-    # aligned; fail closed instead of risking a context-poisoning launch.
-    # Filtered fusion may still explicitly qualify GVR on its compact,
-    # allocator-aligned candidate matrix via SSA_FILTERED_SELECT=gvr.
+    # Direct GVR shifts each row by key_starts[r] before float4 loads.
+    # Packed starts may lack 16-byte alignment; use filtered top-k by default.
+    # Filtered fusion can select GVR for its aligned candidate matrix.
     if topk_impl is None:
         topk_impl = os.environ.get("SSA_TOPK_IMPL", "auto")
-    if topk_impl not in ("dkg", "gvr", "auto"):
+    if topk_impl not in ("filtered", "gvr", "auto"):
         raise ValueError(f"unknown topk_impl: {topk_impl}")
     if topk_impl == "auto":
-        topk_impl = "dkg"
+        topk_impl = "filtered"
     if topk_impl == "gvr":
         raise ValueError(
-            "SSA direct GVR top-k is unsupported for the arbitrary packed-THD " "key-start contract; select topk_impl='dkg' or use filtered fusion"
+            "SSA direct GVR top-k is unsupported for the arbitrary packed-THD " "key-start contract; select topk_impl='filtered' or use filtered fusion"
         )
     cute_dsl_topk_prefill_wrapper(
         topk_input,

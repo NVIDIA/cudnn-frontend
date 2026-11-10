@@ -41,6 +41,24 @@ def test_public_forward_backward_reference(heads, topk):
 
 
 @pytest.mark.usefixtures("supported_gpu")
+@pytest.mark.parametrize("heads,topk", [(16, 512), (32, 1024), (96, 2048)])
+def test_triangular_tiles_reference_and_replay(heads, topk):
+    from dataclasses import replace
+    from determinism_utils import assert_replays
+
+    tensors, metadata, upstream = pack([sample(129, heads), sample(17, heads, seed=31)])
+    inputs = tensors, replace(metadata, triangular_scores=True), upstream
+    check_reference(inputs, run(inputs, backward=True, topk=topk), backward=True, topk=topk)
+
+    def forward():
+        actual = run(inputs, topk=topk)
+        check_reference(inputs, actual, topk=topk)
+        return actual
+
+    assert_replays(forward)
+
+
+@pytest.mark.usefixtures("supported_gpu")
 @pytest.mark.parametrize("key_length", [1024, 131072], ids=["dense", "filtered-repair"])
 @pytest.mark.parametrize("stream_mode", ["default", "shared-side", "separate"])
 def test_host_threads_share_stream(monkeypatch, key_length, stream_mode):
@@ -211,6 +229,25 @@ def test_old_dsl_fails_before_kernel_import(monkeypatch):
     monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
     with pytest.raises(ImportError, match="found 4.7.0"):
         simplified_sparse_attention_reserve(128, 256, 512)
+
+
+def test_jax_old_dsl_allows_inspection_but_rejects_execution():
+    pytest.importorskip("jax")
+    script = """
+import sys
+from cudnn.frost import buffers
+buffers.cutedsl_state = lambda: (True, ("nvidia-cutlass-dsl", "4.7.1"))
+from cudnn.ops import simplified_sparse_attention_jax
+try:
+    simplified_sparse_attention_jax(*([None] * 9))
+except ImportError as error:
+    assert "4.8.0" in str(error) and "found 4.7.1" in str(error), str(error)
+else:
+    raise AssertionError("Unsupported DSL reached execution")
+assert not any(name.startswith("cudnn.simplified_sparse_attention.cutedsl.kernels.") for name in sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.usefixtures("supported_gpu")

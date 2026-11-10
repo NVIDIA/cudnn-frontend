@@ -11,10 +11,6 @@ import jax.numpy as jnp
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-_error = cutedsl_requirement_error("simplified_sparse_attention_jax", floor=(4, 8, 0))
-if _error:
-    raise ImportError(_error)
-
 from cudnn.jax import call, gemm_operand_spec, zeros_init
 from .cutedsl import jax_kernels as kernels
 
@@ -247,5 +243,8 @@ def simplified_sparse_attention_jax(
     loop for exact repair of failed rows.
     """
     arrays = (query, key, value, q_idx, k_idx, key_starts, key_ends, query_valid, loss_denominator)
+    error = cutedsl_requirement_error("simplified_sparse_attention_jax", floor=(4, 8, 0))
+    if error:
+        raise ImportError(error)
     config = _configuration(arrays, topk, loss_coeff, triangular_scores)
     return _attention(*arrays, topk, float(loss_coeff), triangular_scores, config)

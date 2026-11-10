@@ -3,7 +3,7 @@
 
 """Top-k ids stay inside each row's key bounds when indexer keys hold NaN/Inf (SM103).
 
-The vendored DKG top-k's float-compare classifier (``boundary_classify``)
+The vendored top-k's float-compare classifier (``boundary_classify``)
 dropped non-finite and exact +0.0 K-th scores and left output slots
 unwritten. SSA disables it on its exact top-k calls, so every value follows
 the integer key order. Output buffers start as a sentinel, so an unwritten

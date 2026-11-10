@@ -33,7 +33,7 @@ D = 128
 # tensors and passes it as a constexpr through the complete kernel family.
 TOPK = int(os.environ.get("SSA_TOPK", "512"))
 # Scatter probe window, in stream positions per row per pass; must be a
-# multiple of the 4 lanes that share a row.  Swept 4/8/16/32 on GB110 at
+# multiple of the 4 lanes that share a row.  Swept 4/8/16/32 at
 # 8Kx8K: 16 is the minimum at both TOPK=512 (0.2229/0.2201/0.2175/0.2214
 # ms) and TOPK=2048 (0.4039/0.3769/0.3585/0.3671 ms) -- deeper windows
 # issue more independent loads per round trip, past 16 the wasted
@@ -122,7 +122,7 @@ SPLIT_RECT_QP = SPLIT_RECT * QPAIR
 # ratio.  The tile kernel scans the whole Tk domain, so its work is
 # proportional to Tq * Tk; the gather kernel walks the selected set, so its
 # work is proportional to Tq * TOPK.  The crossover therefore sits at a fixed
-# RATIO, not at a fixed Tk.  Re-measured on GB110 at Tq=8192 after the gather
+# RATIO, not at a fixed Tk.  Re-measured at Tq=8192 after the gather
 # pipeline optimizations (full aux pipeline, six interleaved rounds of 100
 # CUDA-event samples): gather is 27-34 percent slower at Tk/TOPK=32 but
 # 2-7 percent faster at 48 and 23-28 percent faster at 64.  Use 48, the

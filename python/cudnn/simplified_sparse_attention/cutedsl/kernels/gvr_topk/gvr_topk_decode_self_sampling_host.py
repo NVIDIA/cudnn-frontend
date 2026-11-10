@@ -57,7 +57,7 @@ _dev_mod = None
 
 def _device():
     """Lazy import of the merged device module (first routed shape compiles;
-    a broken/absent device module only fails when actually reached)."""
+    a invalid/absent device module only fails when actually reached)."""
     global _dev_mod
     if _dev_mod is None:
         try:
@@ -939,7 +939,7 @@ Error contract: launch failures surface as exceptions WITH
 (b, n, npad, k) context.
 
 The device module is imported LAZILY (first shape that routes to it), so a
-missing/broken module only fails when actually reached, with (b, n, npad, k)
+missing/invalid module only fails when actually reached, with (b, n, npad, k)
 context.  The per-family compiled ABIs are documented at each launcher
 builder in _build_launcher; only the main family takes the workspace.
 """

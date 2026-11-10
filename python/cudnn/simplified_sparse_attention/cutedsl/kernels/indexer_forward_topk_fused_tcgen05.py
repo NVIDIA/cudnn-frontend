@@ -5,7 +5,7 @@
 Fusion knob ``SSA_INDEXER_FUSION=hist`` (or ``fusion="hist"`` on the tcgen05
 ``run()``). Rect/THD path only; the existing unfused kernels are untouched.
 
-The DKG filtered top-k reads the score workspace S twice per row: the p1
+The filtered top-k reads the score workspace S twice per row: the p1
 coarse-histogram scan and the p3 filter/collect scan (plus refine). This
 kernel folds p1 into the score epilogue: while each 128x256 MMA tile's values
 are still in registers it bins them (fp32 -> fp16 top-byte ordered key, the
@@ -320,12 +320,12 @@ def _fallback_topk_impl(key_len):
     """Use only the adversarially qualified exact batch-repair backend.
 
     The batch path is a validation/bisect oracle, not the production sparse
-    repair path. Keep it on DKG REREAD_ALWAYS at every key length: the GVR
+    repair path. Keep it on REREAD_ALWAYS at every key length: the GVR
     implementation in this combined lineage is not qualified for all-equal
     overflow and therefore cannot be selected by an environment override.
     """
     del key_len
-    return "dkg"
+    return "filtered"
 
 
 # fusion="filtered" (seeded single pass): sample 1/SAMPLE_STRIDE of each
@@ -590,7 +590,7 @@ def _tie_cap(top_k: int, key_len: int = 262144) -> int:
 
 @cute.jit
 def _coarse8(x):
-    """fp32 -> 8-bit descending-order coarse key; must match the DKG top-k's
+    """fp32 -> 8-bit descending-order coarse key; must match the top-k's
     ``to_coarse_key`` bit-for-bit (fp32 -> fp16 RN convert, sign-flip twiddle,
     top byte) or the preloaded histogram would disagree with p3's classify."""
     h = x.to(cutlass.Float16)
@@ -621,7 +621,7 @@ def _key16(x):
 @cute.jit
 def _f16_key_boundary(key16):
     """Exact fp32 boundary B for the fp16-derived coarse key (verbatim port
-    of the DKG boundary_classify helper): for real fp32 x,
+    of the boundary_classify helper): for real fp32 x,
     key(cvt_rn_f16(x)) < key16  <=>  x > B. IKET measured the per-element
     cvt+twiddle classify at 88% of the filter pass; one precomputed fp32
     boundary per row turns it into a single float compare."""
@@ -645,7 +645,7 @@ def _f16_key_boundary(key16):
 
 @cute.jit
 def _ordered32(x):
-    """fp32 -> 32-bit descending-order key; must match the DKG ``to_ordered``
+    """fp32 -> 32-bit descending-order key; must match the ``to_ordered``
     fp32 branch bit-for-bit (larger value -> smaller key)."""
     bits = float_as_uint32(x)
     key = cutlass.Uint32(0)
@@ -1530,8 +1530,7 @@ def _threshold_kernel(
     mBnd: cute.Tensor = None,
     fine: cutlass.Constexpr = 0,
 ):
-    """Per row: first coarse bin with inclusive-prefix count > top_k (the DKG
-    prefix_sum_and_find_threshold_coarse convention, exactly), plus
+    """Per row: first coarse bin with inclusive-prefix count > top_k, plus
     need = top_k - count(strictly above bins). Rows with length <= trivial_k
     (default: top_k) take everything: tb = 256 (every key classifies in).
 
@@ -3473,7 +3472,7 @@ def run_fused(
     key_ends,
 ):
     """Fused rect SSA indexer: score + p1 histogram in one kernel, then the
-    DKG top-k with ``external_hist`` (p1 scan skipped). Same contract as the
+    top-k with ``external_hist`` (p1 scan skipped). Same contract as the
     unfused ``run()``: GLOBAL ascending selected ids, ``clamp(end-1, 0)``
     padding, predict = softmax over the selected scores."""
     raise ValueError("run_fused/fusion='hist' is an unqualified experimental route; " "use the production auto, off, or filtered route")

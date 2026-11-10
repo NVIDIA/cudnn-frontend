@@ -833,6 +833,11 @@ Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
 
+Widen operands before triangular workspace products, in both producer and
+consumer. Widening an already-overflowed offset cannot recover it. Derive tile
+decoder bounds from the input extent. `test_triangular_offsets.py` compiles the
+actual address expressions and checks large offsets without dereferencing them.
+
 An unused name can still hold a required shared-memory allocation. Preserve
 the allocation when a later operand aliases that storage; remove only the
 binding. The Hq16 sparse-attention teacher kernel reserves padding after Q

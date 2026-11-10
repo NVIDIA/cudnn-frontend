@@ -13,7 +13,7 @@ from cudnn.ops import simplified_sparse_attention_jax
 from cudnn.simplified_sparse_attention import jax_api
 from ssa_reference import pack, sample
 from test_simplified_sparse_attention import supported_gpu
-from test_simplified_sparse_attention_jax import jax_inputs
+from test_simplified_sparse_attention_jax import jax_inputs, torch_outputs
 
 pytestmark = [pytest.mark.L1, pytest.mark.usefixtures("supported_gpu")]
 
@@ -79,7 +79,7 @@ def test_filtered_training_and_changed_inputs(topk, monkeypatch):
             tensors[3] = torch.zeros_like(query[3])
         values, bounds, grad = jax_inputs(inputs)
         result = jax.block_until_ready(train(*values, *bounds, grad))
-        converted = [torch.from_dlpack(x) for x in result]
+        converted = torch_outputs(result, tensors[0].device)
         actual = dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), converted[:7]))
         ids, probabilities = converted[-2:]
         valid = metadata.query_valid

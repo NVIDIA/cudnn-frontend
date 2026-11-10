@@ -25,9 +25,19 @@ def test_public_jax_export():
 
 def jax_inputs(inputs):
     tensors, metadata, upstream = inputs
-    values = tuple(jax.dlpack.from_dlpack(t) for t in tensors)
-    bounds = tuple(jax.dlpack.from_dlpack(t) for t in (metadata.key_starts, metadata.key_ends, metadata.query_valid, metadata.loss_denominator))
-    return values, bounds, jax.dlpack.from_dlpack(upstream)
+
+    def convert(t):
+        with torch.cuda.device(t.device):
+            return jax.dlpack.from_dlpack(t)
+
+    values = tuple(convert(t) for t in tensors)
+    bounds = tuple(convert(t) for t in (metadata.key_starts, metadata.key_ends, metadata.query_valid, metadata.loss_denominator))
+    return values, bounds, convert(upstream)
+
+
+def torch_outputs(result, device):
+    with torch.cuda.device(device):
+        return tuple(torch.from_dlpack(x) for x in result)
 
 
 @lru_cache(maxsize=None)
@@ -51,7 +61,7 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
 def execute(inputs, topk=512, coefficient=0.1, triangular=False, backward=True):
     tensors, metadata, upstream = jax_inputs(inputs)
     result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
-    return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), (torch.from_dlpack(x) for x in result)))
+    return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
 
 
 @pytest.mark.parametrize("heads", [16, 32, 96], ids=lambda n: f"bf16-h{n}")
@@ -132,7 +142,7 @@ def test_captured_jit_uses_native_buffers(monkeypatch):
         for name in ("empty", "zeros", "empty_like", "zeros_like"):
             patch.setattr(torch, name, forbidden)
         result = jax.block_until_ready(jax.jit(lambda: simplified_sparse_attention_jax(*tensors, *metadata))())
-    actual = dict(zip(("output", "indexer_loss"), (torch.from_dlpack(x) for x in result)))
+    actual = dict(zip(("output", "indexer_loss"), torch_outputs(result, inputs[0][0].device)))
     check_reference(inputs, actual, False)
 
 
@@ -142,3 +152,46 @@ def test_dense_workspace_index_limit():
     inputs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in zip(shapes, dtypes)]
     with pytest.raises(ValueError, match="Dense score workspace exceeds"):
         jax.eval_shape(lambda *x: simplified_sparse_attention_jax(*x, triangular_scores=True), *inputs)
+
+
+def test_dlpack_device_context(monkeypatch):
+    from contextlib import contextmanager
+
+    inputs = pack([sample(3)])
+    active = []
+    seen = []
+
+    @contextmanager
+    def device_guard(device):
+        active.append(device)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def convert(t):
+        assert active == [t.device], "DLPack conversion lacks its tensor device context"
+        seen.append(t)
+        return t
+
+    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    monkeypatch.setattr(jax.dlpack, "from_dlpack", convert)
+    monkeypatch.setattr(torch, "from_dlpack", convert)
+    values, bounds, upstream = jax_inputs(inputs)
+    assert len(seen) == 10
+    assert not active
+    torch_outputs((*values, *bounds, upstream), inputs[0][0].device)
+    assert len(seen) == 20
+    assert not active
+
+
+def test_dlpack_with_another_gpu_current():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA devices")
+    with torch.cuda.device(0):
+        inputs = pack([sample(17)])
+    with torch.cuda.device(1):
+        actual = execute(inputs)
+        assert torch.cuda.current_device() == 1
+    with torch.cuda.device(0):
+        check_reference(inputs, actual, True)

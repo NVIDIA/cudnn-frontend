@@ -799,7 +799,7 @@ class FilteredTopKKernelVarlen:
         candidate_capacity = (per_cta_budget - fixed_smem) // candidate_bytes
         # Fixed allocations must fit inside the per-CTA budget. A non-positive
         # capacity means the candidate buffer cannot exist at all (a zero-length
-        # SMEM buffer is as broken as a negative size), so fail loudly instead of
+        # SMEM buffer is as invalid as a negative size), so fail loudly instead of
         # emitting a degenerate SMEM size downstream. This is a hard invariant --
         # unreachable for the supported archs (target_blocks_per_sm in {1, 2}).
         if candidate_capacity <= 0:
@@ -3190,7 +3190,7 @@ class FilteredTopKKernelVarlen:
         if cutlass.const_expr(self.ssa_tri_input):
             # SSA triangular row-contiguous workspace: row bidx = bi*128+rr
             # starts at element tri(bi)*16384 + rr*(bi+1)*128 and is linear.
-            _bi = bidx // 128
+            _bi = cutlass.Int64(bidx) // 128
             _rr = bidx % 128
             _off = (_bi * (_bi + 1) // 2) * cutlass.Int32(16384) + _rr * ((_bi + 1) * 128)
             _addr = input.iterator.toint() + cutlass.Int64(_off) * (self.dtype.width // 8)

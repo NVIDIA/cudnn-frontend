@@ -10,7 +10,7 @@ families fold the first k row values; streaming families never consume a
 temporal hint), so ``run_varlen`` no longer takes ``pre_idx`` -- matching
 our prefill use, which has no prior top-k. Used as an alternative unfused
 top-k backend (topk_impl="gvr") and the filtered-fusion exact fallback,
-where it replaces the DKG top-k's REREAD-bound large-K cost (7.6x at
+where it replaces the top-k's REREAD-bound large-K cost (7.6x at
 256K/K=2048).
 """
 

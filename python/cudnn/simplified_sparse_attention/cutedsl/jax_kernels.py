@@ -20,7 +20,7 @@ def module(name):
 
 @lru_cache(maxsize=128)
 def score_kernel(rows, cols):
-    return module("indexer_forward_topk_tcgen05").SimplifiedSparseScoreDkg(rows, cols, False)
+    return module("indexer_forward_topk_tcgen05").SimplifiedSparseScore(rows, cols, False)
 
 
 @cute.jit
