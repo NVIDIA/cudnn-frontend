@@ -107,7 +107,8 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128):
             )
             api.check_support()
             api.compile()
-            assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+            kernel = "prefill_d512_f16_2x2.py" if head_dim == 512 else "prefill_d128_f16.py"
+            assert api._k_mod.__file__.endswith(f"sm107/{kernel}")
             assert api.flavor == (head_dim, head_dim)
             assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
             plans[b] = api

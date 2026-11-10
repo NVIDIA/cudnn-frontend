@@ -34,3 +34,14 @@ class TestNativeD64Paged:
     from native_d64_paged_thd_determinism import test_thd_batch_and_golden as _thd_determinism
 
     test_thd_determinism = staticmethod(_thd_determinism)
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeD512HalfPaged:
+    import native_d512_paged_sm107_checks as _checks
+
+    test_dense = staticmethod(_checks.test_dense)
+    test_boundaries = staticmethod(_checks.test_boundaries)
+    test_determinism = staticmethod(_checks.test_determinism)
+    test_admission_and_config_boundaries = staticmethod(_checks.test_admission_and_config_boundaries)

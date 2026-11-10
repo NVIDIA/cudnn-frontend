@@ -490,7 +490,7 @@ def supports_native_d256_dense_split(d_shape, *, device_cc, fp8, thd, paged, pac
 
 def supports_native_d512_dense_pack_split(d_shape, *, device_cc, fp8, thd, paged, cga):
     """Dense half D512 uses the native 2x2 body for packed and split plans."""
-    return device_cc == (10, 7) and not fp8 and not thd and not paged and d_shape == (512, 512) and cga in (None, 2)
+    return device_cc == (10, 7) and not fp8 and not thd and d_shape == (512, 512) and cga in (None, 2)
 
 
 def sm107_small_tile_leg(
@@ -1764,8 +1764,9 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
         if flavor == "sm107 d512":
-            if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) or k.thd_varlen:
-                raise ValueError(f"{flavor}: paged KV requires per-tensor FP8 inputs and dense Q")
+            half_2x2 = k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16) and k.mma_2x2 and k.cta_mma == 2
+            if (k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2) and not half_2x2) or k.thd_varlen:
+                raise ValueError(f"{flavor}: paged KV requires dense Q, with per-tensor FP8 or native two-CTA half 2x2 inputs")
             p = k.page_size
             if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
                 raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
@@ -2994,9 +2995,9 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     # The Rubin record guard keys its THD allowlist by FLAVOR NAME (_F16_THD_FLAVORS holds "sm107 d512"): the 2x2 sibling
     # carries the same ported setup-kernel call sites as the role-split d512 body, so it is validated under that name.
     _validate_params("sm107 d512", params, split_wired=True)
-    # Share the d512/half/unpaged guards with SM100. This native twin additionally
-    # addresses packed subgroups and supports the pre-folded scale.
-    _validate_params_sm100("d512", params, scale_prefolded_wired=True, d512_partial_pack_wired=True)
+    # Share the half geometry guards with SM100. This native twin additionally
+    # supports paged 2x2 loads, packed subgroups and the pre-folded scale.
+    _validate_params_sm100("d512", params, scale_prefolded_wired=True, d512_partial_pack_wired=True, d512_paged_2x2_wired=True)
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: BF16/FP16 inputs only")
     if params.cta_mma != 2:
@@ -3006,6 +3007,8 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     n_pairs = cga_m // CfgD512X2.CTA_MMA
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     base = CfgD512X2(
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,

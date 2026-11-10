@@ -1249,6 +1249,17 @@ def native_small_half_dense_paged_leg(capabilities: Capabilities, facts: "ga.Sdp
     )
 
 
+def native_d512_dense_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
+    return capabilities.sm_lo == 107 and _config_sm107.supports_native_d512_dense_pack_split(
+        _selected_d_shape(capabilities, facts, knobs),
+        device_cc=facts.device_cc,
+        fp8=facts.is_fp8 or facts.is_mxfp8,
+        thd=facts.thd,
+        paged=facts.has_paged_kv,
+        cga=knobs.cga if knobs is not None else None,
+    )
+
+
 def native_d192_paged_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
     return capabilities.sm_lo == 107 and _config_sm107.supports_native_d192_paged(
         _selected_d_shape(capabilities, facts, knobs),
@@ -2326,6 +2337,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
+        if (
+            capabilities.sm_lo == 107
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and _selected_d_shape(capabilities, facts, knobs) == (512, 512)
+            and not native_d512_dense_leg(capabilities, facts, knobs)
+        ):
+            return "native SM107 half paged D512 requires dense Q and two-CTA MMA"
         if capabilities.sm_lo == 120:
             reason = _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
             if reason is not None:
@@ -2346,6 +2364,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not capabilities.is_fp8
             and not facts.thd
             and not native_small_half_dense_paged_leg(capabilities, facts, knobs)
+            and not native_d512_dense_leg(capabilities, facts, knobs)
             and not d256_decode_tile_served(capabilities, facts, knobs)
             and not native_d192_paged_leg(capabilities, facts, knobs)
         ):
@@ -2759,7 +2778,7 @@ def _sm107_spec() -> EngineSpec:
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
             paged_kv=True,
-            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             decode=True,  # stated, not inherited: S_q == 1 is served; on d256 by the decode tile (see the docstring)
             # FLOAT only: the half kernels run the f32 exponent (a HALF request declines here, never
             # in the adapter); the pre-folded scale is a neutral arm of every half prefill body.

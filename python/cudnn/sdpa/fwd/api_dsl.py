@@ -3306,9 +3306,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
                 and not self._rubin_native_d192_paged_leg()
                 and not self._rubin_native_small_half_dense_paged_leg()
+                and not self._rubin_native_d512_leg()
                 and not self._rubin_native_d64_pack_leg()
                 and not (self._fp8 and self._pertensor and not self.thd and self.flavor == (512, 512)),
-                "Rubin paged KV serves half THD queries, native half D64/D128/D192, MXFP8 D128/D256, per-tensor FP8 D512 with dense Q, and decode-shaped half D256",
+                "Rubin paged KV serves half THD queries, native half D64/D128/D192/D512, MXFP8 D128/D256, per-tensor FP8 D512 with dense Q, and decode-shaped half D256",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd and not (self._pertensor and self._device_cc in ((10, 0), (10, 3)) and self.flavor in SM100_PAGED_FP8_THD_SHAPES),
@@ -4176,7 +4177,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
             # New native packed/split plans require this body even if the
             # legacy unpacked A/B seam selects the role-split implementation.
-            two_by_two = two_by_two or (self._rubin_native_d512_leg() and (self.pack_gqa or self.split_kv > 1))
+            two_by_two = two_by_two or (self._rubin_native_d512_leg() and (self.paged or self.pack_gqa or self.split_kv > 1))
             if two_by_two:
                 params = replace(params, mma_2x2=True)
         return params

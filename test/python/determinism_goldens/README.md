@@ -1228,3 +1228,38 @@ and8 THD racecheck cases pass with zero diagnostics. No backward path changes.
 
 Additional nonpaged D64 controls pass30 cases:22 dense split/replay and8
 independent THD-origin cases.
+
+
+### Native SM107 half D512 dense-Q paging (2026-11-10)
+
+`test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged` pins the native SM107
+2x2 kernel file, two-CTA MMA, twin-multicast K/V column shares and descriptor
+version1. The new page-box loader preserves three-stage K/V rings and pair
+transaction credits. Dense FP16/BF16 Q/K/V/O supports partial PackGQA and
+split-KV; THD paging and mixed FP8 KV remain declined.
+
+Four goldens cover FP16/BF16 and split1/4 at fixed CGA2/N128. The shared paging
+fixture at D512 verifies independent CPU-double O/Stats references, raw bytes
+under replay and queued stream work, fresh buffers, reordered/duplicated
+batches through129 requests, input preservation, output-padding canaries and
+changed Q/length/table contents under capture. Separate graph checks use
+independent K/V table contents and HND/NHD layouts, including mixed pools.
+
+The strict feature suite passes21 cases with no failures/skips:8 numerical
+rebind/capture cases,8 boundaries,4 goldens and1 graph/config admission check.
+Boundaries include page8–1024, Q1/2/4/17/129/257, empty/tail KV, windows/sinks,
+partial GQA and D504/V480 and D264/V256 envelopes. The first boundary attempt
+requested LPT for a plan whose existing domain is NATURAL-only; the final
+suite pins the supported scheduler without widening its domain.
+
+Runtime: SM107216SM, driver630.10, cuDNN9.30.0.2, Torch2.14.1+cu130,
+DSL4.8.0/CUDA13.4 and matching FE1.33 bindings. Goldens use runtime key
+`0972294c7bd4a660`. No new backward or other-GPU qualification is implied.
+
+Existing nonpaged native 2x2 controls pass16 cases:8 dense graph cases,4
+sink/Stats cases and4 THD cases. Compute Sanitizer13.4.92 passes8 page-boundary
+memcheck cases,8 dense synccheck cases and8 dense racecheck cases, with zero
+errors/hazards. Commands from `test/python`: `python -m pytest
+sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged -q -x`; sanitizer
+runs select `test_boundaries` (memcheck) or `test_dense` (synccheck/racecheck)
+from the same class with `--error-exitcode 99`.
