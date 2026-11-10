@@ -764,3 +764,34 @@ class TestD512Mxfp8Backward:
     test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
     test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
     test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("sq,causal", [(257, True), (257, False), (264, True)])
+def test_delta_workspace_padding_does_not_feed_dkdv(d, sq, causal):
+    """The dKdV TMA sees the eight-row scratch extent, including Q-tail padding."""
+    case = _run(d=d, hq=8, hkv=2, sq=sq, skv=256, causal=causal)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    replay = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(replay, stream=stream):
+            case.graph.execute(case.pack, case.workspace)
+        torch.cuda.current_stream().wait_stream(stream)
+        for captured in (False, True):
+            for sentinel in (0, 255, 127):
+                case.workspace.fill_(sentinel)
+                for name in ("dq", "dk", "dv"):
+                    case.pack[case.refs[name]].fill_(float("nan"))
+                if captured:
+                    replay.replay()
+                else:
+                    case.graph.execute(case.pack, case.workspace)
+                torch.cuda.synchronize()
+                for name, expected in zip(("dq", "dk", "dv"), case.expected):
+                    actual = case.pack[case.refs[name]]
+                    assert not actual.isnan().any(), f"{name}: scratch pattern {sentinel}, captured={captured} contaminated the gradient"
+                    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
+    finally:
+        replay.reset()
