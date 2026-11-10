@@ -4919,7 +4919,11 @@ and columnwise F8_128x4 atoms directly, including independently quantized
 Q_T/K_T/dO_T. dS uses an online E8M0 scale per 32-element contraction;
 P retains the fixed 2^-8 descale. Dense compact BSHD, GQA, top-left causal
 and left windows share fixed output ownership and linear delta workspace.
-O/dO_f16 and gradients are FP16 or BF16; MXFP8 has no amax outputs.
+O/dO_f16 and gradients are FP16 or BF16. Optional FP32 amax_dQ/dK/dV outputs
+are initialized in the existing delta launch and folded by each gradient
+owner; omitted outputs add no reduction work. The amax extension passes
+14 native/strict cases on GB10 SM121, including four six-output byte goldens;
+all parent gradient hashes are unchanged. SM120 execution remains unverified.
 No global SF repack or dequantization staging is introduced. DSL 4.8 minimum;
 THD, padding, bottom-right, sinks and bias remain declined. GB10 SM121 passes
 55 native/strict cases (four byte goldens), 79 per-tensor FP8 regression cases
