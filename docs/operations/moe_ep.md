@@ -188,6 +188,14 @@ Additional topologies and problem shapes are supported, subject to the generic
 kernel resource, layout, output, full-route-capacity, and MXFP8 constraints.
 Both contiguous and discrete native backward weights are supported.
 
+`"rolling"` and `"ds3_ep4_pattern"` both publish dFC2 progress through a ready
+mask of at most 30 bits, two for each 256-column tile of the intermediate
+dimension, so both profiles require `intermediate_size <= 3840`. This limit is
+the same on Rubin SM107 and Blackwell SM100. For a larger `intermediate_size`,
+`prepare_training()` raises `ValueError` on every rank, because the check
+depends only on the configuration that all ranks share. Use `"baseline"` for
+such models.
+
 DS3 owns its scheduling and transport preset fields. It requires
 `token_back_mode="epi_warps"`, `token_in_flag_batch=1`, and `group_hint=None`.
 The default `epi_flag_batch=(1, 1)` is treated

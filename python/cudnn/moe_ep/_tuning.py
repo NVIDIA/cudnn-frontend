@@ -98,6 +98,11 @@ class MoeEpTuningConfig:
     traversal, and ``ds3_ep4_pattern`` is qualified only for the DS3 EP4
     workload; other workloads are declined when training is prepared.
 
+    On every architecture, ``rolling`` and ``ds3_ep4_pattern`` require
+    ``intermediate_size <= 3840``: their dFC2 ready mask holds at most 30 bits,
+    two per 256-column intermediate tile. Training preparation raises
+    ``ValueError`` for a larger intermediate size; use ``baseline`` instead.
+
     ``scheduling``, ``fc2_bulk_store`` and ``mixed_cga`` select forward-kernel
     implementations and apply only to inference and training forward; training
     backward keeps their defaults. ``scheduling`` picks static work
