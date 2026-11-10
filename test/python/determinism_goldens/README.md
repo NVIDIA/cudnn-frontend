@@ -1416,6 +1416,40 @@ not `test_sdpa_fwd_dsl_sm107.py`. The shared mixed-KV class now lives in the
 selected file, with explicit L0/DSL/SM107 guards and no duplicate collector.
 The GPU counts above are direct qualification, not completed CI results.
 
+### SM80 native THD sink forward
+
+The native adapter passes sink pointers and head strides through the existing
+THD host for dense and paged K/V. `test_sdpa_fwd_paged_sm80.py` covers FP16/BF16,
+strided sink declarations with flat graph carriers, HND/NHD independent pools,
+new storage, dynamic lengths/origins and changed-sink CUDA Graph replay. Invalid
+sink bindings are checked before output or metadata writes.
+
+The determinism cases use CPU-generated fixed operands and an independent CPU
+FP64 sink reference, repeat under concurrent scheduling work, compare target
+sequences alone, with neighbors, reordered and duplicated, and mutate neighbor
+pages under capture. On the A100 qualification environment (exact runtime
+identifiers retained in private evidence),
+the original96cases pass:64existing controls,24finite-sink cases covering
+D64/D256/D576x512 and eight strict dense/paged runtime goldens. An additional12endpoint cases cover disabled(-inf) and dominating(+inf) sinks
+with live Q but zero KV iterations, graph/standalone and captured replay. The
+new regression fails before the kernel fix; all108cases pass afterward, with
+unchanged finite-input golden files. The four initial paged and eight expanded
+dense/paged golden-recording cases passed before the original strict run. These are SM80 execution results only; no other GPU is claimed.
+
+The initial finite-sink qualification passed eight D64 cases per sanitizer.
+After the endpoint fix, memcheck, racecheck and synccheck each pass four
+endpoint cases across D64/D256/D576 and graph/standalone with zero findings. These runs use
+driver-compatible task-local CUDA bindings. The initial environment
+reported API-version query errors before attention; an
+exact-source create/destroy-handle control reproduced them. That initial run
+is not counted as a sanitizer pass. No suppression is used in the clean runs.
+
+Commands from `test/python`: `python -m pytest sdpa/frost/test_sdpa_fwd_paged_sm80.py -m L0 -q -x`
+with `CUDNN_DETERMINISM_GOLDENS` pointing to the committed golden directory.
+The endpoint sanitizer selection is `sink_endpoints and dtype0 and (False or dims0)`
+on the same file, with `--error-exitcode 91`. Pre-commit passes; Fern has zero errors and
+one existing redirect warning.
+
 ### SM120 small-head paged forward — 2026-11-10
 
 `sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_width_determinism`

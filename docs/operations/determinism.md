@@ -178,6 +178,13 @@ atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
 
+## SM80 SDPA sink qualification
+
+Native FP16/BF16 THD forward with FP32 attention sinks supports repeatability
+and batch invariance on SM80 for the tested D64 causal/window configurations,
+with dense and paged K/V. This qualification uses a fixed GPU and runtime;
+it does not imply identical bytes across GPU or software versions. Detailed
+coverage is recorded in the determinism test report.
 
 ## SM120 small-head paged SDPA
 

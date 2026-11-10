@@ -6894,6 +6894,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._sm80_origin_geometry = None
         self._thd_origin_batch_strides = (None,) * 5
         self._sm80_extended_origins = False
+        self._thd_sink_stride = None
 
     # ------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -7057,8 +7058,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 "SM80 THD Q lengths cannot be both per-batch and cumulative",
             )
             self._not_implemented_error_if(
-                self._bias_present or self.has_sink or self._rope_max_s,
-                "SM80 THD graph path does not support bias, sinks, or RoPE fusion",
+                self._bias_present or self._rope_max_s,
+                "SM80 THD graph path does not support bias or RoPE fusion",
             )
             self._not_implemented_error_if(
                 not self.seq_kv_lens_present and not self.cu_seq_kv_lens,
@@ -7326,12 +7327,30 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         ragged_v: Optional[torch.Tensor] = None,
         ragged_o: Optional[torch.Tensor] = None,
         ragged_lse: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
         """Bind native packed buffers and launch the already-compiled THD artifact."""
         import cutlass
         from cutlass.cute.runtime import from_dlpack as from_dlpack_raw
 
         device = self.q_desc.device
+        self._value_error_if((sinks is not None) != self.has_sink, "SM80 THD sink presence must match the compiled plan")
+        sink_stride = 1
+        if sinks is not None:
+            self._value_error_if(sinks.dtype != torch.float32 or sinks.device != device, "SM80 THD sinks must be float32 on Q's device")
+            self._value_error_if(sinks.data_ptr() % 4 != 0, "SM80 THD sinks must be float32-aligned")
+            declared_stride = getattr(self, "_thd_sink_stride", None)
+            if declared_stride is not None:
+                sink_stride = declared_stride
+            elif sinks.ndim == 1 and sinks.shape[0] == self.h_q:
+                sink_stride = sinks.stride(0)
+            elif tuple(sinks.shape) == (1, self.h_q, 1, 1):
+                sink_stride = sinks.stride(1)
+            else:
+                raise ValueError("SM80 THD sinks must have shape (H_q,) or (1, H_q, 1, 1)")
+            self._value_error_if(sink_stride < 0 or any(s < 0 for s in sinks.stride()), "SM80 THD sink strides must be nonnegative")
+            span = 0 if sinks.numel() == 0 else 1 + sum((n - 1) * s for n, s in zip(sinks.shape, sinks.stride()))
+            self._value_error_if(span < 1 + (self.h_q - 1) * sink_stride, "SM80 THD sink storage is smaller than the declared head span")
         self._value_error_if(seq_q_lens is None or seq_kv_lens is None, "SM80 THD requires Q and KV lengths")
         q_lens = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         kv_lens = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
@@ -7456,7 +7475,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 lse.data_ptr() if lse is not None else None,
                 cu_q.data_ptr(),
                 cu_kv.data_ptr(),
-                None,
+                sinks.data_ptr() if sinks is not None else None,
                 int(t_q),
                 int(t_kv),
                 int(self.s_q_max),
@@ -7469,7 +7488,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 scale * _LOG2E,
                 1.0 / scale,
                 int(self.right_bound_runtime),
-                (1, 1, 1),
+                (1, 1, int(sink_stride)),
                 int(launch_stream),
                 *((block_table.data_ptr(), block_table_v.data_ptr()) if self.paged else (None, None) if self._sm80_extended_origins else ()),
                 *(
@@ -7551,9 +7570,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
         self._check_sm80_origins((ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse))
         if self.thd:
-            self._value_error_if(
-                sinks is not None or bias_tensor is not None or rope_freqs is not None, "SM80 THD does not accept sinks, bias, or RoPE tensors"
-            )
+            self._value_error_if(bias_tensor is not None or rope_freqs is not None, "SM80 THD does not accept bias or RoPE tensors")
             self._execute_thd(
                 q_tensor,
                 k_tensor,
@@ -7572,6 +7589,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
                 ragged_v,
                 ragged_o,
                 ragged_lse,
+                sinks,
             )
             return
         if self._sm80_spec is not None:
