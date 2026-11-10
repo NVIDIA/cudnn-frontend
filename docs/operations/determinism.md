@@ -50,6 +50,8 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | BF16 Q/K; BF16 or FP32 weights | Unverified | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | MXFP8 E4M3 Q/K; E8M0 scales; BF16 weights | Unsupported | Supported | Supported |
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
+| `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
+| `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
@@ -148,6 +150,11 @@ a row alone and inside a batch under the entry's own picks.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
+- SM90 combined Indexer Forward + Top-K requires packed THD, ratio 4, head
+  dimension 128, 64 query heads per single KV head, and `deterministic=True`
+  for the documented tie policy. Its indices, logits, optional selected-logit
+  softmax, and optional LSE passed SM90 replay, batch reorder/duplication,
+  changed-neighbor isolation, and exact-tie tests.
 - DSA sparse attention forward/backward accepts FP16/BF16 inputs. FP8/MXFP8
   inputs are unsupported on all listed GPUs.
 - DSA sparse/dense indexer backward requires BF16 Q/K/weights and supports
@@ -155,7 +162,7 @@ a row alone and inside a batch under the entry's own picks.
 - Use a compatible CuTe DSL runtime, including `sm_107a` support for SM107.
 
 Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
-fused/separate Top-K generation, THD dense indexer backward, score recompute,
+separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, and distributed execution are outside this status page's scope.
 
 See the [test report](https://github.com/Anerudhan/cudnn-frontend/blob/feat/attention-determinism-tests/test/python/determinism_goldens/README.md)
