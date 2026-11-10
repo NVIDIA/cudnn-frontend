@@ -1101,6 +1101,21 @@ class pygraph:
         facts = self._facts_for(analyzer)
         return None if facts is None else guard(self, facts)
 
+    def _backend_engine_exclusions(self) -> Dict[int, str]:
+        """Backend engines (global ids) a family keeps off this graph, each with the reason
+        (``manifest.EngineFamily.backend_engine_guard``). Planning drops their configs from the backend's list
+        (``backend_plan_entries``) and an explicit pin of one is a typed decline (``_append_backend_plan``)."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return {}
+        guard, analyzer = manifest.resolve_backend_engine_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return {}
+        facts = self._facts_for(analyzer)
+        return {} if facts is None else dict(guard(self, facts))
+
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
@@ -1435,10 +1450,18 @@ class pygraph:
                 continue
             seen.add(key)
             entries.append(PlanConfig(engine_id, knobs, cpp_index=i, mode=self._mode_of_backend_plan(i)))
+        excluded = self._backend_engine_exclusions()
+        dropped = sorted({int(e.engine_id) for e in entries if int(e.engine_id) in excluded})
+        for engine in dropped:
+            _LOG.info("backend engine %d is not offered for this graph: %s", engine, excluded[engine])
+        entries = [e for e in entries if int(e.engine_id) not in excluded]
+        if dropped and not entries:
+            self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
-        if asked_oss or (not entries and self._lowered_graph.get_engine_count()):
+        # The delegating entry lets C++ pick, so it would hand an excluded engine back: not after the guard emptied the list.
+        if asked_oss or (not entries and not dropped and self._lowered_graph.get_engine_count()):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because
@@ -1758,6 +1781,9 @@ class pygraph:
         nor selected by the plain calls. Everything downstream therefore has to
         address it BY INDEX — which is why this returns one."""
         self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
+        reason = self._backend_engine_exclusions().get(int(engine_id))
+        if reason is not None:
+            raise cudnn_graph_not_supported(reason)
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})

@@ -443,6 +443,7 @@ cudnn.engines.CompiledPlan.get_workspace_size
 cudnn.engines.CompiledPlan.takes_variant_pack
 cudnn.engines.EngineFamily
 cudnn.engines.EngineFamily.analyzer
+cudnn.engines.EngineFamily.backend_engine_guard
 cudnn.engines.EngineFamily.backend_guard
 cudnn.engines.EngineFamily.heuristics
 cudnn.engines.EngineFamily.id_end
