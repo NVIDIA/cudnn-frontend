@@ -307,3 +307,13 @@ scale bytes. Four runtime goldens cover D128/D512 with FP16/BF16 gradients.
 This evidence keeps quantized payloads and scale bytes fixed across batch
 comparisons; it does not qualify cross-runtime identity, SM120 execution,
 THD or unsupported masks.
+
+## SM120 D576 forward
+
+D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in
+the tested FP16/BF16 configurations on GB10 (SM121), including half-Q with
+FP8 E4M3/E5M2 paged KV. Split count and packing stay fixed across batch
+reordering, duplication and changed-neighbor capture replay. Compact THD
+repacking follows changed lengths; independent physical gaps are outside this
+path's contract. SM120 hardware execution and other runtimes remain unverified.
+This qualification adds no backward support.

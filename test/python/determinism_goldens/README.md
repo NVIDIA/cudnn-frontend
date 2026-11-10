@@ -1972,3 +1972,38 @@ D-plane-major transposed atoms. The checks cover B1/3/4/129, fresh storage,
 repeated calls, changed-payload capture and live SF mutation. The independent
 MXFP8 numerical oracle passes before byte comparisons. SM120 hardware and
 cross-runtime identity remain unverified.
+
+### SM120-family D576/V512 forward — SM121 qualification, 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:
+eight uniform-half paged, four mixed-FP8 paged, and six dense/split/THD.
+They hold split and packing fixed, preserve CPU-seeded inputs, compare O/Stats
+against FP64, and check duplicated/reordered batches up to B129 and changed
+neighbors under capture. Compact THD repacks inputs and declared offsets as
+a neighbor changes between empty and live; independent physical gaps are not
+part of this existing path's contract. Backward is unsupported by this addition.
+
+GB10 (SM121,48SMs), driver580.142/CUDA13.0, Torch2.9.0a0+50eac811a6.nv25.09,
+cuDNN9.13.0, CuTeDSL4.8.0/compiler12.9, tvm-ffi0.1.14.post1, matching native
+FE extension and verified isolated import: **18 passed,35 deselected** when
+recording into a fresh directory (178.53s), followed by **18 passed,35
+deselected** in a new strict-check process (5.15s). The18 new JSON baselines
+live under runtime key `d2d1094fc872ddba`; all16 hashes recorded before the THD
+fixture correction are unchanged. The independent reference and batch checks
+run before each baseline is recorded. Command from `test/python`:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -q -n0 sdpa/frost/test_sdpa_fwd_d576_sm120.py -k determinism
+```
+
+The first recording passed16 and failed2 THD cases because the fixture changed
+lengths while leaving later sequences at old physical addresses. That failure
+is retained separately from the successful compact replay. An earlier expanded
+feature run stopped at4pass/3fail because the native binder rejected asymmetric
+widths before launch; after its envelope and extension-gate correction, all
+**35 feature cases pass** (275.33s). The full host analyzer passes629checks.
+SM120 D576 hardware execution, other runtimes and performance remain unverified.
+Targeted sanitizer and existing D512 regression results are recorded separately
+when complete; no completed result is implied by this golden qualification.
