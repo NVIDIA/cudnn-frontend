@@ -31,7 +31,7 @@ def supported_gpu():
 
 def skip_without_cuda13_for_12q1kv(hkv):
     # the 12Q/1KV backward declines the CUDA 12 build of the DSL compiler, which its key-major kernel crashes
-    from cudnn.QSA.kernels.bprop_sm100 import dsl_cuda_major
+    from cudnn.QSA._backward import dsl_cuda_major
 
     if hkv == 1 and dsl_cuda_major() < 13:
         pytest.skip("12Q/1KV QSA backward requires the CUDA 13 build of CuTe DSL")
