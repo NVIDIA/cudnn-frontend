@@ -3,7 +3,9 @@
 
 """SM90 WGMMA helpers for SW128 shared memory and FP32 accumulators.
 
-The supported forms are SS and RS ``m64n{64,128,256}k16`` with F16 or BF16 inputs. For warpgroup-local thread ``t``, C
+The supported forms are SS and RS ``m64nNk16`` for any N that is a multiple
+of 8 in [8, 256], with F16 or BF16 inputs; SS A may be K-major (default) or
+MN-major (``transpose_a``). For warpgroup-local thread ``t``, C
 slot ``i`` maps to row ``16*(t//32) + (t%32)//4 + 8*((i//2)%2)`` and column
 ``2*(t%4) + i%2 + 8*(i//4)``; RS A words use the same rows. Callers frame the
 instructions with the WGMMA fence, commit, and wait primitives and keep every
@@ -52,25 +54,30 @@ def _field(name, byte_offset):
 
 
 @dsl_user_op
-def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_b=False, accumulate=True, loc=None, ip=None) -> cutlass.Vector:
-    """Dispatch one ``m64n{64|128|256}k16`` WGMMA and return its FP32 C vector.
+def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_a=False, transpose_b=False, accumulate=True, loc=None, ip=None) -> cutlass.Vector:
+    """Dispatch one ``m64nNk16`` WGMMA and return its FP32 C vector.
 
-    SS A is a SMEM descriptor/value; RS A is a four-word ``Vector``.
-    Both forms accept 32, 64 or 128 C slots (n64, n128 or n256).
-    B is always a SMEM descriptor/value; ``transpose_b`` selects its major
-    layout. The caller owns the surrounding fence/commit/wait and operand
-    lifetime.
+    N is ``2 * len(c)``: a multiple of 8 in [8, 256]. SS A is a SMEM
+    descriptor/value, K-major unless ``transpose_a`` (MN-major A). RS A is a
+    four-word ``Vector`` in the C-fragment row order. B is always a SMEM
+    descriptor/value; ``transpose_b`` selects its MN-major layout. The caller
+    owns the surrounding fence/commit/wait and operand lifetime.
     """
     if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
         raise TypeError(f"A/B dtype must be Float16 or BFloat16, got {ab_dtype}")
+    n = 2 * c.shape[0]
+    if cutlass.const_expr(n % 8 != 0 or not 8 <= n <= 256):
+        raise ValueError(f"wgmma_m64nNk16_f32: C must hold N/2 slots for N a multiple of 8 in [8, 256], got {c.shape[0]}")
     register_a = isinstance(a, cutlass.Vector)
-    if cutlass.const_expr(c.shape[0] not in (32, 64, 128)):
-        raise ValueError(f"wgmma_m64nNk16_f32: C must hold 32, 64 or 128 slots, got {c.shape[0]}")
     if cutlass.const_expr(register_a):
         if cutlass.const_expr(a.shape != (4,)):
             raise ValueError(f"wgmma_m64nNk16_f32: RS A must be four packed words, got shape {a.shape}")
+        if cutlass.const_expr(transpose_a):
+            raise ValueError("wgmma_m64nNk16_f32: register A has no transposed form")
     kind = nvvm.WGMMATypes.f16 if cutlass.const_expr(ab_dtype == cutlass.Float16) else nvvm.WGMMATypes.bf16
-    return _tied(_wgmma_rs if cutlass.const_expr(register_a) else _wgmma_ss, c, a, b_desc, kind, transpose_b, accumulate, loc=loc, ip=ip)
+    if cutlass.const_expr(register_a):
+        return _tied(_wgmma_rs, c, a, b_desc, kind, transpose_b, accumulate, loc=loc, ip=ip)
+    return _tied(_wgmma_ss, c, a, b_desc, kind, (transpose_a, transpose_b), accumulate, loc=loc, ip=ip)
 
 
 def _tied(issue, c, *args, loc, ip):
@@ -81,13 +88,14 @@ def _tied(issue, c, *args, loc, ip):
     return cutlass.Vector.from_elements(values, cutlass.Float32, loc=loc, ip=ip)
 
 
-def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, ip):
+def _wgmma_ss(acc_type, acc, a, b_desc, kind, transposes, accumulate, *, loc, ip):
     """Issue an SS WGMMA through the NVVM dialect op.
 
     The 4.8.0.dev0 public wrapper re-wraps descriptors as DSL ``Int64`` values;
     the raw op requires ``ir.Value``, so this boundary converts them explicitly.
     Re-check this escape hatch when the DSL version changes.
     """
+    transpose_a, transpose_b = transposes
     acc_value = llvm.mlir_undef(acc_type, loc=loc, ip=ip)
     for i, value in enumerate(acc):
         acc_value = llvm.insertvalue(acc_value, value, [i], loc=loc, ip=ip)
@@ -103,7 +111,7 @@ def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, i
         scale_d=nvvm.WGMMAScaleOut.one if cutlass.const_expr(accumulate) else nvvm.WGMMAScaleOut.zero,
         scale_a=nvvm.WGMMAScaleIn.one,
         scale_b=nvvm.WGMMAScaleIn.one,
-        layout_a=nvvm.MMALayout.row,
+        layout_a=nvvm.MMALayout.col if cutlass.const_expr(transpose_a) else nvvm.MMALayout.row,
         layout_b=nvvm.MMALayout.row if cutlass.const_expr(transpose_b) else nvvm.MMALayout.col,
         loc=loc,
         ip=ip,
@@ -111,18 +119,19 @@ def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, i
 
 
 def _wgmma_rs(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, ip):
-    """Issue the native-width RS form through LLVM inline assembly."""
-    # Each C output has one tied input; A/B follow both sets of operands.
-    # Side effects keep the instruction between the caller's fence/commit.
-    count = len(acc)
-    registers = "{" + ",".join(f"${i}" for i in range(count)) + "}, {" + ",".join(f"${2 * count + i}" for i in range(4)) + f"}}, ${2 * count + 4}"
+    """Issue the RS ``m64nNk16`` form through LLVM inline assembly."""
+    # C outputs $0..$(S-1) are tied to the accumulator inputs $S..$(2S-1); A is
+    # $2S..$2S+3 and B is $2S+4. Side effects keep the instruction between the
+    # caller's fence/commit.
+    slots = len(acc)
+    registers = "{" + ",".join(f"${i}" for i in range(slots)) + "}, {" + ",".join(f"${2 * slots + i}" for i in range(4)) + f"}}, ${2 * slots + 4}"
     accumulate_bit = int(cutlass.const_expr(accumulate))
     transpose_bit = int(cutlass.const_expr(transpose_b))
     return llvm.inline_asm(
         acc_type,
         acc + [v.ir_value(loc=loc, ip=ip) for v in (*a.to_elements(), b_desc)],
-        f"wgmma.mma_async.sync.aligned.m64n{2 * count}k16.f32.{kind}.{kind} {registers}, {accumulate_bit}, 1, 1, {transpose_bit};",
-        ",".join(["=f"] * count + [str(i) for i in range(count)] + ["r"] * 4 + ["l"]),
+        f"wgmma.mma_async.sync.aligned.m64n{2 * slots}k16.f32.{kind}.{kind} {registers}, {accumulate_bit}, 1, 1, {transpose_bit};",
+        ",".join(["=f"] * slots + [str(i) for i in range(slots)] + ["r"] * 4 + ["l"]),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
