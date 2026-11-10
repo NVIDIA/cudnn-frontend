@@ -251,11 +251,10 @@ class IndexerBackward(APIBase):
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
-    ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=32 or
-    H=64 on either backend, D=128, block_I=128, and 128-multiple top-k in
-    [128, 2048]. It launches up
-    to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
-    rows and allocates one CTA-private FP32 dK plane for each possible producer.
+    ``deterministic=True`` requires H=64 on SM90 or H in {32, 64} on
+    SM100/SM103, D=128, block_I=128, and 128-multiple top-k in [128, 2048].
+    SM90 submits bounded one-row waves. Both SM100 backends use fixed
+    grid-stride row ownership. Each producer has a private FP32 dK plane.
     The plane count is a compile-time specialization selected from
     ``{96, 128, 148}`` (default 96). A final kernel folds the planes in CTA
     order.
@@ -513,8 +512,8 @@ class IndexerBackward(APIBase):
                     f"backend='sm100_v2' requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                 )
         self._value_error_if(
-            self.deterministic and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
-            f"deterministic IndexerBackward requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, " f"found {capability}",
+            self.deterministic and major != 9 and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+            f"deterministic IndexerBackward requires SM90 or capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, found {capability}",
         )
         if self.deterministic:
             if not self.use_v2:
@@ -534,7 +533,7 @@ class IndexerBackward(APIBase):
                         desc.device != self.iq_desc.device,
                         f"deterministic IndexerBackward requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                     )
-            deterministic_heads = (32, 64)
+            deterministic_heads = (64,) if major == 9 else (32, 64)
             self._value_error_if(
                 self.heads not in deterministic_heads or self.head_dim != 128,
                 f"deterministic IndexerBackward with backend='{self.backend}' requires "
@@ -623,8 +622,10 @@ class IndexerBackward(APIBase):
                 )
             return
         if self.deterministic:
+            major, _ = torch.cuda.get_device_capability(self.iq_desc.device)
+            kernel_factory = indexer_backward_sm90 if major == 9 else indexer_backward_sm100
             with torch.cuda.device(self.iq_desc.device):
-                self._compiled_kernel = indexer_backward_sm100(
+                self._compiled_kernel = kernel_factory(
                     self.batch,
                     self.seqlen,
                     self.seqlen_k,
@@ -1090,11 +1091,11 @@ def indexer_backward_wrapper(
             mode, the live scratch prefix must not overlap any input or output;
             ``execute`` rejects such aliases before clearing the planes.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
-            on SM100/SM103. Fixed-owner producer CTAs accumulate into
-            CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. Both the default backend and ``sm100_v2`` support H32
-            and H64 for aligned top-k; deterministic mode retains the shared
-            128-multiple top-k contract. A warmed plan with preallocated outputs
+            on SM90/SM100/SM103. Fixed-owner producer CTAs accumulate into
+            private FP32 planes; a fixed-order reduction writes ``d_index_k``.
+            SM90 requires H64 and folds dW in fixed lane and warp order.
+            Both SM100 backends support H32/H64. All require D128, block_I=128,
+            and 128-multiple top-k in [128, 2048]. A warmed plan with preallocated outputs
             and workspace remains CUDA Graph compatible. Valid top-k indices
             within each query row must be unique.
         deterministic_dk_planes: compile-time deterministic producer-grid and

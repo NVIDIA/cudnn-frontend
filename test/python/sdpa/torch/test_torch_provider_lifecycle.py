@@ -51,10 +51,10 @@ def test_registry_left_alone_when_torch_has_the_switch(monkeypatch):
     registered = []
     monkeypatch.setattr(attention, "register_flash_attention_impl", lambda name, **kw: registered.append(name))
 
-    monkeypatch.setattr(torch.backends.cuda, "enable_cudnn_sdp_python", lambda enabled: None, raising=False)
+    monkeypatch.setattr(attention, "enable_cudnn_sdp_python", lambda enabled: None, raising=False)
     sdpa_provider._register_with_torch()
     assert registered == []
 
-    monkeypatch.delattr(torch.backends.cuda, "enable_cudnn_sdp_python")
+    monkeypatch.delattr(attention, "enable_cudnn_sdp_python")
     sdpa_provider._register_with_torch()
     assert registered == ["CUDNN"]

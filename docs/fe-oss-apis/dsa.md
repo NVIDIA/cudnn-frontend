@@ -247,6 +247,46 @@ with a helper kernel. With the default `deterministic=False`, short query
 batches split each query's top-k range across otherwise idle two-SM clusters;
 the split count is fixed when the plan is compiled.
 
+On SM90, `deterministic=True` uses a row-aware relay with logical cluster size
+`C in {4, 8, 16, 32, 64}` for H16/H32/H64/H96/H128. The public
+`deterministic_relay_cluster_size` argument selects `C` and defaults to 16.
+Each 128-query wave gives one FP32 dKV plane to every logical relay group. C4,
+C8, and C16 launch one physical cluster per group; C32 and C64 run each group
+as two or four same-stream physical C16 phases. Kernel completion orders phase
+reuse without making a CTA wait for a nonresident cluster. A setup kernel builds
+packed `C`-bit rank masks for every referenced
+`(query wave, M64 head tile, KV row)`. A relay CTA waits only for lower logical
+ranks that actually update the same row; a 128-thread WG1
+barrier carries the acquired visibility to every reducer lane, and the matching
+barrier publishes all relaxed FP32 reductions before one lane release-clears
+that rank's ownership bit at GPU scope when a successor exists. Head tiles and
+later query waves are stream-ordered, while disjoint sparse rows within a
+cluster can progress independently. The postprocess kernel combines the
+`128 / C` planes in fixed order, and one warp per head computes `d_sink` with a
+fixed strided-lane/tree reduction order. Duplicate valid top-k indices within
+one query row remain outside this deterministic contract.
+
+The SM90 deterministic dKV allocation is
+`(128 / C) * (K64 + mask_rows) * D32 * sizeof(float)`, where
+`K64 = round_up(total_S_kv, 64)`, `D32 = round_up(D, 32)`, and
+`mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
+(K64 / (mask_bits / C)) * (mask_bits / 32) / D32)`, where `mask_bits` is
+64 for C64 and 32 otherwise.
+The caller-owned workspace is cleared and the masks are rebuilt on every
+execution, so changing `topk_idxs` or `topk_length` between launches is safe.
+After one eager execution populates the SM90 concrete-tensor compile caches,
+the caller-owned output/workspace path is CUDA Graph capturable. Replay keeps
+the declared tensor shapes and addresses fixed while allowing tensor contents,
+including `topk_idxs` and `topk_length`, to change.
+On the target H200 sweep (BF16 H64 D576/Dv512, KV=65536, top-k 2048), C16
+measured 1.47--1.54x the non-deterministic latency with 1.13--1.26 GiB of
+workspace and remains the conservative default. C32 measured 1.34--1.37x
+with 0.57--0.70 GiB, the best time/memory point in that workload. C64 reduced
+workspace further to 0.29--0.41 GiB, but four sequential physical phases
+raised latency to 2.30--2.37x non-deterministic. C32 and C64 are therefore
+explicit workload-specific choices rather than the automatic default; the
+full table and environment are recorded in `benchmark/dsa/README.md`.
+
 On SM100/SM103, `deterministic=True` retains the two-CTA Tensor Core kernels
 for the supported BF16 H128/D512 and H128/D576 envelopes above. Queries run in
 same-stream waves of at most 74 query tokens, with one two-CTA pair per query.
@@ -269,28 +309,56 @@ combine those groups in fixed order.
 
 If the selected bounded-wave layout would exceed 16 GiB, the generic M64 plan
 keeps each query wave at 128 CTAs and assigns one FP32 dKV plane to each
-cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; longer
+cluster. Queries below 8192 rows prefer sixteen eight-CTA clusters; larger
 queries prefer thirty-two four-CTA clusters for additional reducer parallelism.
 If that preferred layout's complete FP32-plane and packed-mask allocation would
 exceed 32 GiB, the plan selects an eight-plane, sixteen-CTA memory-first relay.
 The long-query policy deliberately skips cluster-8: GB200 sweeps at 393K, 512K,
 and 768K KV found it slower than cluster-16 while retaining twice as many FP32
-planes. A setup kernel builds packed 16-bit, 8-bit, or 4-bit rank masks for every
-`(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
+planes. A setup kernel builds packed 4-, 8-, 16-, 32-, or 64-bit rank masks for
+every `(query wave, head block, KV row)`. Reducer threads wait only for lower cluster
 ranks that actually update the same KV row, then publish that row with
-GPU-scope release/acquire ordering. Disjoint sparse rows continue in parallel;
-the fixed rank order handles both low- and high-overlap top-k rows without a
-global semaphore dependency on non-resident CTAs. The selected planes are
-folded in a fixed order. Duplicate top-k indices within one query row remain
-outside the deterministic contract, as in the bounded-wave path.
+GPU-scope release/acquire ordering. The participating reducer-thread CTA
+barrier carries the release/acquire causality, so no additional GPU-wide fence
+is needed. Rank zero skips the predecessor handoff, the last rank skips the
+successor publication, and the final release needs no second rendezvous.
+Disjoint sparse rows continue in parallel; the fixed rank order handles both
+low- and high-overlap top-k rows without a global semaphore dependency on
+non-resident CTAs. The selected 2, 4, 8, 16, or 32 planes are combined directly in
+the fixed-order conversion kernel, without an intermediate FP32 prefold.
+Duplicate top-k indices within one query row remain outside the deterministic
+contract, as in the bounded-wave path. This condition is not checked at
+runtime; callers that require bitwise repeatability must provide unique valid
+indices within each query's active top-k prefix.
+
+Callers that have profiled their exact SM100 workload may set
+`deterministic_relay_cluster_size` to `4`, `8`, `16`, `32`, or `64` to select
+that many CTAs per logical relay group instead of using the automatic policy.
+The corresponding number of FP32 relay planes is `32`, `16`, `8`, `4`, or
+`2`. Because SM100 hardware clusters contain at most 16 CTAs, the logical
+32- and 64-CTA groups run as two and four same-stream 16-CTA phases,
+respectively. Each kernel boundary completes the preceding physical phase
+before the next ranks reuse the same plane, avoiding cross-cluster residency
+dependencies. Cluster-64 uses a 64-bit packed row mask and is intended as an
+explicit emergency memory-first choice; the automatic policy never selects
+it because its lower per-phase parallelism regresses profiled workloads. This
+is a plan-time specialization: it is part of the compile/cache key, fixes the workspace size,
+and remains unchanged during `execute()` and CUDA Graph replay. The default
+`None` preserves automatic selection. Requests on non-deterministic plans,
+non-generic backends, or shapes that do not require the large-context relay are
+rejected rather than silently ignored. An explicit choice may exceed the
+automatic policy's 32 GiB memory-first budget, so callers should always allocate
+the exact value returned by `scratch_workspace_bytes()`.
 
 For the ordinary policy, additional dKV workspace is
 `selected_shards * K8 * D8 * sizeof(float)`, where
 `K8 = round_up(total_S_kv, 8)` and `D8 = round_up(D, 8)`. The cluster relay
 uses `relay_planes * (K8 + mask_rows) * D8 * sizeof(float)`, where
-`relay_planes` is 8, 16, or 32, `relay_width` is 16, 8, or 4, and
+`relay_planes = 128 / relay_width`. The packed mask uses a 32-bit word for
+relay widths up to 32 and a 64-bit word for relay width 64. With
+`mask_word_bits` equal to 32 or 64, its FP32 storage rows are
 `mask_rows = ceil(ceil(total_S_q / 128) * ceil(H / 64) *
-(K8 / (32 / relay_width)) / D8)`.
+ceil(K8 / (mask_word_bits / relay_width)) * (mask_word_bits / 32) / D8)`.
 One CTA per head reduces `d_sink`. Use `scratch_workspace_bytes()` as the
 authoritative full scratch size; a larger reusable workspace remains valid.
 Treat this as a reproducibility requirement rather than a performance-tuning
@@ -336,6 +404,23 @@ ordinary and two-CTA routes stay within 0.3%. Cluster-8 and cluster-4 trade
 at 512K KV, cluster-16 is 1.0% faster than upstream while using 93.1% less
 scratch.
 
+The follow-up relay scheduling pass was measured against merged commit
+`1dea4471a6e6c05e29d3bf281281fd156d345a84` on the same SM100 environment with
+PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0, BF16 H64, top-k 2048,
+five warm-ups, and 40 allocation-free calls. The automatic policy preserves
+the conservative eight-CTA layout below Q=8K because an earlier cluster-4
+crossover did not generalize across SM100 devices.
+
+| Dqk | Q | KV | Merged latency | Optimized latency | Speedup | Merged scratch | Optimized scratch |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 576 | 1024 | 65536 | 6.957 ms | 4.466 ms | 1.56x | 2.258 GiB | 2.258 GiB |
+| 576 | 8192 | 131072 | 31.677 ms | 24.142 ms | 1.31x | 9.129 GiB | 9.129 GiB |
+| 576 | 16384 | 262144 | 64.390 ms | 48.320 ms | 1.33x | 18.508 GiB | 18.508 GiB |
+| 576 | 16384 | 524288 | 101.409 ms | 64.426 ms | 1.57x | 10.008 GiB | 10.008 GiB |
+| 512 | 8192 | 131072 | 29.207 ms | 21.055 ms | 1.39x | 8.129 GiB | 8.129 GiB |
+| 512 | 16384 | 262144 | 60.060 ms | 42.305 ms | 1.42x | 16.508 GiB | 16.508 GiB |
+| 512 | 16384 | 524288 | 96.221 ms | 60.170 ms | 1.60x | 9.008 GiB | 9.008 GiB |
+
 For H64, a three-round, 20-call, reversed-order A/B measured prepared-plan
 eager execution at 104.579 ms and CUDA Graph replay at 104.225 ms (0.997x).
 Capture completed with PyTorch synchronization-debug error mode enabled. The
@@ -348,8 +433,10 @@ declared tensor shapes and storage addresses while their contents may change.
 `SparseAttentionBackward.scratch_workspace_bytes()` reports the full scratch
 requirement on every backend: the SM100 FP32 statistics and dKV-accumulator
 planes, and on SM90 the FP32 dPsum and log2-scaled LSE vectors plus the dKV
-accumulator (`2 * align128(round64(total_S_q) * H * 4) +
-align128(round64(total_S_kv) * round32(D) * 4)` bytes). Pass a contiguous CUDA
+accumulator. The ordinary SM90 dKV term is
+`align128(round64(total_S_kv) * round32(D) * 4)` bytes; deterministic SM90 uses
+the selected relay term above. Both add
+`2 * align128(round64(total_S_q) * H * 4)` bytes of statistics. Pass a contiguous CUDA
 `uint8` tensor of at least this size to `execute(..., workspace=workspace)` and
 reuse it across calls; the launch sequence re-initializes the accumulators on
 every execution (in-kernel on SM100, and with one stream-ordered memset for the
@@ -374,7 +461,8 @@ result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
-    deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
+    deterministic=True,  # optional; SM90/SM100 H16/H32/H64/H96/H128
+    deterministic_relay_cluster_size=None,  # optional: force 4, 8, 16, 32, or 64 CTAs/group
     q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
@@ -763,8 +851,8 @@ indexer tower:
    `dIndexK_f32` to a BF16 output. Deterministic execution instead uses the
    fixed-order reduction below to write the requested output dtype directly.
 
-With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
-grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
+With `deterministic=True` on SM90, SM100 or SM103, kernel 2 uses fixed
+producer-plane ownership and accumulates dK into private FP32 workspace. The compile-time
 `deterministic_dk_planes` specialization selects 96, 128, or 148 producer
 planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
 CTA order, converting only once to the requested `d_index_k` dtype. The dQ
@@ -781,15 +869,15 @@ missing or undersized buffer raises `ValueError` before `attn_score` is touched.
 the same optional `workspace=` keyword for reuse; executions that share one
 buffer must not overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100/SM103, `D == 128`,
-`block_I == 128`, and `topk % 128 == 0` for `128 <= topk <= 2048`. The default
-backend accepts `H in {32, 64}` while `sm100_v2` accepts `H == 64`. Each
-producer CTA owns one plane and processes the fixed row stripe `cta`,
-`cta + num_ctas`, ...; the v2 backend disables its ordinary dynamic ticket
-assignment for this path. The main GEMM therefore retains its existing Tensor
-Core math while dK has a fixed association order across launches. Scratch is
-exactly `ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for
-either backend. It is cleared on the launch stream at every execute, then
+`deterministic=True` requires H64 on SM90 or H32/H64 on either SM100 backend,
+`D == 128`, `block_I == 128`, and `topk % 128 == 0` for
+`128 <= topk <= 2048`. Each producer CTA owns one plane. SM100 kernels use
+fixed grid-stride row ownership; the v2 backend disables dynamic ticket assignment.
+SM90 submits bounded waves of at most `deterministic_dk_planes` one-row CTAs
+on the same stream. A later wave cannot reuse a plane until the previous wave
+completes. Scratch is exactly
+`ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for either
+backend. It is cleared on the launch stream at every execute, then
 reduced once in fixed plane order. The live scratch byte range must not overlap
 any input or output; `execute` validates this before clearing the planes, while
 allowing disjoint views of the same allocation. A warmed plan with caller-owned
@@ -849,7 +937,11 @@ counts retain their existing behavior.
 
 On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate
-conversion solely for Indexer Backward is unlikely to help.
+conversion solely for Indexer Backward is unlikely to help. Deterministic SM90
+uses the same fixed producer-plane ownership and fixed-order reducer described
+above. Its stream-ordered bounded waves also form the synchronization boundary:
+every one-row CTA in wave N completes before wave N+1 can reuse the same producer
+planes, and the fixed reducer runs only after the last wave.
 
 #### SM100-family sparse backward v2 (opt-in)
 
