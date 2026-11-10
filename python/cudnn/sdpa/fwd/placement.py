@@ -1009,7 +1009,7 @@ def _place_sm120_fp8(facts) -> str:
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
     # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else stays backend-first.
-    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) not in caps.d_shapes:
+    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):
         return TRAIL
     if facts.s_q == 1 and facts.b * facts.h_q < SM90_SQ1_MIN_Q_ROWS:
         return TRAIL

@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Kernel-facing configuration for the FROST SM90 D512 SDPA prefill template.
+"""Kernel-facing configuration for the FROST SM90 SDPA forward templates.
 
 The frozen ``TemplateParams`` record contains only graph declarations and
 selected tuning knobs. Runtime lengths, pointers, and packed token totals stay
 out of compile keys. Graph-adapter declaration logic lives with the adapter;
-this module keeps the small interface consumed by the kernel.
+this module keeps the small interface consumed by the native D64 and D512 kernels.
 """
 
 from __future__ import annotations
@@ -21,17 +21,29 @@ SCALE_ZERO = 0
 SCALE_NEGATIVE = -1
 
 
-# The D envelope. Every WGMMA descriptor and SMEM slab is 512 columns wide, so any
+# The legacy D512 envelope. Its WGMMA descriptors and SMEM regions span 512 columns, so any
 # head dim up to that tile is computed on it: the GMEM descriptors carry the actual
 # extent, loads past it zero-fill and O stores past it clip. 8 is the TMA 16-byte
 # global-stride rule at 2 bytes per element. A small D pays the full D512 tile cost;
-# this is envelope coverage, not a native small-D flavor.
+# this is envelope coverage. Exact dense D64 selects its separate native body;
+# these constants and head_dims_mismatch still describe the legacy D512 template.
 D_TILE = 512
 D_ALIGN = 8
 # Fixed SM90 D512 instruction geometry, matching the FFPA donor. QK is
 # m64n64k512 and each PV half is m64n256k64; these are not tuning axes.
 TILE_M = 64
 TILE_N = 64
+
+
+def native_d64_mismatch(
+    *, thd=False, sink=False, pack_gqa=False, q_lengths=False, kv_lengths=False, window_left=None, window_right=None, bottom_right=False, s_q=0, s_kv=0
+):
+    """The bounded native D64 leg, shared by graph and standalone admission."""
+    if thd or sink or pack_gqa or q_lengths or kv_lengths or window_left is not None or window_right is not None:
+        return "native SM90 D64 serves dense, unpadded, unpacked Q/K/V without sinks or window bands"
+    if bottom_right and s_q > s_kv:
+        return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    return None
 
 
 def head_dims_mismatch(d_qk, d_v) -> str | None:
