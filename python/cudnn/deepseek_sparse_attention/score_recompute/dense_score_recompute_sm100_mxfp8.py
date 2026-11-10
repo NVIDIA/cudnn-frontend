@@ -344,15 +344,17 @@ class BwdDenseAttnScoreSm100Mxfp8(BlockScaledScoreSm100Mixin, ScoreKernelSm100):
             defer_sync=True,
         )
         if warp_idx == 1:
-            cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
         if warp_idx == 0:
-            cute.arch.mbarrier_init(claim_mbar_ptr, 1)  # load warp -> CLC warp: the tile's loads are issued
-            for _s in cutlass.range_constexpr(NSF):
-                cute.arch.mbarrier_init(SF_mbar_ptr + _s, 1)  # full: SF warp commit
-                cute.arch.mbarrier_init(SF_mbar_ptr + NSF + _s, 1)  # empty: MMA commit
-            for _a in cutlass.range_constexpr(NUM_ACC):
-                cute.arch.mbarrier_init(T_mbar_ptr + _a, 1)  # full: MMA commit
-                cute.arch.mbarrier_init(T_mbar_ptr + NUM_ACC + _a, self.WARPGROUP_SIZE)  # empty: the owning math warpgroup
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(claim_mbar_ptr, 1)  # load warp -> CLC warp: the tile's loads are issued
+                for _s in cutlass.range_constexpr(NSF):
+                    cute.arch.mbarrier_init(SF_mbar_ptr + _s, 1)  # full: SF warp commit
+                    cute.arch.mbarrier_init(SF_mbar_ptr + NSF + _s, 1)  # empty: MMA commit
+                for _a in cutlass.range_constexpr(NUM_ACC):
+                    cute.arch.mbarrier_init(T_mbar_ptr + _a, 1)  # full: MMA commit
+                    cute.arch.mbarrier_init(T_mbar_ptr + NUM_ACC + _a, self.WARPGROUP_SIZE)  # empty: the owning math warpgroup
         num_clc_consumer_threads = self.WARP_SIZE * (4 + 4 * self.num_math_wg)
         clc_pipeline = PipelineClcFetchAsync.create(
             barrier_storage=clc_mbar_ptr,

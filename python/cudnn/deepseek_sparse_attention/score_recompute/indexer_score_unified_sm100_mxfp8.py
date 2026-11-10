@@ -437,15 +437,17 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             defer_sync=True,
         )
         if warp_idx == 1:
-            cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
         if warp_idx == 0:
-            cute.arch.mbarrier_init(claim_mbar_ptr, 1)  # load warp -> CLC warp: the tile's loads are issued
-            for _s in cutlass.range_constexpr(self.NUM_SF_STAGES):
-                cute.arch.mbarrier_init(SF_mbar_ptr + _s, 1)  # full: SF warp commit
-                cute.arch.mbarrier_init(SF_mbar_ptr + self.NUM_SF_STAGES + _s, 1)  # empty: MMA commit
-            for _w in cutlass.range_constexpr(SPLIT):
-                cute.arch.mbarrier_init(T_mbar_ptr + _w, 1)  # full: MMA commit
-                cute.arch.mbarrier_init(T_mbar_ptr + SPLIT + _w, self.WARPGROUP_SIZE * self.num_math_wg)  # empty: every math WG
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(claim_mbar_ptr, 1)  # load warp -> CLC warp: the tile's loads are issued
+                for _s in cutlass.range_constexpr(self.NUM_SF_STAGES):
+                    cute.arch.mbarrier_init(SF_mbar_ptr + _s, 1)  # full: SF warp commit
+                    cute.arch.mbarrier_init(SF_mbar_ptr + self.NUM_SF_STAGES + _s, 1)  # empty: MMA commit
+                for _w in cutlass.range_constexpr(SPLIT):
+                    cute.arch.mbarrier_init(T_mbar_ptr + _w, 1)  # full: MMA commit
+                    cute.arch.mbarrier_init(T_mbar_ptr + SPLIT + _w, self.WARPGROUP_SIZE * self.num_math_wg)  # empty: every math WG
         num_clc_consumer_threads = self.WARP_SIZE * (1 + 3 + 4 * self.num_math_wg)
         clc_pipeline = PipelineClcFetchAsync.create(
             barrier_storage=clc_mbar_ptr,
