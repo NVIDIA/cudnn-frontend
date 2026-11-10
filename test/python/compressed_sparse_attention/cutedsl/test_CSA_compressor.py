@@ -325,24 +325,26 @@ def _run_batch_invariance_target(samples, target_position, d, ratio, coff, backw
 
 
 _BATCH_INVARIANCE_CASES = [
-    pytest.param(2, 1, 257, 1024, 1, id="r2-c1"),
-    pytest.param(2, 2, 257, 1024, 1, id="r2-c2"),
-    pytest.param(4, 1, 513, 2048, 3, id="r4-c1"),
-    pytest.param(4, 2, 513, 2048, 3, id="r4-c2"),
+    pytest.param(2, 1, 128, 257, 1024, 1, id="r2-c1-d128"),
+    pytest.param(2, 2, 128, 257, 1024, 1, id="r2-c2-d128"),
+    pytest.param(2, 2, 65, 257, 1024, 1, id="r2-c2-d65-scalar"),
+    pytest.param(4, 1, 128, 513, 2048, 3, id="r4-c1-d128"),
+    pytest.param(4, 2, 128, 513, 2048, 3, id="r4-c2-d128"),
+    pytest.param(4, 1, 512, 513, 2048, 3, id="r4-c1-d512"),
     # 128 compressed neighbor rows plus the target cross the dedicated forward's
     # small/default schedule boundary without making this L0 probe resource-heavy.
-    pytest.param(128, 1, 129, 16384, 127, id="r128-c1-small-to-default"),
-    pytest.param(128, 2, 129, 16384, 127, id="r128-c2-small-to-default"),
+    pytest.param(128, 1, 128, 129, 16384, 127, id="r128-c1-d128-small-to-default"),
+    pytest.param(128, 2, 128, 129, 16384, 127, id="r128-c2-d128-small-to-default"),
+    pytest.param(128, 2, 512, 129, 16384, 127, id="r128-c2-d512-small-to-default"),
 ]
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop-deterministic"])
-@pytest.mark.parametrize("ratio,coff,target_length,large_length,short_length", _BATCH_INVARIANCE_CASES)
-def test_batch_invariance(backward, ratio, coff, target_length, large_length, short_length):
+@pytest.mark.parametrize("ratio,coff,d,target_length,large_length,short_length", _BATCH_INVARIANCE_CASES)
+def test_batch_invariance(backward, ratio, coff, d, target_length, large_length, short_length):
     """A fixed sequence has identical bytes alone, reordered, duplicated, or beside changed neighbors."""
     _require_csa_device(ratio)
-    d = 128
     ape_generator = torch.Generator(device="cpu").manual_seed(20261110)
     ape = torch.randn(ratio, coff * d, generator=ape_generator, dtype=torch.float32).mul_(0.25).cuda()
     target = _make_batch_invariance_sample(target_length, d, ratio, coff, ape, 20261111)
