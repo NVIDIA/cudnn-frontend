@@ -40,18 +40,19 @@ CSA compressor coverage currently lives in
 forward/dKV/dScore bytes, `deterministic=True` dAPE, strict torch deterministic mode,
 poisoned caller workspace/output CUDA Graph replay, ragged and empty segments, and
 exact-zero static-capacity rows for the generic and ratio-128 forward families. The
-focused determinism set has 23 L0 cases: five replay cases; twelve forward/deterministic-
-backward batch cases spanning ratios 2, 4, and 128 with both `coff` values; and six
+focused determinism set has 29 L0 cases: five replay cases; eighteen forward/deterministic-
+backward batch cases spanning ratios 2, 4, and 128, both `coff` values, scalar and
+wide generic layouts, and both supported ratio-128 head dimensions; and six
 replay-plus-reference goldens for generic ratio-2, generic ratio-4 overlap, and the
 dedicated ratio-128 path. Batch cases compare a fixed sequence alone, before and after
 different-size neighbors, duplicated, and beside changed neighbor data. The ratio-128
 case crosses its small/default forward schedule boundary. Backward isolates the fixed
 sequence's upstream gradient and checks BF16 dKV/dScore plus FP32 dAPE bytes.
 
-At revision `70e7eb77d997`, the new SM100 run (CUDA 13.0, cuDNN 9.24, PyTorch
-2.14.1, CUTLASS DSL 4.8.1) reported 12/12 batch cases, 5/5 replay cases, and 6/6
+At revision `dcb7bddaa358`, the new SM100 run (CUDA 13.0, cuDNN 9.24, PyTorch
+2.14.1, CUTLASS DSL 4.8.1) reported 18/18 batch cases, 5/5 replay cases, and 6/6
 golden/reference cases passed. The SM103 run (CUDA 13.0, cuDNN 9.20, PyTorch
-2.12.1, CUTLASS DSL 4.7.1) reported the same 23 passes. The two committed runtime
+2.12.1, CUTLASS DSL 4.7.1) reported the same 29 passes. The two committed runtime
 baselines use keys `842e0ee8788d6de6` and `4e05d04e8e72ed1b`; identical inputs
 produced identical output hashes across the two recorded runtimes. These results establish
 forward and opt-in deterministic backward as Supported in the combined SM100/103 column.

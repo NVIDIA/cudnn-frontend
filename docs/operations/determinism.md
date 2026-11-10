@@ -81,10 +81,12 @@ a row alone and inside a batch under the entry's own picks.
 - CSA compressor forward and dKV/dScore use fixed orders. Complete backward
   determinism requires `deterministic=True`, caller-owned workspace on the class API,
   and a prepared plan before CUDA Graph capture; the default dAPE path uses FP32
-  atomics. On SM100 and SM103, replay, committed goldens, and fixed-sequence batch
-  comparisons cover ratios 2, 4, and 128, both overlap forms, reordered and duplicated
-  sequences, changed neighbors, and a ratio-128 schedule-boundary crossing. SM90 and
-  SM107 remain unverified for batch invariance.
+  atomics. On SM100 and SM103, fixed-sequence batch comparisons cover ratios 2, 4,
+  and 128, both overlap forms, scalar and wide generic layouts, both ratio-128 head
+  dimensions, reordered and duplicated sequences, changed neighbors, and a ratio-128
+  schedule-boundary crossing. Replay and committed goldens cover the generic ratio-2,
+  generic ratio-4 overlap, and dedicated ratio-128 numerical paths. SM90 and SM107
+  remain unverified for batch invariance.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
