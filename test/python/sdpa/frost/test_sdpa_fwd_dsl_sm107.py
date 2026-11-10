@@ -893,26 +893,22 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
 
 
 def test_sm107_f16_thd_is_served_on_every_flavor():
-    """FULLY INVERTED 2026-09-09: every f16 flavor of the 128..512 family serves THD.
+    """THD retains its exact validated shapes; dense D32 and D576 stay declined.
 
-    PARTIALLY RE-INVERTED with the small head-dim tiles (d32 / d64 on the d128 file): `thd_d_shapes` is now a STRICT
-    SUBSET of `d_shapes` -- the small tiles' bodies carry the THD contract in principle (the same file) but their THD leg is
-    unvalidated, so the row declines it TYPED (and the config factory refuses `thd_varlen` for the "sm107 d32" / "sm107 d64"
-    flavors) until a THD sweep lands.  The two halves pinned: every THD shape is a served shape with no kernel-less member,
-    and every small tile is a typed decline, never a KeyError in module loading.  Asserted on real facts objects.
-
-    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`, because that is what makes a partial arch
-    line expressible without reintroducing a boolean that cannot describe it."""
+    The capability set must describe a strict subset, so adding a dense flavor
+    never silently admits packed queries for an unwired kernel path.
+    """
     from cudnn.sdpa.fwd import engines
-    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES, SM107_F16_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32)}, "THD = every f16 shape except D32"
+    assert SM107_F16_THD_SHAPES < caps.d_shapes
+    assert caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32), (576, 512)}
     for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
-    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES - SM107_F16_THD_SHAPES):
+    for d_qk, d_v in sorted(caps.d_shapes - SM107_F16_THD_SHAPES):
         why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
         assert why is not None and "THD" in why, (d_qk, d_v, why)
 
