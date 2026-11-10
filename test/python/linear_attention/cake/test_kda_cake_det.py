@@ -13,6 +13,17 @@ from linear_attention.cake.test_gdn_cake_det import cake_available
 pytestmark = [pytest.mark.L0]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def release_kda_plans():
+    yield
+    import gc
+    from cudnn.linear_attention.ops import kda
+
+    for cache in (kda.fprop_cache, kda.bprop_cache, kda.summary_cache):
+        cache.clear()
+    gc.collect()
+
+
 def inputs(lengths, heads):
     torch.manual_seed(8401)
     total = sum(lengths)
