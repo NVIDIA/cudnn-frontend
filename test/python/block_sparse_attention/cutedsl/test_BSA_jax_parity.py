@@ -14,11 +14,6 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_bsa_jax_torch_parity(layout):
     require_arch(archs=(100, 103), reason="JAX BSA requires SM100 or SM103")
-    from cudnn.frost.buffers import cutedsl_requirement_error
-
-    requirement_error = cutedsl_requirement_error("JAX BSA parity tests", floor=(4, 7, 1))
-    if requirement_error:
-        pytest.skip(requirement_error)
     jax = pytest.importorskip("jax", minversion="0.9.1")
     import jax.numpy as jnp
     from cudnn import ops
