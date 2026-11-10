@@ -253,6 +253,10 @@ forward-only evidence; SM121 and other runtimes remain unverified.
 
 SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.
 
-D576/V512 dense, THD and paged forward has dedicated replay/batch tests,
-including half-Q/FP8 paged KV. Its new numerical path is currently unverified
-for determinism until target execution and strict runtime goldens complete.
+D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in
+the tested FP16/BF16 configurations on GB10 (SM121), including half-Q with
+FP8 E4M3/E5M2 paged KV. Split count and packing stay fixed across batch
+reordering, duplication and changed-neighbor capture replay. Compact THD
+repacking follows changed lengths; independent physical gaps are outside this
+path's contract. SM120 hardware execution and other runtimes remain unverified.
+This qualification adds no backward support.
