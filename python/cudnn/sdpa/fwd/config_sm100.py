@@ -2181,6 +2181,11 @@ def d512_2x2_smem_bytes(cfg: CfgD512X2, n_o_chunks: int = 8) -> dict:
         + 1  # empty_mainloop
         + 1  # tmem_dealloc
     )
+    if getattr(cfg, "DTYPE_KV", -1) in (DTYPE_E4M3, DTYPE_E5M2):
+        # Native mixed storage widens one K/V sub-chunk at a time. The raw
+        # slab follows the MMA operands, preserving their descriptor offsets.
+        data += max(k_sub, v_sub) // bpe
+        n_bars += 1
     barriers = n_bars * 8 + 2 * cfg.SCHEDULER_STAGES * 8 + cfg.SCHEDULER_STAGES * 8 * 4 + 16
     return dict(
         q=q,

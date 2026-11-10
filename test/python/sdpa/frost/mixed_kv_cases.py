@@ -54,6 +54,7 @@ def check_dense_paged_rebind_capture(
     cpu_reference=False,
     head_dim=128,
     q_tokens=None,
+    heads=None,
 ):
     import cudnn
     from cudnn.engines.manifest import family_for
@@ -73,6 +74,8 @@ def check_dense_paged_rebind_capture(
     page = 128 if hnd else 8
     b, sq, sk, hq, hk, d = (9, 17, 384 if hnd else 264, 16, 4, 128) if paged else (2, 193, 257, 8, 2, 128)
     d = head_dim
+    if heads is not None:
+        hq, hk = heads
     if q_tokens is not None:
         sq = q_tokens
     blocks = sk // page if paged else 0
@@ -162,6 +165,8 @@ def check_dense_paged_rebind_capture(
             api.check_support()
             api.compile()
             assert api.split_kv == splits
+            if engine_name.endswith("sm107") and head_dim == 512:
+                assert api.template_params().d_flavor == 512 and api.template_params().mma_2x2
             if engine_name.endswith("sm107") and head_dim == 256 and splits > 1:
                 assert api._fp32_partial_split()
             workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
@@ -175,8 +180,8 @@ def check_dense_paged_rebind_capture(
             if cga == 1 and not (engine_name.endswith("sm107") and (paged or head_dim == 64))
             else ("sm107/prefill_d128_f16.py" if engine_name.endswith("sm107") else "sm100/prefill_d128_f16.py")
         )
-        if engine_name.endswith("sm107") and head_dim == 256:
-            expected_file = "sm107/prefill_d256_f16.py"
+        if engine_name.endswith("sm107") and head_dim in (256, 512):
+            expected_file = "sm107/prefill_d256_f16.py" if head_dim == 256 else "sm107/prefill_d512_f16_2x2.py"
         assert loaded[-1].__file__.endswith(expected_file)
         assert loaded[-1].CFG.CTA_MMA == cga and loaded[-1].KV_STORAGE_DTYPE.width == 8
 
