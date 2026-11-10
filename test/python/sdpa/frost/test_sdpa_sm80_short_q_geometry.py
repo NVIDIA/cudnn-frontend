@@ -92,10 +92,11 @@ def test_declared_geometry_and_explicit_tile(sq, d, dv, thd, tile_m, expected, m
 
 @pytest.mark.parametrize("dims", [(64, 64), (128, 128), (192, 128), (256, 256)])
 @pytest.mark.parametrize("tile_m,warps", [(64, 4), (128, 8)])
-def test_32_key_tile_requires_d256_envelope(dims, tile_m, warps):
-    params = TemplateParams(d_qk=dims[0], d_v=dims[1], tile_m=tile_m, num_warps=warps, tile_n=32)
-    if dims == (256, 256):
-        validate_params(params)
-    else:
-        with pytest.raises(ValueError, match="tile_n must be one of"):
-            validate_params(params)
+def test_32_key_tile_serves_small_head_envelopes(dims, tile_m, warps):
+    validate_params(TemplateParams(d_qk=dims[0], d_v=dims[1], tile_m=tile_m, num_warps=warps, tile_n=32))
+
+
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+def test_32_key_tile_still_declines_wide_heads(dims):
+    with pytest.raises(ValueError, match="tile_n must be one of"):
+        validate_params(TemplateParams(d_qk=dims[0], d_v=dims[1], tile_m=32, num_warps=4, tile_n=32))
