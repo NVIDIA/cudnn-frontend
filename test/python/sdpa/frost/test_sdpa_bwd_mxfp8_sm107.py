@@ -3197,29 +3197,3 @@ def test_mxfp8_gqa_dk_is_the_once_rounded_fold_of_its_fp32_partials(ds_policy):
         f"(group-rounded bf16 partials would read {rel_rms(prev):.3e}); elements more than one bf16 ulp off: {100 * frac_off(dk):.3f} % "
         f"(group-rounded form {100 * frac_off(prev):.3f} %); partial dtype {dtype}"
     )
-
-
-# Architecture CI entry for the shared exact-D512 block-scale contract.
-import d512_mxfp8_bwd_checks as d512_mx_checks
-
-
-@requires_rubin
-class TestD512Mxfp8Backward:
-    @pytest.fixture
-    def d512_mx(self, monkeypatch):
-        from cudnn.frost.buffers import cutedsl_state
-        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
-
-        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
-        if error is not None:
-            pytest.skip(error)
-        import test_sdpa_bwd_mxfp8_sm100 as mx
-
-        monkeypatch.setattr(mx, "_ENGINE", "sdpa_bwd_d512_mxfp8")
-        original = mx._plan_index
-        monkeypatch.setattr(mx, "_plan_index", lambda graph: original(graph, "sdpa_bwd_d512_mxfp8"))
-        return mx
-
-    test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
-    test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
-    test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)

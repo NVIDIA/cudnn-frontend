@@ -1332,8 +1332,8 @@ was not CI inclusion. The new kernel now carries its required cuDNN prefix.
 
 ### D512 MXFP8 backward — 2026-11-10
 
-`TestD512Mxfp8Backward` is collected by the existing SM100 and SM107 MXFP8
-architecture entries. The shared `d512_mxfp8_bwd_checks.py` has six independent
+`TestD512Mxfp8Backward` is collected by the SM100 MXFP8 entry and the
+explicitly selected SM107 `test_sdpa_fp8_sm107.py` entry. The shared `d512_mxfp8_bwd_checks.py` has six independent
 reference cases, seven graph declines and two raw-byte golden/batch cases.
 CPU-seeded inputs are quantized once; SF bytes are reordered in their canonical
 rowwise/columnwise layout with the corresponding payloads. Singletons,
@@ -1354,3 +1354,8 @@ compiles both gradient types; no execution result is inferred. Original
 B2/H64:1/S16384/window128 passes a full structured output oracle and changed-
 input capture on SM107 with8,388,848bytes of scratch. This is not a full
 random-matrix oracle or a performance result.
+
+Review closeout on SM107: the selected `test_sdpa_fp8_sm107.py` entry passes
+all 15 MXFP8 and 19 FP8 strict cases, plus the three kernel-prefix guards
+(37 total). Both new backward kernels have cuDNN symbol prefixes. Arithmetic
+and all existing golden output bytes remain unchanged.
