@@ -1,5 +1,12 @@
 # FROST SDPA — support matrix
 
+**SM80 half PackGQA:** dense queries may pack heads sharing a KV head into
+native MMA rows, including groups that cross tile boundaries. Dense/paged KV,
+split-KV, masks, sinks, bias and independent Q/O/Stats strides use the existing
+graph contract and caller-owned workspace. The eight-aligned head envelopes
+through D576/V512 remain unchanged. THD PackGQA is unsupported. Explicit
+`PACK_GQA` requests control this path; no candidate ranking policy is added.
+
 **SM107 native half D576/V512:** exact half-precision dense Q uses three
 192-column QK chunks in the native 2x2 pipeline, one CTA pair and three-stage
 K/V rings. Dense and paged K/V, partial PackGQA, dense split-KV, causal/window

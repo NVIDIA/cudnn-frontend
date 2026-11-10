@@ -6824,7 +6824,9 @@ def _sm80_load_kernel_module(flavor: str, params):
 
     from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import FROST_SOURCE_DIGEST as ragged_origin_digest
 
-    return load_template(path, params, tag=f"sm80_{stem}", extra_key=f"{paged_load_digest}:{ragged_origin_digest}")
+    from cudnn.sdpa.fwd.kernels.sm80.gqa import FROST_SOURCE_DIGEST as gqa_digest
+
+    return load_template(path, params, tag=f"sm80_{stem}", extra_key=f"{paged_load_digest}:{ragged_origin_digest}:{gqa_digest}")
 
 
 def _sm80_sched_policy_int(token: str) -> int:
@@ -7110,6 +7112,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._rope_max_s and (self.seq_kv_lens_present or self.seq_q_lens_present),
             "SM80 SDPA: RoPE fusion is dense-unpadded-only",
         )
+        self._not_implemented_error_if(self.pack_gqa and self.thd, "SM80 PackGQA requires dense Q")
         self._value_error_if(not 1 <= self.split_kv <= 65535, "SM80 split_kv must be in [1, 65535]")
         self._not_implemented_error_if(self.split_kv > 1 and max(b, h_qo) > 65535, "SM80 split-KV requires batch and heads each at most 65535")
         self._not_implemented_error_if(
@@ -7269,6 +7272,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             score_sign=_sm80_cfg.score_sign(self.scale_softmax),
             paged_page_size=self.paged_page_size,
             split_kv=self.split_kv,
+            pack_g=self.h_q // self.h_kv if self.pack_gqa else 1,
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if self.thd:

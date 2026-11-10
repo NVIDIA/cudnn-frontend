@@ -59,7 +59,7 @@ def test_paged_split_rebind(dims, dtype, graph_mode, cudnn_handle, monkeypatch):
 @pytest.mark.parametrize("dims", [(128, 128), (512, 512), (576, 512)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("stats_log2", [False, True])
-def test_dense_split_partial_initialization(dims, dtype, stats_log2):
+def test_dense_split_partial_initialization(dims, dtype, stats_log2, pack_gqa=False):
     """Every scratch row is written before reduction, under replay and empty KV."""
     import math
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
@@ -87,6 +87,7 @@ def test_dense_split_partial_initialization(dims, dtype, stats_log2):
         o,
         sample_lse=lse,
         split_kv=17,
+        pack_gqa=pack_gqa,
         sched_policy=1,
         has_sink=True,
         seq_q_lens_present=True,

@@ -82,7 +82,7 @@ def _host(
         params.d_qk,
         params.d_v,
         dtype,
-        sq % params.tile_m == 0 and skv % params.tile_n == 0,
+        (sq * params.pack_g) % params.tile_m == 0 and skv % params.tile_n == 0,
         d == params.d_qk,
         mask,
         swa_window,

@@ -45,6 +45,8 @@ def test_native_paged_adapter_rebind_replay(
     split_kv=1,
     sink_stride=3,
     explicit_tiles=None,
+    pack_gqa=False,
+    heads=None,
 ):
     import cutlass.cute as cute
 
@@ -53,6 +55,8 @@ def test_native_paged_adapter_rebind_replay(
     d, dv, page, klayout, vlayout, mask = point
     torch.manual_seed(721 + index)
     b, h, hk, max_sq, max_skv, tq = 3, 8, 2, 65, 129, 89
+    if heads is not None:
+        h, hk = heads
     if single_q:
         max_sq = 1
     cap = (tq + 64 if graph_mode else tq) if thd else max_sq
@@ -113,6 +117,7 @@ def test_native_paged_adapter_rebind_replay(
         sample_lse=lse_desc,
         has_sink=has_sink,
         split_kv=split_kv,
+        pack_gqa=pack_gqa,
         is_causal=causal,
         causal_bottom_right=br,
         window_size_left=31 if swa else None,

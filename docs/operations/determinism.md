@@ -208,6 +208,13 @@ under replay, batch reordering/duplication and changed neighbors. This
 extends the tested forward configuration set; it does not require equality
 between different tile sizes or split counts.
 
+Dense-query native PackGQA forward is repeatable and batch invariant in the
+tested FP16/BF16 D64, D128, D256 and D512 configurations, including head groups
+that cross tile boundaries, unsplit and fixed-split plans. O and FP32 Stats
+retain bytewise identity under replay, reordered/duplicated batches and changed
+neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
+this forward result does not establish a backward or cross-runtime guarantee.
+
 ## SM120 small-head paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch

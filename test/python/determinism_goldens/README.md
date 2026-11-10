@@ -1706,3 +1706,48 @@ numerical, fresh-binding and replay checks. Each also passes memcheck,
 racecheck and synccheck with zero diagnostics, bringing the sanitizer scope
 to 14 cases per tool. These controls exercise the nonpaged copy path with
 all CTA threads and with the reduced copy-thread subset.
+
+
+### Native SM80 PackGQA forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_pack_gqa_sm80.py` qualifies native FP16/BF16
+packed-head forward on A100. Ten new CPU-seeded goldens cover D64/group3
+unsplit M16/N16, D128/group12 split3 M32/N32, D128/group128 split3 M16/N16,
+D256/group8 unsplit M16/N32 and D512/group3 split17 M32/N16. These include
+head groups crossing tile boundaries. Independent CPU FP64 references, fresh
+buffers and concurrent-work replay pass before recording. O and FP32 Stats
+are byte-compared alone, in reordered/duplicated batches through129 and under
+changed-neighbor CUDA Graph replay. Runtime key `a29ca37b88513cb6` identifies
+the qualification environment; exact runtime details remain in private evidence.
+No old golden was regenerated. This is forward-only, with fixed knobs and
+runtime; THD PackGQA remains unsupported.
+
+The native feature run passes64paged graph/standalone cases across both half
+types, split/unsplit, independent HND/NHD pools, masks, sink endpoints,
+strided canaries, fresh pointers and changed device lengths under capture.
+The route assertion observes the packed head count in the compiled template.
+Eight dense split partial-initialization cases and six dense bias/sink replay
+cases pass. The first launch attempt lacked the isolated worktree's compiled
+Python extension and stopped during import; no kernel executed in that attempt.
+
+From `test/python`, run `python -m pytest -n 0 -m L0 -q
+sdpa/frost/test_sdpa_fwd_pack_gqa_sm80.py`, with
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` for strict comparisons. Other runtimes
+require the usual separate golden-recording workflow.
+
+
+The strict follow-up passes132cases:108existing paging/sink cases,
+four original split goldens, eight small-tile goldens, ten new PackGQA goldens,
+and two packed split artifact-reload cases with compilation forbidden on the
+second plan. All108host geometry/admission cases pass, plus the direct THD
+PackGQA rejection. Memcheck passes18cases with zero errors. The initial unfiltered racecheck was interrupted after five passes because
+instrumenting the independent Torch reference dominated runtime; its log is
+retained. Final racecheck and synccheck each pass22cases with zero errors or
+warnings, retaining all18original cases and adding four G128 single-query
+cases. These runs use `--kernel-name kns=cudnn_kernel_` to check every native
+producer/combine and exclude reference kernels. A full launched-name audit
+confirms the producer and combine are included; the first audit hit the
+100-message printing limit, so the completed audit uses `--print-limit 0`.
+The standalone audit passes one additional graph/capture case. No sanitizer
+finding was suppressed or converted into a pass.

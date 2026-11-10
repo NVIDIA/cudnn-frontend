@@ -16,8 +16,9 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason
 
 @pytest.mark.parametrize("d,splits", [(128, 3), (512, 17)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_split_forward_determinism(d, splits, dtype, tile_m=None, tile_n=None, golden_suffix=""):
-    h, hk, sq, sk = 8, 2, 17, 257
+def test_split_forward_determinism(d, splits, dtype, tile_m=None, tile_n=None, golden_suffix="", pack_gqa=False, heads=(8, 2)):
+    h, hk = heads
+    sq, sk = 17, 257
     rng = torch.Generator().manual_seed(941)
     records = [tuple(torch.randn(shape, generator=rng).to(dtype) * 0.25 for shape in ((h, sq, d), (hk, sk, d), (hk, sk, d))) for _ in range(3)]
     sink_cpu = torch.linspace(-3, 3, h)
@@ -38,6 +39,7 @@ def test_split_forward_determinism(d, splits, dtype, tile_m=None, tile_n=None, g
             o,
             sample_lse=lse,
             split_kv=splits,
+            pack_gqa=pack_gqa,
             sched_policy=0,
             tile_m=tile_m,
             tile_n=tile_n,

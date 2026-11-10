@@ -97,7 +97,6 @@ def test_explicit_graph_geometry(d, dv, m, n, mode):
         (512, 512, {"tile_m": 64}, "tile_m"),
         (576, 512, {"tile_n": 64}, "tile_n"),
         (192, 128, {"cga": 2}, "cga"),
-        (192, 128, {"pack_gqa": True}, "pack_gqa"),
     ],
 )
 def test_unsupported_geometry_declines(d, dv, kw, label):
@@ -113,6 +112,25 @@ def test_split_geometry_requires_dense_queries(mode):
         assert reason is not None and "split" in reason
     else:
         assert reason is None
+
+
+@pytest.mark.parametrize("group", [1, 3, 12, 128])
+@pytest.mark.parametrize("mode", ["dense", "paged", "thd"])
+def test_pack_geometry_crosses_tile_boundaries(group, mode):
+    knobs = engines.SdpaFwdKnobs(tile_m=16, tile_n=32, cga=1, sched_policy=0, pack_gqa=True)
+    facts = replace(_facts(mode=mode), h_q=group * 8)
+    reason = engines.mismatch(_CAPS, facts, knobs)
+    if mode == "thd":
+        assert reason is not None and "PackGQA" in reason
+    else:
+        assert reason is None
+        # Unspecified tile geometry must not read max() of an empty domain.
+        assert engines.mismatch(_CAPS, facts, replace(knobs, tile_m=None, tile_n=None)) is None
+
+
+def test_pack_geometry_keeps_unsupported_widths_a_decline():
+    reason = engines.mismatch(_CAPS, _facts(584, 512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert reason is not None and "envelope" in reason
 
 
 @pytest.mark.parametrize("mode", ["dense", "thd", "paged"])

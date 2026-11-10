@@ -2039,6 +2039,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "PackGQA cannot ride the fused epilogue gate (only the d256 decode tile's split applies the gate in its combine)"
             if knobs.tile_m is not None:
                 _pg_tile_m = knobs.tile_m
+            elif capabilities.sm_lo == 80:
+                try:
+                    _pg_tile_m = max(_sm80_graph_tile_domains(facts.d_qk, facts.d_v)[0])
+                except ValueError as error:
+                    return str(error)
             elif capabilities.sm_lo == _BLACKWELL_GEFORCE[0]:
                 # The adapter's own Q tile: the flavor's largest (one 64-row tile on the D=512 templates).
                 _pg_tile_m = max(m for m, _ in _sm120_tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8))
@@ -2071,10 +2076,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # graph that lowers onto it (api_dsl.check_support exempts the same graphs).  The SM100 line
             # keeps the rule as is: its partial PackGQA already admits such groups on the prefill tile.
             _decode_packs_whole_group = capabilities.sm_lo == 107 and decode_tile and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0
+            # SM80 maps each MMA row to (query, subhead), so a group may
+            # straddle tile boundaries without padding or a divisibility rule.
+            _sm80_packs_across_tiles = capabilities.sm_lo == 80 and facts.h_kv > 0 and facts.h_q > 0 and facts.h_q % facts.h_kv == 0
             _requires_divisible = capabilities.pack_gqa_requires_divisible
             if (
                 not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial, requires_divisible=_requires_divisible)
                 and not _decode_packs_whole_group
+                and not _sm80_packs_across_tiles
             ):
                 return (
                     f"PackGQA requires h_q/h_kv to {'not exceed' if not _requires_divisible else 'share a factor with' if _partial else 'divide'} tile_m: "
@@ -3463,6 +3472,8 @@ def _sm80_spec() -> EngineSpec:
             # (per-batch ``seq_len_q`` forward kwarg): rows >= seq_len_q[b]
             # are written explicitly by the kernel (O := 0, LSE := -inf).
             lse_optional=True,
+            pack_gqas=frozenset({False, True}),
+            pack_gqa_requires_divisible=False,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
             # Dense graphs serve all three schedulers; the THD grid is 3-D
