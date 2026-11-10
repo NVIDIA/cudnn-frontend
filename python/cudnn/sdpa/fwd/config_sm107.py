@@ -323,7 +323,7 @@ _F16_THD_FLAVORS = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128", "sm1
 # route, the SM100 decode record re-validated for Rubin) and sm107/sparse_d256_f16.py (make_cfg_d256_sparse -- the
 # index-list core's gather warps read K / V from the pools through the (B, max_pages) table; page_size a multiple of
 # the 4-token block).
-_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128", "sm107 d192xd128 paged", "sm107 d128 mxfp8", "sm107 d256 mxfp8", "sm107 d512"})
+_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d64", "sm107 d128", "sm107 d192xd128 paged", "sm107 d128 mxfp8", "sm107 d256 mxfp8", "sm107 d512"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
@@ -390,7 +390,7 @@ SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 # every requested feature must fit. Other legs retain the larger envelope.
 SM107_HEAD_DIM_TILE_WIDTHS = (32, 64, 128)
 SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
-SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA", "split-KV"})}
+SM107_SMALL_D_NATIVE_LEGS = {(32, 32): frozenset(), (64, 64): frozenset({"THD", "PackGQA", "split-KV", "paged KV"})}
 # cga widths the small tiles are VALIDATED at (the engine row's ``cgas_by_d_shape`` reads this; the factory refuses a width
 # outside it).  cga1 is the default: the narrow slabs need no collective MMA to halve K/V, and a 512-row cga2 cluster wastes
 # 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for.  At TILE_O = 32 a cga2 V operand would be 16 columns
@@ -405,8 +405,15 @@ def supports_native_d192_paged(d_shape, *, device_cc, fp8, paged, cga=None, spli
 
 
 def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None, thd=False):
-    """Native half D64 packs dense plans and one-CTA ragged splits."""
-    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and not paged and (not thd or split_kv == 1 or cga in (None, 1)) and cga in (None, 1, 2)
+    """Native half D64 packing; paged THD is unsplit, nonpaged THD splits use one CTA."""
+    return (
+        device_cc == (10, 7)
+        and d_shape == (64, 64)
+        and not fp8
+        and (not (paged and thd) or split_kv == 1)
+        and (not thd or split_kv == 1 or cga in (None, 1))
+        and cga in (None, 1, 2)
+    )
 
 
 def supports_native_d128_single_q(
@@ -461,9 +468,9 @@ def supports_native_d128_narrow_tile(d_shape, *, device_cc, half_precision, thd,
     )
 
 
-def supports_native_d128_dense_paged(d_shape, *, device_cc, fp8, thd, paged):
-    """Dense half Q binds directly to native D128's page-table loader."""
-    return device_cc == (10, 7) and not fp8 and not thd and paged and d_shape == (128, 128)
+def supports_native_small_half_dense_paged(d_shape, *, device_cc, fp8, thd, paged):
+    """Dense half Q binds directly to the native D64/D128 page-table loader."""
+    return device_cc == (10, 7) and not fp8 and not thd and paged and d_shape in ((64, 64), (128, 128))
 
 
 def supports_native_d128_dense_partial_pack(d_shape, *, device_cc, fp8, thd, paged, cga):
@@ -1762,8 +1769,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             p = k.page_size
             if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
                 raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
-        elif flavor in ("sm107 d128", "sm107 d192xd128 paged"):
-            expected_d = 192 if flavor == "sm107 d192xd128 paged" else 128
+        elif flavor in ("sm107 d64", "sm107 d128", "sm107 d192xd128 paged"):
+            expected_d = {"sm107 d64": 64, "sm107 d128": 128, "sm107 d192xd128 paged": 192}[flavor]
             if k.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16) or k.d_flavor != expected_d:
                 raise ValueError(f"{flavor}: native paged half prefill requires half inputs and d_flavor={expected_d}")
             p = k.page_size
