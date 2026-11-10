@@ -242,10 +242,17 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     fp8 = replace(facts, is_fp8=True)
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 1) is None
     assert engines._prepared_decline_reason(spec.capabilities, fp8, 2) is None
-    # The SM120 paged prepared path serves dense half widths through D128 without splits.
-    paged = replace(facts, has_paged_kv=True)
+    # Prepared binding serves dense half widths through D128; concrete tiles
+    # distinguish unsplit prefill from split-capable decode.
+    paged = replace(facts, has_paged_kv=True, padded=True, page_size=16)
     assert (engines._prepared_decline_reason(spec.capabilities, paged, 1) is None) == (d <= 128)
-    assert engines._prepared_decline_reason(spec.capabilities, paged, 2) is not None
+    assert (engines._prepared_decline_reason(spec.capabilities, paged, 2) is None) == (d <= 128)
+    if d <= 128:
+        # Tile-only knobs keep the default unsplit value (None) legal.
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64)) is None
+        reason = engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=64, split_kv=2))
+        assert reason is not None and "decode tile" in reason
+        assert engines.mismatch(spec.capabilities, paged, engines.SdpaFwdKnobs(tile_m=16, split_kv=2)) is None
     for change in (dict(thd=True), dict(is_fp8=True), dict(is_mxfp8=True)):
         assert engines._prepared_decline_reason(spec.capabilities, replace(paged, **change), 1) is not None, change
     assert engines._prepared_decline_reason(spec.capabilities, replace(facts, is_mxfp8=True), 1) is not None

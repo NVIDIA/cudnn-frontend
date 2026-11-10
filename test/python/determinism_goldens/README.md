@@ -1442,6 +1442,33 @@ Run from `test/python`: `python -m pytest
 sdpa/frost/test_sdpa_fwd_paged_sm120.py -m L0 -q -x`; the sanitizer selection
 is `-k 'widths and (dims6 or dims2 or dims10) and (decode or packed_sink)'`.
 
+### SM120 paged decode and split-KV — 2026-11-10
+
+Eight new records at key42742425a3d29d7c cover FP16/BF16 D64/V64 on M16
+and D120/V88 on M32, packed, split1/3. The preceding small-head paging runtime
+applies. CPU-seeded inputs, a CPU-double O/Stats oracle, raw-byte repeats with
+concurrent work, reordered/duplicated batches through129 requests and
+changed-neighbor capture all pass before recording. All eight compare strictly
+alongside the eight original prefill records; the existing records are unchanged.
+The split count and tile shape remain fixed for each batch-invariance check.
+
+Feature coverage includes direct K/V pages, all16/32/48/64-key stage widths,
+D8 through128, independent HND/NHD layouts, poison/canaries, GQA6 partial
+packing, sink endpoints, device Q/KV lengths and strided natural/log2 Stats.
+Twenty existing nonpaged numerical/capture controls pass, including the newly
+admitted48-key dense stage for unequal QK/V widths. Target execution is SM120;
+SM121 remains unverified. Sanitizer and multi-wrap completion are recorded below.
+
+Final qualification:54 feature cases,17 strict original/new golden and scope
+checks,20 nonpaged numerical/capture controls and7 ring/domain checks pass.
+Each sanitizer reports zero findings on8 compact cases plus2 cases whose
+per-split stage count exceeds the physical ring size. The latter force slot
+reuse for both M16 and M32 consumer groups; four larger numerical cases also
+change page contents/lengths under capture after several ring wraps.
+Original GPT-OSS Q1/KV131072/D64 full and SWA128 graphs execute through ordinary
+OPENSOURCE candidates (M16/N32, split8 and split1 respectively), without a
+candidate or ranking patch. The bounded timing run is not performance qualification.
+
 ### Native SM107 D256 mixed FP8 KV — 2026-11-10
 
 `sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv` exposes D256 checks

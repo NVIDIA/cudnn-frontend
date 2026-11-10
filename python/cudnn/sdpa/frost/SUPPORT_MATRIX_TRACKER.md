@@ -2778,8 +2778,13 @@ by16 are native; intervening eight-aligned widths use the next16-column tile.
 Each operand uses its own swizzle span and physical strides; there is no materialized gather/repack or additional
 launch. K/V pools retain equal physical page capacities. Query and KV lengths,
 per-operand strides, pointers and table contents bind at execution and replay.
-This leg uses TILE_M 64/128 with TILE_N 64/128 and split_kv=1; larger head
-widths, THD Q, quantization and the decode tiles remain declined. Existing mask,
+This leg uses TILE_M 64/128 with TILE_N 64/128 and split_kv=1, or native
+TILE_M16/32 decode tiles with their head-dependent K/V stage widths and
+optional split-KV. The decode producer fills the existing ring directly;
+all32 producer lanes publish both K/V regions before consumer access. Split
+partials retain half O/FP32 Stats and the common fixed-order combine folds
+the sink once, respecting device Q lengths. Larger head widths, THD Q and
+quantization remain declined. Existing mask,
 sink, packing and Stats semantics compose without a heuristic change. Paged
 sink endpoints retain O=0 / Stats=+inf for a +inf sink, and O=0 / Stats=-inf
 for a keyless row with a -inf sink.

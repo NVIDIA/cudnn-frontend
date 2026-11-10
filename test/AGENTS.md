@@ -1325,6 +1325,15 @@ widened. `test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_widths` covers
 16/32/64-element swizzle spans, eight-aligned envelopes, fresh pool storage,
 independent HND/NHD tables and changed-input replay.
 
+SM120 decode stage width can be48 for unequal QK/V tiles (for example32/48).
+When adding a decode domain, intersect the capability row and template guard
+with `config_sm120.decode_kv_stage`, including48; rounding every stage to a
+power of two silently removes valid head-width pairs. The native paging suite
+covers D24/V40 at this stage width with split/unsplit execution.
+A paged ring-loader check must use more K/V stages per split than ring slots.
+Page-boundary tests shorter than the ring cannot detect missing producer waits
+on slot reuse; keep changed-table/length replay and racecheck on a multi-wrap case.
+
 When extending a native split kernel to paged KV, update the adapter's
 partial-format predicate together with route admission. The D256 mixed-KV
 host writes FP32 partials even when final O is half. Allocating or binding

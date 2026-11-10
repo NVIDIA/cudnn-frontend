@@ -187,3 +187,9 @@ and without packed GQA. RTX5080 checks compare O and Stats bytes across
 replays, reordered/duplicated batches and changed neighbors under capture.
 This is a fixed-GPU/runtime result; SM121 execution and cross-GPU bitwise
 identity are unverified. The determinism report records the exact coverage.
+
+The SM120 paged16/32-row decode tiles additionally have eight fixed-runtime
+replay/batch goldens for FP16/BF16 D64/V64 and D120/V88 with split1/3.
+The split count is held fixed across batch changes; the common fixed-order
+combine folds the sink once. This does not claim equality across different
+split counts or between the prefill and decode arithmetic orders.

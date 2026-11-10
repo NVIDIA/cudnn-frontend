@@ -5823,8 +5823,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     FP16/BF16 head dims divisible by 8 through D128 additionally accept dense queries over independent
     HND/NHD K/V page pools, with independent block tables and device KV lengths.
-    This native paged leg is unsplit and uses the 64/128-row prefill tiles;
-    it retains equal K/V page capacities and the shared page-size domain.
+    This native paged leg uses unsplit 64/128-row prefill tiles or 16/32-row
+    decode tiles with optional split-KV. It retains equal K/V page capacities
+    and the shared page-size domain.
 
     Half and per-tensor FP8 THD and zero-copy dense plans use a
     prepared pointer entry: pointers, sequence lengths and Int64 strides bind
@@ -5875,7 +5876,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
         )
         if self.paged:
-            self._not_implemented_error_if(self.thd or self.split_kv != 1, "SM120 paged KV requires dense Q and split_kv=1")
+            self._not_implemented_error_if(self.thd, "SM120 paged KV requires dense Q")
             self._not_implemented_error_if(
                 self.q_desc.ndim != 4
                 or self.v_desc.ndim != 4
@@ -5883,7 +5884,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3]),
                 "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128",
             )
-            self._not_implemented_error_if(self.tile_m in _SM120_DECODE_Q_TILES, "SM120 paged KV requires a prefill tile (tile_m=64 or 128)")
+            self._not_implemented_error_if(
+                self.split_kv > 1 and self.tile_m not in _SM120_DECODE_Q_TILES,
+                "SM120 paged KV split requires a decode tile (tile_m=16 or 32)",
+            )
             self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
             self._value_error_if(
                 self.paged_max_seq_len_kv is None or not 0 < self.paged_max_seq_len_kv < 2**31,
@@ -6227,8 +6231,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 "SM120 split_kv > 1 with an attention sink requires exact D128 dense per-tensor FP8 or FP16/BF16",
             )
             self._value_error_if(
-                self.seq_kv_lens_present or self.seq_q_lens_present,
-                "split_kv > 1 serves unpadded dense graphs only",
+                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and decode_tile),
+                "split_kv > 1 with device lengths requires the native paged decode tile",
             )
         self._value_error_if(
             self.softmax_precision is not None,
