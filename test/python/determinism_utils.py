@@ -21,10 +21,13 @@ def snapshot(outputs, *, allowed_inf=None):
     result = {}
     for name, value in outputs.items():
         assert isinstance(value, torch.Tensor), f"{name}: missing tensor"
-        valid = torch.isfinite(value)
+        # Torch lacks isfinite for some FP8 formats. Promote only the predicate;
+        # snapshots and byte comparisons retain the original FP8 payload.
+        checked = value.float() if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else value
+        valid = torch.isfinite(checked)
         if name in allowed_inf:
             assert allowed_inf[name] in (-torch.inf, torch.inf), "only infinity sentinels may be allowed"
-            valid |= value == allowed_inf[name]
+            valid |= checked == allowed_inf[name]
         assert valid.all(), f"{name}: non-finite result"
         result[name] = value.detach().clone()
     return result

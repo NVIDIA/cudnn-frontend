@@ -1480,12 +1480,38 @@ compute-warp tail sanitation. Multiple compute warps can then overwrite V
 while another warp reads it through `ldmatrix`, even when the stores repeat
 zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
 and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
+For dense runtime lengths and THD, give one warp ownership of that zero fill
+and synchronize all consuming warps before PV. The wide-head THD cases in
+`test_sdpa_fwd_d576_sm120.py` detect this write/read race under racecheck.
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
 qualified SM120 loader also retains producer-local commit/wait-group completion:
 an async-arrival-only variant passed numerics but failed the same racecheck.
 Do not remove that drain without rerunning the native sanitizer/capture cases.
+For a persistent CTA that reinitializes its K/V barriers between work units,
+keep the same producer arrival count at initial launch and every rearm. D512
+paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
+one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
+two CTAs so even compact tests exercise repeated unit transitions.
+An async-copy completion does not substitute for ownership synchronization
+of other shared buffers. The wide-head warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on every loader path,
+including dense and THD TMA. Their K/V handoff does not release score reads.
+`test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
+read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+`test_d576_dense_features[dims0-plain-dtype1]` and the D576 THD cases detect
+the same reuse hazard with TMA. Keep those separate from old-tool RAW reports:
+on SM121, sanitizer2025.3.1 also flags the already synchronized paged exchange;
+the identical cached binary is clean with sanitizer2026.3.0. Confirm active
+instrumentation before interpreting a newer-tool run as a pass.
+The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
+it publishes those stores with release arrivals, while uniform half retains
+copy-tracked arrivals. Do not select the publication operation by the output
+MMA type: it must follow the producer's actual storage operation. The exhaustive
+`test_sm120_mixed_paged_conversion_all_encodings` also checks the supported
+compiler floor; a direct packed BF16 conversion can require a newer PTX ISA
+than the installed DSL compiler even when the GPU supports the operation.
 See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 and run the native paging racecheck as well as memcheck and numerical replay.
 
@@ -1553,3 +1579,62 @@ half-precision resident-arm selector; explicit-only per-tensor widths belong
 in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
 `test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
 first-half tails as well as tile multiples, while admitting an explicit N64.
+
+Shared kernel geometry constants must live below the heuristics/adapter layer.
+Importing heuristics from split-combine creates a cycle when an adapter imports
+that reducer. Re-export shared constants from heuristics when callers already
+use those names, preserving their values and policy. The cold-interpreter
+`test_split_combine_import_without_heuristics` blocks heuristics imports while
+loading both the reducer and SM80 prepared host; a warmed test process can hide
+this dependency.
+
+Test launch recorders retained by a native binder must not capture the owning
+API or prepared spec. That reference cycle can cross a non-GC nanobind object
+and survive Python collection. Capture the immutable stride/index metadata
+and original entrypoint instead. `test_dsl_sm90_graph_singleton_strides`
+reproduced eighteen binder leaks before this correction and runs cleanly
+afterwards; keep the pointer/stride assertions and inspect process shutdown.
+
+A smaller backward KV tile also narrows the transposed dS shared-memory row.
+Select its swizzle from that row's byte width on both stores and ldmatrix loads:
+a 32-column half row requires 64-byte swizzling. Keeping the old 128-byte
+swizzle can cross row boundaries even when the total allocation fits. The
+D256 cases in `test_sdpa_bwd_thd_sm120_gqa.py` exercise the native 32x32 tile
+with independent origins, GQA reduction, tails and bottom-right quiet rows.
+
+A backward gradient-column partition multiplies the physical CTA grid, not the
+logical KV tile count. Both reverse scheduling and the deterministic relay's
+last KV visitor must divide out that partition factor; counters and workspace
+must include the partition and actual Q tile. The dense deterministic cases in
+`test_sdpa_bwd_sm120_wide.py` catch a relay that otherwise waits forever for a
+nonexistent predecessor, while THD's length-derived count alone cannot catch it.
+
+
+FP8 `mma.sync` A/B operands must be registers, including compile-time-dead
+head or sequence tails. A DSL inline-PTX input can fold to literal `0` even
+when its Python type is `Int32`; ptxas rejects `mma ... {0,0}`. Keep the zero
+opaque through a register `mov`, as `_zero_word` in SM120 FP8 backward does.
+The small SQ19/SKV37/D64 case in `test_sdpa_bwd_fp8_sm120.py` reaches both
+fully dead score columns and gradient columns; retain the failing PTX when
+diagnosing this so register-type guesses do not replace the actual operand.
+
+When two warps split a head dimension, each half must contain whole shared-memory
+swizzle chunks. A swizzle that divides the full head can still straddle the warp
+boundary (D576 has 288 columns per half). Check every aliased storage phase too:
+wide Q staging and the O epilogue can exceed different slabs even when the main
+K/V allocation fits. `test_sdpa_fwd_d576_sm120.py` exercises asymmetric envelopes,
+partial packing and persistent reuse. Keep native binder dimension admission in
+sync with the Python row and adapter, and gate new envelopes on the matching
+extension; a host eligibility pass alone does not exercise binder construction.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.

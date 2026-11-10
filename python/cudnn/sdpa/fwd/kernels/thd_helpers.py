@@ -96,9 +96,10 @@ def sanitize_v_tail(
     and NaN bit patterns there must not reach O. Without runtime lengths
     the dense overhang past S_kv zero-fills in hardware.
 
-    Every compute warp redundantly zeroes the full overhang (idempotent
-    zero stores race benignly), so a warp-level sync is enough for each
-    warp's own ``ldmatrix`` lanes to observe the zeros.
+    This helper synchronizes only its calling warp. The caller must give
+    one warp ownership of these stores and synchronize every consuming
+    warp before its ``ldmatrix`` reads. Repeated zero stores are still a
+    write/read race when another warp has already started consuming V.
     """
     seg_elems = 16 // in_dtype.bytes  # elements per 16-byte store
     segs_per_row = head_tile_v // seg_elems

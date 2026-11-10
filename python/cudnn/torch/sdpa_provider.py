@@ -334,7 +334,7 @@ def _honoring_backend(op, serve, serves, counter):
 # Installing the overrides
 #
 # install_sdpa_overrides() is the entry point PyTorch calls from
-# torch.backends.cuda.enable_cudnn_sdp_python(True); it keeps the returned
+# torch.nn.attention.enable_cudnn_sdp_python(True); it keeps the returned
 # handle and calls remove() on disable. Each call installs a fresh set of
 # Library registrations, so a handle owns exactly what it installed.
 #
@@ -388,7 +388,7 @@ def install_sdpa_overrides() -> SdpaOverrides:
 
 
 def _register_with_torch() -> None:
-    if hasattr(torch.backends.cuda, "enable_cudnn_sdp_python"):
+    if hasattr(torch.nn.attention, "enable_cudnn_sdp_python"):
         return  # torch owns the switch; see above
     try:
         from torch.nn.attention import register_flash_attention_impl

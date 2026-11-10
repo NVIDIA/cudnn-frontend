@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Native SM120 D128 paged pools, independent tables and device-length replay."""
+"""Native SM120 paged pools, independent tables and device-length replay."""
 
 import math
 from dataclasses import replace
@@ -32,14 +32,22 @@ def _case(
     scheduler=0,
     sink_value=None,
     pool_capacity=9,
+    dims=(128, 128),
+    split_kv=1,
+    h=4,
+    explicit_plan=False,
+    kv_dtype=None,
 ):
     torch.manual_seed(381)
-    b, h, pages = 2, 4, 3
+    b, pages = 2, 3
+    d_qk, d_v = dims
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    bufs = {"q": torch.randn(b, sq, h, 128, device="cuda", dtype=dtype).transpose(1, 2) * 0.3}
+    bufs = {"q": torch.randn(b, sq, h, d_qk, device="cuda", dtype=dtype).transpose(1, 2) * 0.3}
     for name, hnd, capacity in [("k", k_hnd, pool_capacity), ("v", v_hnd, pool_capacity)]:
-        shape = (capacity, kh, page, 128) if hnd else (capacity, page, kh, 128)
+        d = d_qk if name == "k" else d_v
+        width = ((d + 15) // 16 + 1) * 16 if kv_dtype is not None else (d if dims == (128, 128) else d + 8)
+        shape = (capacity, kh, page, width) if hnd else (capacity, page, kh, width)
         if pool_capacity > 9:
             raw = torch.empty(shape, device="cuda", dtype=dtype)
             raw[:8].normal_(std=0.3)
@@ -47,6 +55,10 @@ def _case(
             raw[1].fill_(-3.0 if name == "k" else -2.0)
         else:
             raw = torch.randn(shape, device="cuda", dtype=dtype) * 0.3
+        raw[..., d:].fill_(float("nan"))
+        if kv_dtype is not None:
+            raw = raw.to(kv_dtype)
+        raw = raw[..., :d]
         bufs[name] = raw if hnd else raw.transpose(1, 2)
         bufs[name][8 if pool_capacity > 9 else -1].fill_(float("nan"))
     bufs["kt"] = torch.tensor([[2, 5, -1], [1, 3, -1]], device="cuda", dtype=torch.int32).view(b, 1, pages, 1)
@@ -61,8 +73,8 @@ def _case(
     bufs["ql"][1] = max(1, sq // 2)
     bufs["q"][1, :, max(1, sq // 2) :].fill_(float("nan"))
     bufs["kl"] = torch.tensor([page + 3, 0], device="cuda", dtype=torch.int32).view(b, 1, 1, 1)
-    storage = torch.full((b, sq, h, 136), 123.0, device="cuda", dtype=dtype)
-    bufs["o"] = storage[..., :128].transpose(1, 2)
+    storage = torch.full((b, sq, h, d_v + 8), 123.0, device="cuda", dtype=dtype)
+    bufs["o"] = storage[..., :d_v].transpose(1, 2)
     stats_storage = torch.full((b, h, sq * 2), 777.0, device="cuda")
     bufs["stats"] = stats_storage[..., ::2]
     if sink:
@@ -82,7 +94,7 @@ def _case(
         k=nodes["k"],
         v=nodes["v"],
         generate_stats=True,
-        attn_scale=128**-0.5,
+        attn_scale=d_qk**-0.5,
         use_padding_mask=True,
         seq_len_q=nodes["ql"],
         seq_len_kv=nodes["kl"],
@@ -97,16 +109,27 @@ def _case(
     nodes.update(o=o, stats=stats)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    selected = select_engine(g, engine_name(arch="sm120"))
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=1, sched_policy=scheduler, pack_gqa=packed))
+    if explicit_plan:
+        from cudnn.engines.manifest import engines_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        # Native qualification may request a legal tile that the ranking does
+        # not propose for this Q length. Keep ordinary-candidate tests separate.
+        selected = next(engine for engine in engines_for(g) if engine.name == engine_name(arch="sm120"))
+        knobs = SdpaFwdKnobs(cga=1, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
+    else:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        selected = select_engine(g, engine_name(arch="sm120"))
+        knobs = replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
+    g.create_execution_plan(selected.engine_id, knobs)
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
     assert g.selected_engine is not None
     assert g._compiled_plans[g._plan_index]._prepared is not None
-    assert g.get_workspace_size() == 0
-    ws = torch.full((1,), 113, device="cuda", dtype=torch.uint8)
+    if split_kv == 1:
+        assert g.get_workspace_size() == 0
+    ws = torch.full((g.get_workspace_size() + 16,), 113, device="cuda", dtype=torch.uint8)
     return g, nodes, bufs, ws, storage, stats_storage
 
 
@@ -118,9 +141,9 @@ def _check(bufs, page, *, mask="none", stats_log2=False):
         pools = []
         for name, table in [("k", "kt"), ("v", "vt")]:
             rows = [bufs[name][int(bufs[table][batch, 0, i // page, 0]), :, i % page] for i in range(length)]
-            tensor = torch.stack(rows, dim=1).double() if rows else q.new_empty((kh, 0, 128))
+            tensor = torch.stack(rows, dim=1).double() if rows else q.new_empty((kh, 0, bufs[name].shape[-1]))
             pools.append(tensor.repeat_interleave(h // kh, dim=0))
-        scores = q[batch] @ pools[0].transpose(-1, -2) / math.sqrt(128)
+        scores = q[batch] @ pools[0].transpose(-1, -2) / math.sqrt(q.shape[-1])
         qr = torch.arange(q.shape[2], device=q.device)[:, None]
         kr = torch.arange(length, device=q.device)[None, :]
         visible = qr < qlength
@@ -135,7 +158,7 @@ def _check(bufs, page, *, mask="none", stats_log2=False):
             sink = bufs["sink"].flatten().double()[:, None, None].expand(h, q.shape[2], 1).clone()
             sink.masked_fill_((qr >= qlength)[None], -float("inf"))
             scores = torch.cat((scores, sink), dim=-1)
-            values = torch.cat((values, values.new_zeros(h, 1, 128)), dim=1)
+            values = torch.cat((values, values.new_zeros(h, 1, bufs["v"].shape[-1])), dim=1)
         ref = torch.nan_to_num(scores.softmax(-1), nan=0.0) @ values
         torch.testing.assert_close(bufs["o"][batch].double(), ref, atol=2e-3, rtol=2e-2)
         lse = scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0)
@@ -164,6 +187,11 @@ def test_sm120_frost_paged_native_rebind_replay(
     endpoints=False,
     capture_adapter=False,
     pool_capacity=9,
+    dims=(128, 128),
+    split_kv=1,
+    h=4,
+    explicit_plan=False,
+    kv_dtype=None,
 ):
     import cutlass.cute as cute
 
@@ -183,6 +211,11 @@ def test_sm120_frost_paged_native_rebind_replay(
         scheduler=scheduler,
         sink_value=sink_value,
         pool_capacity=pool_capacity,
+        dims=dims,
+        split_kv=split_kv,
+        h=h,
+        explicit_plan=explicit_plan,
+        kv_dtype=kv_dtype,
     )
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -197,6 +230,7 @@ def test_sm120_frost_paged_native_rebind_replay(
         pack_gqa=packed,
         stats_log2=stats_log2,
         sched_policy=scheduler,
+        split_kv=split_kv,
         is_causal=mask != "none",
         causal_bottom_right=mask == "br_swa",
         window_size_left=19 if mask == "br_swa" else None,
@@ -207,7 +241,9 @@ def test_sm120_frost_paged_native_rebind_replay(
     api.check_support()
     api.compile()
     assert api.compute_capability in ((12, 0), (12, 1))
-    assert api._k_mod.__file__.endswith("/sm120/prefill_f16.py")
+    kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 else "prefill_f16.py")
+    assert api._k_mod.__file__.endswith("/sm120/" + kernel_file)
+    assert api._k_mod.PARAMS.split_kv == split_kv
     assert api._k_mod.PARAMS.page_size == page
     assert api._k_mod._host.__name__ == "paged_host"
     spec = g._compiled_plans[g._plan_index]._prepared.spec
@@ -218,11 +254,19 @@ def test_sm120_frost_paged_native_rebind_replay(
         if iteration:
             storage = storage.clone()
             stats_storage = stats_storage.clone()
-            bufs["o"] = storage[..., :128].transpose(1, 2)
+            bufs["o"] = storage[..., : dims[1]].transpose(1, 2)
             bufs["stats"] = stats_storage[..., ::2]
             ws = ws.clone()
             for name in ("q", "k", "v", "kt", "vt", "ql", "kl") + (("sink",) if sink else ()):
-                bufs[name] = bufs[name].clone(memory_format=torch.preserve_format)
+                if name in ("k", "v") and (dims != (128, 128) or kv_dtype is not None):
+                    old = bufs[name]
+                    fresh = torch.empty_strided(old.shape, old.stride(), dtype=old.dtype, device=old.device)
+                    span = sum((n - 1) * st for n, st in zip(old.shape, old.stride())) + 1
+                    fresh.as_strided((span,), (1,)).fill_(float("nan"))
+                    fresh.copy_(old)
+                    bufs[name] = fresh
+                else:
+                    bufs[name] = bufs[name].clone(memory_format=torch.preserve_format)
             bufs["q"].mul_(0.7)
         vp = {nodes[n]: t for n, t in bufs.items()}
         g.execute(vp, ws)
@@ -280,8 +324,8 @@ def test_sm120_frost_paged_native_rebind_replay(
                 _check(bufs, page, mask=mask, stats_log2=stats_log2)
         finally:
             graph.reset()
-        assert (ws == 113).all()
-        assert (storage[..., 128:] == 123).all()
+        assert (ws[g.get_workspace_size() :] == 113).all()
+        assert (storage[..., dims[1] :] == 123).all()
         assert (stats_storage[..., 1::2] == 777).all()
 
 
@@ -322,12 +366,12 @@ def test_sm120_frost_paged_scope_declines_before_compile(monkeypatch):
     facts = analyze(g)
     caps = _sm120_spec().capabilities
     assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=64, tile_n=64, split_kv=1)) is None
-    for changes in ({"thd": True}, {"d_qk": 120}, {"d_v": 120}, {"is_fp8": True}, {"is_mxfp8": True}):
+    for changes in ({"thd": True}, {"d_qk": 136}, {"d_v": 136}, {"d_qk": 65}, {"is_fp8": True}, {"is_mxfp8": True}):
         assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=64, split_kv=1)) is not None
-    for knobs in (SdpaFwdKnobs(tile_m=16), SdpaFwdKnobs(tile_m=32), SdpaFwdKnobs(split_kv=2)):
+    for knobs in (SdpaFwdKnobs(tile_m=64, split_kv=2), SdpaFwdKnobs(tile_m=128, split_kv=2)):
         assert mismatch(caps, facts, knobs) is not None
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("unsupported plans must not compile"))
-    for changes in ({"thd": True}, {"split_kv": 2}, {"tile_m": 16}, {"seq_kv_lens_present": False}, {"paged_page_size": 24}, {"sample_bias": bufs["q"]}):
+    for changes in ({"thd": True}, {"split_kv": 2}, {"seq_kv_lens_present": False}, {"paged_page_size": 24}, {"sample_bias": bufs["q"]}):
         kwargs = dict(tile_m=64, tile_n=64, seq_q_lens_present=True, seq_kv_lens_present=True, paged_page_size=16, paged_max_seq_len_kv=48)
         kwargs.update(changes)
         api = SdpaFwdDslSm120(*(bufs[n] for n in ("q", "k", "v", "o")), **kwargs)
@@ -377,3 +421,545 @@ def test_sm120_frost_paged_wide_page_product(monkeypatch):
         pool_capacity=131074,
         replays=4,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(8, 8), (16, 32), (24, 40), (32, 24), (48, 56), (56, 64), (64, 64), (64, 128), (72, 120), (96, 88), (120, 128), (128, 120)])
+@pytest.mark.parametrize("mode", ["decode", "packed_sink", "band"])
+def test_sm120_frost_paged_widths(dtype, dims, mode, monkeypatch):
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        2,
+        mode != "band",
+        mode == "band",
+        16 if mode != "band" else 128,
+        monkeypatch,
+        dims=dims,
+        sq=1 if mode == "decode" else 67,
+        mask="causal" if mode == "decode" else "br_swa" if mode == "packed_sink" else "band",
+        sink=mode == "packed_sink",
+        packed=mode == "packed_sink",
+        stats_log2=mode == "band",
+        tile_m=128 if mode == "packed_sink" else 64,
+        tile_n=128 if mode == "packed_sink" else 64,
+        scheduler=0 if mode == "decode" else 1 if mode == "packed_sink" else 2,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(64, 64), (120, 88)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, tile_n=64, split_kv=1, kv_dtype=None):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+
+    d, dv = dims
+    h, kh, sq, page, blocks = 4, 2, 17, 16, 5
+    rng = torch.Generator().manual_seed(13631)
+    q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
+    k = (torch.randn(37, kh, page, d, generator=rng) * 0.3).to(dtype).cuda()
+    v = (torch.randn(37, page, kh, dv, generator=rng) * 0.3).to(dtype).cuda().transpose(1, 2)
+    if kv_dtype is not None:
+        k, v = k.to(kv_dtype), v.to(kv_dtype)
+    kt = torch.stack([torch.randperm(37, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
+    vt = torch.stack([torch.randperm(37, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
+    ql = torch.tensor([17, 1, 0, 9, 16], device="cuda", dtype=torch.int32)
+    kl = torch.tensor([67, 33, 0, 49, 1], device="cuda", dtype=torch.int32)
+    sinks = torch.linspace(-0.5, 0.5, h).cuda()
+    source = dict(q=q, k=k, v=v, kt=kt, vt=vt, ql=ql, kl=kl, sinks=sinks)
+    before = {n: t.clone() for n, t in source.items()}
+    plans = {}
+
+    def buffers(order):
+        index = torch.tensor(order, device="cuda")
+        b = len(order)
+        qb = torch.full((b, sq, h, d + 8), float("nan"), device="cuda", dtype=dtype)[..., :d].transpose(1, 2)
+        qb.copy_(q.index_select(0, index))
+        storage = torch.full((b, sq, h, dv + 8), 123.0, device="cuda", dtype=dtype)
+        return dict(
+            q=qb,
+            o=storage[..., :dv].transpose(1, 2),
+            storage=storage,
+            lse=torch.empty(b, h, sq, device="cuda"),
+            kt=kt.index_select(0, index).t().contiguous().t(),
+            vt=vt.index_select(0, index).t().contiguous().t(),
+            ql=ql.index_select(0, index),
+            kl=kl.index_select(0, index),
+        )
+
+    def check(t):
+        assert (t["storage"][..., dv:] == 123).all()
+        want_o = torch.zeros(t["o"].shape, dtype=torch.float64)
+        want_lse = torch.full(t["lse"].shape, -torch.inf, dtype=torch.float64)
+        for b, (nq, nk) in enumerate(zip(t["ql"].tolist(), t["kl"].tolist())):
+            if not nq:
+                continue
+            qq = t["q"][b, :, :nq].cpu().double()
+            kk = k[t["kt"][b].long()].cpu().transpose(0, 1).reshape(kh, blocks * page, d)[:, :nk].double().repeat_interleave(h // kh, 0)
+            vv = v[t["vt"][b].long()].cpu().transpose(0, 1).reshape(kh, blocks * page, dv)[:, :nk].double().repeat_interleave(h // kh, 0)
+            scores = qq @ kk.transpose(-1, -2) * d**-0.5
+            diagonal = torch.arange(nq)[:, None] + nk - nq
+            keys = torch.arange(nk)[None, :]
+            scores.masked_fill_((keys > diagonal) | (keys < diagonal - 21), -torch.inf)
+            scores = torch.cat((scores, sinks.cpu().double().view(h, 1, 1).expand(h, nq, 1)), -1)
+            want_o[b, :, :nq] = scores.softmax(-1)[..., :nk] @ vv
+            want_lse[b, :, :nq] = scores.logsumexp(-1)
+        torch.testing.assert_close(t["o"].cpu().double(), want_o, atol=0.003, rtol=0.02)
+        torch.testing.assert_close(t["lse"].cpu().double(), want_lse, atol=0.0006, rtol=0)
+        return {n: t[n] for n in ("o", "lse")}
+
+    def run(order, capture=False):
+        t = buffers(order)
+        b = len(order)
+        if b not in plans:
+            api = SdpaFwdDslSm120(
+                t["q"],
+                k,
+                v,
+                t["o"],
+                t["lse"],
+                is_causal=True,
+                causal_bottom_right=True,
+                window_size_left=21,
+                has_sink=True,
+                seq_q_lens_present=True,
+                seq_kv_lens_present=True,
+                paged_page_size=page,
+                paged_max_seq_len_kv=blocks * page,
+                paged_table_stride=t["kt"].stride(),
+                paged_table_v_stride=t["vt"].stride(),
+                tile_m=tile_m,
+                tile_n=tile_n,
+                split_kv=split_kv,
+                pack_gqa=packed,
+                sched_policy=0 if tile_m in (16, 32) or split_kv > 1 else 1,
+            )
+            api.check_support()
+            api.compile()
+            kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 else "prefill_f16.py")
+            assert api._k_mod.__file__.endswith("sm120/" + kernel_file)
+            assert api._k_mod.PARAMS.split_kv == split_kv
+            assert api._k_mod.PARAMS.page_size == page
+            plans[b] = api
+        api = plans[b]
+        workspace = torch.full((api.scratch_workspace_bytes() + 16,), 113, dtype=torch.uint8, device="cuda")
+
+        def execute():
+            api.execute(
+                t["q"],
+                k,
+                v,
+                t["o"],
+                t["lse"],
+                sinks=sinks,
+                seq_q_lens=t["ql"],
+                seq_kv_lens=t["kl"],
+                block_table=t["kt"],
+                block_table_v=t["vt"],
+                workspace=workspace,
+            )
+
+        execute()
+        result = check(t)
+        if capture:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    execute()
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+            try:
+                target = snapshot({n: result[n][:1] for n in result})
+                t["q"][1:].mul_(0.7)
+                t["ql"][1:] = 1
+                t["kl"][1:] = 17
+                t["kt"][1:].copy_(t["kt"][1:].flip(1))
+                t["vt"][1:].copy_(t["vt"][1:].flip(1))
+                t["o"].fill_(torch.nan)
+                t["lse"].fill_(torch.nan)
+                graph.replay()
+                result = check(t)
+                assert_bitwise({n: result[n][:1] for n in result}, target, "changed neighbors")
+            finally:
+                torch.cuda.synchronize()
+                graph.reset()
+        assert (workspace[api.scratch_workspace_bytes() :] == 113).all()
+        assert_bitwise(source, before, "unchanged inputs")
+        return result
+
+    target = assert_replays(lambda: run([0]), repeats=4)
+    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 64 + [0] + [2] * 64):
+        actual = snapshot(run(order))
+        for row, sequence in enumerate(order):
+            if sequence == 0:
+                assert_bitwise({n: actual[n][row : row + 1] for n in target}, target, f"batch row {row}")
+    run([0, 1, 2, 3, 4], capture=True)
+    actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
+    suffix = f"-decode{tile_m}-split{split_kv}" if tile_m in (16, 32) else (f"-d512-split{split_kv}" if min(dims) > 256 else "")
+    if kv_dtype is not None:
+        suffix += f"-kv{kv_dtype}"
+    assert_golden(f"sdpa-sm120-paged-d{d}v{dv}-{dtype}-pack{int(packed)}{suffix}", before, actual)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(24, 40), (64, 64), (120, 88), (128, 128), (8, 8), (16, 32)])
+@pytest.mark.parametrize("tile_m", [16, 32])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch, *, explicit_plan=False):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, head_tile
+
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        2,
+        tile_m == 16,
+        tile_m == 32,
+        128 if tile_m == 32 else 16,
+        monkeypatch,
+        dims=dims,
+        tile_m=tile_m,
+        tile_n=decode_kv_stage(head_tile(dims[0], 16), head_tile(dims[1], 16)),
+        split_kv=split_kv,
+        sq=1 if tile_m == 16 else 37,
+        mask="br_swa" if tile_m == 16 else "band",
+        sink=True,
+        packed=tile_m == 16,
+        stats_log2=tile_m == 32,
+        replays=4,
+        endpoints=True,
+        capture_adapter=split_kv > 1,
+        explicit_plan=explicit_plan,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tile_m,dims", [(16, (64, 64)), (32, (120, 88))])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_decode_determinism(dtype, tile_m, dims, split_kv):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, head_tile
+
+    test_sm120_frost_paged_width_determinism(
+        dtype, dims, True, tile_m=tile_m, tile_n=decode_kv_stage(head_tile(dims[0], 16), head_tile(dims[1], 16)), split_kv=split_kv
+    )
+
+
+@pytest.mark.parametrize("page", [8, 64, 256])
+@pytest.mark.parametrize("split_kv", [1, 4])
+def test_sm120_frost_paged_decode_partial_gqa(page, split_kv, monkeypatch):
+    test_sm120_frost_paged_native_rebind_replay(
+        torch.bfloat16,
+        2,
+        False,
+        True,
+        page,
+        monkeypatch,
+        dims=(64, 64),
+        h=12,
+        tile_m=16,
+        tile_n=32,
+        split_kv=split_kv,
+        sq=7,
+        mask="none",
+        sink=False,
+        packed=True,
+        replays=4,
+        capture_adapter=split_kv > 1,
+    )
+
+
+@pytest.mark.parametrize("tile_m,dims", [(16, (64, 64)), (32, (120, 88))])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_decode_ring_reuse(tile_m, dims, split_kv, monkeypatch):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, head_tile
+
+    # More stages per split than ring slots; each physical slot changes phase
+    # repeatedly. Short page-boundary cases alone never exercise this reuse.
+    test_sm120_frost_paged_native_rebind_replay(
+        torch.bfloat16,
+        2,
+        True,
+        False,
+        4096,
+        monkeypatch,
+        dims=dims,
+        h=12,
+        tile_m=tile_m,
+        tile_n=decode_kv_stage(head_tile(dims[0], 16), head_tile(dims[1], 16)),
+        split_kv=split_kv,
+        sq=7,
+        mask="none",
+        sink=True,
+        packed=True,
+        replays=4,
+        capture_adapter=split_kv > 1,
+    )
+
+
+@pytest.mark.parametrize("tile_m,dims,split_kv,page", [(16, (64, 64), 3, 2048), (32, (120, 88), 1, 1024)])
+def test_sm120_frost_paged_decode_ring_pipeline(tile_m, dims, split_kv, page, *, explicit_plan=False):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_groups, decode_kv_stage, decode_slots_per_group, head_tile
+
+    dq, dv = (head_tile(d, 16) for d in dims)
+    stage = decode_kv_stage(dq, dv)
+    assert math.ceil((page + 3) / stage) // split_kv > decode_kv_groups(tile_m) * decode_slots_per_group(dq, dv, tile_m)
+    g, nodes, bufs, ws, storage, stats_storage = _case(
+        torch.bfloat16, 2, page, True, False, dims=dims, tile_m=tile_m, tile_n=stage, split_kv=split_kv, sq=1, packed=True, explicit_plan=explicit_plan
+    )
+    # A compact grid keeps sanitizer instrumentation bounded while every
+    # producer still reuses a slot after its prior consumer releases it.
+    vp = {nodes[n]: t for n, t in bufs.items()}
+    for _ in range(2):
+        g.execute(vp, ws)
+        _check(bufs, page)
+    assert (ws[g.get_workspace_size() :] == 113).all()
+    assert (storage[..., dims[1] :] == 123).all()
+    assert (stats_storage[..., 1::2] == 777).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(136, 8), (8, 192), (192, 128), (128, 192), (248, 256), (256, 248), (256, 256)])
+@pytest.mark.parametrize("tile_m", [16, 32])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_wide_decode(dtype, dims, tile_m, split_kv, monkeypatch):
+    test_sm120_frost_paged_decode(dtype, dims, tile_m, split_kv, monkeypatch, explicit_plan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tile_m,dims", [(16, (256, 256)), (32, (192, 128))])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_wide_decode_determinism(dtype, tile_m, dims, split_kv):
+    test_sm120_frost_paged_decode_determinism(dtype, tile_m, dims, split_kv)
+
+
+@pytest.mark.parametrize("tile_m,dims,split_kv,page", [(16, (256, 256), 3, 1024), (32, (248, 192), 1, 512)])
+def test_sm120_frost_paged_wide_decode_ring_pipeline(tile_m, dims, split_kv, page):
+    test_sm120_frost_paged_decode_ring_pipeline(tile_m, dims, split_kv, page, explicit_plan=True)
+
+
+def test_sm120_frost_paged_wide_decode_admission():
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.graph_analyzer import analyze
+
+    g, _, _, _, _, _ = _case(torch.float16, 2, 16, True, False, dims=(256, 256), tile_m=16, tile_n=16, sq=1, explicit_plan=True)
+    facts = analyze(g)
+    caps = _sm120_spec().capabilities
+    assert mismatch(caps, facts) is None
+    for tile_m in (16, 32):
+        for split in (1, 3):
+            assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=16, split_kv=split)) is None
+    for tile_m in (64, 128):
+        reason = mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=64, split_kv=1))
+        assert reason is not None and "decode tile" in reason
+    for dims in ((264, 256), (256, 264), (249, 256)):
+        assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=16, tile_n=16)) is not None
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dims,mask,packed,splits,page,sq,sink",
+    [
+        ((512, 512), "none", False, 1, 16, 1, False),
+        ((512, 512), "none", True, 3, 128, 7, True),
+        ((264, 504), "band", False, 1, 8, 67, False),
+        ((504, 264), "br_swa", True, 3, 256, 37, True),
+        ((512, 512), "none", False, 1, 128, 257, True),
+        ((512, 512), "br_swa", False, 3, 16, 129, True),
+    ],
+    ids=["plain", "split_pack", "q_envelope", "v_envelope", "reuse", "empty_splits"],
+)
+def test_sm120_frost_paged_d512(dtype, dims, mask, packed, splits, page, sq, sink, monkeypatch):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    # A small persistent grid forces K/V barrier reinitialization and Q-slab
+    # reuse even in the compact sanitizer geometry.
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda self, device: 2)
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        2,
+        True,
+        False,
+        page,
+        monkeypatch,
+        dims=dims,
+        mask=mask,
+        sink=sink,
+        packed=packed,
+        stats_log2=splits > 1,
+        tile_m=64,
+        tile_n=32,
+        sq=sq,
+        h=12,
+        split_kv=splits,
+        replays=4,
+        capture_adapter=splits > 1,
+        explicit_plan=True,
+    )
+
+
+@pytest.mark.parametrize("sink_value", [-float("inf"), float("inf")])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_d512_sink_limits(sink_value, split_kv, monkeypatch):
+    test_sm120_frost_paged_native_rebind_replay(
+        torch.bfloat16,
+        2,
+        False,
+        True,
+        16,
+        monkeypatch,
+        dims=(512, 512),
+        tile_m=64,
+        tile_n=32,
+        split_kv=split_kv,
+        sq=7,
+        sink=True,
+        packed=True,
+        sink_value=sink_value,
+        endpoints=True,
+        replays=4,
+        capture_adapter=split_kv > 1,
+        explicit_plan=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("split_kv", [1, 3])
+def test_sm120_frost_paged_d512_determinism(dtype, packed, split_kv):
+    test_sm120_frost_paged_width_determinism(dtype, (512, 512), packed, tile_m=64, tile_n=32, split_kv=split_kv)
+
+
+def test_sm120_frost_paged_d512_admission():
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.graph_analyzer import analyze
+
+    # Ordinary graph candidates must expose the newly legal native path.
+    g, _, _, _, _, _ = _case(torch.float16, 2, 16, True, False, dims=(512, 512), tile_m=64, tile_n=32, sq=1)
+    facts, caps = analyze(g), _sm120_spec().capabilities
+    for dims in ((512, 512), (264, 504), (504, 264)):
+        for split in (1, 3):
+            assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
+    for dims in ((264, 256), (256, 512), (584, 512), (257, 512)):
+        assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+    for changes in ({"thd": True}, {"is_fp8": True}, {"is_mxfp8": True}):
+        assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+    for tile_m, tile_n in ((16, 16), (32, 16), (64, 64), (128, 32)):
+        assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n)) is not None
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize(
+    "dims,tile_m,tile_n,packed,split_kv,mask,sq",
+    [
+        ((64, 64), 64, 64, False, 1, "band", 67),
+        ((120, 88), 16, 16, True, 3, "br_swa", 7),
+        ((256, 256), 32, 16, True, 3, "none", 7),
+        ((512, 512), 64, 32, True, 3, "none", 7),
+        ((264, 504), 64, 32, False, 1, "br_swa", 129),
+    ],
+    ids=["prefill64", "decode_envelope", "decode256", "d512_split_pack", "d512_envelope_reuse"],
+)
+def test_sm120_frost_paged_mixed_fp8(dtype, kv_dtype, dims, tile_m, tile_n, packed, split_kv, mask, sq, monkeypatch):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    monkeypatch.setattr(SdpaFwdDslSm120, "_persistent_ctas", lambda *args: 2)
+    test_sm120_frost_paged_native_rebind_replay(
+        dtype,
+        2,
+        True,
+        False,
+        128,
+        monkeypatch,
+        dims=dims,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        packed=packed,
+        split_kv=split_kv,
+        mask=mask,
+        sq=sq,
+        sink=True,
+        scheduler=0,
+        replays=4,
+        capture_adapter=True,
+        h=12 if packed else 4,
+        explicit_plan=True,
+        kv_dtype=kv_dtype,
+    )
+
+
+@pytest.mark.parametrize("dtype,kv_dtype", [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e5m2)])
+@pytest.mark.parametrize("d,tile_m,tile_n,split_kv", [(64, 64, 64, 1), (128, 16, 16, 3), (256, 32, 16, 3), (512, 64, 32, 3)])
+def test_sm120_frost_paged_mixed_fp8_determinism(dtype, kv_dtype, d, tile_m, tile_n, split_kv):
+    test_sm120_frost_paged_width_determinism(dtype, (d, d), True, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, kv_dtype=kv_dtype)
+
+
+@pytest.mark.parametrize("d,tile_m,tile_n", [(128, 16, 16), (256, 32, 16), (512, 64, 32)])
+def test_sm120_frost_paged_mixed_fp8_candidate(d, tile_m, tile_n):
+    g, nodes, bufs, ws, _, _ = _case(
+        torch.bfloat16,
+        2,
+        16,
+        False,
+        True,
+        dims=(d, d),
+        sq=1,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        packed=True,
+        split_kv=3,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+    g.execute({nodes[n]: t for n, t in bufs.items()}, ws)
+    _check(bufs, 16)
+    if d == 128:
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+        from cudnn.sdpa.graph_analyzer import analyze
+        from cudnn.sdpa.fwd.config_sm120 import TemplateParams, validate_params
+
+        facts, caps = analyze(g), _sm120_spec().capabilities
+        knobs = SdpaFwdKnobs(tile_m=16, tile_n=16, split_kv=3)
+        assert mismatch(caps, facts, knobs) is None
+        for changes in ({"has_paged_kv": False}, {"thd": True}, {"uniform_qo_dtype": False}, {"is_fp8": True}):
+            assert mismatch(caps, replace(facts, **changes), knobs) is not None
+        for dims in ((257, 512), (256, 512), (576, 512)):
+            assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), knobs) is not None
+        for params in (TemplateParams(dtype_kv=0), TemplateParams(dtype_kv=2, page_size=16), TemplateParams(dtype_kv=0, dtype_qkv=0, page_size=16)):
+            with pytest.raises((ValueError, NotImplementedError), match="mixed.*KV"):
+                validate_params(params, allow_paged=True)
+
+
+@pytest.mark.parametrize("qdtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kvdtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_sm120_mixed_paged_conversion_all_encodings(qdtype, kvdtype):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cudnn.sdpa.fwd.kernels.sm120._common import copy_paged_half_tile
+    from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+    from determinism_utils import assert_bitwise
+
+    @cute.kernel
+    def convert_kernel(inp: cute.Tensor, table: cute.Tensor, out: cute.Tensor):
+        lane = cute.arch.thread_idx()[0]
+        tile = cutlass.Array(out.element_type, 16 * 64, alignment=1024, space=cutlass.AddressSpace.smem)
+        copy_paged_half_tile(tile.data_ptr(), inp, table, 0, 0, 0, 16, 16, 16, 64, 64)
+        cute.arch.barrier()
+        for i in cutlass.range(lane, 16 * 64, 32):
+            row, col = i // 64, i % 64
+            out[i] = tile[row * 64 + swizzle_xor(row, col, 64, 2)]
+
+    @cute.jit
+    def convert_host(inp: cute.Tensor, table: cute.Tensor, out: cute.Tensor):
+        convert_kernel(inp, table, out).launch(grid=(1, 1, 1), block=(32, 1, 1))
+
+    encoded = torch.arange(256, dtype=torch.uint8).repeat(4).cuda()
+    inp = encoded.view(kvdtype).reshape(1, 16, 1, 64)
+    table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    out = torch.empty(1024, dtype=qdtype, device="cuda")
+    views = [from_dlpack(t) for t in (inp, table, out)]
+    fn = cute.compile(convert_host, *views)
+    fn(*views)
+    ref = inp.flatten().to(qdtype)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0, equal_nan=True)
+    finite = ref.isfinite()
+    assert_bitwise({"finite": out[finite]}, {"finite": ref[finite]}, "all finite FP8 encodings and signed zeros")

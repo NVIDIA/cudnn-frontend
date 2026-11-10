@@ -163,7 +163,7 @@ assert not hasattr(cudnn.DSA, "qsa_indexed_backward")
 
 @pytest.fixture
 def canonical_inputs(supported_gpu):
-    from cudnn.QSA.kernels import bprop_sm100 as engine
+    from cudnn.QSA import _backward as engine
     from QSA.cutedsl.qsa_index_list_reference import make_inputs as canonical
 
     if engine.dsl_cuda_major() < 13:
@@ -267,6 +267,7 @@ def test_causal_topk_options_are_explicit_and_append_only(supported_gpu):
         ({"cu_seqlens": torch.tensor([0, 5], device="cuda", dtype=torch.int32)}, "require selection_mode"),
         ({"max_seq_len": 5}, "require selection_mode"),
         ({"ds_precision": "fp16"}, "ds_precision"),
+        ({"deterministic": 1}, "deterministic"),
     ]:
         with pytest.raises(ValueError, match=message):
             qsa_indexed_backward(*args, **kwargs)

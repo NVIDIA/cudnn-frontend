@@ -3,7 +3,7 @@
 
 """End-to-end tests for the FROST SM90 DSL SDPA-forward engine against a torch reference.
 
-SM90 serves one flavor -- (512, 512) f16/bf16 prefill -- so this file is the arch line's whole
+SM90 serves native D64/D128/D256/D512 f16/bf16 prefill; this file retains the D512
 forward suite. The end-to-end half runs through test_sdpa_fwd_dsl_sm100.py: its runners, fp32
 references and tolerances are arch-neutral apart from a module-level ``_ARCH`` fed to
 ``engine_name(arch=...)``, so the ``sm100`` fixture repins that one string and SM90 runs the same
@@ -128,12 +128,15 @@ def test_dsl_sm90_graph_singleton_strides(sm100, monkeypatch, dtype, singleton_s
         compile_api(api)
         spec = api._dense_spec
         launch = spec.fn
+        # Retain immutable frame metadata, not api/spec: the native binder owns
+        # this recorder, so capturing its owning spec creates an uncollectable cycle.
+        index, strides = spec.index, api._strides
 
         def checked_launch(*args):
             # Check the positional pointer frame, including singleton canonicalization.
-            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), api._strides):
-                assert args[spec.index[name + "_ptr"]] == original.data_ptr()
-                assert args[spec.index[name + "_strides"]] == (expected[0], expected[2], expected[1])
+            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), strides):
+                assert args[index[name + "_ptr"]] == original.data_ptr()
+                assert args[index[name + "_strides"]] == (expected[0], expected[2], expected[1])
             launches.append(True)
             return launch(*args)
 
@@ -430,15 +433,11 @@ def test_dsl_sm90_wrapper_matches_the_reference(sm100):
 
 @pytest.mark.parametrize(
     ("d_qk", "d_v", "served"),
-    [(512, 512, True), (264, 504, True), (512, 264, True), (256, 512, False), (192, 128, False), (8, 8, False)],
-    ids=["native", "both-inside", "v-inside", "at-floor", "d192x128", "tiny"],
+    [(512, 512, True), (264, 504, True), (512, 264, True), (256, 512, False), (192, 128, True), (128, 128, True), (256, 256, True), (8, 8, False)],
+    ids=["native", "both-inside", "v-inside", "at-floor", "d192x128", "d128", "d256", "tiny"],
 )
-def test_sm90_row_floors_the_d_envelope_at_256(d_qk, d_v, served):
-    """Two levels, deliberately different reach. The ROW serves (256, 512] on both dims
-    (``d_envelope_floors``), so a small graph is declined rather than run at up to 64x
-    zero-padding; the TEMPLATE still serves every multiple of 8 in (0, 512], so a direct
-    adapter caller keeps the full envelope. The declines are the floor's ONLY detector:
-    without them, reverting ``d_envelope_floors`` to () is silent."""
+def test_sm90_row_bounds_native_head_envelopes(d_qk, d_v, served):
+    """Graph admission bounds padding separately for each native width."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.config_sm90 import head_dims_mismatch
 
@@ -460,7 +459,7 @@ def test_sm90_template_d_envelope_rejects(bad):
     ("over", "why"),
     [
         pytest.param(dict(dtype_qkv=0), "uniform FP16 or BF16", id="dtype"),
-        pytest.param(dict(pack_gqa=True, qh_per_kh=3), "ratio dividing tile_m=64", id="pack-ratio"),
+        pytest.param(dict(pack_gqa=True, qh_per_kh=3), "ratio sharing a factor with tile_m=64", id="pack-ratio"),
         pytest.param(dict(sched_policy=SCHED_LPT_L2 + 1), "NATURAL/LPT/LPT_L2", id="sched"),
         pytest.param(dict(thd_varlen=True, seq_kv_lens_present=True, sched_policy=SCHED_LPT), "natural single-tile work decoder", id="thd-sched"),
         pytest.param(dict(scale_mode=2), "scale mode must be positive, zero, or negative", id="scale-mode"),
@@ -554,7 +553,7 @@ def test_sm90_declines_pv_bf16():
         pytest.param(dict(dtype=torch.float32), "Q/K/V/O other than FP16/BF16", id="qkv-dtype"),
         pytest.param(dict(dtype_o=torch.bfloat16), "an output dtype different from Q", id="o-dtype"),
         pytest.param(dict(softmax_precision=cudnn.data_type.BFLOAT16), "non-FP32 softmax precision", id="softmax-precision"),
-        pytest.param(dict(split_kv=2), "does not support split-KV", id="split-kv"),
+        pytest.param(dict(split_kv=2, thd=True), "does not support THD split-KV", id="thd-split-kv"),
         pytest.param(dict(tile_m=128), "tiles other than 64/64", id="tile"),
         pytest.param(dict(cga=2), "CGA other than 1", id="cga"),
         pytest.param(dict(sched_policy=SCHED_LPT_L2 + 1), "only NATURAL/LPT/LPT_L2", id="sched"),
@@ -654,7 +653,8 @@ def test_sm90_every_candidate_is_valid():
         assert plans and len(plans) <= _MAX_SETS_PER_ENGINE and len({p.knobs for p in plans}) == len(plans), plans
         for knobs in (p.knobs for p in plans):
             assert engines.mismatch(_caps(_ROW), facts, knobs) is None, knobs
-            assert (knobs.tile_m, knobs.tile_n, knobs.cga, knobs.split_kv) == (64, 64, 1, 1), knobs
+            assert (knobs.tile_m, knobs.tile_n, knobs.cga) == (64, 64, 1), knobs
+            assert 1 <= knobs.split_kv <= 65535 and (not facts.thd or knobs.split_kv == 1), knobs
             assert knobs.sched_policy in policies and knobs.pack_gqa in packs, knobs
 
 

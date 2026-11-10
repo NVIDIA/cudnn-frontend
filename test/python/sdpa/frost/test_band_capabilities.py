@@ -73,7 +73,10 @@ def _pick_dtype(dtypes):
 def _dims(kind: str, caps):
     if kind == "fwd":
         shapes = sorted(tuple(s) for s in caps.d_shapes)
-        return (128, 128) if (128, 128) in shapes else shapes[0]
+        # A smaller native flavor can support fewer features than the row's
+        # full envelope (SM90 D64 versus D512). Sample the full envelope for
+        # the row-wide band claims; dedicated flavor tests pin its restrictions.
+        return (128, 128) if (128, 128) in shapes else shapes[-1]
     # A backward row lists head dims, not pairs, and may serve only some pairs of
     # them (the SM100 d256 row: exact (256, 256) and dense (192, 128)). Take the
     # first pair the row accepts unmasked, so a head-dim rule never stands in

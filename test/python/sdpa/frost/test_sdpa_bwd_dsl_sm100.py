@@ -555,8 +555,8 @@ def test_reject_bias():
     assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
-def test_reject_deterministic():
-    assert _decline_reason(use_deterministic_algorithm=True) is not None
+def test_accept_deterministic():
+    assert _decline_reason(use_deterministic_algorithm=True) is None
 
 
 def test_reject_padding_mask():
@@ -665,7 +665,7 @@ def test_unserved_band_graph_declines_as_not_supported():
 
     Regression test for the error TYPE, not the message. The C++ node admits
     d in (256, 512] so the FROST engine can claim it, but a graph in the band
-    that NO engine serves (here: deterministic, which this row declines and the
+    that NO engine serves (here: an ALiBi mask, which this row declines and the
     backend has no plan for) used to reach plan build via
     `override_heuristics_query()`, which pins a backend engine id and bypasses
     the heuristics query entirely. That pinned config then failed to finalize
@@ -680,7 +680,7 @@ def test_unserved_band_graph_declines_as_not_supported():
     """
     b, hq, sq, skv = 2, 2, 256, 256
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g = _build_graph_only(b, hq, hq, sq, skv, _D, 1.0 / math.sqrt(_D), use_deterministic_algorithm=True)
+        g = _build_graph_only(b, hq, hq, sq, skv, _D, 1.0 / math.sqrt(_D), use_alibi_mask=True)
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         g.check_support()
         g.build_plans()
@@ -708,8 +708,47 @@ def test_capabilities_match_what_is_implemented():
     assert not c.cu_seq_len, "sdpa_backward has no cu_seq_len_* port; no row can claim or test it"
     assert not c.padded, "DENSE padding masks: the kernel compiles a scalar length; THD carries its own"
     assert not c.bias and not c.dbias and not c.sink and not c.dsink
-    assert not c.deterministic
+    assert c.deterministic, "the chain has no atomics; a deterministic request is served as is"
     assert c.sm_lo == 100 and c.sm_hi == 103
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize(
+    "hq,hkv,causal,bottom_right", [(2, 2, False, False), (4, 2, True, False), (4, 1, True, True)], ids=["mha", "gqa-causal", "mqa-bottom-right"]
+)
+def test_deterministic_request_is_bitwise_across_launches(hq, hkv, causal, bottom_right):
+    """Under ``use_deterministic_algorithm=True`` three launches over poisoned outputs return identical bits."""
+    b, sq, skv, dt = 2, 384, 640, torch.bfloat16
+    q, do = _bshd(b, sq, hq, _D, dt=dt), _bshd(b, sq, hq, _D, dt=dt)
+    k, v = _bshd(b, skv, hkv, _D, dt=dt), _bshd(b, skv, hkv, _D, dt=dt)
+    keep = _causal_keep(sq, skv, bottom_right=bottom_right) if causal else None
+    o_ref, lse, all_masked, *_ = _reference(q, k, v, do, keep, hq // hkv)
+    o = _bshd(b, sq, hq, _D, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
+    kw = dict(use_causal_mask=causal and not bottom_right, use_causal_mask_bottom_right=bottom_right, use_deterministic_algorithm=True)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, _D, 1.0 / math.sqrt(_D), dt=dt, **kw)
+    idx = _plan_index(g)
+    assert idx is not None
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    dq, dk, dv = _bshd(b, sq, hq, _D, dt=dt, fill=False), _bshd(b, skv, hkv, _D, dt=dt, fill=False), _bshd(b, skv, hkv, _D, dt=dt, fill=False)
+    pack = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, dq_t: dq, dk_t: dk, dv_t: dv}
+    bits = None
+    for fill in (0xA5, 0x00, 0xFF):
+        ws.fill_(fill)
+        for out in (dq, dk, dv):
+            out.fill_(float("nan"))
+        g.execute(pack, ws)
+        torch.cuda.synchronize()
+        current = [out.clone() for out in (dq, dk, dv)]
+        assert all(torch.isfinite(c.float()).all() for c in current)
+        if bits is None:
+            bits = current
+        for name, a, c in zip(("dQ", "dK", "dV"), bits, current):
+            assert torch.equal(a, c), f"{name}: changed across identical deterministic executions"
 
 
 def test_engine_is_registered_and_offered_by_default():
