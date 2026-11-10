@@ -98,14 +98,17 @@ def test_optional_outputs(monkeypatch, bits):
     assert_bitwise({n: got[n] for n in ("dQ", "dK", "dV")}, dict(zip(("dQ", "dK", "dV"), run.expected)), "amax leaves gradient bytes unchanged")
     _check_amax(got)
     capture = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(capture):
-        graph.execute(pack, ws)
-    for value in result.values():
-        value.fill_(float("inf"))
-    ws.fill_(255)
-    capture.replay()
-    assert_bitwise(snapshot(result), got, "capture overwrites poisoned amax and gradients")
-    assert_bitwise(snapshot(inputs), before, "input preservation")
+    try:
+        with torch.cuda.graph(capture):
+            graph.execute(pack, ws)
+        for value in result.values():
+            value.fill_(float("inf"))
+        ws.fill_(255)
+        capture.replay()
+        assert_bitwise(snapshot(result), got, "capture overwrites poisoned amax and gradients")
+        assert_bitwise(snapshot(inputs), before, "input preservation")
+    finally:
+        capture.reset()
 
 
 @pytest.mark.parametrize("requested", [(), _NAMES], ids=["none", "all"])
@@ -169,19 +172,22 @@ def test_batch_replay_and_golden(monkeypatch, width, dtype):
         assert_bitwise(got, expected, "per-sequence gradients and global amax composition")
         _check_amax(got)
         capture = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(capture):
-            graph.execute(pack, ws)
-        for name in ("dO", "dO_T"):
-            inputs[name].view(torch.uint8).bitwise_xor_(128)
-        inputs["dO_f16"].neg_()
-        changed = snapshot(execute())
-        for n in ("dQ", "dK", "dV"):
-            torch.testing.assert_close(changed[n], -got[n], rtol=0, atol=0)
-        assert_bitwise({n: changed[n] for n in _NAMES}, {n: got[n] for n in _NAMES}, "negated payload preserves amax")
-        for value in result.values():
-            value.fill_(float("nan"))
-        capture.replay()
-        assert_bitwise(snapshot(result), changed, "changed-payload capture")
+        try:
+            with torch.cuda.graph(capture):
+                graph.execute(pack, ws)
+            for name in ("dO", "dO_T"):
+                inputs[name].view(torch.uint8).bitwise_xor_(128)
+            inputs["dO_f16"].neg_()
+            changed = snapshot(execute())
+            for n in ("dQ", "dK", "dV"):
+                torch.testing.assert_close(changed[n], -got[n], rtol=0, atol=0)
+            assert_bitwise({n: changed[n] for n in _NAMES}, {n: got[n] for n in _NAMES}, "negated payload preserves amax")
+            for value in result.values():
+                value.fill_(float("nan"))
+            capture.replay()
+            assert_bitwise(snapshot(result), changed, "changed-payload capture")
+        finally:
+            capture.reset()
         if len(order) == 3 and order == [0, 1, 2]:
             baseline = got
     source = {n: run.pack[t] for n, t in run.refs.items() if n not in ("dq", "dk", "dv")}
