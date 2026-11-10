@@ -1492,10 +1492,16 @@ paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
 one-arrival barrier. `test_sm120_frost_paged_d512` pins the persistent grid to
 two CTAs so even compact tests exercise repeated unit transitions.
 An async-copy completion does not substitute for ownership synchronization
-of other shared buffers. The D512 warp-pair score exchange completes both
-partners' generic reads before reusing its single buffer on paged paths.
+of other shared buffers. The wide-head warp-pair score exchange completes both
+partners' generic reads before reusing its single buffer on every loader path,
+including dense and THD TMA. Their K/V handoff does not release score reads.
 `test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
 read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+`test_d576_dense_features[dims0-plain-dtype1]` and the D576 THD cases detect
+the same reuse hazard with TMA. Keep those separate from old-tool RAW reports:
+on SM121, sanitizer2025.3.1 also flags the already synchronized paged exchange;
+the identical cached binary is clean with sanitizer2026.3.0. Confirm active
+instrumentation before interpreting a newer-tool run as a pass.
 The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
 it publishes those stores with release arrivals, while uniform half retains
 copy-tracked arrivals. Do not select the publication operation by the output

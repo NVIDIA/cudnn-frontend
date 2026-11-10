@@ -969,10 +969,9 @@ class SM120FusedMultiHeadAttentionForward:
         Each warp publishes its partial scores in its own ``sX`` slots
         (``[warp][k_frag][lane][4]``, one 16-byte store per fragment), meets its
         partner on the slab's named barrier, and adds the partner's slots in
-        place. The buffer is single-buffered. Dense TMA orders its reuse
-        through the V-tile producer/consumer handoff. Paged cp.async barriers
-        publish only the copies, so an explicit pair barrier completes the
-        generic shared reads before either partner overwrites its slots.
+        place. The buffer is single-buffered. Both loaders need an explicit
+        pair barrier after the generic shared reads: a K/V copy's completion
+        does not complete the partner warp's reads of these score slots.
 
         :param basic_params: Lane mapping, warp-pair indices, and ``sX``.
         :param s_regs: This warp's partial QK scores; the full scores on return.
@@ -995,11 +994,10 @@ class SM120FusedMultiHeadAttentionForward:
             partner = (partner_base + k_frag * 32 * 4).load(count=4, alignment=16).bitcast(cutlass.Float32)
             for i in cutlass.range_constexpr(4):
                 s_regs[s_off + i] = s_regs[s_off + i] + partner[i]
-        if cutlass.const_expr(self.page_size > 0):
-            # The cp.async arrival publishes the page copies, not the generic
-            # shared reads from this exchange. Complete both partner reads
-            # explicitly before either warp reuses the single-buffered sX.
-            prims.barrier_cta_sync(self.bar_pair_base + basic_params.slab, thread_count=self.HEAD_SPLIT * cute.arch.WARP_SIZE)
+        # Complete both partner reads before either warp reuses sX. This is
+        # necessary for dense/THD TMA as well as paged cp.async: a producer
+        # handoff orders its K/V slab, not this separate single-buffered tile.
+        prims.barrier_cta_sync(self.bar_pair_base + basic_params.slab, thread_count=self.HEAD_SPLIT * cute.arch.WARP_SIZE)
 
     @cute.jit
     def compute_one_kv_tile(
@@ -1059,8 +1057,8 @@ class SM120FusedMultiHeadAttentionForward:
         while not prims.mbarrier_try_wait_parity(basic_params.v_tma_mbar, tma_phase):
             pass
 
-        # Full scores = this warp's head-dim half + the partner's. After the V
-        # wait on purpose: see exchange_partial_s for why that keeps sX race-free.
+        # Full scores = this warp's head-dim half + the partner's. The exchange
+        # explicitly releases both reads before the next iteration reuses sX.
         self.exchange_partial_s(basic_params, s_regs)
 
         p_regs = self.online_softmax(
