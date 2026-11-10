@@ -3282,6 +3282,9 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
                 torch.empty((batch_size, num_heads, num_q_groups, num_kv_blocks), dtype=torch.int32, device=q.device),
                 # Per (pair, Q group) task record written by the partition kernel and read by the main kernel's _task.
                 torch.empty((batch_size, num_heads, num_q_groups, pair_count, 8), dtype=torch.int32, device=q.device),
+                # Per-KV64-block epilogue bookkeeping (rows: arrival tickets, first-store flag, completions, expected
+                # tasks per pair) that replaces zeroing the FP32 dK/dV workspace.
+                torch.zeros((batch_size, num_heads, 4, num_kv_blocks), dtype=torch.int32, device=q.device),
             )
         # NaN takes the masking-safe nonpositive path as well (as on SM100).
         scale_nonpositive = not (softmax_scale > 0)
@@ -3301,6 +3304,8 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
             round_d_to=32,
             zero_dq_accum=False,
             include_dkv_accum=not direct_kv,
+            # The paired kernel's first arriver stores each dK/dV block instead of reduce-adding onto zeros.
+            zero_kv_accum=not use_paired_kv,
             device=q.device,
         )
 

@@ -657,6 +657,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
+        pair_sync: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -705,6 +706,8 @@ class BlockSparseAttnBackwardSm90Blk128:
             pair_residuals = cute.make_tensor(pair_residuals.iterator, pair_residuals.layout)
         if const_expr(pair_tasks is not None):
             pair_tasks = cute.make_tensor(pair_tasks.iterator, pair_tasks.layout)
+        if const_expr(pair_sync is not None):
+            pair_sync = cute.make_tensor(pair_sync.iterator, pair_sync.layout)
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
 
         self.num_mma_threads = self.num_threads - 128
@@ -830,6 +833,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             pair_flags,
             pair_residuals,
             pair_tasks,
+            pair_sync,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -879,6 +883,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
+        pair_sync: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1048,6 +1053,7 @@ class BlockSparseAttnBackwardSm90Blk128:
                     pair_flags,
                     pair_residuals,
                     pair_tasks,
+                    pair_sync,
                 )
                 cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
                 self.mma(*mma_args)
@@ -1268,6 +1274,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         pair_flags: Optional[cute.Tensor] = None,
         pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
+        pair_sync: Optional[cute.Tensor] = None,
     ):
         # Both WGs execute all five GEMMs. S/dP/dKV split the KV rows;
         # dQ splits the head dimension and reduces the entire KV128 tile.
@@ -1608,6 +1615,22 @@ class BlockSparseAttnBackwardSm90Blk128:
                         read_Q.advance()
                         read_dO.advance()
                         accumulate = True
+            if const_expr(self.paired and pair_sync is not None):
+                # First-arriver protocol (see epilogue_paired_kv): thread 0 of each WG draws its KV64 block's ticket
+                # before the barrier so the L2 round trip overlaps the fragment staging. WG1 owns no block when the
+                # pair is unpaired (kv1 == kv0, b_ok False): it stages zeros but neither counts nor writes.
+                own_kv = kv1 if wg == 1 else kv0
+                participate = steps > 0 and (wg == 0 or begin[4])
+                ticket = Int32(1)
+                stored_early = Int32(0)
+                if participate and tidx % 128 == 0:
+                    arrive_ptr = pair_sync.iterator + cute.crd2idx((batch_idx, head_idx, 0, own_kv), pair_sync.layout)
+                    stored_ptr = pair_sync.iterator + cute.crd2idx((batch_idx, head_idx, 1, own_kv), pair_sync.layout)
+                    ticket = Int32(cute.arch.atomic_add(arrive_ptr.llvm_ptr, Int32(1), sem="relaxed", scope="gpu"))
+                    # The first arriver's flag is normally set long before (same-pair tasks are ~2,000 CTAs apart), so
+                    # read it here too: an acquire that already observed 1 orders the reduce and the poll after the
+                    # barrier does not have to wait for another L2 round trip (ncu: that wait cost ~0.9% of the kernel).
+                    stored_early = copy_utils.ld_acquire_gpu_s32(stored_ptr)
             # Both WGs must finish all input reads before K/V (direct) or Q/dO
             # (multi-bucket) become epilogue scratch. Empty tiles write zeros.
             named_barrier_sync(barrier_id=int(NamedBarrierBwd.Epilogue), number_of_threads=256)
@@ -1616,6 +1639,14 @@ class BlockSparseAttnBackwardSm90Blk128:
                 self.epilogue_direct_kv(acc_dV, mdV, sV, tma_atom_dV, tiled_mma_dV, tidx, n_block, head_idx, batch_idx, Float32(1.0))
                 if tidx < 32:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
+            elif const_expr(self.paired and pair_sync is not None):
+                # Both WGs stage their fragments whenever the pair has work (the barriers inside span both WGs);
+                # the K/V tiles are dead too, so dK and dV are staged at once and drained together.
+                if steps > 0:
+                    if wg == 0:
+                        self.epilogue_paired_kv(acc_dK, acc_dV, mdK, mdV, sQ, sK, tidx, kv0, participate, ticket, stored_early, pair_sync, head_idx, batch_idx)
+                    else:
+                        self.epilogue_paired_kv(acc_dK, acc_dV, mdK, mdV, sdO, sV, tidx, kv1, participate, ticket, stored_early, pair_sync, head_idx, batch_idx)
             elif const_expr(self.paired):
                 # The epilogue barrier spans both WGs, so both add their fragment whenever the pair has work: a WG
                 # whose block attended nothing adds zeros (to the first block when the second is unpaired).
@@ -1669,6 +1700,60 @@ class BlockSparseAttnBackwardSm90Blk128:
                 ptr = output.iterator + output.layout((kv64_block * count, head_idx, batch_idx))
                 copy_utils.cpasync_reduce_bulk_add_f32(shared.iterator, ptr, count * 4)
             cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    @cute.jit
+    def epilogue_paired_kv(
+        self, acc_dK, acc_dV, mdK, mdV, scratch_k, scratch_v, tidx, kv64_block, participate, ticket, stored_early, pair_sync, head_idx, batch_idx
+    ):
+        """Paired-mode dK/dV epilogue without a zeroed workspace: the first (pair, Q group) task to reach a KV64 block
+        stores its FP32 fragments, every later one reduce-adds.
+
+        Each WG stages dK into ``scratch_k`` and dV into ``scratch_v`` at once (sQ/sK for WG0, sdO/sV for WG1; all
+        four are dead once both WGs passed the Epilogue barrier) and thread 0 of the WG runs the protocol on the
+        block's two words of ``pair_sync`` (row 0 ``arrive``: the ticket counter the caller already incremented; row 1
+        ``stored``, which the caller also read once with acquire semantics while the fragments were being staged).
+        Ticket 0: plain bulk stores, ``cp.async.bulk.wait_group 0`` (full completion, not ``.read``),
+        ``fence.proxy.async.global`` (async-proxy writes ordered before the generic-proxy flag), ``st.release.gpu``
+        stored = 1. Tickets >= 1: ``ld.acquire.gpu`` spin on stored unless the early read already saw 1,
+        ``fence.proxy.async.global`` (acquire ordered before the async-proxy reduce), then ``cp.reduce.async.bulk``
+        add as before. The spin sits after the last
+        CTA-wide barrier and a first arriver never waits, so every spin waits on a resident thread that cannot be
+        blocked; the two WGs never share a block (``participate`` is False for WG1 of an unpaired task). Blocks no
+        task arrives at keep arrive == 0 and are zeroed by the convert kernel instead of a 1 GB memset.
+        """
+        count = self.tile_n * self.tile_hdim // self.num_wg_mma
+        shared_k = cute.make_tensor(cute.recast_ptr(scratch_k.iterator, dtype=Float32), cute.make_layout(count))
+        shared_v = cute.make_tensor(cute.recast_ptr(scratch_v.iterator, dtype=Float32), cute.make_layout(count))
+        tiled = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128), cute.make_layout(128), cute.make_layout(4)
+        )
+        thr_copy = tiled.get_slice(tidx % 128)
+        dst_k = thr_copy.partition_D(shared_k)
+        dst_v = thr_copy.partition_D(shared_v)
+        cute.autovec_copy(cute.make_tensor(acc_dK.iterator, cute.make_layout(dst_k.shape)), dst_k)
+        cute.autovec_copy(cute.make_tensor(acc_dV.iterator, cute.make_layout(dst_v.shape)), dst_v)
+        cute.arch.fence_view_async_shared()
+        named_barrier_sync(barrier_id=int(NamedBarrierBwd.Epilogue), number_of_threads=256)
+        if participate and tidx % 128 == 0:
+            dk_ptr = mdK.iterator + mdK.layout((kv64_block * count, head_idx, batch_idx))
+            dv_ptr = mdV.iterator + mdV.layout((kv64_block * count, head_idx, batch_idx))
+            stored_ptr = pair_sync.iterator + cute.crd2idx((batch_idx, head_idx, 1, kv64_block), pair_sync.layout)
+            if ticket == 0:
+                copy_utils.cpasync_bulk_store_s2g(shared_k.iterator, dk_ptr, count * 4)
+                copy_utils.cpasync_bulk_store_s2g(shared_v.iterator, dv_ptr, count * 4)
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
+                copy_utils.fence_proxy_async_global()
+                copy_utils.st_release_gpu_s32(stored_ptr, Int32(1))
+            else:
+                stored = stored_early
+                while stored == 0:
+                    stored = copy_utils.ld_acquire_gpu_s32(stored_ptr)
+                copy_utils.fence_proxy_async_global()
+                copy_utils.cpasync_reduce_bulk_add_f32(shared_k.iterator, dk_ptr, count * 4)
+                copy_utils.cpasync_reduce_bulk_add_f32(shared_v.iterator, dv_ptr, count * 4)
+                cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit

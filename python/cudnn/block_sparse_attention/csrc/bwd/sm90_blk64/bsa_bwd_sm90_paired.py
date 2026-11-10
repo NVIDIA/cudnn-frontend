@@ -8,6 +8,10 @@ common | second-only]. The blk128 backward in paired mode gives each pair one CT
 walks that list once: Q/dO, LSE/dPsum and the dQ reduction are shared, and each WG computes only the Q blocks its own
 block attends, so Q/dO are swept once for all edges. A blk128 compute WG's FP32 dK/dV fragment is one blk64
 accumulator chunk and the dQ fragments match, so the blk64 preprocess, workspace and postprocess serve it unchanged.
+
+The FP32 dK/dV workspace is not zeroed: the first (pair, Q group) task to reach a KV64 block stores its fragments
+and later ones reduce-add (``pair_sync`` tickets, see ``epilogue_paired_kv``); the dK/dV postprocess writes zeros for
+blocks no task arrived at.
 """
 
 from typing import Tuple
@@ -64,6 +68,7 @@ class MixedKvBackwardSm90:
         flags: cute.Tensor,
         residuals: cute.Tensor,
         tasks: cute.Tensor,
+        sync: cute.Tensor,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -106,8 +111,10 @@ class MixedKvBackwardSm90:
             flags,
             residuals,
             tasks,
+            sync,
             stream=stream,
         )
-        regular._postprocess_call(mdQaccum, mdQ, softmax_scale, stream)
-        regular._postprocess_call(mdKaccum, mdK, softmax_scale, stream)
-        regular._postprocess_call(mdVaccum, mdV, Float32(1.0), stream)
+        arrivals = sync[None, None, 0, None]
+        regular._postprocess_call(mdQaccum, mdQ, softmax_scale, stream=stream)
+        regular._postprocess_call(mdKaccum, mdK, softmax_scale, arrivals, stream=stream)
+        regular._postprocess_call(mdVaccum, mdV, Float32(1.0), arrivals, stream=stream)
