@@ -1074,16 +1074,20 @@ class SM120FusedMultiHeadAttentionForward:
         # Paged copies already zero-fill dead rows. Compute-warp tail stores
         # would race the partner warps' PV reads, even when writing zero.
         if cutlass.const_expr(self.page_size == 0 and (self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+            # One warp owns the zero fill. Repeated zero stores from all
+            # compute warps still race another warp's ldmatrix reads.
+            if basic_params.compute_warp_idx == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs)
         if basic_params.compute_warp_idx == 0:
             prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)

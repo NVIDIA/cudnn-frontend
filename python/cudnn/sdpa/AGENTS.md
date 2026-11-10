@@ -1480,6 +1480,9 @@ compute-warp tail sanitation. Multiple compute warps can then overwrite V
 while another warp reads it through `ldmatrix`, even when the stores repeat
 zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
 and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
+For dense runtime lengths and THD, give one warp ownership of that zero fill
+and synchronize all consuming warps before PV. The wide-head THD cases in
+`test_sdpa_fwd_d576_sm120.py` detect this write/read race under racecheck.
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
