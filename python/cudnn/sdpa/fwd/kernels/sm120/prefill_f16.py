@@ -49,7 +49,6 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-from cutlass.base_dsl.typing import Pointer
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
@@ -71,6 +70,7 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
 )
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    load_paged_half_tile,
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
     nvvm_threadquad_reduction_max,
@@ -382,40 +382,20 @@ class SM120FusedMultiHeadAttentionForward:
         :param envelope: Actual head dim < compile-time tile (zero-padded).
         """
         if cutlass.const_expr(self.page_size > 0):
-            # Read the caller's table in the attention CTA. Each 16-byte copy
-            # lands directly in the existing MMA tile; dead rows never read a
-            # table entry or pool payload and cp.async zero-fills their SMEM.
-            src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
-            lane = cute.arch.lane_idx()
-            head_tile = self.head_tile_v if is_v else self.head_tile_qk
-            chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
-            vectors_per_row = head_tile // 8
-            for wave in cutlass.range_constexpr(self.kv_tile * vectors_per_row // 32):
-                chunk = wave * 32 + lane
-                row = chunk // vectors_per_row
-                col = (chunk % vectors_per_row) * 8
-                logical_row = seq_coord + row
-                # The logical width is an eight-element multiple. A complete
-                # 16-byte vector is either live or zero-filled; head padding
-                # must never read the next head or poisoned storage slack.
-                live = cutlass.Int32((logical_row < seqlen_k) & (col < pool.shape[3]))
-                offset = cutlass.Int64(0)
-                if live != 0:
-                    page = cutlass.Int64(page_table[batch_idx, logical_row // self.page_size])
-                    offset = page * cutlass.Int64(pool.stride[0])
-                    offset += cutlass.Int64(logical_row % self.page_size) * cutlass.Int64(pool.stride[1])
-                    offset += cutlass.Int64(head_idx) * cutlass.Int64(pool.stride[2]) + cutlass.Int64(col)
-                physical_row = (col // chunk_elems) * self.kv_tile + row
-                physical_col = swizzle_xor(physical_row, col % chunk_elems, chunk_elems, 2)
-                dst = s_dst.subview(physical_row * chunk_elems + physical_col)
-                prims.cp_async_shared_global(dst, src + offset, 16, prims.LoadCacheModifier.CG, cp_size=live * 16)
-            # Drain this lane's copy group before publishing the tile.
-            prims.cp_async_commit_group()
-            prims.cp_async_wait_group(0)
-            # Each lane contributes one async-tracked arrival after its copies
-            # complete. The init count already includes all 32 lanes (.noinc).
-            # Ordinary mbarrier arrivals do not publish prior cp.async writes.
-            prims.cp_async_mbarrier_arrive(mbar, noinc=True)
+            load_paged_half_tile(
+                s_dst,
+                mbar,
+                pool,
+                page_table,
+                batch_idx,
+                head_idx,
+                seq_coord,
+                seqlen_k,
+                self.page_size,
+                self.kv_tile,
+                self.head_tile_v if is_v else self.head_tile_qk,
+                self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
+            )
         else:
             chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
             chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems

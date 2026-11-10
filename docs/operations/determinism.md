@@ -216,7 +216,7 @@ retain bytewise identity under replay, reordered/duplicated batches and changed
 neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
 this forward result does not establish a backward or cross-runtime guarantee.
 
-## SM120 small-head paged SDPA
+## SM120 paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch
 invariant for the tested D64 and D120/V88 causal-window configurations, with
@@ -235,5 +235,13 @@ The native SM120 paged decode contract also covers independent eight-aligned
 QK/V widths through256 on M16/M32 tiles. The D256 and D192/V128 cases retain
 CPU-seeded inputs, eager/captured byte comparisons, batch invariance and
 runtime-keyed golden outputs in `test_sm120_frost_paged_wide_decode_determinism`.
+
+The D512 native paged envelope additionally has fixed-runtime FP16/BF16
+replay and batch-invariance checks on RTX5080, with and without PackGQA,
+and with split counts one and three held fixed. The M64/N32 path preserves
+O and Stats bytes through fresh buffers, batch reordering/duplication and
+changed-neighbor CUDA Graph replay. The independent numerical checks include
+empty Q/KV, causal windows and attention sinks. SM121 and other runtimes
+remain unverified; this is forward-only qualification.
 
 SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.

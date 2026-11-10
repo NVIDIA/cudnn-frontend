@@ -5929,12 +5929,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.q_desc.ndim != 4
                 or self.v_desc.ndim != 4
                 or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
-                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES),
-                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill or 256 for decode",
+                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES, d512=True),
+                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill, 256 for decode, or both in (256, 512]",
             )
             self._not_implemented_error_if(
-                self.split_kv > 1 and self.tile_m not in _SM120_DECODE_Q_TILES,
-                "SM120 paged KV split requires a decode tile (tile_m=16 or 32)",
+                self.split_kv > 1
+                and self.tile_m not in _SM120_DECODE_Q_TILES
+                and _sm120_pick_flavor(int(self.q_desc.shape[3]), int(self.v_desc.shape[3]), False) != _SM120_D512_FLAVOR,
+                "SM120 paged KV split requires a decode tile (tile_m=16 or 32) or the D512 tile",
             )
             self._not_implemented_error_if(not self.seq_kv_lens_present, "SM120 paged KV requires device KV lengths")
             self._value_error_if(
@@ -6279,8 +6281,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 "SM120 split_kv > 1 with an attention sink requires exact D128 dense per-tensor FP8 or FP16/BF16",
             )
             self._value_error_if(
-                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and decode_tile),
-                "split_kv > 1 with device lengths requires the native paged decode tile",
+                (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and (decode_tile or self.flavor == _SM120_D512_FLAVOR)),
+                "split_kv > 1 with device lengths requires a native paged decode or D512 tile",
             )
         self._value_error_if(
             self.softmax_precision is not None,

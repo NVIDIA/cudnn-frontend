@@ -2783,7 +2783,7 @@ graphs retain typed declines. Dense support below remains unchanged.
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, exact D128 MHA; restrictions above) |
-| Paged KV (dense Q, exact D_QK=D_V=128, unsplit prefill tiles) | ✅ FP16/BF16 | ❌ | ❌ |
+| Paged KV (dense Q; prefill through D128, decode through D256, D512 envelope) | ✅ FP16/BF16; tile/split limits below | ❌ | ❌ |
 | `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
 | Strided / permuted Stats | ✅ | ✅ | ✅ |
 | **Masks / features** | | | |
@@ -2801,7 +2801,8 @@ graphs retain typed declines. Dense support below remains unchanged.
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
 
 **Native paged forward.** FP16/BF16 dense queries with independent
-QK/V head widths divisible by eight through128 (prefill) or256 (decode) may read
+QK/V head widths divisible by eight through128 (general prefill),256 (decode),
+or both in (256,512] (the D512 prefill envelope) may read
 independent K/V block tables and HND/NHD page pools through the common prepared
 graph and standalone contracts. The attention CTA copies each selected page
 segment directly into its existing swizzled MMA shared tile, zero-filling rows
@@ -2817,8 +2818,12 @@ all32 producer lanes publish both K/V regions before consumer access. Split
 partials retain half O/FP32 Stats and the common fixed-order combine folds
 the sink once, respecting device Q lengths. Decode through256 retains the same
 head-dependent ring sizes, including one slot per key group at D256/M16.
-Paged prefill above128, widths above256, THD Q and
-quantization remain declined. Existing mask,
+The D512 half body additionally serves paged dense Q at TILE_M64/TILE_N32,
+with optional split and PackGQA. Q retains its TMA staging; one producer warp
+loads paged K/V into the shared tile and publishes32 copy-tracked arrivals
+per operand, including after persistent-unit barrier reinitialization.
+Paged general prefill above128, asymmetric widths straddling256, widths
+above512, THD Q and quantization remain declined. Existing mask,
 sink, packing and Stats semantics compose without a heuristic change. Paged
 sink endpoints retain O=0 / Stats=+inf for a +inf sink, and O=0 / Stats=-inf
 for a keyless row with a -inf sink.

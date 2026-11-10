@@ -1788,3 +1788,47 @@ counts now order the shared alpha/inverse-factor handoff; intermediate
 named-barrier experiments were discarded. Numerical success alone was not
 used to waive the initial sanitizer diagnostics. This is fixed-GPU/runtime
 forward qualification, not backward or default-dispatch performance.
+
+
+### SM120 D512 paged forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_d512_determinism`
+adds eight L0 forward cases: FP16/BF16, unpacked/PackGQA and split1/3 at
+D512/V512, M64/N32. CPU-seeded inputs and an independent FP64 O/Stats reference
+precede byte checks and golden recording. Tests include fresh storage,
+concurrent work, B129 reorder/duplicates/empty neighbors, changed-neighbor
+CUDA Graph replay, input immutability and output canaries. Split and packing
+choices stay fixed within each comparison; cross-configuration identity is
+not claimed.
+
+RTX5080 (84 SMs), CUDA driver13.5, Torch2.14.1+cu130, cuDNN9.30.0.2,
+CuTe DSL4.8.0 and tvm-ffi0.1.14.post1 use runtime key `1858cfcbf6876f83`.
+Eight new records are appended without replacing existing baselines.
+Eight existing D64/D120-V88 paging cases also pass and gain records for this
+runtime: their input and output hashes exactly match the older driver13.4
+records under `42742425a3d29d7c`. This observed equality does not establish
+a cross-runtime guarantee. SM121 and backward remain unverified by these runs.
+
+From `test/python`, run `python -m pytest -n 0 -m L0 -q
+sdpa/frost/test_sdpa_fwd_paged_sm120.py -k "d512_determinism or paged_width_determinism"`
+with `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`. Recording used separate new directories;
+normal comparison leaves `CUDNN_DETERMINISM_RECORD` unset.
+
+The complete paging regression passes 144 cases, including all sixteen strict
+goldens on this runtime. Final D512 qualification passes 49 cases: the 25 new
+feature/admission/golden cases, existing dense/THD controls and two new dense
+infinite-sink endpoint checks. After the last paged-only score-buffer barrier
+fix, all 25 new cases pass again (279 deselected, no failures or skips).
+Ten BF16 feature/endpoint cases pass each of Compute Sanitizer 13.4 memcheck,
+racecheck and synccheck with zero reported errors; racecheck also reports zero
+warnings. Memcheck is unfiltered; racecheck/synccheck select the native
+`cudnn_kernel_` kernels. These are forward-path checks, not backward coverage.
+
+Retained controls distinguish numerical success from synchronization safety.
+The redundant paged V-tail stores passed numerics but produced 288 racecheck
+errors; skipping those stores on paged input makes the identical case clean.
+A broader ten-case run then passed numerically while reporting 80 grouped
+score-exchange races. An explicit warp-pair read-completion barrier fixes the
+single-buffer reuse: its failing split/packed control and the full ten-case
+racecheck now report zero errors. The dense TMA path retains its prior handoff.
