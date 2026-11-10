@@ -1553,3 +1553,11 @@ half-precision resident-arm selector; explicit-only per-tensor widths belong
 in `effective_tile_ns`, like the native D128 explicit narrow tile. The detector
 `test_fp8_d64_narrow_tile_keeps_graph_defaults` checks both A and FALLBACK at
 first-half tails as well as tile multiples, while admitting an explicit N64.
+
+Shared kernel geometry constants must live below the heuristics/adapter layer.
+Importing heuristics from split-combine creates a cycle when an adapter imports
+that reducer. Re-export shared constants from heuristics when callers already
+use those names, preserving their values and policy. The cold-interpreter
+`test_split_combine_import_without_heuristics` blocks heuristics imports while
+loading both the reducer and SM80 prepared host; a warmed test process can hide
+this dependency.
