@@ -30,6 +30,7 @@ _LAZY_EXPORTS = {
     "gated_rmsnorm_backward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_backward"),
     "zero_centered_rmsnorm_forward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_forward"),
     "zero_centered_rmsnorm_backward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_backward"),
+    "LmHeadLogprobPlan": ("cudnn.lm_head", "LmHeadLogprobPlan"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),

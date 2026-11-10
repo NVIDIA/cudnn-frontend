@@ -85,6 +85,7 @@ The experimental API catalog includes:
 - [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
 
 - [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
+- [Cake LM-head log-probabilities](/operations/cake_lm_head): prepared deterministic forward and gradients.
 
 ## Installation and setup
 
