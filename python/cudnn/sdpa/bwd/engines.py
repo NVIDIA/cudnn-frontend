@@ -49,6 +49,7 @@ _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
 _D512_FP8 = "SdpaBwdDslD512Fp8"
 _D512_MXFP8 = "SdpaBwdDslD512Mxfp8"
 _SM120_FP8 = "SdpaBwdDslSm120Fp8"
+_SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
@@ -117,6 +118,10 @@ def _fp8_adapter(name: str):
 
 
 def _mxfp8_adapter(name: str):
+    if name == _SM120_MXFP8:
+        from cudnn.sdpa.bwd.api_dsl_sm120_mxfp8 import SdpaBwdDslSm120Mxfp8
+
+        return SdpaBwdDslSm120Mxfp8
     if name == _D512_MXFP8:
         from cudnn.sdpa.bwd.api_dsl_d512_mxfp8 import SdpaBwdDslD512Mxfp8
 
@@ -2325,6 +2330,31 @@ def _sm120_fp8_spec():
     )
 
 
+def _sm120_mxfp8_spec():
+    return EngineSpec(
+        name="sdpa_bwd_sm120_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=120,
+            sm_hi=121,
+            d=frozenset({512}),
+            d_envelope=True,
+            d_pad_multiple=8,
+            dqk_ge_dv=True,
+            declaration_check=_sm120_fp8_mismatch,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_mxfp8=True,
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            causal=True,
+            swa=True,
+            gqa=True,
+            deterministic=True,
+            compact_bshd=True,
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM120_MXFP8),
+    )
+
+
 ENGINE_SPECS = (
     _sm120_spec(),
     _sm80_spec(),
@@ -2343,6 +2373,7 @@ ENGINE_SPECS = (
     _d512_fp8_spec(),
     _d512_mxfp8_spec(),
     _sm120_fp8_spec(),
+    _sm120_mxfp8_spec(),
 )
 
 __all__ = [

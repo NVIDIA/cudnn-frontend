@@ -301,6 +301,20 @@ for batch comparisons. This qualifies the tested runtime and dense BSHD
 contract; SM120 hardware, MXFP8, THD and cross-runtime bit identity remain
 unverified.
 
+
+## SM120 MXFP8 backward
+
+The native block-scaled backward engine uses fixed query/key owners and
+fixed-order GQA accumulation. Canonical rowwise and columnwise scale atoms
+are read from current device storage, without a global scale repack.
+The bounded GB10 SM121 checks preserve dQ/dK/dV bytes across replays,
+fresh storage, duplicated/reordered batches of 1, 3, 4 and 129 members,
+and changed-payload capture. Captured execution also observes changed
+scale bytes. Four runtime goldens cover D128/D512 with FP16/BF16 gradients.
+This evidence keeps quantized payloads and scale bytes fixed across batch
+comparisons; it does not qualify cross-runtime identity, SM120 execution,
+THD or unsupported masks.
+
 ## SM120 wide half backward
 
 For eight-aligned `256 < D_QK <= 512` and `0 < D_V <= D_QK`, the native
