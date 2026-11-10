@@ -1,4 +1,4 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cake implementations of sparse attention operations."""
+"""Cake sparse-attention APIs."""
