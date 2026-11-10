@@ -1318,37 +1318,26 @@ class BlockSparseAttnBackwardSm90Blk128:
             acc_dV.fill(0.0)
             if const_expr(self.paired):
                 _, len0, _, res0, b_ok = begin
-                # WG0 owns [0, len0) (first-only + common), WG1 [res0, steps) (common + second-only). Three loops keep
-                # the MMAs out of per-step branches.
-                lo = Int32(0)
-                hi = len0
-                if wg == 1:
-                    lo = res0 if b_ok else steps
-                    hi = steps
-                acc_zero = cute.make_rmem_tensor(tiled_mma_SdP.partition_shape_C(shape_S[:2][::-1]), Float32)
-                acc_zero.fill(0.0)
-                rdS_zero = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_zero), self.dtype)
-                for step in cutlass.range(0, lo, unroll=1):
-                    stage = read_Q.index
-                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
-                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
-                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
-                    # This WG's KV block does not attend this Q block: its half of dS is zero for the shared dQ GEMM.
-                    copy_dS_r2s(rdS_zero, dst_idx=stage)
-                    cute.arch.fence_view_async_shared()
-                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
-                    pipeline_stats.consumer_release(read_Q)
-                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=0)
-                    pipeline_dO.consumer_release(read_dO)
-                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
-                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
-                    cute.autovec_copy(rflat, tdQsdQ)
-                    cute.arch.fence_view_async_shared()
-                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
-                    pipeline_Q.consumer_release(read_Q)
-                    read_Q.advance()
-                    read_dO.advance()
-                for step in cutlass.range(lo, hi, unroll=1):
+                # The walk is [first-only | common | second-only] = [0, lo1) | [lo1, len0) | [len0, steps): WG0 owns
+                # [0, len0), WG1 owns [lo1, steps) (nothing when the second block is unpaired: then lo1 == len0 ==
+                # steps). Five loops keep the MMAs out of per-step branches. In a single-owner step only the owner
+                # computes S/dP/dV/dK and writes its half of dS; BOTH WGs then run their head-dim half of the shared
+                # dQ GEMM over the owner's 64 KV rows only (the two dS halves and the two K halves are independent
+                # 8 KB swizzled blocks, so the K slice is a static descriptor offset), and the non-owner no longer
+                # writes an 8 KB zero dS tile. Every WG keeps one PdS barrier, one dQEmpty/dQFull handshake and one
+                # Q/dO/stats release per step, so the producer and store warps see the same protocol as before.
+                lo1 = res0 if b_ok else steps
+                k_half = cute.size(tdQrdS.shape[2]) // 2  # k-blocks of one KV64 half
+                own_lo_end = lo1  # WG0: owner of [0, lo1), passive in [len0, steps)
+                pas_lo_end = Int32(0)
+                pas_hi_end = steps
+                own_hi_end = len0
+                if wg == 1:  # WG1: passive in [0, lo1), owner of [len0, steps)
+                    own_lo_end = Int32(0)
+                    pas_lo_end = lo1
+                    pas_hi_end = len0
+                    own_hi_end = steps
+                for step in cutlass.range(0, own_lo_end, unroll=1):
                     m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
                     stage = read_Q.index
                     pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
@@ -1361,10 +1350,83 @@ class BlockSparseAttnBackwardSm90Blk128:
                     if const_expr(self.scale_nonpositive):
                         acc_S.store(acc_S.load() * softmax_scale_log2)
                     if const_expr(mBlockSizes is not None or self.has_kv_tail):
-                        if const_expr(self.paired):
-                            mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
-                        else:
-                            mask.apply_mask(acc_S, batch_idx, head_idx, m_block, n_block, thr_mma_SdP, block_size_k=block_size_k)
+                        mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
+                    scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                        lse = rLSE[r]
+                        for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
+                            scores[r, c] = (
+                                cute.math.exp2(
+                                    scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
+                                    fastmath=True,
+                                )
+                                if lse != Float32.inf
+                                else Float32(0.0)
+                            )
+                    rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+                    rDelta = copy_utils.load_s2r(tdPsums[None, stage])
+                    warpgroup.wait_group(0)
+                    dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
+                        for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
+                            # Keep FP32 P for dS, independent of the BF16 dV operand.
+                            dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
+                    rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+                    copy_dS_r2s(rdS, dst_idx=stage)
+                    gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    # The memory-clobbering cross-WG barrier orders both normal
+                    # shared reads before either WG returns the statistics slot.
+                    pipeline_stats.consumer_release(read_Q)
+                    # dQ over this WG's own KV64 half only (WG0 = k-blocks [0, k_half)). Wait only for the
+                    # preceding dV before releasing dO; dK then overlaps dQ store.
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=1, k_begin=0, k_end=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    warpgroup.wait_group(0)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                    accumulate = True
+                for step in cutlass.range(0, pas_lo_end, unroll=1):
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    # The other WG owns this Q block: wait for its dS half, then reduce only that half (K=64) into
+                    # this WG's head-dim half of dQ. No zero dS is written; the handshakes stay one-for-one.
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    pipeline_stats.consumer_release(read_Q)
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=0, k_begin=0, k_end=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                for step in cutlass.range(lo1, len0, unroll=1):
+                    m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
+                    # QK is complete; dP can overlap exp2 and the statistics load.
+                    if const_expr(self.scale_nonpositive):
+                        acc_S.store(acc_S.load() * softmax_scale_log2)
+                    if const_expr(mBlockSizes is not None or self.has_kv_tail):
+                        mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
                     scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
                     for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
                         lse = rLSE[r]
@@ -1408,17 +1470,16 @@ class BlockSparseAttnBackwardSm90Blk128:
                     read_Q.advance()
                     read_dO.advance()
                     accumulate = True
-                for step in cutlass.range(hi, steps, unroll=1):
+                for step in cutlass.range(len0, pas_hi_end, unroll=1):
                     stage = read_Q.index
                     pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
                     pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
                     pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
-                    # This WG's KV block does not attend this Q block: its half of dS is zero for the shared dQ GEMM.
-                    copy_dS_r2s(rdS_zero, dst_idx=stage)
-                    cute.arch.fence_view_async_shared()
+                    # The other WG owns this Q block: wait for its dS half, then reduce only that half (K=64) into
+                    # this WG's head-dim half of dQ. No zero dS is written; the handshakes stay one-for-one.
                     named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
                     pipeline_stats.consumer_release(read_Q)
-                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=0)
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=0, k_begin=k_half)
                     pipeline_dO.consumer_release(read_dO)
                     named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
                     rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
@@ -1428,6 +1489,63 @@ class BlockSparseAttnBackwardSm90Blk128:
                     pipeline_Q.consumer_release(read_Q)
                     read_Q.advance()
                     read_dO.advance()
+                for step in cutlass.range(len0, own_hi_end, unroll=1):
+                    m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
+                    # QK is complete; dP can overlap exp2 and the statistics load.
+                    if const_expr(self.scale_nonpositive):
+                        acc_S.store(acc_S.load() * softmax_scale_log2)
+                    if const_expr(mBlockSizes is not None or self.has_kv_tail):
+                        mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
+                    scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                        lse = rLSE[r]
+                        for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
+                            scores[r, c] = (
+                                cute.math.exp2(
+                                    scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
+                                    fastmath=True,
+                                )
+                                if lse != Float32.inf
+                                else Float32(0.0)
+                            )
+                    rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+                    rDelta = copy_utils.load_s2r(tdPsums[None, stage])
+                    warpgroup.wait_group(0)
+                    dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
+                        for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
+                            # Keep FP32 P for dS, independent of the BF16 dV operand.
+                            dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
+                    rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+                    copy_dS_r2s(rdS, dst_idx=stage)
+                    gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    # The memory-clobbering cross-WG barrier orders both normal
+                    # shared reads before either WG returns the statistics slot.
+                    pipeline_stats.consumer_release(read_Q)
+                    # dQ over this WG's own KV64 half only (WG1 = k-blocks [k_half, 2 k_half)). Wait only for the
+                    # preceding dV before releasing dO; dK then overlaps dQ store.
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=1, k_begin=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    warpgroup.wait_group(0)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                    accumulate = True
             else:
                 for step in cutlass.range(steps, unroll=1):
                     m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
