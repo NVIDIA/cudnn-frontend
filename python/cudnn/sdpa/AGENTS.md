@@ -1496,6 +1496,13 @@ of other shared buffers. The D512 warp-pair score exchange completes both
 partners' generic reads before reusing its single buffer on paged paths.
 `test_sm120_frost_paged_d512[split_pack-dtype1]` under racecheck detects the
 read/write hazard; a one-KV-tile numerical test does not exercise that reuse.
+The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
+it publishes those stores with release arrivals, while uniform half retains
+copy-tracked arrivals. Do not select the publication operation by the output
+MMA type: it must follow the producer's actual storage operation. The exhaustive
+`test_sm120_mixed_paged_conversion_all_encodings` also checks the supported
+compiler floor; a direct packed BF16 conversion can require a newer PTX ISA
+than the installed DSL compiler even when the GPU supports the operation.
 See the [PTX mbarrier completion rules](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 and run the native paging racecheck as well as memcheck and numerical replay.
 

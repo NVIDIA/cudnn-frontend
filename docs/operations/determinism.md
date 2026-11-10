@@ -244,4 +244,11 @@ changed-neighbor CUDA Graph replay. The independent numerical checks include
 empty Q/KV, causal windows and attention sinks. SM121 and other runtimes
 remain unverified; this is forward-only qualification.
 
+The native paged path with half Q/O and FP8 E4M3/E5M2 K/V also preserves
+O and Stats bytes in the tested D64/D128/D256/D512 configurations on RTX5080.
+Quantized cache payloads and split/packing choices stay fixed across batch
+reordering, duplication and changed-neighbor capture replay. Eight new
+runtime goldens accompany the independent numerical checks. This is
+forward-only evidence; SM121 and other runtimes remain unverified.
+
 SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.

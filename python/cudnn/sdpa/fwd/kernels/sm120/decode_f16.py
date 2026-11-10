@@ -56,13 +56,13 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-from cutlass.base_dsl.typing import Pointer
 
 from cutlass.experimental import primitives as prims
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3, DTYPE_E5M2
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    copy_paged_half_tile,
     ceil_div,
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
@@ -100,6 +100,7 @@ _host = _paged_host if PARAMS.page_size else _dense_host
 PREPARED_KV_TAIL_NATIVE = True
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+KV_STORAGE_DTYPE = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_E5M2: cutlass.Float8E5M2}.get(PARAMS.dtype_kv, STORAGE_DTYPE)
 
 
 def round_up_head_tile(d: int) -> int:
@@ -269,27 +270,19 @@ class SM120DecodeForward:
         is_v: cutlass.Constexpr[bool],
     ) -> None:
         """All producer lanes fill one ring region; the caller publishes K and V together."""
-        src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
-        lane = cute.arch.lane_idx()
-        head_tile = self.head_tile_v if is_v else self.head_tile_qk
-        chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
-        vectors_per_row = head_tile // 8
-        for wave in cutlass.range_constexpr(self.kv_stage * vectors_per_row // 32):
-            chunk = wave * 32 + lane
-            row = chunk // vectors_per_row
-            col = (chunk % vectors_per_row) * 8
-            logical_row = seq_coord + row
-            live = cutlass.Int32((logical_row < seqlen_k) & (col < pool.shape[3]))
-            offset = cutlass.Int64(0)
-            if live != 0:
-                page = cutlass.Int64(page_table[batch_idx, logical_row // self.page_size])
-                offset = page * cutlass.Int64(pool.stride[0])
-                offset += cutlass.Int64(logical_row % self.page_size) * cutlass.Int64(pool.stride[1])
-                offset += cutlass.Int64(head_idx) * cutlass.Int64(pool.stride[2]) + cutlass.Int64(col)
-            physical_row = (col // chunk_elems) * self.kv_stage + row
-            physical_col = swizzle_xor(physical_row, col % chunk_elems, chunk_elems, 2)
-            dst = s_dst + physical_row * chunk_elems + physical_col
-            prims.cp_async_shared_global(dst, src + offset, 16, prims.LoadCacheModifier.CG, cp_size=live * 16)
+        copy_paged_half_tile(
+            s_dst,
+            pool,
+            page_table,
+            batch_idx,
+            head_idx,
+            seq_coord,
+            seqlen_k,
+            self.page_size,
+            self.kv_stage,
+            self.head_tile_v if is_v else self.head_tile_qk,
+            self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
+        )
 
     @cute.jit
     def load_kv_region(
@@ -653,7 +646,7 @@ class SM120DecodeForward:
         lane = tidx % cute.arch.WARP_SIZE
         warp = cute.arch.warp_idx()
 
-        ring = cutlass.Array(k.dtype, self.ring_elems, space=cutlass.AddressSpace.smem, alignment=DECODE_REGION_ALIGN)
+        ring = cutlass.Array(self.in_dtype, self.ring_elems, space=cutlass.AddressSpace.smem, alignment=DECODE_REGION_ALIGN)
         full_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         empty_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         ring_ptr = ring.data_ptr()
@@ -753,12 +746,14 @@ class SM120DecodeForward:
                     self.load_paged_kv_region(
                         s_k + cutlass.Int32(self.k_region_elems), v, block_table_v, batch_idx, kv_head_idx, seq_coord, seqlen_k, is_v=True
                     )
-                    prims.cp_async_commit_group()
-                    prims.cp_async_wait_group(0)
-                    # All 32 lanes publish the stage's K/V copies before its
-                    # one consumer group can reuse the ring slot. Ordinary
-                    # arrivals would not publish cp.async writes.
-                    prims.cp_async_mbarrier_arrive(full_ptr + slot, noinc=True)
+                    if cutlass.const_expr(k.dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+                        # All 32 lanes release their generic widening stores.
+                        prims.mbarrier_arrive(full_ptr + slot)
+                    else:
+                        prims.cp_async_commit_group()
+                        prims.cp_async_wait_group(0)
+                        # Async arrivals publish the half cp.async copies.
+                        prims.cp_async_mbarrier_arrive(full_ptr + slot, noinc=True)
                 else:
                     if prims.elect_sync():
                         prims.mbarrier_arrive_expect_tx(full_ptr + slot, k_tx + v_tx)
@@ -1079,4 +1074,4 @@ def compile(  # noqa: A001
         raise ValueError(
             f"the decode tile's kv_tile is its stage width {kernel.kv_stage} at head tiles ({kernel.head_tile_qk}, {kernel.head_tile_v}); got {PARAMS.kv_tile}"
         )
-    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key)
+    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, kv_dtype=KV_STORAGE_DTYPE)
