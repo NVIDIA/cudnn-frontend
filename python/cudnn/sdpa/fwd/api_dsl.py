@@ -5824,7 +5824,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     FP16/BF16 head dims divisible by 8 through D128 additionally accept dense queries over independent
     HND/NHD K/V page pools, with independent block tables and device KV lengths.
     This native paged leg uses unsplit 64/128-row prefill tiles or 16/32-row
-    decode tiles with optional split-KV. It retains equal K/V page capacities
+    decode tiles with optional split-KV. Decode additionally serves independently sized head dims through256.
+    It retains equal K/V page capacities
     and the shared page-size domain.
 
     Half and per-tensor FP8 THD and zero-copy dense plans use a
@@ -5881,8 +5882,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 self.q_desc.ndim != 4
                 or self.v_desc.ndim != 4
                 or self.q_desc.dtype not in (torch.float16, torch.bfloat16)
-                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3]),
-                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128",
+                or not _sm120_paged_head_dims_supported(self.q_desc.shape[3], self.v_desc.shape[3], decode=self.tile_m in _SM120_DECODE_Q_TILES),
+                "SM120 paged KV requires FP16/BF16 head dims divisible by 8 through 128 for prefill or 256 for decode",
             )
             self._not_implemented_error_if(
                 self.split_kv > 1 and self.tile_m not in _SM120_DECODE_Q_TILES,

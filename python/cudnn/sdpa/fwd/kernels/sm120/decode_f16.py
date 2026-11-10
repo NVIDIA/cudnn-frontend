@@ -42,7 +42,7 @@ Constraints:
 - head dims multiples of 8 up to 256; the kernel compiles at head tiles rounded
   up to 16 and TMA zero-fills the pad columns (the head-dim ENVELOPE)
 - dense BSHD storage with the head dim innermost (no THD), SCHED_NATURAL
-- optional independent paged K/V pools for eight-aligned head dims through128
+- optional independent paged K/V pools for eight-aligned head dims through256
 - top-left / bottom-right causal, right-band widening, left sliding window,
   per-batch lengths, per-Q-head sinks, natural-log or log2 LSE
 """
@@ -1054,8 +1054,8 @@ def compile(  # noqa: A001
         raise ValueError("the SM120 decode tile binds runtime strides through the prepared pointer entry only")
     if PARAMS.thd_varlen or lse_head_major or lse_padded_rows:
         raise ValueError("the SM120 decode tile is dense-only")
-    if PARAMS.page_size and not paged_head_dims_supported(d_qk, d_v):
-        raise NotImplementedError("SM120 paged KV requires head dims divisible by 8 through 128")
+    if PARAMS.page_size and not paged_head_dims_supported(d_qk, d_v, decode=True):
+        raise NotImplementedError("SM120 paged KV requires head dims divisible by 8 through 256")
     kernel = SM120DecodeForward(
         in_dtype=STORAGE_DTYPE,
         is_causal=PARAMS.window_right is not None,
