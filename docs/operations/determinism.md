@@ -277,6 +277,13 @@ include padding, a bottom-right causal window and sinks. This is fixed-plan,
 fixed-runtime forward qualification; THD batch invariance and backward remain
 outside this addition.
 
+Native Hopper dense-Q paged FP16/BF16 forward preserves O/Stats bytes across
+fixed-plan replay, fresh allocations, batch reordering/duplication and changed
+neighbors. The qualified D128, D192/V128 and D512 paths use independent K/V
+page tables, padded/empty lengths, a bottom-right causal window and sinks.
+Unsplit unpacked FP16 and split3 PackGQA BF16 are checked separately. THD
+paging and Hopper backward are unsupported; other runtimes remain unverified.
+
 ## SM120 packed backward
 
 The native FP16/BF16 THD backward path through D256/GQA retains unordered
