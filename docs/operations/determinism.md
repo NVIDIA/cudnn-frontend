@@ -52,6 +52,8 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
+| `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Unsupported | Unsupported |
+| `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
@@ -164,6 +166,13 @@ a row alone and inside a batch under the entry's own picks.
   for the documented tie policy. Its indices, logits, optional selected-logit
   softmax, and optional LSE passed SM90 replay, batch reorder/duplication,
   changed-neighbor isolation, and exact-tie tests.
+- The prepared SM90 Indexer Forward + Top-K plan has the same numerical and
+  shape limits as that combined path and also requires caller-owned outputs
+  and candidate workspace. Its retained scorer and radix Top-K artifacts pass
+  direct fixed-input replay, packed batch reorder/duplication, changed-neighbor
+  isolation, independent reference checks, and changed-metadata CUDA Graph
+  replay. It is a forward-only execution surface; there is no corresponding
+  prepared backward API. Other architectures are rejected by contract.
 - DSA sparse attention forward/backward accepts FP16/BF16 inputs. FP8/MXFP8
   inputs are unsupported on all listed GPUs.
 - DSA sparse/dense indexer backward requires BF16 Q/K/weights and supports
