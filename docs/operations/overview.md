@@ -54,6 +54,7 @@ The experimental API catalog includes:
 - [Grouped GEMM + Quant (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_quant_unified)
 - [Grouped GEMM + Wgrad](/operations/Matmul/gemm_fusions/grouped_gemm_wgrad)
 - [Block Sparse Attention (BSA)](/operations/sparse_attention/bsa)
+- [Simplified Sparse Attention: attention and trainable indexer](/operations/sparse_attention/simplified_sparse_attention)
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
@@ -92,9 +93,16 @@ The Triton NVFP4 attention QAT backward API additionally requires the
 Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
-pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
+pip install --group jax     # JAX entry points via cutlass.jax, shipped with nvidia-cutlass-dsl
 ```
-(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
+For the published wheel, install PyTorch with `pip install torch torch-c-dlpack-ext`.
+
+All CuTeDSL JAX entry points require **JAX >=0.9.1**. Install GPU-enabled JAX separately;
+for CUDA 13:
+
+```bash
+pip install 'jax[cuda13]>=0.9.1'
+```
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
