@@ -46,7 +46,9 @@ def test_half_row_serves_the_fold_only(flavor):
 def test_fp8_row_serves_the_half_exponent_only(flavor):
     assert sk.served_softmax_knob_sets("fp8", *flavor) == (DEFAULT, HALF_SET)
     assert sk.served_softmax_knob_sets("fp8", *flavor, thd=True) == (DEFAULT, HALF_SET), "FP8 THD is served on every cc 10.7 flavor"
-    assert sk.served_softmax_knob_sets("fp8", *flavor, paged=True) == (DEFAULT,), "no paged KV on the cc 10.7 FP8 row"
+    expected_paged = (DEFAULT, HALF_SET) if flavor == (512, 512) else (DEFAULT,)
+    assert sk.served_softmax_knob_sets("fp8", *flavor, paged=True) == expected_paged, "native FP8 paging serves dense-query D512"
+    assert sk.served_softmax_knob_sets("fp8", *flavor, thd=True, paged=True) == (DEFAULT,), "no FP8 THD over pools"
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
