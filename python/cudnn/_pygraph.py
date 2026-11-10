@@ -1460,8 +1460,11 @@ class pygraph:
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
-        # The delegating entry lets C++ pick, so it would hand an excluded engine back: not after the guard emptied the list.
-        if asked_oss or (not entries and not dropped and self._lowered_graph.get_engine_count()):
+        # The delegating entry lets C++ pick from its own unfiltered list, so it would hand an excluded engine back:
+        # withheld whenever the guard dropped one.
+        if dropped and asked_oss:
+            _LOG.info("the OPENSOURCE delegating entry is withheld: its fallback list holds excluded engines %s", dropped)
+        if not dropped and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because

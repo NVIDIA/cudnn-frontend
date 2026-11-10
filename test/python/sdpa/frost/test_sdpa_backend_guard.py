@@ -15,7 +15,7 @@ import pytest
 import cudnn
 from cudnn._pygraph import cudnn_graph_not_supported, pygraph
 from cudnn.engines import manifest
-from cudnn.engines.engine_ids import is_python_engine
+from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID, is_python_engine
 from cudnn.sdpa import graph_analyzer
 from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN, backend_guard
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
@@ -431,6 +431,22 @@ def test_wide_v_graph_never_offers_the_wrong_engines_and_its_default_is_right(mo
             g.create_execution_plan(10, {})
     _run_plan(g, pack, 0)
     assert (o.float() - ref).abs().max().item() < 0.05
+
+
+def test_wide_v_guard_withholds_the_opensource_delegate(monkeypatch):
+    """OPENSOURCE in the heuristics adds a delegating entry that lets C++ pick from its own list, engines 10 / 18
+    included. An armed guard withholds it, and every backend plan offered returns the right O."""
+    _requires_wide_v_device()
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, pack, o, ref = _wide_v_graph()
+    g.create_execution_plans([cudnn.heur_mode.OPENSOURCE, cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    if not _bg.backend_engine_guard(g, g._facts_for(graph_analyzer.analyze)):
+        pytest.skip(f"the wide-V guard is not armed on cuDNN {cudnn.backend_version()}")
+    backend = [i for i, p in enumerate(g.plans) if not is_python_engine(p.engine_id)]
+    assert backend and all(int(g.plans[i].engine_id) != BACKEND_HEURISTIC_ENGINE_ID for i in backend)
+    for index in backend:
+        _run_plan(g, pack, index)
+        assert (o.float() - ref).abs().max().item() < 0.05, g.get_plan_name_at_index(index)
 
 
 def test_wide_v_engine_guard_is_current(monkeypatch):
