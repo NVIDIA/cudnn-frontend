@@ -1973,6 +1973,24 @@ repeated calls, changed-payload capture and live SF mutation. The independent
 MXFP8 numerical oracle passes before byte comparisons. SM120 hardware and
 cross-runtime identity remain unverified.
 
+Qualification on 2026-11-10: GB10 SM121, driver 580.126.20, Torch
+2.9.0a0+50eac811a6.nv25.09/cu130, cuDNN 9.13, DSL 4.8/compiler 12.9.
+The full new suite passes **55 tests, zero skips**, including the four goldens
+in a fresh strict-check process; the existing per-tensor FP8 suite passes
+**79 tests**, with all six committed hashes unchanged. The numerical oracle
+also independently requires finite dQ/dK/dV and relative L2 error below 0.05.
+Eleven representative cases pass each of memcheck, racecheck and synccheck.
+From `test/python`, with the isolated checkout verified:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -q -n0 sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py
+```
+
+This change adds no forward kernel; existing forward coverage is unchanged.
+
 ### SM120-family D576/V512 forward — SM121 qualification, 2026-11-10
 
 `sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:
