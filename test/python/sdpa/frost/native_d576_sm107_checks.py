@@ -13,7 +13,7 @@ pytestmark = pytest.mark.L0
 def test_dense(dtype, packed, split, layout, monkeypatch):
     import cudnn
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-    from test_sdpa_fwd_paged_sm100 import _run_graph
+    import test_sdpa_fwd_paged_sm100 as paged
     from sm107_half_test_utils import _rubin_only
 
     _rubin_only()
@@ -30,7 +30,7 @@ def test_dense(dtype, packed, split, layout, monkeypatch):
         seen.append(True)
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
-    _run_graph(
+    paged._run_graph(
         4,
         24,
         2,
@@ -151,7 +151,7 @@ def test_nonpaged(dtype, folded, split):
 def test_boundaries(page, sq, split, packed, empty, monkeypatch):
     import cudnn
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-    from test_sdpa_fwd_paged_sm100 import _run_graph
+    import test_sdpa_fwd_paged_sm100 as paged
     from sm107_half_test_utils import _rubin_only
 
     _rubin_only()
@@ -163,7 +163,7 @@ def test_boundaries(page, sq, split, packed, empty, monkeypatch):
         assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
-    _run_graph(
+    paged._run_graph(
         4,
         24,
         2,
