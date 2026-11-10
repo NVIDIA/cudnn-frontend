@@ -499,8 +499,15 @@ prints its selection, not a pytest command line; the counts are read from the ju
 `test_duplicated_token_and_neighbour_isolation` 2, `test_row_strided_views_write_the_contiguous_bytes_and_leave_the_inputs_unmodified` 4,
 `test_twenty_four_to_twenty_five_is_the_typed_decline` 1.  Skipped: every case of `test_golden` (4) and of
 `test_v1_arm_reproduces_the_v1_goldens` (4), each with "no golden for ..." -- no set is recorded for that runtime, so on cc 10.0 the golden
-comparison is a coverage gap, not a pass.  A cc 10.0 part with 148 SMs has no device run (the host cells pin the same forms for 148, 152
-and 212 SMs).  cc 12.x declined by type.
+comparison is a coverage gap, not a pass.  A cc 10.0 part with 148 SMs (the host cells pin the same forms for 148, 152 and 212 SMs) has one
+device run (2026-11-10 UTC; x86 host, Python 3.10, torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0,
+tvm-ffi 0.1.13.post3; in-process with `CUDNN_TEST_NO_ISOLATION=1` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; on the tree of the pull request
+that added the cc 10.7 record below: the sources of `8e31a5725` with that pull request's comment, status-cell pin and documentation edits):
+`cd test/python && pytest
+moe/frost/test_shared_expert_decode.py moe/frost/test_shared_expert_decode_determinism.py linear_attention/frost/test_gdn_support_matrix_docs.py
+-v -ra --durations=10` -> `test_shared_expert_decode.py` 197 passed, 0 skipped; `test_shared_expert_decode_determinism.py` 19 passed, 8
+skipped, with the per-method counts of the 152-SM part (the 8 golden cases skip there too: no set for that runtime);
+`test_gdn_support_matrix_docs.py` 3 passed.  cc 12.x declined by type.
 
 cc 10.7 record (2026-11-10 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
 13050, cuDNN 92400, nvidia-cutlass-dsl 4.8.0, tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in `73840df1b366af2c/`); in-process
