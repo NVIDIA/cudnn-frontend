@@ -25,14 +25,14 @@ In-CTA pipeline (DeepGEMM mqa_logits style):
 * math warpgroups split the 128 columns: warpgroup ``t`` of ``num_math_wg`` owns columns
   ``[t * cols, (t + 1) * cols)`` -- ``cols / H`` whole query tokens -- of every block.
   A block's TMEM is released once every warpgroup has loaded its columns; the next
-  block's TMEM load is issued before the previous block's head reduce finishes.  At H64
-  without the LSE, each block's full barrier is probed before the previous block's head
-  reduce, so that reduce runs while the block's MMA finishes: blocks 1 and 2 resolve the
-  probe halfway through it and issue their TMEM load before its second half; block 0 is
-  probed before the previous split's last reduce and resolved at the next split's start.
-  A failed probe falls back to a blocking wait.  The head reduce is unconditional (only
-  the store is predicated) and stores go through per-token row tensors (dense scores or
-  the compact ratio-causal candidate buffer).
+  block's TMEM load is issued before the previous block's head reduce finishes.  At H32
+  and H64 without the LSE, each block's full barrier is probed before the previous
+  block's head reduce, so that reduce runs while the block's MMA finishes: blocks 1 and
+  2 resolve the probe halfway through it and issue their TMEM load before its second
+  half; block 0 is probed before the previous split's last reduce and resolved at the
+  next split's start.  A failed probe falls back to a blocking wait.  The head reduce is
+  unconditional (only the store is predicated) and stores go through per-token row
+  tensors (dense scores or the compact ratio-causal candidate buffer).
   The optional LSE is an online (max, sum) per token, reduced across the warpgroup.
 
 ``relu(s) * w`` is evaluated as ``(s + |s|) * w / 2`` (FADD2 with an |abs| operand on
@@ -891,13 +891,14 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         lmax = [-Float32.inf for _ in range(tpw)]
         lsum = [Float32(0.0) for _ in range(tpw)]
         bufs = [cute.make_rmem_tensor(tSrS_shape, Float32), cute.make_rmem_tensor(tSrS_shape, Float32)]
-        # At H64 without the LSE, step j probes block j's full barrier, accumulates the first half of block j - 1's head
-        # pairs, resolves the probe (a blocking wait only if it failed), loads block j from TMEM, then finishes and stores
-        # block j - 1, so block j - 1's reduce overlaps block j's MMA and TMEM load.  Block 0 is probed by the previous
-        # split before its last reduce.  Smaller groups, and H64 with the LSE, wait for block j, load it, then reduce
-        # block j - 1: a smaller group's shorter split loop pays more for the probes than the overlap returns, and the
-        # LSE's longer reduce leaves the MMA ahead, so its probes almost always succeed and only add work.
-        probe = self.qhead_per_kvhead == 64 and not self.compute_lse
+        # At H32 and H64 without the LSE, step j probes block j's full barrier, accumulates the first half of block j - 1's
+        # head pairs, resolves the probe (a blocking wait only if it failed), loads block j from TMEM, then finishes and
+        # stores block j - 1, so block j - 1's reduce overlaps block j's MMA and TMEM load.  Block 0 is probed by the
+        # previous split before its last reduce.  Smaller groups, and the LSE, wait for block j, load it, then reduce
+        # block j - 1: from H16 down a warpgroup reduces several tokens per block, and splitting every token's reduce
+        # around the load costs more than the overlap returns; the LSE's longer reduce leaves the MMA ahead, so its probes
+        # almost always succeed and only add work.
+        probe = self.qhead_per_kvhead >= 32 and not self.compute_lse
         npairs = self.qhead_per_kvhead // 2
         half = npairs // 2 if probe else 0  # head pairs reduced before the block's wait resolves
         zero2 = (Float32(0.0), Float32(0.0))
