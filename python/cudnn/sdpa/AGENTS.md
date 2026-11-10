@@ -1592,3 +1592,15 @@ a 32-column half row requires 64-byte swizzling. Keeping the old 128-byte
 swizzle can cross row boundaries even when the total allocation fits. The
 D256 cases in `test_sdpa_bwd_thd_sm120_gqa.py` exercise the native 32x32 tile
 with independent origins, GQA reduction, tails and bottom-right quiet rows.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.

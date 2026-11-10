@@ -27,6 +27,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
     validate_q_causal_offsets,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
+    fake_cute_tensor,
     get_broadcast_dims,
     to_cute_tensor as _to_cute_tensor,
 )
@@ -108,6 +109,8 @@ def indexer_fwd(
     current_stream=None,
     is_compressed_logits: bool = False,
     cand_batch_offsets: Optional[torch.Tensor] = None,
+    _compile_only: bool = False,
+    _compiled_kernel=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Indexer QK forward pass using the direct SM90 CuTe DSL port.
 
@@ -118,6 +121,8 @@ def indexer_fwd(
     already been pre-scaled by ``q_scale * sm_scale``.
     """
     precision = precision.lower()
+    if _compile_only and not is_compressed_logits:
+        raise ValueError("_compile_only is reserved for the prepared compressed-logits path")
     use_fp8_scales = precision == "fp8"
     _validate_common(
         q,
@@ -218,12 +223,14 @@ def indexer_fwd(
             or cand_batch_offsets.device != q.device
         ):
             raise ValueError("cand_batch_offsets must be a contiguous int64 CUDA tensor of shape (batch_size + 1,) on the input device")
-        if out is None:
+        if out is None and not _compile_only:
             raise ValueError("SM90 compressed indexer forward requires a caller-provided cand_buffer")
-        if not out.is_cuda or out.dtype != torch.float32 or out.ndim != 1 or not out.is_contiguous() or out.device != q.device or out.data_ptr() % 16 != 0:
+        if out is not None and (
+            not out.is_cuda or out.dtype != torch.float32 or out.ndim != 1 or not out.is_contiguous() or out.device != q.device or out.data_ptr() % 16 != 0
+        ):
             raise ValueError("cand_buffer must be a contiguous, 16-byte-aligned 1D float32 CUDA tensor on the input device")
 
-    if out is None:
+    if out is None and not _compile_only:
         with _torch_stream_context(current_stream, q.device):
             out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
     elif not is_compressed_logits:
@@ -232,8 +239,9 @@ def indexer_fwd(
         assert out.is_contiguous(), "out must be contiguous"
     if compute_lse:
         if lse_out is None:
-            with _torch_stream_context(current_stream, q.device):
-                lse_out = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+            if not _compile_only:
+                with _torch_stream_context(current_stream, q.device):
+                    lse_out = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
         else:
             assert lse_out.shape == lse_shape, f"lse_out must have shape {lse_shape}, got {tuple(lse_out.shape)}"
             assert lse_out.dtype == torch.float32 and lse_out.is_cuda
@@ -273,16 +281,17 @@ def indexer_fwd(
         get_broadcast_dims(k_scale) if k_scale is not None else None,
         q_causal_offsets is not None,
     )
-    if compile_key not in _compile_cache:
+    compiled = _compiled_kernel
+    if compiled is None and compile_key not in _compile_cache:
         if is_capturing(current_stream):
-            raise ValueError("SM90 indexer forward must be compiled by a warmup call before CUDA Graph capture")
+            raise ValueError("SM90 indexer forward is not prepared; call plan.compile() before execute() or warm up before CUDA Graph capture")
         q_cute = _to_cute_tensor(q)
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
         q_scale_cute = _to_cute_tensor(q_scale) if q_scale is not None else None
         k_scale_cute = _to_cute_tensor(k_scale) if k_scale is not None else None
         out_cute = _make_i64_cand_buffer_compile_tensor() if is_compressed_logits else _to_cute_tensor(out)
-        lse_cute = _to_cute_tensor(lse_out) if compute_lse else None
+        lse_cute = (fake_cute_tensor(cutlass.Float32, 1) if lse_out is None else _to_cute_tensor(lse_out)) if compute_lse else None
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
         q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
@@ -321,12 +330,17 @@ def indexer_fwd(
                 current_stream,
                 options=compile_options(gpu_arch=gpu_arch),
             )
+    if compiled is None:
+        compiled = _compile_cache[compile_key]
+
+    if _compile_only:
+        return compiled
 
     if not is_compressed_logits:
         with _torch_stream_context(current_stream, q.device):
             out.fill_(float("-inf"))
     with torch.cuda.device(q.device), torch.cuda.nvtx.range("indexer_fwd_kernel_sm90_direct_dsl"):
-        _compile_cache[compile_key](
+        compiled(
             q,
             k,
             w,

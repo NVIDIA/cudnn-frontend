@@ -43,7 +43,7 @@ arbitrary user callbacks.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
-| `qsa_backward` | bprop | BF16 | Unverified | Not guaranteed | Not guaranteed |
+| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -52,6 +52,8 @@ arbitrary user callbacks.
 | `DSA.indexer_forward_wrapper` | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unverified |
 | `DSA.indexer_forward_top_k_wrapper` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
+| `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | BF16 Q/K; BF16 or FP32 weights | Supported | Unsupported | Unsupported |
+| `DSA.prepare_indexer_forward_top_k` / `IndexerForwardTopKPlan.execute` (`deterministic=True`) | fprop | FP8 E4M3 Q/K; FP32 token/head scales; BF16 weights | Supported | Unsupported | Unsupported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 dK | Replay only (H32); H64 unverified | Supported | Supported |
 | `DSA.indexer_backward_wrapper` | bprop | BF16 Q/K/weights; FP32 dK | Replay only (H32); H64 unverified | Replay only | Replay only |
 | `DSA.dense_indexer_backward_wrapper` | bprop | BF16 Q/K/weights; BF16 or FP32 dK | Unverified | Not guaranteed | Not guaranteed |
@@ -147,7 +149,15 @@ a row alone and inside a batch under the entry's own picks.
   rows by ranges of the batch's KV extent, which also changes dQ. SM107 plans
   keep the shard and relay layouts: `'records'` runs as `'shards'` and
   `'chain'` is rejected.
-- QSA and dense indexer backward expose no determinism switch.
+- QSA backward (`qsa_backward`, `qsa_indexed_backward`): set
+  `deterministic=True`. `dq`, `dk` and `dv` then repeat for fixed inputs and a
+  fixed packed layout: every FP32 accumulation adds in an order the layout
+  fixes. The bytes change with the packed layout (key tiles, query groups,
+  query ranges and KV passes are positions in the packed buffer), with
+  `max_seq_len`, with the GPU's SM count and with `ds_precision`. Every
+  document must use one four-token block grid, and a row must not repeat a
+  block.
+- Dense indexer backward exposes no determinism switch.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
@@ -156,6 +166,13 @@ a row alone and inside a batch under the entry's own picks.
   for the documented tie policy. Its indices, logits, optional selected-logit
   softmax, and optional LSE passed SM90 replay, batch reorder/duplication,
   changed-neighbor isolation, and exact-tie tests.
+- The prepared SM90 Indexer Forward + Top-K plan has the same numerical and
+  shape limits as that combined path and also requires caller-owned outputs
+  and candidate workspace. Its retained scorer and radix Top-K artifacts pass
+  direct fixed-input replay, packed batch reorder/duplication, changed-neighbor
+  isolation, independent reference checks, and changed-metadata CUDA Graph
+  replay. It is a forward-only execution surface; there is no corresponding
+  prepared backward API. Other architectures are rejected by contract.
 - DSA sparse attention forward/backward accepts FP16/BF16 inputs. FP8/MXFP8
   inputs are unsupported on all listed GPUs.
 - DSA sparse/dense indexer backward requires BF16 Q/K/weights and supports
