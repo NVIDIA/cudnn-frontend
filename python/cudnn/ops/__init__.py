@@ -15,6 +15,8 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "gated_act_mxfp8_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_forward"),
+    "gated_act_mxfp8_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_backward"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),

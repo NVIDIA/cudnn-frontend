@@ -20,6 +20,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. New A
 - [Tail RoPE + Microscaled QDQ](rope_qdq.md)
 - [Prepared BF16 Tail RoPE](rope_tail.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
+- [SwiGLU + MXFP8 quantization](gemm_fusions/gated_act_mxfp8.md)
 - [GEMM + sReLU](gemm_fusions/gemm_srelu.md)
 - [GEMM + dsReLU](gemm_fusions/gemm_dsrelu.md)
 - [Grouped GEMM (BF16)](gemm_fusions/grouped_gemm.md)
