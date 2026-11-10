@@ -929,6 +929,7 @@ plan = DSA.prepare_indexer_forward_top_k(
     max_seqlen_q=max_q,
     max_seqlen_k=max_k,
     max_candidate_count=candidate_capacity,
+    sm_scale=128**-0.5,
     sample_q_causal_offsets=q_causal_offsets,
     deterministic=True,
     return_softmax=True,
@@ -961,6 +962,13 @@ each call has independent outputs and workspace. The caller must order input
 and metadata updates before the selected stream and retain every binding until
 that stream finishes.
 
+`sm_scale` is a plan-time host scalar applied in FP32 by the scorer. Pass raw
+BF16 `w` and place any uniform softmax/head-normalization factors in this
+scalar; pre-multiplying them into BF16 `w` adds a BF16 rounding and passing the
+same factor in both places scales twice. The scalar is not a compile-cache
+specialization, so another plan value can reuse the compiled artifact, but a
+CUDA Graph launch captures its value and must be recaptured when it changes.
+
 This first plan is intentionally not a general scheduler: it accepts the same
 contiguous packed-THD segments as the SM90 combined kernel and does not model
 CP ranks, zigzag order, arbitrary Q/K storage windows, or index maps. A caller
@@ -970,13 +978,25 @@ segment capacity, maximum lengths, or output addresses change. A workspace may
 be shared by serialized same-stream users only when no graph can replay them
 concurrently and no later consumer reads its candidate scratch.
 
+Query-window microbatching remains a caller policy. A caller may prepare one
+fixed-Q-capacity plan and invoke it once per window while reusing the full K
+tensor. For each active window, set its `q_causal_offsets` to the global query
+start. Represent a short tail window as two packed segments: the active Q rows
+paired with all K rows, followed by the unused Q-capacity rows paired with zero
+K rows. The unused rows then receive the documented padding sentinels
+(`indices=-1`, `logits=-inf`, `softmax=0`, and `lse=-inf`) and may be sliced
+away by the caller. Serialized windows on one stream may share a workspace,
+but their output buffers must be distinct until all consumers finish. The same
+plan accepts bindings with matching descriptors and different addresses; a
+captured graph node retains the addresses used during that capture.
+
 On SM90 the first kernel reuses the Hopper WGMMA scorer and changes only its
 output epilogue: causal-valid scores are written to the 64-bit compact
 candidate layout. The second kernel is the common SM90+ deterministic radix
 Top-K implementation. Candidate memory is still quadratic in sequence length
 (about half the dense ratio-4 causal score storage), so long-context callers
-must budget capacity explicitly; SM90 THD microbatching is not yet
-implemented.
+must budget capacity explicitly. The plan does not provide an internal SM90
+THD microbatch scheduler; callers compose windows as described above.
 
 Leave `microbatch_rows=-1` to use the BSHD long-sequence memory policy; it
 enables windowing only for compatible BF16 shapes. Pass `0` to force one

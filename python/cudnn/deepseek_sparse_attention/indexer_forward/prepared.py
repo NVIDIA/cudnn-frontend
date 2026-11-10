@@ -28,10 +28,12 @@ from ..indexer_top_k.compress_top_k_sm100 import precompile_compress_stage2_topk
 
 
 def _desc(tensor: Optional[torch.Tensor], owner: APIBase, name: str):
+    """Snapshot a sample tensor contract while preserving optional absence."""
     return None if tensor is None else owner._make_tensor_desc(tensor, name=name)
 
 
 def _same_tensor_contract(tensor: Optional[torch.Tensor], desc, name: str) -> None:
+    """Require an execute binding to match its prepared descriptor exactly."""
     if desc is None:
         if tensor is not None:
             raise ValueError(f"{name} must be None: this plan was prepared without it")
@@ -45,6 +47,7 @@ def _same_tensor_contract(tensor: Optional[torch.Tensor], desc, name: str) -> No
 
 
 def _check_output(tensor: Optional[torch.Tensor], name: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device, required: bool) -> None:
+    """Validate a caller-owned output without allocating or converting it."""
     if not required:
         if tensor is not None:
             raise ValueError(f"{name} must be None: this output was not enabled when the plan was prepared")
@@ -140,17 +143,21 @@ class IndexerForwardTopKPlan(APIBase):
 
     @property
     def total_q_capacity(self) -> int:
+        """Return the fixed packed-query storage capacity."""
         return int(self.q_desc.shape[0])
 
     @property
     def total_k_capacity(self) -> int:
+        """Return the fixed packed-key storage capacity."""
         return int(self.k_desc.shape[0])
 
     @property
     def segment_capacity(self) -> int:
+        """Return the fixed number of packed segment slots."""
         return int(self.cu_q_desc.shape[0]) - 1
 
     def check_support(self) -> bool:
+        """Validate the bounded SM90 specialization before compilation."""
         self._logger.debug("Entering check_support")
         device = self.q_desc.device
         self._value_error_if(device.type != "cuda", f"sample_q must be on CUDA, got {device}")
@@ -423,9 +430,13 @@ def prepare_indexer_forward_top_k(
     ``top_k``, ``ratio``, precision, optional outputs, and determinism select
     bounded generated-code variants.  ``max_seqlen_q/k`` and
     ``max_candidate_count`` describe plan/workspace capacity without entering
-    the compile key.  Prefix contents, packed totals, pointers, and streams are
-    runtime data.  The factory compiles both stages but launches neither and
-    allocates no device memory.  Allocate :meth:`IndexerForwardTopKPlan.get_workspace_size`
+    the compile key.  ``sm_scale`` is a host FP32 scoring scalar fixed by the
+    plan and by any graph capture, but does not specialize compilation.  Pass
+    raw BF16 W and use this scalar for uniform softmax/head-normalization
+    factors to avoid an extra BF16 rounding or accidental double scaling.
+    Prefix contents, packed totals, pointers, and streams are runtime data.
+    The factory compiles both stages but launches neither and allocates no
+    device memory.  Allocate :meth:`IndexerForwardTopKPlan.get_workspace_size`
     bytes before calling :meth:`IndexerForwardTopKPlan.execute` or beginning
     CUDA Graph capture.
     """

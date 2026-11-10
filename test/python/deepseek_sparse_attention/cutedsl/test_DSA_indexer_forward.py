@@ -76,6 +76,7 @@ def test_DSA_indexer_forward_api_is_split_from_top_k():
 
 @pytest.mark.L0
 def test_DSA_prepared_indexer_plan_rejects_non_sm90_architecture():
+    """Keep the first prepared plan restricted to its validated architecture."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() == (9, 0):
         pytest.skip("a non-SM90 CUDA device is required")
     from cudnn import DSA

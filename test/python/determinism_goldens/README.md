@@ -53,8 +53,13 @@ Measured on an SM90 validation host with Torch 2.12.1+cu130, CUDA 13.0,
 cuDNN backend 92000 and `nvidia-cutlass-dsl[cu13]` 4.8.1 (CUDA 13.4 DSL
 compiler). Imports resolved to the synchronized validation checkout. The
 focused SM90 run passed all prepared-plan, combined-SM90 and API-export cases;
-the post-rebase run passed 20 cases with 134 deselected and no failures in
-13.10 s. On the separate SM100 validation host, the complete existing
+the post-rebase run passed 23 collected cases with 134 deselected and no
+failures in 13.59 s. Three of those pytest cases capture CUDA Graphs. They
+contain six explicit `graph.replay()` call sites and issue seven replay
+invocations in the focused run because the Megatron-like helper replays both
+its initial and changed payloads. Fixed-input replay loops inside the other
+cases are kernel invocations, not additional pytest cases. On the separate
+SM100 validation host, the complete existing
 compressed-indexer L0 file passed 96 cases with 16 marker-deselected cases;
 the architecture-admission/API-export focus passed 2 cases. These SM100
 results are compatibility evidence for the shared stage-2 host refactor, not

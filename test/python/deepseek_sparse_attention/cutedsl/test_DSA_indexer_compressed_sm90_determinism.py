@@ -375,6 +375,7 @@ def test_sm90_compressed_indexer_cuda_graph_replay_changed_inputs(monkeypatch):
 
 
 def _prepare_plan(packed, offsets, count, *, topk=8, precision="bf16", deterministic=True, return_softmax=True, return_lse=True):
+    """Build the public plan from one packed sample contract."""
     return DSA.prepare_indexer_forward_top_k(
         packed["q"],
         packed["k"],
@@ -399,6 +400,7 @@ def _prepare_plan(packed, offsets, count, *, topk=8, precision="bf16", determini
 
 
 def _plan_outputs(total_q, topk):
+    """Allocate every optional plan output before execution or capture."""
     return {
         "out_indices": torch.empty(total_q, topk, dtype=torch.int32, device="cuda"),
         "out_logits": torch.empty(total_q, topk, dtype=torch.float32, device="cuda"),
@@ -408,6 +410,7 @@ def _plan_outputs(total_q, topk):
 
 
 def _execute_plan(plan, packed, offsets, outputs, workspace, stream=None):
+    """Bind one packed payload to a prepared plan without adapting storage."""
     plan.execute(
         packed["q"],
         packed["k"],
@@ -427,8 +430,10 @@ def _execute_plan(plan, packed, offsets, outputs, workspace, stream=None):
     )
 
 
-def _run_prepared_plan(samples, precision):
+def _run_prepared_plan(samples, precision, weight_dtype):
+    """Pack, prepare, and execute one weight-dtype specialization."""
     packed = _pack(samples, [0] * len(samples))
+    packed["w"] = packed["w"].to(weight_dtype)
     offsets, count = DSA.compress_topk_cand_buffer_size_thd(packed["cu_q"], packed["cu_k"], 4, packed["q_causal_offsets"])
     plan = _prepare_plan(packed, offsets, count, precision=precision)
     outputs = _plan_outputs(packed["q"].shape[0], 8)
@@ -442,16 +447,21 @@ def _run_prepared_plan(samples, precision):
     }
 
 
-@pytest.mark.parametrize("precision", ["bf16", "fp8"])
-def test_sm90_prepared_plan_ragged_replay_batch_invariance_and_reference(precision):
+@pytest.mark.parametrize(
+    ("precision", "weight_dtype"),
+    (("bf16", torch.float32), ("bf16", torch.bfloat16), ("fp8", torch.bfloat16)),
+    ids=("bf16-w-fp32", "bf16-w-bf16", "fp8-w-bf16"),
+)
+def test_sm90_prepared_plan_ragged_replay_batch_invariance_and_reference(precision, weight_dtype):
+    """Check replay, ragged batch isolation, and the independent reference."""
     _require_sm90()
     samples = [_sample(0, 0, precision, 107), _sample(3, 1, precision, 109), _sample(7, 2, precision, 113)]
-    actual = assert_replays(lambda: _run_prepared_plan(samples, precision), repeats=4, allowed_inf=ALLOWED_INF)
+    actual = assert_replays(lambda: _run_prepared_plan(samples, precision, weight_dtype), repeats=4, allowed_inf=ALLOWED_INF)
     _check_reference(samples, actual)
-    individual = [snapshot(_run_prepared_plan([sample], precision), allowed_inf=ALLOWED_INF) for sample in samples]
+    individual = [snapshot(_run_prepared_plan([sample], precision, weight_dtype), allowed_inf=ALLOWED_INF) for sample in samples]
     for order in ((0, 1, 2), (2, 0, 1), (1, 1)):
         chosen = [samples[index] for index in order]
-        packed = snapshot(_run_prepared_plan(chosen, precision), allowed_inf=ALLOWED_INF)
+        packed = snapshot(_run_prepared_plan(chosen, precision, weight_dtype), allowed_inf=ALLOWED_INF)
         q_base = 0
         for index, sample in zip(order, chosen):
             q_len = sample["q"].shape[0]
@@ -459,12 +469,18 @@ def test_sm90_prepared_plan_ragged_replay_batch_invariance_and_reference(precisi
             q_base += q_len
 
 
-@pytest.mark.parametrize("precision", ["bf16", "fp8"])
-def test_sm90_prepared_plan_matches_eager_wrapper(precision):
+@pytest.mark.parametrize(
+    ("precision", "weight_dtype"),
+    (("bf16", torch.float32), ("bf16", torch.bfloat16), ("fp8", torch.bfloat16)),
+    ids=("bf16-w-fp32", "bf16-w-bf16", "fp8-w-bf16"),
+)
+def test_sm90_prepared_plan_matches_eager_wrapper(precision, weight_dtype):
+    """Match each prepared precision/weight variant to the eager wrapper."""
     _require_sm90()
     samples = [_sample(0, 0, precision, 61), _sample(3, 1, precision, 63), _sample(7, 2, precision, 65)]
     q_causal_offsets = [0, 1, 0]
     packed = _pack(samples, q_causal_offsets)
+    packed["w"] = packed["w"].to(weight_dtype)
     offsets, count = DSA.compress_topk_cand_buffer_size_thd(packed["cu_q"], packed["cu_k"], 4, packed["q_causal_offsets"])
     plan = _prepare_plan(packed, offsets, count, precision=precision)
     workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
@@ -491,6 +507,7 @@ def test_sm90_prepared_plan_matches_eager_wrapper(precision):
 
 
 def test_sm90_prepared_plan_default_optional_outputs():
+    """Keep disabled LSE absent while serving the default softmax output."""
     _require_sm90()
     packed = _pack([_sample(7, 2, "bf16", 66)], [1])
     offsets, count = DSA.compress_topk_cand_buffer_size_thd(packed["cu_q"], packed["cu_k"], 4, packed["q_causal_offsets"])
@@ -523,6 +540,7 @@ def test_sm90_prepared_plan_default_optional_outputs():
 
 
 def test_sm90_prepared_plan_zero_candidate_workspace_short_sequence():
+    """Verify short sequences need no candidate bytes and emit sentinels."""
     _require_sm90()
     samples = [_sample(3, 1, "bf16", 67)]
     packed = _pack(samples, [0])
@@ -539,6 +557,7 @@ def test_sm90_prepared_plan_zero_candidate_workspace_short_sequence():
 
 
 def test_sm90_prepared_plan_rejects_unvalidated_specialization_before_compile(monkeypatch):
+    """Reject unsupported static axes before reaching the compiler."""
     _require_sm90()
     packed = _pack([_sample(7, 2, "bf16", 68)], [0])
     offsets, count = DSA.compress_topk_cand_buffer_size_thd(packed["cu_q"], packed["cu_k"], 4, packed["q_causal_offsets"])
@@ -567,6 +586,7 @@ def test_sm90_prepared_plan_rejects_unvalidated_specialization_before_compile(mo
 
 
 def test_sm90_prepared_plan_rejects_workspace_failures_before_launch(monkeypatch):
+    """Reject undersized or aliased workspace without mutating outputs."""
     _require_sm90()
     packed = _pack([_sample(7, 2, "bf16", 69)], [1])
     offsets, count = DSA.compress_topk_cand_buffer_size_thd(packed["cu_q"], packed["cu_k"], 4, packed["q_causal_offsets"])
@@ -602,6 +622,7 @@ def test_sm90_prepared_plan_rejects_workspace_failures_before_launch(monkeypatch
 
 
 def test_sm90_prepared_plan_compile_cache_ignores_capacities(monkeypatch):
+    """Bound compilation to codegen axes across changing capacities."""
     _require_sm90()
     from cudnn.deepseek_sparse_attention.indexer_forward import _interface_sm90
     from cudnn.deepseek_sparse_attention.indexer_top_k import compress_top_k_sm100
@@ -654,6 +675,7 @@ def test_sm90_prepared_plan_compile_cache_ignores_capacities(monkeypatch):
 
 
 def test_sm90_prepared_plan_cuda_graph_replay_updates_packed_schedule(monkeypatch):
+    """Replay changed device metadata without JIT, allocation, or host sync."""
     _require_sm90()
     # Both schedules keep Q/K storage and metadata addresses fixed. Only the
     # prefix/causal/candidate-offset contents change between graph replays.
@@ -785,5 +807,139 @@ def test_sm90_prepared_plan_cuda_graph_replay_updates_packed_schedule(monkeypatc
             allowed_inf=ALLOWED_INF,
         )
         assert_bitwise(replayed, expected, "prepared plan deterministic replay")
+    finally:
+        graph.reset()
+
+
+def test_sm90_prepared_plan_megatron_query_window_graph_integration():
+    """A Megatron-like caller owns Q windowing, stable buffers and graph buckets.
+
+    One plan is captured twice with different Q/output/metadata pointers. Both
+    calls reuse the full K tensor and the same candidate workspace in stream
+    order. The tail window absorbs unused Q capacity in an empty-K segment, so
+    no K copy or cuDNN-FE scheduler abstraction is needed.
+    """
+    _require_sm90()
+    topk, window_q, total_q, total_k = 8, 8, 14, 8
+
+    def make_payload(seed):
+        """Create stable-capacity query windows over one full K payload."""
+        full = _sample(total_q, total_k, "bf16", seed)
+        q0 = full["q"][:window_q].clone()
+        q1 = torch.cat(
+            (
+                full["q"][window_q:],
+                torch.zeros((window_q - (total_q - window_q), 64, 128), dtype=full["q"].dtype, device="cuda"),
+            )
+        )
+        w0 = full["w"][:window_q].clone()
+        w1 = torch.cat(
+            (
+                full["w"][window_q:],
+                torch.zeros((window_q - (total_q - window_q), 64), dtype=full["w"].dtype, device="cuda"),
+            )
+        )
+        return full, q0, q1, w0, w1
+
+    initial, q0, q1, w0, w1 = make_payload(127)
+    k = initial["k"].clone()
+    cu_q = (
+        torch.tensor([0, 8, 8], dtype=torch.int32, device="cuda"),
+        torch.tensor([0, 6, 8], dtype=torch.int32, device="cuda"),
+    )
+    cu_k = tuple(torch.tensor([0, 8, 8], dtype=torch.int32, device="cuda") for _ in range(2))
+    q_offsets = (
+        torch.tensor([0, 0], dtype=torch.int32, device="cuda"),
+        torch.tensor([8, 0], dtype=torch.int32, device="cuda"),
+    )
+    cand = tuple(DSA.compress_topk_cand_buffer_size_thd(cu_q[i], cu_k[i], 4, q_offsets[i]) for i in range(2))
+    capacity = max(count for _, count in cand)
+
+    prepared = {
+        "q": q0,
+        "k": k,
+        "w": w0,
+        "q_scale": None,
+        "k_scale": None,
+        "cu_q": cu_q[0],
+        "cu_k": cu_k[0],
+        "q_causal_offsets": q_offsets[0],
+        "max_q": window_q,
+        "max_k": total_k,
+    }
+    plan = _prepare_plan(prepared, cand[0][0], capacity, topk=topk)
+    workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    outputs = (_plan_outputs(window_q, topk), _plan_outputs(window_q, topk))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    raw_stream = cuda.CUstream(stream.cuda_stream)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            for i, (query, weight) in enumerate(((q0, w0), (q1, w1))):
+                binding = {
+                    "q": query,
+                    "k": k,
+                    "w": weight,
+                    "q_scale": None,
+                    "k_scale": None,
+                    "cu_q": cu_q[i],
+                    "cu_k": cu_k[i],
+                    "q_causal_offsets": q_offsets[i],
+                }
+                # Megatron enters the graph stream context and need not expose
+                # a driver stream object to the plan API.
+                _execute_plan(plan, binding, cand[i][0], outputs[i], workspace)
+
+        def replay_and_compare(full):
+            """Replay both windows and compare their concatenation to eager."""
+            with torch.cuda.stream(stream):
+                workspace.fill_(0xA5)
+                for result in outputs:
+                    result["out_indices"].fill_(123456)
+                    result["out_logits"].fill_(torch.nan)
+                    result["softmax_out"].fill_(torch.nan)
+                    result["lse_out"].fill_(torch.nan)
+                graph.replay()
+            stream.synchronize()
+
+            combined = {
+                "indices": torch.cat((outputs[0]["out_indices"], outputs[1]["out_indices"][:6])),
+                "logits": torch.cat((outputs[0]["out_logits"], outputs[1]["out_logits"][:6])),
+                "softmax": torch.cat((outputs[0]["softmax_out"], outputs[1]["softmax_out"][:6])),
+                "lse": torch.cat((outputs[0]["lse_out"], outputs[1]["lse_out"][:6])),
+            }
+            packed = _pack([full], [0])
+            eager_offsets, eager_count = DSA.compress_topk_cand_buffer_size_thd(packed["cu_q"], packed["cu_k"], 4, packed["q_causal_offsets"])
+            eager_buffers = {
+                "cand_batch_offsets": eager_offsets,
+                "cand_buffer": torch.empty(eager_count, dtype=torch.float32, device="cuda"),
+                **_plan_outputs(total_q, topk),
+            }
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                eager = _invoke(packed, "bf16", eager_buffers, stream=raw_stream)
+            stream.synchronize()
+            expected = snapshot(dict(eager), allowed_inf=ALLOWED_INF)
+            assert_bitwise(snapshot(combined, allowed_inf=ALLOWED_INF), expected, "Megatron Q-window composition")
+
+            # The two unused rows are a Q-capacity segment with no K rows.
+            assert bool((outputs[1]["out_indices"][6:] == -1).all())
+            assert bool(torch.isneginf(outputs[1]["out_logits"][6:]).all())
+            assert bool((outputs[1]["softmax_out"][6:] == 0).all())
+            assert bool(torch.isneginf(outputs[1]["lse_out"][6:]).all())
+
+        replay_and_compare(initial)
+
+        changed, next_q0, next_q1, next_w0, next_w1 = make_payload(131)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            q0.copy_(next_q0)
+            q1.copy_(next_q1)
+            w0.copy_(next_w0)
+            w1.copy_(next_w1)
+            k.copy_(changed["k"])
+        replay_and_compare(changed)
     finally:
         graph.reset()
