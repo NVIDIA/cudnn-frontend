@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from cudnn._device import ensure_current_context
+from cudnn._torch_stream import device_context
 
 _TORCH_DTYPE_TO_CUDNN = {
     torch.float32: 0,  # CUDNN_DATA_FLOAT
@@ -137,19 +138,20 @@ def _medium_fwd_primitive(x: Tensor, weight: Tensor) -> Tensor:
 
     import cudnn
 
-    stream = torch.cuda.current_stream(x.device).cuda_stream
-    ensure_current_context(stream, x.device.index)
-    cudnn.fft_causal_conv1d_forward(
-        stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        y.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.fft_causal_conv1d_forward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            y.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+        )
     return y
 
 
@@ -176,21 +178,22 @@ def _medium_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor) -> List[T
 
     import cudnn
 
-    stream = torch.cuda.current_stream(x.device).cuda_stream
-    ensure_current_context(stream, x.device.index)
-    cudnn.fft_causal_conv1d_backward(
-        stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        grad_out.data_ptr(),
-        grad_x.data_ptr(),
-        grad_weight.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.fft_causal_conv1d_backward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            grad_out.data_ptr(),
+            grad_x.data_ptr(),
+            grad_weight.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+        )
     return [grad_x, grad_weight]
 
 
@@ -234,23 +237,24 @@ def _long_fwd_primitive(x: Tensor, weight: Tensor) -> List[Tensor]:
     workspace_size, reserve_size = cudnn.long_fft_causal_conv1d_get_buffer_sizes(batch, dim, seq_len, kernel_size, _dtype_to_int(x.dtype))
     workspace = torch.empty(workspace_size, device=x.device, dtype=torch.uint8)
     reserve_space = torch.empty(reserve_size, device=x.device, dtype=torch.uint8)
-    stream = torch.cuda.current_stream(x.device).cuda_stream
-    ensure_current_context(stream, x.device.index)
-    cudnn.long_fft_causal_conv1d_forward(
-        stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        y.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        workspace.data_ptr(),
-        workspace_size,
-        reserve_space.data_ptr(),
-        reserve_size,
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.long_fft_causal_conv1d_forward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            y.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            workspace.data_ptr(),
+            workspace_size,
+            reserve_space.data_ptr(),
+            reserve_size,
+        )
     # Reserve space contains transformed x/weight state and must survive until
     # autograd invokes the matching long backward primitive.
     return [y, reserve_space]
@@ -286,23 +290,24 @@ def _long_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, reserve_spa
     if reserve_space.numel() < reserve_size:
         raise ValueError(f"reserve_space has {reserve_space.numel()} bytes, but the backend requires {reserve_size}.")
     workspace = torch.empty(workspace_size, device=x.device, dtype=torch.uint8)
-    stream = torch.cuda.current_stream(x.device).cuda_stream
-    ensure_current_context(stream, x.device.index)
-    cudnn.long_fft_causal_conv1d_backward(
-        stream,
-        grad_out.data_ptr(),
-        grad_x.data_ptr(),
-        grad_weight.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        workspace.data_ptr(),
-        workspace_size,
-        reserve_space.data_ptr(),
-        reserve_size,
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.long_fft_causal_conv1d_backward(
+            stream,
+            grad_out.data_ptr(),
+            grad_x.data_ptr(),
+            grad_weight.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            workspace.data_ptr(),
+            workspace_size,
+            reserve_space.data_ptr(),
+            reserve_size,
+        )
     return [grad_x, grad_weight]
 
 
