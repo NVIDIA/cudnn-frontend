@@ -87,6 +87,8 @@ The experimental API catalog includes:
 - [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
 - [Cake LM-head log-probabilities](/operations/cake_lm_head): prepared deterministic forward and gradients.
 
+- [Cake MoK training](/operations/cake_mok)
+
 ## Installation and setup
 
 All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. Except on Windows ARM64, `nvidia-cutlass-dsl[cu13]>=4.8.0` and `apache-tvm-ffi` are required dependencies, so the CuTeDSL runtime comes with the base install (and the DSL pulls `cuda-python` in transitively):
