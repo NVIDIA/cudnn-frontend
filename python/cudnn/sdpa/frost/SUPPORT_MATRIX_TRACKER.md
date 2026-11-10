@@ -2742,7 +2742,8 @@ Rubin config factories. Target-SM107 numerical validation is still required.
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
-`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`, `sdpa_bwd_sm120_fp8`. Head dims are a **continuum**, not per-model flavors: the
+`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`, `sdpa_bwd_sm120_fp8`,
+`sdpa_bwd_sm120_mxfp8`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
 with the same support).
@@ -2758,7 +2759,8 @@ half or FP8 K/V, packing and split. Q loads directly and O stages through the
 drained K/V slab; no global staging allocation or kernel is introduced.
 
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
-**multiples of 16** and a **64 x 64 CTA**. Half and per-tensor E4M3 BPROP extend through D512 as described below; MXFP8 BPROP remains unsupported.
+**multiples of 16** and a **64 x 64 CTA**. Half, per-tensor E4M3 and MXFP8
+BPROP extend through D512 under their respective contracts described below.
 
 MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
