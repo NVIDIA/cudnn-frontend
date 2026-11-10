@@ -951,9 +951,9 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         facts = _f16_facts(d_qk=d, d_v=d, thd=True, padded=True, has_paged_kv=True, page_size=16)
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
+        assert (engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is None) == (d == 128)
         # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
-        # at every cluster width the leg admits -- while dense paged queries and sink x split-KV keep their declines.
+        # at every cluster width the leg admits; dense D128 uses its native page loader too.
         sink = dataclasses.replace(facts, has_sink=True)
         gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
         assert engines.mismatch(caps, sink, knobs) is None, d
@@ -961,7 +961,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         if d == 128:
             for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
                 assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
-        assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
+        assert (engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs) is None) == (d == 128)
         assert engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2)) is not None
 
 
@@ -1312,10 +1312,12 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
         reason = engines.mismatch(caps, paged(**kw))
         assert reason is not None and needle in reason, (kw, reason)
     assert engines.mismatch(caps, paged(has_sink=True), SdpaFwdKnobs(split_kv=2)) is not None
-    # The half row: dense paged queries stay declined on cc 10.7 (THD queries are its paged form).
+    # The half D128 row now admits dense queries through the native page loader.
     half = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
-    assert half is not None and "THD queries" in half, half
-    assert not _caps("sdpa_fwd_prefill_sm107_fp8").paged_kv
+    assert half is None, half
+    fp8 = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert fp8.paged_kv
+    assert fp8.paged_d_shapes == frozenset({(512, 512)})
 
 
 def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
@@ -8742,7 +8744,7 @@ class TestMixedFp8Kv:
         single_q_unsplit,
         single_q_sink,
         compact_split,
-        dense_paged_decline,
+        dense_paged_native,
         uniform_control,
     )
 
@@ -8757,7 +8759,7 @@ class TestMixedFp8Kv:
     test_single_q_unsplit = staticmethod(single_q_unsplit)
     test_single_q_sink = staticmethod(single_q_sink)
     test_compact_split = staticmethod(compact_split)
-    test_dense_paged_decline = staticmethod(dense_paged_decline)
+    test_dense_paged_native = staticmethod(dense_paged_native)
     test_uniform_control = staticmethod(uniform_control)
 
 
@@ -8873,3 +8875,16 @@ class TestD192LptContract:
 
     test_work_order = staticmethod(_checks.test_thd_work_order)
     test_admission = staticmethod(_checks.test_native_admission)
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeD128DensePaged:
+    import native_d128_dense_paged_sm107_checks as _checks
+
+    test_dense_replay = staticmethod(_checks.test_dense_replay)
+    test_page_boundaries = staticmethod(_checks.test_page_boundaries)
+
+    from native_d128_dense_paged_determinism import test_replay_batch_and_golden as _determinism
+
+    test_replay_batch_and_golden = staticmethod(_determinism)

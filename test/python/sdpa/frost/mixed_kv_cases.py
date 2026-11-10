@@ -38,7 +38,9 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     assert reason and "without a copy" in reason
 
 
-def check_dense_paged_rebind_capture(qdtype, kvdtype, cga, layout, splits, entry, monkeypatch, cudnn_handle, engine_name="sdpa_fwd_prefill_sm100", pack=True):
+def check_dense_paged_rebind_capture(
+    qdtype, kvdtype, cga, layout, splits, entry, monkeypatch, cudnn_handle, engine_name="sdpa_fwd_prefill_sm100", pack=True, cpu_reference=False
+):
     import cudnn
     from cudnn.engines.manifest import family_for
     from cudnn.sdpa.fwd import api_dsl
@@ -156,22 +158,23 @@ def check_dense_paged_rebind_capture(qdtype, kvdtype, cga, layout, splits, entry
         assert loaded[-1].CFG.CTA_MMA == cga and loaded[-1].KV_STORAGE_DTYPE.width == 8
 
         def verify(t, lengths):
+            ref_device = "cpu" if cpu_reference else "cuda"
             for batch, nk in enumerate(lengths):
-                q = t["q"][batch].double()
+                q = t["q"][batch].to(ref_device).double()
                 if paged:
-                    k = t["k"][t["kt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].double()
-                    v = t["v"][t["vt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].double()
+                    k = t["k"][t["kt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].to(ref_device).double()
+                    v = t["v"][t["vt"][batch].flatten().long()].transpose(0, 1).reshape(hk, sk, d)[:, :nk].to(ref_device).double()
                 else:
-                    k, v = t["k"][batch].double(), t["v"][batch].double()
+                    k, v = t["k"][batch].to(ref_device).double(), t["v"][batch].to(ref_device).double()
                 k, v = k.repeat_interleave(hq // hk, 0), v.repeat_interleave(hq // hk, 0)
                 scores = q @ k.transpose(-1, -2) / math.sqrt(d)
-                bound = torch.arange(sq, device="cuda")[:, None] + (nk - sq if paged else 0)
-                scores.masked_fill_(torch.arange(nk, device="cuda")[None, :] > bound, -torch.inf)
+                bound = torch.arange(sq, device=ref_device)[:, None] + (nk - sq if paged else 0)
+                scores.masked_fill_(torch.arange(nk, device=ref_device)[None, :] > bound, -torch.inf)
                 if paged:
-                    scores = torch.cat([scores, t["sink"].reshape(hq, 1, 1).double().expand(hq, sq, 1)], -1)
+                    scores = torch.cat([scores, t["sink"].reshape(hq, 1, 1).to(ref_device).double().expand(hq, sq, 1)], -1)
                 expected = scores.softmax(-1)[..., :nk] @ v
-                torch.testing.assert_close(t["o"][batch].double(), expected, atol=0.003, rtol=0.02)
-                torch.testing.assert_close(t["stats"][batch].double(), scores.logsumexp(-1, keepdim=True), atol=0.0006, rtol=0)
+                torch.testing.assert_close(t["o"][batch].to(ref_device).double(), expected, atol=0.003, rtol=0.02)
+                torch.testing.assert_close(t["stats"][batch].to(ref_device).double(), scores.logsumexp(-1, keepdim=True), atol=0.0006, rtol=0)
 
         def poison(t):
             t["o"].fill_(float("nan"))
