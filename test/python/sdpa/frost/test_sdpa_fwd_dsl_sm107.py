@@ -1362,7 +1362,6 @@ def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
     The shape must land on the NATIVE (192, 128) kernel, not an envelope: the
     d256 flavor's floor (255) would otherwise swallow it onto a padded path
     nobody validated."""
-    import cudnn
     from cudnn.sdpa.fwd import engines
 
     for row, is_mx in (("sdpa_fwd_prefill_sm107_fp8", False), ("sdpa_fwd_prefill_sm107_mxfp8", True)):
