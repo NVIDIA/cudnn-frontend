@@ -3843,20 +3843,25 @@ def test_DSA_indexer_backward_sm100_persistent_short_topk_matches_reference(
 @pytest.mark.L1
 @torch_fork_set_rng(seed=1706)
 def test_DSA_indexer_backward_deterministic_packed_shapes_reuse_compilation(monkeypatch):
-    """Deterministic producer artifacts key plane policy and tile facts, not
-    changing packed B/Sq/Sk extents.  The second shape also makes every default
-    producer CTA consume at least three rows."""
+    """Packed shapes with the same producer policy reuse compiled kernels."""
     _require_indexer_backward_gpu()
     try:
         import cutlass.cute as cute
         from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import DEFAULT_DK_PLANES
     except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    major = torch.cuda.get_device_capability()[0]
+    kernel_module = importlib.import_module(f"cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm{90 if major == 9 else 100}")
+    monkeypatch.setattr(kernel_module, "_compile_cache", {})
+    # SM100 keys the producer grid size; keep both shapes at the full plane count.
+    first_s_q = 7 if major == 9 else DEFAULT_DK_PLANES + 1
 
     def forbidden_compile(*args, **kwargs):
         raise AssertionError("deterministic indexer backward recompiled for a new packed shape")
 
-    for i, (b, s_q, s_kv) in enumerate([(1, 7, 128), (2, 193, 257)]):
+    for i, (b, s_q, s_kv) in enumerate([(1, first_s_q, 128), (2, 193, 257)]):
         cfg = dict(b=b, s_q=s_q, s_kv=s_kv, head_dim=128, qhead_per_kv_head=64, topk=128)
         index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
         attn_score_ref, index_score_ref = attn_score.clone(), index_score.clone()
@@ -3920,15 +3925,12 @@ def test_DSA_indexer_backward_deterministic_packed_shapes_reuse_compilation(monk
 )
 @torch_fork_set_rng(seed=1711)
 def test_DSA_indexer_backward_deterministic_reproducible_and_correct(h, b, s_q, s_kv, topk, dk_planes, dk_dtype, topk_indices_global):
-    """Deterministic execution reproduces every output bit across runs and matches
-    the reference, over compact H32, the larger plane grids (exact scratch size),
-    large top-k and repeated producer handoffs. Canary tails check that the M64
-    tile never escapes the compact H32 dQ/dW stores."""
+    """Check bitwise replay, reference accuracy, and H32 output bounds."""
     try:
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_indexer_backward_gpu()
     if torch.cuda.get_device_capability()[0] == 9 and h != 64:
         pytest.skip("SM90 deterministic IndexerBackward requires H=64")
