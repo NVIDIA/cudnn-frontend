@@ -84,6 +84,8 @@ The experimental API catalog includes:
 - [SwiGLU + MXFP8 quantization](/operations/gemm_fusions/gated_act_mxfp8)
 - [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
 
+- [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
+
 ## Installation and setup
 
 All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. Except on Windows ARM64, `nvidia-cutlass-dsl[cu13]>=4.8.0` and `apache-tvm-ffi` are required dependencies, so the CuTeDSL runtime comes with the base install (and the DSL pulls `cuda-python` in transitively):
