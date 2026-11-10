@@ -2496,3 +2496,28 @@ class TestNativeFp8D192Bwd:
     """Run the D192/V128 per-tensor fp8 backward pair checks in the native CI entry."""
 
     test_native_stage3 = staticmethod(_d192_bwd_checks.test_d192_native_stage3_matches_the_oracle_and_the_d256_row)
+
+
+import d192_fp8_pair_checks as _d192_pair_checks
+
+
+@requires_rubin
+class TestNativeFp8D192Pair:
+    """Run the ``sdpa_bwd_sm100_d192_fp8`` kernel pair checks in the native CI entry."""
+
+    @pytest.fixture
+    def sm100_row(self, monkeypatch):
+        import test_sdpa_bwd_fp8_sm107 as fp8
+
+        monkeypatch.setattr(fp8, "_ENGINE", "sdpa_bwd_sm100_d192_fp8")
+        monkeypatch.setattr(fp8, "_D", 192)
+        return fp8
+
+    test_dense = staticmethod(_d192_pair_checks.test_dense)
+    test_causal = staticmethod(_d192_pair_checks.test_causal)
+    test_non_tile_multiple_seqlens = staticmethod(_d192_pair_checks.test_non_tile_multiple_seqlens)
+    test_amax_subsets = staticmethod(_d192_pair_checks.test_amax_subsets)
+    test_repeated_launches_are_bitwise = staticmethod(_d192_pair_checks.test_repeated_launches_are_bitwise)
+    test_causal_empty_kv_tiles = staticmethod(_d192_pair_checks.test_causal_empty_kv_tiles)
+    test_negative_scale_declined_at_check = staticmethod(_d192_pair_checks.test_negative_scale_declined_at_check)
+    test_explicit_attn_scale = staticmethod(_d192_pair_checks.test_explicit_attn_scale)
