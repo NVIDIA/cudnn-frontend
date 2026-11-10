@@ -58,7 +58,7 @@ import gc
 import pytest
 import torch
 
-from determinism_utils import assert_bitwise, snapshot
+from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 
 
 def _import_compressor():
@@ -364,6 +364,92 @@ def test_batch_invariance(backward, ratio, coff, target_length, large_length, sh
     changed_short = _make_batch_invariance_sample(short_length, d, ratio, coff, ape, 20261115)
     actual = _run_batch_invariance_target([changed_large, target, changed_short], 1, d, ratio, coff, backward)
     assert_bitwise(actual, expected, f"ratio={ratio} coff={coff} changed neighbors")
+
+
+_GOLDEN_CASES = [
+    pytest.param(2, 1, [17, 3], id="generic-r2-c1"),
+    pytest.param(4, 2, [17, 3], id="generic-r4-c2"),
+    pytest.param(128, 1, [257, 129], id="dedicated-r128-c1"),
+]
+
+
+def _run_golden_target(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward):
+    """Run one golden direction, selecting the opt-in deterministic backward contract."""
+    compressor = _import_compressor()
+    total = kv.shape[0]
+    if not backward:
+        out = compressor.csa_compressor_forward_wrapper(
+            kv.view(total, -1),
+            score.view(total, -1),
+            ape,
+            cu,
+            cuc,
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            total_comp=total_comp,
+        )["out"]
+        return {"out": out.view(total_comp, 1, d)}
+
+    grads = compressor.csa_compressor_backward_wrapper(
+        kv.view(total, -1),
+        score.view(total, -1),
+        ape,
+        cu,
+        cuc,
+        grad_out.view(total_comp, d),
+        ratio=ratio,
+        head_dim=d,
+        coff=coff,
+        deterministic=True,
+    )
+    return {
+        "grad_kv": grads["grad_kv"].view_as(kv),
+        "grad_score": grads["grad_score"].view_as(score),
+        "grad_ape": grads["grad_ape"],
+    }
+
+
+def _check_golden_reference(actual, kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward):
+    """Keep the numerical oracle separate from the byte-exact replay/golden checks."""
+    reference = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, mode="fp32")
+    if backward:
+        _assert_grads_vs_fp32(actual["grad_kv"], actual["grad_score"], reference[1], reference[2], ratio)
+        assert (actual["grad_ape"] - reference[3]).abs().max().item() <= 1e-3
+        return
+
+    difference = (actual["out"].float() - reference[0].float()).abs()
+    changed = (actual["out"] != reference[0]).sum().item()
+    assert changed <= max(1, int(0.001 * actual["out"].numel())), changed
+    assert difference.max().item() <= 1.6e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop-deterministic"])
+@pytest.mark.parametrize("ratio,coff,lens", _GOLDEN_CASES)
+def test_determinism_golden(backward, ratio, coff, lens):
+    """Replay, reference, then golden-check each generic/dedicated numerical path."""
+    _require_csa_device(ratio)
+    d = 128
+    kv, score, ape, cu, cuc, total_comp, grad_out = _make_inputs(lens, d, ratio, coff, seed=20261110)
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
+    inputs = {
+        "kv": kv,
+        "score": score,
+        "ape": ape,
+        "cu_seqlens": cu,
+        "cu_seqlens_comp": cuc,
+        "config": torch.tensor([ratio, d, coff, total_comp], dtype=torch.int64),
+    }
+    if backward:
+        inputs["grad_out"] = grad_out
+    original = snapshot(inputs)
+    run = lambda: _run_golden_target(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward)
+    actual = assert_replays(run, repeats=3)
+    assert_bitwise(inputs, original, "golden inputs mutated")
+    _check_golden_reference(actual, kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward)
+    direction = "bprop-deterministic" if backward else "fprop"
+    assert_golden(f"csa-compressor-r{ratio}-c{coff}-{direction}", inputs, actual)
 
 
 def _assert_grads_vs_fp32(gkv, gs, ref_kv, ref_s, ratio):
