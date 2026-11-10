@@ -24,6 +24,8 @@ _LAZY_EXPORTS = {
     "ragged_grouped_gemm_backward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_backward"),
     "dense_gemm_forward": ("cudnn.gemm.cake.dense", "dense_gemm_forward"),
     "dense_gemm_backward": ("cudnn.gemm.cake.dense", "dense_gemm_backward"),
+    "gated_act_mxfp8_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_forward"),
+    "gated_act_mxfp8_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_backward"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),

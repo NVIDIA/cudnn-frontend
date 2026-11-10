@@ -81,6 +81,8 @@ The experimental API catalog includes:
 
 - [Cake dense GEMM training](/operations/gemm_fusions/cake_dense_gemm)
 
+- [SwiGLU + MXFP8 quantization](/operations/gemm_fusions/gated_act_mxfp8)
+
 ## Installation and setup
 
 All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. Except on Windows ARM64, `nvidia-cutlass-dsl[cu13]>=4.8.0` and `apache-tvm-ffi` are required dependencies, so the CuTeDSL runtime comes with the base install (and the DSL pulls `cuda-python` in transitively):
