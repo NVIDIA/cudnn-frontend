@@ -1258,11 +1258,42 @@ def test_sm100_fp8_d512_mtp_leads_outside_its_small_work_floor():
     assert place(b=1, h_q=45, s_kv=1447) == placement.LEAD
     assert place(b=1, h_q=44, s_kv=1448) == placement.LEAD
     assert place(causal=False, bottom_right=False) == placement.TRAIL  # mask-free MTP not measured
-    assert place(has_paged_kv=True, padded=True, page_size=64) == placement.TRAIL  # paged not measured
-    assert place(padded=True) == placement.TRAIL  # per-request lengths not measured
+    paged = dict(has_paged_kv=True, padded=True, page_size=64)
+    assert place(**paged) == placement.LEAD  # paged d512 MTP (#2372): the same floor
+    assert place(**paged, b=1, h_q=16, s_q=16, s_kv=1024) == placement.TRAIL  # 1.50
+    assert place(**paged, b=1, h_q=16, s_q=1, s_kv=1024, causal=False, bottom_right=False) == placement.LEAD  # no backend plan
+    assert place(has_paged_kv=True, padded=False, page_size=64) == placement.TRAIL  # paged without per-request lengths
+    assert place(padded=True) == placement.TRAIL  # per-request lengths over a dense cache not measured
     assert place(window_left=128) == placement.TRAIL
     assert place(h_kv=128) == placement.TRAIL  # MHA not measured
     assert place(dtype_o=cudnn.data_type.BFLOAT16) == placement.TRAIL
+
+
+@pytest.mark.L0
+def test_sm107_fp8_paged_d512_decode_leads():
+    """cc 10.7 per-tensor FP8 paged D512 decode / MTP over E4M3 page pools with a dense Q (#2374) leads: FROST 0.001-0.89 of
+    the backend at s_q 2-16 and the only plan for one row (module docstring). Before the arm every paged graph trailed."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    base = dict(b=128, h_q=128, h_kv=1, s_q=2, s_kv=65536, d_qk=512, d_v=512, causal=True, bottom_right=True, has_paged_kv=True, padded=True)
+    base.update(page_size=64, device_cc=(10, 7), device_sm_count=208)
+
+    def place(**over):
+        return placement.place(spec, _facts(**{**base, **_SM107_FP8_QUANT, "dtype_o": cudnn.data_type.FP8_E4M3, **over}))
+
+    assert place() == placement.LEAD
+    assert place(b=1, h_q=16, s_q=16, s_kv=1024, page_size=16) == placement.LEAD  # 0.89, the closest cell
+    assert place(s_q=1, causal=False, bottom_right=False) == placement.LEAD  # no backend plan
+    assert place(h_q=32, h_kv=4, b=1, s_q=16, s_kv=2048) == placement.LEAD
+    assert place(padded=False) == placement.TRAIL  # paged without per-request lengths not measured
+    assert place(thd=True, max_total_seq_len_q=256) == placement.TRAIL  # THD Q not measured
+    assert place(causal=False, bottom_right=False) == placement.TRAIL  # mask-free MTP not measured
+    assert place(window_left=128) == placement.TRAIL
+    assert place(h_kv=128) == placement.TRAIL  # MHA not measured
+    assert place(d_qk=256, d_v=256) == placement.TRAIL  # only D512 measured paged
+    assert place(dtype_o=cudnn.data_type.BFLOAT16) == placement.TRAIL
+    assert place(s_q=17) == placement.TRAIL  # past the decode-shaped rows
 
 
 @pytest.mark.L0
