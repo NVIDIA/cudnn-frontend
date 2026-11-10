@@ -5479,7 +5479,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 "non-FP32 softmax precision",
             ),
             (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 kernels only)"),
-            (self.split_kv != 1, "split-KV"),
+            (self.thd and self.split_kv > 1, "THD split-KV"),
             (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
             (self.cga not in (None, 1), "CGA other than 1"),
             (self.q_desc.dtype not in (torch.float16, torch.bfloat16), "Q/K/V/O other than FP16/BF16"),
@@ -5575,15 +5575,23 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M), "SM90 D512 PackGQA requires a head ratio dividing tile_m=64"
         )
 
+        self._value_error_if(type(self.split_kv) is not int or not 1 <= self.split_kv <= 65535, "SM90 split_kv must be an integer in [1, 65535]")
+        self._not_implemented_error_if(self.split_kv > 1 and max(b, h_q) > 65535, "SM90 split combine requires batch and heads at most 65535")
+        if self.split_kv > 1:
+            packed_heads = h_kv if self.pack_gqa else h_q
+            tokens_per_tile = _SM90_TILE_M // (h_q // h_kv if self.pack_gqa else 1)
+            units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
+            self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
         self.params = Sm90TemplateParams(
             dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
             **band,
             thd_varlen=self.thd,
-            has_lse=self.lse_desc is not None,
+            has_lse=self.lse_desc is not None or self.split_kv > 1,
             has_sink=self.has_sink,
             stats_log2=self.stats_log2,
             pack_gqa=self.pack_gqa,
             qh_per_kh=h_q // h_kv,
+            split_kv=self.split_kv,
             sched_policy=sched,
             scale_mode=scale_mode,
             seq_q_lens_present=self.seq_q_lens_present,
@@ -5630,14 +5638,21 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             _sm90_validate_params(self.params)
         flavor = "d64" if self._native_d64 else "d512"
         self._k_mod = template = _load_kernel_template(f"sm90/prefill_{flavor}_f16.py", self.params, tag=f"sdpa_fwd_sm90_{flavor}")
+        strides, lse_stride = self._strides, self._lse_stride
+        if self.split_kv > 1:
+            # The producer TMA maps describe split-major partials; final layouts
+            # remain in the shared combine spec.
+            h, sq, dv = self.h_q, self.s_q_max, self.head_dim_v
+            strides = (*strides[:3], (sq * h * dv, dv, h * dv, 1))
+            lse_stride = (h * sq, sq, 1)
         self._compiled_kernel = template.compile(
             self.batch_size,
             self.h_q,
             self.h_kv,
             self.s_q_max,
             self.s_k_max,
-            *self._strides,
-            self._lse_stride,
+            *strides,
+            lse_stride,
             target="sm_90a",
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
@@ -5652,10 +5667,10 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """THD: the metadata, then the tensor maps (and, with physical offsets, the per-port origins),
-        bound as ``seq_kv_lens``; a dense plan needs none."""
+        bound as ``seq_kv_lens``; a dense split plan holds O/Stats partials."""
         self._ensure_support_checked()
         if not self.thd:
-            return 0
+            return self._split_workspace_bytes() if self.split_kv > 1 else 0
         from cudnn.sdpa.fwd.config_sm90 import thd_meta_words
 
         return thd_meta_words(self.batch_size, getattr(self, "_thd_origin_specs", None) is not None) * 4
@@ -5717,7 +5732,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             execute_native_thd_tensors(spec, buffers, ws_ptr, stream, scale, lse_bhs_geometry=lse_geometry)
         else:
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None)
-            execute_native_dense_tensors(spec, buffers, stream, scale)
+            ws_ptr = 0
+            if self.split_kv > 1:
+                if workspace is None:
+                    raise ValueError("SM90 split-KV requires caller-owned workspace")
+                if workspace.device != q_tensor.device or not workspace.is_contiguous():
+                    raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
+                ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90 (split)")
+            execute_native_dense_tensors(spec, buffers, stream, scale, ws_ptr)
         self._logger.debug("execute completed")
 
     def _thd_plan(self):

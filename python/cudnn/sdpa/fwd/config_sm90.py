@@ -103,6 +103,7 @@ class TemplateParams:
     # layout. The setup launch turns each offset into a token origin, so padded THD (gaps between
     # sequences, TE's cu_seqlens_padded) is read and written where the caller put it.
     thd_origins: tuple | None = None
+    split_kv: int = 1
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -137,6 +138,10 @@ BAND_COORDINATE_LIMIT = 2**30
 
 def validate_params(params: TemplateParams) -> None:
     """Validate the immutable specialization before constructing a kernel."""
+    if type(params.split_kv) is not int or not 1 <= params.split_kv <= 65535:
+        raise ValueError("SM90 split_kv must be an integer in [1, 65535]")
+    if params.thd_varlen and params.split_kv > 1:
+        raise ValueError("SM90 split-KV requires dense Q")
     if params.dtype_qkv not in (DTYPE_FP16, DTYPE_BF16):
         raise ValueError("SM90 D512 requires uniform FP16 or BF16 Q/K/V/O")
     if params.qh_per_kh < 1 or (params.pack_gqa and TILE_M % params.qh_per_kh):

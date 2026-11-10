@@ -60,21 +60,21 @@ def host(
     if cutlass.const_expr(kernel.thd_origins is not None):
         caps = tuple(cutlass.Int32(c) for c in thd_origin_caps)
 
-    def bhsd(ptr, heads, tokens, dim, strides):
+    def bhsd(ptr, heads, tokens, dim, strides, batches):
         """Map binder BSH strides to the kernel's BHSD view without changing storage."""
         bs, ss, hs = strides
-        return cute.make_tensor(ptr, cute.make_layout((batch, heads, tokens, dim), stride=(bs, hs, ss, 1)))
+        return cute.make_tensor(ptr, cute.make_layout((batches, heads, tokens, dim), stride=(bs, hs, ss, 1)))
 
-    q = bhsd(q_ptr, kernel.h_q, caps[0], d_qk, q_strides)
-    k = bhsd(k_ptr, kernel.h_kv, caps[1], d_qk, k_strides)
-    v = bhsd(v_ptr, kernel.h_kv, caps[2], d_v, v_strides)
-    o = bhsd(o_ptr, kernel.h_q, caps[3], d_v, o_strides)
+    q = bhsd(q_ptr, kernel.h_q, caps[0], d_qk, q_strides, batch)
+    k = bhsd(k_ptr, kernel.h_kv, caps[1], d_qk, k_strides, batch)
+    v = bhsd(v_ptr, kernel.h_kv, caps[2], d_v, v_strides, batch)
+    o = bhsd(o_ptr, kernel.h_q, caps[3], d_v, o_strides, batch * kernel.split_kv)
     lse = None
     if cutlass.const_expr(lse_ptr is not None):
         strides = lse_strides
         if cutlass.const_expr(kernel.thd_varlen):
             strides = (0, cutlass.Int64(kernel.thd_lse_head_stride), 1) if lse_head_major else (0, 1, kernel.h_q)
-        lse = cute.make_tensor(lse_ptr, cute.make_layout((batch, kernel.h_q, caps[4]), stride=strides))
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((batch * kernel.split_kv, kernel.h_q, caps[4]), stride=strides))
     sinks = None
     if cutlass.const_expr(kernel.has_sink):
         sinks = cute.make_tensor(sinks_ptr, cute.make_layout((kernel.h_q,), stride=(1,)))

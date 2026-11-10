@@ -107,7 +107,7 @@ def test_prepared_thd_rejects_smaller_batch_and_misaligned_workspace():
 
 
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
-def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path):
+def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pack_gqa=False):
     """Verify exported artifacts launch and replay after a new interpreter forbids JIT."""
     import json
     import os
@@ -117,13 +117,17 @@ def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path):
     import cudnn
 
     child = r"""
-import hashlib, json, sys
+import hashlib, json, os, sys
 from pathlib import Path
+package, thd, reload, splits, pack_gqa = sys.argv[1:]
+sys.meta_path[:] = [f for f in sys.meta_path if "__editable__" not in getattr(f, "__module__", "")]
+sys.path.insert(0, str(Path(package).resolve().parent.parent))
+if os.environ.get("FE_TEST_CUDA_BINDINGS"):
+    sys.path.insert(0, os.environ["FE_TEST_CUDA_BINDINGS"])
 import torch, cudnn
 import cutlass.cute as cute
 from cudnn.frost import compiled_cache
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
-package, thd, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 if reload == "1":
     def forbidden(*args, **kwargs):
@@ -131,13 +135,13 @@ if reload == "1":
     cute.compile = forbidden
 torch.manual_seed(0)
 q, k, v, o = (torch.randn(2, 64, 2, 512, device="cuda", dtype=torch.float16).transpose(1, 2) for _ in range(4))
-api = SdpaFwdDslSm90(q, k, v, o, thd=thd == "1")
+api = SdpaFwdDslSm90(q, k, v, o, thd=thd == "1", split_kv=int(splits), pack_gqa=pack_gqa == "1")
 api.compile()
 if reload == "1":
     assert hasattr(api._compiled_kernel, "_compiled_cache_raw")
 lens = torch.full((2,), 64, device="cuda", dtype=torch.int32)
 ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
-kw = dict(seq_q_lens=lens, seq_kv_lens=lens, workspace=ws) if thd == "1" else {}
+kw = dict(seq_q_lens=lens, seq_kv_lens=lens, workspace=ws) if thd == "1" else dict(workspace=ws)
 api.execute(q, k, v, o, **kw)
 reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 torch.testing.assert_close(o, reference, atol=5e-2, rtol=3e-2)
@@ -158,7 +162,7 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     results = []
     for reload in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", child, cudnn.__file__, str(int(thd)), str(reload)],
+            [sys.executable, "-c", child, cudnn.__file__, str(int(thd)), str(reload), str(splits), str(int(pack_gqa))],
             env=env,
             cwd=tmp_path,
             capture_output=True,

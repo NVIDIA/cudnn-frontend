@@ -1751,3 +1751,7 @@ confirms the producer and combine are included; the first audit hit the
 100-message printing limit, so the completed audit uses `--print-limit 0`.
 The standalone audit passes one additional graph/capture case. No sanitizer
 finding was suppressed or converted into a pass.
+
+### SM90 D512 dense split forward
+
+`sdpa/frost/test_sdpa_fwd_split_sm90_determinism.py` adds four L0 forward-only cases: FP16/BF16, split3 unpacked and split17 PackGQA. CPU-seeded inputs retain an independent FP64 numerical reference; fixed-plan checks cover fresh-buffer replay, concurrent work, B129 reorder/duplicates/empty neighbors and changed-neighbor CUDA Graph replay. New H100 records are appended; existing goldens stay unchanged. The record run passed all four cases; strict replay and source/runtime details are recorded with the qualification. No equality across split counts, packing choices or runtimes is claimed.

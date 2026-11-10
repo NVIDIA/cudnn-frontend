@@ -150,11 +150,10 @@ class Bars(NamedTuple):
 class SM90FusedMultiHeadAttentionForward:
     """Configure and launch the SM90 FP16/BF16 D512 FMHA prefill kernel.
 
-    Each CTA runs one work tile through three warpgroups. Three SM120 constructor
-    parameters are omitted: ``engines._sm90_spec()`` declares no capability behind
-    ``split_kv`` or ``thd_lse_padded``, and ``thd_lse_head_major`` has nothing left to
-    select once Stats stay packed -- the declared strides of the packed
-    ``(1, H_q, T_q)`` view choose token-major or head-major.
+    Each CTA runs one query tile and its assigned KV interval through three
+    warpgroups. Dense splits write normalized half O and natural-log FP32 Stats
+    for the shared fixed-order combine. THD stays unsplit with packed Stats;
+    declared strides select token-major or head-major storage.
     """
 
     # The CTA tile: Q_TILE rows by KV_TILE keys over the HEAD_TILE-column D envelope.
@@ -185,6 +184,7 @@ class SM90FusedMultiHeadAttentionForward:
         scale_mode: int = SCALE_POSITIVE,
         stats_log2: bool = False,
         thd_origins: tuple | None = None,
+        split_kv: int = 1,
     ):
         """Initialize the SM90 D512 FMHA prefill kernel configuration.
 
@@ -236,6 +236,8 @@ class SM90FusedMultiHeadAttentionForward:
         :param thd_origins: THD only: ``config_sm90.TemplateParams.thd_origins``, the
             ports whose bound ragged offsets give each sequence's origin in the caller's
             buffer. ``None`` keeps the packed layout.
+        :param split_kv: Dense-only KV partitions. The producer writes sink-free
+            partials; the shared combine folds sinks and the final Stats log base.
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -259,6 +261,8 @@ class SM90FusedMultiHeadAttentionForward:
         # is inert there and True is the value it keeps.
         self.kv_loop_bottom_right = self.bottom_right if self.banded else True
         self.has_sink = has_sink
+        self.fold_sink = has_sink and split_kv == 1
+        self.split_kv = split_kv
         self.thd_varlen = thd_varlen
         self.thd_origins = thd_origins if thd_varlen else None
         # Dense graphs clamp per-sequence device lengths to the declared envelope; THD
@@ -275,7 +279,7 @@ class SM90FusedMultiHeadAttentionForward:
         # maximum for a non-negative scale, the minimum for a negative one, with the
         # sentinel as its identity.
         self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
-        self.stats_log2 = stats_log2
+        self.stats_log2 = stats_log2 and split_kv == 1
 
         # Named-barrier ids. The init publish takes barrier_cta_sync's default id 0, so
         # the named ones start at 1. Id 1 is the V/O alias rendezvous of the 256 PV
@@ -679,9 +683,7 @@ class SM90FusedMultiHeadAttentionForward:
             if local_tid % 4 == 0:
                 for row_half in cutlass.range_constexpr(2):
                     sAlpha_xfer_raw.subview(2 * owned_row(local_tid, row_half)).store(softmax_params.alpha[row_half])
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.mb_alpha_xfer_full.arrive()
+            bars.mb_alpha_xfer_full.arrive()
             alpha_state = advance(alpha_state, 1)
         # Both consumers read P in RS operand order: word 2*k_frag+row_half is score
         # slot 4*k_frag+2*row_half.
@@ -739,9 +741,7 @@ class SM90FusedMultiHeadAttentionForward:
             # All four lanes consume the same pair, at the existing alpha handoff.
             row0_slot, row1_slot = (sAlpha_xfer_raw.subview(2 * owned_row(local_tid, row_half)) for row_half in range(2))
             alpha = cutlass.Vector.from_elements((row0_slot.load(), row1_slot.load()), cutlass.Float32)
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.mb_alpha_xfer_empty.arrive()
+            bars.mb_alpha_xfer_empty.arrive()
             alpha_state = advance(alpha_state, 1)
         # A single-shot probe of this V generation, not a wait loop: a miss falls back
         # to the blocking wait below. The result cannot outlive the generation, because
@@ -803,7 +803,7 @@ class SM90FusedMultiHeadAttentionForward:
                         work.o_desc_ptr,
                         work.head * self.heads_per_tile,
                         work.q_base,
-                        work.batch,
+                        work.output_batch,
                         self.tma_orders[3],
                         d_coord=cutlass.Int32(half * self.PV_HALF),
                     ),
@@ -926,10 +926,21 @@ class SM90FusedMultiHeadAttentionForward:
         # Step kv_step visits tile kv_right - 1 - kv_step. Without a left bound the walk
         # ends at tile 0, so its exclusive upper tile is its length.
         kv_right = bounds.right if cutlass.const_expr(self.mask_flags & MASK_SWA) else iterations
+        output_batch = batch
+        if cutlass.const_expr(self.split_kv > 1):
+            split = cute.arch.block_idx()[2]
+            # Partition the already clipped interval. Empty splits still execute
+            # the normal epilogue and publish O=0/LSE=-inf before combination.
+            span = (iterations + self.split_kv - 1) // self.split_kv
+            skip = cute.math.min(split * span, iterations)
+            kv_right = kv_right - skip
+            iterations = cute.math.min(span, iterations - skip)
+            output_batch = batch + split * self.b
         kv_head = head if self.pack_gqa else head // self.qh_per_kh
         q_output_limit = cutlass.Int32(self.s_q) if cutlass.const_expr(self.dense_q_lengths) else q_len
         work = SimpleNamespace(
             batch=batch,
+            output_batch=output_batch,
             head=head,
             kv_head=kv_head,
             q_base=q_base,
@@ -1079,7 +1090,7 @@ class SM90FusedMultiHeadAttentionForward:
                     # inverse to WG2. Keep it in the live-KV arm; moving it past the
                     # join changes code generation. Load both sink logits before
                     # normalizing either row.
-                    if cutlass.const_expr(self.has_sink):
+                    if cutlass.const_expr(self.fold_sink):
                         logits = cutlass.Array(cutlass.Float32, 2, alignment=8)
                         if cutlass.const_expr(self.dense_q_lengths):
                             trimmed = cutlass.Array(cutlass.Boolean, 2)
@@ -1092,11 +1103,11 @@ class SM90FusedMultiHeadAttentionForward:
                                 trimmed[row_half] = token + work.q_base >= work.q_len
                     for row_half in cutlass.range_constexpr(2):
                         total = quad_reduce(softmax_params.partial_sum[row_half], "sum")
-                        if cutlass.const_expr(self.has_sink):
+                        if cutlass.const_expr(self.fold_sink):
                             inv, value = normalize_sink_row(softmax_params.anchor[row_half], softmax_params.scale, total, logits[row_half], self.scale_mode)
                         else:
                             inv, value = normalize_row(softmax_params.anchor[row_half], softmax_params.scale, softmax_params.scale_log2, total, self.scale_mode)
-                        if cutlass.const_expr(self.has_sink and self.dense_q_lengths):
+                        if cutlass.const_expr(self.fold_sink and self.dense_q_lengths):
                             inv = cutlass.Float32(0.0) if trimmed[row_half] else inv
                             value = cutlass.Float32(-cutlass.Float32.inf) if trimmed[row_half] else value
                         row_sum_inv[row_half], row_lse[row_half] = inv, value
@@ -1106,14 +1117,12 @@ class SM90FusedMultiHeadAttentionForward:
                     if local_tid % 4 == 0:
                         for row_half in cutlass.range_constexpr(2):
                             sInvSum_xfer_raw.subview(2 * owned_row(local_tid, row_half)).store(row_sum_inv_values[row_half])
-                    prims.bar_warp_sync(cute.arch.FULL_MASK)
-                    if prims.elect_sync():
-                        bars.mb_inv_sum_xfer_full.arrive()
+                    bars.mb_inv_sum_xfer_full.arrive()
                 else:
                     # Finalization without KV work: an empty mask interval, zero KV or
                     # trimmed rows. The inverse stays zero, and only requested Stats
                     # need the sink logits.
-                    if cutlass.const_expr(self.has_sink and lse is not None):
+                    if cutlass.const_expr(self.fold_sink and lse is not None):
                         logits = cutlass.Array(cutlass.Float32, 2, alignment=8)
                         if cutlass.const_expr(self.dense_q_lengths):
                             trimmed = cutlass.Array(cutlass.Boolean, 2)
@@ -1154,7 +1163,7 @@ class SM90FusedMultiHeadAttentionForward:
                             if live:
                                 q_head = work.head * self.heads_per_tile + subhead
                                 if cutlass.const_expr(not self.thd_varlen):
-                                    origin = cutlass.Int64(work.batch) * cutlass.Int64(lse.stride[0])
+                                    origin = cutlass.Int64(work.output_batch) * cutlass.Int64(lse.stride[0])
                                 else:
                                     origin = cutlass.Int64(work.lse_offset) * cutlass.Int64(lse.stride[2])
                                 # Base-2 Stats fold at the store: finalization without
@@ -1296,19 +1305,19 @@ class SM90FusedMultiHeadAttentionForward:
             mb_alpha_xfer_full=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
                 stages=1,
-                init_count=cute.arch.WARPS_PER_WARPGROUP,
+                init_count=cute.arch.THREADS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
             mb_alpha_xfer_empty=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
                 stages=1,
-                init_count=cute.arch.WARPS_PER_WARPGROUP,
+                init_count=cute.arch.THREADS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
             mb_inv_sum_xfer_full=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
                 stages=1,
-                init_count=cute.arch.WARPS_PER_WARPGROUP,
+                init_count=cute.arch.THREADS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
         )
@@ -1398,6 +1407,10 @@ class SM90FusedMultiHeadAttentionForward:
             )
         elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             tile, head, batch = lpt_tile_coords(tile, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
+        elif cutlass.const_expr(self.split_kv > 1):
+            batch = tile // (self.q_tiles * self.heads)
+            head = tile // self.q_tiles % self.heads
+            tile = tile % self.q_tiles
         wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
         self._run_unit(
             tma_q_desc,
@@ -1504,8 +1517,8 @@ class SM90FusedMultiHeadAttentionForward:
         # The LPT policies launch the same tiles on one axis, which kernel unflattens.
         # THD is NATURAL, over ceil(thd_max_sq / tokens_per_tile) tiles.
         grid = (self.q_tiles, self.heads, self.b)
-        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
-            grid = (self.q_tiles * self.heads * self.b, 1, 1)
+        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL or self.split_kv > 1):
+            grid = (self.q_tiles * self.heads * self.b, 1, self.split_kv)
         if cutlass.const_expr(self.thd_varlen):
             meta_words = thd_meta_words(self.b, self.thd_origins is not None)
             if cutlass.const_expr(tuple(seq_kv_lens.shape) != (meta_words,)):
@@ -1593,7 +1606,7 @@ class SM90FusedMultiHeadAttentionForward:
         if cutlass.const_expr(lse is not None):
             ports = (*ports, ("LSE", lse, self.h_q, self.s_q))
         for name, tensor, heads, tokens in ports:
-            declared = (batch, heads, tokens)
+            declared = (batch * (self.split_kv if name in ("O", "LSE") else 1), heads, tokens)
             if cutlass.const_expr(any(isinstance(extent, int) and extent != size for extent, size in zip(tensor.shape, declared))):
                 raise ValueError(f"prefill_d512_f16_sm90: {name} shape {tuple(tensor.shape)} disagrees with the declared (B, H, S) = {declared}")
         # Only a length tensor some role reads reaches the kernel; THD's is the metadata.
@@ -1672,6 +1685,7 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         scale_mode=PARAMS.scale_mode,
         stats_log2=PARAMS.stats_log2,
         thd_origins=PARAMS.thd_origins,
+        split_kv=PARAMS.split_kv,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel
