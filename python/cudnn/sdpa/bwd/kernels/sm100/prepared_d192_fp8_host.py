@@ -31,7 +31,7 @@ def _spec(dqk, dv, sm, mx, window):
     base = (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
     if int(sm) in (120, 121):
         return base + ("sm120",)
-    return base + (SM107_LINE_PARAMS if int(sm) in K64_SMS else ())
+    return base + (SM107_LINE_PARAMS if int(sm) in K64_SMS and (int(dqk), int(dv)) == (192, 128) else ())
 
 
 def _kernel_hosts(spec):
