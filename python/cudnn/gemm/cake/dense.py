@@ -173,21 +173,37 @@ class DenseGemmPlan:
         return out
 
 
-def _run(a, b, dtype):
+def _prepare(a, b, dtype):
     with torch.cuda.device(a.device):
         out = torch.empty((*a.shape[:-2], a.shape[-2], b.shape[-1]), dtype=dtype, device=a.device)
         plan = DenseGemmPlan(a, b, out)
         workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=a.device)
-        return plan.execute(a, b, out=out, workspace=workspace)
+        return plan, out, workspace
 
 
 def dense_gemm_forward(x, weight, *, output_dtype=None):
     """Return ``x @ weight.T`` for native BF16 projection or FP32 router operands."""
-    return TupleDict(out=_run(x, weight.transpose(-1, -2), output_dtype or x.dtype))
+    wt = weight.transpose(-1, -2)
+    plan, out, workspace = _prepare(x, wt, output_dtype or x.dtype)
+    return TupleDict(out=plan.execute(x, wt, out=out, workspace=workspace))
 
 
 def dense_gemm_backward(grad_output, x, weight, *, weight_gradient_dtype=None):
     """Return explicit input and per-batch weight gradients."""
-    dx = _run(grad_output, weight, x.dtype)
-    dw = _run(grad_output.transpose(-1, -2), x, weight_gradient_dtype or weight.dtype)
+    for tensor in (grad_output, x, weight):
+        _signature(tensor)
+    if x.ndim not in (2, 3) or grad_output.ndim != x.ndim or weight.ndim != x.ndim:
+        raise ValueError("backward operands must all have rank 2 or rank 3")
+    if (
+        x.shape[:-2] != weight.shape[:-2]
+        or grad_output.shape != (*x.shape[:-2], x.shape[-2], weight.shape[-2])
+        or x.shape[-1] != weight.shape[-1]
+        or any(t.device != x.device or t.dtype != x.dtype for t in (grad_output, weight))
+    ):
+        raise ValueError("backward operands must match the forward dimensions, batch size, device, and dtype")
+    gt = grad_output.transpose(-1, -2)
+    dx_plan, dx, dx_workspace = _prepare(grad_output, weight, x.dtype)
+    dw_plan, dw, dw_workspace = _prepare(gt, x, weight_gradient_dtype or weight.dtype)
+    dx_plan.execute(grad_output, weight, out=dx, workspace=dx_workspace)
+    dw_plan.execute(gt, x, out=dw, workspace=dw_workspace)
     return TupleDict(dx=dx, dw=dw)

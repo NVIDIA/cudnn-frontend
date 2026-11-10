@@ -125,3 +125,19 @@ def test_public_paired_api(device, dtype):
     torch.testing.assert_close(out.double(), x.double() @ wt.double(), atol=tol, rtol=tol)
     torch.testing.assert_close(result["dx"].double(), grad.double() @ weight.double(), atol=tol, rtol=tol)
     torch.testing.assert_close(result["dw"].double(), grad.double().T @ x.double(), atol=tol, rtol=tol)
+
+
+def test_backward_rejects_before_launch(device, monkeypatch):
+    from cudnn.ops import dense_gemm_backward
+
+    _, x, wt, out, _ = _case(device, "fwd", torch.bfloat16)
+    weight = wt.T
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("backward launched before validating both gradients")
+
+    monkeypatch.setattr(DenseGemmPlan, "execute", forbidden)
+    with pytest.raises(ValueError, match="forward dimensions"):
+        dense_gemm_backward(out, x[:, :128], weight)
+    with pytest.raises(ValueError, match="projection output"):
+        dense_gemm_backward(out, x, weight, weight_gradient_dtype=torch.float64)
