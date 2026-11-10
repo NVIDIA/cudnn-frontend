@@ -313,9 +313,99 @@ def d256_admission(qdtype, kvdtype, monkeypatch):
         (replace(facts, has_epilogue_gate=True), engines.SdpaFwdKnobs(cga=2)),
     ]:
         assert engines.mismatch(spec.capabilities, changed, knobs)
-    for dim in (192, 248, 264, 512):
+    for dim in (32, 192, 248, 264, 576):
         assert engines.mismatch(spec.capabilities, replace(facts, d_qk=dim, d_v=dim), engines.SdpaFwdKnobs(cga=2))
     params = TemplateParams(dtype_qkv=2, dtype_kv=0, cta_mma=2)
     for change in (dict(cta_mma=1), dict(pack_gqa=True), dict(thd_varlen=True), dict(epilogue_gate=True)):
         with pytest.raises(ValueError, match="independent FP8 KV"):
             config_sm107.make_cfg_d256(replace(params, **change))
+
+
+@_native
+@pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
+@pytest.mark.parametrize("layout,splits", [("dense", 1), ("dense", 3), ("paged", 1), ("paged", 3)])
+@torch_fork_set_rng(seed=40144)
+def d512_dense_paged(qdtype, kvdtype, layout, splits, monkeypatch, cudnn_handle):
+    checks.check_dense_paged_rebind_capture(
+        qdtype, kvdtype, 2, layout, splits, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=True, cpu_reference=True, head_dim=512
+    )
+
+
+@_native
+@pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
+@pytest.mark.parametrize("splits", [1, 3])
+@torch_fork_set_rng(seed=40145)
+def d512_standalone(qdtype, kvdtype, splits, monkeypatch, cudnn_handle):
+    from cudnn.sdpa.fwd import api_dsl
+
+    # The uniform-half A/B seam must not route mixed KV into a half-only body.
+    monkeypatch.setattr(api_dsl, "D512_2X2", False)
+    checks.check_dense_paged_rebind_capture(
+        qdtype, kvdtype, 2, "dense", splits, "standalone", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=False, cpu_reference=True, head_dim=512
+    )
+
+
+@_native
+@pytest.mark.parametrize("qdtype,kvdtype", _DTYPES)
+@pytest.mark.parametrize("layout,q_tokens", [("dense", 1), ("paged", 1), ("dense", 16), ("paged", 16)])
+@torch_fork_set_rng(seed=40146)
+def d512_mqa(qdtype, kvdtype, layout, q_tokens, monkeypatch, cudnn_handle):
+    checks.check_dense_paged_rebind_capture(
+        qdtype,
+        kvdtype,
+        2,
+        layout,
+        3,
+        "graph",
+        monkeypatch,
+        cudnn_handle,
+        engine_name=_ENGINE,
+        pack=True,
+        cpu_reference=True,
+        head_dim=512,
+        q_tokens=q_tokens,
+        heads=(128, 1),
+    )
+
+
+@_native
+@pytest.mark.parametrize(
+    "qdtype,kvdtype,split,pack",
+    [
+        ("bfloat16", "float8_e4m3fn", 1, True),
+        ("float16", "float8_e5m2", 1, False),
+        ("bfloat16", "float8_e5m2", 4, True),
+        ("float16", "float8_e4m3fn", 4, False),
+    ],
+)
+def d512_replay_batch_golden(qdtype, kvdtype, split, pack):
+    import native_d128_dense_paged_determinism as replay_checks
+
+    replay_checks.test_replay_batch_and_golden(qdtype, kvdtype, 2, split, 128, head_dim=512, pack=pack)
+
+
+@pytest.mark.parametrize("qdtype,kvdtype", [("HALF", "FP8_E4M3"), ("BFLOAT16", "FP8_E5M2")])
+def d512_admission(qdtype, kvdtype, monkeypatch):
+    from cudnn.sdpa.fwd import engines, config_sm107
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, d512_2x2_smem_bytes
+
+    spec, facts = checks.check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 7), head_dim=512, cga=2)
+    for changed, knobs in [
+        (facts, engines.SdpaFwdKnobs(cga=1)),
+        (replace(facts, thd=True, stats_t=None), engines.SdpaFwdKnobs(cga=2)),
+        (replace(facts, has_epilogue_gate=True), engines.SdpaFwdKnobs(cga=2)),
+    ]:
+        assert engines.mismatch(spec.capabilities, changed, knobs)
+    params = TemplateParams(dtype_qkv=2, dtype_kv=0, d_flavor=512, mma_2x2=True, cta_mma=2)
+    mixed, _ = config_sm107.make_cfg_d512_2x2(params, cga_m=2)
+    uniform, _ = config_sm107.make_cfg_d512_2x2(replace(params, dtype_kv=-1), cga_m=2)
+    assert config_sm107.make_cfg_d512(params)[0] == mixed
+    assert mixed.DTYPE_KV == 0 and mixed.KV_SHARE == 1 and mixed.CGA_M == 2
+    assert mixed.N_BMM1_CHUNKS == mixed.N_BMM2_CHUNKS == 2
+    assert d512_2x2_smem_bytes(mixed)["total"] == d512_2x2_smem_bytes(uniform)["total"] + 16384 + 8
+    assert d512_2x2_smem_bytes(mixed)["total"] <= config_sm107.SMEM_USABLE_BYTES
+    for change in [dict(cta_mma=1), dict(thd_varlen=True), dict(d_flavor=576), dict(mma_2x2=False), dict(epilogue_gate=True)]:
+        with pytest.raises(ValueError):
+            config_sm107.make_cfg_d512_2x2(replace(params, **change), cga_m=2)
+    with pytest.raises(ValueError, match="one CTA pair"):
+        config_sm107.make_cfg_d512_2x2(params, cga_m=4)

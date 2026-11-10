@@ -1321,3 +1321,12 @@ host writes FP32 partials even when final O is half. Allocating or binding
 half partials can corrupt O while memcheck still reports zero errors.
 `TestMixedFp8Kv.test_d256_dense_paged` checks numerical O/Stats for split
 and unsplit paging, and `test_d256_standalone` pins the FP32 partial ABI.
+
+
+A raw-copy barrier reused across operand sub-chunks needs a phase invariant
+across calls and empty work items. Native mixed D512 issues exactly two K
+or two V chunks per call, so its local phase returns to zero. Keep the exact
+head-width and chunk-count guards when using that invariant: D576's three K
+chunks cannot reuse the same scheme. `TestMixedFp8Kv.test_d512_admission`
+checks the chunk counts and rejects that geometry; numerical/replay cases
+include empty KV and multiple scheduler waves.

@@ -1426,3 +1426,38 @@ from its FP32-partial predicate while the native host wrote FP32. The fix
 retains the native partial format for both layouts; no numerical comparator
 or tolerance changed. Earlier failing probes remain in the private report.
 Forward only; other GPU mixed-D256 routes are not admitted.
+
+
+### Native SM107 D512 mixed FP8 KV — 2026-11-10
+
+The selected `test_sdpa_fp8_sm107.py::TestMixedFp8Kv` entry exposes exact
+D512/V512 mixed-storage checks. FP16/BF16 Q/O and E4M3/E5M2 K/V use one
+native CTA pair, with dense/paged KV, packed/unpacked groups and splits.
+Four fixed-input goldens cover both Q and KV types, split1/4 and packing;
+raw O/Stats bytes are compared under fresh-buffer replay, queued work,
+reordered/duplicated batches through129 and changed-input graph replay.
+Independent CPU-double references, empty rows, bottom-right/window/sink
+semantics, independent HND/NHD pools and capacity canaries are retained.
+Q1/Q16 at H128:1 additionally checks partial packing of a full MQA group.
+
+SM107216SM, driver630.10, cuDNN9.30.0.2, Torch2.14.1+cu130,
+CuTeDSL4.8.0/CUDA13.4, runtime key0972294c7bd4a660:46 feature/admission/golden
+recording cases pass, with no failures/skips. The initial probe stopped at a
+configuration guard because the generic record retained d_flavor128; the
+loader now normalizes exact mixed D512 before selecting its native2x2 body.
+No numerical comparator changed. Strict comparison, original uniform-half
+controls and sanitizer results are recorded below after completion.
+
+Run from `test/python`: `python -m pytest
+sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv -m L0 -q -x -k d512`.
+Forward only; mixed D512 admission on other GPUs is unchanged.
+
+
+Final qualification repeats46 strict cases against all four recorded goldens.
+Twenty existing uniform-half D512/D576 paging and shared-MLA controls pass.
+The structural suite passes40 cases; its one SM100-only config case is skipped
+by that file's architecture marker and checked separately as host-only assertions.
+Compute Sanitizer13.4.92 memcheck, racecheck and synccheck each pass eight
+representative dense/paged split/unsplit cases with zero errors/hazards.
+Sanitizer selection is `test_d512_dense_paged and (qdtype0 or qdtype3)` with
+`--error-exitcode 91`. No SM100 kernel execution or mixed-D576 support is claimed.

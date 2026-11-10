@@ -740,9 +740,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     tag = _flavor_tag(flavor)
     if rubin and not fp8 and flavor == (128, 128) and params.softmax_wgs == 1:
         return _load_kernel_template("sm107/prefill_d256_f16.py", params, "sdpa_fwd_sm107_d128_single_q")
-    mixed_kv_flavors = ((64, 64), (128, 128), (256, 256)) if rubin else ((128, 128),)
+    mixed_kv_flavors = ((64, 64), (128, 128), (256, 256), (512, 512)) if rubin else ((128, 128),)
     if params.dtype_kv != -1 and (fp8 or flavor not in mixed_kv_flavors):
-        raise ValueError("independent FP8 KV storage requires SM100 D128 or native SM107 D64/D128/D256 half prefill")
+        raise ValueError("independent FP8 KV storage requires SM100 D128 or native SM107 D64/D128/D256/D512 half prefill")
     if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
         params = replace(params, d_flavor=192)
         return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
@@ -804,8 +804,8 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
             # so a caller that pairs the (32, 32) key with a default record (the SASS probes, a test's bare
             # TemplateParams()) traces the 32-wide geometry and never the d128 one under a d32 tag.
             params = replace(params, d_flavor=flavor[0])
-        if not fp8 and flavor == SM100_NATIVE_D576_SHAPE:
-            params = replace(params, d_flavor=576, mma_2x2=True)
+        if not fp8 and (flavor == SM100_NATIVE_D576_SHAPE or (flavor == (512, 512) and params.dtype_kv != -1)):
+            params = replace(params, d_flavor=flavor[0], mma_2x2=True)
         if not fp8 and flavor in ((512, 512), SM100_NATIVE_D576_SHAPE) and getattr(params, "mma_2x2", False):
             # The 2x2-datapath d512 sibling on cc 10.7 (the record is what routes): a distinct file and tag, so the
             # role-split and the 2x2 specializations coexist in one process, as on the SM100 arm below.
@@ -2540,10 +2540,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 (int(d_qk), int(d_v)) == (256, 256) and (self.cga != 2 or self.thd or self.pack_gqa or self.gate_desc is not None),
                 "native mixed D256 requires dense Q, two CTAs, no packing and no gate",
             )
-            mixed_kv_flavors = ((64, 64), (128, 128), (256, 256)) if self._device_cc == (10, 7) else ((128, 128),)
+            self._not_implemented_error_if(
+                (int(d_qk), int(d_v)) == (512, 512) and (self.cga != 2 or self.thd or self.gate_desc is not None),
+                "native mixed D512 requires dense Q, two CTAs and no gate",
+            )
+            mixed_kv_flavors = ((64, 64), (128, 128), (256, 256), (512, 512)) if self._device_cc == (10, 7) else ((128, 128),)
             self._not_implemented_error_if(
                 major != 10 or (int(d_qk), int(d_v)) not in mixed_kv_flavors,
-                "mixed half-Q/FP8-KV requires SM100/SM103 D128 or native SM107 D64/D128/D256 prefill",
+                "mixed half-Q/FP8-KV requires SM100/SM103 D128 or native SM107 D64/D128/D256/D512 prefill",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7) and (int(d_qk), int(d_v)) == (64, 64) and self.thd and self.split_kv > 1,
@@ -4021,7 +4025,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     else self.cga
                 )
             ),
-            d_flavor=self.flavor[0] if self.flavor in ((32, 32), (64, 64), SM100_NATIVE_D576_SHAPE) else 128,
+            d_flavor=(
+                self.flavor[0] if self.flavor in ((32, 32), (64, 64), SM100_NATIVE_D576_SHAPE) or (self._mixed_fp8_kv and self.flavor == (512, 512)) else 128
+            ),
             # The bias arms (resident block / streamed ring): a compile-time axis of the d128 file (check_support admitted the operands and the form).
             bias_mode=self._resident_arm_bias_mode(),
             kv_mask_form=self._kv_mask_form(),
@@ -4194,7 +4200,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
             # New native packed/split plans require this body even if the
             # legacy unpacked A/B seam selects the role-split implementation.
-            two_by_two = two_by_two or (self._rubin_native_d512_leg() and (self.paged or self.pack_gqa or self.split_kv > 1))
+            two_by_two = two_by_two or self._mixed_fp8_kv or (self._rubin_native_d512_leg() and (self.paged or self.pack_gqa or self.split_kv > 1))
             if two_by_two:
                 params = replace(params, mma_2x2=True)
         return params

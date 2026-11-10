@@ -4761,3 +4761,20 @@ Uniform-half D256 keeps its existing routes. Candidate ranking is unchanged.
 The selected SM107 CI entry exposes `TestMixedFp8Kv.test_d256_*`; independent
 O/Stats references, changed-input graph replay, fixed-input batch/replay
 goldens and three sanitizer tools qualify the native path.
+
+
+### Native SM107 mixed FP8 KV at exact D512/V512
+
+`sdpa_fwd_prefill_sm107` accepts FP16/BF16 Q/O and E4M3/E5M2 K/V at
+exact D512/V512, dense Q and CGA2. The native 2x2 pipeline uses one CTA pair
+and converts one FP8 K/V sub-chunk at a time in shared memory. Dense/paged
+KV, packing (including G128 partial groups), splits, sinks and bottom-right
+windows compose. Split partials remain FP32. THD, CGA1, epilogue gates and
+mixed D576/V512 decline. Uniform-half D512 retains its existing topology;
+SM100/103 mixed-storage admission is unchanged. No global staging copy or
+candidate-ranking change is introduced.
+
+`TestMixedFp8Kv.test_d512_*` lives in the selected `test_sdpa_fp8_sm107.py`
+entry. Its checks include Q1/Q16 at H128:1, independent HND/NHD pools,
+changed-input capture, independent CPU-double O/Stats references and four
+fixed-input raw-byte replay/batch goldens.
