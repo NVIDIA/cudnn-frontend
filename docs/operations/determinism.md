@@ -44,6 +44,9 @@ arbitrary user callbacks.
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
+| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -159,6 +162,18 @@ a row alone and inside a batch under the entry's own picks.
   document must use one four-token block grid, and a row must not repeat a
   block.
 - Dense indexer backward exposes no determinism switch.
+- CSA compressor forward and dKV/dScore use fixed orders. Complete backward
+  determinism requires `deterministic=True`, caller-owned workspace on the class API,
+  and a prepared plan before CUDA Graph capture; the default dAPE path uses FP32
+  atomics. On SM100 and SM103, deterministic backward fixed-sequence batch comparisons
+  cover ratios 2, 4, and 128, both overlap forms, scalar and wide generic layouts, both
+  ratio-128 head dimensions, reordered and duplicated sequences, changed neighbors,
+  and a ratio-128 schedule-boundary crossing. Forward passes the same comparisons except
+  for the ratio-128 `coff=2`, head-dimension-512 small/default schedule boundary: SM100 CI
+  observed a one-byte output difference when the fixed sequence moved from the small
+  batch schedule to the default schedule. Forward is therefore Replay only. Replay and
+  committed goldens cover the generic ratio-2, generic ratio-4 overlap, and dedicated
+  ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
@@ -184,7 +199,7 @@ Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
 separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, and distributed execution are outside this status page's scope.
 
-See the [test report](https://github.com/Anerudhan/cudnn-frontend/blob/feat/attention-determinism-tests/test/python/determinism_goldens/README.md)
+See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md)
 for the covered configurations, validation runtimes, and supporting measurements.
 
 
@@ -311,6 +326,13 @@ The bounded GB10 SM121 checks preserve dQ/dK/dV bytes across replays,
 fresh storage, duplicated/reordered batches of 1, 3, 4 and 129 members,
 and changed-payload capture. Captured execution also observes changed
 scale bytes. Four runtime goldens cover D128/D512 with FP16/BF16 gradients.
+The graph may independently request FP32 `amax_dQ`, `amax_dK` and `amax_dV`.
+Each is the global maximum absolute FP32 gradient accumulator before conversion
+to FP16/BF16. Initialization shares the delta launch; the gradient epilogue
+reduces only requested outputs. This adds no gradient atomic reduction.
+For fixed inputs, optional amax outputs preserve gradient bytes. Across batch
+reordering and duplication, global amax equals the maximum of the corresponding
+singleton values; adding different sequences can change that global value.
 This evidence keeps quantized payloads and scale bytes fixed across batch
 comparisons; it does not qualify cross-runtime identity, SM120 execution,
 THD or unsupported masks.

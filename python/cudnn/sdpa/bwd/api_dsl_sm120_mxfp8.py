@@ -9,6 +9,21 @@ from .sm120_fp8_contract import environment_error, validate_bounds
 
 
 class SdpaBwdDslSm120Mxfp8(SdpaBwdDslSm100Mxfp8):
+    """Canonical MXFP8 backward with optional global FP32 gradient amax outputs.
+
+    ``amax_requested`` is a subset of ``amax_dQ``, ``amax_dK`` and ``amax_dV``.
+    Bind exactly those outputs at execution. Maxima are taken before the final
+    half-precision gradient conversion and do not change gradient arithmetic.
+    """
+
+    def __init__(self, *args, amax_requested=(), **kwargs):
+        names = tuple(amax_requested)
+        allowed = ("amax_dQ", "amax_dK", "amax_dV")
+        if any(name not in allowed for name in names):
+            raise ValueError(f"SM120 MXFP8 backward expects a subset of {allowed}; got {names}")
+        self.amax_requested = frozenset(names)
+        super().__init__(*args, **kwargs)
+
     def _pair_route(self):
         return True
 

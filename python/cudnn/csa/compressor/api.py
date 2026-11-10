@@ -289,12 +289,6 @@ class _CSACompressorBase(APIBase):
                 head_dim not in (128, 512),
                 f"CSA compressor at ratio=128 is validated for head_dim in {{128, 512}} only, got head_dim={head_dim}",
             )
-        # Rows (including static-capacity padding rows) gather a window of `ratio`
-        # tokens; the eager gather has the same requirement.
-        self._value_error_if(
-            total_comp > 0 and total_tokens < self.ratio,
-            f"total_comp={total_comp} > 0 requires at least ratio={self.ratio} tokens, got {total_tokens}",
-        )
         for desc, name in (
             (self.kv_desc, "kv"),
             (self.score_desc, "score"),
@@ -335,7 +329,6 @@ class _CSACompressorBase(APIBase):
             capability == _SM90_CAPABILITY and self.ratio == 128,
             "CSA compressor ratio 128 is not yet supported on SM90; use ratio 2 or 4",
         )
-
         self.total_tokens = total_tokens
         self.total_comp = total_comp
         self.head_dim = head_dim
@@ -383,9 +376,8 @@ class CSACompressorForward(_CSACompressorBase):
     Ratio 2/4 plans support SM90 and compute-capability major >= 10. Ratio 128
     remains compute-capability major >= 10 only.
 
-    Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding (for
-    CUDA-graph static shapes) and are computed with first-in-segment semantics from
-    token 0, exactly like the eager gather.
+    Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding and are
+    written as exact zeros on every supported architecture.
     """
 
     def compile(self) -> None:
@@ -801,11 +793,13 @@ def csa_compressor_forward_wrapper(
             in {128, 512}).
         total_comp: output row count. Defaults to ``cu_seqlens_comp[-1]`` (synchronizes);
             pass it explicitly (e.g. a static CUDA-graph capacity, which must be
-            ``>= cu_seqlens_comp[-1]``) to stay capture-safe.
+            ``>= cu_seqlens_comp[-1]``) to stay capture-safe. Rows beyond the
+            device-side true count are written as exact zeros.
         stream: CUDA stream for allocation and kernel launch (None -> current stream).
 
     Returns:
-        ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm).
+        ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm), with
+        exact zeros in static-capacity padding rows.
     """
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if total_comp is None:

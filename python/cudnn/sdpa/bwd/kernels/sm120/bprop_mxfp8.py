@@ -109,6 +109,8 @@ def kernel(
     sf_qt,
     sf_kt,
     sf_dot,
+    amax_g: Optional[cute.Tensor],
+    amax_v: Optional[cute.Tensor],
     scale: cutlass.Float32,
     causal: cutlass.Constexpr[bool],
     window: cutlass.Constexpr[int],
@@ -198,9 +200,9 @@ def kernel(
                 _grad(grad, ds, qt, sf_ds, sf_qt, batch, hq, other * N, chunk, False)
                 _grad(gradv, p, dot, sf_ds, sf_dot, batch, hq, other * N, chunk, True)
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-    _store(grad, dg, batch, head, owner, chunk, cutlass.Float32(1.0), cutlass.Float32(1.0), None)
+    _store(grad, dg, batch, head, owner, chunk, cutlass.Float32(1.0), cutlass.Float32(1.0), amax_g)
     if cutlass.const_expr(not dq):
-        _store(gradv, dv, batch, head, owner, chunk, cutlass.Float32(1.0), cutlass.Float32(1.0), None)
+        _store(gradv, dv, batch, head, owner, chunk, cutlass.Float32(1.0), cutlass.Float32(1.0), amax_v)
 
 
 kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -226,6 +228,8 @@ def host(
     sf_qt,
     sf_kt,
     sf_dot,
+    amax_g: Optional[cute.Tensor],
+    amax_v: Optional[cute.Tensor],
     scale,
     causal: cutlass.Constexpr[bool],
     window: cutlass.Constexpr[int],
@@ -235,7 +239,7 @@ def host(
     rows = q.shape[1] if cutlass.const_expr(dq) else k.shape[1]
     heads = q.shape[2] if cutlass.const_expr(dq) else k.shape[2]
     chunks = (q.shape[3] + C - 1) // C
-    kernel(q, k, v, do, lse, delta, dg, dv, qt, kt, dot, sf_q, sf_k, sf_v, sf_do, sf_qt, sf_kt, sf_dot, scale, causal, window, dq).launch(
+    kernel(q, k, v, do, lse, delta, dg, dv, qt, kt, dot, sf_q, sf_k, sf_v, sf_do, sf_qt, sf_kt, sf_dot, amax_g, amax_v, scale, causal, window, dq).launch(
         grid=((rows + M - 1) // M * chunks, heads, q.shape[0]), block=(32, 1, 1), stream=stream
     )
 
@@ -276,7 +280,7 @@ def dkdv_host(
     sf_do: Optional[cute.Tensor] = None,
     sf_dot: Optional[cute.Tensor] = None,
 ):
-    host(q, k, v, do, lse, delta, dk, dv, qt, k, dot, sf_q, sf_k, sf_v, sf_do, sf_qt, sf_k, sf_dot, scale, causal, WINDOW, False, stream)
+    host(q, k, v, do, lse, delta, dk, dv, qt, k, dot, sf_q, sf_k, sf_v, sf_do, sf_qt, sf_k, sf_dot, amax_dk, amax_dv, scale, causal, WINDOW, False, stream)
 
 
 @cute.jit
@@ -310,4 +314,4 @@ def dq_host(
     sf_kt: Optional[cute.Tensor] = None,
     sf_v: Optional[cute.Tensor] = None,
 ):
-    host(q, k, v, do, lse, delta, dq, dq, q, kt, do, sf_q, sf_k, sf_v, sf_do, sf_q, sf_kt, sf_do, scale, causal, WINDOW, True, stream)
+    host(q, k, v, do, lse, delta, dq, dq, q, kt, do, sf_q, sf_k, sf_v, sf_do, sf_q, sf_kt, sf_do, amax_dq, None, scale, causal, WINDOW, True, stream)

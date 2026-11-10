@@ -304,6 +304,9 @@ def host_mx(
     sfv_ptr: cute.Pointer,
     sfdo_ptr: cute.Pointer,
     sfdot_ptr: cute.Pointer,
+    amax_dq_ptr: Optional[cute.Pointer],
+    amax_dk_ptr: Optional[cute.Pointer],
+    amax_dv_ptr: Optional[cute.Pointer],
     workspace: cutlass.Int64,
     scale: cutlass.Float32,
     geometry: cutlass.Constexpr,
@@ -323,10 +326,11 @@ def host_mx(
     sf_q, sf_qt = _view(sfq_ptr, sf_geoms[0]), _view(sfqt_ptr, sf_geoms[1])
     sf_k, sf_kt = _view(sfk_ptr, sf_geoms[2]), _view(sfkt_ptr, sf_geoms[3])
     sf_v, sf_do, sf_dot = _view(sfv_ptr, sf_geoms[4]), _view(sfdo_ptr, sf_geoms[5]), _view(sfdot_ptr, sf_geoms[6])
+    amax_dq, amax_dk, amax_dv = _optional_view(amax_dq_ptr), _optional_view(amax_dk_ptr), _optional_view(amax_dv_ptr)
     payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
     delta = _scratch(payload, regions[0])
     if cutlass.const_expr(len(SPEC) == 6 and SPEC[5] == "sm120"):
-        delta_host(o16, do16, delta, None, None, None, None, None, None, stream)
+        delta_host(o16, do16, delta, None, None, amax_dq, amax_dk, amax_dv, None, stream)
     else:
         dot_do_o_host(o16, do16, delta, None, None, 128, HEAD_DIMS[0], HEAD_DIMS[1], 64, False, False, stream)
     dkdv_host(
@@ -348,8 +352,8 @@ def host_mx(
         None,
         None,
         None,
-        None,
-        None,
+        amax_dk,
+        amax_dv,
         None,
         scale,
         causal,
@@ -381,7 +385,7 @@ def host_mx(
         None,
         None,
         None,
-        None,
+        amax_dq,
         None,
         scale,
         causal,
@@ -396,16 +400,19 @@ def host_mx(
     )
 
 
-def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1, dqk=128, dv=128, window=0):
+def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1, dqk=128, dv=128, window=0, amax_requested=(False, False, False)):
     """Compile the block-scale chain from declarations only; the kernel templates run in block-scale mode with a left sliding window of ``window`` keys (0 = none)."""
+    if any(amax_requested) and sm not in (120, 121):
+        raise NotImplementedError("MXFP8 gradient amax outputs require the native SM120/SM121 path")
     spec = _spec(dqk, dv, sm, True, window)
     if spec != SPEC:
-        return _specialized(spec).compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio, dqk, dv, window)
+        return _specialized(spec).compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio, dqk, dv, window, amax_requested)
     _bind()
     head_dims = spec[:2]
     fp8 = cutlass.Float8E4M3FN
     types = (fp8, fp8, fp8, out_dtype, fp8, cutlass.Float32, out_dtype, out_dtype, out_dtype, fp8, fp8, fp8, out_dtype) + (cutlass.Int8,) * 7
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
+    args += [cute.runtime.make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4) if requested else None for requested in amax_requested]
     return compile_cached(
         host_mx,
         *args,
@@ -419,7 +426,20 @@ def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=repr(
-            ("sdpa_bwd_sm100_d192_mxfp8", ABI_VERSION, geometry, sf_geoms, regions, str(out_dtype), bool(causal), sm, head_dims, int(ratio), int(window))
+            (
+                "sdpa_bwd_sm100_d192_mxfp8_amax_v1",
+                ABI_VERSION,
+                tuple(amax_requested),
+                geometry,
+                sf_geoms,
+                regions,
+                str(out_dtype),
+                bool(causal),
+                sm,
+                head_dims,
+                int(ratio),
+                int(window),
+            )
         ),
         symbol="frost_sdpa_bwd_sm100_d192_mxfp8_prepared",
     )
