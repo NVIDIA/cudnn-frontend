@@ -2360,7 +2360,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             reason = _prepared_decline_reason(capabilities, facts, knobs.split_kv if knobs is not None else None)
             if reason is not None:
                 return reason
-            if knobs is not None and knobs.split_kv > 1 and knobs.tile_m not in (16, 32):
+            if knobs is not None and (knobs.split_kv or 1) > 1 and knobs.tile_m not in (16, 32):
                 return "SM120 paged KV split requires a decode tile (tile_m=16 or 32)"
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
