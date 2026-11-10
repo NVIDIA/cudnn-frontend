@@ -32,6 +32,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
+from cudnn import launch_plan
 
 from ..common.host import get_dtype
 from ..common.piece_chain import dtype_name, launch_state_chain
@@ -681,7 +682,8 @@ def run_chain_backward(
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its seven launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
-    compiled(
+    launch_plan.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

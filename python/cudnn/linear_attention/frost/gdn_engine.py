@@ -12,6 +12,7 @@ import math
 from operator import itemgetter
 
 from cudnn import behavior_note
+from cudnn import launch_plan
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -442,7 +443,9 @@ class CompiledGdn:
                     None,
                     int(stream or 0),
                 )
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, *context_views, None)), self.stream_type(int(stream or 0)))
+            launch_plan.launch(
+                self.chain_launch, *self.chain_scalars, *self.chain_buffers((*views, *carved, *context_views, None)), self.stream_type(int(stream or 0))
+            )
             return
         k = views[self.index_k]
         v = views[self.index_v]

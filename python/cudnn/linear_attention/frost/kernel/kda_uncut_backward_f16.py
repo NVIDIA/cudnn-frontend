@@ -29,6 +29,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 import cutlass.experimental.cuda.tensor_map as tma
+from cudnn import launch_plan
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.host import get_dtype
@@ -642,7 +643,8 @@ def run_uncut_backward(
 ) -> None:
     """Replay the uncut backward: one crossing into the DSL.  The plan validated the contract at build, so nothing here
     raises."""
-    compiled(
+    launch_plan.launch(
+        compiled,
         int(b_t),
         int(seed_span_tokens or seed_every_n_tokens) // int(b_t),
         int(seed_every_n_tokens),

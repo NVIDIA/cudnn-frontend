@@ -175,3 +175,28 @@ def test_profiler_sees_the_custom_ops(family):
     bwd_name = op_name[: -len("_fwd")] + "_bwd"
     assert {f"cudnn::{op_name}", f"cudnn::{bwd_name}"} <= names
     assert not [n for n in names if "Eager" in n]
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_op_and_eager_paths_share_plans(family, monkeypatch):
+    """The custom op and the eager path call the planned forward and backward with the same arguments: one plan each."""
+    from cudnn import launch_plan
+
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family Frost linear attention")
+    if not launch_plan.ENABLED or launch_plan.VERIFY:
+        pytest.skip("this test counts plans: CUDNN_FRONTEND_LAUNCH_PLANS is 0 or verify")
+    monkeypatch.setattr(launch_plan, "HOT_CALLS", 2)
+    public, _, _, channel_gate = FAMILIES[family]
+    module = kda if family == "kda" else gdn
+    run_fwd, run_bwd = getattr(module, f"run_{family}_fwd"), getattr(module, f"run_{family}_bwd")
+    run_fwd.plans.clear()
+    run_bwd.plans.clear()
+    leaves, cu, _, (do, _) = inputs(4, False, channel_gate)
+    xs = [leaves[k].detach().requires_grad_(True) for k in ("q", "k", "v", "g", "beta")]
+    for custom_op in (True, True, False, False):
+        with PassThrough() if custom_op else contextlib.nullcontext():
+            o = public(*xs, cu, use_qk_l2norm_in_kernel=True)[0]
+            torch.autograd.grad(o, xs, do)
+    assert [type(p).__name__ for p in run_fwd.plans.values()] == ["_Plan"]
+    assert [type(p).__name__ for p in run_bwd.plans.values()] == ["_Plan"]

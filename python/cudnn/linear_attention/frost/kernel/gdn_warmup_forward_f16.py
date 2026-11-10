@@ -33,6 +33,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ..common import split_k
 from cudnn.frost.compiled_cache import compile_cached
+from cudnn import launch_plan
 
 from ..common.host import get_dtype, family_slots
 from . import gdn_prefill_f16
@@ -425,7 +426,8 @@ def run_warmup_forward(
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
-    compiled(
+    launch_plan.launch(
+        compiled,
         facts.n_heads_out,
         facts.n_tiles,
         facts.ideal_chunks,

@@ -37,6 +37,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import cudnn
+from cudnn.launch_plan import planned
 
 from .common import (
     check_composed_state,
@@ -348,6 +349,7 @@ def build_fprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@planned
 def run_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -937,6 +939,7 @@ def build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
+@planned
 def run_kda_bwd(
     dO: torch.Tensor,
     q: torch.Tensor,
