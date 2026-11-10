@@ -1362,7 +1362,7 @@ and all existing golden output bytes remain unchanged.
 
 ### SM107 D64 mixed FP8 K/V — 2026-11-10
 
-`test_sdpa_fwd_dsl_sm107.py::TestMixedFp8Kv` now exposes the exact-D64 mixed
+`test_sdpa_fp8_sm107.py::TestMixedFp8Kv` now exposes the exact-D64 mixed
 storage checks in the selected architecture entry. FP16/BF16 Q/O use E4M3/E5M2
 K/V directly. The native physical-64 prefill specialization serves dense and
 paged KV, CGA1/2, dense splits and unsplit THD; mixed THD splits decline.
@@ -1391,3 +1391,9 @@ All eight D64 standalone split cases pass with the actual split3 plan; the earli
 run had exercised unsplit standalone execution despite its parameter labels.
 Dense graph splits and the eight standalone replay goldens were already passed
 with their requested split counts and remain unchanged.
+
+
+CI-route correction: the pinned SM107 pipeline selects `test_sdpa_fp8_sm107.py`,
+not `test_sdpa_fwd_dsl_sm107.py`. The shared mixed-KV class now lives in the
+selected file, with explicit L0/DSL/SM107 guards and no duplicate collector.
+The GPU counts above are direct qualification, not completed CI results.

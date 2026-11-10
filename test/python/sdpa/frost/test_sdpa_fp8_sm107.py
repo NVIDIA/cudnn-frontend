@@ -2405,3 +2405,54 @@ class TestD512Mxfp8Backward:
     test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
     test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
     test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestMixedFp8Kv:
+    """Native mixed K/V coverage in the architecture CI's selected entry."""
+
+    from mixed_kv_sm107_cases import (
+        graph_admission,
+        d64_admission,
+        d64_dense_paged,
+        d64_thd_origins,
+        d64_standalone,
+        d64_replay_batch_golden,
+        d64_thd_batch_golden,
+        d64_single_q,
+        native_resources,
+        dense_paged,
+        paged_origins,
+        thd_origins,
+        thd_uniform_control,
+        thd_cga1_origins,
+        single_q,
+        single_q_unsplit,
+        single_q_sink,
+        compact_split,
+        dense_paged_native,
+        uniform_control,
+    )
+
+    test_d64_admission = staticmethod(d64_admission)
+    test_d64_dense_paged = staticmethod(d64_dense_paged)
+    test_d64_thd_origins = staticmethod(d64_thd_origins)
+    test_d64_standalone = staticmethod(d64_standalone)
+    test_d64_replay_batch_golden = staticmethod(d64_replay_batch_golden)
+    test_d64_thd_batch_golden = staticmethod(d64_thd_batch_golden)
+    test_d64_single_q = staticmethod(d64_single_q)
+    test_graph_admission = staticmethod(graph_admission)
+    test_native_resources = staticmethod(native_resources)
+    test_dense_paged = staticmethod(dense_paged)
+    test_paged_origins = staticmethod(paged_origins)
+    test_thd_origins = staticmethod(thd_origins)
+    test_thd_uniform_control = staticmethod(thd_uniform_control)
+    test_thd_cga1_origins = staticmethod(thd_cga1_origins)
+    test_single_q = staticmethod(single_q)
+    test_single_q_unsplit = staticmethod(single_q_unsplit)
+    test_single_q_sink = staticmethod(single_q_sink)
+    test_compact_split = staticmethod(compact_split)
+    test_dense_paged_native = staticmethod(dense_paged_native)
+    test_uniform_control = staticmethod(uniform_control)
