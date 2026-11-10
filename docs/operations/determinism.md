@@ -318,6 +318,13 @@ The bounded GB10 SM121 checks preserve dQ/dK/dV bytes across replays,
 fresh storage, duplicated/reordered batches of 1, 3, 4 and 129 members,
 and changed-payload capture. Captured execution also observes changed
 scale bytes. Four runtime goldens cover D128/D512 with FP16/BF16 gradients.
+The graph may independently request FP32 `amax_dQ`, `amax_dK` and `amax_dV`.
+Each is the global maximum absolute FP32 gradient accumulator before conversion
+to FP16/BF16. Initialization shares the delta launch; the gradient epilogue
+reduces only requested outputs. This adds no gradient atomic reduction.
+For fixed inputs, optional amax outputs preserve gradient bytes. Across batch
+reordering and duplication, global amax equals the maximum of the corresponding
+singleton values; adding different sequences can change that global value.
 This evidence keeps quantized payloads and scale bytes fixed across batch
 comparisons; it does not qualify cross-runtime identity, SM120 execution,
 THD or unsupported masks.
