@@ -1,5 +1,13 @@
 # FROST SDPA — support matrix
 
+**SM107 native half D576/V512:** exact half-precision dense Q uses three
+192-column QK chunks in the native 2x2 pipeline, one CTA pair and three-stage
+K/V rings. Dense and paged K/V, partial PackGQA, dense split-KV, causal/window
+masks and sinks are supported at CGA2/N128. Nonpaged plans also support
+pre-folded scale; paging retains its existing decline for that attribute. The complete P
+ring crosses the version-0 address window and therefore uses descriptor
+version1. THD, mixed FP8 K/V and nonexact D576 envelopes remain declined.
+
 **SM107 native half D512 dense-Q paging:** the
 2x2 pipeline reads page-sized K/V boxes while preserving twin-multicast
 column shares, paired byte credits and native three-stage rings. Matching

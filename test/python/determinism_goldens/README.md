@@ -1263,3 +1263,44 @@ errors/hazards. Commands from `test/python`: `python -m pytest
 sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged -q -x`; sanitizer
 runs select `test_boundaries` (memcheck) or `test_dense` (synccheck/racecheck)
 from the same class with `--error-exitcode 99`.
+
+
+### Native SM107 half D576/V512 dense-Q paging (2026-11-10)
+
+`test_sdpa_fwd_native_paged_sm107.py::TestNativeD576Half` pins the native
+2x2 body with three192-column QK chunks, one CTA pair and three-stage rings.
+The complete P ring requires descriptor version1 even though its first slot
+starts below256KiB. Exact FP16/BF16 D576/V512 serves dense or paged K/V,
+partial PackGQA and dense split-KV; THD and mixed FP8 KV remain declined.
+
+Four new strict goldens cover paged FP16/BF16 and split1/4 at CGA2/N128.
+The shared fixture gains an independent V width; prior defaults and golden
+names are unchanged. Independent CPU-double O/Stats references, fresh-buffer
+raw-byte replay with queued work, changed table/length/Q graph replay,
+reordered and duplicated batches through129 requests, input preservation and
+output-padding canaries are checked. Nonpaged coverage separately checks
+pre-folded scale, sink/window semantics and changed-input capture.
+
+Runtime: SM107208SM, driver630.10, cuDNN9.30.0.2, Torch2.14.1+cu130,
+CuTeDSL4.8.0/CUDA13.4, matching FE1.33 bindings. Runtime key2916acaa3402817b.
+The initial28-case suite passes with no failures/skips, alongside39 existing
+2x2 structural checks and16 nonpaged D512 dense/THD/sink controls. Additional
+shared-record MLA checks and final sanitizer results are recorded below.
+
+Initial qualification caught a too-narrow descriptor guard checking only
+the P-ring start; it now agrees with the config's full-ring bound. Two harness
+errors were corrected without loosening numerical/byte comparators: record
+and comparison directories were initially set together, and the D576 metadata
+probe initially omitted the required operand descriptors. Original failures
+remain in the private qualification report. No backward or other-GPU claim.
+
+
+Final qualification passes31 cases, including three actual absorbed-MLA
+shared-record checks (V aliases the first512 columns of each576-wide K row),
+G96/G128 and ordinary Q1/Q2/Q16 candidates. Compute Sanitizer13.4.92 reports
+zero diagnostics:7 page-boundary memcheck cases,3 shared-record memcheck cases,
+8 paging synccheck cases and8 paging racecheck cases. Run from `test/python`:
+`python -m pytest sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD576Half -q -x`.
+Sanitizers select `test_boundaries`, `test_shared_mla_record` or `test_paged`
+from that same class with `--error-exitcode 99`. Pre-commit passes; Fern has
+zero errors and its existing unauthenticated-redirect warning.

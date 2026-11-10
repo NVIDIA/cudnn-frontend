@@ -489,8 +489,8 @@ def supports_native_d256_dense_split(d_shape, *, device_cc, fp8, thd, paged, pac
 
 
 def supports_native_d512_dense_pack_split(d_shape, *, device_cc, fp8, thd, paged, cga):
-    """Dense half D512 uses the native 2x2 body for packed and split plans."""
-    return device_cc == (10, 7) and not fp8 and not thd and d_shape == (512, 512) and cga in (None, 2)
+    """Dense half D512/D576 uses the native 2x2 body for packed and split plans."""
+    return device_cc == (10, 7) and not fp8 and not thd and d_shape in ((512, 512), (576, 512)) and cga in (None, 2)
 
 
 def sm107_small_tile_leg(
@@ -2906,7 +2906,7 @@ def make_cfg_d512(params: TemplateParams):
     # The 2x2-datapath record (TemplateParams.mma_2x2, appended, default False) is read through getattr so a
     # record built before the field existed takes the role-split arm unchanged (the config_sm100 dispatch, mirrored).
     if getattr(params, "mma_2x2", False):
-        return make_cfg_d512_2x2(params)
+        return make_cfg_d512_2x2(params, cga_m=2 if params.d_flavor == 576 else 4)
     return _make_cfg_d512_family(params, flavor="sm107 d512", mxfp8=False)
 
 
@@ -3007,6 +3007,8 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     n_pairs = cga_m // CfgD512X2.CTA_MMA
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     base = CfgD512X2(
+        TILE_K=576 if params.d_flavor == 576 else 512,
+        N_BMM1_CHUNKS=3 if params.d_flavor == 576 else 2,
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         DTYPE_QKV=params.dtype_qkv,

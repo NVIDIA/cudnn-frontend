@@ -1298,3 +1298,11 @@ update every monkeypatched loader spy to accept and forward it while retaining
 route assertions. Exercise the actual spy with both the legacy call and the new
 keyword; architecture-skipped GPU cases can otherwise hide a host-call failure
 until another lane runs, before any kernel executes.
+
+For multistage native SDPA descriptors, check the end of the highest addressed
+stage, not only the first stage's start, against the descriptor address window.
+D576's P ring starts below256KiB while its second slot crosses that boundary;
+it still needs version1. `TestNativeD576Half.test_admission` and the existing
+SM107 descriptor/ledger tests cover this geometry. For absorbed MLA, exercise
+V as a512-column view of the576-wide K record so tests retain the real physical
+stride and alias, including changed-input capture replay.

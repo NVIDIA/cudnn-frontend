@@ -303,6 +303,7 @@ _SM100_MXFP8_KERNEL_FILES = {
 # version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
 # same reason engines.py keeps one row per ARCH LINE.
 _SM107_KERNEL_FILES = {
+    SM100_NATIVE_D576_SHAPE: "sm107/prefill_d512_f16_2x2.py",
     (512, 512): "sm107/prefill_d512_f16.py",
     (256, 256): "sm107/prefill_d256_f16.py",
     (192, 128): "sm107/prefill_d192_d128_f16.py",
@@ -689,7 +690,7 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
 # claims): HALF = the f16x2 exponent arm of the FP8 / MXFP8 kernels; the pre-folded scale = the MXFP8 and half
 # kernels' arm (per-tensor FP8 is declined on contract, see check_support).
 _SM107_HALF_SOFTMAX_FLAVORS = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
-_SM107_PREFOLDED_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+_SM107_PREFOLDED_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE})
 
 
 def softmax_arms_of(k_mod, *, has_lse: bool) -> str:
@@ -801,7 +802,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
             # so a caller that pairs the (32, 32) key with a default record (the SASS probes, a test's bare
             # TemplateParams()) traces the 32-wide geometry and never the d128 one under a d32 tag.
             params = replace(params, d_flavor=flavor[0])
-        if not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
+        if not fp8 and flavor == SM100_NATIVE_D576_SHAPE:
+            params = replace(params, d_flavor=576, mma_2x2=True)
+        if not fp8 and flavor in ((512, 512), SM100_NATIVE_D576_SHAPE) and getattr(params, "mma_2x2", False):
             # The 2x2-datapath d512 sibling on cc 10.7 (the record is what routes): a distinct file and tag, so the
             # role-split and the 2x2 specializations coexist in one process, as on the SM100 arm below.
             filename = _SM107_D512_2X2_KERNEL_FILE
@@ -2716,9 +2719,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 for f in tuple(sorted(_SM100_DENSE_ONLY_D_SHAPES)) + _SM100_FLAVORS
                 if f not in _SM100_DENSE_ONLY_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM100_SMALL_D_CGAS[f]))
             )
-        # This exact half-precision shape is specific to the SM100 line; do
-        # not widen the shared flavor pool inherited by Rubin and FP8.
-        if not self._fp8 and self._device_cc != (10, 7) and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
+        # The native exact half D576 shape uses the architecture-specific 2x2
+        # body; quantized and THD contracts remain independently gated.
+        if not self._fp8 and (int(d_qk), int(d_v)) == SM100_NATIVE_D576_SHAPE:
             _flavor_pool += (SM100_NATIVE_D576_SHAPE,)
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.flavor == SM100_NATIVE_D576_SHAPE:
