@@ -159,7 +159,7 @@ def test_shared_dense_host_compiles_for_sm80(monkeypatch):
 
     monkeypatch.setattr(prepared_host, "compile_cached", compile_spy)
     monkeypatch.setattr(prepared_host.cute.runtime, "make_ptr", lambda *args, **kwargs: None)
-    params = SimpleNamespace(io_bf16=False, bias_is_fp32=False, paged_page_size=0)
+    params = SimpleNamespace(io_bf16=False, bias_is_fp32=False, paged_page_size=0, split_kv=1)
     operand = ((1, 128, 2, 64), (16384, 128, 64, 1))
     geometry = (operand,) * 4 + (((1, 2, 128), (256, 128, 1)),) + (None,) * 4
     result = prepared_host.compile_host(SimpleNamespace(), params, geometry, 0, 0, "shared-sm80-sm89")
