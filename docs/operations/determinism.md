@@ -117,6 +117,7 @@ a row alone and inside a batch under the entry's own picks.
   Triangular two-tile forward replay is checked at all three head counts.
   Moving packed rows changes the scalar loss bytes for Hq32/top-k1024 and
   Hq96/top-k2048. CI also found this for PyTorch Hq16/top-k512.
+  Its approved exception covers only the observed one-byte packed forward loss mismatch on SM100.
   Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
   Numerical agreement does not establish bitwise determinism.
 

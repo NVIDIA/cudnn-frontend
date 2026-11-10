@@ -2591,7 +2591,7 @@ It passed in 23.69 s; removing only the wait failed again in 24.52 s. No
 kernel, tolerance or expected-failure rule changed for this test repair.
 The skipped case needs two GPUs; its device-context control passed on this
 single-GPU host. All existing goldens remain unchanged. The H16 CI packed-loss
-case remains a strict byte comparison.
+case remained strict in this run; the approved exception is recorded below.
 
 Runtime: SM100, 148 SMs, driver 610.11, frontend 1.33.0, Python 3.12.12,
 PyTorch 2.13.0+cu130, JAX/JAXlib 0.11.0, cuDNN 9.27.0, CuTe DSL 4.8.0
@@ -2643,4 +2643,29 @@ From the repository root, in each DSL 4.7.1/4.8.0 environment, with
 ```sh
 CUDA_VISIBLE_DEVICES='' python -m unittest discover \
   -s test/python/api_index -p test_api_index.py -v
+```
+
+### Approved H16 packed-loss exception (2026-11-10)
+
+Extend the existing byte-mismatch exception to PyTorch BF16 forward at
+H16/top-k512 on SM100, as approved. It matches only
+`packed slot 1 indexer_loss: 1/4 bytes differ`. Numerical checks still run
+before byte comparison. H16 backward loss, replay, other tensors, other byte
+counts, SM103, and the JAX H16 case remain outside this new exception. Remove
+it when the scalar-loss reduction is batch invariant. The replay-only support
+status is unchanged.
+
+On the same installed wheel and CUDA 13.4 runtime recorded above, the six
+Torch batch cases reported **1 passed, 5 xfailed** in 33.32 s. H16 forward
+passed locally; its CI failure remains recorded above. Seven injected-failure
+controls confirmed the previous code rejects the observed diagnostic, the
+approved forward case reports an expected failure, and backward loss, SM103,
+two-byte loss, other-output, and numerical failures still raise assertions.
+No kernel, numerical tolerance or golden changed.
+
+```sh
+# From test/python, with the installed wheel environment active.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m pytest \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py::test_batch_invariance \
+  -m L0 -q -s -rxX --tb=short
 ```
