@@ -47,10 +47,12 @@ positive `swiglu_limit` to forward and backward. It computes
 With `fp32_wgrad=True`, backward takes `weight_grad_accumulators`: six
 caller-owned FP32 buffers in the same order as the input weights. Backward
 adds into them; the caller controls when to clear them.
+The six accumulators must not overlap each other or any live input,
+forward-context tensor, schedule tensor, or workspace buffer.
 
 `quantize_mok_weights(gate, up, down)` allocates native MXFP8 routed weights
 in forward and backward orientations. H must then be a multiple of 512.
-Requantize after each weight update, prepare with `mxfp8=True`, and pass the
+Requantize after each weight update, call `adapter.prepare(mxfp8=True)`, and pass the
 matching orientations to forward and backward. Shared weights remain BF16.
 
 Multi-rank expert parallelism is gated off in this first adapter. Its NVLink

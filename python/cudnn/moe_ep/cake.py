@@ -5,9 +5,46 @@
 
 from importlib import import_module
 
+from cudnn._buffer_utils import check_buffers_disjoint
 from cudnn._cake import loader
 
 __all__ = ["prepare_mok_training", "create_mok_workspace", "quantize_mok_weights"]
+
+
+def _guard_accumulators(adapter):
+    from dataclasses import fields, is_dataclass
+    from functools import wraps
+    from inspect import signature
+
+    import torch
+
+    backward = adapter.backward
+    parameters = signature(backward)
+
+    def tensors(name, value):
+        if isinstance(value, torch.Tensor):
+            yield name, value
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                yield from tensors(f"{name}[{index}]", item)
+        elif is_dataclass(value) and not isinstance(value, type):
+            for field in fields(value):
+                yield from tensors(f"{name}.{field.name}", getattr(value, field.name))
+
+    @wraps(backward)
+    def checked_backward(*args, **kwargs):
+        arguments = parameters.bind(*args, **kwargs).arguments
+        accumulators = arguments.pop("weight_grad_accumulators", None)
+        if accumulators is not None:
+            if not isinstance(accumulators, (tuple, list)) or len(accumulators) != 6 or any(not isinstance(t, torch.Tensor) for t in accumulators):
+                raise ValueError("weight_grad_accumulators must contain six tensors")
+            outputs = list(tensors("weight_grad_accumulators", accumulators))
+            inputs = [pair for name, value in arguments.items() for pair in tensors(name, value)]
+            check_buffers_disjoint(outputs, inputs)
+        return backward(*args, **kwargs)
+
+    adapter.backward = checked_backward
+    return adapter
 
 
 def _api(device=None):
@@ -32,13 +69,14 @@ def prepare_mok_training(*, device=None, ep_size=1, local_experts=4, topk=2, cla
     if type(clamped_swiglu) is not bool or type(fp32_wgrad) is not bool:
         raise TypeError("clamped_swiglu and fp32_wgrad must be bool")
     with torch.cuda.device(device):
-        return _api(device).prepare_mok_bf16(
+        adapter = _api(device).prepare_mok_bf16(
             ep_size=ep_size,
             local_experts=local_experts,
             topk=topk,
             clamped_swiglu=clamped_swiglu,
             fp32_wgrad=fp32_wgrad,
         )
+        return _guard_accumulators(adapter)
 
 
 def create_mok_workspace(*, group, device, num_local_tokens, hidden_size, topk=2, **options):

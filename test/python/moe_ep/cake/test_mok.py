@@ -67,7 +67,7 @@ def _reference(x, dy, ids, scores, weights, limit):
 
 
 @pytest.mark.parametrize("mxfp8,fp32_wgrad,limit", [(False, False, None), (False, True, None), (False, False, 0.2), (True, False, None)])
-def test_training(group, mxfp8, fp32_wgrad, limit):
+def test_training(group, mxfp8, fp32_wgrad, limit, monkeypatch):
     process_group, device = group
     x, dy, ids, scores, weights = _inputs(device)
     adapter = prepare_mok_training(device=device, clamped_swiglu=limit is not None, fp32_wgrad=fp32_wgrad)
@@ -90,12 +90,12 @@ def test_training(group, mxfp8, fp32_wgrad, limit):
         fw, bw = (*weights[:3], *forward_weights), (*weights[:3], *backward_weights)
     accumulators = [torch.zeros(w.shape, dtype=torch.float32, device=device) for w in weights] if fp32_wgrad else None
 
-    def run(recompute=False):
+    def run(recompute=False, reset=True):
         schedule = adapter.build_schedule(workspace, config, ids, num_local_experts=4)
         y, context = adapter.forward(config, workspace, schedule, x, scores, *fw, swiglu_limit=limit)
         if recompute:
             context = adapter.recompute_forward_context(config, workspace, schedule, x, fw[0], fw[1], fw[3], fw[4], swiglu_limit=limit)
-        if accumulators is not None:
+        if accumulators is not None and reset:
             for a in accumulators:
                 a.zero_()
         grads = adapter.backward(config, workspace, schedule, context, dy, x, scores, *bw, swiglu_limit=limit, weight_grad_accumulators=accumulators)
@@ -107,6 +107,24 @@ def test_training(group, mxfp8, fp32_wgrad, limit):
         bound = 0.15 if mxfp8 and index < 6 else (0.07 if limit is not None else 0.025)
         error = (value.double() - expected).norm() / expected.norm().clamp_min(1e-10)
         assert error < bound, (index, float(error), bound)
+    if fp32_wgrad:
+        accumulated = run(reset=False)
+        for value, previous in zip(accumulated[3:], got[3:]):
+            torch.testing.assert_close(value, 2 * previous, atol=1e-7, rtol=1e-5)
+        schedule = adapter.build_schedule(workspace, config, ids, num_local_experts=4)
+        _, context = adapter.forward(config, workspace, schedule, x, scores, *fw)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("invalid accumulators reached native backward")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(adapter, "_inputs", forbidden)
+            overlapping = [accumulators[0], accumulators[0], *accumulators[2:]]
+            with pytest.raises(ValueError, match="alias"):
+                adapter.backward(config, workspace, schedule, context, dy, x, scores, *bw, weight_grad_accumulators=overlapping)
+            overlapping = [weights[0].view(torch.float32), *accumulators[1:]]
+            with pytest.raises(ValueError, match="alias"):
+                adapter.backward(config, workspace, schedule, context, dy, x, scores, *bw, weight_grad_accumulators=overlapping)
     for value, previous in zip(run(recompute=True), got):
         assert torch.equal(value.view(torch.uint8), previous.view(torch.uint8))
     stream = torch.cuda.Stream(device=device)
@@ -137,6 +155,13 @@ def test_declines_unqualified_layouts():
         prepare_mok_training(ep_size=4)
     with pytest.raises(TypeError, match="bool"):
         prepare_mok_training(fp32_wgrad=1)
+
+
+def test_public_exports():
+    import cudnn.ops as ops
+
+    for helper in (prepare_mok_training, create_mok_workspace, quantize_mok_weights):
+        assert getattr(ops, helper.__name__) is helper
 
 
 def test_source_hashes():

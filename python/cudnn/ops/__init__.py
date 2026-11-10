@@ -15,6 +15,9 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "prepare_mok_training": ("cudnn.moe_ep.cake", "prepare_mok_training"),
+    "create_mok_workspace": ("cudnn.moe_ep.cake", "create_mok_workspace"),
+    "quantize_mok_weights": ("cudnn.moe_ep.cake", "quantize_mok_weights"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
