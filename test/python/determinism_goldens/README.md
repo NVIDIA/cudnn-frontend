@@ -1656,3 +1656,53 @@ sdpa/frost/test_sdpa_fwd_split_sm80.py
 sdpa/frost/test_sdpa_fwd_split_sm80_determinism.py -m L0 -n 0 -q`.
 Forward only; THD split and packing remain unsupported. This does not
 qualify another GPU, default plan ranking, or serving performance.
+
+
+### Native SM80 small query/KV tiles — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_small_tiles_sm80.py` exercises explicit M16/M32
+query tiles and N16/N32 KV stages without changing default candidate policy.
+Eight new runtime goldens cover D64 M16/N16, D128 M16/N32 and M32/N16,
+and D256 M16/N16 in both half types, all at split 3. The reused split
+qualification preserves CPU-fixed inputs through fresh-buffer replay with
+concurrent work, reordered/duplicated batches through 129 and changed-neighbor
+CUDA Graph replay. O and FP32 Stats pass independent CPU-double references
+before their raw bytes are recorded. No old golden is regenerated.
+
+A100, runtime key `a29ca37b88513cb6`: 64 numerical feature cases and eight
+recording cases pass. Features include dense/THD queries, independent paged
+K/V, dense-Q splitting, eight-aligned head envelopes, sinks including infinity
+endpoints, padded/empty rows, strided outputs, pointer rebinding and capture.
+The host geometry suite passes 96 cases while leaving default candidate
+choices implicit. These are forward-only results on this GPU/runtime.
+
+The new D192/M128/N16 case exposed a copy-wave divisibility restriction.
+The SM80 loader now chooses a whole subset of CTA threads for each operand,
+so dense and paged vector copies still fill complete tiles. Existing tile
+geometries retain all their copy threads. The first 64-case attempt stopped
+after five passes at this compile-time rejection. A subsequent DSL-control-flow
+error was resolved by keeping the static configuration diagnostic outside
+the dynamic lane guard; both failed attempts remain in private evidence.
+The final 64 cases pass after that repair.
+
+Run from `test/python`: `python -m pytest
+sdpa/frost/test_sdpa_fwd_small_tiles_sm80.py -m L0 -n 0 -q` with
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens` for strict comparison.
+The standard golden workflow remains required on a different runtime.
+
+
+The strict follow-up passes 120 cases: 108 existing paging/sink cases,
+four original split goldens and eight new small-tile goldens. Memcheck,
+racecheck and synccheck each pass 12 cases with zero errors/hazards,
+covering standalone/graph and dense/THD query forms over paged KV at
+D48/V32 M16/N16, D192/V128 M128/N16 and D256 M16/N16.
+Sanitizer selection is `-k 'paged_rebind and dtype0 and
+(48-32-16-16 or 192-128-128-16 or 256-256-16-16)'` with
+`--error-exitcode 91`. Runtime details and initial failures remain in
+private evidence; no unsupported GPU or default performance claim is made.
+
+Two additional dense D192/V128 M16/N16 and M128/N16 graph cases pass
+numerical, fresh-binding and replay checks. Each also passes memcheck,
+racecheck and synccheck with zero diagnostics, bringing the sanitizer scope
+to 14 cases per tool. These controls exercise the nonpaged copy path with
+all CTA threads and with the reduced copy-thread subset.

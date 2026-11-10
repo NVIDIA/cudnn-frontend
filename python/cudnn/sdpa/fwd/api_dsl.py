@@ -7145,6 +7145,8 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             tile_m_default = 64
         self.kernel_tile_m = tile_m_default if self.tile_m is None else int(self.tile_m)
         self.kernel_num_warps = 4 if self.flavor in ("llama", "dsv3", "qwen") and self.kernel_tile_m == 64 else num_warps_default
+        if self.flavor not in ("wide512", "mla576") and self.kernel_tile_m in (16, 32):
+            self.kernel_num_warps = self.kernel_tile_m // 16
         # At D256 the 64-key double buffers still occupy 128 KiB. Pair the
         # smaller Q tile with 32-key buffers to reduce that total to 64 KiB.
         if short_d256 and self.kernel_tile_m == 64:
