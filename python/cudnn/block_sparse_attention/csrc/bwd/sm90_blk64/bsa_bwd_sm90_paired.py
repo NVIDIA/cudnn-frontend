@@ -76,8 +76,7 @@ class PairedKvMetadataSm90:
 class MixedKvBackwardSm90:
     """Run every pair's Q walk in one blk128-shaped kernel over the metadata that ``PairedKvMetadataSm90`` built."""
 
-    def __init__(self, dtype, head_dim, bucket_size_blocks, scale_nonpositive, has_kv_tail):
-        self.bucket_size = bucket_size_blocks
+    def __init__(self, dtype, head_dim, scale_nonpositive, has_kv_tail):
         # Supplies the preprocess, the FP32 workspace and the postprocess; its own mainloop does not run.
         self.regular = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
         self.paired = BlockSparseAttnBackwardSm90Blk128(dtype, head_dim, head_dim, scale_nonpositive, has_kv_tail=has_kv_tail, paired=True)
@@ -100,8 +99,6 @@ class MixedKvBackwardSm90:
         mBlockSizes: cute.Tensor | None,
         workspace: cute.Tensor,
         softmax_scale: Float32,
-        flags: cute.Tensor,
-        residuals: cute.Tensor,
         tasks: cute.Tensor,
         sync: cute.Tensor,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -131,8 +128,6 @@ class MixedKvBackwardSm90:
             mBlockSizes,
             offsets,
             indices,
-            flags,
-            residuals,
             tasks,
             sync,
             stream=stream,

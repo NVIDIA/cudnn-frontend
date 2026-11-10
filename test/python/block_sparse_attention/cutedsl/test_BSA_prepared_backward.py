@@ -288,8 +288,10 @@ def test_prepared_metadata_built_on_a_side_stream_survives_its_release_after_the
         prepared = prepare()
     assert prepared.use_paired_kv == paired
     assert not recorded  # the prepare itself records nothing
-    # What the compute entry reads: the CSR, the (B, nk) block_sizes copy and, when paired, flags / residuals / task records.
-    consumed = (prepared._offsets, prepared._indices, prepared._block_sizes, *(prepared._pair_tensors[2:] if paired else ()))
+    # What the compute entry reads: the CSR, the (B, nk) block_sizes copy and, when paired, the task records and the
+    # arrival-bookkeeping template (the backward copies it on its own stream); the pair bitsets, duplicates, flags and
+    # residuals feed the metadata kernels only.
+    consumed = (prepared._offsets, prepared._indices, prepared._block_sizes, *((*prepared._pair_tensors[4:], prepared._pair_sync) if paired else ()))
     released = [(t.data_ptr(), t.numel() * t.element_size()) for t in consumed]
     probe_specs = [(tuple(t.shape), t.dtype) for t in consumed]
     main.wait_stream(side)

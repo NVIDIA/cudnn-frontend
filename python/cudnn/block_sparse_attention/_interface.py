@@ -3494,9 +3494,10 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         )
         if not meta._pairing_ready:
             _sm90_blk64_run_pairing(meta)
-        # The compute entry reads the partitioned CSR through the pair flags, residuals and task records only, plus the
-        # per-KV64-block dK/dV arrival bookkeeping (pair_sync).
-        pair_tensors = meta._pair_tensors[2:] if use_paired_kv else ()
+        # The compute entry reads the partitioned CSR through the (pair, Q group) task records only (the pair bitsets,
+        # duplicates, flags and residuals feed the metadata kernels), plus the per-KV64-block dK/dV arrival bookkeeping
+        # (pair_sync).
+        pair_tensors = meta._pair_tensors[4:] if use_paired_kv else ()
         pair_sync = meta._pair_sync
         if metadata is not None:
             # A prepared object may have been built on another stream (R1): record the tensors the kernels below read on
@@ -3529,7 +3530,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
         if compile_key not in _bsa_attn_bwd_bucketed_k2q_csr.compile_cache:
             # Building the paired kernel enumerates its matchings, so it happens only on a cache miss.
-            bwd_kernel = MixedKvBackwardSm90(dtype, head_dim, meta.bucket_size_blocks, scale_nonpositive, has_kv_tail) if use_paired_kv else stage_kernel
+            bwd_kernel = MixedKvBackwardSm90(dtype, head_dim, scale_nonpositive, has_kv_tail) if use_paired_kv else stage_kernel
             _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(
                 bwd_kernel,
                 problem_shape,

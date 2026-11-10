@@ -654,8 +654,6 @@ class BlockSparseAttnBackwardSm90Blk128:
         mBlockSizes: Optional[cute.Tensor] = None,
         bucketed_k2q_offsets: Optional[cute.Tensor] = None,
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
-        pair_flags: Optional[cute.Tensor] = None,
-        pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
         pair_sync: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -700,10 +698,6 @@ class BlockSparseAttnBackwardSm90Blk128:
             ),
         )
 
-        if const_expr(pair_flags is not None):
-            pair_flags = cute.make_tensor(pair_flags.iterator, pair_flags.layout)
-        if const_expr(pair_residuals is not None):
-            pair_residuals = cute.make_tensor(pair_residuals.iterator, pair_residuals.layout)
         if const_expr(pair_tasks is not None):
             pair_tasks = cute.make_tensor(pair_tasks.iterator, pair_tasks.layout)
         if const_expr(pair_sync is not None):
@@ -830,8 +824,6 @@ class BlockSparseAttnBackwardSm90Blk128:
             SharedStorage,
             bucketed_k2q_offsets,
             bucketed_k2q_indices,
-            pair_flags,
-            pair_residuals,
             pair_tasks,
             pair_sync,
         ).launch(
@@ -880,8 +872,6 @@ class BlockSparseAttnBackwardSm90Blk128:
         SharedStorage: cutlass.Constexpr[Callable],
         bucketed_k2q_offsets: Optional[cute.Tensor] = None,
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
-        pair_flags: Optional[cute.Tensor] = None,
-        pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
         pair_sync: Optional[cute.Tensor] = None,
     ):
@@ -896,7 +886,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         has_work = True
         if const_expr(self.paired):
             n_block, head_idx, batch_idx, q_group = TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
-            _, _, _, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            _, _, _, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
             has_work = steps > 0
         if has_work:
             # prefetch TMA descriptors
@@ -984,8 +974,6 @@ class BlockSparseAttnBackwardSm90Blk128:
                         TileSchedulerCls,
                         bucketed_k2q_offsets,
                         bucketed_k2q_indices,
-                        pair_flags,
-                        pair_residuals,
                         pair_tasks,
                     )
                 if warp_idx == 1:
@@ -996,8 +984,6 @@ class BlockSparseAttnBackwardSm90Blk128:
                         SeqlenInfoCls,
                         bucketed_k2q_offsets,
                         bucketed_k2q_indices,
-                        pair_flags,
-                        pair_residuals,
                         pair_tasks,
                     )
                 if warp_idx == 2:
@@ -1011,8 +997,6 @@ class BlockSparseAttnBackwardSm90Blk128:
                         TileSchedulerCls,
                         bucketed_k2q_offsets,
                         bucketed_k2q_indices,
-                        pair_flags,
-                        pair_residuals,
                         pair_tasks,
                     )
             else:
@@ -1050,8 +1034,6 @@ class BlockSparseAttnBackwardSm90Blk128:
                     bucketed_k2q_offsets,
                     bucketed_k2q_indices,
                     mBlockSizes,
-                    pair_flags,
-                    pair_residuals,
                     pair_tasks,
                     pair_sync,
                 )
@@ -1059,13 +1041,14 @@ class BlockSparseAttnBackwardSm90Blk128:
                 self.mma(*mma_args)
 
     @cute.jit
-    def _task(self, offsets, flags, residuals, tasks, n_block, q_group, head_idx, batch_idx):
+    def _task(self, offsets, tasks, n_block, q_group, head_idx, batch_idx):
         """Return the KV64 blocks of the two compute WGs, the CSR position of their Q walk and its number of Q64 steps."""
         if const_expr(self.paired):
             # The partition kernel resolved this (pair, Q group) task into one record [kv0, kv1, begin0, len0, begin1,
             # res0, b_ok, steps] (LocalPairPartition8.partition): the owner's CSR list is [first-only | common] and the
             # partner's starts with its second-only edges. Eight independent loads of one 32-byte record replace three
-            # dependent rounds through flags/offsets/residuals (~1,100 cycles on every CTA's critical path).
+            # dependent rounds through the pair flags, the CSR offsets and the residuals (~1,100 cycles on every CTA's
+            # critical path); those tensors now feed the metadata kernels only and are not kernel arguments here.
             kv0 = tasks[batch_idx, head_idx, q_group, n_block, 0]
             kv1 = tasks[batch_idx, head_idx, q_group, n_block, 1]
             begin0 = tasks[batch_idx, head_idx, q_group, n_block, 2]
@@ -1119,8 +1102,6 @@ class BlockSparseAttnBackwardSm90Blk128:
         TileSchedulerCls: Callable,
         bucketed_k2q_offsets: Optional[cute.Tensor] = None,
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
-        pair_flags: Optional[cute.Tensor] = None,
-        pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -1153,9 +1134,7 @@ class BlockSparseAttnBackwardSm90Blk128:
                 load_dO, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO)
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
 
-                kv0, kv1, k2q_begin, total_steps = self._task(
-                    bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx
-                )
+                kv0, kv1, k2q_begin, total_steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
                 process_tile = total_steps > Int32(0)
 
                 if process_tile:
@@ -1202,8 +1181,6 @@ class BlockSparseAttnBackwardSm90Blk128:
         TileSchedulerCls,
         offsets,
         indices,
-        pair_flags=None,
-        pair_residuals=None,
         pair_tasks=None,
     ):
         # Preprocess writes the padded statistics and clears dQaccum. This wait
@@ -1219,7 +1196,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             gdPsum = cute.local_tile(mdPsum[None, head_idx, batch_idx], (self.tile_m,), (None,))
             load_LSE = copy_utils.tma_producer_copy_fn(copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE), pipeline_stats)
             load_delta = copy_utils.tma_producer_copy_fn(copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum), pipeline_stats)
-            _, _, begin, steps = self._task(offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            _, _, begin, steps = self._task(offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
             for step in cutlass.range(steps, unroll=1):
                 m_block = self._m_block(indices, begin, step, head_idx, batch_idx)
                 if m_block * self.tile_m < seqlen.seqlen_q:
@@ -1271,8 +1248,6 @@ class BlockSparseAttnBackwardSm90Blk128:
         bucketed_k2q_offsets: cute.Tensor,
         bucketed_k2q_indices: cute.Tensor,
         mBlockSizes: Optional[cute.Tensor] = None,
-        pair_flags: Optional[cute.Tensor] = None,
-        pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
         pair_sync: Optional[cute.Tensor] = None,
     ):
@@ -1312,7 +1287,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             tLSEsLSE = layout_utils.mma_partition_C_vec(sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=False)
             tdPsums = layout_utils.mma_partition_C_vec(sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=False)
             mask = AttentionMaskCls(seqlen)
-            kv0, kv1, begin, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            kv0, kv1, begin, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
             # In paired mode WG w owns KV64 block kv_w: its S rows are mask columns [64 w, 64 w + 64) of the tile.
             mask_n_block = n_block
             if const_expr(self.paired):
@@ -1327,7 +1302,9 @@ class BlockSparseAttnBackwardSm90Blk128:
                 _, len0, _, res0, b_ok = begin
                 # The walk is [first-only | common | second-only] = [0, lo1) | [lo1, len0) | [len0, steps): WG0 owns
                 # [0, len0), WG1 owns [lo1, steps) (nothing when the second block is unpaired: then lo1 == len0 ==
-                # steps). Five loops keep the MMAs out of per-step branches. In a single-owner step only the owner
+                # steps). Five loops keep the MMAs out of per-step branches; the two owner loops ([0, lo1) for WG0,
+                # [len0, steps) for WG1) and the common loop implement the same per-step protocol with static bodies,
+                # as do the two passive loops, so a change to one body must be mirrored in its twins. In a single-owner step only the owner
                 # computes S/dP/dV/dK and writes its half of dS; BOTH WGs then run their head-dim half of the shared
                 # dQ GEMM over the owner's 64 KV rows only (the two dS halves and the two K halves are independent
                 # 8 KB swizzled blocks, so the K slice is a static descriptor offset), and the non-owner no longer
@@ -1765,8 +1742,6 @@ class BlockSparseAttnBackwardSm90Blk128:
         SeqlenInfoCls: Callable,
         bucketed_k2q_offsets: cute.Tensor,
         bucketed_k2q_indices: cute.Tensor,
-        pair_flags: Optional[cute.Tensor] = None,
-        pair_residuals: Optional[cute.Tensor] = None,
         pair_tasks: Optional[cute.Tensor] = None,
     ):
         scheduler = TileSchedulerCls()
@@ -1774,7 +1749,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         if work.is_valid_tile:
             n_block, head_idx, batch_idx, q_group = work.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            _, _, begin, steps = self._task(bucketed_k2q_offsets, pair_flags, pair_residuals, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            _, _, begin, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
             gdQ = cute.local_tile(mdQaccum[None, head_idx, batch_idx], (self.tile_m * self.tile_hdim,), (None,))
             for step in cutlass.range(steps, unroll=1):
                 m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
