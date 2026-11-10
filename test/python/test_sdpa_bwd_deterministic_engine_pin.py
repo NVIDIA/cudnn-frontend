@@ -23,6 +23,10 @@ d128 dense GQA) at an L0-sized sequence length:
 Before the fix, (2) failed on cc 10.7 with every backend (#2086 declined the pin
 for the whole part) and, before #2086, (1) failed on cc 10.7 with a backend that
 does not serve engine 17 (a generic backend-API error instead of a plan).
+
+The preference goes first rather than replacing the heuristics query (#2373): the
+heuristics configs follow it, so a caller that excludes the preferred engine still
+gets a plan, and where the heuristics list nothing (d256) the preference stands alone.
 """
 
 import math
@@ -173,3 +177,49 @@ def test_deterministic_bwd_selects_the_part_bprop_engine(case, cudnn_handle):
         f"selected engine {chosen} ({name}): the override_heuristics_query pin is missing"
     )
     print(f"@@@@ {case}: cuDNN {cudnn.backend_version()} does not serve engine {pinned} on cc {_CC} ({detail}); the fallback built {name}")
+
+
+def _backend_plans(g):
+    return [(index, plan.engine_id) for index, plan in enumerate(g.plans) if not is_python_engine(plan.engine_id)]
+
+
+@pytest.mark.parametrize("case", list(CASES))
+def test_deterministic_bwd_preference_leads_the_heuristics_configs(case, cudnn_handle):
+    """The preferred engine goes first and the heuristics configs follow it, so excluding it still leaves a plan."""
+    pinned = pinned_engine(_CC)
+    g = BackwardGraph(CASES[case], cudnn_handle).g
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    backend = _backend_plans(g)
+    names = [g.get_plan_name_at_index(index) for index, _ in backend]
+    print(f"@@@@ {case}: cc {_CC}, cuDNN {cudnn.backend_version()}: backend plans {names}")
+    if pinned not in [engine for _, engine in backend]:
+        pytest.skip(f"cuDNN {cudnn.backend_version()} does not serve engine {pinned} on cc {_CC} (the fallback, covered above)")
+    assert backend[0][1] == pinned, f"engine {pinned} does not lead the backend plans {names}"
+    # The heuristics answer these graphs with engine 7 (cuDNN 9.18 through 9.30), so a query that ran adds a config.
+    others = [(index, engine) for index, engine in backend if engine != pinned]
+    assert others, f"only the preferred engine {pinned} is listed ({names}): the heuristics query did not run"
+
+    g.deselect_engines([f"eng{pinned}_"])
+    g.select_plan(others[0][0])
+    g.check_support()
+    g.build_plans()
+    assert g.plans[g._plan_index].engine_id == others[0][1]
+
+
+def test_preference_stands_alone_when_the_heuristics_return_nothing(cudnn_handle):
+    """d256 on Blackwell: the heuristics list no backend config, and the preferred engine alone serves the backward."""
+    if cudnn.backend_version() < 92300:
+        pytest.skip("the d256 backward on Blackwell needs cuDNN >= 9.23")
+    spec = dict(h_q=4, h_kv=1, d=256, causal=True, window=None)
+    pinned = pinned_engine(_CC)
+    g = BackwardGraph(spec, cudnn_handle).g
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    backend = _backend_plans(g)
+    names = [g.get_plan_name_at_index(index) for index, _ in backend]
+    print(f"@@@@ d256: cc {_CC}, cuDNN {cudnn.backend_version()}: backend plans {names}")
+    if not backend:
+        pytest.skip(f"cuDNN {cudnn.backend_version()} serves neither engine {pinned} nor a heuristics config for d256 on cc {_CC}")
+    assert backend[0][1] == pinned, f"engine {pinned} does not lead the backend plans {names}"
+    g.select_plan(backend[0][0])
+    g.check_support()
+    g.build_plans()
