@@ -78,6 +78,8 @@ def indexer_fwd_compress_topk_sm90(
     lse_out: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     stream=None,
+    _compiled_score=None,
+    _compiled_topk=None,
 ) -> tuple[torch.Tensor, ...]:
     """Run the validated SM90 packed-THD compact score and Top-K path.
 
@@ -188,6 +190,7 @@ def indexer_fwd_compress_topk_sm90(
         ("k_scale", k_scale),
         ("cu_seqlens_q", cu_seqlens_q),
         ("cu_seqlens_k", cu_seqlens_k),
+        ("cand_batch_offsets", cand_batch_offsets),
         ("q_causal_offsets", q_causal_offsets),
     )
     _reject_overlapping_writes(output_buffers, input_buffers)
@@ -263,6 +266,7 @@ def indexer_fwd_compress_topk_sm90(
         current_stream=launch_stream,
         is_compressed_logits=True,
         cand_batch_offsets=cand_batch_offsets,
+        _compiled_kernel=_compiled_score,
     )
 
     # Keep launch specialization independent of live token counts. 256 threads
@@ -286,6 +290,7 @@ def indexer_fwd_compress_topk_sm90(
         out_softmax=softmax_out,
         return_softmax=want_softmax,
         deterministic=deterministic,
+        _compiled_kernel=_compiled_topk,
     )
     if want_softmax:
         indices, logits, softmax = stage2

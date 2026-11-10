@@ -15,6 +15,8 @@ _SYMBOLS = {
     "IndexerForward": (".indexer_forward", "IndexerForward"),
     "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
     "indexer_forward_top_k_wrapper": (".indexer_forward", "indexer_forward_top_k_wrapper"),
+    "IndexerForwardTopKPlan": (".indexer_forward", "IndexerForwardTopKPlan"),
+    "prepare_indexer_forward_top_k": (".indexer_forward", "prepare_indexer_forward_top_k"),
     "compress_topk_cand_buffer_size": (".indexer_forward", "compress_topk_cand_buffer_size"),
     "compress_topk_cand_buffer_size_thd": (".indexer_forward", "compress_topk_cand_buffer_size_thd"),
     "IndexerTopK": (".indexer_top_k", "IndexerTopK"),

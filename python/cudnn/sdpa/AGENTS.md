@@ -1608,3 +1608,15 @@ opaque through a register `mov`, as `_zero_word` in SM120 FP8 backward does.
 The small SQ19/SKV37/D64 case in `test_sdpa_bwd_fp8_sm120.py` reaches both
 fully dead score columns and gradient columns; retain the failing PTX when
 diagnosing this so register-type guesses do not replace the actual operand.
+
+Padded output rows require an explicit zero store. Setting a normalization
+factor to zero cannot clear a NaN accumulator (`NaN * 0` remains NaN).
+Select the stored half/bfloat16 bits after conversion, using the unpacked query
+row when PackGQA is active. `test_sdpa_sm80_padding_nan.py` and the wide SM80
+padding detector poison physical padding and exercise rebinding and replay.
+
+Prepared split-KV slab offsets must use the same 128-byte carve alignment as
+`scratch_workspace_bytes`; rounding an internal offset to 256 can overrun the
+advertised workspace. Guard the exact allocation on widths/row counts whose
+partial-O extent rounds differently, including packed and unpacked paging.
+`test_split_workspace_128_byte_alignment` is the detector.
