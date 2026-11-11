@@ -159,6 +159,12 @@ A graph-only test misses a direct-API operand silently dropped by that flag.
   default is `True`, which otherwise admits `S_q == 1` before the adapter
   rejects it. `test_sdpa_bwd_d192_sm107.py::test_decode_declines_before_lowering`
   checks real dense/THD graph declarations at that boundary.
+- When enabling partial PackGQA, test ordinary candidate generation as well
+  as explicit plans at groups `tile_q`, `tile_q + 2` and `2 * tile_q`.
+  `create_execution_plan` alone does not exercise `_pack_gqa_points`: its
+  packed token span must use the effective subgroup width. Dividing a tile
+  by the full sharing ratio can produce zero before any kernel launches.
+  Keep the full Q/K ratio separately for KV-head mapping and validation.
 
 **Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
 that stores into columns another warpgroup still has to read must be
