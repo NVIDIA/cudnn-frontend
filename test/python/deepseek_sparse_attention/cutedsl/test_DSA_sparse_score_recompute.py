@@ -55,7 +55,7 @@ def _local_to_global_topk_indices(topk_indices: torch.Tensor, seqlen_k: int) -> 
 
 @pytest.mark.L1
 @torch_fork_set_rng(seed=1234)
-@pytest.mark.parametrize("num_heads,head_dim,topk", [(32, 128, 128), (64, 512, 512), (128, 512, 1024), (64, 576, 1024), (128, 576, 512)])
+@pytest.mark.parametrize("num_heads,head_dim,topk", [(32, 128, 128), (64, 512, 512), (96, 512, 512), (128, 512, 1024), (64, 576, 1024), (128, 576, 512)])
 @pytest.mark.parametrize("has_topk_length", [False, True])
 @pytest.mark.parametrize("use_global", [False, True])
 def test_sparse_attn_sm100_tiles_match_reference(num_heads, head_dim, topk, has_topk_length, use_global):
