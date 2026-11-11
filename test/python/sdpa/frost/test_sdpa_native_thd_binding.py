@@ -887,12 +887,18 @@ def test_native_d64_thd_split_frames(layout, splits):
     _wide_thd_split_frames(False, layout, splits, 64, 64)
 
 
-def _wide_thd_split_frames(paged, layout, splits, d_qk, d_v):
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d256_paged_split_frames(layout, splits):
+    _wide_thd_split_frames(True, layout, splits, 256, 256, cga_tile_m=256)
+
+
+def _wide_thd_split_frames(paged, layout, splits, d_qk, d_v, cga_tile_m=128):
     """Asymmetric partial widths, origins and independent tables survive rebinding."""
     from cudnn.sdpa.fwd.thd_origins import ROLES
 
     s, facts, _ = _paged_fixture(hnd=True, layout=layout, v_hnd=False) if paged else _fixture(layout=layout)
-    s.d_qk, s.d_v, s.cga_tile_m = d_qk, d_v, 128
+    s.d_qk, s.d_v, s.cga_tile_m = d_qk, d_v, cga_tile_m
     for role, dim in (("q", d_qk), ("k", d_qk), ("v", d_v), ("o", d_v)):
         h, _, ts, hs, _, span = s.decl[role]
         s.decl[role] = (h, dim, ts * dim // 128, hs * dim // 128, 1, span * dim // 128)

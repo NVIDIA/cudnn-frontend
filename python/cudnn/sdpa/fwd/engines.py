@@ -3823,7 +3823,14 @@ def lower_dsl_prefill(
                 (
                     not (facts.is_fp8 or facts.is_mxfp8)
                     and (
-                        ((api.split_kv == 1 or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE) and api.cga in (None, 2))
+                        (
+                            (
+                                api.split_kv == 1
+                                or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE
+                                or ((facts.d_qk, facts.d_v) == (256, 256) and facts.has_paged_kv and api.packed_thd_split)
+                            )
+                            and api.cga in (None, 2)
+                        )
                         or (
                             facts.d_qk == 128
                             and api.cga == 1

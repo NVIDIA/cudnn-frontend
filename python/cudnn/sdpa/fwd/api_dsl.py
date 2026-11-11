@@ -2769,6 +2769,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Even compact standalone THD uses sequence-local maps. Graph lowering
             # replaces these absent offsets with the caller's per-port declarations.
             self._thd_origin_specs = (None,) * 5
+        if self.packed_thd_split and self.paged and self.flavor == (256, 256) and self._device_cc in ((10, 0), (10, 3)):
+            # The split body reads physical Q origins; only the final combine
+            # addresses caller O/Stats. Standalone THD supplies compact prefixes.
+            self._thd_origin_specs = (None,) * 5
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
@@ -2816,7 +2820,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.split_kv == 1
                 ),
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
-                "Rubin paged D128 cga1 unsplit, or SM100/103/107 paged D256 cga2 unsplit",
+                "Rubin paged D128 cga1 unsplit, SM100/103 paged D256 cga2, or SM107 paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in SM100 d128 / d256 half and the qualified Rubin

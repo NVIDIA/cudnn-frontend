@@ -1400,3 +1400,10 @@ matrix on a representative full-feature shape and retain separate native
 flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
 The SM90 D64/D512 controls in `test_band_capabilities.py` and
 `test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
+
+For packed THD split kernels, sequence-local Q maps and final O/Stats origins
+must stay separate from compact split scratch. Check partial head groups,
+independent Q/O/Stats gaps, changed-input graph replay and packed batches with
+empty/quiet sequences. `TestPagedD256PackedSplit` detects token-tile/head-index
+confusion; `test_native_d256_paged_split_frames` compares both binders and rejects
+partial buffers overlapping physical-origin metadata before launch.

@@ -3428,3 +3428,15 @@ class TestNativeScalarTailSplit:
 
     test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
     test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D256 paged packed split on SM100/SM103")
+class TestPagedD256PackedSplit:
+    """Combined packing/splitting, physical origins and standalone replay."""
+
+    import sdpa_d256_paged_split_checks as _checks
+
+    test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
+    test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)

@@ -60,6 +60,7 @@ def test_paged_thd_origins_rebind_and_capture(
     key_growth=1.0,
     independent_table_strides=False,
     single_q=False,
+    heads_override=None,
 ):
     import cudnn
     import torch
@@ -89,6 +90,8 @@ def test_paged_thd_origins_rebind_and_capture(
     )
     if kv_bound is not None:
         kv_max = kv_bound
+    if heads_override is not None:
+        heads = heads_override
     scale = d_qk**-0.5 if attention_scale is None else attention_scale
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
@@ -242,6 +245,11 @@ def test_paged_thd_origins_rebind_and_capture(
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if not rubin and d_qk == 256 and splits > 1:
+        plan = graph._compiled_plans[graph._plan_index]
+        assert plan._compiled.kernel_template == "prefill_d256_f16"
+        assert plan._prepared.spec.native is not None
+        assert plan._prepared.spec.origin_specs is not None
     if rubin:
         import inspect
 
