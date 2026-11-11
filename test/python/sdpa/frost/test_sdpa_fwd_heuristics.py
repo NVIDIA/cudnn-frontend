@@ -2493,8 +2493,9 @@ def test_sm100_paged_d64_d256_prefix_defaults_to_the_packed_split(d, h_q, h_kv, 
         dict(causal=False, bottom_right=False),
         dict(device_cc=(10, 7), device_sm_count=208),
         dict(s_kv=512),
+        dict(dtype=cudnn.data_type.HALF),
     ],
-    ids=["full-grid", "mha", "mask-free", "rubin", "short-kv"],
+    ids=["full-grid", "mha", "mask-free", "rubin", "short-kv", "f16"],
 )
 def test_sm100_paged_packed_split_stays_inside_its_domain(over):
     from cudnn.sdpa.fwd.heuristics import sm100_paged_packed_split_choice

@@ -2820,7 +2820,7 @@ SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
 
 
 def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
-    """SM100/103 paged half D64 / D256 GQA prefix: the packed split count, 1 outside the domain.
+    """SM100/103 paged bf16 D64 / D256 GQA prefix: the packed split count, 1 outside the domain.
 
     The packed launch (b x KV heads x packed Q tiles) underfills the part on these short-Q / long-KV graphs; split the KV
     loop over the idle clusters (four KV tiles per partition at least, 16 partials at most). The declaration bounds the
@@ -2832,7 +2832,7 @@ def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
         and caps.sm_lo == 100
         and facts.device_cc in ((10, 0), (10, 3))
         and paged_thd_split_domain(caps, facts)
-        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.dtype == cudnn.data_type.BFLOAT16  # the measured dtype, as the D128 split rule
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in SM100_PAGED_PACKED_SPLIT_GROUPS
