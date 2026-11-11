@@ -905,6 +905,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     # Paged/dense KV has no packed capacity or ragged offsets. Keep this
     # optional state explicit before conditional allocation and binding.
+    max_t_q = None
     max_t_kv = None
     k_ragged_offset_gpu = None
     v_ragged_offset_gpu = None
@@ -1005,6 +1006,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     else:
         padding = None
 
+    # Performance-only runs omit references; correctness branches require them.
+    o_ref = stats_ref = None
     if perf:
         o_amax = 1.0
     else:
@@ -1214,6 +1217,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         o_descale_gpu = torch.tensor([get_fp8_descale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
         dO_descale_gpu = torch.tensor([get_fp8_descale_factor(dO_amax, torch_itype)], dtype=torch.float, device="cuda")
 
+        dQ_ref = dK_ref = dV_ref = dSink_token_ref = None
         if perf:
             dP_amax = 1.0
             dQ_amax = 1.0
