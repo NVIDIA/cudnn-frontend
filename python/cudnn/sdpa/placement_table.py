@@ -188,7 +188,6 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
                 "sm100_d512_paged_decode_b100_20261030",
                 "sm100_d512_paged_context_20261030",
                 "sm100_d256_paged_context_20261030",
-                "sm100_paged_d64_d256_prefill_20261111",
                 "sm100_d576_dense_decode_20261030",
             }
         ),

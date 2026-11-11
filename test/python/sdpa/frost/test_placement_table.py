@@ -447,24 +447,35 @@ def _sm100_paged(d, h_q, h_kv, b, s_q, s_kv, **over):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
-def test_sm100_paged_packed_split_classes_follow_their_study(cc):
+def test_sm100_paged_packed_split_classes_follow_their_study():
     """The SM100 row's packed split is its own group (``gqa_split``) and, at D64, one Q tile per request its own phase
     (``prefill_short_q``): study sm100_paged_d64_d256_prefill_20261111 leads the split and short-Q D64 graphs, keeps the backend
-    for a long-Q D64 graph over a long cache, and leaves D256 unsplit graphs to sm100_d256_paged_context_20261030. cc 10.3 borrows
-    both studies."""
+    for a long-Q D64 graph over a long cache, and leaves D256 unsplit graphs to sm100_d256_paged_context_20261030. cc 10.3 does
+    not borrow the new study (its B300 holdout did not qualify the transfer): the split still leads there through the row's
+    hand rule, and the unsplit D64 graphs keep the backend."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
     row = "sdpa_fwd_prefill_sm100"
     study = "sm100_paged_d64_d256_prefill_20261111"
-    split64 = _sm100_paged(64, 32, 8, 1, 64, 32768, device_cc=cc)
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    split64 = _sm100_paged(64, 32, 8, 1, 64, 32768)
     assert pt.class_key(row, split64)[4] == "prefill_short_q" and pt.class_key(row, split64)[8] == "gqa_split"
-    split256 = _sm100_paged(256, 16, 8, 1, 128, 32768, device_cc=cc)
+    split256 = _sm100_paged(256, 16, 8, 1, 128, 32768)
     assert pt.class_key(row, split256)[4] == "prefill" and pt.class_key(row, split256)[8] == "gqa_split"
-    for facts in (split64, split256, _sm100_paged(64, 16, 8, 16, 64, 16384, device_cc=cc)):
+    short_unsplit = _sm100_paged(64, 16, 8, 16, 64, 16384)
+    for facts in (split64, split256, short_unsplit):
         assert pt.lookup(row, facts) is True
         assert pt.matched_entry(row, facts).study == study
-    assert pt.lookup(row, _sm100_paged(64, 32, 8, 16, 512, 32768, device_cc=cc)) is False
-    unsplit256 = _sm100_paged(256, 32, 8, 16, 512, 8192, device_cc=cc)
+    assert pt.lookup(row, _sm100_paged(64, 32, 8, 16, 512, 32768)) is False
+    unsplit256 = _sm100_paged(256, 32, 8, 16, 512, 8192)
     assert pt.class_key(row, unsplit256)[8] == "gqa"
     assert pt.matched_entry(row, unsplit256).study == "sm100_d256_paged_context_20261030"
-    exact_d128 = _sm100_paged(128, 32, 8, 1, 64, 32768, device_cc=cc)
+    exact_d128 = _sm100_paged(128, 32, 8, 1, 64, 32768)
     assert pt.class_key(row, exact_d128)[4] == "prefill" and pt.class_key(row, exact_d128)[8] == "gqa"
+    b300 = dict(device_cc=(10, 3))
+    for d, h_q, s_q in ((64, 32, 64), (256, 16, 128)):
+        facts = _sm100_paged(d, h_q, 8, 1, s_q, 32768, **b300)
+        assert pt.lookup(row, facts) is None and placement.place(spec, facts) == placement.LEAD
+    assert pt.lookup(row, _sm100_paged(64, 16, 8, 16, 64, 16384, **b300)) is None
+    assert pt.matched_entry(row, _sm100_paged(256, 32, 8, 16, 512, 8192, **b300)).study == "sm100_d256_paged_context_20261030"
