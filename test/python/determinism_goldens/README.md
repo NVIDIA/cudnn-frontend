@@ -602,6 +602,26 @@ determinism command read 33 passed, 2 skipped, and the set was recorded the same
 a new runtime key (GPU name, compute capability, SM count and driver API version differ), not a numerical change.  A part that reports
 another GPU name, SM count or software version hashes to another key, and the golden cases skip there -- a coverage gap, not a pass.
 
+Host-entry change, re-run record (2026-11-11 UTC).  A later commit binds the entry's slab operands with a runtime extent and scopes its
+compile and its launch to the entry's device.  The kernel source is unchanged; the compiled kernel's parameter block changes (a pointer
+and an extent per slab), and from that commit on the kernel the entry compiles on a device is the rendering the functional module pins,
+byte for byte, whatever the first call's row count is.  The functional module gains three cases (147): the declared extents of the
+entry's views, the entry's own launch arguments compiled against the pinned rendering, and an entry on a device that is not the caller's
+current one (needs two CUDA devices).  The determinism suite and both golden sets are unchanged.  Re-run from a clean tree at that
+commit with the three commands above, in the runtimes above:
+
+- cc 10.3 (the GB300 runtime, one visible device), CuTe DSL 4.8.0 compiling with CUDA 13.4: 149 passed, 1 skipped (the two-device case:
+  "needs two CUDA devices" -- not covered on cc 10.3); 35 passed, 0 skipped against the unchanged set in `6451c9d94a2d4210/`; 1 passed.
+- the same part with the CUDA 12.9 compiler flavour of 4.8.0: 148 passed, 2 skipped (the `sm_107a` rendering case, as before, and the
+  two-device case); 35 passed, 0 skipped against the same set; 1 passed.
+- cc 10.7 (the VR200-class runtime) with TWO devices visible, CuTe DSL 4.8.0 compiling with CUDA 13.4: 150 passed, 0 skipped -- the
+  two-device case ran there: first call, warm calls with both output owners and a side stream of the entry's device, the bytes of the
+  same call made with that device current, the caller's device unchanged; 35 passed, 0 skipped against the unchanged set in
+  `d2a97fcefba4b867/`; 1 passed.
+- CuTe DSL 4.8.1 at that commit: cold compile only, on an x86 host (cc 8.0 device: every device case skips), both compiler flavours --
+  65 passed with CUDA 13.4, 64 passed and the `sm_107a` rendering case skipped with CUDA 12.9; the three rendering cases and the
+  launch-argument case are among them.  The 4.8.1 device runs recorded above predate that commit and were not repeated.
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
