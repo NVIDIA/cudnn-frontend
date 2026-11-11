@@ -554,6 +554,14 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
         (tmp_path / "folder").mkdir(exist_ok=True)
         for arguments in (model, []):  # with a checkpoint and for the default run
             assert last(arguments + ["--dump-tokens", str(target)]) == (1, f"[00] ERROR --dump-tokens {target.name}: cannot be written there")
+        # the same file after a run, had the check before the run passed: the reason, with the file's own name
+        assert sample._dump(str(target), "fe-cublas", []) in (
+            f"--dump-tokens {target.name}: No such file or directory",
+            f"--dump-tokens {target.name}: Is a directory",
+        )
+    assert sample._dump(str(tmp_path / "ids.json"), "fe-cublas", [{"sequences": 1, "prompt": 0, "prompt_ids": [1, 2], "ids": [[3]]}]) == ""
+    written = json.loads((tmp_path / "ids.json").read_text())
+    assert written["stack"] == "fe-cublas" and written["greedy"] is True and written["runs"][0]["ids"] == [[3]]
 
     (directory / "generation_config.json").write_text("{not json")
     code, line = last(model)

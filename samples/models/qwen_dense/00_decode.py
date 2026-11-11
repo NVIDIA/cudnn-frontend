@@ -60,6 +60,17 @@ def _reason(error) -> str:
     return str(error)
 
 
+def _dump(path: str, stack: str, runs: list) -> str:
+    """Write the prompt ids and the produced ids of a run as JSON.  Returns "" or, where the file cannot be written after
+    all (the check before the run passed: a full disk, a folder that went away), the reason with the file's own name."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"sample": "qwen_dense/00_decode", "stack": stack, "greedy": True, "runs": runs}, f)
+    except OSError as error:
+        return f"--dump-tokens {os.path.basename(os.path.normpath(path))}: {error.strerror or type(error).__name__}"
+    return ""
+
+
 def _arguments(argv):
     parser = argparse.ArgumentParser(
         description="Plain decode of the dense Qwen model: the reduced seeded model (self-checking), or a checkpoint from local disk."
@@ -312,14 +323,9 @@ def main(argv=None) -> int:
             print(
                 f"{TAG} first launch of {name}, device memory outside PyTorch's pool: {forms} (measured in this process, other processes' changes included; {allowed})"
             )
-    unwritten = ""
-    if args.dump_tokens:
-        try:
-            with open(args.dump_tokens, "w", encoding="utf-8") as f:
-                json.dump({"sample": "qwen_dense/00_decode", "stack": args.stack, "greedy": True, "runs": dumped}, f)
-            print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
-        except OSError as error:
-            unwritten = f"--dump-tokens {_reason(error)}"
+    unwritten = _dump(args.dump_tokens, args.stack, dumped) if args.dump_tokens else ""
+    if args.dump_tokens and not unwritten:
+        print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
     if real:
         print(f"{TAG} checkpoint weights, greedy decoding; ids hash {digest.hexdigest()[:12]}")
     else:
