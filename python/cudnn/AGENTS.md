@@ -848,8 +848,14 @@ anything releases that stage, and prove the order in the compiled kernel.**
   undefined behaviour (the arrive lands on another word of shared memory):
   the host passes the literal 0 and nothing in the kernel tests for it.
 - **Tensor memory.** A value read from tensor memory (`tcgen05.ld`) whose
-  slot the release frees follows the same order. That case is unmeasured; do
-  not read this rule as an exemption for it.
+  slot the release frees follows the same order, as a precaution: keep the
+  load's `tcgen05.wait::ld` and the first read of its registers in front of
+  the release. Test kernels that left such a load unread across the release
+  of its accumulator returned no wrong value on compute capability 10.0, 10.3
+  and 10.7 (more than 12 million launches per class), for one load form and
+  for a slot overwritten by the same thread block's next MMA chain. A slot
+  rewritten by another thread block, by `tcgen05.st` or after a deallocation
+  was not measured. Do not read this rule as an exemption for tensor memory.
 - **Scope.** The rule applies to new and changed release sites. Existing
   sites move onto the helper in follow-up changes; until a site has moved,
   its release arrive, fence or named barrier stays.
