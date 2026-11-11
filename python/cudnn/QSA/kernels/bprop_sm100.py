@@ -68,9 +68,7 @@ Q_BYTES = 4 * QSLAB  # [4 slabs][24 rows x 128 B] with SW128: rows 0-11 are KV h
 OFF_K = 0
 GAP01 = 1024  # the zero pad between stages 0 and 1
 GAP12 = Q_BYTES  # dO sits between stages 1 and 2
-# dS^T as [row groups][3 column chunks][8 rows x 16 B], the MN-major B operand of dQ^T. One KV head needs two row groups
-# per slot (rows 4-7 of each stay zero and mask the other query's tokens that share the K^T atom).
-DS_BYTES = 2 * CHB * 384  # one bf16 part of dS^T
+DS_BYTES = CHB * 384  # one bf16 part of dS^T, the B operand of dQ^T: 8 key rows x 48 B per slot, rows in the key order of the K^T columns
 
 
 def _bf16_parts(x, n, parts):
@@ -108,11 +106,12 @@ def _query_layout(parts):
 
 
 # tensor memory columns of the query-major kernel
-TM_S = 0  # S^T, double buffered at a 64-column pitch
-TM_DP = 32  # dP^T, interleaved with S^T
-TM_DQ = 128  # dQ^T halves at 128 and 160
-TM_KA = 192  # the chunk's K tile as the TMEM A operand of S^T (128 columns of packed bf16 pairs)
-TM_VA = 320  # the chunk's V tile as the TMEM A operand of dP^T
+TM_S = 0  # S^T, double buffered at a 48-column pitch
+TM_DP = 24  # dP^T, interleaved with S^T
+TM_DQ = 96  # dQ^T halves at 96 and 128
+TM_KA = 160  # the chunk's K tile as the TMEM A operand of S^T (128 columns of packed bf16 pairs)
+TM_VA = 288  # the chunk's V tile as the TMEM A operand of dP^T
+TM_KT = 416  # the chunk's K tile transposed (lane = dim of a half, column = packed key pair), the A operand of dQ^T
 TM_COLS = 512
 L2_EVICT_FIRST = 0x12F0000000000000  # createpolicy encoding of the L2 evict-first priority
 
@@ -326,6 +325,8 @@ def qsa_bwd_sparse_query_kernel(
     b_kte = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     b_vtf = cutlass.Array(cutlass.Int64, 4, space=cutlass.AddressSpace.smem, alignment=8)
     b_vte = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    b_kzf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)  # softmax -> copy warps: K rows final, nonfinite ones zeroed
+    b_ktrf = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)  # copy warps -> dQ warp: the chunk's K^T is in TMEM
     tmem_slot = cutlass.Array(I32, 1, space=cutlass.AddressSpace.smem, alignment=4)
 
     # zero the whole operand region once, so padding rows and stale rows stay finite
@@ -344,7 +345,7 @@ def qsa_bwd_sparse_query_kernel(
             prims.mbarrier_init(b_qe, 1)
             for s in cutlass.range_constexpr(NKS):
                 prims.mbarrier_init(b_kf.subview(s), 1)
-                prims.mbarrier_init(b_ke.subview(s), 1)
+                prims.mbarrier_init(b_ke.subview(s), 8)
             for s in cutlass.range_constexpr(2):
                 prims.mbarrier_init(b_pf.subview(s), 4)
             prims.mbarrier_init(b_sf.subview(0), 1)
@@ -361,6 +362,9 @@ def qsa_bwd_sparse_query_kernel(
                 prims.mbarrier_init(b_vtf.subview(s), 8)
             prims.mbarrier_init(b_kte, 1)
             prims.mbarrier_init(b_vte, 1)
+            for s in cutlass.range_constexpr(2):
+                prims.mbarrier_init(b_kzf.subview(s), 4)
+                prims.mbarrier_init(b_ktrf.subview(s), 8)
     if warp == 2:
         prims.tcgen05_alloc(tmem_slot, TM_COLS, group="cta_1")
         prims.tcgen05_relinquish_alloc_permit(group="cta_1")
@@ -552,7 +556,7 @@ def qsa_bwd_sparse_query_kernel(
                                                 prims.tcgen05_mma(
                                                     prims.Tcgen05MMAKind.F16,
                                                     prims.CTAGroup.CTA_1,
-                                                    prims.make_tmem_ptr(tmem_raw + (TM_S + (cgc & 1) * 64), F32),
+                                                    prims.make_tmem_ptr(tmem_raw + (TM_S + (cgc & 1) * 48), F32),
                                                     prims.make_tmem_ptr(tmem_raw + (TM_KA + sl4 * 32 + k4 * 8), BF16),
                                                     d_q_kmaj.advance_start_address(sl4 * QSLAB + k4 * 32),
                                                     idesc_s,
@@ -572,7 +576,7 @@ def qsa_bwd_sparse_query_kernel(
                                                 prims.tcgen05_mma(
                                                     prims.Tcgen05MMAKind.F16,
                                                     prims.CTAGroup.CTA_1,
-                                                    prims.make_tmem_ptr(tmem_raw + (TM_DP + (cgc & 1) * 64), F32),
+                                                    prims.make_tmem_ptr(tmem_raw + (TM_DP + (cgc & 1) * 48), F32),
                                                     prims.make_tmem_ptr(tmem_raw + (TM_VA + sl4 * 32 + k4 * 8), BF16),
                                                     d_do_kmaj.advance_start_address(sl4 * QSLAB + k4 * 32),
                                                     idesc_s,
@@ -596,15 +600,11 @@ def qsa_bwd_sparse_query_kernel(
                 b_dtype=BF16,
                 n_dim=24,
                 m_dim=128,
-                a_major=1,
+                a_major=0,
                 b_major=1,
             )
-            # K tile read as K^T (MN-major SW128) and dS^T (MN-major, no swizzle), as in warp 2. With one KV head a
-            # K-step is one slot, whose atoms each hold 4 alien rows of the next slab (zero dS^T rows), 512 B apart.
-            if cutlass.const_expr(PAIR):
-                d_k_mn3 = _desc(sbase + OFF_K // 4, 512, HALF_BLK, prims.Tcgen05SmemSwizzle.SWIZZLE_128B)
-            else:
-                d_k_mn3 = _desc(sbase + OFF_K // 4, SLAB, BLK_SMEM, prims.Tcgen05SmemSwizzle.SWIZZLE_128B)
+            # A = K^T(c) from TMEM (transposed there by the copy warps), B = the dS^T parts in SMEM. A K-step covers the
+            # 16 keys of two slots.
             d_ds_mn3 = _desc(sbase + OFF_DS // 4, 384, 128, prims.Tcgen05SmemSwizzle.NONE)
             gc = I32(0)
             nq = I32(0)
@@ -618,10 +618,10 @@ def qsa_bwd_sparse_query_kernel(
                         for c in cutlass.range(nchunks, unroll=1):
                             cgb = gc + c
                             pb = cgb & 1
-                            kb = cgb % NKS
                             nv3 = _chunk_valid(nblk, c)
-                            # softmax(c) has written dS^T to SMEM
+                            # softmax(c) has written dS^T to SMEM and warps 8-15 K^T(c) to TMEM
                             _wait(b_pf.subview(pb), (cgb >> 1) & 1)
+                            _wait(b_ktrf.subview(pb), (cgb >> 1) & 1)
                             prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                             if c == 0:
@@ -629,32 +629,23 @@ def qsa_bwd_sparse_query_kernel(
                                 _wait(b_dqe, (nq & 1) ^ 1)
                                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                             acc_q = c > 0  # the first chunk of an item initialises the dQ accumulator
-                            dk_mn = d_k_mn3.advance_start_address(_koff(kb))
-                            # K-steps over the chunk's valid slots only
-                            if cutlass.const_expr(PAIR):
-                                nkk = nv3
-                            else:
-                                nkk = (nv3 + 1) >> 1
+                            # K-steps over the chunk's valid slots only, two slots per step
+                            nkk = (nv3 + 1) >> 1
                             # one pass per bf16 part of dS^T
                             for hh in cutlass.range_constexpr(2):
                                 for part in cutlass.range_constexpr(DQ_PARTS):
                                     for kk in cutlass.range(nkk, unroll=1):
-                                        if cutlass.const_expr(PAIR):
-                                            a_k = dk_mn.advance_start_address(hh * 2 * 512 + kk * BLK_SMEM)
-                                        else:
-                                            a_k = dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM)
                                         if prims.elect_sync():
                                             prims.tcgen05_mma(
                                                 prims.Tcgen05MMAKind.F16,
                                                 prims.CTAGroup.CTA_1,
                                                 prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
-                                                a_k,
+                                                prims.make_tmem_ptr(tmem_raw + (TM_KT + hh * 48 + kk * 8), BF16),
                                                 d_ds_mn3.advance_start_address(part * DS_BYTES + kk * 768),
                                                 idesc_q3,
                                                 acc_q | (part > 0) | (kk > 0),
                                             )
                             if prims.elect_sync():
-                                prims.tcgen05_commit(b_ke.subview(kb), group=prims.CTAGroup.CTA_1)
                                 prims.tcgen05_commit(b_dsf, group=prims.CTAGroup.CTA_1)
                                 if c == nchunks - 1:
                                     prims.tcgen05_commit(b_dqf, group=prims.CTAGroup.CTA_1)
@@ -677,7 +668,7 @@ def qsa_bwd_sparse_query_kernel(
         gc = I32(0)
         nq = I32(0)
         if cutlass.const_expr(PAIR):
-            ds_off = (OFF_DS + (2 * jrow + hrow) * 384 + trow * 16) // 4
+            ds_off = (OFF_DS + jrow * 384 + (hrow * 4 + trow) * 16) // 4
         else:
             ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
         for pp in cutlass.range(NP, unroll=1):
@@ -724,8 +715,8 @@ def qsa_bwd_sparse_query_kernel(
                         st = cgc & 1
                         _wait(b_sf.subview(cgc & 1), (cgc >> 1) & 1)
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                        t_s = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_S + (cgc & 1) * 64).as_ptr(F32)
-                        t_dp = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_DP + (cgc & 1) * 64).as_ptr(F32)
+                        t_s = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_S + (cgc & 1) * 48).as_ptr(F32)
+                        t_dp = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_DP + (cgc & 1) * 48).as_ptr(F32)
                         sv = prims.tcgen05_ld("32x32b", t_s, num=32)
                         dpv = prims.tcgen05_ld("32x32b", t_dp, num=32)
                         prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
@@ -754,12 +745,8 @@ def qsa_bwd_sparse_query_kernel(
                         # a nonfinite K row makes every head's score nonfinite, so one head tells
                         bad = valid & (~cute.math.isfinite(score_v[0]))
                         if cute.arch.vote_any_sync(bad):
-                            # The dQ^T MMA reads this token's K row from SMEM: zero it when its K is nonfinite, so
-                            # nothing nonfinite reaches the paired query through the zero dS^T rows (a masked finite
-                            # row contributes 0 x finite). S^T read the TMEM copy, so the selecting query is still
-                            # poisoned. Rows a slot keeps from an earlier chunk were zeroed the same way back then or
-                            # are finite. The dS publish below fences and releases these stores. The warp vote keeps
-                            # the branch uniform on the hot path.
+                            # Zero a nonfinite K row before the copy warps transpose it into the dQ^T operand: the paired query then sees
+                            # 0 x finite, while S^T already read the TMEM copy and keeps the selecting query poisoned.
                             if bad:
                                 st_k = cgc % NKS
                                 if cutlass.const_expr(PAIR):
@@ -772,6 +759,10 @@ def qsa_bwd_sparse_query_kernel(
                                     for s4 in cutlass.range_constexpr(4):
                                         for u in cutlass.range_constexpr(8):
                                             (krow + (s4 * SLAB) // 4 + u * 4).store(zero4, alignment=16)
+                        # the K rows of the chunk are final: warps 8-15 may transpose them into TMEM
+                        prims.bar_warp_sync(0xFFFFFFFF)
+                        if prims.elect_sync():
+                            prims.mbarrier_arrive(b_kzf.subview(cgc & 1))
                         valid = valid & (tk >= lo_q) & (tk <= hi_q)
                         prob_v = zero12
                         ds_v = zero12
@@ -891,7 +882,24 @@ def qsa_bwd_sparse_query_kernel(
             yr = r & 7
             roff = (OFF_K + (r >> 3) * BLK_SMEM + yr * 128) // 4
             slab_w = SLAB // 4
-        # zero every quadrant's K / V operand rows once, so rows a chunk does not copy keep finite data
+        # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3. Tiles 0 / 1 take the keys 4p + {0, 1} and tiles 2 / 3
+        # the keys 4p + {2, 3} of a 16-key K-step at this warp's dim chunks, so one fragment is one 16x256b store in key order.
+        ldm_tile = lane >> 3
+        ldm_row = lane & 7
+        kstep_row = 4 * (ldm_row >> 1) + 2 * (ldm_tile & 1) + (ldm_row & 1)
+        dim_slab = 2 * hh + (qd >> 1)
+        ldm_off = []
+        for half in cutlass.range_constexpr(2):
+            dim_chunk = (qd & 1) * 4 + half * 2 + (ldm_tile >> 1)
+            if cutlass.const_expr(PAIR):
+                row_phase = (kstep_row & 3) + 4 * (dim_slab & 1)
+                row_off = (
+                    (kstep_row >> 3) * BLK_SMEM + ((kstep_row >> 2) & 1) * HALF_BLK + dim_slab * 512 + (kstep_row & 3) * 128 + ((dim_chunk ^ row_phase) << 4)
+                )
+            else:
+                row_off = (kstep_row >> 3) * BLK_SMEM + dim_slab * SLAB + (kstep_row & 7) * 128 + ((dim_chunk ^ (kstep_row & 7)) << 4)
+            ldm_off.append(row_off // 4)
+        # zero every quadrant's K / V / K^T operand rows once, so rows a chunk does not copy keep finite data
         zw = []
         for e in cutlass.range_constexpr(16):
             zw.append(I32(0))
@@ -902,6 +910,12 @@ def qsa_bwd_sparse_query_kernel(
                     prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + zb * 128 + sl4 * 32 + hh * 16).as_ptr(I32),
                     cutlass.Vector.from_elements(zw, I32),
                 )
+        for z3 in cutlass.range_constexpr(3):
+            prims.tcgen05_st(
+                "32x32b",
+                prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KT + hh * 48 + z3 * 16).as_ptr(I32),
+                cutlass.Vector.from_elements(zw, I32),
+            )
         prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
         gc = I32(0)
         for pp in cutlass.range(NP, unroll=1):
@@ -990,6 +1004,27 @@ def qsa_bwd_sparse_query_kernel(
                                     prims.mbarrier_arrive(b_vtf.subview(1))
                         if prims.elect_sync():
                             prims.mbarrier_arrive(b_ve)
+                        # K^T(c): the chunk's K rows transposed into the TMEM A operand of dQ^T once softmax(c) has
+                        # zeroed its nonfinite rows in SMEM and dQ(c-1) has finished reading the previous K^T. The K
+                        # SMEM stage is free after this copy.
+                        _wait(b_kzf.subview(cgc & 1), (cgc >> 1) & 1)
+                        _wait(b_dsf, (cgc & 1) ^ 1)
+                        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                        kbase = sbase + (OFF_K + _koff(st)) // 4
+                        for kk in cutlass.range_constexpr(CHB // 2):
+                            for half in cutlass.range_constexpr(2):
+                                frag = prims.ldmatrix(kbase + ((kk * 2 * BLK_SMEM) // 4 + ldm_off[half]), 4, prims.MMALayout.COL)
+                                prims.tcgen05_st(
+                                    "16x256b",
+                                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32 + half * 16, tmem_col0 + TM_KT + hh * 48 + kk * 8).as_ptr(I32),
+                                    frag,
+                                )
+                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                        prims.bar_warp_sync(0xFFFFFFFF)
+                        if prims.elect_sync():
+                            prims.mbarrier_arrive(b_ktrf.subview(cgc & 1))
+                            prims.mbarrier_arrive(b_ke.subview(st))
                     gc = gc + nchunks
 
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
