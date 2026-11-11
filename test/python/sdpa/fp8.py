@@ -1129,7 +1129,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if not perf and generate_stats and origins:
         stats_ref_physical = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q, origins=origins.get("stats"))
         torch.testing.assert_close(stats_gpu, stats_ref_physical, atol=2e-2, rtol=2e-2, equal_nan=True)
-    if not perf and generate_stats and is_ragged and is_paged:
+    if not perf and generate_stats and is_ragged and is_paged and not origins:
         # Packed Stats follow Q's live token prefix; the page pools remain dense.
         # Check them before Amax_O, whose known backend defect can xfail its check.
         stats_ref_packed = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
