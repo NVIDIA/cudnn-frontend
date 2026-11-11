@@ -212,6 +212,22 @@ def _training_graph_pattern(
             physical_recv_pool_size=128,
             combine_format="bf16",
         )
+    if name == "smoke_h256":
+        # The smallest workload FC2 bulk store accepts (hidden_size % 256 == 0),
+        # valid at any EP size: rank r routes each token to ranks r .. r+top_k-1.
+        top_k = min(8, 2 * world_size)
+        max_tokens_per_rank = 128
+        return _TrainingGraphPattern(
+            name=name,
+            num_experts=2 * world_size,
+            hidden_size=256,
+            intermediate_size=256,
+            top_k=top_k,
+            max_tokens_per_rank=max_tokens_per_rank,
+            # Room for every route on one rank plus per-expert padding: never overflows.
+            physical_recv_pool_size=world_size * max_tokens_per_rank * top_k + 2 * 128,
+            combine_format="bf16",
+        )
     if name == "ds3_ep4_pattern":
         if world_size != 4:
             raise ValueError("ds3_ep4_pattern training graph pattern requires world_size=4, " f"got {world_size}")
@@ -225,7 +241,7 @@ def _training_graph_pattern(
             physical_recv_pool_size=131968,
             combine_format="mxfp8",
         )
-    raise ValueError("training graph pattern must be 'smoke' or 'ds3_ep4_pattern', " f"got {name!r}")
+    raise ValueError("training graph pattern must be 'smoke', 'smoke_h256' or 'ds3_ep4_pattern', " f"got {name!r}")
 
 
 def _constant_mxfp8(

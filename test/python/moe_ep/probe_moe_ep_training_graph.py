@@ -37,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pattern",
-        choices=("smoke", "ds3_ep4_pattern"),
+        choices=("smoke", "smoke_h256", "ds3_ep4_pattern"),
         default="smoke",
     )
     parser.add_argument(
