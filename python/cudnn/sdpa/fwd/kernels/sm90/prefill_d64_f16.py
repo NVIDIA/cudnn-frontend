@@ -319,7 +319,11 @@ class SM90FusedMultiHeadAttentionForward(_HopperForward):
         seq_q_lens,
         seq_kv_lens,
         scale: cutlass.Float32,
+        block_table=None,
+        block_table_v=None,
     ):
+        if cutlass.const_expr(block_table is not None or block_table_v is not None):
+            raise ValueError("native SM90 D64 paging uses the D128 body")
         sQ_raw = cutlass.Array(self.storage_dtype, 4096, alignment=1024, space=cutlass.AddressSpace.smem)
         sK_raw = cutlass.Array(self.storage_dtype, 4096, alignment=1024, space=cutlass.AddressSpace.smem)
         sVO_raw = cutlass.Array(self.storage_dtype, 4096, alignment=1024, space=cutlass.AddressSpace.smem)

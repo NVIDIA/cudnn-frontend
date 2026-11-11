@@ -1311,3 +1311,16 @@ def test_square_causal_places_the_same_from_either_corner():
     for over in (dict(paged_d512, s_q=2048, s_kv=2048), dict(paged_d512, s_q=8192, s_kv=8192), dict(h_q=32, h_kv=2, s_q=4096, s_kv=4096)):
         assert place(bottom_right=False, **over) == place(bottom_right=True, **over), over
     assert place(bottom_right=False, s_q=8192, s_kv=8192, **paged_d512) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 5, 1024])
+def test_sm90_paged_d512_stays_backend_first(s_q):
+    """The SM90 row's d512 lead was measured on dense K/V only. Paged K/V reaches the row now, unmeasured, so a sink-free paged
+    d512 graph keeps the backend first while its dense twin still leads."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    shape = dict(b=64, h_q=8, h_kv=2, s_q=s_q, s_kv=4096, d_qk=512, d_v=512, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132)
+    assert placement.place(spec, _facts(**shape)) == placement.LEAD
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == placement.TRAIL

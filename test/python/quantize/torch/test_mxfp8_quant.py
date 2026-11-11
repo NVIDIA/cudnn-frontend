@@ -206,3 +206,38 @@ def test_te_parity(fp8):
     tex.swizzle_scales_for_gemm_(r)
     assert torch.equal(r._rowwise_scale_inv.view(torch.uint8).flatten(), swizzle_sf_rowwise(re).flatten()), "rowwise swizzle mismatch vs TE"
     assert torch.equal(r._columnwise_scale_inv.view(torch.uint8).flatten(), swizzle_sf_columnwise(ce).flatten()), "columnwise swizzle mismatch vs TE"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dim,tokens", [(128, 17), (128, 147), (512, 17), (512, 147)])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_thd_columnwise_sf_matches_independent_atoms(dim, tokens, dtype):
+    """Both THD fixtures preserve independently quantized head/tile scale bytes."""
+    from sdpa.mxfp8 import _quantize_seq as graph_quantize
+    from sdpa.frost.mxfp8_test_reference import _quantize_seq as frost_quantize
+    from sdpa.mxfp8_quant import pack_thd_columnwise_sf
+
+    heads = 2
+    rng = torch.Generator().manual_seed(2459)
+    values = torch.randn(1, heads, tokens, dim, generator=rng)
+    exponents = torch.arange(heads).view(1, heads, 1, 1) * 3 + torch.arange(tokens).view(1, 1, tokens, 1) // 32
+    values *= torch.pow(2.0, exponents.float())
+    full = quantize_to_mxfp8(values, 1, heads, tokens, dim, fp8_dtype=dtype)
+    expected = []
+    for head in range(heads):
+        pieces = []
+        for start in range(0, tokens, 128):
+            atom = values[:, head:head + 1, start:start + 128]
+            isolated = quantize_to_mxfp8(atom, 1, 1, atom.shape[2], dim, fp8_dtype=dtype)
+            pieces.append(isolated[5].view(torch.uint8).reshape(-1))
+        expected.append(torch.stack(pieces))
+    expected = torch.stack(expected)
+    assert torch.equal(pack_thd_columnwise_sf(full[5], heads, tokens, dim), expected)
+    assert torch.equal(full[5].view(torch.uint8).reshape_as(expected), expected) == (dim == 128)
+    for actual in (
+        graph_quantize(values, heads, tokens, dim, dtype, 32, columnwise=True),
+        frost_quantize(values, heads, tokens, dim, dtype, columnwise=True),
+    ):
+        assert torch.equal(actual[0].view(torch.uint8), full[3].view(torch.uint8))
+        assert torch.equal(actual[1].reshape_as(full[4]), full[4])
+        assert torch.equal(actual[2], expected)

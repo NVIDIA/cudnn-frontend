@@ -82,6 +82,7 @@ arbitrary user callbacks.
 | FROST native D64 dense/THD paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
@@ -361,6 +362,8 @@ include padding, a bottom-right causal window and sinks. This is fixed-plan,
 fixed-runtime forward qualification; THD batch invariance and backward remain
 outside this addition.
 
+
+
 ## SM120 FP8 and MXFP8 forward tails
 
 Native per-tensor FP8 and block-scaled MXFP8 forward preserve per-sequence
@@ -379,68 +382,6 @@ and synccheck coverage, including separate multi-tile THD cases. This evidence
 does not establish SM121 or cross-runtime bit identity, independent physical
 THD origins for quantized inputs, or backward behavior.
 
-## SM120 packed backward
-
-The native FP16/BF16 THD backward path through D256/GQA retains unordered
-FP32 dQ atomic accumulation. General deterministic backward and batch
-invariance are unsupported by this path; deterministic-mode graphs decline.
-The bounded single-KV-tile test compares dQ/dK/dV bytes across replays,
-fresh storage, duplicated/reordered batches and changed-neighbor capture.
-That limited coverage passes on SM121 (GB10); SM120 remains unverified.
-It does not extend the deterministic contract to multiple KV tiles. This change adds
-no forward kernel.
-
-## SM120 per-tensor FP8 backward
-
-The native E4M3 backward engine assigns each gradient row and column partition
-to one fixed query/key owner. Key owners visit GQA heads in ascending order;
-there are no gradient atomic reductions. The bounded SM121 (GB10) suite
-preserves dQ/dK/dV and all four amax outputs across repeated execution, fresh
-storage, duplicated/reordered batches of 1, 3, 4 and 129 members, and changed
-input capture replay. Six runtime-keyed goldens cover D192 and D512 with
-E4M3, FP16 and BF16 gradients. Scalar scales and input payloads remain fixed
-for batch comparisons. This qualifies the tested runtime and dense BSHD
-contract; SM120 hardware, MXFP8, THD and cross-runtime bit identity remain
-unverified.
-
-
-## SM120 MXFP8 backward
-
-The native block-scaled backward engine uses fixed query/key owners and
-fixed-order GQA accumulation. Canonical rowwise and columnwise scale atoms
-are read from current device storage, without a global scale repack.
-The bounded GB10 SM121 checks preserve dQ/dK/dV bytes across replays,
-fresh storage, duplicated/reordered batches of 1, 3, 4 and 129 members,
-and changed-payload capture. Captured execution also observes changed
-scale bytes. Four runtime goldens cover D128/D512 with FP16/BF16 gradients.
-The graph may independently request FP32 `amax_dQ`, `amax_dK` and `amax_dV`.
-Each is the global maximum absolute FP32 gradient accumulator before conversion
-to FP16/BF16. Initialization shares the delta launch; the gradient epilogue
-reduces only requested outputs. This adds no gradient atomic reduction.
-For fixed inputs, optional amax outputs preserve gradient bytes. Across batch
-reordering and duplication, global amax equals the maximum of the corresponding
-singleton values; adding different sequences can change that global value.
-This evidence keeps quantized payloads and scale bytes fixed across batch
-comparisons; it does not qualify cross-runtime identity, SM120 execution,
-THD or unsupported masks.
-
-## SM120 wide half backward
-
-For eight-aligned `256 < D_QK <= 512` and `0 < D_V <= D_QK`, the native
-FP16/BF16 backward path supports `use_deterministic_algorithm=True` on the
-FE graph (`deterministic=True` on the standalone adapter). A fixed-order
-relay orders dQ accumulation independently for each gradient-column partition;
-dK/dV have fixed output owners. Dense and THD layouts, MHA/GQA/MQA,
-padding, top-left/bottom-right causal masks and left/right windows are
-supported; bias and sink are outside this wide path.
-
-The measured D512 configurations preserve dQ/dK/dV raw bytes across repeat
-execution, fresh pointers, batch reordering/duplication and changed-neighbor
-CUDA Graph replay on SM121 (GB10). Independent native SM120 (RTX 5080)
-validation also covers the wide deterministic path. These are runtime-specific
-results; they do not guarantee bitwise identity across GPUs or software
-versions, or extend the generally unordered through-D256 THD path above.
-
 ## SM89 half backward
 
 On SM89 (Ada), `sdpa_bwd_sm89` runs the SM80 FP16/BF16 backward chain and
@@ -453,46 +394,3 @@ repeat execution preserves dQ/dK/dV raw bytes for dense and THD-with-origins
 graphs, and CUDA Graph replay after changing the input payload in place matches
 the reference. Batch reordering/duplication and cross-GPU identity are not
 covered by these checks.
-
-## SM120 D576 forward
-
-D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in
-the tested FP16/BF16 configurations on GB10 (SM121), including half-Q with
-FP8 E4M3/E5M2 paged KV. Split count and packing stay fixed across batch
-reordering, duplication and changed-neighbor capture replay. Compact THD
-repacking follows changed lengths; this earlier qualification covered compact
-origins only. Independent physical gaps on SM120 are covered below; their
-execution on SM121 and other runtimes remains unverified.
-This qualification adds no backward support.
-
-Native SM107 half D64/D128 single-sequence THD origin setup retains forward
-O/Stats byte and batch invariance on the qualified runtime. Independent
-physical origins, changed strides/addresses, empty and keyless replay and the
-runtime multi-sequence fallback, including one capacity-4096 plan alternating
-between single and multiple sequences through shape overrides, are covered by
-`test_sdpa_single_sequence_setup_sm107.py`. The setup optimization is limited
-to nonpaged, unsplit uniform FP16/BF16; other supported paths retain their
-existing setup. Measurement details and runtime goldens are in the coverage
-report. This adds no backward or cross-runtime byte guarantee.
-
-
-Native SM107 D512 split forward also retains exact O/Stats bytes with the
-coalesced partial-store path for packing groups32/64. FP16/BF16 tests hold the
-split count fixed while comparing replay, standalone requests, reordered and
-duplicated batches, changed neighbors, and changed-input CUDA Graph replay.
-Sixteen unchanged-parent runtime goldens cover the new cases and existing
-D512/D576 half/mixed controls; other runtimes remain unverified by this check.
-
-## SM120 half THD physical origins
-
-Native FP16/BF16 THD forward preserves O/Stats bytes across repeat execution,
-batch reordering, duplicated sequences, a sequence alone, changed neighbors,
-fresh pointers and retained CUDA Graph replay in the tested RTX PRO 6000
-configurations. Q/K/V/O/Stats each retain their own physical offset, pitch
-and capacity; token-major and head-major Stats are both covered. Tested
-head shapes are D64, D128, D192/V128, D256, D512 and D576/V512.
-
-These are fixed-runtime forward results with the selected plan held fixed.
-SM121 physical-gap execution, FP8/MXFP8 origins and backward are not qualified
-by this suite. See the coverage report for numerical, golden and sanitizer
-results; passing byte comparisons alone do not establish race freedom.

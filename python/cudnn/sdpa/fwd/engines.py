@@ -1668,7 +1668,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return facts.invalid
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
-    if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64):
+    if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
         why = native_d64_mismatch(
@@ -1686,6 +1686,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         )
         if why is not None:
             return why
+    if capabilities.sm_lo == 90 and facts.has_paged_kv:
+        if facts.thd:
+            return "SM90 paged KV currently requires dense Q"
     if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
@@ -2538,8 +2541,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(capabilities.paged_d_shapes))
                 return f"paged KV is wired on the {wired} kernel flavors only; head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
         p = facts.page_size
-        if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
-            return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
+        page_tile = 64 if capabilities.sm_lo == 90 else 128
+        if p % 8 != 0 or (p < page_tile and page_tile % p != 0) or (p > page_tile and p % page_tile != 0):
+            return f"page_size {p} must be a multiple of 8 that divides the {page_tile}-row KV tile or is a multiple of it"
 
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
@@ -3884,7 +3888,7 @@ def lower_dsl_prefill(
                         )
                     )
                 )
-                or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
+                or (facts.is_fp8 and (facts.has_paged_kv or (facts.d_qk, facts.d_v) == (128, 128)) and api.split_kv == 1)
             )
         )
         or (
@@ -3918,6 +3922,7 @@ def lower_dsl_prefill(
             and api.cga in (None, 2)
         )
         or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
+        or (facts.thd and spec.name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
@@ -4152,7 +4157,7 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
-        if facts.thd and ("sample_ragged_q" in _ctor_params or (spec.name == "sdpa_fwd_prefill_sm120" and getattr(api, "_thd_origin_specs", None) is not None)):
+        if facts.thd and ("sample_ragged_q" in _ctor_params or getattr(api, "_thd_origin_specs", None) is not None):
             for name in ("q", "k", "v", "o", "stats"):
                 offsets = getattr(binding, "ragged_" + name)
                 execute_kwargs["ragged_" + ("lse" if name == "stats" else name)] = (
@@ -4409,6 +4414,7 @@ def _sm90_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            paged_kv=True,
             padded_stats=True,
             sink=True,
             stats=True,
