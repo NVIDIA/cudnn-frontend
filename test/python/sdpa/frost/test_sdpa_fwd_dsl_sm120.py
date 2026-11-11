@@ -252,6 +252,7 @@ def _run_dsl_graph(
     return_stats: bool = False,
     stats_use_log2: bool = False,
     stats_layout: str = "contiguous",
+    explicit_plan: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
 
@@ -332,8 +333,18 @@ def _run_dsl_graph(
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A])
-    plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
+    if explicit_plan:
+        from cudnn.engines.manifest import engines_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        selected = next(engine for engine in engines_for(graph) if engine.name == engine_name(arch="sm120"))
+        knobs = SdpaFwdKnobs(cga=1, tile_m=q_tile, tile_n=kv_tile, sched_policy=0, split_kv=1, pack_gqa=pack_gqa)
+        graph.create_execution_plan(selected.engine_id, knobs)
+        graph.select_plan(0)
+        plan = graph.plans[0]
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Native dense plans have no dummy LSE scratch. Split plans add the
@@ -1682,7 +1693,7 @@ def test_dsl_sm120_pack_gqa_tile_q_not_divisible_features(mask: str):
 
 @pytest.mark.L0
 def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
-    """Every template packs any group up to the tile, and declines a group past it."""
+    """Every template packs groups up to its tile; wide half also packs larger subgroups."""
     _require_dsl()
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -1693,8 +1704,83 @@ def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
 
     for d, q_tile in ((128, 64), (256, 128), (512, 64)):
         assert api(24, 4, d, q_tile).check_support()
-        with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
-            api(2 * q_tile, 1, d, q_tile).check_support()
+        if d == 512:
+            assert api(2 * q_tile, 1, d, q_tile).check_support()
+            assert api(3 * q_tile, 2, d, q_tile).check_support()
+            with pytest.raises(ValueError, match="common subgroup"):
+                api(q_tile + 1, 1, d, q_tile).check_support()
+        else:
+            with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
+                api(2 * q_tile, 1, d, q_tile).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dq,dv,group", [(512, 512, 128), (512, 512, 96), (384, 320, 66), (576, 512, 128), (576, 512, 96)])
+@torch_fork_set_rng(seed=83417)
+def test_dsl_sm120_wide_partial_pack_dense(dtype, dq, dv, group):
+    """Subgroups preserve full KV-head sharing, causal positions, sinks and Stats."""
+    q = _bhsd(2, 2 * group, 3, dq, dtype)
+    k = _bhsd(2, 2, 65, dq, dtype)
+    v = _bhsd(2, 2, 65, dv, dtype)
+    sinks = torch.linspace(-0.5, 0.5, 2 * group, device="cuda").view(1, 2 * group, 1, 1)
+    out, stats = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=dq**-0.5,
+        is_causal=True,
+        causal_bottom_right=True,
+        sinks=sinks,
+        q_tile=64,
+        kv_tile=32,
+        pack_gqa=True,
+        return_stats=True,
+        explicit_plan=True,
+    )
+    qc, kc, vc = (t.cpu().double() for t in (q, k, v))
+    want = torch.empty(out.shape, dtype=torch.float64)
+    want_stats = torch.empty(stats.shape, dtype=torch.float64)
+    mask = torch.arange(65)[None, :] > torch.arange(3)[:, None] + 62
+    for batch in range(2):
+        for kv_head in range(2):
+            for first in range(kv_head * group, (kv_head + 1) * group, 16):
+                last = min(first + 16, (kv_head + 1) * group)
+                scores = (qc[batch, first:last].reshape(-1, dq) @ kc[batch, kv_head].T) * dq**-0.5
+                scores.masked_fill_(mask.repeat(last - first, 1), -torch.inf)
+                sink = sinks.flatten()[first:last].cpu().double().repeat_interleave(3).view(-1, 1)
+                full = torch.cat((scores, sink), dim=1)
+                want[batch, first:last] = (full.softmax(-1)[:, :65] @ vc[batch, kv_head]).reshape(last - first, 3, dv)
+                want_stats[batch, first:last] = full.logsumexp(-1).reshape(last - first, 3, 1)
+    torch.testing.assert_close(out.cpu().double(), want, atol=0.004, rtol=0.004)
+    torch.testing.assert_close(stats.cpu().double(), want_stats, atol=0.0006, rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group,split_kv", [(96, 1), (96, 3), (128, 1), (128, 3)])
+def test_dsl_sm120_wide_partial_pack_paged(dtype, group, split_kv, monkeypatch):
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_native_rebind_replay as run
+
+    run(
+        dtype,
+        2,
+        True,
+        False,
+        16,
+        monkeypatch,
+        dims=(512, 512),
+        h=2 * group,
+        sq=5,
+        tile_m=64,
+        tile_n=32,
+        packed=True,
+        split_kv=split_kv,
+        mask="br_swa",
+        sink=True,
+        explicit_plan=True,
+        capture_adapter=True,
+    )
 
 
 @pytest.mark.L0
