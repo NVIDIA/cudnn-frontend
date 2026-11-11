@@ -3889,7 +3889,7 @@ def lower_dsl_prefill(
                         )
                     )
                 )
-                or (facts.is_fp8 and (facts.has_paged_kv or (facts.d_qk, facts.d_v) == (128, 128)) and api.split_kv == 1)
+                or (facts.is_fp8 and (facts.has_paged_kv or (facts.d_qk, facts.d_v) in ((128, 128), (256, 256))) and api.split_kv == 1)
             )
         )
         or (
@@ -3921,6 +3921,46 @@ def lower_dsl_prefill(
             and not api.pack_gqa
             and api.split_kv == 1
             and api.cga in (None, 2)
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm107"
+            and api.flavor == (512, 512)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm107_fp8"
+            and api.flavor in ((128, 128), (192, 128), (256, 256), (512, 512))
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm107_mxfp8"
+            and api.flavor == (256, 256)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name in ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_prefill_sm100_mxfp8")
+            and api.flavor == (192, 128)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm100_mxfp8"
+            and api.flavor in ((128, 128), (256, 256), (512, 512))
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
         )
         or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
         or (facts.thd and spec.name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
