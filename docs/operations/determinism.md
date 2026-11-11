@@ -349,6 +349,14 @@ changed-neighbor CUDA Graph replay. The independent numerical checks include
 empty Q/KV, causal windows and attention sinks. SM121 and other runtimes
 remain unverified; this is forward-only qualification.
 
+SM120 wide-half packing also preserves O and Stats bytes for the tested
+D512/V512 and D576/V512 groups of 96 and 128 query heads per KV head on
+RTX PRO 6000. Dense and paged FP16/BF16 queries cover split counts 1 and 3;
+paged E4M3/E5M2 KV storage covers split count 3. These explicit-plan checks
+include repeat, reordered/duplicated/changed-neighbor batches and CUDA Graph
+replay. SM121 and other runtimes remain unverified; this is forward-only
+qualification and does not establish automatic candidate selection.
+
 The native paged path with half Q/O and FP8 E4M3/E5M2 K/V also preserves
 O and Stats bytes in the tested D64/D128/D256/D512 configurations on RTX5080.
 Quantized cache payloads and split/packing choices stay fixed across batch
