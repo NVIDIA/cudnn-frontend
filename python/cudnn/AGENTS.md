@@ -450,6 +450,50 @@ DSL satisfies your kernel.**
   `l2_hint=True` by name -- the decline states the defect as observed (never as a property of
   the compiler it found) and prescribes the cu13 flavour under a CUDA 13 driver, not a wheel
   number.
+  The `cutlass.cute.experimental` layer (`@cute.experimental.kernel` / `.jit` / `.compile`, the
+  IR-level `allocate` / `tma_load` / `dot` / `partition_and_copy` ops; the FP8 projection for
+  decode rows, `gemm/frost/projection_decode`) → 4.8.0. The DSL marks this layer deprecated in
+  favour of the unified decorators, so a version floor cannot promise it: the entry probes the
+  layer's names before it imports the kernel module and declines by name
+  (`fp8_projection_decode.DSL_LAYER`, `dsl_layer_error`). No version ceiling is set.
+- **Bind a DSL name that moved between releases through `cudnn._cutlass_compat`, never through
+  its old home.** DSL 4.8 keeps `cutlass.utils.LayoutEnum` (and the other moved names) as a
+  package-level alias that warns on every read and is announced for removal; a kernel body that
+  still reads it compiles today and raises `AttributeError` from inside the trace on the release
+  that drops it -- past the version gate, on every shape. The shim binds each name from its
+  owning module and falls back to the older home. Detectors:
+  `test_kernel_module_reads_no_deprecated_name_off_a_dsl_module` (host: every name the kernel
+  module imports from or reads off a DSL module resolves without a `DeprecationWarning` unless
+  the entry's probe names it) and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` (device: a real trace) in
+  `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py`; the pytest warnings
+  summary of a kernel suite shows the same reads by file and line.
+- **A kernel on the `cutlass.cute.experimental` layer reads TWO environment namespaces.** The
+  target check of `cutlass.utils.blackwell_helpers` reads `CUTE_DSL_ARCH`; the layer's own
+  lowering, dump and cache settings read `CUTE_EXPERIMENTAL_DSL_*`. A cross-target render
+  needs BOTH `CUTE_DSL_ARCH` and `CUTE_EXPERIMENTAL_DSL_ARCH`; `CUTE_DSL_KEEP` dumps nothing
+  for such a kernel -- use `CUTE_EXPERIMENTAL_DSL_KEEP=cubin,ptx` with
+  `CUTE_EXPERIMENTAL_DSL_DUMP_DIR` (and `CUTE_EXPERIMENTAL_DSL_NO_CACHE=1` for a real
+  compile). With only one of the two set the kernel traces for the host's part or is refused
+  by the helper. On 4.8.0 the unified spelling (`@cute.kernel(is_experimental=True)` on a
+  method, `@cute.jit(is_experimental=True)` on a module function) does not preprocess such a
+  kernel (a staged `if` is rejected as plain Python control flow; the jit function's code
+  object is rejected for its free variables), so the layer's own decorators stay and
+  `test_frost_kernel_name_prefix.py` recognises both spellings.
+- **A DSL that knows a target can be bound to a compiler that does not have it.**
+  `cutedsl_arch_requirement_error` checks that the DSL's `Arch` has `sm_107a`; it does not read
+  the compiler flavor. DSL 4.8.0 refuses a Rubin target on a compiler up to CUDA 13.3 from
+  inside the trace (`Unsupported GPU architecture 'sm_107a' with CUDA toolkit version ...`, an
+  internal DSL error), and a default install binds the CUDA 12.9 flavor even under a CUDA 13
+  driver. A kernel that admits cc 10.7 therefore also gates on `CUDA_VERSION` before JIT and
+  tests the decline (`fp8_projection_decode.DSL_COMPILER_FLOORS`, `dsl_compiler_error`; found by
+  running that entry's suites under the CUDA 12.9 flavor on a cc 10.7 part: 394 cells failed
+  inside the DSL before the gate existed).
+- **The PTX compiler's output depends on the kernel's symbol name.** Two renderings with
+  byte-identical PTX apart from the entry symbol can differ in SASS (other move idioms, another
+  block layout, a few instructions more or fewer): the cuDNN prefix of Rule 6 changes the
+  symbol, so "the same kernel" is established on the PTX, and a SASS-level comparison or a
+  static audit of the instruction order belongs to one rendering with its final symbol.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/python_tests/cutedsl.yml` in internal CI); a lane below your floor
@@ -921,7 +965,8 @@ python/cudnn/gemm/
 │   ├── compiler.py                 # facade for the active family's compiler
 │   ├── epilogue_codegen.py          # facade for the active family's codegen
 │   ├── kernel_templates/           # template code shared by architecture families
-│   └── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+│   ├── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+│   └── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
 └── ops/                            # backend-independent torch custom-op contracts
 ```
 
