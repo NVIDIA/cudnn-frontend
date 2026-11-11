@@ -961,6 +961,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
                 score_sum_exp_ref[i, :, m:, :] = 0
                 score_sum_exp_gpu[i, :, m:, :] = 0
 
+    # Inference has no gradient reference; the training branches below populate it.
+    dQ_ref = dK_ref = dV_ref = dBias_ref = dSink_token_ref = None
     if cfg.is_train:
         # Use the O the bwd kernel actually consumes for D = rowsum(dO * O): a separately
         # rounded o_ref shifts D, which injected negative-score rows amplify into dK/dQ.
