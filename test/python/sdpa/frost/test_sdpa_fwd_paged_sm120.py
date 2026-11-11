@@ -37,6 +37,7 @@ def _case(
     h=4,
     explicit_plan=False,
     kv_dtype=None,
+    independent_tables=False,
 ):
     torch.manual_seed(381)
     b, pages = 2, 3
@@ -66,6 +67,11 @@ def _case(
     if pool_capacity > 9:
         bufs["kt"][0, 0, 0, 0] = pool_capacity - 1
         bufs["vt"][0, 0, 0, 0] = pool_capacity - 1
+    if independent_tables:
+        kt = torch.empty((b, 1, pages * 2, 1), device="cuda", dtype=torch.int32)[:, :, ::2]
+        kt.copy_(bufs["kt"])
+        bufs["kt"] = kt
+        bufs["vt"] = bufs["vt"][:, 0, :, 0].t().contiguous().t()[:, None, :, None]
     # Only three rows of the final live page belong to request zero.
     bufs["k"][5, :, 3:].fill_(float("nan"))
     bufs["v"][6, :, 3:].fill_(float("nan"))
@@ -449,7 +455,7 @@ def test_sm120_frost_paged_widths(dtype, dims, mode, monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dims", [(64, 64), (120, 88)])
 @pytest.mark.parametrize("packed", [False, True])
-def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, tile_n=64, split_kv=1, kv_dtype=None):
+def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, tile_n=64, split_kv=1, kv_dtype=None, api_type=None, arch="sm120"):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
     from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 
@@ -512,7 +518,7 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
         t = buffers(order)
         b = len(order)
         if b not in plans:
-            api = SdpaFwdDslSm120(
+            api = (api_type or SdpaFwdDslSm120)(
                 t["q"],
                 k,
                 v,
@@ -536,8 +542,8 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
             )
             api.check_support()
             api.compile()
-            kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 else "prefill_f16.py")
-            assert api._k_mod.__file__.endswith("sm120/" + kernel_file)
+            kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
+            assert api._k_mod.__file__.endswith(arch + "/" + kernel_file)
             assert api._k_mod.PARAMS.split_kv == split_kv
             assert api._k_mod.PARAMS.page_size == page
             plans[b] = api
@@ -599,7 +605,7 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
     suffix = f"-decode{tile_m}-split{split_kv}" if tile_m in (16, 32) else (f"-d512-split{split_kv}" if min(dims) > 256 else "")
     if kv_dtype is not None:
         suffix += f"-kv{kv_dtype}"
-    assert_golden(f"sdpa-sm120-paged-d{d}v{dv}-{dtype}-pack{int(packed)}{suffix}", before, actual)
+    assert_golden(f"sdpa-{arch}-paged-d{d}v{dv}-{dtype}-pack{int(packed)}{suffix}", before, actual)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
