@@ -18,6 +18,7 @@ from .helpers import (
     time_execution,
     profile_execution,
     note_frost_routing,
+    ragged_live_rows,
 )
 from .mxfp8_ref import compute_ref, compute_ref_backward
 from .fp8 import BACKEND_AMAX_O_ISSUE, assert_amax_o, assert_close_fp8_grad, block_scaled_o_sf_dims, p_code_step
@@ -592,15 +593,15 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         pytest.skip("perf mode not wired for the mxfp8 THD path")
     if cfg.is_train:
         pytest.skip("MXFP8 SDPA not supported: no THD backward engine")
-    # THD mxfp8 is served only by the opt-in FROST engine
-    # (sdpa_fwd_prefill_sm100_mxfp8). The native backend passes check_support
+    # THD MXFP8 requires an offered FROST engine (some rows are default,
+    # while others remain opt-in). The native backend passes check_support
     # for these graphs but cannot execute them (NaN output at normal shapes,
     # device hang on sub-tile shapes) — skip rather than exercise that
     # known support gap. This only READS the FE feature flag; the suite never
     # sets environment variables.
-    import os
-    if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").strip().lower() not in ("1", "true", "yes", "on"):
-        pytest.skip("MXFP8 THD requires the opt-in FROST engine (set CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
+    major, minor = torch.cuda.get_device_capability()
+    if not _mxfp8_frost_row_offered(major * 10 + minor):
+        pytest.skip("MXFP8 THD requires an offered FROST engine (opt-in rows need CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
 
     b = cfg.batches
     h_q, h_k, h_v = cfg.h_q, cfg.h_k, cfg.h_v
@@ -632,6 +633,7 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     cudnn_otype = cudnn.data_type.HALF if torch_otype == torch.float16 else cudnn.data_type.BFLOAT16
 
     seq_len_q, seq_len_kv = list(cfg.seq_len_q), list(cfg.seq_len_kv)
+    origins = getattr(cfg, "ragged_origin_rows", None) or {}
     # All-zero sides are legal configs (t_q == 0: nothing to compute; t_kv == 0:
     # every live row is dead and must come back exact 0) — no skipping.
     t_q, t_kv = sum(seq_len_q), sum(seq_len_kv)
@@ -672,21 +674,26 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         dqq_seqs.append(dqq); dqk_seqs.append(dqk); dqv_seqs.append(dqv)
         sfq_seqs.append(sfq); sfk_seqs.append(sfk); sfv_seqs.append(sfv)
 
-    def _pack_tokens(x8_seqs, h, d, capacity_tokens, dt):
+    def _pack_tokens(x8_seqs, h, d, capacity_tokens, dt, rows=None):
         # [1,h,s,d] per sequence -> packed [T,h,d] tokens in a
         # capacity-tokens buffer whose tail is NaN-poisoned (GitHub #624).
         # With zero live tokens the whole buffer is poison — legal, since the
         # clamped descriptors must never read it.
         stor = torch.full((capacity_tokens * h * d,), float("nan"), device="cuda", dtype=torch.float32).to(dt)
+        if rows is not None:
+            for start, x in zip(rows, x8_seqs):
+                payload = x.squeeze(0).permute(1, 0, 2).reshape(-1)
+                stor[start * h * d : start * h * d + payload.numel()].copy_(payload)
+            return stor
         pieces = [x.squeeze(0).permute(1, 0, 2).reshape(-1) for x in x8_seqs if x.numel()]
         if pieces:
             packed = torch.cat(pieces)
             stor[: packed.numel()] = packed
         return stor
 
-    q_stor = _pack_tokens(q8_seqs, h_q, d_qk, max_t_q, torch_itype)
-    k_stor = _pack_tokens(k8_seqs, h_k, d_qk, max_t_kv, torch_itype)
-    v_stor = _pack_tokens(v8_seqs, h_v, d_vo, max_t_kv, torch_itype)
+    q_stor = _pack_tokens(q8_seqs, h_q, d_qk, max_t_q, torch_itype, origins.get("q"))
+    k_stor = _pack_tokens(k8_seqs, h_k, d_qk, max_t_kv, torch_itype, origins.get("k"))
+    v_stor = _pack_tokens(v8_seqs, h_v, d_vo, max_t_kv, torch_itype, origins.get("v"))
     # Packed SF: [h, total_tiles, tile_bytes] — per head, the sequences' tiles
     # in cu_seqlens order. The buffer is EXACTLY the packed layout (the engine
     # derives the packed tile extent from its byte size).
@@ -715,11 +722,11 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     seq_len_kv_gpu = torch.tensor(seq_len_kv, dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
     cu_q_gpu = torch.tensor(cu_q, dtype=torch.int32, device="cuda").view(b + 1, 1, 1, 1)
     cu_kv_gpu = torch.tensor(cu_kv, dtype=torch.int32, device="cuda").view(b + 1, 1, 1, 1)
-    ro_q = (torch.tensor(cu_q, dtype=torch.int64, device="cuda") * h_q * d_qk).view(b + 1, 1, 1, 1)
-    ro_k = (torch.tensor(cu_kv, dtype=torch.int64, device="cuda") * h_k * d_qk).view(b + 1, 1, 1, 1)
-    ro_v = (torch.tensor(cu_kv, dtype=torch.int64, device="cuda") * h_v * d_vo).view(b + 1, 1, 1, 1)
-    ro_o = (torch.tensor(cu_q, dtype=torch.int64, device="cuda") * h_q * d_vo).view(b + 1, 1, 1, 1)
-    ro_stats = (torch.tensor(cu_q, dtype=torch.int64, device="cuda") * h_q).view(b + 1, 1, 1, 1)
+    ro_q = (torch.tensor(origins.get("q", cu_q), dtype=torch.int64, device="cuda") * h_q * d_qk).view(b + 1, 1, 1, 1)
+    ro_k = (torch.tensor(origins.get("k", cu_kv), dtype=torch.int64, device="cuda") * h_k * d_qk).view(b + 1, 1, 1, 1)
+    ro_v = (torch.tensor(origins.get("v", cu_kv), dtype=torch.int64, device="cuda") * h_v * d_vo).view(b + 1, 1, 1, 1)
+    ro_o = (torch.tensor(origins.get("o", cu_q), dtype=torch.int64, device="cuda") * h_q * d_vo).view(b + 1, 1, 1, 1)
+    ro_stats = (torch.tensor(origins.get("stats", cu_q), dtype=torch.int64, device="cuda") * h_q).view(b + 1, 1, 1, 1)
 
     try:
         graph = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -791,6 +798,7 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        _apply_plan_pin(graph, cfg)
         graph.check_support()
         graph.build_plans()
         note_frost_routing(graph, label="mxfp8-fwd")
@@ -838,11 +846,17 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     # packed live tokens only (dead rows from zero-length KV must be exact 0,
     # their Stats are engine-conventional and skipped).
     err = 0
-    o_out = o_stor[: t_q * h_q * d_vo].reshape(t_q, h_q, d_vo)
-    lse_out = stats_stor[: t_q * h_q].reshape(t_q, h_q)
+    o_out = o_stor.reshape(max_t_q, h_q, d_vo)
+    lse_out = stats_stor.reshape(max_t_q, h_q)
+    live_o = ragged_live_rows(seq_len_q, max_t_q, origins.get("o"), device=o_out.device)
+    if origins:
+        live_stats = ragged_live_rows(seq_len_q, max_t_q, origins.get("stats"), device=lse_out.device)
+        assert torch.isnan(o_out[~live_o]).all(), "O wrote physical padding"
+        assert torch.isnan(lse_out[~live_stats]).all(), "Stats wrote physical padding"
     amax_ref = 0.0
     for i in range(b):
-        lo, hi = cu_q[i], cu_q[i + 1]
+        lo = origins.get("o", cu_q)[i]
+        hi = lo + seq_len_q[i]
         if lo == hi:
             continue
         o_rows = o_out[lo:hi]
@@ -865,11 +879,12 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         o_ref_rows = o_ref.squeeze(0).permute(1, 0, 2).float()
         assert_o_within_one_p_code_flip(o_rows, o_ref_rows, 0.12, 0.20, v_absmax=dqv_seqs[i].float().abs().max().item(), torch_itype=torch_itype, tag=f"output[seq{i}]")
         assert_close_fp8_grad(o_rows, o_ref_rows, 0.12, 0.20, tag=f"output[seq{i}]", keys=int(seq_len_kv[i]))
-        err += compare_tensors(lse_out[lo:hi], stats_ref.squeeze(0).squeeze(-1).permute(1, 0), 0.05, 0.05, f"stats[seq{i}]")
+        stats_start = origins.get("stats", cu_q)[i]
+        err += compare_tensors(lse_out[stats_start:stats_start + seq_len_q[i]], stats_ref.squeeze(0).squeeze(-1).permute(1, 0), 0.05, 0.05, f"stats[seq{i}]")
     assert err == 0, f"THD mismatch: {err} elements differ"
     # Amax_O over the packed live tokens (dead rows are exact 0 on both sides, checked above): the fp32 reference amax
     # and the kernel's own stored O.  THD is FROST-only here (the backend fallback skipped above), so no waiver.
-    assert_amax_o(amax_o_gpu, amax_ref, torch_itype=torch_itype, torch_otype=torch_otype, o_gpu=o_out)
+    assert_amax_o(amax_o_gpu, amax_ref, torch_itype=torch_itype, torch_otype=torch_otype, o_gpu=o_out[live_o])
 
 
 def _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align):

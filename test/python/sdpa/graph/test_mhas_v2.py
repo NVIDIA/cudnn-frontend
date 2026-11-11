@@ -1035,9 +1035,10 @@ def _physical_origin_cfg(dtype_name, width):
     return cfg
 
 
-def _exec_physical_origin_case(cfg, request, cudnn_handle):
+def _exec_physical_origin_case(cfg, request, cudnn_handle, *, mxfp8=False):
+    cfg.is_mxfp8 = mxfp8
     print(cfg.to_repro_cmd(request.module.__file__), flush=True)
-    runner = exec_sdpa_fp8 if cfg.data_type.itemsize == 1 else exec_sdpa
+    runner = exec_sdpa_mxfp8 if mxfp8 else exec_sdpa_fp8 if cfg.data_type.itemsize == 1 else exec_sdpa
     runner(cfg, request, cudnn_handle)
 
 
@@ -1046,6 +1047,13 @@ def _exec_physical_origin_case(cfg, request, cudnn_handle):
 def test_sdpa_physical_origins_L0(dtype_name, width, request, cudnn_handle):
     """Logical lengths never specify Q/K/V/O/Stats physical row placement."""
     _exec_physical_origin_case(_physical_origin_cfg(dtype_name, width), request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name,width", [case for case in _PHYSICAL_ORIGIN_CASES if case[0].startswith("float8_")])
+def test_sdpa_physical_origins_mxfp8_L0(dtype_name, width, request, cudnn_handle):
+    """Data gaps never change MXFP8's packed logical scale-tile coordinates."""
+    _exec_physical_origin_case(_physical_origin_cfg(dtype_name, width), request, cudnn_handle, mxfp8=True)
 
 
 @pytest.mark.L0
