@@ -248,7 +248,7 @@ def test_independent_thd_origins_rebind_and_capture(
         values["stats"].fill_(-29)
         workspace.fill_(255)
 
-    def check(values, state):
+    def check(values, state, *, output_normalization=1):
         ql, kl, origins = state
         inputs = {name: flat(values[name]).double().cpu() for name in ("q", "k", "v")}
         if mxfp8:
@@ -295,8 +295,8 @@ def test_independent_thd_origins_rebind_and_capture(
             # gapped candidate controls produce identical bytes and errors.
             e5m2 = quantized and dtype_name == "float8_e5m2"
             torch.testing.assert_close(
-                output[o_start : o_start + nq].double(),
-                expected,
+                output[o_start : o_start + nq].double() / output_normalization,
+                expected / output_normalization,
                 atol=0.1 if e5m2 else 0.03 if quantized else 0.025 if dtype_name == "bfloat16" else 0.004,
                 rtol=0.0 if e5m2 else 0.03 if quantized else 0.02,
             )
@@ -337,6 +337,17 @@ def test_independent_thd_origins_rebind_and_capture(
                 values["descale_q"].mul_(0.5)
                 values["descale_v"].mul_(1.25)
             if mxfp8:
+                # First qualify these exact replay inputs at their original
+                # scale. Changing only V's power-of-two scale must then double
+                # every live O byte exactly and leave Stats unchanged.
+                poison(values)
+                captured.replay()
+                torch.cuda.synchronize()
+                check(values, state)
+                expected_output = values["o"].clone()
+                expected_stats = values["stats"].clone()
+                for start, length in zip(state[2]["o"], state[0]):
+                    flat(expected_output)[start : start + length].mul_(2)
                 values["sf_v"].add_(1)
                 mx_refs[id(values)][1]["sf_v"].add_(1)
                 for _, descale in mx_refs[id(values)][0]["v"]:
@@ -344,7 +355,13 @@ def test_independent_thd_origins_rebind_and_capture(
             poison(values)
             captured.replay()
             torch.cuda.synchronize()
-            check(values, state)
+            if mxfp8:
+                for actual, expected in ((values["o"], expected_output), (values["stats"], expected_stats)):
+                    assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+            # Preserve the original reference error budget in the original V
+            # units; the exact-byte scaling assertion above separately checks
+            # the scale change, including unchanged physical padding.
+            check(values, state, output_normalization=2 if mxfp8 else 1)
             # The launch envelope stays nonzero after live query work reaches
             # zero. No dead cluster may acquire the unwritten sentinel maps.
             state = fill(values, shift + 32, short=True, empty=True)

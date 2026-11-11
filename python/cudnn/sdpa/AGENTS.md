@@ -113,7 +113,7 @@ and layout, not just its paged path. Assert the prepared THD spec contains
 `origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
 THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
 gaps, independent port origins, rebinding, and changed-length replay.
-The SM120 half and per-tensor FP8 hosts must also retain each port's physical capacity: a
+The SM120 half, per-tensor FP8 and MXFP8 hosts must also retain each port's physical capacity: a
 `max_total_seq_len_*` hint bounds live work, not the address span of a gapped
 buffer. Exercise both prepared graph binding and the graph's standalone-adapter
 fallback; forwarding offsets only through the prepared route leaves the fallback
@@ -122,6 +122,13 @@ The FP8 detector `test_sdpa_fwd_thd_origins_fp8_sm120.py` also changes device
 descale values during retained replay. Quantized origin operands follow the
 quantization-role tuple in the native binder frame; keep that order in the
 standalone adapter as well.
+
+MXFP8 origin operands follow the full quantization-role tuple, including
+Q/K/V scale buffers; using the shorter per-tensor FP8 role count binds scales
+as offsets. Data origins do not move the logically packed scale-tile prefixes.
+`test_sdpa_fwd_thd_origins_mxfp8_sm120.py` checks both facts with poisoned
+physical gaps, unchanged quantized payloads and repacked scale bytes across
+batch changes, then modifies scale exponents during retained replay.
 
 A test that changes a port's token pitch must update that port's physical
 ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
