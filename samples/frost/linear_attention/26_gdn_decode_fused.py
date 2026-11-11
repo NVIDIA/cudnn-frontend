@@ -27,6 +27,14 @@ alone) and at 4 rows, and checks:
 * a replay from the pool's snapshot, byte for byte;
 * sequence 0 alone against sequence 0 among 4, byte for byte, and that a step touches only the slots it names.
 
+The comparison with the reference is a band, not byte equality: the fused step accumulates in fp32 with its own
+exp / SiLU forms and the reference in fp64, so a value next to the midpoint of two bf16 neighbours is now and then
+rounded to the other one, which changes a few 8-bit output bytes or, in a gate value, moves one head's state by up
+to a bf16 step until the decay removes it.  The script gates the share of equal 8-bit bytes (above 99.9 %) and the
+rms ratio of the state (below 1e-3), which tolerate such isolated flips and fail when an operand is wired wrongly
+or a head reads another head's parameters, and beside the rms ratio it prints the largest error of a state element
+and the share of the state's elements within 1e-4.
+
 It prints the compile time of each row count and the memory the run took.  The entry serves compute capability
 10.x and 12.x GPUs with nvidia-cutlass-dsl >= 4.8.0; elsewhere it declines by type and the script prints that
 sentence after SKIP.  The entry's contract (operand layouts, forms, declines) is described in
@@ -179,12 +187,13 @@ def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: i
             assert untouched, f"rows={rows}: {name} moved in a slot the steps did not name"
 
     # ---- the plain PyTorch step, chained over every step on its own pool ----------------------------------------
-    # The fused step sums in fp32 and has its own exp / SiLU forms, so now and then one bf16 rounding of the chain goes the other way:
-    # an 8-bit output moves by a code, and such a flip in a gate value moves one head's state by up to a bf16 step until the decay
-    # washes it out.  Hence a count on the 8-bit outputs and an rms ratio (not a max) on the state.
+    # Gated: the share of equal 8-bit bytes and the rms ratio of the state (see the docstring: a bf16 midpoint flip moves a few bytes
+    # or one head's state, and a bound on the largest element would pass or fail by which element flips).  Printed beside the rms
+    # ratio: the largest error of a state element and the share of elements within 1e-4, both relative to the state's largest entry
+    # (to 1 when that is smaller).
     ref_pool = {name: t.clone() for name, t in snapshot.items()}
     q_ref = torch.stack([_reference_step(seqs, t, weights, ref_pool, inputs, slots, eps) for t in range(steps)])
-    worst_equal, worst_rms = 1.0, 0.0
+    worst_equal, worst_rms, worst_element, worst_inside = 1.0, 0.0, 0.0, 1.0
     for rows, run in runs.items():
         live = slice(1, rows + 1)
         q, state, state_ref = run["q"], run["pool"]["state"][live], ref_pool["state"][live]
@@ -192,14 +201,16 @@ def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: i
         equal = 1 - differ / q.numel()
         apart = (_codes(q) - _codes(q_ref[:, :rows])).abs().max().item()
         r_state = _rms_ratio(state, state_ref)
-        e_state = ((state.double() - state_ref.double()).abs().max() / state_ref.abs().max()).item()
+        distance = (state.double() - state_ref.double()).abs() / state_ref.abs().max().clamp_min(1.0)
+        e_state, inside = distance.max().item(), (distance <= 1e-4).double().mean().item()
         assert _same_bytes(run["pool"]["conv_state"][live], ref_pool["conv_state"][live]), f"rows={rows}: the conv history is not the last three tokens"
         assert equal > 0.999, f"rows={rows}: {equal:.4%} of the 8-bit outputs equal the reference"
         assert r_state < 1e-3, f"rows={rows}: state rms ratio {r_state:.3g}"
         worst_equal, worst_rms = min(worst_equal, equal), max(worst_rms, r_state)
+        worst_element, worst_inside = max(worst_element, e_state), min(worst_inside, inside)
         print(
             f"[26] rows={rows}  8-bit outputs equal {equal:.3%} ({differ} of {q.numel()} differ, largest code distance {apart})  "
-            f"state rms {r_state:.1e} (max {e_state:.1e} of the largest entry)  replay bitwise"
+            f"state rms {r_state:.1e} (largest element {e_state:.1e}, {inside:.4%} of the elements within 1e-4)  replay bitwise"
         )
 
     # ---- a sequence's bytes do not depend on its neighbours: every run against the widest one ------------------------
@@ -218,7 +229,8 @@ def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: i
     print(f"[26] memory: tensors peak {peak:.0f} MiB (allocator {reserved:.0f} MiB); device {taken:+.0f} MiB since the start (other processes count)")
     print(
         f"[26] PASS  gdn decode step (fused)     K={K} V={V} hidden={hidden} steps={steps} rows={list(row_counts)} "
-        f"(8-bit equal {worst_equal:.3%}, state rms {worst_rms:.1e}, replay and batch invariance bitwise)"
+        f"(8-bit equal {worst_equal:.3%}, state rms {worst_rms:.1e}, largest element {worst_element:.1e}, {worst_inside:.4%} within 1e-4, "
+        f"replay and batch invariance bitwise)"
     )
 
 
