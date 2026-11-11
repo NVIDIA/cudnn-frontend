@@ -1436,3 +1436,9 @@ describes a different output location. Head-major Stats offsets advance by one
 element per token, while token-major Stats offsets advance by the head count.
 The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
 numerical and replay checks for these contracts.
+
+Host-ABI comparisons use the role-split baseline from the same architecture.
+An origin operand can land independently on SM100 and SM107; borrowing the
+other architecture's parameter list hides missing slots or rejects a valid
+new slot. `test_two_by_two_host_slots_match_role_split` pins each pair and
+checks the native SM107 origin operand explicitly.
