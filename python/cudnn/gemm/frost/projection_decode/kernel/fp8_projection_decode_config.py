@@ -18,10 +18,12 @@ TWO KINDS OF KNOBS, kept in two types so that one can never reach the other:
 ``Cfg`` is one compiled rendering: a ``Numerics``, a ``Form`` resolved for one row count, the launch knobs and the part's readings.
 
 LEDGERS.  Shared memory: :func:`smem_bytes` mirrors the kernel's allocation order (the buffer table of the kernel module) and is what the
-launch reserves; ``Cfg.SMEM_RESIDENT`` = how many CTAs of that footprint the launcher places on one SM.  Tensor memory: an SM has 512
-columns and a CTA of this kernel holds ``TMEM_COLS`` of them from its first instruction to its last; :func:`validate_cfg` declines
-``SMEM_RESIDENT x TMEM_COLS > 512`` by name -- a CTA placed by shared memory but without columns would park inside ``tcgen05.alloc`` for a
-neighbour's whole lifetime, and under dependent launch it could have released its successor before it owns its columns.
+launch reserves; ``Cfg.SMEM_RESIDENT`` = how many CTAs of that footprint shared memory lets the launcher place on one SM (an upper
+bound of what a part places).  Tensor memory: an SM has 512 columns and a CTA of this kernel holds ``TMEM_COLS`` of them from its first
+instruction to its last; :func:`validate_cfg` declines ``SMEM_RESIDENT x TMEM_COLS > 512`` by name -- a CTA placed by shared memory but
+without columns would park inside ``tcgen05.alloc`` for a neighbour's whole lifetime, and under dependent launch it could have released
+its successor before it owns its columns.  The ledger cuts both ways: a very shallow ring is declined too (a one-stage CTA of 11,520 B
+would sit 18 to an SM), because 17 CTAs of 32 columns do not fit either.
 ``Cfg.RUNNING`` = ``min(SMEM_RESIDENT, 512 // TMEM_COLS)`` is what the one-wave rule of the pick counts.
 """
 

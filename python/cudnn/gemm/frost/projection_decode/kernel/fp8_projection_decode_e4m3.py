@@ -24,9 +24,9 @@ configuration uses (the source: the whole per-CTA capacity); (5) the tensor-memo
 source: 256 columns), so that every CTA the launcher places on an SM also gets its columns; (6) a control arm in which the weight loader
 waits for the predecessor too (``PREWAIT_WEIGHTS`` off; the source never waits on the weight loader); (7) the dependent-launch wait and
 the release of the successor are two knobs; (8) the epilogue releases the tensor memory after it has consumed the registers it read
-from it (the source: right after the read) and rank 0 arms the reduction barrier at the top of its epilogue role (the source: after the read); (9) named barrier
-counts and the cuDNN symbol prefix.  Not carried: the source's own
-configuration validation and autotune list, its batched views, split-K 3.
+from it (the source: right after the read) and rank 0 arms the reduction barrier at the top of its epilogue role (the source: after
+the read); (9) named barrier counts and the cuDNN symbol prefix.  Not carried: the source's own configuration validation and autotune
+list, its batched views, split-K 3.
 
 COORDINATES.  Kernel M = the weight rows ``N`` (``MMA_M`` 64 or 128 per CTA), kernel N = the token rows (one token tile of 8 / 16 / 32
 per CTA; rows past ``rows`` are outside the activation's tensor map and load as zeros), kernel K = ``K`` in 128-element K tiles.  Grid
@@ -72,9 +72,9 @@ BARRIER TABLE (all ``cta_group::1``; ``SUM(issuing lanes) == init`` on every pat
   bar_reduce (SPLIT_K > 1)  init REDUCE_BAR_ARRIVERS = 1 in every CTA, waited on rank 0 only.  Arrive: rank 0, epilogue thread 0,
                             ``arrive.expect_tx((SPLIT_K - 1) x MMA_M x token tile x 4 B)``, the FIRST instruction of its role (above
                             every shared- and tensor-memory read of the role, and normally before any peer ships); the bytes by every
-                            epilogue thread of every other rank, 16 B per remote store.  Wait: rank 0's 128 epilogue threads before they read the
-                            mailbox.  Nothing orders a peer's bytes behind the expect; the pending count is signed, so either order
-                            completes the phase.
+                            epilogue thread of every other rank, 16 B per remote store.  Wait: rank 0's 128 epilogue threads before
+                            they read the mailbox.  Nothing orders a peer's bytes behind the expect; the pending count is signed, so
+                            either order completes the phase.
   init                      warp 0, ONE elected lane, every barrier; ``fence.mbarrier_init`` by all; then the cluster arrive / wait by
                             every thread (the CTA barrier at SPLIT_K 1) BEFORE any cross-CTA store.
 
