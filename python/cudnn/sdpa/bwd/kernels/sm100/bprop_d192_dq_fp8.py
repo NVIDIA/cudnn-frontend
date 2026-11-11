@@ -49,7 +49,10 @@ from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import (
 _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", (192, 128))
 MX = bool(_PARAMS[3]) if len(_PARAMS) > 3 else False
 WINDOW = int(_PARAMS[4]) if len(_PARAMS) > 4 else 0
-CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX)
+K_HW = int(_PARAMS[5]) if len(_PARAMS) > 5 else 32
+L2_MIB = int(_PARAMS[6]) if len(_PARAMS) > 6 else 50
+PDL = bool(int(_PARAMS[7])) if len(_PARAMS) > 7 else False
+CFG, BAR_LAYOUT = make_config(int(_PARAMS[0]), int(_PARAMS[1]), MX, k_hw=K_HW)
 TS = bool(CFG.T_SHARED)
 OUT_SPLIT = bool(CFG.OUT_SPLIT)
 EXP2_FMA_SPLIT = bool(_PARAMS[2]) if len(_PARAMS) > 2 else False
@@ -419,9 +422,9 @@ def _mma_loop(
     swizzle: cutlass.Constexpr[int],
     causal: cutlass.Constexpr[bool],
 ):
-    score = _mma_desc(CFG.M, CFG.N, CFG.DQK, mx=MX)
-    dpdesc = _mma_desc(CFG.M, CFG.N, CFG.DV, mx=MX)
-    dqdesc = _mma_desc(CFG.M, CFG.DQK, CFG.N, btranspose=True, mx=MX)
+    score = _mma_desc(CFG.M, CFG.N, CFG.DQK, mx=MX, k_hw=CFG.K_HW)
+    dpdesc = _mma_desc(CFG.M, CFG.N, CFG.DV, mx=MX, k_hw=CFG.K_HW)
+    dqdesc = _mma_desc(CFG.M, CFG.DQK, CFG.N, btranspose=True, mx=MX, k_hw=CFG.K_HW)
     sf_q = _sf_ptr(tmem_base, CFG.TMEM_SF_Q) if MX else None
     sf_do = _sf_ptr(tmem_base, CFG.TMEM_SF_DO) if MX else None
     qd = _operand(slab, CFG.Q, FP8, CFG.M, CFG.DQK, swz=CFG.QK_SWZ).desc()
@@ -944,7 +947,7 @@ def host(
     if cutlass.const_expr(q.shape[1] <= 0 or k.shape[1] <= 0):
         raise ValueError("dense d192 fp8 dQ requires positive Sq/Skv")
     nq = (q.shape[1] + CFG.M - 1) // CFG.M
-    heads_per_l2 = (50 * 1024 * 1024) // (k.shape[1] * (CFG.DQK + CFG.DV) * CFG.BPE)
+    heads_per_l2 = (L2_MIB * 1024 * 1024) // (k.shape[1] * (CFG.DQK + CFG.DV) * CFG.BPE)
     swizzle = 1 << (heads_per_l2.bit_length() - 1) if heads_per_l2 > 0 else 1
     grid = (nq * q.shape[2] * q.shape[0], 1, 1) if causal else (nq, q.shape[2], q.shape[0])
     k_map = _tensor_map(k, CFG.N, CFG.QK_BOX, CFG.QK_SWZ)
@@ -992,4 +995,4 @@ def host(
         swizzle,
         grad_dtype,
         ratio,
-    ).launch(grid=grid, block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)
+    ).launch(grid=grid, block=(CFG.THREADS, 1, 1), stream=stream, min_blocks_per_mp=1, use_pdl=PDL)

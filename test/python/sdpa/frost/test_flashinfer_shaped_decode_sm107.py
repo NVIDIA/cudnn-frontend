@@ -10,8 +10,8 @@ page pools ``[pages, H_kv, page, D]`` bound by ``tensor_like`` (any in-page layo
 (the padding mask), the Q lengths likewise, ``paged_attention_max_seq_len_kv``, no Stats, the bottom-right causal diagonal when
 ``q_len > 1``, and the CUDA-graph replay hint when its caller captures.  The decode twin of ``test_flashinfer_shaped_sdpa.py``.
 
-What it pins (the decode-tile placement bands of ``placement._place_sm107_f16``, the MEASURED frontier of the tile against the backend's
-default plan on this very graph): on every LEAD cell FE's DEFAULT plan is the FROST row ``sdpa_fwd_prefill_sm107`` served by the Rubin
+What it pins (the decode-tile placement bands of ``placement._place_sm107_f16`` and, for the MTP rows, the generated table's study
+``sm107_paged_mtp_20261110`` -- the MEASURED frontier of the tile against the backend's default plan on this very graph): on every LEAD cell FE's DEFAULT plan is the FROST row ``sdpa_fwd_prefill_sm107`` served by the Rubin
 d256 decode tile (the route readback: the kernel template is ``decode_d256_f16``); on every TRAIL cell the default is the backend's
 plan, by name.  Both regimes (the replay hint set and unset) agree on the verdict.  The default plan is also EXECUTED under the D2H
 detector and compared with the backend's plan pinned on the SAME graph (the numbers, not only the name); a padded entry (``kv_len = 0``
@@ -204,7 +204,8 @@ def _assert_numbers(case: _DecodeCase, out_default: torch.Tensor):
     torch.testing.assert_close(a, r, atol=2e-2 if case.dtype == torch.float16 else 5e-2, rtol=0)
 
 
-# The cells: the measured frontier of the three bands (placement.py's module docstring) -- LEAD inside, TRAIL one step outside.
+# The cells: the measured frontier of the two s_q == 1 bands (placement.py's module docstring) and the MTP rows (placement_table) --
+# LEAD inside, TRAIL one step outside.
 _CELLS = [
     # id, kwargs, verdict
     ("24-2_b32_kv8k_q1_tokenmajor", dict(heads="24/2", b=32, kv=8192), "LEAD"),  # the first band, FlashInfer's benchmark pool layout
@@ -218,7 +219,8 @@ _CELLS = [
     ("24-2_b32_kv8k_q1_dead_entry", dict(heads="24/2", b=32, kv=8192, dead_entry=5), "LEAD"),  # a padded entry keeps the verdict
     ("24-2_b4_kv4k_q1", dict(heads="24/2", b=4, kv=4096), "TRAIL"),  # 2**15 tokens in flight: mixed, the backend stays first
     ("64-2_b4_kv8k_q1", dict(heads="64/2", b=4, kv=8192), "TRAIL"),  # group 32 one step below its band (the parity cell)
-    ("24-2_b4_kv8k_q2_p32", dict(heads="24/2", b=4, kv=8192, q_len=2, page=32), "TRAIL"),  # the MTP rows at page 32: unmeasured
+    ("24-2_b4_kv8k_q2_p32", dict(heads="24/2", b=4, kv=8192, q_len=2, page=32), "LEAD"),  # the MTP rows at page 32 (the table's study)
+    ("24-2_b4_kv8k_q2_f16", dict(heads="24/2", b=4, kv=8192, q_len=2, dtype=torch.float16), "TRAIL"),  # f16 MTP: no entry, unmeasured
 ]
 
 
