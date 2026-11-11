@@ -359,7 +359,7 @@ def gen_registry(class_ids, class_knobs, selection, build_info: str) -> str:
     L += ["};", ""]
     # Class-local base offset of each (dtype, class) in g_prefill.
     base, off = [], 0
-    for dt in V.DTYPES:
+    for _ in V.DTYPES:
         row = []
         for ci in class_ids:
             row.append(off)
