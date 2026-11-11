@@ -3877,6 +3877,14 @@ def lower_dsl_prefill(
             and facts.epilogue_gate_t is None
             and api.split_kv == 1
         )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm100_mxfp8"
+            and api.flavor in ((128, 128), (512, 512))
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
         or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
         or (facts.thd and spec.name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
         or (

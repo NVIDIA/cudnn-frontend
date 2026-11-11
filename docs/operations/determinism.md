@@ -79,6 +79,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
+| `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
@@ -502,3 +503,17 @@ also cover the already-admitted D384/V448 and D264/V504 head envelopes.
 All six dtype/implementation lowerings compile for SM103, whose execution
 remains unverified. These results do not qualify MXFP8, SM107 or backward.
 See the coverage report for the exact cases and validation receipts.
+
+## SM100 MXFP8 THD physical origins
+
+Native D128 (CGA2) and D512 (CGA1) E4M3/E5M2 forward preserve O/Stats
+bytes across repeat execution, batch reorder/duplication, an isolated sequence,
+changed neighbors and retained CUDA Graph replay on the tested SM100 runtime.
+The unsplit, unpacked cases use BF16 output and token/head-major Stats.
+Q/K/V/O/Stats origins are independent; quantized payloads and logical scale
+bytes are retained across batch changes. Physical data gaps do not move the
+packed scale-tile prefixes. Prepared and standalone graph execution agree.
+
+All four admitted SM103 dtype/width lowerings compile offline; GPU execution
+there remains unverified. These results do not qualify D192/D256, SM107 or
+backward. See the coverage report for exact cases and validation receipts.

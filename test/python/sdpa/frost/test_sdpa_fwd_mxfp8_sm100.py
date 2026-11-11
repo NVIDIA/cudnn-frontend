@@ -38,7 +38,17 @@ from mxfp8_test_reference import _cdiv, _quantize, _quantize_seq, _ref
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import (
+    _SM,
+    assert_no_new_spills,
+    make_dense_stats,
+    requires_blackwell,
+    requires_dsl,
+    requires_pre_rubin_blackwell,
+    requires_rubin,
+    run_sass_probe,
+    sass_probe_source,
+)
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -3043,3 +3053,16 @@ def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
     assert not o_neg.isnan().any()
     assert torch.equal(o_neg, o_pos)
     assert torch.equal(a_neg, a_pos)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestPhysicalOrigins:
+    """Collect native D128/D512 origin contracts in the architecture CI entry."""
+
+    from sdpa.frost import sdpa_fwd_thd_origins_mxfp8_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)

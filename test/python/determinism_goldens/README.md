@@ -3078,3 +3078,66 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest -q -m L0 \
   sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
 ```
+
+### SM100 MXFP8 D128/D512 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins` collects 24 L0 cases:
+4 shared `test_mhas_v2` regressions, 8 reference/rebind/replay/batch cases,
+4 no-total-hint cases and 8 new goldens. Both E4M3/E5M2 types run the
+existing public THD configurations: D128 CGA2 and D512 CGA1. The initial
+expanded probe also requested D128 CGA1 and D512 CGA2; those twelve cases
+were existing planning declines, not numerical failures. The suite now
+states the admitted pairs explicitly, with no capability or ranking change.
+Every expanded case asserts its actual native kernel template.
+
+The shared fixture retains quantized payload and scale bytes across batch
+changes, poisons physical data gaps with NaNs, and checks output canaries.
+It covers independent mixed-width offsets and multipliers, FP64 references,
+new pointers/strides, live/empty retained replay, scale-only replay changes,
+batch reorder/duplication/isolation and prepared/standalone graph parity.
+The D512 maps use token dimension 1 for Q/K/V and dimension 2 for O;
+D128 maps retain dimension 2 for every port. Scale map coordinates continue
+to use compact logical prefixes.
+
+Current measured runtime: SM100, 148 SMs; driver 595.71.05;
+Torch 2.14.1+cu130; cuDNN 9.24.0.43; DSL 4.8.0 with its CUDA 13.4
+compiler; cuda-bindings 13.4.4; tvm-ffi 0.1.14.post1. The runner asserts
+`cutlass.CUDA_VERSION`, uses a fresh compiler cache, and checks the imported
+checkout and native-extension hashes. The native C++ extension is rebuilt
+against toolkit 13.4.92.
+
+On this runtime all four shared cases fail on the immediate parent and pass
+after repair. The full strict matrix passes all 24 cases, including eight
+unchanged goldens; 30 neighboring MXFP8 cases also pass. No case is skipped.
+The new baselines use `361d6da48de8fd55`; older goldens and all tolerances
+are unchanged. The historical CUDA 12.9 run passed the 16 functional cases
+and eight new golden-record cases with independent references and exact-byte
+checks before recording. Its later strict run also passed all 24 cases.
+Compiler-version equality is asserted separately because the current golden
+runtime key records the DSL package version, not its CUDA compiler flavor.
+
+CUDA 13.4 memcheck additionally reproduced pre-existing single-CTA THD
+scheduler errors on the unchanged D256/D512 parent. Local publication fixes
+those errors; D256 broadcasts all predecoded fields before an elected warp
+returns slot credit, while D512 retains its per-lane credits and matching count.
+The six directed memcheck cases then pass with zero errors.
+
+Racecheck also reproduced the existing D128 CGA2 V-scale tail helper's access
+to an exited peer: a compact causal-tail parent control reports 2400 errors.
+The tail path now keeps both CTAs alive through a cluster exit barrier. Both
+origin replay dtype cases pass racecheck with zero hazards, errors or warnings;
+the remaining four D256/D512 racecheck cases also pass in a separate run,
+and the six-case synccheck suite passes with zero errors. The final repaired
+source passes strict24 with unchanged goldens and all30 MXFP8 neighbors. The earlier failed
+sanitizer runs remain in the private qualification report.
+
+All six SM103 D128/D256/D512 x E4M3/E5M2 lowerings compile with CUDA 13.4.
+The shared origin helper also compiles in the SM107 half D128 consumer,
+including its single-batch fast path. This is compile coverage only;
+SM103 execution and SM107 MXFP8 execution remain unverified.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins
+```
