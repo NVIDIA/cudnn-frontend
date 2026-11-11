@@ -103,7 +103,7 @@ grid on the stream; a chain with a dependent launched under the attribute is not
 
 | question | answer |
 | --- | --- |
-| device | compute capability 10.x; validated on cc 10.3 and cc 10.7; cc 10.0 is admitted and its rendering is pinned, but it has not run on a device; 9.0 and 12.x are declined by type |
+| device | compute capability 10.x; validated on cc 10.3 and cc 10.7. The kernel's rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets: cc 10.0 is admitted on that basis and has not run on a device, and any other 10.x minor is admitted by the range alone. 9.0 and 12.x are declined by type |
 | rows | 1 .. 160 per call (runtime argument); 161 and up declined by name |
 | width | a positive multiple of 8 up to 32768, fixed at construction |
 | dtypes | bf16 `attn` / `gate`; one fp32 `scale`; E4M3 `out`; fp32 arithmetic, rounded once to bf16 and once to E4M3 |

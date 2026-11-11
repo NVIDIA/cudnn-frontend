@@ -177,7 +177,9 @@ a row alone and inside a batch under the entry's own picks.
   checked with no dependent grid on the stream. SM103 is verified on cc 10.3
   (a GB300, 152 SMs) and SM107 on cc 10.7 (a VR200-class part, 212 SMs),
   each with its own committed goldens; cc 10.0 has not been run, so SM100 is
-  unverified. SM90 and SM120 are declined by type. The bytes follow the
+  unverified (the entry admits compute capability 10.x, and the kernel's
+  rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets).
+  SM90 and SM120 are declined by type. The bytes follow the
   installed CuTe DSL's lowering of the exponential: the status holds on a
   fixed runtime, and a golden recorded on one runtime does not qualify
   another.
