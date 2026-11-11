@@ -34,6 +34,67 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM120 wide partial PackGQA — validation, 2026-11-11 (UTC)
+
+The new L0 cases qualify explicit native forward plans for D512/V512 and
+D576/V512 with GQA ratios 96 and 128, two KV heads, and FP16/BF16 queries.
+There are 16 dense and 16 paged half cases across split counts 1 and 3,
+plus 16 paged mixed-KV cases across E4M3/E5M2 storage at split count 3.
+They preserve O and FP32 Stats bytes across repeat, isolated/reordered/
+duplicated/changed-neighbor batches and CUDA Graph replay. The stress batch
+has 33 sequences; numerical references, empty/tail/keyless rows, source
+immutability and output canaries remain independent checks. KV quantization
+is fixed across batch variants. This is forward-only coverage; no backward
+API or arithmetic is changed.
+
+Measured on RTX PRO 6000 Blackwell Server Edition (SM120, 188 SMs), driver
+595.84.01, Torch 2.14.0+cu130, cuDNN backend 9.24.0.43, CuTe DSL 4.8.0 with
+its CUDA 13.4 compiler, and the original image's cuda-bindings 13.0.3.
+The frozen source derives from `3c6a485cd3b9`; all 2,547 source/binary files
+per arm were hash-checked and the imported `cudnn` path was verified before
+each run. The compatible extension's binding/build inputs are unchanged.
+SM121 and other runtimes are unverified.
+
+The immutable parent recorded 14 existing wide dense/THD/paged controls;
+the candidate passed all 14 against those unchanged hashes. The 48 new
+subgroup cases passed numerical/batch/replay checks before recording, then
+all 48 passed a separate strict comparison with recording disabled. These
+62 records are added under runtime fingerprint `812f98809d9324c5`; no existing
+record is replaced. An additional 18 new functional cases and one admission
+case pass. Memcheck, racecheck and synccheck each pass the same 24-case subset:
+all 18 functional cases plus six representative D576 half/mixed subgroup
+cases. Memcheck reports zero errors, racecheck zero errors/warnings, and
+synccheck zero errors. Racecheck/synccheck filter to `cudnn_kernel_` symbols;
+memcheck is unfiltered and CUDA API errors remain enabled. All allocations
+were released.
+
+From `test/python`, the strict new-golden selection is:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -v -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  sdpa/frost/test_sdpa_fwd_d576_sm120.py sdpa/frost/test_sdpa_fwd_paged_sm120.py \
+  -k wide_subgroup
+```
+
+The old controls select `test_d576_dense_thd_determinism` and
+`test_d576_paged_determinism` in `test_sdpa_fwd_d576_sm120.py`. The functional
+selection is `wide_partial_pack or pack_gqa_admits_any_ratio_up_to_the_tile`.
+The sanitizer selection on the same three files is
+`wide_partial_pack or (wide_subgroup and 3-96-dims1-dtype1) or (wide_subgroup_mixed and 96-dims1)`.
+Host graph-analysis checks pass 629 cases, and four variants compile offline;
+neither substitutes for the target results above.
+
+Earlier attempts are retained as failures: the first runner stopped before
+collection because xdist was absent; the second recorded 18 failures before
+interruption (10 ordinary-generator division-by-zero errors, eight reference
+cache permission errors) and 15 passes. After setting a writable Triton cache
+and using explicit legal plans, the remaining 53 cases passed, followed by
+the strict 48 and the three sanitizer passes. The ordinary candidate-generator
+failure is a separate integration blocker; these explicit-plan results do
+not claim it is fixed. Existing measurements below are retained, not rerun
+as part of this addition.
+
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 
 `test_DSA_indexer_compressed_sm90_determinism.py` now covers the public
