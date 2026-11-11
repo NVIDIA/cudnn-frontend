@@ -881,10 +881,11 @@ def test_native_d192_thd_split_frames(layout, splits):
     _wide_thd_split_frames(False, layout, splits, 192, 128)
 
 
+@pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("splits", [2, 5])
-def test_native_d64_thd_split_frames(layout, splits):
-    _wide_thd_split_frames(False, layout, splits, 64, 64)
+def test_native_d64_thd_split_frames(paged, layout, splits):
+    _wide_thd_split_frames(paged, layout, splits, 64, 64)
 
 
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])

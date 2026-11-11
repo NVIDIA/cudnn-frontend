@@ -351,7 +351,7 @@ class SdpaThdBinder {
             // they do not reserve per-sequence tensor-map descriptors.
             const bool nonpaged_fp8_origin_caps =
                 quantized_ && !paged_ && std::find(order.begin(), order.end(), "thd_origin_caps") != order.end();
-            const bool d64_split = !quantized_ && !paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 64 &&
+            const bool d64_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 64 &&
                                    integer(spec, "d_v") == 64 && splits_ > 1;
             const bool d128_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
                                     integer(spec, "d_v") == 128 && splits_ > 1;
@@ -364,7 +364,7 @@ class SdpaThdBinder {
             if ((quantized_ && !nonpaged_fp8_origin_caps && mx_scales_) ||
                 (splits_ != 1 && !d64_split && !d128_split && !d192_split && !d256_split && !d576_split) || has_gate_)
                 invalid(
-                    "physical THD origins require ungated half unsplit/D128 split/nonpaged D64/D192 split/paged D256 "
+                    "physical THD origins require ungated half unsplit/D64/D128 split/nonpaged D192 split/paged D256 "
                     "split/native D576 "
                     "split or unsplit "
                     "per-tensor FP8 map or FP8/MXFP8 per-port-capacity pointer-origin plans");
@@ -1111,6 +1111,7 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def_prop_ro_static("supports_paged_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_split_sink", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_d64_packed_split", [](py::object) { return true; })
+        .def_prop_ro_static("supports_paged_d64_split_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_d64_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_d256_packed_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_paged_d256_split_physical_origins", [](py::object) { return true; })

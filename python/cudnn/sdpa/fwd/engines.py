@@ -3895,6 +3895,19 @@ def lower_dsl_prefill(
             )
         )
         or (
+            # Paged D64 shares the origin-aware single-CTA body with D128.
+            # Explicit live lengths must not replace the graph's Q/O/Stats
+            # addresses, including when the split scratch is compact.
+            facts.thd
+            and not getattr(api, "thd_decode_leg", False)
+            and facts.epilogue_gate_t is None
+            and spec.name == "sdpa_fwd_prefill_sm100"
+            and facts.device_cc in ((10, 0), (10, 3))
+            and (facts.d_qk, facts.d_v) == (64, 64)
+            and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+            and facts.has_paged_kv
+        )
+        or (
             # Native D64 and paged D192 use the same per-port origins as native D128.
             facts.thd
             and facts.epilogue_gate_t is None

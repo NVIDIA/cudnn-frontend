@@ -1422,3 +1422,9 @@ describes a different output location. Head-major Stats offsets advance by one
 element per token, while token-major Stats offsets advance by the head count.
 The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
 numerical and replay checks for these contracts.
+
+Paged tests with explicit Q lengths must also leave gaps between sequence
+origins. Uniform lengths hide a lowering that substitutes compact prefixes
+for the graph's Q/O/Stats offsets. `TestPagedD64PhysicalOrigins` covers both
+unsplit and packed/unpacked split plans, changed offsets and strides, poisoned
+padding, and retained capture; D128/D256 coverage cannot prove D64 forwarding.
