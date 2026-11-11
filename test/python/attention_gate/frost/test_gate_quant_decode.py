@@ -325,6 +325,27 @@ def test_compile_key_is_plan_time_only():
     assert entry.AttentionGateQuantDecode("cpu", 2048, cfg=kcfg.Cfg(THREADS=128)).key(1) != k.key(1)
 
 
+def test_slab_views_bind_a_runtime_extent():
+    """Rule 4 on the binding: the DSL views the entry builds for ``attn``, ``gate`` and ``out`` declare a DYNAMIC extent (and the unit
+    stride), so the kernel is compiled for a runtime element count and a launch at another row count or width re-binds it -- never a
+    view whose static extent is the first call's.  ``scale`` is one element and binds static.  Host tensors suffice: the declaration is
+    a property of the view, not of the device."""
+    pytest.importorskip("cutlass")
+    msg = entry._dsl_version_error()
+    if msg is not None:
+        pytest.skip(msg)
+    for rows, width in ((1, 8), (1, 2048), (160, 2048), (3, 6144)):
+        ops = _host_operands(rows, width)
+        for name, t in (("attn", ops["attn"]), ("gate", ops["gate"]), ("out", ops["out"].view(U8))):
+            view = entry._flat(t)
+            assert tuple(view.shape) == (rows * width,) and tuple(view.stride) == (1,), (name, rows, width)
+            assert tuple(view.dynamic_shapes_mask) == (1,), f"{name} [{rows}, {width}]: the view declares a static extent ({view})"
+            assert tuple(view.dynamic_strides_mask) == (0,), f"{name} [{rows}, {width}]: the unit stride is a compile-time fact ({view})"
+    for scale in (torch.tensor([0.01]), torch.tensor(0.01)):
+        view = entry._flat(scale)
+        assert tuple(view.shape) == (1,) and tuple(view.dynamic_shapes_mask) == (0,), f"scale {tuple(scale.shape)}: one static element ({view})"
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # host-only: the DSL gates (installed -> version floor -> the part's target -> the compiler that assembles it)
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -462,14 +483,45 @@ _RENDER_PROBE = textwrap.dedent("""
     scale = cute.runtime.make_fake_tensor(dtype=cutlass.Float32, shape=(1,), stride=(1,), assumed_align=4)
     out = cute.runtime.make_fake_tensor(dtype=cutlass.Uint8, shape=(cute.sym_int(),), stride=(1,), assumed_align=16)
     for spec in sys.argv[3:]:
-        threads, release = spec.split(":")
         before = set(os.listdir(dump))
-        cfg = kcfg.Cfg(THREADS=int(threads), PDL_RELEASE=release == "1")
-        cute.compile(mod.launch, cfg, half(), half(), scale, out, cutlass.Int32(2048), make_fake_stream())
+        if spec.startswith("bind:"):  # the launch arguments the ENTRY builds from CUDA tensors of that many rows (its default config)
+            import torch
+            from cudnn.attention_gate.frost import gate_quant_decode as entry
+
+            rows, width = int(spec.split(":")[1]), 2048
+            dev = torch.device("cuda", torch.cuda.current_device())
+            k = entry.AttentionGateQuantDecode(dev, width)
+            slab = lambda: torch.zeros(rows, width, dtype=torch.bfloat16, device=dev)
+            args = k._args(slab(), slab(), torch.ones(1, dtype=torch.float32, device=dev), k._default_out(), False)
+            cute.compile(mod.launch, k.cfg_for(rows), *args, rows * width, make_fake_stream())
+        else:
+            threads, release = spec.split(":")
+            cfg = kcfg.Cfg(THREADS=int(threads), PDL_RELEASE=release == "1")
+            cute.compile(mod.launch, cfg, half(), half(), scale, out, cutlass.Int32(2048), make_fake_stream())
         for name in sorted(set(os.listdir(dump)) - before):
             print("KEPT", spec, name)
     print("COMPILED", arch)
     """)
+
+
+def _render(tmp_path, arch, specs):
+    """Run the probe for ``arch`` in a fresh process (the DSL reads its dump settings once, at the first import); returns the compiler's
+    CUDA major and ``{spec: [kept file paths]}``.  A compile failure FAILS."""
+    probe = tmp_path / "render_probe.py"  # a FILE, not ``python -c``: the DSL preprocessor re-reads a kernel's source through inspect
+    probe.write_text(_RENDER_PROBE)
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, str(probe), str(dump), arch, *specs], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"trace-compile for {arch} failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}"
+    lines = proc.stdout.splitlines()
+    assert f"COMPILED {arch}" in lines, proc.stdout[-2000:]
+    major = int(next(ln for ln in lines if ln.startswith("COMPILER")).split()[1])
+    kept = {}
+    for ln in lines:
+        if ln.startswith("KEPT "):
+            _, spec, name = ln.split(" ", 2)
+            kept.setdefault(spec, []).append(str(dump / name))
+    return major, kept
 
 
 def _nvdisasm_candidates():
@@ -503,8 +555,9 @@ _RECORDED_CONTRACTED_ADDS = {12: 8, 13: 8}
 
 @pytest.mark.parametrize("arch, cc", (("sm_100a", (10, 0)), ("sm_103a", (10, 3)), ("sm_107a", (10, 7))))
 def test_rendering_pins_the_convention(arch, cc, tmp_path):
-    """Trace-compile the kernel for a claimed target on this box (fake tensors: no device needed) and pin, per arm, the instructions that ARE
-    the contract: two 128-bit global loads and one 32-bit load; nine ``div.rn.f32`` (eight gate divisions and the reciprocal, whose
+    """Trace-compile the kernel for a claimed target on this box (fake tensors: no device needed; their slab extents are symbolic, the
+    form the entry's own launch arguments have -- ``test_entry_binding_compiles_the_pinned_rendering``) and pin, per arm, the instructions
+    that ARE the contract: two 128-bit global loads and one 32-bit load; nine ``div.rn.f32`` (eight gate divisions and the reciprocal, whose
     numerator is the immediate 1.0); eight ``ex2.approx.ftz.f32`` (the precise exponential's core); eight ``cvt.rn.bf16.f32`` (the first
     rounding), eight ``mul.f32`` by the reciprocal and eight ``cvt.rn.satfinite.e4m3x2.f32`` (the second rounding), each with its one-byte
     global store; none of ``tanh`` / ``div.approx`` / ``div.full`` / ``rcp.approx`` (an approximate sigmoid or division), no shared-memory
@@ -515,21 +568,8 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     msg = entry._dsl_error(cc)
     if msg is not None:
         pytest.skip(msg)
-    probe = tmp_path / "render_probe.py"  # a FILE, not ``python -c``: the DSL preprocessor re-reads a kernel's source through inspect
-    probe.write_text(_RENDER_PROBE)
-    dump = tmp_path / "dump"
-    dump.mkdir()
     specs = [f"{threads}:{int(release)}" for threads, release in _ARMS]
-    proc = subprocess.run([sys.executable, str(probe), str(dump), arch, *specs], capture_output=True, text=True, timeout=900)
-    assert proc.returncode == 0, f"trace-compile for {arch} failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}"
-    lines = proc.stdout.splitlines()
-    assert f"COMPILED {arch}" in lines, proc.stdout[-2000:]
-    major = int(next(ln for ln in lines if ln.startswith("COMPILER")).split()[1])
-    kept = {}
-    for ln in lines:
-        if ln.startswith("KEPT "):
-            _, spec, name = ln.split(" ", 2)
-            kept.setdefault(spec, []).append(str(dump / name))
+    major, kept = _render(tmp_path, arch, specs)
     bodies = {}
     for (threads, release), spec in zip(_ARMS, specs):
         files = kept.get(spec, [])
@@ -591,6 +631,33 @@ def _strip_symbols(text):
     import re
 
     return re.sub(r"cudnn_kernel_frost_attention_gate_quant_\w+", "ENTRY", text)
+
+
+def test_entry_binding_compiles_the_pinned_rendering(tmp_path):
+    """Rule 4 on the compiled kernel: the launch arguments the ENTRY builds from CUDA tensors -- of 1 row and of 160 rows -- compile to the
+    PTX text of the fake-tensor rendering pinned above, byte for byte, the kernel symbol and its parameter block included.  So the kernel
+    the entry ships is the pinned one whatever the first call's row count is: no extent of an operand enters it, and a launch at another
+    row count re-binds a kernel that was compiled for a runtime extent.  A binding that declares the first call's extents fails here twice:
+    its symbol and its parameter block differ from the pinned rendering, and the two row counts compile to two texts.  Compile-only, for
+    ``sm_100a`` (a target both compiler flavours assemble): any CUDA device serves, whatever its compute capability; nothing is launched."""
+    if not torch.cuda.is_available():
+        pytest.skip("a CUDA device is required to build the entry's launch arguments (any compute capability: the cell compiles, never launches)")
+    msg = entry._dsl_error((10, 0))
+    if msg is not None:
+        pytest.skip(msg)
+    specs = ["256:0", "bind:1", "bind:160"]
+    _, kept = _render(tmp_path, "sm_100a", specs)
+    texts = {}
+    for spec in specs:
+        ptx_files = [f for f in kept.get(spec, []) if f.endswith(".ptx")]
+        assert len(ptx_files) == 1, f"{spec}: expected one PTX, kept {kept.get(spec)}"
+        texts[spec] = Path(ptx_files[0]).read_text()
+    entry_line = lambda text: next(ln for ln in text.splitlines() if ".entry" in ln)  # noqa: E731
+    for spec in ("bind:1", "bind:160"):
+        assert texts[spec] == texts["256:0"], (
+            f"the entry's launch arguments ({spec.split(':')[1]} rows) compile to another kernel than the pinned rendering:\n"
+            f"  pinned: {entry_line(texts['256:0'])}\n  entry:  {entry_line(texts[spec])}"
+        )
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -883,6 +950,49 @@ def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_u
         k(attn, gate, scale, attn.view(U8).reshape(-1)[: 2 * 2048].view(E4M3).view(2, 2048))  # the first half of attn's own bytes
     torch.cuda.synchronize()
     assert torch.equal(_bytes(k.out_buffer)[:2], want), "a declined warm call launches nothing"
+
+
+def test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current():
+    """Rule 5 (the device is implicit state exactly like the stream): an entry built for a device that is NOT the caller's current one
+    compiles and launches on ITS device and leaves the caller's current device as it found it -- on the first call (compile + launch), on
+    a warm call with an entry-owned and with a caller-owned output, and on a side stream of the entry's device entered while the caller's
+    device is current.  The bytes are those of the same call made with the entry's device current, and the caller's next default-device
+    allocation lands on the caller's device.  Needs two CUDA devices the step serves."""
+    dev = _device_or_skip()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    other = torch.device("cuda", (dev.index + 1) % torch.cuda.device_count())
+    cc = torch.cuda.get_device_capability(other)
+    if not entry.cc_supported(cc) or entry._dsl_error(cc) is not None:
+        pytest.skip(f"the second CUDA device ({other}, compute capability {cc[0]}.{cc[1]}) is not one the step serves")
+    rows, width = 17, 2048
+    attn, gate = make_operands(rows, width, other, seed=77, kind="adversarial")
+    scale = scale_tensor(0.01, other)
+    with torch.cuda.device(other):  # the reference: the same call with the entry's device current, checked there (the helper's own math too)
+        want = _bytes(entry.AttentionGateQuantDecode(other, width)(attn, gate, scale)).clone()
+        assert_reference(want, attn, gate, scale, "the entry's device current")
+    assert torch.cuda.current_device() == dev.index
+    k = entry.AttentionGateQuantDecode(other, width)  # built, compiled and launched while the CALLER's device is current
+    assert k.device == other
+    owned = k(attn, gate, scale)  # the first call: compile + launch
+    assert torch.cuda.current_device() == dev.index, "the first call (compile + launch) left the entry's device current"
+    assert owned.device == other and torch.equal(_bytes(owned), want), "the first call's bytes on the entry's device"
+    mine = torch.full((rows, width), 0xA5, dtype=U8, device=other).view(E4M3)
+    for label, out in (("entry-owned", None), ("caller-owned", mine)):  # warm calls: the launch alone
+        got = k(attn, gate, scale, out)
+        assert torch.cuda.current_device() == dev.index, f"a warm call ({label} output) left the entry's device current"
+        assert torch.equal(_bytes(got), want), f"a warm call ({label} output) on the entry's device"
+    _bytes(mine).fill_(0x5A)
+    side = torch.cuda.Stream(device=other)
+    side.wait_stream(torch.cuda.current_stream(other))  # the operands and the fill were produced on the entry's device's current stream
+    with torch.cuda.stream(side):  # the entry's device current, ``side`` its current stream ...
+        with torch.cuda.device(dev):  # ... then the caller's device current again: ``side`` stays the entry's device's current stream
+            k(attn, gate, scale, mine)
+            assert torch.cuda.current_device() == dev.index, "a launch on a side stream of the entry's device left that device current"
+    torch.cuda.current_stream(other).wait_stream(side)
+    assert torch.equal(_bytes(mine), want), "the side-stream launch on the entry's device"
+    assert torch.cuda.current_device() == dev.index
+    assert torch.empty(1, device="cuda").device == dev, "the caller's next default-device allocation landed on another device"
 
 
 def test_reciprocal_primitive_is_the_correctly_rounded_division():

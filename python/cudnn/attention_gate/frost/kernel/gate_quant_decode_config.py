@@ -9,7 +9,7 @@ The op (the output gate of an attention block fused with the static FP8 quantiza
 counts): ``out[r, c] = e4m3( bf16( attn[r, c] / (1 + exp(-gate[r, c])) ) * (1 / scale) )`` for ``attn`` / ``gate`` ``[rows, width]`` bf16,
 ``scale`` one fp32 element, ``out`` ``[rows, width]`` E4M3.  One launch, an element-wise map: thread ``i`` of the flat grid owns the ``VEC``
 elements ``VEC i .. VEC i + VEC - 1`` of the row-major slab, so the element count ``N = rows x width`` is a RUNTIME kernel argument and one
-compiled kernel serves every row count and width.
+compiled kernel serves every row count and width (the host entry declares the slabs with a dynamic extent: no shape enters the kernel).
 
 There is NO numerics knob: the kernel has no reduction, so nothing here can change an fp32 association -- every output byte is a function of
 its own (attn, gate) pair and ``scale``.  The knobs are performance-only and bit-neutral (the suite compares their bytes):

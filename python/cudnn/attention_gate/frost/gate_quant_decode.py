@@ -30,7 +30,9 @@ Launch knob ``pdl_release`` sets the config's ``PDL_RELEASE`` = ``griddepcontrol
 knob measured before it defaults on).  CALLER OBLIGATION when on: every grid that can start before this kernel completes -- a grid launched
 with the programmatic-stream-serialization attribute, and transitively its own dependents -- issues its wait before it reads ``out`` and
 before it writes ``attn``, ``gate`` or ``scale``.  The launch itself is ordinary (no attribute, no wait in the kernel): it starts when its
-stream predecessor has completed, on ``torch.cuda.current_stream`` of the entry's device.
+stream predecessor has completed, on ``torch.cuda.current_stream`` of the entry's device.  That device need not be the caller's current
+one: the compile and the launch run under the entry's device and the caller's current device is restored behind them (Rule 5: the device
+is implicit state exactly like the stream).
 
 Output ownership.  With ``out`` the caller owns the storage and gets its own tensor back.  Without it the entry returns a view of ONE
 entry-owned ``[160, width]`` buffer, allocated at the first compile or call that passes no ``out`` (never on a warm path; allocate it
@@ -42,6 +44,7 @@ entry each).  Workspace: none.  The launch reads no device memory to the host (R
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
+from cudnn._torch_stream import device_context  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
 
 from .kernel.gate_quant_decode_config import MAX_ROWS, Cfg, default_cfg, validate_cfg, validate_rows, validate_width
@@ -211,12 +214,16 @@ def check_support(attn, gate, scale, out=None, device_cc=None, device=None, widt
 
 
 def _flat(t):
-    """A 1-D DSL view covering a contiguous tensor's whole footprint (16-byte aligned; 4 for the one-element scale); the kernel addresses
-    by flat element and takes the element count as a runtime argument, so the view's extent enters no compile key."""
+    """A 1-D DSL view covering a contiguous tensor's whole footprint.  A slab (``attn``, ``gate``, ``out``: 16-byte aligned) declares a
+    DYNAMIC extent with the unit stride (Rule 4: the row count is a runtime fact, so the kernel is compiled for a runtime extent and a
+    launch at another row count re-binds it -- a view left static would compile the first call's extents into the kernel's symbol and
+    rely on the DSL never checking them again); the one-element ``scale`` (4-byte aligned) stays static.  The kernel addresses by flat
+    element and takes the element count as its own runtime argument: it never reads a view's extent."""
     from cutlass.cute.runtime import from_dlpack
 
     n = t.numel()
-    return from_dlpack(t.detach().as_strided((n,), (1,)), assumed_align=ALIGN_BYTES if n > 1 else SCALE_ALIGN_BYTES)
+    view = from_dlpack(t.detach().as_strided((n,), (1,)), assumed_align=ALIGN_BYTES if n > 1 else SCALE_ALIGN_BYTES)
+    return view.mark_layout_dynamic() if n > 1 else view
 
 
 class AttentionGateQuantDecode:
@@ -262,7 +269,8 @@ class AttentionGateQuantDecode:
 
     def key(self, rows: int) -> tuple:
         """The compile key: plan-time facts only -- the config.  ``rows`` selects it through the pick; neither the row count nor the width
-        enters the compiled kernel (the element count is a runtime argument)."""
+        enters the compiled kernel: the slabs bind with a dynamic extent (:func:`_flat`) and the element count is a runtime argument, so
+        the kernel compiled at the first call is the one the suite's rendering cell pins, whatever that call's shape was."""
         return (self.cfg_for(rows),)
 
     def _default_out(self):
@@ -279,8 +287,8 @@ class AttentionGateQuantDecode:
         return self._default_out()[: validate_rows(rows)]
 
     def _args(self, attn, gate, scale, out, given: bool):
-        """The four DSL views of a launch.  ``out`` binds through its ``uint8`` view (a true view: one byte per E4M3 element); the
-        entry-owned buffer never moves, so its view is built once."""
+        """The four DSL views of a compile or a launch (one form for both: :func:`_flat`).  ``out`` binds through its ``uint8`` view (a
+        true view: one byte per E4M3 element); the entry-owned buffer never moves, so its view is built once."""
         import torch
 
         if given:
@@ -309,15 +317,17 @@ class AttentionGateQuantDecode:
 
         from .kernel import gate_quant_decode_f16 as mod
 
-        args = self._args(attn, gate, scale, out, given)
-        with torch.cuda.device(self.device):
+        with device_context(self.device):  # a compiled launchable belongs to its device's context
+            args = self._args(attn, gate, scale, out, given)
             for cfg in missing:
                 self.compiled[(cfg,)] = cute.compile(mod.launch, cfg, *args, rows * self.width, make_fake_stream())
 
     def __call__(self, attn, gate, scale, out=None):
         """Launch on torch's current stream of the entry's device; returns ``out`` -- the caller's tensor as given, or the entry-owned
         buffer sliced to ``[rows, width]`` (E4M3).  Compiles on first use.  Every launch re-runs the binding checks before the compiled
-        kernel is looked up."""
+        kernel is looked up.  The launch is scoped to the entry's device (a no-op when that device is the caller's current one) and the
+        caller's current device is restored behind it: the compiled kernel belongs to that device's context (Rule 4), and a launch that
+        left another device current would move the caller's next default-device work (Rule 5)."""
         import cuda.bindings.driver as cuda
         import torch
 
@@ -327,6 +337,7 @@ class AttentionGateQuantDecode:
         key = self.key(rows)
         if key not in self.compiled:
             self.compile(attn, gate, scale, out if given else None)
-        args = self._args(attn, gate, scale, out, given)
-        self.compiled[key](*args, rows * self.width, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
+        with device_context(self.device):
+            args = self._args(attn, gate, scale, out, given)
+            self.compiled[key](*args, rows * self.width, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
         return out if given else out[:rows]

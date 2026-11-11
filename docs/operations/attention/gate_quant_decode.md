@@ -59,10 +59,12 @@ codes = entry(attn, gate, scale)                          # [rows, 2048] float8_
 codes = entry(attn, gate, scale, out)                     # or into a caller-owned [>= rows, 2048] float8_e4m3fn buffer
 ```
 
-One compiled kernel serves every row count and every layer of a model: all four tensors are launch arguments and the
-element count `rows x width` is a runtime argument, so the compile key is the config alone and a captured CUDA graph
-holds pointers, never values. The launch goes to torch's current stream of the entry's device. There is no workspace;
-a warm call allocates nothing and reads no device memory to the host.
+One compiled kernel serves every row count and every layer of a model: all four tensors are launch arguments, the
+slabs are bound with a runtime extent and the element count `rows x width` is a runtime argument, so no shape enters
+the compiled kernel, the compile key is the config alone, and a captured CUDA graph holds pointers, never values. The
+launch goes to torch's current stream of the entry's device. That device need not be the caller's current one: the
+compile and the launch run under the entry's device, and the caller's current device is restored afterwards. There is
+no workspace; a warm call allocates nothing and reads no device memory to the host.
 
 Everything the entry does not serve is declined by name: `TypeError` for a non-tensor, a dtype, a `width` that is not
 an `int`, or a `cfg` of another type; `ValueError` for a shape, a non-contiguous operand, an alignment, a device
@@ -112,6 +114,7 @@ grid on the stream; a chain with a dependent launched under the attribute is not
 | DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 the CUDA 12.9 and CUDA 13.4 compiler flavours of 4.8.0 render the same PTX and are both served; on cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT) |
 
 Tests: `test/python/attention_gate/frost/test_gate_quant_decode.py` (host declines, config and pick pins, the rendering
-pinned per target, the device cells against the fp64 reference), `test_gate_quant_decode_determinism.py` (replay, batch
+pinned per target and tied to the entry's own launch arguments, the device cells against the fp64 reference, an entry
+on a device that is not the caller's current one), `test_gate_quant_decode_determinism.py` (replay, batch
 invariance, goldens) and `test_gate_quant_decode_census.py` (`pytest -m L2`: every bf16 pair). Source:
 `python/cudnn/attention_gate/frost/`.

@@ -142,7 +142,9 @@ def product_form_model(attn, gate, scale):
 
 
 def assert_reference(out, attn, gate, scale, label=""):
-    """The three statements of the module docstring on one launch's bytes (``out``: E4M3 or its uint8 view; finite operands)."""
+    """The three statements of the module docstring on one launch's bytes (``out``: E4M3 or its uint8 view; finite operands).  Call it
+    with the operands' device CURRENT: the helper is plain torch math, and ``torch.ldexp`` (the fp32 unit of the margin rule) faults with
+    an illegal memory access on a tensor of a non-current CUDA device (measured with torch 2.14.0 on two cc 10.7 devices)."""
     got = out.view(torch.uint8)
     assert got.shape == attn.shape, f"{label}: output shape {tuple(got.shape)} for operands {tuple(attn.shape)}"
     _, v, other, nearest, margin = fp64_bracket(attn, gate)
