@@ -18,12 +18,12 @@ _CASES = [
 ]
 
 
-def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None, pack=True):
+def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None, pack=True, num_q_heads=8):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _rubin_only()
     dtype, kv_dtype = getattr(torch, dtype_name), getattr(torch, kv_name)
-    h, kh, sq, d, page, blocks = 8, 2, 17, head_dim, 16, 17
+    h, kh, sq, d, page, blocks = num_q_heads, 2, 17, head_dim, 16, 17
     dv = d if value_dim is None else value_dim
     rng = torch.Generator().manual_seed(73461)
     q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
