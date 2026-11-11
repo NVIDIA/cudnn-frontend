@@ -3375,3 +3375,23 @@ CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest -q -m L0 sdpa/frost/test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins
 ```
+
+#### Refresh after the #2220 develop merge
+
+The integrated native D128 implementation passes12 strict cases plus all four
+compact THD neighbors, with zero failures/skips. Its memcheck4, racecheck4
+and synccheck4 runs are clean; all ten offline CUDA13.4 variants still compile.
+The comparison control contains the same develop schedule with only this
+D128 physical-origin change reverted. Its four compact neighbor cases also
+pass, with byte-identical inputs/scales, O/reference and Amax.
+
+The incoming #2220 `_E11` schedule normalizes O with the unquantized FP32
+row sum instead of the earlier quantized-P ones-MMA denominator. Replaying
+the original source reproduces its four old golden files exactly; comparing
+against the integrated source preserves input/runtime and Stats hashes while
+changing O. Maximum O changes are0.01171875 for E4M3 and0.0234375 for E5M2,
+identical for token/head Stats layouts. Independent references, byte replay,
+concurrent work and batch invariance pass before recording the four updated
+O hashes, then strict comparison passes in another process. No tolerance or
+skip was changed. The earlier pre-#2220 E5M2 edge and old golden mismatch
+remain historical evidence; neither is a failure on this integrated head.
