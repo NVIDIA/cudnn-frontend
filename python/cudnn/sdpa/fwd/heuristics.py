@@ -145,6 +145,8 @@ _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
 # causal walks take plain LPT (see _sched_points): 8 MiB sits between the measured
 # S=8K bf16 (4 MiB, LPT ahead) and S=32K bf16 (16 MiB, LPT_L2 ahead) points.
 _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
+# Per-KV-head K+V footprint below which the quantized d128 GQA causal arm of the 107 line proposes plain LPT first.
+_SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES = 2 * 1024 * 1024
 # Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
 # (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
@@ -153,7 +155,7 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # 256 = the 2-CTA flavors' q rows per cluster; measured on the 212-SM part (106 clusters).
 _SM107_CGA_Q_ROWS = 256
 _SM107_MEASURED_SMS = 212
-_SM107_NO_GQA_LPT_MAX_WAVES = 24
+_SM107_NO_GQA_LPT_MAX_WAVES = 8
 # Rubin half THD causal prefill on the d128 flavor without packing: LPT ahead of NATURAL up to ~10 waves (9.48 and 11.85
 # measured; 311 FI-path cells, ragged and paged, 2026-11-01). d256 measured mixed from 5 waves on and keeps NATURAL.
 _SM107_THD_LPT_MAX_WAVES = 10
@@ -1521,6 +1523,16 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # proposes LPT on cc 10.3, where LPT vs LPT_L2 is unmeasured; it follows the
         # existing B200-measured precedent of the decode-tile arm above, keyed the same way.
         primary = SCHED_LPT
+    elif (
+        causal_ish
+        and 107 <= caps.sm_lo < 120
+        and (facts.is_fp8 or facts.is_mxfp8)
+        and _selected_d_shape(caps, facts) == (128, 128)
+        and int(facts.h_q) != int(facts.h_kv)
+        and int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) < _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES
+    ):
+        # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
+        primary = SCHED_LPT
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -2103,6 +2115,8 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # The SM100 nonpaged D128 half THD graphs with one query head per KV head run the single-CTA two-slab prefill body
         # (engines.sm100_nonpaged_d128_thd_single_cta_leg); the pair tile stays a runner.
         return sched_policy, 1
+    if selected_shape == (128, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
+        return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
@@ -2121,6 +2135,8 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
+    if selected_shape == (192, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
+        return SCHED_LPT, 1
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
