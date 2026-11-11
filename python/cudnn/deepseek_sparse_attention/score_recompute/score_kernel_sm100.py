@@ -123,10 +123,14 @@ class ScoreKernelSm100:
         self.mma_tiler_qk = (n_block_size, m_block_size, self.k_block_size)
         self.qk_acc_dtype = Float32
         self.load_warp_id, self.mma_warp_id, self.sched_warp_id = 0, 1, 2
-        self.num_clc_stage = 1
+        self.num_clc_stage = self._num_clc_stages()
         self.num_clc_response_bytes = 16
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
+
+    def _num_clc_stages(self) -> int:
+        """Depth of the CLC response ring (``num_clc_stage``): one stage unless a kernel deepens it."""
+        return 1
 
     def _set_register_split(self, num_math_wg: int):
         """Warps 0-3 (load / MMA / CLC / aux) plus ``num_math_wg`` math warpgroups, and their setmaxnreg split.

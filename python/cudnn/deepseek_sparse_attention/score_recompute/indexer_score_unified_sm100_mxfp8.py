@@ -100,7 +100,7 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
     NUM_SF_STAGES = 2  # K-scale TMEM ring depth
     Q_STAGES = 2  # Q / Q scale ring depth
     NUM_W_STAGES = 2  # W ring depth (deeper measured no faster)
-    NUM_CLC_STAGES = 2  # CLC response ring depth from H16 up (H8 / H4 keep 1, see num_clc_stage)
+    NUM_CLC_STAGES = 2  # CLC response ring depth from H16 up (H8 / H4 keep 1, see _num_clc_stages)
 
     def __init__(
         self,
@@ -164,8 +164,6 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         self.q_stage = self.Q_STAGES
         self.num_q_scale_stages = self.q_stage
         self.k_scale_stage = self.NUM_SPLIT_STAGES * self.SPLIT
-        # H8 / H4 keep one CLC stage: the second ring slot's live state spills their math warpgroups.
-        self.num_clc_stage = self.NUM_CLC_STAGES if self.qhead_per_kvhead >= 16 else 1
 
         # Warps: 0 load, 1 MMA, 2 CLC scheduler, 3 K-scale S2T, then the math warpgroups.
         # H64 tiles hold 2 tokens (one per math warpgroup); smaller groups use 4 warpgroups so a
@@ -187,6 +185,10 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
         self.tmem_q_sfb_offset = self.tmem_k_sfa_base_offset + self.NUM_SF_STAGES * self.sfa_stage_cols
         self.tmem_alloc_cols = 512
         assert self.tmem_q_sfb_offset + self.tmem_sfb_cols <= self.tmem_alloc_cols
+
+    def _num_clc_stages(self) -> int:
+        # H8 / H4 keep one CLC stage: the second ring slot's live state spills their math warpgroups.
+        return self.NUM_CLC_STAGES if self.qhead_per_kvhead >= 16 else 1
 
     @cute.jit
     def __call__(
