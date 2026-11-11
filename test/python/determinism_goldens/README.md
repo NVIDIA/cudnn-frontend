@@ -2659,6 +2659,56 @@ python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py \
   gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py -m L0 -q -rs
 ```
 
+### Rebased grouped GLU stack — SM100, 2026-11-11
+
+The feature was rebuilt on develop `683f294b` with the default NVFP4 column-scale
+packing fix as a separate prerequisite. The tested stack `c6e49e62` passed
+**102 Torch cases with 6 Rubin-only skips**: 97 from the three quantization,
+branch-layout and natural-rank suites above (149.01 s), plus all 5 default-layout
+determinism cases (11.93 s). The JAX selection passed **16 cases** (45.26 s).
+Subsequent history cleanup moved API documentation into the prerequisite fix
+and clarified documentation; the tested feature source and tests are unchanged.
+The runtime was the same GB200 / CUDA 13.4 compiler environment documented above.
+
+Separate processes imported the standalone fix and feature stack, generated
+identical inputs, and compared raw-byte hashes of C, D, columnwise RHT and its
+scales. All outputs matched for the default `interleaved_32` path at expert
+M=[256,0,512], N=256/2048, K=512. Each process also checked an independent
+numerical reference. The 15-case TE integration selection passed (48.64 s)
+using TE Python source `21d47d4d` and its previously built native libraries;
+this was not a fresh full native rebuild. SM103/SM107 remain unverified.
+
+### Rebased grouped GLU stack — SM100, 2026-11-16
+
+The prerequisite column-scale fix and grouped GLU feature were rebased on
+develop `5304d19d`. On four GB200 GPUs (SM100), the standalone fix passed
+**24 Torch and 16 JAX cases**, with 6 SM107-only scale-format skips. The feature
+selection, including the current upstream Hadamard suite, passed **371 unique
+Torch cases and 16 JAX cases**, with the same 6 SM107-only skips. The two-device
+cache-isolation case was rerun with two visible GPUs and passed.
+
+The feature-layout reference now follows the upstream Hadamard contract:
+pre-RHT amax is the maximum of stored BF16 D, and post-RHT amax is the maximum
+after rounding the transformed values to BF16. Independent GEMM/activation
+checks remain in place; their tolerances were not relaxed. Separate processes
+again compared all default `interleaved_32` output bytes between the standalone
+fix and feature at expert M=[256,0,512], N=256/2048, K=512. Both comparisons
+matched, and each process checked its independent numerical reference.
+
+The FE binding and TE native libraries were freshly built against this stack.
+The TE integration selection on upstream main `f96e7b24` passed **115 unique
+cases**, with 6 existing bias-support skips. Four-rank Megatron integration on
+main `7c0fac79` passed **81 cases**: GTP 12, FSDP V2 11, FSDP V1 3, adapter/config
+51, CUDA graph 1, and canonical grouped MLP determinism replay 3. Counts are
+per test case, not multiplied by ranks. Tests that trace dispatch now include
+the Hadamard forward variants selected by TE.
+
+The runtime used Torch `2.13.0a0+8145d630e8.nv26.06` (CUDA 13.3), FE backend
+92600, CuTe DSL 4.8.0 and the CUDA 13.4 compiler. The optional NCCL EP extension
+was disabled in the fresh TE build. These are targeted numerical and replay
+checks, not a complete upstream CI run or a new performance measurement.
+SM103/SM107 remain unverified.
+
 ### Custom reduction — SM100 validation, 2026-11-09 (UTC)
 
 The new `test_custom_reduction_determinism.py` L0 suite has **seven cases**:
