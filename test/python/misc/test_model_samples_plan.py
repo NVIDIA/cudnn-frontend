@@ -388,7 +388,8 @@ def test_reference_stack_decodes_a_tiny_geometry_on_the_cpu_and_replays_byte_for
     again, logits_again = run()
     assert again == first and bytes_equal(logits, logits_again), "a second run from a fresh state is byte-identical"
     stream = text.decoder(prompts[0])
-    assert "".join(stream.push(step[0]) for step in first) + stream.close() == text.decode([step[0] for step in first])
+    streamed = "".join(stream.push(step[0]) for step in first) + stream.close()
+    assert streamed == text.decode([step[0] for step in first])
     with pytest.raises(ValueError, match="2 sequences; got 1 prompts"):
         session.prefill(prompts[:1])
     with pytest.raises(ValueError, match="one non-zero length"):

@@ -105,7 +105,7 @@ def _probe(sources: Sequence[str]) -> dict:
         try:
             editable = editable or not package.is_relative_to(Path(str(dist.locate_file(""))).resolve())
         except (OSError, ValueError):
-            pass
+            pass  # the distribution's location cannot be resolved: keep what direct_url.json said
     facts["editable"] = editable
     try:
         facts["dsl_version"] = metadata.version("nvidia-cutlass-dsl")

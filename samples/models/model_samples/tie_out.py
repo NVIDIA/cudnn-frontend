@@ -129,7 +129,7 @@ def rms_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
 
 def _largest(so_far: float, value: float) -> float:
     """The larger of the two, and NaN as soon as one of them is: Python's ``max(x, nan)`` returns ``x``."""
-    if so_far != so_far or value != value:
+    if math.isnan(so_far) or math.isnan(value):
         return float("nan")
     return max(so_far, value)
 

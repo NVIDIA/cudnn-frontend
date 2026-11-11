@@ -100,15 +100,20 @@ class Block(Protocol):
     per_row: Tuple[int, ...]  # the operands that have one leading row per sequence
     state_args: Tuple[int, ...]  # the operands the call updates in place
 
-    def check_support(self, sequences: int, tokens: int) -> None: ...
+    def check_support(self, sequences: int, tokens: int) -> None:
+        """Raise the provider's typed decline when it does not serve this run; return otherwise."""
 
-    def compile(self, sequences: int, tokens: int) -> None: ...
+    def compile(self, sequences: int, tokens: int) -> None:
+        """Build everything the run needs before its first step."""
 
-    def reserve_bytes(self) -> int: ...
+    def reserve_bytes(self) -> int:
+        """Device bytes the provider takes outside PyTorch's pool, for the memory sentence of the plan."""
 
-    def first_launch(self) -> dict: ...
+    def first_launch(self) -> dict:
+        """What the first launch of each compiled form took, measured at load."""
 
-    def __call__(self, *operands): ...
+    def __call__(self, *operands):
+        """Launch the block on the current stream."""
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,17 @@ class Plan(dict):
         self.sequences, self.tokens, self.stack = sequences, tokens, stack
         self.regime: Optional[Regime] = regime
         self.source = source
+
+    def __eq__(self, other):
+        """Two plans are equal when they hold the same blocks and the same decisions.  Against a plain mapping the comparison is
+        the mapping's own (the blocks alone)."""
+        if not isinstance(other, Plan):
+            return NotImplemented
+        mine = (self.rows, self.calls, self.facts, self.sequences, self.tokens, self.stack, self.regime, self.source)
+        theirs = (other.rows, other.calls, other.facts, other.sequences, other.tokens, other.stack, other.regime, other.source)
+        return dict.__eq__(self, other) and mine == theirs
+
+    __hash__ = None  # a mapping with decisions attached: unhashable, like the dict it extends
 
     def by_provider(self) -> str:
         """The "by provider" line: block kinds per provider; a row with a ``fallback`` reason counts as a fallback."""
