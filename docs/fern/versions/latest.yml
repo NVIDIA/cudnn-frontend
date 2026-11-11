@@ -30,6 +30,9 @@ navigation:
           - page: Gated Attention Block (SM107)
             path: ../../operations/attention/gated_attention_block.md
             slug: gated_attention_block
+          - page: Attention Gate + Quantize Decode Step (SM100-class)
+            path: ../../operations/attention/gate_quant_decode.md
+            slug: gate_quant_decode
           - page: Compact GQA backward (SM107)
             path: ../../operations/attention/compact_gqa_backward.md
             slug: compact_gqa_backward
