@@ -1702,7 +1702,8 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
     # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o, then the score side outputs.
-    assert exec_params[-10:] == [
+    extension_start = exec_params.index("block_table_v")
+    assert exec_params[extension_start : extension_start + 10] == [
         "block_table_v",
         "gate",
         "sf_o",
@@ -1713,7 +1714,7 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "score_sum_exp_tensor",
         "bias_tensor",
         "kv_mask_tensor",
-    ], exec_params[-11:]
+    ], exec_params[extension_start:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
     assert all(inspect.signature(SdpaFwdDslSm100.execute).parameters[n].default is None for n in ("ragged_q", "ragged_o", "ragged_lse"))
