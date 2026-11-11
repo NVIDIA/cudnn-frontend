@@ -1421,3 +1421,10 @@ count. Check persistent CGA2 as well as CGA1: DSMEM publication does not
 protect later generic-proxy field reads. The D192 quantized origin tests
 force two clusters to exercise slot reuse; their compact-parent racecheck
 controls reproduce this failure without independent offsets.
+
+Host-frame fixtures that derive runtime arguments from a Python AST must retain
+unannotated arguments. Check `argument.annotation is None` before calling
+`ast.unparse`; only an explicit `Constexpr` annotation removes a runtime slot.
+The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
+exercise appended untyped origin arguments and compare native frames with
+the independent Python reference.
