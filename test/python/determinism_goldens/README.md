@@ -21,6 +21,7 @@ pytest core/test_determinism_utils.py
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
+| `TestQSABackwardEngine` | `qsa_backward`, `qsa_indexed_backward` | — | dQ, dK, dV |
 | CSA compressor focused cases | `CSA.csa_compressor_forward_wrapper`, `CSA.csa_compressor_backward_wrapper` | BF16 pooled output, including exact-zero capacity rows | BF16 dKV/dScore, FP32 dAPE |
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
 | `TestDSADeterministicDKV` | `sparse_attention_backward_wrapper` dKV layouts (`deterministic_dkv_mode`, SM100/SM103) | output, max logits, LSE (H128 D576: reference inputs) | dQ, dKV, dSink |
@@ -193,7 +194,8 @@ and arbitrary reducers remain unverified.
 The four linear-attention suites live in `linear_attention/frost/test_*_determinism.py`.
 They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
 nonzero initial state and fixed output/final-state gradients. QSA lives in
-`QSA/cutedsl/test_qsa_determinism.py`; its public API has no determinism switch.
+`QSA/cutedsl/test_qsa_determinism.py` and enables `deterministic=True` on
+backward; the forward has no switch.
 It covers BF16 with 12:1, 24:2, and 6:1 query/KV head counts.
 DSA uses FP16/BF16 and enables `deterministic=True` on backward;
 `TestDSADeterministicDKV` also pins each SM100/SM103 dKV layout.
@@ -529,7 +531,7 @@ version differ from the cc 10.3 set's), not a numerical change -- the input and 
 an observation on these two runtimes, not a contract across architectures.  A cc 10.7 part that reports another GPU name, SM count or software
 version hashes to another key, and the golden cells skip there.
 
-### QSA: 35 cases
+### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
 must match even when the BF16 output rounds to the same value.
@@ -538,13 +540,14 @@ must match even when the BF16 output rounds to the same value.
 | --- | --- | --- | ---: |
 | `test_replay` | L0 | fprop/bprop × Q:KV heads 12:1, 24:2, 6:1; eight executions; input mutation check | 6 |
 | `test_batch_invariance` | L0 | Same six combinations; lengths 65, 3, 17; removal/reorder with masks preserved | 6 |
-| `test_golden` | L0 | fprop/bprop; lengths 17, 3; three executions, reference, saved hashes | 2 |
+| `test_golden` | L0 | fprop/bprop; lengths 17, 3; three executions, reference, saved hashes; the backward runs its default path | 2 |
 | `test_sparse_batch_invariance` | L0 | fprop/bprop; lengths 2057, 3; four executions then standalone comparison | 2 |
 | `test_dispatch_boundary` | L0 | fprop/bprop × total tokens 512/513; a fixed 3-token target before/after a neighbor | 4 |
 | `test_mask_replay` | L0 | fprop/bprop × all selected, every seventh row empty, all masked; reference and eight executions | 6 |
 | `test_mask_batch_invariance` | L0 | Same six combinations; each sequence alone, reversed batch, duplicate sequence | 6 |
-| `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring values, masks, and upstream gradients | 2 |
+| `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring values, masks, and upstream gradients; the backward keeps the packed layout | 2 |
 | `test_zero_upstream_gradient_bprop` | L0 | Eight executions with zero dO; all gradients must be zero | 1 |
+| `TestQSABackwardEngine::test_replay` | L0 | bitmap and indexed entries with `deterministic=True`; multi-tile dense, sparse record windows, packed sparse; four executions and reference | 7 |
 
 Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 `test_dispatch_boundary[total513-fprop]` identifies the routing boundary and
@@ -783,17 +786,17 @@ the checklist is a review safeguard.
 
 ## Temporary skips
 
-The 26 cases below use `skip until fix` reasons, as requested. They remain L0.
+The 21 cases below use `skip until fix` reasons, as requested. They remain L0.
 The set is the union of failures recorded on SM100, SM103, and SM107. A pass
 on one run does not clear a nondeterministic case that failed on another GPU.
 Passing parameters, golden checks, and all FP8/MXFP8 cases remain active.
 
 | Suite | Temporarily skipped parameters | Cases |
 | --- | --- | ---: |
-| QSA | Backward replay and basic batch checks, all three head layouts | 6 |
+| QSA | Backward batch checks, all three head layouts | 3 |
 | QSA | Sparse batch checks, both directions | 2 |
 | QSA | Dispatch boundary at total513, both directions | 2 |
-| QSA | Backward mask replay/batch checks, all-selected and empty-rows | 4 |
+| QSA | Backward mask batch checks, all-selected and empty-rows | 2 |
 | DSA attention | H128/D512/Top-K128 BF16 backward batch check | 1 |
 | DSA attention | Backward query boundaries H64 Q129/Q257 and H128 Q74/Q75 | 4 |
 | DSA indexer | Dense H64 replay/batch checks, BF16 and FP32 dK | 4 |
