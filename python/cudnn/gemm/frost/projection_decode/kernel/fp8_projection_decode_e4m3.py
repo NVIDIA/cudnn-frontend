@@ -24,7 +24,8 @@ configuration uses (the source: the whole per-CTA capacity); (5) the tensor-memo
 source: 256 columns), so that every CTA the launcher places on an SM also gets its columns; (6) a control arm in which the weight loader
 waits for the predecessor too (``PREWAIT_WEIGHTS`` off; the source never waits on the weight loader); (7) the dependent-launch wait and
 the release of the successor are two knobs; (8) the epilogue releases the tensor memory after it has consumed the registers it read
-from it (the source: right after the read); (9) named barrier counts and the cuDNN symbol prefix.  Not carried: the source's own
+from it (the source: right after the read) and rank 0 arms the reduction barrier at the top of its epilogue role (the source: after the read); (9) named barrier
+counts and the cuDNN symbol prefix.  Not carried: the source's own
 configuration validation and autotune list, its batched views, split-K 3.
 
 COORDINATES.  Kernel M = the weight rows ``N`` (``MMA_M`` 64 or 128 per CTA), kernel N = the token rows (one token tile of 8 / 16 / 32
@@ -69,9 +70,11 @@ BARRIER TABLE (all ``cta_group::1``; ``SUM(issuing lanes) == init`` on every pat
                             wait is a parity wait: it is correct because the epilogue's 128 entry arrivals (the first instructions of
                             their role) land long before warp 2 has issued its last K tile.
   bar_reduce (SPLIT_K > 1)  init REDUCE_BAR_ARRIVERS = 1 in every CTA, waited on rank 0 only.  Arrive: rank 0, epilogue thread 0,
-                            ``arrive.expect_tx((SPLIT_K - 1) x MMA_M x token tile x 4 B)``; the bytes by every epilogue thread of
-                            every other rank, 16 B per remote store.  Wait: rank 0's 128 epilogue threads before they read the mailbox.
-                            A peer's bytes may complete before rank 0 arms the expect (the pending count is signed).
+                            ``arrive.expect_tx((SPLIT_K - 1) x MMA_M x token tile x 4 B)``, the FIRST instruction of its role (above
+                            every shared- and tensor-memory read of the role, and normally before any peer ships); the bytes by every
+                            epilogue thread of every other rank, 16 B per remote store.  Wait: rank 0's 128 epilogue threads before they read the
+                            mailbox.  Nothing orders a peer's bytes behind the expect; the pending count is signed, so either order
+                            completes the phase.
   init                      warp 0, ONE elected lane, every barrier; ``fence.mbarrier_init`` by all; then the cluster arrive / wait by
                             every thread (the CTA barrier at SPLIT_K 1) BEFORE any cross-CTA store.
 
@@ -498,6 +501,14 @@ class Fp8ProjectionDecodeKernel:
         bar_reduce,
         split_rank: cutlass.Int32,
     ):
+        if cutlass.const_expr(self.split_k > 1):
+            # Rank 0 arms the reduction barrier with the peers' byte count as the FIRST instruction of the role: above every
+            # shared-memory and tensor-memory read of the role, so no read of this role has this arrive between it and its first use,
+            # and the expect is normally in place before a peer ships.
+            if split_rank == OWNER_RANK:
+                if epi_tid == 0:
+                    cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, self.expected_transaction_bytes)
+
         # Wait until the MMA warp has published the tensor-memory base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
@@ -539,8 +550,6 @@ class Fp8ProjectionDecodeKernel:
                         Int32(OWNER_RANK),
                     )
             else:
-                if epi_tid == 0:
-                    cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, self.expected_transaction_bytes)
                 cute.arch.mbarrier_wait(bar_reduce, 0)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
