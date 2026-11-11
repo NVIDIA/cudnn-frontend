@@ -584,6 +584,17 @@ for `sm_107a`: that compiler rejects the target, and the cell skips with the ent
 pass against the SAME set, whose runtime key does not name the compiler flavour, so the two flavours write the same bytes for those cases;
 1 passed.
 
+CuTe DSL 4.8.1 on the same part (2026-11-11 UTC; the 4.8.1 wheels put first on the path of the same runtime, compiling with CUDA 13.4):
+the functional command -> 147 passed, 0 skipped; the determinism command WITHOUT the goldens variable -> 33 passed, 2 skipped (both
+`test_golden` cases: the DSL version is part of the runtime key and no set is committed for that key, so the golden comparison is a
+coverage gap there, not a pass); the census -> 1 passed.  A record into a new directory under that runtime (2 passed, 33 deselected) holds
+the input and output hashes of the committed 4.8.0 set; it is not committed.  With only the CUDA 12 toolchain libraries of 4.8.1
+(`CUDA_VERSION` 12.9): 146 passed, 1 skipped (the `sm_107a` rendering cell, as under 4.8.0); 33 passed, 2 skipped (the golden cases, same
+reason); 1 passed; its record holds the same hashes (that run's tree differed from the commit in this report's text only).  Cold compile on an x86 host (fake tensors, empty caches): under 4.8.0 and under
+4.8.1 the kernel's four arms render byte-identical cubins for `sm_100a`, `sm_103a` and `sm_107a` with the CUDA 13.4 compiler and for
+`sm_100a` / `sm_103a` with the CUDA 12.9 compiler; `sm_107a` does not compile under CUDA 12.9 in either version (the entry's typed
+decline).  Not run on a device: 4.8.1 on cc 10.7.
+
 cc 10.7 record (2026-11-11 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver
 API 13050, cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in
 `d2a97fcefba4b867/`).  The same three commands -> 147 passed, 0 skipped; 35 passed, 0 skipped; 1 passed.  Before its set existed the
