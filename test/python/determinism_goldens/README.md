@@ -3356,57 +3356,6 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins
 ```
 
-### SM100 half / per-tensor FP8 D512 THD physical origins — 2026-11-11
-
-`test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins` collects 42 L0 cases:
-4 shared `test_mhas_v2` regressions, 12 reference/rebind/replay/batch cases,
-6 no-total-hint cases, 8 half head-envelope cases and 12 goldens. FP16/BF16
-each run both the role-split and 2x2 half implementations; E4M3/E5M2 run
-the FP8 implementation. Every
-expanded case asserts the actual kernel template, so a sibling implementation
-cannot satisfy its check. All plans retain the existing unsplit/unpacked
-contract and cover token/head-major Stats.
-
-Independent Q/K/V/O/Stats origins use mixed INT32/INT64 buffers and element
-multipliers. The fixture poisons input gaps with NaNs and checks output
-canaries, independent FP64 references, fresh pointer/stride bindings and
-retained capture after changing live lengths, origins and scalar scales.
-All-empty query work must leave output padding untouched. Exact-byte checks
-cover repeats, batch reorder/duplication, an isolated sequence and changed
-neighbors. Prepared and standalone graph execution must agree. D512 uses
-16-element Q/K multipliers so its +16 head-padding variant still represents
-whole physical token rows exactly. Eight additional half cases cover
-D384/V448 and D264/V504 in both implementations and dtypes; the latter
-uses an 8-element origin unit that divides its declared token stride.
-
-Measured runtime: SM100, 148 SMs; driver 595.71.05; Torch 2.14.1+cu130;
-cuDNN 9.24.0.43; DSL 4.8.0/compiler CUDA 12.9; tvm-ffi 0.1.14.post1.
-The final suite passes all 42 cases in 52.62 seconds, with zero failures or
-skips, including strict checks of twelve new goldens under
-`361d6da48de8fd55`. These were recorded after their references and byte
-comparisons passed; earlier goldens and tolerances are unchanged. The
-paired-host ABI detector passes separately. All 23 neighbor controls pass:
-compact D512 FP8 THD, dense output/amax, existing half dense/THD and D576
-physical-origin packed/split paths.
-The immediate parent fails all three shared D512 dtype cases. The first
-expanded candidate exposed seven 2x2 declines caused by an obsolete D576-only
-origin compile guard; removing it enables the existing D512 origin body.
-All six SM103 lowerings compile offline; execution there remains unverified.
-
-Compute Sanitizer memcheck, racecheck and synccheck each pass eight cases:
-the six token-major replay legs and both BF16 D264/V504 implementations.
-All report zero errors; racecheck reports zero hazards and warnings. Runtimes
-are 6.64, 341.42 and 4.67 seconds respectively. The private launcher initializes
-cuda-python before Torch for the procedure-lookup issue documented above;
-API reporting remains explicit, with all kernels instrumented and error exit
-code 86. No sanitizer diagnostics are suppressed.
-
-```bash
-CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
-  pytest -q -m L0 \
-  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
-```
-
 ### SM100 D256 paged THD packed split — 2026-11-11
 
 `sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit` is collected
