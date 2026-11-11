@@ -365,6 +365,8 @@ include padding, a bottom-right causal window and sinks. This is fixed-plan,
 fixed-runtime forward qualification; THD batch invariance and backward remain
 outside this addition.
 
+
+
 ## SM120 FP8 and MXFP8 forward tails
 
 Native per-tensor FP8 and block-scaled MXFP8 forward preserve per-sequence
