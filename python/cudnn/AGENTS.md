@@ -791,11 +791,12 @@ anything releases that stage, and prove the order in the compiled kernel.**
   from a few launches in a hundred thousand to every launch, depending on how
   many loads are still unread and on what sits between the load and the
   release. The rate also depends on the launch geometry: on the two parts
-  where this was measured (10.0 and 10.7), the same unsafe kernel failed in
-  every launch with every lane of a load in the same shared-memory banks and
-  two or three thread blocks per SM, and in none with one thread block per
-  SM. A kernel with this order can pass every functional test and fail in
-  another shape or on another part.
+  where this was measured (10.0 and 10.7), the same unsafe kernel, with every
+  lane of a load in the same shared-memory banks, failed in every launch at
+  three thread blocks per SM, in all or all but one of 20,000 launches at
+  two, and in none at one; released through the helper below it read zero at
+  two and at three. A kernel with this order can pass every functional test
+  and fail in another shape or on another part.
 - **A release is anything after which the stage may be rewritten:** every
   `mbarrier` arrive form (plain, counted, `expect_tx`, the remote and cluster
   forms), `tcgen05.commit` to a barrier, a named-barrier or cluster-barrier
@@ -832,9 +833,11 @@ anything releases that stage, and prove the order in the compiled kernel.**
   disassembly; or, when the refill is an async-proxy write (a TMA load, a
   bulk copy, the cluster launch-control response), put
   `fence.proxy.async.shared::cta` between the LAST load and the release. Both
-  read zero in every measurement and neither is ordered by data flow: name
-  the choice in the kernel's shared-memory buffer table and keep the site
-  under the warm stress.
+  read zero in every measurement — the fence against TMA and bulk-copy
+  refills; the launch-control response is a write of the same kind and was
+  not measured separately — and neither is ordered by data flow: name the
+  choice in the kernel's shared-memory buffer table and keep the site under
+  the warm stress.
 - **Never let the kernel know the mask.** The release-zero argument has
   exactly one use in the kernel, `release_zero(arg)`. A compare, a branch, an
   assert or an assume on it — an entry guard `if arg == 0:` is enough — lets

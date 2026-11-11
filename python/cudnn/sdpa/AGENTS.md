@@ -615,8 +615,10 @@ and its predecoded fields, the per-tile softmax statistics and the alpha
 transfer slot, a cross-CTA mailbox — returns the slot with every word it
 loaded, through `tile_dsl.consume`, or names in the kernel's barrier table
 which other ordering of Rule 11 the site relies on. `read_clc_payload` keeps
-its cross-proxy fence: it is measured to order the read against the cluster
-launch-control response, an async-proxy write (measured, not proven: Rule 11).
+its cross-proxy fence. Between the last load and the release, that fence is
+measured to order a read against async-proxy refills (a TMA load, a bulk
+copy). The cluster launch-control response is a write of that kind; it was
+not measured separately, and none of this is proven (Rule 11).
 It does not order a slot that ordinary stores refill (a single-CTA persistent
 scheduler, a statistics slot written by the softmax warps). Reading through
 lane zero and broadcasting, as the single-CTA path does, stops other lanes
