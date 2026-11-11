@@ -69,9 +69,10 @@ ACCUMULATION_PARTS = "SM100, SM103 or SM107 (cc 10.0 / 10.3 / 10.7)"
 DENSE_SM_RANGE = (100, 107)
 # The parts the deterministic kernel pair is measured on; elsewhere a deterministic dense MHA request keeps the recompute body.
 PAIR_CCS = ((10, 0), (10, 3))
+D192_FP8_CCS = ACCUMULATION_CCS
 
 
-def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=128, d_v=128, input_bytes=2):
+def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=128, d_v=128, input_bytes=2, ccs=ACCUMULATION_CCS):
     """Choose from plan facts; recompute stays the fallback outside the accumulation envelope.
 
     The accumulation kernels round both sequence lengths up to whole 128-row
@@ -79,7 +80,7 @@ def select_implementation(cc, dsl_version, batch, heads, sq, skv, scale, d_qk=12
     reductions, and the tail Stats rows publish -inf, so unaligned S_q / S_kv
     take the same path as aligned ones.
     """
-    if tuple(cc) not in ACCUMULATION_CCS or not dsl_version or dsl_version[0] != "nvidia-cutlass-dsl":
+    if tuple(cc) not in ccs or not dsl_version or dsl_version[0] != "nvidia-cutlass-dsl":
         return RECOMPUTE
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", dsl_version[1])
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
