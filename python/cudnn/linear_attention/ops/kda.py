@@ -2219,9 +2219,30 @@ def kimi_delta_attention_summary(
     semantics match :func:`kimi_delta_attention` (k ``[total_tokens, HK, K]``, v ``[total_tokens, HV, V]``, g
     ``[total_tokens, HO, K]`` per-key-channel log decay, beta ``[total_tokens, HO]``, cu_seqlens ``[N+1]``); ``initial_state`` is float32.
 
+    For composition, request H with ``initial_state=None``; a seeded H already
+    includes its boundary state's contribution.
+
     FROST BF16 H/M projection accumulators, residual subtraction and beta
     multiplication remain FP32 until the Y operand is rounded to BF16. MMA
     operands and the chunk inverse are not upgraded; FP16 arithmetic is unchanged.
+
+    On SM90, ``kda_summary_hopper_cuda`` computes H and M directly with FP32
+    state operands and accumulation; M never reads V or ``initial_state``.
+    Do not extract M by subtracting two ordinary KDA forwards: their BF16
+    state MMA operands make that subtraction inaccurate. The SM90 summary
+    accepts BF16 k/v, FP32 log gates, activated FP32 beta and FP32 state,
+    equal head counts and K=V=128. Normalize k and activate gates/beta before
+    calling; in-kernel normalization, safe gate and beta sigmoid are not
+    supported on this route. INT32/INT64 packed offsets and nonnegative
+    outer strides with a unit innermost stride are supported, including empty
+    sequences. Outputs must not overlap inputs or each other. No workspace is
+    needed by the engine; compilation occurs when the graph plan is built.
+    The recurrence is sequential in tokens, so long spans may be slower than
+    tensor-core apply kernels. Warm the public op before CUDA Graph capture.
+    The public wrapper allocates outputs; the graph engine only writes caller
+    buffers, on the handle's execution stream. Keep all bindings alive until
+    that stream finishes. Execute-time shape changes are rejected; offset
+    values may change in-place between replays within the declared capacity.
 
     Args:
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
@@ -2230,7 +2251,7 @@ def kimi_delta_attention_summary(
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
-        plan_name: pin one execution plan by name (e.g. ``kda_summary_frost``).
+        plan_name: pin one execution plan by name (e.g. ``kda_summary_frost`` or ``kda_summary_hopper_cuda``).
     """
     if k.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -2289,6 +2310,15 @@ def kimi_delta_attention_summary_bwd(
     ``[total_tokens, HO, K]``, beta ``[total_tokens, HO]``, dO ``[total_tokens, HO, V]`` in the io dtype, cu_seqlens
     ``[N+1]``); ``d_final_state`` is float32 ``[N, HO, V, K]``.
 
+    On SM90, ``kda_summary_hopper_cuda`` uses a direct FP32 reverse recurrence
+    with the same dtype, dimension, layout and activation restrictions as
+    :func:`kimi_delta_attention_summary`. Q and dO must be BF16. Its transition
+    is independent of Q, dO and ``d_final_state``; it represents the transpose
+    of the forward summary's transition (within FP32 rounding). This route
+    does not produce a backward context or state checkpoints. It computes
+    only the state-gradient summary, not dQ/dK/dV/dG/dBeta, and is not an
+    autograd implementation for the summary operation itself.
+
     Args:
         scale: attention scale applied to ``q``; defaults to ``1 / sqrt(K)``.
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
@@ -2297,7 +2327,7 @@ def kimi_delta_attention_summary_bwd(
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]^K``, 1e-10 floor, ``dG`` with respect
             to ``alpha``); not with ``safe_gate``.
-        plan_name: pin one execution plan by name (e.g. ``kda_summary_frost``).
+        plan_name: pin one execution plan by name (e.g. ``kda_summary_frost`` or ``kda_summary_hopper_cuda``).
         output_context: with ``output_transition``, also return the backward's context as a third value, for
             ``torch.ops.cudnn.kimi_delta_attention_bwd(..., context=context)``; prepared at ``checkpoint_every_n_tokens``, which must
             equal the backward's.

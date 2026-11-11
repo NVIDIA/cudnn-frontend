@@ -4,6 +4,80 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM90 KDA FP32 summaries — validation, 2026-11-11
+
+`linear_attention/hopper/test_kda_summary_sm90.py` adds 35 L0 cases for
+`kimi_delta_attention_summary` and `kimi_delta_attention_summary_bwd`, pinned
+to `kda_summary_hopper_cuda`. BF16 Q/K/V/dO, FP32 gate/beta/state, K=V=128,
+equal head counts and INT32/INT64 offsets are covered. Both FP32 outputs
+(H/G and transition) are compared with an independent FP64 recurrence;
+the reverse summary also matches FP64 autograd. The APIs are non-differentiable
+summaries, not implementations of the ordinary dQ/dK/dV/dG/dBeta backward.
+
+Two determinism cases compare all output bytes over four fixed-input calls
+with fresh storage and concurrent GPU work, then move/duplicate the same
+33-token sequence among empty and 17-token neighbors, including a 23-sequence
+packed batch. `batch_invariant=True` is enabled. Inputs are unchanged and
+the independent reference passes before recording two new runtime goldens.
+No existing golden is replaced. Four CUDA Graph cases cover both directions
+and offset dtypes, with two changed-input/changed-offset replays each, padded
+outer strides, poisoned outputs, and fresh-address eager rebinding.
+Separate tests check 64 logical spans composed in FP64 against a monolithic
+FP64 recurrence; this isolates summary error and is **not** a 64-GPU E2E run.
+Unsupported-feature and malformed-binding tests reject before launch.
+
+On H20-3e (SM90), Torch 2.9.1+cu128, CUDA 12.8, driver 12080 and cuDNN 91002,
+the full suite passed **35 tests, no skips**, both during separate golden
+recording (2.58 s) and final strict checking with recording unset (2.51 s).
+The installed DSL was 4.8.1, but this engine compiles CUDA C++ with NVRTC;
+it does not use CuTeDSL. Imports and the freshly built extension resolved
+to the validation checkout based on `develop@3ac68cf8f`.
+Ten existing Hopper CUDA forward/default-routing/serving-dtype controls
+also passed (1.27 s). Other GPU architectures and CUDA 13 are unverified
+for this addition; existing FROST support is unchanged.
+
+Compute Sanitizer memcheck passed 15 reference/empty/capture cases (9.22 s),
+with `ERROR SUMMARY: 0 errors`. This run used
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`: the first instrumented
+attempt encountered `CUDA_ERROR_NOT_PERMITTED` in Torch's expandable
+allocator `cuMemCreate`, before the test kernels. The instrumented process
+also reports nanobind shutdown reference warnings; an unchanged ordinary
+Hopper forward control reproduces those warnings and passes with zero
+memcheck errors. No memory-leak fix is claimed here.
+
+From `test/python`, after preparing the two runtime goldens separately:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_sm90.py -m L0 -q -s
+python -m pytest linear_attention/hopper/test_kda_sm90_cuda.py -m L0 -q -s \
+  -k 'is_the_default_on_hopper or serving_dtypes or absent_initial_state_is_zeroed'
+```
+
+The new V-independence regression was observed RED on the unmodified base:
+no SM90 summary plan was available. During development, direct FP32 `exp(g)`
+factors still failed the unchanged 64-span FP64 tolerance under weak decay;
+using `expm1(g)` with FMA in that regime made both directions pass.
+
+For context, the following measurements use `make_case((T,), heads=8)`
+(seed 713, normalized BF16 Q/K, BF16 V, g=-0.001, beta=0.5), the suite's
+FP64 reference, and median CUDA-event time over five groups of 50 CUDA Graph
+replays. The probe is two ordinary `kda_hopper_cuda` forwards, one with zero
+state and one with identity, followed by state subtraction. Summary timing
+includes H and M, not communication or the full KDA layer.
+
+| Tokens | Probe M relative L2 error | FP32 summary M relative L2 error | Probe time (µs) | FP32 summary time (µs) |
+| --- | --- | --- | --- | --- |
+| 64 | 1.1082e-2 | 2.3770e-7 | 41.58 | 80.84 |
+| 256 | 3.9914e-2 | 5.5151e-7 | 130.62 | 314.68 |
+| 1024 | 8.6890e-1 | 1.1520e-6 | 608.54 | 1247.20 |
+
+This is a precision/coverage addition with a measured latency cost, not a
+performance improvement to the ordinary tensor-core apply kernels.
+
+### Shared suite inventory
+
 These suites check six attention families and the DSA indexer APIs. Run from `test/python`:
 
 ```bash

@@ -38,6 +38,8 @@ arbitrary user callbacks.
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `kimi_delta_attention_summary` | state / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
+| `kimi_delta_attention_summary_bwd` | state-gradient / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -113,6 +115,14 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- SM90 KDA summaries: pin `kda_summary_hopper_cuda`; K=V=128, equal head
+  counts, caller-normalized Q/K, FP32 log gates and activated FP32 beta/state.
+  The direct FP32 recurrence has no cross-sequence reduction and supports
+  `batch_invariant=True`, including empty spans and changed THD packing.
+  Both H/G and transition are covered. These non-differentiable summary APIs
+  do not provide dQ/dK/dV/dG/dBeta or a backward context; this qualification
+  does not establish determinism of the ordinary SM90 KDA apply kernels.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed

@@ -1108,6 +1108,13 @@ checks holes, duplicates, bounded lengths, all-masked rows and target alignment.
 
 ## Linear-attention decay factorisation range
 
+SM90 KDA apply kernels round state operands to BF16 for MMA. Do not derive
+the span transition by subtracting seeded apply results: `F(I,V)-F(0,V)`
+amplifies their V-dependent rounding. Use the direct FP32 summary engine.
+Its weak-decay path uses `expm1(g)` with FMA instead of materializing a
+rounded near-one factor; `test/python/linear_attention/hopper/test_kda_summary_sm90.py` pins V independence,
+FP64 state/transition parity, and 64-span composition without relaxing tolerances.
+
 A chunk kernel that splits a decay `2^(g[t] - g[s])` into `exp2(+g[t])` on one MMA
 operand and `rcp(exp2(g[s]))` on the other is exact only while each factor stays
 in the operand's range: an in-tile log2 prefix of -126 with bf16 operands (`exp2`
