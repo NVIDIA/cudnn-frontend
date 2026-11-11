@@ -2396,7 +2396,6 @@ def recompute_w_u_fwd(k, v, beta, A, gk, q=None, cu_seqlens=None, chunk_indices=
         int(q is not None),
         1,
         str(k.dtype),
-        str(dev),
     )
     autotuned_launch(recompute_w_u_fwd_kda_kernel, _wu_key, _wu_grid, _wu_args, occ_choices=(1, 2, 4, 8), nww_choices=(4,), stream=stream)
     return w, u, qg, kg
@@ -2572,7 +2571,6 @@ def chunk_kda_fwd_intra(
         1,
         int(use_solved_diagonal),
         str(k.dtype),
-        str(dev),
     )
     autotuned_launch(chunk_kda_fwd_kernel_inter_solve_fused, _isf_key, _isf_grid, _isf_args, occ_choices=(1, 2, 4), nww_choices=(4,), stream=stream)
     w, u, qg, kg = recompute_w_u_fwd(
@@ -2836,7 +2834,6 @@ def chunk_gla_fwd_o_gk(q, v, g, A, h, scale, state_v_first=False, cu_seqlens=Non
         int(BV),
         int(state_v_first),
         str(q.dtype),
-        str(dev),
     )
     autotuned_launch(chunk_gla_fwd_kernel_o, _o_key, grid, _o_args, occ_choices=(1, 2, 4), nww_choices=(4,), stream=stream)
     return o
