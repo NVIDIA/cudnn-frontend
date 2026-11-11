@@ -2670,4 +2670,5 @@ class TestD512PhysicalOrigins:
     test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
     test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
     test_half_head_envelope_origins = staticmethod(_origins.test_half_head_envelope_origins)
+    test_stats_slot_waits_for_all_warps = staticmethod(_origins.test_stats_slot_waits_for_all_warps)
     test_origin_golden = staticmethod(_origins.test_origin_golden)
