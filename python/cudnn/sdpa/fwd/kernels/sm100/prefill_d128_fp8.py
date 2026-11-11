@@ -353,7 +353,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # (issue #552) — no length ever reaches the host — and publishes the live unit
 # total + claim counter, so the adapter launches a MACHINE-sized grid rather
 # than the plan-time envelope (issue #618).
-from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_map_ptr, origin_tensors, origin_tma_slice
 from cudnn.frost.tile_dsl.thd import thd_port_origin, exit_if_dead_thd_cluster
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
@@ -959,7 +959,10 @@ def _tmaldg_warp_group(
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)  # noqa: E731
     else:
         tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
+    if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
+        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)  # noqa: E731
+        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)  # noqa: E731
+    elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's RUNTIME descriptors (o_desc_words
         # slots n_batch+1 / n_batch+2), whose seq extent is clamped to the
         # packed KV total cu_k[B]. The last sequence's tile steps past that
@@ -1037,9 +1040,11 @@ def _tmaldg_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(thd_origins is not None):
-            # A persistent unit can switch batches; acquire its current Q map.
-            q_map = o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1) + batch_idx) * cutlass.Int32(_TENSOR_MAP_QWORDS)
-            tma_tensormap_acquire(q_map.tospace(cutlass.AddressSpace.generic))
+            # Persistent work can switch sequences, so acquire every current map.
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 1, n_batch, batch_idx))
+            if cutlass.const_expr(not PAGED_KV):
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, batch_idx))
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, batch_idx))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -3371,7 +3376,7 @@ def _host(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
-                paged=True,
+                paged=PAGED_KV,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         elif cutlass.const_expr(PAGED_KV):
             # Compact standalone THD keeps page-pool maps intact as well.
@@ -3497,8 +3502,8 @@ def compile_prepared(
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd and not PARAMS.paged_kv:
         raise ValueError("paged_hnd requires a paged-KV specialization")
-    if thd_origin_specs is not None and (not CFG.THD_VARLEN or not PAGED_KV or CFG.SPLIT_KV != 1 or len(thd_origin_specs) != 5):
-        raise ValueError("physical origins require unsplit paged THD and five port specifications")
+    if thd_origin_specs is not None and (not CFG.THD_VARLEN or CFG.SPLIT_KV != 1 or len(thd_origin_specs) != 5):
+        raise ValueError("physical origins require unsplit THD and five port specifications")
     return compile_host(
         _host,
         CFG,

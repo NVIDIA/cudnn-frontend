@@ -47,6 +47,9 @@ _TWO_WARPGROUP_KERNELS = (
     "sm107/prefill_d192_d128_fp8.py",
     "sm107/prefill_d192_d128_mxfp8.py",
 )
+# The sm107 d192x128 quantized kernels start a tile on ``mb_tile_go``: softmax warpgroup 1 and the correction group (after O
+# sub-tile 0) arrive it, and the correction group waits its own O slot, so the softmax warpgroups carry no top-of-tile mb_o_empty wait.
+_TILE_GATE_KERNELS = ("sm107/prefill_d192_d128_fp8.py", "sm107/prefill_d192_d128_mxfp8.py")
 
 
 @pytest.mark.parametrize("kernel", _TWO_WARPGROUP_KERNELS)
@@ -61,6 +64,14 @@ def test_softmax_top_of_tile_wait_is_on_the_warpgroups_own_o_slot(kernel):
     # One own-slot wait per tile body: the sm107 d128 kernel carries a second body (the resident-bias pair-step tile) whose
     # top-of-step wait follows the same slot discipline; every other kernel has one body.
     waits = len(re.findall(r"mb_o_empty\[sub_tile_id\].*epilogue_state", code))
+    if kernel in _TILE_GATE_KERNELS:
+        assert waits == 0 and not re.search(r"mb_o_empty\[sub_tile_id\]", code), f"{kernel}: the softmax warpgroups wait the tile gate, not mb_o_empty"
+        assert len(re.findall(r"mb_tile_go\.wait\(", code)) == 1, f"{kernel}: one top-of-tile gate wait"
+        assert re.search(r"init_count=CFG\.CORR_LANES \+ CFG\.SOFTMAX_LANES", code), f"{kernel}: the gate counts the correction lanes and one softmax warpgroup"
+        assert re.search(r"sub_tile_id == 1\):\n\s+mb_tile_go\.arrive\(\)", code), f"{kernel}: softmax warpgroup 1 arrives the gate (its back-edge)"
+        assert re.search(r"qs == 0\):\n\s+mb_tile_go\.arrive\(\)", code), f"{kernel}: the correction group arrives the gate after O sub-tile 0"
+        assert re.search(r"mb_o_empty\[qs\]\.wait\(o_empty_phase", code), f"{kernel}: the correction group waits its own O slot"
+        return
     assert waits == (
         2 if kernel == "sm107/prefill_d128_f16.py" else 1
     ), f"{kernel}: expected one per-warpgroup top-of-tile mb_o_empty wait per tile body, found {waits}"

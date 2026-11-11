@@ -108,12 +108,16 @@ def _facts_recorded(c, s):
 ADAPTERS = {"inference": _facts_inference, "training": _facts_training, "recorded": _facts_recorded}
 
 
-def load(path):
+def load(paths):
+    """Cases with both the backend and the FROST leg timed. ``paths`` is one JSONL or a list; records join on (file, idx), so
+    splits from separate driver runs (each counting idx from 0) never overwrite each other."""
     rows = collections.defaultdict(dict)
-    for line in open(path):
-        r = json.loads(line)
-        if r.get("ms") is not None:
-            rows[r["idx"]][r["leg"]] = r
+    for path in [paths] if isinstance(paths, str) else paths:
+        with open(path) as fh:
+            for line in fh:
+                r = json.loads(line)
+                if r.get("ms") is not None:
+                    rows[(path, r["idx"])][r["leg"]] = r
     return [d for d in rows.values() if "cudnn" in d and "cudnn_oss" in d]
 
 

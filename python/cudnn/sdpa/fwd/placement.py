@@ -323,6 +323,10 @@ window 128 / 512 / 4096; bottom-right chunks q128 / q2048 over a 32k cache at wi
   Rubin (216 SMs; the SM107 half and per-tensor FP8 rows) bf16 0.33-0.97, FP8 0.40-0.73
 FP8 agrees with the backend within rel-RMS 0.04 (E4M3 O), bf16 within 0.003.
 
+Rubin bf16 THD prefill through FlashInfer's paths (page 16 / 64 and ragged, d64-d256) is placed by the generated table
+(study ``sm107_thd_prefill_20261111``), which answers before the hand rules below; they still decide f16, bounded paged
+declarations, sinks and the classes that study left without an entry.
+
 Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
 128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. MHA and group 2 retain the
 backend-first order. Long-prefix chunks (2026-10-27): GQA 4 / 8 / 16 also lead at 1024 < s_q <= 4096 with

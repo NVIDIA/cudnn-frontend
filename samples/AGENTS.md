@@ -11,6 +11,7 @@ Usage examples for the C++ graph API and the Python API. Build commands: [../AGE
 | `python/` | Numbered Jupyter notebooks (`00_introduction.ipynb` ...) — the Python tutorial sequence |
 | `frost/` | Standalone Python scripts for the FROST engines and blocks: `gemm/`, `linear_attention/` and `gated_attention_block/`, numbered, each self-checking against a reference |
 | `llama/`, `llm_coverage/` | End-to-end LLaMA tie-out scripts and per-op coverage scripts (plain `.py`, see their READMEs) |
+| `models/` | End-to-end model samples: one process, a per-block provider table, a self-check against a plain-PyTorch reference; a shared helper layer `models/model_samples/`. Own rules: [models/AGENTS.md](models/AGENTS.md) |
 
 ## Running
 
