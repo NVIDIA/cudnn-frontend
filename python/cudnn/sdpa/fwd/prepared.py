@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 from cudnn.datatypes import _DLPACK_FP4_CODE_BITS
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
+from cudnn.sdpa.fwd.config_sm100 import paged_pool_layout as _paged_pool_layout
 
 _ALIGN_TMA = 16
 _ALIGN_F32 = 4
@@ -530,28 +531,6 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
 
 
 @lru_cache(maxsize=256)
-def _paged_pool_layout(shape, strides, elem_bytes, hnd, kh, page_size, d):
-    """Cache pure geometry only; addresses and observed storage are checked per call."""
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
-    if len(shape) != 4 or any(n <= 0 for n in shape) or shape[1] != kh or shape[2] != page_size or shape[3] != d:
-        raise ValueError(f"a page pool is (n_pages, {kh}, {page_size}, {d}); got {shape}")
-    if strides[3] != 1:
-        raise ValueError("the page pool's head dim must be contiguous")
-    if (strides[1] > strides[2]) != hnd:
-        raise ValueError(f"this artifact was compiled for {'HND' if hnd else 'NHD'} page pools; got strides {strides}")
-    # Match dense TMA admission in storage order, including singleton axes.
-    ordered_shape = (shape[0], shape[2], shape[1], shape[3]) if hnd else shape
-    ordered_strides = (strides[0], strides[2], strides[1], strides[3]) if hnd else strides
-    bound = dense_bind_strides(ordered_shape, ordered_strides, elem_bytes)
-    if bound is None:
-        raise ValueError(f"page-pool strides must be covering and 16-byte aligned; got {shape} / {strides}")
-    bs, ss, hs = (bound[0], bound[2], bound[1]) if hnd else bound
-    need = (shape[0] - 1) * bs + (page_size - 1) * ss + (kh - 1) * hs + d
-    return (bs, ss, hs), need
-
-
-@lru_cache(maxsize=256)
 def _paged_table_layout(shape, strides):
     """Normalize immutable table geometry; pointer/span checks stay per call."""
     if len(shape) == 4:
@@ -944,7 +923,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.combine = None
     s.combine_q_lens = False
     if s.split > 1:
-        from cudnn.sdpa.fwd.api_dsl import ws_align
+        from cudnn.api_base import ws_align
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn import _pybind_module
 

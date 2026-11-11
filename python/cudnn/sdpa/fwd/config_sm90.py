@@ -116,6 +116,8 @@ class TemplateParams:
     split_kv: int = 1
     # Native contraction/storage envelope; independent of runtime lengths.
     head_tile: int = 512
+    # Dense queries with native TMA loads from independently mapped K/V pages.
+    page_size: int = 0
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -150,6 +152,14 @@ BAND_COORDINATE_LIMIT = 2**30
 
 def validate_params(params: TemplateParams) -> None:
     """Validate the immutable specialization before constructing a kernel."""
+    if type(params.page_size) is not int or params.page_size < 0:
+        raise ValueError("SM90 page_size must be a nonnegative integer")
+    if params.page_size:
+        p = params.page_size
+        if p % 8 or (p < TILE_N and TILE_N % p) or (p >= TILE_N and p % TILE_N):
+            raise ValueError("SM90 page_size must be divisible by 8 and divide 64 or be a multiple of 64")
+        if params.thd_varlen or not params.seq_kv_lens_present:
+            raise ValueError("SM90 paged KV requires dense Q and device KV lengths")
     if type(params.head_tile) is not int or params.head_tile not in (128, 256, 512):
         raise ValueError("SM90 head_tile must be 128, 256 or 512")
     if type(params.split_kv) is not int or not 1 <= params.split_kv <= 65535:
