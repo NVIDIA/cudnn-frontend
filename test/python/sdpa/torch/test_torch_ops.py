@@ -602,6 +602,37 @@ class TestSdpaVarlen:
         assert (v.grad[:live].float() - rdv[:live]).abs().max().item() < TOL
 
     @pytest.mark.L0
+    @pytest.mark.parametrize("decline", ["unsupported", "not_implemented", "bug"])
+    def test_thd_autograd_adapts_only_explicit_declines(self, monkeypatch, decline):
+        """Legacy Stats adaptation is cached; implementation errors propagate."""
+        from cudnn.sdpa import packed_lse
+
+        with torch_op._graph_cache_lock:
+            torch_op._graph_cache.clear()
+        build = torch_op._build_bwd_graph
+        layouts = []
+
+        def legacy_build(handle, **kwargs):
+            layouts.append(kwargs["stats_is_packed"])
+            if kwargs["stats_is_packed"]:
+                error = {"unsupported": cudnn.cudnnGraphNotSupportedError, "not_implemented": NotImplementedError, "bug": RuntimeError}[decline]
+                raise error("injected packed-Stats decline")
+            return build(handle, **kwargs)
+
+        monkeypatch.setattr(torch_op, "_build_bwd_graph", legacy_build)
+        # Also exercise the compatibility implementation when DSL preparation
+        # is unavailable; live prefixes must ignore trailing capacity rows.
+        monkeypatch.setattr(packed_lse, "cutedsl_state", lambda: (False, None))
+        if decline == "bug":
+            with pytest.raises(RuntimeError, match="injected packed-Stats decline"):
+                self.test_thd_autograd_ignores_trailing_capacity(False)
+            assert layouts == [True]
+        else:
+            self.test_thd_autograd_ignores_trailing_capacity(False)
+            self.test_thd_autograd_ignores_trailing_capacity(False)
+            assert layouts == [True, False]
+
+    @pytest.mark.L0
     def test_thd_kv_packed_views(self):
         """K/V as views of a kv-interleaved [T, 2, H, D] buffer (token stride
         2*H*D) — the layout torch.nn.attention.varlen users produce. Must be
