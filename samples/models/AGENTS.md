@@ -113,7 +113,8 @@ defect that shows it.
   to 52 bf16 units of the largest logit apart within 80 steps and disagreed on the greedy token at 13 of them, at margins of
   up to several logits. A band that two correct stacks pass can only catch a path that has failed outright. Verify providers per block,
   teacher-forced; print a second reference's distance beside the provider's instead of pretending the token check gates more
-  than it does.
+  than it does. And know where such a band stops meaning anything: the largest logit is at least 128 and below 256 of its
+  own bf16 units, so beyond 128 units a stack that returns zeros passes.
 - The first call of a tokenizer and of a compiled chat template pays for caches the libraries build, tens of times the
   repeated call. A sample that times one call times the caches; print the first call and the repeated call apart.
 - A streaming decoder is a library feature with its own history: the incremental decoder of `tokenizers` 0.21.0 fails on

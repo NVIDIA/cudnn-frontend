@@ -94,11 +94,14 @@ as on seeded ones. The token check is weak on a checkpoint, and says so: the mod
 its projection inputs to 8, so a difference of one bf16 rounding in a multiply becomes a different code in the next
 quantiser, 64 layers deep. Two reference stacks that differ only in their accumulation precision (fp64 against IEEE fp32)
 were up to 52 bf16 units of the largest logit apart over 80 steps of one prompt and chose another greedy token at 13 of
-them; the provider stack was up to 54 units from the fp64 reference over the same steps, and 69 units in a window whose
-largest logit was one binade lower. The declared logits band of a checkpoint is therefore 128 units (`configs.py`): it
-catches a path whose logits are unrelated to the reference's or not finite, and nothing finer. Every run prints, beside
-the provider stack's distance, the distance of a second reference with the other accumulation precision and the number of
-greedy tokens each pair agrees on, so the two can be read side by side. Comparing the produced ids with a serving engine
+them; the provider stack was up to 54 units from the fp64 reference over the same steps. In the 16-step windows a run
+checks, whose largest logit is often one binade lower, the provider stack was up to 69 units from the reference and a
+second reference up to 92. The declared logits band of a checkpoint is therefore 128 units (`configs.py`): it catches a
+path whose logits are unrelated to the reference's or not finite, and nothing finer. It is also as wide as it can be: the
+largest reference logit is at least 128 and below 256 of its own units, so a stack that returned zeros sits at the band or
+beyond it. If a correct stack is ever seen beyond the band, the line becomes a reported one; the band is not widened.
+Every run prints, beside the provider stack's distance, the distance of a second reference with the other accumulation
+precision and the number of greedy tokens each pair agrees on, so the two can be read side by side. Comparing the produced ids with a serving engine
 is not part of this sample; `--dump-tokens` writes them for a comparison made elsewhere, and greedy decoding is not the
 checkpoint's own default (its generation settings sample).
 

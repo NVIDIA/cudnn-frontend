@@ -105,10 +105,14 @@ LOGITS_BAND_UNITS = 4.0
 #: rounding in a multiply becomes a different code in the next quantiser, 64 layers deep.  Measured by this sample on the
 #: published 27B-class checkpoint: two REFERENCE stacks that differ only in their accumulation precision (fp64 against IEEE
 #: fp32) were up to 52 units apart over 80 steps and chose another greedy token at 13 of them; the provider stack was up to
-#: 54 units from the fp64 reference over the same steps (69 units in a window whose largest logit was in a lower binade).
+#: 54 units from the fp64 reference over the same steps.  In the 16-step windows a run checks, whose largest logit is often
+#: one binade lower, the provider stack was up to 69 units from the reference and a second reference up to 92.
 #: A band below that would fail two correct stacks; at this width the check catches a path that has failed outright (logits unrelated
-#: to the reference's, a NaN) and nothing finer.  What verifies a provider on a checkpoint is the per-block check; the run
-#: prints the second reference's distance beside the provider's so that the two can be read side by side
+#: to the reference's, a NaN) and nothing finer.  It is also as wide as it can be: the largest reference logit is at least
+#: 128 and below 256 of its own units, so a stack that returned zeros sits at this band or beyond it, and would pass a wider
+#: one.  If a correct stack is ever seen beyond it, the line becomes a reported one; the band is not widened.  What verifies
+#: a provider on a checkpoint is the per-block check; the run prints the second reference's distance beside the provider's
+#: so that the two can be read side by side
 CHECKPOINT_LOGITS_BAND_UNITS = 128.0
 
 
