@@ -61,6 +61,12 @@ Cover these checks in each supported direction:
 - Add a small golden case per direction and distinct numerical path. Require
   replay and the reference to pass before recording its hashes. A small golden
   does not establish determinism for larger reductions.
+- Replay equality does not cover a kernel that releases a shared-memory stage
+  it has read ([Rule 11](../../python/cudnn/AGENTS.md)): that failure is
+  timing-dependent and can be absent from eight replays. For a kernel with a
+  refilled stage, add `warm_stress.assert_warm_stress` on a shape that refills
+  the stage within one launch beside the replay and batch-invariance cases,
+  and record a GPU where its control does not reproduce as unverified.
 
 Use the API's deterministic mode when provided. Pin the intended backend;
 do not let a missing plan silently select another provider. Quantize each

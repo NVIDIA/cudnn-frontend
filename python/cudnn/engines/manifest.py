@@ -201,7 +201,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "gdn",
         "cudnn.linear_attention",
         "GdnEngines",
-        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2)},
+        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2), "gdn_cake_det": EngineSlot(3, opt_in=True)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
@@ -219,6 +219,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_cake": EngineSlot(3),
             "kda_hopper": EngineSlot(4),
             "kda_hopper_cuda": EngineSlot(5),
+            "kda_cake_det": EngineSlot(6, opt_in=True),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
         # Ordering only, and only on Hopper: slot order is identity, not
