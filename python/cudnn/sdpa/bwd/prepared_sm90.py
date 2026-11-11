@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Storage-free plan construction for the Hopper dense d64 / d128 backward pair."""
+"""Storage-free plan construction for the Hopper dense d64 / d128 backward chain."""
 
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.bwd.prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
-from .d128_contract import PAIR, pair_workspace_layout, validate_launch
+from .d128_contract import RELAY, relay_workspace_layout, validate_launch
 
 
 class _GuardedEntry:
@@ -50,7 +50,7 @@ def compile_plan(api):
         operands.append(Operand(str(desc.dtype).split(".")[-1], shape, strides, span, alignment, desc.dtype.itemsize))
     device = resolve_device(api.q_desc.device)
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
-    regions, required = pair_workspace_layout(api.batch_size, api.h_q, api.s_q_max)
+    regions, required = relay_workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.
     with torch.cuda.device(device):
         entry = compile_host(tuple(geometry), regions, dtype, api.is_causal, api.h_q // api.h_kv)
@@ -58,9 +58,9 @@ def compile_plan(api):
     if fn is None:
         raise NotImplementedError("sdpa_bwd_sm90 requires a positional tvm-ffi entry")
     if required != api.scratch_workspace_bytes():
-        raise RuntimeError("the Hopper backward pair's compiled workspace disagrees with its advertised size")
+        raise RuntimeError("the Hopper backward chain's compiled workspace disagrees with its advertised size")
     return BwdLaunchSpec(
-        SimpleNamespace(entry=entry, workspace_bytes=required, workspace_regions=regions, implementation=PAIR),
+        SimpleNamespace(entry=entry, workspace_bytes=required, workspace_regions=regions, implementation=RELAY),
         _GuardedEntry(fn, operands, required),
         tuple(operands),
         required,

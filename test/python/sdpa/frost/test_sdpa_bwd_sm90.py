@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Hopper dense d64 / d128 backward: the deterministic dK / dV + dQ kernel pair, its selection, workspace, numerics and replay."""
+"""Hopper dense d64 / d128 backward: the key-owner kernel with the ordered dQ relay, its selection, workspace, numerics and replay."""
 
 from types import SimpleNamespace
 
@@ -20,7 +20,10 @@ def test_geometry():
 
     assert (kernel.HEAD_DIM, kernel.RATIO, kernel.STAGES, kernel.THREADS) == (128, 1, 3, 384)
     assert kernel.SMEM_BYTES <= 227 * 1024 and kernel.SMEM_BYTES % 1024 == 0
-    assert kernel.BARS == 2 * kernel.RESIDENT_BYTES + kernel.STAGES * 2 * kernel.STEP_BYTES
+    assert (
+        kernel.BARS
+        == 2 * kernel.RESIDENT_BYTES + kernel.STAGES * 2 * kernel.STEP_BYTES + 2 * kernel.DS_BYTES + kernel.DQS_BYTES + kernel.STAGES * kernel.STATS_BYTES
+    )
     assert kernel.PRODUCER_REGS * 128 + kernel.CONSUMER_REGS * 256 <= 65536
     with pytest.raises(ValueError):
         from cudnn.frost.template_loader import load_template
@@ -68,8 +71,8 @@ def _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed=729):
 
 
 def _case(dt, d, causal, b, hq, hkv, sq, sk, deterministic=True, seed=729):
-    """A dense graph pinned to the Hopper pair: the three-launch chain, its delta-only workspace, the fp64 gate."""
-    from cudnn.sdpa.bwd.d128_contract import pair_workspace_layout
+    """A dense graph pinned to the Hopper chain: its three launches, its workspace, the fp64 gate."""
+    from cudnn.sdpa.bwd.d128_contract import relay_workspace_layout
 
     tensors, expected, keep = _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed)
     graph, refs, outputs = _build_graph(
@@ -79,8 +82,8 @@ def _case(dt, d, causal, b, hq, hkv, sq, sk, deterministic=True, seed=729):
     graph.check_support()
     graph.build_plans()
     prepared = graph._compiled_plans[graph._plan_index]._prepared
-    assert prepared.spec.artifact.implementation == "pair"
-    required = pair_workspace_layout(b, hq, sq)[1]
+    assert prepared.spec.artifact.implementation == "relay"
+    required = relay_workspace_layout(b, hq, sq, d)[1]
     assert graph.get_workspace_size() == required == prepared.spec.workspace_bytes
     refs.update(zip(("dq", "dk", "dv"), outputs))
     pack = {refs[n]: value for n, value in tensors.items()}
@@ -133,13 +136,13 @@ def _check_case(case):
         "d64-6of2-tail",
     ],
 )
-def test_pair_matches_fp64(dt, d, causal, hq, hkv, sq, sk):
+def test_chain_matches_fp64(dt, d, causal, hq, hkv, sq, sk):
     _case(dt, d, causal, 2, hq, hkv, sq, sk)
 
 
 @requires_hopper
 @pytest.mark.parametrize("deterministic", [True, False])
-def test_both_requests_take_the_pair_bitwise(deterministic):
+def test_both_requests_take_the_chain_bitwise(deterministic):
     case = _case(torch.bfloat16, 128, True, 2, 4, 2, 640, 640, deterministic=deterministic)
     expected_bits = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
     stream = torch.cuda.Stream()
@@ -175,7 +178,7 @@ def test_three_launches_without_allocation_or_sync():
     if names is None:
         pytest.skip("the profiler records no CUDA activity on this device")
     assert len(names[0]) == 3, names[0]
-    for name, expected in zip(names[0], ("dot_do_o_kernel", "bprop_sm90_dkdv_kernel", "bprop_sm90_dq_kernel")):
+    for name, expected in zip(names[0], ("dot_do_o_kernel", "bprop_sm90_kernel", "cast_dq_d128_kernel")):
         assert expected in name, names[0]
 
 
