@@ -78,6 +78,7 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
 * [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul. Needs a data-center Blackwell-family GPU (`100 <= SM < 120`); on other parts the scripts print `[NN] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)` and exit 0.
 * [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2, GDP and Mamba-2 prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
+  [26_gdn_decode_fused.py](frost/linear_attention/26_gdn_decode_fused.py) drives the fused GDN decode step (`cudnn.GdnDecodeFused`) from a slot pool for 32 steps at 1 and 4 rows, checked against an fp64-accumulated PyTorch step; the entry serves compute capability 10.x and 12.x GPUs, and elsewhere the script prints `[26] SKIP` with the requirement and exits 0.
 * [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
 
 ```

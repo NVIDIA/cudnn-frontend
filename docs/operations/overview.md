@@ -30,6 +30,7 @@ The experimental API catalog includes:
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
 - [Fused GDN Decode / Verify Steps as a FlashInfer Backend (SM100 / SM120)](/operations/LinearAttention/gdn_decode_flashinfer_backend) — the fused Gated DeltaNet decode step and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer as one FROST launch each, registered as the `frost_fe` backend of FlashInfer's experimental Qwen 3.5 GDN block (bf16 operands, fp32 state, FP8 output)
 - [Shared-Expert Decode Pair (SM100-class)](/operations/MoeGroupedMatmul/shared_expert_decode) — the bf16 shared expert next to a routed MoE at decode-time token counts (1 .. 24) as two FROST launches (gate_up + SiLU-mul with the gate logit, down + sigmoid gate), bitwise repeatable and batch-invariant
+- [Attention Gate + Quantize Decode Step (SM100-class)](/operations/Attention/gate_quant_decode) — the sigmoid output gate of an attention block fused with the static FP8 (E4M3) quantization of the following projection's input, at decode-time row counts (1 .. 160), as one FROST launch (bf16 in, E4M3 out), bitwise repeatable and batch-invariant
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
 - [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) with the in-block indexer's decode and extend steps over the paged side caches, and write-through into a paged KV cache
@@ -76,6 +77,15 @@ The experimental API catalog includes:
 - [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](/operations/Convolutions/conv3d_postops)
 - [NVFP4 Block-Scale Conversion](/operations/BlockScaling/nvfp4_block_scale_conversion)
 - [DSv4.1 mHC projection/RMS backward](/operations/Matmul/gemm_fusions/mhc_projection_bwd)
+
+- [Ragged grouped GEMM training](/operations/gemm_fusions/ragged_grouped_gemm)
+
+- [Cake dense GEMM training](/operations/gemm_fusions/cake_dense_gemm)
+
+- [SwiGLU + MXFP8 quantization](/operations/gemm_fusions/gated_act_mxfp8)
+- [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
+
+- [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
 
 ## Installation and setup
 
@@ -199,3 +209,6 @@ Methods:
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
 - Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).
+
+- [Cake GDN training](cake_gdn.md): opt-in packed BF16 forward and backward.
+- [Cake chunk-64 KDA training](cake_kda.md): opt-in serial forward and backward.
