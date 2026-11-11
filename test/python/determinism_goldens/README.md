@@ -29,6 +29,7 @@ pytest core/test_determinism_utils.py
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
 | `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
+| `attention_gate/frost/test_gate_quant_decode_determinism.py` | `AttentionGateQuantDecode` (the attention gate + quantize decode step, rows 1 .. 160) | FP8 E4M3 output `out` | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
@@ -530,6 +531,65 @@ version differ from the cc 10.3 set's), not a numerical change -- the input and 
 `ksplit2` / `ksplit4` / `ksplit8`, one and two m-tiles, both geometries) equal those of the cc 10.3 set `6451c9d94a2d4210/`.  That equality is
 an observation on these two runtimes, not a contract across architectures.  A cc 10.7 part that reports another GPU name, SM count or software
 version hashes to another key, and the golden cells skip there.
+
+### Attention gate + quantize decode step: replay, batch invariance and goldens
+
+`attention_gate/frost/test_gate_quant_decode_determinism.py` pins `cudnn.AttentionGateQuantDecode` (the sigmoid output gate of an attention
+block fused with the static E4M3 quantization of the following projection's input: bf16 `attn` / `gate` `[rows, width]`, one fp32 scale,
+E4M3 `out`; rows 1 .. 160, one launch).  Every comparison is raw bytes over the one output `out`; the step has no backward, no state and no
+scratch.  The independent reference is a separate check (`gate_quant_utils.assert_reference`: every byte is the code of one of the two bf16
+values that bracket the fp64 gated value, and of the nearest one outside a 2.5-fp32-unit margin around the bracket's midpoint; then the
+torch model of the rounding chain, bitwise) and gates the goldens.  The kernel has no reduction, so there is no split or association to
+hold fixed across batch layouts; the cells build one operand set and slice or permute it.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | rows 1 / 17 / 160 x width 2048 / 6144, and 160 x 32768 (2,560 CTAs of 256 threads: several waves); eight executions into fresh buffers under side-stream contention; reference check | 7 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | width 2048 / 1032; two entries, two fresh identical operand sets | 2 |
+| `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | the same call under a side stream (ordered after the operands' producer stream) vs the current stream | 1 |
+| `test_batch_invariance` | L0 | width 2048 / 6144 / 1032 / 1536 x `THREADS` 128 / 256; one 160-row operand set: every row alone (a one-row call) vs inside the 160-row call, vs the first 2 / 3 / 8 / 16 / 17 / 24 / 32 / 64 rows as one call, vs the reversed batch.  At 2048 / 6144 a row is whole CTAs; at 1536 rows share CTAs, at 1032 also warps | 8 |
+| `test_insertion_removal_and_reordering` | L0 | width 2048 / 1032 x `THREADS`; a 24-row call, then a row inserted at position 5, rows 3 / 11 / 23 removed, a permutation: every row keeps its bytes | 4 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | width 2048 / 6144 / 1032 / 1536 x `THREADS`; a row twice in one call (both copies = alone); the row among 63 redrawn neighbours | 8 |
+| `test_pick_function_moves_no_byte` | L0 | every served thread count vs the default pick; then a pick table that depends on the row count (128 threads up to 8 rows, 256 above): both configs are compiled at plan time, and every row alone writes the bytes it writes inside 2 .. 160 rows on either side of the pick boundary | 1 |
+| `test_inputs_are_unmodified` | L0 | `attn`, `gate`, `scale` bytes before and after twelve launches (caller-owned and entry-owned output, the release arm included) | 1 |
+| `test_one_sixty_to_one_sixty_one_and_the_empty_call_are_typed_declines` | L0 | 161 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch, never another provider | 1 |
+| `test_golden` | L0 | width 2048 x 3 rows (scale 0.01) and width 6144 x 19 rows (scale 1.0): three executions, the reference, the three knob arms on the same operands, the saved hashes | 2 |
+
+Golden sets: `attention-gate-quant-decode-w2048-rows3` and `attention-gate-quant-decode-w6144-rows19`, the first goldens of this API,
+recorded after the replay, batch-invariance and reference cells passed -- in `6451c9d94a2d4210/` for the cc 10.3 runtime below and in
+`d2a97fcefba4b867/` for the cc 10.7 runtime below.  The knob arms (`THREADS` 128, `PDL_RELEASE`, both) write the default's bytes inside
+`test_golden` and, on more shapes, in `test_gate_quant_decode.py` (`test_bit_neutral_knob_arms_write_the_default_bytes`), so the one set
+holds for every served config.  The release arm is compared with no dependent grid on the stream; a chain with a dependent launched under
+the programmatic-stream-serialization attribute is not covered here.  The graph-capture replay (bitwise with eager, operands changed in
+place) is in `test_gate_quant_decode.py`.  The input and output hashes of the two records are equal between the cc 10.3 and the cc 10.7
+set: an observation on these two runtimes, not a contract across architectures.
+
+GPU coverage: cc 10.3 and cc 10.7 (replay, batch invariance and goldens); cc 10.0 has not been run on a device (unverified); cc 9.0 and
+cc 12.x are declined by type.  Every run below is an in-process pytest run (`CUDNN_TEST_NO_ISOLATION=1`), one fresh process per command
+with empty CuTe DSL and driver compile caches, from `test/python` of a clean tree at the commit that carries the goldens.
+
+cc 10.3 record (2026-11-11 UTC): a GB300 (cc 10.3, 152 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API 13030,
+cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in
+`6451c9d94a2d4210/`).  `pytest attention_gate/frost/test_gate_quant_decode.py core/frost/test_frost_kernel_name_prefix.py -q -ra` -> 147
+passed, 0 skipped.  `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest attention_gate/frost/test_gate_quant_decode_determinism.py
+-q -ra` -> 35 passed, 0 skipped (the case counts of the table).  `pytest -m L2 attention_gate/frost/test_gate_quant_decode_census.py -q -s`
+-> 1 passed.  Before the set existed the same determinism command without the goldens variable read 33 passed, 2 skipped (both
+`test_golden` cases, "no golden for ..."); the set was then recorded into a new directory, `CUDNN_DETERMINISM_RECORD=<new directory> pytest
+attention_gate/frost/test_gate_quant_decode_determinism.py -q -ra -k golden` -> 2 passed, 33 deselected.
+
+CUDA 12.9 compiler flavour on the same part and runtime (2026-11-11 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
+libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL compatibility
+and is not a deployment that uses CUDA 12 throughout): the same three commands -> 146 passed, 1 skipped (`test_rendering_pins_the_convention`
+for `sm_107a`: that compiler rejects the target, and the cell skips with the entry's own decline); 35 passed, 0 skipped -- the golden cases
+pass against the SAME set, whose runtime key does not name the compiler flavour, so the two flavours write the same bytes for those cases;
+1 passed.
+
+cc 10.7 record (2026-11-11 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver
+API 13050, cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in
+`d2a97fcefba4b867/`).  The same three commands -> 147 passed, 0 skipped; 35 passed, 0 skipped; 1 passed.  Before its set existed the
+determinism command read 33 passed, 2 skipped, and the set was recorded the same way (2 passed, 33 deselected).  Reason for the second set:
+a new runtime key (GPU name, compute capability, SM count and driver API version differ), not a numerical change.  A part that reports
+another GPU name, SM count or software version hashes to another key, and the golden cases skip there -- a coverage gap, not a pass.
 
 ### QSA: 42 cases
 

@@ -181,7 +181,9 @@ def _mutations():
     wide = lambda dtype: torch.zeros(3, 4096, dtype=dtype)[:, ::2]  # noqa: E731  (a non-contiguous [3, 2048])
     return {
         "attn-not-a-tensor": (dict(attn=[[0.0] * 2048] * 3), TypeError, "attn must be a torch.Tensor"),
+        "gate-not-a-tensor": (dict(gate=None), TypeError, "gate must be a torch.Tensor"),
         "scale-not-a-tensor": (dict(scale=0.01), TypeError, "scale must be a torch.Tensor"),
+        "out-not-a-tensor": (dict(out="buffer"), TypeError, "out must be a torch.Tensor"),
         "attn-fp32": (dict(attn=torch.zeros(3, 2048)), TypeError, "attn must be torch.bfloat16"),
         "gate-fp16": (dict(gate=torch.zeros(3, 2048, dtype=torch.float16)), TypeError, "gate must be torch.bfloat16"),
         "scale-fp64": (dict(scale=torch.tensor([0.01], dtype=torch.float64)), TypeError, "scale must be torch.float32"),
@@ -203,6 +205,7 @@ def _mutations():
         "gate-strided": (dict(gate=wide(torch.bfloat16)), ValueError, "gate must be contiguous"),
         "out-strided": (dict(out=torch.zeros(3, 4096, dtype=U8).view(E4M3)[:, ::2]), ValueError, "out must be contiguous"),
         "scale-two-elements": (dict(scale=torch.tensor([0.01, 0.02])), ValueError, "scale must be one fp32 element"),
+        "out-1d": (dict(out=torch.zeros(3 * 2048, dtype=U8).view(E4M3)), ValueError, "out must be .>= 3, 2048."),
         "out-other-width": (dict(out=_e4m3(3, 2040)), ValueError, "out must be .>= 3, 2048."),
         "out-too-few-rows": (dict(out=_e4m3(2, 2048)), ValueError, "out must be .>= 3, 2048."),
         "attn-misaligned": (
@@ -252,6 +255,48 @@ def test_binding_check_requires_every_operand_on_the_given_device():
     with pytest.raises(ValueError, match=r"every operand must live on one device, the entry's \(cuda:1\); attn is on cpu"):
         entry.check_binding(ops["attn"], ops["gate"], ops["scale"], ops["out"], device="cuda:1")
     assert entry.check_binding(ops["attn"], ops["gate"], ops["scale"], ops["out"], device="cpu") == 3
+
+
+def test_binding_check_requires_the_operands_to_share_attns_device():
+    """Without an entry's device the operands must share ``attn``'s: one operand on another device declines naming it and that device."""
+    dev = torch.device("cuda", torch.cuda.current_device())
+    ops = _host_operands()
+    moved = dict(
+        gate=torch.zeros(3, 2048, dtype=torch.bfloat16, device=dev),
+        scale=torch.tensor([0.01], device=dev),
+        out=torch.zeros(3, 2048, dtype=U8, device=dev).view(E4M3),
+    )
+    for name, tensor in moved.items():
+        bad = {**ops, name: tensor}
+        with pytest.raises(ValueError, match=rf"every operand must live on one device, attn's \(cpu\); {name} is on cuda:{dev.index}"):
+            entry.check_binding(bad["attn"], bad["gate"], bad["scale"], bad["out"])
+        with pytest.raises(ValueError, match=rf"{name} is on cuda:{dev.index}"):
+            _check(bad)
+
+
+@pytest.mark.parametrize("width", (4, 2052, kcfg.MAX_WIDTH + 8))
+def test_width_taken_from_attn_is_validated_by_name(width):
+    """Without an entry's width the binding checks take ``attn``'s own and validate it: a row that is not whole threads, or one wider
+    than the served ceiling, declines by name before anything else is derived from it."""
+    ops = _host_operands(2, width, with_out=False)
+    with pytest.raises(NotImplementedError, match=f"multiple of 8 elements up to {kcfg.MAX_WIDTH}.*got {width}"):
+        entry.check_binding(ops["attn"], ops["gate"], ops["scale"])
+    with pytest.raises(NotImplementedError, match=f"multiple of 8 elements up to {kcfg.MAX_WIDTH}.*got {width}"):
+        _check(ops)
+
+
+def test_row_count_queries_decline_outside_the_served_band():
+    """``cfg_for`` / ``key`` take a row count in 1 .. 160: zero or a negative count is a ``ValueError``, a count past the ceiling the
+    ``NotImplementedError`` of a call that tall."""
+    k = entry.AttentionGateQuantDecode("cpu", 2048)
+    for rows in (0, -1):
+        with pytest.raises(ValueError, match="a call holds at least one row"):
+            k.cfg_for(rows)
+        with pytest.raises(ValueError, match="a call holds at least one row"):
+            k.key(rows)
+    with pytest.raises(NotImplementedError, match="at most 160 rows.*got 161"):
+        k.key(161)
+    assert k.key(1) == k.key(160)
 
 
 def test_launch_knob_applies_on_top_of_the_pick_and_of_a_given_cfg():
@@ -368,6 +413,29 @@ def test_import_cudnn_does_not_import_the_kernel_or_torch():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
     assert out.strip() == "[]", out
+
+
+def test_docs_rows_exist_for_the_api():
+    """The determinism status page carries the API's ONE row -- SM90 unsupported (declined by type); SM100/103 split by the evidence
+    (replay and batch invariance verified on cc 10.3, cc 10.0 not run); SM107 supported (verified on cc 10.7) -- and its bullet under
+    the required settings; the goldens README its suite row and section; the operation page, its navigation entry and the overview and
+    llms.txt links exist; and the two golden cases the page names are committed for at least one runtime."""
+    det = (REPO / "docs" / "operations" / "determinism.md").read_text()
+    row = [ln for ln in det.splitlines() if ln.startswith("| `AttentionGateQuantDecode`")]
+    assert len(row) == 1, "one AttentionGateQuantDecode row on the status page"
+    cells = [c.strip() for c in row[0].strip("|").split("|")]
+    assert cells[1] == "fprop (inference step)" and cells[2] == "BF16 in; FP8 E4M3 out", cells
+    assert cells[3] == "Unsupported" and cells[4] == "SM103: Supported; SM100: Unverified" and cells[5] == "Supported", cells
+    assert "- Attention gate + quantize decode step (`AttentionGateQuantDecode`):" in det
+    readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
+    assert "AttentionGateQuantDecode" in readme and "attention_gate/frost/test_gate_quant_decode_determinism.py" in readme
+    page = REPO / "docs" / "operations" / "attention" / "gate_quant_decode.md"
+    assert page.exists() and "cudnn.AttentionGateQuantDecode" in page.read_text()
+    assert "../../operations/attention/gate_quant_decode.md" in (REPO / "docs" / "fern" / "versions" / "latest.yml").read_text()
+    assert "/operations/Attention/gate_quant_decode" in (REPO / "docs" / "operations" / "overview.md").read_text()
+    assert "docs/operations/attention/gate_quant_decode.md" in (REPO / "llms.txt").read_text()
+    goldens = {p.name for p in (REPO / "test" / "python" / "determinism_goldens").glob("*/attention-gate-quant-decode-*.json")}
+    assert goldens == {"attention-gate-quant-decode-w2048-rows3.json", "attention-gate-quant-decode-w6144-rows19.json"}, goldens
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
