@@ -580,7 +580,13 @@ class TestSdpaVarlen:
         lens, capacity, H, D = [64, 33], 112, 4, 128
         live = sum(lens)
         cu = torch.tensor([0, lens[0], live], dtype=torch.int32, device="cuda")
-        q, k, v = (torch.randn(capacity, H, D, dtype=torch.bfloat16, device="cuda").requires_grad_(True) for _ in range(3))
+
+        def packed(poison):
+            value = torch.randn(capacity, H, D, dtype=torch.bfloat16, device="cuda")
+            value[live:] = poison
+            return value.requires_grad_(True)
+
+        q, k, v = (packed(poison) for poison in (float("nan"), float("inf"), 1e4))
         scale = D**-0.5
         was_deterministic = torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(deterministic)
@@ -589,7 +595,7 @@ class TestSdpaVarlen:
                 q, k, v, scale, is_causal=True,
                 cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=max(lens), max_seqlen_kv=max(lens), return_lse=True,
             )  # fmt: skip
-            grad = torch.zeros_like(o)
+            grad = torch.full_like(o, float("nan"))
             grad[:live] = torch.randn_like(grad[:live])
             o.backward(grad)
         finally:
