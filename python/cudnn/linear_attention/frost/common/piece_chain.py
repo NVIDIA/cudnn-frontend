@@ -64,6 +64,13 @@ LENGTH_RULE_PIECE_TOKENS = 8192
 CHAIN_MIN_UNITS_PER_PIECE = 4
 DV_SPLIT_TILES = 2
 
+# A packed KDA shape can have enough nominal (sequence, head) tiles to suppress
+# the ordinary chain while nearly all tokens belong to one sequence.  Keep the
+# device-side length rule available for a bounded number of nominal waves; the
+# piece table reads the actual cu_seqlens and leaves sequences of at most this
+# many tokens uncut.
+KDA_RAGGED_MAX_TILE_WAVES = 4
+
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
 CHAIN_ROW_GROUPS = 2
@@ -132,6 +139,65 @@ def choose_pieces(
     if pieces >= (CHAIN_MIN_PIECES_REVERSE if reverse else CHAIN_MIN_PIECES):
         return pieces, unit_chunks
     return 0, unit_chunks
+
+
+def choose_kda_pieces(
+    *,
+    num_seqs,
+    heads_out,
+    num_sm,
+    total_tokens,
+    b_t,
+    cadence_tokens,
+    batch_invariant,
+    expand_num,
+    enable_ragged_fallback,
+    reverse=False,
+    compose_tail=False,
+    min_tokens=0,
+):
+    """Return ``(pieces, unit_chunks, length_rule)`` for a KDA main plan.
+
+    The ordinary shape-only rule assumes all declared sequences contribute
+    equally.  That is pessimistic for an oversubscribed packed batch containing
+    one long sequence and many short or empty ones: ``num_seqs * heads_out``
+    can exceed the SM count while the long sequence remains the critical path.
+
+    On the measured SM100 route, keep a bounded length-rule chain in that gap.
+    Its device-built piece table reads ``cu_seqlens`` and cuts only sequences
+    longer than :data:`LENGTH_RULE_PIECE_TOKENS`; no device value reaches the
+    host and balanced short sequences stay single-piece.  The caller controls
+    ``enable_ragged_fallback`` so unmeasured architectures preserve the prior
+    choice exactly.
+    """
+    pieces, unit_chunks = choose_pieces(
+        num_seqs=num_seqs,
+        heads_out=heads_out,
+        num_sm=num_sm,
+        total_tokens=total_tokens,
+        b_t=b_t,
+        cadence_tokens=cadence_tokens,
+        batch_invariant=batch_invariant,
+        expand_num=expand_num,
+        reverse=reverse,
+        compose_tail=compose_tail,
+        min_tokens=min_tokens,
+    )
+    if pieces or batch_invariant or not enable_ragged_fallback:
+        return pieces, unit_chunks, bool(pieces and batch_invariant)
+
+    num_seqs = max(1, int(num_seqs))
+    heads_out = max(1, int(heads_out))
+    num_sm = max(1, int(num_sm))
+    total_tokens = int(total_tokens)
+    nominal_tiles = num_seqs * heads_out
+    length_pieces = min(-(-total_tokens // LENGTH_RULE_PIECE_TOKENS), CHAIN_MAX_PIECES)
+
+    if not (num_sm <= nominal_tiles <= KDA_RAGGED_MAX_TILE_WAVES * num_sm):
+        return 0, unit_chunks, False
+    if length_pieces < 2:
+        return 0, unit_chunks, False
+    return length_pieces, unit_chunks, True
 
 
 def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):

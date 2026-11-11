@@ -14,7 +14,7 @@ from operator import itemgetter
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
-from cudnn.frost.device import build_device, current_device, multiprocessor_count
+from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
 from .common.piece_chain import chain_min_tokens
@@ -138,7 +138,7 @@ class CompiledKda:
         from cuda.bindings.driver import CUstream
 
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, is_dv_split, piece_table_layout
         from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
@@ -184,7 +184,7 @@ class CompiledKda:
         self.composed_fold = None
         self.n_heads_out = HO
         self.num_seqs = B
-        self.pieces, self.unit_chunks = choose_pieces(
+        self.pieces, self.unit_chunks, self.length_rule = choose_kda_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
@@ -194,6 +194,7 @@ class CompiledKda:
             batch_invariant=self.batch_invariant,
             expand_num=1,
             min_tokens=chain_min_tokens(reverse=False),
+            enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
         self.chain = self.pieces > 0
         self.dv_split = (
@@ -213,7 +214,6 @@ class CompiledKda:
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
-        self.length_rule = self.chain and self.batch_invariant
 
         from .common.host import get_dtype
         from .common.steep_decay import STEEP_OFF, steep_mode_for
@@ -513,7 +513,7 @@ class CompiledKdaBwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, piece_table_layout
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -570,7 +570,7 @@ class CompiledKdaBwd:
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
-        self.pieces, self.unit_chunks = choose_pieces(
+        self.pieces, self.unit_chunks, self.length_rule = choose_kda_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
@@ -581,9 +581,9 @@ class CompiledKdaBwd:
             reverse=True,
             expand_num=1,
             min_tokens=chain_min_tokens(reverse=True),
+            enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
         self.chain = self.pieces > 0
-        self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
         self.has_context = bool(node.params.get("input_context", False))
