@@ -245,9 +245,10 @@ def test_paged_thd_origins_rebind_and_capture(
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
-    if not rubin and d_qk == 256 and splits > 1:
+    if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
         plan = graph._compiled_plans[graph._plan_index]
-        assert plan._compiled.kernel_template == "prefill_d256_f16"
+        expected_template = ("decode_d128_f16" if splits > 1 else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
+        assert plan._compiled.kernel_template == expected_template
         assert plan._prepared.spec.native is not None
         assert plan._prepared.spec.origin_specs is not None
     if rubin:

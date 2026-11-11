@@ -17,6 +17,8 @@ CASES = {
     "g128_unsplit": (128, 3, 257, 1, True, False, None, True, "natural", "bfloat16"),
     "g64_split": (64, 1, 2048, 8, True, False, None, False, "log2", "float16"),
     "g128_split": (128, 4, 1025, 8, True, True, None, True, "log2", "bfloat16"),
+    "g32_split": (32, 3, 257, 4, True, False, None, False, "natural", "float16"),
+    "g16_split": (16, 3, 257, 4, True, False, None, False, "natural", "bfloat16"),
     "partial6": (6, 17, 385, 3, True, True, 31, True, "natural", "bfloat16"),
     "keyless": (128, 129, 65, 8, True, True, 0, False, "log2", "bfloat16"),
     "unpacked": (128, 3, 257, 8, False, True, None, True, "none", "bfloat16"),

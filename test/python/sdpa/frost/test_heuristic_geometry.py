@@ -622,8 +622,13 @@ def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, p
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert mismatch(spec.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
-    for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
-        assert mismatch(spec.capabilities, facts, invalid) is not None
+    assert mismatch(spec.capabilities, facts, replace(knobs, cga=1)) is not None
+    packed = replace(knobs, pack_gqa=True)
+    if paged and device_cc in ((10, 0), (10, 3)):
+        assert mismatch(spec.capabilities, facts, packed) is None
+        assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in packed.to_public().items()}) == packed
+    else:
+        assert mismatch(spec.capabilities, facts, packed) is not None
     for invalid in (
         replace(facts, has_sink=True),
         replace(facts, has_epilogue_gate=True),

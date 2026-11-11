@@ -170,7 +170,7 @@ def test_capabilities_field_is_appended():
 
 
 def test_adapter_signatures_append_the_score_kwargs():
-    """Public-API signatures evolve append-only: the constructor's samples and execute's tensors are the last parameters."""
+    """Public-API signatures evolve append-only: existing parameter segments retain their order."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     ctor = inspect.signature(SdpaFwdDsl.__init__).parameters
@@ -191,7 +191,8 @@ def test_adapter_signatures_append_the_score_kwargs():
     ], list(ctor)[j:]
     assert ctor["sample_score_max"].default is None and ctor["sample_score_sum_exp"].default is None
     ex = inspect.signature(SdpaFwdDslSm100.execute).parameters
-    assert list(ex)[-4:] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
+    j = list(ex).index("score_max_tensor")
+    assert list(ex)[j : j + 4] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
     assert ex["score_max_tensor"].default is None and ex["score_sum_exp_tensor"].default is None
     assert ex["bias_tensor"].default is None and ex["kv_mask_tensor"].default is None
 

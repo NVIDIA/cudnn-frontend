@@ -3440,3 +3440,25 @@ class TestPagedD256PackedSplit:
 
     test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
     test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64 paged origins on SM100/SM103")
+class TestPagedD64PhysicalOrigins:
+    """Paged queries keep physical row origins distinct from valid lengths."""
+
+    @pytest.mark.parametrize(
+        "dtype,layout,stats,splits,packed,page",
+        [
+            ("bfloat16", "hnd", "token", 1, False, 16),
+            ("bfloat16", "hnd", "head", 2, True, 16),
+            ("float16", "nhd", "token", 3, False, 128),
+            ("float16", "mixed", "head", 9, True, 256),
+        ],
+        ids=["bf16-unsplit", "bf16-packed-split2", "fp16-unpacked-split3", "fp16-packed-split9"],
+    )
+    def test_origins_and_replay(self, dtype, layout, stats, splits, packed, page):
+        from sdpa.frost.test_sdpa_fwd_paged_thd_origins import test_paged_thd_origins_rebind_and_capture as check
+
+        check(64, dtype, layout, stats, 1, splits, packed, page_size=page, kv_bound=1024, cpu_reference=True)
