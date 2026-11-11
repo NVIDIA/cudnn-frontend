@@ -47,6 +47,7 @@ def test_vendor_files_match_record():
     record = json.loads((root / "VENDORED_GQA.json").read_text())
     for package, info in record["packages"].items():
         for relative, expected in info["files"].items():
+            expected = info.get("local_modifications", {}).get(relative, {}).get("blob", expected)
             data = (root / "_vendor" / package / relative).read_bytes()
             assert hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() == expected
 
@@ -172,3 +173,24 @@ def test_rejects_alias_short_workspace_and_deterministic_before_launch(gpu, monk
             api.gqa_attention_backward(q, k, v, out, lse, grad, cu_q, cu_k)
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+@pytest.mark.parametrize("mode", ["bf16", "fp32", "rowmap"])
+def test_native_empty_backward_outputs(monkeypatch, mode):
+    from cudnn._cake._vendor.cake_gqa_nondet_train import cake_backend as backend
+
+    monkeypatch.setattr(backend, "_check_operands", lambda *args: dict(total_q=0, total_k=1, num_heads_q=2, num_heads_kv=1))
+    monkeypatch.setattr(backend, "_launch", lambda *args: pytest.fail("empty backward launched a kernel"))
+    q = torch.empty((0, 2, 256), dtype=torch.bfloat16)
+    k = torch.ones((1, 1, 256), dtype=torch.bfloat16)
+    cu = torch.tensor([0, 0], dtype=torch.int32)
+    dtype = torch.bfloat16 if mode == "bf16" else torch.float32
+    dk, dv = (torch.ones_like(k, dtype=dtype) for _ in range(2))
+    kwargs = dict(dk=dk, dv=dv, dkv_dtype=dtype)
+    if mode == "rowmap":
+        kwargs = dict(dk_acc=dk, dv_acc=dv, row_map=torch.tensor([0], dtype=torch.int32))
+    dq, actual_dk, actual_dv = backend.cake_gqa_nondet_train_backward(q, k, k, q, torch.empty((2, 0)), q, cu, cu, **kwargs)
+    assert dq.shape == q.shape and dq.dtype == q.dtype
+    assert actual_dk is dk and actual_dv is dv
+    expected = torch.ones_like(dk) if mode == "rowmap" else torch.zeros_like(dk)
+    assert torch.equal(dk, expected) and torch.equal(dv, expected)

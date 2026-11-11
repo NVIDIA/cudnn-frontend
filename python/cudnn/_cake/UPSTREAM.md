@@ -10,6 +10,8 @@ Operation PRs add their own pinned kernel packages and source records under
 `_vendor`. Retain imported license headers. `VENDORED_KDA.json` records a local
 Python host patch that makes backward saved-row selection explicit for CodeQL.
 Its `files` map retains upstream hashes; `local_modifications` records the patch.
+`VENDORED_GQA.json` also records a local Python host patch that assigns backward
+output buffers on every path. Its source hashes and local patch hash are separate.
 CUDA sources are unchanged.
 
 The loader requires Linux, nvcc 13.4 or newer, and the installed TVM-FFI headers.

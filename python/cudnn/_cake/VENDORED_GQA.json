@@ -32,6 +32,12 @@
         "kind": "flashinfer",
         "path": "flashinfer/experimental/cake/cake_gqa_nondet_train",
         "repo": "https://github.com/flashinfer-ai/flashinfer"
+      },
+      "local_modifications": {
+        "cake_backend.py": {
+          "blob": "d616caf58aae9a0ec03516e38c4b8a0fef0c8429",
+          "reason": "Assign backward output buffers unconditionally for CodeQL; preserve BF16, FP32, and row-map behavior."
+        }
       }
     }
   }

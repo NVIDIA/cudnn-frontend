@@ -13,6 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
+cuDNN Frontend modification: assign backward output buffers on every path.
+
 Loader, launches and autograd of the Cake packed-varlen GQA training
 attention (head dimension 256, SM100 / SM103 / SM107).
 
@@ -555,7 +557,7 @@ def cake_gqa_nondet_train_backward(
         dst_shape = (int(dk_acc.shape[0]),) + kv_shape[1:] if dk_acc.dim() == 3 else ()
         _check_out("dk_acc", dk_acc, dst_shape, torch.float32, device)
         _check_out("dv_acc", dv_acc, dst_shape, torch.float32, device)
-        mode, dk_out, dv_out = "rowmap", dk_acc, dv_acc
+        mode = "rowmap"
     else:
         if dk_acc is not None or dv_acc is not None:
             raise ValueError(
@@ -582,7 +584,7 @@ def cake_gqa_nondet_train_backward(
             dk = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
         if dv is None:
             dv = torch.empty(kv_shape, dtype=dkv_dtype, device=device)
-        dk_out, dv_out = dk, dv
+    dk_out, dv_out = (dk_acc, dv_acc) if row_map is not None else (dk, dv)
     if dq is None:
         dq = torch.empty(
             total_q, heads_q, HEAD_DIM, dtype=torch.bfloat16, device=device
