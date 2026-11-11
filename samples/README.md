@@ -84,6 +84,14 @@ Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python A
 python samples/frost/linear_attention/01_gdn_prefill.py
 ```
 
+## Model Samples
+End-to-end samples of open-weight model families in [samples/models](models/): one process, a printed table of which provider serves every block of the model, and a self-check against a plain-PyTorch reference. They are not a serving engine and carry no performance table; see [models/README.md](models/README.md).
+* [models/qwen_dense](models/qwen_dense/): the dense Qwen 3.5-architecture model. `00_decode.py` runs a plain greedy decode on the reduced seeded model (2 layers at the published widths, no checkpoint, no extra package), token ids in and token ids out, with the linear-attention step on `cudnn.GdnDecodeFused`. Needs a GPU of compute capability 10.x or 12.x; elsewhere it prints `[00] SKIP <requirement>` and exits 0.
+
+```
+python samples/models/qwen_dense/00_decode.py
+```
+
 ## C++ Interface Samples
 Samples leveraging FE's C++ interface are located in [samples/cpp](cpp/).
 
