@@ -44,6 +44,13 @@ For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
+Columnwise F8_128x4 scale atoms span all B*H scale rows along their column
+axis. A rank-4 carrier's physical B slices cannot simply be concatenated:
+unswizzle to logical bytes, rebatch, then reswizzle without requantizing.
+A single D128 row atom can hide the error; D512 exposes it. The CPU fixture
+control `test_v_tail_scale_repack` in `test_sdpa_fp8_v_tail_sync_sm120.py`
+compares this byte permutation with the canonical quantizer and rejects naive
+physical concatenation for the multi-atom case.
 Check against dequantized inputs and include a scale-only change. Keep SM90
 FP8 and SM100/SM103/SM107 MXFP8 results separate; an architecture skip is not
 a measured pass on that architecture.
@@ -341,6 +348,7 @@ prefill; a short query alone does not imply the D128 decode template.
   count that selects it; a declaration-time flag derived from such a resolver is re-read where it is consumed (the block re-reads
   `capture_safe` at `compile()`), so the two cannot disagree across devices.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
+- **A two-launch equality check is not a race test; use the warm stress helper.** A kernel that hands a shared-memory stage back to its producer (Rule 11 in `python/cudnn/AGENTS.md`) can be wrong in a small fraction of launches, in no cold launch, or in every launch of one shape and none of another. "Launch 1 equals launch 2", a replay loop of a handful of launches and a tolerance-based numerics test all pass such a kernel. `warm_stress.assert_warm_stress(StressCase(...))` takes a ONE-launch callable on the launch path that ships and every tensor the kernel writes — the kernel's own storage, never a copy of it (`.contiguous()` of a strided view and a dtype cast return copies): an output that both cold launches leave at the sentinel fill is refused when the case has no reference, and fails against one. It builds a cold reference (two launches behind a cache flush must agree byte for byte, and equal the case's independent reference when it has one), then compares every output byte of N back-to-back launches and of N launches behind a launch that overwrites every SM's shared memory; outputs are refilled with a sentinel before each launch. A failure names the block, the launch index, the output, the first differing byte with the bytes got and expected, and the case's `locate()` text. Six rules. (1) The shape must refill the stage under test inside one launch: state `refills_per_launch`; zero is refused. (2) State `thread_blocks`: the report prints thread blocks per SM and flags fewer than two. The control shows that this GPU and driver expose the class in the test ring's geometry (three thread blocks per SM, every lane of a load in the same shared-memory banks); the same unsafe ring reads zero with one thread block per SM. A zero for another kernel is a rate bound for the shape that was launched — prefer a shape with at least two thread blocks per SM — and the disassembly reading of Rule 11 is the proof. (3) A zero count is reported as a pass only in a process where `stress_validation()` saw the unsafe twin of the test ring fail on this GPU; elsewhere the test is skipped with `warm stress not validated on <part>` and the record goes through `frost_routing.measured` — a coverage gap, neither a pass nor a failure. A mismatch fails in either case. (4) Byte equality only: no tolerance, no rounded metric, no float compare; a kernel whose outputs are not bit-reproducible by design cannot be tested this way and its test says so. (5) Give an independent `reference` whenever one exists: without it the helper tests stability across launches only, and an error that every launch repeats passes (the unsafe ring is wrong in its cold launches too); a case without one whose reference launches had no cache flush in front of them is skipped as incomplete. (6) The default 3,000 + 3,000 launches bound a per-launch rate at 0.1 %; larger counts are a local run of the same helper, never an L0 cell. The launch blocks have a wall-clock budget (60 s by default): a block that uses it up on a busy GPU ends early and the test is skipped as incomplete, so give the cell `gpu_exclusive` with its xdist group, and never raise a kernel timeout instead. A cell that guards its launches with `process_watchdog` calls `warm_stress.build_launchers()` and builds its own kernel in front of the watchdog: the first CuTe DSL import of a process can take minutes on a cold file system, and a watchdog that covers it reports a slow import as a hung kernel. `sdpa/frost/test_tile_dsl_consume_then_arrive.py` is the usage example and the helper's own control; `core/test_warm_stress.py` pins the report.
 - **Poison caller workspace, including physical padding.** A TMA descriptor can expose aligned scratch rows beyond the logical sequence. Initialize workspace bytes to both zero and `0xff`, poison outputs, and compare eager and captured results against the same reference. Numerically masked rows still need defined intermediates: `0 * NaN` remains NaN. A clean initcheck result is insufficient when the caller initialized those stale bytes itself (`test_delta_workspace_padding_does_not_feed_dkdv`).
 - **A harness mirror of an engine's admission rule includes the engine's DSL target gate.** `sdpa/mxfp8.py::block_scaled_o_draw` admits a block-scaled O draw where the FROST MXFP8 row would serve it, and an admitted draw the row then declines FAILS the test (the `sf_o` output has no backend lowering), so the mirror must agree with the row on every gate. When the cc 10.7 row became a default candidate (PR #1478) the mirror asked the manifest but not `cutedsl_arch_requirement_error`: on a cc 10.7 host with the public CuTe DSL 4.7.0 (no `sm_107a`) the row declines through that gate while the mirror admitted the draw, so every flag-less d128 block-scaled draw of `test_sdpa_mxfp8_fwd_L0` would have failed where develop ran the backend on the folded draw (verified host-side with the target modelled absent). Model the target on both sides: `sdpa/test_mxfp8_block_scaled_fold.py::test_cc107_default_admission_needs_the_sm_107a_dsl_target` pins the fold with `buffers._cutedsl_has_sm107` patched absent and present.
 - **A version-bounded backend workaround ships with the detector that re-measures it.** A constant such as `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN` is a measurement, and nothing in an ordinary test run would ever notice the backend getting fixed (the guard keeps it from being asked). `sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0` runs the trigger matrix one interpreter per contract with the guard disabled in the child (the constant set to 0 there; a crash is the child's rc 139, never the runner's) plus a control contract the backend is known to plan, and fails with the version to record once the installed backend plans the matrix cleanly -- or, above a recorded version, once it crashes again. Spawn the children with the test module's own directory and `test/python` on their `sys.path`; they inherit neither pytest's path setup nor its fixtures.
@@ -513,6 +521,20 @@ valid-memory control with and without that option before diagnosing a kernel
 error from the count alone. Use a known-bad memory/race canary to verify the
 detector, and retain a normal run of the real capture test without launch dumps.
 
+### Ragged physical-origin fixtures
+
+Token/head stride gaps do not vary sequence start addresses. Use
+`ExecConfig.ragged_origin_rows` for independent Q/K/V/O/Stats row starts,
+while sequence-length and cumulative-length tensors retain logical lengths.
+Packing, reference unpacking and output masks must all use the selected port's
+origins; masking everything after `sum(seq_lens)` drops valid gapped outputs.
+`test_mhas_v2.py::test_sdpa_physical_origins_L0` exercises the shared harness,
+and `frost/test_sdpa_physical_origins_shared.py` pins the native SM120 route so
+backend fallback cannot hide a missing kernel repair. The SM100 selected entry
+`test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
+FP8 D128 cases and checks both prepared and standalone graph execution.
+Default-provider passes alone cannot qualify an advertised native path.
+
 ### CUDA Graph test lifetimes
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
@@ -638,6 +660,11 @@ Dense V scale factors for D > 128 are plane-major; THD factors are packed
 per-sequence tiles per head. Reuse `_quantize_seq` when constructing THD test
 inputs; reshaping a dense buffer does not produce the THD contract. Rebind
 E8M0 exponent values as well as pointers and validate after graph replay.
+Both the shared graph harness and native fixtures use `pack_thd_columnwise_sf`
+to permute `[D-plane, H, tile, 512]` bytes into `[H, tile, D-plane * 512]`.
+`test_thd_columnwise_sf_matches_independent_atoms` compares that permutation
+with separately quantized per-head 128-token atoms. Keep D512 with multiple
+heads and token tiles: D128 alone cannot expose a misplaced D plane.
 The MXFP8 split combine has no per-tensor output scalar: specialize its
 scale pointer to None and remove Amax unscaling, rather than handing a NULL
 runtime address to the per-tensor unscale kernel. `test_prepared_mxfp8_capture_reads_current_scales`
@@ -1288,6 +1315,11 @@ Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
 both packings classify the same element, but the token-major binder requires
 exact strides, so the wrapper must retain the head-major ABI for unused pitches.
 
+For Torch/JAX DLPack transfers, select the tensor's CUDA device during conversion
+and restore the caller's device afterward. Cover values, metadata, gradients and
+reverse transfers. The simplified sparse attention JAX suite checks the context
+guard and runs with another GPU current when two devices are available.
+
 For JAX device-target admission, test zero-argument JIT closures that capture every
 operand as well as fully and partially traced inputs. Concrete captured arrays do
 not pin execution placement; detect the active trace independently of operand
@@ -1369,3 +1401,17 @@ matrix on a representative full-feature shape and retain separate native
 flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
 The SM90 D64/D512 controls in `test_band_capabilities.py` and
 `test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
+
+Host-frame fixtures that derive runtime arguments from a Python AST must retain
+unannotated arguments. Check `argument.annotation is None` before calling
+`ast.unparse`; only an explicit `Constexpr` annotation removes a runtime slot.
+The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
+exercise appended untyped origin arguments and compare native frames with
+the independent Python reference.
+
+When a THD fixture changes O's physical row stride, give O independent Int64
+element offsets and update them with the stride; retaining Q's compact offsets
+describes a different output location. Head-major Stats offsets advance by one
+element per token, while token-major Stats offsets advance by the head count.
+The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
+numerical and replay checks for these contracts.

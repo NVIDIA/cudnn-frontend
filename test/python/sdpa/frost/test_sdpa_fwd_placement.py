@@ -434,9 +434,11 @@ def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch,
 @pytest.mark.parametrize("group, expected", [(8, placement.LEAD), (16, placement.TRAIL)], ids=["gqa8", "gqa16"])
 def test_sm107_paged_packed_prefill_shard_keeps_its_measured_groups(group, expected):
     """The paged packed-GQA prefill shard (Q 64-128, page 16, no sink) was timed on GQA 4 / 8; GQA16 now packs by default
-    on cc 10.7 paged THD (issue #1472's paged table) but keeps the backend first here until that band is measured."""
+    on cc 10.7 paged THD (issue #1472's paged table) but the shard keeps the backend first there. An exact bf16 graph is
+    answered first by study sm107_thd_prefill_20261111, which leads both groups."""
     from types import SimpleNamespace
 
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
@@ -455,7 +457,9 @@ def test_sm107_paged_packed_prefill_shard_keeps_its_measured_groups(group, expec
         device_cc=(10, 7),
         device_sm_count=216,
     )
-    assert placement.place(spec, facts) == expected
+    assert placement._place_sm107_f16(spec.capabilities, facts) == expected
+    assert placement.place(spec, facts) == placement.LEAD
+    assert placement_table.matched_entry(spec.name, facts).study == "sm107_thd_prefill_20261111"
 
 
 @pytest.mark.L0
@@ -840,25 +844,26 @@ _SM107_PAGED_D256_DECODE_CORNERS = [
 
 _SM107_PAGED_D256_MTP_CORNERS = [
     # (heads, s_q, b, declared KV, dtype, page, verdict): the MTP rows -- FlashInfer's decode graph at q_len_per_req 2-4 (the bottom-right
-    # causal diagonal + the padding mask) on 24/2 and 32/2: the tile 0.01-0.31 of the backend on every measured cell (b 1-128 x KV 1k-128k,
-    # page 16 bf16), so LEAD over the whole measured box incl. its 2-unit corner; outside it (another geometry -- incl. 12/1 and 16/1, the
-    # same groups unmeasured at s_q > 1 -- KV below 1k or past 128k, more than 256 units, page 32, f16) the backend stays first. From s_q 5
-    # the graph is the paged prefill class, which the generated table answers (test_sm107_paged_d256_past_the_mtp_rows_...).
+    # causal diagonal + the padding mask) -- are the generated table's (study sm107_paged_mtp_20261110: bf16 GQA 4-32, b 1-256, page
+    # 16 / 32 / 64, declared KV 16 to 1M). FROST leads from 2**7.5 KV tokens on the 128-key tile and from 2**7.01 off it. The old hand
+    # box (24/2 and 32/2, page 16, b 1-128, KV 1k-128k) is inside; f16 has no entry and keeps the backend first.
     ("24/2", 2, 1, 1024, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 3, 4, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("24/2", 4, 128, 131072, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("32/2", 2, 32, 4096, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
-    ("32/2", 3, 16, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
     ("32/2", 4, 1, 131072, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
-    ("24/2", 2, 1, 512, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
-    ("24/2", 2, 32, 262144, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
-    ("24/2", 2, 256, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
-    ("16/4", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
-    ("64/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),
-    ("12/1", 2, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # group 12 on the unmeasured 12/1 geometry at s_q > 1
-    ("16/1", 3, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # group 16 on the unmeasured 16/1 geometry at s_q > 1
+    ("24/2", 2, 1, 512, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("24/2", 2, 1, 128, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # one KV tile on the tile: below the 2**7.5 threshold
+    ("24/2", 2, 1, 125, cudnn.data_type.BFLOAT16, 16, placement.TRAIL),  # off the tile below 2**7.01 KV tokens
+    ("24/2", 2, 1, 133, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("24/2", 2, 32, 262144, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("24/2", 2, 256, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("16/4", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("64/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("12/1", 2, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("16/1", 3, 64, 8192, cudnn.data_type.BFLOAT16, 16, placement.LEAD),
+    ("24/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 32, placement.LEAD),
     ("24/2", 2, 32, 8192, cudnn.data_type.HALF, 16, placement.TRAIL),
-    ("24/2", 2, 32, 8192, cudnn.data_type.BFLOAT16, 32, placement.TRAIL),
 ]
 
 
@@ -889,33 +894,24 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
     _SM107_PAGED_D256_MTP_CORNERS,
     ids=[f"{h}-q{q}-b{b}-kv{kv}-{'f16' if dt == cudnn.data_type.HALF else 'bf16'}-p{p}" for h, q, b, kv, dt, p, _ in _SM107_PAGED_D256_MTP_CORNERS],
 )
-def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv, dtype, page, verdict, replay):
-    """The MTP arm of ``_sm107_paged_d256_decode_tile_leads``: FlashInfer's paged decode graph at ``q_len_per_req`` 2-4 (the bottom-right
-    causal diagonal with the padding mask) on 24/2 and 32/2 LEADs over the whole measured box (b 1-128 x declared KV 1k-128k, page 16, bf16;
-    the tile 0.01-0.31 of the backend's default plan on all 576 (cell, regime) pairs), the same verdict in both regimes; everything the
-    box does not cover keeps the backend first.  Before the arm every one of these graphs trailed (the RED half on the pre-arm tree)."""
+def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_kv, dtype, page, verdict, replay):
+    """FlashInfer's paged decode graph at ``q_len_per_req`` 2-4 (the bottom-right causal diagonal with the padding mask) on cc 10.7 is
+    placed by study sm107_paged_mtp_20261110, the same verdict in both regimes; without the diagonal or with a window (no sink) the
+    graph is another class with no entry and keeps the backend first, as does f16."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
     h_q, h_kv = (int(x) for x in heads.split("/"))
-    facts = _sm107_paged_d256_decode_facts(
-        h_q=h_q, h_kv=h_kv, b=b, s_q=s_q, s_kv=s_kv, dtype=dtype, page_size=page, causal=True, bottom_right=True, cuda_graph_replay=replay
-    )
+    shape = dict(h_q=h_q, h_kv=h_kv, b=b, s_q=s_q, s_kv=s_kv, dtype=dtype, page_size=page, cuda_graph_replay=replay)
+    facts = _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, **shape)
     assert placement.place(spec, facts) == verdict
-    if verdict == placement.LEAD:
-        # the diagonal is the MTP rows' shape: the same cell without it (not FlashInfer's graph, unmeasured) and with a window keep the backend
-        assert (
-            placement.place(spec, _sm107_paged_d256_decode_facts(h_q=h_q, h_kv=h_kv, b=b, s_q=s_q, s_kv=s_kv, dtype=dtype, page_size=page)) == placement.TRAIL
-        )
-        assert (
-            placement.place(
-                spec,
-                _sm107_paged_d256_decode_facts(
-                    h_q=h_q, h_kv=h_kv, b=b, s_q=s_q, s_kv=s_kv, dtype=dtype, page_size=page, causal=True, bottom_right=True, window_left=128
-                ),
-            )
-            == placement.TRAIL
-        )
+    entry = placement_table.matched_entry(spec.name, facts)
+    assert (entry is None) == (dtype == cudnn.data_type.HALF)
+    if entry is not None:
+        assert entry.study == "sm107_paged_mtp_20261110"
+    assert placement.place(spec, _sm107_paged_d256_decode_facts(**shape)) == placement.TRAIL
+    assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)) == placement.TRAIL
 
 
 @pytest.mark.L0
@@ -924,14 +920,18 @@ def test_sm107_paged_d256_mtp_rows_lead_on_the_measured_box(heads, s_q, b, s_kv,
 def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     """Past the MTP rows (s_q >= 5) FlashInfer's paged decode graph with the bottom-right diagonal is the paged prefill class, which
     study sm107_paged_prefill_20261109 leads: on this dense-Q graph FROST measured 0.03-0.61 of the backend's plan at s_q 5 / 8 / 16 (216
-    cells, d256 and D192xV128, 208-SM cc 10.7, cuDNN 9.30.0.2), as on the THD prefill graph the study fit. Without the diagonal, or with a
-    window, the graph is another class and keeps the backend first."""
+    cells, d256 and D192xV128, 208-SM cc 10.7, cuDNN 9.30.0.2), as on the THD prefill graph the study fit. Without the diagonal the
+    graph is the mask-free paged prefill class: study sm107_thd_prefill_20261111 leads d256 there and has no D192 entry (the backend
+    failed to build it), which keeps the backend first; with a window it keeps the backend first too."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
     shape = dict(b=32, s_q=s_q, s_kv=8192, d_qk=d[0], d_v=d[1])
     assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, **shape)) == placement.LEAD
-    assert placement.place(spec, _sm107_paged_d256_decode_facts(**shape)) == placement.TRAIL
+    mask_free = _sm107_paged_d256_decode_facts(**shape)
+    assert placement.place(spec, mask_free) == (placement.LEAD if d == (256, 256) else placement.TRAIL)
+    assert (placement_table.matched_entry(spec.name, mask_free) is None) == (d != (256, 256))
     assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)) == placement.TRAIL
 
 
@@ -1001,7 +1001,7 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
     values.update(outside or {})
     assert placement.place(spec, _sm107_paged_d256_decode_facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
     if outside is None:
-        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, s_q=2, causal=True, bottom_right=True)) == placement.LEAD  # the MTP rows
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, s_q=2, causal=True, bottom_right=True)) == placement.LEAD  # the MTP rows (table)
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64)) == placement.LEAD  # group 32 inside its band (64 units x 8k)
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64, dtype=cudnn.data_type.HALF)) == placement.LEAD  # its f16 twin
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, dtype=cudnn.data_type.HALF)) == placement.LEAD
@@ -1085,11 +1085,15 @@ def _sm107_paged_facts(**over):
 @pytest.mark.L0
 def test_sm107_paged_gqa_prefill_leads_inside_its_box():
     """Rubin paged bf16 d128 GQA 4/8/16 prefill chunks (exact or bounded) and full squares lead; MHA, group 2,
-    short queries and out-of-box batches keep the backend."""
+    short queries and out-of-box batches keep the backend. The box is the hand rule; an exact graph is answered first by
+    study sm107_thd_prefill_20261111, so the box below is read through the row's hand rules."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    place = lambda **over: placement.place(spec, _sm107_paged_facts(**over))
+    assert placement_table.matched_entry(spec.name, _sm107_paged_facts()).study == "sm107_thd_prefill_20261111"
+    assert placement_table.matched_entry(spec.name, _sm107_paged_facts(shape_overrides=True)) is None
+    place = lambda **over: placement._place_sm107_f16(spec.capabilities, _sm107_paged_facts(**over))
     assert place() == placement.LEAD
     assert place(h_q=32, h_kv=8, b=4, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751) == placement.LEAD
     assert place(h_q=64, h_kv=64, s_q=628, s_kv=28240) == placement.TRAIL
@@ -1307,3 +1311,16 @@ def test_square_causal_places_the_same_from_either_corner():
     for over in (dict(paged_d512, s_q=2048, s_kv=2048), dict(paged_d512, s_q=8192, s_kv=8192), dict(h_q=32, h_kv=2, s_q=4096, s_kv=4096)):
         assert place(bottom_right=False, **over) == place(bottom_right=True, **over), over
     assert place(bottom_right=False, s_q=8192, s_kv=8192, **paged_d512) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 5, 1024])
+def test_sm90_paged_d512_stays_backend_first(s_q):
+    """The SM90 row's d512 lead was measured on dense K/V only. Paged K/V reaches the row now, unmeasured, so a sink-free paged
+    d512 graph keeps the backend first while its dense twin still leads."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    shape = dict(b=64, h_q=8, h_kv=2, s_q=s_q, s_kv=4096, d_qk=512, d_v=512, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132)
+    assert placement.place(spec, _facts(**shape)) == placement.LEAD
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == placement.TRAIL

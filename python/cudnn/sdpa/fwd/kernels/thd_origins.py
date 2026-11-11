@@ -12,6 +12,7 @@ from cudnn.frost.tile_dsl.barrier import launch_dependent_grids
 
 from cudnn.frost.tile_dsl.thd import (
     THD_SETUP_THREADS,
+    set_tensor_map_bit21,
     emit_clamped_desc,
     emit_seq_descs,
     write_thd_batch_remap,
@@ -56,6 +57,89 @@ def origin_tensors(maps_ptr, offset_ptrs, batch):
     return maps, origins, offsets
 
 
+@cute.jit
+def _build_one_batch_origins(
+    tensors,
+    descs,
+    maps,
+    origins,
+    offsets,
+    specs: cutlass.Constexpr,
+    meta_t,
+    q_lens,
+    kv_lens,
+    lens_form,
+    heads,
+    tile_rows,
+    clusters,
+    paged: cutlass.Constexpr,
+    splits: cutlass.Constexpr,
+):
+    """One-sequence setup with no cross-warp metadata dependency.
+
+    Every descriptor writer reads lengths and its physical origin directly.
+    Metadata is published separately on thread zero; kernel completion and
+    the existing consumer acquire retain the same cross-kernel ordering.
+    """
+    tid = cutlass.Int32(cute.arch.thread_idx()[0])
+    warp = tid // 32
+    if nvvm.elect_sync():
+        if warp < 5:
+            ql = cutlass.make_array_view(q_lens)
+            kl = cutlass.make_array_view(kv_lens)
+            q_len = cutlass.Int32(ql[0])
+            kv_len = cutlass.Int32(kl[0])
+            if (lens_form & 1) != 0:
+                q_len = cutlass.Int32(ql[1]) - q_len
+            if (lens_form & 2) != 0:
+                kv_len = cutlass.Int32(kl[1]) - kv_len
+            # A map per port, using the same O/Q/K/V slot order as the
+            # generic setup. Each elected writer owns a disjoint map.
+            for slot in cutlass.range_constexpr(5):
+                port = (3, 0, 1, 2, 4)[slot]
+                if warp == slot:
+                    origin = cutlass.Int64(0)
+                    if cutlass.const_expr(specs[port] is not None):
+                        token_stride = cutlass.Int64(tensors[port].stride[1]) if cutlass.const_expr(port < 4) else cutlass.Int64(specs[port][2])
+                        raw = cutlass.Int64(cutlass.make_array_view(offsets[port])[0])
+                        origin = raw * cutlass.Int64(specs[port][1]) // token_stride
+                    cutlass.make_array_view(origins)[port, 0] = origin
+                    if cutlass.const_expr(port < 4 and (not paged or port not in (1, 2))):
+                        tensor = tensors[port]
+                        dptr = maps.iterator.raw_ptr() + cutlass.Int32(slot * 2 * 16)
+                        src = Pointer(descs[port].get_ptr(), dtype=cutlass.Int64)
+                        for word in cutlass.range_constexpr(16):
+                            (dptr + word).store((src + word).load())
+                        extent = cute.math.max(kv_len if cutlass.const_expr(port in (1, 2)) else q_len, cutlass.Int32(1))
+                        stride = cutlass.Int64(tensor.stride[1])
+                        row_base = tensor.iterator.raw_ptr() + origin * stride
+                        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_ADDRESS, dptr, new_value=row_base.toint(cutlass.Int64))
+                        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=2)
+                        set_tensor_map_bit21(dptr, cutlass.Int64(extent) * stride * cutlass.Int64(tensor.element_type.width // 8))
+                        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+    # The scheduler publisher is thread zero, not an implementation-defined
+    # elected lane. No other writer or descriptor reads these stores here.
+    if tid == 0:
+        ql = cutlass.make_array_view(q_lens)
+        kl = cutlass.make_array_view(kv_lens)
+        q_len = cutlass.Int32(ql[0])
+        kv_len = cutlass.Int32(kl[0])
+        if (lens_form & 1) != 0:
+            q_len = cutlass.Int32(ql[1]) - q_len
+        if (lens_form & 2) != 0:
+            kv_len = cutlass.Int32(kl[1]) - kv_len
+        meta = cutlass.make_array_view(meta_t)
+        meta[0] = kv_len
+        meta[1] = cutlass.Int32(0)
+        meta[2] = q_len
+        meta[3] = cutlass.Int32(0)
+        meta[4] = kv_len
+        meta[5] = cutlass.Int32(0)
+        meta[6] = ((q_len + tile_rows - 1) // tile_rows) * heads * cutlass.Int32(splits)
+        meta[7] = clusters
+        origin_compact_word(origins, cutlass.Int32(1)).store(cutlass.Int64(0))
+
+
 @cute.kernel
 def build_thd_origins(
     tensors,
@@ -80,6 +164,7 @@ def build_thd_origins(
     release_dependents: cutlass.Constexpr[bool] = False,
     splits: cutlass.Constexpr[int] = 1,
     single_maps: cutlass.Constexpr[bool] = False,
+    single_batch_fast: cutlass.Constexpr[bool] = False,
 ):
     """Lengths control work and clipping; physical offsets control addresses.
 
@@ -95,127 +180,146 @@ def build_thd_origins(
     that choice for the consuming launch; a consumer that does not read it
     keeps sequence-local maps.
     """
-    tid = cutlass.Int32(cute.arch.thread_idx()[0])
-    if cutlass.const_expr(release_dependents):
-        # The consumer may initialize CTA-local state while these maps are
-        # built. It must wait for this grid before reading metadata or maps.
+    if cutlass.const_expr(single_batch_fast and not single_maps and not release_dependents) and batch == 1:
+        _build_one_batch_origins(
+            tensors,
+            (q_desc, k_desc, v_desc, o_desc),
+            maps,
+            origins,
+            offsets,
+            specs,
+            meta_t,
+            q_lens,
+            kv_lens,
+            lens_form,
+            heads,
+            tile_rows,
+            clusters,
+            paged,
+            splits,
+        )
+    else:
+        tid = cutlass.Int32(cute.arch.thread_idx()[0])
+        if cutlass.const_expr(release_dependents):
+            # The consumer may initialize CTA-local state while these maps are
+            # built. It must wait for this grid before reading metadata or maps.
+            if tid == 0:
+                launch_dependent_grids()
+        warp, lane = tid // 32, tid % 32
+        meta = cutlass.make_array_view(meta_t)
+        base_maps = (q_desc, k_desc, v_desc, o_desc)
+        if warp == 0:
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens), batch, batch, (lens_form & 1) != 0, lane, store_lengths=False)
+        if warp == 1:
+            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens), batch, 2 * batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
+        compact_word = origin_compact_word(origins, batch)
         if tid == 0:
-            launch_dependent_grids()
-    warp, lane = tid // 32, tid % 32
-    meta = cutlass.make_array_view(meta_t)
-    base_maps = (q_desc, k_desc, v_desc, o_desc)
-    if warp == 0:
-        write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens), batch, batch, (lens_form & 1) != 0, lane, store_lengths=False)
-    if warp == 1:
-        write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens), batch, 2 * batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
-    compact_word = origin_compact_word(origins, batch)
-    if tid == 0:
-        # Single maps unless a live sequence votes otherwise below.
-        compact_word.store(cutlass.Int64(1 if single_maps else 0))
-    cute.arch.barrier()
-    destination = cutlass.make_array_view(origins)
-    for b in cutlass.range(tid, batch, THD_SETUP_THREADS, unroll=1):
-        # Issue every port's offset load before the first conversion.
-        raw = [None] * 5
-        for port in cutlass.range_constexpr(5):
-            if cutlass.const_expr(specs[port] is not None):
-                raw[port] = cutlass.Int64(cutlass.make_array_view(offsets[port])[b])
-        cu_q_b = cutlass.Int32(meta[batch + b])
-        q_len = cutlass.Int32(meta[batch + b + 1]) - cu_q_b
-        cu_k_b = cutlass.Int32(meta[2 * batch + 1 + b])
-        kv_len = cutlass.Int32(meta[2 * batch + 2 + b]) - cu_k_b
-        mismatch = cutlass.Boolean(False)
-        for port in cutlass.range_constexpr(5):
-            if cutlass.const_expr(specs[port] is not None):
-                spec = specs[port]
-                # Q/K/V/O geometry can be rebound through graph stride overrides.
-                # Divide element offsets by that invocation's token stride, never
-                # a cached stride from the original graph declaration.
-                token_stride = cutlass.Int64(tensors[port].stride[1]) if cutlass.const_expr(port < 4) else cutlass.Int64(spec[2])
-                origin = raw[port] * cutlass.Int64(spec[1]) // token_stride
-                destination[port, b] = origin
-                if cutlass.const_expr(single_maps):
-                    # A port's shared map covers the packed prefix, so every
-                    # sequence that occupies rows in that buffer votes: Q/O/
-                    # Stats when it has query rows, K/V when it has keys. A
-                    # sequence with keys but no query rows still has its K/V
-                    # rows loaded by its predecessor's tile tail.
-                    if cutlass.const_expr(port in (1, 2)):
-                        live = kv_len > 0
-                        expected = cutlass.Int64(cu_k_b)
-                    else:
-                        live = q_len > 0
-                        expected = cutlass.Int64(cu_q_b)
-                    mismatch = mismatch | (live & (origin != expected))
-        if cutlass.const_expr(single_maps):
-            if mismatch:
-                compact_word.store(cutlass.Int64(0))
-    cute.arch.barrier()
-    compact = compact_word.load() != cutlass.Int64(0)
-    if nvvm.elect_sync():
-        if cutlass.const_expr(single_maps) and compact:
-            # O keeps a map per sequence for clipped stores. The load ports
-            # take one map each, clamped to the packed total like the
-            # compact-prefix path; the consumer acquires each once.
-            emit_seq_descs(
-                o_desc,
-                maps,
-                meta,
-                batch,
-                tensors[3],
-                batch,
-                cutlass.Int64(tensors[3].stride[1]),
-                2,
-                slot_base=COMPACT_MAP_SEQUENCE,
-                first_batch=warp,
-                batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
-                origins=origins,
-                origin_row=3 if specs[3] is not None else -1,
-            )
-            # A zero extent would make a map invalid rather than empty; an
-            # all-empty side is never loaded, so one row keeps the map valid.
-            total_q = cute.math.max(cutlass.Int32(meta[2 * batch]), cutlass.Int32(1))
-            total_kv = cute.math.max(cutlass.Int32(meta[3 * batch + 1]), cutlass.Int32(1))
-            if warp == 0:
-                emit_clamped_desc(q_desc, maps, 1 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_q, 2)
-            if cutlass.const_expr(not paged):
-                if warp == 1:
-                    emit_clamped_desc(k_desc, maps, 2 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
-                if warp == 2:
-                    emit_clamped_desc(v_desc, maps, 3 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
-        else:
-            # Stripe warps over ports as well as sequences. A short batch must
-            # not serialize all four maps on one elected writer. O/Q occupy the
-            # first two slots, which are the only maps needed for paged KV.
-            map_count = 2 if cutlass.const_expr(paged) else 4
-            for slot in cutlass.range_constexpr(4):
-                port = (3, 0, 1, 2)[slot]
-                if cutlass.const_expr(not paged or port not in (1, 2)):
-                    if warp % map_count == slot:
-                        cu0 = 2 * batch + 1 if port in (1, 2) else batch
-                        emit_seq_descs(
-                            base_maps[port],
-                            maps,
-                            meta,
-                            cu0,
-                            tensors[port],
-                            batch,
-                            cutlass.Int64(tensors[port].stride[1]),
-                            2,
-                            slot_base=slot * (batch + 1),
-                            first_batch=warp // map_count,
-                            batch_step=cutlass.Int32(THD_SETUP_THREADS // 32 // map_count),
-                            origins=origins,
-                            origin_row=port if specs[port] is not None else -1,
-                        )
-        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
-    # Optional packed Stats without offsets keeps the compact-prefix contract.
-    if cutlass.const_expr(specs[4] is None):
+            # Single maps unless a live sequence votes otherwise below.
+            compact_word.store(cutlass.Int64(1 if single_maps else 0))
+        cute.arch.barrier()
+        destination = cutlass.make_array_view(origins)
         for b in cutlass.range(tid, batch, THD_SETUP_THREADS, unroll=1):
-            cutlass.make_array_view(origins)[4, b] = cutlass.Int64(meta[batch + b])
-    write_thd_batch_remap(meta, batch, tid, cutlass.Int32(THD_SETUP_THREADS), rank_by_kv=rank_by_kv)
-    cute.arch.barrier()
-    write_thd_work_prefix(meta, batch, heads, tile_rows, clusters, tid, splits)
+            # Issue every port's offset load before the first conversion.
+            raw = [None] * 5
+            for port in cutlass.range_constexpr(5):
+                if cutlass.const_expr(specs[port] is not None):
+                    raw[port] = cutlass.Int64(cutlass.make_array_view(offsets[port])[b])
+            cu_q_b = cutlass.Int32(meta[batch + b])
+            q_len = cutlass.Int32(meta[batch + b + 1]) - cu_q_b
+            cu_k_b = cutlass.Int32(meta[2 * batch + 1 + b])
+            kv_len = cutlass.Int32(meta[2 * batch + 2 + b]) - cu_k_b
+            mismatch = cutlass.Boolean(False)
+            for port in cutlass.range_constexpr(5):
+                if cutlass.const_expr(specs[port] is not None):
+                    spec = specs[port]
+                    # Q/K/V/O geometry can be rebound through graph stride overrides.
+                    # Divide element offsets by that invocation's token stride, never
+                    # a cached stride from the original graph declaration.
+                    token_stride = cutlass.Int64(tensors[port].stride[1]) if cutlass.const_expr(port < 4) else cutlass.Int64(spec[2])
+                    origin = raw[port] * cutlass.Int64(spec[1]) // token_stride
+                    destination[port, b] = origin
+                    if cutlass.const_expr(single_maps):
+                        # A port's shared map covers the packed prefix, so every
+                        # sequence that occupies rows in that buffer votes: Q/O/
+                        # Stats when it has query rows, K/V when it has keys. A
+                        # sequence with keys but no query rows still has its K/V
+                        # rows loaded by its predecessor's tile tail.
+                        if cutlass.const_expr(port in (1, 2)):
+                            live = kv_len > 0
+                            expected = cutlass.Int64(cu_k_b)
+                        else:
+                            live = q_len > 0
+                            expected = cutlass.Int64(cu_q_b)
+                        mismatch = mismatch | (live & (origin != expected))
+            if cutlass.const_expr(single_maps):
+                if mismatch:
+                    compact_word.store(cutlass.Int64(0))
+        cute.arch.barrier()
+        compact = compact_word.load() != cutlass.Int64(0)
+        if nvvm.elect_sync():
+            if cutlass.const_expr(single_maps) and compact:
+                # O keeps a map per sequence for clipped stores. The load ports
+                # take one map each, clamped to the packed total like the
+                # compact-prefix path; the consumer acquires each once.
+                emit_seq_descs(
+                    o_desc,
+                    maps,
+                    meta,
+                    batch,
+                    tensors[3],
+                    batch,
+                    cutlass.Int64(tensors[3].stride[1]),
+                    2,
+                    slot_base=COMPACT_MAP_SEQUENCE,
+                    first_batch=warp,
+                    batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
+                    origins=origins,
+                    origin_row=3 if specs[3] is not None else -1,
+                )
+                # A zero extent would make a map invalid rather than empty; an
+                # all-empty side is never loaded, so one row keeps the map valid.
+                total_q = cute.math.max(cutlass.Int32(meta[2 * batch]), cutlass.Int32(1))
+                total_kv = cute.math.max(cutlass.Int32(meta[3 * batch + 1]), cutlass.Int32(1))
+                if warp == 0:
+                    emit_clamped_desc(q_desc, maps, 1 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_q, 2)
+                if cutlass.const_expr(not paged):
+                    if warp == 1:
+                        emit_clamped_desc(k_desc, maps, 2 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
+                    if warp == 2:
+                        emit_clamped_desc(v_desc, maps, 3 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
+            else:
+                # Stripe warps over ports as well as sequences. A short batch must
+                # not serialize all four maps on one elected writer. O/Q occupy the
+                # first two slots, which are the only maps needed for paged KV.
+                map_count = 2 if cutlass.const_expr(paged) else 4
+                for slot in cutlass.range_constexpr(4):
+                    port = (3, 0, 1, 2)[slot]
+                    if cutlass.const_expr(not paged or port not in (1, 2)):
+                        if warp % map_count == slot:
+                            cu0 = 2 * batch + 1 if port in (1, 2) else batch
+                            emit_seq_descs(
+                                base_maps[port],
+                                maps,
+                                meta,
+                                cu0,
+                                tensors[port],
+                                batch,
+                                cutlass.Int64(tensors[port].stride[1]),
+                                2,
+                                slot_base=slot * (batch + 1),
+                                first_batch=warp // map_count,
+                                batch_step=cutlass.Int32(THD_SETUP_THREADS // 32 // map_count),
+                                origins=origins,
+                                origin_row=port if specs[port] is not None else -1,
+                            )
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        # Optional packed Stats without offsets keeps the compact-prefix contract.
+        if cutlass.const_expr(specs[4] is None):
+            for b in cutlass.range(tid, batch, THD_SETUP_THREADS, unroll=1):
+                cutlass.make_array_view(origins)[4, b] = cutlass.Int64(meta[batch + b])
+        write_thd_batch_remap(meta, batch, tid, cutlass.Int32(THD_SETUP_THREADS), rank_by_kv=rank_by_kv)
+        cute.arch.barrier()
+        write_thd_work_prefix(meta, batch, heads, tile_rows, clusters, tid, splits)
 
 
 build_thd_origins.set_name_prefix("cudnn", remove_cutlass_symbol=True)

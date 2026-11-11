@@ -38,8 +38,8 @@ whose per-chunk accumulation form is selected per ``nb_total`` schedule bucket
 
 Work decomposition: one CTA per output block row (``gridDim.x = nb_total``),
 ``gridDim.y`` spans head-dim column groups of ``threads_x * vec`` dims, CTA shape
-``(threads_x, tchunks)``. Everything else (THD segment scan, static-capacity padding
-rows with first-in-segment semantics, the ``coff == 2`` overlap window with the invalid
+``(threads_x, tchunks)``. Everything else (THD segment scan, exact-zero static-capacity
+padding rows, the ``coff == 2`` overlap window with the invalid
 previous-block half for each segment's first block, fp32-only window math with a single
 final bf16 rounding, pinned ``mul.rn``/``fma.rn``) matches ``compressor_sm100.py``.
 
@@ -186,6 +186,10 @@ def _compressor_fwd_r128_kernel(
     W: cutlass.Constexpr = coff * d
     col = bidy * threads_x + tidx
     bb = bidx  # one output row per CTA
+    # Keep the device-side logical row count outside the staged ``col < ncol``
+    # regions.  Multi-chunk schedules consume it again after the CTA barrier, and
+    # CuTeDSL does not carry Python names defined in one staged region into another.
+    nb_valid = mCuComp[n_seq]
 
     smem = SmemAllocator()
     # Partial-merge buffer, [tchunks][threads_x][vec] per quantity; unused (0 B) when
@@ -200,9 +204,8 @@ def _compressor_fwd_r128_kernel(
         cvec = col * vec
 
         # THD segment scan (identical to compressor_sm100): rows beyond the true
-        # compressed count are static-capacity padding and gather the window from
-        # token 0 with first-in-segment semantics, like the eager code.
-        nb_valid = mCuComp[n_seq]
+        # compressed count are static-capacity padding. They publish empty partials
+        # through the same CTA barriers, then tidy==0 writes an exact zero.
         seq_idx = cutlass.Int32(0)
         bis = cutlass.Int32(0)
         if bb < nb_valid:
@@ -221,6 +224,8 @@ def _compressor_fwd_r128_kernel(
         # only the projection column / APE row / validity differ per half.
         k0 = tidy * C
         run_chunk = cutlass.Boolean(True)
+        if bb >= nb_valid:
+            run_chunk = cutlass.Boolean(False)
         tok_row0 = tok0 + k0
         colbase = cvec
         ape_row0 = cutlass.Int32(k0)
@@ -229,7 +234,7 @@ def _compressor_fwd_r128_kernel(
             if k0 < ratio:
                 # Previous block's half-window: first-half projection columns, APE
                 # row k; invalid (contributes nothing) for the segment's first block
-                # and for static-capacity padding rows (bis == 0 in both cases).
+                # (bis == 0).
                 if bis == 0:
                     run_chunk = cutlass.Boolean(False)
             else:
@@ -343,7 +348,10 @@ def _compressor_fwd_r128_kernel(
         if cutlass.const_expr(tchunks == 1):
             fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
             for j in cutlass.range_constexpr(vec):
-                fr_o[j] = cutlass.BFloat16(cutlass.Float32(fr_a[j]) / cutlass.Float32(fr_d[j]))
+                if bb < nb_valid:
+                    fr_o[j] = cutlass.BFloat16(cutlass.Float32(fr_a[j]) / cutlass.Float32(fr_d[j]))
+                else:
+                    fr_o[j] = cutlass.BFloat16(0.0)
             ooff = cute.assume(bb * d + cvec, divby=vec)
             gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
             cute.autovec_copy(fr_o, gO)
@@ -366,28 +374,31 @@ def _compressor_fwd_r128_kernel(
                 cvec = col * vec
                 fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                 for j in cutlass.range_constexpr(vec):
-                    m = cutlass.Float32(sM[tidx * vec + j])
-                    den = cutlass.Float32(sD[tidx * vec + j])
-                    acc = cutlass.Float32(sA[tidx * vec + j])
-                    for t in cutlass.range_constexpr(1, tchunks):
-                        slot = (t * threads_x + tidx) * vec + j
-                        d2 = cutlass.Float32(sD[slot])
-                        # A NaN partial (a NaN or +inf score in that chunk) is merged, so the output is NaN.
-                        if d2 != cutlass.Float32(0.0):
-                            m2 = cutlass.Float32(sM[slot])
-                            a2 = cutlass.Float32(sA[slot])
-                            mn = m
-                            if m2 > mn:
-                                mn = m2
-                            # The running partial may still be empty (den == acc == 0,
-                            # m the initial lowest finite value); den and acc stay 0
-                            # whatever exp(m - mn) is.
-                            s1 = cute_math.exp(m - mn)
-                            s2 = cute_math.exp(m2 - mn)
-                            den = _ffma_rn(den, s1, _fmul_rn(d2, s2))
-                            acc = _ffma_rn(acc, s1, _fmul_rn(a2, s2))
-                            m = mn
-                    fr_o[j] = cutlass.BFloat16(acc / den)
+                    if bb < nb_valid:
+                        m = cutlass.Float32(sM[tidx * vec + j])
+                        den = cutlass.Float32(sD[tidx * vec + j])
+                        acc = cutlass.Float32(sA[tidx * vec + j])
+                        for t in cutlass.range_constexpr(1, tchunks):
+                            slot = (t * threads_x + tidx) * vec + j
+                            d2 = cutlass.Float32(sD[slot])
+                            # A NaN partial (a NaN or +inf score in that chunk) is merged, so the output is NaN.
+                            if d2 != cutlass.Float32(0.0):
+                                m2 = cutlass.Float32(sM[slot])
+                                a2 = cutlass.Float32(sA[slot])
+                                mn = m
+                                if m2 > mn:
+                                    mn = m2
+                                # The running partial may still be empty (den == acc == 0,
+                                # m the initial lowest finite value); den and acc stay 0
+                                # whatever exp(m - mn) is.
+                                s1 = cute_math.exp(m - mn)
+                                s2 = cute_math.exp(m2 - mn)
+                                den = _ffma_rn(den, s1, _fmul_rn(d2, s2))
+                                acc = _ffma_rn(acc, s1, _fmul_rn(a2, s2))
+                                m = mn
+                        fr_o[j] = cutlass.BFloat16(acc / den)
+                    else:
+                        fr_o[j] = cutlass.BFloat16(0.0)
                 ooff = cute.assume(bb * d + cvec, divby=vec)
                 gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
                 cute.autovec_copy(fr_o, gO)

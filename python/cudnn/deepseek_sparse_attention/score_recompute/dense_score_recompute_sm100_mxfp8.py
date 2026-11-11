@@ -572,7 +572,7 @@ class BwdDenseAttnScoreSm100Mxfp8(BlockScaledScoreSm100Mixin, ScoreKernelSm100):
 
             # ---------------- CLC scheduler warp ----------------
             if warp_idx == self.sched_warp_id:
-                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state, claim_mbar_ptr)
+                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state, claim_mbar_ptr, clc_response_ptr)
 
         # ---------------- math warpgroups ----------------
         if warp_group_idx > 0:

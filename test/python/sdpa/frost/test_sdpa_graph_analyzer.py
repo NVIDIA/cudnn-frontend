@@ -1091,7 +1091,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # the two together so the gate cannot drift: the f16 SM100 row declares
     # exactly the adapter's flavors. Native SM107 admits D64, paged D192/V128, D512 and D576/V512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
-    # requires whole groups. Native SM90 D512 admits gcd-based subgroups.
+    # requires whole groups. Native SM90 D128/D256/D512 admit gcd-based subgroups.
     # Quantized and SM120 routes retain their gates.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
@@ -1101,7 +1101,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     native_sm107 = engines.engine_name(arch="sm107")
     assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512), (576, 512)})
     native_sm90 = engines.engine_name(arch="sm90")
-    assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
+    assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
     others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107, native_sm90)}
     assert all(v is None for v in others.values()), others
 
@@ -3252,14 +3252,14 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
     if accepted:
         for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
             assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
-    # The Rubin row's prepared MXFP8 contract, on every row of the table: the executor is device cc 10.7 only;
-    # it serves fixed dense plans (a dense shape override is declined) or bounded THD (the override rides the
-    # per-sequence lengths, as on SM100); split-KV is declined dense and THD alike.  So on cc 10.7 the row
-    # accepts exactly what the SM100 row accepts at split 1.
+    # The Rubin row's prepared MXFP8 contract: device cc 10.7 only; on cc 10.7 it accepts exactly what the
+    # SM100 row accepts (dense split rides the d128 body with half outputs; THD split declines).
     rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
     rubin_facts = replace(facts, device_cc=rubin_cc)
-    rubin_accepts = rubin_cc == (10, 7) and split == 1 and (thd or not override)
-    assert rubin_accepts == (rubin_cc == (10, 7) and accepted and split == 1)
+    rubin_accepts = rubin_cc == (10, 7) and accepted
+    if rubin_accepts and split > 1:
+        for changed in (dict(d_qk=192), dict(dtype_o=cudnn.data_type.FP8_E4M3)):
+            assert engines._prepared_decline_reason(rubin, replace(rubin_facts, **changed), split) is not None, changed
     rubin_reason = engines._prepared_decline_reason(rubin, rubin_facts, split)
     assert (rubin_reason is None) == rubin_accepts, (thd, override, split, rubin_cc, rubin_reason)
 

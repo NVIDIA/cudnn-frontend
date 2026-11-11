@@ -726,6 +726,8 @@ def store_fp32_partial_tile_coalesced(
     chunk: cutlass.Constexpr[int],
     scratch_addr,
     lane,
+    column_offset=0,
+    tile_live=None,
 ) -> None:
     """:func:`store_fp32_partial_tile` with whole-line global stores.
 
@@ -746,6 +748,8 @@ def store_fp32_partial_tile_coalesced(
     bank-conflict free.  Requires the 16-byte-store conditions of the direct
     path (d_v % 4 == 0, chunk % 4 == 0, unit D stride, 16-byte aligned slab);
     the caller falls back to :func:`store_fp32_partial_tile` otherwise.
+    ``column_offset`` locates a column-sliced TMEM owner in the output row;
+    an explicit false ``tile_live`` writes zeros without reading unwritten TMEM.
     """
     op = cutlass.make_array_view(o_partial_f32)
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
@@ -760,8 +764,14 @@ def store_fp32_partial_tile_coalesced(
     rd_seg = lane % cutlass.Int32(SEGS)
     for blk in cutlass.range_constexpr(tile_o // chunk):
         addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
-        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        if cutlass.const_expr(tile_live is None):
+            vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        else:
+            vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(chunk)), cutlass.Float32)
+            if tile_live:
+                vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         scaled = vals * inv_sum
         for seg in cutlass.range_constexpr(SEGS):
             values = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[seg * 4 + j].ir_value())) for j in range(4)]
@@ -775,7 +785,7 @@ def store_fp32_partial_tile_coalesced(
             q_t = nvvm.shfl_sync(0xFFFFFFFF, q_row_global, row, 31, kind=nvvm.Shfl.IDX)
             h_t = nvvm.shfl_sync(0xFFFFFFFF, row_head_idx, row, 31, kind=nvvm.Shfl.IDX)
             ok_t = nvvm.shfl_sync(0xFFFFFFFF, valid_i, row, 31, kind=nvvm.Shfl.IDX)
-            col = cutlass.Int32(blk * chunk) + rd_seg * cutlass.Int32(4)
+            col = column_offset + cutlass.Int32(blk * chunk) + rd_seg * cutlass.Int32(4)
             if (ok_t != cutlass.Int32(0)) & (col < cutlass.Int32(d_v)):
                 row_ptr = op.data_ptr((o_batch, q_t, h_t, 0))
                 st_global_v4(
