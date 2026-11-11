@@ -16,6 +16,7 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
 | `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
 | `gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py` | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | — | D in both directions, both scale planes, dprob; dbias numerical reference |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
@@ -86,6 +87,42 @@ on the import path:
 python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py -m L0 -q -rs
 python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py -m L0 -q -rs -s
 python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -k glu_hadamard_quant -m L0 -q -rs
+```
+
+### Grouped wgrad empty inputs — validation, 2026-11-11
+
+`gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` covers NVFP4 E2M1/E4M3
+and MXFP8 E4M3/E8M0 with BF16/FP32 outputs, dense/discrete output storage,
+matrix/flat scale buffers, 1CTA/2CTA tiles, and overwrite/accumulate modes.
+Each of its 64 cases starts with an empty wrapper cache. It checks exact-zero
+overwrite or byte-preserving accumulation (including negative zero), reuses
+the compiled artifact for nonempty and mixed-empty experts with compilation
+forbidden, rebinds fresh empty inputs, and replays a CUDA Graph twice.
+The independent reference uses exact unit operands/scales and per-expert token
+counts; empty outputs are compared directly to zero or the original bytes.
+No runtime-specific golden is required for these exact boundary identities.
+This qualifies the empty-expert contract, not general nonempty determinism.
+
+The cold NVFP4 case failed before the fix in
+`from_dlpack(...).mark_compact_shape_dynamic(...)`. Empty FP4 samples retain
+strides that do not describe a nonempty compact tensor, and Torch's empty
+`dim_order()` may ignore those strides. Compiling their logical descriptors
+with symbolic token extents avoids inferring a layout from the empty sample.
+The kernel's empty accumulate path also skips the output reduction: adding
+positive zero changed negative zero in the original output.
+
+Measured on GB200 SM100 with Torch `2.13.0a0+8145d630e8.nv26.06`, framework
+CUDA 13.3, cuDNN 92600, and CuTe DSL 4.8.0. Separate cold-cache CUDA 13.4
+and CUDA 12.9 DSL compiler runs each passed **131 cases**, with **45 existing
+skips** and **2 cases deselected** by the default selection. All 64 new cases passed in each lane.
+The runs took 101.48 s and 99.28 s respectively. SM103 and SM107 are unverified.
+From `test/python`, both compiler lanes ran:
+
+```bash
+python -m pytest -n0 -v --tb=short \
+  gemm/cutedsl/test_grouped_gemm_wgrad_empty.py \
+  gemm/cutedsl/test_grouped_gemm_wgrad.py \
+  gemm/cutedsl/test_wgrad_tensormap_acquire.py
 ```
 
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10

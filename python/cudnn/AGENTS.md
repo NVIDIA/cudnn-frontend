@@ -215,6 +215,11 @@ not become a compile key.
   tensors (one symbol per ragged group) so one compiled artifact re-binds any
   total; runtime scalars the launch needs (grid extents like THD `max_sq`)
   are `cutlass.Int32` call arguments, never compile parameters.
+- **Cold-empty compilation cannot infer compact strides from empty samples.**
+  Packed tensors can retain arbitrary outer strides, and Torch's empty
+  `dim_order()` can ignore them. Build symbolic token extents from logical
+  descriptors, then verify empty-to-nonempty reuse with compilation forbidden.
+  Detector: `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py`.
 - **Derived values count.** A stride tuple whose batch stride is
   `t_q * token_stride` smuggles the runtime total into the key just as
   surely as `sq=t_q` — normalize it out (zero the never-stepped batch
