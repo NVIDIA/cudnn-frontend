@@ -58,16 +58,17 @@ The sample was last run with:
 |---|---|
 | checkpoint | `nvidia/Qwen3.8-27B-NVFP4`: 3 shards, 2,194 tensors, 21.9 GB; licence field on its model card `apache-2.0`, not gated (card read 2026-11-10) |
 | manifest hash | `95049016a247`, printed in the first line of a run: a SHA-256 over every shard's name, size and header (tensor names, formats, shapes, offsets), not over the values |
-| packages | tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0; the lower bounds of `samples/models/requirements.txt` (0.21.1, 3.1.0, 0.4.3) pass the host tests of the text and weight readers |
-| run | 2026-11-11, compute capability 10.3 (aarch64, PyTorch 2.14.0, CuTe DSL 4.8.0): four prompts at one sequence (two plain user turns, one with a system turn and the reasoning switched off, one with a tool schema) and one prompt at two sequences; text out, `[00] PASS` |
+| packages | tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0; the lower bounds of `samples/models/requirements.txt` (0.21.1, 3.1.6, 0.4.3) pass the host tests of the text and weight readers |
+| run | 2026-11-11, compute capability 10.3 (aarch64, PyTorch 2.14.0, CuTe DSL 4.8.0): four prompts at one sequence (two plain user turns, one with a system turn and the reasoning switched off, one with a tool schema) and one prompt at two sequences; text out, `[00] PASS` in every run, the token line reported in the later ones |
 | provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0, the PyTorch chains |
 
 The sample downloads nothing. Fetching the checkpoint is your own step, for example
 `hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4`; it needs 22 GB of free disk, and the weights
 carry their own licence, which is not this repository's. The files read: `config.json`, `tokenizer.json`,
 `chat_template.jinja` (or the template in `tokenizer_config.json`), `generation_config.json` for the end tokens, and the
-`*.safetensors` shards. A directory that lacks one of them is an `ERROR` that names the file; a checkpoint of another
-architecture or in other storage formats is a `SKIP` that names the first tensor that does not fit.
+`*.safetensors` shards. A path that is not a directory is an `ERROR` that says nothing is downloaded; a directory that
+lacks one of the files, or holds one that is not what its name says, is an `ERROR` that names the file; a checkpoint of
+another architecture or in other storage formats is a `SKIP` that names the first tensor that does not fit.
 
 What happens, in order: the tokenizer, the template and the shard headers are read (no weights); every prompt is rendered
 and encoded; the plan is resolved and printed with the memory the run needs, and a GPU with less free memory is a `SKIP`
@@ -76,10 +77,14 @@ beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, th
 is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
 printed; reasoning the model writes before its answer is part of that text.
 
-Memory: the stack `fe-cublas` holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and asks for about 52.4 GB
-free with one sequence. On the run above PyTorch held 51.5 GB at its peak and reserved 55.2 GB. A 32 GB GPU cannot run this
-stack with a checkpoint of this size; it prints the memory sentence and exits 0. A stack on the stored formats, which
-needs less than half, arrives with the next step of this area.
+Memory, in GiB (2^30 bytes; the memory lines of a run print these values with the label "GB"): the stack `fe-cublas`
+holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 52.4 GiB free with one
+sequence: the copies, the state and 2 GiB of working memory. For a checkpoint of this size that allowance is about 3 GiB
+short: on the run above PyTorch held 51.5 GiB at its peak, reserved 55.2 GiB from the device, and the device grew by
+55.4 GiB. A GPU with between 52.4 and about 56 GiB free therefore passes the plan and can run out of memory after the
+load, which is an exception, not a `SKIP`. A 32 GB GPU cannot run this stack with a checkpoint of this size; it prints the
+memory sentence and exits 0. A stack on the stored formats, which needs less than half, arrives with the next step of
+this area.
 
 The prompt goes through the decode step, one step per token (the `first token` line says so), and a step issues 484 block
 calls from Python: on the run above about twelve thousand kernel launches and a thousand small copies per step, with the
@@ -90,20 +95,33 @@ values of that run and no more; no rate of this stack is a number to quote.
 The checks of a run with a checkpoint cover the first 16 steps of every prompt: replay, every provider block
 teacher-forced against the fp64-accumulated reference with the bands below, the tokens, and with more than one sequence
 the batch invariance. The block check is what verifies the providers, and it holds on trained weights with the same bands
-as on seeded ones. The token check is weak on a checkpoint, and says so: the model quantises its MLP inputs to 4 bits and
-its projection inputs to 8, so a difference of one bf16 rounding in a multiply becomes a different code in the next
-quantiser, 64 layers deep. Two reference stacks that differ only in their accumulation precision (fp64 against IEEE fp32)
-were up to 52 bf16 units of the largest logit apart over 80 steps of one prompt and chose another greedy token at 13 of
-them; the provider stack was up to 54 units from the fp64 reference over the same steps. In the 16-step windows a run
-checks, whose largest logit is often one binade lower, the provider stack was up to 69 units from the reference and a
-second reference up to 92. The declared logits band of a checkpoint is therefore 128 units (`configs.py`): it catches a
-path whose logits are unrelated to the reference's or not finite, and nothing finer. It is also as wide as it can be: the
-largest reference logit is at least 128 and below 256 of its own units, so a stack that returned zeros sits at the band or
-beyond it. If a correct stack is ever seen beyond the band, the line becomes a reported one; the band is not widened.
-Every run prints, beside the provider stack's distance, the distance of a second reference with the other accumulation
-precision and the number of greedy tokens each pair agrees on, so the two can be read side by side. Comparing the produced ids with a serving engine
-is not part of this sample; `--dump-tokens` writes them for a comparison made elsewhere, and greedy decoding is not the
-checkpoint's own default (its generation settings sample).
+as on seeded ones.
+
+The token line of a checkpoint is `REPORTED`: it fails on a logit that is not finite and is judged against no band. The
+model quantises its MLP inputs to 4 bits and its projection inputs to 8, so a difference of one bf16 rounding in a
+multiply becomes a different code in the next quantiser, 64 layers deep. Two reference stacks that differ only in their
+accumulation precision (fp64 against IEEE fp32) were up to 52 bf16 units of the largest logit (13.0 logits) apart over 80
+steps of one prompt and chose another greedy token at 13 of them; the provider stack was up to 54 units (13.5 logits)
+from the fp64 reference over the same steps. In the three 16-step windows the runs above checked, the provider stack was
+8.7 to 10.3 logits from the reference and a second reference 7.5 to 11.4. No declared band separates a correct stack
+from a failed one here. A band in bf16 units of the largest logit is 8, 16 or 32 logits wide by that logit's binade, and
+the distance of two correct stacks does not follow the binade: 128 units, beyond which a stack that returns zeros
+passes, are 8 logits where a window's largest logit is below 16, which is less than two correct stacks were apart. And a
+greedy token is decidable only where its margin exceeds twice the band, which no step of these runs reached. So the line
+prints what it measured (the provider stack's distance, the number of greedy tokens equal to the reference's, and the
+same two figures for a second reference with the other accumulation precision) and gates on finite logits only. A
+defect of a provider shows in the block check. A defect in what both stacks share, the reading of the checkpoint
+included, shows in neither: the area README says what verifies that.
+
+Which steps are checked: the first 16 of the prompt. This checkpoint's chat template opens a conversation that has no
+system turn with a fixed one of its own, and a plain `--prompt` reaches the text of the prompt only after it, at token 45 of
+the 58 of the default prompt. The checked window of every plain prompt is therefore the same 16 tokens of that
+preamble. A `--messages` file with its own system turn or with tool schemas has another window. The runs above cover
+three distinct windows (the preamble, a system turn, a tool schema), not one per prompt, and none of them reaches a
+decode step.
+
+Comparing the produced ids with a serving engine is not part of this sample; `--dump-tokens` writes them for a
+comparison made elsewhere, and greedy decoding is not the checkpoint's own default (its generation settings sample).
 
 ## Who serves each block (stack `fe-cublas`)
 
@@ -138,7 +156,7 @@ Against the plain-PyTorch reference of every block, which keeps the chain's cast
 |---|---|
 | replay | the same inputs from a fresh state give byte-identical ids and logits |
 | blocks, teacher-forced | every value finite; every multiply within one bf16 rounding of the reference, element by element; the linear-attention step inside its band (below) |
-| tokens | the logits of the two stacks, each run end to end on its own state, are finite and within the declared logits band (`configs.py`: 4 bf16 units of the run's largest reference logit for the reduced seeded model, 128 for a checkpoint); the greedy token equals the reference stack's at every step whose margin exceeds twice that band; steps below it are counted and printed as near-ties, and the number of equal greedy tokens is printed |
+| tokens | the logits of the two stacks, each run end to end on its own state, are finite. On the reduced seeded model they are also within the declared logits band (`configs.py`: 4 bf16 units of the run's largest reference logit), and the greedy token equals the reference stack's at every step whose margin exceeds twice that band; steps below it are counted and printed as near-ties. On a checkpoint no band is declared and the line is `REPORTED` (the section on checkpoints says why). The largest logit distance and the number of equal greedy tokens are printed either way |
 | batch invariance | one sequence alone gives the bytes it has among 4; the sequence that runs alone rotates with the step, so every row of the batch is covered: a gate for the linear-attention step on compute capability 10.0, 10.3 and 12.0, a printed fact for every other block and class |
 
 The band of the linear-attention step is judged twice. Over the whole run: more than 99.9 % of its 8-bit output bytes
@@ -163,7 +181,7 @@ weights it guards the path, not the layers: the layers move the logits by little
 with two to eight layers, and a fused step with its two gate rows exchanged moved that by a third of a unit), so a
 defect of one block shows in the block check, and the token check catches what breaks the run as a whole: the state between
 steps, the position, the output head, the token choice. That band, 4 units, is declared for the reduced seeded model; a
-checkpoint has its own, and the section on checkpoints above says why it is wide.
+checkpoint declares none, and the section on checkpoints above says why its token line is reported.
 
 The multiplies of this stack ask cuBLAS for the fp32 accumulator throughout: `model_samples/providers/library.py` switches
 `torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction` off for its call and restores it. With PyTorch's

@@ -48,7 +48,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
-   from the run's own measurement: the family declares its logits band (`logits_band_units` in `configs.py`).
+   from the run's own measurement: the family declares its logits band (`logits_band_units` in `configs.py`). Where no
+   band both passes two correct stacks and fails a wrong one, the family declares none (`None`) and the line is printed
+   as `REPORTED`, gated on finite values only: a line that cannot fail on a finite value is never printed as `PASS`.
 9. **A default run is a test.** Each sample's default run is loaded by path and run by a GPU test that records its verdict in
    the job log; a required run that skips is uncovered, not passing. Host-only behaviour is tested under `test/python/misc/`.
 10. **The reference accumulates in fp64** and keeps every intermediate cast of the chain it models
@@ -58,10 +60,11 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     through the `benchmark/` folder's formal mode. A licence header on every file; the repository's formatter settings; no
     absolute local path in any output.
 12. **Sample-only packages stay at the edge.** `samples/models/requirements.txt` holds them with lower bounds, never pins,
-    and a "Validated with" line; none is a dependency of the package. Each is imported inside the one function that needs it
-    (`TextIO.from_checkpoint`: `tokenizers`, `jinja2`; `Checkpoint.describe` and its reads: `safetensors`), never at module
-    import, and a missing one is a `SKIP` that names the requirement file. A lower bound is a version the host tests of the
-    text and weight readers were run against; raise it with evidence, in the same change as the code that needs it. The
+    and a "Validated with" line; none is a dependency of the package. Each is imported inside the functions that need it
+    (`TextIO.from_checkpoint` and the stream decoder: `tokenizers`, `jinja2`; `Checkpoint.describe` and the tensor read:
+    `safetensors`), never at module import, and a missing one is a `SKIP` that names the requirement file. A lower bound
+    is a version the host tests of the text and weight readers were run against; raise it with evidence, in the same
+    change as the code that needs it (for `jinja2`, whose sandbox a checkpoint's template runs in, with a sandbox fix). The
     family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
     package versions and the GPU class of the last run with a checkpoint. Dependency alerts come through the `pip` entry for
     `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.
@@ -69,6 +72,12 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
+    Only the profiler's own start and stop are reported as a missing trace; an error of a step under it propagates.
+14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
+    file that is missing or is not what its name says, a request file that is not JSON, messages a template cannot render,
+    an output file that cannot be written: each is raised as a `ValueError` whose text names the file by its own name, and
+    the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
+    untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
 
 ## What the first GPU run of this area taught
 
@@ -111,10 +120,8 @@ defect that shows it.
 - An end-to-end comparison of logits or tokens is weak on a model with 4-bit activations, and no band makes it sharp. On
   the published checkpoint two reference stacks that differ only in accumulation precision (fp64 against IEEE fp32) were up
   to 52 bf16 units of the largest logit apart within 80 steps and disagreed on the greedy token at 13 of them, at margins of
-  up to several logits. A band that two correct stacks pass can only catch a path that has failed outright. Verify providers per block,
-  teacher-forced; print a second reference's distance beside the provider's instead of pretending the token check gates more
-  than it does. And know where such a band stops meaning anything: the largest logit is at least 128 and below 256 of its
-  own bf16 units, so beyond 128 units a stack that returns zeros passes.
+  up to several logits. Verify providers per block, teacher-forced; print a second reference's distance beside the
+  provider's instead of pretending the token check gates more than it does.
 - The first call of a tokenizer and of a compiled chat template pays for caches the libraries build, tens of times the
   repeated call. A sample that times one call times the caches; print the first call and the repeated call apart.
 - A streaming decoder is a library feature with its own history: the incremental decoder of `tokenizers` 0.21.0 fails on
@@ -122,3 +129,24 @@ defect that shows it.
 - The profiler's tracing library logs to stderr at start and stop, and once per kernel it cannot rate on a GPU it does not
   know. The sample sets its log level before PyTorch is imported unless one is set in the environment; the report says itself when the
   records are missing.
+
+## What the review of the checkpoint path taught
+
+Each of these survived the first set of tests; the host tests now hold the defect or the input that shows it.
+
+- A band in units of the run's largest value changes its absolute width with that value's binade. 128 bf16 units of the
+  largest logit are 8 logits where that logit is below 16 and 16 where it is below 32, while two correct stacks were 8.7 to
+  13.5 logits apart whatever the binade. Such a band fails a correct stack on the next prompt, and its token half is never
+  reached: a token is decidable only above twice the band, which is more than the largest logit. A gate that can fail a
+  correct stack and cannot fail a wrong token is worse than none; print the line as `REPORTED`.
+- Count distinct inputs, not runs. A chat template that opens with a fixed preamble makes the first 16 steps of every
+  plain prompt the same 16 tokens: four prompts were three checked windows. Say which steps a check covers.
+- A setting no test fails without is a setting a refactor drops. The template sandbox, block trimming, encoding without
+  added special tokens and the precedence of the template file each needed a template or a tokenizer that renders
+  differently, or escapes, when the setting is gone. Inject the defect; if the tests stay green, write the test.
+- An `except` around a loop that runs the workload reports the workload's failure as the tool's. Catch around the tool's
+  own start and stop.
+- "Installed by the README" means the README's lines and no other. One unlisted `pip install --upgrade pip` hid that the
+  pip of a new virtual environment has no `--group` option.
+- Both stacks of the tie-out read a checkpoint through the same loader, so `PASS` cannot see a wrong reading. Say what
+  does verify it (the text, read by a person; a comparison of the dumped ids), and do not let the verdict line imply more.

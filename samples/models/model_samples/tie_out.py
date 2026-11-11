@@ -17,7 +17,10 @@ Four checks, run after the timed loop on the ids the loop produced:
    counted and printed as near-ties; they are not failures and not hidden.  The band is declared, not taken from the run: a
    band that follows the run's own distance can never fail.  The check cannot be sharper than the two stacks are close: a
    chain of 8-bit and 4-bit quantisers turns a one-unit rounding difference into different codes, so the logits of two
-   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.
+   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.  Where a
+   family can declare no band for a model -- none that passes two correct stacks and fails a wrong one -- it declares
+   ``None``: the line is then REPORTED, prints the distance and the count of equal tokens, and fails only on a logit that
+   is not finite.  A line that cannot fail on a finite value is not printed as PASS.
 4. **batch invariance** -- with more than one sequence, every block is run again on ONE sequence alone, on the same operands
    and state; the bytes of that sequence must be equal.  The sequence that runs alone rotates with the step (step ``t``:
    sequence ``t`` modulo the count), so every row of the batch is covered at no extra launch.  A gate for a block whose

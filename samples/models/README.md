@@ -35,8 +35,11 @@ its time per token is longer and its time to first token is dominated by waiting
 
 Building cuDNN Frontend from this checkout needs a CUDA toolkit with its compiler, cuDNN 9 headers and libraries, CMake 3.26
 or newer and a C++17 compiler. Install PyTorch first so the build finds the cuDNN headers of its wheel, or set `CUDNN_PATH`.
+`pip install --group` reads the dependency groups of `pyproject.toml` and needs pip 25.1 or newer; the pip a new virtual
+environment starts with is often older, so upgrade it first.
 
 ```bash
+python -m pip install --upgrade pip                # --group needs pip 25.1 or newer
 pip install --group torch
 pip install -e .                                   # the decode entries are newer than the last released wheel
 python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint, no extra package
@@ -46,8 +49,9 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 ```
 
 `samples/models/requirements.txt` holds sample-only dependencies with lower bounds; none of them is a dependency of the
-`nvidia-cudnn-frontend` package, and the default run of every sample needs none of them. They are imported in two places
-only: `tokenizers` and `jinja2` where a checkpoint's text is read, `safetensors` where its weights are. Where one is
+`nvidia-cudnn-frontend` package, and the default run of every sample needs none of them. They are imported only inside the
+functions that read a checkpoint: `tokenizers` and `jinja2` where its text is read and streamed (`text_io.py`),
+`safetensors` where its shards are described and read (`weights.py`); never at module import. Where one is
 missing, a run with `--model` prints a `SKIP` that names the file. The family README states which checkpoint the sample
 was last run with, how much disk and GPU memory it needs and where the checkpoint comes from; a sample reads it from the
 directory it is given and from nowhere else.
@@ -60,14 +64,16 @@ the run at once: a `SKIP` comes before the first load or not at all. It ends in 
 | `[00] PASS` | 0 | every check of the run held |
 | `[00] SKIP <requirement>` | 0 | this GPU, library version or free-memory budget is not served; the sentence names the fix |
 | `[00] RAN reference stack (no provider checked)` | 0 | `--stack reference`: every block ran on the reference, so nothing was verified |
-| `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key, a `--model` directory that is not a checkpoint, messages the checkpoint's chat template refuses, or an installed distribution that disagrees with the imported `cudnn` |
+| `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key; a `--model` path that is not a directory (a hub name is not fetched), or a directory with a file that is missing or is not what its name says; a `--messages` file that cannot be read or is not JSON; messages the checkpoint's chat template refuses; a `--dump-tokens` file that cannot be written; or an installed distribution that disagrees with the imported `cudnn`. A file is named by its own name, never by its path |
 | `[00] FAIL` | 1 | a check did not hold; the check lines above it say which |
 
 The first lines of a run state the environment: the `cudnn` version, whether it is an editable checkout or a wheel, a hash of
 the package files the sample's cuDNN Frontend provider runs, and the installed distribution's version. If the last two
 disagree the sample stops with `ERROR`: an editable install with stale metadata lets a later `pip install` replace the
-checkout with a released wheel. `pip install -e .` again fixes it. The GPU comes first: on a GPU the sample does not serve
-it prints its `SKIP`, whatever is installed.
+checkout with a released wheel. `pip install -e .` again fixes it. The GPU class comes before that check: on a GPU the
+sample does not serve, the default run prints its `SKIP` whatever is installed. With `--model` the directory is read
+before the plan, because the plan needs the model: a missing sample-only package (`SKIP`) or a directory that is not a
+checkpoint (`ERROR`) is reported before the GPU class is.
 
 ## The helper layer
 
@@ -107,7 +113,7 @@ no rate. None of it is a measurement of record: no clock is locked, and the stac
 | `bytes per step` | arithmetic on the model's tensor list: the bytes of the weights a step reads in their stored formats plus the state it reads and writes, against the same with the weights as this stack holds them |
 | `note` | what bounds a step of this stack |
 | `text out` | the text of sequence 0 and why it ended |
-| `checks` | replay, blocks, tokens, batch invariance (the family README has the bands); with a checkpoint, on the first 16 steps of every prompt |
+| `checks` | replay, blocks, tokens, batch invariance (the family README has the bands); with a checkpoint, on the first 16 steps of every prompt, and the token line is `REPORTED`, not judged against a band |
 | `GPU memory`, `first launch` | PyTorch's peak, the growth on the device since the plan, and what the first launch of a compiled form took outside PyTorch's pool |
 
 ## What is verified where
@@ -119,6 +125,12 @@ no rate. None of it is a measurement of record: no clock is locked, and the stac
 | the text side: the synthetic tokenizer and its stream; chat requests from JSON files; a chat template with the constructs of a checkpoint's own (tool schemas, a reasoning block, tool calls and results, several turns, an option, a refusal) against stored strings; a tokenizer trained in the test, encoded, decoded and streamed; the requirement file | `test/python/misc/test_model_samples_text.py` | any host, level L0; the checkpoint tests skip visibly without `jinja2` or `tokenizers` |
 | the default run of each sample: `[NN] PASS` with its own checks | `test/python/linear_attention/frost/test_model_sample_qwen_dense.py` | one GPU the family serves; L0 runs two layers, L1 four |
 | a real checkpoint: text out, and the sample's checks on the first 16 steps of every prompt | by hand, with a run record; the family README states the checkpoint, the versions and the GPU class of the last run | a GPU with room for the stack; never in CI |
+
+`[00] PASS` on a checkpoint says that the provider blocks agree with the reference blocks on the weights both were given.
+It cannot see an error in how the checkpoint was read: the two stacks read the same bf16 copies through the same name map,
+scales and merges, so a wrong reading passes replay, blocks and tokens alike. The reading of a real checkpoint is verified
+by the text the run produces, read by a person, and by comparing the ids of `--dump-tokens` with another implementation;
+the host tests verify the reader on a checkpoint they generate.
 
 No tokenizer, template or weight file of a real checkpoint is committed. A default run that skips on a GPU class is
 uncovered there, not passing. The family README lists, per GPU class, whether the default run has been verified.
