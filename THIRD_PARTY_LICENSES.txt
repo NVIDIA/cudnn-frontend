@@ -355,3 +355,27 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+12. FlashInfer (flashinfer-ai/flashinfer)
+    https://github.com/flashinfer-ai/flashinfer
+
+The FP8 split-K projection kernel for decode rows in
+python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py
+is derived from FlashInfer's cluster split-K dense GEMM kernel
+(flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py), pinned to
+flashinfer-python 0.7.2.post1 (commit beabf5004585b03da60e927bbb803acbaa62fe36).
+The derived file retains the upstream notice. The port replaces the BF16/FP16
+operands and the optional bias by FP8 E4M3 operands with a scalar FP32 scale and
+one BF16 cast, binds static shapes, reserves the shared memory the configuration
+uses, allocates the tensor-memory columns the accumulator needs, releases them
+after the registers read from them are consumed, and adds the host entry with
+its typed declines and performance picks.
+
+FlashInfer's NOTICE:
+
+    FlashInfer
+    Copyright 2025-2026 NVIDIA
+    Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
