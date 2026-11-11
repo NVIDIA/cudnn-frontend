@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Kernel-facing configuration for the FROST SM90 D512 SDPA prefill template.
+"""Kernel-facing configuration for the FROST SM90 SDPA forward templates.
 
 The frozen ``TemplateParams`` record contains only graph declarations and
 selected tuning knobs. Runtime lengths, pointers, and packed token totals stay
 out of compile keys. Graph-adapter declaration logic lives with the adapter;
-this module keeps the small interface consumed by the kernel.
+this module keeps the small interface consumed by the native D64/D128/D256/D512 kernels.
 """
 
 from __future__ import annotations
@@ -21,17 +21,39 @@ SCALE_ZERO = 0
 SCALE_NEGATIVE = -1
 
 
-# The D envelope. Every WGMMA descriptor and SMEM slab is 512 columns wide, so any
-# head dim up to that tile is computed on it: the GMEM descriptors carry the actual
-# extent, loads past it zero-fill and O stores past it clip. 8 is the TMA 16-byte
-# global-stride rule at 2 bytes per element. A small D pays the full D512 tile cost;
-# this is envelope coverage, not a native small-D flavor.
+# Maximum envelope. The adapter selects native 128/256/512-column storage and
+# contraction; exact dense D64 keeps its separate body. GMEM maps carry the actual
+# extents, with zero-filled loads and clipped stores at head tails. Eight elements
+# satisfy the TMA 16-byte global-stride rule for both half types.
 D_TILE = 512
 D_ALIGN = 8
-# Fixed SM90 D512 instruction geometry, matching the FFPA donor. QK is
-# m64n64k512 and each PV half is m64n256k64; these are not tuning axes.
+# Sequence tile geometry shared by the native head widths.
 TILE_M = 64
 TILE_N = 64
+
+
+def native_d64_mismatch(
+    *,
+    thd=False,
+    sink=False,
+    pack_gqa=False,
+    q_lengths=False,
+    kv_lengths=False,
+    window_left=None,
+    window_right=None,
+    bottom_right=False,
+    s_q=0,
+    s_kv=0,
+    split_kv=1,
+):
+    """The bounded native D64 leg, shared by graph and standalone admission."""
+    if split_kv != 1:
+        return "native SM90 D64 does not support split-KV"
+    if thd or sink or pack_gqa or q_lengths or kv_lengths or window_left is not None or window_right is not None:
+        return "native SM90 D64 serves dense, unpadded, unpacked Q/K/V without sinks or window bands"
+    if bottom_right and s_q > s_kv:
+        return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    return None
 
 
 def head_dims_mismatch(d_qk, d_v) -> str | None:
@@ -85,6 +107,42 @@ class TemplateParams:
     # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the Stats store
     # scales the natural-log LSE by log2(e).
     stats_log2: bool = False
+    # THD caller-buffer origins: per port in (Q, K, V, O, Stats) order, ``(bits, multiplier)`` of the
+    # port's bound ragged offsets (int32 / int64, and the offset unit in elements), or None for a port
+    # bound without offsets, which keeps the compact prefix. None for the whole field keeps the packed
+    # layout. The setup launch turns each offset into a token origin, so padded THD (gaps between
+    # sequences, TE's cu_seqlens_padded) is read and written where the caller put it.
+    thd_origins: tuple | None = None
+    split_kv: int = 1
+    # Native contraction/storage envelope; independent of runtime lengths.
+    head_tile: int = 512
+    # Dense queries with native TMA loads from independently mapped K/V pages.
+    page_size: int = 0
+
+
+# The ports of ``TemplateParams.thd_origins``, in order.
+THD_ORIGIN_PORTS = ("q", "k", "v", "o", "stats")
+
+
+def thd_origin_maps(b: int) -> int:
+    """Tensor maps of a caller-origin THD plan: per-sequence O in ``0..B-1``, the dead-unit pad at
+    ``B``, then per-sequence K at ``B+1..2B`` and V at ``2B+1..3B``."""
+    return 3 * b + 1
+
+
+def thd_origins_off(b: int) -> int:
+    """Int32 word offset of the Int64 ``[5, B]`` token origins, right after the maps."""
+    from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF
+
+    return THD_MAPS_OFF(b) + thd_origin_maps(b) * TENSOR_MAP_QWORDS * 2
+
+
+def thd_meta_words(b: int, origins: bool) -> int:
+    """Int32 words of the THD metadata operand: the shared layout with its ``B + 3`` maps or, with
+    caller-buffer origins, the ``3B + 1`` maps and then the origins."""
+    from cudnn.frost.tile_dsl.thd import THD_MAPS_META_WORDS
+
+    return thd_origins_off(b) + 2 * len(THD_ORIGIN_PORTS) * b if origins else THD_MAPS_META_WORDS(b)
 
 
 # A band bound at or beyond S_q + S_kv never masks a key inside the declared envelopes, and
@@ -94,10 +152,26 @@ BAND_COORDINATE_LIMIT = 2**30
 
 def validate_params(params: TemplateParams) -> None:
     """Validate the immutable specialization before constructing a kernel."""
+    if type(params.page_size) is not int or params.page_size < 0:
+        raise ValueError("SM90 page_size must be a nonnegative integer")
+    if params.page_size:
+        p = params.page_size
+        if p % 8 or (p < TILE_N and TILE_N % p) or (p >= TILE_N and p % TILE_N):
+            raise ValueError("SM90 page_size must be divisible by 8 and divide 64 or be a multiple of 64")
+        if params.thd_varlen or not params.seq_kv_lens_present:
+            raise ValueError("SM90 paged KV requires dense Q and device KV lengths")
+    if type(params.head_tile) is not int or params.head_tile not in (128, 256, 512):
+        raise ValueError("SM90 head_tile must be 128, 256 or 512")
+    if type(params.split_kv) is not int or not 1 <= params.split_kv <= 65535:
+        raise ValueError("SM90 split_kv must be an integer in [1, 65535]")
+    if params.thd_varlen and params.split_kv > 1:
+        raise ValueError("SM90 split-KV requires dense Q")
     if params.dtype_qkv not in (DTYPE_FP16, DTYPE_BF16):
         raise ValueError("SM90 D512 requires uniform FP16 or BF16 Q/K/V/O")
-    if params.qh_per_kh < 1 or (params.pack_gqa and TILE_M % params.qh_per_kh):
-        raise ValueError("SM90 D512 PackGQA requires a positive head ratio dividing tile_m=64")
+    from .config_sm100 import pack_gqa_supported
+
+    if params.qh_per_kh < 1 or (params.pack_gqa and not pack_gqa_supported(params.qh_per_kh, 1, TILE_M, partial=True)):
+        raise ValueError("SM90 D512 PackGQA requires a positive head ratio sharing a factor with tile_m=64")
     if params.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError("SM90 D512 supports only NATURAL/LPT/LPT_L2 single-tile scheduling")
     if params.thd_varlen and params.sched_policy != SCHED_NATURAL:
@@ -109,6 +183,14 @@ def validate_params(params: TemplateParams) -> None:
             raise ValueError("SM90 D512 thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
         if params.seq_q_lens_present:
             raise ValueError("SM90 D512 seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+    if params.thd_origins is not None:
+        if not params.thd_varlen or len(params.thd_origins) != len(THD_ORIGIN_PORTS):
+            raise ValueError("SM90 D512 thd_origins is THD-only and lists Q, K, V, O and Stats")
+        for port, entry in zip(THD_ORIGIN_PORTS, params.thd_origins):
+            if entry is not None and (len(entry) != 2 or entry[0] not in (32, 64) or type(entry[1]) is not int or entry[1] < 1):
+                raise ValueError(f"SM90 D512 thd_origins[{port}] must be (32 or 64, multiplier >= 1)")
+        if params.thd_origins[4] is not None and not params.has_lse:
+            raise ValueError("SM90 D512 Stats origins require has_lse")
     if params.causal and params.window_right is not None:
         raise ValueError("SM90 D512 plain causal is causal=True; window_right holds only a widened right bound")
     for name, bound, low in (("window_left", params.window_left, 0), ("window_right", params.window_right, 1)):

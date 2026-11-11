@@ -1194,6 +1194,25 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
     }
 };
 
+// The config a deterministic SDPA backward (half and FP8) prefers on Blackwell, which no heuristics mode proposes (see
+// INode::override_heuristics_query): the part's own bprop engine -- 5 on cc 10.0 / 10.3, 17 past them -- with the
+// {128,128} bprop tiles: TILE_M 3, TILE_N 2, KERNEL_CFG 2 (bprop warp), STREAM_K 0, TILE_CGA_M 0; before cuDNN 9.23 the
+// same kernel is KERNEL_CFG 31.
+inline std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
+blackwell_deterministic_bprop_config(int32_t const sm_version, int64_t const stages) {
+    int64_t const engine_id = sm_version > 103 ? 17 : 5;
+    if (cudnn_frontend::detail::get_backend_version() >= 92300) {
+        return {engine_id,
+                {{KnobType_t::TILE_M, 3},
+                 {KnobType_t::TILE_N, 2},
+                 {KnobType_t::KERNEL_CFG, 2},
+                 {KnobType_t::STREAM_K, 0},
+                 {KnobType_t::TILE_CGA_M, 0},
+                 {KnobType_t::STAGES, stages}}};
+    }
+    return {engine_id, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, stages}}};
+}
+
 class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     using input_names  = SDPA_backward_attributes::input_names;
     using output_names = SDPA_backward_attributes::output_names;
@@ -2323,43 +2342,23 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         // The (256, 512] band has no cuDNN backend plan at all -- only the
-        // opt-in frontend FROST engine serves it. Pinning a backend engine id
-        // here bypasses the heuristics query entirely, and the pinned config
-        // then fails to finalize with CUDNN_STATUS_NOT_SUPPORTED, which
-        // surfaces as a generic backend-API error rather than "not supported".
-        // Decline the override and let heuristics run: it returns no configs
-        // and create_execution_plans reports GRAPH_NOT_SUPPORTED, which is what
-        // a caller (and every test harness) can act on.
+        // opt-in frontend FROST engine serves it. Decline the override and let
+        // heuristics run: it returns no configs and create_execution_plans
+        // reports GRAPH_NOT_SUPPORTED, which is what a caller (and every test
+        // harness) can act on. (create_execution_plans falls back to the
+        // heuristics query itself when a pinned engine cannot be created, so
+        // this decline is a shortcut past a pin that cannot finalize, not the
+        // only thing standing between the caller and a backend-API error.)
         if (is_d512_on_blackwell) {
             return {-1, {}};
         }
         int32_t const sm_version = context.get_sm_version();
-        bool const use_new_knobs = detail::get_backend_version() >= 92300;
-        // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
-        if (sm_version > 103 && (is_deterministic_algorithm_supported_on_blackwell)) {
-            if (use_new_knobs) {
-                return {17,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            } else {
-                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            }
-        } else if (is_deterministic_algorithm_supported_on_blackwell) {
-            if (use_new_knobs) {
-                return {5,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            } else {
-                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
-            }
+        if (is_deterministic_algorithm_supported_on_blackwell) {
+            // The heuristics propose only engine 7 here (the SM80 bprop plus matmul_dq_sm80 over a quadratic dS
+            // workspace: 4.7x slower on d128 GQA and 22x on d64 sliding-window attention at s=8192 on cc 10.7,
+            // cuDNN 9.29 and 9.30), or nothing at all for D192 / D256. Determinism does not rest on this config: a
+            // deterministic request already expands through the dP-workspace form (dQ = dS @ K as its own matmul).
+            return blackwell_deterministic_bprop_config(sm_version, is_d256_on_blackwell ? 3 : 2);
         } else if (use_sm90_ordered_dq_deterministic && sm_version >= 90 && sm_version < 100) {
             // Hopper bwd engine, 64x64 bprop tiles, ordered deterministic dQ
             // accumulation (STAGES = 4).
@@ -2671,6 +2670,32 @@ class UnifiedSDPANode : public SDPANodeBase<UnifiedSDPANode> {
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91301, cudnn_ver_error);
         auto unified_sdpa_operation =
             make_shared_backend_pointer((cudnnBackendDescriptorType_t)CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
+
+        // FLOAT is the unified backend's historical default. Only a non-default
+        // request needs the new attribute; old headers/libraries keep working for
+        // FLOAT, and must never silently discard a HALF request.
+        auto const compute_type =
+            attributes.compute_data_type == DataType_t::NOT_SET ? DataType_t::FLOAT : attributes.compute_data_type;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(compute_type != DataType_t::FLOAT && compute_type != DataType_t::HALF,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Unified SDPA accumulation type must be FLOAT or HALF");
+        if (compute_type != DataType_t::FLOAT) {
+#if (CUDNN_VERSION >= 92900)
+            auto compute_type_version_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                                      "Unified SDPA compute type requires backend attribute support"};
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92900, compute_type_version_error);
+            cudnnDataType_t backend_compute_type;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(compute_type, backend_compute_type));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(unified_sdpa_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SDPA_FWD_COMP_TYPE,
+                                                           CUDNN_TYPE_DATA_TYPE,
+                                                           1,
+                                                           &backend_compute_type));
+#else
+            return {error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Unified SDPA compute type requires cuDNN 9.29.0 or newer headers"};
+#endif
+        }
 
         auto Q         = attributes.inputs.find(SDPA_attributes::input_names::Q)->second;
         auto backend_q = tensors[Q->get_uid()]->get_desc()->get_backend_descriptor();

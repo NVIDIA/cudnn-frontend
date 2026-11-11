@@ -6,17 +6,20 @@
 Wraps the SM100 and SM90 CuTe-DSL score kernels. Each backend provides
 indexer and attention score variants, giving four public classes.
 
-Tile / SMEM dispatch logic and compile caching live in the backend interface
-modules. This module adapts those entry points to the APIBase contract.
+Tile / SMEM dispatch logic lives in the backend interface modules. This module
+adapts those entry points to the APIBase contract and prepares symbolic SM90
+sparse-score artifacts at plan compile time.
 """
 
 from __future__ import annotations
 
+import weakref
 from typing import Optional
 
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.tensor_adapter import has_tcgen05
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_capability,
     maybe_contiguous,
@@ -24,9 +27,11 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 )
 
 from cudnn._torch_stream import contiguous_on_stream, copy_into_on_stream, record_streams
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import APIBase, TupleDict, check_buffers_disjoint, tensor_byte_span
+from cudnn.tensor_adapter import get_version
 
 from . import _interface_sm100 as _iface_sm100
+from ._block_scaled import BLOCK_SCALED_PRECISION_NAMES
 
 # ---------------------------------------------------------------------------
 # Base helpers
@@ -36,9 +41,27 @@ from . import _interface_sm100 as _iface_sm100
 def _check_score_arch(api: APIBase) -> None:
     major, _ = torch.cuda.get_device_capability()
     api._runtime_error_if(
-        major != 9 and major < 10,
-        f"{type(api).__name__} requires SM90 or SM100+ compute capability, found SM{major}",
+        major != 9 and not has_tcgen05(major),
+        f"{type(api).__name__} requires SM90 or SM100+ compute capability with tcgen05 (not cc 12.x), found SM{major}",
     )
+
+
+def _check_sm100_bf16_indexer_tile(api: APIBase, q_desc, k_desc, is_thd: bool) -> None:
+    """The SM100 BF16 indexer kernel packs 128 // H tokens per 128-row tile: head groups 4..64, and a head dim
+    whose Q tile plus two K blocks fit shared memory (SM90 runs its own kernel)."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 9:
+        return
+    from cudnn.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
+    from ._interface_sm100 import bf16_indexer_smem_plan
+
+    h_q, h_kv, d = (q_desc.shape[1], k_desc.shape[1], q_desc.shape[2]) if is_thd else (q_desc.shape[2], k_desc.shape[2], q_desc.shape[3])
+    group = h_q // h_kv if h_kv > 0 else 0
+    api._value_error_if(
+        group not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
+        f"{type(api).__name__}: SM100 BF16 dense indexer requires qhead_per_kv_head in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16}, got {group}",
+    )
+    api._value_error_if(bf16_indexer_smem_plan(d) is None, f"{type(api).__name__}: SM100 BF16 dense indexer: head_dim={d} does not fit shared memory")
 
 
 def _decline_unless_unit_innermost(api: APIBase, desc, name: str) -> None:
@@ -56,6 +79,14 @@ def _decline_unless_contiguous(api: APIBase, desc, name: str) -> None:
         not desc.is_contiguous(),
         f"{type(api).__name__}: {name} must be contiguous (no .contiguous() copy on the execute path); got shape {desc.shape} strides {desc.stride}",
     )
+
+
+def _check_sm90_sparse_topk_capacity(device, topk_desc) -> None:
+    """Keep public admission aligned with the prepared SM90 compiler without narrowing SM100."""
+    if device_capability(device)[0] == 9:
+        from . import _interface_sm90 as _iface_sm90
+
+        _iface_sm90._sparse_topk_capacity(topk_desc.shape[2])
 
 
 def _require_live_tensor(api: APIBase, t: Optional[torch.Tensor], desc, name: str, *, contiguous: bool) -> None:
@@ -107,6 +138,43 @@ def _wrapper_stage_output(t: Optional[torch.Tensor], shape, dtype: torch.dtype, 
     return torch.empty(shape, dtype=t.dtype, device=t.device), t
 
 
+def _score_tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """Exact span with a compact fast path for the score API's usual contiguous bindings."""
+    base = int(tensor.data_ptr())
+    nbytes = int(tensor.nbytes)
+    if nbytes == 0:
+        return base, base
+    if tensor.is_contiguous():
+        return base, base + nbytes
+    return tensor_byte_span(tensor)
+
+
+def _wrapper_stage_overlapping_output(
+    out: torch.Tensor,
+    out_user: Optional[torch.Tensor],
+    readers,
+    shape,
+    dtype: torch.dtype,
+    device,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Keep the allocating wrapper convenient when a valid user output aliases an input.
+
+    Prepared SM90 plans reject that alias before launch.  The wrapper instead
+    computes into a private contiguous tensor and copies back, matching its
+    existing treatment of a non-contiguous caller output.  Invalid outputs are
+    left for the class contract to reject rather than silently repaired.
+    """
+    if out_user is not None or tuple(out.shape) != tuple(shape) or out.dtype != dtype or out.device != device or not out.is_contiguous():
+        return out, out_user
+    out_lo, out_hi = _score_tensor_byte_span(out)
+    for _, reader in readers:
+        if reader is not None:
+            reader_lo, reader_hi = _score_tensor_byte_span(reader)
+            if out_lo < reader_hi and reader_lo < out_hi:
+                return torch.empty(shape, dtype=dtype, device=device), out
+    return out, out_user
+
+
 def _wrapper_copy_back(stream, staged: torch.Tensor, user: Optional[torch.Tensor]) -> torch.Tensor:
     if user is None:
         return staged
@@ -117,21 +185,113 @@ def _wrapper_copy_back(stream, staged: torch.Tensor, user: Optional[torch.Tensor
 class _ScoreRecomputeBase(APIBase):
     """Common APIBase shell for score-recompute ops.
 
-    ``_interface.py`` owns compile caches keyed per-kernel; ``check_support``
-    and ``compile`` are thin markers that simply gate invocation. ``execute``
-    delegates to the relevant ``_iface`` entry point.
+    Dense and SM100 score backends retain their existing interface-owned lazy
+    compilation.  The SM90 sparse subclasses override ``compile`` so prepared
+    plans own a symbolic artifact before execution.
     """
 
     def __init__(self):
         super().__init__()
+        # The live dtype/device/shape checks run on every execute.  Tensor
+        # identity, PyTorch's mutation counter, and live pointer/offset/stride
+        # metadata cover both set_ mutations and .data storage rebinding.
+        # Weak references do not retain caller tensors or storage.
+        # Resizing a storage may move its base, but cannot make two distinct
+        # live storages overlap; same-storage views retain their relative spans.
+        self._sparse_score_disjoint_binding = None
+        self._is_prepared_sm90_sparse_score = False
 
     def compile(self) -> None:
         self._ensure_support_checked()
-        # The score backends compile from the real execute-time tensors (their
-        # plan-time-only compile caches key on dtypes/tile params/flags), so
-        # this API validates eagerly and lets the backend compile on the first
-        # execute(); compile() itself launches and allocates nothing.
+        # Dense and SM100 score backends still compile from real execute-time
+        # tensors. The SM90 sparse subclasses override this method with their
+        # symbolic plan-time compilation path.
         self._compiled_kernel = True
+
+    @staticmethod
+    def _make_sparse_score_disjoint_binding(tensors):
+        binding = []
+        for _, tensor in tensors:
+            if tensor is None:
+                binding.append(None)
+                continue
+            # Inference tensors intentionally have no mutation counter, so an
+            # exact span check is required for each execute using one.
+            if tensor.is_inference():
+                return None
+            binding.append(
+                (
+                    weakref.ref(tensor),
+                    get_version(tensor),
+                    int(tensor.data_ptr()),
+                    int(tensor.storage_offset()),
+                    tuple(tensor.stride()),
+                )
+            )
+        return tuple(binding)
+
+    @staticmethod
+    def _sparse_score_disjoint_binding_matches(binding, tensors) -> bool:
+        if binding is None or len(binding) != len(tensors):
+            return False
+        for cached, (_, tensor) in zip(binding, tensors, strict=True):
+            if tensor is None:
+                if cached is not None:
+                    return False
+                continue
+            if cached is None:
+                return False
+            if cached[0]() is not tensor or cached[1] != get_version(tensor):
+                return False
+            if cached[2:] != (int(tensor.data_ptr()), int(tensor.storage_offset()), tuple(tensor.stride())):
+                return False
+        return True
+
+    @staticmethod
+    def _refresh_sparse_score_disjoint_binding(binding, tensors):
+        """Refresh value-only version bumps after verifying every live tensor layout."""
+        if binding is None or len(binding) != len(tensors):
+            return None
+        refreshed = list(binding)
+        for index, (cached, (_, tensor)) in enumerate(zip(binding, tensors, strict=True)):
+            if tensor is None:
+                if cached is not None:
+                    return None
+                continue
+            if cached is None or cached[0]() is not tensor:
+                return None
+            version = get_version(tensor)
+            updated = (
+                cached[0],
+                version,
+                int(tensor.data_ptr()),
+                int(tensor.storage_offset()),
+                tuple(tensor.stride()),
+            )
+            if cached[2:] != updated[2:]:
+                return None
+            refreshed[index] = updated
+        return tuple(refreshed)
+
+    def _check_sparse_score_disjoint_binding(self, out: torch.Tensor, readers) -> None:
+        tensors = (("out", out), *readers)
+        if self._sparse_score_disjoint_binding_matches(self._sparse_score_disjoint_binding, tensors):
+            return
+        refreshed = self._refresh_sparse_score_disjoint_binding(self._sparse_score_disjoint_binding, tensors)
+        if refreshed is not None:
+            self._sparse_score_disjoint_binding = refreshed
+            return
+        _check_sparse_score_disjoint(out, readers)
+        self._sparse_score_disjoint_binding = self._make_sparse_score_disjoint_binding(tensors)
+
+
+def _check_sparse_score_disjoint(out: torch.Tensor, readers) -> None:
+    """Reject a prepared SM90 output that overlaps an operand still being read."""
+    check_buffers_disjoint(
+        [("out", out)],
+        readers,
+        what="the prepared SM90 sparse score kernel",
+    )
 
 
 def _check_sparse_score_shapes(
@@ -222,6 +382,11 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
 
     Computes per-query ``softmax( sum_h ReLU(Q_h · K_topk^T) * W_h )`` over
     the top-K KV positions given by ``topk_indices``.
+
+    On SM90, ``compile()`` prepares a symbolic CuTeDSL artifact and
+    ``execute()`` requires that prepared plan; execution is allocation-free
+    and CUDA Graph capturable with caller-owned ``out``. The physical top-K
+    width must be in ``[1, 2176]`` on SM90; the SM100 contract is unchanged.
     """
 
     def __init__(
@@ -263,8 +428,29 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
             "W",
             self.qhead_per_kv_head,
         )
+        _check_sm90_sparse_topk_capacity(self.q_desc.device, self.topk_desc)
         self._is_supported = True
         return True
+
+    def compile(self) -> None:
+        self._ensure_support_checked()
+        self._is_prepared_sm90_sparse_score = device_capability(self.q_desc.device)[0] == 9
+        if not self._is_prepared_sm90_sparse_score:
+            self._compiled_kernel = True
+            return
+        from . import _interface_sm90 as _iface_sm90
+
+        self._compiled_kernel = _iface_sm90.compile_sparse_score_recompute(
+            device=self.q_desc.device,
+            dtype=self.q_desc.dtype,
+            head_dim=self.q_desc.shape[3],
+            qhead_per_kvhead=self.q_desc.shape[2],
+            physical_topk=self.topk_desc.shape[2],
+            is_index_scores=True,
+            has_topk_length=self.topk_length_desc is not None,
+            output_log_probs=False,
+            topk_indices_global=self.topk_indices_global,
+        )
 
     def execute(
         self,
@@ -276,16 +462,27 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         topk_length: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        self._value_error_if(self._compiled_kernel is None, "SparseIndexerScoreRecompute plan not compiled; call compile() first")
         _require_live_tensor(self, q_indexer, self.q_desc, "q_indexer", contiguous=False)
         _require_live_tensor(self, k_indexer, self.k_desc, "k_indexer", contiguous=False)
         _require_live_tensor(self, weights, self.w_desc, "weights", contiguous=False)
         _require_live_tensor(self, topk_indices, self.topk_desc, "topk_indices", contiguous=True)
         _require_live_tensor(self, out, self.out_desc, "out", contiguous=True)
         _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
-        major, _ = device_capability()
+        major, _ = device_capability(q_indexer.device)
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
+            self._check_sparse_score_disjoint_binding(
+                out,
+                (
+                    ("q_indexer", q_indexer),
+                    ("k_indexer", k_indexer),
+                    ("weights", weights),
+                    ("topk_indices", topk_indices),
+                    ("topk_length", topk_length),
+                ),
+            )
             return _iface_sm90.sparse_indexer_score_recompute(
                 q_indexer,
                 k_indexer,
@@ -295,6 +492,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
                 topk_length=topk_length,
                 topk_indices_global=self.topk_indices_global,
                 current_stream=current_stream,
+                compiled_kernel=self._compiled_kernel,
             )
         return _iface_sm100.sparse_indexer_score_recompute(
             q_indexer,
@@ -335,7 +533,7 @@ def sparse_indexer_score_recompute_wrapper(
     omitted. All of it runs on ``stream``.
 
     ``topk_length`` does not replace the ``-1`` padding: slots at and past
-    ``topk_length[row]`` must still hold ``-1`` (docs/fe-oss-apis/dsa.md,
+    ``topk_length[row]`` must still hold ``-1`` (docs/operations/sparse_attention/dsa.md,
     "Compact vs. non-compact sparse indices").
     """
     with _torch_stream_context(stream):
@@ -374,6 +572,27 @@ def sparse_indexer_score_recompute_wrapper(
         obj.compile()
         _cache_of_SparseIndexerScoreRecomputeObjects[key] = obj
 
+    if obj._is_prepared_sm90_sparse_score:
+        readers = (
+            ("q_indexer", q_indexer),
+            ("k_indexer", k_indexer),
+            ("weights", weights),
+            ("topk_indices", topk_indices),
+            ("topk_length", topk_length),
+        )
+        try:
+            obj._check_sparse_score_disjoint_binding(out, readers)
+        except ValueError:
+            with _torch_stream_context(stream):
+                out, out_user = _wrapper_stage_overlapping_output(
+                    out,
+                    out_user,
+                    readers,
+                    (q_indexer.shape[0], q_indexer.shape[1], topk_indices.shape[-1]),
+                    torch.float32,
+                    q_indexer.device,
+                )
+
     predict = obj.execute(
         q_indexer,
         k_indexer,
@@ -397,6 +616,11 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
     Recovers per-head softmax from ``LSE``, sums across heads, and L1-normalizes
     over the top-K KV positions:
     ``target[b,q,i] = (sum_h exp(Q_h·K_topk^T·scale - LSE_h)) / sum_i(...)``.
+
+    On SM90, ``compile()`` prepares a symbolic CuTeDSL artifact and
+    ``execute()`` requires that prepared plan; execution is allocation-free
+    and CUDA Graph capturable with caller-owned ``out``. The physical top-K
+    width must be in ``[1, 2176]`` on SM90; the SM100 contract is unchanged.
     """
 
     def __init__(
@@ -440,8 +664,29 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
             "LSE",
             self.qhead_per_kv_head,
         )
+        _check_sm90_sparse_topk_capacity(self.q_desc.device, self.topk_desc)
         self._is_supported = True
         return True
+
+    def compile(self) -> None:
+        self._ensure_support_checked()
+        self._is_prepared_sm90_sparse_score = device_capability(self.q_desc.device)[0] == 9
+        if not self._is_prepared_sm90_sparse_score:
+            self._compiled_kernel = True
+            return
+        from . import _interface_sm90 as _iface_sm90
+
+        self._compiled_kernel = _iface_sm90.compile_sparse_score_recompute(
+            device=self.q_desc.device,
+            dtype=self.q_desc.dtype,
+            head_dim=self.q_desc.shape[3],
+            qhead_per_kvhead=self.q_desc.shape[2],
+            physical_topk=self.topk_desc.shape[2],
+            is_index_scores=False,
+            has_topk_length=self.topk_length_desc is not None,
+            output_log_probs=False,
+            topk_indices_global=self.topk_indices_global,
+        )
 
     def execute(
         self,
@@ -454,6 +699,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        self._value_error_if(self._compiled_kernel is None, "SparseAttnScoreRecompute plan not compiled; call compile() first")
         _require_live_tensor(self, q_attn, self.q_desc, "q_attn", contiguous=False)
         _require_live_tensor(self, k_attn, self.k_desc, "k_attn", contiguous=False)
         _require_live_tensor(self, lse, self.lse_desc, "lse", contiguous=False)
@@ -461,10 +707,20 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         _require_live_tensor(self, out, self.out_desc, "out", contiguous=True)
         _require_live_optional(self, topk_length, self.topk_length_desc, "topk_length")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
-        major, _ = device_capability()
+        major, _ = device_capability(q_attn.device)
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
+            self._check_sparse_score_disjoint_binding(
+                out,
+                (
+                    ("q_attn", q_attn),
+                    ("k_attn", k_attn),
+                    ("lse", lse),
+                    ("topk_indices", topk_indices),
+                    ("topk_length", topk_length),
+                ),
+            )
             return _iface_sm90.sparse_attn_score_recompute(
                 q_attn,
                 k_attn,
@@ -475,6 +731,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
                 topk_length=topk_length,
                 topk_indices_global=self.topk_indices_global,
                 current_stream=current_stream,
+                compiled_kernel=self._compiled_kernel,
             )
         return _iface_sm100.sparse_attn_score_recompute(
             q_attn,
@@ -519,7 +776,7 @@ def sparse_attn_score_recompute_wrapper(
     ``topk_length`` does not replace the ``-1`` padding: slots at and past
     ``topk_length[row]`` must still hold ``-1``, because the SM100 kernel may
     ignore ``topk_length`` and skip slots by index value (issue #1549; see
-    docs/fe-oss-apis/dsa.md, "Compact vs. non-compact sparse indices").
+    docs/operations/sparse_attention/dsa.md, "Compact vs. non-compact sparse indices").
     """
     with _torch_stream_context(stream):
         q_attn, k_attn, lse = (maybe_contiguous(t, stream) for t in (q_attn, k_attn, lse))
@@ -558,6 +815,27 @@ def sparse_attn_score_recompute_wrapper(
         assert obj.check_support()
         obj.compile()
         _cache_of_SparseAttnScoreRecomputeObjects[key] = obj
+
+    if obj._is_prepared_sm90_sparse_score:
+        readers = (
+            ("q_attn", q_attn),
+            ("k_attn", k_attn),
+            ("lse", lse),
+            ("topk_indices", topk_indices),
+            ("topk_length", topk_length),
+        )
+        try:
+            obj._check_sparse_score_disjoint_binding(out, readers)
+        except ValueError:
+            with _torch_stream_context(stream):
+                out, out_user = _wrapper_stage_overlapping_output(
+                    out,
+                    out_user,
+                    readers,
+                    (q_attn.shape[0], q_attn.shape[1], topk_indices.shape[-1]),
+                    torch.float32,
+                    q_attn.device,
+                )
 
     target = obj.execute(
         q_attn,
@@ -785,6 +1063,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
             self.is_thd,
             self.qhead_per_kv_head,
         )
+        _check_sm100_bf16_indexer_tile(self, self.q_desc, self.k_desc, self.is_thd)
         _check_dense_thd_plan(self)
         self._is_supported = True
         return True
@@ -873,6 +1152,13 @@ def dense_indexer_score_recompute_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'out': scores, 'denom': logsumexp}``.
 
+    ``precision`` is ``"bf16"`` (SM90 and SM100+) or an SM100 block-scaled
+    precision: ``"mxfp8"`` (E4M3 Q/K) or ``"mxfp4"``
+    (``torch.float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``), both with
+    one E8M0 scale per 32 head_dim values (``head_dim // 32`` per row, for
+    MXFP4 too). Block-scaled precisions take packed
+    ``q_scale`` / ``k_scale`` (and, for THD, ``cu_seqlens_*_scale_padded``).
+
     THD (``cu_seqlens_q``/``cu_seqlens_k`` given) runs natively on SM100+; on
     SM90 the wrapper adapts it per batch from a host copy of ``cu_seqlens``
     (the class declines SM90 THD). Pass ``max_seqlen_q`` and ``max_seqlen_k``:
@@ -902,7 +1188,9 @@ def dense_indexer_score_recompute_wrapper(
     if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
         major, _ = device_capability()
         if major == 9:
-            raise NotImplementedError("Dense indexer score FP8/MXFP8 is SM100-only")
+            raise NotImplementedError(
+                f"Dense indexer score with block scales (precision={BLOCK_SCALED_PRECISION_NAMES}) is SM100-only; SM90 supports precision='bf16'"
+            )
         o, d = _iface_sm100.dense_indexer_score_recompute(
             q,
             k,

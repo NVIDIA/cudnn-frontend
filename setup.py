@@ -14,6 +14,10 @@ stable_abi_value = os.environ.get("CUDNN_FRONTEND_PYTHON_STABLE_ABI", "OFF").str
 if stable_abi_value not in ("", "0", "OFF", "NO", "FALSE", "1", "ON", "YES", "TRUE"):
     raise ValueError("CUDNN_FRONTEND_PYTHON_STABLE_ABI must be ON or OFF")
 stable_abi_requested = stable_abi_value in ("1", "ON", "YES", "TRUE")
+free_threaded_value = os.environ.get("CUDNN_FRONTEND_PYTHON_FREE_THREADED", "OFF").strip().upper()
+if free_threaded_value not in ("", "0", "OFF", "NO", "FALSE", "1", "ON", "YES", "TRUE"):
+    raise ValueError("CUDNN_FRONTEND_PYTHON_FREE_THREADED must be ON or OFF")
+free_threaded = free_threaded_value in ("1", "ON", "YES", "TRUE")
 stable_abi = stable_abi_requested and sys.implementation.name == "cpython" and sys.version_info >= (3, 12) and not sysconfig.get_config_var("Py_GIL_DISABLED")
 if stable_abi_requested and not stable_abi:
     raise ValueError(
@@ -45,6 +49,7 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
             f"-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=ON",
             f"-DCUDNN_FRONTEND_PYTHON_STABLE_ABI={'ON' if stable_abi else 'OFF'}",
+            f"-DCUDNN_FRONTEND_PYTHON_FREE_THREADED={'ON' if free_threaded else 'OFF'}",
             # There's no need to build cpp samples and tests with python
             f"-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF",
             f"-DCUDNN_FRONTEND_BUILD_TESTS=OFF",

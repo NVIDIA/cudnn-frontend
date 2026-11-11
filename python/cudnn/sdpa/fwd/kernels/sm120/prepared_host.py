@@ -11,6 +11,7 @@ from cuda.bindings import driver as cuda_driver
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd
 from cudnn.sdpa.fwd.kernels._quantized import _reset_amax_kernel, _unscale_amax_kernel
+from cudnn.frost.tile_dsl.thd import THD_WORK_META_WORDS
 
 
 @cute.jit
@@ -41,13 +42,23 @@ def _operands(
     d_v: cutlass.Constexpr[int],
     persistent_ctas: cutlass.Constexpr[int],
     thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_caps=None,
 ):
     """The binder validates runtime geometry; head counts and dimensions are plan constants."""
     b, _, _, sq, skv, _ = problem_size
-    q = _bshd(q_ptr, b, sq, qh, d_qk, q_strides, kernel.thd_varlen)
-    k = _bshd(k_ptr, b, skv, kh, d_qk, k_strides, kernel.thd_varlen)
-    v = _bshd(v_ptr, b, skv, kh, d_v, v_strides, kernel.thd_varlen)
-    o = _bshd(o_ptr, b * kernel.split_kv, sq, qh, d_v // (2 if getattr(kernel, "o_block_scale", 0) == 16 else 1), o_strides, kernel.thd_varlen)
+    q_extent = sq
+    k_extent = skv
+    v_extent = skv
+    o_extent = sq
+    stats_extent = sq
+    if cutlass.const_expr(thd_origin_caps is not None):
+        q_extent, k_capacity, v_capacity, o_extent, stats_extent = thd_origin_caps
+        if cutlass.const_expr(not getattr(kernel, "page_size", 0)):
+            k_extent, v_extent = k_capacity, v_capacity
+    q = _bshd(q_ptr, b, q_extent, qh, d_qk, q_strides, kernel.thd_varlen)
+    k = _bshd(k_ptr, b, k_extent, kh, d_qk, k_strides, kernel.thd_varlen)
+    v = _bshd(v_ptr, b, v_extent, kh, d_v, v_strides, kernel.thd_varlen)
+    o = _bshd(o_ptr, b * kernel.split_kv, o_extent, qh, d_v // (2 if getattr(kernel, "o_block_scale", 0) == 16 else 1), o_strides, kernel.thd_varlen)
     lse = None
     if cutlass.const_expr(lse_ptr is not None):
         if cutlass.const_expr(kernel.thd_varlen):
@@ -56,7 +67,7 @@ def _operands(
             elif cutlass.const_expr(kernel.thd_lse_head_major):
                 lse = cute.make_tensor(lse_ptr, cute.make_layout((qh, lse_ext), stride=(cutlass.Int64(lse_ext), 1)))
             else:
-                lse = cute.make_tensor(lse_ptr, cute.make_layout((sq, qh), stride=(qh, 1)))
+                lse = cute.make_tensor(lse_ptr, cute.make_layout((stats_extent, qh), stride=(qh, 1)))
         else:
             lse = cute.make_tensor(lse_ptr, cute.make_layout((b * kernel.split_kv, qh, sq), stride=lse_strides))
     sinks = None
@@ -64,7 +75,7 @@ def _operands(
         sinks = cute.make_tensor(sinks_ptr, cute.make_layout((qh,), stride=(1,)))
     q_lens_ptr = cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4)
     q_lens = cute.make_tensor(q_lens_ptr, cute.make_layout((b,), stride=(1,)))
-    kv_lens = cute.make_tensor(meta_ptr, cute.make_layout((4 * b + 4 if kernel.thd_varlen else b,), stride=(1,)))
+    kv_lens = cute.make_tensor(meta_ptr, cute.make_layout((THD_WORK_META_WORDS(b) if kernel.thd_varlen else b,), stride=(1,)))
     thd_q_lens = None
     thd_kv_lens = None
     n_ctas = cutlass.Int32(persistent_ctas)
@@ -107,6 +118,9 @@ def host(
     d_v: cutlass.Constexpr[int],
     persistent_ctas: cutlass.Constexpr[int],
     thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_ptrs,
+    thd_origin_caps,
+    thd_origin_specs: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
@@ -136,7 +150,11 @@ def host(
         d_v,
         persistent_ctas,
         thd_max_sq,
+        thd_origin_caps,
     )
+    origins = None
+    if cutlass.const_expr(thd_origin_ptrs is not None):
+        origins = tuple(None if ptr is None else cute.make_tensor(ptr, cute.make_layout((problem_size[0] + 1,), stride=(1,))) for ptr in thd_origin_ptrs)
     kernel(
         q,
         k,
@@ -154,6 +172,106 @@ def host(
         n_ctas,
         stream,
         prepared=True,
+        **({"thd_origins": origins, "thd_origin_specs": thd_origin_specs} if cutlass.const_expr(thd_origin_specs is not None) else {}),
+    )
+
+
+@cute.jit
+def paged_host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int64,
+    scale_softmax_log2: cutlass.Float32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    n_thd_units: cutlass.Int32,
+    block_table_ptr: cute.Pointer,
+    block_table_v_ptr: cute.Pointer,
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    n_pages: cutlass.Int32,
+    kernel: cutlass.Constexpr,
+    qh: cutlass.Constexpr[int],
+    kh: cutlass.Constexpr[int],
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    persistent_ctas: cutlass.Constexpr[int],
+    thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_ptrs,
+    thd_origin_caps,
+    thd_origin_specs: cutlass.Constexpr,
+    stream: cuda_driver.CUstream,
+):
+    q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        seq_q_lens_addr,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        n_thd_units,
+        kernel,
+        qh,
+        kh,
+        d_qk,
+        d_v,
+        persistent_ctas,
+        thd_max_sq,
+        thd_origin_caps,
+    )
+    b, _, _, _, skv, _ = problem_size
+    n_blocks = skv // kernel.page_size
+    table = cute.make_tensor(block_table_ptr, cute.make_layout((b, n_blocks), stride=table_strides))
+    table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((b, n_blocks), stride=table_v_strides))
+    origins = None
+    if cutlass.const_expr(thd_origin_ptrs is not None):
+        origins = tuple(None if ptr is None else cute.make_tensor(ptr, cute.make_layout((problem_size[0] + 1,), stride=(1,))) for ptr in thd_origin_ptrs)
+    kernel(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        sinks,
+        q_lens,
+        kv_lens,
+        scale_softmax_log2,
+        cutlass.Int32(thd_max_sq),
+        thd_q_lens,
+        thd_kv_lens,
+        thd_lens_form,
+        n_ctas,
+        stream,
+        prepared=True,
+        **({"thd_origins": origins, "thd_origin_specs": thd_origin_specs} if cutlass.const_expr(thd_origin_specs is not None) else {}),
+        block_table=table,
+        block_table_v=table_v,
     )
 
 
@@ -195,6 +313,9 @@ def fp8_host(
     d_v: cutlass.Constexpr[int],
     persistent_ctas: cutlass.Constexpr[int],
     thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_ptrs,
+    thd_origin_caps,
+    thd_origin_specs: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
@@ -224,6 +345,7 @@ def fp8_host(
         d_v,
         persistent_ctas,
         thd_max_sq,
+        thd_origin_caps,
     )
 
     def scalar(ptr):
@@ -234,6 +356,9 @@ def fp8_host(
     if cutlass.const_expr(kernel.split_kv == 1 and has_amax):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict(prepared=True)
+    if cutlass.const_expr(thd_origin_specs is not None):
+        origins = tuple(None if ptr is None else cute.make_tensor(ptr, cute.make_layout((problem_size[0] + 1,), stride=(1,))) for ptr in thd_origin_ptrs)
+        kwargs.update(thd_origins=origins, thd_origin_specs=thd_origin_specs)
     if cutlass.const_expr(sfo_geometry is not None):
         kwargs.update(
             sf_o=scalar(sf_o_ptr),
@@ -286,6 +411,8 @@ def compile_host(
     has_amax=False,
     scale_o_in_combine=False,
     sfo_geometry=None,
+    kv_dtype=None,
+    thd_origin_specs=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -299,10 +426,10 @@ def compile_host(
     fp8 = output_dtype is not None
     strides = (cutlass.Int64(0),) * 3
     return compile_cached(
-        fp8_host if fp8 else host,
+        fp8_host if fp8 else (paged_host if getattr(kernel, "page_size", 0) else host),
         ptr(dtype),
-        ptr(dtype),
-        ptr(dtype),
+        ptr(dtype if kv_dtype is None else kv_dtype),
+        ptr(dtype if kv_dtype is None else kv_dtype),
         ptr(output_dtype if fp8 else dtype),
         ptr(cutlass.Float32, 4) if has_lse else None,
         ptr(cutlass.Float32, 4),
@@ -322,6 +449,11 @@ def compile_host(
         cutlass.Int32(0) if kernel.thd_varlen else None,
         cutlass.Int32(0),
         *(
+            (ptr(cutlass.Int32, 4), ptr(cutlass.Int32, 4), (cutlass.Int64(0),) * 2, (cutlass.Int64(0),) * 2, cutlass.Int32(0))
+            if getattr(kernel, "page_size", 0)
+            else ()
+        ),
+        *(
             (ptr(cutlass.Float32, 4),) * 3
             + (
                 None if scale_o_in_combine else ptr(cutlass.Float32, 4),
@@ -340,6 +472,13 @@ def compile_host(
         d_v,
         persistent_ctas,
         thd_max_sq,
+        (
+            tuple(None if spec is None else ptr(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        (cutlass.Int64(0),) * 5 if thd_origin_specs is not None else None,
+        thd_origin_specs,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

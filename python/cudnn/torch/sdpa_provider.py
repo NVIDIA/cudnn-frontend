@@ -41,8 +41,9 @@ import cudnn.sdpa.fwd.torch_op as _cudnn_ops  # noqa: F401
 _lib: Optional[torch.library.Library] = None
 
 # Observability for tests: how many aten calls the bridge served on the
-# python API vs fell back (cpp = C++ worker ops; fa2 = flash varlen kernels).
-calls = {"fwd": 0, "bwd": 0, "fwd_cpp": 0, "bwd_cpp": 0, "fwd_fa2": 0, "bwd_fa2": 0}
+# python API vs fell back (cpp = C++ worker ops; fa2 = flash varlen kernels;
+# torch = varlen calls passed to torch's own op body, see _honoring_backend).
+calls = {"fwd": 0, "bwd": 0, "fwd_cpp": 0, "bwd_cpp": 0, "fwd_fa2": 0, "bwd_fa2": 0, "fwd_torch": 0, "bwd_torch": 0}
 
 
 def _fwd(
@@ -141,6 +142,13 @@ def install() -> None:
 # level up instead: override the `torch_attn::_varlen_attn{,_backward}`
 # custom ops at the CUDA key. Their autograd wiring is untouched; unlike the
 # dead branch we also serve GQA and causal sliding windows.
+#
+# Later torch versions give these ops a trailing `backend` argument: the
+# backend varlen_attn selected from sdpa_kernel and the SDPA priority order.
+# There the overrides honor it (_honoring_backend): a call runs here only if
+# it selected cuDNN and _varlen_supported admits it. Every other call goes to
+# the kernel the override replaced, torch's own op body, which runs flash or
+# the C++ cuDNN path as selected.
 # ---------------------------------------------------------------------------
 
 
@@ -228,13 +236,19 @@ def _varlen_fwd_out(out, query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is
             False, scale=scale, window_size_left=ws[0], window_size_right=ws[1],
             seqused_k=seqused_k, block_table=block_table, num_splits=num_splits,
         )  # fmt: skip
-    o, lse, _rng = _varlen_fwd(
-        query, key, value, cu_seq_q, cu_seq_k, max_q, max_k,
-        is_causal=is_causal, scale=scale, window_size=window_size, enable_gqa=enable_gqa,
-        seqused_k=seqused_k, block_table=block_table, num_splits=num_splits,
+    is_causal, window_right = _fa_window_right_to_cudnn(is_causal, ws[1])
+    calls["fwd"] += 1
+    attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
+    # Below the dispatcher: write O straight into the caller's `out` (no extra O copy).
+    o, stats = _cudnn_ops._sdpa_fwd_impl(
+        query, key, value, attn_scale,
+        is_causal=is_causal, window_left=_fa_window_left_to_cudnn(ws[0]), window_right=window_right,
+        cu_seqlens_q=cu_seq_q, cu_seqlens_kv=cu_seq_k,
+        max_seqlen_q=max_q, max_seqlen_kv=max_k, return_lse=True, _out=out,
     )  # fmt: skip
-    out.copy_(o)
-    return lse
+    if o.data_ptr() != out.data_ptr():  # `out` not declarable as-is (_out_bindable)
+        out.copy_(o)
+    return stats.squeeze(-1).transpose(0, 1).contiguous()  # (T,H,1) -> (H,T) flash convention
 
 
 def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, rng_state, scale=None, window_size=None,):  # fmt: skip
@@ -270,11 +284,57 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
     return dq, dk, dv
 
 
+def _serves_varlen_fwd(call) -> bool:
+    ws = _norm_window(call.get("window_size"))
+    return _varlen_supported(ws, call.get("seqused_k"), call.get("block_table"), call.get("num_splits"))
+
+
+def _serves_varlen_bwd(call) -> bool:
+    return _varlen_supported(_norm_window(call.get("window_size")))
+
+
+# (op, implementation, the calls it serves, counter for the calls it passes on)
+_VARLEN_OVERRIDES = (
+    ("_varlen_attn", _varlen_fwd, _serves_varlen_fwd, "fwd_torch"),
+    ("_varlen_attn_out", _varlen_fwd_out, _serves_varlen_fwd, "fwd_torch"),
+    ("_varlen_attn_backward", _varlen_bwd, _serves_varlen_bwd, "bwd_torch"),
+)
+
+
+def _has_backend_arg(op) -> bool:
+    args = op._schema.arguments
+    return bool(args) and args[-1].name == "backend"
+
+
+def _honoring_backend(op, serve, serves, counter):
+    """Wrap ``serve`` so that it runs only for calls that selected cuDNN and
+    that ``serves`` admits; every other call goes to the kernel being replaced.
+
+    Call before registering the override: it captures the CUDA kernel in
+    effect now (torch's own op body) as the one to pass calls on to.
+    """
+    names = [a.name for a in op._schema.arguments]
+    default = op._schema.arguments[-1].default_value
+    replaced = torch.library.get_kernel(op, "CUDA")
+    cudnn_backend = torch.nn.attention.SDPBackend.CUDNN_ATTENTION.value
+
+    def impl(keyset, *args, **kwargs):
+        # The dispatcher leaves out trailing arguments that equal their
+        # default, `backend` among them when flash is selected.
+        call = dict(zip(names, args), **kwargs)
+        if call.pop("backend", default) == cudnn_backend and serves(call):
+            return serve(**call)
+        calls[counter] += 1
+        return replaced.call_boxed(keyset, *args, **kwargs)
+
+    return impl
+
+
 # ---------------------------------------------------------------------------
 # Installing the overrides
 #
 # install_sdpa_overrides() is the entry point PyTorch calls from
-# torch.backends.cuda.enable_cudnn_sdp_python(True); it keeps the returned
+# torch.nn.attention.enable_cudnn_sdp_python(True); it keeps the returned
 # handle and calls remove() on disable. Each call installs a fresh set of
 # Library registrations, so a handle owns exactly what it installed.
 #
@@ -308,8 +368,9 @@ def install_sdpa_overrides() -> SdpaOverrides:
 
     Overrides the CUDA kernels of ``aten::_scaled_dot_product_cudnn_attention``
     and its backward, and of ``torch_attn::_varlen_attn``,
-    ``_varlen_attn_out`` and ``_varlen_attn_backward``. Returns the handle that
-    removes them.
+    ``_varlen_attn_out`` and ``_varlen_attn_backward``. Where the varlen ops
+    take a ``backend`` argument, their overrides serve only calls that
+    selected cuDNN. Returns the handle that removes them.
     """
     lib = torch.library.Library("aten", "IMPL")
     lib.impl("_scaled_dot_product_cudnn_attention", _fwd, "CUDA")
@@ -317,14 +378,17 @@ def install_sdpa_overrides() -> SdpaOverrides:
     vlib = torch.library.Library("torch_attn", "IMPL")
     from torch.nn.attention import varlen as _varlen_mod  # noqa: F401 — ensure torch_attn ops are defined
 
-    vlib.impl("_varlen_attn", _varlen_fwd, "CUDA")
-    vlib.impl("_varlen_attn_out", _varlen_fwd_out, "CUDA")
-    vlib.impl("_varlen_attn_backward", _varlen_bwd, "CUDA")
+    for name, serve, serves, counter in _VARLEN_OVERRIDES:
+        op = getattr(torch.ops.torch_attn, name).default
+        if _has_backend_arg(op):
+            vlib.impl(name, _honoring_backend(op, serve, serves, counter), "CUDA", with_keyset=True)
+        else:
+            vlib.impl(name, serve, "CUDA")
     return SdpaOverrides(lib, vlib)
 
 
 def _register_with_torch() -> None:
-    if hasattr(torch.backends.cuda, "enable_cudnn_sdp_python"):
+    if hasattr(torch.nn.attention, "enable_cudnn_sdp_python"):
         return  # torch owns the switch; see above
     try:
         from torch.nn.attention import register_flash_attention_impl

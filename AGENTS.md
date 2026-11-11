@@ -15,7 +15,7 @@ Directory-specific guides: [include/cudnn_frontend/AGENTS.md](include/cudnn_fron
 | `test/` | `test/cpp` (Catch2 binary `tests`) and `test/python` (pytest) |
 | `benchmark/` | Standalone perf harnesses (SDPA training, norms, DSA, CuTeDSL fusions); each has a README |
 | `tools/cudnn_repro/` | Standalone CLI that parses cuDNN logs into repro commands (own pyproject) |
-| `docs/` | Markdown docs: `operations/` (graph-op reference), `fe-oss-apis/` (OSS kernel APIs), how-to guides |
+| `docs/` | Markdown docs: `operations/` (graph and OSS API reference), how-to guides |
 | `cmake/cuDNN.cmake` | Locates the cuDNN backend library (or reuses existing `CUDNN::` targets) |
 | `skills/` | Agent skills (see [Agent skills](#agent-skills)) |
 
@@ -47,7 +47,7 @@ pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutl
                               # ".[cutedsl]" still resolves -- it now holds only cuda-python, which the DSL pulls in anyway
 pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
-pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
+pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.9.1; XLA entry points via cutlass.jax)
 ```
 
 `setup.py` honors env vars: `CUDNN_PATH`, `CUDA_PATH` / `CUDAToolkit_ROOT`, `DEBUG=1` (debug build), `CMAKE_BUILD_PARALLEL_LEVEL`, `CMAKE_GENERATOR`.
@@ -85,9 +85,10 @@ First invocation builds the hook environments and can take >5 minutes; later run
 ## Conventions
 
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
-- Every new frontend-only Python API needs: public functions, lazy export in `python/cudnn/ops/__init__.py`, docs under `docs/fe-oss-apis/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
+- Docs moves: check `/cudnn/<route>` and `/cudnn/latest/<route>` redirects against the navigation slugs. Shared Markdown pages need explicit GitHub links alongside Fern site links; see [docs/README.md](docs/README.md).
+- Every new frontend-only Python API needs: public functions, lazy export in `python/cudnn/ops/__init__.py`, docs under `docs/operations/`, and pytest coverage under `test/python/fe_api/`. Full recipe: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) and the `cutedsl-kernel-integration` skill.
 - Frontend-only OSS APIs are experimental; keep the lazy-import boundary intact (no eager `torch`/`cutlass` imports at `cudnn` import time). CuTeDSL is a required dependency now, but a tensor framework is not, and `import cudnn` still has to stay cheap.
-- The `pyproject.toml` floor on `nvidia-cutlass-dsl` (`>=4.6.2`) is the **downstream** floor (vLLM/SGLang inherit quack-kernels' `==4.6.2`), and it is **below** what the FROST-derived kernels need (`CUTEDSL_MIN_VERSION`, 4.7.0). Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
+- The `pyproject.toml` floor on `nvidia-cutlass-dsl` is `>=4.8.0`, matching the version pinned by vLLM v0.32.0 and SGLang v0.5.22. Every backend/kernel gates the DSL version at runtime and declines with an error that names the version — never assume the installed DSL satisfies your kernel. [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) **Rule 7** is canonical; cite it in review.
 - Version lives in three places that must stay in sync: `CMakeLists.txt` (`project(... VERSION ...)`), `include/cudnn_frontend_version.h`, `python/cudnn/__init__.py` (`__version__`).
 - Runtime debugging: set `CUDNN_FRONTEND_LOG_INFO=1` and `CUDNN_FRONTEND_LOG_FILE=stderr` for FE logs; backend logs via `CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=stderr`.
 - Public-API signatures evolve **append-only**: new parameters go at the end (with defaults), never inserted mid-signature — positional callers across C++, pybind, and Python wrappers break silently otherwise (review on PR #266).
@@ -100,14 +101,15 @@ First invocation builds the hook environments and can take >5 minutes; later run
 
 ## Agent skills
 
-Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
+Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills` and by Codex via `.agents/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
+- [skills/determinism_tests/](skills/determinism_tests/SKILL.md) — required for new numerical APIs and changes to kernels, datatypes, or GPU targets: add and run L0 determinism tests, then update the API support page.
 
 ## Links
 
 - Published documentation: <https://docs.nvidia.com/deeplearning/cudnn/latest/developer/overview.html>
-- In-repo docs index: [llms.txt](llms.txt) · operation reference in [docs/operations/](docs/operations/) · OSS kernel APIs in [docs/fe-oss-apis/overview.md](docs/fe-oss-apis/overview.md)
+- In-repo docs index: [llms.txt](llms.txt) · operation reference in [docs/operations/](docs/operations/) · OSS kernel APIs in [docs/operations/overview.md](docs/operations/overview.md)
 - PyPI: <https://pypi.org/project/nvidia-cudnn-frontend/>
 
 
@@ -118,5 +120,16 @@ When opening a pull request, apply **at minimum one label from each group**: one
 Leave `closed-*` and `open-*` labels for maintainers; Milestone/Projects sidebar fields are set by reviewers/maintainers, not authors.
 
 ## Reviewing a PR (human or agent)
+
+### Kernel determinism and batch invariance
+
+- Use [skills/determinism_tests/SKILL.md](skills/determinism_tests/SKILL.md) when adding a numerical API or changing its kernel paths, datatypes, or GPU targets. Run the affected L0 suites and update the support page in the same PR; mark unavailable GPU coverage unverified.
+- New kernels and numerical kernel changes need forward and backward determinism tests in the same PR. Include every output, input gradient, gate gradient, and state gradient. If a direction is unsupported, name that gap in the test documentation.
+- Use raw-byte equality for replay and batch invariance. Do not replace it with a tolerance, a rounded metric, or float-value equality. Keep an independent numerical reference as a separate correctness check.
+- Build inputs once. Reuse the same values and upstream gradients after batch splitting, insertion, removal, and reordering. Restore mutable state and RNG state where used. Include ragged lengths and partial tiles; include empty sequences where supported.
+- Exercise fresh allocations, concurrent GPU work, and a shape large enough to cross scheduling boundaries. Test the public entry point with its deterministic mode enabled. Do not silently select another provider when a required plan is absent.
+- Update the applicable suite and coverage table in [test/python/determinism_goldens/README.md](test/python/determinism_goldens/README.md). A skipped GPU run is a coverage gap, not a pass. Record the GPU, runtime, command, and pytest summary.
+- Keep [docs/operations/determinism.md](docs/operations/determinism.md) as an API-by-dtype/GPU support page. Distinguish repeatability from batch invariance. Put test results and failure diagnostics in the test report above.
+- Golden changes need a stated numerical reason and a successful independent reference check. Record into a new directory, inspect the byte-hash diff, then replace the approved files. Never regenerate goldens during a normal check or hide a failure with an unbounded skip/xfail.
 
 Each Hard Rule is numbered so it can be cited by number in review comments. Before approving or requesting changes on a diff, check it against every Hard Rules section whose directory it touches: [python/cudnn/AGENTS.md](python/cudnn/AGENTS.md) (all numbered Python rules, including Rule 9 on backend/FROST parity), [python/cudnn/sdpa/AGENTS.md](python/cudnn/sdpa/AGENTS.md) (SDPA Rules S1+), [include/cudnn_frontend/AGENTS.md](include/cudnn_frontend/AGENTS.md) (header-only, warnings-as-errors), plus the conventions in [test/AGENTS.md](test/AGENTS.md) and [samples/AGENTS.md](samples/AGENTS.md). Where a rule names a detector (grep pattern, `set_sync_debug_mode` snippet, a `RED-then-green` test), prefer running or citing it over an eyeballed read. When a review surfaces a new concrete, checkable technique or trap that these guides don't already cover, land it in the relevant `AGENTS.md` in the same PR rather than leaving it in a review comment.

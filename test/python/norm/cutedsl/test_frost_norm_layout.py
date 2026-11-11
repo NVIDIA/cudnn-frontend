@@ -30,9 +30,9 @@ alone catches neither -- the result stays perfectly correct either way, which is
 exactly how InstanceNorm and GroupNorm shipped a channels-last forward that did not
 exist.
 
-The chain is the realistic one: ``dy = torch.randn_like(y)`` inherits ``y``'s layout
-rather than being forced channels-last by hand. Forcing it hides the case where fprop
-loses the layout, because the backward then sees a ``dy`` no real model would hand it.
+The mean-MSE loss supplies ``dy`` values, copied into ``torch.empty_like(y)`` so
+``dy`` inherits the forward output's layout. This keeps a lost forward layout
+visible to the backward path.
 
 Split by cost, because the repo gates on ``-m L0`` and a comparable L0 norm test runs
 in 3-5s: the L0 entry is one bf16 case per variant per applicable layout, and the full
@@ -109,11 +109,6 @@ if requirement_error:
 
 from cudnn.norm import NormVariant, norm_bprop, norm_fprop  # noqa: E402
 
-TOL = {
-    torch.float32: dict(fwd=3e-4, bwd=2e-4),
-    torch.float16: dict(fwd=6e-2, bwd=4e-2),
-    torch.bfloat16: dict(fwd=8e-2, bwd=7e-2),
-}
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 LN, RMS = NormVariant.LAYER_NORM, NormVariant.RMS_NORM
@@ -165,6 +160,10 @@ CONTIG = [
 CL = [
     _case("BN 64x56x56", BN, (8, 64, 56, 56), cl=True, want="batchnorm_nhwc_sm100"),
     _case("BN 256x7x7", BN, (8, 256, 7, 7), cl=True, want="batchnorm_nhwc_sm100", smoke=True),
+    # The NHWC training forward's cache tiers (batchnorm_nhwc_sm100._knobs_for): mid M and
+    # wide C take the TMEM tier on SM100 and the smem tier where there is no TMEM (SM90).
+    _case("BN mid-M 256x56x56", BN, (16, 256, 56, 56), cl=True, want="batchnorm_nhwc_sm100", smoke=True),
+    _case("BN wide-C 1024x7x7", BN, (8, 1024, 7, 7), cl=True, want="batchnorm_nhwc_sm100", smoke=True),
     _case("IN 64x56x56", IN, (8, 64, 56, 56), cl=True, want="instancenorm_nhwc_sm100"),
     _case("IN 256x7x7", IN, (8, 256, 7, 7), cl=True, want="instancenorm_nhwc_sm100", smoke=True),
     _case("GN cpg=2 64x56x56", GN, (8, 64, 56, 56), cl=True, groups=32, want="groupnorm_nhwc_sm100"),
@@ -242,8 +241,12 @@ def _check(name, got, ref, dtype, kind):
     if got is None and ref is None:
         return True
     amax = (got.float() - ref.float()).abs().max().item()
-    scale = max(1.0, ref.float().abs().max().item())
-    ok = amax <= TOL[dtype][kind] * scale
+    try:
+        torch.testing.assert_close(got, ref, check_dtype=False)
+        ok = True
+    except AssertionError as exc:
+        print(f"  {name}: {exc}")
+        ok = False
     print(f"  [{'PASS' if ok else 'FAIL'}] {name:<12} {str(dtype):>16} maxabs={amax:.3e}")
     return ok
 
@@ -298,17 +301,21 @@ def _check_case(c, dtypes=DTYPES):
         b = torch.randn(glen, device="cuda", dtype=dtype) if c["has_beta"] else None
         fwd, bwd = _kwargs(c)
 
-        with _no_hidden_copies() as copies, _record_dispatch() as seen:
-            y, mean, rstd = norm_fprop(c["variant"], x, g, b, **fwd)
-            # dy inherits y's layout -- the chain a real model produces.
-            dy = torch.randn_like(y)
-            dx, dgamma, dbeta = norm_bprop(c["variant"], dy, x, g, mean, rstd, has_beta=c["has_beta"], **bwd)
-            torch.cuda.synchronize()
-
         xr = x.float().detach().requires_grad_(True)
         gr = g.float().detach().requires_grad_(True)
         br = b.float().detach().requires_grad_(True) if b is not None else None
         y_ref = _reference(c, xr, gr, br)
+        loss = F.mse_loss(y_ref, torch.randn_like(x).float(), reduction="mean")
+        dy_ref = torch.autograd.grad(loss, y_ref, retain_graph=True)[0]
+        del loss
+
+        with _no_hidden_copies() as copies, _record_dispatch() as seen:
+            y, mean, rstd = norm_fprop(c["variant"], x, g, b, **fwd)
+            # dy inherits y's layout -- the chain a real model produces.
+            dy = torch.empty_like(y).copy_(dy_ref)
+            dx, dgamma, dbeta = norm_bprop(c["variant"], dy, x, g, mean, rstd, has_beta=c["has_beta"], **bwd)
+            torch.cuda.synchronize()
+
         ins = [t for t in (xr, gr, br) if t is not None]
         grads = torch.autograd.grad(y_ref, ins, grad_outputs=dy.float())
         dx_ref, dg_ref = grads[0], grads[1]

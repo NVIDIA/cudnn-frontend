@@ -65,6 +65,37 @@ def test_single_gemm_unchanged() -> None:
     assert "vec_f32_1" not in epi
 
 
+def test_parallel_analysis_keeps_graph_metadata_isolated(monkeypatch) -> None:
+    """Analyze graphs concurrently with independent tensor declarations."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from cudnn.gemm.frost import graph_analyzer
+
+    graphs = []
+    for i, dtype in enumerate((cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)):
+        graph = _graph(io=dtype)
+        m, n, k = 64 * (i + 1), 128, 256
+        result = graph.matmul(A=_A(graph, m, k), B=_B(graph, k, n))
+        graph.relu(input=result).set_output(True)
+        if i:
+            result.set_output(True)
+        graphs.append(graph)
+    expected = [analyze(graph) for graph in graphs]
+    read_state = graph_analyzer._state_from_graph
+    ready = Barrier(len(graphs))
+
+    def interleaved_state(graph):
+        state = read_state(graph)
+        ready.wait(timeout=10)
+        return state
+
+    monkeypatch.setattr(graph_analyzer, "_state_from_graph", interleaved_state)
+    with ThreadPoolExecutor(max_workers=len(graphs)) as executor:
+        actual = list(executor.map(analyze, graphs))
+    assert actual == expected
+
+
 def test_dual_gemm_shared_a_detected() -> None:
     """silu(A@B0) * (A@B1) * scale: 2 GEMMs, A shared, B distinct."""
     M, N, K = 256, 256, 128
@@ -527,3 +558,109 @@ def test_single_gemm_still_runs_on_1ctamma() -> None:
     compiled({A: a, B: b, Y: c})
     torch.cuda.synchronize()
     torch.testing.assert_close(c, torch.relu(_mm(a, b)).bfloat16(), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("reverse_dtypes", [False, True])
+@requires_sm100
+def test_fused_gemms_preserve_each_declared_dtype(family, grouped, reverse_dtypes):
+    """Round every GEMM before its pointwise consumers."""
+    import importlib
+
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    graph = _graph()
+    m = n = k = 128
+    a = _A(graph, m, k)
+    b = graph.tensor(name="b", dim=[2 if grouped else 1, k, n], stride=[k * n, 1, k])
+    offsets = graph.tensor(name="offsets", dim=[3], stride=[1], data_type=cudnn.data_type.INT32) if grouped else None
+
+    def matmul(name):
+        if grouped:
+            return graph.moe_grouped_matmul(token=a, weight=b, first_token_offset=offsets, mode=cudnn.moe_grouped_matmul_mode.NONE, name=name)
+        return graph.matmul(A=a, B=b, name=name)
+
+    dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16) if reverse_dtypes else (cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT)
+    c0, c1 = matmul("mm0").set_data_type(dtypes[0]), matmul("mm1").set_data_type(dtypes[1])
+    y = graph.sub(a=c1, b=c0).set_data_type(cudnn.data_type.FLOAT).set_output(True)
+    cfg = by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma" if family == "sm100" else "CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4")
+    compiled = compiler.jit_from_cudnn_graph(graph, cfg)
+    av = torch.ones((1, m, k), device="cuda", dtype=torch.bfloat16)
+    av[:, :, 0] = 1.5
+    bv = torch.zeros((2 if grouped else 1, n, k), device="cuda", dtype=torch.bfloat16)
+    bv[:, :, 0], bv[:, :, 1] = 1.0, 1.0 / 256
+    out = torch.empty((1, m, n), device="cuda")
+    vp = {a: av, b: bv, y: out}
+    if grouped:
+        vp[offsets] = torch.tensor([0, 64, m], device="cuda", dtype=torch.int32)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8) if compiled.workspace_bytes else None
+    compiled(vp, workspace=workspace)
+    torch.testing.assert_close(out, torch.full_like(out, (-1 if reverse_dtypes else 1) / 256), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("family", ["sm100", "sm120"])
+@requires_sm100
+def test_unfused_gemm_outputs_preserve_independent_layouts(family):
+    """Store each raw GEMM through its declared output strides."""
+    import importlib
+
+    graph = _graph()
+    m = n = k = 128
+    pitch = m + 8
+    a, b = _A(graph, m, k), _B(graph, k, n)
+    c0 = graph.matmul(A=a, B=b, name="mm0").set_stride([n * pitch, 1, pitch]).set_output(True)
+    c1 = graph.matmul(A=a, B=b, name="mm1").set_output(True)
+    compiler = importlib.import_module(f"cudnn.gemm.frost.{family}.compiler")
+    cfg = by_name("CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma" if family == "sm100" else "CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4")
+    compiled = compiler.jit_from_cudnn_graph(graph, cfg)
+    av = torch.ones((1, m, k), device="cuda", dtype=torch.bfloat16)
+    bv = torch.ones((1, n, k), device="cuda", dtype=torch.bfloat16)
+    storage = torch.full((1, n, pitch), float("nan"), device="cuda", dtype=torch.bfloat16)
+    out0 = storage.transpose(1, 2)[:, :m]
+    out1 = torch.full((1, m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    compiled({a: av, b: bv, c0: out0, c1: out1})
+    torch.testing.assert_close(out0, torch.full_like(out0, k), atol=0, rtol=0)
+    torch.testing.assert_close(out1, torch.full_like(out1, k), atol=0, rtol=0)
+    assert torch.isnan(storage[:, :, m:]).all()
+
+
+@requires_sm100
+def test_mixed_int32_fp32_gemm_outputs_keep_integer_precision():
+    """Preserve integer accumulators before per-GEMM rounding."""
+    from cudnn.gemm.frost.sm120 import compiler
+
+    m = n = 128
+    k = 2048
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.INT8, intermediate_data_type=cudnn.data_type.INT32, compute_data_type=cudnn.data_type.INT32)
+    a = _A(graph, m, k)
+    b = _B(graph, k, n)
+    exact = graph.matmul(A=a, B=b).set_data_type(cudnn.data_type.INT32)
+    rounded = graph.matmul(A=a, B=b).set_data_type(cudnn.data_type.FLOAT)
+    out = graph.sub(a=exact, b=rounded, compute_data_type=cudnn.data_type.INT32).set_data_type(cudnn.data_type.INT32).set_output(True)
+    compiled = compiler.jit_from_cudnn_graph(graph, by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"))
+    av = torch.zeros((1, m, k), device="cuda", dtype=torch.int8)
+    bv = torch.zeros((1, n, k), device="cuda", dtype=torch.int8)
+    av[:, :, :1040], bv[:, :, :1040] = 127, 127
+    av[:, :, 1040], bv[:, :, 1040] = 127, 24
+    av[:, :, 1041], bv[:, :, 1041] = 9, 1
+    result = torch.empty((1, m, n), device="cuda", dtype=torch.int32)
+    compiled({a: av, b: bv, out: result})
+    # The exact dot product is 2**24+1; fp32 rounds it to 2**24.
+    torch.testing.assert_close(result, torch.ones_like(result), atol=0, rtol=0)
+
+
+@requires_sm100
+def test_int32_gemm_identity_fp8_keeps_cast_materialization():
+    """Convert an integer GEMM through the declared fp32 compute dtype."""
+    from cudnn.gemm.frost.sm120 import compiler
+
+    graph = cudnn.pygraph(io_data_type=cudnn.data_type.INT8, intermediate_data_type=cudnn.data_type.INT32, compute_data_type=cudnn.data_type.INT32)
+    a, b = _A(graph, 128, 128), _B(graph, 128, 128)
+    c = graph.matmul(A=a, B=b).set_data_type(cudnn.data_type.INT32)
+    y = graph.identity(input=c, compute_data_type=cudnn.data_type.FLOAT).set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
+    compiled = compiler.jit_from_cudnn_graph(graph, by_name("CONFIG_sm120_64x64x64_16x16x32_cluster1x1_warps2x4"))
+    av = torch.ones((1, 128, 128), device="cuda", dtype=torch.int8)
+    bv = torch.ones_like(av)
+    out = torch.empty((1, 128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    compiled({a: av, b: bv, y: out})
+    torch.testing.assert_close(out.float(), torch.full((1, 128, 128), 128.0, device="cuda"), atol=0, rtol=0)

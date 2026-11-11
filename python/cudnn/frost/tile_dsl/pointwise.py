@@ -63,12 +63,19 @@ def row_max_reduction(vec):
     return elems[0]
 
 
-def row_reduction_pair(vec):
+def row_reduction_pair(vec, balanced=False):
+    """Sum even/odd lanes; optionally shorten dependencies with a pairwise tree."""
     n = int(vec.shape[0])
     assert n % 2 == 0, f"row_reduction_pair: N={n} must be even"
     half = n // 2
     paired_ty = _ir.VectorType.get([half, 2], T_.f32())
     paired = vector.shape_cast(paired_ty, vec.ir_value())
+
+    if balanced:
+        nodes = [vector.extract(paired, dynamic_position=[], static_position=[i]) for i in range(half)]
+        while len(nodes) > 1:
+            nodes = [arith.addf(nodes[i], nodes[i + 1]) if i + 1 < len(nodes) else nodes[i] for i in range(0, len(nodes), 2)]
+        return cutlass.Vector(nodes[0], dtype=cutlass.Float32)
 
     acc = vector.extract(paired, dynamic_position=[], static_position=[0])
     for i in range(1, half):
@@ -152,6 +159,31 @@ def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
         read_only_args=list(values),
     )
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
+
+
+@cute.jit
+def bf16_words_to_e4m3_words(w0: cutlass.Int32, w1: cutlass.Int32, w2: cutlass.Int32, w3: cutlass.Int32):
+    """The e4m3 rounding OF A PACKED bf16 ROW: four ``bf16x2`` words (8 elements, element ``2w`` in the low half of word ``w``) into two
+    ``e4m3x4`` words ``(u0, u1)`` -- ``u0`` holds elements 0..3 in byte order, ``u1`` elements 4..7.  Each bf16 is widened to fp32 EXACTLY
+    (a bit move: bf16 is the top half of an fp32) and rounded ONCE by ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating
+    at +-448, never a NaN from a finite value), so the result is bitwise ``bf16_row.to(torch.float8_e4m3fn)`` on the torch pinned here --
+    the convention of the indexer's e4m3 compressed-key cache (the serving stacks' ``x.to(bf16).to(e4m3)`` chain and the prefill form's
+    per-tensor cast of the bf16 rows): one rounding convention across every writer, so a cache primed by one writer and appended by
+    another is bitwise.  ``cvt...e4m3x2 d, a, b`` puts ``a`` in the UPPER byte, so the operands are ``(hi, lo)`` -- the order
+    :func:`fp32_to_fp8_pack` spells.  Needs sm_89+ (the fp8 ``cvt``); the callers decline older parts by name at compile time."""
+    return inline_ptx(
+        "{ .reg .b16 lo0, hi0, lo1, hi1, e0, e1; .reg .f32 f0, f1, f2, f3;\n"
+        "mov.b32 {lo0, hi0}, $2; mov.b32 f0, {0, lo0}; mov.b32 f1, {0, hi0};\n"
+        "mov.b32 {lo1, hi1}, $3; mov.b32 f2, {0, lo1}; mov.b32 f3, {0, hi1};\n"
+        "cvt.rn.satfinite.e4m3x2.f32 e0, f1, f0; cvt.rn.satfinite.e4m3x2.f32 e1, f3, f2;\n"
+        "mov.b32 $0, {e0, e1};\n"
+        "mov.b32 {lo0, hi0}, $4; mov.b32 f0, {0, lo0}; mov.b32 f1, {0, hi0};\n"
+        "mov.b32 {lo1, hi1}, $5; mov.b32 f2, {0, lo1}; mov.b32 f3, {0, hi1};\n"
+        "cvt.rn.satfinite.e4m3x2.f32 e0, f1, f0; cvt.rn.satfinite.e4m3x2.f32 e1, f3, f2;\n"
+        "mov.b32 $1, {e0, e1}; }",
+        write_only_types=[cutlass.Int32, cutlass.Int32],
+        read_only_args=[w0, w1, w2, w3],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,9 +645,17 @@ def opaque_i32_zero():
 
 
 @cutlass.cute.jit
-def opaque_i32(value: cutlass.Int32) -> cutlass.Int32:
-    """Identity mov.b32 that pins a per-lane loop invariant in its register."""
-    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=[value])
+def opaque_i32(value: cutlass.Int32, anchor=None) -> cutlass.Int32:
+    """Identity mov.b32 that pins a per-lane loop invariant in its register.
+
+    ``anchor`` (optional, append-only): a loop-VARIANT ``Int32`` (the q-tile counter) passed as an extra, unreferenced asm operand -- the
+    :func:`~cudnn.frost.tile_dsl.mma.desc_opaque` form for a 32-bit address term.  Without it an item-invariant SMEM address and every
+    ``base + vec`` add derived from it are hoisted by LLVM's LICM to the item loop's preheader and stay live across the whole tile body
+    (the sm100 d128 2-CTA softmax's 8 dS STS addresses: 8 registers, 4 of them spilled at the 144-register split, 2026-10-27); anchored,
+    the mov and the adds that depend on it sit inside the tile next to the STS that consumes them, so their live range is one tile.  The
+    default path (no anchor) emits exactly the asm it always did."""
+    args = [value] if cutlass.const_expr(anchor is None) else [value, anchor]
+    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=args)
 
 
 @cutlass.cute.jit
@@ -847,6 +887,62 @@ def rope_rotate_half(
     partner = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
     signed = -partner if lane < cutlass.Int32(half_lanes) else partner
     return y * cos_v + signed * sin_v
+
+
+@cute.jit
+def round_pair_io(lo: cutlass.Float32, hi: cutlass.Float32, io_dtype):
+    """Two fp32 values rounded to ``io_dtype`` (bf16 / f16: ``cvt.rn.{bf16,f16}x2.f32``, round-to-nearest-even -- the SAME
+    instruction the store path rounds with) and widened back EXACTLY: the io-dtype ROUNDING POINT of a value that stays in fp32
+    registers (``x.to(io).to(fp32)`` in torch terms).  The pair form is the hardware's (one ``cvt`` rounds two values); a lone
+    value rounds as ``round_pair_io(x, x, dt)[0]``.  Used by the ``"hf"`` rounding arm of the QSA indexer's compress chains
+    (``gated_attention_block/kernels/qsa_compress.py``: the pooled key before its norm, the normed row before its rotation, the
+    rotation's three operations); :func:`round_values_io` is the row form."""
+    return f16x2_to_f32(fp32_to_fp16(lo, hi, dtype=io_dtype), dtype=io_dtype)
+
+
+def round_values_io(values, io_dtype):
+    """:func:`round_pair_io` over an EVEN-length Python list of fp32 values (a lane's chunk of a row), pairwise; returns the new
+    list.  Plain Python at trace time (no staged control flow), so it is callable from a kernel body like the unpack comprehensions."""
+    assert len(values) % 2 == 0, f"round_values_io: an even number of values is needed, got {len(values)}"
+    out = []
+    for i in range(0, len(values), 2):
+        lo, hi = round_pair_io(values[i], values[i + 1], io_dtype)
+        out.append(lo)
+        out.append(hi)
+    return out
+
+
+@cute.jit
+def rope_rotate_half_io(
+    y0: cutlass.Float32,
+    y1: cutlass.Float32,
+    cos0: cutlass.Float32,
+    cos1: cutlass.Float32,
+    sin0: cutlass.Float32,
+    sin1: cutlass.Float32,
+    lane: cutlass.Int32,
+    half_lanes: cutlass.Constexpr[int],
+    io_dtype,
+):
+    """:func:`rope_rotate_half` for a PAIR of adjacent elements with the io-dtype rotation of the HF / vLLM-prepare dtype flow:
+    ``a = io(y * cos)``, ``b = io(signed_partner * sin)``, ``out = io(a + b)`` -- each of the three operations rounded to ``io_dtype``
+    (torch's bf16 ops and Triton's bf16 ops both round per op; ``a - b == a + (-b)`` exactly, so the sign convention of
+    :func:`rope_rotate_half` is kept).  The TABLES are rounded to ``io_dtype`` first -- the HF reference rotates with ``cos`` / ``sin``
+    cast to the key dtype, so a 16-bit table of the OTHER width (f16 tables under bf16 io, or the converse) meets the oracle's rounding
+    point here, and a table already in the io dtype passes unchanged (an exact identity: every io value is a fixed point of its own
+    ``cvt.rn``).  With that, every input is io-representable (the caller rounded the normed row), so the fp32 products are exact and
+    the ONE rounding per op is the io one.  Same partner shuffle (every lane of the warp must reach this call), same lane rules;
+    returns ``(out0, out1)``.  Pairs so that one ``cvt`` rounds two values (:func:`round_pair_io`)."""
+    cos0, cos1 = round_pair_io(cos0, cos1, io_dtype)
+    sin0, sin1 = round_pair_io(sin0, sin1, io_dtype)
+    p0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y0, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    p1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y1, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    lower = lane < cutlass.Int32(half_lanes)
+    s0 = -p0 if lower else p0
+    s1 = -p1 if lower else p1
+    a0, a1 = round_pair_io(y0 * cos0, y1 * cos1, io_dtype)
+    b0, b1 = round_pair_io(s0 * sin0, s1 * sin1, io_dtype)
+    return round_pair_io(a0 + b0, a1 + b1, io_dtype)
 
 
 @cute.jit
@@ -1283,3 +1379,62 @@ def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
     ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
     nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))
+
+
+@cutlass.cute.jit
+def quad_reduce_max(val: cutlass.Float32) -> cutlass.Float32:
+    """The max over the FOUR lanes of a thread quad (lanes ``4 g .. 4 g + 3``: the lanes that share an ``m16n8`` C-fragment row), two
+    ``shfl.sync.bfly`` steps (offsets 2, 1) on the full warp mask -- every lane of the quad holds the result.  ``ftz`` max (FMNMX; the
+    operands are scores, a flushed sub-normal max changes no exp2).  The SM120 SDPA kernels carry the same two shuffles as
+    ``sm120/_common.nvvm_threadquad_reduction_max``; this is the arch-neutral home so an sm107 ``mma.sync`` kernel need not import an
+    sm120 module.  Call it from EVERY lane of the warp (``shfl.sync`` with the full mask)."""
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    return val
+
+
+@cutlass.cute.jit
+def quad_reduce_sum(val: cutlass.Float32) -> cutlass.Float32:
+    """The sum over the four lanes of a thread quad (see :func:`quad_reduce_max`): offsets 2 then 1, a FIXED order, so every lane of
+    the quad holds the bitwise-same sum and two launches agree bitwise.  Call it from every lane of the warp."""
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY))
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY))
+    return val
+
+
+def rcp_div_rn(s: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``div.rn.f32(1, s)`` -- the IEEE correctly-rounded fp32 reciprocal, as ONE opaque op.
+
+    For a static per-tensor DEQUANTIZATION scale ``s`` whose stored code is ``fp8(x * (1 / s))``: the conventions this
+    reproduces compute ``inv = 1 / s`` once with a correctly rounded division and multiply by it, so the reciprocal must be
+    ``div.rn`` -- an approximate ``rcp`` (``MUFU.RCP`` alone) or a ``fastmath`` division can land one fp32 ulp off and move
+    a code on a rounding boundary.  The numerator is a PTX immediate (``0f3F800000``), never a constant float asm OPERAND
+    (that ICEs libNVVM, :func:`opaque_f32_bits`); ``s`` must be a traced register.  :func:`div_rn_f32` is the two-register
+    form of the same instruction."""
+    r = nvvm.inline_ptx("div.rn.f32 $0, 0f3F800000, $1;", write_only_types=[cutlass.Float32], read_only_args=[s])
+    return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
+
+
+def fp32_times_inv_to_e4m3(value: cutlass.Float32, inv_scale: cutlass.Float32) -> cutlass.Uint8:
+    """ONE E4M3 code of ``value * inv_scale``: the static per-tensor quantization of a single fp32 value.
+
+    ``mul.f32`` then ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating at +-448) with a literal zero as
+    the convert's second value; the low byte is the code.  The multiply sits INSIDE the asm block, so no pass can contract
+    it into a neighbouring add or reassociate it: the byte is ``e4m3(fl32(value * inv_scale))`` by construction.
+    ``inv_scale`` is the reciprocal of the consumer's dequantization scale (:func:`rcp_div_rn`).  For a store of one byte
+    per element (``out[i] = fp32_times_inv_to_e4m3(v, inv)``); :func:`fp32_to_fp8x2` is the two-value form without the
+    multiply.  Both operands must be traced registers.  Spelled as a raw asm block with float-register (``f``) operand
+    constraints rather than through ``inline_ptx``: that wrapper stages every float operand through a ``mov.f32`` block of
+    its own, which changes nothing numerically but does change the register allocation of an eight-element body."""
+    from cutlass._mlir.dialects import llvm  # the one raw asm block of this module: imported where it is used
+
+    word = llvm.inline_asm(
+        T_.i32(),
+        [value.ir_value(), inv_scale.ir_value()],
+        "{ .reg .f32 v; .reg .b16 p; mul.f32 v, $1, $2; cvt.rn.satfinite.e4m3x2.f32 p, 0f00000000, v; cvt.u32.u16 $0, p; }",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(word).to(cutlass.Uint8)

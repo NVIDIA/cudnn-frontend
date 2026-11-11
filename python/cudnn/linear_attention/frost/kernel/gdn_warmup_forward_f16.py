@@ -32,6 +32,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common import split_k
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype, family_slots
 from . import gdn_prefill_f16
 
@@ -75,6 +77,7 @@ def warmup_forward_host(
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
@@ -156,6 +159,7 @@ def warmup_forward_host(
         o,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,
@@ -182,6 +186,7 @@ def build_warmup_forward(
     o,
     cu_seqlens,
     state_in,
+    composed=None,
     state_out,
     seed_indices,
     final_indices,
@@ -255,6 +260,7 @@ def build_warmup_forward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         state_in is not None,
+        composed is not None,
         state_out is not None,
         seed_indices is not None,
         final_indices is not None,
@@ -273,7 +279,9 @@ def build_warmup_forward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_initial_state=state_in is not None,
+            use_initial_state=state_in is not None or composed is not None,
+            state_table=state_in is not None,
+            has_composed=composed is not None,
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
             checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
@@ -318,10 +326,13 @@ def build_warmup_forward(
         state_in_placeholder = None
         if state_in is not None:
             state_in_placeholder = from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_placeholder = None
+        if composed is not None:
+            composed_placeholder = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         state_out_placeholder = None
         if state_out is not None:
             state_out_placeholder = from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        warmup_forward_cache[key] = cute.compile(
+        warmup_forward_cache[key] = compile_cached(
             warmup_forward_host,
             facts.split,
             facts.b_t,
@@ -358,6 +369,7 @@ def build_warmup_forward(
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             state_in_placeholder,
+            composed_placeholder,
             state_out_placeholder,
             from_dlpack(seed_indices, assumed_align=4).mark_layout_dynamic() if seed_indices is not None else None,
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
@@ -374,6 +386,8 @@ def build_warmup_forward(
             cuda.CUstream(int(stream)),
             k_slots,
             v_slots,
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_forward_cache[key]
@@ -394,6 +408,7 @@ def run_warmup_forward(
     o,
     cu_seqlens,
     state_in,
+    composed=None,
     state_out,
     seed_indices,
     final_indices,
@@ -434,6 +449,7 @@ def run_warmup_forward(
         cu_seqlens,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,

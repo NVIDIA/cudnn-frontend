@@ -48,7 +48,10 @@ SMEM layout (stage counts live in gdn2_bprop_config.py and the kernel cfg; sizes
   K decay / K inv / Q decay    3 x 4096       2
   decay scale                       512       2
   T_inv / A (intermediate)         2560       2    <-- five BT x BT tiles per stage, as the bprop
-  sub-bank fill                   17408       1    <-- 1024 B plus two operand rings keeps the high group at 128 KB
+  sub-bank fill                   17408       1    <-- 1024 B plus two operand rings keeps the high group at 128 KB; holds the
+                                                      steep scratch (STEEP_FAST / STEEP_EXACT): KK / A corrections 2 x 2048,
+                                                      last-token decay factors 2 x 512, ballot words 2 x 16 + 2 x 16, k inverse
+                                                      norms 64
   scheduler ticket ring               4       8    <-- next-tile publish ring
 
 TMEM layout (512 columns allocated):
@@ -70,6 +73,7 @@ Warp assignments (16 warps = 512 threads):
   warp  15      : epilogue warp  - register-MMA A tile
 """
 
+import dataclasses
 from dataclasses import dataclass
 import functools
 from typing import NamedTuple, Type
@@ -85,17 +89,17 @@ from ..common.beta_guard import beta_guard
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
-from ..common.steep_scratch import SteepScratchLayout, steep_scratch_layout, StateGradientScratchLayout, state_gradient_scratch_layout
 from ..common.gdn2_operands import scan_gate_prefixes, load_qk_beta_row, load_operand_scales, key_operand_half, query_operand_half
 from ..common.gdn2_state_grad import pack_dstate_operand, store_steep_keys, add_steep_du
 from ..common.steep_decay import (
-    has_exact_path,
     encode_gate_exchange,
+    STEEP_EXACT,
     STEEP_FAST,
+    STEEP_OFF,
     exchange_offset,
     add_steep_corrections,
     lane_steep_bits,
-    steep_launch_cfg,
+    steep_mode_for,
     steep_exit_unless_flagged,
     steep_row_corrections,
     steep_ticket,
@@ -1035,7 +1039,7 @@ def compute0_warp_group(
             # ---- decay scale: exp2(g last) per key channel ---------------------------
             if channel_active:
                 (sDecay_scale_ptr + channel_dim).store(exp_g_last)
-            if cutlass.const_expr(has_exact_path(cfg)):
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
                 if lane_idx == 0:
                     (sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids) + cg0_warp).store(steep_word)
             bars.mb_decay_scale_ready[decay_stage].arrive()
@@ -1089,8 +1093,8 @@ def compute0_warp_group(
             exp_g_regs, inverse_g_regs, restore_g_regs = load_operand_scales(
                 cfg, decay_row, lane_in_row_group, steep_bits, sGate_exchange_ptr, steep_last_ptr, False
             )
-            if cutlass.const_expr(has_exact_path(cfg)):
-                keys = mDstateScratch.iterator + bidx * (cfg.state_grad_scratch.nbytes // 4) + cfg.state_grad_scratch.keys.offset // 4
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
+                keys = mDstateScratch.iterator + bidx * cfg.dstate_scratch_cosize + cfg.d_v * cfg.d_k
                 store_steep_keys(cfg, raw_k_regs, k_inv_norm, inverse_g_regs, steep_bits, decay_row, lane_in_row_group, keys + decay_stage * cfg.b_t * cfg.d_k)
             nvvm.fence_proxy("async.shared", space="cta")
             if cutlass.const_expr(not cfg.beta_guard):
@@ -1184,6 +1188,7 @@ def compute1_warp_group(
     warp_idx,
     mDstate0,
     mDstate_in,
+    mDcomposed,
     mDstateScratch,
     sDecay_scale_raw,
     sSteepTile_ptr,
@@ -1208,7 +1213,7 @@ def compute1_warp_group(
         state_gmem_row = tmem_sp * 16 + lane_idx % 16
         state_row_valid = lane_idx < 16
 
-    dstate_scratch = mDstateScratch.iterator + bidx * (cfg.state_grad_scratch.nbytes // 4)
+    dstate_scratch = mDstateScratch.iterator + bidx * cfg.dstate_scratch_cosize
     scratch_row = dstate_scratch + state_gmem_row * cfg.d_k
     dstate_acquire_index = PipelineState.start(phase=0)
 
@@ -1239,15 +1244,29 @@ def compute1_warp_group(
                 seed_steep_ptr = sSteepTile_ptr + seed_stage * len(cfg.compute_group_0_warp_ids)
                 seed_steep_any = steep_tile_mask(cfg, seed_steep_ptr)
                 row_lo_addr = tmem_row << 16
-                seed_vw = 16 // (mDstate_in.element_type.width // 8)
-                dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, state_gmem_row, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.dstate_table):
+                    seed_vw = 16 // (mDstate_in.element_type.width // 8)
+                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, state_gmem_row, 0))).raw_ptr()
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                    composed_src = (mDcomposed.iterator + mDcomposed.layout((cutlass.Int32(0), head_idx, state_gmem_row, 0))).raw_ptr()
                 for i in cutlass.range(cfg.d_k // 16, unroll=1):
                     seed_block = cutlass.Array(cutlass.Float32, 16, alignment=16)
-                    for g in cutlass.range_constexpr(16 // seed_vw):
-                        seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                        for t in cutlass.range_constexpr(seed_vw):
-                            dval = seed_chunk[t].to(cutlass.Float32)
-                            seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.dstate_table):
+                        for g in cutlass.range_constexpr(16 // seed_vw):
+                            seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                            for t in cutlass.range_constexpr(seed_vw):
+                                dval = seed_chunk[t].to(cutlass.Float32)
+                                seed_block[g * seed_vw + t] = dval if seed_true else cutlass.Float32(0.0)
+                    else:
+                        for j in cutlass.range_constexpr(16):
+                            seed_block[j] = cutlass.Float32(0.0)
+                    if cutlass.const_expr(cfg.has_composed_dstate):
+                        for g in cutlass.range_constexpr(4):
+                            composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                            for t in cutlass.range_constexpr(4):
+                                cval = composed_chunk[t] if seed_true else cutlass.Float32(0.0)
+                                seed_block[g * 4 + t] = cval if is_boundary else seed_block[g * 4 + t]
 
                     seed_undecayed = cutlass.Array(cutlass.Float32, 16, alignment=16)
                     for j in cutlass.range_constexpr(16):
@@ -1289,18 +1308,20 @@ def compute1_warp_group(
             if cutlass.const_expr(dv_halves == 2):
                 du_vec_hi = nvvm.tcgen05_ld("16x256b", nvvm.make_tmem_ptr(row_hi_addr + du_col_id, cutlass.Float32), num=2)
 
-            if cutlass.const_expr(has_exact_path(cfg)):
+            if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
                 has_dstate = cutlass.Boolean(rev_idx > 0)
                 if cutlass.const_expr(cfg.use_dstate_in):
                     has_dstate = cutlass.Boolean(True)
                 if has_dstate:
                     decay_stage = gc % cfg.smem_decay_stages
-                    # Acquire generic-memory writes directly, independently of MMA completion.
-                    bars.mb_dstate_input_ready.wait(dstate_acquire_index.phase)
-                    dstate_acquire_index = advance(dstate_acquire_index, 1)
-                    bars.mb_k_decay_inv_ready[decay_stage].wait((gc // cfg.smem_decay_stages) % 2)
                     words = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
-                    keys = dstate_scratch + cfg.state_grad_scratch.keys.offset // 4 + decay_stage * cfg.b_t * cfg.d_k
+                    steep_tile = steep_tile_mask(cfg, words)
+                    if steep_tile != 0:
+                        # Acquire generic-memory writes directly, independently of MMA completion.
+                        bars.mb_dstate_input_ready.wait(dstate_acquire_index.phase)
+                        bars.mb_k_decay_inv_ready[decay_stage].wait((gc // cfg.smem_decay_stages) % 2)
+                    dstate_acquire_index = advance(dstate_acquire_index, 1)
+                    keys = dstate_scratch + cfg.d_v * cfg.d_k + decay_stage * cfg.b_t * cfg.d_k
                     du_vec_lo = add_steep_du(cfg, du_vec_lo, dstate_scratch, keys, words, tmem_sp * (cfg.d_v // 4), lane_idx)
                     if cutlass.const_expr(dv_halves == 2):
                         du_vec_hi = add_steep_du(cfg, du_vec_hi, dstate_scratch, keys, words, tmem_sp * (cfg.d_v // 4) + 16, lane_idx)
@@ -1408,11 +1429,19 @@ def compute1_warp_group(
                                     alignment=16,
                                 )
             else:
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
                 for key_dim_base in cutlass.range_constexpr(0, cfg.d_k, 32):
                     for kk_i in cutlass.range_constexpr(32):
                         kd = key_dim_base + kk_i
                         if state_row_valid:
-                            if cutlass.const_expr(cfg.use_dstate_in):
+                            if cutlass.const_expr(cfg.has_composed_dstate):
+                                value = cutlass.Float32(0.0)
+                                if cutlass.const_expr(cfg.dstate_table):
+                                    value = mDstate_in[batch_idx, head_idx, state_gmem_row, kd].to(cutlass.Float32)
+                                value = mDcomposed[cutlass.Int32(0), head_idx, state_gmem_row, kd] if is_boundary else value
+                                mDstate0[batch_idx, head_idx, state_gmem_row, kd] = value.to(mDstate0.element_type)
+                            elif cutlass.const_expr(cfg.use_dstate_in):
                                 mDstate0[batch_idx, head_idx, state_gmem_row, kd] = mDstate_in[batch_idx, head_idx, state_gmem_row, kd]
                             else:
                                 mDstate0[batch_idx, head_idx, state_gmem_row, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
@@ -1614,6 +1643,7 @@ def host(
     cu_seqlens: cute.Tensor,
     d_initial_state: cute.Tensor | None,
     d_final_state: cute.Tensor | None,
+    dcomposed: cute.Tensor | None,
     work_items: cute.Tensor | None,
     work_count: cute.Tensor | None,
     scheduler_counter: cute.Tensor,
@@ -1631,7 +1661,7 @@ def host(
     grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     for launch_idx in cutlass.range_constexpr(2 if cfg.steep_mode == STEEP_FAST else 1):
         frost_gdn2_bprop_summary(
-            steep_launch_cfg(cfg, launch_idx),
+            cfg if launch_idx == 0 else dataclasses.replace(cfg, steep_mode=STEEP_EXACT),
             q_ratio,
             k_ratio,
             tensormap_workspace,
@@ -1641,6 +1671,7 @@ def host(
             dt_bias,
             d_initial_state,
             d_final_state,
+            dcomposed,
             work_items,
             work_count,
             scheduler_counter,
@@ -1667,6 +1698,7 @@ def frost_gdn2_bprop_summary(
     mDt_bias: cute.Tensor | None,
     mDstate0: cute.Tensor | None,
     mDstate_in: cute.Tensor | None,
+    mDcomposed: cute.Tensor | None,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -1713,11 +1745,11 @@ def frost_gdn2_bprop_summary(
     # stage the KK / A corrections and the tile's ballot words, per raw stage the scan's ballot words and last-row
     # log2 gates, and the chunk's k inverse norms
     steep_fill = sBank_fill.data_ptr().toint()
-    sSteepCorr_ptr = cute.make_ptr(cutlass.Float32, steep_fill + cfg.steep_scratch.corr.offset, mem_space=SMEM, assumed_align=16)
-    sSteepLast_ptr = cute.make_ptr(cutlass.Float32, steep_fill + cfg.steep_scratch.last.offset, mem_space=SMEM, assumed_align=16)
-    sSteepScan_ptr = cute.make_ptr(cutlass.Int32, steep_fill + cfg.steep_scratch.scan.offset, mem_space=SMEM, assumed_align=16)
-    sSteepTile_ptr = cute.make_ptr(cutlass.Int32, steep_fill + cfg.steep_scratch.tile.offset, mem_space=SMEM, assumed_align=16)
-    sSteepNorm_ptr = cute.make_ptr(cutlass.Float32, steep_fill + cfg.steep_scratch.norm.offset, mem_space=SMEM, assumed_align=16)
+    sSteepCorr_ptr = cute.make_ptr(cutlass.Float32, steep_fill + cfg.steep_corr_offset, mem_space=SMEM, assumed_align=16)
+    sSteepLast_ptr = cute.make_ptr(cutlass.Float32, steep_fill + cfg.steep_last_offset, mem_space=SMEM, assumed_align=16)
+    sSteepScan_ptr = cute.make_ptr(cutlass.Int32, steep_fill + cfg.steep_scan_offset, mem_space=SMEM, assumed_align=16)
+    sSteepTile_ptr = cute.make_ptr(cutlass.Int32, steep_fill + cfg.steep_tile_offset, mem_space=SMEM, assumed_align=16)
+    sSteepNorm_ptr = cute.make_ptr(cutlass.Float32, steep_fill + cfg.steep_norm_offset, mem_space=SMEM, assumed_align=16)
     sQ_raw = cutlass.Array(cfg.io_dtype, cfg.raw_qk_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sK_raw = cutlass.Array(cfg.io_dtype, cfg.raw_qk_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sGate_raw = cutlass.Array(cutlass.Float32, cfg.raw_gate_cosize, space=SMEM, alignment=1024)
@@ -1942,6 +1974,7 @@ def frost_gdn2_bprop_summary(
             warp_idx,
             mDstate0,
             mDstate_in,
+            mDcomposed,
             mDstateScratch,
             sDecay_scale_raw,
             sSteepTile_ptr,
@@ -1967,6 +2000,8 @@ class Gdn2BpropSummaryCfg:
     d_k: int
     d_v: int
     log_gate: bool = True
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
     scheduler_stages: int = 8
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -1980,7 +2015,7 @@ class Gdn2BpropSummaryCfg:
     threads_per_warp: int = CFG.THREADS_PER_WARP
     threads_per_cta: int = 0
     num_regs_compute_group_0: int = CFG.NUM_REGS_COMPUTE_GROUP_0
-    num_regs_compute_group_1: int = CFG.NUM_REGS_COMPUTE_GROUP_1
+    num_regs_compute_group_1: int = CFG.NUM_REGS_SUMMARY_COMPUTE_GROUP_1
     num_regs_other: int = CFG.NUM_REGS_OTHER
 
     # ---- named barrier slots (ids 1-4; 0 is the CTA-wide sync) -----------------------
@@ -2011,9 +2046,13 @@ class Gdn2BpropSummaryCfg:
     bank_fill_cosize: int = 0
     decay_scale_cosize: int = 0
     intermediate_cosize: int = 0
-    steep_scratch: SteepScratchLayout | None = None
-    state_grad_scratch: StateGradientScratchLayout | None = None
-    steep_mode: int = STEEP_FAST  # common/steep_decay.py: STEEP_FAST / STEEP_EXACT
+    steep_mode: int = STEEP_FAST  # common/steep_decay.py: STEEP_OFF / STEEP_FAST / STEEP_EXACT
+    steep_corr_offset: int = 0
+    steep_last_offset: int = 0
+    steep_scan_offset: int = 0
+    steep_tile_offset: int = 0
+    steep_norm_offset: int = 0
+    dstate_scratch_cosize: int = 0
 
 
 def build_cfg(
@@ -2032,12 +2071,15 @@ def build_cfg(
     d_k: int,
     d_v: int,
     log_gate: bool = True,
-    steep_mode: int = STEEP_FAST,
+    dstate_table: bool | None = None,
+    has_composed_dstate: bool = False,
 ) -> Gdn2BpropSummaryCfg:
     cfg = Gdn2BpropSummaryCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         use_dstate0=use_dstate0,
         l2norm=l2norm,
         safe_gate=safe_gate,
@@ -2067,25 +2109,22 @@ def build_cfg(
     cfg.raw_gate_cosize = cfg.smem_raw_stages * cfg.d_k * cfg.b_t
     cfg.gate_stage_elems = (cfg.d_k * cfg.b_t) * (4 // (cfg.gate_dtype.width // 8))
     cfg.operand_cosize = cfg.smem_decay_stages * cfg.b_t * cfg.d_k
-    cfg.state_grad_scratch = state_gradient_scratch_layout(d_k=cfg.d_k, d_v=cfg.d_v, b_t=cfg.b_t, decay_stages=cfg.smem_decay_stages)
+    cfg.dstate_scratch_cosize = cfg.d_v * cfg.d_k + cfg.smem_decay_stages * cfg.b_t * cfg.d_k
 
     # ---- sub-bank fill: 1024 B plus two operand rings keeps the high group at 128KB ----
     cfg.bank_fill_cosize = 1024 // (io_dtype.width // 8) + 2 * cfg.operand_cosize
-    cfg.steep_scratch = steep_scratch_layout(
-        b_t=cfg.b_t,
-        d_k=cfg.d_k,
-        scan_warps=len(cfg.compute_group_0_warp_ids),
-        scan_stages=cfg.smem_raw_stages,
-        last_stages=cfg.smem_raw_stages,
-        decay_stages=cfg.smem_decay_stages,
-        norm_stages=1,
-        dadm_stages=0,
-        io_bytes=io_dtype.width // 8,
-    )
-    cfg.steep_scratch.check_capacity(cfg.bank_fill_cosize * (io_dtype.width // 8))
+    cfg.steep_mode = steep_mode_for(cfg.io_dtype, cfg.l2norm, cfg.safe_gate, cfg.gate_scale_log2, cfg.b_t)
+    steep = cfg.steep_mode != STEEP_OFF
+    scan_warps = len(cfg.compute_group_0_warp_ids)
+    cfg.steep_corr_offset = 0
+    cfg.steep_last_offset = (cfg.steep_corr_offset + (cfg.smem_decay_stages * 2 * cfg.b_t * cfg.b_t if steep else 1) * 4 + 15) // 16 * 16
+    cfg.steep_scan_offset = (cfg.steep_last_offset + (cfg.smem_raw_stages * cfg.d_k if steep else 1) * 4 + 15) // 16 * 16
+    cfg.steep_tile_offset = (cfg.steep_scan_offset + (cfg.smem_raw_stages * scan_warps if steep else 1) * 4 + 15) // 16 * 16
+    cfg.steep_norm_offset = (cfg.steep_tile_offset + (cfg.smem_decay_stages * scan_warps if steep else 1) * 4 + 15) // 16 * 16
+    steep_bytes = (cfg.steep_norm_offset + (cfg.b_t if steep else 1) * 4 + 15) // 16 * 16
+    assert steep_bytes <= cfg.bank_fill_cosize * (io_dtype.width // 8), f"steep scratch of {steep_bytes} B exceeds the bank fill"
     cfg.decay_scale_cosize = cfg.smem_decay_stages * cfg.d_k
     cfg.intermediate_cosize = cfg.smem_intermediate_stages * cfg.intermediate_tiles * cfg.b_t * cfg.b_t
-    cfg.steep_mode = steep_mode
     return cfg
 
 
@@ -2118,6 +2157,7 @@ def get_compiled_cache(
     beta_guard: bool,
     order_in_prologue: bool,
     log_gate: bool = True,
+    has_composed_dstate: bool = False,
 ):
     return {}
 
@@ -2145,6 +2185,7 @@ def compile(
     cu_seqlens_cute,
     dstate0_cute,
     dstate_in_cute,
+    dcomposed_cute=None,
     work_items_cute,
     work_count_cute,
     scheduler_counter_cute,
@@ -2152,12 +2193,16 @@ def compile(
     dstate_scratch_cute,
     scale,
     stream,
+    dstate_table=None,
+    has_composed_dstate=False,
 ):
     """JIT-compile the chunked GDN-2 bprop summary kernel for one static config."""
     cfg = build_cfg(
         io_dtype,
         gate_dtype,
         use_dstate_in=use_dstate_in,
+        dstate_table=dstate_table,
+        has_composed_dstate=has_composed_dstate,
         use_dstate0=use_dstate0,
         l2norm=l2norm,
         safe_gate=safe_gate,
@@ -2181,6 +2226,7 @@ def compile(
         cu_seqlens_cute,
         dstate0_cute,
         dstate_in_cute,
+        dcomposed_cute,
         work_items_cute,
         work_count_cute,
         scheduler_counter_cute,
@@ -2223,6 +2269,7 @@ def chunk_gdn2_bwd_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    dcomposed=None,
 ) -> None:
     """BT=16 chunked GDN-2 backward state summary: the reverse state-gradient recurrence alone, writing
     ``d_initial_state`` = dL/dS0 (``(num_seqs, HO, DV, DK)``; the gradient-state pass G when ``d_final_state`` is None, else the full
@@ -2239,7 +2286,9 @@ def chunk_gdn2_bwd_summary(
     HO = max(HQ, HV)
     DK = q.shape[2]
     DV = do.shape[2]
-    use_dstate_in = d_final_state is not None
+    dstate_table = d_final_state is not None
+    has_composed_dstate = dcomposed is not None
+    use_dstate_in = dstate_table or has_composed_dstate
     use_dstate0 = d_initial_state is not None
     if not use_dstate0:
         raise ValueError("chunk_gdn2_bwd_summary requires d_initial_state (its single output)")
@@ -2277,6 +2326,7 @@ def chunk_gdn2_bwd_summary(
         beta_guard,
         order_in_prologue,
         log_gate=log_gate,
+        has_composed_dstate=has_composed_dstate,
     )
 
     if "compiled" not in cache:
@@ -2287,8 +2337,9 @@ def chunk_gdn2_bwd_summary(
         if use_dstate0:
             dstate0_cute = from_dlpack(d_initial_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         dstate_in_cute = None
-        if use_dstate_in:
+        if dstate_table:
             dstate_in_cute = from_dlpack(d_final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_cute = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if has_composed_dstate else None
         work_items_cute = from_dlpack(work_items, assumed_align=16)
         work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -2321,6 +2372,9 @@ def chunk_gdn2_bwd_summary(
             cu_seqlens_cute=cu_seqlens_cute,
             dstate0_cute=dstate0_cute,
             dstate_in_cute=dstate_in_cute,
+            dcomposed_cute=dcomposed_cute,
+            dstate_table=dstate_table,
+            has_composed_dstate=has_composed_dstate,
             work_items_cute=work_items_cute,
             work_count_cute=work_count_cute,
             scheduler_counter_cute=scheduler_counter_cute,
@@ -2386,6 +2440,7 @@ def chunk_gdn2_bwd_summary(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         work_items,
         work_count,
         scheduler_counter,
@@ -2419,6 +2474,7 @@ def run_bwd_summary(
     own_prologue=True,
     *,
     dstate_scratch,
+    dcomposed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -2445,6 +2501,7 @@ def run_bwd_summary(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         work_items,
         work_count,
         scheduler_counter,

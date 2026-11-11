@@ -21,7 +21,6 @@ import statistics
 
 import torch
 from cudnn.csa import CSACompressorBackward
-from cudnn.csa.compressor.compressor_sm100 import _BWD_ROWS
 
 # On the seeded 1M case, both deterministic trees stay within 2.1e-4 of the
 # FP64 sum while the atomic result varies by more than 1.9e-3.
@@ -36,6 +35,19 @@ SHAPES = (
     ("r128-c2-d128-3x8192", [8192] * 3, 128, 128, 2),
     ("r128-c1-d512-1x8192", [8192], 512, 128, 1),
     ("r128-c2-d512-3x8192", [8192] * 3, 512, 128, 2),
+)
+
+GENERIC_SHAPES = (
+    ("r2-c2-d128-1x8192", [8192], 128, 2, 2),
+    ("r2-c2-d128-3x8192", [8192] * 3, 128, 2, 2),
+    ("r2-c2-d512-1x8192", [8192], 512, 2, 2),
+    ("r2-c2-d512-3x8192", [8192] * 3, 512, 2, 2),
+    *SHAPES[:4],
+)
+
+SM90_PRIMARY_SHAPES = (
+    ("r4-c1-d128-1x8192", [8192], 128, 4, 1),
+    ("r4-c1-d128-3x8192", [8192] * 3, 128, 4, 1),
 )
 
 LONG_CONTEXT_SHAPES = (
@@ -53,6 +65,30 @@ LONG_CONTEXT_SHAPES = (
         4,
         1,
     ),
+)
+
+
+def _fragmented_lengths(tokens):
+    """Build a deterministic unequal pack that stresses compressed-row lookup."""
+    pattern = (31, 777, 2048, 4093, 8192, 16385, 1021, 6144)
+    lengths = []
+    remaining = tokens
+    index = 0
+    while remaining:
+        length = min(pattern[index % len(pattern)], remaining)
+        lengths.append(length)
+        remaining -= length
+        index += 1
+    # Place a valid row after the repeated prefix without changing the token count.
+    lengths.insert(1, 0)
+    return lengths
+
+
+PACKED_METADATA_SHAPES = (
+    ("r4-c1-d128-plain256k", [1 << 18], 128, 4, 1),
+    ("r4-c1-d128-fragmented256k", _fragmented_lengths(1 << 18), 128, 4, 1),
+    ("r4-c1-d128-plain1m", [1 << 20], 128, 4, 1),
+    ("r4-c1-d128-fragmented1m", _fragmented_lengths(1 << 20), 128, 4, 1),
 )
 
 
@@ -108,7 +144,11 @@ def _dape_fp64_reference(workspace, total_comp, ratio, coff, d):
     """Sum the reducer's FP32 producer partials independently in FP64."""
     nelems = ratio * coff * d
     if ratio == 4:
-        npartials = (total_comp + _BWD_ROWS - 1) // _BWD_ROWS
+        # Keep --atomic-only usable with pre-selector source checkouts.
+        from cudnn.csa.compressor.compressor_sm100 import _bwd_rows
+
+        rows_per_cta = _bwd_rows(ratio, True, total_comp)
+        npartials = (total_comp + rows_per_cta - 1) // rows_per_cta
     else:
         # Ratio 128 chooses rows_per_cta from the runtime device shape; its
         # workspace (like generic ratio 2) contains only the producer planes.
@@ -184,12 +224,14 @@ def _bench_shape(name, lens, d, ratio, coff, args):
     result = {
         "shape": name,
         "workspace_mib": workspace_bytes / (1024 * 1024),
+        "atomic_rows_per_cta": getattr(plans[False], "_rows_per_cta", None),
         "atomic_kernel_us": statistics.median(kernel[False]),
         "atomic_operation_us": statistics.median(operation[False]),
         **accuracy,
     }
     if True in plans:
         result.update(
+            deterministic_rows_per_cta=getattr(plans[True], "_rows_per_cta", None),
             deterministic_kernel_us=statistics.median(kernel[True]),
             deterministic_operation_us=statistics.median(operation[True]),
         )
@@ -199,6 +241,7 @@ def _bench_shape(name, lens, d, ratio, coff, args):
 
 
 def main():
+    """Benchmark atomic and deterministic backward for the selected shape suite."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=30)
@@ -207,12 +250,36 @@ def main():
     shape_group = parser.add_mutually_exclusive_group()
     shape_group.add_argument("--quick", action="store_true", help="Run one generic and one ratio=128 shape")
     shape_group.add_argument(
+        "--generic-only",
+        action="store_true",
+        help="Run the ratio-2/4 d128/d512 1x/3x8192 matrix (supported on SM90)",
+    )
+    shape_group.add_argument(
+        "--sm90-primary",
+        action="store_true",
+        help="Run ratio=4, coff=1, head_dim=128 on 1x/3x8192 THD packs",
+    )
+    shape_group.add_argument(
         "--long-context",
         action="store_true",
         help="Run the unequal packed 256K/CP32-or-64 and 1M/CP64 production shapes",
     )
+    shape_group.add_argument(
+        "--packed-metadata",
+        action="store_true",
+        help="A/B plain and highly fragmented THD packs at 256K and 1M tokens",
+    )
     args = parser.parse_args()
-    shapes = LONG_CONTEXT_SHAPES if args.long_context else (SHAPES[::4] if args.quick else SHAPES)
+    if args.long_context:
+        shapes = LONG_CONTEXT_SHAPES
+    elif args.packed_metadata:
+        shapes = PACKED_METADATA_SHAPES
+    elif args.generic_only:
+        shapes = GENERIC_SHAPES
+    elif args.sm90_primary:
+        shapes = SM90_PRIMARY_SHAPES
+    else:
+        shapes = SHAPES[::4] if args.quick else SHAPES
     results = [_bench_shape(*shape, args) for shape in shapes]
     print(json.dumps({"construct_order": args.construct_order, "results": results}, indent=2))
 

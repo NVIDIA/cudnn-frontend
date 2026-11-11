@@ -1115,6 +1115,7 @@ class TokenCommNonDeterministic(KernelComponent):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "token_back_schedule_mode": str,
+            "token_back_ready_granularity": OptionalRequirement(str),
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
         }
@@ -1139,6 +1140,7 @@ class TokenCommNonDeterministic(KernelComponent):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode: TokenBackMode = impl_desc["token_back_mode"]
         self.token_back_schedule_mode: TokenBackScheduleMode = impl_desc["token_back_schedule_mode"]
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
 
@@ -1183,6 +1185,13 @@ class TokenCommNonDeterministic(KernelComponent):
             raise ValueError(
                 f"token_back_schedule_mode must be static or atomic_counter, got {self.token_back_schedule_mode!r}."
             )
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}.")
+        if self.token_back_ready_granularity == "token_tile" and (
+            self.token_back_mode not in ("standalone_warps", "reuse_dispatch_warps")
+            or self.token_back_schedule_mode != "atomic_counter"
+        ):
+            raise ValueError("token_tile return-ready requires standalone_warps or reuse_dispatch_warps with atomic_counter.")
         if not 1 <= self.token_in_flag_batch <= 32:
             raise ValueError(f"token_in_flag_batch must be in [1, 32], got {self.token_in_flag_batch}.")
         if self.tokens_per_fc1_ready_slot % self.token_padding_block != 0:
@@ -1421,8 +1430,13 @@ class TokenCommNonDeterministic(KernelComponent):
         )
 
         if self.token_back_enabled:
+            fc2_done_slots = (
+                self.max_fc1_ready_slot_count
+                if self.token_back_ready_granularity == "token_tile"
+                else self.experts_per_rank
+            )
             workspace.register(
-                self.fc2_done_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
+                self.fc2_done_region, cutlass.Int32, (fc2_done_slots,), buffer_space="local", reset="tail_reset"
             )
         if self.token_back_push_data:
             fc2_element_count = self.worst_case_token_count * self.hidden_size
@@ -1903,24 +1917,39 @@ class TokenCommNonDeterministic(KernelComponent):
         next_dense_token = self.next_token(next_dense_token)
         expert_valid_begin = Int32(0)
         transfer_phase = Int32(0)
+        if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+            expert_ready_slot_begin = Int32(0)
+            last_ready_slot = Int32(-1)
 
         iket.range_push("token_back.work")
         local_expert = Int32(0)
         while local_expert < Int32(self.experts_per_rank):
             expert_token_count = owned_sizes[local_expert]
             expert_valid_end = expert_valid_begin + expert_token_count
-            if next_dense_token < expert_valid_end:
-                token_tile_count = (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(
-                    self.tokens_per_fc1_ready_slot
-                )
-                completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
-                iket.range_push("token_back.wait_fc2")
-                while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
-                    nanosleep(500)
-                iket.range_pop()
+            if cutlass.const_expr(self.token_back_ready_granularity == "expert"):
+                if next_dense_token < expert_valid_end:
+                    token_tile_count = (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(
+                        self.tokens_per_fc1_ready_slot
+                    )
+                    completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
+                    iket.range_push("token_back.wait_fc2")
+                    while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
+                        nanosleep(500)
+                    iket.range_pop()
 
             while next_dense_token < expert_valid_end:
                 token_in_expert = next_dense_token - expert_valid_begin
+                if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+                    # Same rank-local expert/tile prefix as FC1 ready; separate counter storage.
+                    ready_slot = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+                    if ready_slot != last_ready_slot:
+                        iket.range_push("token_back.wait_fc2")
+                        while cute.arch.load(fc2_done + ready_slot, Int32, sem="acquire", scope="gpu") < Int32(
+                            self.fc2_done_signals_per_token_tile
+                        ):
+                            nanosleep(500)
+                        iket.range_pop()
+                        last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
@@ -2069,6 +2098,11 @@ class TokenCommNonDeterministic(KernelComponent):
                 cute.arch.sync_warp()
                 next_dense_token = self.next_token(next_dense_token)
 
+            if cutlass.const_expr(self.token_back_ready_granularity == "token_tile"):
+                # Advance even when this worker skipped the expert (empty experts contribute zero).
+                expert_ready_slot_begin = expert_ready_slot_begin + (
+                    expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)
+                ) // Int32(self.tokens_per_fc1_ready_slot)
             expert_valid_begin = expert_valid_end
             local_expert = local_expert + Int32(1)
         iket.range_pop()

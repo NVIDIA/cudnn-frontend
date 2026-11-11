@@ -24,12 +24,13 @@ from .helpers import (
     prefix_sum,
     convert_packed_to_uniform,
     convert_uniform_to_packed,
+    ragged_live_rows,
     time_execution,
     profile_execution,
     note_frost_routing,
 )
 from .random_config import packed_token_capacity
-from .fp16 import _apply_plan_pin
+from .fp16 import _apply_plan_pin, kv_packed
 
 # fmt: off
 
@@ -133,8 +134,9 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         v = graph_fwd.tensor(uid=GraphFwdUid.v, dim=(num_blocks, h_v, block_size, d_vo), stride=(block_size * h_v * d_vo, block_size * d_vo, d_vo, 1), data_type=cudnn_itype)
 
         use_padding_mask = True
-        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
-        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+        if not is_ragged:
+            kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+            q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
         k_block_table = graph_fwd.tensor(uid=GraphFwdUid.k_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
         v_block_table = graph_fwd.tensor(uid=GraphFwdUid.v_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
 
@@ -148,19 +150,22 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
             kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
 
         q_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.q_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
-        k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
-        v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         o_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.o_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         stats_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.stats_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if generate_stats else None
         q.set_ragged_offset(q_ragged_offset)
-        k.set_ragged_offset(k_ragged_offset)
-        v.set_ragged_offset(v_ragged_offset)
         if with_ragged_offset_multiplier:
             # Offsets are stored in coarser units (divided out in the allocation);
             # the engine multiplies back to element offsets.
             q.set_ragged_offset_multiplier(d_qk)
-            k.set_ragged_offset_multiplier(d_qk)
-            v.set_ragged_offset_multiplier(d_vo)
+        if block_size == 0:
+            # Only unpaged K/V are packed. Page pools never carry ragged offsets.
+            k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+            v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+            k.set_ragged_offset(k_ragged_offset)
+            v.set_ragged_offset(v_ragged_offset)
+            if with_ragged_offset_multiplier:
+                k.set_ragged_offset_multiplier(d_qk)
+                v.set_ragged_offset_multiplier(d_vo)
 
     q_descale = graph_fwd.tensor(uid=GraphFwdUid.q_descale, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
     k_descale = graph_fwd.tensor(uid=GraphFwdUid.k_descale, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
@@ -875,6 +880,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         torch_otype = torch.float8_e4m3fn
     deterministic = cfg.is_determin if hasattr(cfg, 'is_determin') else False
     is_ragged = cfg.is_ragged if hasattr(cfg, 'is_ragged') else False
+    origins = getattr(cfg, "ragged_origin_rows", None) or {}
+    is_kv_packed = kv_packed(cfg)
     left_bound = cfg.left_bound if hasattr(cfg, 'left_bound') else None
     right_bound = cfg.right_bound if hasattr(cfg, 'right_bound') else None
     diag_align = cfg.diag_align if hasattr(cfg, 'diag_align') else None
@@ -896,6 +903,13 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     seq_len_q_list = cfg.seq_len_q if hasattr(cfg, 'seq_len_q') and cfg.seq_len_q else []
     seq_len_kv_list = cfg.seq_len_kv if hasattr(cfg, 'seq_len_kv') and cfg.seq_len_kv else []
 
+    # Paged/dense KV has no packed capacity or ragged offsets. Keep this
+    # optional state explicit before conditional allocation and binding.
+    max_t_q = None
+    max_t_kv = None
+    k_ragged_offset_gpu = None
+    v_ragged_offset_gpu = None
+
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
@@ -913,11 +927,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         k_off_mult = d_qk if with_ragged_offset_multiplier else 1
         v_off_mult = d_vo if with_ragged_offset_multiplier else 1
         o_off_mult = d_vo if with_ragged_offset_multiplier else 1
-        q_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * d_qk // q_off_mult).to(torch.int64)
-        k_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_k * d_qk // k_off_mult).to(torch.int64)
-        v_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_v * d_vo // v_off_mult).to(torch.int64)
-        o_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * d_vo // o_off_mult).to(torch.int64)
-        stats_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * 1).to(torch.int64)
+        q_ragged_offset_gpu = ((torch.tensor(origins["q"], device="cuda", dtype=torch.int64) if "q" in origins else prefix_sum(seq_len_q_gpu)) * h_q * d_qk // q_off_mult).to(torch.int64)
+        if is_kv_packed:
+            k_ragged_offset_gpu = ((torch.tensor(origins["k"], device="cuda", dtype=torch.int64) if "k" in origins else prefix_sum(seq_len_kv_gpu)) * h_k * d_qk // k_off_mult).to(torch.int64)
+            v_ragged_offset_gpu = ((torch.tensor(origins["v"], device="cuda", dtype=torch.int64) if "v" in origins else prefix_sum(seq_len_kv_gpu)) * h_v * d_vo // v_off_mult).to(torch.int64)
+        o_ragged_offset_gpu = ((torch.tensor(origins["o"], device="cuda", dtype=torch.int64) if "o" in origins else prefix_sum(seq_len_q_gpu)) * h_q * d_vo // o_off_mult).to(torch.int64)
+        stats_ragged_offset_gpu = ((torch.tensor(origins["stats"], device="cuda", dtype=torch.int64) if "stats" in origins else prefix_sum(seq_len_q_gpu)) * h_q * 1).to(torch.int64)
         if is_cu_seq_len:
             cu_seq_len_q_gpu = prefix_sum(seq_len_q_gpu).to(torch.int32).view(-1)
             cu_seq_len_kv_gpu = prefix_sum(seq_len_kv_gpu).to(torch.int32).view(-1)
@@ -926,7 +941,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     try:
         graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, generate_stats=generate_stats, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
                                        max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
-                                       max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
+                                       max_total_seq_len_kv=max_t_kv if (is_kv_packed and getattr(cfg, "declare_total_seq_len", False)) else None,
                                        o_block_scale=o_block_scale, softmax_precision=softmax_precision)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -991,6 +1006,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     else:
         padding = None
 
+    # Performance-only runs omit references; correctness branches require them.
+    o_ref = stats_ref = None
     if perf:
         o_amax = 1.0
     else:
@@ -1021,9 +1038,10 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     v_gpu = v_fp8
 
     if is_ragged:
-        q_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", q_fp8), torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda"), max_t_q)
-        k_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", k_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv)
-        v_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", v_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv)
+        q_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", q_fp8), torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda"), max_t_q, origins=origins.get("q"))
+    if is_kv_packed:
+        k_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", k_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv, origins=origins.get("k"))
+        v_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", v_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv, origins=origins.get("v"))
 
     if is_paged:
         k_gpu_bhsd = torch.einsum('bshd->bhsd', k_fp8).contiguous()
@@ -1078,8 +1096,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
+        if not is_ragged:
+            variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
+            variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = k_block_table_gpu
         variant_pack[int(GraphFwdUid.v_block_table)] = v_block_table_gpu
 
@@ -1091,8 +1110,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
             variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
         variant_pack[int(GraphFwdUid.q_ragged_offset)] = q_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
+        if is_kv_packed:
+            variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
+            variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.o_ragged_offset)] = o_ragged_offset_gpu
         if generate_stats:
             variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
@@ -1109,6 +1129,15 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         profile_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
     graph_fwd.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
+    if not perf and generate_stats and origins:
+        stats_ref_physical = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q, origins=origins.get("stats"))
+        torch.testing.assert_close(stats_gpu, stats_ref_physical, atol=2e-2, rtol=2e-2, equal_nan=True)
+    if not perf and generate_stats and is_ragged and is_paged and not origins:
+        # Packed Stats follow Q's live token prefix; the page pools remain dense.
+        # Check them before Amax_O, whose known backend defect can xfail its check.
+        stats_ref_packed = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
+        live_q = sum(seq_len_q_list)
+        torch.testing.assert_close(stats_gpu[:live_q], stats_ref_packed[:live_q], atol=2e-2, rtol=2e-2)
     # Amax_O on a backend-served graph: a known backend defect xfails that check only (see BACKEND_AMAX_O_ISSUE).
     amax_known_issue = BACKEND_AMAX_O_ISSUE if getattr(graph_fwd, "selected_engine", None) is None else None
 
@@ -1144,7 +1173,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         assert_amax_o(o_amax_gpu, o_amax, torch_itype=torch_itype, torch_otype=torch_otype, known_issue=amax_known_issue)
     elif not perf:
         if is_ragged:
-            o_ref_comp = convert_uniform_to_packed(torch.einsum("bshd->bhsd", o_ref), seq_len_q_ref, max_t_q)
+            o_ref_comp = convert_uniform_to_packed(torch.einsum("bshd->bhsd", o_ref), seq_len_q_ref, max_t_q, origins=origins.get("o"))
         else:
             o_ref_comp = o_ref
 
@@ -1152,9 +1181,11 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         o_ref_float = o_ref_comp.detach().float() * get_fp8_descale_factor(o_amax, torch_otype)
 
         if is_ragged:
-            t_idx = sum(seq_len_q_list)
-            o_gpu_float[t_idx:] = 0
-            o_ref_float[t_idx:] = 0
+            live = ragged_live_rows(seq_len_q_list, max_t_q, origins.get("o"), device=o_gpu.device)
+            if origins:
+                assert torch.isnan(o_gpu.float()[~live]).all(), "O wrote physical padding"
+            o_gpu_float[~live] = 0
+            o_ref_float[~live] = 0
         elif is_paged:
             # Padded (dead) query rows: the reference holds 0 there and the engines
             # write O := 0 (the FROST dense padded-Q trim) or leave the buffer; compare
@@ -1186,6 +1217,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         o_descale_gpu = torch.tensor([get_fp8_descale_factor(o_amax, torch_otype)], dtype=torch.float, device="cuda")
         dO_descale_gpu = torch.tensor([get_fp8_descale_factor(dO_amax, torch_itype)], dtype=torch.float, device="cuda")
 
+        dQ_ref = dK_ref = dV_ref = dSink_token_ref = None
         if perf:
             dP_amax = 1.0
             dQ_amax = 1.0
@@ -1194,10 +1226,10 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         else:
             # Get unpacked BSHD references for backward
             if is_ragged:
-                q_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(q_gpu, seq_len_q_ref, s_qo))
-                k_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(k_gpu, seq_len_kv_ref, s_kv))
-                v_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(v_gpu, seq_len_kv_ref, s_kv))
-                o_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(o_gpu, seq_len_q_ref, s_qo))
+                q_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(q_gpu, seq_len_q_ref, s_qo, origins=origins.get("q")))
+                k_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(k_gpu, seq_len_kv_ref, s_kv, origins=origins.get("k")))
+                v_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(v_gpu, seq_len_kv_ref, s_kv, origins=origins.get("v")))
+                o_ref_bwd = torch.einsum("bhsd->bshd", convert_packed_to_uniform(o_gpu, seq_len_q_ref, s_qo, origins=origins.get("o")))
                 dO_ref_bwd = dO_fp8
             else:
                 q_ref_bwd = q_gpu
@@ -1252,7 +1284,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             pytest.fail(f"Error building backward graph: {e}")
 
         if is_ragged:
-            dO_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dO_fp8), torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda"), max_t_q)
+            dO_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dO_fp8), torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda"), max_t_q, origins=origins.get("o"))
         else:
             dO_gpu = dO_fp8
 
@@ -1332,9 +1364,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
         if not perf:
             if is_ragged:
-                dQ_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dQ_ref), seq_len_q_ref, max_t_q)
-                dK_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dK_ref), seq_len_kv_ref, max_t_kv)
-                dV_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dV_ref), seq_len_kv_ref, max_t_kv)
+                dQ_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dQ_ref), seq_len_q_ref, max_t_q, origins=origins.get("q"))
+                dK_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dK_ref), seq_len_kv_ref, max_t_kv, origins=origins.get("k"))
+                dV_ref = convert_uniform_to_packed(torch.einsum("bshd->bhsd", dV_ref), seq_len_kv_ref, max_t_kv, origins=origins.get("v"))
 
             dQ_out = dQ_gpu.detach().float() * get_fp8_descale_factor(dQ_amax, torch_otype)
             dK_out = dK_gpu.detach().float() * get_fp8_descale_factor(dK_amax, torch_otype)
@@ -1345,14 +1377,16 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             dV_ref_float = dV_ref.detach().float() * get_fp8_descale_factor(dV_amax, torch_otype)
 
             if is_ragged:
-                t_idx_q = sum(seq_len_q_list)
-                dQ_out[t_idx_q:] = 0
-                dQ_ref_float[t_idx_q:] = 0
-                t_idx_kv = sum(seq_len_kv_list)
-                dK_out[t_idx_kv:] = 0
-                dK_ref_float[t_idx_kv:] = 0
-                dV_out[t_idx_kv:] = 0
-                dV_ref_float[t_idx_kv:] = 0
+                for port, actual, expected, lengths, capacity in (
+                    ("q", dQ_out, dQ_ref_float, seq_len_q_list, max_t_q),
+                    ("k", dK_out, dK_ref_float, seq_len_kv_list, max_t_kv),
+                    ("v", dV_out, dV_ref_float, seq_len_kv_list, max_t_kv),
+                ):
+                    live = ragged_live_rows(lengths, capacity, origins.get(port), device=actual.device)
+                    if origins:
+                        assert torch.isnan(actual[~live]).all(), f"d{port.upper()} wrote physical padding"
+                    actual[~live] = 0
+                    expected[~live] = 0
 
             # E5M2 is less precise than E4M3, so its P quantization needs one wider step.
             atol, rtol = (0.125 if torch_itype == torch.float8_e5m2 else 0.08), 0.2

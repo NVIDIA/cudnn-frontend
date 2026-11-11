@@ -201,6 +201,55 @@ mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -
 queuing Q(i + 1) / ids(i + 1) (their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's
 LAST BMM1) and before its next credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
 
+PDL SITES (``use_pdl``, a compile-time kernel argument and the launch attribute, appended 2026-10-21; NO barrier row, ring depth,
+SMEM buffer or TMEM column changes -- the table above is the ``use_pdl=False`` rendering's and the ``use_pdl=True`` rendering's alike,
+and the two compute the same function bitwise).  Under the programmatic-stream-serialization attribute this grid may START while
+its predecessor on the stream (the norm + RoPE / prepare launch that writes the slab, the write-through that fills the pools, the
+selector that writes the block list, the stack's kernels that write the lengths and the table) still runs, so EVERY global read of a
+predecessor's output sits below a ``griddepcontrol.wait`` (``wait_on_dependent_grids()``) of the reading role, and no global WRITE
+sits above one.  Per role, every global read, and where its wait is:
+
+    TMA warp      reads: block_ids (the ids bulk copy, barrier row 3), the Q^T box (the slab; row 1), the gate tile (the slab's GATE
+                  columns; row 11, gated arm).  Wait: at the top of ``_tmaldg_warp_group``, before the prologue's ``_decode_item`` and
+                  ``_tma_issue_item`` (the tensor-map prefetches above it read kernel PARAMETERS, not a predecessor's output).
+    gather warps  reads: ``_item_bounds``' inputs -- seq_kv_lens (the stack's lengths) and block_lens (the selector's counts) --, the
+                  block table (``_gather_block_pages``, paged arm) and the K / V rows (``tma_gather4`` of the pools or the dense
+                  operands).  Wait: at the top of ``_gather_warp_group``, before the prologue's ``_decode_item`` and the first
+                  ``_item_bounds``.  (Dense BSHD: ``_decode_item`` reads nothing global -- the grid position; the THD arm's metadata
+                  read is below the wait too, but see the prologue note.)
+    MMA warp      reads: ``_item_bounds``' inputs (seq_kv_lens, block_lens) only -- its operands arrive through SMEM.  Wait: after the
+                  TMEM allocation, the named-barrier hand-off and the descriptor builds (its prologue), before ``_decode_item``.
+    softmax warps reads: ``_item_bounds``' inputs (seq_kv_lens, block_lens); WRITES: O / the partial slabs and the LSE (the epilogue).
+                  Wait: after the TMEM hand-off (``barrier_cta_sync`` on named barrier 1 + the SMEM read of the TMEM base), before
+                  ``_decode_item`` -- every global write of the role is below it.
+    scheduler     reads nothing global on the BSHD / CLC form (the CLC responses are hardware; the payload ring is SMEM): no wait.
+    spare warp    exits after the init sync: no wait.
+    the release   NONE explicit: no CTA executes ``griddepcontrol.launch_dependents``, so each CTA counts as released when it EXITS (the
+                  PTX rule) and the dependent grid (the split combine, or the out projection at split 1) launches at this grid's
+                  completion through the programmatic edge.  Its own wait blocks on this grid's completion and memory flush wherever a
+                  trigger would sit, so the placement is a performance choice, never a correctness one -- and it is a MEASURED one
+                  (2026-10-21, the cc 10.7 class: a 212-SM gate of the switched block chain and a per-kernel timeline of one replay on
+                  a 204-SM part under two instruments).  The first form of this paragraph released right after ``fence_mbarrier_init +
+                  barrier_cta_sync``, before the role dispatch: the combine's CTAs then sat resident on the idle SMs from this grid's
+                  first microsecond, spinning in their wait through the whole mainloop, and after this grid completed they needed
+                  7.4-7.9 us for 2.75 us of work (+4.6-5.1 us at that one link) while this kernel ran 0.4-0.7 us slower with them
+                  resident -- the whole 3.2-4.4 us per-step loss the switched chain showed at B <= 4 (the graph's launch overhead did
+                  not move with the number of programmatic nodes).  The SAME edge triggered at this grid's completion cost nothing
+                  (2.85 vs 2.75 us), and the dependents the norm + RoPE, cache-write and combine kernels launch early (short, non-CLC
+                  primaries) gain 0.2-0.8 us each.  Rule for a long CLC-scheduled primary: no release above its mainloop (trigger at
+                  completion, or after the CTA's last item); a prologue release is a measured exception.  The TMEM-footprint argument
+                  the prologue release needed (no dependent CTA could co-reside with this one -- 226,688 B of the 227 KiB carveout, one
+                  CTA per SM -- so a dependent allocating TMEM before its own wait could never hold columns this CTA's later allocation
+                  needs) is moot: nothing is released above the MMA warp's allocation, or at all.
+
+The PRE-DISPATCH prologue holds ONE global read ABOVE every role wait: ``exit_if_dead_thd_cluster(seq_kv_lens_tensor, ...)`` under
+``CFG.THD_VARLEN == 1`` reads the live-unit total ``meta[4B + 2]`` -- the SETUP LAUNCH's device value, written by the kernel launched
+right before this one on the same stream -- before any mbarrier init, and the THD scheduler's claim counter reads ``meta[4B + 3]`` the
+same way.  A dependent launch of the THD rendering would therefore read the metadata the setup launch has not written yet, so THD x
+``use_pdl`` is a typed decline of the adapter (``SparseGqaFwdDslSm107.check_support``: ``thd=True`` with ``use_pdl=True``), never a wait
+placed above the exit (which would serialize every CTA of the grid behind the predecessor anyway).  The early-exit CTAs of the THD form
+count as released by completing, like every CTA of this kernel.  The PDL scope is the dense BSHD and paged decode chain.
+
 THE ONE HELPER ``_item_bounds``: n_tiles, count, the tail block id(s), dead and the split chunk are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
 same inputs (the item ``_decode_item`` decoded from the payload -- ONE decode for every role and every item, the CTA's
@@ -333,6 +382,43 @@ index past the table and a -1 table entry (the page -1 convention of the dense p
 bytes credited -- so the rows of a partially filled last page beyond the KV length (another sequence's tokens, or garbage)
 never reach an MMA, and the straddling rows of the open block are masked exactly as in the dense arm (key_abs < the length).
 
+THD x PAGED (CFG.THD_VARLEN x CFG.PAGED_KV x CFG.BOTTOM_RIGHT [x CFG.EPILOGUE_GATE]; LIST_PER_SEQUENCE 0, SPLIT_KV 1 -- the packed EXTEND
+form over the pools, admitted 2026-10-30; the adapter's ``thd_paged_kv`` claim, the validator's two pair predicates): NO body change --
+three arms each validated alone compose because they touch DISJOINT facts of a work item.  The THD fold changes WHO decodes the item
+(``_decode_item``: the unit id from the claim counter -> head, tok_packed, the sequence b by ``_thd_find_batch`` over cu_q, tok =
+tok_packed - cu_q[b], eff_seqlen_q = cu_q[b + 1] - cu_q[b], item_row = tok_packed, the Q / O / LSE coordinate (tok_packed, 0)); the PAGED
+fold changes the gather ROW coordinate only (``_gather_block_pages``: page = block_table[b, (4 blk) // PAGE_SIZE] with b from the THD decode
+-- the table has B = the SEQUENCE count rows --, ``_gather_fill``: page x rows_per_page + head_rows + (4 blk) % PAGE_SIZE; kv_row_base =
+cu_k[b] is UNREAD); the BOTTOM_RIGHT fold changes ``visible_bounds``' position and dead predicate (pos = tok + (eff_seqlen_kv -
+eff_seqlen_q) with eff_seqlen_kv = meta[b] = the SERVING kv_lens[b] the setup launch stores -- the KV-lengths tensor the host hands it is
+the stack's per-sequence logical length AFTER the step, not a self-attention length --, dead when pos < 0 / tok >= eff_seqlen_q /
+eff_seqlen_kv == 0 / nothing listed) and the store predicate (live_row = tok < eff_seqlen_q).  All three are arithmetic in roles that
+already run once per item.  BARRIER TABLE under this rendering: every row of the table above holds with the SAME init count, arrive
+site, byte count, phase init and exit drain -- row 1 (the Q box at (tok_packed, 0): 1 == 1), row 2 (ONE commit per item: 1 == 1), row 3
+(the ids bulk copy at item_row = tok_packed, one row per packed token, dead items included: 1 == 1), row 4 (8 gather + 8 softmax elected
+arrives: IDS_EMPTY_ARRIVERS 16 == 16), rows 5 / 6 (each gather warp's ONE expect_tx of KV_TX_BYTES_PER_WARP then its 16 gather4 -- a -1
+page / a row past the length takes row -1: TMA zero-fills AND credits the bytes, the full-box arm -- KV_FULL_ARRIVERS 8 == 8; the MMA
+warp's one commit per stage 1 == 1; kv_state carried across items in the gather AND the MMA warp), rows 7-10 (per tile, carried, never
+reset at an item boundary: 1 / 256 / 256 / 1), rows 11 / 12 (the gate box at the same packed coordinate as O, 1 == 1; the 256-lane
+release, in ORDER at the exit path), row 13 (the persistent form: ONE elected arrive per publication after the claim, 1 == ONE_LANE),
+row 14 (18 == READ_TILE_ARRIVERS: every consuming warp credits once per item whatever the item mix), row 15 (256 == 256), the named
+barriers 16 / 17 (288 / 128) and barrier 0 (640) after fence_mbarrier_init -- with the dead-CTA exit ABOVE every init (a CTA at or past
+live exits WHOLE).  What the composition DOES change is the per-CTA ITEM MIX: 1-tile decode items beside 17-tile chunk items under one
+persistent loop, so the carried-state discipline (rows 5-10 per TILE, rows 1-4 / 11-14 per ITEM, the exit drains per role) is what the
+mixed-item sequence cells of the sparse suite stress on this rendering.  SMEM table and TMEM map: the dense arm's, unchanged (no new
+buffer, no new column).  Composed degenerate rows: a sequence with kv_lens 0 and Q rows -> every row dead (one -1 tile; O = 0 / LSE = -inf
+STORED); q_len_b = 0 -> no unit (T_live = cu_q[B] excludes it, the binary search steps over it); 0 < kv_lens < q_len_b -> the rows at a
+negative position dead, the rest live; a -1 table entry / a page index past the table under a VISIBLE block -> row -1 (zero rows, bytes
+credited); stale FINITE pool rows past kv_len inside the last live page -> (key0 + r) < eff_seqlen_kv per row, never gathered; the
+capacity tail past cu_q[B] never written; T_live x KH units below the occupancy grid -> the CTAs at or past live exit at entry, above it
+the counter hands the rest out.  THD x PDL stays declined (the pre-dispatch read and the claim counter sit above every role wait).
+Trace-compile record of the rendering (host sm_107a trace-compile, cutlass-dsl 4.8.0 with its CUDA 13.4 ptxas, 2026-10-30; nothing
+dispatched): the composed module renders TWO entries (the THD setup kernel REG 22 and the core) with no griddepcontrol; the core at G 4
+ungated REG 96 / STACK 8 / LOCAL 0 / STL 1 / LDL 1 -- IDENTICAL to the THD-dense rendering at the same toolchain (the THD arm's pre-existing
+pair; the dense arm 95 / 0 / 0 / 0, the paged bottom-right dense-Q arm 96 / 0 / 0 / 0), G 4 gated REG 93 / 0 / 0 / 0, G 12 ungated REG 96 /
+0 / 0 / 0; SYNCS 174 (182 gated) and UBLKCP 2 = the sibling renderings' counts, ATOM 5 = the dense arm's 4 + the claim counter's one: the
+96 FLAT register budget holds and the composition adds no spill, so no named fallback is selected.
+
 DECODE FORM (CFG.BOTTOM_RIGHT + CFG.LIST_PER_SEQUENCE + CFG.SPLIT_KV, each a const_expr arm; the dense rendering is unchanged):
 the serving step's S_q <= 4 rows per sequence sit at the END of the sequence (BOTTOM_RIGHT: pos = tok + L_b - S_q), share ONE
 block list (LIST_PER_SEQUENCE: block_ids [B, BLOCK_TOPK], block_lens [B]; item_row = b, so every item of the sequence -- every
@@ -346,7 +432,8 @@ EPILOGUE_GATE is refused under a split by the config).  An empty chunk is a DEAD
 LSE_s = -inf, exactly the combine's identity), so every ring advances exactly as on a live item (P14); SPLIT_KV <=
 MAX_TILES_PER_ITEM (a larger split has an empty chunk on every item).  No barrier init count, ring depth, SMEM buffer or TMEM
 column changes: the per-sequence list is a SOURCE change of barrier row 3, the split a tile-range change of rows 5-10 plus the
-epilogue's store target.  THD never composes with the three arms (the config refuses each pair).
+epilogue's store target.  THD composes with BOTTOM_RIGHT over PAGED pools only (the THD x PAGED paragraph above); the per-sequence list
+and the split stay refused under THD (the config refuses each pair).
 MTP rows as single-token items (the shared list at S_q <= 4): every row is its OWN work item re-gathering the sequence's list --
 per item IDS_TX_BYTES of ids (2 KiB at top_k 512; the copy runs for every item, dead ones included) plus (count + n_tail) x 4 rows x
 2 operands x 512 B of K / V (514 blocks = 2056 KiB at a saturated list with two tail ids; 17 tiles x 128 KiB credited with the
@@ -364,8 +451,9 @@ tile, no host read); padded Q rows -> dead, no store; B x H > 1 with n_tiles = 1
 -> clamped on device; B >= 2 / the slab stride -> the ROW coordinate carries b x S (cu_k[b] under THD), the COLUMN
 coordinate the head and the column offset; one CTA / one item -> cga1 init counts; THD: S_kv_b = 0 with Q tokens -> dead items
 stored, S_q_b = 0 -> no unit, the packed capacity tails untouched, a CTA past the live total exits at entry; a paged block whose
-page is -1 / past the table -> row -1 (zero rows, the keys masked by the length); THD x paged -> a typed decline at config /
-check_support (the sequence's row offset composes with a dense tensor only); page_size % 4 != 0, top_k outside [4, 512] or
+page is -1 / past the table -> row -1 (zero rows, the keys masked by the length); THD x paged TOP-LEFT -> a typed decline at config /
+check_support (a packed self-attention over a page pool has no serving meaning); THD x paged x bottom-right -> the composed rows of the
+THD x PAGED paragraph; page_size % 4 != 0, top_k outside [4, 512] or
 % 4 != 0, G > 16 -> typed declines at config / check_support.  Decode form: kv_len_b = 0 -> pos_0 = -S_q -> every row dead (stored
 0 / -inf; under a split every chunk dead -> the combine's all-dead identity); kv_len_b < S_q -> the rows with pos_j < 0 dead, the
 rest live; (L_b - S_q + 1) % 4 == 0 -> the step-0 row has no tail and row j >= 1 one tail block (the block that completed between
@@ -420,7 +508,7 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
-from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait
+from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, wait, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import TMA_L2_EVICT_LAST, bulk_copy, opaque_i64, tma_gather4, tma_load_tile
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
@@ -428,6 +516,9 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload, read_tile_id_arrive, scheduler_warp_loop, scheduler_warp_loop_persistent
 from cudnn.frost.tile_dsl.thd import THD_CTR_OFF, THD_CU_Q_TOTAL_OFF, THD_LIVE_OFF, THD_META_WORDS, THD_SETUP_THREADS, exit_if_dead_thd_cluster
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16
+
+# The visible-set helper shared with the lean mma.sync decode tile (ONE helper for both bodies; the SELECT spellings travel with it).
+from cudnn.sdpa.fwd.kernels.sm107._sparse_item_common import _select_f32, _select_i32, block_id_at, visible_bounds
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd, _vec, gate_epilogue_pairs, gate_half_opaque, gate_inv_sum, row_max_for_exp2
 
 # The THD metadata setup launch (per-sequence lengths -> [seq_kv_lens | cu_q | cu_k | remap | live | ctr]) is the shared one of
@@ -612,16 +703,6 @@ def make_sparse_bars() -> SparseBars:
 
 
 @cute.jit
-def _select_i32(cond, a, b):
-    return cutlass.Int32(arith.select(cond.ir_value(), cutlass.Int32(a).ir_value(), cutlass.Int32(b).ir_value()))
-
-
-@cute.jit
-def _select_f32(cond, a, b):
-    return cutlass.Float32(arith.select(cond.ir_value(), a.ir_value(), b.ir_value()))
-
-
-@cute.jit
 def _item_bounds(tok, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional[cute.Tensor], seq_kv_lens_tensor, seqlen_kv, split):
     """THE ONE HELPER (header): the row's key-space position, the entries read from the item's list, the appended tail block(s),
     the dead flag, the tile count and -- under CFG.SPLIT_KV -- this work item's chunk of the tiles, computed by EVERY role that
@@ -629,56 +710,32 @@ def _item_bounds(tok, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional
     ``block_ids`` / ``block_lens`` row ``item_row``, the sequence's Q length ``eff_seqlen_q`` and the split index), nothing
     staged through SMEM.
 
-    eff_seqlen_kv = seq_kv_lens[b] under SEQ_KV_LENS_PRESENT (the THD metadata's first B words are exactly that) else the
-    dense extent; pos = tok (top-left) or tok + (eff_seqlen_kv - eff_seqlen_q) (BOTTOM_RIGHT); n_vis = clamp(min(pos + 1,
-    eff_seqlen_kv), 0): the visible range.  The count and the tail are anchored at ``anchor`` = pos, or the STEP-0 position
-    pos_0 = eff_seqlen_kv - eff_seqlen_q under LIST_PER_SEQUENCE (the shared list of the decode / MTP rows): n_sel_default =
-    min(BLOCK_TOPK, floor((anchor + 1) / BLOCK_SIZE)); count = clamp(block_lens[item_row], 0, n_sel_default) when the pointer is
-    given (a device min / max, never a host read, never a fault), else n_sel_default.  The tail = the blocks from tail_lo =
-    floor(n_anchor / BLOCK_SIZE) (the first block not complete at the anchor) to the block holding the row's last visible key:
-    n_tail = max(0, ceil(n_vis / BLOCK_SIZE) - tail_lo) -- the open block of the row's own position (0 or 1) when anchor = pos,
-    0..2 under the shared list at S_q <= 4 (every token from the step-0 tail start to the row's own position stays visible); the
-    per-lane mask removes the rows past pos / past the length.
-    dead = (pos < 0) | (tok >= eff_seqlen_q) | (eff_seqlen_kv == 0) | (count + n_tail == 0).
+    The VISIBLE SET (position, count, tail, dead) is ``_sparse_item_common.visible_bounds`` -- the helper this module SHARES with the
+    lean ``mma.sync`` decode tile (``sparse_lean_d256_f16.py``), every CFG knob handed over as a constexpr parameter (the cubins of
+    this module are byte-identical with the arithmetic inlined and with it shared, the md5 record in
+    ``test_sdpa_fwd_sparse_lean_sm107.py``; the visible-token count the helper returns is unused here); its arithmetic (eff_seqlen_kv, pos, the anchor, n_sel_default, count, tail_lo, n_tail,
+    dead) is documented there and in the header above.  This module's own geometry follows:
     n_tiles = max(1, ceil((count + n_tail) / BLOCKS_PER_TILE)) -- CLAMPED >= 1: a dead item runs ONE tile of -1 rows.
     SPLIT_KV > 1: the item's tiles are cut into SPLIT_KV contiguous chunks (per = n // S, rem = n % S: chunk s = [s per + min(s, rem),
     + per + (s < rem))) and this work item runs chunk ``split`` from ``tile0``; an EMPTY chunk is a dead item (one clamped tile).
     The store predicate is the Q ROW's liveness (``tok < eff_seqlen_q``), computed by the softmax group at the store.
     """
-    eff_seqlen_kv = seqlen_kv
-    if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
-        eff_seqlen_kv = cutlass.Int32(cutlass.make_array_view(seq_kv_lens_tensor)[batch])
+    pos, count, n_tail, tail_lo, dead, n_listed, eff_seqlen_kv, _n_vis = visible_bounds(
+        tok,
+        batch,
+        item_row,
+        eff_seqlen_q,
+        block_lens_tensor,
+        seq_kv_lens_tensor,
+        seqlen_kv,
+        seq_kv_lens_present=CFG.SEQ_KV_LENS_PRESENT,
+        bottom_right=BOTTOM_RIGHT,
+        list_per_sequence=LIST_PER_SEQUENCE,
+        include_open_block=CFG.INCLUDE_OPEN_BLOCK,
+        block_size=BLOCK_SIZE,
+        block_topk=BLOCK_TOPK,
+    )
     zero = cutlass.Int32(0)
-    one = cutlass.Int32(1)
-    bs = cutlass.Int32(BLOCK_SIZE)
-    # Every arm below is a const_expr fold spelled so the dense rendering (no arm) traces EXACTLY the prefill form's program.
-    pos = tok
-    if cutlass.const_expr(BOTTOM_RIGHT == 1):
-        pos = tok + (eff_seqlen_kv - eff_seqlen_q)
-    n_vis = cute.math.max(cute.math.min(pos + one, eff_seqlen_kv), zero)
-    anchor = pos
-    n_anchor = n_vis
-    if cutlass.const_expr(LIST_PER_SEQUENCE == 1):
-        anchor = eff_seqlen_kv - eff_seqlen_q  # pos_0: the step-0 position (BOTTOM_RIGHT is forced by the config)
-        n_anchor = cute.math.max(cute.math.min(anchor + one, eff_seqlen_kv), zero)
-    n_sel_default = cute.math.min(cutlass.Int32(BLOCK_TOPK), cute.math.max(anchor + one, zero) // bs)
-    count = n_sel_default
-    if cutlass.const_expr(block_lens_tensor is not None):
-        given = cutlass.Int32(cutlass.make_array_view(block_lens_tensor)[item_row])
-        count = cute.math.min(cute.math.max(given, zero), n_sel_default)
-    tail_lo = n_anchor // bs
-    n_tail = zero
-    if cutlass.const_expr(CFG.INCLUDE_OPEN_BLOCK == 1):
-        if cutlass.const_expr(LIST_PER_SEQUENCE == 1):
-            n_tail = cute.math.max((n_vis + bs - one) // bs - tail_lo, zero)
-        else:
-            # anchor = pos: the same count spelled as the prefill form's has_open
-            n_tail = _select_i32((n_vis % bs) != zero, 1, 0)
-    n_listed = count + n_tail
-    dead = (pos < zero) | (pos >= eff_seqlen_q) | (eff_seqlen_kv <= zero) | (n_listed == zero)
-    if cutlass.const_expr(BOTTOM_RIGHT == 1):
-        # the padded-row term is on the Q ROW, not the key-space position (identical when the diagonal is top-left)
-        dead = (pos < zero) | (tok >= eff_seqlen_q) | (eff_seqlen_kv <= zero) | (n_listed == zero)
     n_tiles = cute.math.max(cutlass.Int32(1), (n_listed + cutlass.Int32(BLOCKS_PER_TILE - 1)) // cutlass.Int32(BLOCKS_PER_TILE))
     tile0 = zero
     if cutlass.const_expr(SPLIT_KV > 1):
@@ -693,20 +750,10 @@ def _item_bounds(tok, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional
 
 @cute.jit
 def _block_id_at(idx, loaded, count, n_tail, tail_lo, dead):
-    """The block id at list index ``idx`` of the current item: the staged word while ``idx < count``, the tail blocks
-    ``tail_lo .. tail_lo + n_tail - 1`` at ``idx == count .. count + n_tail - 1`` (0, 1 or 2 of them), -1 past that -- and -1
-    for every index of a dead item.  ``loaded`` is the word the caller read unconditionally at an in-bounds address; this
-    SELECT decides whether it means anything."""
-    if cutlass.const_expr(LIST_PER_SEQUENCE == 1):
-        rel = idx - count
-        tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))
-    else:
-        # one tail id at most (n_tail in {0, 1}): the prefill form's spelling, so the dense rendering traces its own program
-        tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))
-    blk = _select_i32(idx < count, loaded, tail)
-    # Bound the block domain BEFORE forming 4 * blk + lane: a large positive Int32 id must not wrap into a live key.
-    invalid = dead | (blk < cutlass.Int32(0)) | (blk > cutlass.Int32((2**31 - 1) // BLOCK_SIZE))
-    return _select_i32(invalid, cutlass.Int32(-1), blk)
+    """The block id at list index ``idx`` of the current item (the staged word while ``idx < count``, the tail blocks at
+    ``idx == count .. count + n_tail - 1``, -1 past that and for every index of a dead item): the shared
+    ``_sparse_item_common.block_id_at`` with this module's constants -- ONE spelling of the visible set for both bodies."""
+    return block_id_at(idx, loaded, count, n_tail, tail_lo, dead, list_per_sequence=LIST_PER_SEQUENCE, block_size=BLOCK_SIZE)
 
 
 @cute.jit
@@ -858,7 +905,20 @@ def _tma_issue_gate(tma_gate, sQ, bars, out_tok, head, out_batch, qg_idx, qg_pha
 
 @cute.jit
 def _tmaldg_warp_group(
-    tma_q_desc, tma_gate_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv, t0_init, t1_init
+    tma_q_desc,
+    tma_gate_desc,
+    sQ,
+    sIds_raw,
+    bars,
+    sched,
+    block_ids_tensor,
+    seq_kv_lens_tensor,
+    n_batch,
+    seqlen_q,
+    seqlen_kv,
+    t0_init,
+    t1_init,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     tma_q = GmemTileTma(tma_q_desc)
     tma_gate = GmemTileTma(tma_gate_desc) if cutlass.const_expr(CFG.EPILOGUE_GATE) else None
@@ -875,6 +935,11 @@ def _tmaldg_warp_group(
     qg_state = PipelineState.start(phase=0)
     ge_state = PipelineState.start(phase=1)
 
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): this role's first global reads are the prologue's ids bulk copy (block_ids: the selector's / the
+        # caller's list) and the Q^T box (the slab a projection / norm + RoPE launch wrote); the tensor-map prefetches above are kernel
+        # parameters.  Nothing of the role is read or written above this wait.
+        wait_on_dependent_grids()
     # Prologue: the first item's loads (its coordinates are this CTA's grid position, decoded like every later payload).
     _tok, head, _batch, item_row, _kvb, _sq, out_tok, out_batch, _split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     qi, qp, qei, qep, ii, ip, iei, iep, gei, gep = _tma_issue_item(
@@ -1037,8 +1102,9 @@ def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, kv_row_base, ro
     item's ``kv_row_base`` (``batch x S_kv`` on the dense map whose rows are the tokens of every batch; ``cu_k[b]`` under THD,
     the sequence's first packed K / V row -- the block ids are the sequence's own) on the dense arm, and on the PAGED arm the
     pool row ``page x rows_per_page + head_rows + (4 blk) % PAGE_SIZE`` (``pages`` from ``_gather_block_pages``; ``head_rows``
-    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column; ``kv_row_base`` is unread there -- THD x
-    paged is a typed decline); a ``-1`` block (or page), a block past the sequence's length or the straddling rows of its
+    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column; ``kv_row_base`` is unread there -- under THD x
+    paged the page comes from the table row of the sequence the THD decode found, never from ``cu_k[b]``); a ``-1`` block (or page),
+    a block past the sequence's length or the straddling rows of its
     last block take row ``-1`` -> TMA zero-fills and still credits the bytes, so no foreign batch's / sequence's row (or its
     NaN) ever reaches an MMA under P = 0."""
     stage_off = stage_idx * cutlass.Int32(kvBufferElems)
@@ -1097,7 +1163,12 @@ def _gather_warp_group(
     k_rows_per_head=None,
     v_rows_per_page=None,
     v_rows_per_head=None,
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): this role's first global reads are _item_bounds' lengths / counts, then the block table (paged arm)
+        # and the K / V rows of the gathers -- all a predecessor's output; nothing is read above this wait.
+        wait_on_dependent_grids()
     hint = opaque_i64(TMA_L2_EVICT_LAST)
     # kv_state: the stage to fill next (producer of mb_kv_full) == the mb_kv_empty wait (pre-armed: the first STAGES_KV
     # fills pass fresh barriers); advanced per LOAD in the K(0), K(1), V(0), K(2), V(1), ... order the MMA warp consumes,
@@ -1214,7 +1285,23 @@ def _gather_warp_group(
 
 
 @cute.jit
-def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tensor, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv, t0_init, t1_init):
+def _mma_warp_group(
+    sQ,
+    sK,
+    sVt,
+    sP,
+    tmem_ptr_i32,
+    bars,
+    sched,
+    block_lens_tensor,
+    seq_kv_lens_tensor,
+    n_batch,
+    seqlen_q,
+    seqlen_kv,
+    t0_init,
+    t1_init,
+    use_pdl: cutlass.Constexpr[bool] = False,
+):
     tmem_alloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(_BAR_TMEM, BAR_TMEM_THREADS)
 
@@ -1279,6 +1366,10 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
     p_state = PipelineState.start(phase=0)
     bmm2_state = PipelineState.start(phase=0)
 
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): the TMEM allocation, the named-barrier hand-off and the descriptor builds above are this role's
+        # prologue; its only global reads are _item_bounds' lengths / counts, below (the operands arrive through SMEM).
+        wait_on_dependent_grids()
     tok, head, batch, item_row, _kvb, eff_seqlen_q, _ot, _ob, split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1401,6 +1492,7 @@ def _softmax_warp_group(
     t1_init,
     scale_log2: cutlass.Float32,
     sQ_raw=None,  # the gated arm reads the item's gate out of its freed Q^T slot (appended; unused ungated)
+    use_pdl: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=BAR_TMEM_THREADS)
     tidx = cute.arch.thread_idx()[0]
@@ -1433,6 +1525,10 @@ def _softmax_warp_group(
     gf_state = PipelineState.start(phase=0)
     qslot_state = PipelineState.start(phase=0)
 
+    if cutlass.const_expr(use_pdl):
+        # PDL (header, PDL SITES): the TMEM hand-off above is this role's prologue; its global reads (_item_bounds' lengths / counts)
+        # and every global WRITE of the role (O / the partial slabs, the LSE) are below this wait.
+        wait_on_dependent_grids()
     tok, head, batch, item_row, _kvb, eff_seqlen_q, out_tok, out_batch, split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1751,6 +1847,11 @@ def _kernel(
     # rendering's parameter offsets are untouched; ungated it aliases tma_q_desc (a GridConstant tensor map is always a valid
     # one) and is never read -- CFG.EPILOGUE_GATE stays the single fold flag.
     tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,
+    # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag; header, PDL SITES): every role
+    # waits on the dependent grid before its first global read of a predecessor's output; no explicit release -- the CTA exit triggers
+    # the dependent grid at this grid's completion (the measured placement).  Appended LAST; the False rendering traces the program
+    # above unchanged.
+    use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1884,6 +1985,9 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     # No CTA-wide barrier-0 sync may follow this one: the spare warp exits here.
+    # PDL (header, PDL SITES): NO release here, or anywhere -- the CTA exit is the trigger of the dependent grid (a release at this
+    # point made the split combine's CTAs resident through the core's whole run and cost 3.2-4.4 us per step at B <= 4 on the cc 10.7
+    # class, the measured placement); each role's own wait follows in its body.
 
     if warp_idx < SOFTMAX_WARPS:
         _softmax_warp_group(
@@ -1904,6 +2008,7 @@ def _kernel(
             t1_init=t1_init,
             scale_log2=scale_softmax_log2,
             sQ_raw=sQ_raw,
+            use_pdl=use_pdl,
         )
     elif warp_idx < GATHER_WARP_BASE + GATHER_WARPS:
         _gather_warp_group(
@@ -1929,6 +2034,7 @@ def _kernel(
             k_rows_per_head=k_rows_per_head,
             v_rows_per_page=v_rows_per_page,
             v_rows_per_head=v_rows_per_head,
+            use_pdl=use_pdl,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1946,6 +2052,7 @@ def _kernel(
             seqlen_kv=seqlen_kv,
             t0_init=t0_init,
             t1_init=t1_init,
+            use_pdl=use_pdl,
         )
     elif warp_idx == TMALDG_WARP_ID:
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
@@ -1967,6 +2074,7 @@ def _kernel(
             seqlen_kv=seqlen_kv,
             t0_init=t0_init,
             t1_init=t1_init,
+            use_pdl=use_pdl,
         )
     elif warp_idx == SCHED_WARP_ID:
         cta_id_x = cutlass.Int32(0)
@@ -2012,6 +2120,7 @@ def _host(
     n_ctas: Optional[cutlass.Int32] = None,
     gate_ptr: Optional[cute.Pointer] = None,
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
+    use_pdl: cutlass.Constexpr[bool] = False,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the explicit pointer ABI and launch the sparse core.
@@ -2040,13 +2149,21 @@ def _host(
     the per-split LSE drives the combine); the grid is (SQ x S, KH, B) and ``sm100/split_combine.py`` reduces the slabs into the
     caller's O / LSE afterwards (the adapter's second launch; the gate, when given, rides it).
 
+    PDL (``use_pdl``, a compile-time constant of this entry -- the adapter's ``compile(use_pdl=)`` key): the main kernel launches with
+    the programmatic-stream-serialization attribute and carries the griddepcontrol sites (header, PDL SITES); the THD setup launch never
+    takes the attribute (THD x ``use_pdl`` is the adapter's typed decline: the main kernel reads the setup launch's metadata above every
+    role wait).  The same math, bitwise.
+
     THD (CFG.THD_VARLEN): ``B`` is the number of SEQUENCES and ``SQ`` / ``SKV`` the packed CAPACITIES of the ``[1, T, H, D]``
     operands (batch extent 1; the live totals are device values); ``seq_kv_lens_ptr`` -> the int32 metadata workspace of
     ``THD_META_WORDS(B)`` words that the setup launch fills from ``thd_q_lens_ptr`` / ``thd_kv_lens_ptr`` (per-sequence lengths
     ``[B]``, or cumulative ``[B + 1]`` per ``thd_lens_form`` bit 0 / 1): ``[seq_kv_lens(B) | cu_q(B + 1) | cu_k(B + 1) | remap(B) |
     live | ctr]``; ``block_ids_ptr`` -> int32 [SQ, BLOCK_TOPK] (one row per packed token); ``n_ctas`` the occupancy-sized grid
-    (one CTA per SM, at most one per unit) that also seeds the claim counter.  THD x paged is never rendered (a validator
-    predicate): under THD ``n_q_batches`` is 1 and the gather maps span the packed capacity ``SKV``.
+    (one CTA per SM, at most one per unit) that also seeds the claim counter.  THD x paged renders with BOTTOM_RIGHT (the packed
+    EXTEND form over the pools; a validator predicate refuses the top-left composition): under THD ``n_q_batches`` is 1 and under
+    PAGED the gather maps span the pool's rows (``num_pages x rows_per_page``) whatever the Q form, the block table has ``B`` = the
+    SEQUENCE count rows and ``SKV`` is the table's capacity ``max_pages x PAGE_SIZE``; ``thd_kv_lens_ptr`` is then the serving
+    per-sequence KV length after the step (the lengths form), stored as ``meta[b]``.
     """
     B, QH, KH, SQ, SKV = problem_size
     num_pages, max_pages, k_rows_per_page, k_rows_per_head, v_rows_per_page, v_rows_per_head = paged_geom
@@ -2173,11 +2290,13 @@ def _host(
         cutlass.Int32(v_rows_per_head),
         cutlass.Int32(B),
         tma_gate_desc,
+        use_pdl,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(1, 1, 1),
         stream=stream,
+        use_pdl=use_pdl,  # the programmatic-stream-serialization attribute, paired with the kernel's griddepcontrol sites
     )
 
 
@@ -2188,11 +2307,16 @@ EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument l
 def compile(  # noqa: A001
     has_lse: bool = True,
     has_block_lens: bool = False,
+    use_pdl: bool = False,
 ) -> Callable:
     """Compile the pointer ABI: ``has_lse`` folds the LSE store in / out, ``has_block_lens`` the per-row count read; the
     paged arm's block table is present exactly when the config is paged (CFG.PAGED_KV, part of the template's identity).
     Head dims are the config's (d_qk = d_v = 256, exact); shapes and strides are runtime arguments.  SPLIT_KV > 1 (the
-    config's): the O pointer is the fp32 PARTIAL slab and ``has_lse`` must be True (the per-split LSE drives the combine)."""
+    config's): the O pointer is the fp32 PARTIAL slab and ``has_lse`` must be True (the per-split LSE drives the combine).
+    ``use_pdl`` (appended; in the key) traces the programmatic-dependent-launch form: the launch attribute plus the per-role
+    ``griddepcontrol`` wait before the first dependent global read, and NO explicit release -- the CTA exit triggers the dependent
+    grid at this grid's completion (header, PDL SITES: the measured placement) -- the same math, bitwise; the False rendering is the
+    program as before."""
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("sparse_d256_f16: split_kv > 1 requires has_lse=True (the per-split LSE partial drives the combine)")
     _cache_key = _template_key(globals(), locals(), "compile")
@@ -2230,6 +2354,7 @@ def compile(  # noqa: A001
         # the gated rendering only, its strides are runtime host arguments, so nothing of it is in the compile key.
         P(STORAGE_DTYPE) if CFG.EPILOGUE_GATE else None,
         i64_3,
+        bool(use_pdl),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

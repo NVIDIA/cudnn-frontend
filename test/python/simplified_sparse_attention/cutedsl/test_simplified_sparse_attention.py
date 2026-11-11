@@ -1,0 +1,310 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, get_ident
+
+import cutlass
+import pytest
+import torch
+
+from cudnn.ops import SimplifiedSparseAttentionMetadata, simplified_sparse_attention, simplified_sparse_attention_reserve
+from determinism_utils import assert_bitwise
+from ssa_reference import check_reference, pack, run, sample
+
+pytestmark = pytest.mark.L0
+
+
+@pytest.fixture
+def supported_gpu():
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    error = cutedsl_requirement_error("simplified_sparse_attention", floor=(4, 8, 0))
+    if error:
+        pytest.skip(error)
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Requires SM100 or SM103")
+
+
+@pytest.mark.usefixtures("supported_gpu")
+@pytest.mark.parametrize("heads", [16, 32, 96], ids=lambda n: f"bf16-h{n}")
+@pytest.mark.parametrize("topk", [512, 1024, 2048], ids=lambda n: f"k{n}")
+def test_public_forward_backward_reference(heads, topk):
+    inputs = pack([sample(65, heads), sample(17, heads, seed=31)])
+    before = [t.clone() for t in (*inputs[0], inputs[2])]
+    result = run(inputs, backward=True, topk=topk)
+    check_reference(inputs, result, backward=True, topk=topk)
+    for actual, expected in zip((*inputs[0], inputs[2]), before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("supported_gpu")
+@pytest.mark.parametrize("heads,topk", [(16, 512), (32, 1024), (96, 2048)])
+def test_triangular_tiles_reference_and_replay(heads, topk):
+    from dataclasses import replace
+    from determinism_utils import assert_replays
+
+    tensors, metadata, upstream = pack([sample(129, heads), sample(17, heads, seed=31)])
+    inputs = tensors, replace(metadata, triangular_scores=True), upstream
+    check_reference(inputs, run(inputs, backward=True, topk=topk), backward=True, topk=topk)
+
+    def forward():
+        actual = run(inputs, topk=topk)
+        check_reference(inputs, actual, topk=topk)
+        return actual
+
+    assert_replays(forward)
+
+
+@pytest.mark.usefixtures("supported_gpu")
+@pytest.mark.parametrize("key_length", [1024, 131072], ids=["dense", "filtered-repair"])
+@pytest.mark.parametrize("stream_mode", ["default", "shared-side", "separate"])
+def test_host_threads_share_stream(monkeypatch, key_length, stream_mode):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import cute_dsl_filter_topk as selector
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import indexer_forward_topk_fused_tcgen05 as filtered
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import indexer_forward_topk_tcgen05 as indexer
+
+    q = torch.zeros((8, 16, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((key_length, 1, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    v[: key_length // 2] = 1
+    iq = torch.ones((8, 128), device="cuda", dtype=torch.bfloat16)
+    ik = torch.ones((key_length, 128), device="cuda", dtype=torch.bfloat16)
+    ik[key_length // 2 :] = -1
+    queries = (iq, -iq)
+    metadata = SimplifiedSparseAttentionMetadata(
+        torch.zeros(8, device="cuda", dtype=torch.int32),
+        torch.full((8,), key_length, device="cuda", dtype=torch.int32),
+        torch.ones(8, device="cuda", dtype=torch.bool),
+        torch.ones(1, device="cuda"),
+        False,
+        False,
+    )
+    stream = torch.cuda.default_stream() if stream_mode == "default" else torch.cuda.Stream()
+    streams = (stream, torch.cuda.Stream() if stream_mode == "separate" else stream)
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+
+    def invoke(i):
+        with torch.cuda.stream(streams[i]):
+            result = simplified_sparse_attention(q, k, v, queries[i], ik, metadata, 512)
+            return {name: tensor.detach().clone() for name, tensor in result.items()}
+
+    expected = [invoke(i) for i in range(2)]
+    for stream in streams:
+        stream.synchronize()
+    for i, result in enumerate(expected):
+        torch.testing.assert_close(result["output"], torch.full_like(q, 1 - i), rtol=0, atol=0)
+        assert torch.isfinite(result["indexer_loss"]).all()
+
+    paused, release, second_entered, second_done = (Event() for _ in range(4))
+    first_thread = []
+    original_run = indexer.run
+
+    def enter(*args, **kwargs):
+        if get_ident() != first_thread[0]:
+            second_entered.set()
+        return original_run(*args, **kwargs)
+
+    # Pause after writing shared scores or filtered inputs, before consuming them.
+    module, name = (selector, "cute_dsl_topk_prefill_wrapper") if key_length == 1024 else (filtered, "_filtered_repair_graph")
+    original_consume = getattr(module, name)
+
+    def consume(*args, **kwargs):
+        if get_ident() == first_thread[0]:
+            paused.set()
+            assert release.wait(30), "First caller was not released"
+        return original_consume(*args, **kwargs)
+
+    def worker(i):
+        if i == 0:
+            first_thread.append(get_ident())
+        try:
+            return invoke(i)
+        finally:
+            if i == 1:
+                second_done.set()
+
+    monkeypatch.setattr(indexer, "run", enter)
+    monkeypatch.setattr(module, name, consume)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker, 0)
+        try:
+            assert paused.wait(30), "First caller did not reach shared scratch"
+            second = pool.submit(worker, 1)
+            assert second_entered.wait(30), "Second caller did not enter the indexer"
+            # An unlocked caller overwrites scratch while the first is paused.
+            if stream_mode == "separate":
+                assert second_done.wait(30), "Separate streams were serialized"
+            else:
+                second_done.wait(1)
+        finally:
+            release.set()
+        actual = [first.result(timeout=30), second.result(timeout=30)]
+    for stream in streams:
+        stream.synchronize()
+    for result, reference in zip(actual, expected):
+        assert_bitwise(result, reference)
+
+
+def test_lazy_imports():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import importlib.abc
+
+class NoJax(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "jax" or fullname.startswith("jax."):
+            raise ModuleNotFoundError("JAX is not installed", name=fullname)
+
+sys.meta_path.insert(0, NoJax())
+import cudnn.ops
+import cudnn.simplified_sparse_attention
+assert "torch" not in sys.modules
+assert "cutlass" not in sys.modules
+assert "jax" not in sys.modules
+assert "simplified_sparse_attention" in cudnn.ops.__all__
+assert "simplified_sparse_attention_jax" in cudnn.ops.__all__
+from cudnn.simplified_sparse_attention import (
+    SimplifiedSparseAttentionMetadata,
+    dense_indexer_kl,
+    simplified_sparse_attention,
+    simplified_sparse_attention_reserve,
+)
+assert SimplifiedSparseAttentionMetadata is cudnn.ops.SimplifiedSparseAttentionMetadata
+assert dense_indexer_kl is cudnn.ops.dense_indexer_kl
+assert simplified_sparse_attention is cudnn.ops.simplified_sparse_attention
+assert simplified_sparse_attention_reserve is cudnn.ops.simplified_sparse_attention_reserve
+assert "jax" not in sys.modules
+assert "flash_attn" not in sys.modules
+assert "cudnn.simplified_sparse_attention.cutedsl.kernels.phase1_dense_indexer_kl" not in sys.modules
+""",
+        ],
+        check=True,
+    )
+
+
+@pytest.mark.parametrize("name", ["a_major", "b_major", "c_major"])
+def test_dense_tensor_layout_rejected_before_allocation(monkeypatch, name):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels.dense_gemm_sm100 import prepare_tensors
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("Allocated tensors before checking their layouts")
+
+    monkeypatch.setattr(torch, "empty", unexpected_allocation)
+    layouts = dict(a_major="k", b_major="n", c_major="n")
+    layouts[name] = "invalid"
+    with pytest.raises(ValueError, match=name):
+        prepare_tensors((16, 32, 64, 1), cutlass.BFloat16, cutlass.BFloat16, **layouts)
+
+
+@pytest.mark.parametrize("unroll,threads,blocks,expected", [(0, 512, 4, 2), (0, 1024, 2, 2), (0, 256, 1, 4), (1, 512, 4, 1), (8, 512, 4, 8)])
+@pytest.mark.parametrize("local_indices", [False, True])
+def test_prefill_constructor_settings(unroll, threads, blocks, expected, local_indices):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels.cute_dsl_filter_topk.filtered_top_k_prefill_varlen import FilteredTopKKernelVarlenPrefill
+
+    kernel = FilteredTopKKernelVarlenPrefill(
+        cutlass.Float32,
+        131072,
+        512,
+        unroll_factor=unroll,
+        num_threads=threads,
+        target_blocks_per_sm=blocks,
+        subtract_row_start=local_indices,
+    )
+    assert kernel.unroll_factor == expected
+    assert kernel.num_threads_per_cta == threads
+    assert kernel.subtract_row_start_on_output is local_indices
+
+
+def test_old_dsl_fails_before_kernel_import(monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
+    with pytest.raises(ImportError, match="found 4.7.0"):
+        simplified_sparse_attention_reserve(128, 256, 512)
+
+
+def test_jax_old_dsl_allows_inspection_but_rejects_execution():
+    pytest.importorskip("jax")
+    script = """
+import sys
+from cudnn.frost import buffers
+buffers.cutedsl_state = lambda: (True, ("nvidia-cutlass-dsl", "4.7.1"))
+from cudnn.ops import simplified_sparse_attention_jax
+try:
+    simplified_sparse_attention_jax(*([None] * 9))
+except ImportError as error:
+    assert "4.8.0" in str(error) and "found 4.7.1" in str(error), str(error)
+else:
+    raise AssertionError("Unsupported DSL reached execution")
+assert not any(name.startswith("cudnn.simplified_sparse_attention.cutedsl.kernels.") for name in sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.usefixtures("supported_gpu")
+def test_capture_rejected_before_allocation():
+    inputs, metadata, _ = pack([sample(8)])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    probe = torch.zeros(1, device="cuda")
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=stream):
+        with pytest.raises(NotImplementedError, match="external CUDA graph capture"):
+            simplified_sparse_attention(*inputs, metadata, 512)
+        with pytest.raises(NotImplementedError, match="external CUDA graph capture"):
+            simplified_sparse_attention_reserve(128, 131072, 512)
+        probe.add_(1)
+    graph.replay()
+    torch.cuda.current_stream().wait_stream(stream)
+    assert probe.item() == 1
+
+
+@pytest.mark.usefixtures("supported_gpu")
+@pytest.mark.parametrize("change", ["dtype", "heads", "topk", "empty"])
+def test_rejects_unsupported_inputs(change):
+    inputs, metadata, _ = pack([sample(8)])
+    topk = 512
+    if change == "dtype":
+        inputs[0] = inputs[0].float()
+    elif change == "heads":
+        inputs[0] = inputs[0][:, :8]
+    elif change == "topk":
+        topk = 32
+    else:
+        inputs[0] = inputs[0][:0]
+    with pytest.raises(NotImplementedError):
+        simplified_sparse_attention(*inputs, metadata, topk)
+
+
+@pytest.mark.usefixtures("supported_gpu")
+def test_selected_support_reference():
+    tensors, upstream = sample(1025)
+    tensors[0], tensors[3] = tensors[0][:65], tensors[3][:65]
+    _, metadata, _ = pack([sample(65)])
+    metadata.key_ends.fill_(1025)
+    inputs = tensors, metadata, upstream[:65]
+    actual = run(inputs, backward=True)
+    check_reference(inputs, actual, backward=True)
+
+
+def test_filtered_runtime_declines_before_allocation(monkeypatch):
+    from cudnn.simplified_sparse_attention.cutedsl.kernels import indexer_forward_topk_fused_tcgen05 as fused
+
+    monkeypatch.setitem(sys.modules, "torch._higher_order_ops.cudagraph_conditional_nodes", None)
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("Allocated filtered state before checking the runtime")
+
+    monkeypatch.setattr(torch, "empty", unexpected_allocation)
+    with pytest.raises(NotImplementedError, match="PyTorch CUDA conditional graph support"):
+        fused._filtered_state(torch.device("cuda", 0), torch.bfloat16, 512, 128, 131072)

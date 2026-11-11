@@ -50,6 +50,7 @@ and wired into every ``SmemTile``, ``SPIN_RING_WAITS`` on exactly the per-KV-ite
 ring waits, the config twin's backstops, and the CuTe DSL version gate (Rule 7).
 """
 
+import ast
 import math
 import os
 import re
@@ -145,12 +146,47 @@ def test_sm107_decode_routes_to_the_rubin_sibling():
     assert sm100.__file__.endswith("/sm100/decode_d256_f16.py") and "sm100_decode" in sm100.__name__, sm100.__name__
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"split_kv": 4},
+        {"pack_gqa": False},
+        {"qh_per_kh": 8},
+        {"decode_q_tile": 32},
+        {"dtype_qkv": 3},
+        {"dtype_qkv": 3, "dtype_o": 3},
+        {"paged_kv": True, "page_size": 16, "seq_kv_lens_present": True},
+        {"has_sink": True},
+        {"window_right": 0},
+        {"stats_log2": True},
+        {"seq_q_lens_present": True, "seq_kv_lens_present": True},
+        {"seq_kv_lens_present": True},
+    ],
+)
+def test_cluster_combine_keeps_other_decode_contracts_unfused(change):
+    params = dict(dtype_qkv=2, split_kv=8, pack_gqa=True, qh_per_kh=16, decode_q_tile=16)
+    mod = _load(**(params | change))
+    assert mod.cluster_combine_supported(256, 256) == (not change)
+    if change:
+        with pytest.raises(ValueError, match="cluster combine requires"):
+            mod.compile(cluster_combine=True)
+
+
+@pytest.mark.parametrize("kwargs", [{"use_pdl": True}, {"has_lse": False}, {"d_qk": 248}, {"d_v": 248}])
+def test_cluster_combine_rejects_incompatible_compile_contract(kwargs):
+    mod = _load(dtype_qkv=2, split_kv=8, pack_gqa=True, qh_per_kh=16, decode_q_tile=16)
+    with pytest.raises(ValueError, match="cluster combine requires|per-split LSE"):
+        mod.compile(cluster_combine=True, **kwargs)
+
+
 def test_sm107_decode_body_matches_the_sm100_body():
-    """The SNAPSHOT pin: the Rubin module is the SM100 body line for line, modulo the
+    """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits and the header prose.  A fix that lands in one file and
-    not the other fails here; so does a body change smuggled into the port."""
+    keyword on the ring waits and the header prose. The optional cluster reducer and
+    its host/compiler bindings are separate implementations, exercised by the cluster
+    binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
 
     kdir = Path(api_dsl.__file__).parent / "kernels"
@@ -158,6 +194,20 @@ def test_sm107_decode_body_matches_the_sm100_body():
     sm107 = (kdir / "sm107" / "decode_d256_f16.py").read_text(encoding="utf-8")
 
     def _body(src):
+        lines = src.splitlines(keepends=True)
+        omitted = set()
+        for node in ast.parse(src).body:
+            if isinstance(node, ast.FunctionDef) and node.name in ("_host", "compile", "cluster_combine_supported"):
+                start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                omitted.update(range(start, node.end_lineno + 1))
+            if isinstance(node, ast.FunctionDef) and node.name == "_kernel":
+                for arg in node.args.args:
+                    if arg.arg in ("final_o_tensor", "final_lse_tensor"):
+                        omitted.update(range(arg.lineno, arg.end_lineno + 1))
+                tail = node.body[-1]
+                if isinstance(tail, ast.If) and ast.unparse(tail.test) == "cutlass.const_expr(final_o_tensor is not None)":
+                    omitted.update(range(tail.lineno, tail.end_lineno + 1))
+        src = "".join(line for n, line in enumerate(lines, 1) if n not in omitted)
         # everything after the module docstring, comments dropped
         end = src.index('"""', src.index('"""') + 3) + 3
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
@@ -419,7 +469,7 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     """The facts-level twin (engines.d256_decode_tile_selected) of the adapter's _decode_q_tile on the
     Rubin row: a decode-shaped half d256 graph is selected (paged or dense, sink or not); a gated,
     pre-folded, THD, quantized or wider graph is not -- and the row's paged rule admits exactly the
-    selected form while the paged PREFILL pipeline keeps its THD-only scope."""
+    selected D256 form; native D128 also serves dense-Q paging."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
@@ -442,10 +492,10 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     gated = SdpaGraphFacts(**{**base, "has_epilogue_gate": True, "epilogue_gate_dtype": cudnn.data_type.BFLOAT16})
     assert engines.d256_decode_tile_selected(caps, gated, 12) and engines.d256_decode_tile_selected(caps, gated, 12, split_kv=2)
     assert not engines.d256_decode_tile_selected(caps, gated, 12, split_kv=1)
-    for change in (dict(s_q=64), dict(d_qk=128, d_v=128)):
-        g = SdpaGraphFacts(**{**base, **change})
-        reason = engines.mismatch(caps, g, None)
-        assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
+    reason = engines.mismatch(caps, SdpaGraphFacts(**{**base, "s_q": 64}), None)
+    assert reason and "Rubin paged KV requires THD" in reason
+    # D128 has a native dense-Q page loader independently of the D256 decode tile.
+    assert engines.mismatch(caps, SdpaGraphFacts(**{**base, "d_qk": 128, "d_v": 128}), None) is None
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the 32-column tile, one unit
     # base is a PADDED, mask-free paged graph: the 64-column width's predicate declines it, so the (16, 32) table rules here
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units of the 32-column tile
@@ -635,6 +685,7 @@ def _run_graph(
     padded=True,
     capture=None,
     gate=None,
+    explicit_knobs=None,
 ):
     """Build cuDNN's paged (``page`` > 0) or dense SDPA graph -- padded (per-batch
     ``seq_len_kv`` / ``seq_len_q``, the default) or, with ``padded=False`` on a dense cache
@@ -652,7 +703,10 @@ def _run_graph(
     (``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)``, ``cudnn._sdpa_tail``) with a +-2 sigma
     G in the IO dtype; a number = that gate logit on every element (+-1e4: an exactly
     saturated sigmoid, 0: exactly one half).  The reference is then multiplied by
-    ``sigmoid(G)`` in fp32; the captured ``gate`` is the BSHD fp32 G."""
+    ``sigmoid(G)`` in fp32; the captured ``gate`` is the BSHD fp32 G.
+
+    ``explicit_knobs`` builds a caller-selected public knob configuration, including
+    supported configurations that the default proposal list does not yet contain."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
 
@@ -722,7 +776,15 @@ def _run_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, _engine(), pack_gqa=pack_gqa, split_kv=split_kv)
+    if explicit_knobs is None:
+        plan = select_engine(g, _engine(), pack_gqa=pack_gqa, split_kv=split_kv)
+    else:
+        select_engine(g, _engine())
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        knobs.update(explicit_knobs)
+        g.create_execution_plan(engine, knobs)
+        g.select_plan(g.get_execution_plan_count() - 1)
+        plan = g.plans[g._plan_index]
     idx = g._plan_index
     g.check_support()
     g.build_plans()

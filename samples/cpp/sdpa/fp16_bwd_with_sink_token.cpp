@@ -201,7 +201,7 @@ TEST_CASE("Toy sdpa backward with sink", "[graph][sdpa][flash][backward]") {
     bool has_attn_bias  = (cudnnGetVersion() >= 90500);
     bool has_sink_token = (cudnnGetVersion() >= 91300);
     if (cudnnGetVersion() < 91300) {
-        SKIP("Test requires cudnn 9.1.3 or above");
+        SKIP("Test requires cudnn 9.13 or above");
         return;
     }
 

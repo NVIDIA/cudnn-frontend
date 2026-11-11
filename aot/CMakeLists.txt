@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Ahead-of-time compiled kernels (opt-in: -DCUDNN_FRONTEND_BUILD_AOT_SM120=ON). See docs/fe-oss-apis/aot_sm120_attention.md.
+# Ahead-of-time compiled kernels (opt-in: -DCUDNN_FRONTEND_BUILD_AOT_SM120=ON). See docs/operations/attention/aot_sm120_attention.md.
 #
 # libcudnn_frontend_aot_sm120.so is produced by aot/sm120/build.py, which needs a Python with this checkout importable
 # (e.g. `pip install -e .`, which brings the CuTeDSL wheel). Point CMake at it with -DPython3_EXECUTABLE=<python>.

@@ -29,6 +29,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype
 from ..common.state_snapshot import snapshot_states
 from . import gdn2_prefill_f16, gdn2_prep_f16, gdn2_prep_prefill_f16
@@ -57,6 +59,7 @@ def uncut_forward_host(
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
@@ -167,6 +170,7 @@ def uncut_forward_host(
         w,
         cu_seqlens,
         seed_state,
+        composed,
         o,
         state_out,
         seed_rows,
@@ -194,6 +198,7 @@ def build_uncut_forward(
     o,
     cu_seqlens,
     state_in,
+    composed=None,
     state_out,
     seed_indices,
     final_indices,
@@ -263,6 +268,7 @@ def build_uncut_forward(
         bool(allow_neg_eigval),
         bool(beta_guard),
         state_in is not None,
+        composed is not None,
         state_out is not None,
         seed_indices is not None,
         final_indices is not None,
@@ -278,7 +284,9 @@ def build_uncut_forward(
             io_dtype,
             state_dtype,
             gate_dtype,
-            use_initial_state=state_in is not None,
+            use_initial_state=state_in is not None or composed is not None,
+            state_table=state_in is not None,
+            has_composed=composed is not None,
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
             checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
@@ -320,7 +328,7 @@ def build_uncut_forward(
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        uncut_forward_cache[key] = cute.compile(
+        uncut_forward_cache[key] = compile_cached(
             uncut_forward_host,
             int(b_t),
             int(num_sm),
@@ -341,6 +349,7 @@ def build_uncut_forward(
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_in is not None else None,
+            from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if composed is not None else None,
             from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_out is not None else None,
             from_dlpack(seed_indices, assumed_align=4).mark_layout_dynamic() if seed_indices is not None else None,
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
@@ -354,6 +363,8 @@ def build_uncut_forward(
             *prep_placeholders,
             from_dlpack(state_snapshot, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_snapshot is not None else None,
             cuda.CUstream(int(stream)),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_gdn2_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_forward_cache[key]
@@ -373,6 +384,7 @@ def run_uncut_forward(
     o,
     cu_seqlens,
     state_in,
+    composed=None,
     state_out,
     seed_indices,
     final_indices,
@@ -411,6 +423,7 @@ def run_uncut_forward(
         o,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,

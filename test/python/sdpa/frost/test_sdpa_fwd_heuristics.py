@@ -434,7 +434,8 @@ def _sm120_gqa6_facts(**over):
 def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     """Every SM120 template packs any GQA group up to the tile (the rows past (tile_m // G) * G are dead), at
     D=128, 256 and 512, and declines a group past the tile. An unset tile_m is the adapter's own Q tile: 64 rows on
-    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. Every other row requires divisibility."""
+    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. SM100/SM90 retain a divisor-based packing rule; SM80 packs consecutive query/head rows across tile boundaries.
+    """
     from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
     from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
@@ -464,8 +465,9 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
     assert caps.pack_gqa_requires_divisible is False
-    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm80"):
+    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90"):
         assert _sm120_spec(other).capabilities.pack_gqa_requires_divisible, other
+    assert _sm120_spec("sdpa_fwd_prefill_sm80").capabilities.pack_gqa_requires_divisible is False
 
 
 @pytest.mark.L0
@@ -550,13 +552,15 @@ def test_sm120_split_model_counts_whole_tokens_per_packed_tile():
 def test_sm120_pack_gqa_sets_split_for_their_own_launch(monkeypatch, over):
     """The split chooser (mocked) sees each set's own launch -- G-head packed units, or G x as many unpacked -- so
     the unpacked runner of a packed lead carries its own answer, not the packed launch's split, and so does a tile
-    runner: at S_q = 31 the 128-row packed lead launches two Q tiles per KV head, its 64-row runner four."""
+    runner: at S_q = 31 the 128-row packed lead launches two Q tiles per KV head, its 64-row runner four.  The decode
+    tile's own chooser is mocked with the same rule over its unit count."""
     from cudnn.sdpa.fwd import heuristics
 
     def by_units(*, q_tiles, heads_q, batch, **_):
         return max(1, 256 // (q_tiles * heads_q * batch))
 
     monkeypatch.setattr(heuristics, "choose_split_kv", by_units)
+    monkeypatch.setattr(heuristics, "choose_sm120_decode_split_kv", lambda *, units, **_: max(1, 256 // units))
     monkeypatch.setattr(heuristics, "_MAX_SETS_PER_ENGINE", 64)
     facts = _sm120_gqa6_facts(**{**dict(s_q=1, s_kv=16384, causal=False), **over})
     sets = heuristics._knob_sets(_sm120_spec(), facts)
@@ -634,14 +638,14 @@ def test_sm120_mxfp8_d512_flavor_and_tile_contract():
 @pytest.mark.L0
 @pytest.mark.parametrize("dim", [256, 512])
 def test_sm120_fp8_dense_layouts_and_split_output(dim):
-    """FP8 layouts normalize to compact storage before main and split-combine kernels."""
+    """Aligned FP8 pitches bind natively in both main and split-combine kernels."""
     from types import SimpleNamespace
 
     shape = (1, 4, 16, dim)
     head_major = (64 * dim, 16 * dim, dim, 1)
-    padded = (64 * (dim + 1), 16 * (dim + 1), dim + 1, 1)
-    query = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: padded)
-    output = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: head_major)
+    padded = (64 * (dim + 16), 16 * (dim + 16), dim + 16, 1)
+    query = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: padded, get_data_type=lambda: cudnn.data_type.FP8_E4M3)
+    output = SimpleNamespace(get_dim=lambda: shape, get_stride=lambda: head_major, get_data_type=lambda: cudnn.data_type.BFLOAT16)
     facts = _facts(
         s_q=16,
         s_kv=32768,
@@ -752,18 +756,17 @@ def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
 
 @pytest.mark.L0
 def test_per_tensor_fp8_envelope_uses_d256_cga1():
-    """The D256 flavor's geometry (cga = 1) reaches the plan list for its exact
-    shape; a non-native shape in its padded envelope is declined (the flavor is
-    floored to exact shapes until its padded paths are validated), so no plan is
-    proposed for it at all."""
-
+    """Exact and aligned padded heads use the D256 flavor with CGA1."""
     name = engines.engine_name(fp8=True)
-    exact = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    plans = recommend("A", exact, {name: 20510})
-    assert plans
-    assert {plan.knobs.cga for plan in plans} == {1}
-    padded = _facts(d_qk=224, d_v=224, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    assert not recommend("A", padded, {name: 20510})
+    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
+    for d in (256, 224):
+        facts = _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+        plans = recommend("A", facts, {name: 20510})
+        assert plans
+        assert {plan.knobs.cga for plan in plans} == {1}
+        assert all(engines._selected_d_shape(row, facts, plan.knobs) == (256, 256) for plan in plans)
+    misaligned = _facts(d_qk=225, d_v=224, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
+    assert not recommend("A", misaligned, {name: 20510})
 
 
 @pytest.mark.L0
@@ -846,6 +849,25 @@ def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
 
 
 @pytest.mark.L0
+def test_sm100_mxfp8_row_serves_a_ragged_mask_free_kv_tail():
+    """The SM100 MXFP8 row admits a dense, mask-free S_kv off the 128-key tile (skv_tail_via_padding); the lowering
+    predicate selects that graph and not a covered causal tail or real per-batch lengths; the split gate keeps it
+    unsplit."""
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    sm100 = caps[engines.engine_name(mxfp8=True)]
+    quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
+    ragged = dict(s_q=2100, s_kv=2100, causal=False, **quant)
+    assert sm100.skv_tail_via_padding
+    assert engines.mismatch(sm100, _facts(**ragged)) is None
+    assert engines._synth_kv_padding(sm100, _facts(**ragged))
+    assert not engines._synth_kv_padding(sm100, _facts(**dict(ragged, causal=True)))
+    assert not engines._synth_kv_padding(sm100, _facts(padded=True, **ragged))
+    assert engines.mismatch(sm100, _facts(**dict(ragged, causal=True))) is None
+    why = engines.mismatch(sm100, _facts(**ragged), engines.SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
 def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm107_metadata_target):
     """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at
@@ -884,8 +906,9 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     GQA 1 and 3, S=4K..32K, controls <= 0.35 %; O / Stats / Amax_O bitwise identical across policies).  The notch is
     an explicit oracle arm, not a domain effect (unlike d256: the d128 kernel serves LPT_L2), so the row's domain must
     still list all three.  Everything around it keeps the old proposal: the per-tensor FP8 d128 row measured
-    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor and the Rubin d128 MXFP8 row are unmeasured
-    and lead with LPT_L2 on a GQA graph; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
+    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor leads with LPT_L2 on a
+    GQA graph; the sm107 quantized d128 rows lead with plain LPT below _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES per KV
+    head on a GQA graph and keep the L2-budget arm above it; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
@@ -911,8 +934,49 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     # Scope: d128 only, SM100 row only, causal only.
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
+    rubin_fp8 = caps[engines.engine_name(fp8=True, arch="sm107")]
     assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    for s in (2048, 4096):
+        short = {**quant, "s_q": s, "s_kv": s}
+        assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=24, device_cc=(10, 7), **short))[0] != SCHED_LPT_L2, s
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, causal=False, **quant)) == [SCHED_NATURAL]
+
+
+@pytest.mark.L0
+def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
+    """sm100 d192x128 f16/bf16 without GQA, causal: plain LPT leads while the grid is at most
+    _SM100_D192_LPT_MAX_WAVES waves of 512-row pair units; above that LPT_L2 leads, except on cc 10.3 with more
+    (batch, head) streams than SMs, where NATURAL leads; a mask-free graph proposes NATURAL alone; a GQA d192 graph
+    keeps the L2-budget rule."""
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+    from cudnn.sdpa.fwd.heuristics import _SM100_D192_LPT_MAX_WAVES, _sched_points
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    f16 = caps[engines.engine_name()]
+    d192 = dict(d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_sm_count=148)
+
+    def points(b, h, s, **over):
+        return _sched_points(f16, _facts(b=b, h_q=h, h_kv=over.pop("h_kv", h), s_q=s, s_kv=s, **d192, **over))
+
+    lpt, lpt_l2, natural = [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2]
+    assert _SM100_D192_LPT_MAX_WAVES == 12
+    for cc in ((10, 0), (10, 3)):
+        assert points(2, 64, 2048, device_cc=cc) == lpt  # 512 pair units / 74 clusters = 6.9 waves
+        assert points(1, 64, 4096, device_cc=cc) == lpt  # 6.9 waves
+        assert points(2, 96, 2048, device_cc=cc) == lpt  # 10.4 waves
+        assert points(2, 64, 4096, device_cc=cc) == lpt_l2  # 13.8 waves, 128 streams
+        assert points(1, 64, 16384, device_cc=cc) == lpt_l2  # 27.7 waves, 64 streams
+        assert points(2, 64, 2048, device_cc=cc, causal=False) == [SCHED_NATURAL]
+        assert points(2, 64, 2048, device_cc=cc, h_kv=8) == lpt_l2
+    assert points(2, 128, 2048, device_cc=(10, 0)) == lpt_l2  # 13.8 waves, 256 streams
+    assert points(2, 128, 2048, device_cc=(10, 3)) == natural
+    assert points(2, 96, 4096, device_cc=(10, 0)) == lpt_l2  # 20.8 waves, 192 streams
+    assert points(2, 96, 4096, device_cc=(10, 3)) == natural
+    plans = recommend("A", _facts(b=2, h_q=64, h_kv=64, s_q=2048, s_kv=2048, **d192), _OFFERED)
+    lead = next(p for p in plans if p.engine_id == 20500)
+    assert (lead.knobs.split_kv, lead.knobs.cga, lead.knobs.sched_policy) == (1, 2, SCHED_LPT), lead.knobs
 
 
 @pytest.mark.L0
@@ -1177,6 +1241,74 @@ def test_unsplit_leg_accounting_moves_the_wide_head_flavors_too():
     for plans in (d256, d192):
         assert (plans[0].knobs.cga, plans[0].knobs.split_kv) == (2, 1), plans[0].knobs
         assert all(p.knobs.split_kv == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_sm100_d192_half_proposals_are_admissible_and_transport_the_chooser(monkeypatch):
+    """Every set the SM100 f16 row proposes for a dense half-input d192x128 MHA graph passes mismatch() and sits in
+    the flavor's width domain at the sequence lengths around the 512-row pair geometry, masked or not; and the lead
+    set carries exactly the width and scheduler select_d192_auto_knobs returns (transport, the chooser mocked both
+    ways).  Which width wins where is the chooser's measured business, not a contract of this test."""
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+
+    def facts(**over):
+        base = dict(b=8, h_q=64, h_kv=64, d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16)
+        base.update(over)
+        return _facts(**base)
+
+    for s in (128, 256, 384, 512, 768, 1024, 1280, 1792, 2048):
+        for causal in (True, False):
+            f = facts(s_q=s, s_kv=s, causal=causal)
+            plans = [p for p in recommend("A", f, _OFFERED) if p.engine_id == 20500]
+            assert plans, (s, causal)
+            for p in plans:
+                assert engines.mismatch(spec.capabilities, f, p.knobs) is None, (s, causal, p.knobs)
+                assert p.knobs.cga in engines.effective_cgas(spec.capabilities, f), (s, causal, p.knobs)
+    for forced in ((SCHED_LPT, 1), (SCHED_NATURAL, 2)):
+        # The split leg keeps the real chooser's answer (the pair): only the unsplit lead is forced.
+        monkeypatch.setattr(heur, "select_d192_auto_knobs", lambda params, _forced=forced, **kw: _forced if params.split_kv == 1 else (SCHED_NATURAL, 2))
+        lead = [p for p in recommend("A", facts(s_q=640, s_kv=640), _OFFERED) if p.engine_id == 20500][0]
+        assert (lead.knobs.sched_policy, lead.knobs.cga) == forced
+
+
+@pytest.mark.L0
+def test_d192_half_default_width_constructs_on_both_targets():
+    """The width select_d192_auto_knobs returns for a dense causal half-input MHA graph constructs a configuration on
+    the target it was asked about: the SM100 factory for cc 10.0 / 10.3, the SM107 factory for cc 10.7 -- whose d192
+    tile has no single-CTA configuration, so the selector must leave that target on the pair."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd import config_sm100 as c100
+    from cudnn.sdpa.fwd import config_sm107 as c107
+    from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+
+    for cc, cfgmod in (((10, 0), c100), ((10, 3), c100), ((10, 7), c107)):
+        for s in (128, 256, 384, 512, 768, 1024):
+            params = cfgmod.TemplateParams(window_right=0)  # top-left causal
+            sched, cga = select_d192_auto_knobs(params, pertensor=False, s_q=s, s_kv=s, device_cc=cc)
+            cfg, _ = cfgmod.make_cfg_d192(replace(params, cta_mma=cga, sched_policy=sched))
+            assert cfg.CTA_MMA == cga, (cc, s)
+            if cc == (10, 7):
+                assert cga == 2, (cc, s)
+
+
+@pytest.mark.L0
+def test_sm100_d192_half_single_cta_ring_geometry():
+    """The half-input single-CTA d192 tile runs K as three 16 KiB D-subtile slots over one stage and V double-buffered
+    (208 KiB under the Q u O slab); the pair and the FP8 single-CTA tile keep one depth for both rings
+    (config_sm100.CfgD192.STAGES_K / STAGES_V / K_SUB)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.fwd.config_sm100 import _SM100_MAX_DYN_SMEM, TemplateParams, _d192_smem_bytes, make_cfg_d192
+
+    one, _ = make_cfg_d192(TemplateParams(cta_mma=1))
+    assert (one.STAGES_KV, one.STAGES_K, one.STAGES_V, one.K_SUB) == (1, 1, 2, 3)
+    assert _d192_smem_bytes(one) == 208 * 1024 <= _SM100_MAX_DYN_SMEM
+    two, _ = make_cfg_d192(TemplateParams(cta_mma=2))
+    assert (two.STAGES_KV, two.STAGES_K, two.STAGES_V, two.K_SUB) == (2, 2, 2, 1)
+    fp8, _ = make_cfg_d192(TemplateParams(cta_mma=1, dtype_qkv=DTYPE_E4M3))
+    assert (fp8.STAGES_KV, fp8.STAGES_K, fp8.STAGES_V, fp8.K_SUB) == (2, 2, 2, 1)
 
 
 @pytest.mark.L0
@@ -1572,11 +1704,13 @@ def test_sm107_d128_prefolded_graphs_keep_the_native_body(sm107_metadata_target)
 @pytest.mark.L0
 def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     """Explicit pins on the cc 10.7 half row (issue #1472): dense d128 half admits cga=1 (the shared decode tile) and
-    cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
-    does not (96/8) is declined with the divisibility reason, dense d256 packs on the d256 decode tile within its route
+    cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too). Partial
+    groups (96/8) also run on native cga=2; shared cga=1 retains its divisibility rule. Dense d256 packs within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    keeps the cga2 prefill pipeline (cga=1 outside its domain, no packed leg), and dense PAGED queries -- not wired on
-    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    admits both native prefill widths and unsplit packing, and dense PAGED queries admit native cga=1 and cga=2
+    since #2375 (the native D128 loader reads dense Q over page pools)."""
+    from dataclasses import replace
+
     from cudnn.sdpa.fwd.engines import effective_cgas
 
     caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
@@ -1586,7 +1720,10 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     for h_kv in (16, 8, 4):
         assert engines.mismatch(caps, _sm107_d128_facts(h_kv=h_kv), pack) is None, h_kv
     assert engines.mismatch(caps, _sm107_d128_facts(d_qk=64, d_v=64), pack) is None
-    assert "divide" in engines.mismatch(caps, _sm107_d128_facts(h_q=96, h_kv=8), pack)
+    partial = _sm107_d128_facts(h_q=96, h_kv=8)
+    assert engines.mismatch(caps, partial, pack) is None
+    assert engines.mismatch(caps, partial, replace(pack, cga=2)) is None
+    assert "divide" in engines.mismatch(caps, partial, replace(pack, cga=1))
     # dense d256 (64/8 at S_q 8 = 64 packed rows = ONE unit of the 64-column tile; S_q 16 = 128 rows = two units of it): the d256
     # decode tile packs the whole group, so the request is ADMITTED; past the route (S_q 17 = 136 rows, a third unit) the dense d256
     # prefill kernel runs unpacked and the packed request is a typed decline naming the decode tile among the routes
@@ -1595,9 +1732,11 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     past_route = engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=17), pack)
     assert past_route is not None and "decode tile" in past_route, past_route
     thd = _sm107_d128_facts(thd=True, padded=True)
-    assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
-    assert engines.mismatch(caps, thd, pack) is not None
-    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+    assert engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1)) is None
+    assert engines.mismatch(caps, thd, pack) is None
+    assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
+    assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
+    assert effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True)) == frozenset({1, 2})  # #2375
 
 
 @pytest.mark.L0
@@ -1616,17 +1755,17 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
     "over, first_sched",
     [
         (dict(), SCHED_LPT),
-        (dict(b=1, s_q=1, s_kv=32768), SCHED_LPT),
+        (dict(s_q=1, s_kv=32768), SCHED_LPT),  # b=128: no split; at b=1 the split leads, sink or not
         (dict(b=32, s_q=16, s_kv=8192), SCHED_LPT),
         (dict(b=8, s_q=1, s_kv=1024), 0),
-        (dict(b=8, s_q=4, s_kv=4096, d_qk=64, d_v=64, window_left=128), 0),
+        (dict(b=8, s_q=4, s_kv=4096, d_qk=128, d_v=128, window_left=128), 0),
         (dict(h_kv=4, s_q=16, s_kv=2048), 0),
         (dict(b=2, s_q=4096, s_kv=4096, window_left=1024), 0),
         (dict(b=2, s_q=4096, s_kv=4096, window_left=1024, has_sink=False), 0),
     ],
     ids=[
         "issue_cell_lpt",
-        "long_cache_b1_lpt",
+        "long_cache_lpt",
         "q16_g8_one_tile_lpt",
         "short_cache_natural",
         "swa_decode_natural",
@@ -1637,19 +1776,20 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
 )
 def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_target, over, first_sched):
     """The scheduler lead of the cc 10.7 shared dense d128 legs (issue #1472's tables, heuristics._SM107_DECODE_TILE_LPT_MIN_KV
-    and the two cc 10.7 arms of _sched_points): the packed decode tile walks plain LPT first from a 2k cache on; a short
+    and the two cc 10.7 arms of _sched_points): the unsplit packed decode tile walks plain LPT first from a 2k cache on; a short
     cache, a sliding window (on the decode tile and on the packed cga2 prefill body alike) and the one-cluster packed cga2
     band keep NATURAL first.  The other policy is always listed as a runner and every proposed set stays admissible; the
     SM100 row's one-cluster NATURAL lead on the same decode shape is untouched."""
     facts = _sm107_d128_facts(**over)
     plans = _sm107_f16_plans(facts)
     first = plans[0].knobs
-    if over.get("d_qk") == 64:
-        # The d64 envelope no longer rides the shared d128 bodies knob-less: the row's native 64-wide tile (the dense leg, cga1,
-        # unpacked) is the first proposal; the shared decode tile stays reachable through the PackGQA / split knobs.
+    if over.get("d_qk") == 128:
+        # D128 still reaches the shared decode tile when packed. D64 has
+        # its own native packed tile and is covered by the flavor contract test.
         caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
-        assert first.pack_gqa is False and first.cga == 1, first
-        assert engines.mismatch(caps, facts, first) is None, first
+        assert any(p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+        assert any(not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+        assert all(engines.mismatch(caps, facts, p.knobs) is None for p in plans), [p.knobs for p in plans]
         return
     assert first.pack_gqa is True, first
     assert first.sched_policy == first_sched, [p.knobs for p in plans]
@@ -1660,6 +1800,32 @@ def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_
     )
     sm100_plans = [p for p in recommend("A", sm100, {_F16: 20500}) if p.engine_id == 20500]
     assert sm100_plans and sm100_plans[0].knobs.sched_policy in (None, 0), sm100_plans[0].knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, lpt",
+    [
+        (dict(b=1, s_q=4096, s_kv=4096), True),  # d128, 4.7 waves
+        (dict(b=16, s_q=8192, s_kv=8192), False),  # d128, 152 waves
+        (dict(b=16, s_q=8192, s_kv=8192, d_qk=64, d_v=64), True),  # the 1-CTA d64 flavor at any size
+        (dict(b=1, s_q=4096, s_kv=4096, d_qk=256, d_v=256), False),  # d256 keeps NATURAL
+        (dict(b=1, s_q=4096, s_kv=4096, window_left=1024), False),
+        (dict(b=1, s_q=4096, s_kv=4096, has_sink=True), False),
+        (dict(b=1, s_q=4096, s_kv=4096, causal=False, bottom_right=False), False),
+    ],
+    ids=["d128_few_waves", "d128_many_waves", "d64_any_size", "d256", "window", "sink", "no_mask"],
+)
+def test_sm107_unpacked_causal_thd_scheduler(sm107_metadata_target, over, lpt):
+    """cc 10.7 half THD prefill without packing (MHA here): LPT leads on d64 and on d128 up to
+    _SM107_THD_LPT_MAX_WAVES, NATURAL otherwise; the other policy stays listed for autotune (rubin_sched_thd study)."""
+    from cudnn.sdpa.fwd.heuristics import _sched_points
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    facts = _sm107_d128_facts(**{**dict(h_q=32, h_kv=32, thd=True, padded=True, has_sink=False), **over})
+    points = _sched_points(caps, facts)
+    assert points[0] == (SCHED_LPT if lpt else SCHED_NATURAL), points
+    assert set(points) == {SCHED_LPT, SCHED_NATURAL}, points
 
 
 def _decode_d256_facts(**over):
@@ -1867,8 +2033,9 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert sink[0].pack_gqa is True and all(k.split_kv == 1 for k in sink), sink
     prefill = facts(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False)
     assert all(k.pack_gqa is not True and k.split_kv == 1 for k in sets(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False))
-    why = engines.mismatch(row, prefill, engines.SdpaFwdKnobs(split_kv=2))
-    assert why and "decode tile" in why, why
+    # Native unpacked prefill now supports an explicit split request; this
+    # does not change the existing heuristic's unsplit recommendation above.
+    assert engines.mismatch(row, prefill, engines.SdpaFwdKnobs(split_kv=2)) is None
     # The paged THD d256 packed graph is NOT the decode tile's (it has no THD scheduler): unsplit at CGA2 it is served by
     # the paged half prefill pipeline's own D256 PackGQA (config_sm100.supports_paged_d256_pack_gqa); a SPLIT packed
     # request has no route on either path and the decline names both.
@@ -2033,14 +2200,15 @@ def test_sm107_paged_thd_sink_sets_pack_and_order_like_their_sink_free_twins(sm1
 
 @pytest.mark.L0
 def test_sm107_paged_thd_rules_do_not_move_the_sm100_row():
-    """The cc 10.7 paged measurements widen nothing on the SM100 line: paged GQA16 stays unpacked-first there, a sink keeps
-    the NATURAL lead and the cga2 width (its own measured family, #1468 / PR #1469's domain)."""
+    """The cc 10.7 paged measurements do not move the SM100 line: a sink keeps the NATURAL lead and the cga2 width (its own
+    measured family, #1468 / PR #1469's domain). Paged GQA16 packs first on SM100 by the SM100 row's own measurement
+    (B200 full-prefill GQA16), not through the cc 10.7 half predicate."""
     from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
 
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
     sm100 = dict(device_cc=(10, 0), device_sm_count=148)
     gqa16 = _sm107_paged_thd_facts(h_kv=4, has_sink=False, **sm100)
-    assert not _sm107_paged_half(caps, gqa16) and not _prefer_thd_pack_gqa(caps, gqa16)
+    assert not _sm107_paged_half(caps, gqa16) and _prefer_thd_pack_gqa(caps, gqa16)
     sink = _sm107_paged_thd_facts(**sm100)
     plans = [p for p in recommend("A", sink, {_F16: 20500}) if p.engine_id == 20500]
     assert plans and all(engines.mismatch(caps, sink, p.knobs) is None for p in plans)
@@ -2120,3 +2288,237 @@ def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
     else:
         assert reason is not None
     assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=2) == 128
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv, causal",
+    [
+        (8, 8, 1, 576, 13568, True),  # past one 512-row Q tile
+        (8, 8, 1, 640, 13568, False),
+        (4, 32, 4, 768, 13568, True),
+        (1, 64, 8, 2048, 2048, True),
+        (8, 16, 16, 576, 8192, True),  # MHA: nothing to pack
+    ],
+)
+def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, h_q, h_kv, s_q, s_kv, causal):
+    """Rubin per-tensor FP8 dense d128 past one Q tile: GQA graphs list a packed set (admission, not which set wins), MHA
+    lists none, and every proposed set is admitted by mismatch()."""
+    facts = _facts(
+        b=b,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        bottom_right=causal,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
+    assert plans
+    assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    import dataclasses
+
+    from cudnn.sdpa.fwd.heuristics import _sm107_fp8_dense_d128
+
+    assert _sm107_fp8_dense_d128(spec.capabilities, facts)
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, has_paged_kv=True, page_size=16))
+    assert not _sm107_fp8_dense_d128(spec.capabilities, dataclasses.replace(facts, padded=True))
+
+
+@pytest.mark.L0
+def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target):
+    """Past one Q tile the Rubin paged split budget is two waves of SMs: a mixed-length chunk whose declared capacity fills
+    one wave still splits; at most one Q tile keeps the first-wave budget; far past two waves stays unsplit."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    base = dict(
+        b=3,
+        h_q=8,
+        h_kv=2,
+        s_q=864,
+        s_kv=16384,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1)),
+        max_total_seq_len_q=3 * 864,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    assert paged_thd_split_choice(caps, _facts(**base))[0] > 1
+    assert paged_thd_split_choice(caps, _facts(**dict(base, b=4, h_q=32, h_kv=8, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751)))[0] == 1
+    # MHA / group 2 keep the first-wave budget (the review's B3 32/32 and 32/16, Q 256, KV 16k, total 768 example)
+    for h_kv in (32, 16):
+        f = _facts(**dict(base, h_q=32, h_kv=h_kv, s_q=256, s_kv=16384, max_total_seq_len_q=768))
+        assert paged_thd_split_choice(caps, f)[0] == 1, h_kv
+    # The two-wave split stays the default; the first-wave split is listed second (review: B3 8/2, Q 256, KV 4096, total 768)
+    f = _facts(**dict(base, s_q=256, s_kv=4096, max_total_seq_len_q=768))
+    assert paged_thd_split_choice(caps, f)[0] == 8 and paged_thd_split_choice(caps, f, first_wave=True)[0] == 4
+    plans = _sm107_f16_plans(f)
+    assert [p.knobs.split_kv for p in plans[:2]] == [8, 4], [p.knobs for p in plans[:3]]
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert all(engines.mismatch(spec.capabilities, f, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+def test_sm107_paged_split_ties_go_to_the_packed_grid(sm107_metadata_target):
+    """A bounded one-tile Rubin paged chunk (Q bound 128) declares as many packed tiles as unpacked ones; the live tokens sit at or
+    below the bound, so the equal-work tie goes to the packed grid at the same split -- on the main arm (G16 at one Q tile: a first-wave tie) and on the
+    one-tile fallback (G8). The SM100 wave choice keeps its unpacked tie-break."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import _d128_thd_split_wave_choice, paged_thd_split_choice
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    base = dict(
+        s_q=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        shape_overrides=True,
+        k_t=SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1)),
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    g16 = _facts(**dict(base, b=2, h_q=32, h_kv=2, s_kv=16384, max_total_seq_len_q=256))
+    assert paged_thd_split_choice(caps, g16) == (3, True)
+    assert [(p.knobs.pack_gqa, p.knobs.split_kv) for p in _sm107_f16_plans(g16)[:1]] == [(True, 3)]
+    g8 = _facts(**dict(base, b=4, h_q=32, h_kv=4, s_kv=32768, max_total_seq_len_q=512))
+    splits, pack = paged_thd_split_choice(caps, g8)
+    assert pack and splits > 1
+    assert _d128_thd_split_wave_choice(g8, extra_waves=3) == (splits, False)  # the default tie-break, unchanged for SM100
+
+
+@pytest.mark.L0
+def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
+    """GQA16 paged d128: Rubin's split domain admits group 16 (SM100 already did), and paged SM100 lists the packed set first."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, paged_thd_split_choice
+
+    kt = SimpleNamespace(get_stride=lambda: (2 * 16 * 128, 16 * 128, 128, 1))
+    paged = dict(
+        b=1, h_q=32, h_kv=2, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, causal=True, thd=True, padded=True, has_paged_kv=True, page_size=16, k_t=kt
+    )
+    rubin = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    f = _facts(**paged, s_q=248, s_kv=32768, bottom_right=True, max_total_seq_len_q=248, device_cc=(10, 7), device_sm_count=216)
+    assert paged_thd_split_choice(rubin, f)[0] > 1
+    sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
+    assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))
+
+
+@pytest.mark.L0
+def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
+    """GB10 (cc 12.1, 48 SMs): a bf16 / f16 d64 / d128 causal dense prefill with more (batch, head) streams than SMs
+    leads with the NATURAL walk, the LPT variants behind it as runners; up to one stream per SM, a sliding window, an FP8
+    row and the cc 12.0 parts keep the L2-budget rule's LPT_L2."""
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+
+    def plans(**over):
+        facts = _facts(**{**dict(b=8, h_q=16, h_kv=16, s_q=2048, s_kv=2048, causal=True, bottom_right=True, device_cc=(12, 1), device_sm_count=48), **over})
+        out = recommend("A", facts, offered)
+        assert out
+        return out
+
+    many = plans()  # 128 streams on 48 SMs
+    assert many[0].knobs.sched_policy == SCHED_NATURAL, many[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in many}, [p.knobs for p in many]
+    assert plans(d_qk=64, d_v=64, h_kv=4)[0].knobs.sched_policy == SCHED_NATURAL  # GQA counts query-head streams
+    assert plans(b=3)[0].knobs.sched_policy == SCHED_LPT_L2  # 48 streams: one per SM
+    assert plans(device_cc=(12, 0), device_sm_count=188)[0].knobs.sched_policy == SCHED_LPT_L2
+    assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2
+
+
+def test_sm107_pt_fp8_d192_mha_causal_fp8_o_lists_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d192x128 row lists both widths for a dense unsplit MHA causal graph with an fp8 O inside the
+    K/V budget, and the auto pick takes the single CTA; a half-precision O, GQA, a mask-free graph or a larger K/V set keep cga2."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=64,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=192,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    assert effective_cgas(spec.capabilities, _facts(**base)) == frozenset({1, 2})
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+
+    assert _auto_sched_cga(spec, _facts(**base), split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    for off in (dict(dtype_o=cudnn.data_type.BFLOAT16), dict(h_kv=8), dict(causal=False), dict(h_q=128, h_kv=128)):
+        assert effective_cgas(spec.capabilities, _facts(**{**base, **off})) == frozenset({2}), off
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    assert effective_cgas(mx_spec.capabilities, _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "h_q": 128, "h_kv": 128})) == frozenset({2})
+
+
+@pytest.mark.L0
+def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d128 row lists both widths on dense unsplit graphs inside the K/V budget and the auto pick takes
+    the single CTA with the scheduler it was handed; THD and the larger K/V sets keep the pair."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=8,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    for over, sched in (
+        (dict(), SCHED_LPT),
+        (dict(causal=False), SCHED_NATURAL),
+        (dict(b=1, h_q=40, h_kv=40, s_q=7800, s_kv=7800, causal=False), SCHED_NATURAL),
+    ):
+        facts = _facts(**{**base, **over})
+        assert effective_cgas(spec.capabilities, facts) == frozenset({1, 2}), over
+        assert _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched) == (sched, 1), over
+    assert effective_cgas(spec.capabilities, _facts(**{**base, "b": 8, "h_kv": 64})) == frozenset({2})
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_LPT) == (SCHED_LPT, 1)

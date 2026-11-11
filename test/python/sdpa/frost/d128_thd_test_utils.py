@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Storage and independent CPU-reference fixtures for d128 THD backward tests."""
+"""Storage and independent CPU-reference fixtures for native half THD backward tests."""
 
 from types import SimpleNamespace
 
@@ -14,7 +14,7 @@ D = 128
 SCALE = D**-0.5
 
 
-def reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed):
+def reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk=D, d_v=D, kv_heads=None, bottom_right=False, window_left=None):
     """FP64 autograd on CPU, independently for each sequence.
 
     Inputs are rounded to the caller's storage dtype before the oracle sees
@@ -22,21 +22,33 @@ def reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed):
     never enters softmax. Nothing here knows the kernel's tile or scheduler.
     """
     gen = torch.Generator(device="cpu").manual_seed(seed)
+    kv_heads = heads if kv_heads is None else kv_heads
     result = []
     for nq, nk in zip(lens_q, lens_kv, strict=True):
-        draw = lambda n: (torch.randn(n, heads, D, generator=gen) * 0.5).to(dtype)
-        q, k, v, do = draw(nq), draw(nk), draw(nk), draw(nq)
+        draw = lambda n, width, h: (torch.randn(n, h, width, generator=gen) * 0.5).to(dtype)
+        q, k, v, do = draw(nq, d_qk, heads), draw(nk, d_qk, kv_heads), draw(nk, d_v, kv_heads), draw(nq, d_v, heads)
         if nq == 0 or nk == 0:
-            o = torch.zeros(nq, heads, D, dtype=dtype)
+            o = torch.zeros(nq, heads, d_v, dtype=dtype)
             stats = torch.full((nq, heads), float("-inf"), dtype=torch.float32)
             dq, dk, dv = (torch.zeros_like(x, dtype=torch.float64) for x in (q, k, v))
         else:
             q64, k64, v64 = (x.transpose(0, 1).double().requires_grad_() for x in (q, k, v))
-            scores = (q64 @ k64.transpose(-1, -2)) * SCALE
+            k_grouped = k64.repeat_interleave(heads // kv_heads, dim=0) if kv_heads != heads else k64
+            v_grouped = v64.repeat_interleave(heads // kv_heads, dim=0) if kv_heads != heads else v64
+            scores = (q64 @ k_grouped.transpose(-1, -2)) * d_qk**-0.5
             if causal:
-                keep = torch.arange(nk)[None, :] <= torch.arange(nq)[:, None]
+                keep = torch.arange(nk)[None, :] <= torch.arange(nq)[:, None] + (nk - nq if bottom_right else 0)
                 scores = scores.masked_fill(~keep, float("-inf"))
-            o64 = torch.softmax(scores, dim=-1) @ v64
+            if window_left is not None:
+                anchor = torch.arange(nq)[:, None] + (nk - nq if bottom_right else 0)
+                scores = scores.masked_fill(torch.arange(nk)[None, :] < anchor - window_left, float("-inf"))
+            if bottom_right or window_left is not None:
+                live = torch.isfinite(scores).any(dim=-1, keepdim=True)
+                probs = torch.softmax(torch.where(live, scores, 0.0), dim=-1)
+                probs = torch.where(live, probs, 0.0)
+            else:
+                probs = torch.softmax(scores, dim=-1)
+            o64 = probs @ v_grouped
             dq, dk, dv = (x.transpose(0, 1).detach() for x in torch.autograd.grad(o64, (q64, k64, v64), do.transpose(0, 1).double()))
             o = o64.transpose(0, 1).detach().to(dtype)
             stats = torch.logsumexp(scores.detach(), dim=-1).transpose(0, 1).float()
@@ -61,6 +73,13 @@ def make_case(
     capacities=None,
     origin_ports=None,
     device="cuda",
+    d_qk=D,
+    d_v=D,
+    kv_heads=None,
+    bottom_right=False,
+    sequences=None,
+    window_left=None,
+    deterministic=False,
 ):
     """Each port has independent origins, including a nonzero first origin.
 
@@ -75,7 +94,9 @@ def make_case(
     assert origin_ports <= set(ROLES)
     envelope = envelope or (max(max(lens_q), 1), max(max(lens_kv), 1))
     assert max(lens_q) <= envelope[0] and max(lens_kv) <= envelope[1]
-    seqs = reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed)
+    kv_heads = heads if kv_heads is None else kv_heads
+    seqs = reference_sequences(lens_q, lens_kv, heads, dtype, causal, seed, d_qk, d_v, kv_heads, bottom_right, window_left) if sequences is None else sequences
+    assert len(seqs) == len(lens_q)
     origins, ends = {}, {}
     for index, role in enumerate(ROLES):
         lens = lens_q if role in Q_ROLES else lens_kv
@@ -106,8 +127,10 @@ def make_case(
         cap = cap_q if role in Q_ROLES else cap_kv
         lens = lens_q if role in Q_ROLES else lens_kv
         is_stats = role == "stats"
+        role_heads = heads if role in Q_ROLES else kv_heads
+        width = d_v if role in ("v", "o", "do", "dv") else d_qk
         dt = torch.float32 if is_stats else dtype
-        shape = ((cap_q, heads) if stats_layout == "TH1" else (1, heads, head_pitch)) if is_stats else (1, cap, heads, D)
+        shape = ((cap_q, heads) if stats_layout == "TH1" else (1, heads, head_pitch)) if is_stats else (1, cap, role_heads, width)
         numel = 1
         for n in shape:
             numel *= n
@@ -130,19 +153,26 @@ def make_case(
         raw[role] = host_raw.to(device=device)
         tensors[role] = raw[role][16:-16].view(shape)
         dead_rows[role] = ~live
-        token_stride = (heads if stats_layout == "TH1" else 1) if is_stats else heads * D
+        token_stride = (heads if stats_layout == "TH1" else 1) if is_stats else role_heads * width
         values = (*origins[role], cap)
         multiplier = token_stride if units == "tokens" else 1
         if role in origin_ports:
             offsets[role] = torch.tensor(values, dtype=offset_dtype, device=device) * (1 if units == "tokens" else token_stride)
             declarations[role] = (offset_dtype, multiplier)
     return SimpleNamespace(
+        d_qk=d_qk,
+        d_v=d_v,
+        scale=d_qk**-0.5,
         lens_q=lens_q,
         lens_kv=lens_kv,
         batch=len(lens_q),
         heads=heads,
+        kv_heads=kv_heads,
         dtype=dtype,
         causal=causal,
+        bottom_right=bottom_right,
+        window_left=window_left,
+        deterministic=deterministic,
         stats_layout=stats_layout,
         offset_dtype=offset_dtype,
         units=units,
@@ -161,15 +191,16 @@ def make_case(
 
 
 def declaration(case, role):
-    h, b = case.heads, case.batch
+    h, b = (case.heads if role in Q_ROLES else getattr(case, "kv_heads", case.heads)), case.batch
     s = case.envelope[0 if role in Q_ROLES else 1]
     if role == "stats":
         stride = (case.capacities[0] * h, 1, h, 1) if case.stats_layout == "TH1" else (h * case.head_pitch, case.head_pitch, 1, 1)
         return (b, h, s, 1), stride
-    return (b, h, s, D), (s * h * D, D, h * D, 1)
+    width = case.d_v if role in ("v", "o", "do", "dv") else case.d_qk
+    return (b, h, s, width), (s * h * width, width, h * width, 1)
 
 
-def make_adapter(case):
+def make_adapter(case, api_type=None, *, tile_m=None, tile_n=None):
     from cudnn.api_base import TensorDesc
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
@@ -184,10 +215,15 @@ def make_adapter(case):
             device=case.tensors["q"].device,
             name=role,
         )
-    api = SdpaBwdDslSm100D128(
+    api = (api_type or SdpaBwdDslSm100D128)(
         **samples,
+        tile_m=tile_m,
+        tile_n=tile_n,
         is_causal=case.causal,
-        scale_softmax=SCALE,
+        deterministic=getattr(case, "deterministic", False),
+        window_size_left=getattr(case, "window_left", None),
+        causal_bottom_right=getattr(case, "bottom_right", False),
+        scale_softmax=case.scale,
         thd=True,
         max_total_seq_len_q=case.capacities[0],
         max_total_seq_len_kv=case.capacities[1],
@@ -208,7 +244,7 @@ def adapter_arguments(case):
     return args
 
 
-def make_graph(case):
+def make_graph(case, engine_name="sdpa_bwd_sm100_d128", engine_id=20609):
     import cudnn
     from frost_test_utils import select_engine
 
@@ -238,15 +274,18 @@ def make_graph(case):
     for role in ("seq_q", "seq_kv"):
         refs[role] = graph.tensor(name=role, dim=[case.batch, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
     outs = graph.sdpa_backward(
-        name="d128_thd_bwd",
+        name="native_thd_bwd",
         q=refs["q"],
         k=refs["k"],
         v=refs["v"],
         o=refs["o"],
         dO=refs["do"],
         stats=refs["stats"],
-        attn_scale=SCALE,
-        use_causal_mask=case.causal,
+        attn_scale=case.scale,
+        use_deterministic_algorithm=getattr(case, "deterministic", False),
+        diagonal_band_left_bound=None if getattr(case, "window_left", None) is None else case.window_left + 1,
+        use_causal_mask=case.causal and not getattr(case, "bottom_right", False),
+        use_causal_mask_bottom_right=getattr(case, "bottom_right", False),
         use_padding_mask=True,
         seq_len_q=refs["seq_q"],
         seq_len_kv=refs["seq_kv"],
@@ -261,9 +300,9 @@ def make_graph(case):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_bwd_sm100_d128")
+    select_engine(graph, engine_name)
     engine, _ = graph.get_engine_and_knobs_at_index(graph._plan_index)
-    assert engine == 20609, engine
+    assert engine == engine_id, engine
     graph.check_support()
     graph.build_plans()
     assert graph._compiled_plans[graph._plan_index]._prepared.spec.native is not None
@@ -329,7 +368,8 @@ def copy_case_storage(destination, source):
     assert destination.offsets.keys() == source.offsets.keys()
     for role in destination.offsets:
         destination.offsets[role].copy_(source.offsets[role])
-    for role in ("seq_q", "seq_kv"):
+    assert destination.lengths.keys() == source.lengths.keys()  # both THD sides' lengths, or none on a dense case
+    for role in destination.lengths:
         destination.lengths[role].copy_(source.lengths[role])
     for field in ("lens_q", "lens_kv", "origins", "sequences", "dead_rows"):
         setattr(destination, field, getattr(source, field))

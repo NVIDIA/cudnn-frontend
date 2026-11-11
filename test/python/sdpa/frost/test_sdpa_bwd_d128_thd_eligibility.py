@@ -76,7 +76,8 @@ def test_thd_admission_and_ranking(packing, dtype, causal):
 @pytest.mark.parametrize(
     "overrides,token",
     [
-        ({"device_cc": (10, 3)}, "cc 10.0"),
+        ({"device_cc": (10, 1)}, "cc 10.0 / 10.3 / 10.7"),
+        ({"device_cc": (11, 0)}, "SM100-107"),  # past the row's range: the range decline fires before the part check
         ({"scale": float("inf")}, "positive"),
         ({"scale": float("nan")}, "positive"),
         ({"scale": 0.0}, "attn_scale = 0"),
@@ -102,7 +103,7 @@ def test_thd_requires_public_dsl_48(monkeypatch, version):
     assert "nvidia-cutlass-dsl >= 4.8.0" in reason(facts())
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7)])
 def test_dense_keeps_older_compiler_and_negative_scale(monkeypatch, cc):
     monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.4")))
     value = SdpaGraphFacts(is_backward=True, b=2, h_q=2, h_kv=2, s_q=129, s_kv=257, d_qk=128, d_v=128, dtype=cudnn.data_type.HALF, device_cc=cc, scale=-0.1)
@@ -196,7 +197,14 @@ def test_thd_stats_malformed_descriptor_declines(shape, stride, token):
 
 @pytest.mark.parametrize(
     "cc,scale,missing_totals,token",
-    [((10, 0), 0.125, False, None), ((10, 3), 0.125, False, "cc 10.0"), ((10, 0), -0.125, False, "positive"), ((10, 0), 0.125, True, "positive")],
+    [
+        ((10, 0), 0.125, False, None),
+        ((10, 3), 0.125, False, None),
+        ((10, 7), 0.125, False, None),
+        ((10, 1), 0.125, False, "cc 10.0 / 10.3 / 10.7"),
+        ((10, 0), -0.125, False, "positive"),
+        ((10, 0), 0.125, True, "positive"),
+    ],
 )
 def test_real_thd_graph_admission(monkeypatch, cc, scale, missing_totals, token):
     from cudnn.sdpa import graph_analyzer

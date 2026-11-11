@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
 
 if TYPE_CHECKING:
@@ -48,6 +49,8 @@ class _FrostNormPlan(CompiledPlan):
 class FrostNormBwdEngine(BaseEngine):
     """One shipped norm-backward engine spec, bound to its manifest id."""
 
+    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
+
     def __init__(self, spec: "EngineSpec", engine_id: int):
         super().__init__()
         self._spec = spec
@@ -73,7 +76,7 @@ class FrostNormBwdEngine(BaseEngine):
             # synthesising a gamma here would allocate inside execute (Rule 1), so
             # the graph goes to an engine that serves it natively.
             return "backward without a scale input is not served"
-        if not facts.uniform_dtype:
+        if not facts.uniform_dtype and not facts.extended_affine:
             # These kernels read scale/bias/DY at the I/O dtype; a mixed-precision
             # graph would be read wrong rather than merely be slow.
             return "scale/bias/DY must share the input dtype; mixed-precision parameters are not supported"

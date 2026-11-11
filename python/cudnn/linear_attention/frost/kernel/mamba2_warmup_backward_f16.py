@@ -36,7 +36,7 @@ from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from ..common import split_k
 from ..common.host import get_dtype
 from ..common.gate_bwd import exit_slot_table_body
-from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, order_body
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
 from . import mamba2_bprop_f16, mamba2_bprop_summary_f16, mamba2_recompute_f16
 
 USE_PDL = True
@@ -80,10 +80,13 @@ def warmup_backward_host(
     dv: cute.Tensor,
     checkpoints: cute.Tensor,
     exit_dots: cute.Tensor,
+    dot_q: cute.Tensor,
+    dot_k: cute.Tensor,
     skip_bwd_part: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
@@ -163,9 +166,13 @@ def warmup_backward_host(
         dv,
         checkpoints,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
+        None,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,
@@ -193,9 +200,12 @@ def build_warmup_backward(
     dv,
     checkpoints,
     exit_dots,
+    dot_q,
+    dot_k,
     skip_bwd_part,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -253,6 +263,7 @@ def build_warmup_backward(
         bool(split),
         bool(dt_softplus),
         dstate_in is not None,
+        dcomposed is not None,
         dstate0 is not None,
         transition is not None,
         skip_bwd_part is not None,
@@ -262,7 +273,9 @@ def build_warmup_backward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_dstate_in=dstate_in is not None,
+            use_dstate_in=dstate_in is not None or dcomposed is not None,
+            dstate_table=dstate_in is not None,
+            has_composed_dstate=dcomposed is not None,
             use_dstate0=dstate0 is not None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
@@ -299,6 +312,9 @@ def build_warmup_backward(
         dstate_in_placeholder = None
         if dstate_in is not None:
             dstate_in_placeholder = from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_placeholder = None
+        if dcomposed is not None:
+            dcomposed_placeholder = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         dstate0_placeholder = None
         if dstate0 is not None:
             dstate0_placeholder = from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3)
@@ -340,10 +356,13 @@ def build_warmup_backward(
             from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(exit_dots, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dot_q, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dot_k, assumed_align=4).mark_layout_dynamic(leading_dim=1),
             from_dlpack(skip_bwd_part, assumed_align=4).mark_layout_dynamic(leading_dim=len(skip_bwd_part.shape) - 1) if skip_bwd_part is not None else None,
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             dstate_in_placeholder,
+            dcomposed_placeholder,
             dstate0_placeholder,
             work_items_placeholder,
             work_items_table_placeholder,
@@ -380,9 +399,12 @@ def run_warmup_backward(
     dv,
     checkpoints,
     exit_dots,
+    dot_q,
+    dot_k,
     skip_bwd_part,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -423,10 +445,13 @@ def run_warmup_backward(
         dv,
         checkpoints,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
         cu_seqlens,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_items,
@@ -476,10 +501,16 @@ def frost_mamba2_regenerate_prologue(
     mSchedulerBprop: cute.Tensor,
     n_batch: cutlass.Int32,
     mSlots: cute.Tensor,
+    coarse: cutlass.Constexpr[bool],
+    seed_span_chunks: cutlass.Int32,
+    mSeriesItems: Optional[cute.Tensor],
+    mSeriesCount: Optional[cute.Tensor],
 ) -> None:
-    """Three-CTA prologue of the regenerate path: block 0 LPT-orders the work-item table both kernels consume and zeroes
-    both scheduler rings, block 1 builds the recompute's per-batch TMA-descriptor arrays (K, V, the series), block 2 the
-    bprop's (Q, K, V, dO, the series, dQ, dK, dV), one warp per array, then the gate backward's exit-slot table."""
+    """Three-CTA prologue of the regenerate path: block 0 LPT-orders the work-item table both kernels consume (under
+    ``coarse`` the bprop's alone; the recompute then runs over checkpoint-seeded interval items of ``seed_span_chunks``)
+    and zeroes both scheduler rings, block 1 builds the recompute's per-batch TMA-descriptor arrays (K, V, the series),
+    block 2 the bprop's (Q, K, V, dO, the series, dQ, dK, dV), one warp per array, then the gate backward's exit-slot
+    table."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
@@ -512,6 +543,8 @@ def frost_mamba2_regenerate_prologue(
             sIdx,
             sSpread,
         )
+        if cutlass.const_expr(coarse):
+            gen_interval_items(b_t, ORDER_THREADS, tidx, n_heads_out, n_heads_out * n_batch, seed_span_chunks, cu_seqlens, mSeriesCount, mSeriesItems, None)
     elif bidx == cutlass.Int32(1):
         mamba2_recompute_f16.build_descs_body(
             widx,
@@ -564,6 +597,7 @@ def regenerate_backward_host(
     num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     order_gen: cutlass.Constexpr[bool],
+    coarse: cutlass.Constexpr[bool],
     recompute_cfg: cutlass.Constexpr,
     bprop_cfg: cutlass.Constexpr,
     n_tiles: cutlass.Int32,
@@ -590,11 +624,15 @@ def regenerate_backward_host(
     dv: cute.Tensor,
     series: cute.Tensor,
     exit_dots: cute.Tensor,
+    dot_q: cute.Tensor,
+    dot_k: cute.Tensor,
     skip_bwd_part: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     cu_seqlens_table: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_table: cute.Tensor,
@@ -609,10 +647,16 @@ def regenerate_backward_host(
     recompute_workspace: cute.Tensor,
     bprop_workspace: cute.Tensor,
     exit_slots: cute.Tensor,
+    seed_checkpoints: Optional[cute.Tensor],
+    series_items: Optional[cute.Tensor],
+    series_count: Optional[cute.Tensor],
+    seed_span_chunks: cutlass.Int32,
+    seed_every_n_tokens: cutlass.Int32,
     stream: cuda.CUstream,
 ) -> None:
     """The backward without a saved series: the split-K table (warmup only), one prologue for both kernels, the
-    recompute writing the chunk-cadence series, the bprop reading it."""
+    recompute writing the chunk-cadence series (under ``coarse`` over interval items seeded from ``seed_checkpoints``,
+    io or fp32 rows ``seed_every_n_tokens`` apart), the bprop reading it."""
     if cutlass.const_expr(split):
         split_k.launch(
             split,
@@ -678,6 +722,10 @@ def regenerate_backward_host(
         scheduler_bprop,
         batch_size,
         exit_slots,
+        coarse,
+        seed_span_chunks,
+        series_items,
+        series_count,
     ).launch(grid=(3, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
     mamba2_recompute_f16.host(
         recompute_cfg,
@@ -690,15 +738,17 @@ def regenerate_backward_host(
         a,
         dt_bias,
         cu_seqlens,
-        state_in,
+        seed_checkpoints if coarse else state_in,
+        composed,
         None,
         None,
         None,
-        work_items,
-        work_count,
+        series_items if coarse else work_items,
+        series_count if coarse else work_count,
         scheduler_recompute,
         None,
         cutlass.Int32(b_t),
+        seed_every_n_tokens if coarse else cutlass.Int32(0),
         dt_min,
         dt_max,
         recompute_workspace,
@@ -719,9 +769,13 @@ def regenerate_backward_host(
         dv,
         series,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
+        None,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,
@@ -749,10 +803,14 @@ def build_regenerate_backward(
     dv,
     series,
     exit_dots,
+    dot_q,
+    dot_k,
     skip_bwd_part,
     cu_seqlens,
     state_in,
+    composed=None,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -774,9 +832,15 @@ def build_regenerate_backward(
     device,
     stream,
     transition=None,
+    seed_checkpoints=None,
+    series_items=None,
+    series_count=None,
+    seed_span_tokens=0,
+    seed_every_n_tokens=0,
 ):
     """Compile (cached per static config) the regenerate backward launch (table, one prologue, recompute, bprop) over
-    the buffers of one plan."""
+    the buffers of one plan; ``seed_checkpoints`` (io or fp32 rows ``seed_every_n_tokens`` apart) makes the recompute run
+    over interval items of ``seed_span_tokens`` seeded from the rows."""
     _HQ, DK = q.shape[1], q.shape[2]
     _HV, DV = do.shape[1], do.shape[2]
     facts = split_k.split_table_facts(
@@ -795,7 +859,9 @@ def build_regenerate_backward(
     io_dtype = get_dtype(q.dtype)
     dstate_source = dstate_in if dstate_in is not None else dstate0
     dstate_dtype = get_dtype(dstate_source.dtype) if dstate_source is not None else cutlass.Float32
-    state_dtype = get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32
+    coarse = seed_checkpoints is not None
+    state_source = seed_checkpoints if coarse else state_in
+    state_dtype = get_dtype(state_source.dtype) if state_source is not None else cutlass.Float32
     key = (
         str(q.dtype),
         str(gate.dtype),
@@ -804,7 +870,9 @@ def build_regenerate_backward(
         str(d.dtype) if d is not None else "none",
         len(d.shape) if d is not None else 0,
         str(cu_seqlens.dtype),
-        str(state_in.dtype) if state_in is not None else "none",
+        str(state_source.dtype) if state_source is not None else "none",
+        bool(coarse),
+        composed is not None,
         str(dstate_source.dtype) if dstate_source is not None else "none",
         str(series.dtype),
         int(device),
@@ -815,6 +883,7 @@ def build_regenerate_backward(
         bool(split),
         bool(dt_softplus),
         dstate_in is not None,
+        dcomposed is not None,
         dstate0 is not None,
         transition is not None,
         skip_bwd_part is not None,
@@ -824,10 +893,13 @@ def build_regenerate_backward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_initial_state=state_in is not None,
+            use_initial_state=state_source is not None or composed is not None,
+            state_table=state_source is not None,
+            has_composed=composed is not None,
             store_final_state=False,
             enable_checkpoints=True,
             dt_softplus=dt_softplus,
+            seed_checkpoints=coarse,
             d_k=DK,
             d_v=DV,
         )
@@ -835,7 +907,9 @@ def build_regenerate_backward(
             io_dtype,
             dstate_dtype,
             max_active_clusters=num_sm,
-            use_dstate_in=dstate_in is not None,
+            use_dstate_in=dstate_in is not None or dcomposed is not None,
+            dstate_table=dstate_in is not None,
+            has_composed_dstate=dcomposed is not None,
             use_dstate0=dstate0 is not None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
@@ -871,9 +945,21 @@ def build_regenerate_backward(
         state_in_placeholder = None
         if state_in is not None:
             state_in_placeholder = from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        composed_placeholder = None
+        if composed is not None:
+            composed_placeholder = from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        seed_checkpoints_placeholder = None
+        series_items_placeholder = None
+        if coarse:
+            seed_checkpoints_placeholder = from_dlpack(seed_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+            series_items_placeholder = from_dlpack(series_items, assumed_align=16)
+            series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         dstate_in_placeholder = None
         if dstate_in is not None:
             dstate_in_placeholder = from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_placeholder = None
+        if dcomposed is not None:
+            dcomposed_placeholder = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         dstate0_placeholder = None
         if dstate0 is not None:
             dstate0_placeholder = from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3)
@@ -890,6 +976,7 @@ def build_regenerate_backward(
             facts.num_sms,
             io_dtype,
             not split,
+            bool(coarse),
             recompute_cfg,
             bprop_cfg,
             cutlass.Int32(facts.n_tiles),
@@ -916,11 +1003,15 @@ def build_regenerate_backward(
             from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(series, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(exit_dots, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dot_q, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dot_k, assumed_align=4).mark_layout_dynamic(leading_dim=1),
             from_dlpack(skip_bwd_part, assumed_align=4).mark_layout_dynamic(leading_dim=len(skip_bwd_part.shape) - 1) if skip_bwd_part is not None else None,
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             state_in_placeholder,
+            composed_placeholder,
             dstate_in_placeholder,
+            dcomposed_placeholder,
             dstate0_placeholder,
             work_items_placeholder,
             work_items_table_placeholder,
@@ -935,6 +1026,11 @@ def build_regenerate_backward(
             from_dlpack(recompute_workspace, assumed_align=128).mark_layout_dynamic(),
             from_dlpack(bprop_workspace, assumed_align=128).mark_layout_dynamic(),
             from_dlpack(exit_slots, assumed_align=8).mark_layout_dynamic(leading_dim=1),
+            seed_checkpoints_placeholder,
+            series_items_placeholder,
+            from_dlpack(series_count, assumed_align=4).mark_layout_dynamic() if coarse else None,
+            cutlass.Int32(int(seed_span_tokens or seed_every_n_tokens) // int(b_t)),
+            cutlass.Int32(int(seed_every_n_tokens)),
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
         )
@@ -958,10 +1054,14 @@ def run_regenerate_backward(
     dv,
     series,
     exit_dots,
+    dot_q,
+    dot_k,
     skip_bwd_part,
     cu_seqlens,
     state_in,
+    composed=None,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -976,6 +1076,11 @@ def run_regenerate_backward(
     dt_max,
     stream,
     transition=None,
+    seed_checkpoints=None,
+    series_items=None,
+    series_count=None,
+    seed_span_tokens=0,
+    seed_every_n_tokens=0,
 ) -> None:
     """Replay the regenerate backward: one crossing into the DSL for the table, prologue, recompute and bprop launches."""
     compiled(
@@ -1004,11 +1109,15 @@ def run_regenerate_backward(
         dv,
         series,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
         cu_seqlens,
         cu_seqlens,
         state_in,
+        composed,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_items,
@@ -1023,6 +1132,11 @@ def run_regenerate_backward(
         recompute_workspace,
         bprop_workspace,
         exit_slots,
+        seed_checkpoints,
+        series_items,
+        series_count,
+        int(seed_span_tokens or seed_every_n_tokens) // int(facts.b_t),
+        int(seed_every_n_tokens),
         cuda.CUstream(int(stream)),
     )
 
@@ -1041,6 +1155,7 @@ def summary_backward_host(
     dt_bias: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: cute.Tensor,
     work_items: cute.Tensor,
     work_count: cute.Tensor,
@@ -1076,6 +1191,7 @@ def summary_backward_host(
         dt_bias,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,
@@ -1097,6 +1213,7 @@ def build_summary_backward(
     dt_bias,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -1131,6 +1248,7 @@ def build_summary_backward(
         int(b_t),
         bool(dt_softplus),
         dstate_in is not None,
+        dcomposed is not None,
         str(transition.dtype) if transition is not None else "none",
     )
     if key not in summary_backward_cache:
@@ -1138,7 +1256,9 @@ def build_summary_backward(
             io_dtype,
             state_dtype,
             max_active_clusters=num_sm,
-            use_dstate_in=dstate_in is not None,
+            use_dstate_in=dstate_in is not None or dcomposed is not None,
+            dstate_table=dstate_in is not None,
+            has_composed_dstate=dcomposed is not None,
             dt_softplus=dt_softplus,
             d_k=DK,
             d_v=DV,
@@ -1159,6 +1279,7 @@ def build_summary_backward(
             from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate_in is not None else None,
+            from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dcomposed is not None else None,
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             work_items_placeholder,
             from_dlpack(work_count, assumed_align=4).mark_layout_dynamic(),
@@ -1181,6 +1302,7 @@ def run_summary_backward(
     dt_bias,
     cu_seqlens,
     dstate_in,
+    dcomposed=None,
     dstate0,
     work_items,
     work_count,
@@ -1202,6 +1324,7 @@ def run_summary_backward(
         dt_bias,
         cu_seqlens,
         dstate_in,
+        dcomposed,
         dstate0,
         work_items,
         work_count,

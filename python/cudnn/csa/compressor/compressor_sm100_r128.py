@@ -38,8 +38,8 @@ whose per-chunk accumulation form is selected per ``nb_total`` schedule bucket
 
 Work decomposition: one CTA per output block row (``gridDim.x = nb_total``),
 ``gridDim.y`` spans head-dim column groups of ``threads_x * vec`` dims, CTA shape
-``(threads_x, tchunks)``. Everything else (THD segment scan, static-capacity padding
-rows with first-in-segment semantics, the ``coff == 2`` overlap window with the invalid
+``(threads_x, tchunks)``. Everything else (THD segment scan, exact-zero static-capacity
+padding rows, the ``coff == 2`` overlap window with the invalid
 previous-block half for each segment's first block, fp32-only window math with a single
 final bf16 rounding, pinned ``mul.rn``/``fma.rn``) matches ``compressor_sm100.py``.
 
@@ -87,12 +87,15 @@ from __future__ import annotations
 
 import threading
 
+try:  # Torch is needed only by the eager wrapper; JAX imports the pure DSL kernels.
+    import torch
+except ImportError:  # pragma: no cover - exercised by JAX-only installs
+    torch = None
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.arch as cute_arch
 import cutlass.cute.math as cute_math
-import torch
 
 from cudnn._cutlass_compat import SmemAllocator
 
@@ -183,6 +186,10 @@ def _compressor_fwd_r128_kernel(
     W: cutlass.Constexpr = coff * d
     col = bidy * threads_x + tidx
     bb = bidx  # one output row per CTA
+    # Keep the device-side logical row count outside the staged ``col < ncol``
+    # regions.  Multi-chunk schedules consume it again after the CTA barrier, and
+    # CuTeDSL does not carry Python names defined in one staged region into another.
+    nb_valid = mCuComp[n_seq]
 
     smem = SmemAllocator()
     # Partial-merge buffer, [tchunks][threads_x][vec] per quantity; unused (0 B) when
@@ -197,9 +204,8 @@ def _compressor_fwd_r128_kernel(
         cvec = col * vec
 
         # THD segment scan (identical to compressor_sm100): rows beyond the true
-        # compressed count are static-capacity padding and gather the window from
-        # token 0 with first-in-segment semantics, like the eager code.
-        nb_valid = mCuComp[n_seq]
+        # compressed count are static-capacity padding. They publish empty partials
+        # through the same CTA barriers, then tidy==0 writes an exact zero.
         seq_idx = cutlass.Int32(0)
         bis = cutlass.Int32(0)
         if bb < nb_valid:
@@ -218,6 +224,8 @@ def _compressor_fwd_r128_kernel(
         # only the projection column / APE row / validity differ per half.
         k0 = tidy * C
         run_chunk = cutlass.Boolean(True)
+        if bb >= nb_valid:
+            run_chunk = cutlass.Boolean(False)
         tok_row0 = tok0 + k0
         colbase = cvec
         ape_row0 = cutlass.Int32(k0)
@@ -226,7 +234,7 @@ def _compressor_fwd_r128_kernel(
             if k0 < ratio:
                 # Previous block's half-window: first-half projection columns, APE
                 # row k; invalid (contributes nothing) for the segment's first block
-                # and for static-capacity padding rows (bis == 0 in both cases).
+                # (bis == 0).
                 if bis == 0:
                     run_chunk = cutlass.Boolean(False)
             else:
@@ -340,7 +348,10 @@ def _compressor_fwd_r128_kernel(
         if cutlass.const_expr(tchunks == 1):
             fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
             for j in cutlass.range_constexpr(vec):
-                fr_o[j] = cutlass.BFloat16(cutlass.Float32(fr_a[j]) / cutlass.Float32(fr_d[j]))
+                if bb < nb_valid:
+                    fr_o[j] = cutlass.BFloat16(cutlass.Float32(fr_a[j]) / cutlass.Float32(fr_d[j]))
+                else:
+                    fr_o[j] = cutlass.BFloat16(0.0)
             ooff = cute.assume(bb * d + cvec, divby=vec)
             gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
             cute.autovec_copy(fr_o, gO)
@@ -363,28 +374,31 @@ def _compressor_fwd_r128_kernel(
                 cvec = col * vec
                 fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                 for j in cutlass.range_constexpr(vec):
-                    m = cutlass.Float32(sM[tidx * vec + j])
-                    den = cutlass.Float32(sD[tidx * vec + j])
-                    acc = cutlass.Float32(sA[tidx * vec + j])
-                    for t in cutlass.range_constexpr(1, tchunks):
-                        slot = (t * threads_x + tidx) * vec + j
-                        d2 = cutlass.Float32(sD[slot])
-                        # A NaN partial (a NaN or +inf score in that chunk) is merged, so the output is NaN.
-                        if d2 != cutlass.Float32(0.0):
-                            m2 = cutlass.Float32(sM[slot])
-                            a2 = cutlass.Float32(sA[slot])
-                            mn = m
-                            if m2 > mn:
-                                mn = m2
-                            # The running partial may still be empty (den == acc == 0,
-                            # m the initial lowest finite value); den and acc stay 0
-                            # whatever exp(m - mn) is.
-                            s1 = cute_math.exp(m - mn)
-                            s2 = cute_math.exp(m2 - mn)
-                            den = _ffma_rn(den, s1, _fmul_rn(d2, s2))
-                            acc = _ffma_rn(acc, s1, _fmul_rn(a2, s2))
-                            m = mn
-                    fr_o[j] = cutlass.BFloat16(acc / den)
+                    if bb < nb_valid:
+                        m = cutlass.Float32(sM[tidx * vec + j])
+                        den = cutlass.Float32(sD[tidx * vec + j])
+                        acc = cutlass.Float32(sA[tidx * vec + j])
+                        for t in cutlass.range_constexpr(1, tchunks):
+                            slot = (t * threads_x + tidx) * vec + j
+                            d2 = cutlass.Float32(sD[slot])
+                            # A NaN partial (a NaN or +inf score in that chunk) is merged, so the output is NaN.
+                            if d2 != cutlass.Float32(0.0):
+                                m2 = cutlass.Float32(sM[slot])
+                                a2 = cutlass.Float32(sA[slot])
+                                mn = m
+                                if m2 > mn:
+                                    mn = m2
+                                # The running partial may still be empty (den == acc == 0,
+                                # m the initial lowest finite value); den and acc stay 0
+                                # whatever exp(m - mn) is.
+                                s1 = cute_math.exp(m - mn)
+                                s2 = cute_math.exp(m2 - mn)
+                                den = _ffma_rn(den, s1, _fmul_rn(d2, s2))
+                                acc = _ffma_rn(acc, s1, _fmul_rn(a2, s2))
+                                m = mn
+                        fr_o[j] = cutlass.BFloat16(acc / den)
+                    else:
+                        fr_o[j] = cutlass.BFloat16(0.0)
                 ooff = cute.assume(bb * d + cvec, divby=vec)
                 gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
                 cute.autovec_copy(fr_o, gO)
@@ -1156,12 +1170,25 @@ def _bwd_schedule_r128(ratio, d, coff, nb_total=None):
         raise ValueError(f"coff=2 chunks must not straddle the half-window boundary (ratio={ratio}, chunk={win // tchunks})")
     if threads_x * tchunks > 1024:
         raise ValueError(f"CTA too large: {threads_x} x {tchunks}")
-    # smem: fp32 s/e tile + bf16 kv tile + max merge + den/S' partials + den/S
-    # publish, 16 B aligned.
-    smem_bytes = win * threads_x * vec * 6 + 3 * tchunks * threads_x * vec * 4 + 2 * threads_x * vec * 4 + 64
+    smem_bytes = _bwd_smem_bytes(win, vec, tchunks, threads_x)
     if smem_bytes > 227 * 1024:
         raise ValueError(f"backward smem tile too large ({smem_bytes} B) for W={W}")
     return vec, tchunks, threads_x, fastexp, goreuse
+
+
+def _bwd_smem_bytes(win, vec, tchunks, threads_x):
+    """Shared memory of one backward CTA: fp32 s/e tile + bf16 kv tile + max merge + den/S' partials + den/S publish,
+    16 B aligned."""
+    return win * threads_x * vec * 6 + 3 * tchunks * threads_x * vec * 4 + 2 * threads_x * vec * 4 + 64
+
+
+def bwd_smem_bytes_r128(ratio, d, coff, nb_total=None):
+    """Shared memory per CTA of the ratio=128 backward under the schedule ``_bwd_schedule_r128`` picks for ``nb_total``.
+
+    The schedule only bounds it by the SM100 227 KiB ceiling; a device with less per-CTA shared memory (cc 12.x has
+    ~99 KiB) must be checked against its own limit before launch."""
+    vec, tchunks, threads_x = _bwd_schedule_r128(ratio, d, coff, nb_total)[:3]
+    return _bwd_smem_bytes(2 * ratio if coff == 2 else ratio, vec, tchunks, threads_x)
 
 
 def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
@@ -1177,10 +1204,15 @@ def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
     ~101 KB smem), 3 for coff=1 T=8, 4 for the coff=1 T=4 (d >= 512) schedule.
     Capped at 16 (beyond one wave per SM the pipeline depth stops paying).
     """
+    return bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, d, coff, _sm_count(dev))
+
+
+def bwd_rows_per_cta_for_sm_count_r128(nb_total, ratio, d, coff, sm_count):
+    """Framework-neutral form of :func:`_bwd_rows_per_cta` for a known SM count."""
     vec, tchunks, threads_x = _bwd_schedule_r128(ratio, d, coff, nb_total)[:3]
     gy = (d // vec + threads_x - 1) // threads_x
     ctas_per_sm = 2 if coff == 2 else (4 if tchunks <= 4 else 3)
-    slots = ctas_per_sm * _sm_count(dev)
+    slots = ctas_per_sm * sm_count
     return max(1, min(16, -((nb_total * gy) // -slots)))
 
 

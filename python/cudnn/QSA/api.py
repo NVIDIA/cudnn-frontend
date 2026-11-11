@@ -13,7 +13,7 @@ from torch import Tensor
 
 from cudnn._device import device_info
 
-from ._contract import check_inputs, check_tensor
+from ._contract import check_inputs, check_tensor, ds_parts
 
 
 def _implementation(q, direction):
@@ -29,35 +29,9 @@ def _implementation(q, direction):
     if reason:
         raise NotImplementedError(reason)
     arch = cc[0] * 10 + cc[1]
-    family = 107 if arch == 107 else 100
-    if direction == "bprop" and q.shape[1] == 12:
-        family = 100
-    return importlib.import_module(f".kernels.{direction}_sm{family}", __package__), arch
-
-
-def _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream):
-    from ._metadata import compile_kernel
-
-    ids = torch.empty(sel_blocks.shape, dtype=torch.int32, device=sel_blocks.device)
-    counts = torch.empty((sel_blocks.shape[0],), dtype=torch.int32, device=sel_blocks.device)
-    compile_kernel(arch)(sel_blocks, lo, hi, block_first, block_last, ids, counts, stream)
-    return ids, counts
-
-
-def _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, kv_heads):
-    if kv_heads == 1:
-        from ._metadata import compile_group_kernel
-        from .kernels.bprop_sm100 import NQ, BLK_BITS
-
-        total, blocks = sel_blocks.shape
-        if blocks > 1 << BLK_BITS:
-            raise NotImplementedError(f"Paired QSA requires NB <= {1 << BLK_BITS} for block-owner encoding")
-        groups = (total + NQ - 1) // NQ
-        ids = torch.empty((groups, blocks), dtype=torch.int32, device=sel_blocks.device)
-        counts = torch.empty(groups, dtype=torch.int32, device=sel_blocks.device)
-        compile_group_kernel(arch, NQ, BLK_BITS)(sel_blocks, lo, hi, block_first, block_last, ids, counts, total, stream)
-        return ids, counts
-    return _compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
+    # the forward has a Rubin flavor, the backward launch sequence picks its Rubin kernels itself
+    name = f".kernels.fprop_sm{107 if arch == 107 else 100}" if direction == "fprop" else "._backward"
+    return importlib.import_module(name, __package__), arch
 
 
 @lru_cache(maxsize=1)
@@ -87,7 +61,7 @@ def qsa_forward(
     """Return ``(out, out_fp32, lse)`` for packed THD QSA.
 
     Selection and inclusive token bounds follow Miles. Block spans and bases must
-    describe the same packed sequences. See ``docs/fe-oss-apis/qsa.md``.
+    describe the same packed sequences. See ``docs/operations/sparse_attention/qsa.md``.
     """
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
     with torch.cuda.device(q.device):
@@ -116,30 +90,40 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
+    ds_precision: str = "fp32",
+    deterministic: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE."""
+    """Return ``(dq, dk, dv)`` using forward's FP32 output and natural-log LSE.
+
+    ``ds_precision`` selects how dS reaches the dQ MMAs: ``"fp32"`` feeds three bf16 parts of its fp32 value, which keeps
+    a dQ whose terms nearly cancel accurate. ``"bf16"`` rounds dS (and on the dense prefix P) to bf16 at a lower cost.
+    ``deterministic=True`` adds the gradients of the dense prefix in a fixed order, at a lower speed, so the same inputs
+    and packed layout return the same bytes on every run.
+    """
+    if not isinstance(deterministic, bool):
+        raise ValueError("deterministic must be a bool")
     total, hq, hkv, _ = check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, block_last, scale, block_size)
+    parts = ds_parts(ds_precision)
     check_tensor("grad_out", grad_out, q.shape, q.dtype, q.device, 16)
     check_tensor("out_fp32", out_fp32, q.shape, torch.float32, q.device, 16)
     check_tensor("lse", lse, (hq, total), torch.float32, q.device)
     with torch.cuda.device(q.device):
         impl, arch = _implementation(q, "bprop")
-        import cutlass
-        from cuda.bindings import driver as cuda
-        from cudnn.api_base import TupleDict
-
-        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        compiled = impl.compile_kernel(cutlass.BFloat16, hq, hkv, arch)
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        scratch = {
-            "delta": torch.empty((total, hq), dtype=torch.float32, device=q.device),
-            "dq_acc": torch.empty_like(q, dtype=torch.float32),
-            "dk_acc": torch.empty_like(k, dtype=torch.float32),
-            "dv_acc": torch.empty_like(v, dtype=torch.float32),
-        }
-        ids, counts = _compact_backward(sel_blocks, lo, hi, block_first, block_last, arch, stream, hkv)
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        impl.launch(
-            compiled, grad_out, q, k, v, out_fp32, lse, ids, counts, lo, hi, block_first, block_last, dq, dk, dv, scratch, float(scale), stream, num_sms
+        return impl.backward(
+            grad_out,
+            q,
+            k,
+            v,
+            out_fp32,
+            lse,
+            sel_blocks,
+            lo,
+            hi,
+            tok_base,
+            block_first,
+            block_last,
+            float(scale),
+            arch,
+            dq_parts=parts,
+            deterministic=deterministic,
         )
-        return TupleDict(dq=dq, dk=dk, dv=dv)

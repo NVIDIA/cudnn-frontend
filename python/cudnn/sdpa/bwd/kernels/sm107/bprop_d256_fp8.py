@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""SM107 (Rubin) SDPA backward, d_qk = d_v = 256, per-tensor FP8 E4M3: dV in-kernel + e4m3 (or bf16) dS workspace.
+"""SM107 (Rubin) SDPA backward, D256 or D192/V128, per-tensor FP8 E4M3: dV in-kernel + e4m3 (or bf16) dS workspace.
+
+The diagram below shows D256. D192/V128 uses 128 dV accumulator columns,
+64-byte Q/K and dO_dV swizzles, and 128-byte V/dO swizzles for dP.
 
 One cga2 pair (CGA_M=2, CGA_N=1, CTA_MMA=2) owns one 256-row kv block of one (batch, head) and walks the q tiles that
 attend it.  It computes **dV in-kernel** (TMEM accumulator over the q loop, stored per Q-head) and writes **dS** to a
@@ -219,12 +222,15 @@ from cudnn.frost.tile_dsl.scheduler import SCHED_NATURAL, Sched, read_clc_payloa
 from cudnn.frost.tile_dsl.thd import (
     TENSOR_MAP_ALIGN,
     TENSOR_MAP_QWORDS,
+    THD_BWD_META_WORDS,
     THD_BWD_MAPS_META_WORDS,
+    THD_BWD_MAPS_OFF,
+    THD_BWD_WORK_PREFIX_OFF,
     THD_SETUP_THREADS,
     emit_clamped_desc,
     emit_seq_descs,
-    thd_decode_unit,
-    write_thd_live_and_ctr,
+    thd_decode_unit_prefix,
+    write_thd_work_prefix,
 )
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
@@ -345,6 +351,7 @@ LEADING_BYTE_OFFSET_dO_SG1 = _B.LEADING_BYTE_OFFSET_dO_SG1  # BT=true B operand:
 STRIDE_BYTE_OFFSET_dO_SG1 = _B.STRIDE_BYTE_OFFSET_dO_SG1
 SMEM_LAYOUT_Q = _B.SMEM_LAYOUT_Q
 SMEM_LAYOUT_dO = _B.SMEM_LAYOUT_dO
+SMEM_LAYOUT_dO_SG1 = _B.SMEM_LAYOUT_dO_SG1
 SMEM_LAYOUT_K = _B.SMEM_LAYOUT_K
 SMEM_LAYOUT_V = _B.SMEM_LAYOUT_V
 SMEM_LAYOUT_dS = _B.SMEM_LAYOUT_dS
@@ -480,7 +487,7 @@ def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv_real):
 
 def _thd_maps_off_words(n_batch):
     """int32 word offset of the tensor-map array inside the metadata buffer (``tile_dsl.thd.THD_BWD_MAPS_OFF`` on a runtime B)."""
-    return ((cutlass.Int32(5) * n_batch + cutlass.Int32(5)) * cutlass.Int32(4) + cutlass.Int32(127)) // cutlass.Int32(128) * cutlass.Int32(_THD_MAP_WORDS)
+    return (THD_BWD_META_WORDS(n_batch) * cutlass.Int32(4) + cutlass.Int32(127)) // cutlass.Int32(128) * cutlass.Int32(_THD_MAP_WORDS)
 
 
 def _thd_map_ptr(meta_t, n_batch, slot):
@@ -658,7 +665,16 @@ def _thd_decode(linear, meta_t, n_batch, n_qh):
     ``batch == n_batch`` (the dead-unit sentinel ``_seq_ctx`` turns into a fully masked tile)."""
     meta = cutlass.make_array_view(meta_t)
     uid = cute.arch.make_warp_uniform(linear) // cutlass.Int32(CFG.CGA_M)
-    kv_blk, batch, head = thd_decode_unit(meta, n_batch, uid, n_qh, cutlass.Int32(_KV_BLOCK_ROWS), False, cu0=cutlass.Int32(2) * n_batch + cutlass.Int32(1))
+    kv_blk, batch, head = thd_decode_unit_prefix(
+        meta,
+        n_batch,
+        uid,
+        n_qh,
+        cutlass.Int32(_KV_BLOCK_ROWS),
+        False,
+        cu0=cutlass.Int32(2) * n_batch + cutlass.Int32(1),
+        prefix0=THD_BWD_WORK_PREFIX_OFF(n_batch),
+    )
     return cute.arch.make_warp_uniform(kv_blk), cute.arch.make_warp_uniform(head), cute.arch.make_warp_uniform(batch)
 
 
@@ -827,7 +843,7 @@ def _kernel(
         stages=CFG.STAGES_dO_DV,
         leading_byte_offset=LEADING_BYTE_OFFSET_dO_SG1,
         stride_byte_offset=STRIDE_BYTE_OFFSET_dO_SG1,
-        layout=SMEM_LAYOUT_dO,
+        layout=SMEM_LAYOUT_dO_SG1,
         tma_loads_per_tile=TMA_VO_SG1_ITERS,
         tma_granu_elems=TMA_VO_SG1_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_SG1_GRANU_ELEMS,
@@ -849,8 +865,8 @@ def _kernel(
         base=sV_raw,
         elems_per_stage=vBufferElems,
         stages=CFG.STAGES_KV,
-        leading_byte_offset=LEADING_BYTE_OFFSET_QK,
-        stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
+        leading_byte_offset=LEADING_BYTE_OFFSET_dO,
+        stride_byte_offset=STRIDE_BYTE_OFFSET_dO,
         layout=SMEM_LAYOUT_V,
         tma_loads_per_tile=TMA_VO_ITERS,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
@@ -2041,7 +2057,9 @@ def _thd_setup_kernel(
         )
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     cute.arch.barrier()
-    write_thd_live_and_ctr(meta, n_batch, n_qh, cutlass.Int32(_KV_BLOCK_ROWS), n_clusters, cutlass.Int32(tidx), cu0=cu_k0)
+    write_thd_work_prefix(
+        meta, n_batch, n_qh, cutlass.Int32(_KV_BLOCK_ROWS), n_clusters, cutlass.Int32(tidx), 1, cu0=cu_k0, prefix0=THD_BWD_WORK_PREFIX_OFF(n_batch)
+    )
 
 
 _thd_setup_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -2108,7 +2126,7 @@ def _host(
         do_tensor, box_dims=do_box, stride_order=stride_order, swizzle=_tma_swz(CFG.dO_SWZ_BYTES), l2_promotion=tmap.TensorMapL2Promotion.l2_128b
     )
     tma_do_dv_desc = tmap.create_tensor_map_tiled_from_view(
-        do_tensor, box_dims=do_dv_box, stride_order=stride_order, swizzle=_tma_swz(CFG.dO_SWZ_BYTES), l2_promotion=tmap.TensorMapL2Promotion.l2_128b
+        do_tensor, box_dims=do_dv_box, stride_order=stride_order, swizzle=_tma_swz(CFG.dO_DV_SWZ_BYTES), l2_promotion=tmap.TensorMapL2Promotion.l2_128b
     )
     tma_k_desc = tmap.create_tensor_map_tiled_from_view(
         k_tensor, box_dims=qk_box_k, stride_order=stride_order, swizzle=_tma_swz(CFG.K_SWZ_BYTES), l2_promotion=tmap.TensorMapL2Promotion.l2_128b
@@ -2137,7 +2155,7 @@ def _host(
         # The tensor-map array inside the metadata buffer (tile_dsl.thd.THD_BWD_MAPS_OFF: the next 128-B boundary after the
         # 5B+5 words), as an int64 view the descriptor patchers write through.  Non-negative arithmetic only: a runtime
         # `//` truncates toward zero, so the Python negation trick for a ceil would floor instead.
-        _maps_off_bytes = (((5 * B + 5) * 4 + 127) // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN
+        _maps_off_bytes = THD_BWD_MAPS_OFF(B) * 4
         _maps = cute.make_tensor(
             cute.make_ptr(cutlass.Int64, seq_kv_lens_tensor.iterator.toint() + cutlass.Int64(_maps_off_bytes), cute.AddressSpace.gmem, assumed_align=128),
             cute.make_layout(((THD_INPUT_SLOTS + B) * TENSOR_MAP_QWORDS,), stride=(1,)),

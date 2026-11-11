@@ -128,6 +128,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         )
         self._offset_values = self._validate_offsets(sample_offsets, tokens_sum_a, name="sample_offsets")
         self._scale_cols = _round_up(ceil_div(tokens_sum_a, self.sf_vec_size), 4)
+        # Only the token count changes between calls, so the flat scale-buffer check precomputes the rest.
+        self._flat_sf_rows = (_round_up(self.a_desc.shape[0], 128), _round_up(self.b_desc.shape[1], 128))
+        self._tokens_per_a_col = 2 if self._is_fp4x2(sample_a) and self.a_desc.stride[1] == 1 else 1
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self.wgrad_desc = self._make_tensor_desc(sample_wgrad, name="sample_wgrad")
@@ -321,10 +324,14 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
         device = torch.cuda.current_device()
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmWgrad requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
+        if not has_tcgen05(major):
+            raise RuntimeError(
+                f"GroupedGemmWgrad requires SM100+ compute capability with tcgen05 (not cc 12.x), but found SM{compute_capability} on device {device}"
+            )
 
         self._is_supported = True
         return True
@@ -589,11 +596,9 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         # The kernel rebuilds a flat SF layout from the A/B shapes, so the buffer itself is checked on every call.
         if sfa_tensor.ndim == 1 or sfb_tensor.ndim == 1:
-            m, tokens = self._tensor_shape(a_tensor, name="a_tensor")
-            n = self._tensor_shape(b_tensor, name="b_tensor")[1]
-            scale_cols = _round_up(ceil_div(tokens, self.sf_vec_size), 4)
-            for name, sf, rows in (("sfa_tensor", sfa_tensor, m), ("sfb_tensor", sfb_tensor, n)):
-                numel = _round_up(rows, 128) * scale_cols
+            scale_cols = _round_up(ceil_div(a_tensor.shape[1] * self._tokens_per_a_col, self.sf_vec_size), 4)
+            for name, sf, rows in zip(("sfa_tensor", "sfb_tensor"), (sfa_tensor, sfb_tensor), self._flat_sf_rows):
+                numel = rows * scale_cols
                 if sf.ndim == 1 and (sf.numel() != numel or not sf.is_contiguous()):
                     raise ValueError(f"flat {name} must be a contiguous packed buffer of {numel} elements, got shape {tuple(sf.shape)} stride {sf.stride()}")
 

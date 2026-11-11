@@ -36,13 +36,70 @@ void
 throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::string const& error_msg);
 
 void
-init_pygraph_norm_submodule(py::class_<PyGraph>&);
+init_pygraph_norm_submodule(PyGraphClass&);
 
 void
-init_pygraph_sdpa_submodule(py::class_<PyGraph>&);
+init_pygraph_sdpa_submodule(PyGraphClass&);
 
 void
-init_pygraph_pointwise_submodule(py::class_<PyGraph>&);
+init_pygraph_pointwise_submodule(PyGraphClass&);
+
+void
+init_pygraph_custom_reduction_submodule(PyGraphClass&);
+
+namespace {
+
+int
+pygraph_traverse(PyObject* self, visitproc visit, void* arg) {
+    Py_VISIT(Py_TYPE(self));
+    if (!py::inst_ready(self)) {
+        return 0;
+    }
+    auto* graph = py::inst_ptr<PyGraph>(self);
+    Py_VISIT(graph->callback_gc_owner.ptr());
+    for (auto const& weak : graph->custom_callback_states) {
+        if (auto state = weak.lock()) {
+            Py_VISIT(state->reducer.ptr());
+            Py_VISIT(state->owner_weakref.ptr());
+        }
+    }
+    for (auto const* callback : {&graph->callback_fn, &graph->callback_fn_bprop}) {
+        if (callback->has_value()) {
+            py::handle function = py::find(callback->value());
+            Py_VISIT(function.ptr());
+        }
+    }
+    return 0;
+}
+
+int
+pygraph_clear(PyObject* self) {
+    if (!py::inst_ready(self)) {
+        return 0;
+    }
+    auto* graph = py::inst_ptr<PyGraph>(self);
+    // Detach every member before decref can run a finalizer that reenters the graph.
+    decltype(graph->custom_callback_states) states;
+    states.swap(graph->custom_callback_states);
+    std::optional<PyGraph::PyCallback> callback;
+    callback.swap(graph->callback_fn);
+    std::optional<PyGraph::PyCallback> callback_bprop;
+    callback_bprop.swap(graph->callback_fn_bprop);
+    auto owner = std::move(graph->callback_gc_owner);
+    for (auto const& weak : states) {
+        if (auto state = weak.lock()) {
+            auto reducer       = std::move(state->reducer);
+            auto owner_weakref = std::move(state->owner_weakref);
+        }
+    }
+    return 0;
+}
+
+PyType_Slot pygraph_gc_slots[] = {{Py_tp_traverse, reinterpret_cast<void*>(pygraph_traverse)},
+                                  {Py_tp_clear, reinterpret_cast<void*>(pygraph_clear)},
+                                  {0, nullptr}};
+
+}  // namespace
 
 cudnn_frontend::DataType_t
 convert_to_cudnn_data_type(const DLDataType& dtype) {
@@ -891,7 +948,7 @@ default_vector(void) {
 
 void
 init_pygraph_submodule(py::module_& m) {
-    py::class_<PyGraph> pygraph_(m, "backend_graph");
+    PyGraphClass pygraph_(m, "backend_graph", py::is_weak_referenceable(), py::type_slots(pygraph_gc_slots));
     pygraph_
         .def(py::init<std::string const&,
                       cudnn_frontend::DataType_t,
@@ -903,7 +960,8 @@ init_pygraph_submodule(py::module_& m) {
                       std::shared_ptr<KernelCache>,
                       std::shared_ptr<cudnn_frontend::DeviceProperties>,
                       bool,
-                      bool>(),
+                      bool,
+                      std::optional<cudnn_frontend::CudaGraphRetention_t>>(),
              py::arg("name")                      = "test_graph",
              py::arg("io_data_type")              = cudnn_frontend::DataType_t::NOT_SET,
              py::arg("intermediate_data_type")    = cudnn_frontend::DataType_t::NOT_SET,
@@ -914,7 +972,16 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("kernel_cache")              = py::none(),
              py::arg("device_property")           = py::none(),
              py::arg("is_dynamic_shape_enabled")  = false,
-             py::arg("is_override_shape_enabled") = false)
+             py::arg("is_override_shape_enabled") = false,
+             py::arg("cuda_graph_retention")      = py::none())
+        .def(
+            "get_cuda_graph_retention",
+            [](PyGraph const& self) { return self.graph->get_cuda_graph_retention(); },
+            R"pbdoc(
+                The CUDA graph retention mode in effect for this graph: the one passed as
+                cuda_graph_retention, else the CUDNN_CUDA_GRAPH_RETENTION environment variable,
+                else cuda_graph_retention.PER_GRAPH.
+            )pbdoc")
         .def("tensor_like",
              py::overload_cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> const&, std::string const&>(
                  &PyGraph::tensor_like),
@@ -1493,6 +1560,7 @@ init_pygraph_submodule(py::module_& m) {
     init_pygraph_norm_submodule(pygraph_);
     init_pygraph_sdpa_submodule(pygraph_);
     init_pygraph_pointwise_submodule(pygraph_);
+    init_pygraph_custom_reduction_submodule(pygraph_);
 }
 
 }  // namespace cudnn_frontend::python_bindings

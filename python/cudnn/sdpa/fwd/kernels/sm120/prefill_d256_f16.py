@@ -65,10 +65,13 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_kernel,
     sanitize_v_tail,
     thd_claim_next,
-    thd_decode_unit,
+    THD_BATCH_OF_WORK_META_WORDS,
+    THD_WORK_META_WORDS,
+    thd_decode_unit_prefix,
     THD_SETUP_THREADS,
 )
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    thd_row_origin,
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
     nvvm_threadquad_reduction_max,
@@ -846,17 +849,21 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
-        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+        if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
+            # One compute warp owns shared V-tail stores; all PV readers
+            # must wait for those stores, even when every writer stores zero.
+            if basic_params.q_warp_row0 == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs)
         if basic_params.q_warp_row0 == 0:
             prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
@@ -867,7 +874,7 @@ class SM120FusedMultiHeadAttentionForward:
                     basic_params.v_tma_mbar,
                     basic_params.tma_batch_idx,
                     basic_params.kv_head_idx,
-                    basic_params.kv_row_base + (kv_tile_idx - 1) * self.kv_tile,
+                    basic_params.v_row_base + (kv_tile_idx - 1) * self.kv_tile,
                     is_v=True,
                     envelope=basic_params.v_envelope,
                 )
@@ -902,6 +909,8 @@ class SM120FusedMultiHeadAttentionForward:
         q_tile_idx,
         batch_idx,
         head_idx,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> cutlass.Int32:
         """One unit of work: the (Q tile, sequence, head) triple named by the
         last three arguments.
@@ -921,7 +930,7 @@ class SM120FusedMultiHeadAttentionForward:
             # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr].
             # Per-sequence lengths come from the prefix sums; the bases offset
             # every packed (1, T, H, D) access below.
-            n_batch = (seq_kv_lens.shape[0] - 4) // 4
+            n_batch = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
             meta = cutlass.make_array_view(seq_kv_lens)
             # batch_idx is a real batch index here: whichever dispatch produced
             # it has already resolved the longest-first batch_remap.
@@ -943,6 +952,19 @@ class SM120FusedMultiHeadAttentionForward:
 
         num_heads_q = q.shape[2]
         num_heads_kv = k.shape[2]
+        o_row_base = q_row_base
+        stats_row_base = q_row_base
+        v_row_base = kv_row_base
+        if cutlass.const_expr(thd_origin_specs is not None):
+            # Prefixes above own lengths/work scheduling; offsets own addresses.
+            q_row_base = thd_row_origin(thd_origins, thd_origin_specs, 0, batch_idx, q.stride[1], q_row_base)
+            kv_row_base = cutlass.Int32(thd_row_origin(thd_origins, thd_origin_specs, 1, batch_idx, k.stride[1], kv_row_base))
+            v_row_base = cutlass.Int32(thd_row_origin(thd_origins, thd_origin_specs, 2, batch_idx, v.stride[1], v_row_base))
+            o_row_base = thd_row_origin(thd_origins, thd_origin_specs, 3, batch_idx, o.stride[1], o_row_base)
+            if cutlass.const_expr(lse is not None and not self.thd_lse_padded):
+                stats_stride = lse.stride[1] if cutlass.const_expr(self.thd_lse_head_major) else lse.stride[0]
+                stats_row_base = thd_row_origin(thd_origins, thd_origin_specs, 4, batch_idx, stats_stride, stats_row_base)
+
         head_dim_qk = q.shape[3]
         head_dim_v = v.shape[3]
         # ENVELOPE flags (static shapes): actual dim < compile-time tile means
@@ -960,7 +982,7 @@ class SM120FusedMultiHeadAttentionForward:
             # batch stride term, and every Q/O row index below stays
             # sequence-local.
             q_head_off = q_row_base * q_seq_stride + q_head_base * q_head_stride
-            o_head_off = q_row_base * o_seq_stride + q_head_base * o_head_stride
+            o_head_off = o_row_base * o_seq_stride + q_head_base * o_head_stride
         else:
             q_head_off = batch_idx * q_batch_stride + q_head_base * q_head_stride
             o_head_off = o_batch_idx * o_batch_stride + q_head_base * o_head_stride
@@ -1069,6 +1091,7 @@ class SM120FusedMultiHeadAttentionForward:
             tma_batch_idx=tma_batch_idx,
             kv_head_idx=kv_head_idx,
             kv_row_base=kv_row_base,
+            v_row_base=v_row_base,
             min_kv_tile=min_kv_tile,
             k_envelope=k_envelope,
             v_envelope=v_envelope,
@@ -1089,7 +1112,7 @@ class SM120FusedMultiHeadAttentionForward:
         if warp == 0 and has_kv_work:
             kv_seq_idx = (num_kv_tiles - 1) * self.kv_tile
             self.load_one_kv_tile(sK, tma_k_desc, k_tma_mbar, tma_batch_idx, kv_head_idx, kv_row_base + kv_seq_idx, is_v=False, envelope=k_envelope)
-            self.load_one_kv_tile(sV, tma_v_desc, v_tma_mbar, tma_batch_idx, kv_head_idx, kv_row_base + kv_seq_idx, is_v=True, envelope=v_envelope)
+            self.load_one_kv_tile(sV, tma_v_desc, v_tma_mbar, tma_batch_idx, kv_head_idx, v_row_base + kv_seq_idx, is_v=True, envelope=v_envelope)
 
         # Load Q into registers.
         q_regs = self.load_q_tile(basic_params)
@@ -1233,9 +1256,9 @@ class SM120FusedMultiHeadAttentionForward:
                                 # per-batch padded Stats (B, H, s_max), no ragged offsets
                                 lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
                             elif cutlass.const_expr(self.thd_lse_head_major):
-                                lse_arr[_lse_head, q_row_base + lse_q_idx] = lse_out
+                                lse_arr[_lse_head, stats_row_base + lse_q_idx] = lse_out
                             else:
-                                lse_arr[q_row_base + lse_q_idx, _lse_head] = lse_out
+                                lse_arr[stats_row_base + lse_q_idx, _lse_head] = lse_out
                     else:
                         # Rows at/past this batch's Q length trim to -inf.
                         if lse_q_idx >= seqlen_q:
@@ -1334,6 +1357,8 @@ class SM120FusedMultiHeadAttentionForward:
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
         n_q_tiles: cutlass.Int32,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> None:
         """SM120 FMHA prefill kernel.
 
@@ -1401,7 +1426,7 @@ class SM120FusedMultiHeadAttentionForward:
             # more CTAs than there is work is harmless — the extra ones fail the
             # loop test and retire.
             _meta = cutlass.make_array_view(seq_kv_lens)
-            _nb = (seq_kv_lens.shape[0] - 4) // 4
+            _nb = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
             _live = cutlass.Int32(_meta[4 * _nb + 2])
             _slot = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=16)
             _bidx, _, _ = cute.arch.block_idx()
@@ -1411,7 +1436,7 @@ class SM120FusedMultiHeadAttentionForward:
             # phase up where the previous one left it.
             _phase = cutlass.Int32(0)
             while _uid < _live:
-                _qt, _b, _h = thd_decode_unit(
+                _qt, _b, _h = thd_decode_unit_prefix(
                     _meta,
                     cutlass.Int32(_nb),
                     _uid,
@@ -1445,6 +1470,8 @@ class SM120FusedMultiHeadAttentionForward:
                     _qt,
                     _b,
                     _h,
+                    thd_origins=thd_origins,
+                    thd_origin_specs=thd_origin_specs,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -1488,7 +1515,7 @@ class SM120FusedMultiHeadAttentionForward:
                 # the ragged tail of the launch to short sequences whose
                 # over-length tiles retire without work.
                 _m = cutlass.make_array_view(seq_kv_lens)
-                _n = (seq_kv_lens.shape[0] - 4) // 4
+                _n = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
                 batch_idx = cutlass.Int32(_m[3 * _n + 2 + batch_idx])
                 o_batch_idx = batch_idx
             self._run_unit(
@@ -1517,6 +1544,8 @@ class SM120FusedMultiHeadAttentionForward:
                 q_tile_idx,
                 batch_idx,
                 head_idx,
+                thd_origins=thd_origins,
+                thd_origin_specs=thd_origin_specs,
             )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1540,6 +1569,8 @@ class SM120FusedMultiHeadAttentionForward:
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
         prepared: cutlass.Constexpr[bool] = False,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
 
@@ -1640,8 +1671,8 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(self.thd_varlen):
                 if cutlass.const_expr(q.shape[0] != 1):
                     raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-                if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
-                    raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
+                if cutlass.const_expr(seq_kv_lens.shape != (THD_WORK_META_WORDS(self.thd_batch),)):
+                    raise ValueError("THD seq_kv_lens must be the (THD_WORK_META_WORDS(B),) metadata tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
         # per-tensor TMA descriptor over the compact (B, S, H, D) storage.
@@ -1688,7 +1719,7 @@ class SM120FusedMultiHeadAttentionForward:
         # Prepared THD carries the current batch in the metadata extent; tensor
         # entries retain their compile-time batch. Device readers already derive
         # the same batch from this layout, so setup and consumers stay in step.
-        thd_batch = (seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
+        thd_batch = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0]) if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
         if cutlass.const_expr(self.thd_varlen):
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
@@ -1702,6 +1733,7 @@ class SM120FusedMultiHeadAttentionForward:
                 cutlass.Int32(q.shape[2]),
                 cutlass.Int32(self.q_tile),
                 thd_n_ctas,
+                True,  # work_prefix: the unit decode binary-searches the prefix (THD_WORK_META_WORDS(B) metadata)
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
@@ -1739,6 +1771,8 @@ class SM120FusedMultiHeadAttentionForward:
             tma_v_desc,
             softmax_scale_log2,
             cutlass.Int32(n_q_tiles),
+            thd_origins=thd_origins,
+            thd_origin_specs=thd_origin_specs,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -1768,6 +1802,7 @@ def compile(  # noqa: A001
     lse_stride: Optional[tuple[int, int, int]] = None,
     prepared: bool = True,
     persistent_ctas: int = 0,
+    thd_origin_specs=None,
 ) -> Callable:
     """Compile the dense/packed pointer host; geometry binds at execution."""
 
@@ -1801,4 +1836,16 @@ def compile(  # noqa: A001
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
     )
-    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)
+    return _compile_prepared_host(
+        kernel,
+        STORAGE_DTYPE,
+        qh,
+        kh,
+        d_qk,
+        d_v,
+        has_lse,
+        persistent_ctas,
+        _cache_key,
+        thd_max_sq=sq if PARAMS.thd_varlen else 0,
+        thd_origin_specs=thd_origin_specs,
+    )

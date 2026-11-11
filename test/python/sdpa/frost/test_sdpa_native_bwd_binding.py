@@ -32,15 +32,17 @@ _WORKSPACE = 0x700000000000
 
 def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0, workspace_bytes=4096):
     family = "sm100" if arch.startswith("sm100_d128") else arch.split("_thd")[0]
-    filename = {
-        "sm100_d128": "prepared_d128_host.py",
-        "sm100_d128_accum": "prepared_d128_accum_host.py",
-        "sm100_d128_thd": "prepared_d128_thd_host.py",
-        "sm100_d128_grouped_dense": "prepared_d128_grouped_host.py",
-        "sm100_d128_grouped_thd": "prepared_d128_grouped_thd_host.py",
-    }.get(arch, "prepared_host.py")
+    # the d128 family's pointer hosts live in ONE module (kernels/sm100/prepared_d128_host.py), one traced entry per route
+    d128_entry = {
+        "sm100_d128": "host_recompute",
+        "sm100_d128_accum": "host_accum",
+        "sm100_d128_thd": "host_thd",
+        "sm100_d128_grouped_dense": "host_grouped_dense",
+        "sm100_d128_grouped_thd": "host_grouped_thd",
+    }.get(arch)
+    filename = "prepared_d128_host.py" if d128_entry else "prepared_host.py"
     path = Path(prep.__file__).parent / "kernels" / family / filename
-    entry = "host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host"
+    entry = d128_entry or ("host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host")
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == entry)
     names = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
     # SM80 binds these four immutable launch bounds through functools.partial.
@@ -134,6 +136,70 @@ def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
         if role in changed:
             assert rebound[i] == changed[role].ptr
     assert rebound[-1] == 31
+
+
+@pytest.mark.parametrize("native_binding", [False, True])
+@pytest.mark.parametrize("external_delta", [False, True])
+@pytest.mark.parametrize("scale", [None, 0.0, -0.0, 0.375])
+def test_shared_standalone_adapter_uses_current_native_storage(native_binding, external_delta, scale, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+    import cudnn._device as device
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.fwd import prepared as fwd_prep
+
+    spec, _, facts, _, frames = _fixture("sm107", features=False)
+    ops = list(spec.operands)
+    # Kernel operands use BSHD; standalone carriers declare logical BHSD.
+    for i, role in enumerate(spec.roles[:9]):
+        op = ops[i]
+        if role == "stats":
+            ops[i] = replace(op, shape=(2, 3, 5), strides=(15, 5, 1), span=30)
+            facts[role] = facts[role]._replace(shape=(30,), strides=(1,), span=30)
+        else:
+            facts[role] = facts[role]._replace(shape=tuple(op.shape[j] for j in (0, 2, 1, 3)), strides=tuple(op.strides[j] for j in (0, 2, 1, 3)))
+    if external_delta:
+        i = spec.roles.index("delta")
+        ops[i] = prep.Operand("float32", (2, 3, 5), (15, 5, 1), 30, 4, 4)
+        facts["delta"] = BufferFacts(0x100000000000 + i * 2**40, "float32", (2, 0), 30, (2, 3, 5), (15, 5, 1))
+    spec = replace(spec, operands=tuple(ops), native_binding=native_binding)
+    api = SimpleNamespace(_prepared=spec, q_desc=SimpleNamespace(device=torch.device("cuda", 0)))
+    workspace = BufferFacts(_WORKSPACE, "uint8", (2, 0), 4096, (4096,), (1,))
+    contexts = []
+    monkeypatch.setattr(fwd_prep, "facts_of_tensor", lambda tensor: tensor)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda dev: SimpleNamespace(cuda_stream=17))
+    monkeypatch.setattr(device, "ensure_current_context", lambda stream, dev: contexts.append((stream, dev)))
+    expected_bind = prep._bind_python
+    if native_binding:
+        monkeypatch.setattr(prep, "_bind_python", lambda *a, **kw: pytest.fail("standalone adapter fell back to Python binding"))
+
+    def execute(current, ws=workspace, stream=None):
+        prepared_sm107.execute_standalone(api, [current.get(role) for role in spec.roles], ws, stream, scale)
+
+    for offset, stream in ((0, None), (0x10000, 29)):
+        current = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
+        expected = expected_bind(spec, current, workspace.ptr, 17 if stream is None else stream, scale=scale)
+        execute(current, stream=stream)
+        assert frames[-1] == tuple(expected)
+        scale_slot = len(spec.operands) + 1 + spec.scale_log2
+        assert frames[-1][scale_slot].hex() == float(spec.scale if scale is None else scale).hex()
+    assert contexts == [(17, 0), (29, 0)]
+    # Reject current storage before entry, including the optional external delta.
+    bad_facts = [
+        dict(current, q=current["q"]._replace(shape=(current["q"].span,), strides=(1,))),
+        dict(current, stats=current["stats"]._replace(shape=(29,), span=29)),
+        dict(current, dq=current["dq"]._replace(ptr=current["dq"].ptr + 1)),
+    ]
+    if external_delta:
+        bad_facts.extend([dict(current, delta=None), dict(current, delta=current["delta"]._replace(dtype="bfloat16"))])
+    for bad in bad_facts:
+        with pytest.raises(ValueError):
+            execute(bad)
+    with pytest.raises(ValueError, match="workspace"):
+        execute(current, ws=workspace._replace(span=4095))
+    assert len(frames) == 2
 
 
 @pytest.mark.parametrize("arch", ["sm100", "sm107"])
@@ -498,3 +564,93 @@ def test_d128_thd_guard_includes_the_last_prefix_element(arch, role):
     with pytest.raises(ValueError, match="overlaps"):
         prep.execute(spec, current, _WORKSPACE, 29)
     assert len(frames) == 1
+
+
+@pytest.mark.parametrize("engine", ["sm80", "sm100", "sm107_d512"])
+@pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
+@pytest.mark.parametrize("raw_storage", [False, True])
+def test_native_gradient_overlap_rejected_before_entry(engine, pair, raw_storage):
+    spec, _, facts, geometry, frames = _fixture("sm80" if engine == "sm80" else "sm100", features=False)
+    spec = replace(spec, name="sdpa_bwd_" + engine)
+    spec = replace(spec, native_binding=True)
+    prep.execute(spec, facts, _WORKSPACE, 17, raw_storage=raw_storage, geometry=geometry)
+    first, second = pair
+    for shift in (0, 16, 64):
+        bad = dict(facts)
+        bad[second] = bad[second]._replace(ptr=bad[first].ptr + shift)
+        with pytest.raises(ValueError, match=first + " overlaps " + second):
+            prep.execute(spec, bad, _WORKSPACE, 17, raw_storage=raw_storage, geometry=geometry)
+    assert len(frames) == 1, "invalid gradients must be rejected before any launch"
+    prep.execute(spec, facts, _WORKSPACE, 29, raw_storage=raw_storage, geometry=geometry)
+    assert len(frames) == 2
+
+
+@pytest.mark.parametrize("engine", ["sm80", "sm100", "sm107_d512"])
+@pytest.mark.parametrize("strides", [(96, 48, 16, 1), (192, 16, 64, 1), (256, 64, 16, 1), (176, 80, 24, 1), (128, 56, 24, 1), (160, 80, 24, 1)])
+@pytest.mark.parametrize("second_layout", [None, ((2, 2, 3, 8), (176, 80, 24, 1)), ((2, 2, 3, 16), (176, 80, 24, 1))])
+@pytest.mark.parametrize("pair", [("dq", "dk"), ("dq", "dv"), ("dk", "dv")])
+def test_native_shared_gradient_storage_matches_address_oracle(engine, strides, second_layout, pair):
+    from itertools import product
+
+    spec, _, facts, _, frames = _fixture("sm80" if engine == "sm80" else "sm100", features=False)
+    spec = replace(spec, name="sdpa_bwd_" + engine)
+    shape = (2, 2, 3, 8)
+    addresses = []
+    ops = list(spec.operands)
+    for role, (dims, layout) in zip(pair, ((shape, strides), (shape, strides) if second_layout is None else second_layout)):
+        offsets = {sum(i * s for i, s in zip(index, layout)) for index in product(*(range(n) for n in dims))}
+        addresses.append(offsets)
+        span = max(offsets) + 1
+        i = spec.roles.index(role)
+        ops[i] = replace(ops[i], shape=dims, strides=layout, span=span)
+        facts[role] = facts[role]._replace(shape=dims, strides=layout, span=span)
+    spec = replace(spec, operands=tuple(ops), native_binding=True)
+    # Includes exact and shifted overlap, legal interleaved runs, and finite
+    # disjoint layouts that cannot be separated by a stride-GCD check alone.
+    # Head/batch gaps may be smaller than a row gap; mixed layouts and both
+    # pointer orders must not inherit a shortcut for matching run starts.
+    first, second = pair
+    span = max(map(max, addresses)) + 1
+    limit = (span + 15) // 8 * 8
+    for delta in range(-limit, limit + 1, 8):
+        current = dict(facts)
+        current[second] = facts[second]._replace(ptr=facts[first].ptr + 2 * delta)
+        overlap = not addresses[0].isdisjoint({x + delta for x in addresses[1]})
+        if overlap:
+            with pytest.raises(ValueError, match=first + " overlaps " + second):
+                prep.bind(spec, current, _WORKSPACE, 17)
+        else:
+            frame = prep.bind(spec, current, _WORKSPACE, 17)
+            assert frame[spec.roles.index(second)] == current[second].ptr
+    assert not frames
+
+
+@pytest.mark.parametrize("engine", ["sm100", "sm107_d512"])
+@pytest.mark.parametrize("shift", [16, 32])
+@pytest.mark.parametrize("flat", [False, True])
+def test_gradient_overlap_uses_declared_graph_addresses(engine, shift, flat):
+    """A graph carrier supplies storage, not a replacement kernel layout."""
+    spec, _, facts, _, frames = _fixture("sm100", features=False)
+    shape, strides = (2, 2, 3, 8), (96, 48, 16, 1)
+    ops = list(spec.operands)
+    for role in ("dq", "dk"):
+        i = spec.roles.index(role)
+        ops[i] = replace(ops[i], shape=shape, strides=strides, span=184)
+        facts[role] = facts[role]._replace(shape=shape, strides=strides, span=512)
+    spec = replace(spec, name="sdpa_bwd_" + engine, operands=tuple(ops), native_binding=True)
+    changed = dict(facts)
+    # The strided carrier's own addressed elements overlap at shift=16, but
+    # the compiled layout writes disjoint alternating 16-byte rows there.
+    changed["dk"] = facts["dk"]._replace(ptr=facts["dq"].ptr + shift, shape=(512,) if flat else shape, strides=(1,) if flat else (128, 64, 8, 1))
+    indices = tuple(range(len(spec.operands)))
+    if shift == 16:
+        spec.native.execute(_pack(spec, changed), indices, _WORKSPACE, 17, ())
+        assert len(frames) == 1
+    else:
+        with pytest.raises(ValueError, match="dq overlaps dk"):
+            spec.native.execute(_pack(spec, changed), indices, _WORKSPACE, 17, ())
+        assert not frames
+    # Explicit geometry overrides remain a different contract: this fixed
+    # host cannot accept a different layout, even if storage is sufficient.
+    with pytest.raises(ValueError, match="runtime geometry"):
+        spec.native.execute(_pack(spec, changed), indices, _WORKSPACE, 17, (spec.roles.index("dk"),))

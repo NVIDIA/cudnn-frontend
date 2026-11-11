@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CUDA-only MXFP8 scale packing helpers for the SM100 Indexer DSL path.
+"""CUDA-only MXFP8 and MXFP4 scale packing helpers for the SM100 Indexer DSL path.
 
+MXFP8 and MXFP4 share the E8M0 scale format, one byte per 32 logical head_dim
+values: ``G = head_dim // 32`` scales per row (4 for head_dim 128), also for
+MXFP4, whose ``float4_e2m1fn_x2`` rows hold ``head_dim // 2`` elements.
 Runtime packing requires contiguous one-byte CUDA inputs, a supported GPU, and
 the CuTe DSL version required by the DSA kernels. PyTorch reference packing is
 kept in the test suite and is deliberately not a runtime fallback.
@@ -28,7 +31,7 @@ def make_scale_cu_seqlens_padded(cu_seqlens: torch.Tensor, token_alignment: int)
     """Return per-sequence padded token prefixes for a compact THD tensor.
 
     ``cu_seqlens`` remains the prefix for compact Q/K data. The returned
-    ``(B+1,)`` int32 tensor is the prefix for independently padded MXFP8 scale
+    ``(B+1,)`` int32 tensor is the prefix for independently padded scale
     storage, where each sequence length is minimally rounded up to
     ``token_alignment``. Callers may instead pass the THD scale packers any
     span that covers the logical sequence and is a multiple of
@@ -148,8 +151,8 @@ def _cuda_packer_requirement_error(device_index: int) -> str | None:
     installed, _ = cutedsl_state()
     if not installed:
         floor = ".".join(str(component) for component in CUTEDSL_MIN_VERSION)
-        return f"SM100 DSA MXFP8 scale packing requires nvidia-cutlass-dsl >= {floor}"
-    requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8 scale packing")
+        return f"SM100 DSA MXFP8/MXFP4 scale packing requires nvidia-cutlass-dsl >= {floor}"
+    requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8/MXFP4 scale packing")
     if requirement_error:
         return requirement_error
 
@@ -158,7 +161,7 @@ def _cuda_packer_requirement_error(device_index: int) -> str | None:
 
     capability = device_capability(device_index)
     if capability not in _ARCH_MAP:
-        return f"SM100 DSA MXFP8 scale packing does not support compute capability {capability[0]}.{capability[1]}"
+        return f"SM100 DSA MXFP8/MXFP4 scale packing does not support compute capability {capability[0]}.{capability[1]}"
     arch_error = cutedsl_arch_requirement_error(capability)
     if arch_error:
         return arch_error
@@ -192,7 +195,7 @@ def _cuda_pack_launchers():
     """Return gated CUDA launchers without repeating import/version work."""
     from cudnn.frost.buffers import cutedsl_requirement_error
 
-    requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8 scale packing")
+    requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8/MXFP4 scale packing")
     if requirement_error:
         raise RuntimeError(requirement_error)
     from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_pack import (
@@ -469,7 +472,7 @@ def pack_q_scale_thd(
     if n_heads_q % qhead_per_kv_head != 0:
         raise ValueError(f"n_heads_q ({n_heads_q}) must be divisible by qhead_per_kv_head ({qhead_per_kv_head})")
     if out is None:
-        raise ValueError("out is required for THD MXFP8 scale packing")
+        raise ValueError("out is required for THD MXFP8/MXFP4 scale packing")
     _require_cuda_packer(q_scale, name="q_scale")
     n_heads_kv = n_heads_q // qhead_per_kv_head
     _validate_thd_cuda_prefixes(q_scale, cu_seqlens_q, cu_seqlens_q_scale_padded)
@@ -511,7 +514,7 @@ def pack_k_scale_thd(
     if k_scale.ndim != 3:
         raise ValueError(f"k_scale must have shape (total_k, H_kv, sf_groups), got {tuple(k_scale.shape)}")
     if out is None:
-        raise ValueError("out is required for THD MXFP8 scale packing")
+        raise ValueError("out is required for THD MXFP8/MXFP4 scale packing")
     _require_cuda_packer(k_scale, name="k_scale")
     _, n_heads_kv, sf_groups = k_scale.shape
     _validate_thd_cuda_prefixes(k_scale, cu_seqlens_k, cu_seqlens_k_scale_padded)

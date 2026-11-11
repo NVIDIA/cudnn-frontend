@@ -13,6 +13,39 @@ from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm80, SdpaFwdDslSm100, 
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("fp8", [False, True])
+def test_compile_parameter_names_reused_across_plans_and_refreshed_for_new_entry(monkeypatch, fp8):
+    """New plans share immutable function metadata, but a replaced entry cannot reuse it."""
+    from types import SimpleNamespace
+
+    def compile_entry(*, has_lse):
+        pass
+
+    def replacement(*, has_lse, has_amax):
+        pass
+
+    replacement.__name__ = compile_entry.__name__
+    signature = inspect.signature
+    inspected = []
+
+    def track(entry):
+        inspected.append(entry)
+        return signature(entry)
+
+    monkeypatch.setattr(inspect, "signature", track)
+    km = SimpleNamespace(compile=compile_entry, compile_prepared=compile_entry)
+    for _ in range(2):
+        plan = SimpleNamespace(_k_mod=km, _fp8=fp8)
+        assert SdpaFwdDslSm100._kernel_compile_accepts(plan) == {"has_lse"}
+    assert inspected == [compile_entry]
+
+    setattr(km, "compile_prepared" if fp8 else "compile", replacement)
+    plan._kernel_accepts = None  # compile() resets this when reloading the module
+    assert SdpaFwdDslSm100._kernel_compile_accepts(plan) == {"has_lse", "has_amax"}
+    assert inspected == [compile_entry, replacement]
+
+
+@pytest.mark.L0
 def test_new_constructor_parameters_follow_the_legacy_positional_prefix():
     """New optional operands must not change legacy positional bindings."""
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
@@ -151,15 +184,17 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
         params = inspect.signature(fn).parameters
         assert "sf_o" in params, f"{api_cls.__name__}.{fn.__name__} does not accept sf_o"
         assert params["sf_o"].default is None
-    # Append-only public signature: sf_o closes the block-scale tail; the ragged-Q
-    # decode leg's offset operands (defaulted None) follow it.
+    # Append-only public signature: sf_o keeps its position before later operands.
     exec_params = list(inspect.signature(api_cls.execute).parameters)
     tail = exec_params[exec_params.index("sf_o") :]
-    # SM100 carries the leg and, appended after it, the score side outputs and the resident-block operands (bias / kv_mask); SM120 does not.
-    assert tail in (
-        ["sf_o"],
-        ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"],
-    ), tail
+    if api_cls is SdpaFwdDslSm120:
+        # Physical origins follow the existing sf_o / paged-table prefix.
+        assert tail[:8] == ["sf_o", "block_table", "block_table_v", "ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_lse"], tail
+        for name in tail[1:8]:
+            assert params[name].default is None
+    else:
+        # SM100 appends ragged-Q offsets, score side outputs and resident-block operands.
+        assert tail[:8] == ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"], tail
 
 
 @pytest.mark.L0

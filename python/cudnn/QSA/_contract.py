@@ -7,6 +7,19 @@ import math
 
 import torch
 
+# (query heads, KV heads) geometries the attention kernels serve: the full 24Q/2KV model and its 12Q/1KV (two-way) and
+# 6Q/1KV (four-way, KV head replicated) tensor-parallel shards.
+HEAD_GEOMETRIES = ((6, 1), (12, 1), (24, 2))
+# bf16 parts of dS that reach the dQ MMAs: dS rounded to bf16 (on the dense prefix P too) or three parts of its fp32
+# value
+DS_PRECISIONS = {"bf16": 1, "fp32": 3}
+
+
+def ds_parts(ds_precision):
+    if not isinstance(ds_precision, str) or ds_precision not in DS_PRECISIONS:
+        raise ValueError("ds_precision must be 'bf16' or 'fp32'")
+    return DS_PRECISIONS[ds_precision]
+
 
 def check_tensor(name, tensor, shape, dtype, device, alignment=4):
     if not isinstance(tensor, torch.Tensor):
@@ -26,8 +39,8 @@ def check_inputs(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, block_first, b
         raise ValueError("k must have shape [T, Hkv, 256]")
     total, hq, dim = q.shape
     hkv = k.shape[1]
-    if total < 1 or dim != 256 or (hq, hkv) not in ((12, 1), (24, 2)):
-        raise NotImplementedError("QSA requires T > 0, D = 256, and 12/1 or 24/2 query/KV heads")
+    if total < 1 or dim != 256 or (hq, hkv) not in HEAD_GEOMETRIES:
+        raise NotImplementedError("QSA requires T > 0, D = 256, and 6/1, 12/1 or 24/2 query/KV heads")
     if q.numel() > 2**31 - 1:
         raise NotImplementedError("QSA requires T * Hq * D <= INT32_MAX")
     if q.dtype != torch.bfloat16:

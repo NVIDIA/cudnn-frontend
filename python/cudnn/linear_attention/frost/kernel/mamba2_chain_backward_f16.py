@@ -46,6 +46,7 @@ def chain_backward_host(
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
     regenerate: cutlass.Constexpr[bool],
+    coarse: cutlass.Constexpr[bool],
     recompute_summary_cfg: cutlass.Constexpr,
     recompute_series_cfg: cutlass.Constexpr,
     bprop_summary_cfg: cutlass.Constexpr,
@@ -60,6 +61,7 @@ def chain_backward_host(
     num_seqs: cutlass.Int32,
     dt_min: cutlass.Float32,
     dt_max: cutlass.Float32,
+    seed_every_n_tokens: cutlass.Int32,
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -90,14 +92,20 @@ def chain_backward_host(
     state_h: Optional[cute.Tensor],
     transition: cute.Tensor,
     state_x: Optional[cute.Tensor],
+    seed_checkpoints: Optional[cute.Tensor],
     state_g: cute.Tensor,
     state_dx: cute.Tensor,
     seed: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     dfs: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
     exit_dots: cute.Tensor,
+    dot_q: cute.Tensor,
+    dot_k: cute.Tensor,
     skip_bwd_part: Optional[cute.Tensor],
     exit_slots: cute.Tensor,
+    exit_base: cute.Tensor,
     stream: cuda.CUstream,
 ) -> None:
     mamba2_chain_prologue_f16.chain_prologue(
@@ -131,10 +139,11 @@ def chain_backward_host(
         dk,
         dv,
         exit_slots,
+        exit_base,
         stream,
     )
-    if cutlass.const_expr(regenerate):
-        # the forward chain's own three steps: zero-state summaries, the scalar chain, the series from the chain states
+    if cutlass.const_expr(regenerate and not coarse):
+        # the forward chain's own first two steps: zero-state summaries and the scalar chain
         mamba2_recompute_f16.host(
             recompute_summary_cfg,
             1,
@@ -147,6 +156,7 @@ def chain_backward_host(
             dt_bias,
             cu_pieces,
             None,
+            None,
             state_h,
             None,
             None,
@@ -154,6 +164,7 @@ def chain_backward_host(
             summary_count,
             scheduler_summary_fwd,
             transition,
+            cutlass.Int32(0),
             cutlass.Int32(0),
             dt_min,
             dt_max,
@@ -165,17 +176,24 @@ def chain_backward_host(
             dim_v,
             dim_k,
             chain_rows,
+            pieces,
             has_seed,
             False,
+            False,
+            True,
             num_seqs,
             state_h,
             transition,
             state_x,
             seed,
+            None,
             main_rows,
             None,
+            composed,
             stream,
         )
+    if cutlass.const_expr(regenerate):
+        # the series pass: every piece seeded from its chain state, or under coarse from its checkpoint row
         mamba2_recompute_f16.host(
             recompute_series_cfg,
             1,
@@ -187,7 +205,8 @@ def chain_backward_host(
             a,
             dt_bias,
             cu_pieces,
-            state_x,
+            seed_checkpoints if coarse else state_x,
+            None,
             None,
             None,
             None,
@@ -196,6 +215,7 @@ def chain_backward_host(
             scheduler_regenerate,
             None,
             cutlass.Int32(b_t),
+            seed_every_n_tokens if coarse else cutlass.Int32(0),
             dt_min,
             dt_max,
             prefill_words,
@@ -212,11 +232,12 @@ def chain_backward_host(
         dt_bias,
         cu_pieces,
         None,
+        None,
         state_g,
         work_items_summary,
         summary_count,
         scheduler_summary_bwd,
-        None if regenerate else transition,
+        None if (regenerate and not coarse) else transition,
         dt_min,
         dt_max,
         bprop_words,
@@ -227,15 +248,20 @@ def chain_backward_host(
         dim_v,
         dim_k,
         chain_rows,
+        pieces,
         has_dfs,
+        True,
+        False,
         True,
         num_seqs,
         state_g,
         transition,
         state_dx,
         dfs,
+        None,
         main_rows,
         None,
+        dcomposed,
         stream,
     )
     mamba2_bprop_f16.host(
@@ -253,9 +279,13 @@ def chain_backward_host(
         dv,
         series,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
+        exit_base,
         cu_pieces,
         state_dx,
+        None,
         dstate0,
         work_items,
         main_count,
@@ -268,13 +298,15 @@ def chain_backward_host(
     )
 
 
-def build_configs(io_dtype, *, regenerate, use_dstate0, dt_softplus, has_d, d_per_channel, skip_bwd_partials, max_active_clusters, d_k, d_v):
+def build_configs(
+    io_dtype, *, regenerate, coarse, seed_dtype, use_dstate0, dt_softplus, has_d, d_per_channel, skip_bwd_partials, max_active_clusters, d_k, d_v
+):
     """The configs of the chain backward: the two recompute passes of the series regeneration (the zero-state summary and
-    the series pass seeded from the chain states, the forward chain's own pair), the backward summary and the main
-    bprop."""
+    the series pass seeded from the chain states, the forward chain's own pair; under ``coarse`` the series pass alone,
+    seeded from the checkpoint rows of ``seed_dtype``), the backward summary and the main bprop."""
     recompute_summary_cfg = None
     recompute_series_cfg = None
-    if regenerate:
+    if regenerate and not coarse:
         recompute_summary_cfg = mamba2_recompute_f16.build_cfg(
             io_dtype,
             cutlass.Float32,
@@ -286,14 +318,16 @@ def build_configs(io_dtype, *, regenerate, use_dstate0, dt_softplus, has_d, d_pe
             d_k=d_k,
             d_v=d_v,
         )
+    if regenerate:
         recompute_series_cfg = mamba2_recompute_f16.build_cfg(
             io_dtype,
-            cutlass.Float32,
+            seed_dtype if coarse else cutlass.Float32,
             max_active_clusters=max_active_clusters,
             use_initial_state=True,
             store_final_state=False,
             enable_checkpoints=True,
             dt_softplus=dt_softplus,
+            seed_checkpoints=coarse,
             d_k=d_k,
             d_v=d_v,
         )
@@ -357,11 +391,16 @@ def build_chain_backward(
     state_g,
     state_dx,
     seed,
+    composed=None,
     dfs,
+    dcomposed=None,
     dstate0,
     exit_dots,
+    dot_q,
+    dot_k,
     skip_bwd_part,
     exit_slots,
+    exit_base,
     pieces,
     heads_out,
     num_seqs,
@@ -375,14 +414,18 @@ def build_chain_backward(
     device,
     num_sm,
     stream,
+    seed_checkpoints=None,
+    seed_every_n_tokens=0,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``,
     ``heads_out`` and ``num_seqs`` are launch arguments; ``prefill_words`` is None when the graph passes the series back
-    at the chunk cadence."""
+    at the chunk cadence; ``seed_checkpoints`` (io or fp32 rows ``seed_every_n_tokens`` apart) seeds the series pass per
+    piece instead of the forward summary and the scalar chain."""
     _HQ, DK = q.shape[1], q.shape[2]
     _HV, DV = v.shape[1], v.shape[2]
     io_dtype = get_dtype(q.dtype)
     regenerate = prefill_words is not None
+    coarse = seed_checkpoints is not None
     has_seed = seed is not None
     has_dfs = dfs is not None
     key = (
@@ -396,6 +439,8 @@ def build_chain_backward(
         str(series.dtype),
         dtype_name(seed.dtype) if has_seed else "none",
         dtype_name(dfs.dtype) if has_dfs else "none",
+        composed is not None,
+        dcomposed is not None,
         str(dstate0.dtype) if dstate0 is not None else "none",
         int(device),
         int(num_sm),
@@ -406,6 +451,8 @@ def build_chain_backward(
         bool(length_rule),
         bool(dt_softplus),
         regenerate,
+        bool(coarse),
+        str(seed_checkpoints.dtype) if coarse else "none",
         int(chain_rows),
         skip_bwd_part is not None,
     )
@@ -413,6 +460,8 @@ def build_chain_backward(
         recompute_summary_cfg, recompute_series_cfg, bprop_summary_cfg, bprop_cfg = build_configs(
             io_dtype,
             regenerate=regenerate,
+            coarse=coarse,
+            seed_dtype=get_dtype(seed_checkpoints.dtype) if coarse else cutlass.Float32,
             use_dstate0=dstate0 is not None,
             dt_softplus=dt_softplus,
             has_d=d is not None,
@@ -435,6 +484,7 @@ def build_chain_backward(
             int(b_t),
             bool(length_rule),
             regenerate,
+            coarse,
             recompute_summary_cfg,
             recompute_series_cfg,
             bprop_summary_cfg,
@@ -449,6 +499,7 @@ def build_chain_backward(
             cutlass.Int32(int(num_seqs)),
             cutlass.Float32(float(dt_min)),
             cutlass.Float32(float(dt_max)),
+            cutlass.Int32(int(seed_every_n_tokens)),
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
@@ -476,17 +527,23 @@ def build_chain_backward(
             from_dlpack(prefill_words, assumed_align=128).mark_layout_dynamic() if regenerate else None,
             from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic(),
             from_dlpack(series, assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            from_dlpack(state_h, assumed_align=16).mark_layout_dynamic(leading_dim=3) if regenerate else None,
+            from_dlpack(state_h, assumed_align=16).mark_layout_dynamic(leading_dim=3) if regenerate and not coarse else None,
             from_dlpack(transition, assumed_align=4).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(state_x, assumed_align=16).mark_layout_dynamic(leading_dim=3) if regenerate else None,
+            from_dlpack(state_x, assumed_align=16).mark_layout_dynamic(leading_dim=3) if regenerate and not coarse else None,
+            from_dlpack(seed_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if coarse else None,
             from_dlpack(state_g, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(state_dx, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(seed, assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
+            from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if composed is not None else None,
             from_dlpack(dfs, assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_dfs else None,
+            from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dcomposed is not None else None,
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate0 is not None else None,
             from_dlpack(exit_dots, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dot_q, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dot_k, assumed_align=4).mark_layout_dynamic(leading_dim=1),
             from_dlpack(skip_bwd_part, assumed_align=4).mark_layout_dynamic(leading_dim=len(skip_bwd_part.shape) - 1) if skip_bwd_part is not None else None,
             from_dlpack(exit_slots, assumed_align=8).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(exit_base, assumed_align=4).mark_layout_dynamic(),
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
         )
@@ -529,17 +586,24 @@ def run_chain_backward(
     state_g,
     state_dx,
     seed,
+    composed=None,
     dfs,
+    dcomposed=None,
     dstate0,
     exit_dots,
+    dot_q,
+    dot_k,
     skip_bwd_part,
     exit_slots,
+    exit_base,
     pieces,
     heads_out,
     num_seqs,
     dt_min,
     dt_max,
     stream,
+    seed_checkpoints=None,
+    seed_every_n_tokens=0,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its launches."""
     compiled(
@@ -548,6 +612,7 @@ def run_chain_backward(
         int(num_seqs),
         float(dt_min),
         float(dt_max),
+        int(seed_every_n_tokens),
         q,
         k,
         v,
@@ -578,13 +643,19 @@ def run_chain_backward(
         state_h,
         transition,
         state_x,
+        seed_checkpoints,
         state_g,
         state_dx,
         seed,
+        composed,
         dfs,
+        dcomposed,
         dstate0,
         exit_dots,
+        dot_q,
+        dot_k,
         skip_bwd_part,
         exit_slots,
+        exit_base,
         cuda.CUstream(int(stream)),
     )

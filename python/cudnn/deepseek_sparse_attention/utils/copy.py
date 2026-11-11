@@ -65,6 +65,26 @@ def cpasync_reduce_bulk_add_f32(
     )
 
 
+@dsl_user_op
+def red_global_add_f32x4(gmem_ptr: cute.Pointer, v0, v1, v2, v3, *, loc=None, ip=None):
+    """Relaxed GPU-scope FP32x4 global reduction (SM90+); ``gmem_ptr`` must be 16-byte aligned."""
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.llvm_ptr,
+            cutlass.Float32(v0).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v1).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v2).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def tma_get_copy_fn(
     atom: cute.CopyAtom,
     cta_coord: cute.Coord,

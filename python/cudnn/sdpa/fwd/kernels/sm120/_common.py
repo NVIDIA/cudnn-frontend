@@ -15,6 +15,10 @@ from typing import Type
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.typing import Pointer
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
+from cudnn.sdpa.fwd.kernels._mixed_kv import _packed_asm
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 
 from cutlass.experimental import primitives as prims
 
@@ -98,3 +102,90 @@ def sfo_atom_offset(plane, r, c, cols):
     order at ``plane``: ``plane + (r//128)*128*cols + (c//4)*512 + (r%32)*16 + ((r//32)%4)*4 + c%4``."""
     off = plane + (r >> cutlass.Int32(7)) * (cols << cutlass.Int32(7)) + (c >> cutlass.Int32(2)) * cutlass.Int32(512)
     return off + (r & cutlass.Int32(31)) * cutlass.Int32(16) + ((r >> cutlass.Int32(5)) & cutlass.Int32(3)) * cutlass.Int32(4) + (c & cutlass.Int32(3))
+
+
+@cute.jit
+def copy_paged_half_tile(
+    s_dst,
+    pool: cute.Tensor,
+    page_table,
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    seq_coord: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    page_size: cutlass.Constexpr[int],
+    kv_tile: cutlass.Constexpr[int],
+    head_tile: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
+) -> None:
+    """One producer warp fills a half MMA tile from half or FP8 page storage.
+
+    The caller owns publication: cp.async arrivals for half copies, ordinary
+    release arrivals for the FP8 widening stores. Dead rows/columns read no
+    table or payload. Eight-element chunks fit the half SMEM swizzle.
+    """
+    # Read the caller's table in the attention CTA. Each half vector lands
+    # directly in the existing MMA tile; dead rows never read a table entry
+    # or pool payload. Copies and widening both zero-fill those SMEM rows.
+    src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
+    lane = cute.arch.lane_idx()
+    vectors_per_row = head_tile // 8
+    for wave in cutlass.range_constexpr(kv_tile * vectors_per_row // 32):
+        chunk = wave * 32 + lane
+        row = chunk // vectors_per_row
+        col = (chunk % vectors_per_row) * 8
+        logical_row = seq_coord + row
+        # The logical width is an eight-element multiple. A complete
+        # 16-byte vector is either live or zero-filled; head padding
+        # must never read the next head or poisoned storage slack.
+        live = cutlass.Int32((logical_row < seqlen_k) & (col < pool.shape[3]))
+        offset = cutlass.Int64(0)
+        if live != 0:
+            page = cutlass.Int64(page_table[batch_idx, logical_row // page_size])
+            offset = page * cutlass.Int64(pool.stride[0])
+            offset += cutlass.Int64(logical_row % page_size) * cutlass.Int64(pool.stride[1])
+            offset += cutlass.Int64(head_idx) * cutlass.Int64(pool.stride[2]) + cutlass.Int64(col)
+        physical_row = (col // chunk_elems) * kv_tile + row
+        physical_col = swizzle_xor(physical_row, col % chunk_elems, chunk_elems, 2)
+        dst = s_dst + physical_row * chunk_elems + physical_col
+        if cutlass.const_expr(pool.element_type in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+            inline_ptx(_packed_asm(pool.element_type, s_dst.dtype, global_src=True), read_only_args=[src + offset, dst, live])
+        else:
+            prims.cp_async_shared_global(dst, src + offset, 16, prims.LoadCacheModifier.CG, cp_size=live * 16)
+
+
+@cute.jit
+def load_paged_half_tile(
+    s_dst: cutlass.Array,
+    mbar: cutlass.Array,
+    pool: cute.Tensor,
+    page_table,
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    seq_coord: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    page_size: cutlass.Constexpr[int],
+    kv_tile: cutlass.Constexpr[int],
+    head_tile: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
+) -> None:
+    """Fill one paged half tile, then publish all 32 producer arrivals."""
+    copy_paged_half_tile(s_dst.data_ptr(), pool, page_table, batch_idx, head_idx, seq_coord, seqlen_k, page_size, kv_tile, head_tile, chunk_elems)
+    if cutlass.const_expr(pool.element_type in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+        # Ordinary release arrivals publish the generic widening stores.
+        prims.mbarrier_arrive(mbar)
+    else:
+        prims.cp_async_commit_group()
+        prims.cp_async_wait_group(0)
+        # Async-tracked arrivals publish cp.async writes; .noinc accounts
+        # for the 32 lanes already counted by barrier initialization/rearm.
+        prims.cp_async_mbarrier_arrive(mbar, noinc=True)
+
+
+@cute.jit
+def thd_row_origin(offsets, specs: cutlass.Constexpr, port: cutlass.Constexpr[int], batch, token_stride, prefix):
+    """Resolve one physical token origin without changing logical lengths."""
+    origin = cutlass.Int64(prefix)
+    if cutlass.const_expr(specs is not None and specs[port] is not None):
+        origin = cutlass.Int64(cutlass.make_array_view(offsets[port])[batch]) * cutlass.Int64(specs[port][1]) // cutlass.Int64(token_stride)
+    return origin

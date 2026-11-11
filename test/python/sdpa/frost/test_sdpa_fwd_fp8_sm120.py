@@ -141,20 +141,25 @@ def _run(
     qkv=None,
     sched_policy=None,
     split_kv=None,
+    capture=None,
+    quantized_qkv=None,
 ):
     import cudnn
 
     dev = "cuda"
     D_v = D if D_v is None else D_v
-    if qkv is None:
-        Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
-        Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
-        Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
+    if quantized_qkv is None:
+        if qkv is None:
+            Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
+            Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
+            Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
+        else:
+            Qf, Kf, Vf = qkv
+        Q8, dq = _quant(Qf, io_dtype)
+        K8, dk = _quant(Kf, io_dtype)
+        V8, dv = _quant(Vf, io_dtype)
     else:
-        Qf, Kf, Vf = qkv
-    Q8, dq = _quant(Qf, io_dtype)
-    K8, dk = _quant(Kf, io_dtype)
-    V8, dv = _quant(Vf, io_dtype)
+        (Q8, dq), (K8, dk), (V8, dv) = quantized_qkv
     if negative_descale_q:
         # Same dequantized Q, with a negative descale_q * descale_k on the device.
         Q8, dq = (-Q8.float()).to(io_dtype), -dq
@@ -279,7 +284,18 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    if quantized_qkv is None:
+        chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    else:
+        # Kernel qualification holds the plan fixed independently of ranked offerings.
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(
+            family_for(g).offered_ids()[engine_name(arch="sm120", fp8=True)],
+            {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
+        )
+        g.select_plan(len(g.plans) - 1)
+        chosen = g.plans[g._plan_index]
     if split_kv is not None and (chosen.knobs.split_kv or 1) != split_kv:
         # The ranked plans need not carry this split count: re-plan the engine's own knob set with it.
         g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv, sched_policy=0))
@@ -304,6 +320,14 @@ def _run(
         if sync_debug:
             torch.cuda.set_sync_debug_mode(prev_sync_mode)
     torch.cuda.synchronize()
+
+    if capture is not None:
+        assert with_stats and not blk
+        capture.update(
+            run=lambda: g.execute(vp, ws),
+            inputs=dict(q=Qb, k=Kb, v=Vb, dq=dqt, dk=dkt, dv=dvt, ds=dst, ss=sst, so=sot),
+            outputs=dict(o=Ob, stats=lse, amax=amax_o),
+        )
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
     o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, seq_lens_q=seq_lens_q, sinks=sinks, **ref_kw)
@@ -567,6 +591,43 @@ def test_fp8_sm120_multi_tile_long_seq():
     scale = 1.0 / math.sqrt(128)
     res = _run(1, 4, 4, 1024, 1024, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
     _check(*res)
+
+
+def _peaked_tail_qkv(S_q, S_kv, D):
+    """Anchor keys at both ends of the cache (logit 1 per unit attn_scale) over S_kv - 2 tail keys at logit 0;
+    V_anchor = e0, V_tail = e1.
+
+    An anchor sits in the first KV tile the kernel visits in either order, so every tail P is cast after the row
+    max reached the anchor. Every value is exact in e4m3, so O[..., 0] / O[..., 1] are the anchor / tail masses.
+    """
+    Qf = torch.zeros(1, 1, S_q, D, device="cuda")
+    Qf[..., 0] = 1.0
+    Kf = torch.zeros(1, 1, S_kv, D, device="cuda")
+    Vf = torch.zeros(1, 1, S_kv, D, device="cuda")
+    Vf[..., 1] = 1.0
+    for anchor in (0, S_kv - 1):
+        Kf[:, :, anchor, 0] = 1.0
+        Vf[:, :, anchor] = 0.0
+        Vf[:, :, anchor, 0] = 1.0
+    return Qf, Kf, Vf
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [128, 512], ids=["d128", "d512"])
+def test_fp8_sm120_peaked_row_keeps_its_tail(D):
+    """A peaked long row keeps the probability mass of keys far below its max.
+
+    attn_scale = 10 puts two anchors 10 nats above 32766 tail keys: each tail P is e^-10 = 4.5e-5 of the row
+    max, and together they carry 0.427 of the mass. P is cast to e4m3 with the kernel's P_CAST_LOG2_SCALE bias;
+    a bias that flushes 4.5e-5 to zero (2^4 does: 7.3e-4 is under half of e4m3's smallest subnormal) loses
+    O[..., 1], while 2^8 lands it on a subnormal within 1%. Unsplit: a split without an anchor would cast its
+    tail against its own max of 0 and hide the flush.
+    """
+    S_q, S_kv = 16, 32768
+    res = _run(1, 1, 1, S_q, S_kv, scale=10.0, sdpa_kwargs={}, D=D, split_kv=1, qkv=_peaked_tail_qkv(S_q, S_kv, D))
+    tail = 1.0 / (1.0 + 2.0 * math.exp(10.0) / (S_kv - 2))
+    assert abs(res.reference[..., 1].mean().item() - tail) < 1e-4, "the reference is the analytic tail mass"
+    _check(*res, tol_o=2e-2)
 
 
 @pytest.mark.L0

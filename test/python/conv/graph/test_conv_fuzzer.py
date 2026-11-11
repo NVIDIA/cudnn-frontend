@@ -34,7 +34,7 @@ import sys
 import signal
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple, Union, overload
 from enum import IntEnum
 from sdpa.helpers import create_sparse_int_tensor, print_tensor_stats, compare_tensors
 
@@ -622,25 +622,89 @@ def create_tensors(config: ConvConfig, rng: random.Random):
     return X, W, Y, bias
 
 
+def _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, expose_intermediate):
+    """Validate fusion arguments and return the intermediate dtype, defaulting to FP32.
+
+    Reject backward bias, missing bias tensors, and intermediate requests
+    without an epilogue or residual add.
+    """
+    if config.conv_type != ConvType.FPROP and config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU):
+        raise ValueError("Backward convolution does not support bias epilogues")
+    if config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU) and bias is None:
+        raise ValueError("The selected epilogue requires a bias tensor")
+    has_intermediate = (
+        prior_output is not None
+        or config.epilogue == EpilogueType.RELU
+        or (bias is not None and config.epilogue in (EpilogueType.BIAS, EpilogueType.BIAS_RELU))
+    )
+    if not has_intermediate and (intermediate_dtype is not None or expose_intermediate):
+        raise ValueError("An intermediate dtype or output requires an epilogue or residual add")
+    return torch.float32 if intermediate_dtype is None else intermediate_dtype
+
+
+@overload
 def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                       Y: torch.Tensor, bias: Optional[torch.Tensor],
-                      prior_output: Optional[torch.Tensor] = None) -> torch.Tensor:
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: Literal[False] = False) -> torch.Tensor:
+    pass
+
+
+@overload
+def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
+                      Y: torch.Tensor, bias: Optional[torch.Tensor],
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: Literal[True]) -> Tuple[torch.Tensor, torch.Tensor]:
+    pass
+
+
+@overload
+def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
+                      Y: torch.Tensor, bias: Optional[torch.Tensor],
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: bool) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    pass
+
+
+def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
+                      Y: torch.Tensor, bias: Optional[torch.Tensor],
+                      prior_output: Optional[torch.Tensor] = None,
+                      *, intermediate_dtype: Optional[torch.dtype] = None,
+                      return_intermediate: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Compute reference result using PyTorch.
+    Compute an independent PyTorch reference with FP32 accumulation.
 
     Convention:
-      FPROP: compute Y = conv(X, W) + bias + relu
+      FPROP: compute Y from X and W
       DGRAD: compute dX from dY(=Y) and W
       WGRAD: compute dW from X and dY(=Y)
 
-    If prior_output is provided, it is added before the FPROP epilogue or to the computed dX/dW.
+    intermediate_dtype controls rounding before optional residual addition,
+    FPROP bias, and ReLU applied to the convolution output (not ReLU backward).
+    None preserves FP32 intermediates and plain-convolution defaults.
+    This does not change accumulation precision.
 
-    Returns the tensor that should match the cuDNN output:
-      FPROP -> Y_ref (to compare with Y)
-      DGRAD -> dX_ref (to compare with X)
-      WGRAD -> dW_ref (to compare with W)
+    Return the final output, or (output, intermediate) when return_intermediate
+    is enabled. The intermediate precedes residual addition and all epilogues.
     """
+    intermediate_dtype = _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, return_intermediate)
     compute_dtype = torch.float32
+
+    def finalize_reference(result, output_dtype):
+        # Model the declared convolution edge before the residual/bias/activation.
+        intermediate = result.to(intermediate_dtype)
+        result = intermediate.to(compute_dtype)
+        if prior_output is not None:
+            result = result + prior_output.to(compute_dtype)
+        if config.conv_type == ConvType.FPROP and bias is not None and config.epilogue in [EpilogueType.BIAS, EpilogueType.BIAS_RELU]:
+            result = result + bias.to(compute_dtype)
+        if config.epilogue in [EpilogueType.RELU, EpilogueType.BIAS_RELU]:
+            result = torch.relu(result)
+        result = result.to(output_dtype)
+        return (result, intermediate) if return_intermediate else result
 
     # Disable cuDNN for reference to avoid comparing cuDNN with itself
     with torch.backends.cudnn.flags(enabled=False):
@@ -667,16 +731,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                         groups=config.groups
                     )
 
-                if prior_output is not None:
-                    ref = ref + prior_output.to(compute_dtype)
-
-                # Apply epilogue
-                if bias is not None and config.epilogue in [EpilogueType.BIAS, EpilogueType.BIAS_RELU]:
-                    ref = ref + bias.to(compute_dtype)
-                if config.epilogue in [EpilogueType.RELU, EpilogueType.BIAS_RELU]:
-                    ref = torch.relu(ref)
-
-                return ref.to(config.y_dtype)
+                return finalize_reference(ref, config.y_dtype)
             finally:
                 del X_f, W_f
 
@@ -689,7 +744,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
 
             # Use autograd to compute the reference
             # Create a dummy input and run forward, then backward to get dX
-            dummy_X = torch.zeros(config.x_shape, device='cuda', dtype=compute_dtype, requires_grad=True)
+            dummy_X = torch.zeros(config.x_shape, device=X.device, dtype=compute_dtype, requires_grad=True)
             dummy_Y = None  # set before try so finally can safely del if OOM occurs during conv
 
             try:
@@ -714,10 +769,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                 dummy_Y.backward(dY_f)
                 dX_ref = dummy_X.grad.clone()
 
-                if prior_output is not None:
-                    dX_ref = dX_ref + prior_output.to(compute_dtype)
-
-                return dX_ref.to(config.x_dtype)
+                return finalize_reference(dX_ref, config.x_dtype)
             finally:
                 del dY_f, W_f, dummy_X
                 if dummy_Y is not None:
@@ -732,7 +784,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
 
             # Use autograd to compute the reference
             # Create a dummy weight and run forward, then backward to get dW
-            dummy_W = torch.zeros(config.w_shape, device='cuda', dtype=compute_dtype, requires_grad=True)
+            dummy_W = torch.zeros(config.w_shape, device=W.device, dtype=compute_dtype, requires_grad=True)
             dummy_Y = None  # set before try so finally can safely del if OOM occurs during conv
 
             try:
@@ -757,10 +809,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                 dummy_Y.backward(dY_f)
                 dW_ref = dummy_W.grad.clone()
 
-                if prior_output is not None:
-                    dW_ref = dW_ref + prior_output.to(compute_dtype)
-
-                return dW_ref.to(config.w_dtype)
+                return finalize_reference(dW_ref, config.w_dtype)
             finally:
                 del X_f, dY_f, dummy_W
                 if dummy_Y is not None:
@@ -770,7 +819,9 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
 def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torch.Tensor,
                    bias: Optional[torch.Tensor], cudnn_handle,
                    prior_output: Optional[torch.Tensor] = None,
-                   *, raise_on_unsupported: bool = False) -> Tuple[bool, str]:
+                   *, raise_on_unsupported: bool = False,
+                   intermediate_dtype: Optional[torch.dtype] = None,
+                   intermediate_output: Optional[torch.Tensor] = None) -> Tuple[bool, str]:
     """
     Run convolution using cuDNN and return success status and message.
 
@@ -779,9 +830,16 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
       DGRAD: inputs=Y(dY),W, output=X (compute dX into X)
       WGRAD: inputs=X,Y(dY), output=W (compute dW into W)
 
-    If prior_output is provided, it is added before the FPROP epilogue or to the computed dX/dW.
+    Add prior_output to Y/dX/dW before any bias or output ReLU. ReLU on dX/dW
+    is a pointwise output epilogue, not the derivative of a forward ReLU.
     raise_on_unsupported exposes planning-time support rejections to fixed-case callers.
+    intermediate_dtype overrides only a fused raw convolution edge; None preserves FP32.
+    Add/bias edges stay FP32. Plain convolution accepts no intermediate override.
+    intermediate_output optionally materializes that raw edge in a separate output buffer.
     """
+    intermediate_dtype = _validate_fusion_arguments(config, bias, prior_output, intermediate_dtype, intermediate_output is not None)
+    if intermediate_output is not None and intermediate_output.dtype != intermediate_dtype:
+        raise ValueError("Intermediate buffer dtype does not match the graph edge")
     planning = False
     try:
         stream = torch.cuda.current_stream().cuda_stream
@@ -822,6 +880,7 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                 stride=list(config.stride),
                 dilation=list(config.dilation),
             )
+            raw_output = conv_output
 
             if prior_output is not None:
                 prior_output_tensor = graph.tensor(
@@ -843,7 +902,7 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
             if config.epilogue in [EpilogueType.RELU, EpilogueType.BIAS_RELU]:
                 conv_output = graph.relu(name="relu", input=conv_output)
 
-            conv_output.set_output(True)
+            conv_output.set_output(True).set_data_type(convert_to_cudnn_type(Y.dtype))
 
             # Execution dict: X,W are inputs, Y is output
             exec_dict = {X_tensor: X, W_tensor: W, conv_output: Y}
@@ -873,6 +932,7 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
             )
             # Must set output dimensions explicitly for dgrad (cuDNN can't infer them)
             conv_output.set_dim(list(X.size())).set_stride(list(X.stride()))
+            raw_output = conv_output
 
             if prior_output is not None:
                 prior_output_tensor = graph.tensor(
@@ -883,7 +943,10 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                 )
                 conv_output = graph.add(a=conv_output, b=prior_output_tensor, name="accumulate_dX")
 
-            conv_output.set_output(True).set_dim(list(X.size())).set_stride(list(X.stride()))
+            if config.epilogue == EpilogueType.RELU:
+                conv_output = graph.relu(name="relu", input=conv_output)
+
+            conv_output.set_output(True).set_data_type(convert_to_cudnn_type(X.dtype)).set_dim(list(X.size())).set_stride(list(X.stride()))
 
             # Execution dict: Y(dY),W are inputs, X(dX) is output
             exec_dict = {dY_tensor: Y, W_tensor: W, conv_output: X}
@@ -910,6 +973,7 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                 dilation=list(config.dilation),
             )
             conv_output.set_dim(list(W.size())).set_stride(list(W.stride()))
+            raw_output = conv_output
 
             if prior_output is not None:
                 prior_output_tensor = graph.tensor(
@@ -920,12 +984,23 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                 )
                 conv_output = graph.add(a=conv_output, b=prior_output_tensor, name="accumulate_dW")
 
-            conv_output.set_output(True).set_dim(list(W.size())).set_stride(list(W.stride()))
+            if config.epilogue == EpilogueType.RELU:
+                conv_output = graph.relu(name="relu", input=conv_output)
+
+            conv_output.set_output(True).set_data_type(convert_to_cudnn_type(W.dtype)).set_dim(list(W.size())).set_stride(list(W.stride()))
 
             # Execution dict: X,Y(dY) are inputs, W(dW) is output
             exec_dict = {X_tensor: X, dY_tensor: Y, conv_output: W}
             if prior_output is not None:
                 exec_dict[prior_output_tensor] = prior_output
+
+        if raw_output is not conv_output:
+            raw_output.set_data_type(convert_to_cudnn_type(intermediate_dtype))
+
+        if intermediate_output is not None:
+            raw_output.set_output(True)
+            raw_output.set_dim(list(intermediate_output.size())).set_stride(list(intermediate_output.stride()))
+            exec_dict[raw_output] = intermediate_output
 
         # Validate and build
         graph.validate()

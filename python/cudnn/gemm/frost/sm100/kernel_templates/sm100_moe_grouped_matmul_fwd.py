@@ -1,20 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 MoE grouped matmul fwd: grouped persistent scheduler + per-group A TMA
-descriptor replacement.
+# SM100-family MoE NONE/SCATTER/COMBINE; GATHER uses its dedicated template.
 
-Serves both MMA modes; ``cta_group`` is an injected tile constant.
-
-  cta_group=1  single-CTA MMA — every CTA runs its own MMA on its own
-               SMEM/TMEM, no leader-follower pair.
-  cta_group=2  2-CTA MMA cluster pair — the leader CTA issues the MMA while the
-               follower consumes the scheduler ring only.
-
-Blocks that genuinely differ between the two MMA modes are expressed with
-``cutlass.const_expr(cta_group == N)`` or, where an arm is not statement-shaped,
-with ``@@CTA{1,2}_ONLY@@`` marker regions that the renderer strips.
-"""
+"""sm100 MoE grouped matmul fwd: grouped persistent scheduler + per-group A TMA descriptor replacement."""
 
 from __future__ import annotations
 
@@ -30,8 +19,6 @@ from cudnn.gemm.frost.tile_helpers import (
     moe_combine_add,
     moe_combine_add_vector,
     tma_scatter4,
-    moe_gather_row,
-    tma_gather4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,
     fence_tensormap_acquire as _fence_tensormap_acquire,
@@ -57,10 +44,19 @@ from cuda.bindings import driver as _cuda
 # A TMA tensormap is 128 bytes = 16 int64 qwords.
 # @@INJECT_TILE_CONSTANTS@@
 
-# Tensormap workspace slots per CTA: the A operands, plus the output descriptor
-# when the TMA-store epilogue re-dimensions it per routed group.
 moe_desc_slots = num_a_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
+# The scheduler warp of cluster rank 0 publishes each claimed tile into every
+# cluster CTA's broadcast slot through mapa and arrives on that CTA's barrier,
+# a cluster-scope release by a thread of another CTA. The waits on the
+# broadcast ring poll that barrier at cluster scope with relaxed ordering and
+# then acquire through a fence restricted to shared::cluster memory. That
+# orders the slot read (and the producer's reuse of the slot) after the peer's
+# access just like an acquire-ordered cluster-scope wait, without the L1
+# invalidation such a wait costs on every poll.
+_SCHED_BCAST_CLUSTER = cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1
+_SCHED_BCAST_SCOPE = nvvm.MBarrierScope.CLUSTER if _SCHED_BCAST_CLUSTER else None
+_SCHED_BCAST_ORDER = nvvm.MemOrder.RELAXED if _SCHED_BCAST_CLUSTER else None
 
 
 # Scheduler ring depth.
@@ -85,12 +81,7 @@ TMEM_ALLOC_BARRIER_ID = 2
 
 @cute.jit
 def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
-    """N-super-block width for one routed group, resolved per group.
-
-    Same rule as the dense path, but the "M side" is THIS group's token slice, not the
-    whole token tensor: block along the shorter of (group tokens, expert weight), capped
-    by what L2 can hold onto. A group spanning one m-tile makes both orders identical.
-    """
+    """N-super-block width for one routed group, resolved per group."""
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
@@ -291,9 +282,6 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
-    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         cd_dtype,
@@ -309,9 +297,6 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
-    # One block per MMA mode, every count defined in both: the 2-CTA pair
-    # releases per PAIR (so ab_empty counts pairs and acc_empty counts both
-    # CTAs' epilogue warps), the 1-CTA one per CTA.
     if cutlass.const_expr(cta_group == 2):
         ab_empty_count = cluster_size // cta_group if cutlass.const_expr(ab_empty_full_mask) else (cluster_m // cta_group) + cluster_n - 1
         acc_empty_count = num_epilogue_warps * 2
@@ -372,9 +357,6 @@ def _kernel(
     )
 
     if cutlass.const_expr(cta_group == 1):
-        # TMEM accumulator layout, per acc stage: gemm g, M block mi, N block ni
-        # -> columns [g*cols_per_acc_stage + mi*epi_cols_per_mma_m + ni*mma_inst_n, +N),
-        # all at TMEM lane base 0.
         epi_cols_per_mma_m = cta_tile_mnk[1]
     else:
         pair_n_size = cgrp_tile_mnk[1] // cluster_n
@@ -430,17 +412,17 @@ def _kernel(
         is_tile_valid = cutlass.Int32(1)
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the cluster leader claims the next GLOBAL
-            # tile index and broadcasts it, so the clusters live at any instant
-            # sit in one contiguous window of tile space and share L2. Static
-            # striding lets them drift apart and share nothing.
             if cta_rank_in_cluster == 0:
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_bcast_empty_mbar_ptr.subview(bcast_stage),
                     bcast_empty_phase,
                     time_limit=10_000_000,
+                    scope=_SCHED_BCAST_SCOPE,
+                    order=_SCHED_BCAST_ORDER,
                 ):
                     pass
+                if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                    nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
                 claimed = cutlass.Int32(0)
                 if lane == 0:
                     claimed = nvvm.atomicrmw(
@@ -458,17 +440,18 @@ def _kernel(
                 sched_bcast_full_mbar_ptr.subview(bcast_stage),
                 bcast_full_phase,
                 time_limit=10_000_000,
+                scope=_SCHED_BCAST_SCOPE,
+                order=_SCHED_BCAST_ORDER,
             ):
                 pass
+            if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
             # Finish every lane's slot reads before the elected release.
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if lane == 0:
                 nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
             if cutlass.const_expr(cluster_size > 1):
-                # The final invalid broadcast has no next reuse of this stage to
-                # wait for its cluster-wide acknowledgements, so retain its exact
-                # stage and completion parity for the scheduler-warp drain below.
                 last_bcast_stage = bcast_stage
                 last_bcast_empty_done_phase = bcast_empty_phase ^ 1
             bcast_stage += 1
@@ -564,20 +547,18 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_empty_phase = sched_empty_phase ^ 1
 
-        # Every multi-CTA cluster emits one invalid scheduler record before
-        # leaving the loop. Keep the leader CTA's DSM alive until every
-        # scheduler warp has consumed that final broadcast and acknowledged the
-        # leader slot. A singleton cluster has no remote DSM lifetime to drain.
         if cutlass.const_expr(cluster_size > 1):
             if cta_rank_in_cluster == 0:
-                # Each acknowledgement flips the saved pre-wrap empty phase, so
-                # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
                 while not nvvm.mbarrier_try_wait_parity(
                     sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
                     last_bcast_empty_done_phase,
                     time_limit=10_000_000,
+                    scope=_SCHED_BCAST_SCOPE,
+                    order=_SCHED_BCAST_ORDER,
                 ):
                     pass
+                if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                    nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
 
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
@@ -603,11 +584,11 @@ def _kernel(
             for _ai in range(num_a_operands)
         ]
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_gather or moe_aligned_offsets):
+        if cutlass.const_expr(moe_aligned_offsets):
             a_desc_load_list = [tma_a_descs[_ai].get_ptr() for _ai in range(num_a_operands)]
         else:
             a_desc_load_list = a_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_gather and not moe_aligned_offsets):
+        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
             for _ai in cutlass.range_constexpr(num_a_operands):
                 _copy_tensormap_to_workspace(tma_a_descs[_ai].get_ptr(), tma_a_desc_smem_list[_ai])
         nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -646,7 +627,7 @@ def _kernel(
                 else:
                     coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_gather and not moe_aligned_offsets):
+                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
                     previous_group_begin = group_begin
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         _fence_tensormap_acquire(a_desc_tma_ptr_list[_ai])
@@ -692,39 +673,17 @@ def _kernel(
                     if a_data_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
-                            if cutlass.const_expr(moe_gather):
-                                for _am in cutlass.range(cta_tile_mnk[0] // a_mcast_slices // 4, unroll_full=True):
-                                    if elect_one:
-                                        row = group_begin + coord_m_group + _a_off + _am * 4
-                                        source_rows = mA_list[_ai].shape[0]
-                                        r0 = moe_gather_row(token_index, row, group_end, source_rows)
-                                        r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
-                                        r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
-                                        r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
-                                        tma_gather4(
-                                            sA_stage.subview((_a_off + _am * 4) * cta_tile_mnk[2]),
-                                            a_desc_load_list[_ai],
-                                            coord_k,
-                                            r0,
-                                            r1,
-                                            r2,
-                                            r3,
-                                            ab_full_mbar_ptr.subview(stage),
-                                            tma_mcast_mask_a,
-                                            cta_group,
-                                        )
-                            else:
-                                for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
-                                    if elect_one:
-                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                            sA_stage.subview(_a_off * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
-                                            a_desc_load_list[_ai],
-                                            (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
-                                            ab_full_mbar_ptr.subview(stage),
-                                            [],
-                                            multicast_mask=tma_mcast_mask_a,
-                                            group=_CTA_GROUP,
-                                        )
+                            for _am in cutlass.range_constexpr(cta_tile_mnk[0] // a_mcast_slices // a_tma_box_m):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                        sA_stage.subview(_a_off * cta_tile_mnk[2] + _am * a_tma_box_m * cta_tile_mnk[2]),
+                                        a_desc_load_list[_ai],
+                                        (coord_k, coord_m_desc + _a_off + _am * a_tma_box_m, cutlass.Int32(0)),
+                                        ab_full_mbar_ptr.subview(stage),
+                                        [],
+                                        multicast_mask=tma_mcast_mask_a,
+                                        group=_CTA_GROUP,
+                                    )
                     b_issue = (not multicast_b) or (pair_m_idx == 0)
                     if cutlass.const_expr(b_mcast_slices > 1):
                         b_data_issue = True
@@ -814,8 +773,6 @@ def _kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
-            # Per-group TMA replacement changes the GMEM source, not these invariant
-            # MMA-side SMEM descriptor roots.
             desc_a_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                     start_address=smem_a_list[i],
@@ -864,8 +821,6 @@ def _kernel(
                         pass
 
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                    # One accumulator per (gemm, M block). Column arithmetic stays on
-                    # the encoded (row << 16) | col integer.
                     tmem_addr_mmas = [
                         [
                             cutlass.inttoptr(
@@ -896,8 +851,6 @@ def _kernel(
                                 desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                                 desc_b_k = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                                 for mi in cutlass.range_constexpr(mma_size_m):
-                                    # The M sub-block offset is a whole SMEM swizzle atom,
-                                    # so the descriptor's swizzle phase is preserved.
                                     desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                     if elect_one:
                                         _tcgen05_mma(
@@ -911,8 +864,6 @@ def _kernel(
                                             collector_op=_a_collector_op(g),
                                             b_collector_op=_b_collector_op(mi),
                                         )
-                            # Every accumulator sees scale_d=False on exactly the first
-                            # k_block of the tile, so the flip stays outside mi.
                             scale_d = cutlass.Boolean(True)
 
                         if elect_one:
@@ -967,8 +918,6 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = cutlass.Int32(0)
                 acc_stage = cutlass.Int32(0)
-                # Per-group TMA replacement changes the GMEM source, not these
-                # invariant MMA-side SMEM descriptor roots.
                 desc_a_roots = [
                     cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                         start_address=smem_a_list[i],
@@ -1017,8 +966,6 @@ def _kernel(
                             pass
 
                         acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                        # One accumulator per (gemm, M block). Column arithmetic stays on the
-                        # encoded (row << 16) | col integer.
                         tmem_addr_mmas = [
                             [
                                 cutlass.inttoptr(
@@ -1049,8 +996,6 @@ def _kernel(
                                     desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                                     desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                                     for mi in cutlass.range_constexpr(mma_size_m):
-                                        # The M sub-block offset is a whole SMEM swizzle atom, so the
-                                        # descriptor's swizzle phase is preserved. B is shared.
                                         desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                         if elect_one:
                                             _tcgen05_mma(
@@ -1064,8 +1009,6 @@ def _kernel(
                                                 collector_op=_a_collector_op(g),
                                                 b_collector_op=_b_collector_op(mi),
                                             )
-                                # Every accumulator sees scale_d=False on exactly the first
-                                # k_block of the tile, so the flip stays outside mi/ni.
                                 scale_d = cutlass.Boolean(True)
 
                             if elect_one:
@@ -1163,10 +1106,10 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
+        # Routed rows the groups cover (the final offset, at most the capacity M): the count an
+        # ungrouped AVG over tokens divides by. At least 1, so an empty routing flushes 0, not NaN.
+        moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), M), cutlass.Int64(1))
 
-        # The drain layout follows the MMA INSTRUCTION's M: at hardware M=64 the
-        # accumulator occupies data paths 0-15 of each sub-partition, so the
-        # 32-data-path LDTM layout cannot be used to read it.
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
             row_id_with_warp_offset = base_row_id
@@ -1222,16 +1165,9 @@ def _kernel(
         while is_valid != 0:
             coord_m_tile = group_begin + tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
             # @@TMA_STORE_ONLY:BEGIN@@
-            # Re-dimension D to this group's last row so the hardware clips the
-            # ragged tail; the base stays put, so the store coords are global.
-            # Under `moe_aligned_offsets` no tile crosses `group_end` in the
-            # first place -- `cgrp_tile_m` divides every group -- so the clip
-            # has nothing to clip and the original descriptor serves.
             if warp_idx == 0 and cutlass.const_expr(not moe_aligned_offsets and not moe_scatter):
                 if group_end != previous_group_end:
                     previous_group_end = group_end
-                    # One drain retires the in-flight stores of EVERY descriptor,
-                    # so it does not repeat per output.
                     nvvm.cp_async_bulk_wait_group(0, read=True)
                     for _di in cutlass.range_constexpr(n_tma_outputs):
                         _scratch = tma_c_desc_smem.subview(_di * TENSOR_MAP_QWORDS)
@@ -1415,14 +1351,9 @@ def _host(
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
-        if cutlass.const_expr(moe_gather):
-            a_dims = [k_sym, _a_op.shape[0]]
-            a_strides = [a_stride_m * ab_dtype.width // 128]
-            a_box = [cta_tile_mnk[2], 1]
-        else:
-            a_dims = [k_sym, m, 1]
-            a_strides = [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128]
-            a_box = [cta_tile_mnk[2], a_tma_box_m, 1]
+        a_dims = [k_sym, m, 1]
+        a_strides = [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128]
+        a_box = [cta_tile_mnk[2], a_tma_box_m, 1]
         tma_a_desc_list.append(
             _tma.create_tensor_map_tiled(
                 global_address=_a_op.iterator.toint(),
@@ -1501,13 +1432,10 @@ def compile() -> Callable:
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=out_vec_elems)
-    # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
-    # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
-    # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
-    sym_source_m = cute.sym_int64() if moe_gather else sym_m
+    sym_source_m = sym_m
 
     def _make_fake_a():
         return make_fake_compact_tensor(

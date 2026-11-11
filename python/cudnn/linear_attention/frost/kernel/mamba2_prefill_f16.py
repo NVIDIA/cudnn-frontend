@@ -32,7 +32,8 @@ Algorithm overview (per chunk c of C = 128 tokens, natural orientation, tokens o
     cumsumlog[t]  = sum_{l=0}^{t} dt_l A / ln 2                            log2 of the running decay
     beta[t]       = dt_t
 
-  QK GEMM        : W[BT,BT]   = Q @ K^T                        (hoisted one chunk ahead)
+  QK GEMM        : W[BT,BT]   = Q @ K^T                        (hoisted one chunk ahead; in place with fp32
+                                                                 checkpoint rows, whose Q / K ring has one stage)
   A epilogue     : A[i,j]     = [i >= j] exp2(cumsumlog_i - cumsumlog_j) beta_j W[i,j]   (bf16, OVERLAID
                    on the first 64 columns of its own accumulator stage)
   Q*state GEMM   : O_inter    = Q @ S
@@ -41,17 +42,20 @@ Algorithm overview (per chunk c of C = 128 tokens, natural orientation, tokens o
 
   Epilogues:
     S            <- exp2(cumsumlog_127) S  before the state GEMM accumulates (in place, CG1), with the
-                    bf16 copy of S for the Q*state GEMM (the copy doubles as the checkpoint tile)
+                    bf16 copy of S for the Q*state GEMM (the copy doubles as the io-dtype checkpoint tile;
+                    fp32 rows stage their own tile)
     O[i,:]        = exp2(cumsumlog_i) O_inter[i,:] + O_intra[i,:] + D x[i,:]  (D per head or per channel)
                     (* z sigmoid(z) when the z gate is fused; the pre-gate O is stored too under grad)
 
-SMEM layout (227 KB SM100 / SM103 / SM107 cap; stage counts live in mamba2_prefill_config.py):
+SMEM layout (227 KB SM100 / SM103 / SM107 cap; stage counts live in mamba2_prefill_config.py; fp32 checkpoint rows
+trim Q and K to one stage each, which drops the Q K^T hoist, and stage the fp32 tile in the freed space):
   Buffer                       Size (B)  Stages
-  Q                               32768       2
-  K                               32768       2
+  Q                               32768       2     <-- 1 with fp32 checkpoint rows
+  K                               32768       2     <-- 1 with fp32 checkpoint rows
   V                               16384       2
   z                               16384       1     <-- has_z only
   S^T bf16 copy / checkpoint tile 16384       1   (V-major: [DV][DK], two 64-column panels)
+  fp32 checkpoint tile            32768       1     <-- fp32 checkpoint rows only (V-major: [DV][DK], four 32-column panels)
   U'                              16384       1
   O store                         16384       1
   cumsumlog / beta                  512       3     <-- 2 with z
@@ -247,6 +251,7 @@ def tmastg_warp(
     tidx,
     sO_raw,
     sState_raw,
+    sCheckpoint_raw,
     desc_o_base,
     desc_pre_base,
     desc_checkpoint_base,
@@ -278,15 +283,15 @@ def tmastg_warp(
     )
     if cutlass.const_expr(cfg.enable_checkpoints):
         sCheckpoint_tma = SmemTile(
-            base=sState_raw,
+            base=sCheckpoint_raw if cutlass.const_expr(cfg.checkpoint_dtype.width == 32) else sState_raw,
             elems_per_stage=cfg.d_k * cfg.d_v,
             stages=1,
             leading_byte_offset=0,
             stride_byte_offset=0,
             layout=0,
-            tma_loads_per_tile=cfg.d_k // box_elements,
-            tma_granu_elems=box_elements,
-            tma_subtile_stride_elems=cfg.d_v * box_elements,
+            tma_loads_per_tile=cfg.d_k // cfg.checkpoint_box_elems,
+            tma_granu_elems=cfg.checkpoint_box_elems,
+            tma_subtile_stride_elems=cfg.d_v * cfg.checkpoint_box_elems,
         )
         checkpoint_store_count = cutlass.Int32(0)
         checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
@@ -479,7 +484,8 @@ def tcgen05_mma_warp(
     sScheduler,
     bars,
 ):
-    """MMA issuer role (warp 12): every tcgen05 GEMM; the Q K^T GEMM of chunk c + 1 is hoisted into chunk c."""
+    """MMA issuer role (warp 12): every tcgen05 GEMM; the Q K^T GEMM of chunk c + qk_lookahead is issued in chunk c (hoisted
+    one chunk ahead with the two-stage Q / K ring, in place with the one-stage ring of the fp32 checkpoint compiles)."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
 
     q_index = PipelineState.start(phase=0)
@@ -601,21 +607,22 @@ def tcgen05_mma_warp(
         )
         n_local = write_end - compute_start
 
-        # ---- Q K^T of the first chunk ----------------------------------------------------
-        if n_local > 0:
-            qk_idx = qk_issue_index.idx
-            bars.mb_qk_acc_done[qk_idx].wait(qk_issue_index.phase)
-            qk_issue_index = advance(qk_issue_index, cfg.tmem_qk_acc_stages)
-            q_look_idx = q_look_index.idx
-            k_look_idx = k_look_index.idx
-            bars.mb_q_ready[q_look_idx].wait(q_look_index.phase)
-            q_look_index = advance(q_look_index, cfg.smem_q_stages)
-            bars.mb_k_ready[k_look_idx].wait(k_look_index.phase)
-            k_look_index = advance(k_look_index, cfg.smem_k_stages)
-            acc_qk = nvvm.make_tmem_ptr(tmem_qk_col + qk_idx * QK_STAGE_COLS, cutlass.Float32)
-            mma_ss(bmm_qk_desc, desc_opaque(sQ[q_look_idx].desc()), desc_opaque(sK[k_look_idx].desc()), acc_qk, accumulate=False)
-            if elect_one:
-                bars.mb_qk_acc_ready[qk_idx].arrive(cta_group=1)
+        # ---- Q K^T of the first chunk (the hoist) ----------------------------------------
+        if cutlass.const_expr(cfg.qk_lookahead == 1):
+            if n_local > 0:
+                qk_idx = qk_issue_index.idx
+                bars.mb_qk_acc_done[qk_idx].wait(qk_issue_index.phase)
+                qk_issue_index = advance(qk_issue_index, cfg.tmem_qk_acc_stages)
+                q_look_idx = q_look_index.idx
+                k_look_idx = k_look_index.idx
+                bars.mb_q_ready[q_look_idx].wait(q_look_index.phase)
+                q_look_index = advance(q_look_index, cfg.smem_q_stages)
+                bars.mb_k_ready[k_look_idx].wait(k_look_index.phase)
+                k_look_index = advance(k_look_index, cfg.smem_k_stages)
+                acc_qk = nvvm.make_tmem_ptr(tmem_qk_col + qk_idx * QK_STAGE_COLS, cutlass.Float32)
+                mma_ss(bmm_qk_desc, desc_opaque(sQ[q_look_idx].desc()), desc_opaque(sK[k_look_idx].desc()), acc_qk, accumulate=False)
+                if elect_one:
+                    bars.mb_qk_acc_ready[qk_idx].arrive(cta_group=1)
 
         for peel in cutlass.range_constexpr(1 if cfg.use_initial_state else 2):
             have_state = True if cfg.use_initial_state else peel == 1
@@ -628,8 +635,8 @@ def tcgen05_mma_warp(
                 desc_q = desc_opaque(sQ[q_idx].desc())
                 desc_k_trans = desc_opaque(sK_trans[k_idx].desc())
 
-                # ---- Q K^T lookahead (chunk c + 1) ---------------------------------------
-                if local_idx + 1 < n_local:
+                # ---- Q K^T of chunk c + qk_lookahead -------------------------------------
+                if local_idx + cfg.qk_lookahead < n_local:
                     qk_idx = qk_issue_index.idx
                     bars.mb_qk_acc_done[qk_idx].wait(qk_issue_index.phase)
                     qk_issue_index = advance(qk_issue_index, cfg.tmem_qk_acc_stages)
@@ -960,10 +967,12 @@ def compute1_warp_group(
     tmem_base_slot,
     sV_raw,
     sState_raw,
+    sCheckpoint_raw,
     sU_raw,
     sCumsumlog,
     sBeta,
     mState_init,
+    mComposed,
     mState_out,
     mSeedIndices,
     mFinalIndices,
@@ -1001,6 +1010,11 @@ def compute1_warp_group(
     sState_base = sState_raw.data_ptr()
     sU_base = sU_raw.data_ptr()
     checkpoint_count = cutlass.Int32(0)
+    if cutlass.const_expr(cfg.enable_checkpoints and cfg.checkpoint_dtype.width == 32):
+        sCheckpoint_base = sCheckpoint_raw.data_ptr()
+        checkpoint_panel = warp_in_group * (cfg.d_v * cfg.checkpoint_box_elems)
+        checkpoint_k = lane_idx // 4
+        checkpoint_v = (lane_idx % 4) * 2
 
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
     tmem_base = tmem_base_slot.load()
@@ -1024,16 +1038,27 @@ def compute1_warp_group(
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
             checkpoint_mod = compute_start % checkpoint_chunks
+        if cutlass.const_expr(cfg.has_composed):
+            gComposed = mComposed[None, None, head_o, cutlass.Int32(0)]
+            is_boundary = batch_idx == cutlass.Int32(0)
         if n_local > 0:
             # ---- state seed: initial state (V-major in GMEM) or zeros -> TMEM -------------
             if cutlass.const_expr(cfg.use_initial_state):
-                gState_init = mState_init[None, None, head_o, seed_row]
+                if cutlass.const_expr(cfg.state_table):
+                    gState_init = mState_init[None, None, head_o, seed_row]
                 seed_state = compute_start == 0
                 if seed_state:
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
                         for t in cutlass.range_constexpr(ldtm_width):
-                            words.append(gState_init[i * ldtm_width + t + v_offset, cg1_tidx].to(cfg.acc_dtype))
+                            if cutlass.const_expr(cfg.state_table):
+                                value = gState_init[i * ldtm_width + t + v_offset, cg1_tidx].to(cfg.acc_dtype)
+                            else:
+                                value = cutlass.Float32(0.0)
+                            if cutlass.const_expr(cfg.has_composed):
+                                composed_value = gComposed[i * ldtm_width + t + v_offset, cg1_tidx].to(cfg.acc_dtype)
+                                value = composed_value if is_boundary else value
+                            words.append(value)
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -1062,8 +1087,9 @@ def compute1_warp_group(
                         # ---- checkpoint row 0 = the zero incoming state -----------------------
                         if chunk_idx == 0 and write_start == 0:
                             bars.mb_checkpoint_tmastg_done[0].wait((checkpoint_count & cutlass.Int32(1)) ^ cutlass.Int32(1))
-                            checkpoint_zero_ptr = cutlass.inttoptr(sState_base.toint(), cutlass.AddressSpace.smem, cutlass.Int32)
-                            for z in cutlass.range_constexpr(cfg.d_k * cfg.d_v * bytes_per_element // 4 // num_threads_cg1):
+                            checkpoint_tile_base = sCheckpoint_base if cutlass.const_expr(cfg.checkpoint_dtype.width == 32) else sState_base
+                            checkpoint_zero_ptr = cutlass.inttoptr(checkpoint_tile_base.toint(), cutlass.AddressSpace.smem, cutlass.Int32)
+                            for z in cutlass.range_constexpr(cfg.d_k * cfg.d_v * cfg.checkpoint_elem_bytes // 4 // num_threads_cg1):
                                 (checkpoint_zero_ptr + cg1_tidx + z * num_threads_cg1).store(cutlass.Int32(0))
                             nvvm.fence_proxy("async.shared", space="cta")
                             if elect_one:
@@ -1094,7 +1120,7 @@ def compute1_warp_group(
                         state_copy_done_index = advance(state_copy_done_index, 1)
                         if cutlass.const_expr(cfg.enable_checkpoints):
                             bars.mb_checkpoint_tmastg_done[0].wait((checkpoint_count & cutlass.Int32(1)) ^ cutlass.Int32(1))
-                        # ---- S^T bf16 copy (V-major): the Q S operand and the checkpoint tile ----
+                        # ---- S^T bf16 copy (V-major): the Q S operand and the io-dtype checkpoint tile ----
                         matrix = lane_idx // 8
                         panel_base = (warp_in_group // 2) * (cfg.d_v * box_elements)
                         for half in cutlass.range_constexpr(2):
@@ -1112,6 +1138,20 @@ def compute1_warp_group(
                             do_checkpoint = do_checkpoint_now and chunk_idx < write_end
                             do_checkpoint = do_checkpoint and chunk_idx >= write_start
                             if do_checkpoint:
+                                if cutlass.const_expr(cfg.checkpoint_dtype.width == 32):
+                                    # ---- S^T fp32 checkpoint tile (V-major): one element per store ----------
+                                    for half in cutlass.range_constexpr(2):
+                                        for j in cutlass.range_constexpr(16):
+                                            for b in cutlass.range_constexpr(2):
+                                                checkpoint_row = checkpoint_v + cutlass.Int32(8 * (j // 2) + b)
+                                                checkpoint_col = checkpoint_k + cutlass.Int32(16 * half + 8 * (j % 2))
+                                                checkpoint_addr = (
+                                                    checkpoint_panel
+                                                    + checkpoint_row * cfg.checkpoint_box_elems
+                                                    + swizzle_xor_128b(checkpoint_row, checkpoint_col, elem_bytes=cfg.checkpoint_elem_bytes)
+                                                )
+                                                (sCheckpoint_base + checkpoint_addr).store(state_halves[half][2 * j + b])
+                                    nvvm.fence_proxy("async.shared", space="cta")
                                 if elect_one:
                                     bars.mb_checkpoint_tmastg_ready[0].arrive()
                                 checkpoint_count = checkpoint_count + 1
@@ -1177,11 +1217,18 @@ def compute1_warp_group(
                         final_row = cutlass.Int32(mFinalIndices[final_destination])
                     gState_out = mState_out[None, None, head_o, final_row]
                     if cutlass.const_expr(cfg.use_initial_state):
-                        gState_in = mState_init[None, None, head_o, seed_row]
+                        if cutlass.const_expr(cfg.state_table):
+                            gState_in = mState_init[None, None, head_o, seed_row]
                         for p in cutlass.range_constexpr(cfg.d_v):
-                            seed_value = gState_in[p + v_offset, cg1_tidx]
-                            if cutlass.const_expr(mState_init.element_type != mState_out.element_type):
-                                seed_value = seed_value.to(mState_out.element_type)
+                            if cutlass.const_expr(cfg.state_table):
+                                seed_value = gState_in[p + v_offset, cg1_tidx]
+                                if cutlass.const_expr(mState_init.element_type != mState_out.element_type):
+                                    seed_value = seed_value.to(mState_out.element_type)
+                            else:
+                                seed_value = cutlass.Float32(0.0).to(mState_out.element_type)
+                            if cutlass.const_expr(cfg.has_composed):
+                                composed_value = gComposed[p + v_offset, cg1_tidx].to(mState_out.element_type)
+                                seed_value = composed_value if is_boundary else seed_value
                             gState_out[p + v_offset, cg1_tidx] = seed_value
                     else:
                         for p in cutlass.range_constexpr(cfg.d_v):
@@ -1395,6 +1442,7 @@ def frost_mamba2_prefill(
     mD: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
+    mComposed: Optional[cute.Tensor],
     mState_out: Optional[cute.Tensor],
     mSeedIndices: Optional[cute.Tensor],
     mFinalIndices: Optional[cute.Tensor],
@@ -1537,6 +1585,15 @@ def frost_mamba2_prefill(
         space=cutlass.AddressSpace.smem,
         alignment=cfg.buffer_align_bytes,
     )
+    if cutlass.const_expr(cfg.enable_checkpoints and cfg.checkpoint_dtype.width == 32):
+        sCheckpoint_raw = cutlass.Array(
+            cfg.checkpoint_dtype,
+            cfg.checkpoint_cosize,
+            space=cutlass.AddressSpace.smem,
+            alignment=cfg.buffer_align_bytes,
+        )
+    else:
+        sCheckpoint_raw = None
     bars = make_bars(cfg)
     tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=16)
     sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
@@ -1629,10 +1686,12 @@ def frost_mamba2_prefill(
             tmem_base_slot=tmem_base_slot,
             sV_raw=sV_raw,
             sState_raw=sState_raw,
+            sCheckpoint_raw=sCheckpoint_raw,
             sU_raw=sU_raw,
             sCumsumlog=sCumsumlog,
             sBeta=sBeta,
             mState_init=mState_init,
+            mComposed=mComposed,
             mState_out=mState_out,
             mSeedIndices=mSeedIndices,
             mFinalIndices=mFinalIndices,
@@ -1733,6 +1792,7 @@ def frost_mamba2_prefill(
             tidx=tidx,
             sO_raw=sO_raw,
             sState_raw=sState_raw,
+            sCheckpoint_raw=sCheckpoint_raw,
             desc_o_base=desc_o_base,
             desc_pre_base=desc_pre_base,
             desc_checkpoint_base=desc_checkpoint_base,
@@ -1766,6 +1826,8 @@ class Mamba2PrefillCfg:
     has_z: bool = False
     store_pre_gate: bool = False
     tiles_per_head: int = 1
+    state_table: bool = True
+    has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
@@ -1799,6 +1861,10 @@ class Mamba2PrefillCfg:
     smem_u_stages: int = CFG.SMEM_U_STAGES
     smem_o_stages: int = CFG.SMEM_O_STAGES
     smem_gate_stages: int = CFG.SMEM_GATE_STAGES
+    qk_lookahead: int = 1
+    checkpoint_dtype: Type[cutlass.Numeric] = None
+    checkpoint_box_elems: int = 64
+    checkpoint_elem_bytes: int = 2
     tmem_state_acc_stages: int = CFG.TMEM_STATE_ACC_STAGES
     tmem_o_inter_acc_stages: int = CFG.TMEM_O_INTER_ACC_STAGES
     tmem_o_intra_acc_stages: int = CFG.TMEM_O_INTRA_ACC_STAGES
@@ -1817,6 +1883,7 @@ class Mamba2PrefillCfg:
     state_cosize: int = 0
     u_cosize: int = 0
     o_cosize: int = 0
+    checkpoint_cosize: int = 0
     tma_q_bytes: int = 0
     tma_k_bytes: int = 0
     tma_v_bytes: int = 0
@@ -1832,6 +1899,7 @@ def build_cfg(
     use_initial_state: bool,
     store_final_state: bool = True,
     enable_checkpoints: bool = False,
+    checkpoint_dtype=None,
     dt_softplus: bool = True,
     has_d: bool = False,
     d_per_channel: bool = False,
@@ -1839,15 +1907,20 @@ def build_cfg(
     store_pre_gate: bool = False,
     d_k: int,
     d_v: int,
+    state_table: Optional[bool] = None,
+    has_composed: bool = False,
 ) -> Mamba2PrefillCfg:
     """Build the per-compile ``Mamba2PrefillCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32); ``has_z``
-    compiles run two gate-table stages."""
+    compiles run two gate-table stages; fp32 checkpoint rows (``checkpoint_dtype`` Float32) run one Q and one K stage and
+    issue Q K^T in place instead of one chunk ahead."""
     cfg = Mamba2PrefillCfg(
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
         state_dtype=state_dtype,
         max_active_clusters=max_active_clusters,
         use_initial_state=use_initial_state,
+        state_table=use_initial_state if state_table is None else bool(state_table),
+        has_composed=bool(has_composed),
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         dt_softplus=dt_softplus,
@@ -1860,6 +1933,13 @@ def build_cfg(
     )
     if has_z:
         cfg.smem_gate_stages = 2
+    cfg.checkpoint_dtype = io_dtype if checkpoint_dtype is None else checkpoint_dtype
+    cfg.checkpoint_box_elems = 128 // (cfg.checkpoint_dtype.width // 8)
+    cfg.checkpoint_elem_bytes = cfg.checkpoint_dtype.width // 8
+    if enable_checkpoints and cfg.checkpoint_dtype.width == 32:
+        cfg.smem_q_stages = 1
+        cfg.smem_k_stages = 1
+        cfg.qk_lookahead = 0
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
     n_cg2 = len(cfg.compute_group_2_warp_ids)
@@ -2138,6 +2218,7 @@ def host(
     o_pre: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
@@ -2171,6 +2252,14 @@ def host(
                 stride=(state_in.stride[2], state_in.stride[3], state_in.stride[1], state_in.stride[0]),
             ),
         )
+    if cutlass.const_expr(composed is not None):
+        composed = cute.make_tensor(
+            composed.iterator,
+            cute.make_layout(
+                (composed.shape[2], composed.shape[3], composed.shape[1], composed.shape[0]),
+                stride=(composed.stride[2], composed.stride[3], composed.stride[1], composed.stride[0]),
+            ),
+        )
     if cutlass.const_expr(state_out is not None):
         state_out = cute.make_tensor(
             state_out.iterator,
@@ -2193,6 +2282,7 @@ def host(
     cfg.state_cosize = cfg.d_k * cfg.d_v
     cfg.u_cosize = v_tile_elements
     cfg.o_cosize = o_tile_elements * cfg.smem_o_stages
+    cfg.checkpoint_cosize = cfg.d_k * cfg.d_v
 
     cumsumlog_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
     beta_smem_layout_staged = cute.make_layout((cfg.b_t, 1, cfg.smem_gate_stages))
@@ -2219,6 +2309,7 @@ def host(
         d,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,

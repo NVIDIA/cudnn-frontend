@@ -311,6 +311,125 @@ def test_workspace_carve_is_the_dense_one_plus_the_band_columns():
     assert lay_b.o - lay_d.o == _align_up(t * 640 * e) == t * band.qsa.index_band_cols * e
 
 
+def test_workspace_carve_of_the_decode_indexer_is_the_caller_list_carve_plus_five_slots_at_the_end():
+    """The in-block indexer's DECODE step over the pools (2026-10-21) carves FIVE slots after everything the caller-list band block's
+    decode carve holds -- `ix_q [T, index_heads, index_head_dim]`, `ix_logits [T, n_blocks_max]` fp32, `ix_counts [T]` int32, `ix_ids
+    [T, top_k]` int32, `ix_cslot [B, S_q]` int32 -- in that order, each 16-byte aligned, and nothing else moves: every other field of the
+    two carves is equal, the prefill indexer's slots stay unused (-1), and the total grows by exactly the five aligned sizes.  The planner's
+    `qsa_indexer_decode` is the logits width (the table's reach in compressed rows); the DSL-free ring rule equals the kernel's."""
+    import dataclasses
+
+    from cudnn.gated_attention_block.api import _index_state_ring_extra_rows, _qsa_indexer_decode_slots
+
+    b, s, n_blocks_max, e = 2, 4, 32 * 4, _itemsize(torch.bfloat16)
+    t = b * s
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
+    lay_c = _plan_workspace(geom, b, s, torch.bfloat16, True, False, True)
+    lay_i = _plan_workspace(geom, b, s, torch.bfloat16, True, False, True, qsa_indexer_decode=n_blocks_max)
+    five = ["ix_q", "ix_logits", "ix_counts", "ix_ids", "ix_cslot"]
+    slots = _qsa_indexer_decode_slots(geom, b, s, e, n_blocks_max)
+    assert [nm for nm, _ in slots] == five
+    q = geom.qsa
+    assert [nbytes for _, nbytes in slots] == [t * q.index_heads * q.index_head_dim * e, t * n_blocks_max * 4, t * 4, t * q.top_k * 4, b * s * 4]
+    for f in dataclasses.fields(lay_c):
+        if f.name in five or f.name in ("engine_scratch", "total_bytes"):
+            continue  # the five slots sit before the engines' scratch, which the planner keeps at the END of the carve
+        assert getattr(lay_c, f.name) == getattr(lay_i, f.name), f.name
+    assert all(getattr(lay_c, nm) == -1 for nm in five) and lay_i.ix_kbar == lay_i.ix_scores == lay_i.ix_cand == lay_i.ix_ids_sorted == -1
+    acc = lay_c.total_bytes
+    for nm, nbytes in slots:
+        assert getattr(lay_i, nm) == acc and acc % 16 == 0, nm
+        acc += _align_up(nbytes)
+    assert lay_i.total_bytes == lay_i.engine_scratch == acc and lay_c.engine_scratch == lay_c.total_bytes
+    assert _index_state_ring_extra_rows(q.block_size) == q.block_size - 1 == 3  # == kernels.qsa_compress.min_ring_rows(0, 4), checked at plan time
+
+
+def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names_the_indexer_facts(monkeypatch):
+    """The decode indexer's decline rows (`_qsa_decode_decline_texts`) reach the envelope VERBATIM under a sparse geometry on every reading,
+    each carrying its one shared token, and the FlashInfer-read indexer facts are published by name on a Rubin reading: `index_sources`
+    (`"caller"`, `"indexer"` at bf16 x head dim 128; `"caller"` alone at f16), the cache dtype, the head dims / KV heads / block sizes, the
+    `top_k` range, the 64-row query envelope, the ring's extra rows, the page sizes the paged scorer serves, `fuse_prepare_default` True on the measured part (cc 10.7,
+    2026-10-21) for the bf16 indexer geometry and False off it; the cache dtypes `(bf16, e4m3)` since the e4m3 indexer cache is served at decode (2026-10-21; the
+    `indexer_e4m3_cache` decline row retired) -- the DSL state MODELED as the served one (the facts are a reading of the SERVED form, never of this
+    host's wheel); a DENSE geometry publishes none of them (any device, no host sync)."""
+    import dataclasses
+
+    from cudnn.frost import buffers as _buffers
+    from cudnn.gated_attention_block import DecodeEnvelope
+    from cudnn.gated_attention_block.api import SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS, _qsa_decode_decline_texts
+
+    # the DSL state MODELED as the served one (the public 4.8.0 wheel with the sm_107a target, the version-gate cell's convention): the facts
+    # published for the measured part are a reading of the SERVED form, never of this host's wheel -- under a DSL at the floor but without
+    # the Rubin target (the public 4.7 wheels) `serving_envelope(..., device_cc=(10, 7))` reports decode unserved and the knob's AUTO reading
+    # False, the rule this cell is not about
+    monkeypatch.setattr(_buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(_buffers, "_cutedsl_has_sm107", lambda: True)
+    tokens = {
+        "shared_list_rows": "tail covers at most two blocks",
+        "indexer_f16": "needs bf16 activations",
+        "indexer_head_dim": "packs 128-wide heads",
+        "indexer_thd": "scores dense [B, S] prompts",
+        "indexer_query_rows": "query rows per sequence (at most 64",
+        "indexer_page_size": "a power-of-two count of compressed rows",
+        "indexer_e4m3_pool": "in-kernel dequant arm",
+        "indexer_shared_list": "selects per row",
+        "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
+        # the EXTEND step's rows (2026-10-29)
+        "indexer_extend_fuse_prepare": "the T-row chunk's ring read and its tail write live in two launches",
+        "indexer_extend_ring_slots": "the extend step takes the stack's ring slots",
+        "indexer_extend_rope_tables_only": "the extend step is always unfused and its query norm reads the per-token",
+        "indexer_extend_ring_rows": "at least block_size - 1 = 3 ring rows",
+        "indexer_extend_chunk_rows": "a chunk longer than the table's reach",
+    }
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
+    for dtype in (torch.bfloat16, torch.float16):
+        texts = _qsa_decode_decline_texts(geom, dtype)
+        assert set(texts) == set(tokens) and all(tok in texts[nm] for nm, tok in tokens.items())
+        d = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=(10, 7)).decode
+        assert all(d.declines[nm] == texts[nm] for nm in texts), "a decline row reaches the envelope reworded"
+        assert d.index_sources == (("caller", "indexer") if dtype == torch.bfloat16 else ("caller",))
+        assert d.index_cache_dtypes == (
+            (torch.bfloat16, torch.float8_e4m3fn) if dtype == torch.bfloat16 else ()
+        )  # the e4m3 indexer cache served at decode (2026-10-21)
+        assert "indexer_e4m3_cache" not in d.declines  # the row retired: a served form has no decline row
+        assert d.index_head_dims == (128,) and d.index_kv_heads == (1,) and d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4)
+        assert d.index_query_rows_max == 64 and d.index_state_rows_extra == 3 and d.index_page_sizes == (16, 32, 64, 128)
+        assert d.fuse_prepare_default is (dtype == torch.bfloat16) and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == (
+            (10, 7),
+        )  # the measured part; f16: not served
+        assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row"
+    dense = GatedAttentionBlockFwd.serving_envelope(
+        GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True), torch.bfloat16, _DEV, device_cc=(10, 7)
+    ).decode
+    assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
+    assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
+    assert not (set(tokens) & set(dense.declines))
+    # the append-only tail: the EXTEND step's four fields after route_cc (2026-10-29); `quant_modes` appended after them 2026-10-30 (the quant
+    # spellings the DENSE paged forms serve on the part -- the FP8-projection + bf16-attention mode; `()` on every QsaSpec geometry)
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-19:] == [
+        "index_sources",
+        "index_cache_dtypes",
+        "index_head_dims",
+        "index_kv_heads",
+        "index_block_sizes",
+        "index_top_k_range",
+        "index_query_rows_max",
+        "index_state_rows_extra",
+        "index_page_sizes",
+        "fuse_prepare_default",
+        "sparse_tiles",
+        "sparse_tile_lean_default",
+        "device_cc",
+        "route_cc",
+        "index_select_forms",
+        "index_extend_ring_rows_min",
+        "index_extend_select_budget_bytes",
+        "index_compress_roundings",
+        "quant_modes",
+    ]
+    assert dense.quant_modes == (("QuantSpec(attention_dtype=torch.bfloat16)",) if dense.served else ()), "a served dense form on cc 10.7 names the mode"
+
+
 # ---------------------------------------------------------------------------
 # Declaration-time declines (any GPU; no host sync)
 # ---------------------------------------------------------------------------
@@ -367,7 +486,8 @@ _DECLINES = [
         marks=_needs_dsl_floor,  # the head-group read sits behind the floor gate: below it the version decline answers first
     ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
-    # the fp8 indexer cache on f16 activations: the indexer's own dtype row speaks (the scorer packs bf16 queries and keys)
+    # the fp8 indexer cache on f16 activations: the indexer's own dtype row speaks (the scorer packs bf16 queries and keys); on the decode form
+    # over the pools the e4m3 cache itself is served since 2026-10-21 (test_block_qsa_decode.py) -- the f16 row is what stays
     pytest.param(
         {},
         QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=_E4M3),
@@ -375,7 +495,7 @@ _DECLINES = [
         torch.float16,
         NotImplementedError,
         "bf16 activations",
-        id="indexer_e4m3_cache_f16",
+        id="indexer_e4m3_cache_on_f16_activations",
     ),
     # THD composed with what the core does not carry under packed sequences: the in-block indexer (the paged write-through composes
     # with the packed sparse block since 2026-10-14: test_write_through_under_thd_builds_the_same_stage_beside_the_packed_sparse_stage)
@@ -521,7 +641,7 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
     indexer accepts the family) -- both texts exercised on every GPU host through a simulated capability.  Form only, no plan,
     no launch."""
     from cudnn.deepseek_sparse_attention.indexer_forward import compress_topk_cand_buffer_size_thd
-    from cudnn.gated_attention_block.api import _QSA_SORT_ROWS, _Indexer, _qsa_cand_floats, _qsa_indexer_slots
+    from cudnn.gated_attention_block.api import _Indexer, _qsa_cand_floats, _qsa_indexer_slots
 
     spec = QsaSpec(index_source="indexer", index_band=True)
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=spec)
@@ -542,11 +662,19 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
                 # the slots in the stage's own order, each 256-B aligned, appended after the caller-list block's carve; the names and
                 # byte counts are the stage's (the layout pins the arithmetic: order, alignment, the total)
                 slots = _qsa_indexer_slots(geom, b, s, e, ix.cand_floats)
-                assert [nm for nm, _ in slots] == ["ix_q", "ix_kbar", "ix_ids", "ix_scores", "ix_cand", "ix_ids_sorted", "ix_sort_idx"]
+                assert [nm for nm, _ in slots] == [
+                    "ix_q",
+                    "ix_kbar",
+                    "ix_ids",
+                    "ix_scores",
+                    "ix_cand",
+                ]  # the sort scratch gone (2026-10-29: the canonical kernel runs in place)
                 assert (
                     dict(slots)["ix_q"] == t * spec.index_heads * spec.index_head_dim * e and dict(slots)["ix_kbar"] == b * (s // 4) * spec.index_head_dim * e
                 )
-                assert dict(slots)["ix_ids"] == dict(slots)["ix_ids_sorted"] == t * spec.top_k * 4 and dict(slots)["ix_cand"] == ix.cand_floats * 4
+                assert (
+                    dict(slots)["ix_ids"] == t * spec.top_k * 4 and dict(slots)["ix_cand"] == ix.cand_floats * 4 and lay.ix_ids_sorted == lay.ix_sort_idx == -1
+                )
                 acc = lay_c.total_bytes
                 for nm, nbytes in slots:
                     assert getattr(lay, nm) == acc, nm
@@ -610,40 +738,50 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
             with pytest.raises(ValueError, match="declared without geometry.qsa"):
                 blk_d.execute(*args_d, ws, **ex_kw)
     if torch.cuda.is_available():
-        # the canonical row sort the stage runs after the top-k: torch's small-segment sort into PREALLOCATED outputs, descending
-        # (the -1 padding last), equal to torch's own result, and no allocation retained across the call (Rule 1's observable)
+        # the canonical order the stage runs after the top-k (2026-10-29): the FROST row canonicalizer IN PLACE on the list -- the selected ids
+        # descending, the -1 padding last, equal to torch's descending sort, -1 past the row's count whatever the slots held -- one launch, no
+        # torch op, no allocation (the former torch.sort windows and their int64 index scratch are gone); it runs on any CuTe DSL device
+        from cudnn.gated_attention_block.kernels.qsa_canonical_list import compile_qsa_canonical_list, run_qsa_canonical_list
+
         rows, top_k = 4096 + 7, spec.top_k
         g = torch.Generator(device="cuda").manual_seed(3)
         raw = torch.randperm(4 * top_k, device="cuda", generator=g)[:top_k].to(torch.int32).repeat(rows, 1)
         raw[:, 300:] = -1
-        dst = torch.empty_like(raw)
-        scratch = torch.empty(_QSA_SORT_ROWS, top_k, dtype=torch.int64, device="cuda")
+        counts = torch.full((rows,), 300, dtype=torch.int32, device="cuda")
+        counts[7] = 100  # a count below the valid ids the top-k left: the canonical list is -1 past the COUNT
+        want = torch.sort(raw, dim=-1, descending=True).values
+        want[7, 100:] = -1
+        canon = compile_qsa_canonical_list(with_lens=False)
+        dst = raw.clone()
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
-        for r0 in range(0, rows, _QSA_SORT_ROWS):
-            r1 = min(rows, r0 + _QSA_SORT_ROWS)
-            torch.sort(raw[r0:r1], dim=-1, descending=True, out=(dst[r0:r1], scratch[: r1 - r0]))
+        run_qsa_canonical_list(canon, dst, counts, dst, None, top_k=top_k, stream=torch.cuda.current_stream().cuda_stream)  # in place
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == before
-        assert (
-            torch.equal(dst, torch.sort(raw, dim=-1, descending=True).values)
-            and bool((dst[:, 300:] == -1).all())
-            and bool((dst[:, :299] > dst[:, 1:300]).all())
-        )
+        assert torch.equal(dst, want) and bool((dst[:, 300:] == -1).all()) and bool((dst[7, 100:] == -1).all())
+        assert bool((dst[:, :99] > dst[:, 1:100]).all()) and bool((dst[:7, :299] > dst[:7, 1:300]).all())  # strictly descending inside every valid prefix
     if torch.cuda.is_available():
-        # Off Rubin the block declines before any launch, and WHICH stage speaks depends on the part: below cc 10 the indexer
-        # stage (it precedes the sparse SDPA) names the scorer's device family; on a cc 10.x part other than Rubin (B200 / GB300)
-        # the indexer ACCEPTS -- the scorer is an SM100-family kernel -- and the sparse adapter's record declines, naming the
-        # found cc.  Both texts on every GPU host through a simulated capability (restored on exit), then the real device.
-        for sim_cc, pattern in (((9, 0), r"qsa_indexer: .*\(cc 10\.x\).*found cc 9\.0"), ((10, 0), r"Rubin-line GPU.*got cc 10\.0")):
+        # Off Rubin the block declines before any launch.  Since the cc 10.0 admission of the dense forms (2026-10-29) the FIRST word
+        # on any other part is the block's SPARSE PART STATEMENT (`_check_part_support`, before any stage: the sparse forms -- the
+        # core, the lean tile through the block, the indexer, the e4m3 cache -- are served on cc 10.7 only, the lift named), below
+        # and beside Rubin alike.  The stages' own gates still speak when asked directly: below cc 10 the indexer stage names the
+        # scorer's device family; on a cc 10.x part other than Rubin the sparse stage repeats the part statement AHEAD of the
+        # adapter (whose record would admit the explicit lean tile there since #1999).  Every text on every GPU host through a
+        # simulated capability (restored on exit), then the real device.
+        part = r"sparse forms .* served on cc 10\.7 \(Rubin\) only"
+        for sim_cc, stage, stage_pattern in (
+            ((9, 0), blk._indexer, r"qsa_indexer: .*\(cc 10\.x\).*found cc 9\.0"),
+            ((10, 0), blk._sdpa, part + r".*found SM100"),
+        ):
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(torch.cuda, "get_device_capability", lambda *a, _cc=sim_cc, **k: _cc)
-                with pytest.raises(NotImplementedError, match=pattern):
+                with pytest.raises(NotImplementedError, match=part + rf".*found SM{sim_cc[0]}{sim_cc[1]}"):
                     blk.check_support()
+                with pytest.raises(NotImplementedError, match=stage_pattern):
+                    stage.check_support()
         cc = tuple(torch.cuda.get_device_capability())
         if cc != (10, 7):
-            pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] == 10 else r"cc 10\.x"
-            with pytest.raises(NotImplementedError, match=pattern):
+            with pytest.raises(NotImplementedError, match=part + rf".*found SM{cc[0]}{cc[1]}"):
                 blk.check_support()
 
 
@@ -677,27 +815,26 @@ def _indexer_stage_probe(monkeypatch, *, seq_len: int, stub_select=None):
 
 def _identity_list(seq_len: int, batch: int, block_size: int, top_k: int) -> tuple:
     """The identity selection and its counts as the stage's contract spells them, derived on the host: ``counts[t] = min(top_k,
-    floor((pos + 1) / block_size))``, ``ids[t, j] = j`` below the count and ``-1`` past it."""
+    floor((pos + 1) / block_size))``, ``ids[t, j] = counts[t] - 1 - j`` below the count (the block's ONE canonical order, DESCENDING, like every
+    scorer-written list; 2026-10-29) and ``-1`` past it."""
     t = batch * seq_len
     pos = torch.arange(seq_len, device="cuda").repeat(batch)
     counts = torch.minimum((pos + 1) // block_size, torch.full_like(pos, top_k)).to(torch.int32)
     j = torch.arange(top_k, device="cuda", dtype=torch.int32)
-    ids = torch.where(j[None, :] < counts[:, None], j[None, :].expand(t, top_k), torch.full((t, top_k), -1, dtype=torch.int32, device="cuda"))
+    ids = torch.where(j[None, :] < counts[:, None], counts[:, None] - 1 - j[None, :], torch.full((t, top_k), -1, dtype=torch.int32, device="cuda"))
     return ids, counts
 
 
 @_needs_dsl_floor
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the stage's row sort and its DtoD copies run on a CUDA device")
 def test_indexer_stage_row_sort_runs_on_the_launch_stream_through_as_torch_stream(monkeypatch):
-    """Recipe R1 at the stage: past the identity bound ``_Indexer.execute`` sorts every row of the top-k's list on the LAUNCH stream as a
-    torch stream through ``as_torch_stream`` -- the default-stream handle ``0`` every eager caller hands in maps to torch's default stream
-    and ``torch.cuda.ExternalStream`` is never constructed (torch before 2.13 made ``ExternalStream(0)`` a fresh non-blocking pool stream,
-    unordered against the top-k that writes the list and the sparse core that reads the sorted one: a stale or half-sorted list attended,
-    silently).  The kernels are stubbed (the compress recipes to sentinels, the scorer to a known row permutation), so the host contract runs
-    on any CUDA device: ``ExternalStream`` monkeypatched to raise (the previous tree's hand-rolled wrapper trips it), the sorted slot equal to
-    torch's own descending sort of the stub's list with the ``-1`` padding last, the counts copied out."""
-    from cudnn.gated_attention_block.api import _QSA_SORT_ROWS
-
+    """Recipe R1 at the stage: past the identity bound ``_Indexer.execute`` puts every row of the top-k's list in canonical order on the LAUNCH
+    stream -- since 2026-10-29 the FROST row canonicalizer on the raw launch stream, IN PLACE on ``ix_ids`` (no torch op at all: the former
+    ``torch.sort`` windows went through ``as_torch_stream``, never a hand-rolled ``ExternalStream``, which torch before 2.13 made a fresh
+    non-blocking pool stream unordered against the top-k and the sparse core).  The compress recipes are stubbed to sentinels and the scorer
+    to a known row permutation, so the host contract runs on any CUDA device (the canonical kernel itself runs from sm_80): ``ExternalStream``
+    monkeypatched to raise, the list stage (4) consumes IS the ``ix_ids`` slot, equal to torch's descending sort of the stub's list with the
+    ``-1`` padding last, the counts copied out."""
     spec = QsaSpec(index_source="indexer", index_band=True)
     s, top_k = spec.identity_bound + 1, spec.top_k  # the first length past the identity: the scorer and the sort run
     _, counts = _identity_list(s, 1, spec.block_size, top_k)
@@ -710,7 +847,7 @@ def test_indexer_stage_row_sort_runs_on_the_launch_stream_through_as_torch_strea
         return ids
 
     ix, lay, ws, ops = _indexer_stage_probe(monkeypatch, seq_len=s, stub_select=fake_select)
-    assert ix.selects and s > _QSA_SORT_ROWS // 4
+    assert ix.selects
     ix.compile()  # the real scratch-sizing helper, the stubbed recipes, the stub warm-up
     lens_out = torch.full((s,), -7, dtype=torch.int32, device="cuda")
 
@@ -722,7 +859,7 @@ def test_indexer_stage_row_sort_runs_on_the_launch_stream_through_as_torch_strea
     got = ix.execute(ops["proj"], ops["cos"], ops["sin"], ops["w"], ops["w"], seq_lens=None, workspace=ws, lay=lay, block_lens_out=lens_out, current_stream=0)
     torch.cuda.synchronize()
     v = ix.views(ws, lay)
-    assert got.data_ptr() == v["ids_sorted"].data_ptr(), "the list stage (4) consumes is the sorted workspace slot"
+    assert got.data_ptr() == v["ids"].data_ptr() and lay.ix_ids_sorted == -1, "the list stage (4) consumes is the ix_ids slot, canonical in place"
     assert torch.equal(got, torch.sort(stub, dim=-1, descending=True).values), "the canonical order differs from torch's descending sort"
     assert torch.equal(got >= 0, torch.arange(top_k, device="cuda")[None, :] < counts[:, None]), "the valid ids are not the count's prefix (-1 last)"
     assert torch.equal(lens_out, counts), "the counts copied out differ from the contract's"
@@ -800,13 +937,17 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
                 pytest.skip(str(_CUTEDSL_REQUIREMENT))  # the stages ahead import their CuTe DSL kernels to answer check_support()
             cc = tuple(torch.cuda.get_device_capability())
             if cc != (10, 7):
-                # a cc 10.x part other than Rubin hears the record's Rubin-line decline; below cc 10 the gather4 part floor
-                # (tile_dsl.requirements, cc 10.0+) answers one gate EARLIER, naming the instruction's floor, not the record
-                pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] >= 10 else r"requires a cc 10\.0\+ part"
-                with pytest.raises(NotImplementedError, match=pattern):
+                # since the cc 10.0 admission of the dense forms (2026-10-29) a part other than Rubin hears the block's SPARSE PART
+                # STATEMENT first -- the block-level part row before any stage, then the sparse stage's own gate ahead of the adapter
+                # (whose record would admit the explicit lean tile on cc 10.0 / 10.3) -- naming the lift; the record's Rubin-line
+                # decline and the gather4 part floor are the standalone adapter's words there
+                part = rf"sparse forms .* served on cc 10\.7 \(Rubin\) only.*found SM{cc[0]}{cc[1]}"
+                with pytest.raises(NotImplementedError, match=part):
                     blk.check_support()
-                assert not blk._is_supported
-                assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None  # declined before any kernel module was loaded
+                assert not blk._is_supported and blk._sdpa._impl is None  # declined before the stage was asked: no adapter, no kernel module
+                with pytest.raises(NotImplementedError, match=part):
+                    blk._sdpa.check_support()  # the stage on its own: the same statement, before the adapter is built
+                assert blk._sdpa._impl is None
             else:
                 assert blk.check_support() and blk._is_supported
     # The fused projection fork's own decline is geometry-first (reads the same on every device).
@@ -1041,6 +1182,10 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     if not torch.cuda.is_available():
         pytest.skip("the block's check_support reads the device capability")
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    # the block's part rows (its own, then the sparse stage's, both before the adapter) precede the floor check since the cc 10.0
+    # admission of the dense forms (2026-10-29): on a part other than Rubin they would answer first, so the probe reads a cc 10.7
+    # device throughout (the sm_107a half below needs the same substitution)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
@@ -1048,7 +1193,6 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None, "the kernel module must not be loaded below the floor"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     blk2 = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
     with pytest.raises(NotImplementedError, match="sm_107a"):
         blk2.check_support()
@@ -1057,20 +1201,20 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     # groups are read off the DSA tree, whose package imports its kernel modules, so the version decline must come first -- and
     # from the stage's own check_support; the sm_107a target from the stage.  The head-group reader is replaced by a failing
     # stub, so REACHING it below the floor is the failure, never an import error from inside the DSL.
-    import cudnn.gated_attention_block.qsa_select as qsa_select
+    import cudnn.QSA.selection as qsa_select_forward
 
-    real_groups = qsa_select.indexer_scorer_head_groups
+    real_groups = qsa_select_forward.indexer_scorer_head_groups
     geom_ix = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     blk_ix = GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # declared AT the floor (4.8.0 above): the stage arms run on it
-    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", lambda: pytest.fail("the scorer's package was imported below the DSL floor"))
+    monkeypatch.setattr(qsa_select_forward, "indexer_scorer_head_groups", lambda: pytest.fail("the scorer's package was imported below the DSL floor"))
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
         GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # the declaration-time arm
     with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
         blk_ix._indexer.check_support()  # the stage on its own
     assert blk_ix._indexer._k_recipe is None and blk_ix._sdpa._impl is None  # nothing compiled; no stage past the indexer was asked
-    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", real_groups)
+    monkeypatch.setattr(qsa_select_forward, "indexer_scorer_head_groups", real_groups)
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)  # the capability still reads (10, 7) from above
     with pytest.raises(NotImplementedError, match="sm_107a"):
@@ -1326,7 +1470,7 @@ def test_an_e4m3_indexer_cache_declaration_appends_its_slots_and_the_cache_dtype
     attribute is byte-identical to before; the launch census is the bf16 indexer's plus two casts (plus one cache cast), below the
     bound the staging compress plus the cache cast; ``execute`` REQUIRES an e4m3 ``index_k_compressed`` on the e4m3 block and a bf16
     one on the bf16 block (the mirror images refused by name, each message naming the declared cache dtype).  Form only, no plan."""
-    from cudnn.gated_attention_block.api import _QSA_SORT_ROWS, _qsa_indexer_slots
+    from cudnn.gated_attention_block.api import _qsa_indexer_slots
 
     e4 = QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=_E4M3)
     g16 = QsaSpec(index_source="indexer", index_band=True)
@@ -1340,18 +1484,18 @@ def test_an_e4m3_indexer_cache_declaration_appends_its_slots_and_the_cache_dtype
             assert ix.selects == ix16.selects == (s > e4.identity_bound) and ix.n_blocks == s // 4
             lay, lay16 = blk._layout(), blk16._layout()
             t, nb, d_i, h_i = b * s, s // 4, e4.index_head_dim, e4.index_heads
-            windows = -(-t // _QSA_SORT_ROWS)
             if ix.selects:
-                # the seven bf16-indexer slots at the SAME offsets, then the two e4m3 slots, then the total
-                for nm in ("ix_q", "ix_kbar", "ix_ids", "ix_scores", "ix_cand", "ix_ids_sorted", "ix_sort_idx"):
+                # the five bf16-indexer slots at the SAME offsets (the sort scratch gone, 2026-10-29), then the two e4m3 slots, then the total
+                for nm in ("ix_q", "ix_kbar", "ix_ids", "ix_scores", "ix_cand"):
                     assert getattr(lay, nm) == getattr(lay16, nm) >= 0, nm
+                assert lay.ix_ids_sorted == lay16.ix_ids_sorted == lay.ix_sort_idx == lay16.ix_sort_idx == -1
                 slots = _qsa_indexer_slots(geom, b, s, 2, ix.cand_floats, e4m3=True)
-                assert [nm for nm, _ in slots][-2:] == ["ix_q8", "ix_kbar8"] and len(slots) == 9
+                assert [nm for nm, _ in slots][-2:] == ["ix_q8", "ix_kbar8"] and len(slots) == 7
                 assert dict(slots)["ix_q8"] == t * h_i * d_i and dict(slots)["ix_kbar8"] == b * nb * d_i
                 assert lay.ix_q8 == lay16.total_bytes and lay.ix_kbar8 == lay.ix_q8 + _align_up(t * h_i * d_i)
                 assert lay.total_bytes == lay.ix_kbar8 + _align_up(b * nb * d_i)
-                assert ix.launches_per_execute(False) == 6 + windows == ix16.launches_per_execute(False) + 2
-                assert ix.launches_per_execute(True) == 7 + windows == ix16.launches_per_execute(True) + 2
+                assert ix.launches_per_execute(False) == 7 == ix16.launches_per_execute(False) + 2  # + the canonical kernel (one launch, no windows)
+                assert ix.launches_per_execute(True) == 8 == ix16.launches_per_execute(True) + 2
             else:
                 # below the bound: the bf16 indexer block reserves nothing; the e4m3 one reserves the staging slot alone
                 assert lay16.ix_kbar == -1 and lay.ix_kbar == lay16.total_bytes and lay.ix_q == lay.ix_q8 == lay.ix_kbar8 == -1

@@ -14,6 +14,44 @@ from frost_test_utils import launch_f16, requires_blackwell, requires_dsl, requi
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 
+@pytest.mark.parametrize(
+    "host_attr,flag", [("_host", None), ("_host_prepared", "_prepared_fp8"), ("_host_prepared", "_prepared_mxfp8"), ("_host_thd_split", "packed_thd_split")]
+)
+def test_host_order_reused_but_each_compiled_wrapper_still_checked(monkeypatch, host_attr, flag):
+    """Template metadata may be shared; mutable plan lists and compiled ABI checks may not."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import prepared
+
+    def host(q, tile: "Constexpr", stream):
+        pass
+
+    def compiled(q, stream):
+        pass
+
+    def new_entry(q, extra, stream):
+        pass
+
+    km = SimpleNamespace(__name__="test_host", _host=host, _host_prepared=host, _host_thd_split=host)
+    api = SimpleNamespace(_k_mod=km, _compiled_kernel=compiled, **({flag: True} if flag else {}))
+    monkeypatch.setattr(prepared, "positional_entry", lambda fn: fn)
+    _, _, order = prepared._positional_order(api)
+    order.clear()
+    signature = prepared.inspect.signature
+
+    def no_repeat_host(entry):
+        assert entry is not host, "Repeated immutable template-host inspection"
+        return signature(entry)
+
+    monkeypatch.setattr(prepared.inspect, "signature", no_repeat_host)
+    assert prepared._positional_order(api) == (compiled, compiled, ["q", "stream"])
+    api._compiled_kernel = new_entry
+    with pytest.raises(NotImplementedError, match="disagrees with the compiled wrapper"):
+        prepared._positional_order(api)
+    setattr(km, host_attr, new_entry)
+    assert prepared._positional_order(api) == (new_entry, new_entry, ["q", "extra", "stream"])
+
+
 def _load(arch, template, d_qk, d_v, **overrides):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl

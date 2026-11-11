@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.bwd.prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
-from .d128_contract import ACCUMULATION, validate_launch, workspace_layout
+from .d128_contract import ACCUMULATION, PAIR, pair_workspace_layout, validate_launch, workspace_layout
 
 
 class _GuardedAccumulationEntry:
@@ -51,24 +51,33 @@ def compile_plan(api):
     cc = compute_capability(device)
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     regions, required = (), 0
-    if api._implementation == ACCUMULATION:
-        from .kernels.sm100.prepared_d128_accum_host import compile_host
-
-        regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max)
-        compile_args = (tuple(geometry), regions, dtype, api.is_causal, cc[0] * 10 + cc[1])
-    else:
-        from .kernels.sm100.prepared_d128_host import compile_host
-
-        compile_args = (tuple(geometry), dtype, api.is_causal, cc[0] * 10 + cc[1])
+    sm = cc[0] * 10 + cc[1]
+    window = 0 if api.window_size_left is None else api.window_size_left + 1
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.
-    with torch.cuda.device(device):
-        entry = compile_host(*compile_args)
+    if api._implementation == ACCUMULATION:
+        from .kernels.sm100.prepared_d128_host import compile_host_accum
+
+        regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
+        with torch.cuda.device(device):
+            entry = compile_host_accum(tuple(geometry), regions, dtype, api.is_causal, sm, window)
+    elif api._implementation == PAIR:
+        from .kernels.sm100.prepared_d128_host import compile_host_pair
+
+        split = api._pair_split
+        regions, required = pair_workspace_layout(api.batch_size, api.h_q, api.s_q_max, split, api.h_kv, api.s_k_max, api.head_dim_qk)
+        with torch.cuda.device(device):
+            entry = compile_host_pair(tuple(geometry), regions, dtype, api.is_causal, sm, window, api.h_q // api.h_kv, split)
+    else:
+        from .kernels.sm100.prepared_d128_host import compile_host_recompute
+
+        with torch.cuda.device(device):
+            entry = compile_host_recompute(tuple(geometry), dtype, api.is_causal, sm, window)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("sdpa_bwd_sm100_d128 requires a positional tvm-ffi entry")
     if required != api.scratch_workspace_bytes():
         raise RuntimeError("dense d128 compiled workspace disagrees with its advertised size")
-    if api._implementation == ACCUMULATION:
+    if api._implementation in (ACCUMULATION, PAIR):
         fn = _GuardedAccumulationEntry(fn, operands, required)
     return BwdLaunchSpec(
         SimpleNamespace(entry=entry, workspace_bytes=required, workspace_regions=regions, implementation=api._implementation),

@@ -13,9 +13,9 @@ offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. That flag is a
 per-engine maturity gate, not an architecture switch: an engine graduates by
 flipping one field once it has the arch coverage and the benchmarks to justify
 serving graphs unasked. The SDPA forward f16/bf16 rows for SM100, SM107, SM120 and SM90,
-the SM100 per-tensor FP8 row and the SM107 block-scale MXFP8 row have
-graduated; where a graduated engine is timed behind the backend its family ranks
-the backend's block first (`sdpa/fwd/placement.py`), and the flag, when set,
+the SM100, SM107 and SM120 per-tensor FP8 rows, the SM107 and SM120 block-scale MXFP8
+rows have graduated; where a graduated engine is timed behind the backend its family
+ranks the backend's block first (`sdpa/fwd/placement.py`), and the flag, when set,
 ranks FROST first everywhere. Engines that are the only implementation of their
 operation (GDN/KDA/GDN2 -- the backend has no lowering for those nodes at all)
 are never gated.
@@ -370,9 +370,14 @@ python/cudnn/
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
                                 layer (recipe, tile_config, kernel_registry ...);
-                                compiler.py / epilogue_codegen.py are FACADES that
-                                become the active arch tree's module on first
-                                import (arch_family.py picks it from the GPU, or
+    graph_analyzer.py           SHARED dense/MoE builders and per-analysis metadata
+    compiler.py                 SHARED executors, launch arguments, source cache,
+                                buffer validation and workspace helpers
+    epilogue_codegen.py         SHARED pointwise DAG, auxiliary addressing,
+                                casts, stores and row-quantization emitters
+                                Both files become the active arch tree's module
+                                on first import, retaining the shared helpers
+                                (arch_family.py selects the tree from the GPU or
                                 CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
     sm100/                      compiler.py + epilogue_codegen.py
                                 + kernel_templates/ (sm100_*, sm103_*)
@@ -385,6 +390,10 @@ python/cudnn/
                                 SM100-only tcgen05 compatibility wrappers;
                                 imported directly, never rendered as a kernel
 ```
+
+Dense and grouped GEMM analysis share one epilogue DAG builder in
+`gemm/frost/graph_analyzer.py`. Architecture-specific resource accounting,
+support checks and kernel scheduling remain in each source family.
 
 Two levels under the pass directory, always. **Arch is the one coverage axis
 that may be a directory** — `kernels/sm<arch>/` — because it partitions the
@@ -581,6 +590,16 @@ expressible, with one discipline separating them:
 
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
+- A SET-valued axis gets a model of its own when "unmentioned" would mean "no":
+  the mask band is decided through `cudnn/sdpa/band.py` -- the graph's
+  `BandFacts` (left bound present, right mode unbounded / causal / finite-right,
+  top-left or bottom-right anchor) against the row's `Capabilities.band`
+  (`BandSupport`). The legacy mask flags stay the declaration spelling and are
+  mapped onto that set once, in `Capabilities.__post_init__`; a row that serves
+  only unmasked graphs, or only a causal diagonal, says so instead of leaving an
+  axis to default (one coupling is expressible: `window_right`, the right modes
+  a left window pairs with), and the matcher asks every axis in both directions so an
+  unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
   per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
@@ -769,7 +788,7 @@ sdpa_fwd_prefill_sm100_d256
 sdpa_fwd_prefill_sm100_d128_fp8
 sdpa_fwd_prefill_sm120
 sdpa_fwd_decode_sm100_d256          (future)
-sdpa_bwd_sm100_d128                 (future)
+sdpa_bwd_sm100_d128
 ```
 
 - The name is what `get_plan_name_at_index()` reports and what
@@ -833,6 +852,203 @@ Asserts:
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
+
+
+## LayerNorm-prologue dual GEMM
+
+`gemm/frost/ln_prologue/` owns the parameter validation, geometry and launch
+adapter for the SM100 and SM107 LayerNorm-prologue dual GEMM bodies. These are
+specialized renderings beside the host module, rather than entries in the
+ordinary GEMM template registry. Preserve matching kernel protocols in both
+`sm100_dual_gemm.py` and `sm107_dual_gemm.py`; their architecture constants and
+resource limits differ.
+
+The operation normalizes each activation row in FP32, rounds the normalized
+operand to BF16, and computes value/gate GEMMs. Its epilogue applies biases,
+`sigmoid(gate) * value`, the mask and any configured residual before the final
+BF16 store. Masked or padded rows must store exactly positive zero through a
+select. Multiplying a stale accumulator by zero does not satisfy that contract.
+Statistics are written by pass zero. With `pairing="columns"`, weights are
+interleaved so each 128-channel value block precedes its corresponding gate
+block. With `pairing="accumulators"`, pass separate value and gate weight
+tensors. Biases use the interleaved value/gate block order in both arms.
+
+### Row-block tiling and tile order
+
+A pair processes 256 rows. The host chooses power-of-two `kb` and `r_i` with
+`r_i * kb == 256`. For scheduler row-block index `tile_m` and pair row `r`:
+
+```text
+ib = tile_m // n_kb
+kb_idx = tile_m % n_kb
+bi = ib * r_i + (r >> lkb)
+k = kb_idx * kb + (r & (kb - 1))
+```
+
+Each CTA owns 128 of those rows. Loads zero-fill rows outside `bn` or `n_res`;
+mask/statistics accesses and stores must also honor those bounds and `n_pad`.
+The descriptor layout, swizzled LayerNorm accesses and MMA operand layout must
+agree. The accumulator-pairing arm has two independently normalized operands
+and its own output layout.
+
+With `pass_order="major"`, pass is the scheduler's z-axis. With
+`pass_order="interleaved"`, scheduler M encodes
+`passes * row_block + pass`, and `_decode_pass` restores the two indices.
+Every CLC consumer must use the same decode. Reordering work must preserve the
+operation's arithmetic and output addressing.
+
+### Stage ownership and LayerNorm reuse
+
+| Barrier | Producer | Consumer / protected lifetime |
+|---|---|---|
+| `a_full` | CTA-local elected TMA lane | LayerNorm warps wait for A loads |
+| `a_norm_full` | One elected lane per LayerNorm warp in both CTAs | Leader MMA waits for normalized A |
+| `ab_full` | Elected TMA lane, counting both CTAs' B traffic | Leader MMA waits for B loads |
+| `ab_empty` | Leader MMA commit with the pair multicast mask | TMA producers wait before reusing an operand stage |
+| `acc_full` / `acc_empty` | MMA / epilogue warps | Protect accumulator production, drain and reuse |
+| `clc_full` / `clc_empty` | Scheduler / consumer warps | Protect each scheduler response until every consumer finishes |
+
+Before publishing normalized A through `a_norm_full`, every writing lane
+performs the async shared-memory fence, the warp synchronizes, and the elected
+lane issues the release arrival. Preserve the leader/follower arrival counts
+and the corresponding waits. Fully masked work still commits completion so
+the epilogue cannot wait forever. Accumulator loads must complete before TMEM
+release or deallocation.
+
+With `ln_once` enabled, one work item covers several N tiles and/or passes.
+The A region holds `_A_SLOTS * _NK` immutable stages; LayerNorm runs once per
+item, while the B ring, accumulator ring and epilogue remain per tile.
+`_item_tile` decodes the item's subtile into N tile and pass. CLC is consumed
+once per item. After the last K step of the last subtile, the MMA commits
+`a_empty` to release the A slot; both CTAs drain all outstanding slots before
+exit. A-region phases advance for each item and slot, rather than with the
+B ring's per-tile cadence. Use `ln_once_a_slots` and `ln_once_b_stages_effective` for
+the architecture-specific capacity decision.
+
+### Register allocation and LayerNorm forms
+
+The bodies assign epilogue, MMA, TMA, scheduler and LayerNorm warp roles.
+Set `min_blocks_per_mp=1` on the launch for their `setmaxregister` requests to
+take effect. The adapter defaults to zero; without the hint, ptxas can drop
+the register split. Check the generated binary before claiming that a
+toolchain honored the requests; do not infer effective register allocation
+from source-level requests alone.
+
+`sm100_register_form_unallocatable` declines the measured SM100 C7600 class:
+register-resident LayerNorm with K at least `4 * K_STAGE` and a packed epilogue,
+for every accumulator-pairing case, or a columns-pairing statistics writer
+using `packed_hoist` / `packed_biasfold`. This gate does not apply to SM107.
+Keep it a typed host rejection rather than allowing a later compilation error.
+
+The register form retains row words between statistics passes. Shared-memory
+forms re-read their unchanged stages; the accumulator-pairing re-read forms
+require the MN-major prologue because transpose writes can overwrite another
+lane's unread input. The `smem_rolled_tree` form changes the FP32 summation
+order and requires its numerical checks; the other forms retain the existing
+association. Packed epilogue variants keep the final mask select and their
+declared rounding points. These choices do not justify changing barrier
+counts, stage ownership or output layout.
+
+
+## SM100 block-scale descriptor roots
+
+The SM100 block-scale templates declare the scale-factor rings before the
+data rings. Their non-versioned `Tcgen05SmemDesc.build` encoding has a 14-bit
+start-address field in 16-byte units. A ring root at or above `262144` bytes
+wraps into earlier shared memory. `advance_start_address` advances an encoded
+descriptor without that root mask, so the restriction applies to the build
+roots rather than every stage offset.
+
+`sm100/compiler.py::_block_scale_smem_desc_roots` models each complete ring
+in declaration order, with 1024-byte ring alignment and the template's actual
+output-staging placement. Dense templates place output staging after the
+rings; grouped templates place it before them. The compiler trims stage depth
+until every build root fits, and rejects a configuration when even one stage
+cannot fit. This check is separate from the target GPU's shared-memory budget.
+More shared memory does not make a wrapped descriptor valid.
+
+Keep the root model, declaration order and support gates consistent when
+changing ring depth or adding distinct operands. The regression in
+`test_block_scale_smem_layout_sm107.py` checks the source order and the
+independent root model; source comments link this section instead of repeating
+the encoding details.
+
+
+## Releasing a shared-memory stage: `tile_dsl.consume`
+
+A consumer that read a stage with ordinary shared-memory loads returns it
+through this module, never through a bare arrive (`python/cudnn/AGENTS.md`
+Rule 11 has the reason and what was measured).
+
+```python
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
+
+@cute.kernel
+def kernel(..., rz_arg: cutlass.Int32):            # the release-zero: one more kernel argument, last
+    rz = release_zero(rz_arg)                      # once, at the top of the kernel
+    ...
+    w = stage.load(base, vector_size=4, alignment=16)
+    consume_then_arrive(mb_empty[s], w, rz, pred=nvvm.elect_sync())
+    ... w is used here, or later ...
+
+@cute.jit
+def host(...):
+    kernel(..., cutlass.Int32(0)).launch(...)       # the only value ever passed
+```
+
+| Release | Call | Arrives as |
+|---|---|---|
+| local, every calling lane | `consume_then_arrive(mb, consumed, rz)` | `barrier.arrive` |
+| elected lane | `consume_then_arrive(mb, consumed, rz, pred=nvvm.elect_sync())` | one predicated local arrive |
+| counted | `consume_then_arrive(mb, consumed, rz, count=n)`, with or without `pred=` | `n` per arriving lane |
+| peer CTA | `consume_then_arrive_on_peer(mb, peer, consumed, rz, pred=, release_cta=True)` | `mbar_arrive_on_peer` |
+| scheduler slot credit | `consume_then_read_tile_id_arrive(mb, cga_size, consumed, rz)` | the predicated arm of `read_tile_id_arrive` |
+
+Contract:
+
+- **What it emits.** A wrapping 32-bit sum over every word of `consumed`, an
+  AND with the release-zero, the result added to the barrier address, then
+  the arrive of the chosen form. For W loaded 32-bit words that is
+  ceil(W / 2) + 2 integer instructions per release (12 for 20 words on
+  `sm_100a`: nine three-input adds, one add, the AND, one multiply-add); no
+  load, no store, no shared-memory word.
+- **`consumed` is required** and may not be empty: every value the calling
+  lanes loaded from the stage since they acquired it — scalars, vectors,
+  register tiles, nested tuples; 64-bit values contribute both halves. Pass
+  each loaded value once, and the loaded value itself: a value derived from
+  another passed value (a difference, a negation, a checksum) can cancel the
+  term it was computed from and leave that load unread without any error.
+  `None`, an empty sequence, a Python number, a constant, a Boolean, the same
+  value twice and a vector together with one of its elements are refused at
+  trace time.
+- **The release-zero is a kernel argument** and the host of the same module
+  passes the literal 0. Its only use in the kernel is `release_zero(arg)`,
+  which rejects a Python number, a constant and a computed value; the forms
+  refuse to trace when the argument already has another use. Never compare
+  it, branch on it, assert or assume its value: a kernel that knows the value
+  has no ordering left, without any error. A zero the toolchain can see (a
+  literal, an inline-asm `mov`) removes the ordering the same way. A non-zero
+  argument is undefined behaviour (the arrive lands on another word of shared
+  memory); nothing in the kernel may test for it.
+- **Lane ledger unchanged.** No form elects for the caller. Each arrives
+  where and as often as its plain twin (`barrier.arrive`,
+  `mbar_arrive_on_peer`, `read_tile_id_arrive`): init counts do not move when
+  a site changes over.
+- **Elected arrives take `pred=`.** Every calling lane computes the address;
+  one predicated arrive fires. Keep the call out of a lane branch: the
+  unconditional sum in front of a predicated arrive is the measured form.
+- **Scope.** The helper orders the calling lanes' own loads. A warp that
+  loads releases through the helper itself; a release issued by another
+  thread block than the one that loaded cannot be ordered this way. A release
+  without an address operand (a CTA barrier in front of a refill, a peer
+  send) is outside it: see Rule 11 for the two alternatives. Only the
+  predicated lowering of the scheduler credit exists here; a kernel whose
+  measurement prefers the branch arm of `read_tile_id_arrive` adds that arm
+  with its own measurement.
+- **Check a new call site** with `warm_stress.assert_release_dependence` on
+  the rendering's PTX, by reading its disassembly (no load of the stage first
+  read behind the arrive), and with `warm_stress.assert_warm_stress` on a
+  shape that refills the stage (`test/AGENTS.md`).
 
 
 ## Adding coverage, cheapest first
@@ -922,3 +1138,8 @@ Asserts:
     rots otherwise. Knob-domain-only changes are exempt (it does not track
     knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
     exact scope and is the number to cite in review.
+15. **A stage that was read is released through `tile_dsl.consume`.** A bare
+    arrive behind shared-memory loads of the stage it frees is not accepted
+    in new or changed kernel code, even when every test passes
+    (`python/cudnn/AGENTS.md` Rule 11); existing sites move over in follow-up
+    changes.

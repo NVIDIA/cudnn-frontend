@@ -30,14 +30,16 @@ back to global: traffic is then the minimal 3 units (read dy, read x, write dx).
 
 from __future__ import annotations
 
+import math
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.primitives as nvvm
+import cutlass.experimental.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget
+from cudnn.norm.utils import ws_bytes, ws_empty, ws_zeros, cur_stream, dyn, fake_stream, smem_budget, dsl_compile_lock
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -335,7 +337,25 @@ def eligible(spec, elem_bytes):
         return False
     if 2 * int(spec.M) * elem_bytes + 2 * 1024 * 4 + 256 > smem_budget(_SMEM_CAP_PREF):
         return False
-    return True
+    return block_threads(spec, elem_bytes) is not None
+
+
+def block_threads(spec, elem_bytes):
+    """The CTA width: sized to the ROW, not to a fixed 256, and a multiple of both 32 and CPG. ``None`` when no such width fits
+    1024 threads.
+
+    InstanceNorm has CPG=1, so a whole block serves one span of M elements; at 7x7 that is 49 vectors and a 256-thread block
+    leaves 80% of its lanes idle. Round the vector count up to a warp, then up to a multiple of CPG so the segment split stays
+    exact. The multiple of CPG must also be a whole number of warps: :func:`_block_sum2` shuffles with a full mask and reduces
+    ``bt // 32`` warp slots, so a partial last warp (CPG 20 / 40 rounded 256 up to 260 / 280) is dropped from the row sums and
+    its lane 0 writes past the first accumulator's slots -- dx then varies from run to run."""
+    cpg = int(spec.channels_per_group)
+    step = cpg * 32 // math.gcd(cpg, 32)  # lcm(CPG, 32)
+    if step > 1024:
+        return None
+    nvec = max(1, int(spec.M) // _vec_for(int(spec.gamma_inner_span), elem_bytes))
+    bt = min(256, max(32, ((nvec + 31) // 32) * 32))
+    return min(1024, -(-bt // step) * step)
 
 
 def scratch_bytes(spec, params, shape=None, has_beta=False, knobs=None):
@@ -367,17 +387,9 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     V = _vec_for(SPAN, eb)
     GPS = int(spec.groups_per_sample)
     R = int(spec.R)
-    # Size the block to the ROW, not to a fixed 256. InstanceNorm has CPG=1, so a
-    # whole block serves one span of M elements; at 7x7 that is 49 vectors and a
-    # 256-thread block leaves 80% of its lanes idle. Round the vector count up to
-    # a warp, then up to a multiple of CPG so the segment split stays exact.
-    nvec = max(1, M // V)
-    bt = min(256, max(32, ((nvec + 31) // 32) * 32))
-    if bt < CPG:
-        bt = CPG
-    if bt % CPG:
-        bt = ((bt + CPG - 1) // CPG) * CPG
-    bt = min(bt, 1024)
+    bt = block_threads(spec, eb)
+    if bt is None:
+        raise ValueError("GroupNorm backward: no whole-warp CTA width is a multiple of the channels per group")
 
     # ctas MUST be a multiple of GPS so every row a CTA sees shares its group
     # index -- that is what makes the channel set fixed and the partials [ctas,CPG].
@@ -404,10 +416,14 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params, out_d
     dyf, xf, dxf = dy2d.reshape(-1), x2d.reshape(-1), dx.reshape(-1)
     args = (dyn(dyf), dyn(xf), dyn(dxf), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (M, V, CPG, SPAN, GPS, bt, it_ty, et, spec.has_mean, has_beta, smem_bytes, fgrid, fbt)
-    key = (params.io_dtype, ctas) + ce
+    # dyn() specializes strides 0 and 1; larger strides are dynamic.
+    key = (params.io_dtype, ctas, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_fast_host, *args, *ce, fake_stream())
-        _KCACHE[key] = fn
+        with dsl_compile_lock():
+            fn = _KCACHE.get(key)
+            if fn is None:
+                fn = cute.compile(_gn_bwd_fast_host, *args, *ce, fake_stream())
+                _KCACHE[key] = fn
     fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

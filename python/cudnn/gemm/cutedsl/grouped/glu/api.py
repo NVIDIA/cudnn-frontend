@@ -47,6 +47,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     framework_dtype,
     get_compute_capability,
+    has_tcgen05,
     get_device,
     get_shape,
     get_strides,
@@ -735,6 +736,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
 
     cache_key = backend_cache_key(
         GroupedGemmBackend.BLOCK_SCALED,
+        a_tensor.device,
         *cache_key,
         wrapper_operand_meta(call.scheduler_counter_tensor),
         is_flat_sf(sfa_tensor),
@@ -1071,8 +1073,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if compute_capability < 100:
-        raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+, found SM{compute_capability}")
+    if not has_tcgen05(major):
+        raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
     return normalized, backend
 
 

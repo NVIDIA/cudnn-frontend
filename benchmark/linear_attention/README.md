@@ -9,6 +9,7 @@ This directory contains benchmarking tools for linear attention operations (GDN/
 - `Dockerfile` - Docker container setup for running benchmarks
 - `benchmark_single_linear_attention.py` - Single linear attention benchmark script
 - `plot_results.py` - Renders the charts under `results/` from a sweep CSV
+- `steep_decay/` - Standalone GDN-2 steep-decay reproduction and its summary script (see its notes)
 - `results/<variant>/<gpu>/` - Dated sweep CSVs and the charts rendered from them
 
 ## Quick Start
@@ -57,7 +58,7 @@ python benchmark_single_linear_attention.py \
 # group count, x at the head count; state dim N = 128, head dim P = 64)
 python benchmark_single_linear_attention.py \
     --batch_size 4 --seqlen 8192 \
-    --num_q_heads 64 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
+    --num_q_heads 8 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
     --la_backend cudnn --variant mamba2 --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
@@ -89,6 +90,13 @@ python benchmark_single_linear_attention.py \
     --la_backend flash_kda --variant kda --data_type bfloat16 \
     --skip_ref
 
+# mamba_ssm comparison point (mamba2 variant only; B / C at the group count)
+python benchmark_single_linear_attention.py \
+    --batch_size 4 --seqlen 8192 \
+    --num_q_heads 8 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
+    --la_backend mamba_ssm --variant mamba2 --data_type bfloat16 \
+    --skip_ref --fwd_bwd
+
 # Input initial state and dump state for every chunk
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
@@ -111,10 +119,11 @@ The decay gates are all ones (alpha = 1, log gate 0) for every variant and backe
 | `fla`   | FLA (flash-linear-attention, Triton; `gdn`, `kda`, `gdn2`, `gdp`, and `mamba2` through `chunk_simple_gla` with the Mamba-2 pre-scaling of k by dt and g = A dt) |
 | `flash_qla` | FlashQLA (TileLang fused GDN kernels, `gdn` variant only) |
 | `flash_kda` | FlashKDA (`kda` forward variant only) |
+| `mamba_ssm` | mamba_ssm (the reference Mamba-2 SSD Triton kernel `mamba_chunk_scan_combined`, `mamba2` variant only; takes B / C at the group count natively, chunk size 128) |
 
 The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-SM103 and SM107, the cuTile engines elsewhere. `gdn2`, `gdp` and `mamba2` are FROST-only.
 
-Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, `mamba2`), the counts the tracked sweeps run at; the low-occupancy sweep passes 16 explicitly.  `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`): the cudnn op fuses it and produces `dD`, the fla path adds it in torch inside the timed region.  Mamba-2 only.
+Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, and the `mamba2` x heads; Mamba-2's B / C default to 8 groups, `--num_q_heads` being the group count).  For Mamba-2 only, `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`). 
 
 ## Results
 

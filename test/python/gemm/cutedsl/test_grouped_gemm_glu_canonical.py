@@ -123,6 +123,65 @@ def test_glu_canonical_graph_changed_inputs():
     assert_outputs_equal(result, legacy, 2048)
 
 
+@pytest.mark.parametrize("entry", ["swiglu", "glu"])
+def test_block_scaled_wrapper_cache_separates_devices(monkeypatch, entry):
+    from cudnn.gemm.cutedsl.grouped.glu import api as glu_api
+    from cudnn.gemm.cutedsl.grouped.swiglu import api as swiglu_api
+
+    first = torch.cuda.current_device()
+    other = next((i for i in range(torch.cuda.device_count()) if i != first and torch.cuda.get_device_capability(i)[0] == 10), None)
+    if other is None:
+        pytest.skip("two SM100+ CUDA devices are required")
+    monkeypatch.setattr(swiglu_api, "_cache_of_GroupedGemmSwigluSm100Objects", {})
+    monkeypatch.setattr(glu_api, "_cache_of_GroupedGemmGluSm100Objects", {})
+    monkeypatch.setattr(glu_api, "_glu_wrapper_memo", {})
+    source = natural_inputs(mxfp8_inputs([256] * 4))
+    host = {name: value.cpu() if isinstance(value, torch.Tensor) else value for name, value in source.items()}
+    wrapper = swiglu_api.grouped_gemm_swiglu_wrapper_sm100 if entry == "swiglu" else glu_api.grouped_gemm_glu_wrapper_sm100
+
+    def call(inputs):
+        return wrapper(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            norm_const_tensor=inputs["norm_const_tensor"],
+            d_dtype=torch.float8_e4m3fn,
+            sf_vec_size=32,
+        )
+
+    retained = {}
+    graphs = []
+    try:
+        for device in (first, other):
+            with torch.cuda.device(device):
+                inputs = {name: value.to(device=device) if isinstance(value, torch.Tensor) else value for name, value in host.items()}
+                call(inputs)  # Compile once on each device, without clearing the shared caches.
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                graph = torch.cuda.CUDAGraph()
+                graphs.append((device, graph))
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = call(inputs)
+                retained[device] = inputs, graph, captured
+
+        for device in (first, other, first):
+            with torch.cuda.device(device):
+                inputs, graph, captured = retained[device]
+                inputs["alpha_tensor"].mul_(0.5)
+                expected = call(inputs)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert_outputs_equal(captured, expected, 1024)
+    finally:
+        for device, graph in graphs:
+            with torch.cuda.device(device):
+                graph.reset()
+
+
 @pytest.mark.parametrize("natural_operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor"])
 def test_glu_mixed_layouts(natural_operand):
     inputs = mxfp8_inputs([512] * 4)

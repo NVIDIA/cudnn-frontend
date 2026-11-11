@@ -11,6 +11,7 @@ Usage examples for the C++ graph API and the Python API. Build commands: [../AGE
 | `python/` | Numbered Jupyter notebooks (`00_introduction.ipynb` ...) — the Python tutorial sequence |
 | `frost/` | Standalone Python scripts for the FROST engines and blocks: `gemm/`, `linear_attention/` and `gated_attention_block/`, numbered, each self-checking against a reference |
 | `llama/`, `llm_coverage/` | End-to-end LLaMA tie-out scripts and per-op coverage scripts (plain `.py`, see their READMEs) |
+| `models/` | End-to-end model samples: one process, a per-block provider table, a self-check against a plain-PyTorch reference; a shared helper layer `models/model_samples/`. Own rules: [models/AGENTS.md](models/AGENTS.md) |
 
 ## Running
 
@@ -27,3 +28,4 @@ Samples need a GPU + cuDNN backend at runtime; individual cases `SKIP()` on unsu
 - Follow the existing pattern: build graph → `validate()` → `build_operation_graph()` → plans → `check_support()` (skip gracefully if unsupported) → execute → verify.
 - Python notebooks are formatted by `black-jupyter` (`pre-commit run`); keep the numbered-prefix naming so the tutorial order stays obvious.
 - A new public feature should come with a sample here and a doc page under `docs/`.
+- Version-gated Python samples must check both the headers used to compile the module and the loaded cuDNN library. A newer runtime cannot enable code compiled out by older headers. Exercise old-header/new-runtime, new-header/old-runtime, and supported controls; notebook 71 checks this before any cuDNN graph cell.

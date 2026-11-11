@@ -94,7 +94,7 @@ The Blackwell tcgen05 MMA tile shape is (128, 128), and the kernel uses fp16 for
 with fp32 for accumulation.
 
 Constraints for this example:
-* Supported head dimension: 256
+* Supported head dimensions: 128 and 256 (one or two 128-wide K halves)
 * mma_tiler_mn must be 128,128
 * For causal masking, use --is_causal
 * For variable sequence lengths, use --varlen
@@ -137,8 +137,8 @@ class BlackwellFmhaBackwardDKDV256:
         # NOTE: hereafter, the mma_tiler has already been set as (M, N, K) w.r.t the Transposed S
 
         self.head_dim = mma_tiler[2]
-        if self.head_dim != 256:
-            raise ValueError("fmha_bwd_dKdV only supports head dimension 256")
+        if self.head_dim not in (128, 256):
+            raise ValueError("fmha_bwd_dKdV only supports head dimensions 128 and 256")
         self.use_2cta_instrs = True
         self.use_2cta_divisor = 2
         self.cluster_shape_mn = (2, 1)
@@ -295,7 +295,9 @@ class BlackwellFmhaBackwardDKDV256:
         self.compute_mma_dS_stage = 4
         self.mma_compute_dKdV_stage = 1
         self.num_prologue_iters = self.mma_compute_KQ_stage
-        self.k_halves = 2
+        self.k_halves = self.head_dim // 128
+        self.kh0 = (None, 0) if self.k_halves > 1 else None
+        self.kh1 = (None, 1) if self.k_halves > 1 else None
         self.VDO_mma_tiler_sfv_load = (
             self.VDO_mma_tiler_sfa[0],
             self.VDO_mma_tiler_sfa[1],
@@ -1292,14 +1294,14 @@ class BlackwellFmhaBackwardDKDV256:
         tSTrQ = KQ_tiled_mma.make_fragment_B(sQ)
 
         # K-half SMEM fragments for d=256 support.
-        tSTrK_0 = KQ_tiled_mma_smem.make_fragment_A(sK[(None, None, (None, 0), None)])
-        tSTrK_1 = KQ_tiled_mma_smem.make_fragment_A(sK[(None, None, (None, 1), None)])
-        tSTrQ_0 = KQ_tiled_mma_smem.make_fragment_B(sQ[(None, None, (None, 0), None)])
-        tSTrQ_1 = KQ_tiled_mma_smem.make_fragment_B(sQ[(None, None, (None, 1), None)])
-        tDPrV_0 = VDO_tiled_mma_smem.make_fragment_A(sV[(None, None, (None, 0), None)])
-        tDPrV_1 = VDO_tiled_mma_smem.make_fragment_A(sV[(None, None, (None, 1), None)])
-        tdPTrdO_0 = VDO_tiled_mma_smem.make_fragment_B(sdO[(None, None, (None, 0), None)])
-        tdPTrdO_1 = VDO_tiled_mma_smem.make_fragment_B(sdO[(None, None, (None, 1), None)])
+        tSTrK_0 = KQ_tiled_mma_smem.make_fragment_A(sK[(None, None, self.kh0, None)])
+        tSTrK_1 = KQ_tiled_mma_smem.make_fragment_A(sK[(None, None, self.kh1, None)])
+        tSTrQ_0 = KQ_tiled_mma_smem.make_fragment_B(sQ[(None, None, self.kh0, None)])
+        tSTrQ_1 = KQ_tiled_mma_smem.make_fragment_B(sQ[(None, None, self.kh1, None)])
+        tDPrV_0 = VDO_tiled_mma_smem.make_fragment_A(sV[(None, None, self.kh0, None)])
+        tDPrV_1 = VDO_tiled_mma_smem.make_fragment_A(sV[(None, None, self.kh1, None)])
+        tdPTrdO_0 = VDO_tiled_mma_smem.make_fragment_B(sdO[(None, None, self.kh0, None)])
+        tdPTrdO_1 = VDO_tiled_mma_smem.make_fragment_B(sdO[(None, None, self.kh1, None)])
 
         # (MMA, MMA_N, MMA_K, STAGE)
         tdPTrdO = VDO_tiled_mma.make_fragment_B(sdO)
@@ -1353,7 +1355,10 @@ class BlackwellFmhaBackwardDKDV256:
             cute.slice_(sfK_smem_layout_staged, (None, None, None, 0, 0)),
         )
         tSTtSFK, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tSTtSFK_layout, self.sf_dtype)
-        tSTtSFK_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tSTtSFK_layout, self.sf_dtype)
+        if cutlass.const_expr(self.k_halves > 1):
+            tSTtSFK_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tSTtSFK_layout, self.sf_dtype)
+        else:
+            tSTtSFK_h1 = tSTtSFK
 
         tSTtSFQ_layout = blockscaled_utils.make_tmem_layout_sfb(
             KQ_tiled_mma_sfb,
@@ -1362,7 +1367,10 @@ class BlackwellFmhaBackwardDKDV256:
             cute.slice_(sfQ_smem_layout_staged, (None, None, None, 0, 0)),
         )
         tSTtSFQ, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tSTtSFQ_layout, self.sf_dtype)
-        tSTtSFQ_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tSTtSFQ_layout, self.sf_dtype)
+        if cutlass.const_expr(self.k_halves > 1):
+            tSTtSFQ_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tSTtSFQ_layout, self.sf_dtype)
+        else:
+            tSTtSFQ_h1 = tSTtSFQ
 
         tDPtSFV_layout = blockscaled_utils.make_tmem_layout_sfa(
             VDO_tiled_mma,
@@ -1371,7 +1379,10 @@ class BlackwellFmhaBackwardDKDV256:
             cute.slice_(SFV_smem_layout_staged, (None, None, None, 0, 0)),
         )
         tDPtSFV, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tDPtSFV_layout, self.sf_dtype)
-        tDPtSFV_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tDPtSFV_layout, self.sf_dtype)
+        if cutlass.const_expr(self.k_halves > 1):
+            tDPtSFV_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tDPtSFV_layout, self.sf_dtype)
+        else:
+            tDPtSFV_h1 = tDPtSFV
 
         tDPtSFDO_layout = blockscaled_utils.make_tmem_layout_sfb(
             VDO_tiled_mma_sfb,
@@ -1380,7 +1391,10 @@ class BlackwellFmhaBackwardDKDV256:
             cute.slice_(SFDO_smem_layout_staged, (None, None, None, 0, 0)),
         )
         tDPtSFDO, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tDPtSFDO_layout, self.sf_dtype)
-        tDPtSFDO_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tDPtSFDO_layout, self.sf_dtype)
+        if cutlass.const_expr(self.k_halves > 1):
+            tDPtSFDO_h1, tmem_offset, _ = cute_common.reserve_tmem_tensor(tmem_ptr, tmem_offset, tDPtSFDO_layout, self.sf_dtype)
+        else:
+            tDPtSFDO_h1 = tDPtSFDO
 
         SFDST_layout = blockscaled_utils.make_tmem_layout_sfa(
             dSQ_tiled_mma,
@@ -2989,27 +3003,29 @@ class BlackwellFmhaBackwardDKDV256:
                 tCsSFK_compact_s2t[None, None, None, None, 0],
                 tCtSFK_compact_s2t,
             )
-            cute.copy(
-                tiled_copy_s2t_sfk_h1,
-                tCsSFK_compact_s2t_h1[None, None, None, None, 1],
-                tCtSFK_compact_s2t_h1,
-            )
+            if cutlass.const_expr(self.k_halves > 1):
+                cute.copy(
+                    tiled_copy_s2t_sfk_h1,
+                    tCsSFK_compact_s2t_h1[None, None, None, None, 1],
+                    tCtSFK_compact_s2t_h1,
+                )
             cute.copy(
                 tiled_copy_s2t_sfq,
                 tCsSFQ_compact_s2t[s2t_stage_coord],
                 tCtSFQ_compact_s2t,
             )
-            cute.copy(
-                tiled_copy_s2t_sfq_h1,
-                tCsSFQ_compact_s2t_h1[
-                    None,
-                    None,
-                    None,
-                    None,
-                    load_mma_KQ_consumer_state.index * self.k_halves + 1,
-                ],
-                tCtSFQ_compact_s2t_h1,
-            )
+            if cutlass.const_expr(self.k_halves > 1):
+                cute.copy(
+                    tiled_copy_s2t_sfq_h1,
+                    tCsSFQ_compact_s2t_h1[
+                        None,
+                        None,
+                        None,
+                        None,
+                        load_mma_KQ_consumer_state.index * self.k_halves + 1,
+                    ],
+                    tCtSFQ_compact_s2t_h1,
+                )
 
             # Fence for TMEM stores
             cute.arch.fence_view_async_tmem_store()
@@ -3047,27 +3063,29 @@ class BlackwellFmhaBackwardDKDV256:
                 tCsSFV_compact_s2t[None, None, None, None, 0],
                 tCtSFV_compact_s2t,
             )
-            cute.copy(
-                tiled_copy_s2t_sfv_h1,
-                tCsSFV_compact_s2t_h1[None, None, None, None, 1],
-                tCtSFV_compact_s2t_h1,
-            )
+            if cutlass.const_expr(self.k_halves > 1):
+                cute.copy(
+                    tiled_copy_s2t_sfv_h1,
+                    tCsSFV_compact_s2t_h1[None, None, None, None, 1],
+                    tCtSFV_compact_s2t_h1,
+                )
             cute.copy(
                 tiled_copy_s2t_sfdo,
                 tCsSFDO_compact_s2t[s2t_stage_coord],
                 tCtSFDO_compact_s2t,
             )
-            cute.copy(
-                tiled_copy_s2t_sfdo_h1,
-                tCsSFDO_compact_s2t_h1[
-                    None,
-                    None,
-                    None,
-                    None,
-                    load_mma_VDO_consumer_state.index * self.k_halves + 1,
-                ],
-                tCtSFDO_compact_s2t_h1,
-            )
+            if cutlass.const_expr(self.k_halves > 1):
+                cute.copy(
+                    tiled_copy_s2t_sfdo_h1,
+                    tCsSFDO_compact_s2t_h1[
+                        None,
+                        None,
+                        None,
+                        None,
+                        load_mma_VDO_consumer_state.index * self.k_halves + 1,
+                    ],
+                    tCtSFDO_compact_s2t_h1,
+                )
 
             # Fence for TMEM stores
             cute.arch.fence_view_async_tmem_store()
@@ -3115,17 +3133,18 @@ class BlackwellFmhaBackwardDKDV256:
                     tCsSFQ_compact_s2t[s2t_stage_coord],
                     tCtSFQ_compact_s2t,
                 )
-                cute.copy(
-                    tiled_copy_s2t_sfq_h1,
-                    tCsSFQ_compact_s2t_h1[
-                        None,
-                        None,
-                        None,
-                        None,
-                        load_mma_KQ_consumer_state.index * self.k_halves + 1,
-                    ],
-                    tCtSFQ_compact_s2t_h1,
-                )
+                if cutlass.const_expr(self.k_halves > 1):
+                    cute.copy(
+                        tiled_copy_s2t_sfq_h1,
+                        tCsSFQ_compact_s2t_h1[
+                            None,
+                            None,
+                            None,
+                            None,
+                            load_mma_KQ_consumer_state.index * self.k_halves + 1,
+                        ],
+                        tCtSFQ_compact_s2t_h1,
+                    )
                 C = tStS[None, None, None, mma_compute_KQ_producer_state.index]
                 KQ_tiled_mma.set(ACCUMULATE, False)
                 stage = load_mma_KQ_consumer_state.index
@@ -3153,17 +3172,18 @@ class BlackwellFmhaBackwardDKDV256:
                     tCsSFDO_compact_s2t[s2t_stage_coord],
                     tCtSFDO_compact_s2t,
                 )
-                cute.copy(
-                    tiled_copy_s2t_sfdo_h1,
-                    tCsSFDO_compact_s2t_h1[
-                        None,
-                        None,
-                        None,
-                        None,
-                        load_mma_VDO_consumer_state.index * self.k_halves + 1,
-                    ],
-                    tCtSFDO_compact_s2t_h1,
-                )
+                if cutlass.const_expr(self.k_halves > 1):
+                    cute.copy(
+                        tiled_copy_s2t_sfdo_h1,
+                        tCsSFDO_compact_s2t_h1[
+                            None,
+                            None,
+                            None,
+                            None,
+                            load_mma_VDO_consumer_state.index * self.k_halves + 1,
+                        ],
+                        tCtSFDO_compact_s2t_h1,
+                    )
                 C_vdo = tDPtDP[None, None, None, mma_compute_VDO_producer_state.index]
                 VDO_tiled_mma.set(ACCUMULATE, False)
                 stage = load_mma_VDO_consumer_state.index
@@ -3262,17 +3282,18 @@ class BlackwellFmhaBackwardDKDV256:
                     tCsSFQ_compact_s2t[s2t_stage_coord],
                     tCtSFQ_compact_s2t,
                 )
-                cute.copy(
-                    tiled_copy_s2t_sfq_h1,
-                    tCsSFQ_compact_s2t_h1[
-                        None,
-                        None,
-                        None,
-                        None,
-                        load_mma_KQ_consumer_state.index * self.k_halves + 1,
-                    ],
-                    tCtSFQ_compact_s2t_h1,
-                )
+                if cutlass.const_expr(self.k_halves > 1):
+                    cute.copy(
+                        tiled_copy_s2t_sfq_h1,
+                        tCsSFQ_compact_s2t_h1[
+                            None,
+                            None,
+                            None,
+                            None,
+                            load_mma_KQ_consumer_state.index * self.k_halves + 1,
+                        ],
+                        tCtSFQ_compact_s2t_h1,
+                    )
                 C = tStS[None, None, None, mma_compute_KQ_producer_state.index]
                 KQ_tiled_mma.set(ACCUMULATE, False)
                 stage = load_mma_KQ_consumer_state.index
@@ -3348,17 +3369,18 @@ class BlackwellFmhaBackwardDKDV256:
                     tCsSFDO_compact_s2t[s2t_stage_coord],
                     tCtSFDO_compact_s2t,
                 )
-                cute.copy(
-                    tiled_copy_s2t_sfdo_h1,
-                    tCsSFDO_compact_s2t_h1[
-                        None,
-                        None,
-                        None,
-                        None,
-                        load_mma_VDO_consumer_state.index * self.k_halves + 1,
-                    ],
-                    tCtSFDO_compact_s2t_h1,
-                )
+                if cutlass.const_expr(self.k_halves > 1):
+                    cute.copy(
+                        tiled_copy_s2t_sfdo_h1,
+                        tCsSFDO_compact_s2t_h1[
+                            None,
+                            None,
+                            None,
+                            None,
+                            load_mma_VDO_consumer_state.index * self.k_halves + 1,
+                        ],
+                        tCtSFDO_compact_s2t_h1,
+                    )
                 # dP = V * dO
                 C_vdo = tDPtDP[None, None, None, mma_compute_VDO_producer_state.index]
                 VDO_tiled_mma.set(ACCUMULATE, False)
@@ -3760,6 +3782,10 @@ class BlackwellFmhaBackwardDKDV256:
                     (tTR_rVDO[i], tTR_rVDO[i + 1]),
                     (tTR_rKQ[i], tTR_rKQ[i + 1]),
                 )
+                tTR_rVDO[i], tTR_rVDO[i + 1] = cute.arch.mul_packed_f32x2(
+                    (tTR_rVDO[i], tTR_rVDO[i + 1]),
+                    (scale_softmax, scale_softmax),
+                )
 
             tTR_rdPT_scaled = cute.make_rmem_tensor_like(tTR_rVDO)
             tTR_rdPT_scaled.store(tTR_rVDO.load())
@@ -3933,8 +3959,6 @@ class BlackwellFmhaBackwardDKDV256:
         ) = cute_common.epilogue_tmem_copy_and_partition(load_op, tdKtdK, cdK, gdK, dp_idx, self.acc_dtype)
 
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
-        for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
-            tTR_rdK[i] = scale_softmax * tTR_rdK[i]
 
         cute.arch.fence_view_async_tmem_load()
         cute_common.store(self, tTR_gdK, tTR_rdK, tTR_cdK, (K, D))

@@ -37,6 +37,7 @@ def _case(
     explicit_plan=False,
     gate=None,
     padded_stats=False,
+    independent_o_offsets=False,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -48,7 +49,7 @@ def _case(
     )
     buffers, tensors, vp = {}, {}, {}
     input_type = cudnn.data_type.FP8_E4M3 if dtype == torch.float8_e4m3fn else cudnn.data_type.FP8_E5M2
-    from sdpa.frost.test_sdpa_fwd_mxfp8_sm100 import _quantize, _quantize_seq
+    from mxfp8_test_reference import _quantize, _quantize_seq
 
     sf_args = {}
     for name, h, seq, dim in (("q", hq, sq, d), ("k", hk, skv, d), ("v", hk, skv, dv)):
@@ -123,12 +124,14 @@ def _case(
         buffers["o_storage"] = storage
         o.set_stride(out.stride())
     if thd:
-        if dv == d:
+        if dv == d and not independent_o_offsets:
             o.set_ragged_offset(tensors["off_q"])
         else:
-            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_o")
+            offset_type = cudnn.data_type.INT64 if independent_o_offsets else cudnn.data_type.INT32
+            offset_dtype = torch.int64 if independent_o_offsets else torch.int32
+            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=offset_type, name="off_o")
             o.set_ragged_offset(off_o)
-            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=torch.int32) * sq * hq * dv
+            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=offset_dtype) * sq * hq * dv
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
@@ -295,12 +298,14 @@ def test_prepared_mxfp8_thd_output_stride_above_int32(dtype, d, dv):
     row_stride = 2**32 + 4 * dv
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("physical row-stride regression needs 9 GiB free")
-    g, vp, ws, bufs, ts = _case(thd=True, override=True, dtype=dtype, d=d, dv=dv, sq=1, skv=64)
+    g, vp, ws, bufs, ts = _case(thd=True, override=True, dtype=dtype, d=d, dv=dv, sq=1, skv=64, independent_o_offsets=True)
     try:
         bufs["o"] = torch.empty_strided((2, 4, dv), (row_stride, dv, 1), dtype=torch.bfloat16, device="cuda")
     except torch.OutOfMemoryError:
         pytest.skip("physical row-stride storage unavailable")
     vp[ts["o"]] = bufs["o"]
+    # A wider output pitch needs its own physical offsets, independent of Q.
+    vp[ts["off_o"]] = torch.arange(3, device="cuda", dtype=torch.int64) * row_stride
     overrides = dict(override_uids=[ts["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1]])
     owner = g._compiled_plans[g._plan_index]._prepared.spec.owner
     bufs["o"].fill_(float("nan"))

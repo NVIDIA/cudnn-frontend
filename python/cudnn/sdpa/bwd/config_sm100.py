@@ -202,6 +202,8 @@ class MatmulTemplateParams:
     #               mainloop) -- no padding at d = 256; the sm107 d256 chain.
     #   (512, 256)  cluster (2,1,1), CTA tile 256 x 128, 4 stages, one 512-col
     #               accumulator -- an A/B alternate, selected by no adapter.
+    #   (128, 192)  cluster (1,1,1), CTA tile 128 x 192, 5 stages, two 192-col
+    #               accumulators -- native SM100 D192 half backward, 32-column epilogue.
     # Append-only, defaulted: the SM100 adapter never sets it, so its records
     # render exactly the constants they always did.
     cgrp_tile_mn: tuple = (512, 512)
@@ -307,9 +309,10 @@ class MatmulTemplateParams:
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
-STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256))
-# The fp8 arm is rendered at this row only (see ``MatmulTemplateParams.dtype_qkv``).
-STAGE3_FP8_CGRP_TILE = (256, 256)
+STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256), (128, 192), (256, 192))
+# The rows the fp8 arm renders; the block-scale arm renders the first only.
+STAGE3_FP8_CGRP_TILES = ((256, 256), (256, 192))
+STAGE3_FP8_CGRP_TILE = STAGE3_FP8_CGRP_TILES[0]
 STAGE3_EPI_MODES = (EPI_NONE, EPI_DESCALE, EPI_QUANT)
 # The block-scale arm (``MatmulTemplateParams.block_scale``): the E8M0 block along K, and the TMEM the arm allocates -- the
 # 512 accumulator columns of the (256, 256) row plus 4 SFA + 8 SFB scale columns, in the Rubin line's 576-column EXCLUSIVE
@@ -375,13 +378,13 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
     epi_mode = int(getattr(params, "epi_mode", EPI_NONE))
     if epi_mode not in STAGE3_EPI_MODES:
         raise ValueError(f"SDPA bwd stage 3: epi_mode must be one of {STAGE3_EPI_MODES} (EPI_NONE / EPI_DESCALE / EPI_QUANT); got {epi_mode}.")
-    if fp8 and tuple(params.cgrp_tile_mn) != STAGE3_FP8_CGRP_TILE:
-        raise ValueError(
-            f"SDPA bwd stage 3: the fp8 arm (dtype_qkv=DTYPE_E4M3) is rendered at the {STAGE3_FP8_CGRP_TILE} row only -- its constants are lifted "
-            f"from the upstream Rubin rendering of that config (cluster 2x1, 128 x 128 x 128 e4m3 per CTA, K64 MMA) and no other row was validated; "
-            f"got cgrp_tile_mn={params.cgrp_tile_mn!r}."
-        )
     block_scale = bool(getattr(params, "block_scale", False))
+    if block_scale and tuple(params.cgrp_tile_mn) != STAGE3_FP8_CGRP_TILE:
+        raise ValueError(f"SDPA bwd stage 3: the block-scale arm is rendered at the {STAGE3_FP8_CGRP_TILE} row only; got cgrp_tile_mn={params.cgrp_tile_mn!r}.")
+    if fp8 and tuple(params.cgrp_tile_mn) not in STAGE3_FP8_CGRP_TILES:
+        raise ValueError(
+            f"SDPA bwd stage 3: the fp8 arm (dtype_qkv=DTYPE_E4M3) is rendered at the {STAGE3_FP8_CGRP_TILES} rows only; got cgrp_tile_mn={params.cgrp_tile_mn!r}."
+        )
     if block_scale and not fp8:
         raise ValueError(
             f"SDPA bwd stage 3: block_scale is the MXFP8 arm of the fp8 rendering (dtype_qkv=DTYPE_E4M3: e4m3 payloads with an E8M0 scale per "
@@ -1322,3 +1325,16 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
     )
     _validate_cfg_d512_2x2(cfg)
     return cfg
+
+
+def _sm100_device_clusters(device, cga_m: int) -> int:
+    """Clusters that fit the device once, for the THD persistent grid.
+
+    Occupancy-sized rather than work-sized: the work list is a device value, so
+    the grid cannot be it.  One CTA per SM is this kernel's design point, so the
+    cluster count is simply SM count / CGA width.
+    """
+    from cudnn.frost import device as _dev
+
+    idx = _dev.resolve_device(device)
+    return max(1, _dev.multiprocessor_count(idx) // cga_m)

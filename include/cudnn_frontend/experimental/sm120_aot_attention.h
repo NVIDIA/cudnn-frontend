@@ -6,7 +6,7 @@
 /*
  * Header-only C++ API over libcudnn_frontend_aot_sm120.so (ahead-of-time compiled sm_120a attention forward).
  * The library is dlopened; nothing here needs cuDNN, Python or a runtime compiler. See
- * docs/fe-oss-apis/aot_sm120_attention.md.
+ * docs/operations/attention/aot_sm120_attention.md.
  *
  *   namespace aot = cudnn_frontend::experimental::sm120_aot;
  *   aot::SdpaDesc desc = aot::make_desc();            // head_dim, dtypes, mask, sinks, gqa_ratio

@@ -1154,3 +1154,63 @@ def test_workspace_and_grid_helpers():
     lpt = _cfg(FAMILY_FP8, sched_policy=SCHED_LPT)
     assert launch_grid(lpt, 2, 8, 8192) == ((32 * 8 * 2 * 2, 1, 1), (2, 1, 1))
     assert (cfgmod.q_pad_rows(_cfg(FAMILY_MXFP8)), cfgmod.kv_pad_rows(_cfg(FAMILY_MXFP8)), cfgmod.q_write_tiles(_cfg(FAMILY_MXFP8))) == (128, 256, 2)
+
+
+@pytest.mark.parametrize("dtype_o", [DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, cfgmod.DTYPE_FP32])
+@pytest.mark.parametrize("dtype_ds", [DTYPE_E4M3, DTYPE_BF16])
+@pytest.mark.parametrize("thd", [False, True])
+def test_native_d192_fp8_geometry_keeps_each_operand_width(dtype_o, dtype_ds, thd):
+    params = cfgmod.TemplateParamsFp8(
+        dtype_qkv=DTYPE_E4M3,
+        dtype_o=dtype_o,
+        dtype_ds=dtype_ds,
+        head_dim_qk=192,
+        head_dim_v=128,
+        thd_varlen=thd,
+    )
+    cfg = make_cfg_d256_bwd(params, FAMILY_FP8)
+    buffers = cfgmod.buffer_elems(cfg)
+    tmem = cfgmod.tmem_layout(cfg)
+    assert (cfg.TILE_K, cfg.TILE_O) == (192, 128)
+    assert (cfg.Q_SWZ_BYTES, cfg.K_SWZ_BYTES, cfg.dO_SWZ_BYTES, cfg.V_SWZ_BYTES) == (64, 64, 128, 128)
+    assert (buffers.TMA_QK_ITERS, buffers.TMA_VO_ITERS, buffers.TMA_VO_SG1_ITERS) == (3, 1, 1)
+    assert buffers.qTmaTransactionBytes == 128 * 192
+    assert buffers.dOTmaTransactionBytes == 128 * 128
+    assert buffers.kTmaTransactionBytes == 256 * 192
+    assert buffers.vTmaTransactionBytes == 256 * 128
+    assert tmem.dV_COLS == 128 and tmem.P_OFF == 384
+    assert tmem.P_OFF + cfg.STAGES_TMEM_P * tmem.P_COLS <= tmem.TOTAL_COLS
+    assert cfgmod.kernel_smem_bytes(cfg) <= cfgmod.SMEM_CAP_BYTES
+
+
+def test_native_d192_record_preserves_d256_and_rejects_other_families():
+    native = cfgmod.TemplateParamsFp8(dtype_qkv=DTYPE_E4M3, head_dim_qk=192, head_dim_v=128)
+    for family in (FAMILY_F16, FAMILY_MXFP8):
+        with pytest.raises(ValueError):
+            make_cfg_d256_bwd(native, family)
+    plain = TemplateParams(dtype_qkv=DTYPE_E4M3)
+    extended = cfgmod.TemplateParamsFp8(dtype_qkv=DTYPE_E4M3)
+    assert make_cfg_d256_bwd(plain, FAMILY_FP8) == make_cfg_d256_bwd(extended, FAMILY_FP8)
+
+
+@pytest.mark.parametrize("head_dims", [(192, 128), (256, 256)], ids=["d192-v128", "d256"])
+def test_fp8_tma_layout_matches_each_mma_consumer(head_dims):
+    from cudnn.frost.tile_dsl.handles import MmaDesc
+
+    cfg = make_cfg_d256_bwd(cfgmod.TemplateParamsFp8(dtype_qkv=DTYPE_E4M3, head_dim_qk=head_dims[0], head_dim_v=head_dims[1]), FAMILY_FP8)
+    buffers = buffer_elems(cfg)
+    common = dict(M=cfg.TILE_M * cfg.CTA_MMA, bpe_a=cfg.BPE, bpe_b=cfg.BPE, cta_group=cfg.CTA_MMA, tile_k_hw=cfg.TILE_K_HW_BMM1)
+    score = MmaDesc(N=cfg.TILE_N, K=cfg.TILE_K, **common)
+    dp = MmaDesc(N=cfg.TILE_N, K=cfg.TILE_O, **common)
+    dv = MmaDesc(N=cfg.TILE_O, K=cfg.TILE_N, btranspose=True, **common)
+    # The instruction walker derives its atoms independently from each consumer's
+    # contraction/transpose geometry. TMA and SMEM must agree with that walker.
+    assert (cfg.K_SWZ_BYTES, cfg.Q_SWZ_BYTES) == (score.swz_a_bytes, score.swz_b_bytes)
+    assert (cfg.V_SWZ_BYTES, cfg.dO_SWZ_BYTES) == (dp.swz_a_bytes, dp.swz_b_bytes)
+    assert cfg.dO_DV_SWZ_BYTES == dv.swz_b_bytes
+    assert buffers.STRIDE_BYTE_OFFSET_QK == 8 * score.swz_b_bytes
+    assert buffers.STRIDE_BYTE_OFFSET_dO == 8 * dp.swz_b_bytes
+    assert buffers.STRIDE_BYTE_OFFSET_dO_SG1 == 8 * dv.swz_b_bytes
+    assert buffers.LEADING_BYTE_OFFSET_dO_SG1 == cfg.TILE_N * dv.swz_b_bytes
+    assert buffers.TMA_VO_SG1_GRANU_ELEMS * cfg.BPE == dv.swz_b_bytes
+    assert buffers.SMEM_LAYOUT_dO_SG1 == {32: 6, 64: 4, 128: 2}[dv.swz_b_bytes]

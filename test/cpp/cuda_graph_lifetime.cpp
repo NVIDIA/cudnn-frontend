@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -863,5 +864,148 @@ TEST_CASE("ALiBi slopes outlive the frontend graph in a CUDA graph", "[cudagraph
         CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));
         CUDA_CHECK(cudaGraphDestroy(cudnn_cuda_graph));
     }
+#endif  // CUDART_VERSION < 12000
+}
+
+/*
+With CudaGraphRetention_t::NONE, the CUDA graphs recorded from a frontend graph hold no reference to its
+execution plans: destroying the frontend graph and then the CUDA graph releases nothing through the
+deferred-release queue. With PER_GRAPH (the default), the CUDA graph's reference to the plan is queued
+for release once the CUDA graph is gone. Both hold whether the plans come from heuristics or from
+create_execution_plan() for a given engine.
+*/
+TEST_CASE("CUDA graph retention option", "[cudagraph][graph]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    namespace fe = cudnn_frontend;
+    using fe::detail::CudaGraphRetainedResource;
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    REQUIRE(cudnnSetStream(handle, stream) == CUDNN_STATUS_SUCCESS);
+
+    int64_t const b = 1, h = 4, s = 64, d = 64;
+    Surface<half> q_gpu(b * h * s * d);
+    Surface<half> k_gpu(b * h * s * d);
+    Surface<half> v_gpu(b * h * s * d);
+    Surface<half> o_gpu(b * h * s * d);
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> variant_pack = {
+        {101, q_gpu.devPtr}, {102, k_gpu.devPtr}, {103, v_gpu.devPtr}, {104, o_gpu.devPtr}};
+
+    auto make_graph = [&]() {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+        auto qkv = [&](char const *name, int64_t uid) {
+            return graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name(name)
+                                     .set_uid(uid)
+                                     .set_dim({b, h, s, d})
+                                     .set_stride({h * s * d, s * d, d, 1}));
+        };
+        auto [o, stats] = graph->sdpa(qkv("Q", 101),
+                                      qkv("K", 102),
+                                      qkv("V", 103),
+                                      fe::graph::SDPA_attributes().set_generate_stats(false).set_attn_scale(0.125f));
+        (void)stats;
+        o->set_output(true).set_uid(104).set_dim({b, h, s, d}).set_stride({h * s * d, s * d, d, 1});
+        REQUIRE(graph->validate().is_good());
+        REQUIRE(graph->build_operation_graph(handle).is_good());
+        return graph;
+    };
+
+    // Builds the plan from heuristics, or with create_execution_plan() for the engine and knobs that
+    // heuristics chose (manual_plan), then records it into a CUDA graph and destroys both graphs.
+    auto record_and_release = [&](fe::CudaGraphRetention_t retention, bool manual_plan) -> bool {
+        auto graph = make_graph();
+        graph->set_cuda_graph_retention(retention);
+        REQUIRE(graph->get_cuda_graph_retention() == retention);
+        REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+        graph->select_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
+        if (graph->check_support().is_bad()) {
+            return false;
+        }
+        REQUIRE(graph->build_plans().is_good());
+        if (manual_plan) {
+            std::string chosen, name;
+            REQUIRE(graph->get_plan_name(chosen).is_good());
+            int64_t engine_id = -1;
+            std::unordered_map<fe::KnobType_t, int64_t> knobs;
+            for (int64_t i = 0; i < graph->get_execution_plan_count() && engine_id < 0; ++i) {
+                if (graph->get_plan_name_at_index(i, name).is_good() && name == chosen) {
+                    REQUIRE(graph->get_engine_and_knobs_at_index(i, engine_id, knobs).is_good());
+                }
+            }
+            REQUIRE(engine_id >= 0);
+            graph = make_graph();
+            graph->set_cuda_graph_retention(retention);
+            REQUIRE(graph->create_execution_plan(engine_id, knobs).is_good());
+            REQUIRE(graph->build_plans().is_good());
+        }
+        Surface<int8_t> workspace(graph->get_workspace_size());
+
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<half> reference(o_gpu.size);
+        CUDA_CHECK(cudaMemcpy(reference.data(), o_gpu.devPtr, sizeof(half) * o_gpu.size, cudaMemcpyDeviceToHost));
+
+        CudaGraphRetainedResource::drain_deferred_releases();  // start from an empty queue
+        REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+
+        cudaGraph_t cuda_graph;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+        CUDA_CHECK(cudaStreamEndCapture(stream, &cuda_graph));
+        cudaGraphExec_t exec;
+        CUDA_CHECK(cudaGraphInstantiate(&exec, cuda_graph, nullptr, nullptr, 0));
+
+        // The frontend graph stays alive across the replay, as NONE requires.
+        CUDA_CHECK(cudaMemsetAsync(o_gpu.devPtr, 0, sizeof(half) * o_gpu.size, stream));
+        CUDA_CHECK(cudaGraphLaunch(exec, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<half> replayed(o_gpu.size);
+        CUDA_CHECK(cudaMemcpy(replayed.data(), o_gpu.devPtr, sizeof(half) * o_gpu.size, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < replayed.size(); ++i) {
+            REQUIRE(__half2float(replayed[i]) == __half2float(reference[i]));
+        }
+
+        graph.reset();
+        CUDA_CHECK(cudaGraphExecDestroy(exec));
+        CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+        return true;
+    };
+
+    // The setting reaches plans built from heuristics and plans built for a given engine alike.
+    auto const manual_plan = GENERATE(false, true);
+    CAPTURE(manual_plan);
+
+    SECTION("PER_GRAPH: the CUDA graph's reference to the plan is released once the CUDA graph is gone") {
+        if (!record_and_release(fe::CudaGraphRetention_t::PER_GRAPH, manual_plan)) {
+            SKIP("No runtime-compiled engine for this SDPA graph.");
+        }
+        REQUIRE(wait_for_deferred_release());
+        CudaGraphRetainedResource::drain_deferred_releases();
+    }
+
+    SECTION("NONE: the CUDA graph holds no reference") {
+        if (!record_and_release(fe::CudaGraphRetention_t::NONE, manual_plan)) {
+            SKIP("No runtime-compiled engine for this SDPA graph.");
+        }
+        // User-object destructors run asynchronously; give a release time to show up.
+        for (int i = 0; i < 200 && !CudaGraphRetainedResource::has_deferred_releases(); ++i) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+    }
+
+    REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
+    CUDA_CHECK(cudaStreamDestroy(stream));
 #endif  // CUDART_VERSION < 12000
 }

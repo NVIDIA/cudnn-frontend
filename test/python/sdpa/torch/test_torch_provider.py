@@ -29,6 +29,8 @@ import cudnn  # noqa: F401
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA device required", allow_module_level=True)
+if torch.cuda.get_device_capability()[0] < 8:
+    pytest.skip("cuDNN SDPA (FP16 / BF16) requires SM80 or newer", allow_module_level=True)
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -39,6 +41,13 @@ except ImportError:
 import torch.nn.functional as F  # noqa: E402
 
 import cudnn.torch as provider  # noqa: E402
+from cudnn.torch import sdpa_provider  # noqa: E402
+
+# Where torch's varlen ops take a `backend` argument, the provider serves only
+# calls that selected cuDNN, and torch's rules decide which configs can select
+# it: full or causal windows only (test_torch_provider_backend.py covers the
+# routing itself).
+_SELECTS_BACKEND = sdpa_provider._has_backend_arg(torch.ops.torch_attn._varlen_attn.default)
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +187,8 @@ VARLEN_CASES = [
 @pytest.mark.L0
 @pytest.mark.parametrize("Hq,Hkv,D,lens,window,enable_gqa,kv_packed", VARLEN_CASES)
 def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
+    if _SELECTS_BACKEND and window not in ((-1, -1), (-1, 0)):
+        pytest.skip("torch's varlen_attn does not select cuDNN for this window")
     torch.manual_seed(0)
     lens_t = torch.tensor(lens, device="cuda")
     cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
@@ -191,7 +202,8 @@ def test_varlen_attn(Hq, Hkv, D, lens, window, enable_gqa, kv_packed):
         v = torch.randn(T, Hkv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
     fwd0, bwd0 = provider.calls["fwd"], provider.calls["bwd"]
-    out, lse = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=window, enable_gqa=enable_gqa, return_aux=AuxRequest(lse=True))
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        out, lse = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=window, enable_gqa=enable_gqa, return_aux=AuxRequest(lse=True))
     grad = torch.randn_like(out)
     out.backward(grad)
     assert provider.calls["fwd"] == fwd0 + 1 and provider.calls["bwd"] == bwd0 + 1, "provider did not intercept"
@@ -238,7 +250,8 @@ def test_varlen_backward_does_not_sync():
     q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True) for _ in range(3))
 
     bwd0 = provider.calls["bwd"]
-    out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        out = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
     grad = torch.randn_like(out)
 
     # Any blocking D2H inside the backward raises here.
@@ -313,3 +326,67 @@ def test_d256_direct_aten_op():
     o_ref.backward(torch.ones_like(o_ref))
     assert (o.float() - o_ref).abs().max().item() < 0.05
     assert (q.grad.float() - q_ref.grad).abs().max().item() < 0.5
+
+
+@pytest.mark.L0
+def test_varlen_attn_out_writes_into_out(monkeypatch):
+    """`_varlen_attn_out` declares the caller's `out` as O: the op writes it in place (no O copy afterwards)."""
+    from cudnn.torch import sdpa_provider as sp
+
+    torch.manual_seed(0)
+    lens = [200, 312, 96]
+    H, D = 8, 128
+    lens_t = torch.tensor(lens, device="cuda")
+    cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
+    T, mx = int(cu[-1]), int(lens_t.max())
+    q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda") for _ in range(3))
+    impl, returned = sp._cudnn_ops._sdpa_fwd_impl, []
+
+    def spy(*args, **kwargs):
+        returned.append(impl(*args, **kwargs))
+        return returned[-1]
+
+    monkeypatch.setattr(sp._cudnn_ops, "_sdpa_fwd_impl", spy)
+    out = torch.empty(T, H, D, dtype=torch.bfloat16, device="cuda")
+    lse = sp._varlen_fwd_out(out, q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert returned and returned[0][0].data_ptr() == out.data_ptr(), "O must be written into `out` itself"
+    ref_o, ref_lse, _ = sp._varlen_fwd(q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert torch.equal(out, ref_o) and torch.equal(lse, ref_lse)
+
+
+def _varlen_inputs(lens, H, D):
+    lens_t = torch.tensor(lens, device="cuda")
+    cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
+    T, mx = int(cu[-1]), int(lens_t.max())
+    q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda") for _ in range(3))
+    return q, k, v, cu, T, mx
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("alias", ["k", "v"])
+def test_varlen_attn_out_aliasing_an_input_is_not_written_in_place(alias):
+    """An `out` that IS an input (out=K / out=V) must not be written while the kernels read it (review on #2003)."""
+    from cudnn.torch import sdpa_provider as sp
+
+    torch.manual_seed(0)
+    q, k, v, cu, T, mx = _varlen_inputs([2048, 4096], 4, 64)
+    ref_o, ref_lse, _ = sp._varlen_fwd(q, k, v, cu, cu, mx, mx, is_causal=True)
+    out = k if alias == "k" else v
+    lse = sp._varlen_fwd_out(out, q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert torch.equal(out, ref_o) and torch.equal(lse, ref_lse)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("strides", [(257, 64, 1), (260, 65, 1)])
+def test_varlen_attn_out_with_an_undeclarable_pitch_falls_back(strides):
+    """An aligned-base `out` whose outer pitch is not a 16-byte multiple cannot be declared; it gets the
+    allocate-then-copy path instead of a descriptor rejection (review on #2003)."""
+    from cudnn.torch import sdpa_provider as sp
+
+    torch.manual_seed(0)
+    H, D = 4, 64
+    q, k, v, cu, T, mx = _varlen_inputs([128, 256], H, D)
+    ref_o, ref_lse, _ = sp._varlen_fwd(q, k, v, cu, cu, mx, mx, is_causal=True)
+    out = torch.empty(T * strides[0] + 64, dtype=torch.bfloat16, device="cuda").as_strided((T, H, D), strides)
+    lse = sp._varlen_fwd_out(out, q, k, v, cu, cu, mx, mx, is_causal=True)
+    assert torch.equal(out, ref_o) and torch.equal(lse, ref_lse)

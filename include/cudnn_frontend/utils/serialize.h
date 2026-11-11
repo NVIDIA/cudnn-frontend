@@ -5,6 +5,11 @@
 
 #pragma once
 
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+
 #include "../graph_properties.h"
 #include "../graph_helpers.h"
 
@@ -595,6 +600,99 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Moe_grouped_matmul_bwd_attributes::output_names,
                                  {Moe_grouped_matmul_bwd_attributes::output_names::DWeight, "DWeight"},
                              })
 
+namespace serialization_detail {
+
+inline uint8_t
+hex_digit_to_value(char const digit) {
+    if (digit >= '0' && digit <= '9') {
+        return static_cast<uint8_t>(digit - '0');
+    }
+    if (digit >= 'A' && digit <= 'F') {
+        return static_cast<uint8_t>(digit - 'A' + 10);
+    }
+    if (digit >= 'a' && digit <= 'f') {
+        return static_cast<uint8_t>(digit - 'a' + 10);
+    }
+    throw std::invalid_argument("Compile-time constant contains a non-hexadecimal raw byte");
+}
+
+template <typename T>
+T
+scalar_from_raw_hex(std::string const& raw_hex) {
+    static_assert(std::is_trivially_copyable_v<T>, "Compile-time constants must be trivially copyable");
+    using raw_bits_t = typename unsigned_scalar_bits<sizeof(T)>::type;
+
+    if (raw_hex.size() != sizeof(T) * 2) {
+        throw std::invalid_argument("Compile-time constant raw byte count does not match its type");
+    }
+
+    raw_bits_t raw_bits = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        auto const byte =
+            static_cast<uint8_t>((hex_digit_to_value(raw_hex[2 * i]) << 4) | hex_digit_to_value(raw_hex[2 * i + 1]));
+        raw_bits = static_cast<raw_bits_t>((raw_bits << 8) | byte);
+    }
+    return scalar_from_raw_bits<T>(raw_bits);
+}
+
+inline nlohmann::json
+compile_time_constant_to_json(Tensor_attributes::pass_by_values_t const& constant) {
+    return std::visit(
+        [](auto const& value) {
+            using value_t = std::decay_t<decltype(value)>;
+            char const* type;
+            if constexpr (std::is_same_v<value_t, int64_t>) {
+                type = "INT64";
+            } else if constexpr (std::is_same_v<value_t, int32_t>) {
+                type = "INT32";
+            } else if constexpr (std::is_same_v<value_t, half>) {
+                type = "HALF";
+            } else if constexpr (std::is_same_v<value_t, float>) {
+                type = "FLOAT";
+            } else if constexpr (std::is_same_v<value_t, double>) {
+                type = "DOUBLE";
+            } else {
+                static_assert(std::is_same_v<value_t, nv_bfloat16>, "Unsupported compile-time constant type");
+                type = "BFLOAT16";
+            }
+            return nlohmann::json{{"type", type}, {"raw", scalar_to_raw_hex(value)}};
+        },
+        constant);
+}
+
+inline Tensor_attributes::pass_by_values_t
+compile_time_constant_from_json(nlohmann::json const& constant) {
+    if (!constant.is_object() || !constant.contains("type") || !constant["type"].is_string() ||
+        !constant.contains("raw") || !constant["raw"].is_string()) {
+        throw std::invalid_argument("Compile-time constant needs the string fields type and raw");
+    }
+    auto const type    = constant["type"].get<std::string>();
+    auto const raw_hex = constant["raw"].get<std::string>();
+
+    if (type == "INT64") {
+        return Tensor_attributes::pass_by_values_t{std::in_place_type<int64_t>, scalar_from_raw_hex<int64_t>(raw_hex)};
+    }
+    if (type == "INT32") {
+        return Tensor_attributes::pass_by_values_t{std::in_place_type<int32_t>, scalar_from_raw_hex<int32_t>(raw_hex)};
+    }
+    if (type == "HALF") {
+        return Tensor_attributes::pass_by_values_t{std::in_place_type<half>, scalar_from_raw_hex<half>(raw_hex)};
+    }
+    if (type == "FLOAT") {
+        return Tensor_attributes::pass_by_values_t{std::in_place_type<float>, scalar_from_raw_hex<float>(raw_hex)};
+    }
+    if (type == "DOUBLE") {
+        return Tensor_attributes::pass_by_values_t{std::in_place_type<double>, scalar_from_raw_hex<double>(raw_hex)};
+    }
+    if (type == "BFLOAT16") {
+        return Tensor_attributes::pass_by_values_t{std::in_place_type<nv_bfloat16>,
+                                                   scalar_from_raw_hex<nv_bfloat16>(raw_hex)};
+    }
+    throw std::invalid_argument("Compile-time constant has an unsupported type tag");
+}
+
+}  // namespace serialization_detail
+
 inline void
 to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     j = nlohmann::json{{"data_type", ta.data_type},
@@ -622,35 +720,75 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
     if (ta.alignment != Tensor_attributes::default_alignment) {
         j["alignment"] = ta.alignment;
     }
+    // Compile-time constants were added after the tensor JSON format was established. Keep both
+    // fields absent for ordinary tensors so existing payloads and Graph::key() values are unchanged.
+    // When present, store the scalar's exact bits in canonical most-significant-byte-first order
+    // together with a stable type tag; numeric JSON would not preserve signed zero or NaN payload bits.
+    // The writer records the state as it is, so key() and serialize() never throw.
+    if (ta.has_compile_time_constant) {
+        j["has_compile_time_constant"] = true;
+    }
+    if (ta.compile_time_constant_value.has_value()) {
+        j["compile_time_constant_value"] =
+            serialization_detail::compile_time_constant_to_json(ta.compile_time_constant_value.value());
+    }
 }
 
 inline void
 from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     ta.name             = j.contains("name") && !j["name"].is_null() ? j.at("name").get<std::string>() : "";
     ta.data_type        = j.at("data_type").get<DataType_t>();
-    ta.dim              = j.at("dim").get<std::vector<int64_t>>();
-    ta.stride           = j.at("stride").get<std::vector<int64_t>>();
+    ta.dim              = ::cudnn_frontend::serialization_detail::integer_array(j.at("dim"));
+    ta.stride           = ::cudnn_frontend::serialization_detail::integer_array(j.at("stride"));
     ta.is_virtual       = j.at("is_virtual").get<bool>();
     ta.is_pass_by_value = j.at("is_pass_by_value").get<bool>();
     ta.reordering_type  = j.at("reordering_type").get<TensorReordering_t>();
-    ta.set_uid(j.at("uid").get<Tensor_attributes::uid_t>());
+    ta.set_uid(::cudnn_frontend::serialization_detail::signed_integer(j.at("uid")));
 
-    if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
+    ta.pass_by_value.reset();
+    if (ta.is_pass_by_value && !j.at("pass_by_value").is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
     }
+    ta.ragged_offset.reset();
+    ta.ragged_offset_multiplier = 1;
     if (j.contains("ragged_offset_uid")) {
         auto ragged_offset = std::make_shared<Tensor_attributes>();
-        ragged_offset->set_uid(j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>());
+        ragged_offset->set_uid(::cudnn_frontend::serialization_detail::signed_integer(j.at("ragged_offset_uid")));
         if (j.contains("ragged_offset_name")) {
             ragged_offset->name = j.at("ragged_offset_name").get<std::string>();
         }
         ta.ragged_offset = ragged_offset;
     }
     if (j.contains("ragged_offset_multiplier")) {
-        ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
+        ta.ragged_offset_multiplier =
+            ::cudnn_frontend::serialization_detail::signed_integer(j.at("ragged_offset_multiplier"));
     }
     // Optional read, for backward compatibility with payloads that predate this key.
-    ta.alignment = j.value("alignment", Tensor_attributes::default_alignment);
+    ta.alignment = j.contains("alignment") ? ::cudnn_frontend::serialization_detail::signed_integer(j.at("alignment"))
+                                           : Tensor_attributes::default_alignment;
+
+    // Optional reads preserve compatibility with tensor payloads written before compile-time
+    // constants were serialized. A true flag makes the typed raw value mandatory so malformed
+    // payloads cannot silently turn a baked constant into a runtime parameter.
+    if (j.contains("has_compile_time_constant") && !j["has_compile_time_constant"].is_boolean()) {
+        throw std::invalid_argument("Compile-time constant flag must be a boolean");
+    }
+    ta.has_compile_time_constant = j.value("has_compile_time_constant", false);
+    ta.compile_time_constant_value.reset();
+    if (ta.has_compile_time_constant) {
+        if (!ta.is_pass_by_value || ta.pass_by_value.has_value()) {
+            throw std::invalid_argument("Compile-time constant tensor has inconsistent pass-by-value state");
+        }
+        if (!j.contains("compile_time_constant_value")) {
+            throw std::invalid_argument("Compile-time constant flag is true but its value is absent");
+        }
+        // A constant type that differs from the tensor type is read as written: validate() accepts it, and develop
+        // restores such a plan.
+        ta.compile_time_constant_value =
+            serialization_detail::compile_time_constant_from_json(j["compile_time_constant_value"]);
+    } else if (j.contains("compile_time_constant_value")) {
+        throw std::invalid_argument("Compile-time constant value is present while its flag is false");
+    }
 }
 
 NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
@@ -699,6 +837,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(KnobType_t,
                                  {KnobType_t::CTA_GROUP, "CTA_GROUP"},
                                  {KnobType_t::WARPS_M, "WARPS_M"},
                                  {KnobType_t::WARPS_N, "WARPS_N"},
+                                 {KnobType_t::CLUSTER_K_REDUCE, "CLUSTER_K_REDUCE"},
                              })
 
 #endif
