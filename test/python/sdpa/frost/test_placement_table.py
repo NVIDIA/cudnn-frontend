@@ -49,8 +49,8 @@ def test_entries_are_well_formed_and_name_known_rows():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
-        assert phase in ("q1", "mtp", "prefill", "prefill_short_square") and layout in ("dense", "paged", "thd", "thd_ragged")
-        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked")
+        assert phase in ("q1", "mtp", "prefill", "prefill_short_square", "prefill_short_q") and layout in ("dense", "paged", "thd", "thd_ragged")
+        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -434,3 +434,37 @@ def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     assert pt.lookup(row, paged(window_left=128)) is None
     assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
     assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+def _sm100_paged(d, h_q, h_kv, b, s_q, s_kv, **over):
+    """FlashInfer's exact paged prefill declaration on a 148-SM cc 10.0 part (head-major page pool, page 16)."""
+    from types import SimpleNamespace
+
+    base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=d, d_v=d, causal=True, bottom_right=True, thd=True, padded=True)
+    base.update(page_size=16, max_total_seq_len_q=b * s_q, device_sm_count=148, k_t=SimpleNamespace(get_stride=lambda: (16 * d * h_kv, 16 * d, d, 1)))
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_sm100_paged_packed_split_classes_follow_their_study(cc):
+    """The SM100 row's packed split is its own group (``gqa_split``) and, at D64, one Q tile per request its own phase
+    (``prefill_short_q``): study sm100_paged_d64_d256_prefill_20261111 leads the split and short-Q D64 graphs, keeps the backend
+    for a long-Q D64 graph over a long cache, and leaves D256 unsplit graphs to sm100_d256_paged_context_20261030. cc 10.3 borrows
+    both studies."""
+    row = "sdpa_fwd_prefill_sm100"
+    study = "sm100_paged_d64_d256_prefill_20261111"
+    split64 = _sm100_paged(64, 32, 8, 1, 64, 32768, device_cc=cc)
+    assert pt.class_key(row, split64)[4] == "prefill_short_q" and pt.class_key(row, split64)[8] == "gqa_split"
+    split256 = _sm100_paged(256, 16, 8, 1, 128, 32768, device_cc=cc)
+    assert pt.class_key(row, split256)[4] == "prefill" and pt.class_key(row, split256)[8] == "gqa_split"
+    for facts in (split64, split256, _sm100_paged(64, 16, 8, 16, 64, 16384, device_cc=cc)):
+        assert pt.lookup(row, facts) is True
+        assert pt.matched_entry(row, facts).study == study
+    assert pt.lookup(row, _sm100_paged(64, 32, 8, 16, 512, 32768, device_cc=cc)) is False
+    unsplit256 = _sm100_paged(256, 32, 8, 16, 512, 8192, device_cc=cc)
+    assert pt.class_key(row, unsplit256)[8] == "gqa"
+    assert pt.matched_entry(row, unsplit256).study == "sm100_d256_paged_context_20261030"
+    exact_d128 = _sm100_paged(128, 32, 8, 1, 64, 32768, device_cc=cc)
+    assert pt.class_key(row, exact_d128)[4] == "prefill" and pt.class_key(row, exact_d128)[8] == "gqa"

@@ -584,6 +584,9 @@ production kernels gain no debug knob or timing-dependent assertion.
 
   Draw holdouts OFF the training lattice (odd head counts, batches, off-tile lengths), and add a key field only when it
   follows the kernel (`_unpacked_decode` reads the row's own pack decision).
+- A new FROST capability that changes a class's plan (e.g. the SM100 packed split) makes that class's entries stale where
+  the plan changed. Key the new regime from the row's own decision (`gqa_split`) and fit it; keep an older study's
+  entries for the unchanged regime instead of refitting it over a narrower grid than that study measured.
 
 
 **Rule S13 — Register redistribution must converge at warpgroup scope.**

@@ -1100,8 +1100,8 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
-    # The prepared single-CTA split removes the underfilled paged D128
-    # launch. Placement and the concrete split share one bounded rule.
+    # The prepared single-CTA split removes the underfilled paged D128 launch, and the packed split the underfilled
+    # D64 / D256 one. Placement and the concrete split share one bounded rule.
     if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:

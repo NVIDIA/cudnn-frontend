@@ -2812,6 +2812,53 @@ def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaun
     return launch if units <= resident else None
 
 
+SM100_PAGED_PACKED_SPLIT_CGA = {(64, 64): 1, (256, 256): 2}  # SM100/103 paged half packed split: D64 decode tile, D256 pair
+SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
+SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
+SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
+
+
+def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
+    """SM100/103 paged half D64 / D256 GQA prefix: the packed split count, 1 outside the domain.
+
+    The packed launch (b x KV heads x packed Q tiles) underfills the part on these short-Q / long-KV graphs; split the KV
+    loop over the idle clusters (four KV tiles per partition at least, 16 partials at most). The declaration bounds the
+    launch: live lengths are never read."""
+    d_shape = (facts.d_qk, facts.d_v)
+    cga = SM100_PAGED_PACKED_SPLIT_CGA.get(d_shape)
+    if not (
+        cga is not None
+        and caps.sm_lo == 100
+        and facts.device_cc in ((10, 0), (10, 3))
+        and paged_thd_split_domain(caps, facts)
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in SM100_PAGED_PACKED_SPLIT_GROUPS
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and SM100_PAGED_PACKED_SPLIT_Q[0] <= facts.s_q <= SM100_PAGED_PACKED_SPLIT_Q[1]
+        and SM100_PAGED_PACKED_SPLIT_KV[0] <= facts.s_kv <= SM100_PAGED_PACKED_SPLIT_KV[1]
+        and facts.s_kv >= SM100_PAGED_PACKED_SPLIT_KV_PER_Q * facts.s_q
+        and facts.device_sm_count
+    ):
+        return 1
+    pack_g = _pack_gqa_group(caps, facts, 128, True, split_kv=2)
+    if pack_g <= 1:
+        return 1
+    launch = _split_launch(caps, facts, 128, 128, cga, pack_g, split_kv=2)
+    units = facts.b * launch.heads_q * launch.q_tiles
+    budget = min(16, (facts.device_sm_count // launch.ctas_per_tile) // max(1, units), launch.kv_tiles // 4)
+    if budget < 2:
+        return 1
+    splits = _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+    knobs = SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=splits)
+    return splits if mismatch(caps, facts, knobs) is None else 1
+
+
 def _paged_d256_thd_split_choice(caps: Capabilities, facts) -> int:
     launch = paged_d256_prefix_launch(caps, facts)
     if launch is None:
@@ -2874,7 +2921,11 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
     listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
+    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed).
     """
+    sm100_splits = sm100_paged_packed_split_choice(caps, facts)
+    if sm100_splits > 1:
+        return sm100_splits, True
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
     if not (
@@ -3182,7 +3233,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
                 cga=_sole(effective_cgas(caps, facts, splits)),
                 pack_gqa=packed,
                 split_kv=splits,
-                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
+                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 or (facts.d_qk, facts.d_v) in SM100_PAGED_PACKED_SPLIT_CGA else SCHED_LPT,
             ),
         )
         first_splits, first_packed = paged_thd_split_choice(caps, facts, first_wave=True) if caps.sm_lo == 107 else (1, False)
