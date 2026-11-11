@@ -1096,12 +1096,12 @@ class _PbLayout:
 def _active_key(p_active, n0, KR, i):
     # Item i of the key-major kernel: the n0 active tokens as keys of range 0, then the same tokens as keys of range 1.
     # n0 is a multiple of the grid, so a CTA walks the same tokens in both ranges and their adds keep one order.
-    key = I32(0)
+    off = i
+    base = I32(0)
     if i >= n0:
-        key = (p_active + (i - n0)).load() + KR
-    else:
-        key = (p_active + i).load()
-    return key
+        off = i - n0
+        base = KR
+    return (p_active + off).load() + base
 
 
 @cute.kernel
