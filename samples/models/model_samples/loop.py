@@ -4,10 +4,12 @@
 """``Session``: plan, load, prefill, step for a fixed set of sequences.
 
 A session decides everything before it loads anything: ``plan_table()`` resolves the family's provider table for this GPU, the
-number of sequences and the stack, and states the memory the run needs.  ``load()`` then reads (or draws), merges and
-dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one warm-up step, each
-as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the chosen ids stay on the
-GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is no ``generate()`` here.
+number of sequences and the stack, and states the memory the run needs -- for this session and for the sessions that will
+follow it on its weights, so that nothing can decline once the first of them has loaded.  ``load()`` then reads (or draws),
+merges and dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one
+warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
+chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
+no ``generate()`` here.
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -123,13 +125,22 @@ class Session:
             )
         return self.plan
 
-    def plan_table(self) -> str:
-        """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded."""
+    def plan_table(self, later: Sequence["Session"] = ()) -> str:
+        """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
+
+        ``later`` are the sessions that will run after this one in the same process on its weights (``share=self``).  Their
+        plans are resolved here too, and the memory sentence then covers the whole run -- this session's need plus their
+        state -- against what is free now: every decline of a run comes before its first load, none after it."""
         plan = self.resolve()
+        for session in later:
+            session.resolve()
         if self.device.type != "cuda":
             return plan.table()
         need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
-        return plan.table() + "\n  " + plan.memory(need)
+        need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
+        counts = [self.sequences, *(session.sequences for session in later)]
+        what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
+        return plan.table() + "\n  " + plan.memory(need, what)
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:

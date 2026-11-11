@@ -118,6 +118,7 @@ class QwenDense:
     provider_table = configs.PROVIDERS
     regimes = configs.REGIMES
     first_launch_reserve = configs.FIRST_LAUNCH_RESERVE
+    logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
 
     @classmethod
@@ -226,9 +227,9 @@ class QwenDense:
         """Bytes of the bf16 copies the ``fe-cublas`` and ``reference`` stacks hold: 2 per weight element."""
         return sum(2 * s.numel for s in self.tensor_specs() if s.fmt != "scalar")
 
-    def memory_bytes(self, sequences: int, capacity: int) -> int:
-        """What a run needs on the GPU besides a kernel's own reservation: the copies, the state and 2 GiB of working memory
-        (load-time temporaries, activations, the reference's fp64 temporaries during the checks, the allocator's slack)."""
+    def state_bytes(self, sequences: int, capacity: int) -> int:
+        """Bytes of the decode state of ``sequences`` sequences: the slot pools of the linear-attention layers (one null slot
+        each) and the key/value caches of the attention layers."""
         g = self.geometry
         state = 0
         for kind in g.layer_kinds:
@@ -236,7 +237,12 @@ class QwenDense:
                 state += (sequences + 1) * (g.la_value_heads * g.la_head_dim**2 * 4 + (g.la_conv_width - 1) * g.qkv_channels * 2)
             else:
                 state += 2 * sequences * g.attn_kv_heads * capacity * g.attn_head_dim * 2
-        return self.copy_bytes() + state + 2 * GIB
+        return state
+
+    def memory_bytes(self, sequences: int, capacity: int) -> int:
+        """What a run needs on the GPU besides a kernel's own reservation: the copies, the state and 2 GiB of working memory
+        (load-time temporaries, activations, the reference's fp64 temporaries during the checks, the allocator's slack)."""
+        return self.copy_bytes() + self.state_bytes(sequences, capacity) + 2 * GIB
 
     def state_shapes(self) -> Dict[str, tuple]:
         g = self.geometry

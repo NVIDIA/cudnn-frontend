@@ -6,9 +6,10 @@
 The default run needs no checkpoint and no extra package: it builds the model at its published layer widths with two layers
 and seeded weights, prints which provider serves every block, feeds one seeded prompt per sequence through the decode step,
 decodes 32 tokens greedily at 1 and at 4 sequences, and checks the whole path against a plain-PyTorch reference that
-accumulates in fp64 (replay, every provider block teacher-forced, the greedy tokens, sequence 0 alone against sequence 0 in the
-batch).  It prints ``[00] PASS``, or ``[00] SKIP <requirement>`` with exit code 0 on a GPU, a library version or a free-memory
-budget it does not serve.
+accumulates in fp64 (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the same
+sequence in the batch).  It prints ``[00] PASS``, or ``[00] SKIP <requirement>`` with exit code 0 on a GPU, a library version
+or a free-memory budget it does not serve.  Every sequence count of a run is planned before anything is loaded, so a SKIP
+comes before the first load or not at all.
 
     python samples/models/qwen_dense/00_decode.py
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
@@ -100,11 +101,6 @@ def main(argv=None) -> int:
     from model_samples.blocks import DeviceFacts, parse_overrides
     from model_samples.qwen_dense import QwenDense
 
-    try:
-        environment = model_samples.check_environment()
-    except model_samples.EnvironmentMismatch as error:
-        print(f"{TAG} ERROR {error}")
-        return 1
     if not torch.cuda.is_available():
         print(f"{TAG} SKIP needs a CUDA GPU")
         return 0
@@ -121,12 +117,10 @@ def main(argv=None) -> int:
     counts = ",".join(str(n) for n in args.sequences)
     print(f"{TAG} {model.name} decode | reduced model: {'; '.join(model.reductions)}")
     print(f"{TAG} {facts.name} ({facts.class_text}, {facts.sm_count} SMs) | sequences {counts} | stack {args.stack} | launched from Python, not captured")
-    print(f"{TAG} {environment.header()}")
-    print(f"{TAG} clock not locked: timings are for orientation only | reference precision {args.reference_precision}")
 
-    shared, passed, digest = None, True, hashlib.sha256()
+    started = time.perf_counter()
+    runs = []  # (session, prompts) per sequence count; the later sessions run on the first one's weights
     for sequences in args.sequences:
-        started = time.perf_counter()
         render = time.perf_counter()
         # one seeded prompt per sequence, all of one length; the open assistant turn ends in the sequence's own token
         rendered = [
@@ -145,30 +139,42 @@ def main(argv=None) -> int:
             overrides=overrides,
             reference_precision=args.reference_precision,
             capacity=int(prompts[0].numel()) + rule.limit,
-            share=shared,
+            share=runs[0][0] if runs else None,
         )
-        try:
-            table = session.plan_table()
-        except NotImplementedError as error:
-            print(f"{TAG} SKIP {error}")
-            return 0
-        except ValueError as error:
-            print(f"{TAG} ERROR {error}")
-            return 1
+        session.report().text_path.update(render=(tokenize - render) / sequences, tokenize=(encoded - tokenize) / sequences)
+        runs.append((session, prompts))
+    # Every sequence count is planned before the first load, and the memory sentence covers the whole run: a GPU class, a
+    # library version or a free-memory budget this sample does not serve is a SKIP here, and nothing skips after it.
+    first, later = runs[0][0], [session for session, _ in runs[1:]]
+    planning = time.perf_counter()
+    try:
+        tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
+    except NotImplementedError as error:
+        print(f"{TAG} SKIP {error}")
+        return 0
+    except ValueError as error:
+        print(f"{TAG} ERROR {error}")
+        return 1
+    first.stages.add("import", started - _START)
+    first.stages.add("plan", time.perf_counter() - planning)
+    try:  # after the plan: a GPU this sample does not serve skips, whatever is installed
+        environment = model_samples.check_environment()
+    except model_samples.EnvironmentMismatch as error:
+        print(f"{TAG} ERROR {error}")
+        return 1
+    print(f"{TAG} {environment.header()}")
+    print(f"{TAG} clock not locked: timings are for orientation only | reference precision {args.reference_precision}")
+
+    passed, digest = True, hashlib.sha256()
+    for (session, prompts), table in zip(runs, tables):
         print()
         print(table)
-        if shared is None:
-            session.stages.add("import", started - _START)
-        session.stages.add("plan", time.perf_counter() - encoded)
         session.load()
         print(f"{TAG} {session.stages.line()}")
-        report = session.report()
-        report.text_path.update(render=(tokenize - render) / sequences, tokenize=(encoded - tokenize) / sequences)
         ok, produced = _decode(session, text, rule, prompts, tie_out, check=args.stack != "reference")
         passed = passed and ok
         for ids in produced:
             digest.update(b"".join(int(i).to_bytes(4, "little") for i in ids))
-        shared = shared or session
     gib = 2.0**30
     grown = (facts.free_bytes - torch.cuda.mem_get_info(device)[0]) / gib
     print()
@@ -178,7 +184,7 @@ def main(argv=None) -> int:
     )
     mib = 2.0**20
     allowance = getattr(model, "first_launch_reserve", {}).get(f"cc{facts.cc[0]}.x", 0)
-    for name, block in shared.plan.items():
+    for name, block in first.plan.items():
         launches = block.first_launch()  # measured by the block: rows -> device bytes outside PyTorch's pool
         if launches:
             forms = " | ".join(f"{rows} row{'s' if rows > 1 else ''} {taken / mib:,.0f} MiB" for rows, taken in launches.items())

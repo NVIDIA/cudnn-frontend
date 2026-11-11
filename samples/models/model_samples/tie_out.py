@@ -8,44 +8,58 @@ Four checks, run after the timed loop on the ids the loop produced:
 1. **replay** -- the same inputs from a fresh state (new allocations) give byte-identical ids and logits.
 2. **blocks** -- teacher-forced: every provider block that is not the reference chain itself is compared, call by call, with
    the reference block on the SAME operands and the same state, so an error cannot accumulate and a wiring error is told apart
-   from rounding.  The band of a block is named in its provider row (``BANDS``) and is never widened here.
-3. **tokens** -- end to end and margin-aware: the reference stack runs the same inputs with its own state; the greedy token must
-   equal the reference's at every step whose reference margin (largest minus second largest logit) exceeds the logits band,
-   ``LOGITS_FACTOR`` times the largest logit distance between the two stacks in this run.  Steps below the band are counted and
-   printed as near-ties; they are not failures and not hidden.  The check cannot be sharper than the two stacks are close:
-   a chain of 8-bit and 4-bit quantisers turns a one-unit rounding difference into different codes, so the logits of two
-   correct stacks differ by far more than one rounding, and the block check above is what verifies each provider.
-4. **batch invariance** -- with more than one sequence, every block is run again on sequence 0 alone, on the same operands
-   and state; the bytes of sequence 0 must be equal.  A gate for a block whose provider row lists the GPU class under
-   ``batch_invariant``; a printed fact for the rest.
+   from rounding.  The band of a block is named in its provider row (``BANDS``) and is never widened here.  Every band is
+   judged element by element and asks for finite values first: a NaN is a failure of the block that produced it, never a tie.
+3. **tokens** -- end to end: the reference stack runs the same inputs with its own state.  The largest distance between the
+   logits of the two stacks must be finite and inside the logits band, which the family declares beforehand in bf16 units of
+   the run's largest reference logit (``logits_band_units``); and the greedy token must equal the reference's at every step
+   whose reference margin (largest minus second largest logit) exceeds ``LOGITS_FACTOR`` times that band.  Steps below it are
+   counted and printed as near-ties; they are not failures and not hidden.  The band is declared, not taken from the run: a
+   band that follows the run's own distance can never fail.  The check cannot be sharper than the two stacks are close: a
+   chain of 8-bit and 4-bit quantisers turns a one-unit rounding difference into different codes, so the logits of two
+   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.
+4. **batch invariance** -- with more than one sequence, every block is run again on ONE sequence alone, on the same operands
+   and state; the bytes of that sequence must be equal.  The sequence that runs alone rotates with the step (step ``t``:
+   sequence ``t`` modulo the count), so every row of the batch is covered at no extra launch.  A gate for a block whose
+   provider row lists the GPU class under ``batch_invariant``; a printed fact for the rest.
 
-Bands: ``bf16_rounding`` / ``bf16_unit`` = every element within one bf16 unit of the reference, the unit taken at the larger
-magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the scaled
-result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = more than
-99.9 % of the 8-bit output bytes of the run equal, more than 99.9 % of the recurrent state's elements within 1e-4 and none
-farther than two bf16 units (2**-6) of the state's largest value (of 1 when that is larger), and the conv history
-byte-identical; ``same`` = the provider is the reference chain, nothing to compare.
+Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
+the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
+scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
+``same`` = the provider is the reference chain, nothing to compare.
 
-Why the state band has two parts: the fused step rounds its beta / alpha projection, its conv taps and its SiLU to bf16 as a
-serving chain does, and it accumulates them in fp32 in its own order.  Against an fp64-accumulated reference a few of those
-roundings fall on the other side of a midpoint; one such unit moves one head's write gate, its decay or one key column, and
-with it that head's state, by up to a few 1e-3 of the state's largest value, while every other element agrees to fp32
+``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
+output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
+of the state's largest value (of 1 when that is larger), every value finite, the conv history byte-identical and the null
+slot untouched.  And per cell -- one value head of one sequence in one layer, which is one block of the step's launch grid
+and so its natural unit of failure: over the run, more than 99 % of the cell's output bytes equal and more than 99.9 % of
+the cell's state within 1e-4.  The null slot is in no share.
+
+Why the state band has a share and a cap: the fused step rounds its beta / alpha projection, its conv taps and its SiLU to
+bf16 as a serving chain does, and it accumulates them in fp32 in its own order.  Against an fp64-accumulated reference a few of
+those roundings fall on the other side of a midpoint; one such unit moves one head's write gate, its decay or one key column,
+and with it that head's state, by up to a few 1e-3 of the state's largest value, while every other element agrees to fp32
 rounding.  A state "within 1e-4 everywhere" therefore does not hold against this reference (measured by this sample: the
 largest distance of a default run is a few 1e-4 to a few 1e-3), and it is not what a wiring error looks like: that moves every
 element.  The cap is one unit for each of the two gates of a head.
 
-What the band tolerates: such moves of single heads, as long as they stay below 0.1 % of the state's elements over the run and
-below the cap.  What it still catches: a head that is wrong at every step (one value head of 48 is 2 % of the elements), any
-error of the wiring or of an operand's layout (with the beta and alpha rows exchanged, 28 % of the state was within 1e-4 and
-the largest distance was 0.99), and any element beyond the cap.  The line of the step also prints the state's rms ratio --
-the rms of the difference over the rms of the reference state, at the worst call -- as a second, averaged view of the same
-comparison: one flipped head barely moves it, an error of the wiring moves it to order one.  It is printed, not gated.
+What the band tolerates: such a move of one head at one step.  It is an event, not a state of the head: the reference starts
+every call from the provider's state, so the move is seen once.  Measured over runs of this sample with two to eight layers,
+the worst cell of a run had about 0.1 % of its output bytes different and about 0.01 % of its state outside 1e-4, a tenth of
+what the band allows.  What it still catches: a value head of one sequence that is wrong at every step, from two of its 128
+output bytes or 0.1 % of its state's elements on; a NaN anywhere; any error of the wiring or of an operand's layout (with the
+beta and alpha rows exchanged, 23 % of the output bytes were equal, a tenth of the state was within 1e-4 and the largest
+distance was 0.99); a write to the null slot; and any element beyond the cap.  One wrong output byte of one head at every
+step stays inside the band.  The line of the step also prints the state's rms ratio -- the rms of the difference over the rms
+of the reference state, at the worst call -- as a second, averaged view of the same comparison: one flipped head barely moves
+it, an error of the wiring moves it to order one.  It is printed, not gated.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -54,15 +68,21 @@ from .sampling import margin
 
 LOGITS_FACTOR = 2.0
 GDN_EQUAL_BYTES = 0.999
+GDN_CELL_BYTES = 0.99
 GDN_STATE_BAND = 1e-4
 GDN_STATE_SHARE = 0.999
+GDN_CELL_STATE = 0.999
 GDN_STATE_CAP = 2.0**-6
 BANDS = {
     "same": "the provider is the reference chain",
     "bitwise": "byte-identical",
-    "bf16_rounding": "within one bf16 rounding",
-    "bf16_unit": "within one bf16 unit",
-    "gdn_step": f"more than {GDN_EQUAL_BYTES:.1%} equal 8-bit bytes, more than {GDN_STATE_SHARE:.1%} of the state within {GDN_STATE_BAND:g} and all of it within two bf16 units, conv history equal",
+    "bf16_rounding": "finite and within one bf16 rounding",
+    "bf16_unit": "finite and within one bf16 unit",
+    "gdn_step": (
+        f"8-bit bytes: more than {GDN_EQUAL_BYTES:.1%} equal over the run and more than {GDN_CELL_BYTES:.0%} in every cell (layer, sequence, value head); "
+        f"state: more than {GDN_STATE_SHARE:.1%} within {GDN_STATE_BAND:g} over the run and more than {GDN_CELL_STATE:.1%} in every cell, "
+        "all of it finite and within two bf16 units; conv history equal; null slot untouched"
+    ),
 }
 
 
@@ -107,11 +127,28 @@ def rms_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
     return float((out - ref).square().mean().sqrt() / ref.square().mean().sqrt().clamp_min(1e-12))
 
 
+def _largest(so_far: float, value: float) -> float:
+    """The larger of the two, and NaN as soon as one of them is: Python's ``max(x, nan)`` returns ``x``."""
+    if so_far != so_far or value != value:
+        return float("nan")
+    return max(so_far, value)
+
+
+@dataclass
+class _Cells:
+    """One layer's (sequence, value head) cells over the run: equal output bytes and state elements inside the band."""
+
+    equal: torch.Tensor  # [rows, value heads]
+    inside: torch.Tensor  # [slots - 1, value heads]
+    calls: int = 0
+
+
 @dataclass
 class BlockStats:
     band: str
     calls: int = 0
     ok: bool = True
+    finite: bool = True
     elements: int = 0
     off_by_one: int = 0
     worst_units: float = 0.0
@@ -122,31 +159,51 @@ class BlockStats:
     state_rms: float = 0.0
     state_inside: int = 0
     state_elements: int = 0
+    within_cap: bool = True
     conv_equal: bool = True
+    null_equal: bool = True
+    cells: Dict[int, _Cells] = field(default_factory=dict)
+    cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
+    cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
     batch_calls: int = 0
     batch_equal: int = 0
     notes: List[str] = field(default_factory=list)
 
+    def worst_cell(self, of: Dict[int, Tuple[float, str]]) -> Tuple[float, str]:
+        return min(of.values(), default=(1.0, "no cell"))
+
     def line(self) -> str:
+        loud = "" if self.finite else "; NON-FINITE VALUES"
         if self.band == "gdn_step":
             share = self.equal_bytes / max(self.total_bytes, 1)
-            conv = "equal" if self.conv_equal else "DIFFERS"
             inside = self.state_inside / max(self.state_elements, 1)
+            (cell_bytes, bytes_at), (cell_state, state_at) = self.worst_cell(self.cell_bytes), self.worst_cell(self.cell_state)
             return (
-                f"{share:.3%} of 8-bit bytes equal (worst call {self.worst_call:.3%}); {inside:.4%} of the state within {GDN_STATE_BAND:g}, "
-                f"largest distance {self.state_error:.1e}, rms ratio {self.state_rms:.1e} at the worst call (printed, not gated); conv history {conv}"
+                f"{share:.3%} of 8-bit bytes equal (worst call {self.worst_call:.3%}; worst cell {cell_bytes:.3%}: {bytes_at}); "
+                f"{inside:.4%} of the state within {GDN_STATE_BAND:g} (worst cell {cell_state:.4%}: {state_at}), largest distance {self.state_error:.1e}, "
+                f"rms ratio {self.state_rms:.1e} at the worst call (printed, not gated); conv history {'equal' if self.conv_equal else 'DIFFERS'}; "
+                f"null slot {'untouched' if self.null_equal else 'WRITTEN'}{loud}"
             )
         share = self.off_by_one / max(self.elements, 1)
-        return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit"
+        return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{loud}"
+
+
+def _smallest(counts: torch.Tensor, total: int, layer: int) -> Tuple[float, str]:
+    """The cell with the fewest counted elements of ``counts`` ``[sequences, value heads]``: its share of ``total`` and its name."""
+    at = int(counts.argmin())
+    sequence, head = divmod(at, counts.shape[1])
+    return float(counts.flatten()[at]) / max(total, 1), f"layer {layer}, sequence {sequence}, value head {head}"
 
 
 class BlockTap:
     """The hook of a checked pass: runs the provider block, then the reference block and -- with more than one sequence -- the
-    provider block on sequence 0 alone, each from the same state, and restores the provider's results before it returns them."""
+    provider block on one sequence alone (sequence ``step`` modulo the count), each from the same state, and restores the
+    provider's results before it returns them."""
 
     def __init__(self, plan, reference):
         self.plan, self.reference = plan, reference
         self.stats: Dict[str, BlockStats] = {}
+        self.step = 0  # set by the checked pass before every step
 
     @staticmethod
     def _state(block, operands):
@@ -178,50 +235,103 @@ class BlockTap:
         if independent:
             self._load(holders, before)
             ref_out = ref(*operands)
-            self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders))
+            self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer)
         if alone:
+            s = self.step % self.plan.sequences
             self._load(holders, before)
-            first = [(_rows(o, 0, 1) if i in block.per_row else o) for i, o in enumerate(operands)]
-            alone_out = block(*first)
-            same = bytes_equal(tuple(t[0:1] for t in compared), block.compared(alone_out))
-            for holder, full, single in zip(holders, after, self._save(holders)):
-                at = 1 if hasattr(holder, "conv_storage") else 0  # a slot pool keeps sequence 0 in slot 1, a cache in row 0
-                same = same and bytes_equal(tuple(t[at] for t in full), tuple(t[at] for t in single))
+            single = [(_rows(o, s, s + 1) if i in block.per_row else o) for i, o in enumerate(operands)]
+            alone_out = block(*single)
+            same = bytes_equal(tuple(t[s : s + 1] for t in compared), block.compared(alone_out))
+            for holder, full, one in zip(holders, after, self._save(holders)):
+                at = s + 1 if hasattr(holder, "conv_storage") else s  # a slot pool keeps sequence s in slot s + 1, a cache in row s
+                same = same and bytes_equal(tuple(t[at] for t in full), tuple(t[at] for t in one))
             stats.batch_calls += 1
             stats.batch_equal += int(same)
         self._load(holders, after)
         return out
 
     @staticmethod
-    def _judge(stats: BlockStats, out, ref, state, ref_state) -> None:
+    def _judge(stats: BlockStats, out, ref, state, ref_state, layer: int = 0) -> None:
         if stats.band == "gdn_step":
-            equal = int((out[0] == ref[0]).sum())
-            stats.equal_bytes += equal
-            stats.total_bytes += out[0].numel()
-            stats.worst_call = min(stats.worst_call, equal / out[0].numel())
+            codes, ref_codes = out[0], ref[0]
             (recurrent, conv), (ref_recurrent, ref_conv) = state[0], ref_state[0]
-            distance = (recurrent - ref_recurrent).abs() / max(1.0, float(ref_recurrent.abs().amax()))
-            stats.state_error = max(stats.state_error, float(distance.amax()))
-            stats.state_rms = max(stats.state_rms, rms_ratio(recurrent, ref_recurrent))
-            stats.state_inside += int((distance <= GDN_STATE_BAND).sum())
+            heads, dim = recurrent.shape[1], recurrent.shape[2]
+            same = codes == ref_codes
+            equal = int(same.sum())
+            stats.equal_bytes += equal
+            stats.total_bytes += codes.numel()
+            stats.worst_call = min(stats.worst_call, equal / codes.numel())
+            # slot 0 is the null slot (model_samples.state): it is in no share and must be left as it was
+            live, ref_live = recurrent[1:], ref_recurrent[1:]
+            distance = (live - ref_live).abs() / max(1.0, float(ref_recurrent.abs().amax()))
+            inside = distance <= GDN_STATE_BAND  # False for a NaN
+            stats.state_error = _largest(stats.state_error, float(distance.amax()))
+            stats.state_rms = _largest(stats.state_rms, rms_ratio(recurrent, ref_recurrent))
+            stats.state_inside += int(inside.sum())
             stats.state_elements += distance.numel()
             stats.conv_equal = stats.conv_equal and bytes_equal(conv, ref_conv)
+            stats.null_equal = stats.null_equal and bytes_equal(recurrent[0], ref_recurrent[0])
+            stats.within_cap = stats.within_cap and bool((distance <= GDN_STATE_CAP).all())  # element by element: False for a NaN
+            stats.finite = (
+                stats.finite
+                and bool(((codes & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+                and bool(torch.isfinite(recurrent).all())
+                and bool(torch.isfinite(conv).all())
+            )
+            cells = stats.cells.get(layer)
+            if cells is None:
+                cells = stats.cells[layer] = _Cells(torch.zeros_like(same.view(-1, heads, dim).sum(-1)), torch.zeros_like(inside.flatten(2).sum(-1)))
+            cells.equal += same.view(-1, heads, dim).sum(-1)
+            cells.inside += inside.flatten(2).sum(-1)
+            cells.calls += 1
+            stats.cell_bytes[layer] = _smallest(cells.equal, cells.calls * dim, layer)
+            stats.cell_state[layer] = _smallest(cells.inside, cells.calls * dim * dim, layer)
             stats.ok = (
-                stats.equal_bytes > GDN_EQUAL_BYTES * stats.total_bytes
+                stats.finite
+                and stats.equal_bytes > GDN_EQUAL_BYTES * stats.total_bytes
                 and stats.state_inside > GDN_STATE_SHARE * stats.state_elements
-                and stats.state_error <= GDN_STATE_CAP
+                and stats.worst_cell(stats.cell_bytes)[0] > GDN_CELL_BYTES
+                and stats.worst_cell(stats.cell_state)[0] > GDN_CELL_STATE
+                and stats.within_cap
                 and stats.conv_equal
+                and stats.null_equal
             )
             return
         for o, r in zip(out, ref):
+            if o.is_floating_point():
+                stats.finite = stats.finite and bool(torch.isfinite(o).all())
             if stats.band == "bitwise" or o.dtype != torch.bfloat16:
                 stats.ok = stats.ok and bytes_equal(o, r)
                 continue
             units = bf16_units(o, r)
             stats.elements += units.numel()
             stats.off_by_one += int((units >= 0.5).sum())
-            stats.worst_units = max(stats.worst_units, float(units.amax()))
-            stats.ok = stats.ok and stats.worst_units <= 1.0
+            stats.worst_units = _largest(stats.worst_units, float(units.amax()))
+            stats.ok = stats.ok and bool((units <= 1.0).all())  # element by element: False for a NaN
+        stats.ok = stats.ok and stats.finite
+
+
+def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: float) -> Tuple[bool, str]:
+    """The end-to-end check of a run's greedy tokens against the reference stack's: ``(held, the text of its line)``.
+
+    ``band_units`` is the declared logits band in bf16 units of the largest reference logit of the run.  The check holds when
+    every logit is finite, the largest distance between the two stacks' logits is inside the band, and the token equals the
+    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band."""
+    a, r = logits.float(), ref_logits.float()
+    finite = bool(torch.isfinite(a).all()) and bool(torch.isfinite(r).all())
+    top = float(r.abs().amax()) if finite else float("nan")
+    unit = 2.0 ** (math.frexp(top)[1] - 8) if top > 0.0 else float("nan")  # False for a NaN
+    band = band_units * unit
+    distance = float((a - r).abs().amax())
+    decidable = margin(ref_logits) > LOGITS_FACTOR * band  # nowhere when the band is not a number
+    wrong = int((decidable & ~(ids == ref_ids)).sum())
+    count, near = int(decidable.sum()), int((~decidable).sum())
+    held = finite and distance <= band and wrong == 0
+    text = (
+        f"{count - wrong} of {count} decidable greedy tokens equal to the reference; {near} near-ties (margin not above {LOGITS_FACTOR:g} x the band); "
+        f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit  [band: {band_units:g} units = {band:.4g}, declared]"
+    )
+    return held, text + ("" if finite else "; NON-FINITE LOGITS")
 
 
 @dataclass
@@ -260,6 +370,7 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
     session.tap = tap
     try:
         for t in range(steps):
+            tap.step = t
             session._advance(inputs[t])
     finally:
         session.tap = None
@@ -268,14 +379,8 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
     reference.reset(fresh=True)
     for t in range(steps):
         reference._advance(inputs[t])
-    ref_logits = reference.record.logits[:steps]
-    distance = float((logits.float() - ref_logits.float()).abs().amax())
-    band = LOGITS_FACTOR * distance
-    decidable = margin(ref_logits) > band
-    equal = ids == reference.record.outputs[:steps]
-    wrong = int((decidable & ~equal).sum())
-    count, near = int(decidable.sum()), int((~decidable).sum())
-    tokens_ok = wrong == 0
+    band_units = float(session.model.logits_band_units)  # declared by the family, in its configs.py
+    tokens_ok, tokens_text = token_check(logits, reference.record.logits[:steps], ids, reference.record.outputs[:steps], band_units)
 
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
@@ -290,10 +395,7 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
     )
     for name, s in judged.items():
         lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {BANDS[s.band]}]  {_verdict(s.ok)}")
-    lines.append(
-        f"  tokens            {count - wrong} of {count} decidable greedy tokens equal to the reference; {near} near-ties below the logits band "
-        f"({LOGITS_FACTOR:g} x {distance:.4g}, the largest logit distance of this run)    {_verdict(tokens_ok)}"
-    )
+    lines.append(f"  tokens            {tokens_text}    {_verdict(tokens_ok)}")
     batch_ok = True
     if session.sequences > 1:
         cls = f"cc{facts.cc[0]}.{facts.cc[1]}"
@@ -308,7 +410,9 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
         gate_text = "; ".join(gated) if gated else f"no block is gated on {facts.class_text}"
         rest = f"{len(tap.stats) - len(differs)} of {len(tap.stats)} blocks equal" + (f"; differs: {', '.join(differs)}" if differs else "")
         verdict = _verdict(batch_ok) if gated else "REPORTED"
-        lines.append(f"  batch invariance  sequence 0 alone vs among {session.sequences}: {gate_text}; {rest}    {verdict}")
+        lines.append(
+            f"  batch invariance  one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences}): {gate_text}; {rest}    {verdict}"
+        )
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
     session.reset(fresh=True)

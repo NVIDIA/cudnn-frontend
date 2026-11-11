@@ -3,9 +3,10 @@
 
 """GPU smoke of the dense Qwen model sample (``samples/models/qwen_dense/00_decode.py``): the script is loaded by path and its
 ``main()`` is called as a user's default run -- the reduced seeded model, 1 and 4 sequences, the sample's own checks against its
-fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, sequence 0 alone against sequence 0
-in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a free-memory budget
-the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with that sentence.  The
+fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the
+same sequence in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a
+free-memory budget the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with
+that sentence -- unless a check failed before it: a skip never covers a failure.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
 the four-layer one (three + one)."""
@@ -51,6 +52,7 @@ def _run(sample, capsys, arguments):
     key = "model sample qwen_dense 00_decode " + (" ".join(arguments) or "(default)")
     frost_routing.measured(key, f"{verdict}; stack fe-cublas; {device}; {versions}; {seconds:.0f} s")
     if verdict.startswith("[00] SKIP"):
+        assert " FAIL" not in out and "[00] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
         pytest.skip(verdict)
     assert code == 0 and verdict == "[00] PASS", out[-6000:]
     assert "distribution" in versions and "source hash" in versions, "the environment check ran and its line was printed"

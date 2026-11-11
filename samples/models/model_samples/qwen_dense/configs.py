@@ -95,6 +95,13 @@ BLOCK_TITLES = {
 FIRST_LAUNCH_RESERVE = {"cc12.x": 3 * GIB}
 
 
+#: the logits band of the token check, declared here and not taken from a run: the logits of the provider stack and of the
+#: reference stack, each run end to end on its own state, may differ by this many bf16 units of the run's largest reference
+#: logit.  It is declared for the reduced seeded model (measured by this sample: 1.0 unit with two layers, 1.2 with four, 1.4
+#: with eight); a real checkpoint declares its own
+LOGITS_BAND_UNITS = 4.0
+
+
 def readme_table(calls: dict) -> str:
     """The block table of the family README (markdown) for the ``fe-cublas`` stack, with ``calls`` per step of the full model."""
     from ..providers import ENTRY_NAMES

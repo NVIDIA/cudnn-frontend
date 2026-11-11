@@ -40,7 +40,8 @@ pip install -e .                                   # the decode entries are newe
 python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint, no extra package
 ```
 
-A sample checks the GPU, the library versions and the free memory before it loads anything. It ends in one of:
+A sample checks the GPU, the library versions and the free memory before it loads anything, for every sequence count of
+the run at once: a `SKIP` comes before the first load or not at all. It ends in one of:
 
 | last line | exit code | meaning |
 |---|---|---|
@@ -52,8 +53,9 @@ A sample checks the GPU, the library versions and the free memory before it load
 
 The first lines of a run state the environment: the `cudnn` version, whether it is an editable checkout or a wheel, a hash of
 the package files the sample's cuDNN Frontend provider runs, and the installed distribution's version. If the last two
-disagree the sample stops: an editable install with stale metadata lets a later `pip install` replace the checkout with a
-released wheel. `pip install -e .` again fixes it.
+disagree the sample stops with `ERROR`: an editable install with stale metadata lets a later `pip install` replace the
+checkout with a released wheel. `pip install -e .` again fixes it. The GPU comes first: on a GPU the sample does not serve
+it prints its `SKIP`, whatever is installed.
 
 ## The helper layer
 
@@ -79,7 +81,8 @@ and it imports nothing beyond cuDNN Frontend, PyTorch and the standard library.
 
 | what | by | where |
 |---|---|---|
-| the helper layer without a GPU: tables, plan, declines, memory sentence, environment check, token choice, stop rules, a decode of a tiny geometry on the CPU | `test/python/misc/test_model_samples_plan.py` | any host, level L0 |
+| the helper layer without a GPU: tables, plan, declines, memory sentence, environment check, token choice, stop rules, a decode of a tiny geometry on the CPU; the tie-out itself on stated tensors and through stand-in providers with deliberate defects (a NaN, one wrong value head, a row that reads its neighbour) | `test/python/misc/test_model_samples_plan.py` | any host, level L0 |
+| the weight formats: the bf16 copies both stacks read against a decode written from the format definitions, the quantisers, both merge rules, the reference multiply | `test/python/misc/test_model_samples_weights.py` | any host, level L0 |
 | the default run of each sample: `[NN] PASS` with its own checks | `test/python/linear_attention/frost/test_model_sample_qwen_dense.py` | one GPU the family serves; L0 runs two layers, L1 four |
 | a real checkpoint | not yet read by any sample | -- |
 

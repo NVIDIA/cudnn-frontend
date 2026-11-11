@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Host-only tests of the model samples' helper layer (``samples/models/model_samples``): the provider and regime tables against
-the family README, the plan's row selection and its typed declines, the memory sentence on stated device facts, the
-precision setting of the fallback multiply, the environment check on stated metadata, token choice, the stop rules, the call
-counts of a decode step, the import boundary of a dry plan, and one decode on the CPU: a tiny geometry on the reference stack,
-replayed byte for byte.  No GPU, no weights."""
+the family README, the plan's row selection and its typed declines, the memory sentence on stated device facts and for a
+run of several sequence counts, the precision setting of the fallback multiply, the environment check on stated metadata,
+token choice, the stop rules, the call counts of a decode step, the import boundary of a dry plan, one decode on the CPU (a
+tiny geometry on the reference stack, replayed byte for byte), and the tie-out itself: what the band of the fused step and
+of a multiply accept and refuse on stated tensors, the token check against its declared band, and the checks of a whole run
+through stand-in providers with deliberate defects.  No GPU, no weights."""
 
 import subprocess
 import sys
@@ -162,6 +164,97 @@ def test_memory_sentence_on_stated_device_facts():
         small.memory(need)
 
 
+def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
+    """The first session plans the sessions that follow it on its weights, and its memory sentence covers the whole run
+    against what is free before anything is loaded: a later count can decline only there."""
+    import model_samples
+    from model_samples import blocks
+    from model_samples.qwen_dense import QwenDense, configs
+
+    model = QwenDense.reduced(2)
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    free = [8 * GIB]
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, free[0])))
+
+    def run(*counts):
+        first = model_samples.Session(model, text, sequences=counts[0], device="cuda:0", capacity=58)
+        later = [model_samples.Session(model, text, sequences=n, device="cuda:0", capacity=58, share=first) for n in counts[1:]]
+        return later, first.plan_table(later)
+
+    later, table = run(1, 4)
+    assert later[0].plan is not None and later[0].plan.sequences == 4, "the later count is planned with the first one"
+    need = model.memory_bytes(1, 58) + model.state_bytes(4, 58) + configs.FIRST_LAUNCH_RESERVE["cc12.x"]
+    assert need < 7 * GIB, "the copies and the working memory are counted once for the run, the first launch once"
+    assert f"this stack needs about {need / GIB:.1f} GB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GB are free" in table
+    assert "one count after the other" not in run(4)[1], "one count: the sentence of that count"
+    with pytest.raises(NotImplementedError, match="serves rows 1-65,535; this run has 70000 sequences"):
+        run(1, 70000)
+    free[0] = 6 * GIB
+    with pytest.raises(
+        NotImplementedError, match=r"needs about 6\.\d GB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GB are free: free memory"
+    ):
+        run(1, 4)
+
+
+def _sample_main(monkeypatch, capsys, arguments, cc=(10, 0), free=80 * GIB, environment=None):
+    """``main()`` of the sample script on stated device facts, up to its first load: no GPU is touched and nothing is loaded.
+    Returns ``(exit code, printed text)``; raises ``AssertionError("reached a load")`` when the run gets that far."""
+    import importlib.util
+
+    import model_samples
+    from model_samples import blocks
+
+    def no_load(session):
+        raise AssertionError("reached a load")
+
+    def matching():
+        return model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls(cc, "stated device", 148, 0, free)))
+    monkeypatch.setattr(model_samples, "check_environment", environment or matching)
+    monkeypatch.setattr(model_samples.Session, "load", no_load)
+    paths = list(sys.path)
+    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_on_stated_facts", MODELS / "qwen_dense" / "00_decode.py")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return module.main(arguments), capsys.readouterr().out
+    finally:
+        sys.path[:] = paths
+
+
+def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the_environment(monkeypatch, capsys):
+    """Every sequence count is planned before anything is loaded, so a SKIP cannot follow a check that ran; and the
+    environment check comes after the plan, so a GPU the sample does not serve skips whatever is installed."""
+    import model_samples
+
+    def stale():
+        raise model_samples.EnvironmentMismatch(
+            'cudnn 1.33.0 was imported from an editable checkout, but the installed distribution says 1.29.0: run "pip install -e ." again'
+        )
+
+    code, out = _sample_main(monkeypatch, capsys, [], cc=(9, 0), environment=stale)
+    assert code == 0 and out.splitlines()[-1] == "[00] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is 9.0", out
+    code, out = _sample_main(monkeypatch, capsys, [], environment=stale)
+    assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR cudnn 1.33.0 was imported from an editable checkout"), out
+    code, out = _sample_main(monkeypatch, capsys, ["--sequences", "1,70000"])
+    assert (
+        code == 0 and out.splitlines()[-1] == "[00] SKIP cudnn.GdnDecodeFused serves rows 1-65,535; this run has 70000 sequences x 1 tokens per sequence"
+    ), out
+    code, out = _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=6 * GIB)
+    skip = "[00] SKIP stack fe-cublas needs about 6.7 GB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GB are free: free memory on this GPU"
+    assert code == 0 and out.splitlines()[-1].startswith(skip), out
+    code, out = _sample_main(monkeypatch, capsys, ["--provider", "mlp.down=nothing"])
+    assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
+    with pytest.raises(AssertionError, match="reached a load"):
+        _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
+    out = capsys.readouterr().out
+    assert "this stack needs about 6.7 GB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GB are free" in out
+    assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
+
+
 def test_the_fallback_multiply_asks_for_the_fp32_accumulator_and_restores_the_setting(monkeypatch):
     """PyTorch lets cuBLAS reduce the partial sums of a bf16 multiply in bf16 by default; the fallback multiply switches that
     off for its own call and leaves the caller's setting as it found it."""
@@ -243,8 +336,7 @@ print("TABLE", "cudnn.GdnDecodeFused" in table)
     assert "ADDED []" in done.stdout and "TABLE True" in done.stdout, done.stdout + done.stderr
 
 
-def _tiny_session(sequences, stack="reference"):
-    import model_samples
+def _tiny_model():
     from model_samples.qwen_dense import Geometry, QwenDense
 
     geometry = Geometry(
@@ -260,8 +352,14 @@ def _tiny_session(sequences, stack="reference"):
         attn_head_dim=8,
         rotary_dim=4,
     )
-    model = QwenDense(geometry, reductions=("tiny geometry",))
-    text = model_samples.TextIO.synthetic(geometry.vocab)
+    return QwenDense(geometry, reductions=("tiny geometry",))
+
+
+def _tiny_session(sequences, stack="reference"):
+    import model_samples
+
+    model = _tiny_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
     session = model_samples.Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=32)
     assert "torch_ref.gdn_decode_step" in session.plan_table()
     session.load()
@@ -295,3 +393,224 @@ def test_reference_stack_decodes_a_tiny_geometry_on_the_cpu_and_replays_byte_for
         session.prefill(prompts[:1])
     with pytest.raises(ValueError, match="one non-zero length"):
         session.prefill([prompts[0], prompts[1][:-1]])
+
+
+def _judged_step(calls, rows=2, defect=None):
+    """``calls`` judged calls of a fused step at the published head layout (48 value heads of 128): the provider side is the
+    reference side plus what ``defect(call, codes [rows, heads, dim], state [slots, heads, dim, dim])`` changes."""
+    from model_samples import tie_out
+
+    heads, dim = 48, 128
+    generator = torch.Generator().manual_seed(0)
+    ref_state = torch.randn((rows + 1, heads, dim, dim), generator=generator) * 0.05
+    ref_state[0].zero_()  # the null slot
+    ref_state[1, 0, 0, 0] = 1.0  # the state's largest value: distances are relative to it
+    ref_codes = torch.randint(0, 0x7E, (rows, heads * dim), generator=generator, dtype=torch.uint8)  # finite E4M3 codes, also with bit 0 flipped
+    conv = torch.zeros((rows + 1, 3, 16), dtype=torch.bfloat16)
+    stats = tie_out.BlockStats("gdn_step")
+    for call in range(calls):
+        codes, state = ref_codes.clone(), ref_state.clone()
+        if defect is not None:
+            defect(call, codes.view(rows, heads, dim), state)
+        tie_out.BlockTap._judge(stats, (codes,), (ref_codes,), [(state, conv)], [(ref_state, conv)], layer=0)
+    return stats
+
+
+def test_the_fused_step_is_judged_per_sequence_and_value_head():
+    """One value head of one sequence is one block of the step's launch grid.  A defect confined to such a cell is a small
+    share of a run's bytes and state, so the band also holds every cell to a share of its own."""
+    from model_samples import tie_out
+
+    assert _judged_step(4).ok
+
+    def one_head_moves_once(call, codes, state):  # what the rounding of a correct kernel looks like against the fp64 reference
+        if call == 5:
+            codes[0, 7, :24] ^= 1
+            state[1, 7].view(-1)[:300] += 2.0e-3
+
+    tolerated = _judged_step(57, rows=1, defect=one_head_moves_once)
+    assert tolerated.ok and "worst cell 99.671%: layer 0, sequence 0, value head 7" in tolerated.line(), tolerated.line()
+
+    def sixteen_columns(call, codes, state):
+        codes[-1, 47, -16:] ^= 1
+
+    stats = _judged_step(8, rows=4, defect=sixteen_columns)
+    assert stats.equal_bytes > tie_out.GDN_EQUAL_BYTES * stats.total_bytes, "over the run the share of equal bytes holds"
+    assert not stats.ok and "worst cell 87.500%: layer 0, sequence 3, value head 47" in stats.line(), stats.line()
+
+    def two_bytes(call, codes, state):
+        codes[0, 3, :2] ^= 1
+
+    def one_byte(call, codes, state):
+        codes[0, 3, :1] ^= 1
+
+    assert not _judged_step(8, defect=two_bytes).ok, "from two wrong bytes of a head at every step on"
+    assert _judged_step(8, defect=one_byte).ok, "one wrong byte of a head at every step is inside the band (stated in the README)"
+
+    def a_tenth_of_one_state(call, codes, state):
+        state[-1, 47].view(-1)[:1638] += 1.0e-2  # inside the cap
+
+    stats = _judged_step(8, rows=4, defect=a_tenth_of_one_state)
+    assert stats.state_inside > tie_out.GDN_STATE_SHARE * stats.state_elements, "over the run the share of the state holds"
+    assert not stats.ok and "(worst cell 90.0024%: layer 0, sequence 3, value head 47)" in stats.line(), stats.line()
+
+    def null_slot(call, codes, state):
+        state[0, 0, 0, 0] = 1.0e-6
+
+    stats = _judged_step(2, defect=null_slot)
+    assert not stats.ok and "null slot WRITTEN" in stats.line() and stats.state_inside == stats.state_elements, "the null slot is in no share"
+
+    def beyond_the_cap_once(call, codes, state):
+        if call == 1:
+            state[1, 3, 0, 1] += 0.05
+
+    assert not _judged_step(4, defect=beyond_the_cap_once).ok
+
+
+def test_a_value_that_is_not_finite_fails_its_block():
+    """A NaN is not a tie: Python's ``max(x, nan)`` keeps ``x`` and a comparison with a NaN is false, so the bands ask for
+    finite values and judge element by element."""
+    from model_samples import tie_out
+
+    def nan_once(call, codes, state):
+        if call == 1:
+            state[-1, 47, 5, 7] = float("nan")
+
+    stats = _judged_step(4, defect=nan_once)
+    assert not stats.ok and "largest distance nan" in stats.line() and "NON-FINITE VALUES" in stats.line(), stats.line()
+
+    def nan_code(call, codes, state):
+        codes[0, 0, 0] = 0x7F  # E4M3's NaN
+
+    stats = _judged_step(4, rows=1, defect=nan_code)
+    assert stats.worst_cell(stats.cell_bytes)[0] > tie_out.GDN_CELL_BYTES, "one byte of a head per call is inside both byte shares"
+    assert not stats.ok and not stats.finite and "NON-FINITE VALUES" in stats.line()
+
+    def multiply(out, ref):
+        stats = tie_out.BlockStats("bf16_rounding")
+        tie_out.BlockTap._judge(stats, (out,), (ref,), [], [])
+        return stats
+
+    ref = torch.tensor([[1.0, -2.0, 0.5, 100.0]], dtype=torch.bfloat16)
+    one_unit, two_units, nan, infinite = (ref.clone() for _ in range(4))
+    one_unit[0, 0], two_units[0, 0], nan[0, 2], infinite[0, 3] = 1.0 + 2.0**-7, 1.0 + 2.0**-6, float("nan"), float("inf")
+    assert multiply(ref.clone(), ref).ok and multiply(one_unit, ref).ok and multiply(one_unit, ref).worst_units == 1.0
+    assert not multiply(two_units, ref).ok and multiply(two_units, ref).worst_units == 2.0
+    for out in (nan, infinite):
+        stats = multiply(out, ref)
+        assert not stats.ok and not stats.finite and "NON-FINITE VALUES" in stats.line(), stats.line()
+    assert "largest distance nan" in multiply(nan, ref).line()
+
+
+def test_the_token_check_has_a_declared_band_and_can_fail():
+    """The logits band is declared in bf16 units of the run's largest reference logit, not taken from the run's own distance:
+    a band that follows the distance forces the tokens to be equal at every decidable step and can never fail."""
+    from model_samples import tie_out
+    from model_samples.qwen_dense import QwenDense, configs
+    from model_samples.sampling import greedy
+
+    assert QwenDense.reduced(2).logits_band_units == configs.LOGITS_BAND_UNITS == 4.0
+    logits = torch.tensor([[[64.0, 1.0, 0.0, -3.0]], [[2.0, 70.0, 69.5, 0.0]]], dtype=torch.bfloat16)  # 2 steps of 1 sequence
+    ids = torch.stack([greedy(step) for step in logits])
+    held, text = tie_out.token_check(logits, logits.clone(), ids, ids.clone(), 2.0)
+    # the largest logit is 70: one bf16 unit there is 0.5, the band is 1, and a margin must exceed 2 to decide a step
+    assert held and "1 of 1 decidable" in text and "1 near-ties" in text and "[band: 2 units = 1, declared]" in text, text
+
+    def moved(by, step=0, at=1):
+        out = logits.clone()
+        out[step, 0, at] += by
+        return out
+
+    assert tie_out.token_check(moved(1.0), logits, ids, ids, 2.0)[0], "two units: inside"
+    held, text = tie_out.token_check(moved(1.5), logits, ids, ids, 2.0)
+    assert not held and "1 of 1 decidable" in text and "largest logit distance 1.5 = 3.00 bf16 units" in text, text
+    other = ids.clone()
+    other[1, 0] = 2
+    assert tie_out.token_check(logits, logits, other, ids, 2.0)[0], "another token at a near-tie is counted, not failed"
+    other[0, 0] = 3
+    held, text = tie_out.token_check(logits, logits, other, ids, 2.0)
+    assert not held and "0 of 1 decidable" in text, text
+    held, text = tie_out.token_check(moved(float("nan"), step=1, at=3), logits, ids, ids, 2.0)
+    assert not held and "NON-FINITE LOGITS" in text, text
+
+
+def _checked_run(sequences, step_defect=None, multiply_defect=None):
+    """One decode of the tiny geometry on the CPU through the ``fe-cublas`` rows and the sample's checks of it.  Every provider
+    of that stack is replaced by a stand-in that runs the reference's own arithmetic under another type -- the tie-out then
+    judges it with the row's band, and a clean run is exact on any host -- plus a deliberate defect."""
+    import model_samples
+    from model_samples import blocks, tie_out
+    from model_samples.providers import factories, torch_ref
+
+    class Step(torch_ref.GdnDecodeStep):
+        def __call__(self, x, z, hidden, slot_ids, params, slots):
+            out = super().__call__(x, z, hidden, slot_ids, params, slots)
+            if step_defect is not None:
+                step_defect(out.codes.view(x.shape[0], params.value_heads, params.head_dim), slot_ids, slots)
+            return out
+
+    class Multiply(torch_ref.Linear):
+        def __call__(self, qx, weight):
+            product = super().__call__(qx, weight)
+            return product if multiply_defect is None else multiply_defect(product, weight)
+
+    class GateUp(torch_ref.GateUp):
+        pass
+
+    stand_ins = {"fe.gdn_decode_fused": Step, "cublas.bf16_dequantized": Multiply, "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": GateUp}
+    model = _tiny_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16)
+    facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)  # a class on which the fused step's batch invariance is a gate
+    options = {"reference_precision": "fp64", "device": "cpu"}
+    session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=dict(factories(), **stand_ins))
+    session.load()
+    prompts = [text.encode("ab" + str(s)) for s in range(sequences)]
+    ids = session.prefill(prompts)
+    session.read(ids)
+    for _ in range(4):
+        ids = session.step(ids)
+        session.read(ids)
+    return tie_out.run_checks(session, prompt_tokens=3)
+
+
+def _line(checks, start):
+    return next(line for line in checks.lines if line.strip().startswith(start))
+
+
+def test_the_checks_of_a_run_hold_on_exact_stand_ins_and_fail_on_a_nan():
+    clean = _checked_run(2)
+    assert clean.ok, clean.text()
+    assert "6 of 6 provider blocks inside their bands" in clean.text() and "linear_attention.step equal (gated)" in clean.text()
+    assert "largest logit distance 0 = 0.00 bf16 units" in _line(clean, "tokens") and _line(clean, "tokens").endswith("PASS")
+
+    def nan_in_the_down_projection(product, weight):  # one element of one multiply, at every call
+        if weight.data.shape == (64, 96):
+            product = product.clone()
+            product[-1, 3] = float("nan")
+        return product
+
+    checks = _checked_run(2, multiply_defect=nan_in_the_down_projection)
+    assert not checks.ok, checks.text()
+    assert "NON-FINITE VALUES" in _line(checks, "mlp.down") and _line(checks, "mlp.down").endswith("FAIL")
+    assert "NON-FINITE LOGITS" in _line(checks, "tokens") and _line(checks, "tokens").endswith("FAIL")
+    assert _line(checks, "replay").endswith("PASS"), "the bytes of a NaN replay: only a finite check sees it"
+
+    def nan_in_one_head_of_the_state(codes, slot_ids, slots):
+        slots.state[int(slot_ids[-1]), 1, 2, 3] = float("nan")
+
+    checks = _checked_run(2, step_defect=nan_in_one_head_of_the_state)
+    assert not checks.ok and "NON-FINITE VALUES" in _line(checks, "linear_attention.step"), checks.text()
+
+
+def test_batch_invariance_covers_every_sequence_of_the_batch():
+    """The sequence that runs alone rotates with the step, so a row other than the first that reads its neighbour is seen."""
+
+    def last_row_reads_its_neighbour(codes, slot_ids, slots):
+        if codes.shape[0] > 1:
+            codes[-1, 0, 0] ^= 0x01 | (codes[-2, 0, 0] & 0x02)
+
+    checks = _checked_run(3, step_defect=last_row_reads_its_neighbour)
+    line = _line(checks, "batch invariance")
+    assert not checks.ok and "one sequence alone vs among 3 (step t: sequence t mod 3)" in line, checks.text()
+    assert "linear_attention.step DIFFERS (gated)" in line and "linear_attention.step (2 of 7 calls)" in line and line.endswith("FAIL"), line
