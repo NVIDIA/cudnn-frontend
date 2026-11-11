@@ -216,6 +216,7 @@ def _cfg(**kw):
         (dict(TMEM_COLS=48), "TMEM_COLS"),
         (dict(TMEM_COLS=16), "TMEM_COLS"),
         (dict(PDL=1), "PDL"),
+        (dict(HOLD_TMEM=None), "HOLD_TMEM"),
         (dict(STAGES=16, ROWS=17, TOKEN_TILE=32, SMEM_OPTIN_BYTES=100 * 1024), "opt-in"),
         (dict(SMEM_OPTIN_BYTES=0), "positive int"),
         (dict(SMEM_PER_SM_BYTES=1024, SMEM_OPTIN_BYTES=2048), "cannot exceed"),
@@ -347,6 +348,8 @@ def test_binding_check_requires_every_operand_on_the_given_device():
 def test_host_entry_keeps_the_reference_readings_and_a_given_form_overrides_the_pick():
     k = entry.Fp8ProjectionDecode("cpu", G_IN)
     assert k.split_k == 4 and k.numerics == C_IN4 and k.form is None and k.device_cc is None
+    assert not any(c.HOLD_TMEM for c in k.cfgs.values()) and entry.Fp8ProjectionDecode("cpu", G_IN, form=Form(HOLD_TMEM=True)).cfg_for(9).HOLD_TMEM
+    assert k.cfg_for(9).FORM == Form(MMA_M=64, STAGES=7, TMEM_COLS=32, TOKEN_TILE=16, PREWAIT_WEIGHTS=True, HOLD_TMEM=False)
     assert k.readings == dict(SMEM_PER_SM_BYTES=233472, SMEM_OPTIN_BYTES=232448, SM_COUNT=152)
     assert (k.cfg_for(1).STAGES, k.cfg_for(4).STAGES, k.cfg_for(5).STAGES, k.cfg_for(32).STAGES) == (11, 11, 7, 7)
     assert sorted(k.cfgs) == list(range(1, 33)), "every served row count is resolved and validated at construction"
@@ -586,6 +589,8 @@ FORM_ARMS = [
     dict(form=Form(MMA_M=64, STAGES=8, TOKEN_TILE=16)),
     dict(form=Form(MMA_M=64, STAGES=6, TOKEN_TILE=32)),
     dict(form=Form(MMA_M=64, STAGES=4, PREWAIT_WEIGHTS=False), pdl=True),
+    dict(form=Form(MMA_M=64, STAGES=7, HOLD_TMEM=True)),
+    dict(form=Form(MMA_M=64, STAGES=7, HOLD_TMEM=True), pdl=True),
     dict(pdl=True),
     dict(pdl=True, pdl_release=False),
     dict(pdl_release=True),
@@ -596,7 +601,8 @@ FORM_ARMS = [
 @pytest.mark.parametrize("numerics", CLASSES, ids=cid)
 def test_performance_arms_write_the_default_bytes(numerics, arm):
     """No performance knob changes a byte: ring depths from two stages up (two to nine CTAs per SM), the wider weight tile, more tensor-memory
-    columns, a token tile wider than the rows need, the weight loader waiting too, the dependent-launch attribute and the release."""
+    columns, a token tile wider than the rows need, the weight loader waiting too, the tensor memory held until its registers are
+    consumed, the dependent-launch attribute and the release."""
     dev = device_or_skip()
     ops = _ops(dev, numerics.GEOM, "wide")
     default, other = _entry(dev, numerics), _entry(dev, numerics, **arm)

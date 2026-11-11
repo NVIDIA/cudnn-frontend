@@ -11,9 +11,10 @@ TWO KINDS OF KNOBS, kept in two types so that one can never reach the other:
   accumulation: the K axis is cut into ``SPLIT_K`` equal slices (one CTA of a cluster each), every slice is one tensor-core chain over its
   128-element K tiles in ascending K, the slice sums are added in slice order, the sum is scaled and cast once.  ``SPLIT_K`` therefore
   changes the fp32 association: it is fixed for the life of a host entry and is never a function of the row count.
-* ``Form(MMA_M, STAGES, TMEM_COLS, TOKEN_TILE, PREWAIT_WEIGHTS)`` -- performance only: the weight rows per CTA, the depth of the operand
-  ring, the tensor-memory columns a CTA allocates, the token tile and whether the weight stream runs ahead of the dependent-launch wait.
-  None of them enters a sum.  :func:`pick` returns a ``Form`` and nothing else, so a pick cannot change the split.
+* ``Form(MMA_M, STAGES, TMEM_COLS, TOKEN_TILE, PREWAIT_WEIGHTS, HOLD_TMEM)`` -- performance only: the weight rows per CTA, the depth of
+  the operand ring, the tensor-memory columns a CTA allocates, the token tile, whether the weight stream runs ahead of the
+  dependent-launch wait and when the epilogue releases the tensor memory.  None of them enters a sum.  :func:`pick` returns a ``Form``
+  and nothing else, so a pick cannot change the split.
 
 ``Cfg`` is one compiled rendering: a ``Numerics``, a ``Form`` resolved for one row count, the launch knobs and the part's readings.
 
@@ -129,13 +130,17 @@ class Form:
     ``TMEM_COLS``: tensor-memory columns a CTA allocates (0 = the smallest granule holding the token tile, which is 32 at every served
     tile).  ``TOKEN_TILE``: 0 = the smallest of 8 / 16 / 32 holding the call's rows; 8 / 16 / 32 = a floor (a wider tile than the rows
     need).  ``PREWAIT_WEIGHTS``: under dependent launch the weight loader does not wait for the predecessor (the weights are never a
-    predecessor's output); False = every loader waits, the control arm."""
+    predecessor's output); False = every loader waits, the control arm.  ``HOLD_TMEM``: False = the epilogue releases the tensor memory
+    right after its accumulator read and that read's ``tcgen05.wait`` (the deallocation then overlaps the reduction); True = it holds the
+    columns until every register read from them is consumed and releases them as the last instruction of its role, which moves the
+    deallocation behind the output store (the CTA ends that much later)."""
 
     MMA_M: int = 64
     STAGES: int = 7
     TMEM_COLS: int = 0
     TOKEN_TILE: int = 0
     PREWAIT_WEIGHTS: bool = True
+    HOLD_TMEM: bool = False
 
 
 def token_tile_for(rows: int, floor: int = 0) -> int:
@@ -193,6 +198,7 @@ class Cfg:
     TOKEN_TILE: int = 8
     TMEM_COLS: int = 32
     PREWAIT_WEIGHTS: bool = True
+    HOLD_TMEM: bool = False
     PDL: bool = False
     PDL_RELEASE: bool = False
     SMEM_PER_SM_BYTES: int = SM100_SMEM_PER_SM_BYTES
@@ -205,7 +211,7 @@ class Cfg:
 
     @property
     def FORM(self) -> Form:
-        return Form(self.MMA_M, self.STAGES, self.TMEM_COLS, self.TOKEN_TILE, self.PREWAIT_WEIGHTS)
+        return Form(self.MMA_M, self.STAGES, self.TMEM_COLS, self.TOKEN_TILE, self.PREWAIT_WEIGHTS, self.HOLD_TMEM)
 
     @property
     def N(self) -> int:
@@ -334,7 +340,7 @@ def validate_cfg(cfg: Cfg) -> None:
             f"{NAME}: a ({cfg.MMA_M}, {cfg.TOKEN_TILE}) tile gives {cfg.VALUES_PER_THREAD} values per epilogue thread; the cluster reduction "
             f"ships them {REMOTE_STORE_VALUES} at a time"
         )
-    for name in ("PREWAIT_WEIGHTS", "PDL", "PDL_RELEASE"):
+    for name in ("PREWAIT_WEIGHTS", "HOLD_TMEM", "PDL", "PDL_RELEASE"):
         if not isinstance(getattr(cfg, name), bool):
             raise ValueError(f"{NAME}: {name} must be a bool, got {getattr(cfg, name)!r}")
     part_readings(cfg.SMEM_PER_SM_BYTES, cfg.SMEM_OPTIN_BYTES, cfg.SM_COUNT)
@@ -372,6 +378,7 @@ def resolve_form(numerics: Numerics, rows: int, form: Form, readings: Dict[str, 
         TOKEN_TILE=token_tile,
         TMEM_COLS=form.TMEM_COLS if form.TMEM_COLS else tmem_cols_for(token_tile),
         PREWAIT_WEIGHTS=form.PREWAIT_WEIGHTS,
+        HOLD_TMEM=form.HOLD_TMEM,
         PDL=pdl,
         PDL_RELEASE=pdl_release,
         **readings,

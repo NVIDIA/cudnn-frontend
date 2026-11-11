@@ -23,10 +23,10 @@ that a one-row activation keeps a 2-D tensor map (the source: fully dynamic layo
 configuration uses (the source: the whole per-CTA capacity); (5) the tensor-memory allocation is the configuration's ``TMEM_COLS`` (the
 source: 256 columns), so that every CTA the launcher places on an SM also gets its columns; (6) a control arm in which the weight loader
 waits for the predecessor too (``PREWAIT_WEIGHTS`` off; the source never waits on the weight loader); (7) the dependent-launch wait and
-the release of the successor are two knobs; (8) the epilogue releases the tensor memory after it has consumed the registers it read
-from it (the source: right after the read) and rank 0 arms the reduction barrier at the top of its epilogue role (the source: after
-the read); (9) named barrier counts and the cuDNN symbol prefix.  Not carried: the source's own configuration validation and autotune
-list, its batched views, split-K 3.
+the release of the successor are two knobs; (8) rank 0 arms the reduction barrier at the top of its epilogue role (the source: after
+its accumulator read), and ``HOLD_TMEM`` lets the epilogue hold the tensor memory until it has consumed the registers it read from it
+(off = the source's order: released right after the read); (9) named barrier counts and the cuDNN symbol prefix.  Not carried: the
+source's own configuration validation and autotune list, its batched views, split-K 3.
 
 COORDINATES.  Kernel M = the weight rows ``N`` (``MMA_M`` 64 or 128 per CTA), kernel N = the token rows (one token tile of 8 / 16 / 32
 per CTA; rows past ``rows`` are outside the activation's tensor map and load as zeros), kernel K = ``K`` in 128-element K tiles.  Grid
@@ -63,10 +63,11 @@ BARRIER TABLE (all ``cta_group::1``; ``SUM(issuing lanes) == init`` on every pat
                             128 epilogue threads, before they read the accumulator.
   bar_tmem_alloc            init TMEM_BAR_ARRIVERS = 32 + 128, a rendezvous with two phases.  Phase 0: warp 2's 32 lanes after
                             ``tcgen05.alloc`` + the 128 epilogue threads at entry; waited by the epilogue threads (the tensor-memory base
-                            pointer is published).  Phase 1: warp 2's 32 lanes after the last commit + the 128 epilogue threads as the
-                            LAST instruction of their role, after every use of the registers the tensor-memory read filled (the remote
-                            stores on ranks >= 1; the reduction, the scale and the output store on rank 0): the columns are released
-                            only once what was read from them is consumed.  Waited by warp 2, which then deallocates.  Warp 2's phase-1
+                            pointer is published).  Phase 1: warp 2's 32 lanes after the last commit + the 128 epilogue threads right
+                            after their accumulator read and its ``tcgen05.wait`` (the read is complete before the columns can be
+                            deallocated) or, under ``HOLD_TMEM``, as the LAST instruction of their role, after every use of the
+                            registers that read filled (the remote stores on ranks >= 1; the reduction, the scale and the output
+                            store on rank 0).  Waited by warp 2, which then deallocates.  Warp 2's phase-1
                             wait is a parity wait: it is correct because the epilogue's 128 entry arrivals (the first instructions of
                             their role) land long before warp 2 has issued its last K tile.
   bar_reduce (SPLIT_K > 1)  init REDUCE_BAR_ARRIVERS = 1 in every CTA, waited on rank 0 only.  Arrive: rank 0, epilogue thread 0,
@@ -97,7 +98,10 @@ SMEM BUFFER TABLE (allocation order = ``smem_bytes`` of the config, which the la
 
 TENSOR MEMORY.  Warp 2 allocates ``TMEM_COLS`` columns at entry (the accumulator is one column per token row; 32 is the allocation
 granule and the default at every token tile) and deallocates the same constant after the rendezvous.  An SM has 512 columns; the config
-declines a form whose shared-memory co-residency times ``TMEM_COLS`` exceeds them.
+declines a form whose shared-memory co-residency times ``TMEM_COLS`` exceeds them.  By default the epilogue releases the columns right
+after ``tcgen05.ld`` + ``tcgen05.wait``, so the deallocation overlaps rank 0's wait for its peers while the loaded registers are
+still unread; ``HOLD_TMEM`` releases them only after the last use of those registers, at the price of a deallocation that starts
+after the output store.
 
 PDL SITES.  ``PDL``: the launch carries the programmatic-stream-serialization attribute; warp 1 issues ``griddepcontrol.wait`` as its
 first instruction, i.e. BEFORE every read of ``activation``.  Above that wait run the barrier inits, the cluster sync, warp 2's
@@ -204,6 +208,7 @@ class Fp8ProjectionDecodeKernel:
         self.pdl_release = cfg.PDL_RELEASE
         self.prewait_weights = cfg.PREWAIT_WEIGHTS
         self.tmem_cols = cfg.TMEM_COLS
+        self.hold_tmem = cfg.HOLD_TMEM
         self.shared_bytes = cfg.SMEM_BYTES
 
         self.threads_per_cta = THREADS_PER_CTA
@@ -530,8 +535,11 @@ class Fp8ProjectionDecodeKernel:
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
-        # tcgen05.wait: the tensor-memory read is complete before the registers are used.
+        # tcgen05.wait: the tensor-memory read is complete before the columns are released and before the registers are used.
         cute.arch.fence_view_async_tmem_load()
+        if cutlass.const_expr(not self.hold_tmem):
+            # Release the tensor memory now: its deallocation overlaps the reduction.
+            cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         # Ranks >= 1 ship their fp32 partial sums to rank 0; rank 0 adds them in rank order and stores.
         if cutlass.const_expr(self.split_k > 1):
@@ -560,9 +568,10 @@ class Fp8ProjectionDecodeKernel:
             # The copy keeps the accumulator's coordinates and predicates the rows past the output's bounds.
             cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
-        # Release the tensor memory LAST: every use of the accumulator registers (the remote stores on ranks >= 1, the reduction,
-        # the scale and the output store on rank 0) is above this arrive, so the columns are still this CTA's while they are consumed.
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)
+        if cutlass.const_expr(self.hold_tmem):
+            # Release the tensor memory LAST: every use of the accumulator registers (the remote stores on ranks >= 1, the reduction,
+            # the scale and the output store on rank 0) is above this arrive, so the columns are still this CTA's while they are consumed.
+            cute.arch.mbarrier_arrive(bar_tmem_alloc)
         # The peers' stores have a register source and rank 0 waited their bytes: no cluster barrier at exit.
 
 

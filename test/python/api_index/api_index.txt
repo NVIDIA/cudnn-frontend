@@ -743,6 +743,7 @@ cudnn.gemm.MhcProjectionBackward.compile
 cudnn.gemm.MhcProjectionBackward.execute
 cudnn.gemm.MhcProjectionBackward.scratch_workspace_bytes
 cudnn.gemm.ProjectionForm
+cudnn.gemm.ProjectionForm.HOLD_TMEM
 cudnn.gemm.ProjectionForm.MMA_M
 cudnn.gemm.ProjectionForm.PREWAIT_WEIGHTS
 cudnn.gemm.ProjectionForm.STAGES
