@@ -39,7 +39,13 @@
         "row_grad",
         "gemm_dx",
         "gemm_dw_acc"
-      ]
+      ],
+      "local_modifications": {
+        "cake_backend.py": {
+          "blob": "1bf364ff59e7bcb98f3a0f518c76d896b5987ea7",
+          "reason": "Initialize host temporaries explicitly for CodeQL; preserve chunk views and gradient finalization."
+        }
+      }
     }
   }
 }

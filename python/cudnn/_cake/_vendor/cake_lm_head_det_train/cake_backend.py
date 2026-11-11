@@ -204,6 +204,7 @@ This module reads no environment variable.
 FlashInfer's public wrapper (``flashinfer.cake_lm_head_det_train``) owns the A/B
 environment variables of the first six and passes the resolved values down;
 it leaves the log-probability arms at their defaults.
+cuDNN Frontend modification: initialize host temporaries explicitly for CodeQL.
 """
 
 from __future__ import annotations
@@ -5687,6 +5688,7 @@ def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, 
     stop = row0 + rows_c
     base = base_stage(stage) if stage in GEMM_STAGES else stage
     logits = t["logits"]
+    x_chunk = None
     if base in LOGITS_BASES or base == "gemm_dw_acc" or base in DW_CAST_STAGES:
         x_chunk = t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]
         if t.get("x_last") is not None and index == plan.num_chunks - 1:
@@ -10667,7 +10669,9 @@ def backward_logprob_keep(
     _check_output(lse, "lse", (rows,), torch.float32)
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
-    dx_cast = not (fused_dx and row_index is not None)
+    dx_cast = True
+    if fused_dx and row_index is not None:
+        dx_cast = False
     cache = BINDING_CACHE
     key = None
     binding: Optional[_KeptBinding] = None
