@@ -53,7 +53,7 @@ def run(case, backward=False, seeded=False, **kwargs):
     )
 
 
-def reference(case, backward=False, seeded=False):
+def reference(case, backward=False, seeded=False, scale=128**-0.5):
     """Independent FP64 recurrence; CPU input construction also fixes golden inputs."""
     x = {name: value.double() for name, value in case.items() if name != "cu"}
     bounds = case["cu"].tolist()
@@ -65,7 +65,7 @@ def reference(case, backward=False, seeded=False):
         for t in range(end - 1, start - 1, -1) if backward else range(start, end):
             k, decay, beta = x["k"][t], x["g"][t].exp(), x["beta"][t]
             if backward:
-                state = state + x["dO"][t, :, :, None] * x["q"][t, :, None, :] * 128**-0.5
+                state = state + x["dO"][t, :, :, None] * x["q"][t, :, None, :] * scale
                 state = (state - beta[:, None, None] * (state * k[:, None, :]).sum(-1, keepdim=True) * k[:, None, :]) * decay[:, None, :]
                 transition = (transition - beta[:, None, None] * (transition * k[:, None, :]).sum(-1, keepdim=True) * k[:, None, :]) * decay[:, None, :]
             else:
@@ -363,3 +363,128 @@ def test_backward_summary_matches_fp64_autograd():
     (expected,) = torch.autograd.grad(loss, seed)
     actual, _ = run(x, backward=True, seeded=True)
     torch.testing.assert_close(actual.double(), expected, atol=2e-6, rtol=3e-5)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
+@pytest.mark.parametrize("gate", [0.0, -1e-8, -0.001, -0.2, -5.0, "varying", "mixed-steep"], ids=str)
+def test_tiled_summary_boundaries_and_gate_range(backward, gate):
+    x = make_case((0, 1, 15, 16, 17, 31, 32, 33, 65), heads=2)
+    if isinstance(gate, str):
+        rng = torch.Generator().manual_seed(871)
+        x["g"].copy_(-torch.rand(x["g"].shape, generator=rng).cuda() * 0.3)
+        x["beta"].copy_(torch.rand(x["beta"].shape, generator=rng).cuda())
+        if gate == "mixed-steep":
+            # A huge gate must not erase later small gates through prefix subtraction.
+            x["g"][::17, :, ::7] = -1e8
+    else:
+        x["g"].fill_(gate)
+    for got, ref in zip(run(x, backward, seeded=True), reference(x, backward, seeded=True)):
+        assert torch.isfinite(got).all()
+        torch.testing.assert_close(got.double(), ref, atol=2e-6, rtol=3e-5)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
+def test_long_summary_and_large_seed(backward):
+    for length, gate, magnitude in ((1024, -0.001, 0.1), (65, -5.0, 70000.0)):
+        x = make_case((length,), heads=2, gate=gate)
+        x["state"].fill_(magnitude)
+        for got, ref in zip(run(x, backward, seeded=True), reference(x, backward, seeded=True)):
+            torch.testing.assert_close(got.double(), ref, atol=2e-6, rtol=3e-5)
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.125, 0.5])
+def test_reverse_summary_scale(scale):
+    x = make_case((17, 0, 33), heads=1)
+    actual = run(x, backward=True, seeded=True, scale=scale)
+    expected = reference(x, backward=True, seeded=True, scale=scale)
+    for got, ref in zip(actual, expected):
+        torch.testing.assert_close(got.double(), ref, atol=2e-6, rtol=3e-5)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
+def test_changed_gate_capture_and_input_independence(backward, cudnn_handle):
+    x = make_case((17, 0, 65), heads=2)
+    original = {name: x[name].clone() for name in ("q", "v", "dO", "state")}
+    graph, _, state_t, transition_t, bindings, state, trans = make_graph(x, backward)
+    workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    saved_stream = cudnn.get_stream(cudnn_handle)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.execute(bindings, workspace, handle=cudnn_handle)
+        torch.cuda.current_stream().wait_stream(stream)
+        with torch.cuda.graph(capture, stream=stream):
+            graph.execute(bindings, workspace, handle=cudnn_handle)
+        for gate in (-0.001, -5.0, -0.001):
+            for name, value in original.items():
+                x[name].copy_(value)
+            x["g"].fill_(gate)
+            x["cu"].copy_(torch.tensor([0, 15, 48, 82], dtype=torch.int32, device="cuda"))
+            capture.replay()
+            for got, ref in zip((state, trans), reference(x, backward, seeded=True)):
+                torch.testing.assert_close(got.double(), ref, atol=2e-6, rtol=3e-5)
+            expected_m = trans.clone()
+            x["v"].mul_(-128)
+            x["dO"].mul_(-128)
+            x["q"].neg_()
+            x["state"].mul_(-3)
+            capture.replay()
+            assert_bitwise({"transition": trans}, {"transition": expected_m})
+    finally:
+        capture.reset()
+        cudnn.set_stream(cudnn_handle, saved_stream)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
+def test_current_empty_input_does_not_alias_output(backward, cudnn_handle):
+    x = make_case((0,), heads=1)
+    graph, tensors, _, _, bindings, state, _ = make_graph(x, backward)
+    # A zero-length view can carry a nonnull address inside a live output allocation.
+    # It has no addressed elements, so it must not fail the output alias guard.
+    from cudnn.frost.buffers import DeviceView
+
+    bindings[tensors["k"]] = DeviceView(state.data_ptr() + 32, (0, 1, 128), "bfloat16", state.device.index)
+    workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+    saved_stream = cudnn.get_stream(cudnn_handle)
+    try:
+        cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+        graph.execute(bindings, workspace, handle=cudnn_handle)
+        torch.testing.assert_close(state, x["state"])
+    finally:
+        cudnn.set_stream(cudnn_handle, saved_stream)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
+def test_physical_wide_token_stride(backward):
+    # A wrapped uint32 element address lands in poisoned slack, not another
+    # live row. Only the two logical rows are initialized/read by the test.
+    x = make_case((2,), heads=1)
+    stride = 2**32 + 128
+    needed = (stride + 128) * 2
+    free, _ = torch.cuda.mem_get_info()
+    if free < needed + 2**30:
+        pytest.skip("requires 9 GiB free for a physical BF16 stride above uint32")
+    storage = torch.empty(stride + 128, dtype=torch.bfloat16, device="cuda")
+    storage[128:512].fill_(float("nan"))
+    wide = storage.as_strided(x["k"].shape, (stride, 128, 1))
+    wide.copy_(x["k"])
+    x["k"] = wide
+    for got, ref in zip(run(x, backward, seeded=True), reference(x, backward, seeded=True)):
+        torch.testing.assert_close(got.double(), ref, atol=2e-6, rtol=3e-5)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["fwd", "bwd"])
+def test_zero_sequences_do_not_launch(backward, cudnn_handle, monkeypatch):
+    x = make_case(())
+    graph, _, _, _, bindings, state, trans = make_graph(x, backward)
+    from cudnn.linear_attention.cake import compiler
+
+    def no_launch(*args, **kwargs):
+        raise AssertionError("zero sequences must not launch a kernel")
+
+    monkeypatch.setattr(compiler, "launch", no_launch)
+    graph.execute(bindings, torch.empty(0, dtype=torch.uint8, device="cuda"), handle=cudnn_handle)
+    assert state.shape == trans.shape == (0, 2, 128, 128)

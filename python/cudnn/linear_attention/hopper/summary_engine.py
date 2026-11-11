@@ -3,11 +3,12 @@
 
 """FP32 KDA span summaries on SM90, independent of the BF16-MMA apply path.
 
-One warp owns a state/transition row throughout a sequence. Transition rows
-start from identity and never read V or the caller's boundary state. This is
-essential: subtracting ordinary forwards F(I,V)-F(0,V) amplifies the rounding
-of their BF16 state operands. This correctness path is sequential in tokens;
-it does not change the ordinary KDA forward/backward kernels.
+One warp owns a state/transition row throughout a sequence. A 512-thread CTA
+shares each 16-token tile's keys and decay factors across 16 state rows, keeping
+the direct FP32 recurrence's operation order. Transition rows start from
+identity and never read V/dO or the caller's boundary state. Subtracting
+ordinary forwards F(I,V)-F(0,V) instead amplifies BF16 operand rounding.
+The ordinary KDA forward/backward kernels are unchanged.
 """
 
 import math
@@ -50,7 +51,7 @@ def check_contract(facts, node):
         decline("requires BF16 THD inputs")
     if facts.d_qk != 128 or facts.d_v != 128 or not (facts.h_q == facts.h_k == facts.h_v == facts.h_o):
         decline("requires K=V=128 and equal head counts")
-    if facts.h_o <= 0 or facts.n_seq < 0 or facts.total_t < 0 or facts.h_o * facts.n_seq * 64 >= 2**31:
+    if facts.h_o <= 0 or facts.n_seq < 0 or facts.total_t < 0 or facts.h_o * facts.n_seq * 16 >= 2**31:
         decline("invalid dimensions or CUDA grid exceeds signed-int32 range")
     if not facts.gates_at_ho or facts.gate_channels != 128:
         decline("requires g [T,H,128] and beta [T,H]")
@@ -105,7 +106,7 @@ class KdaSummaryHopperPlan(CompiledPlan):
         self.cu64 = facts.cu_dtype == cudnn.data_type.INT64
         self.ports = None
         self.library = _library(self.device)
-        self.function = self.library.function("kda_summary_bwd" if self.is_bwd else "kda_summary_fwd")
+        self.function = self.library.function("cudnn_kda_summary_bwd" if self.is_bwd else "cudnn_kda_summary_fwd")
 
     def get_workspace_size(self):
         return 0
@@ -152,7 +153,7 @@ class KdaSummaryHopperPlan(CompiledPlan):
             x[name] = (ptr, (0,) * (4 - len(strides)) + strides)
         for i, (name, start, end) in enumerate(spans):
             for other, lo, hi in spans[:i]:
-                if start < hi and lo < end and (name in self.outputs or other in self.outputs):
+                if start < end and lo < hi and start < hi and lo < end and (name in self.outputs or other in self.outputs):
                     raise ValueError(f"{self.plan_name}: {name} overlaps {other}")
         params = compiler.Params()
         names = (
@@ -172,10 +173,10 @@ class KdaSummaryHopperPlan(CompiledPlan):
             for stride in strides:
                 params.i64(stride)
         params.i32(self.heads).i32(int(self.cu64)).f32(self.scale)
-        groups = 64 if "transition" in x else 32
+        groups = 16 if "transition" in x else 8
         if self.seqs:
             with device_context(self.device):
-                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (128, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
+                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (512, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
 
 
 class KdaSummaryHopperCudaEngine(BaseEngine):
