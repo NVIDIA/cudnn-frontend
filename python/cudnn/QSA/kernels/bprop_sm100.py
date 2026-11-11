@@ -46,14 +46,13 @@ LOG2E = 1.4426950408889634
 NTHREADS = 512
 # Blocks per chunk fill 8 * CHB of the 128 MMA rows. With the K and V tiles copied on to TMEM, 12 blocks leave room
 # for a 3-stage K ring with one dS^T part (2 stages with three). Rows past 8 * CHB alias the next region and are
-# masked out. With one KV head every K^T atom of the dQ^T MMA holds 4 alien rows (the next 512 B, cancelled by zero
-# dS^T rows), and 0 * NaN would poison every column: the softmax warps zero the rows of the chunk the MMA must not
-# see, and the 512 B after a stage, which its last K-step reads the same way, never hold K or V (see the layout below).
+# masked out. The dQ^T MMA reads K^T from TMEM in K-steps of two slots, so no alien row reaches it; the softmax warps
+# zero a nonfinite K row in SMEM before the copy warps transpose it, since 0 * NaN would poison the paired query.
 CHB = 12
 
-# shared memory of the query-major kernel (bytes from a 1024-aligned base): [K0][pad][K1][dO][K2][Q][V][dS] with one
-# dS^T part, [K0][pad][K1][dO][Q][V][dS x 3] with three (the third K stage, which lets K(c+1) stream in while S(c),
-# dP(c) and dQ(c-1) run, pays for the parts).
+# shared memory of the query-major kernel (bytes from a 1024-aligned base): [K0][K1][dO][K2][Q][V][dS] with one dS^T
+# part, [K0][K1][dO][Q][V][dS x 3] with three (the third K stage, which lets K(c+1) stream in while S(c), dP(c) and
+# dQ(c-1) run, pays for the parts).
 # A chunk slot is 8 MMA rows in 4 KB: one block of one query with two KV heads (row = 2 * token + head, one SW128 box)
 # or the same block number of two consecutive queries with one KV head (row = 4 * query + token, two 2 KB boxes).
 BLK_SMEM = 4096
@@ -61,13 +60,10 @@ SLAB = 1024
 HALF_BLK = 2048
 K_STAGE = CHB * BLK_SMEM  # blocks sit at the 8-row-group stride of the MMA operand
 PAIR_HALF = CHB * HALF_BLK + 512  # one query's boxes of a K / V stage plus 512 B: the two queries' rows take complementary SW128 phases
-# A zero pad, dO and Q separate the K stages, so the alien rows of a stage's last K-step never hold the next chunk's
-# K (a nonfinite block there would reach the previous chunk's pair). Every region stays 1024-aligned: a stage that
-# starts 512 B into its swizzle span is slower, and the budget holds one aligned pad, not three.
+# Every region stays 1024-aligned (the swizzle of TMA and tcgen05 follows the absolute SMEM address).
 QSLAB = 3072
 Q_BYTES = 4 * QSLAB  # [4 slabs][24 rows x 128 B] with SW128: rows 0-11 are KV head 0 / the first query of the pair
 OFF_K = 0
-GAP01 = 1024  # the zero pad between stages 0 and 1
 GAP12 = Q_BYTES  # dO sits between stages 1 and 2
 DS_BYTES = CHB * 384  # one bf16 part of dS^T, the B operand of dQ^T: 8 key rows x 48 B per slot, rows in the key order of the K^T columns
 
@@ -105,7 +101,7 @@ def _query_layout(parts, pair):
     # K stage count and size, and the dO, Q, V and dS offsets of the query-major kernel
     nks = 3 if parts == 1 else 2
     ks = _k_stage(pair)
-    off_do = OFF_K + 2 * ks + GAP01
+    off_do = OFF_K + 2 * ks
     off_q = off_do + GAP12 + (nks - 2) * ks
     off_v = off_q + Q_BYTES
     return nks, ks, off_do, off_q, off_v, off_v + ks
@@ -218,7 +214,7 @@ def _chunk_bytes(nblk_0, nblk_1, c, PAIR: cutlass.Constexpr[bool]):
 @cute.jit
 def _koff(st, ks):
     # byte offset of K stage st (of ks bytes) from OFF_K: the regions between the stages differ in size
-    return st * ks + ((st + 1) >> 1) * GAP01 + (st >> 1) * GAP12
+    return st * ks + (st >> 1) * GAP12
 
 
 @cute.jit
