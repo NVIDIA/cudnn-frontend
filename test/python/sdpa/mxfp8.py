@@ -32,6 +32,7 @@ from .softmax_knobs import LN2, prefold_factor
 # primitives is covered by test_mxfp8_quant.py (which only runs when TE is
 # installed).
 from .mxfp8_quant import (
+    pack_thd_columnwise_sf,
     quantize_to_mxfp8,
 )  # noqa: F401  (re-exported; mxfp8_ref imports it from here)
 
@@ -578,7 +579,7 @@ def _quantize_seq(t_1hsd, h, s, d, torch_itype, block_size, *, columnwise):
     # dq stays in the quantizer's raw (b*h, s, d) shape — that is what
     # mxfp8_ref.compute_ref consumes.
     if columnwise:
-        return data_s, dq_s, swz_s.view(torch.uint8).reshape(h, n_tiles, tile_bytes)
+        return data_s, dq_s, pack_thd_columnwise_sf(swz_s, h, s, d)
     return data_d, dq_d, swz_d.view(torch.uint8).reshape(h, n_tiles, tile_bytes)
 
 
