@@ -576,7 +576,17 @@ def test_graph_thd_stats_packings(layout, stage2_datapath):
     _run_graph((300, 128), (300, 128), stats_layout=layout)
 
 
-def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats(stage2_datapath):
+@pytest.fixture(params=[False, True], ids=["nondeterministic", "deterministic"])
+def autograd_determinism(request):
+    was = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(request.param)
+    try:
+        yield request.param
+    finally:
+        torch.use_deterministic_algorithms(was)
+
+
+def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats(stage2_datapath, autograd_determinism):
     """The public differentiable op reaches the THD+GQA d512 engine.
 
     The direct graph tests above deliberately pin ``sdpa_bwd_sm100`` and feed
@@ -620,7 +630,7 @@ def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats(stage2_datapath
     assert sum(_ENGINE in name for name in served_plan_names()) == frost_before + 2
 
 
-def test_torch_varlen_provider_thd_gqa_autograd_preserves_packed_stats(stage2_datapath):
+def test_torch_varlen_provider_thd_gqa_autograd_preserves_packed_stats(stage2_datapath, autograd_determinism):
     """PyTorch's registered CUDNN varlen provider also reaches this engine."""
     from torch.nn.attention import activate_flash_attention_impl, restore_flash_attention_impl
     from torch.nn.attention.varlen import varlen_attn
