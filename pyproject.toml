@@ -118,9 +118,10 @@ torch = [
 ]
 # The jax.jit-compatible XLA custom-call entry points (cudnn.jax, e.g.
 # gemm_amax_jax_sm100) build on the CuTeDSL JAX extensions (cutlass.jax,
-# shipped with nvidia-cutlass-dsl), which require jax >= 0.5.
+# shipped with nvidia-cutlass-dsl). The shared floor covers every JAX kernel,
+# including block sparse attention.
 jax = [
-    "jax>=0.5",
+    "jax>=0.9.1",
 ]
 
 [build-system]
@@ -144,6 +145,7 @@ include-package-data = true
 version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
+"cudnn.simplified_sparse_attention" = ["NOTICE", "contributors.md"]
 "cudnn.sdpa.bwd.compact_gqa" = ["csrc/*.cpp"]
 include = ["**/*"]
 "cudnn.moe_ep._megamoe_backend.cutedsl_src" = [

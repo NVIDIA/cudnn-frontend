@@ -70,6 +70,8 @@ def test_determinism(dtype_name, split):
         ((512, 512), 1024, 2, 4, True, False),
         ((512, 512), 8, 1, 4, True, True),
         ((504, 480), 32, 2, 1, False, False),
+        ((504, 480), 32, 2, 4, True, False),
+        ((504, 264), 32, 2, 4, True, True),
         ((264, 256), 16, 4, 4, True, False),
     ],
 )

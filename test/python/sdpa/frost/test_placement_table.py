@@ -434,3 +434,54 @@ def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     assert pt.lookup(row, paged(window_left=128)) is None
     assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
     assert pt.lookup(row, paged(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+_SM107_PAGED_MTP_SHORT_KV = [
+    # (head pair, (h_q, h_kv), mask, on-tile (KV, verdict) pairs, off-tile (KV, verdict) pairs) at b 1, s_q 2: where the thresholds
+    # of study sm107_paged_mtp_20261110 fall; one KV tile is the backend's, and d512 / D576 lead at any length.
+    ((64, 64), (32, 4), {}, ((128, False), (256, True)), ((49, False), (59, True))),
+    ((64, 64), (64, 8), dict(has_sink=True), ((128, False), (256, True)), ((104, False), (140, True))),
+    ((64, 64), (64, 8), dict(has_sink=True, window_left=128), ((128, True),), ((24, True),)),
+    ((128, 128), (16, 2), {}, ((128, False), (8192, True)), ((24, False), (8191, True))),
+    ((256, 256), (16, 1), {}, ((128, False), (256, True)), ((125, False), (133, True))),
+    ((512, 512), (16, 2), {}, ((128, True),), ((24, True),)),
+    ((512, 512), (128, 1), {}, ((128, True),), ((24, True),)),
+    ((576, 512), (96, 1), {}, ((128, True),), ((24, True),)),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, heads, mask, on_tile, off_tile", _SM107_PAGED_MTP_SHORT_KV, ids=["d64", "d64_sink", "d64_sink_window", "d128", "d256", "d512_gqa", "d512", "d576"]
+)
+def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask, on_tile, off_tile):
+    """Study sm107_paged_mtp_20261110 (Rubin, the inference benchmark's paged generation graph): the bf16 MTP rows (s_q 2-4 under the
+    bottom-right diagonal) lead from long caches down to the short-KV threshold of each class; d512 / D576 and the windowed d64 sink
+    rows lead at any length. Without the diagonal, f16, and another part keep the hand rules."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def mtp(**over):
+        base = dict(b=1, h_q=heads[0], h_kv=heads[1], s_q=2, s_kv=8192, d_qk=d[0], d_v=d[1], causal=True, bottom_right=True)
+        base.update(device_cc=(10, 7), page_size=16, padded=True, **mask)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (8192, 8191, 1048576):
+        assert pt.lookup(row, mtp(b=4, s_q=3, s_kv=s_kv)) is True
+    for s_kv, verdict in on_tile + off_tile:
+        assert pt.lookup(row, mtp(s_kv=s_kv)) is verdict, s_kv
+        assert pt.matched_entry(row, mtp(s_kv=s_kv)).study == "sm107_paged_mtp_20261110"
+    assert pt.lookup(row, mtp(causal=False, bottom_right=False, window_left=None)) is None
+    assert pt.lookup(row, mtp(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, mtp(device_cc=(10, 3))) is None  # no transfer names this study
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [(512, 512), (576, 512)], ids=["d512", "d576"])
+def test_sm107_paged_mla_single_row_decode_has_no_entry(d):
+    """Study sm107_paged_mtp_20261110 measured absorbed-MLA s_q == 1 but ships no entry for it: d512 lost 1.32x on the holdout at
+    h_kv 2, and D576 was not measured at h_kv > 1. The hand rules keep deciding these graphs."""
+    row = "sdpa_fwd_prefill_sm107"
+    for s_kv in (131072, 131071, 1024, 1023):
+        facts = _facts(b=128, h_q=16, h_kv=1, s_q=1, s_kv=s_kv, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
+        assert pt.lookup(row, facts) is None

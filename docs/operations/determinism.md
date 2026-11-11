@@ -42,8 +42,17 @@ arbitrary user callbacks.
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
+| `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
+| `simplified_sparse_attention_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
+| `dense_indexer_kl`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Unverified | Unverified |
+| `dense_indexer_kl`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
 | `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
+| `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
+| `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -79,6 +88,12 @@ The D64 mixed-storage checks also cover fixed-plan dense splits and unsplit
 THD, preserving each quantized KV payload across batch changes. D64 THD
 split with FP8 KV remains unsupported. These paging changes add no backward path.
 
+The SM107 D512/D576 split partial-store optimization preserves the existing
+O/Stats golden bytes for matching half storage and D512 mixed FP8 KV storage.
+Its checks retain a fixed split count and packing, and include partial value
+widths and empty rows. Vector stores do not change the reduction order or
+extend determinism across different plans or runtimes.
+
 The D512 FP8 paged row covers the native role-split forward path with whole-group
 PackGQA and a fixed split count (1 or 4 in its determinism suite). Its batch
 checks preserve quantized payloads and scalar scales, and compare per-sequence
@@ -95,6 +110,25 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
+  repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
+  rows move. The fused CuTe path also changes scalar loss and saved gradient
+  bytes across runs through atomic reductions. Only indexer Q/K receive
+  gradients; the teacher stays frozen. Tiny single-row goldens do not qualify
+  larger reductions. CPU and other GPUs are not qualified for determinism.
+
+- Simplified sparse attention (PyTorch and JAX): no deterministic mode. The SM100 forward
+  result covers short packed sequences with Hq 16/32/96 and top-k
+  512/1024/2048, plus an Hq16 scheduling-boundary case. Long filtered-indexer
+  batch invariance and saved internal statistics are unverified. PyTorch host-thread
+  isolation is checked for dense and filtered repair calls on shared and separate streams.
+  Triangular two-tile forward replay is checked at all three head counts.
+  Moving packed rows changes the scalar loss bytes for Hq32/top-k1024 and
+  Hq96/top-k2048. CI also found this for PyTorch Hq16/top-k512.
+  Its approved exception covers only the observed one-byte packed forward loss mismatch on SM100.
+  Backward uses atomic reductions; dK/dV fail raw-byte replay and batch invariance.
+  Numerical agreement does not establish bitwise determinism.
 
 - Custom reduction: these rows have no determinism switch and pin the native
   cuDNN backend. SM100 support applies only to the suite's dense, 257-element
@@ -159,6 +193,18 @@ a row alone and inside a batch under the entry's own picks.
   document must use one four-token block grid, and a row must not repeat a
   block.
 - Dense indexer backward exposes no determinism switch.
+- CSA compressor forward and dKV/dScore use fixed orders. Complete backward
+  determinism requires `deterministic=True`, caller-owned workspace on the class API,
+  and a prepared plan before CUDA Graph capture; the default dAPE path uses FP32
+  atomics. On SM100 and SM103, deterministic backward fixed-sequence batch comparisons
+  cover ratios 2, 4, and 128, both overlap forms, scalar and wide generic layouts, both
+  ratio-128 head dimensions, reordered and duplicated sequences, changed neighbors,
+  and a ratio-128 schedule-boundary crossing. Forward passes the same comparisons except
+  for the ratio-128 `coff=2`, head-dimension-512 small/default schedule boundary: SM100 CI
+  observed a one-byte output difference when the fixed sequence moved from the small
+  batch schedule to the default schedule. Forward is therefore Replay only. Replay and
+  committed goldens cover the generic ratio-2, generic ratio-4 overlap, and dedicated
+  ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
@@ -184,7 +230,7 @@ Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
 separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, and distributed execution are outside this status page's scope.
 
-See the [test report](https://github.com/Anerudhan/cudnn-frontend/blob/feat/attention-determinism-tests/test/python/determinism_goldens/README.md)
+See the [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md)
 for the covered configurations, validation runtimes, and supporting measurements.
 
 
@@ -355,3 +401,13 @@ reordering, duplication and changed-neighbor capture replay. Compact THD
 repacking follows changed lengths; independent physical gaps are outside this
 path's contract. SM120 hardware execution and other runtimes remain unverified.
 This qualification adds no backward support.
+
+Native SM107 half D64/D128 single-sequence THD origin setup retains forward
+O/Stats byte and batch invariance on the qualified runtime. Independent
+physical origins, changed strides/addresses, empty and keyless replay and the
+runtime multi-sequence fallback, including one capacity-4096 plan alternating
+between single and multiple sequences through shape overrides, are covered by
+`test_sdpa_single_sequence_setup_sm107.py`. The setup optimization is limited
+to nonpaged, unsplit uniform FP16/BF16; other supported paths retain their
+existing setup. Measurement details and runtime goldens are in the coverage
+report. This adds no backward or cross-runtime byte guarantee.
