@@ -397,6 +397,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "GdnDecodeFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "GdnVerifyFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -414,6 +415,9 @@ _LAZY_OPTIONAL_IMPORTS = {
     # the shared-expert decode kernel pair (bf16 shared expert next to a routed MoE, SM100-class parts): a direct-call entry like the GDN
     # steps (also `cudnn.moe.frost.SharedExpertDecode`)
     "SharedExpertDecode": (".moe.frost.shared_expert_decode", "SharedExpertDecode"),
+    # the FP8 split-K projection for decode rows (E4M3 x E4M3 -> bf16, 1 .. 32 rows, SM100-class parts): a direct-call entry like the
+    # GDN steps (also `cudnn.gemm.Fp8ProjectionDecode`, with its `ProjectionGeometry` / `ProjectionForm`)
+    "Fp8ProjectionDecode": (".gemm.frost.projection_decode.fp8_projection_decode", "Fp8ProjectionDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
