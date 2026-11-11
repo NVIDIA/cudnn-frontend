@@ -624,6 +624,37 @@ and live/empty transitions; a sanitizer pass or a single launch does not
 establish liveness.
 
 
+**Rule S15 — A scheduler payload, a statistics word and a mailbox slot are consumed before their slot credit (package Rule 11).**
+
+Every role that reads a slot another role refills — the scheduler response
+and its predecoded fields, the per-tile softmax statistics and the alpha
+transfer slot, a cross-CTA mailbox — returns the slot with every word it
+loaded, through `tile_dsl.consume`, or names in the kernel's barrier table
+which other ordering of Rule 11 the site relies on. `read_clc_payload` keeps
+its cross-proxy fence. Between the last load and the release, that fence is
+measured to order a read against async-proxy refills (a TMA load, a bulk
+copy). The cluster launch-control response is a write of that kind; it was
+not measured separately, and none of this is proven (Rule 11).
+It does not order a slot that ordinary stores refill (a single-CTA persistent
+scheduler, a statistics slot written by the softmax warps). Reading through
+lane zero and broadcasting, as the single-CTA path does, stops other lanes
+from holding their own loads; it does not order lane zero's load before the
+credit. A compare, a vote or a shuffle written between the load and the
+credit is not an ordering either: the compiler can place such a use behind
+the credit.
+
+The rule applies to new and changed credit sites; existing sites move onto
+the helper in follow-up changes. A slot credit that has not moved keeps its
+release arrive, fence or named barrier: none of them is the ordering Rule 11
+asks for, and removing one changes the timing of an unordered site.
+
+Detector: per rendering, the disassembly reading of Rule 11 for the slot's
+loads, and `warm_stress.assert_release_dependence` on the PTX once the site
+uses the helper; at run time `warm_stress.assert_warm_stress` on a shape with
+several KV tiles per Q tile (the slot must be refilled inside the launch; a
+one-tile or top-k-1 shape cannot fail).
+
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
