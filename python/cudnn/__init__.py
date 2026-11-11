@@ -171,6 +171,9 @@ def destroy_handle(handle):
 from .datatypes import _library_type, _is_torch_tensor
 
 __version__ = "1.33.0"
+# Keep in sync with the JAX dependency minimum in pyproject.toml.
+CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
+CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
 
 
 def _tensor(
@@ -328,6 +331,8 @@ _EAGER_PUBLIC_NAMES = (
     "Handle",
     "DeviceInfo",
     "__version__",
+    "CUTEDSL_MIN_JAX_VERSION",
+    "CUTEDSL_MIN_JAX_VERSION_STR",
     "NodeType",
     "Tensor",
     "pygraph",
@@ -392,6 +397,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "GdnDecodeFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "GdnVerifyFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AttentionGateQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -409,6 +416,13 @@ _LAZY_OPTIONAL_IMPORTS = {
     # the shared-expert decode kernel pair (bf16 shared expert next to a routed MoE, SM100-class parts): a direct-call entry like the GDN
     # steps (also `cudnn.moe.frost.SharedExpertDecode`)
     "SharedExpertDecode": (".moe.frost.shared_expert_decode", "SharedExpertDecode"),
+    # the attention gate + quantize decode step (the sigmoid output gate of an attention block fused with the static E4M3 quantization of
+    # the following projection's input, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.attention_gate.frost.AttentionGateQuantDecode`)
+    "AttentionGateQuantDecode": (".attention_gate.frost.gate_quant_decode", "AttentionGateQuantDecode"),
+    # the FP8 split-K projection for decode rows (E4M3 x E4M3 -> bf16, 1 .. 32 rows, SM100-class parts): a direct-call entry like the
+    # GDN steps (also `cudnn.gemm.Fp8ProjectionDecode`, with its `ProjectionGeometry` / `ProjectionForm`)
+    "Fp8ProjectionDecode": (".gemm.frost.projection_decode.fp8_projection_decode", "Fp8ProjectionDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -801,7 +815,7 @@ def __getattr__(name: str) -> Any:
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
         # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax

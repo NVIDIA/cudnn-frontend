@@ -4,7 +4,10 @@
 """Measured placement table: FROST row vs the backend, per shape class, generated from frozen sweeps.
 
 A class is read off the graph facts (row, device, dtype, head pair, phase, layout, mask, sink, MHA vs GQA, and whether
-S_kv is off the 128-key tile; a decode-shaped GQA graph the row cannot pack is its own group). SM120 backward on
+S_kv is off the 128-key tile; a decode-shaped GQA graph the row cannot pack is its own group). A bounded declaration
+(``shape_overrides``: one plan serves every live shape up to the declared one, e.g. FlashInfer's ragged path) is a layout of
+its own (``*_bounded``), keyed and thresholded on what it declares; an exact graph's entry never answers it, and a bounded
+prefill declaring at most one 128-row Q tile per request is ``prefill_short_q``. SM120 backward on
 cc 12.0 separates square prefills below that first tile into ``prefill_short_square``; their studies cannot be
 borrowed from longer off-tile squares. Each entry
 is a monotone rule on ONE scalar from :data:`FEATURES` -- the roofline-shaped cost proxy :func:`log2_work`, the
@@ -53,7 +56,6 @@ def _unmeasured(facts) -> bool:
         or getattr(facts, "deterministic", False)
         or getattr(facts, "has_dbias", False)
         or getattr(facts, "o_block_scale", False)
-        or getattr(facts, "shape_overrides", False)
     )
 
 
@@ -89,6 +91,11 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         phase = "prefill_short_square"
     else:
         phase = "prefill"
+    bounded = bool(getattr(facts, "shape_overrides", False))
+    if bounded and phase == "prefill" and facts.s_q <= 128:
+        # One 128-row Q tile per request at most (FlashInfer's short-row declaration): the backend switches to its short-row
+        # engine and FROST runs one Q tile per head, a different regime from the long declaration.
+        phase = "prefill_short_q"
     if facts.has_paged_kv:
         layout = "paged"
     elif facts.thd:
@@ -96,6 +103,8 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         layout = "thd_ragged" if total is not None and total < facts.b * facts.s_q else "thd"
     else:
         layout = "dense"
+    if bounded:
+        layout += "_bounded"
     bottom_right = facts.bottom_right or facts.s_q == facts.s_kv  # a square reads the same from either corner
     if facts.window_left is not None:
         mask = "window"
@@ -279,6 +288,141 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "mha", True): Entry(
         "always", None, "sm107_paged_prefill_20261109"
+    ),
+    # study sm107_paged_mtp_20261110 (208-SM Rubin, cuDNN 9.30.0.3; benchmark/attention_inference's paged generation graph: dense Q,
+    # shuffled HND page pool, per-request KV, recorded graph facts; bf16 MTP rows s_q 2-4 under the bottom-right diagonal at
+    # d64 (sink, sink + window 128, neither) / d128 / d256 GQA and d512 / D576xV512 absorbed MLA and GQA; GQA 4-128, b 1-256,
+    # page 16 / 32 / 64, declared KV 16 to 1M on and off the tile; calls timed N per captured graph; 1421 train cells (incl. a
+    # consumed first holdout) + a fresh 144-cell holdout: never >5% behind the measured default. The absorbed-MLA s_q == 1 classes
+    # are not included: d512 lost 1.32x on the holdout at h_kv 2, and D576 was not measured at h_kv > 1)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry("ge", 18.793, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry("ge", 22.325, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 7.5, "sm107_paged_mtp_20261110", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 7.011, "sm107_paged_mtp_20261110", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_mtp_20261110"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (512, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_paged_mtp_20261110"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", False): Entry("ge", 7.5, "sm107_paged_mtp_20261110", "kv"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 5.749, "sm107_paged_mtp_20261110", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", False): Entry("ge", 7.5, "sm107_paged_mtp_20261110", "kv"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "causal_br", True, "gqa", True): Entry("ge", 6.915, "sm107_paged_mtp_20261110", "kv"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", False): Entry("always", None, "sm107_paged_mtp_20261110"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", True): Entry("always", None, "sm107_paged_mtp_20261110"),
+    # study sm107_thd_prefill_20261111 (208-SM Rubin, cuDNN 9.30.0.3; FlashInfer's cudnn path, recorded graph facts; bf16 HND
+    # paged page 16/64 and ragged THD, d64/d128 all masks, D192xV128 / d256 ragged all masks and paged mask-free (paged causal
+    # D192/D256 is sm107_paged_prefill_20261109's); short-Q, chunks, squares; GQA groups 3-12 incl. 8/1 and 12/1, MHA 16-128.
+    # Train 664 frozen cells, holdout 200, scored once; 14 entries dropped by the holdout. Ragged reaches FE as bounded
+    # declarations (shape_overrides): those classes are the declaration's, scored on the realized shapes.)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "paged", "causal_br", False, "mha", False): Entry(
+        "ge", 32.17, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "paged", "causal_br", False, "mha", True): Entry(
+        "ge", 13.304, "sm107_thd_prefill_20261111", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "paged", "none", False, "gqa", False): Entry("le", 27.584, "sm107_thd_prefill_20261111"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "paged", "none", False, "gqa", True): Entry("le", 26.976, "sm107_thd_prefill_20261111"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill", "thd_bounded", "none", False, "mha", False): Entry(
+        "le", 33.5, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "thd_bounded", "causal_br", False, "gqa", False): Entry(
+        "le", 45.5, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (128, 128), "prefill_short_q", "thd_bounded", "causal_br", False, "mha", False): Entry(
+        "le", 38.0, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill", "thd_bounded", "none", False, "mha", False): Entry(
+        "ge", 55.322, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill_short_q", "thd_bounded", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill_short_q", "thd_bounded", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (192, 128), "prefill_short_q", "thd_bounded", "none", False, "gqa", False): Entry(
+        "ge", 45.822, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "none", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "none", False, "gqa", True): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "none", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "paged", "none", False, "mha", True): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill", "thd_bounded", "causal_br", False, "gqa", False): Entry(
+        "le", 26.5, "sm107_thd_prefill_20261111", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill_short_q", "thd_bounded", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill_short_q", "thd_bounded", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill_short_q", "thd_bounded", "none", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (256, 256), "prefill_short_q", "thd_bounded", "none", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "mha", False): Entry(
+        "le", 38.764, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "mha", True): Entry(
+        "le", 39.287, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "none", False, "gqa", False): Entry("le", 34.475, "sm107_thd_prefill_20261111"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "paged", "none", False, "gqa", True): Entry("always", None, "sm107_thd_prefill_20261111"),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "thd_bounded", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "thd_bounded", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "thd_bounded", "none", False, "gqa", False): Entry(
+        "ge", 16.5, "sm107_thd_prefill_20261111", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "thd_bounded", "none", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill_short_q", "thd_bounded", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill_short_q", "thd_bounded", "causal_br", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill_short_q", "thd_bounded", "none", False, "gqa", False): Entry(
+        "ge", 42.5, "sm107_thd_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill_short_q", "thd_bounded", "none", False, "mha", False): Entry(
+        "always", None, "sm107_thd_prefill_20261111"
     ),
     # study sm80_dense_prefill_20261031 (cuDNN 9.29.0.18; A100 80GB PCIe; dense bf16 context d64 / d128 / d192x128 / d256, causal,
     # mask-free and d64 sink / window + sink, s_q 8-8192 over S_kv on and off the tile; 2,448 train cells incl. two consumed

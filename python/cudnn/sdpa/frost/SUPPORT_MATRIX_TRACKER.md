@@ -270,9 +270,10 @@ FP8 rows (#1425), the kernels replacing the tail tile's fully padded V scale blo
 SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
 and for the block-scaled MXFP8 O on fixed dense unsplit plans;
 supported dense layouts bind their declared strides directly, with the scale tensors bound unchanged.
-SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
-head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
-three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
+SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense native head
+shapes, unsplit or, at D128 with half outputs, split-KV, and for bounded THD at d256
+(`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other three shapes, split-KV at the other shapes
+or with quantized outputs, and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
@@ -336,26 +337,40 @@ overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
 tensors or tensor-launch fallback.
 Forward only; optional Stats do not provide a backward implementation. Q/K/V/O
-all use FP16 or all BF16. The D512 leg's native head tile is **(512, 512)**. Its
-envelope is floored at 256 (`d_envelope_floors`): `D_QK` and `D_V`
-independently accept positive multiples of 8 in **(256, 512]**, and the exact
-native hit always passes. Pairs inside the envelope are **envelope-served at
-the full D512 compute cost**, with TMA zero-fill and output clipping, so the
-floor caps that at 2x padding.
+all use FP16 or all BF16. The shared body has native **D128, D256 and D512**
+contraction/storage specializations. QK uses 8/16/32 k16 WGMMA steps and the
+PV warpgroups each own 64/128/256 columns, respectively. Smaller head pairs
+inside each admitted envelope pay that envelope's cost, with TMA zero-fill
+and clipped output stores:
 
-The floor is a **routing** change, not only a claim change: SM90 is the only
-cc-9.0 row, so an f16/bf16 Hopper graph with either head dim at or below 256,
-except the exact native D64 leg below, gets no FROST plan and falls back to the cuDNN backend. Unfloored,
-this row led the preference order and took such graphs at up to 64x
-zero-padding. Deliberate asymmetry: `config_sm90.head_dims_mismatch` still
-serves every multiple of 8 in `(0, 512]`; outside the exact D64 specialization,
-the standalone adapter keeps the existing full D512 envelope. Exact D64 selects
-the native body only when its feature checks pass. Otherwise, standalone
-declarations retain the existing D512 path, including sinks, window/right bands,
-device lengths, THD and PackGQA when that path supports them. The graph D64 row
-keeps its narrower admission.
+| Native tile | Graph envelope (both D_QK and D_V independently, multiple of 8) |
+|---|---|
+| D64 | exact (64,64), with the narrower feature domain below |
+| D128 | [64,128], except exact (64,64) remains on its dedicated row domain |
+| D256 | [128,256], using D128 when both dimensions fit there |
+| D512 | (256,512] |
 
-**Native D64 draft (not Hopper-qualified).** Exact `D_QK=D_V=64` dense FP16/BF16
+D192/V128 therefore uses D256; D120/V72 uses D128. Mixed pairs outside these
+bounded envelopes, such as D256/V512, remain declined. Existing placement is
+unchanged: non-D512 shapes trail the backend. Eligibility supplies a native
+candidate, without promoting it ahead of backend candidates.
+
+The standalone adapter retains every eight-aligned pair in (0,512], selecting
+the smallest covering D128/D256/D512 tile. Exact dense D64 keeps its dedicated
+body when its feature checks pass; its other standalone features use the D128
+envelope. Dense splits, partial PackGQA, masks, sinks, optional/base-2 Stats and
+unsplit THD use the shared smaller-head geometry. Paging, THD splits and THD
+PackGQA retain their existing declines.
+
+Native H100 qualification on 2026-11-10 covers 88 new feature/strict-golden
+cases in `test_sdpa_fwd_native_heads_sm90.py`: exact and eight-aligned widths,
+FP16/BF16, masks, padded/empty rows, independent THD origins and both packed
+Stats layouts, all three schedulers, partial PackGQA, poisoned split workspace,
+and changed-input/offset CUDA Graph replay. Eight golden cases additionally
+check fixed-plan repeatability and B129 reorder/duplication/neighbor isolation
+against independent FP64 references. This is forward qualification only.
+
+**Native D64 specialization.** Exact `D_QK=D_V=64` dense FP16/BF16
 MHA and unpacked GQA select `sm90/prefill_d64_f16.py`: two warpgroups (256
 threads), QK and PV both m64n64k64 (four SS k16 steps each), one shared P tile,
 and a full 64-column output fragment. No D512 zero-padding. Optional FP32 Stats
@@ -369,10 +384,10 @@ backend-first; D512 placement is unchanged.
 
 `test_sdpa_native_d64_sm90.py` separates graph-domain checks and sm_90a
 cross-compilation from actual SM90 numerical/replay tests. Cross-compilation
-on SM120 is evidence of valid target code generation only. No Hopper numerical,
-memory-safety, synchronization, capture/rebinding or performance qualification
-has been performed for this D64 body; the D512 hardware results below do not
-qualify D64. Keep this change in draft until the Hopper detectors run.
+on SM120 is evidence of valid target code generation only. Later H100 D64
+execution and prepared-body controls are recorded in the 2026-11-10 dense-split
+qualification in `test/python/determinism_goldens/README.md`; the earlier D512
+hardware results below do not independently qualify D64.
 
 H200 validation (2026-09-20, on `b100e342`; DSL 4.8.0.dev0, cuDNN 9.24.0,
 torch 2.14.0+cu130). The SM90 L0/L1 conformance suites — 21 files, not yet in
@@ -769,7 +784,7 @@ the query tiles, the dQ kernel owns one 128-query tile and streams the key tiles
 P and dS travel through SMEM rings and only the diagonal and tail tiles are masked.
 D64, with or without a left sliding window, runs the FP8 accumulation chain (FP32 dQ
 scratch; GQA/MQA appends BF16 dK/dV partials per query head and a fixed-order fold).
-Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public
+Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3 (the D192x128 pair row also cc 10.7), public
 CuTeDSL >= 4.8 and a finite positive scale. Declined: THD, padding, bottom-right causal,
 right-band widening, deterministic requests on the D64 / D128 chain (the (192, 128) kernel
 pair honors them: each kernel owns its outputs and the amax folds are maxima), a
@@ -2742,7 +2757,8 @@ Rubin config factories. Target-SM107 numerical validation is still required.
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
-`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
+`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`, `sdpa_bwd_sm120_fp8`,
+`sdpa_bwd_sm120_mxfp8`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
 with the same support).
@@ -2751,56 +2767,68 @@ D512 FP16/BF16 FPROP (`sm120/prefill_d512_f16.py`) supports **both D_QK and D_V
 in (256, 512]**, in multiples of 8. It uses a 64 x 32 CTA and 512 x 512 head
 tiles: (512, 512) is **native**; smaller shapes are **envelope-served** by
 zero-padding, with the same MMA and on-chip storage cost.
+The same half template also serves **native D576/V512**, with eight-aligned
+QK in (512,576] and V in (256,512] envelope-served at that tile cost. Dense
+and THD retain their existing layout/mask contracts; dense-Q paging includes
+half or FP8 K/V, packing and split. Q loads directly and O stages through the
+drained K/V slab; no global staging allocation or kernel is introduced.
+
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
-**multiples of 16** and a **64 x 64 CTA**. BPROP remains limited to 256.
+**multiples of 16** and a **64 x 64 CTA**. Half, per-tensor E4M3 and MXFP8
+BPROP extend through D512 under their respective contracts described below.
 
 MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
 16**; both head dims in (256, 512] run `sm120/prefill_d512_mxfp8.py`, the d512
 FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.
 
-On **SM120 / SM121 (cc 12.0 / 12.1)**, FP16/BF16 backward also serves native **exact D128
-MHA THD**, with independent device ragged offsets for Q/K/V/O/dO/dQ/dK/dV
+On **SM120 / SM121 (cc 12.0 / 12.1)**, FP16/BF16 backward also serves native
+**THD through D256**, including GQA/MQA and eight-aligned `0 < D_V <= D_QK <= 256`,
+with independent device ragged offsets for Q/K/V/O/dO/dQ/dK/dV
 and packed token-major or head-major Stats. This reuses the row-predicated
-`cp.async` / `mma.sync` packed compute with a fixed 64x64 tile, one Q/dO
+`cp.async` / `mma.sync` packed compute with a 32/64-row tile, one Q/dO
 stage and direct FP32 dQ atomic accumulation to fit SM120 shared memory.
 It is not a TMA optimization or a performance claim; placement is unchanged.
 Nonuniform and empty Q/KV lengths retain exact zero-gradient semantics, and
 metadata/scratch live in caller workspace. Both positive packed capacities
-must be declared; each capacity times H times 128 must be below 2^31 for
+must be declared; each capacity times H times the padded head width must be below 2^31 for
 native launch counts. Sequence envelopes are at most 2^31-64 and batch/head
-counts at most 65535. Only mask-free and top-left causal THD are admitted;
-Other head widths, GQA, deterministic, windowed, bias and sink THD
-graphs retain typed declines. Dense support below remains unchanged.
+counts at most 65535. Both `B * max_SQ` and `B * max_SKV` must be below 2^31
+for origin-aware delta/cast and GQA reduction launches, independently of packed
+capacity. Mask-free, top-left and bottom-right causal THD are admitted.
+Tile dimensions must fit the native geometry and 99 KiB shared-memory budget;
+D128 keeps 64x64 by default, while D256 uses 32x32. Deterministic, windowed, bias and sink THD
+graphs retain typed declines. The new D_QK > 256 native route additionally supports deterministic and windowed dense/THD graphs; bias and sink remain declined on that route.
 
-| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 256, any ×8 |
-|---|:--:|:--:|:--:|
-| **Data types** | | | |
-| FP16 / BF16 | ✅ | — | ✅ |
-| FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ |
-| MXFP8 | — | ✅ | ❌ |
-| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
-| Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, ≤ 512ᵃ | ×8, ≤ 256 |
-| **Layout** | | | |
-| BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, exact D128 MHA; restrictions above) |
-| Paged KV (dense Q; prefill through D128, decode through D256, D512 envelope) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ |
-| `cu_seq_len_q/kv` | ✅ | ❌ | ❌ |
-| Strided / permuted Stats | ✅ | ✅ | ✅ |
-| **Masks / features** | | | |
-| Causal (top-left) | ✅ | ✅ | ✅ |
-| Causal bottom-right | ✅ | ✅ | ✅ |
-| Causal right-band widening | ✅ | ✅ | ✅ |
-| Sliding window (left) | ✅ | ✅ | ✅ |
-| Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ |
-| Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ |
-| Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — |
-| Bias / dBias | ❌ | ❌ | ✅ / ✅ |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ |
-| Deterministic (`use_deterministic_algorithm`) | — | — | ✅ |
-| Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
-| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8;<br>or D576/V512 envelope | FPROP FP8 / MXFP8<br>d ≤ 512, any ×16 | BPROP<br>d ≤ 512, any ×8 | BPROP FP8 / MXFP8<br>D_V ≤ D_QK ≤ 512, ×8 |
+|---|:--:|:--:|:--:| :--: |
+| **Data types** | | | |  |
+| FP16 / BF16 | ✅ | — | ✅ | ❌ |
+| FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ | E4M3 ✅ · E5M2 ❌ |
+| MXFP8 | — | ✅ | ❌ | ✅ canonical F8_128x4 |
+| O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — | Per-tensor: E4M3 O, E4M3/half grads; MX: half O/grads |
+| Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) | ✅ (D_QK ≥ D_V) |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512]; or QK ∈ (512,576], V ∈ (256,512] | ×16, ≤ 512ᵃ | ×8, ≤ 512 | ×8, ≤ 512; contraction rounds to 32 |
+| **Layout** | | | |  |
+| BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ compact / ❌ |
+| THD / ragged | ✅ | ✅ | ✅ (cc 12.0 / 12.1, through D512/GQA; restrictions above) | ❌ |
+| Paged KV (dense Q; prefill through D128, decode through D256, D512/D576 envelopes) | ✅ FP16/BF16 Q/O, half or FP8 K/V; tile/split limits below | ❌ | ❌ | ❌ |
+| `cu_seq_len_q/kv` | ✅ | ❌ | ❌ | ❌ |
+| Strided / permuted Stats | ✅ | ✅ | ✅ | ❌ |
+| **Masks / features** | | | |  |
+| Causal (top-left) | ✅ | ✅ | ✅ | ✅ |
+| Causal bottom-right | ✅ | ✅ | ✅ | ❌ |
+| Causal right-band widening | ✅ | ✅ | ✅ | ❌ |
+| Sliding window (left) | ✅ | ✅ | ✅ | ✅ |
+| Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ | ❌ |
+| Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
+| Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — | ❌ |
+| Bias / dBias | ❌ | ❌ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ |
+| Deterministic (`use_deterministic_algorithm`) | — | — | ✅ | ✅ |
+| Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ | ✅ |
+| Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ | ✅ |
+
 
 **Native paged forward.** FP16/BF16 dense queries with independent
 QK/V head widths divisible by eight through128 (general prefill),256 (decode),
@@ -3146,7 +3174,7 @@ same kernel skeleton would have to be re-measured on those parts first.
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
-| Backward deterministic | SM100, SM103 — served by the MXFP8 row (the d = 256 chain and the D64 / D128 / (192, 128) kernel pair), the f16/bf16 d128 row (dense MHA / GQA / MQA: the dK/dV + dQ kernel pair on cc 10.0 / 10.3 -- `d128_contract.PAIR_CCS`; recompute for MHA outside its gates and on cc 10.7), the f16/bf16 d256 row, the half d512 chain and the per-tensor FP8 (192, 128) pair; declined by d128 THD, dense GQA / MQA on cc 10.7, the per-tensor FP8 D64 / D128 chain and the opt-in d192 accumulation row |
+| Backward deterministic | SM100, SM103 — served by the MXFP8 row (the d = 256 chain and the D64 / D128 / (192, 128) kernel pair), the f16/bf16 d128 row (dense MHA / GQA / MQA: the dK/dV + dQ kernel pair on cc 10.0 / 10.3 -- `d128_contract.PAIR_CCS`; recompute for MHA outside its gates and on cc 10.7), the f16/bf16 d256 row, the half d512 chain and the per-tensor FP8 (192, 128) pair (also on cc 10.7); declined by d128 THD, dense GQA / MQA on cc 10.7, the per-tensor FP8 D64 / D128 chain and the opt-in d192 accumulation row |
 | d128 grouped `cta_group::2` pair body below `S` 8192 (THD and dense), on MHA, and on dense GQA / MQA with `S % 128 != 0` or `dkv_accum = fp32_reduce` | SM100, SM103, SM107 — the per-S heuristic (`cta_pair = auto`) serves the one-CTA grouped body of the layout below the threshold (the pair has no measured win there: the 2K / 4K cells are MEASURED as a loss for the pair on the step, -3.9 % / -3.5 %, on cc 10.0, THD; the per-part threshold is re-measured on cc 10.7 (2026-11-03: 8192 holds, the pair +7.9 / +9.9 / +12.3 % at 8K / 16K / 32K and not a win at 4K), carried as is on cc 10.3 and on dense); the pair has no MHA body; the dense twin keeps the grouped dense requirements (compact BSHD, contiguous Stats, `S % 128 == 0`, bf16 partials); `cta_pair = on` declines by name; outside the admitted parts (cc 8.x / 9.0 / 11.x / 12.x: no `cta_group::2` pair) `auto` serves the one-CTA body and `on` declines naming the cc |
 | Backward decode-shaped S_q = 1 | SM100, SM103 — served by the MXFP8 d=256 row and the dense MHA f16/bf16 d128 row |
 | MXFP8 backward: E5M2, bottom-right / band-widened masks, a sliding window at d = 256 or without the causal mask, non-BSHD strides, `amax_*` outputs | SM100, SM103 — a left window under the causal mask is served at D64 / D128 / (192, 128) |
@@ -3538,8 +3566,8 @@ only at the 128k endpoint (0.67; not admitted) -- `SM107_PAGED_D256_G32_*`; and 
 32/2 -- 12/1 and 16/1 share the groups but were not measured at `S_q > 1` and trail -- = the 32-column tile in up to two token units; FlashInfer's decode graph at `q_len_per_req` 2-4 declares the bottom-right causal diagonal with the
 padding mask) over the WHOLE measured box b 1-128 × declared KV 1k-128k at page 16 bf16 -- the tile 0.01-0.31 of the backend's plan
 (which costs 6.8-142 ms per launch at KV 128k) on all 576 (cell, regime) pairs, every one quotable, so no tokens-in-flight floor and the
-2-unit corner included -- `SM107_PAGED_D256_MTP_*`; page 32 / 64 and the f16 twin were not measured on the MTP rows and keep the backend
-first. On both bands the tile trails FlashInfer's own fa2 kernel on part of the cells (7-9 % at the medians on group 32; 6 % at q 2 and
+2-unit corner included. Since 2026-11-10 the MTP rows are the generated placement table's (study `sm107_paged_mtp_20261110`: bf16
+d64-d576, GQA 4-128, page 16 / 32 / 64, declared KV 16-1M); the f16 twin still keeps the backend first. On both bands the tile trails FlashInfer's own fa2 kernel on part of the cells (7-9 % at the medians on group 32; 6 % at q 2 and
 21-22 % at q 3-4 on the MTP rows -- the 32-column tile's issue-rate gap at 24-64 packed rows, the gaps table's row): FE's verdict is
 against the backend's plan on the same graph; which of its kernels a consumer routes to is the consumer's question, and the kernel
 lever stays open. Not measured, backend-first:
@@ -4714,7 +4742,9 @@ The CGA4x1 / CTA_MMA2 role-split D512 body now supports dense packed and unpacke
 The existing opt-in `sdpa_bwd_sm107_fp8` row serves exact Q/K=192 and V/O=128
 alongside D256. Dense BSHD and packed THD use native operand widths, including
 their tensor maps, delta reduction, workspace and GQA fold; no data repack is
-added. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
+added. Dense MHA (192, 128) without a window on cc 10.7 is served by the
+`sdpa_bwd_sm100_d192_fp8` kernel pair row, which lists ahead of this row; the chain
+keeps the other (192, 128) graphs. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
 Stats-layout and declared-total contracts. Other head pairs, half and MXFP8
 rows keep their existing eligibility. Placement and heuristic policy are unchanged.
 
@@ -4932,10 +4962,62 @@ retain their work ordering inside each split. THD splits and PackGQA remain
 outside this admission; unsplit routes retain their existing behavior.
 
 
-SM90 D512 dense PackGQA also supports subgroups: each tile packs
+SM90 D128/D256/D512 dense PackGQA also supports subgroups: each tile packs
 `gcd(H_q/H_kv, 64)` heads per token, so G12 packs four and G128 packs 64.
 Groups with no nontrivial common factor (except MHA) remain declined.
-The declared row exposes this for the D512 envelope, with and without dense
+The declared row exposes this for the D128/D256/D512 envelopes, with and without dense
 split-KV. Native D64 remains unpacked and unsplit; THD packing remains declined.
 `test_sdpa_fwd_split_sm90.py` covers grouped KV addressing, independent strides,
 sinks, changed-length replay, multiple KV stages, and all three schedulers.
+
+### SM120 native half wide backward
+
+The existing `sdpa_bwd_sm120` row additionally serves eight-aligned
+`256 < D_QK <= 512`, `0 < D_V <= D_QK` through a native 512/512 envelope.
+Its mma.sync chain uses 16x16 tiles, one Q/dO stage and two independent gradient
+column partitions; no tensor staging is added. Dense and THD GQA, causal,
+bottom-right, SWA, padding and deterministic dQ share that geometry. Each
+partition has its own deterministic relay. Workspace remains linear in tokens.
+Bias and sink operands remain explicitly declined on this wide route pending
+qualification; the established <=D256 routes retain their existing domains.
+
+Detector: `test_sdpa_bwd_sm120_wide.py`. Initial SM121 qualification passes
+66 native graph/standalone cases, including two strict deterministic dQ/dK/dV
+goldens, 73 existing native THD controls and 145 host checks. Fourteen targeted
+cases per memory/race/synchronization sanitizer are qualified separately.
+SM120 hardware execution and performance are unmeasured.
+
+
+### SM120 per-tensor FP8 backward extension
+
+`sdpa_bwd_sm120_fp8` uses native `mma.sync.m16n8k32` on SM120/SM121,
+with eight-aligned `0 < D_V <= D_QK <= 512`. The contraction rounds to 32
+columns and gradient ownership rounds to 128 columns; no 512-wide envelope
+is imposed on small widths. Dense compact BSHD E4M3 Q/K/V/O/dO, FP32 Stats,
+E4M3/FP16/BF16 gradients, all four amax outputs, GQA, top-left causal/left
+window and fixed-order deterministic gradients are implemented. THD, padding,
+bottom-right, bias, sink and MXFP8 decline. DSL 4.8.0 minimum. SM121 passes
+79 native/strict cases, including six byte goldens; ten targeted cases per
+memcheck, racecheck and synccheck pass with zero errors or race warnings.
+SM120 hardware and performance remain unmeasured; candidate placement is unchanged.
+
+
+### SM120 native MXFP8 backward
+
+`sdpa_bwd_sm120_mxfp8` adds eight-aligned `0 < D_V <= D_QK <= 512`
+with native block-scaled `mma.sync.m16n8k32`. It consumes canonical rowwise
+and columnwise F8_128x4 atoms directly, including independently quantized
+Q_T/K_T/dO_T. dS uses an online E8M0 scale per 32-element contraction;
+P retains the fixed 2^-8 descale. Dense compact BSHD, GQA, top-left causal
+and left windows share fixed output ownership and linear delta workspace.
+O/dO_f16 and gradients are FP16 or BF16. Optional FP32 amax_dQ/dK/dV outputs
+are initialized in the existing delta launch and folded by each gradient
+owner; omitted outputs add no reduction work. The amax extension passes
+14 native/strict cases on GB10 SM121, including four six-output byte goldens;
+all parent gradient hashes are unchanged. SM120 execution remains unverified.
+No global SF repack or dequantization staging is introduced. DSL 4.8 minimum;
+THD, padding, bottom-right, sinks and bias remain declined. GB10 SM121 passes
+55 native/strict cases (four byte goldens), 79 per-tensor FP8 regression cases
+and eleven cases per memory/race/synchronization sanitizer. Host admission
+passes 44 MXFP8 checks; SM100/SM120 D128 and D512 compile offline. SM120
+hardware and performance remain unmeasured; candidate placement is unchanged.

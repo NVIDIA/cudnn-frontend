@@ -35,6 +35,12 @@ def _sm120_default_tiles(facts) -> Optional[Tuple[int, int]]:
     (``config_sm120.DEFAULT_TILES``, keyed by the padded d_qk the kernel runs at)."""
     from .config_sm120 import DEFAULT_TILES, padded_head_dims
 
+    if facts.d_qk > 256:
+        return (16, 16)
+    if facts.thd:
+        from .sm120_thd_contract import native_tiles
+
+        return native_tiles(int(facts.d_qk), int(facts.d_v))
     pads = padded_head_dims(int(facts.d_qk), int(facts.d_v))
     return None if pads is None else DEFAULT_TILES[pads[0]]
 

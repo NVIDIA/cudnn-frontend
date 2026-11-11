@@ -838,7 +838,7 @@ def test_sm120_frost_paged_d512_admission():
     for dims in ((512, 512), (264, 504), (504, 264)):
         for split in (1, 3):
             assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
-    for dims in ((264, 256), (256, 512), (520, 512), (257, 512)):
+    for dims in ((264, 256), (256, 512), (584, 512), (257, 512)):
         assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
     for changes in ({"thd": True}, {"is_fp8": True}, {"is_mxfp8": True}):
         assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None

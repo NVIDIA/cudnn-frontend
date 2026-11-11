@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: MIT
 
 """
-A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D=512 heads on NVIDIA
+A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D128/D256/D512 on NVIDIA
 Hopper SM90 (sm_90a), on WGMMA tensor cores.
 
-The CTA tile is (64, 64) over the (512, 512) head tile, which fixes both GEMM shapes. QK
-is m64n64k512, one commit group of 32 k16 instructions. PV is m64n256k64 per compute
-warpgroup, one group of 4. A 64-row FP32 O accumulator over 512 columns costs 256
-registers per thread, and a WGMMA N is at most 256. Two compute warpgroups therefore
-split the head dim, each owning one 256-column V/O half.
+The CTA tile is (64, 64). QK contracts the specialized 128/256/512-column
+head tile in one group of k16 instructions. Two compute warpgroups split
+V/O into 64/128/256-column halves, each using four k16 PV instructions.
+The D512 specialization retains its original arithmetic and geometry.
 
 The kernel implements:
 - Three warpgroups per CTA. WG0 issues the TMA loads. WG1 runs QK (SS), the online
@@ -25,7 +24,7 @@ The kernel implements:
   lengths, THD (ragged / packed) batches, PackGQA, per-Q-head sinks, and per-row LSE
   (Stats) in natural log or, under ``stats_log2``, base 2.
 
-Storage: Q, K and V/O are single-stage 64 x 512 regions of eight SW128 slabs, V and O
+Storage: Q, K and V/O are single-stage regions of two/four/eight SW128 slabs, V and O
 aliasing one of them. Single-stage K and V mean the producer cannot run a KV tile ahead:
 the next K lands only after QK releases the current one. P is the one multi-stage
 region, crossing WG1 to WG2 through a three-stage ring; the alpha and inverse row
@@ -38,7 +37,7 @@ Constraints:
 - Q/K/V/O keep their declared strides: D contiguous, the rest 16-byte multiples.
 - ``SdpaFwdDslSm90.check_support`` owns the served set.
 
-WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the D512 tile
+WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the tile
 operations and softmax arithmetic in ``sm90/_common_hopper.py``.
 """
 
@@ -64,7 +63,6 @@ from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF, thd_port_o
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_group_size
 from cudnn.sdpa.fwd.config_sm90 import (
-    D_TILE,
     SCALE_POSITIVE,
     SCALE_ZERO,
     TILE_M,
@@ -149,7 +147,7 @@ class Bars(NamedTuple):
 
 
 class SM90FusedMultiHeadAttentionForward:
-    """Configure and launch the SM90 FP16/BF16 D512 FMHA prefill kernel.
+    """Configure and launch the native-width SM90 FP16/BF16 FMHA prefill kernel.
 
     Each CTA runs one query tile and its assigned KV interval through three
     warpgroups. Dense splits write normalized half O and natural-log FP32 Stats
@@ -160,7 +158,7 @@ class SM90FusedMultiHeadAttentionForward:
     # The CTA tile: Q_TILE rows by KV_TILE keys over the HEAD_TILE-column D envelope.
     Q_TILE = TILE_M
     KV_TILE = TILE_N
-    HEAD_TILE = D_TILE
+    HEAD_TILE = PARAMS.head_tile
     PV_HALF = HEAD_TILE // 2
     P_STAGES = 3  # Slots of the WG1-to-WG2 P ring.
     # setmaxnreg budgets per warpgroup: 128 * (24 + 240 + 240) fits the SM's 65,536.
@@ -640,7 +638,7 @@ class SM90FusedMultiHeadAttentionForward:
         SM80 (#2135) and SM120 bodies.
         """
         row_lo = work.kv_len - (work.kv_right - 1) * self.KV_TILE
-        zero_v_tail_rows(sV_raw.subview(half * self.vo_half_elements), row_lo, local_tid, self.storage_dtype)
+        zero_v_tail_rows(sV_raw.subview(half * self.vo_half_elements), row_lo, local_tid, self.storage_dtype, self.PV_HALF)
         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
         prims.barrier_cta_sync(self.bar_v_tail_base + half, thread_count=cute.arch.THREADS_PER_WARPGROUP)
 
@@ -673,7 +671,7 @@ class SM90FusedMultiHeadAttentionForward:
         sP_xfer_raw, sAlpha_xfer_raw = basic_params.sP_xfer_raw, basic_params.sAlpha_xfer_raw
         kv_seq_idx = (work.kv_right - 1 - kv_step) * self.KV_TILE
         bars.mb_tma_k_full.wait(kv_full_state.phase)
-        mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype)
+        mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype, head_tile=self.HEAD_TILE)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_k_empty.arrive()
@@ -1646,15 +1644,17 @@ def compile(  # noqa: A001
     ``(B, H, S, D)`` mode order, with a zero batch stride under THD, and ``lse_stride``
     the ``(B, H_q, S_q)`` Stats strides of a ``has_lse`` template. The result exposes the positional pointer ABI in ``prepared_host.host``.
 
-    ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). They size only the
-    GMEM descriptors: the compute tile stays 512 wide, so a smaller D still pays the
-    D512 tile cost. This front coerces them to plain ints: ``template_key`` refuses a
+    ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). The adapter
+    selects their covering native head tile in ``PARAMS``; these dimensions
+    also bound the GMEM maps. This front coerces them to plain ints: ``template_key`` refuses a
     non-plain argument, which would drop the persisted cache entry.
     """
     reason = head_dims_mismatch(d_qk, d_v)
     if reason is not None:
         raise ValueError(f"prefill_d512_f16_sm90: {reason}")
     d_qk, d_v = int(d_qk), int(d_v)
+    if max(d_qk, d_v) > PARAMS.head_tile:
+        raise ValueError("SM90 declared dimensions exceed the specialized head tile")
     if PARAMS.thd_varlen:
         s_q = s_kv = 0
     return _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, lse_stride, target=target, d_qk=d_qk, d_v=d_v)

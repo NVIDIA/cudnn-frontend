@@ -3871,20 +3871,12 @@ def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn
 
 @_cc107_only
 @pytest.mark.L0
-def test_sdpa_paged_sink_dense_queries_decline_cc107_L0(env_info, request, cudnn_handle):
-    """The lift is THD-only: dense (BSHD, padded) paged half queries with a sink on cc 10.7 keep a typed decline naming
-    the THD requirement (pinned by engine id through create_execution_plan, so the row -- not the walk -- answers)."""
+def test_sdpa_paged_sink_dense_queries_cc107_L0(env_info, request, cudnn_handle):
+    """Native D128 now serves dense padded paged queries with a sink. Pin and execute the FROST row,
+    checking O against the harness reference instead of retaining the former THD-only refusal."""
     _require_p2_env()
     cfg = _p2_cfg(dtype=torch.bfloat16, d=128, h_q=32, h_kv=8, b=4, s_q=8, seq_len_q=[1, 4, 8, 8], s_kv=4096, seq_len_kv=[4096, 2048, 129, 16], page=16, ragged=False, poison=False)
-    cfg.softmax_precision = cudnn.data_type.FLOAT
-    graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
-    from cudnn.engines.manifest import MANIFEST
-    engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("half")]
-    graph.create_execution_plan(engine_id, {})
-    graph.select_plan(graph.get_execution_plan_count() - 1)
-    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="Rubin paged KV requires THD queries") as decline:
-        graph.check_support()
-    print(f"@@@@ P2 dense decline: {decline.value}")
+    _p2_frost(cfg, request, cudnn_handle, cga=2, pin={"TILE_CGA_M": 2, "PACK_GQA": 0, "SPLIT_KV": 1})
 
 
 # The first MULT=4 sweep failure (test340): d256 64/8, one 4-token request in a packed batch of ONE, s_q 5, page 128,
@@ -4371,15 +4363,10 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
 @_cc107_only
 @pytest.mark.L0
 def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
-    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split -- on the sink-free graph
-    and on the sink graph alike, because the row wires no split (split_kv_supported=False: "not wired in this engine's
-    lowering"); and INDEPENDENTLY of that flag the sink-aware rule every row shares keeps a sink graph unsplit: with the
-    row's split flag flipped (dataclasses.replace -- the shape a cc 10.7 MXFP8 split-KV change would take) the sink graph
-    is still declined with the "sink-free" reason, so wiring split-KV on this row cannot silently split a sink graph."""
+    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split: the row's split-KV serves
+    dense graphs only, so the sink-free pool graph is declined by that clause and the sink graph by the shared sink rule."""
     engine = _cc107_engine("mxfp8")
     _require_frost_sm107(engine)
-    import dataclasses
-
     from cudnn.sdpa.fwd import engines
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
@@ -4392,16 +4379,12 @@ def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
             assert reason is None, (with_sink, reason)  # the unsplit graph IS served, with and without the sink
             served[with_sink] = facts
     split2 = engines.SdpaFwdKnobs(split_kv=2)
-    assert not spec.capabilities.split_kv_supported  # today's deciding clause is the row's flag ...
-    for with_sink, facts in served.items():
-        why = engines.mismatch(spec.capabilities, facts, split2)
-        assert why is not None and "split_kv > 1 is not wired in this engine's lowering" in why, (with_sink, why)
-    # ... and with that flag flipped the shared sink rule still refuses to split the sink graph (engines.mismatch: the
-    # per-split LSE is the combine weight; a sink graph produces no per-split partials until a sink-aware combine lands).
-    caps_split = dataclasses.replace(spec.capabilities, split_kv_supported=True)
-    why_sink = engines.mismatch(caps_split, served[True], split2)
+    assert spec.capabilities.split_kv_supported
+    why = engines.mismatch(spec.capabilities, served[False], split2)
+    assert why is not None and "serves dense graphs with half outputs only" in why, why
+    why_sink = engines.mismatch(spec.capabilities, served[True], split2)
     assert why_sink is not None and "sink-free" in why_sink, why_sink
-    print(f"@@@@ P6a split declines: row flag: {why}; sink rule: {why_sink}")
+    print(f"@@@@ P6a split declines: pools: {why}; sink: {why_sink}")
 
 
 # # =====================================================================
