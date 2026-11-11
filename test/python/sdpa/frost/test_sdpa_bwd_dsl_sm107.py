@@ -1965,8 +1965,9 @@ def test_stage3_fp8_arm_records_are_validated_together():
     assert matmul_out_dtype(MatmulTemplateParams(**fp8, epi_mode=EPI_DESCALE)) == DTYPE_BF16, "the fp8 arm's inherited output is the bf16 true-unit value"
     assert matmul_out_dtype(MatmulTemplateParams(dtype_qkv=DTYPE_FP16)) == DTYPE_FP16
     for bad, needle in (
-        (dict(dtype_qkv=DTYPE_E4M3, epi_mode=EPI_QUANT), "(256, 256) row only"),
-        (dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(512, 256), epi_mode=EPI_QUANT), "(256, 256) row only"),
+        (dict(dtype_qkv=DTYPE_E4M3, epi_mode=EPI_QUANT), "rows only"),
+        (dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(512, 256), epi_mode=EPI_QUANT), "rows only"),
+        (dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 192), block_scale=True), "(256, 256) row only"),
         (dict(**fp8), "the fp8 arm requires one"),
         (dict(**fp8, epi_mode=EPI_NONE), "the fp8 arm requires one"),
         (dict(**fp8, epi_mode=EPI_DESCALE, dtype_out=DTYPE_E4M3), "needs EPI_QUANT"),

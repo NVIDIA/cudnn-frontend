@@ -28,7 +28,10 @@ PyTorch autograd through the same API. The two fused GDN step entries
 (`GdnDecodeFused`, `GdnVerifyFused`) are imported from `cudnn` (lazily; also
 under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
 with no backward. `SharedExpertDecode` (the shared-expert decode pair, also
-under `cudnn.moe.frost`) is the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+under `cudnn.moe.frost`), `AttentionGateQuantDecode` (the attention gate +
+quantize decode step, also under `cudnn.attention_gate.frost`) and
+`Fp8ProjectionDecode` (the FP8 projection for decode rows, also under
+`cudnn.gemm`) are the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
@@ -39,9 +42,11 @@ arbitrary user callbacks.
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
-| `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
-| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
+| `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
+| `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
+| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
+| `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
+| `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in; BF16 out; FP32 accumulate | Unsupported | SM100: Unverified; SM103: Supported | Supported |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -149,7 +154,8 @@ a row alone and inside a batch under the entry's own picks.
   form's bytes, so the status holds under any knob and at every served
   geometry (`Geometry(K_HEADS, V_HEADS, HIDDEN)`; verified at the default
   27B-class geometry and five per-rank shards). SM100/103 is verified on
-  cc 10.0 and cc 10.3; SM90 is declined by type. The entries also serve
+  cc 10.0 and cc 10.3, SM107 on cc 10.7 (a VR200-class part, 212 SMs);
+  SM90 is declined by type. The entries also serve
   SM120-class parts (compute capability 12.x; verified on cc 12.0 with the
   forms a 99 KB per-CTA opt-in holds, at the default geometry and four of
   the five shards -- `Geometry(2, 8, 4096)` is unverified there) with the
@@ -162,11 +168,43 @@ a row alone and inside a batch under the entry's own picks.
   of up to 24 tokens, across the one- and two-m-tile forms and the one- and
   two-group forms; every other knob writes the default's bytes, and the first
   release's form (`v1_cfg`) keeps its own goldens as an A/B arm. SM100/103 is
-  verified on cc 10.0 (a GB200, 152 SMs) and cc 10.3 (a GB300, 152 SMs). The
-  committed goldens belong to one cc 10.3 runtime: on cc 10.0 the status
-  rests on the replay and batch-invariance cells, and the golden comparison
-  is not covered there. cc 10.7 runs the same admission, unverified; SM90
-  and SM120 are declined by type.
+  verified on cc 10.0 (a GB200, 152 SMs) and cc 10.3 (a GB300, 152 SMs),
+  SM107 on cc 10.7 (a VR200-class part, 212 SMs). The committed goldens
+  belong to one cc 10.3 runtime and one cc 10.7 runtime: on cc 10.0 the
+  status rests on the replay and batch-invariance cells, and the golden
+  comparison is not covered there. SM90 and SM120 are declined by type.
+- Attention gate + quantize decode step (`AttentionGateQuantDecode`): no
+  determinism switch and no numerics knob. The kernel has no reduction, so a
+  row's bytes are a function of its own operand values and of the scale: a
+  row alone equals the same row inside a call of up to 160 rows, at any
+  position and among any neighbours. Both knobs (`THREADS`, `PDL_RELEASE`)
+  and the thread-count pick write the default's bytes; the release is
+  checked with no dependent grid on the stream. SM103 is verified on cc 10.3
+  (a GB300, 152 SMs) and SM107 on cc 10.7 (a VR200-class part, 212 SMs),
+  each with its own committed goldens; cc 10.0 has not been run, so SM100 is
+  unverified (the entry admits compute capability 10.x, and the kernel's
+  rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets).
+  SM90 and SM120 are declined by type. The bytes follow the
+  installed CuTe DSL's lowering of the exponential: the status holds on a
+  fixed runtime, and a golden recorded on one runtime does not qualify
+  another.
+- FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism
+  switch. The result bytes are a function of `(geometry, split_k)` on one
+  runtime: the number of K slices is fixed when the entry is built (given, or
+  a function of the geometry alone -- never of the row count or of the part),
+  and every other knob, including the measured pick per row count and part, is
+  a performance form that writes the same bytes. A row's bytes alone equal its
+  bytes among up to 32 rows at any position, across the 8- / 16- / 32-row
+  token tiles; the kernel is specialised on the row count, so replay and batch
+  invariance are verified at every row count 1 .. 32 of each served class
+  (`ProjectionGeometry(4608, 8192)` at split 4 and at split 2,
+  `ProjectionGeometry(8192, 2048)` at split 2). Another split is another byte
+  class and another entry; the status holds per entry. SM100/103 is verified
+  on cc 10.3 (a GB300, 152 SMs) only -- cc 10.0 is admitted by the entry and
+  unverified; SM107 on cc 10.7 (a VR200-class part, 212 SMs). The committed
+  goldens belong to one cc 10.3 runtime; on any other runtime the status rests
+  on the replay and batch-invariance cells and the golden comparison is not
+  covered. No backward entry point exists. SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
