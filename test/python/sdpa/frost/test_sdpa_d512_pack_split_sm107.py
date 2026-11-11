@@ -17,6 +17,8 @@ CASES = {
     "g128_unsplit": (128, 3, 257, 1, True, False, None, True, "natural", "bfloat16"),
     "g64_split": (64, 1, 2048, 8, True, False, None, False, "log2", "float16"),
     "g128_split": (128, 4, 1025, 8, True, True, None, True, "log2", "bfloat16"),
+    "g32_split": (32, 3, 257, 4, True, False, None, False, "natural", "float16"),
+    "g16_split": (16, 3, 257, 4, True, False, None, False, "natural", "bfloat16"),
     "partial6": (6, 17, 385, 3, True, True, 31, True, "natural", "bfloat16"),
     "keyless": (128, 129, 65, 8, True, True, 0, False, "log2", "bfloat16"),
     "unpacked": (128, 3, 257, 8, False, True, None, True, "none", "bfloat16"),
@@ -210,3 +212,22 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
         for captured, _, _ in captures:
             captured.reset()
         cudnn.set_stream(cudnn_handle, saved_stream)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("group", [32, 64])
+def test_coalesced_split_replay_batch_golden(dtype_name, group):
+    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+    from native_d128_dense_paged_determinism import _runner
+
+    run, inputs = _runner(dtype_name, dtype_name, 2, 4, 128, head_dim=512, num_q_heads=2 * group)
+    target = assert_replays(lambda: run([0]), repeats=4)
+    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 16 + [0] + [2] * 16):
+        actual = snapshot(run(order))
+        for row, sequence in enumerate(order):
+            if sequence == 0:
+                assert_bitwise({name: actual[name][row : row + 1] for name in target}, target, f"batch row {row}")
+    run([0, 1, 2, 3, 4], capture=True)
+    actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
+    assert_golden(f"sdpa-half-d512-paged-coalesced-{dtype_name}-g{group}-split4", inputs, actual)

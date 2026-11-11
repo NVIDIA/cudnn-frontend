@@ -2788,3 +2788,30 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
 ```
+
+
+### SM107 coalesced packed split partials — 2026-11-11
+
+`test_coalesced_split_replay_batch_golden` adds four L0 cases for FP16/BF16
+and packing groups32/64 at split4. It checks standalone/reordered/duplicated
+and changed-neighbor batches through33members, repeated raw bytes, numerical
+references and changed-input CUDA Graph replay. Existing graph/standalone
+boundary coverage now includes groups16and32, alongside64/128, partial groups,
+keyless rows, masks and sinks.
+
+On SM107 with driver620.62, Torch2.14.1+cu130, cuDNN9.24.0.43 and
+DSL4.8.0/compiler13.4,106native functional/strict-golden cases passed without
+skips.20cases each passed Compute Sanitizer2026.3 memcheck, racecheck and
+synccheck, with zero errors and zero race warnings. Memcheck was unfiltered;
+race/sync used the attention-kernel name filter with API errors enabled.
+All16records under `de01ba4cf30a4c9b` were recorded from unchanged parent
+`8e31a5725` after its references and replay/batch checks passed, then checked
+strictly by the candidate. No previous baseline or tolerance changed.
+
+From `test/python`, use the preceding D512/D576 qualification command; its
+existing test-file selection includes the new cases. The sanitizer subset is
+`test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged::test_boundaries`
+plus `test_sdpa_d512_pack_split_sm107.py`, selected with
+`test_boundaries or g64_split or g128_split or g32_split or g16_split or keyless`.
+Earlier runs stopped before tests on a missing interpreter target and a DSL
+package path; the final execution used the explicitly verified imports above.
