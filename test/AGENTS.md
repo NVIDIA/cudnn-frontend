@@ -521,6 +521,17 @@ valid-memory control with and without that option before diagnosing a kernel
 error from the count alone. Use a known-bad memory/race canary to verify the
 detector, and retain a normal run of the real capture test without launch dumps.
 
+### Ragged physical-origin fixtures
+
+Token/head stride gaps do not vary sequence start addresses. Use
+`ExecConfig.ragged_origin_rows` for independent Q/K/V/O/Stats row starts,
+while sequence-length and cumulative-length tensors retain logical lengths.
+Packing, reference unpacking and output masks must all use the selected port's
+origins; masking everything after `sum(seq_lens)` drops valid gapped outputs.
+`test_mhas_v2.py::test_sdpa_physical_origins_L0` exercises the shared harness,
+and `frost/test_sdpa_physical_origins_shared.py` pins the native SM120 route so
+backend fallback cannot hide a missing kernel repair.
+
 ### CUDA Graph test lifetimes
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
@@ -646,6 +657,11 @@ Dense V scale factors for D > 128 are plane-major; THD factors are packed
 per-sequence tiles per head. Reuse `_quantize_seq` when constructing THD test
 inputs; reshaping a dense buffer does not produce the THD contract. Rebind
 E8M0 exponent values as well as pointers and validate after graph replay.
+Both the shared graph harness and native fixtures use `pack_thd_columnwise_sf`
+to permute `[D-plane, H, tile, 512]` bytes into `[H, tile, D-plane * 512]`.
+`test_thd_columnwise_sf_matches_independent_atoms` compares that permutation
+with separately quantized per-head 128-token atoms. Keep D512 with multiple
+heads and token tiles: D128 alone cannot expose a misplaced D plane.
 The MXFP8 split combine has no per-tensor output scalar: specialize its
 scale pointer to None and remove Amax unscaling, rather than handing a NULL
 runtime address to the per-tensor unscale kernel. `test_prepared_mxfp8_capture_reads_current_scales`
@@ -1382,3 +1398,17 @@ matrix on a representative full-feature shape and retain separate native
 flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
 The SM90 D64/D512 controls in `test_band_capabilities.py` and
 `test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
+
+Host-frame fixtures that derive runtime arguments from a Python AST must retain
+unannotated arguments. Check `argument.annotation is None` before calling
+`ast.unparse`; only an explicit `Constexpr` annotation removes a runtime slot.
+The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
+exercise appended untyped origin arguments and compare native frames with
+the independent Python reference.
+
+When a THD fixture changes O's physical row stride, give O independent Int64
+element offsets and update them with the stride; retaining Q's compact offsets
+describes a different output location. Head-major Stats offsets advance by one
+element per token, while token-major Stats offsets advance by the head count.
+The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
+numerical and replay checks for these contracts.

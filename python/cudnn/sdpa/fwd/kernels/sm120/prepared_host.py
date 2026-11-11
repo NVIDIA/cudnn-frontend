@@ -313,6 +313,9 @@ def fp8_host(
     d_v: cutlass.Constexpr[int],
     persistent_ctas: cutlass.Constexpr[int],
     thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_ptrs,
+    thd_origin_caps,
+    thd_origin_specs: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
@@ -342,6 +345,7 @@ def fp8_host(
         d_v,
         persistent_ctas,
         thd_max_sq,
+        thd_origin_caps,
     )
 
     def scalar(ptr):
@@ -352,6 +356,9 @@ def fp8_host(
     if cutlass.const_expr(kernel.split_kv == 1 and has_amax):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict(prepared=True)
+    if cutlass.const_expr(thd_origin_specs is not None):
+        origins = tuple(None if ptr is None else cute.make_tensor(ptr, cute.make_layout((problem_size[0] + 1,), stride=(1,))) for ptr in thd_origin_ptrs)
+        kwargs.update(thd_origins=origins, thd_origin_specs=thd_origin_specs)
     if cutlass.const_expr(sfo_geometry is not None):
         kwargs.update(
             sf_o=scalar(sf_o_ptr),
@@ -465,19 +472,13 @@ def compile_host(
         d_v,
         persistent_ctas,
         thd_max_sq,
-        *(
-            (
-                (
-                    tuple(None if spec is None else ptr(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) for spec in thd_origin_specs)
-                    if thd_origin_specs is not None
-                    else None
-                ),
-                (cutlass.Int64(0),) * 5 if thd_origin_specs is not None else None,
-                thd_origin_specs,
-            )
-            if not fp8
-            else ()
+        (
+            tuple(None if spec is None else ptr(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
         ),
+        (cutlass.Int64(0),) * 5 if thd_origin_specs is not None else None,
+        thd_origin_specs,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

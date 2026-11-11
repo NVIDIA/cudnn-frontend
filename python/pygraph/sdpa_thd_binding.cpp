@@ -345,7 +345,12 @@ class SdpaThdBinder {
                 gate_decl_[4] != 1)
                 invalid("invalid native THD gate declaration");
         }
+        auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (py::hasattr(spec, "origin_specs") && !spec.attr("origin_specs").is_none()) {
+            // Pointer-origin hosts use each port's physical extent directly;
+            // they do not reserve per-sequence tensor-map descriptors.
+            const bool nonpaged_fp8_origin_caps =
+                quantized_ && !paged_ && std::find(order.begin(), order.end(), "thd_origin_caps") != order.end();
             const bool d64_split = !quantized_ && !paged_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 64 &&
                                    integer(spec, "d_v") == 64 && splits_ > 1;
             const bool d128_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 128 &&
@@ -354,13 +359,12 @@ class SdpaThdBinder {
                                     integer(spec, "d_v") == 128 && splits_ > 1;
             const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
                                     integer(spec, "d_v") == 512 && splits_ > 1;
-            if ((quantized_ && (!paged_ || mx_scales_)) ||
+            if ((quantized_ && !nonpaged_fp8_origin_caps && (!paged_ || mx_scales_)) ||
                 (splits_ != 1 && !d64_split && !d128_split && !d192_split && !d576_split) || has_gate_)
                 invalid(
                     "physical THD origins require ungated half unsplit/D128 split/nonpaged D64/D192 split/native D576 "
                     "split or unsplit "
-                    "per-tensor FP8 "
-                    "paged plans");
+                    "per-tensor FP8 paged or FP8/MXFP8 per-port-capacity pointer-origin plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
             if (d64_split || d128_split || d192_split || d576_split) {
@@ -372,7 +376,7 @@ class SdpaThdBinder {
                 if (off_partial_o_ < add(off_o_desc_, origin_bytes))
                     invalid("packed split partials overlap the physical-origin reservation");
             }
-            if (quantized_) {
+            if (quantized_ && !nonpaged_fp8_origin_caps) {
                 const int64_t origin_bytes =
                     add(multiply(add(b_, 1), 512), multiply(add(multiply(b_, 40), 127) / 128, 128));
                 if (quant_offset_ < add(off_o_desc_, origin_bytes))
@@ -391,7 +395,6 @@ class SdpaThdBinder {
                 }
             }
         }
-        auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             if (slot == OriginPtrs && !has_origins_) continue;
@@ -552,8 +555,9 @@ class SdpaThdBinder {
         py::object origin_ptrs = py::none();
         if (has_origins_) {
             py::list pointers;
+            const size_t base_roles = mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles);
             for (size_t i = 0; i < 5; ++i) {
-                const auto &offset = facts[(quantized_ ? PerTensorNumRoles : HalfNumRoles) + i];
+                const auto &offset = facts[base_roles + i];
                 if (!origin_bits_[i]) {
                     if (offset.filled) invalid("unexpected THD physical-offset operand");
                     pointers.append(py::none());
@@ -828,7 +832,8 @@ class SdpaThdBinder {
             }
             if (!bytes) continue;
             const auto operand_end = add(f.pointer, bytes);
-            const auto name        = has_origins_ && role >= PerTensorNumRoles ? "THD physical offsets" : names[role];
+            const auto base_roles  = mx_scales_ ? NumRoles : PerTensorNumRoles;
+            const auto name        = has_origins_ && role >= base_roles ? "THD physical offsets" : names[role];
             if (workspace < operand_end && f.pointer < end)
                 invalid("prepared FP8 workspace overlaps " + std::string(name));
             if (bound.amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(name));
@@ -1086,6 +1091,8 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("stream").none())
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_physical_origin_caps", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_fp8_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_mxfp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576_packed_split", [](py::object) { return true; })

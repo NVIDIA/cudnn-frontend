@@ -1580,7 +1580,9 @@ class SdpaFwdDsl(APIBase):
             self.thd or self.paged or self.split_kv > 1 or self.pack_gqa or self.gate_desc is not None or getattr(self, "pv_bf16", False)
         )
 
-    def _execute_fp8_prepared(self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream, block_table=None, block_table_v=None):
+    def _execute_fp8_prepared(
+        self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream, block_table=None, block_table_v=None, origins=None
+    ):
         """Prepared FP8 always uses caller scratch, including omitted scales / amax.
 
         Standalone callers allocate scratch_workspace_bytes() before execute;
@@ -1617,6 +1619,8 @@ class SdpaFwdDsl(APIBase):
                 raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
             buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
             buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+            if spec.origin_specs is not None:
+                buffers += origins if origins is not None else (None,) * 5
             with device_context(q.device):
                 _ensure_current_context(stream_int, q.device.index)
                 launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
@@ -6475,7 +6479,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         """Execute tensors matching the compiled specialization.
 
         ``ragged_q/k/v/o/lse`` bind the independent physical offsets of a
-        graph-lowered half THD specialization. The binder checks their declared
+        graph-lowered half or per-tensor FP8 THD specialization. The binder checks their declared
         integer widths and presence; logical lengths remain separate operands.
 
         ``block_table`` / ``block_table_v``: paged plans bind int32
@@ -6493,7 +6497,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         origins = (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)
         if any(value is not None for value in origins) and getattr(self, "_thd_origin_specs", None) is None:
-            raise ValueError("physical offsets require a compiled half THD origin specialization")
+            raise ValueError("physical offsets require a compiled THD origin specialization")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
         from cudnn._torch_stream import _raw_current_stream, device_context
@@ -6566,6 +6570,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 scale_val,
                 workspace,
                 current_stream,
+                origins=origins,
             )
             self._logger.debug("execute (SM120 MXFP8) completed" if mxfp8 else "execute (SM120 FP8 per-tensor) completed")
             return
