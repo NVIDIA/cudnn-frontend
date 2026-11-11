@@ -270,9 +270,10 @@ FP8 rows (#1425), the kernels replacing the tail tile's fully padded V scale blo
 SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
 and for the block-scaled MXFP8 O on fixed dense unsplit plans;
 supported dense layouts bind their declared strides directly, with the scale tensors bound unchanged.
-SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
-head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
-three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
+SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense native head
+shapes, unsplit or, at D128 with half outputs, split-KV, and for bounded THD at d256
+(`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other three shapes, split-KV at the other shapes
+or with quantized outputs, and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
@@ -783,7 +784,7 @@ the query tiles, the dQ kernel owns one 128-query tile and streams the key tiles
 P and dS travel through SMEM rings and only the diagonal and tail tiles are masked.
 D64, with or without a left sliding window, runs the FP8 accumulation chain (FP32 dQ
 scratch; GQA/MQA appends BF16 dK/dV partials per query head and a fixed-order fold).
-Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3, public
+Compact BSHD, unmasked or top-left causal, any S_q / S_kv, cc 10.0 or 10.3 (the D192x128 pair row also cc 10.7), public
 CuTeDSL >= 4.8 and a finite positive scale. Declined: THD, padding, bottom-right causal,
 right-band widening, deterministic requests on the D64 / D128 chain (the (192, 128) kernel
 pair honors them: each kernel owns its outputs and the amax folds are maxima), a
@@ -3101,7 +3102,7 @@ THD graphs.
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
-| Backward deterministic | SM100, SM103 — served by the MXFP8 row (the d = 256 chain and the D64 / D128 / (192, 128) kernel pair), the f16/bf16 d128 row (dense MHA / GQA / MQA: the dK/dV + dQ kernel pair on cc 10.0 / 10.3 -- `d128_contract.PAIR_CCS`; recompute for MHA outside its gates and on cc 10.7), the f16/bf16 d256 row, the half d512 chain and the per-tensor FP8 (192, 128) pair; declined by d128 THD, dense GQA / MQA on cc 10.7, the per-tensor FP8 D64 / D128 chain and the opt-in d192 accumulation row |
+| Backward deterministic | SM100, SM103 — served by the MXFP8 row (the d = 256 chain and the D64 / D128 / (192, 128) kernel pair), the f16/bf16 d128 row (dense MHA / GQA / MQA: the dK/dV + dQ kernel pair on cc 10.0 / 10.3 -- `d128_contract.PAIR_CCS`; recompute for MHA outside its gates and on cc 10.7), the f16/bf16 d256 row, the half d512 chain and the per-tensor FP8 (192, 128) pair (also on cc 10.7); declined by d128 THD, dense GQA / MQA on cc 10.7, the per-tensor FP8 D64 / D128 chain and the opt-in d192 accumulation row |
 | d128 grouped `cta_group::2` pair body below `S` 8192 (THD and dense), on MHA, and on dense GQA / MQA with `S % 128 != 0` or `dkv_accum = fp32_reduce` | SM100, SM103, SM107 — the per-S heuristic (`cta_pair = auto`) serves the one-CTA grouped body of the layout below the threshold (the pair has no measured win there: the 2K / 4K cells are MEASURED as a loss for the pair on the step, -3.9 % / -3.5 %, on cc 10.0, THD; the per-part threshold is re-measured on cc 10.7 (2026-11-03: 8192 holds, the pair +7.9 / +9.9 / +12.3 % at 8K / 16K / 32K and not a win at 4K), carried as is on cc 10.3 and on dense); the pair has no MHA body; the dense twin keeps the grouped dense requirements (compact BSHD, contiguous Stats, `S % 128 == 0`, bf16 partials); `cta_pair = on` declines by name; outside the admitted parts (cc 8.x / 9.0 / 11.x / 12.x: no `cta_group::2` pair) `auto` serves the one-CTA body and `on` declines naming the cc |
 | Backward decode-shaped S_q = 1 | SM100, SM103 — served by the MXFP8 d=256 row and the dense MHA f16/bf16 d128 row |
 | MXFP8 backward: E5M2, bottom-right / band-widened masks, a sliding window at d = 256 or without the causal mask, non-BSHD strides, `amax_*` outputs | SM100, SM103 — a left window under the causal mask is served at D64 / D128 / (192, 128) |
@@ -3493,8 +3494,8 @@ only at the 128k endpoint (0.67; not admitted) -- `SM107_PAGED_D256_G32_*`; and 
 32/2 -- 12/1 and 16/1 share the groups but were not measured at `S_q > 1` and trail -- = the 32-column tile in up to two token units; FlashInfer's decode graph at `q_len_per_req` 2-4 declares the bottom-right causal diagonal with the
 padding mask) over the WHOLE measured box b 1-128 × declared KV 1k-128k at page 16 bf16 -- the tile 0.01-0.31 of the backend's plan
 (which costs 6.8-142 ms per launch at KV 128k) on all 576 (cell, regime) pairs, every one quotable, so no tokens-in-flight floor and the
-2-unit corner included -- `SM107_PAGED_D256_MTP_*`; page 32 / 64 and the f16 twin were not measured on the MTP rows and keep the backend
-first. On both bands the tile trails FlashInfer's own fa2 kernel on part of the cells (7-9 % at the medians on group 32; 6 % at q 2 and
+2-unit corner included. Since 2026-11-10 the MTP rows are the generated placement table's (study `sm107_paged_mtp_20261110`: bf16
+d64-d576, GQA 4-128, page 16 / 32 / 64, declared KV 16-1M); the f16 twin still keeps the backend first. On both bands the tile trails FlashInfer's own fa2 kernel on part of the cells (7-9 % at the medians on group 32; 6 % at q 2 and
 21-22 % at q 3-4 on the MTP rows -- the 32-column tile's issue-rate gap at 24-64 packed rows, the gaps table's row): FE's verdict is
 against the backend's plan on the same graph; which of its kernels a consumer routes to is the consumer's question, and the kernel
 lever stays open. Not measured, backend-first:
@@ -4669,7 +4670,9 @@ The CGA4x1 / CTA_MMA2 role-split D512 body now supports dense packed and unpacke
 The existing opt-in `sdpa_bwd_sm107_fp8` row serves exact Q/K=192 and V/O=128
 alongside D256. Dense BSHD and packed THD use native operand widths, including
 their tensor maps, delta reduction, workspace and GQA fold; no data repack is
-added. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
+added. Dense MHA (192, 128) without a window on cc 10.7 is served by the
+`sdpa_bwd_sm100_d192_fp8` kernel pair row, which lists ahead of this row; the chain
+keeps the other (192, 128) graphs. The row retains its E4M3 input, E4M3/BF16/FP16 gradient, mask, amax,
 Stats-layout and declared-total contracts. Other head pairs, half and MXFP8
 rows keep their existing eligibility. Placement and heuristic policy are unchanged.
 

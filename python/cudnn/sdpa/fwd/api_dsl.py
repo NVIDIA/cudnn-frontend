@@ -59,6 +59,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGA
 from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_tile_leg
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_SPLIT_SHAPES as _SM107_FP8_SPLIT_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_SPLIT_SHAPES as _SM107_MXFP8_SPLIT_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import supports_fp8_padded_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_PACK_GQA_SHAPES as _SM107_FP8_PACK_GQA_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES as _SM107_MXFP8_THD_SHAPES
@@ -624,7 +625,7 @@ def _exp2_fma_split_for(device_cc: tuple[int, int], *, kind: str, flavor: tuple[
     return bool((kind, tuple(flavor)) in kernels and tuple(device_cc) in _EXP2_FMA_SPLIT_CC)
 
 
-def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True) -> tuple[int, ...]:
+def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[int, int], pertensor: bool = True, fp8_o: bool = False) -> tuple[int, ...]:
     """CGA widths the STANDALONE adapter serves for a kernel flavor.
 
     A module-level function, not an inline expression in ``check_support``, so a
@@ -648,7 +649,8 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     ``cgas={2}``.  Keep the three in lockstep.
     """
     if device_cc == (10, 7) and fp8 and flavor == (192, 128):
-        return (2,)
+        # Inside the version-0 descriptor window at cga1: the per-tensor kernel with an fp8 O, the MXFP8 kernel with any O.
+        return (1, 2) if (fp8_o or not pertensor) else (2,)
     if flavor == (192, 128):
         return (1, 2)
     if device_cc == (10, 7) and not fp8 and flavor in _SM107_F16_SMALL_D_SHAPES:
@@ -672,13 +674,13 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         # cc 10.7 MXFP8 admits both widths: the dense unsplit legs run the 2-CTA pair (config_sm100.d256_mxfp8_pair_leg,
         # the width template_params derives); per-tensor FP8 d256 keeps cga1.
         return (1, 2) if (device_cc == (10, 7) and not pertensor) else (1,)
-    if device_cc != (10, 7) and fp8 and pertensor and flavor == (128, 128):
+    if fp8 and pertensor and flavor == (128, 128):
         # Per-tensor FP8 d128 builds at both widths: cga1 is one 256-row CTA
         # (no collective MMA, STAGES_KV=2, Q/O aliased), cga2 the 2-CTA pair.
         return (1, 2)
     if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
-    if device_cc != (10, 7) and fp8 and not pertensor and flavor == (128, 128):
+    if fp8 and not pertensor and flavor == (128, 128):
         # MXFP8 d128 builds at both widths on the SM100 line: cga1 is one 256-row CTA of the prefill body (no
         # collective MMA, three K/V stages), cga2 the 2-CTA pair; heuristics._auto_sched_cga picks between them.
         return (1, 2)
@@ -1718,6 +1720,7 @@ class SdpaFwdDsl(APIBase):
             return (
                 bool(not self._fp8 and self.flavor in ((64, 64), (128, 128), (192, 128)))
                 or bool(self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
+                or bool(self._fp8 and not self._pertensor and self.flavor in _SM107_MXFP8_SPLIT_SHAPES)
                 or self._decode_q_tile() > 0
                 or self._rubin_native_d512_leg()
                 or self._rubin_native_d256_split_leg()
@@ -2927,7 +2930,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             else (
                 ((2,) if self.flavor in ((256, 256), SM100_NATIVE_D576_SHAPE) else (1,))
                 if self.packed_thd_split
-                else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
+                else supported_cgas_for(
+                    self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor, fp8_o=getattr(self, "dtype_o", None) in _SM100_FP8_DTYPES
+                )
             )
         )
         # Only a non-None request is checked: None means "let the lowering pick",
@@ -3460,6 +3465,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     self.packed_thd_split
                     or (not self._fp8 and self.flavor in ((128, 128), (192, 128)))
                     or (self._fp8 and self._pertensor and self.flavor in _SM107_FP8_SPLIT_SHAPES)
+                    or (self._fp8 and not self._pertensor and self.flavor in _SM107_MXFP8_SPLIT_SHAPES)
                 ),
                 "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D64/D128 or D192/V128, per-tensor FP8 D256, half D256 THD or native dense unpacked prefill, native dense D512 half, or the d256 decode tile",
             )
@@ -4311,7 +4317,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (not self.o_block_scale or self._can_prepare_block_output())
         ):
             return False
-        if self._device_cc == (10, 7) and (self.split_kv > 1 or self.pack_gqa):
+        if self._device_cc == (10, 7) and (
+            self.pack_gqa
+            or (
+                self.split_kv > 1
+                and (self.flavor not in _SM107_MXFP8_SPLIT_SHAPES or self._o_dtype() not in (torch.bfloat16, torch.float16) or self.paged or self.thd)
+            )
+        ):
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None

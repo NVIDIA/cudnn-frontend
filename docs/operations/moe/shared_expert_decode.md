@@ -69,7 +69,7 @@ form and stays off.
 
 | question | answer |
 | --- | --- |
-| device | compute capability 10.x (validated on cc 10.0 and cc 10.3; cc 10.7 runs the same admission, unverified); 12.x declined (no launch-1 form fits a 99 KB per-CTA opt-in) |
+| device | compute capability 10.x (validated on cc 10.0, cc 10.3 and cc 10.7); 12.x declined (no launch-1 form fits a 99 KB per-CTA opt-in) |
 | geometry | `Geometry(8192, 256)` and `Geometry(8192, 128)`; others declined by name |
 | tokens | 1 .. 24 per call (runtime argument); 25 and up declined by name |
 | dtypes | bf16 in / out; fp32 accumulation; `act` rounded once to bf16 |
