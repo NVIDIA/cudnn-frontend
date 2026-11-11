@@ -666,7 +666,7 @@ _D512_2X2_ARRIVE_SITE_PINS = {
     "mb_stat_full[": 2,  # per-iteration alpha + tile-end stats
     "mb_stat_empty[": 3,  # correction: kv_left consume + per-iteration + tile-end
     "mb_bmm2_ready[": 8,  # correction: 2 (kv_left) + 2 (fast arm) + 2 (slow arm) + 2 (lever-off arm)
-    "mb_o_full[": 2,  # epilogue: staged + fp32-partials arms (64 lanes of one half each)
+    "mb_o_full[": 3,  # staged, coalesced-partial, direct-partial arms; mutually exclusive, still 64 arrivals per chunk
     "mb_o_empty.arrive": 1,  # TMA-STG warp, all lanes, own copy ...
     "mb_o_empty.arrive_on_peer": 1,  # ... + the twin's copy (KV_SHARE=2) = ONE_WARP x KV_SHARE per CTA
     "mb_empty_mainloop.arrive": 1,
@@ -679,8 +679,8 @@ _D512_2X2_ARRIVE_SITE_PINS = {
 
 
 def test_sm107_d512_2x2_source_arrive_sites_match_the_ledger():
-    """The arrive-site counts of the 2x2 module against the ledger (a new site on a per-lane barrier changes its init
-    count), the pair-wide O-empty gate's two arrives on the twin's rank, the proxy fence on every lane right before the P
+    """The arrive-site counts of the 2x2 module against the ledger (mutually exclusive sites share the same per-phase
+    arrival count), the pair-wide O-empty gate's two arrives on the twin's rank, the proxy fence on every lane right before the P
     release arrive, and the kernel-end drain of the final mb_o_empty phase."""
     mod = _load_2x2()
     with open(mod.__file__, encoding="utf-8") as fh:
