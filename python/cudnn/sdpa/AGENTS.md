@@ -55,6 +55,14 @@ the same storage without copying. The SM80 detector
 fresh pointers, changed-length replay, and pre-launch rejection of short or
 incorrectly pitched carriers.
 
+The semantic `cudnn::sdpa_bwd` op has no explicit Stats layout attribute.
+Its legacy padded `(B,H,S)` input overlaps packed `(T,H,1)` when `T == B`
+and `S == 1`. Preserve the legacy interpretation and pass known packed
+inputs as the unambiguous `(T,H)` view, including autograd's saved forward
+Stats. Do not resolve the ambiguity by reading device sequence lengths.
+`test_thd_backward_ambiguous_stats_with_empty_sequence` checks leading and
+trailing empty batches with extra Q capacity against an independent reference.
+
 An explicitly padded Stats output is a separate existing forward contract:
 when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
 its declared `(B, H, S_max)` strides even when Q/O are THD. FlashInfer prefill's

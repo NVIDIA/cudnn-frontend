@@ -543,8 +543,8 @@ class TestSdpaVarlen:
     @pytest.mark.L0
     def test_thd_autograd(self):
         """sdpa_fwd is differentiable end to end on the varlen path: the
-        registered autograd glue converts the packed TH1 stats to the padded
-        LSE layout and routes grads through cudnn::sdpa_bwd."""
+        registered autograd glue preserves packed TH1 Stats and routes grads
+        through cudnn::sdpa_bwd, which adapts only for a legacy backend."""
         torch.manual_seed(0)
         lens, H, D = [200, 312, 96], 8, 128
         q, k, v, cu, _, mx = self._make(lens, H, H, D)
@@ -564,6 +564,124 @@ class TestSdpaVarlen:
         assert (q.grad.float() - rdq).abs().max().item() < TOL
         assert (k.grad.float() - rdk).abs().max().item() < TOL
         assert (v.grad.float() - rdv).abs().max().item() < TOL
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_thd_autograd_ignores_trailing_capacity(self, deterministic):
+        """A reusable packed buffer may be larger than the live ``cu[-1]``.
+
+        Public forward/backward must ignore that tail without a host read.  In
+        particular, the packed-to-padded LSE bridge must not interpret capacity
+        rows as a sentinel batch index and scatter out of bounds.
+        """
+        if deterministic and torch.cuda.get_device_capability()[0] in (8, 12):
+            pytest.skip("cuDNN has no deterministic THD backward on SM8X/SM12X")
+        torch.manual_seed(0)
+        lens, capacity, H, D = [64, 33], 112, 4, 128
+        live = sum(lens)
+        cu = torch.tensor([0, lens[0], live], dtype=torch.int32, device="cuda")
+
+        def packed(poison):
+            value = torch.randn(capacity, H, D, dtype=torch.bfloat16, device="cuda")
+            value[live:] = poison
+            return value.requires_grad_(True)
+
+        q, k, v = (packed(poison) for poison in (float("nan"), float("inf"), 1e4))
+        scale = D**-0.5
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic)
+        try:
+            o, _ = torch.ops.cudnn.sdpa_fwd(
+                q, k, v, scale, is_causal=True,
+                cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=max(lens), max_seqlen_kv=max(lens), return_lse=True,
+            )  # fmt: skip
+            grad = torch.full_like(o, float("nan"))
+            grad[:live] = torch.randn_like(grad[:live])
+            o.backward(grad)
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic)
+
+        ref, _, rdq, rdk, rdv = self._ref(q, k, v, cu, is_causal=True, grad=grad[:live])
+        assert (o[:live].float() - ref).abs().max().item() < TOL
+        assert (q.grad[:live].float() - rdq[:live]).abs().max().item() < TOL
+        assert (k.grad[:live].float() - rdk[:live]).abs().max().item() < TOL
+        assert (v.grad[:live].float() - rdv[:live]).abs().max().item() < TOL
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("leading_empty", [True, False])
+    @pytest.mark.parametrize("stats_layout", ["padded3d", "padded4d", "packed2d", "autograd"])
+    def test_thd_backward_ambiguous_stats_with_empty_sequence(self, leading_empty, stats_layout):
+        """Legacy BHS Stats stay padded when T capacity == B and maxS == 1."""
+        torch.manual_seed(959)
+        B, H, D = 2, 2, 128
+        live_batch = 1 if leading_empty else 0
+        kv_start = 2 if leading_empty else 0
+        cu_q = torch.tensor([0, 0, 1] if leading_empty else [0, 1, 1], dtype=torch.int32, device="cuda")
+        cu_kv = torch.tensor([0, 2, 5] if leading_empty else [0, 3, 5], dtype=torch.int32, device="cuda")
+        q = torch.randn(B, H, D, dtype=torch.bfloat16, device="cuda")
+        q[1:] = float("nan")  # unused capacity must not become another query
+        k, v = (torch.randn(5, H, D, dtype=q.dtype, device="cuda") for _ in range(2))
+        for operand in (q, k, v):
+            operand.requires_grad_(True)
+        grad = torch.full_like(q, float("nan"))
+        grad[:1] = torch.randn_like(grad[:1])
+        kwargs = dict(cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, max_seqlen_q=1, max_seqlen_kv=3)
+        o, stats = torch.ops.cudnn.sdpa_fwd(q, k, v, D**-0.5, return_lse=True, **kwargs)
+        if stats_layout == "autograd":
+            o.backward(grad)
+            actual = (q.grad, k.grad, v.grad)
+        else:
+            if stats_layout == "packed2d":
+                lse = stats.squeeze(-1)
+            else:
+                # Distinguish the empty batch's row from the live packed row.
+                lse = torch.full((B, H, 1, 1), 13.0, device=q.device, dtype=torch.float32)
+                lse[live_batch, :, 0, 0] = stats[0, :, 0]
+                if stats_layout == "padded3d":
+                    lse = lse.squeeze(-1)
+            actual = torch.ops.cudnn.sdpa_bwd(grad, q, k, v, o, lse, D**-0.5, **kwargs)
+
+        # Independent FP64 attention on the sole live sequence. The two
+        # batches have different Q/KV prefixes; unused Q capacity is excluded.
+        qr = q[:1].detach().double().requires_grad_(True)
+        kr, vr = (t[kv_start : kv_start + 3].detach().double().requires_grad_(True) for t in (k, v))
+        scores = torch.einsum("qhd,khd->hqk", qr, kr) * D**-0.5
+        ref = torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), vr)
+        ref.backward(grad[:1].double())
+        torch.testing.assert_close(o[:1].double(), ref, rtol=0, atol=TOL)
+        for got, expected, start in zip(actual, (qr.grad, kr.grad, vr.grad), (0, kv_start, kv_start)):
+            torch.testing.assert_close(got[start : start + expected.shape[0]].double(), expected, rtol=0, atol=TOL)
+
+    @pytest.mark.L0
+    @pytest.mark.parametrize("decline", ["unsupported", "not_implemented", "bug"])
+    def test_thd_autograd_adapts_only_explicit_declines(self, monkeypatch, decline):
+        """Legacy Stats adaptation is cached; implementation errors propagate."""
+        from cudnn.sdpa import packed_lse
+
+        with torch_op._graph_cache_lock:
+            torch_op._graph_cache.clear()
+        build = torch_op._build_bwd_graph
+        layouts = []
+
+        def legacy_build(handle, **kwargs):
+            layouts.append(kwargs["stats_is_packed"])
+            if kwargs["stats_is_packed"]:
+                error = {"unsupported": cudnn.cudnnGraphNotSupportedError, "not_implemented": NotImplementedError, "bug": RuntimeError}[decline]
+                raise error("injected packed-Stats decline")
+            return build(handle, **kwargs)
+
+        monkeypatch.setattr(torch_op, "_build_bwd_graph", legacy_build)
+        # Also exercise the compatibility implementation when DSL preparation
+        # is unavailable; live prefixes must ignore trailing capacity rows.
+        monkeypatch.setattr(packed_lse, "cutedsl_state", lambda: (False, None))
+        if decline == "bug":
+            with pytest.raises(RuntimeError, match="injected packed-Stats decline"):
+                self.test_thd_autograd_ignores_trailing_capacity(False)
+            assert layouts == [True]
+        else:
+            self.test_thd_autograd_ignores_trailing_capacity(False)
+            self.test_thd_autograd_ignores_trailing_capacity(False)
+            assert layouts == [True, False]
 
     @pytest.mark.L0
     def test_thd_kv_packed_views(self):
