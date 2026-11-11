@@ -860,7 +860,8 @@ python/cudnn/gemm/
 │   ├── compiler.py                 # facade for the active family's compiler
 │   ├── epilogue_codegen.py          # facade for the active family's codegen
 │   ├── kernel_templates/           # template code shared by architecture families
-│   └── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+│   ├── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+│   └── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
 └── ops/                            # backend-independent torch custom-op contracts
 ```
 
