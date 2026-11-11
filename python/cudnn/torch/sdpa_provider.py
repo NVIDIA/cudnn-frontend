@@ -267,9 +267,9 @@ def _varlen_bwd(grad_out, query, key, value, out, lse, cu_seq_q, cu_seq_k, max_q
     calls["bwd"] += 1
     attn_scale = scale if scale is not None else query.shape[-1] ** -0.5
     # PyTorch carries packed Stats as (H, T); hand the (T, H) view to the
-    # semantic backward op unchanged.  It preserves that packing for FROST's
-    # SM100 large-head THD engine and performs the legacy backend's device-side
-    # repad itself, so this provider does not duplicate engine layout policy.
+    # semantic backward op unchanged. It preserves that packing for the selected
+    # engine and performs a legacy backend's device-side repad only
+    # when necessary, so this provider does not duplicate engine layout policy.
     lse_packed = lse.transpose(0, 1)
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_out, query, key, value, out, lse_packed, attn_scale,

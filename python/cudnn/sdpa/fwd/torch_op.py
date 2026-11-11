@@ -662,8 +662,8 @@ def _build_bwd_graph(
         o_t.set_ragged_offset(ro)
         do_t.set_ragged_offset(ro)
         if stats_is_packed:
-            # FROST's THD path consumes the forward's token-major packed LSE
-            # directly.  The descriptor keeps the ragged BHS1 envelope while
+            # The graph declares the forward's token-major packed LSE directly.
+            # The descriptor keeps the ragged BHS1 envelope while
             # this offset maps each batch to its first packed token.
             rs = g.tensor(name="ragged_stats", dim=[B + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64, uid=_UIDs.RAGGED_STATS)
             stats_t.set_ragged_offset(rs)
@@ -737,6 +737,24 @@ def _build_bwd_graph(
             )
         )
     return g, g.get_workspace_size(), tuple(int(uid) for uid in tensor_uids)
+
+
+def _build_bwd_graph_with_stats_fallback(handle, **kwargs):
+    """Offer the declared Stats layout to the normal backend/FROST planner.
+
+    Only an explicit unsupported-graph decline permits the legacy padded
+    representation. Compilation errors and invalid input still propagate.
+    The cached tensor UIDs record which representation execution must bind.
+    """
+    from cudnn.engines.base import decline_types
+
+    try:
+        return _build_bwd_graph(handle, **kwargs)
+    except decline_types():
+        if not (kwargs["is_thd"] and kwargs["stats_is_packed"]):
+            raise
+    padded = dict(kwargs, stats_is_packed=False, stats_stride=(kwargs["H_q"] * kwargs["S_q"], kwargs["S_q"], 1, 1))
+    return _build_bwd_graph(handle, **padded)
 
 
 _lib.define(
@@ -953,8 +971,8 @@ def _sdpa_bwd_impl(
     S_q, S_kv = max_seqlen_q, max_seqlen_kv
     _check_same_device(q, k=k, v=v, o=o, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, lse=lse, grad_out=grad_out)
 
-    # Accept both public layouts.  FROST SM100 consumes token-major packed LSE
-    # in place; classic backend THD consumes a padded per-batch rectangle.
+    # Accept both public layouts. Keep packed Stats for any serving engine;
+    # adapt to a padded rectangle only when the packed graph is unsupported.
     # Normalize before reshape (a non-contiguous reshape may silently copy),
     # and also repair a base-pointer alignment violation.
     if lse.dtype != torch.float32:
@@ -970,13 +988,6 @@ def _sdpa_bwd_impl(
         )
     if not lse.is_contiguous() or lse.data_ptr() % 16:
         lse = lse.clone(memory_format=torch.contiguous_format)
-    if stats_is_packed and not _thd_bwd_prefers_packed_stats(q, k, v, o, S_q, is_deterministic):
-        # Public forward always returns packed TH1.  Keep direct bwd callers
-        # equivalent to autograd: adapt inside this semantic op when the
-        # serving path is the classic backend rather than making every caller
-        # know an engine's private Stats layout.
-        lse = thd_lse_to_padded(lse.reshape(T_q, H_q, 1)[:, :, 0], cu_seqlens_q, S_q)
-        stats_is_packed = False
     if stats_is_packed:
         lse = lse.reshape(T_q, H_q, 1)
         stats_stride = (S_q * H_q, 1, H_q, 1)  # TH1 token-major
@@ -1028,7 +1039,7 @@ def _sdpa_bwd_impl(
     handle = _get_handle(q.device)
     g, ws, tensor_uids = _cached_graph(
         key,
-        lambda: _build_bwd_graph(
+        lambda: _build_bwd_graph_with_stats_fallback(
             handle,
             dtype=q.dtype,
             B=B,
@@ -1056,6 +1067,11 @@ def _sdpa_bwd_impl(
             is_thd=True,
         ),
     )
+
+    plan_stats_is_packed = _UIDs.RAGGED_STATS in tensor_uids
+    if stats_is_packed and not plan_stats_is_packed:
+        lse = thd_lse_to_padded(lse[:, :, 0], cu_seqlens_q, S_q)
+    stats_is_packed = plan_stats_is_packed
 
     # Gradients are ours: packed-contiguous, one io dtype (validated above).
     dq = torch.empty(T_q, H_q, D_qk, dtype=q.dtype, device=q.device)
@@ -1184,49 +1200,6 @@ def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seql
     from ..packed_lse import prepare_padded_lse
 
     return prepare_padded_lse(lse_th, cu_seqlens_q, max_seqlen_q)
-
-
-def _thd_bwd_prefers_packed_stats(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    o: torch.Tensor,
-    max_seqlen_q: int,
-    is_deterministic: bool,
-) -> bool:
-    """Whether the currently offered THD backward consumes packed Stats.
-
-    This is layout routing, not model matching: the SM100 large-head engine is
-    the one backward capability cell whose contract is ragged Stats.  Classic
-    backend THD paths require padded Stats instead.  Keep the predicate beside
-    the bridge so the public forward's native packed result is not destroyed
-    before the engine that owns it sees the graph.  This runs inside the CUDA
-    custom op, so AOT autograd never captures an environment/device decision.
-    """
-    from cudnn.engines.manifest import opt_in_engines_enabled
-    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-
-    if not opt_in_engines_enabled() or is_deterministic or max_seqlen_q <= 1:
-        return False
-    installed, version = cutedsl_state()
-    if not installed or cutedsl_too_old(version):
-        return False
-    major, minor = torch.cuda.get_device_capability(q.device)
-    sm = major * 10 + minor
-    d_qk, d_v = q.shape[-1], v.shape[-1]
-
-    def _is_compact_thd(t: torch.Tensor) -> bool:
-        _, h, d = t.shape
-        return tuple(t.stride()) == (h * d, d, 1)
-
-    # The graph analyzer's layout filter is intentionally coarse; this adapter
-    # has no THD staging leg and accepts only exact compact BSHD physical
-    # storage.  Mirror that final capability here so a kv-interleaved public
-    # input is repadded for the legacy engine instead of building a ragged-Stats
-    # graph for a FROST plan that will decline it.
-    return (
-        100 <= sm <= 103 and d_qk == d_v and k.shape[1] == v.shape[1] and 256 < d_qk <= 512 and d_qk % 8 == 0 and all(_is_compact_thd(t) for t in (q, k, v, o))
-    )
 
 
 def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable

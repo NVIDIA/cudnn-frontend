@@ -1415,3 +1415,11 @@ describes a different output location. Head-major Stats offsets advance by one
 element per token, while token-major Stats offsets advance by the head count.
 The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
 numerical and replay checks for these contracts.
+
+Packed Stats from public Torch autograd must reach the ordinary graph planner
+before any compatibility conversion. Exercise deterministic and nondeterministic
+backward through both the public op and the registered varlen provider; a
+shape/architecture predicate can become stale when a native engine expands.
+The D512 autograd regressions in `test_sdpa_bwd_thd_sm100.py` cover this route.
+When a test switches a compile-time datapath, clear cached public graphs before
+recording its template; otherwise a prior test's plan bypasses the recorder.

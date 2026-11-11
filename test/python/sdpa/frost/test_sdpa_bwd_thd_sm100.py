@@ -578,6 +578,12 @@ def test_graph_thd_stats_packings(layout, stage2_datapath):
 
 @pytest.fixture(params=[False, True], ids=["nondeterministic", "deterministic"])
 def autograd_determinism(request):
+    from cudnn.sdpa.fwd import torch_op
+
+    # The stage-2 fixture changes a compile-time kernel choice. A cached public
+    # graph from the preceding datapath would bypass its template recorder.
+    with torch_op._graph_cache_lock:
+        torch_op._graph_cache.clear()
     was = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(request.param)
     try:
