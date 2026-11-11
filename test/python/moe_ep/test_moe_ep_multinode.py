@@ -328,6 +328,34 @@ def test_stateless_training_multinode_mixed_cga_matches_independent_reference(to
     )
 
 
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
+def test_mxfp8_forward_multinode_fc2_bulk_store_matches_reference(torchrun_world, token_back_mode):
+    world = torchrun_world
+    if world.world_size != 8 or world.local_world_size != 4:
+        pytest.skip(
+            "EP8 FC2 bulk-store inference requires torchrun WORLD_SIZE=8, LOCAL_WORLD_SIZE=4; "
+            f"got WORLD_SIZE={world.world_size}, LOCAL_WORLD_SIZE={world.local_world_size}"
+        )
+    try:
+        _run_forward_output_case(
+            device=world.device,
+            ep_group=dist.group.WORLD,
+            ep_rank=world.rank,
+            ep_size=8,
+            expected_global_ranks=tuple(range(8)),
+            hidden=256,
+            tuning_kwargs={"fc2_bulk_store": "auto", "token_back_mode": token_back_mode},
+        )
+        dist.barrier()
+    finally:
+        from cudnn.moe_ep._megamoe_backend._runtime import (
+            get_runtime_manager,
+        )
+
+        get_runtime_manager().shutdown()
+        dist.barrier()
+
+
 def test_stateless_training_ep32_uneven_tokens_forward_backward_matches_reference(
     torchrun_world,
 ):
