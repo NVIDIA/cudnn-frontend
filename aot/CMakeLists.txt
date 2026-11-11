@@ -52,5 +52,5 @@ target_link_libraries(bench_sdpa_sm120 PRIVATE CUDA::cudart cudnn_frontend_aot_l
 target_compile_features(bench_sdpa_sm120 PRIVATE cxx_std_17)
 add_dependencies(bench_sdpa_sm120 cudnn_frontend_aot_sm120)
 
-# Both find the library through --lib, $CUDNN_FRONTEND_AOT_SM120_LIB or the loader path.
+# Both find the library through --lib or the loader path.
 message(STATUS "AOT SM120: run ${CMAKE_CURRENT_BINARY_DIR}/test_sdpa_sm120 --lib ${AOT_SM120_LIB}")

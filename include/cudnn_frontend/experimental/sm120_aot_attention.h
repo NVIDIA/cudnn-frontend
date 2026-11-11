@@ -15,7 +15,7 @@
  *   aot::SdpaArgs args = aot::make_args();            // extents, byte strides, pointers
  *   plan.execute(args, workspace, workspace_size, stream);                               // launches only
  *
- * Library lookup: the path given to Library::load(), else $CUDNN_FRONTEND_AOT_SM120_LIB, else
+ * Library lookup: a trusted path explicitly given to Library::load(), else
  * "libcudnn_frontend_aot_sm120.so" on the dynamic loader's search path.
  */
 
@@ -32,7 +32,6 @@
 #include <dlfcn.h>
 #endif
 
-#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -172,17 +171,8 @@ class Library {
 
     Status
     do_load(const char* path) {
-        if (!path || !*path) {
-#ifdef _WIN32
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
-            const char* env = std::getenv("CUDNN_FRONTEND_AOT_SM120_LIB");
-#ifdef _WIN32
-#pragma warning(pop)
-#endif
-            path = (env && *env) ? env : kDefaultName;
-        }
+        // An alternate executable library is an explicit caller decision, never an ambient environment override.
+        if (!path || !*path) path = kDefaultName;
         handle_ = open(path);
         if (!handle_) {
             error_ = std::string("unable to load ") + path + ": " + dl_error();

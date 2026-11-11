@@ -106,7 +106,7 @@ def in_domain(c: ShapeClass, g: int, k: Knobs) -> bool:
     """Whether knob set ``k`` (proposed at GQA ratio ``g``) is compiled for class ``c``: the class's KV tile; PackGQA only
     for the class's ratios and at tile_m 128; splits from ``SPLITS``, unpacked at tile_m 64; an unsplit causal set on
     LPT_L2 (LPT folds into it)."""
-    if k.tile_n != kv_tile(c.d) or k.split not in SPLITS:
+    if k.tile_m not in (64, 128) or k.tile_n != kv_tile(c.d) or k.split not in SPLITS:
         return False
     if k.pack_gqa and (g not in c.pack_gqa or k.tile_m != 128):
         return False
@@ -119,7 +119,7 @@ def snap(c: ShapeClass, g: int, pick: Knobs) -> Knobs:
     """``pick`` moved into the compiled domain of class ``c`` (see :func:`in_domain`)."""
     pack = pick.pack_gqa if (pick.pack_gqa and g in c.pack_gqa) else 0
     split = max(s for s in SPLITS if s <= pick.split)
-    tile_m = 128 if pack else (64 if split > 1 else pick.tile_m)
+    tile_m = 128 if pack else (64 if split > 1 else (64 if pick.tile_m < 128 else 128))
     sched = 0 if split > 1 else (2 if c.causal else 0)
     return Knobs(pack, sched, split, tile_m, kv_tile(c.d))
 

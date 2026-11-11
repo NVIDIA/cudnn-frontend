@@ -97,7 +97,8 @@ int
 main(int argc, char** argv) {
     const char* lib_path = nullptr;
     int iters            = 50;
-    for (int i = 1; i < argc; ++i) {
+    int i                = 1;
+    while (i < argc) {
         if (!std::strcmp(argv[i], "--lib") && i + 1 < argc)
             lib_path = argv[++i];
         else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc)
@@ -106,6 +107,7 @@ main(int argc, char** argv) {
             std::fprintf(stderr, "usage: %s [--lib path] [--iters N]\n", argv[0]);
             return 2;
         }
+        ++i;
     }
     aot::Library& lib = aot::Library::instance();
     if (lib.load(lib_path)) {

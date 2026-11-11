@@ -37,7 +37,7 @@ The plan's `kv_dtype` picks the backend. A combination outside this table fails 
 ## C++ API
 
 `include/cudnn_frontend/experimental/sm120_aot_attention.h` is header-only. It dlopens the library and needs only
-`cuda_runtime.h`. The library is found through `Library::load(path)`, then `$CUDNN_FRONTEND_AOT_SM120_LIB`, then
+`cuda_runtime.h`. The library is found through a trusted explicit `Library::load(path)`, otherwise through
 `libcudnn_frontend_aot_sm120.so` on the loader path.
 
 ```c++

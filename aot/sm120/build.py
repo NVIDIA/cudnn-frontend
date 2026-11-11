@@ -45,9 +45,19 @@ LIB_NAME = "libcudnn_frontend_aot_sm120.so"
 AOT_CUTEDSL_MIN_VERSION = (4, 8)
 
 
+def check_checkout():
+    """The cache fingerprint and the imported kernels must describe the same checkout."""
+    import cudnn
+
+    expected = (REPO / "python/cudnn/__init__.py").resolve()
+    if Path(cudnn.__file__).resolve() != expected:
+        raise RuntimeError(f"AOT build imports {cudnn.__file__}, expected {expected}; install this checkout before building")
+
+
 def check_cutedsl():
     """Exit with a version-naming error before anything imports the DSL."""
     sys.path.insert(0, str(REPO / "python"))
+    check_checkout()
     from cudnn.frost import buffers
 
     installed, version = buffers.cutedsl_state()
@@ -70,6 +80,7 @@ def check_cutedsl():
 
 def _sel_init(repo_python: str):
     sys.path.insert(0, repo_python)
+    check_checkout()
 
 
 def _candidates(c: V.ShapeClass, g: int, sm: int, units: int, sq: int, skv: int):
@@ -142,7 +153,7 @@ def run_selection(class_ids, jobs: int):
 
 def _export_init(repo_python: str):
     os.environ["CUTE_DSL_DISABLE_FILE_CACHING"] = "1"
-    sys.path.insert(0, repo_python)
+    _sel_init(repo_python)
     from cutlass.runtime import find_runtime_libraries
 
     # export_to_c on a host without the target GPU resolves the launcher's runtime symbols against the process.

@@ -6,6 +6,8 @@ import concurrent.futures
 import importlib.util
 from pathlib import Path
 import tempfile
+import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +17,11 @@ SPEC.loader.exec_module(build)
 
 
 class ExportCacheTests(unittest.TestCase):
+    def test_other_editable_checkout_is_rejected(self):
+        with patch.dict(sys.modules, {"cudnn": SimpleNamespace(__file__="/some/other/checkout/cudnn/__init__.py")}):
+            with self.assertRaisesRegex(RuntimeError, "expected"):
+                build.check_checkout()
+
     def test_transitive_inputs_and_partial_outputs_invalidate_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -44,6 +51,22 @@ class ExportCacheTests(unittest.TestCase):
                     (out / "include/kernel.h").write_bytes(b"interrupted export")
                     build.run_export([rec], out, 1, Path("/cuda"), True)
                     self.assertEqual(len(calls), 3)
+
+
+class VariantDomainTests(unittest.TestCase):
+    def test_small_query_tiles_use_a_prebuilt_template(self):
+        c = build.V.CLASSES[0]
+        with patch.object(build.V, "kv_tile", return_value=128):
+            for tile_m in (16, 32, 96, 256):
+                with self.subTest(tile_m=tile_m):
+                    candidate = build.V.Knobs(0, 0, 1, tile_m, 128)
+                    self.assertFalse(build.V.in_domain(c, 1, candidate))
+                    snapped = build.V.snap(c, 1, candidate)
+                    self.assertEqual(snapped.tile_m, 64 if tile_m < 128 else 128)
+                    self.assertTrue(build.V.in_domain(c, 1, snapped))
+            for tile_m in (64, 128):
+                candidate = build.V.Knobs(0, 0, 1, tile_m, 128)
+                self.assertTrue(build.V.in_domain(c, 1, candidate))
 
 
 if __name__ == "__main__":
