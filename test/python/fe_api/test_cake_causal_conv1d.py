@@ -119,7 +119,10 @@ def test_training_and_capture(torch_cuda, dtype, bias, channels):
 @pytest.mark.parametrize("packed", [False, True])
 def test_existing_public_api_autograd(torch_cuda, packed):
     torch = torch_cuda
-    from cudnn.ops import causal_conv1d
+    from cudnn import ops
+    from cudnn.ops.causal_conv1d import causal_conv1d
+
+    assert ops.causal_conv1d is causal_conv1d
 
     x = torch.randn((1 if packed else 2, 7, 256), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     w = (torch.randn((256, 4), dtype=torch.float32, device="cuda") * 0.1).requires_grad_()
@@ -162,7 +165,10 @@ os._exit(3)
 
 def test_public_rejections(torch_cuda):
     torch = torch_cuda
-    from cudnn.ops import causal_conv1d
+    from cudnn import ops
+    from cudnn.ops.causal_conv1d import causal_conv1d
+
+    assert ops.causal_conv1d is causal_conv1d
 
     x = torch.randn((1, 7, 256), dtype=torch.bfloat16, device="cuda").transpose(1, 2)
     w = torch.randn((256, 4), dtype=torch.float32, device="cuda")
