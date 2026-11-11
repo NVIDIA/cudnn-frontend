@@ -785,6 +785,99 @@ read by the family's analyzer under the spelling of EVERY op that takes it.**
   `test/python/sdpa/graph/test_flexible_sdpa_te_shape.py` (the TE shape is
   served by the backend and O carries the modifier).
 
+**Rule 11 — consume what a thread loaded from a shared-memory stage before
+anything releases that stage, and prove the order in the compiled kernel.**
+
+- **The hazard.** A consumer that reads a pipeline stage with ordinary
+  shared-memory loads (`ld.shared`, `ldmatrix`) and then lets the producer
+  refill it can receive the bytes of the NEXT fill in any load whose
+  destination registers have not been read when the release executes. Nothing
+  faults and nothing hangs; the kernel returns a wrong value. Measured with
+  test kernels on SM100-line parts of compute capability 10.0, 10.3 and 10.7:
+  from a few launches in a hundred thousand to every launch, depending on how
+  many loads are still unread and on what sits between the load and the
+  release. The rate also depends on the launch geometry: on the two parts
+  where this was measured (10.0 and 10.7), the same unsafe kernel, with every
+  lane of a load in the same shared-memory banks, failed in every launch at
+  three thread blocks per SM, in all or all but one of 20,000 launches at
+  two, and in none at one; released through the helper below it read zero at
+  two and at three. A kernel with this order can pass every functional test
+  and fail in another shape or on another part.
+- **A release is anything after which the stage may be rewritten:** every
+  `mbarrier` arrive form (plain, counted, `expect_tx`, the remote and cluster
+  forms), `tcgen05.commit` to a barrier, a named-barrier or cluster-barrier
+  arrive, a peer send that completes the peer's barrier (`st.async`), and a
+  CTA barrier behind which the stage is refilled (by `cp.async`, a bulk copy,
+  a TMA load or another warp's stores). The loading lanes and the releasing
+  lane need not be the same.
+- **Source order is not consumption.** The compiler moves pure arithmetic,
+  comparisons, warp votes and shuffles, and `mma` on register operands behind
+  a release that does not depend on them. Writing the use in front of the
+  arrive proves nothing; the generated code does.
+- **Not an ordering:** `bar.warp.sync`, a CTA barrier, `fence.acq_rel` /
+  `fence.sc`, the release semantics of the arrive itself, the cross-proxy
+  fence placed in front of the loads, a warp-collective operation by itself,
+  a delay, a polling wait.
+- **Do this:** release through `cudnn.frost.tile_dsl.consume` —
+  `consume_then_arrive` (local; elected with `pred=`; counted with `count=`),
+  `consume_then_arrive_on_peer` (a peer CTA's barrier) and
+  `consume_then_read_tile_id_arrive` (the scheduler slot credit). Each form
+  adds every loaded word into a wrapping 32-bit sum, masks the sum with the
+  kernel's release-zero argument (0 at run time, unknown to the compiler and
+  to the assembler) and adds the result to the barrier address. The address
+  of the arrive is then computed from every loaded register, so each of them
+  is read in front of the release in the generated code, and no data value
+  can change where the arrive lands. Pass EVERY value the calling lanes
+  loaded from the stage since they acquired it, each once, and never a value
+  derived from another one (a difference or a checksum can cancel the term it
+  was computed from). Every warp that loads releases through the helper
+  itself. Contract and cost: [frost/README.md](frost/README.md).
+- **Where the helper does not fit** (the release has no address operand — a
+  CTA barrier in front of a refill, a peer send — or another warp or thread
+  block releases): put the release behind a store of a result computed from
+  the values, and show that store in front of the release in the
+  disassembly; or, when the refill is an async-proxy write (a TMA load, a
+  bulk copy, the cluster launch-control response), put
+  `fence.proxy.async.shared::cta` between the LAST load and the release. Both
+  read zero in every measurement — the fence against TMA and bulk-copy
+  refills; the launch-control response is a write of the same kind and was
+  not measured separately — and neither is ordered by data flow: name the
+  choice in the kernel's shared-memory buffer table and keep the site under
+  the warm stress.
+- **Never let the kernel know the mask.** The release-zero argument has
+  exactly one use in the kernel, `release_zero(arg)`. A compare, a branch, an
+  assert or an assume on it — an entry guard `if arg == 0:` is enough — lets
+  the optimizer replace the mask by a constant. A zero from an inline-asm
+  `mov` (`opaque_i32_zero`) is opaque to the optimizer only; the assembler
+  folds it. In both cases the sum disappears from the kernel and the loads
+  are unread at the release again, without any error. A non-zero argument is
+  undefined behaviour (the arrive lands on another word of shared memory):
+  the host passes the literal 0 and nothing in the kernel tests for it.
+- **Tensor memory.** A value read from tensor memory (`tcgen05.ld`) whose
+  slot the release frees follows the same order, as a precaution: keep the
+  load's `tcgen05.wait::ld` and the first read of its registers in front of
+  the release. Test kernels that left such a load unread across the release
+  of its accumulator returned no wrong value on compute capability 10.0, 10.3
+  and 10.7 (more than 12 million launches per class), for one load form and
+  for a slot overwritten by the same thread block's next MMA chain. A slot
+  rewritten by another thread block, by `tcgen05.st` or after a deallocation
+  was not measured. Do not read this rule as an exemption for tensor memory.
+- **Scope.** The rule applies to new and changed release sites. Existing
+  sites move onto the helper in follow-up changes; until a site has moved,
+  its release arrive, fence or named barrier stays.
+- **Detectors.** Rendering (the proof): in the disassembly of every rendering
+  that ships, each load of a released stage has a read of every destination
+  register in front of the release on every path.
+  `warm_stress.assert_release_dependence` pins the helper's chain in a
+  kernel's PTX (the address of the arrive reaches an `and` with the
+  release-zero parameter, and that `and` reaches the loaded registers);
+  `sdpa/frost/test_tile_dsl_consume_then_arrive.py` applies it to every form
+  on a ring whose unsafe twin fails. Run time (a rate bound, not a proof):
+  `warm_stress.assert_warm_stress` ([test/AGENTS.md](../../test/AGENTS.md))
+  on a shape that refills the stage inside one launch, with at least two
+  thread blocks per SM where the kernel allows it. A cold functional test and
+  a first-launch-equals-second-launch check do not test this class.
+
 ## Frontend-only kernel package layout
 
 Organize kernels by operation, then backend, then GPU architecture where needed.
@@ -986,6 +1079,9 @@ that warp. Keep the MoE scheduler's release arrives unless a separate ordering
 proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
+Rule 11 is the general form of this requirement and names the helper that
+satisfies it. Until a site has moved onto that helper, its release arrive,
+fence or named barrier is kept; none of them is the ordering Rule 11 asks for.
 
 A TMA-store epilogue must not reuse an smem output buffer while a bulk store may
 still be reading it. Every `PipelineTmaStore.producer_commit()` needs a

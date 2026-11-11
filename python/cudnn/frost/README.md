@@ -974,6 +974,83 @@ independent root model; source comments link this section instead of repeating
 the encoding details.
 
 
+## Releasing a shared-memory stage: `tile_dsl.consume`
+
+A consumer that read a stage with ordinary shared-memory loads returns it
+through this module, never through a bare arrive (`python/cudnn/AGENTS.md`
+Rule 11 has the reason and what was measured).
+
+```python
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
+
+@cute.kernel
+def kernel(..., rz_arg: cutlass.Int32):            # the release-zero: one more kernel argument, last
+    rz = release_zero(rz_arg)                      # once, at the top of the kernel
+    ...
+    w = stage.load(base, vector_size=4, alignment=16)
+    consume_then_arrive(mb_empty[s], w, rz, pred=nvvm.elect_sync())
+    ... w is used here, or later ...
+
+@cute.jit
+def host(...):
+    kernel(..., cutlass.Int32(0)).launch(...)       # the only value ever passed
+```
+
+| Release | Call | Arrives as |
+|---|---|---|
+| local, every calling lane | `consume_then_arrive(mb, consumed, rz)` | `barrier.arrive` |
+| elected lane | `consume_then_arrive(mb, consumed, rz, pred=nvvm.elect_sync())` | one predicated local arrive |
+| counted | `consume_then_arrive(mb, consumed, rz, count=n)`, with or without `pred=` | `n` per arriving lane |
+| peer CTA | `consume_then_arrive_on_peer(mb, peer, consumed, rz, pred=, release_cta=True)` | `mbar_arrive_on_peer` |
+| scheduler slot credit | `consume_then_read_tile_id_arrive(mb, cga_size, consumed, rz)` | the predicated arm of `read_tile_id_arrive` |
+
+Contract:
+
+- **What it emits.** A wrapping 32-bit sum over every word of `consumed`, an
+  AND with the release-zero, the result added to the barrier address, then
+  the arrive of the chosen form. For W loaded 32-bit words that is
+  ceil(W / 2) + 2 integer instructions per release (12 for 20 words on
+  `sm_100a`: nine three-input adds, one add, the AND, one multiply-add); no
+  load, no store, no shared-memory word.
+- **`consumed` is required** and may not be empty: every value the calling
+  lanes loaded from the stage since they acquired it — scalars, vectors,
+  register tiles, nested tuples; 64-bit values contribute both halves. Pass
+  each loaded value once, and the loaded value itself: a value derived from
+  another passed value (a difference, a negation, a checksum) can cancel the
+  term it was computed from and leave that load unread without any error.
+  `None`, an empty sequence, a Python number, a constant, a Boolean, the same
+  value twice and a vector together with one of its elements are refused at
+  trace time.
+- **The release-zero is a kernel argument** and the host of the same module
+  passes the literal 0. Its only use in the kernel is `release_zero(arg)`,
+  which rejects a Python number, a constant and a computed value; the forms
+  refuse to trace when the argument already has another use. Never compare
+  it, branch on it, assert or assume its value: a kernel that knows the value
+  has no ordering left, without any error. A zero the toolchain can see (a
+  literal, an inline-asm `mov`) removes the ordering the same way. A non-zero
+  argument is undefined behaviour (the arrive lands on another word of shared
+  memory); nothing in the kernel may test for it.
+- **Lane ledger unchanged.** No form elects for the caller. Each arrives
+  where and as often as its plain twin (`barrier.arrive`,
+  `mbar_arrive_on_peer`, `read_tile_id_arrive`): init counts do not move when
+  a site changes over.
+- **Elected arrives take `pred=`.** Every calling lane computes the address;
+  one predicated arrive fires. Keep the call out of a lane branch: the
+  unconditional sum in front of a predicated arrive is the measured form.
+- **Scope.** The helper orders the calling lanes' own loads. A warp that
+  loads releases through the helper itself; a release issued by another
+  thread block than the one that loaded cannot be ordered this way. A release
+  without an address operand (a CTA barrier in front of a refill, a peer
+  send) is outside it: see Rule 11 for the two alternatives. Only the
+  predicated lowering of the scheduler credit exists here; a kernel whose
+  measurement prefers the branch arm of `read_tile_id_arrive` adds that arm
+  with its own measurement.
+- **Check a new call site** with `warm_stress.assert_release_dependence` on
+  the rendering's PTX, by reading its disassembly (no load of the stage first
+  read behind the arrive), and with `warm_stress.assert_warm_stress` on a
+  shape that refills the stage (`test/AGENTS.md`).
+
+
 ## Adding coverage, cheapest first
 
 1. **New dtype an existing template already handles**: add it to the row's
@@ -1061,3 +1138,8 @@ the encoding details.
     rots otherwise. Knob-domain-only changes are exempt (it does not track
     knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
     exact scope and is the number to cite in review.
+15. **A stage that was read is released through `tile_dsl.consume`.** A bare
+    arrive behind shared-memory loads of the stage it frees is not accepted
+    in new or changed kernel code, even when every test passes
+    (`python/cudnn/AGENTS.md` Rule 11); existing sites move over in follow-up
+    changes.
