@@ -36,6 +36,22 @@ pytest core/test_determinism_utils.py
 
 ### SM90 CUDA KDA FP32 P — H20 validation, 2026-11-11
 
+Follow-up on **2026-11-12**: the packed 16x8 FP32 P layout and asynchronous
+shared-memory prefetch pass the same command below: **47 passed, 1 skipped,
+5 warnings in 10.60 s**. All 23 precision/determinism cases pass, including
+the unchanged strict golden, 3,000 warm and 3,000 poisoned launches; the
+unsafe control fails 200/200. No golden was rerecorded or tolerance changed.
+All six gradients also match the initial FP32 commit `719e5111` bytewise in
+the six performance workloads through 128K/H32 and THD22. All five FP64
+precision-case error records are identical to that commit. The same prepared
+sanitizer harness reports zero memcheck/synccheck errors and zero racecheck
+errors/warnings across all five scan specializations. Generated SASS retains
+seed consumption before release and consumes every P load through FP32 adds
+before branching to the next iteration. Final source hashes, samples and the
+SASS audit are in the [H20 report](../../../benchmark/linear_attention/sm90_kda_fp32_p_results.md).
+The support scope below is unchanged; this is an H20 rerun, not coverage of
+another GPU or distributed training.
+
 `linear_attention/hopper/test_kda_sm90_precision.py` adds **23 L0 cases** for
 `plan_name="kda_hopper_cuda"`, `batch_invariant=True`, BF16 Q/K/V and FP32
 gates/beta/state, K=V=128. Every replay/reference/batch check includes O,

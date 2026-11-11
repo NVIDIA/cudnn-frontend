@@ -124,7 +124,8 @@ sequence isolation/reordering/duplication, changed neighbors, fresh-buffer
 replay, and concurrent work. This row applies only to the pinned CUDA provider;
 FP16 and grouped-head backward are outside its contract. BF16 P was replaced
 by FP32 P in the backward state-gradient addition, so its output hashes change.
-The other BF16 intermediates retain their existing precision. See the
+Packing P into MMA tiles and prefetching it asynchronously preserve those
+FP32-P hashes. The other BF16 intermediates retain their existing precision. See the
 [H20 precision and cost report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/sm90_kda_fp32_p_results.md)
 for the tested shapes and limitations.
 

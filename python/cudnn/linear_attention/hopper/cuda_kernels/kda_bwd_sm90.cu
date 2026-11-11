@@ -992,6 +992,9 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
         // P is added to an FP32 state gradient, not used as an MMA operand.
         // Preserve its accumulator directly in global memory: rounding it to
         // BF16 here can erase a residual before cancellation with that state.
+        // Pack P as [8 key tiles][16 value tiles][16 rows][8 columns]. Each
+        // warp stores contiguous 8x8 halves of its MMA tiles; the reverse scan
+        // can copy only its value slice without gathering strided matrix rows.
         float* const dst = Pg + ((size_t)cs * H + h) * DH * DH;
 #pragma unroll
         for (int j = 0; j < TL2::TPW; ++j) {
@@ -1002,10 +1005,11 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                 *reinterpret_cast<uint32_t*>(sB1 + o0 + rp * (8 * 128)) = bf2(acc[j][rp * 2], acc[j][rp * 2 + 1]);
 #pragma unroll
             for (int u = 0; u < 2; ++u) {
-                const int pr = (2 * dmi + u) * 16 + (lane >> 2);
+                const int tile = (2 * dmi + u) * (DH / 8) + TL2::ni(warp, j);
+                const int p0   = tile * 128 + lane * 2;
 #pragma unroll
                 for (int rp = 0; rp < 2; ++rp)
-                    *reinterpret_cast<float2*>(dst + (pr + rp * 8) * DH + c0) =
+                    *reinterpret_cast<float2*>(dst + p0 + rp * 64) =
                         make_float2(pac[u][j][rp * 2], pac[u][j][rp * 2 + 1]);
             }
         }
@@ -1023,13 +1027,13 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
 #pragma once
 
 static constexpr int PCV = 64;  // physical swizzle width of the V tiles
-// One prefetch stage: w, kg (128-wide) + a (BV-wide) + gn.
-// P = qg^T dO is precomputed in FP32 by the parallel prep pass and loaded
-// directly into registers in the reverse direction; it needs no shared stage.
-static constexpr int STAGE = 2 * 64 * 128 * 2 + 64 * PCV * 2 + 512;
+// One prefetch stage: w, kg (128-wide) + a (BV-wide) + gn + packed FP32 P.
+// Reserve P for the widest scan (BV=32); BV=16 copies only its active half.
+// P stays in FP32 throughout this staging, independently of BF16 MMA operands.
+static constexpr int STAGE = 2 * 64 * 128 * 2 + 64 * PCV * 2 + 512 + 128 * 32 * 4;
 // Three operand stages instead of two: each chunk's copies then get two full
-// iterations to land rather than one. Shared memory still limits this scan
-// to one CTA per SM; removing the P stages saves 48 KiB per CTA.
+// iterations to land rather than one. The compact P slice fits in the same
+// 16 KiB per stage as the old padded BF16 slab. Occupancy stays one CTA per SM.
 static constexpr int SMEM_SCAN = 128 * PCV * 2 + 64 * PCV * 2 + 3 * STAGE;
 
 // byte offsets of the operand tiles inside one prefetch stage
@@ -1037,6 +1041,7 @@ static constexpr uint32_t O_W  = 0;
 static constexpr uint32_t O_KG = 64 * 128 * 2;
 static constexpr uint32_t O_A  = 2 * 64 * 128 * 2;
 static constexpr uint32_t O_GN = O_A + 64 * PCV * 2;
+static constexpr uint32_t O_P  = O_GN + 512;
 
 // ---------------------------------------------------------------------------
 // K2 "scan": grid.x = 2*NVB (dir, v-block), grid.y = N*H.
@@ -1158,6 +1163,15 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
             if (actV) cpasync16z(sb + O_A + 2 * sVo, uu + bs + vb * BV + gVo, rV < L);
         } else {
             if (actV) cpasync16z(sb + O_A + 2 * sVo, dvl + bs + vb * BV + gVo, rV < L);
+            // A key tile's BV-column slice is contiguous in the packed P
+            // layout. All P elements are defined, including for partial chunks.
+            const float* pb = Pg + ((size_t)cs * H + h) * DH * DH + (vb * BV / 8) * 128;
+#pragma unroll
+            for (int i = 0; i < 128 * BV / (NT * 4); ++i) {
+                const int e = tid * 4 + i * NT * 4;
+                const int m = e / (BV * 16), rest = e % (BV * 16);
+                cpasync16(sb + O_P + e * 4, pb + m * (DH * 16) + rest);
+            }
         }
         if (tid < 32) cpasync16(sb + O_GN + tid * 16, gn2 + ((size_t)cs * H + h) * DH + tid * 4);
     };
@@ -1205,18 +1219,6 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         const bf16* pKG  = stb + 64 * 128;
         const bf16* pA   = stb + 2 * 64 * 128;
         const float* pGn = reinterpret_cast<const float*>(reinterpret_cast<const char*>(stb) + O_GN);
-        // k_prep completed on this stream. Fetch P into registers before the
-        // projections so their MMA work can hide the FP32 global-load latency.
-        float2 pv[TS::TPW][2];
-        if (dir == 1) {
-            const float* pP = Pg + ((size_t)cs * H + h) * DH * DH + vb * BV;
-#pragma unroll
-            for (int j = 0; j < TS::TPW; ++j) {
-                const int col = TS::col(warp, lane, j, 0);
-                pv[j][0]      = *reinterpret_cast<const float2*>(pP + rS[j] * DH + col);
-                pv[j][1]      = *reinterpret_cast<const float2*>(pP + (rS[j] + 8) * DH + col);
-            }
-        }
         // pGn and the staged `a` tile are published by the barrier above and are
         // not consumed until after the first GEMM pair, so reading them here
         // puts a whole 64x(2*BV)x64 product between the loads and their uses.
@@ -1272,6 +1274,17 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         if (dir == 0) {
             gemm_acc<128, BV, 64, NW, 1, 1, 128, PCV>(acc, pKG, sB, warp, lane);
         } else {
+            // The stage wait above completed P's asynchronous copies. Load
+            // contiguous MMA-tile halves before the final projection; their
+            // FP32 additions are consumed by accumulator staging before reuse.
+            float2 pv[TS::TPW][2];
+            const float* pP = reinterpret_cast<const float*>(reinterpret_cast<const char*>(stb) + O_P);
+#pragma unroll
+            for (int j = 0; j < TS::TPW; ++j) {
+                const int p = (TS::mi(warp, j) * (BV / 8) + TS::ni(warp, j)) * 128 + lane * 2;
+                pv[j][0]    = *reinterpret_cast<const float2*>(pP + p);
+                pv[j][1]    = *reinterpret_cast<const float2*>(pP + p + 64);
+            }
             gemm_acc<128, BV, 64, NW, 1, 1, 128, PCV>(acc, pW, sB, warp, lane);
 #pragma unroll
             for (int j = 0; j < TS::TPW; ++j) {

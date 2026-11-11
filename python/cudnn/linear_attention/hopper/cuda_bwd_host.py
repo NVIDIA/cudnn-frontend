@@ -50,7 +50,7 @@ DH = 128  # head dim (K == V == 128)
 PNT = 512  # k_prep threads
 BNT = 512  # k_bwd threads
 SMEM_PREP = 220160
-SMEM_SCAN = 148992
+SMEM_SCAN = 198144
 SMEM_BWD = 230656
 
 # What the artifact requests for k_prep/k_scan_t -- a flat cap above both

@@ -1,14 +1,40 @@
 # SM90 KDA FP32 P: H20 precision and cost
 
-Baseline: `8348887bd580770ec2dd2339ec919f06dbaf8702` (`develop`). The unchanged baseline host and CUDA source were SHA256-checked against that commit. Candidate source hashes and raw samples are in [the accompanying JSON records](results/kda/h20_fp32_p/).
+Updated **2026-11-12** with the optimized implementation. Compare upstream
+`8348887bd580770ec2dd2339ec919f06dbaf8702`, the initial FP32-P implementation
+`719e5111a8eb9122785f0a0900522aba7323a8cb`, and the current packed/prefetched
+FP32 implementation. Source hashes and samples are in
+[the JSON records](results/kda/h20_fp32_p/performance-optimized.json).
+The original `performance-final.json` remains as the initial PR measurement.
 
-Tested on H20-3e, driver 570.133.20, PyTorch 2.9.1+cu128, CUDA Toolkit 12.8, cuDNN 9.10.2, and CuTe DSL 4.8.1. Inputs are generated on CPU from fixed seeds. SM100 is unchanged and was not retested.
+H20-3e, driver 570.133.20, PyTorch 2.9.1+cu128, CUDA Toolkit 12.8,
+cuDNN 9.10.2, CuTe DSL 4.8.1. Inputs are generated on CPU from fixed seeds.
+SM100 is unchanged and was not retested.
 
 ## What changes
 
-The reverse recurrence adds `P = Q_g^T dO` into an FP32 state gradient. Its Tensor Core accumulator was FP32, but storing P in BF16 discarded low bits before that addition. P now stays FP32 in global scratch and is loaded into registers early in the scan. BF16 Tensor Core input operands, the inverse, saved state operands, and other BF16 intermediates retain their existing precision.
+The reverse recurrence adds `P = Q_g^T dO` into an FP32 state gradient. Its
+Tensor Core accumulator was FP32, but storing P in BF16 discarded low bits
+before that addition. P now stays FP32 through storage, loading and addition.
+BF16 Tensor Core input operands, the inverse, saved state operands and other
+BF16 intermediates retain their existing precision.
 
-The scan no longer stages P in shared memory. Dynamic shared memory falls from 198,144 to 148,992 bytes per CTA (48 KiB); the unchanged 1 KiB static allocation is separate. The seed is staged into its existing MMA-operand buffer before the aliased seed storage is reused by prefetch. Its recurrent accumulator remains FP32.
+The optimized implementation packs P as `[8 key tiles][16 value tiles][16][8]`.
+Each warp writes contiguous 8x8 halves of its MMA tiles directly from FP32
+registers. The reverse scan copies only its 16- or 32-column value slice into
+its existing three-stage asynchronous prefetch pipeline, then reads contiguous
+FP32 pairs before the final projection. There is no repacking kernel and no
+change to arithmetic order, public APIs, compile specializations or global
+workspace capacity.
+
+Each P stage reserves 16 KiB, sufficient for the widest 128x32 FP32 slice.
+Dynamic scan shared memory is **198,144 bytes per CTA**, up from 148,992 in the
+initial FP32 PR and equal to upstream BF16's padded staging allocation.
+The unchanged 1 KiB runtime/static allocation is separate. Occupancy remains
+one CTA per SM. The initial PR's 48 KiB shared-memory saving is superseded by
+this faster pipeline. The initial seed-consumption fix is retained: the seed
+feeds its existing BF16 MMA-operand staging before aliased storage is reused,
+while the recurrent accumulator stays FP32.
 
 ## Precision
 
@@ -26,38 +52,103 @@ The following are relative L2 errors against an independent FP64 token recurrenc
 
 Ragged lengths are `[0,1,15,16,17,63,64,65]`; weak decay is T=257 with g=-1e-6; steep decay is T=65 with g=-5; correlated keys use T=65 with two repeated nonzero coordinates and g=0; the long random case has T=1024. These measurements isolate one rounding removal. The correlated case still has a larger dG error: this PR does not claim to fix all SM90 precision differences, establish loss parity, or replace a distributed training test.
 
+The optimized implementation reproduces every error record in this table
+exactly. All six gradients also match the initial FP32 PR **byte for byte** in
+each of the performance cases below, including 128K/H32 and THD22. The strict
+forward/backward golden is unchanged. No tolerance was relaxed.
+
 ## Performance and memory
 
-CUDA-event latency for prepared launches captured in CUDA graphs; compilation, allocations, FP64 references, and Python autograd dispatch are outside timing. Each sample averages 20 replays; the table reports the median of 9 groups with alternating baseline/candidate order. Both implementations use the same inputs and output addresses, with separate scratch. F+B includes the unchanged forward kernel and the complete backward chain.
+CUDA-event latency for prepared launches captured in CUDA graphs; compilation,
+allocations, references and Python autograd dispatch are outside timing.
+Median of 9 alternating-order groups, 20 replays/group. All three implementations
+use the same inputs/output addresses and separate scratch. F+B includes the
+unchanged forward kernel and the complete backward chain. These are kernel-chain
+measurements, not full-model training or distributed CP timings.
 
-| THD workload | Backward ms, baseline → fix | F+B ms, baseline → fix | F+B change | Workspace MiB, baseline → fix | Public F+B peak GiB, baseline → fix |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 1k-h8 | 0.122 → 0.132 | 0.427 → 0.437 | +2.27% | 25.06 → 29.06 | — |
-| 16k-h8 | 1.570 → 1.713 | 6.459 → 6.603 | +2.23% | 401.00 → 465.00 | 0.928 → 0.990 |
-| 128k-h8 | 12.196 → 13.372 | 52.558 → 53.737 | +2.24% | 3208.02 → 3720.02 | 7.397 → 7.897 |
-| 128k-h32 | 43.420 → 47.688 | 86.479 → 90.733 | +4.92% | 12832.02 → 14880.02 | 29.588 → 31.588 |
-| 128k-thd22-h8 | 11.550 → 13.233 | 21.478 → 23.161 | +7.83% | 3225.16 → 3742.41 | 7.466 → 7.970 |
-| ragged-h8 | 0.458 → 0.514 | 1.192 → 1.246 | +4.55% | 112.21 → 130.71 | — |
+| THD workload | Upstream BF16 ms | Initial FP32 ms | Optimized FP32 ms | BWD reduction vs initial FP32 |
+| --- | ---: | ---: | ---: | ---: |
+| 1k-h8 | 0.1221 | 0.1319 | 0.1240 | 6.02% |
+| 16k-h8 | 1.5703 | 1.7142 | 1.5970 | 6.84% |
+| 128k-h8 | 12.1964 | 13.3750 | 12.3857 | 7.40% |
+| 128k-h32 | 43.4178 | 47.6848 | 43.8784 | 7.98% |
+| 128k-thd22-h8 | 11.5486 | 13.2340 | 11.5839 | 12.47% |
+| ragged-h8 | 0.4581 | 0.5146 | 0.4600 | 10.61% |
 
-128K is 131,072 tokens. The 22-document workload is 20 × 256-token documents plus 2 × 62,976-token documents. The small ragged case is `[0,1,65,257,4097]`.
+| THD workload | Upstream BF16 ms | Initial FP32 ms | Optimized FP32 ms | Remaining F+B overhead vs BF16 |
+| --- | ---: | ---: | ---: | ---: |
+| 1k-h8 | 0.4279 | 0.4377 | 0.4291 | +0.30% |
+| 16k-h8 | 6.4606 | 6.6033 | 6.4859 | +0.39% |
+| 128k-h8 | 52.5640 | 53.7411 | 52.7525 | +0.36% |
+| 128k-h32 | 86.4734 | 90.7348 | 86.9478 | +0.55% |
+| 128k-thd22-h8 | 21.4761 | 23.1608 | 21.5110 | +0.16% |
+| ragged-h8 | 1.1868 | 1.2535 | 1.1987 | +1.00% |
 
-A separate five-replay CUDA profiler sample at 16K/H8 attributes the increase to prep (428.98 → 509.59 µs) and scan (538.51 → 599.50 µs); the final backward kernel is unchanged within noise (609.65 → 608.96 µs). This is consistent with the larger P stores/loads and additional live scan registers. The measured fix is a precision tradeoff, not a throughput improvement.
+128K is 131,072 tokens. THD22 is **20 x 256 + 2 x 62,976** tokens. The small
+ragged case is `[0,1,65,257,4097]`.
 
-Workspace increases by `max(ceil(T/64)+N-1,1) * H * 128 * 128 * 2` bytes. The shape-only chunk-slot upper bound reserves space for ragged tails. At 128K/H8/N1 this is exactly 512 MiB; H32 adds 2 GiB. Public peak allocation is measured separately in fresh baseline/fix processes with `torch.cuda.max_memory_allocated()` around the warmed public forward + autograd call, including fixed inputs, cloned differentiable leaves, outputs, gradients, and transient workspace. It excludes allocator-reserved free blocks, driver memory, and CUDA graph pools; it is not a full training/model-memory figure.
+## Why it is faster
+
+A five-replay CUDA profiler sample at 16K/H8 measures prep **509.22 → 438.04 us**
+and scan **598.42 → 554.39 us**, initial FP32 → optimized. The final backward
+kernel remains unchanged within noise, **609.97 → 610.51 us**.
+
+Nsight Compute on the same 16K/H8 geometry supports the memory-scheduling
+explanation: prep's LG-throttle stall ratio drops **2.028 → 0.204**, and scan's
+long-scoreboard ratio drops **0.323 → 0.252** (reported per issued instruction).
+Prep uses 114 rather than 116 registers/thread; this scan specialization uses
+128 rather than 130. These are not universal register reductions: the final
+BV32 variants use 133/132/143 registers and still have no local spills.
+The same global P bytes are transferred; the improvement comes from contiguous
+warp accesses and overlapping P copies with scan computation, not a smaller
+workspace. Raw selected counters and source hashes are in
+[`ncu-summary.json`](results/kda/h20_fp32_p/ncu-summary.json).
+
+An initial tile-layout-only experiment was faster than row-major P; adding
+asynchronous staging improved it further. A four-float vector experiment was
+slower in prep and was not retained. No additional algorithm dispatch or
+precision option is introduced.
+
+## Memory
+
+| THD workload | Upstream workspace MiB | FP32 workspace MiB | Public F+B peak GiB, upstream → FP32 |
+| --- | ---: | ---: | ---: |
+| 1k-h8 | 25.06 | 29.06 | — |
+| 16k-h8 | 401.00 | 465.00 | 0.928 → 0.990 |
+| 128k-h8 | 3208.02 | 3720.02 | 7.397 → 7.897 |
+| 128k-h32 | 12832.02 | 14880.02 | 29.588 → 31.588 |
+| 128k-thd22-h8 | 3225.16 | 3742.41 | 7.466 → 7.970 |
+| ragged-h8 | 112.21 | 130.71 | — |
+
+Public peaks were rerun for the optimized implementation and exactly match the
+initial FP32 PR. Upstream peaks are retained from the original fresh-process
+measurement. The FP32 workspace increment remains
+`max(ceil(T/64)+N-1,1) * H * 128 * 128 * 2` bytes: **512 MiB at 128K/H8/N1**,
+**2 GiB at H32**, and **517.25 MiB at THD22/H8**. Global memory cost has not
+been eliminated.
+
+Public peak allocation uses `torch.cuda.max_memory_allocated()` around warmed
+public forward + autograd in a separate process. It includes fixed inputs,
+cloned differentiable leaves, outputs, gradients and transient workspace;
+it excludes driver memory, allocator-reserved free blocks and CUDA graph pools.
+It is not a full-model memory figure.
 
 ## Reproduce
 
-Use an unchanged baseline checkout and this branch with its built `cudnn` Python binding. Set `PYTHONPATH` to this branch, and verify `cudnn.__file__` before running. In the commands below `$BASELINE` names the unchanged checkout.
+Use unchanged checkouts for upstream (`$BASELINE`) and the initial FP32 commit
+(`$PREVIOUS_FP32`). Set `PYTHONPATH` to this branch with its built `cudnn`
+binding and verify `cudnn.__file__` before running.
 
 ```bash
 python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode baseline --output baseline-precision.json
-python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode fp32 --output fp32-precision.json
-python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode performance --output performance-final.json
-python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode baseline --memory --output baseline-memory.json
-python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode fp32 --memory --output fp32-memory.json
+python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode fp32 --output optimized-precision.json
+python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --previous-fp32 "$PREVIOUS_FP32" --mode performance --output performance-optimized.json
+python benchmark/linear_attention/benchmark_sm90_kda_precision.py --baseline "$BASELINE" --mode fp32 --memory --output optimized-memory.json
 ```
 
-The sanitizer harness uses the shipped prepared backward launcher, five geometries covering every scan specialization, exact-sized scratch surrounded by 256-byte canaries, all six gradients, and ten CUDA graph replays per geometry:
+The sanitizer harness uses the shipped prepared backward launcher, five
+geometries covering every scan specialization, exact-sized scratch surrounded
+by 256-byte canaries, all six gradients and ten graph replays per geometry:
 
 ```bash
 for check in memcheck racecheck synccheck; do
@@ -66,12 +157,33 @@ for check in memcheck racecheck synccheck; do
 done
 ```
 
-Public autograd tests remain separate: the CUDA 12.8 sanitizer reports handled `cuCtxGetDevice` probes on autograd worker threads as API errors, and its default expandable allocator fails `cuMemCreate` on this host. No API-error suppression is used in the prepared-launch run.
+Public autograd tests remain separate: CUDA 12.8 sanitizer reports handled
+`cuCtxGetDevice` probes on autograd worker threads as API errors, and its default
+expandable allocator fails `cuMemCreate` on this host. No API-error suppression
+is used in the prepared-launch run.
 
 ## Review and coverage
 
-See [the determinism coverage record](../../test/python/determinism_goldens/README.md#sm90-cuda-kda-fp32-p--h20-validation-2026-11-11) for pytest counts, strict golden checks, and the 6,000-launch warm/poisoned stress test. The new golden records all forward outputs and all six gradients, after the independent FP64 reference check. FP16 and grouped-head backward are outside this CUDA provider’s contract; safe-gate backward and composed CP summaries remain unsupported. Nonzero FP32 boundary gradients are exercised, but no multi-rank communication or end-to-end model loss is measured here.
+The optimized source passes **47 tests, 1 optional-cuTile skip**, including all
+23 precision/determinism cases, the unchanged strict golden and **6,000 clean
+warm/poisoned replays**. The unsafe control fails 200/200. See the
+[dated determinism record](../../test/python/determinism_goldens/README.md#sm90-cuda-kda-fp32-p--h20-validation-2026-11-11)
+for commands, scope and retained original regression evidence. The optimized
+prepared launcher passes **memcheck: 0 errors; racecheck: 0 errors/0 warnings;
+synccheck: 0 errors** across all five scan variants.
 
-Compatibility audit: passed for the changed packed BF16 CUDA path, both scan widths, full/partial chunks, empty documents, nonzero state and final-state gradient, graph replay, and existing routing/layout/serving tests. No public signature or dispatch gate changed. Docstring audit: passed for the KDA wrapper, workspace sizing, and raw launcher.
+Compatibility audit: passed for the changed packed BF16 CUDA path, both scan
+widths, full/partial chunks, empty documents, nonzero boundary states/gradients,
+stream routing, graph replay and existing serving/layout cases. No API or
+dispatch gate changed. Docstring audit: passed for the KDA wrapper, workspace
+sizing and launcher. Other GPUs and distributed training remain unverified.
 
-Fence audit: P has one writer per element in prep and is read only after that kernel completes on the same stream; the graph preserves this dependency. P uses ordinary global accesses and has no shared ring to release. The retained W/KG/A/gn stages keep their cp.async commit/wait and CTA publication/reuse barriers. Generated SASS was inspected for all five scan specializations, including seed consumption before aliased prefetch and staged operand consumption before refill. The sanitizer/stress results supplement this ownership review. Memcheck and synccheck each report **0 errors**; racecheck reports **0 errors and 0 warnings** across all five geometries. The source-to-SASS seed audit is recorded in `results/kda/h20_fp32_p/seed_release_audit.json`.
+Memory ordering: prep has one writer per P element and completes on the scan's
+stream. P joins the existing cp.async commit/wait and CTA publication/reuse
+protocol. Each packed slice is consumed before its stage can be refilled.
+Generated SASS for all five scan specializations preserves all 16 seed-word
+uses before seed release; all 16 loaded P words feed FP32 additions before any
+branch or release. On loop continuation, accumulator staging precedes the
+barrier permitting refill. Source ownership review, sanitizer and warm stress
+supplement these concrete generated-code checks; the site record is
+[`optimized-sass-audit.json`](results/kda/h20_fp32_p/optimized-sass-audit.json).

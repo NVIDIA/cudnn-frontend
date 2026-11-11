@@ -4,7 +4,9 @@
 
 --baseline points at an unchanged checkout. Both paths use identical inputs.
 Precision runs select one host module before constructing any public plans.
-Performance alternates both modules on the same tensors, with separate scratch.
+Performance alternates implementations on the same tensors, with separate scratch.
+--previous-fp32 optionally adds an earlier FP32-P checkout to performance runs
+and requires all six gradients to match the current implementation bytewise.
 """
 
 import argparse
@@ -124,6 +126,7 @@ def performance(modules):
             )
 
         graphs, scratch, memory = {}, {}, {}
+        previous_gradients = None
         forward()
         for variant, module in modules.items():
             torch.cuda.synchronize()
@@ -151,6 +154,11 @@ def performance(modules):
                 )
 
             backward()
+            if variant == "previous_fp32":
+                previous_gradients = {n: outputs[n].clone() for n in OUTS[2:]}
+            elif variant == "fp32" and previous_gradients is not None:
+                for n in OUTS[2:]:
+                    assert torch.equal(outputs[n].view(torch.uint8), previous_gradients[n].view(torch.uint8)), (name, n)
             for mode in ("backward", "forward_backward"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -190,6 +198,7 @@ def performance(modules):
             heads=heads,
             memory=memory,
             kernel_us=kernel_us,
+            previous_fp32_byte_equal=previous_gradients is not None,
             timing={
                 variant: {
                     mode: dict(median_ms=statistics.median(timings[(variant, mode)]), samples_ms=timings[(variant, mode)])
@@ -202,7 +211,7 @@ def performance(modules):
         print(name, {v: {m: round(t["median_ms"], 4) for m, t in a.items()} for v, a in row["timing"].items()}, flush=True)
         for graph in graphs.values():
             graph.reset()
-        del graphs, scratch, outputs, x, graph, backward, forward
+        del graphs, scratch, outputs, x, graph, backward, forward, previous_gradients
         torch.cuda.synchronize()
     return rows
 
@@ -239,24 +248,35 @@ def main():
     parser.add_argument("--mode", choices=["baseline", "fp32", "performance"], required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--memory", action="store_true")
+    parser.add_argument("--previous-fp32", type=Path, help="previous FP32-P checkout; performance only")
     args = parser.parse_args()
     if args.memory and args.mode == "performance":
         parser.error("--memory requires --mode baseline or fp32")
+    if args.previous_fp32 is not None and args.mode != "performance":
+        parser.error("--previous-fp32 requires --mode performance")
     torch.set_num_threads(1)
     path = args.baseline / "python/cudnn/linear_attention/hopper/cuda_bwd_host.py"
     spec = importlib.util.spec_from_file_location("cudnn.linear_attention.hopper._baseline_bwd", path)
     baseline = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(baseline)
+    modules = dict(baseline=baseline)
+    if args.previous_fp32 is not None:
+        previous_path = args.previous_fp32 / "python/cudnn/linear_attention/hopper/cuda_bwd_host.py"
+        previous_spec = importlib.util.spec_from_file_location("cudnn.linear_attention.hopper._previous_fp32_bwd", previous_path)
+        previous = importlib.util.module_from_spec(previous_spec)
+        previous_spec.loader.exec_module(previous)
+        modules["previous_fp32"] = previous
+    modules["fp32"] = cuda_bwd_host
     report = dict(source=cudnn.__file__, baseline_host=str(path), torch=torch.__version__, mode=args.mode)
     report["source_hashes"] = {
         variant: {
             part: hashlib.sha256(file.read_bytes()).hexdigest()
             for part, file in {"host": Path(module.__file__), "kernel": module.KERNEL_DIR / module.KERNEL_BODY}.items()
         }
-        for variant, module in {"baseline": baseline, "fp32": cuda_bwd_host}.items()
+        for variant, module in modules.items()
     }
     if args.mode == "performance":
-        report["rows"] = performance(dict(baseline=baseline, fp32=cuda_bwd_host))
+        report["rows"] = performance(modules)
     else:
         hopper.cuda_bwd_host = baseline if args.mode == "baseline" else cuda_bwd_host
         report["rows"] = peak_memory() if args.memory else precision()
