@@ -118,28 +118,31 @@ def test_replay_batch_and_golden(monkeypatch, dtype, width):
         if order == [0, 1, 2]:
             baseline = got
         capture = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(capture):
-            graph.execute(pack, workspace)
-        inputs["dO"].view(torch.uint8).bitwise_xor_(128)
-        inputs["dO_T"].view(torch.uint8).bitwise_xor_(128)
-        inputs["dO_f16"].neg_()
-        changed = snapshot(execute())
-        for n in grads:
-            torch.testing.assert_close(changed[n], -got[n], rtol=0, atol=0)
-        # Changing a scale atom after capture must be read by the captured path.
-        inputs["sf_dO"].view(torch.uint8).add_(1)
-        changed_scale = snapshot(execute())
-        assert any(not torch.equal(changed_scale[n].view(torch.uint8), changed[n].view(torch.uint8)) for n in grads)
-        for x in grads.values():
-            x.fill_(float("nan"))
-        workspace.fill_(255)
-        capture.replay()
-        assert_bitwise(snapshot(grads), changed_scale, "captured payload and canonical SF mutation")
-        torch.cuda.set_sync_debug_mode("error")
         try:
-            graph.execute(pack, workspace)
+            with torch.cuda.graph(capture):
+                graph.execute(pack, workspace)
+            inputs["dO"].view(torch.uint8).bitwise_xor_(128)
+            inputs["dO_T"].view(torch.uint8).bitwise_xor_(128)
+            inputs["dO_f16"].neg_()
+            changed = snapshot(execute())
+            for n in grads:
+                torch.testing.assert_close(changed[n], -got[n], rtol=0, atol=0)
+            # Changing a scale atom after capture must be read by the captured path.
+            inputs["sf_dO"].view(torch.uint8).add_(1)
+            changed_scale = snapshot(execute())
+            assert any(not torch.equal(changed_scale[n].view(torch.uint8), changed[n].view(torch.uint8)) for n in grads)
+            for x in grads.values():
+                x.fill_(float("nan"))
+            workspace.fill_(255)
+            capture.replay()
+            assert_bitwise(snapshot(grads), changed_scale, "captured payload and canonical SF mutation")
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                graph.execute(pack, workspace)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
         finally:
-            torch.cuda.set_sync_debug_mode("default")
+            capture.reset()
     assert_bitwise(snapshot(sources), before, "inputs preserved")
     assert_golden("sdpa_sm120_mxfp8_bwd_d" + str(width) + "_" + str(dtype).split(".")[-1], before, baseline)
 
