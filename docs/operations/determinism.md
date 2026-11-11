@@ -84,6 +84,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); SM103 execution unverified | Supported (FP8 tested configurations); FP16/BF16 unverified by this suite |
 | `pygraph.sdpa_fp8`, FROST native D192/V128 and D256 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
+| `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
@@ -574,3 +575,12 @@ Native SM107 preserves O/Stats bytes for the tested configurations with
 CGA2 D192/V128, CGA1 D256 and the D512 role-split body. The qualification
 uses CUDA13.4. Backward and MXFP8 are outside these cases; see the test
 coverage report for exact validation scope.
+
+## Native SM107 D256 MXFP8 THD physical origins
+
+Native D256 nonpaged, unsplit, unpacked CGA1 preserves O/Stats bytes across
+replay, concurrent work and fixed-input batch transformations for the tested
+E4M3/E5M2, E8M0-scale and BF16-output cases. Independent data origins do
+not move the logical scale-tile prefixes. The CUDA13.4 qualification also
+covers fresh strides and retained live/empty captures. Other native MXFP8
+THD widths and backward are not qualified by this suite.

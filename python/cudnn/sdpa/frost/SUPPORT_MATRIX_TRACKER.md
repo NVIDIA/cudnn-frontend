@@ -4998,3 +4998,17 @@ entry exposes30 reference/replay/batch/golden cases, all passing on native
 SM107 under CUDA13.4, alongside22 existing compact neighbors and12 golden
 files. Each of memcheck/racecheck/synccheck passes12 directed cases; all30
 offline variants compile. This is not a default placement or performance claim.
+
+### Native SM107 D256 MXFP8 THD physical addressing
+
+The existing native D256 MXFP8 THD route now binds independent Q/K/V/O/Stats
+origins through its prepared host. Q/K/V use sequence-local data maps, while
+Q/K/V scale descriptors keep the packed batch and logical scale-tile prefixes.
+The existing setup launch builds rank-4 data maps and logical metadata; dead
+initial clusters exit before acquiring uninitialized maps. Eligibility rows,
+other MXFP8 widths, packing/splitting and paging are unchanged.
+`TestD256Mxfp8PhysicalOrigins` in the SM107 CI entry passes10 strict
+reference/replay/batch/golden cases under CUDA13.4, with four new goldens.
+All ten origin/dense variants compile;24 compact prepared neighbors pass
+on both parent and candidate. Memcheck4/racecheck4/synccheck4 are clean.
+This is not a default-placement or performance claim.

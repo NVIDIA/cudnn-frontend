@@ -3434,3 +3434,33 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestD192Fp8PhysicalOrigins \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestWideFp8PhysicalOrigins
 ```
+
+### Native SM107 D256 MXFP8 THD origins — 2026-11-11
+
+`test_sdpa_fp8_sm107.py::TestD256Mxfp8PhysicalOrigins` exposes10 L0 cases
+for E4M3/E5M2 inputs, E8M0 block scales, BF16 O and token/head-major Stats.
+CGA1 nonpaged, unsplit, unpacked plans bind independent Q/K/V/O/Stats
+origins. The data maps select each physical sequence while scale descriptors
+retain packed batch zero and logical per-sequence tile prefixes. Fixed
+quantized values and scale tiles survive batch reorder/duplication/isolation,
+changed addresses/pitches and retained live/empty CUDA Graph capture. The
+suite independently checks numerical references and concurrent-work raw bytes.
+
+Native SM107 with actual CUDA13.4, DSL4.8.0, Torch2.14.1+cu130 and
+cuDNN9.24.0.43 passes all10 strict cases,0fail/skip, after four golden cases
+pass recording and separate strict processes. The two old-source controls
+stop at the missing-origin-binding assertion before GPU execution. All ten
+offline variants compile: both formats with token/head/padded/omitted Stats
+and dense controls. All24 compact prepared neighbors pass on both parent
+and candidate, including changed scale bindings, all four output dtypes,
+optional Stats/Amax, SF carriers and no-allocation/no-sync checks.
+Memcheck4, racecheck4 and synccheck4 pass with zero errors/hazards/warnings.
+Other widths, GPUs, backward, split, packing and paging remain outside this
+new suite; their existing admission is unchanged.
+
+```bash
+cd test/python
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 sdpa/frost/test_sdpa_fp8_sm107.py::TestD256Mxfp8PhysicalOrigins
+```

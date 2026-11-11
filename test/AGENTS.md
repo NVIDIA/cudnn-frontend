@@ -1409,6 +1409,10 @@ Native SM107 D192/D256/D512 per-tensor FP8 uses rank-4 for all four ports.
 Inspect the actual host descriptor geometry before reusing origin-axis indices.
 Their token axes differ. Move data origins independently while preserving the
 logical MXFP8 scale-tile order, including a reordered or duplicated sequence.
+On native SM107 MXFP8 D256, the data map index is the physical sequence;
+scale maps still use packed batch zero and logical SF tile prefixes.
+`TestD256Mxfp8PhysicalOrigins` detects accidentally applying the data batch
+coordinate to those scale descriptors.
 `TestMidwidthPhysicalOrigins` in both SM100 quantized architecture suites
 checks these cases, retained captures and concurrent-work byte equality.
 Run racecheck on a bottom-right tail as well: the V-scale sanitizer can access

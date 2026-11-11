@@ -64,6 +64,15 @@ class TestWideFp8PhysicalOrigins:
     test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
 
 
+@requires_rubin
+class TestD256Mxfp8PhysicalOrigins:
+    """Physical data maps retain the original logical scale-tile coordinates."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("mxfp8", "sm107", [(256, 1)])
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
