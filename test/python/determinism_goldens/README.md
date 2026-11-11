@@ -3069,6 +3069,7 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest -m L0 sdpa/frost/test_sdpa_fwd_thd_origins_sm120.py
 ```
 
+
 ### SM107 coalesced packed split partials — 2026-11-11
 
 `test_coalesced_split_replay_batch_golden` adds four L0 cases for FP16/BF16
