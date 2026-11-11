@@ -20,11 +20,16 @@ def _check_routes_and_invariance(graph, nodes, values, state, workspace, overrid
     pack = {nodes[name]: value for name, value in values.items()}
     plan._prepared, plan.takes_variant_pack = None, False
     try:
-        values["o"].fill_(-17)
-        values["stats"].fill_(-29)
-        graph.execute(pack, workspace, **overrides)
-        for name, bits in expected.items():
-            assert torch.equal(values[name].contiguous().view(torch.uint8), bits), name
+        # Shape/stride overrides belong to the prepared path. The fallback
+        # uses the original graph declaration, including its physical pitches.
+        with pytest.raises(ValueError, match="does not support execute-time shape or stride overrides"):
+            graph.execute(pack, workspace, **overrides)
+        if all(tuple(values[name].stride()) == tuple(nodes[name].get_stride()) for name in ("q", "k", "v", "o")):
+            values["o"].fill_(-17)
+            values["stats"].fill_(-29)
+            graph.execute(pack, workspace)
+            for name, bits in expected.items():
+                assert torch.equal(values[name].contiguous().view(torch.uint8), bits), name
     finally:
         plan._prepared, plan.takes_variant_pack = prepared, True
     torch.cuda.set_sync_debug_mode("error")
@@ -45,8 +50,8 @@ def test_independent_origins_rebind_replay(dims, dtype, stats):
 
 @pytest.mark.parametrize("dims", [128, 512])
 @pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float8_e5m2"])
-def test_packed_origins_rebind_replay(dims, dtype):
-    _check_origins(dims, dtype, "token", False, True, 1, engine_name="sdpa_fwd_prefill_sm120_fp8", extra_checks=_check_routes_and_invariance)
+def test_origins_without_total_hints(dims, dtype):
+    _check_origins(dims, dtype, "token", False, False, 1, engine_name="sdpa_fwd_prefill_sm120_fp8", extra_checks=_check_routes_and_invariance)
 
 
 @pytest.mark.parametrize("dims", [128, 512])
