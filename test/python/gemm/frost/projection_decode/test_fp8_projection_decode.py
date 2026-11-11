@@ -11,10 +11,14 @@ the launch matrix in a child process with a stage-aware deadline, and a warm str
 The operand builders, the reference and the device gate live in ``fp8_projection_decode_utils.py`` beside this module; replay, batch
 invariance per row count, the pick's byte neutrality and the goldens live in ``test_fp8_projection_decode_determinism.py``."""
 
+import ast
+import importlib
 import inspect
 import subprocess
 import sys
 import textwrap
+import types
+import warnings
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -548,7 +552,59 @@ def test_installed_dsl_provides_the_layer_or_declines_by_name():
     msg = entry.dsl_error()
     assert msg is None or isinstance(msg, str)
     names = [n for _, ns in entry.DSL_LAYER for n in ns]
-    assert len(names) == len(set(names)) and "kernel" in names and "tma_load" in names
+    assert len(names) == len(set(names)) and "kernel" in names and "tma_load" in names and "LayoutEnum" in names
+
+
+def test_layer_probe_covers_the_shim_of_the_moved_dsl_names(monkeypatch):
+    """The kernel module binds the DSL names that moved between releases through ``cudnn._cutlass_compat``.  The probe imports that shim,
+    so a DSL on which it does not import is a decline by name before the kernel module is imported, never an ``ImportError`` out of
+    ``compile``."""
+    from cudnn.frost import buffers
+
+    shim = [row for row in entry.DSL_LAYER if row[0] == "cudnn._cutlass_compat"]
+    assert shim == [("cudnn._cutlass_compat", ("LayoutEnum",))]
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "9.9.9")))
+    monkeypatch.setattr(entry, "DSL_LAYER", tuple(shim))
+    monkeypatch.setitem(sys.modules, "cudnn._cutlass_compat", None)  # the import system raises for a None entry
+    msg = entry.dsl_error()
+    assert msg is not None and "cudnn._cutlass_compat" in msg and "9.9.9" in msg and "does not import" in msg
+    k = _modelled_cuda_entry(monkeypatch, (233472, 232448, 152), geometry=G_OUT)
+    with pytest.raises(NotImplementedError, match=r"cudnn\._cutlass_compat"):
+        k.compile(1)
+    assert not k.compiled and k._kernel_module is None
+
+
+def test_kernel_module_reads_no_deprecated_name_off_a_dsl_module():
+    """Every name the kernel module imports from a DSL module or reads off one resolves on the installed DSL without a
+    ``DeprecationWarning``, unless the layer probe names it.  The DSL keeps a moved name as a warning alias for some releases and then
+    drops it; a kernel that still reads the alias raises from inside the trace on that release, at every row count, where the entry
+    promises a decline by name."""
+    msg = entry.dsl_error()
+    if msg is not None:
+        pytest.skip(msg)
+    from cudnn.gemm.frost.projection_decode.kernel import fp8_projection_decode_e4m3 as kernel
+
+    reads = set()
+    for node in ast.walk(ast.parse(Path(kernel.__file__).read_text())):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module.startswith("cutlass"):
+            reads |= {(node.module, alias.name, node.lineno) for alias in node.names}
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            owner = vars(kernel).get(node.value.id)
+            if isinstance(owner, types.ModuleType) and owner.__name__.startswith("cutlass"):
+                reads.add((owner.__name__, node.attr, node.lineno))
+    assert len(reads) > 20, "the scan found the kernel module's DSL reads"
+    probed = {(module, name) for module, names in entry.DSL_LAYER for name in names}
+    flagged = []
+    for module, name, line in sorted(reads):
+        if (module, name) in probed:
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            try:
+                getattr(importlib.import_module(module), name)
+            except (DeprecationWarning, AttributeError) as e:
+                flagged.append(f"line {line}: {module}.{name}: {type(e).__name__}: {e}")
+    assert not flagged, flagged
 
 
 def test_cudnn_level_export_resolves_to_the_entry():
@@ -959,6 +1015,21 @@ def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_u
         k(_ops(dev, G_IN, "random")["weight"], act, ops["scale"], out)
     with pytest.raises(NotImplementedError, match="contiguous"):
         k(ops["weight"], act, ops["scale"], torch.empty(G_OUT.OUT_FEATURES, 3, dtype=torch.bfloat16, device=dev).t())
+
+
+def test_trace_raises_no_deprecation_warning_from_the_kernel_package():
+    """A fresh entry's compile -- a real trace on this device's DSL -- attributes no ``DeprecationWarning`` to a file of the entry's
+    package: a deprecated DSL accessor in the kernel body shows here on the releases that warn, ahead of the one that drops it."""
+    dev = device_or_skip()
+    k = entry.Fp8ProjectionDecode(dev, G_IN)  # not one of this module's shared entries: nothing is compiled yet, so compile traces
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        k.compile(1)
+        k.compile(17)
+    assert len(k.compiled) == 2
+    package = str(Path(entry.__file__).parent)
+    own = [f"{w.filename}:{w.lineno}: {w.message}" for w in seen if issubclass(w.category, DeprecationWarning) and str(w.filename).startswith(package)]
+    assert not own, own
 
 
 def test_reservation_covers_the_kernel_allocation(capfd):

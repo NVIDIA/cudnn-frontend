@@ -25,8 +25,9 @@ source: 256 columns), so that every CTA the launcher places on an SM also gets i
 waits for the predecessor too (``PREWAIT_WEIGHTS`` off; the source never waits on the weight loader); (7) the dependent-launch wait and
 the release of the successor are two knobs; (8) rank 0 arms the reduction barrier at the top of its epilogue role (the source: after
 its accumulator read), and ``HOLD_TMEM`` lets the epilogue hold the tensor memory until it has consumed the registers it read from it
-(off = the source's order: released right after the read); (9) named barrier counts and the cuDNN symbol prefix.  Not carried: the
-source's own configuration validation and autotune list, its batched views, split-K 3.
+(off = the source's order: released right after the read); (9) named barrier counts, the cuDNN symbol prefix, and ``LayoutEnum``
+bound through the tree's shim over the DSL names that moved between releases (the source reads the DSL's older alias).  Not carried:
+the source's own configuration validation and autotune list, its batched views, split-K 3.
 
 COORDINATES.  Kernel M = the weight rows ``N`` (``MMA_M`` 64 or 128 per CTA), kernel N = the token rows (one token tile of 8 / 16 / 32
 per CTA; rows past ``rows`` are outside the activation's tensor map and load as zeros), kernel K = ``K`` in 128-element K tiles.  Grid
@@ -122,7 +123,6 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32
 from cutlass._mlir.dialects import llvm
@@ -130,6 +130,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from cudnn._cutlass_compat import LayoutEnum
 
 from .fp8_projection_decode_config import (
     EMPTY_BAR_ARRIVERS,
@@ -266,8 +268,8 @@ class Fp8ProjectionDecodeKernel:
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             ab_dtype,
             ab_dtype,
-            utils.LayoutEnum.from_tensor(mA).mma_major_mode(),
-            utils.LayoutEnum.from_tensor(mB).mma_major_mode(),
+            LayoutEnum.from_tensor(mA).mma_major_mode(),
+            LayoutEnum.from_tensor(mB).mma_major_mode(),
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_mn,
@@ -384,7 +386,7 @@ class Fp8ProjectionDecodeKernel:
                 mAlpha,
                 cute.arch.thread_idx()[0] - 128,
                 mC.element_type,
-                utils.LayoutEnum.from_tensor(mC),
+                LayoutEnum.from_tensor(mC),
                 mailbox,
                 bar_reduce,
                 split_rank,

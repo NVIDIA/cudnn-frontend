@@ -96,6 +96,9 @@ DSL_LAYER = (
     ),
     ("cutlass.cute.nvgpu.tcgen05", ("commit", "make_tmem_copy", "CtaGroup", "Field")),
     ("cutlass.cutlass_dsl", ("dsl_user_op", "T")),
+    # the tree's shim over the DSL names that moved between releases: it binds each from its owning module and falls back to the older
+    # home, so the kernel never reads a deprecated alias; a DSL on which the shim itself does not import declines here, by name
+    ("cudnn._cutlass_compat", ("LayoutEnum",)),
 )
 
 
@@ -108,7 +111,7 @@ def cc_supported(cc) -> bool:
 
 
 def dsl_layer_error() -> Optional[str]:
-    """The layer probe: every DSL name of :data:`DSL_LAYER` must import.  Imports the DSL (callers run it after the version gate, right
+    """The layer probe: every name of :data:`DSL_LAYER` must import.  Imports the DSL (callers run it after the version gate, right
     before the kernel module's own import).  None when the layer is complete, else a message naming the first missing piece."""
     import importlib
 
@@ -118,7 +121,7 @@ def dsl_layer_error() -> Optional[str]:
         try:
             mod = importlib.import_module(module)
         except Exception as e:  # noqa: BLE001 - any failure to reach the layer is the same answer
-            return f"{NAME} is written on {module}, which the installed CuTe DSL ({found}) does not provide ({type(e).__name__}: {e})"
+            return f"{NAME} is written on {module}, which does not import on the installed CuTe DSL ({found}) ({type(e).__name__}: {e})"
         missing = [n for n in names if not hasattr(mod, n)]
         if missing:
             return f"{NAME} is written on {module}; the installed CuTe DSL ({found}) does not export {', '.join(missing)}"

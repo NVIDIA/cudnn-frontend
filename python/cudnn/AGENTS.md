@@ -456,6 +456,18 @@ DSL satisfies your kernel.**
   favour of the unified decorators, so a version floor cannot promise it: the entry probes the
   layer's names before it imports the kernel module and declines by name
   (`fp8_projection_decode.DSL_LAYER`, `dsl_layer_error`). No version ceiling is set.
+- **Bind a DSL name that moved between releases through `cudnn._cutlass_compat`, never through
+  its old home.** DSL 4.8 keeps `cutlass.utils.LayoutEnum` (and the other moved names) as a
+  package-level alias that warns on every read and is announced for removal; a kernel body that
+  still reads it compiles today and raises `AttributeError` from inside the trace on the release
+  that drops it -- past the version gate, on every shape. The shim binds each name from its
+  owning module and falls back to the older home. Detectors:
+  `test_kernel_module_reads_no_deprecated_name_off_a_dsl_module` (host: every name the kernel
+  module imports from or reads off a DSL module resolves without a `DeprecationWarning` unless
+  the entry's probe names it) and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` (device: a real trace) in
+  `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py`; the pytest warnings
+  summary of a kernel suite shows the same reads by file and line.
 - **A kernel on the `cutlass.cute.experimental` layer reads TWO environment namespaces.** The
   target check of `cutlass.utils.blackwell_helpers` reads `CUTE_DSL_ARCH`; the layer's own
   lowering, dump and cache settings read `CUTE_EXPERIMENTAL_DSL_*`. A cross-target render
