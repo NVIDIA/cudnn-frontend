@@ -7,7 +7,8 @@ the typed declines of the host entry (CPU tensors), the DSL gate, the plan-time 
 the entry against an fp64 reference of the E4M3 operands under a per-element bound, exact-integer cells byte for byte against the host,
 the edge rows (zeros, NaN, overflow), the output rows it must not touch, every performance arm bitwise with the default, a row alone
 against the same row in a batch, CUDA-graph replay, the warm call (a cache hit that reads nothing to the host and allocates nothing),
-the launch matrix in a child process with a stage-aware deadline, and a warm stress with byte references.
+the launch matrix in a child process with a stage-aware deadline, and a warm stress with byte references.  A child interpreter runs the
+source overlay of this process and reports the files it loaded; the parent compares them with its own.
 The operand builders, the reference and the device gate live in ``fp8_projection_decode_utils.py`` beside this module; replay, batch
 invariance per row count, the pick's byte neutrality and the goldens live in ``test_fp8_projection_decode_determinism.py``."""
 
@@ -648,13 +649,37 @@ def test_docs_rows_exist_for_the_api():
     assert "fp8_projection_decode" in (REPO / "llms.txt").read_text()
 
 
+# Child interpreters.  A child is a fresh process: nothing of this process's import setup carries over, so ``import cudnn`` there is the
+# installed package, while this process may run the entry from a source tree laid over that package (this directory's conftest).  A
+# child that imports the entry therefore runs CHILD_TREE first -- the same overlay, with the source directory THIS process loaded the
+# entry from -- and every child prints the files it loaded on ``LOADED`` lines, which the parent compares with its own (test/AGENTS.md,
+# "Confirm you are testing the code you edited").  Without the overlay a child would test the installed package, whatever tree that is.
+SOURCE_CUDNN = str(Path(entry.__file__).parents[3])  # <...>/cudnn of <...>/cudnn/gemm/frost/projection_decode/<the entry module>
+KERNEL_FILE = str(Path(kcfg.__file__).with_name("fp8_projection_decode_e4m3.py"))
+CHILD_TREE = f"""
+import importlib, os
+for name in ("cudnn", "cudnn.gemm"):
+    package, source = importlib.import_module(name), os.path.join({SOURCE_CUDNN!r}, *name.split(".")[1:])
+    if source not in package.__path__:
+        package.__path__.insert(0, source)
+"""
+
+
+def loaded_files(stdout):
+    """``{name: file}`` of the ``LOADED <name> <file>`` lines a child printed."""
+    return dict(line.split(" ", 2)[1:] for line in stdout.splitlines() if line.startswith("LOADED "))
+
+
 def test_import_cudnn_does_not_import_the_kernel_or_torch():
     """The lazy boundary in fresh interpreters: importing cudnn loads nothing of this package; building a host entry and running its
-    declines loads neither the kernel module nor the DSL."""
-    code = "import sys, cudnn; print(sorted(m for m in sys.modules if 'projection_decode' in m or m in ('cutlass', 'torch')))"
+    declines loads neither the kernel module nor the DSL.  The first child runs the package initializer this process runs; the second
+    one the entry module of the tree under test."""
+    code = "import sys, cudnn; print('LOADED cudnn', cudnn.__file__)\n"
+    code += "print(sorted(m for m in sys.modules if 'projection_decode' in m or m in ('cutlass', 'torch')))"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
-    assert out.strip() == "[]", out
-    code = textwrap.dedent("""
+    assert loaded_files(out) == {"cudnn": cudnn.__file__}, f"the child imported another cudnn package than this process:\n{out}"
+    assert out.strip().splitlines()[-1] == "[]", out
+    code = CHILD_TREE + textwrap.dedent("""
         import sys, cudnn
         from cudnn.gemm import ProjectionGeometry
         k = cudnn.Fp8ProjectionDecode("cpu", ProjectionGeometry(8192, 2048))
@@ -662,10 +687,12 @@ def test_import_cudnn_does_not_import_the_kernel_or_torch():
             k.compile(1)
         except NotImplementedError:
             pass
+        print("LOADED entry", sys.modules[type(k).__module__].__file__)
         print(sorted(m for m in sys.modules if m == "cutlass" or m.endswith("fp8_projection_decode_e4m3")))
         """)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
-    assert out.strip() == "[]", out
+    assert loaded_files(out) == {"entry": entry.__file__}, f"the child did not load the entry of the tree under test:\n{out}"
+    assert out.strip().splitlines()[-1] == "[]", out
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -1058,9 +1085,12 @@ _CHILD = """
 import faulthandler, sys, time
 faulthandler.dump_traceback_later({dump_s}, exit=False)
 print("STAGE import", flush=True)
+{tree}
 import torch
 from cudnn.gemm.frost.projection_decode import fp8_projection_decode as entry
 from cudnn.gemm.frost.projection_decode.kernel import fp8_projection_decode_config as kcfg
+print("LOADED entry", entry.__file__, flush=True)
+print("LOADED config", kcfg.__file__, flush=True)
 dev = torch.device("cuda", torch.cuda.current_device())
 print("STAGE compile", flush=True)
 cells = []
@@ -1081,6 +1111,7 @@ for k, w, x, s, o in cells:
     for _ in range(16):  # back to back: under pdl each launch is the next one's predecessor, released after its last weight issue
         k(w, x, s, o)
 torch.cuda.synchronize()
+print("LOADED kernel", cells[0][0]._kernel_module.__file__, flush=True)
 print("STAGE done", round(time.monotonic() - t0, 3), "s", flush=True)
 """
 
@@ -1088,7 +1119,7 @@ print("STAGE done", round(time.monotonic() - t0, 3), "s", flush=True)
 def test_launch_matrix_completes_in_a_child_process():
     device_or_skip()
     limit = CHILD_COMPILE_BUDGET_S + CHILD_DISPATCH_LIMIT_S
-    code = _CHILD.format(dump_s=limit - 15)
+    code = _CHILD.format(dump_s=limit - 15, tree=CHILD_TREE)
     try:
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=limit)
     except subprocess.TimeoutExpired as e:
@@ -1101,6 +1132,9 @@ def test_launch_matrix_completes_in_a_child_process():
     assert proc.returncode == 0, f"child failed:\n{proc.stdout}\n{proc.stderr[-4000:]}"
     assert "STAGE done" in proc.stdout, proc.stdout
     assert "may exceed" not in proc.stdout + proc.stderr, "the launch reserved less shared memory than the kernel allocates"
+    tree = dict(entry=entry.__file__, config=kcfg.__file__, kernel=KERNEL_FILE)
+    assert loaded_files(proc.stdout) == tree, f"the child did not dispatch the kernel of the tree under test ({tree}):\n{proc.stdout}"
+    print(proc.stdout)
 
 
 @pytest.mark.parametrize("rows", (1, 32))
