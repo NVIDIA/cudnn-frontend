@@ -30,6 +30,7 @@ from cutlass.cute.runtime import make_fake_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.glu_layout import GLU_LAYOUTS, validate_glu_layout
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     canonicalize_unit_dim_strides,
@@ -70,6 +71,9 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         >>> api.execute(..., stream)
     """
 
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("nvfp4", "mxfp8")
+
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -98,6 +102,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         act_func: str = "swiglu",
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         """Initialize the DiscreteGroupedGemmSwigluSm100 API.
 
@@ -126,8 +131,23 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
         :param act_func: Activation function, one of "swiglu" or "geglu"
         :param b_major: Major dimension for B tensor, one of "k" or "n"
+        :param glu_layout: Persistent B, bias, SFB, and C branch order: interleaved_32 or gate_then_up.
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        glu_layout = validate_glu_layout(glu_layout)
+        self._canonical_api = None
+        if glu_layout == "gate_then_up":
+            # Keep the legacy entry point and supplied output buffers. Only the
+            # canonical branch uses the unified kernel's descriptor view.
+            canonical_kwargs = dict(locals())
+            canonical_kwargs.pop("self")
+            canonical_kwargs.pop("__class__", None)
+            from cudnn.gemm.cutedsl.grouped.glu._blockscaled_api import GroupedGemmGluBlockScaledAPI
+
+            super().__init__()
+            self._canonical_api = GroupedGemmGluBlockScaledAPI(**canonical_kwargs)
+            self._kernel = self._canonical_api._kernel
+            return
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
 
@@ -233,6 +253,10 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        if self._canonical_api is not None:
+            supported = self._canonical_api.check_support()
+            self._is_supported = self._canonical_api._is_supported
+            return supported
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -517,6 +541,11 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel from tensor descriptors captured in __init__."""
+        if self._canonical_api is not None:
+            self._canonical_api.compile()
+            self._is_supported = self._canonical_api._is_supported
+            self._compiled_kernel = self._canonical_api._compiled_kernel
+            return
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -842,6 +871,29 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         :param prob_tensor: Optional probability tensor
         :param current_stream: CUDA stream
         """
+        if self._canonical_api is not None:
+            return self._canonical_api.execute(
+                a_tensor=a_tensor,
+                b_ptrs=b_ptrs,
+                c_tensor=c_tensor,
+                d_tensor=d_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_ptrs=sfb_ptrs,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                bias_tensor=bias_tensor,
+                d_col_tensor=d_col_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                amax_tensor=amax_tensor,
+                norm_const_tensor=norm_const_tensor,
+                prob_tensor=prob_tensor,
+                linear_offset=linear_offset,
+                geglu_alpha=geglu_alpha,
+                glu_clamp_max=glu_clamp_max,
+                glu_clamp_min=glu_clamp_min,
+                current_stream=current_stream,
+            )
         self._logger.debug("Entering execute")
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
@@ -933,6 +985,7 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
     glu_clamp_min: float = -7.0,
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    glu_layout: str = "interleaved_32",
 ) -> TupleDict:
     """Convenience wrapper for discrete-weight grouped GEMM GLU forward operation.
 
@@ -982,11 +1035,18 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
             Runtime parameter, not part of the cache key. Ignored when
             ``act_func == "swiglu"``.
         current_stream: CUDA stream
+        glu_layout: Persistent B, bias, SFB, and C branch order: interleaved_32 or gate_then_up.
 
     Returns:
         TupleDict with keys: c_tensor, d_tensor, d_col_tensor, amax_tensor,
             sfd_row_tensor, sfd_col_tensor
     """
+    glu_layout = validate_glu_layout(glu_layout)
+    if glu_layout == "gate_then_up":
+        canonical_kwargs = dict(locals())
+        from cudnn.gemm.cutedsl.grouped.glu.api import grouped_gemm_glu_wrapper_sm100
+
+        return grouped_gemm_glu_wrapper_sm100(**canonical_kwargs, generate_c=True)
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for discrete_grouped_gemm_swiglu_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -1250,3 +1310,7 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
     )
+
+
+discrete_grouped_gemm_swiglu_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+discrete_grouped_gemm_swiglu_wrapper_sm100.supports_gate_then_up_precisions = DiscreteGroupedGemmSwigluSm100.supports_gate_then_up_precisions
