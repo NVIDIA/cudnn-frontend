@@ -637,15 +637,23 @@ stride of the grid, so the producer loads the next item's first K tile, Q and
 first V tile while the current item finishes. A causal plan's items differ in
 length, and a stride by the grid ran three long causal shapes at 0.889-0.922x
 the one-item-per-CTA kernel on an H100 (an earlier run on 2026-10-20 that timed
-a development build of the loop), so a causal plan's persistent grid deals a
-paired walk instead: each (head, batch)'s heavy and light Q tiles go out in
-pairs of equal KV work. A plan-time route (`_sm90_d128_causal_route`) runs a
-causal plan one work item per CTA instead when it has at most one item per CTA,
-when it is a paired walk of 48 or more KV tiles per Q tile on average (unless
-each CTA gets at most one pair), or when the walk's own rule keeps the stride
-by the grid at more than 15 KV tiles per Q tile with more than one Q head per KV
-head, or at 10 or more on MHA; its cutoffs come from 161 timings of 132 causal
-shapes on H100 SXM GPUs (`api_dsl.D128_CAUSAL_WALK_ROUTE`). The online
+a development build of the loop), so a causal plan's persistent grid follows a
+plan-time rule: with at least 9 Q tiles per (head, batch) a paired walk, each
+(head, batch)'s heavy and light Q tiles going out in pairs of equal KV work,
+unless the stride by the grid balances better; with fewer, the stride, on a
+plan of at most 8 query heads per KV head (with more, the paired walk's rule
+decides at every Q tile count). Such a
+record walks the NATURAL order unless the caller pins one, so a stride runs a
+(head, batch)'s Q tiles in one round on neighbouring CTAs and reads K and V from
+HBM about once (Nsight Compute on H100, 2026-11-06: the LPT_L2 order the rule
+used before read them 1.26 to 2.16 times the read-once floor on causal MHA plans
+with short S_q), dealt each round from CTA 0 or with odd rounds reversed,
+whichever leaves the busiest CTA lighter. A plan-time route
+(`_sm90_d128_causal_route`, `api_dsl.D128_CAUSAL_WALK_ROUTE`) runs a causal plan
+of at most one item per CTA, or of at least 48 KV tiles per Q tile on average,
+one work item per CTA. The rule was chosen on 88 causal shapes timed on H100 SXM
+GPUs against cuDNN 9.27, its head limit and route cutoff on 56 fresh ones, and
+checked on 48 fresh shapes (2026-11-06). The online
 softmax, the sign-aware row anchor, the FP64 path for extreme scales and the
 reverse KV walk are D512's arithmetic (shared helpers in
 `sm90/_common_hopper.py`). Dense only: a direct caller's

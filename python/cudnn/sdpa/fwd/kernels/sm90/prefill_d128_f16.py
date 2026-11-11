@@ -74,7 +74,31 @@ from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.scheduler import SCHED_LPT_L2, SCHED_NATURAL, lpt_l2_tile_coords, lpt_tile_coords
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
-from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, FLAVOR_TILES, SCALE_POSITIVE, SCALE_ZERO, TemplateParams, validate_params
+from cudnn.sdpa.fwd.config_sm90 import (  # noqa: F401 (the planner's names stay this module's attributes)
+    CAUSAL_WALK_CUT_MAX_QH,
+    CAUSAL_WALK_L2_CAP,
+    CAUSAL_WALK_LIGHT_ROWS,
+    CAUSAL_WALK_MIN_TILES,
+    CAUSAL_WALK_PHI,
+    CAUSAL_WALK_SNAKE,
+    D128_FLAVOR,
+    FLAVOR_TILES,
+    SCALE_POSITIVE,
+    SCALE_ZERO,
+    STRIDE_DEAL,
+    CausalWalk,
+    TemplateParams,
+    _lpt_l2_bytes,
+    _rounds_makespan,
+    _stride_deal,
+    _stride_item_costs,
+    _walk_unit_costs,
+    causal_kv_tiles,
+    causal_stride_snake,
+    causal_walk_layout,
+    causal_walk_plan,
+    validate_params,
+)
 from cudnn.sdpa.fwd.kernels.sm90.prepared_host import host as _host, compile_host
 from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     FLT_MAX_F64,
@@ -117,167 +141,12 @@ PERSISTENT: bool = PARAMS.persistent
 # refused 1 outside a persistent causal record.
 CAUSAL_WALK: int = PARAMS.causal_walk
 
-# The paired walk's plan-time rule (causal_walk_plan) reads the four constants below. Each is a speed choice: every
-# value computes the same O and Stats bit for bit, and each is part of this file's source digest, so a changed value
-# is its own compile key.
-# The light-row count light_rows, the number of each (head, batch) group's lightest Q tiles that go out one at a time
-# after the pairs: -1 lets the rule choose it, and keep the stride by the grid where the stride balances the plan at
-# least as well; n >= 0 forces light_rows = min(n, T) on the paired walk of a plan with more items than CTAs (0: pairs
-# only; T: single items only, heaviest first). A plan with at most one item per CTA keeps light_rows = T at every value.
-CAUSAL_WALK_LIGHT_ROWS: int = -1
-# The rule's light_rows stops where a round of single items would spread its K and V reads past the L2 budget of the
-# LPT_L2 order (work_of's): such a round reads up to min(ceil(CTAs / qh_per_kh) + 1, h_kv * b) KV heads, each to its
-# row's last KV tile. False lets light_rows reach T.
-CAUSAL_WALK_L2_CAP: bool = True
-# An item's fixed cost in KV tiles, which the rule adds to each item's KV tile count. On an H100 SXM a development copy
-# of the persistent loop took about 3.2 us of each item outside its KV steps and about 1.7 us per KV step at S = 1024
-# (an in-kernel clock probe and a fit to kernel times), so 2; 1 and 3 choose the same light_rows as 2 on 26 causal
-# shapes from b1 to b66 at S = 512 to 16384.
-CAUSAL_WALK_PHI: int = 2
-# Odd rounds go to the CTAs in reverse, so a CTA that took one of the heaviest units of a round takes one of the
-# lightest of the next. False deals every round from CTA 0.
-CAUSAL_WALK_SNAKE: bool = True
-
-
-class CausalWalk(NamedTuple):
-    """The paired walk's compile-time constants (causal_walk_plan): plain ints and bools.
-
-    Units in walk order. For each (head, batch) group g = head + h_q * batch in turn, ``pairs`` units, the j-th holding
-    Q tiles T - 1 - j and light_rows + j; when T - light_rows is odd, groups 2k and 2k + 1 share one unit of their
-    middle tile light_rows + pairs, right after group 2k + 1's pairs, and an odd group count leaves the last group's
-    middle alone, the last heavy unit. Then the light rows, one item per unit: tile light_rows - 1 of every group, then
-    light_rows - 2, ..., tile 0. Round k deals units k * ctas to k * ctas + ctas - 1 to CTAs 0 to ctas - 1, in reverse
-    when k is odd under snake.
-    """
-
-    q_tiles: int
-    groups: int
-    light_rows: int
-    pairs: int  # pair units per group, (q_tiles - light_rows) // 2
-    middles: bool  # q_tiles - light_rows is odd
-    lone_middle: int  # 1 when the last group's middle unit holds one item (middles and an odd group count), else 0
-    heavy_units: int  # the pair and middle units, which come first
-    units: int
-    ctas: int  # min(units, the persistent CTA count): every CTA has a unit
-    snake: bool
-
-
-def causal_walk_layout(q_tiles: int, groups: int, light_rows: int, persistent_ctas: int, snake: bool) -> CausalWalk:
-    """The paired walk over ``groups`` groups of ``q_tiles`` Q tiles with ``light_rows`` light rows (CausalWalk)."""
-    pairs, middles = divmod(q_tiles - light_rows, 2)
-    heavy = groups * pairs + middles * ((groups + 1) // 2)
-    units = heavy + groups * light_rows
-    lone = int(bool(middles) and groups % 2 == 1)
-    return CausalWalk(q_tiles, groups, light_rows, pairs, bool(middles), lone, heavy, units, min(units, persistent_ctas), snake)
-
-
-def causal_kv_tiles(shape: tuple[int, int, int, int, int], bottom_right: bool) -> list[int]:
-    """Each Q tile's KV tile count on a causal plan: work_record's iterations (compute_kv_loop_bounds' right bound) in
-    plain ints. Tile t walks min(N_kv, t + 1 + ceil(diag / KV_TILE)) tiles, diag = S_kv - S_q under bottom-right and 0
-    under top-left; a partial last Q tile walks for all of its rows."""
-    _, _, _, s_q, s_kv = shape
-    q_tile, kv_tile = FLAVOR_TILES[D128_FLAVOR]
-    diag = s_kv - s_q if bottom_right else 0
-    return [max(0, min(-(-s_kv // kv_tile), -(-(t * q_tile + q_tile + diag) // kv_tile))) for t in range(-(-s_q // q_tile))]
-
-
-def _rounds_makespan(costs: list[int], ctas: int, snake: bool) -> int:
-    """The largest CTA load when ``costs`` (one per unit, in walk order) go out in rounds of min(ctas, len(costs))
-    units, each round from CTA 0 or, under snake, odd rounds in reverse."""
-    n = min(ctas, len(costs))
-    padded = costs + [0] * (-len(costs) % n)
-    rows = [padded[i : i + n] for i in range(0, len(padded), n)]
-    if snake:
-        rows[1::2] = [row[::-1] for row in rows[1::2]]
-    return max(map(sum, zip(*rows)))
-
-
-def _walk_unit_costs(walk: CausalWalk, item_cost: list[int]) -> list[int]:
-    """Each unit's cost in walk order (CausalWalk): the sum of its items' ``item_cost`` (indexed by Q tile)."""
-    q_tiles, groups, light, pairs = walk.q_tiles, walk.groups, walk.light_rows, walk.pairs
-    pair_costs = [item_cost[q_tiles - 1 - j] + item_cost[light + j] for j in range(pairs)]
-    if walk.middles:
-        middle = item_cost[light + pairs]
-        costs = (pair_costs + pair_costs + [2 * middle]) * (groups // 2) + (pair_costs + [middle] if groups % 2 else [])
-    else:
-        costs = pair_costs * groups
-    for tile in range(light - 1, -1, -1):
-        costs += [item_cost[tile]] * groups
-    return costs
-
-
-def _lpt_l2_bytes(s_kv: int, row_bytes: int) -> int:
-    """work_of's LPT_L2 budget: a power of two of whole KV groups within SCHED_L2_BUDGET_BYTES; 0 is one group."""
-    groups = SCHED_L2_BUDGET_BYTES // max(1, s_kv * row_bytes)
-    return (1 << groups.bit_length() - 1) * s_kv * row_bytes if groups > 1 else 0
-
-
-def _stride_item_costs(shape, sched_policy: int, qh_per_kh: int, item_cost: list[int], row_bytes: int) -> list[int]:
-    """Each item's cost in the stride walk's order, the one-tile grid's order under ``sched_policy`` (work_of): NATURAL
-    Q tile fastest, then head, then batch; LPT the heaviest row of every (head, batch) first; LPT_L2 the same row by row
-    inside each block of whole KV groups (lpt_l2_tile_coords' blocks)."""
-    b, h_q, _, _, s_kv = shape
-    if sched_policy == SCHED_NATURAL:
-        return item_cost * (h_q * b)
-    row_items = [h_q * b]
-    if sched_policy == SCHED_LPT_L2:
-        n_groups = h_q // qh_per_kh * b
-        active = min(max(1, _lpt_l2_bytes(s_kv, row_bytes) // max(1, s_kv * row_bytes)), n_groups)
-        active = -(-n_groups // -(-n_groups // active))
-        blocks = -(-n_groups // active)
-        row_items = [(n_groups - k * active if k == blocks - 1 else active) * qh_per_kh for k in range(blocks)]
-    costs = []
-    for per_row in row_items:
-        for tile in range(len(item_cost) - 1, -1, -1):
-            costs += [item_cost[tile]] * per_row
-    return costs
-
-
-def causal_walk_plan(
-    shape: tuple[int, int, int, int, int],
-    bottom_right: bool,
-    sched_policy: int,
-    qh_per_kh: int,
-    persistent_ctas: int,
-    storage_bytes: int,
-    *,
-    light_rows: int = CAUSAL_WALK_LIGHT_ROWS,
-    l2_cap: bool = CAUSAL_WALK_L2_CAP,
-    phi: int = CAUSAL_WALK_PHI,
-    snake: bool = CAUSAL_WALK_SNAKE,
-) -> Optional[CausalWalk]:
-    """The paired walk of a persistent causal record, or None where the stride by the grid balances the plan at least as
-    well: the plan-time rule, every input a compile-key one (the declared shape, the mask, sched_policy, the GQA ratio,
-    the CTA count, the storage width) or a constant above.
-
-    A plan with at most one item per CTA takes light_rows = T, one item per CTA. Otherwise, with each item costing its
-    KV tiles plus ``phi``, the rule takes the light_rows in [0, cap] whose walk has the smallest largest CTA load (the
-    smaller on a tie), cap the largest light_rows whose rounds of single items stay within the L2 budget (the LPT_L2
-    order's, or one KV group's bytes where that is 0), and keeps the stride where the stride's largest load is smaller.
-    Costs are exact integer sums over the units, at most T + 1 walks of at most T * b * h_q items.
-    """
-    b, h_q, _, _, s_kv = shape
-    kv_tiles = causal_kv_tiles(shape, bottom_right)
-    q_tiles, groups = len(kv_tiles), h_q * b
-    if q_tiles * groups <= persistent_ctas:
-        return causal_walk_layout(q_tiles, groups, q_tiles, persistent_ctas, snake)
-    if light_rows >= 0:
-        return causal_walk_layout(q_tiles, groups, min(light_rows, q_tiles), persistent_ctas, snake)
-    item_cost = [tiles + phi for tiles in kv_tiles]
-    row_bytes = 2 * D128_FLAVOR[0] * storage_bytes
-    top = q_tiles
-    if l2_cap:
-        budget = _lpt_l2_bytes(s_kv, row_bytes) or s_kv * row_bytes
-        heads = min(-(-persistent_ctas // qh_per_kh) + 1, h_q // qh_per_kh * b)
-        top = next((tile for tile, tiles in enumerate(kv_tiles) if heads * tiles * FLAVOR_TILES[D128_FLAVOR][1] * row_bytes > budget), q_tiles)
-    best_load, best = None, None
-    for light in range(top + 1):
-        walk = causal_walk_layout(q_tiles, groups, light, persistent_ctas, snake)
-        load = _rounds_makespan(_walk_unit_costs(walk, item_cost), persistent_ctas, snake)
-        if best is None or load < best_load:
-            best_load, best = load, walk
-    stride_load = _rounds_makespan(_stride_item_costs(shape, sched_policy, qh_per_kh, item_cost, row_bytes), persistent_ctas, False)
-    return best if best_load <= stride_load else None
+# The plan-time rule of a persistent causal record (causal_walk_plan, and causal_stride_snake for the stride), its
+# seven constants (CAUSAL_WALK_LIGHT_ROWS, CAUSAL_WALK_L2_CAP, CAUSAL_WALK_PHI, CAUSAL_WALK_SNAKE, CAUSAL_WALK_MIN_TILES,
+# CAUSAL_WALK_CUT_MAX_QH, STRIDE_DEAL), CausalWalk and the cost helpers are host arithmetic and live in config_sm90,
+# torch- and DSL-free, so that the adapter and the tests read the rule without this template. They are imported above
+# and stay this module's attributes, under the same names, for the record's planner call below, the tests and the kits'
+# site hooks.
 
 
 # The paired walk in the kernel. Both roles carry one warp-uniform walk position per CTA, pos = 2 * round + slot (slot
@@ -307,6 +176,16 @@ def walk_live(pos, cta, walk: CausalWalk):
     """Whether walk position ``pos`` of CTA ``cta`` names an item, that is whether its unit exists: the item loop's
     condition."""
     return walk_unit(pos, cta, walk) < walk.units
+
+
+def stride_next(item, ctas: int, snake: bool):
+    """The item after ``item`` on the stride by the grid, for the CTA that holds it: one grid stride on, or under
+    ``snake`` the mirrored column of the next round (column c of round k is item k * ctas + c, odd rounds dealt in
+    reverse). ``ctas`` is a compile-time constant, so the modulo strength-reduces; a host test runs it on plain ints."""
+    if not snake:
+        return item + ctas
+    column = item % ctas
+    return item - column + ctas + (ctas - 1 - column)
 
 
 def walk_next(pos, unit, walk: CausalWalk):
@@ -581,9 +460,13 @@ class SM90FusedMultiHeadAttentionForward:
         # The paired walk's constants, or None for the stride by the grid: the plan-time rule over the declared shape
         # and the CTA count (causal_walk_plan).
         self.walk = None
+        # Under the stride a causal record's deal (causal_stride_snake); every other stride deals each round from CTA 0.
+        self.stride_snake = False
         if self.causal_walk:
             shape = (self.b, self.h_q, self.h_kv, self.s_q, self.s_kv)
-            self.walk = causal_walk_plan(shape, self.kv_loop_bottom_right, self.sched_policy, self.qh_per_kh, self.persistent_ctas, self.storage_dtype.bytes)
+            plan = (shape, self.kv_loop_bottom_right, self.sched_policy, self.qh_per_kh, self.persistent_ctas, self.storage_dtype.bytes)
+            self.walk = causal_walk_plan(*plan)
+            self.stride_snake = self.walk is None and causal_stride_snake(*plan)
         # The paired walk launches one CTA per unit up to the cap (walk.ctas), so every CTA has a unit.
         self.paired_walk = self.walk is not None
         if self.paired_walk:
@@ -1384,6 +1267,8 @@ class SM90FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.paired_walk):
             cta, _, _ = cute.arch.block_idx()
             return cute.arch.make_warp_uniform(walk_next(item, walk_unit(item, cta, self.walk), self.walk))
+        if cutlass.const_expr(self.stride_snake):
+            return cute.arch.make_warp_uniform(stride_next(item, self.n_ctas, True))
         return cute.arch.make_warp_uniform(item + cutlass.Int32(self.n_ctas))
 
     @cute.jit

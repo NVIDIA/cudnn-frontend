@@ -24,8 +24,9 @@ from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 from cudnn.frost.tile_dsl.wgmma import wgmma_m64nNk16_f32, wgmma_smem_desc
 from cudnn.sdpa.fwd.config_sm90 import SCALE_POSITIVE, SCALE_ZERO
 
-# The SCHED_LPT_L2 budget; api_dsl and heuristics keep their own copies.
-SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+# The SCHED_LPT_L2 budget, which the SM90 templates import from here: single-sourced in config_sm90, whose D128 planner
+# reads it; api_dsl and heuristics keep their own copies.
+from cudnn.sdpa.fwd.config_sm90 import SCHED_L2_BUDGET_BYTES  # noqa: E402,F401
 
 # FP64 FLT_MAX used by the positive-scale overflow guards.
 FLT_MAX_F64 = 3.4028234663852886e38

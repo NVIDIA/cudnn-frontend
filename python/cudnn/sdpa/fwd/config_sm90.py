@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import numbers
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import NamedTuple, Optional
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
@@ -72,6 +74,273 @@ D128_NOT_SERVED = {
     "pack_gqa": "PackGQA",
 }
 NOT_SERVED = {D128_FLAVOR: D128_NOT_SERVED}
+
+# The route's cutoff on L, a causal plan's mean KV tiles per Q tile: from L 48 every causal D128 plan of the walk's rule
+# goes one tile per CTA, whatever kind the rule picks (d128_causal_route). On H100 SXM GPUs (#1159's harness, bf16,
+# ratios medians of per-round ratios, the band the larger of 1% and the twins' gap), an earlier rule routed the paired
+# walks from this L, on 161 timings of the walk against the one-tile kernel. The walk beat it on all 54 at L 40.5 or
+# less; from L 48.5 to 80.5 it won five (by 1.2% to 2.6%) and tied eight, and from L 88.5 up it lost 12 of 23 (by 1.0%
+# to 2.3%), tied ten and won one; the walk of b8 h32/8 S_q 2048 S_kv 16384 (L 120.5) ran 0.988 of the one-tile kernel.
+# At the same S_q and S_kv a later run timed the one-tile kernel 1.4% faster than the walk of b5 h12/12 and 1.2% faster
+# the NATURAL stride of b1 h20/20 (both beyond the band), and 0.3% and 0.9% slower than the walks of b1 h32/8 and b1
+# h64/4 (inside it). Every one-tile timing here ran the causal order a routed plan keeps (LPT_L2: no arm pinned one,
+# and the graph route proposed it), so heuristics._sched_points proposes that order for a routed plan.
+D128_ROUTE_MAX_L = 48
+
+
+# The SCHED_LPT_L2 budget of the SM90 templates (D512 and D128 read it through kernels/sm90/_common_hopper; api_dsl and
+# heuristics keep their own copies): here, so that the D128 planner below reads the same value without the DSL.
+SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+
+# The plan-time rule of a persistent causal record (causal_walk_plan, and causal_stride_snake for the stride) reads the
+# seven constants below. Each is a speed choice: every value computes the same O and Stats bit for bit. The rule lives
+# here, host arithmetic with no template, no torch and no DSL, so that the adapter's route (d128_causal_route) and the
+# graph route's proposal read it without loading the template; prefill_d128_f16 imports every name below and keeps it
+# as its own attribute. A changed value never reuses a compiled artifact: the persistent cache's environment carries a
+# digest of the whole cudnn package's source (frost/compiled_cache.source_tree_digest).
+# The light-row count light_rows, the number of each (head, batch) group's lightest Q tiles that go out one at a time
+# after the pairs: -1 lets the rule choose it, and keep the stride by the grid where the stride balances the plan at
+# least as well; n >= 0 forces light_rows = min(n, T) on the paired walk of a plan with more items than CTAs (0: pairs
+# only; T: single items only, heaviest first). A plan with at most one item per CTA keeps light_rows = T at every value.
+CAUSAL_WALK_LIGHT_ROWS: int = -1
+# The rule's light_rows stops where a round of single items would spread its K and V reads past the L2 budget of the
+# LPT_L2 order (work_of's): such a round reads up to min(ceil(CTAs / qh_per_kh) + 1, h_kv * b) KV heads, each to its
+# row's last KV tile. False lets light_rows reach T.
+CAUSAL_WALK_L2_CAP: bool = True
+# An item's fixed cost in KV tiles, which the rule adds to each item's KV tile count. On an H100 SXM a development copy
+# of the persistent loop took about 3.2 us of each item outside its KV steps and about 1.7 us per KV step at S = 1024
+# (an in-kernel clock probe and a fit to kernel times), so 2; 1 and 3 choose the same light_rows as 2 on 26 causal
+# shapes from b1 to b66 at S = 512 to 16384.
+CAUSAL_WALK_PHI: int = 2
+# Odd rounds go to the CTAs in reverse, so a CTA that took one of the heaviest units of a round takes one of the
+# lightest of the next. False deals every round from CTA 0.
+CAUSAL_WALK_SNAKE: bool = True
+# The paired walk needs a head's Q tiles spread over enough CTAs: a plan with fewer Q tiles per (head, batch) group than
+# CAUSAL_WALK_MIN_TILES takes the stride by the grid instead (causal_walk_plan returns None). With T <= 8 a group's
+# pairs sit on at most four CTAs, each running two of its Q tiles one after the other, so the second reads its K and V
+# back from HBM; the stride in NATURAL order runs all of a group's Q tiles in one round on neighbouring CTAs, which
+# read them once (Nsight Compute: 1.00 to 1.03 times the read-once floor against 1.26 to 2.16 for the LPT_L2 stride
+# shipped before; timed on 69 shapes, the walk at T 2 to 4 ran 0.98 of cuDNN where the stride ran 1.05 to 1.07). -1 lets
+# the walk's rule decide at every T.
+CAUSAL_WALK_MIN_TILES: int = 9
+# The cut above applies only to a plan of at most CAUSAL_WALK_CUT_MAX_QH Q heads per KV head (qh_per_kh); a plan with
+# more goes to the walk's rule at every T. Its argument is K and V read once, and with 16 Q heads per KV head the 16
+# heads that share a KV head already read it close together in either order. A timing run compared the stride the cut
+# keeps with the walk the rule picks without it on 20 such shapes of 56 fresh frozen ones (#1159's harness, H100
+# SXM, ratios medians of per-round ratios, the band the larger of 1% and the twins' gap): 1.00 to 1.14 at qh_per_kh 8
+# or less (12 shapes, 9 above the band, none below), 0.985 to 1.004 at 16 (8 shapes, 4 below the band, none above).
+CAUSAL_WALK_CUT_MAX_QH: int = 8
+# The stride by the grid's deal (causal_stride_snake): round k gives items k * n to k * n + n - 1 to CTAs 0 to n - 1, n
+# the grid; under the snake deal odd rounds go to the CTAs in reverse (stride_next), so a CTA that took a group's
+# heaviest Q tile in one round takes a light one in the next, while each round still holds the same items. "auto"
+# takes the deal whose busiest CTA carries less (item costs as the walk's rule counts them, the straight deal on a tie);
+# "straight" and "snake" force one. The planner's cost predicted the measured snake-over-straight ratio within about 2%
+# on 19 causal shapes (0.878 against 0.881 on the shape where the straight deal won). Bit for bit either way.
+STRIDE_DEAL: str = "auto"
+
+
+class CausalWalk(NamedTuple):
+    """The paired walk's compile-time constants (causal_walk_plan): plain ints and bools.
+
+    Units in walk order. For each (head, batch) group g = head + h_q * batch in turn, ``pairs`` units, the j-th holding
+    Q tiles T - 1 - j and light_rows + j; when T - light_rows is odd, groups 2k and 2k + 1 share one unit of their
+    middle tile light_rows + pairs, right after group 2k + 1's pairs, and an odd group count leaves the last group's
+    middle alone, the last heavy unit. Then the light rows, one item per unit: tile light_rows - 1 of every group, then
+    light_rows - 2, ..., tile 0. Round k deals units k * ctas to k * ctas + ctas - 1 to CTAs 0 to ctas - 1, in reverse
+    when k is odd under snake.
+    """
+
+    q_tiles: int
+    groups: int
+    light_rows: int
+    pairs: int  # pair units per group, (q_tiles - light_rows) // 2
+    middles: bool  # q_tiles - light_rows is odd
+    lone_middle: int  # 1 when the last group's middle unit holds one item (middles and an odd group count), else 0
+    heavy_units: int  # the pair and middle units, which come first
+    units: int
+    ctas: int  # min(units, the persistent CTA count): every CTA has a unit
+    snake: bool
+
+
+def causal_walk_layout(q_tiles: int, groups: int, light_rows: int, persistent_ctas: int, snake: bool) -> CausalWalk:
+    """The paired walk over ``groups`` groups of ``q_tiles`` Q tiles with ``light_rows`` light rows (CausalWalk)."""
+    pairs, middles = divmod(q_tiles - light_rows, 2)
+    heavy = groups * pairs + middles * ((groups + 1) // 2)
+    units = heavy + groups * light_rows
+    lone = int(bool(middles) and groups % 2 == 1)
+    return CausalWalk(q_tiles, groups, light_rows, pairs, bool(middles), lone, heavy, units, min(units, persistent_ctas), snake)
+
+
+def causal_kv_tiles(shape: tuple[int, int, int, int, int], bottom_right: bool) -> list[int]:
+    """Each Q tile's KV tile count on a causal plan: work_record's iterations (compute_kv_loop_bounds' right bound) in
+    plain ints. Tile t walks min(N_kv, t + 1 + ceil(diag / KV_TILE)) tiles, diag = S_kv - S_q under bottom-right and 0
+    under top-left; a partial last Q tile walks for all of its rows."""
+    _, _, _, s_q, s_kv = shape
+    q_tile, kv_tile = FLAVOR_TILES[D128_FLAVOR]
+    diag = s_kv - s_q if bottom_right else 0
+    return [max(0, min(-(-s_kv // kv_tile), -(-(t * q_tile + q_tile + diag) // kv_tile))) for t in range(-(-s_q // q_tile))]
+
+
+def _rounds_makespan(costs: list[int], ctas: int, snake: bool) -> int:
+    """The largest CTA load when ``costs`` (one per unit, in walk order) go out in rounds of min(ctas, len(costs))
+    units, each round from CTA 0 or, under snake, odd rounds in reverse."""
+    n = min(ctas, len(costs))
+    padded = costs + [0] * (-len(costs) % n)
+    if not snake:
+        return max(sum(padded[cta::n]) for cta in range(n))
+    # Under snake, CTA c takes column c of the even rounds and column n - 1 - c of the odd ones (units 2n - 1 - c,
+    # 4n - 1 - c and so on): one strided slice each, summed in C, about twice as fast as summing the rows' columns.
+    return max(sum(padded[cta :: 2 * n]) + sum(padded[2 * n - 1 - cta :: 2 * n]) for cta in range(n))
+
+
+def _walk_unit_costs(walk: CausalWalk, item_cost: list[int]) -> list[int]:
+    """Each unit's cost in walk order (CausalWalk): the sum of its items' ``item_cost`` (indexed by Q tile)."""
+    q_tiles, groups, light, pairs = walk.q_tiles, walk.groups, walk.light_rows, walk.pairs
+    pair_costs = [item_cost[q_tiles - 1 - j] + item_cost[light + j] for j in range(pairs)]
+    if walk.middles:
+        middle = item_cost[light + pairs]
+        costs = (pair_costs + pair_costs + [2 * middle]) * (groups // 2) + (pair_costs + [middle] if groups % 2 else [])
+    else:
+        costs = pair_costs * groups
+    for tile in range(light - 1, -1, -1):
+        costs += [item_cost[tile]] * groups
+    return costs
+
+
+def _lpt_l2_bytes(s_kv: int, row_bytes: int) -> int:
+    """work_of's LPT_L2 budget: a power of two of whole KV groups within SCHED_L2_BUDGET_BYTES; 0 is one group."""
+    groups = SCHED_L2_BUDGET_BYTES // max(1, s_kv * row_bytes)
+    return (1 << groups.bit_length() - 1) * s_kv * row_bytes if groups > 1 else 0
+
+
+def _stride_item_costs(shape, sched_policy: int, qh_per_kh: int, item_cost: list[int], row_bytes: int) -> list[int]:
+    """Each item's cost in the stride walk's order, the one-tile grid's order under ``sched_policy`` (work_of): NATURAL
+    Q tile fastest, then head, then batch; LPT the heaviest row of every (head, batch) first; LPT_L2 the same row by row
+    inside each block of whole KV groups (lpt_l2_tile_coords' blocks)."""
+    b, h_q, _, _, s_kv = shape
+    if sched_policy == SCHED_NATURAL:
+        return item_cost * (h_q * b)
+    row_items = [h_q * b]
+    if sched_policy == SCHED_LPT_L2:
+        n_groups = h_q // qh_per_kh * b
+        active = min(max(1, _lpt_l2_bytes(s_kv, row_bytes) // max(1, s_kv * row_bytes)), n_groups)
+        active = -(-n_groups // -(-n_groups // active))
+        blocks = -(-n_groups // active)
+        row_items = [(n_groups - k * active if k == blocks - 1 else active) * qh_per_kh for k in range(blocks)]
+    costs = []
+    for per_row in row_items:
+        for tile in range(len(item_cost) - 1, -1, -1):
+            costs += [item_cost[tile]] * per_row
+    return costs
+
+
+def _stride_deal(costs: list[int], ctas: int, deal: str) -> tuple[int, bool]:
+    """``(largest CTA load, snake)`` of the stride by the grid over ``costs`` (one per item, in the stride's order)
+    under ``deal`` (STRIDE_DEAL): "auto" takes the snake deal only where its largest load is strictly smaller."""
+    if deal not in ("auto", "straight", "snake"):
+        raise ValueError(f"prefill_d128_f16_sm90: STRIDE_DEAL must be 'auto', 'straight' or 'snake'; got {deal!r}")
+    straight = _rounds_makespan(costs, ctas, False) if deal != "snake" else None
+    snaked = _rounds_makespan(costs, ctas, True) if deal != "straight" else None
+    if snaked is not None and (straight is None or snaked < straight):
+        return snaked, True
+    return straight, False
+
+
+@lru_cache(maxsize=64)
+def causal_walk_plan(
+    shape: tuple[int, int, int, int, int],
+    bottom_right: bool,
+    sched_policy: int,
+    qh_per_kh: int,
+    persistent_ctas: int,
+    storage_bytes: int,
+    *,
+    light_rows: int = CAUSAL_WALK_LIGHT_ROWS,
+    l2_cap: bool = CAUSAL_WALK_L2_CAP,
+    phi: int = CAUSAL_WALK_PHI,
+    snake: bool = CAUSAL_WALK_SNAKE,
+    min_tiles: int = CAUSAL_WALK_MIN_TILES,
+    cut_max_qh: int = CAUSAL_WALK_CUT_MAX_QH,
+    deal: str = STRIDE_DEAL,
+) -> Optional[CausalWalk]:
+    """The paired walk of a persistent causal record, or None for the stride by the grid: the plan-time rule, every
+    input a compile-key one (the declared shape, the mask, sched_policy, the GQA ratio, the CTA count, the storage
+    width) or a constant above. Cached (its answer is an immutable CausalWalk or None), so repeated plans reuse it.
+
+    A plan with at most one item per CTA takes light_rows = T, one item per CTA, and a forced ``light_rows`` its walk.
+    Below ``min_tiles`` Q tiles per group the stride, where ``qh_per_kh`` is at most ``cut_max_qh``
+    (CAUSAL_WALK_MIN_TILES, CAUSAL_WALK_CUT_MAX_QH). Otherwise, with each item costing its KV tiles plus ``phi``, the
+    rule takes the light_rows in [0, cap] whose walk has the smallest largest CTA load (the smaller on a tie), cap the
+    largest light_rows whose rounds of single items stay within the L2 budget (the LPT_L2 order's, or one KV group's
+    bytes where that is 0), and keeps the stride where the stride's largest load, under the deal ``deal`` picks
+    (_stride_deal), is smaller. Costs are exact integer sums over the units, at most T + 1 walks of at most T * b * h_q
+    items.
+    """
+    b, h_q, _, _, s_kv = shape
+    kv_tiles = causal_kv_tiles(shape, bottom_right)
+    q_tiles, groups = len(kv_tiles), h_q * b
+    if q_tiles * groups <= persistent_ctas:
+        return causal_walk_layout(q_tiles, groups, q_tiles, persistent_ctas, snake)
+    if light_rows >= 0:
+        return causal_walk_layout(q_tiles, groups, min(light_rows, q_tiles), persistent_ctas, snake)
+    if q_tiles < min_tiles and qh_per_kh <= cut_max_qh:
+        return None
+    item_cost = [tiles + phi for tiles in kv_tiles]
+    row_bytes = 2 * D128_FLAVOR[0] * storage_bytes
+    top = q_tiles
+    if l2_cap:
+        budget = _lpt_l2_bytes(s_kv, row_bytes) or s_kv * row_bytes
+        heads = min(-(-persistent_ctas // qh_per_kh) + 1, h_q // qh_per_kh * b)
+        top = next((tile for tile, tiles in enumerate(kv_tiles) if heads * tiles * FLAVOR_TILES[D128_FLAVOR][1] * row_bytes > budget), q_tiles)
+    best_load, best = None, None
+    for light in range(top + 1):
+        walk = causal_walk_layout(q_tiles, groups, light, persistent_ctas, snake)
+        load = _rounds_makespan(_walk_unit_costs(walk, item_cost), persistent_ctas, snake)
+        if best is None or load < best_load:
+            best_load, best = load, walk
+    stride_load, _ = _stride_deal(_stride_item_costs(shape, sched_policy, qh_per_kh, item_cost, row_bytes), persistent_ctas, deal)
+    return best if best_load <= stride_load else None
+
+
+@lru_cache(maxsize=64)
+def causal_stride_snake(
+    shape: tuple[int, int, int, int, int],
+    bottom_right: bool,
+    sched_policy: int,
+    qh_per_kh: int,
+    persistent_ctas: int,
+    storage_bytes: int,
+    *,
+    phi: int = CAUSAL_WALK_PHI,
+    deal: str = STRIDE_DEAL,
+) -> bool:
+    """Whether the stride by the grid of a persistent causal record deals odd rounds in reverse (stride_next): the
+    stride's deal (STRIDE_DEAL) over the items in the stride's order (sched_policy, _stride_item_costs), each costing
+    its KV tiles plus ``phi`` as in causal_walk_plan, on min(items, ``persistent_ctas``) CTAs. Every input a compile-key
+    one, and cached as causal_walk_plan."""
+    kv_tiles = causal_kv_tiles(shape, bottom_right)
+    item_cost = [tiles + phi for tiles in kv_tiles]
+    row_bytes = 2 * D128_FLAVOR[0] * storage_bytes
+    _, snaked = _stride_deal(_stride_item_costs(shape, sched_policy, qh_per_kh, item_cost, row_bytes), persistent_ctas, deal)
+    return snaked
+
+
+# The route's name for the planner's KV tile count (causal_kv_tiles above): one definition.
+d128_causal_kv_tiles = causal_kv_tiles
+
+
+def d128_causal_route(shape, bottom_right: bool, ctas: int) -> bool:
+    """Whether a causal D128 plan of the walk's rule goes one tile per CTA (api_dsl.D128_CAUSAL_WALK_ROUTE): a plan of
+    at most ``ctas`` work items (Q tiles times heads times batch), on which both kernels run one item per CTA, or one
+    whose L, its mean KV tiles per Q tile (d128_causal_kv_tiles), is at least D128_ROUTE_MAX_L, whatever kind the rule
+    picks. ``shape`` is the declared (b, h_q, h_kv, S_q, S_kv), ``bottom_right`` the mask's alignment as the template
+    reads it, and ``ctas`` the persistent CTA count compile() gives the record (the device's SM count). No template, no
+    planner and no torch: the walk's search takes seconds on the largest plans, and the graph route's proposal
+    (heuristics._sm90_d128_causal_walks) reads the same decision from this import-light module."""
+    b, h_q, _, _, _ = shape
+    kv_tiles = d128_causal_kv_tiles(shape, bottom_right)
+    return len(kv_tiles) * h_q * b <= ctas or sum(kv_tiles) >= D128_ROUTE_MAX_L * len(kv_tiles)
 
 
 def declared_features(*, thd=False, sink=False, window_left=None, window_right=None, lengths=False, pack_gqa=False, paged=False, split_kv=1) -> frozenset[str]:
@@ -228,21 +497,22 @@ class TemplateParams:
     # sizes to the SM count). It requires intra_wg_overlap, so the v1 loop stays the non-persistent reference, and it
     # computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90 sets the shipped value
     # (api_dsl.D128_PERSISTENT) on non-causal D128 plans, and on causal ones only as api_dsl.D128_PERSISTENT_CAUSAL_WALK
-    # says, less the plans api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA (causal_walk below; at that constant's
-    # default, 2, every causal plan the route keeps is persistent). D512 refuses it.
+    # says, less the plans api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA, those of at most one item per CTA or
+    # of L, the mean KV tiles per Q tile, at least D128_ROUTE_MAX_L above (causal_walk below; at that constant's
+    # default, 2, every other causal plan is persistent). D512 refuses it.
     persistent: bool = False
     # Causal walk of the D128 persistent loop, appended after the persistent switch so every earlier specialization
     # keeps its default (0: the stride by the grid over the sched_policy order). 1 is the paired walk: of each (head,
     # batch)'s T Q tiles, tiles light_rows to T - 1 go out in pairs of equal KV work on an aligned causal staircase
     # (tile T - 1 - j with tile light_rows + j; two groups' middle tiles pair up when T - light_rows is odd), then tiles
     # light_rows - 1 down to 0 one at a time, in rounds dealt to the CTAs in alternating directions, with light_rows set
-    # at compile time from the declared shape and CTA count (or the stride, where it balances better). It requires
-    # persistent and causal, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90
-    # sets it from api_dsl.D128_PERSISTENT_CAUSAL_WALK on causal D128 plans only (1 at that constant's default, 2), and
-    # clears it (with persistent) on a plan api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA: a plan of at most
-    # one item per CTA, a paired walk of 48 or more KV tiles per Q tile on average unless it deals pairs alone, and the
-    # stride above 15 KV tiles per Q tile on a GQA or MQA plan or at 10 or more on an MHA plan, from 161 timings of 132
-    # causal shapes. D512 refuses it.
+    # at compile time from the declared shape and CTA count (or the stride kept below the template's
+    # CAUSAL_WALK_MIN_TILES Q tiles per group on a plan of at most its CAUSAL_WALK_CUT_MAX_QH Q heads per KV head, and
+    # where it balances the plan better, dealing odd rounds in reverse where that balances it better). It requires
+    # persistent and causal, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit.
+    # SdpaFwdDslSm90 sets it from api_dsl.D128_PERSISTENT_CAUSAL_WALK on causal D128 plans only (1 at that constant's
+    # default, 2), with sched_policy NATURAL unless the caller pins one, and clears it (with persistent) on a plan
+    # api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA. D512 refuses it.
     causal_walk: int = 0
 
 
