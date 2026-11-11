@@ -150,7 +150,9 @@ The three phase tuning fields are independent. Training backward accepts only
 `token_back_mode="epi_warps"` with
 `reduce_topk_in_kernel=False`. `dgrad_optimization` is a backward-only tuning
 choice; inference and training forward require its default value,
-`"baseline"`.
+`"baseline"`. Conversely, `scheduling`, `fc2_bulk_store`, and `mixed_cga`
+select forward-kernel implementations: inference and training forward accept
+them, and training backward requires their defaults.
 
 ### Dgrad optimization profiles
 
@@ -188,6 +190,57 @@ DS3 owns its scheduling and transport preset fields. It requires
 as handing that field to the preset and is canonicalized to `(4, 2)`;
 explicit `(4, 2)` is equivalent. Other values are rejected instead of
 creating a custom DS3 variant.
+
+### Forward kernel scheduling and transport
+
+`inference_tuning` and `training_forward_tuning` select three implementation
+choices of the forward kernel. The defaults keep the original behavior. The
+fields map to upstream kernel parameters, which the kernel's own error
+messages name:
+
+| Field | Value | Upstream kernel parameters |
+|---|---|---|
+| `scheduling` | `"static"` (default) | `load_balance_mode="static"`, `schedule_mode="grouped"` |
+| | `"atomic"` | `load_balance_mode="atomic_counter"`, `schedule_mode="grouped"` |
+| | `"phase_interleave"` | `load_balance_mode="atomic_counter"`, `schedule_mode="phase_interleave"` |
+| `fc2_bulk_store` | `"off"` (default) | `fc2_use_bulk=False` |
+| | `"auto"` | `fc2_use_bulk=True`, kernel-chosen `fc2_tma_stages` |
+| | `1`, `2`, `4`, or `8` | `fc2_use_bulk=True`, `fc2_tma_stages=<value>` |
+| `mixed_cga` | `False` (default) | `cluster_shape_mnk=(2, 1, 1)` |
+| | `True` | `cluster_shape_mnk=(4, 1, 1)`, `fallback_cluster_shape_mn=(2, 1)` |
+
+- `"phase_interleave"` interleaves FC1 and FC2 work claims. An explicit
+  `group_hint` must cover one FC2 claim wave; the kernel rejects a smaller
+  hint when the operator is prepared.
+- FC2 bulk stores stage FC2 output in shared memory and issue bulk copies:
+  128-byte peer copies under `token_back_mode="epi_warps"`, and TMA stores
+  into the local FC2 buffer under the dispatch token-back modes, whose
+  token-back warps then send the rows to the source ranks. They require
+  `hidden_size` divisible by 256 and `reduce_topk_in_kernel=False`. An
+  explicit depth is limited to 4 stages (BF16 combine) or 2 stages (MXFP8
+  combine) under `epi_warps`, and to 8 stages under the dispatch modes.
+  `"auto"` uses one stage for peer copies and up to four stages, bounded by
+  the free FC1 scratch memory, for TMA stores.
+- `mixed_cga=True` launches preferred (4, 1, 1) clusters and fills the SMs
+  they leave idle with fallback (2, 1, 1) clusters, the only combination that
+  upstream validates. With `P` resident 4-CTA clusters and `F` resident 2-CTA
+  clusters, the backend launches `P` preferred clusters and
+  `floor((2F - 4P) / 4) * 2` fallback clusters, `P + fallback / 2`
+  preferred-cluster slots in total. When no fallback cluster fits, the launch
+  is a uniform (4, 1, 1) launch. Training backward keeps (2, 1, 1) clusters.
+  Upstream covers this geometry at EP1; MoeEp's inference and training
+  tests also cover EP2 and EP4 within one node and EP8 across two nodes.
+
+The forward kernel is persistent: every launched CTA must be co-resident.
+The backend sizes the launch from the device's occupancy, so MoeEp requires
+exclusive use of the GPU. MPS, green contexts, or kernels running
+concurrently on other streams can leave fewer clusters resident than the
+launch assumes, and the kernel then deadlocks instead of reporting an error.
+This holds for every launch and matters more with `mixed_cga=True`, whose
+fallback clusters fill the last idle SMs.
+
+These fields change only how work is scheduled and transported. The forward
+output bytes match the default tuning for the same inputs.
 
 `MoeEpFc1WeightLayout.GATE_THEN_UP` denotes conventional source ordering.
 `GATE_UP_INTERLEAVED_32` denotes alternating 32-row gate/up strips. Inference
@@ -282,7 +335,10 @@ remains fail-fast: if a selected profile violates a generic kernel resource,
 layout, or capacity constraint, the sweep aborts instead of silently skipping
 that candidate. The reported winner contains the canonical public tuning;
 `group_hint=None` still resolves to the resident cluster count of the runtime
-device.
+device, or to the preferred-cluster slot count when `mixed_cga=True`.
+Inference and training-forward candidates may vary `scheduling`,
+`fc2_bulk_store`, and `mixed_cga`; a candidate that violates a forward-kernel
+constraint ends the sweep like any other candidate failure.
 
 The sweep is fail-fast. Any validation, allocation, compile, launch, timing,
 synchronization, or teardown error ends the whole sweep. An existing active

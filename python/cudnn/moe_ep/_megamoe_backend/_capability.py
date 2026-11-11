@@ -25,6 +25,14 @@ _MAX_TOKENS_PER_RANK = 1 << 16
 # larger expert-parallel group would silently misroute; nothing in the vendored
 # training path checks this bound.
 _MAX_EP_SIZE = 1 << 8
+# The vendored FC2 bulk-store epilogue checks these only when the kernel is
+# compiled (after workspace allocation): bulk stores need whole FC2 CTA tiles
+# (mma_tiler N = 256), and the staging depth is capped by the store path --
+# 128 B peer UBLKs under epi_warps (four BF16 or two MXFP8 issues per tile) or
+# eight 32-column TMA subtiles under dispatch token-back.
+_FC2_BULK_HIDDEN_MULTIPLE = 256
+_FC2_BULK_EPI_WARPS_MAX_STAGES = {MoeFormat.BF16: 4, MoeFormat.MXFP8: 2}
+_FC2_BULK_DISPATCH_MAX_STAGES = 8
 
 
 def _validate_operand(name, tensor) -> None:
@@ -92,6 +100,25 @@ def validate_config(config: ResolvedMoeEpConfig) -> None:
         raise NotImplementedError("MoeEp SM107 MXFP8 dispatch currently requires top_k <= 32")
     if not data_path.apply_topk_in_fc1:
         raise NotImplementedError("MoeEp Rubin training MegaMoE requires apply_topk_in_fc1=True")
+    for name, tuning in (
+        ("inference_tuning", config.public_config.inference_tuning),
+        ("training_forward_tuning", config.public_config.training_forward_tuning),
+    ):
+        if tuning.fc2_bulk_store == "off":
+            continue
+        if model.hidden_size % _FC2_BULK_HIDDEN_MULTIPLE:
+            raise NotImplementedError(f"{name}.fc2_bulk_store requires hidden_size divisible by " f"{_FC2_BULK_HIDDEN_MULTIPLE}, got {model.hidden_size}")
+        if tuning.fc2_bulk_store == "auto":
+            continue
+        if tuning.token_back_mode == "epi_warps":
+            max_stages = _FC2_BULK_EPI_WARPS_MAX_STAGES[data_path.combine_format]
+        else:
+            max_stages = _FC2_BULK_DISPATCH_MAX_STAGES
+        if tuning.fc2_bulk_store > max_stages:
+            raise NotImplementedError(
+                f"{name}.fc2_bulk_store={tuning.fc2_bulk_store} exceeds the {max_stages}-stage limit for "
+                f"token_back_mode={tuning.token_back_mode!r} with combine_format={data_path.combine_format.value!r}"
+            )
 
 
 def validate_request(

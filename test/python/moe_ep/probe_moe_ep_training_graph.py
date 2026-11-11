@@ -52,7 +52,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--expect-overflow-assert", action="store_true")
     parser.add_argument("--asymmetric-overflow", action="store_true")
+    parser.add_argument(
+        "--forward-scheduling",
+        choices=("static", "atomic", "phase_interleave"),
+        default="static",
+    )
+    parser.add_argument(
+        "--forward-fc2-bulk-store",
+        choices=("off", "auto", "1", "2", "4", "8"),
+        default="off",
+    )
+    parser.add_argument("--forward-mixed-cga", action="store_true")
     return parser.parse_args()
+
+
+def _forward_tuning(args: argparse.Namespace) -> MoeEpTuningConfig:
+    fc2_bulk_store = args.forward_fc2_bulk_store
+    return MoeEpTuningConfig(
+        scheduling=args.forward_scheduling,
+        fc2_bulk_store=(fc2_bulk_store if fc2_bulk_store in ("off", "auto") else int(fc2_bulk_store)),
+        mixed_cga=args.forward_mixed_cga,
+    )
 
 
 def _positive(name: str, value: int) -> None:
@@ -170,7 +190,9 @@ def _prepare_case(
     physical_recv_pool_rows: int,
     drop_on_overflow: bool,
     asymmetric_overflow: bool = False,
+    forward_tuning: MoeEpTuningConfig | None = None,
 ):
+    forward_tuning = forward_tuning or MoeEpTuningConfig()
     _runtime_debug(
         "probe.prepare.inputs.begin",
         physical_capacity=physical_recv_pool_rows,
@@ -231,6 +253,7 @@ def _prepare_case(
             drop_on_overflow=drop_on_overflow,
             combine_format=pattern.combine_format,
             fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
+            training_forward_tuning=forward_tuning,
             training_backward_tuning=MoeEpTuningConfig(
                 dgrad_optimization=dgrad_optimization,
             ),
@@ -255,6 +278,15 @@ def _prepare_case(
     }[dgrad_optimization]
     if upstream_profile != expected_upstream_profile:
         raise RuntimeError("training graph probe did not select the requested upstream " f"profile: {upstream_profile!r} != " f"{expected_upstream_profile!r}")
+    forward = state.forward_prepared
+    expected_cluster = (4, 1, 1) if forward_tuning.mixed_cga else (2, 1, 1)
+    if forward.config.cluster_shape_mnk != expected_cluster:
+        raise RuntimeError("training graph probe prepared the wrong forward cluster: " f"{forward.config.cluster_shape_mnk} != {expected_cluster}")
+    expected_schedule = "phase_interleave" if forward_tuning.scheduling == "phase_interleave" else "grouped"
+    if (forward.kernel.schedule_mode, forward.config.fc2_use_bulk) != (expected_schedule, forward_tuning.fc2_bulk_store != "off"):
+        raise RuntimeError(
+            "training graph probe prepared the wrong forward schedule: " f"{forward.kernel.schedule_mode!r}, fc2_use_bulk={forward.config.fc2_use_bulk}"
+        )
     _runtime_debug("probe.prepare_training.end")
     _runtime_debug("probe.pack_weights.begin")
     forward_staging, backward_staging = _allocate_training_weight_staging(source_weights)
@@ -329,6 +361,7 @@ def _run_error_mode_assert_probe(
         physical_recv_pool_rows=physical_capacity,
         drop_on_overflow=False,
         asymmetric_overflow=args.asymmetric_overflow,
+        forward_tuning=_forward_tuning(args),
     )
     op, inputs, _, native_forward, _, output_pair = case
     forward_out = output_pair[0]
@@ -427,6 +460,7 @@ def _run_cycle(
         physical_recv_pool_rows=physical_capacity,
         drop_on_overflow=True,
         asymmetric_overflow=args.asymmetric_overflow,
+        forward_tuning=_forward_tuning(args),
     )
     op, inputs, grad_output, native_forward, native_backward, output_pair = case
     forward_out, backward_out = output_pair
@@ -583,6 +617,7 @@ def main() -> None:
                 "stateless MoeEP training graph probe passed: "
                 f"world_size={world_size}, pattern={pattern.name}, "
                 f"dgrad_optimization={args.dgrad_optimization}, "
+                f"forward_tuning={_forward_tuning(args)}, "
                 f"cycles={args.cycles}",
                 flush=True,
             )

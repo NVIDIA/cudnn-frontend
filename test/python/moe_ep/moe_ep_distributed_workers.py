@@ -29,6 +29,7 @@ from moe_ep.moe_ep_test_support import (
     _output_as_float,
     _poison_training_outputs_for_test,
     _reference_forward,
+    _replay_cuda_graph,
     make_distributed_forward_inputs,
     quantize_mxfp8,
 )
@@ -154,22 +155,40 @@ def _run_forward_output_case(
     ep_size: int,
     combine_format: str = "bf16",
     expected_global_ranks: tuple[int, ...] | None = None,
+    hidden: int = 128,
+    tuning_kwargs: dict | None = None,
 ) -> None:
-    """Run inference-forward parity across two dense routing patterns."""
+    """Run inference-forward parity across two dense routing patterns.
 
-    from cudnn import MoeEp
+    With ``tuning_kwargs`` the tuned operator must also reproduce the default
+    tuning's output bytes and survive CUDA Graph replay.
+    """
 
-    args = make_distributed_forward_inputs(ep_rank, ep_size, device)
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    args = make_distributed_forward_inputs(ep_rank, ep_size, device, hidden=hidden)
     config = _forward_config(
         num_experts=2 * ep_size,
+        hidden_size=hidden,
         ep_group=ep_group,
         max_tokens_per_rank=8,
         combine_format=combine_format,
     )
     expected = _reference_forward(args, **config)
+    original_topk_idx = args[3].clone()
     alternate_topk_idx = args[3].flip(1).contiguous()
     alternate_args = (*args[:3], alternate_topk_idx, args[4])
     alternate_expected = _reference_forward(alternate_args, **config)
+    default_bytes = None
+    if tuning_kwargs is not None:
+        with MoeEp(_moe_ep_config(**config)) as default_op:
+            default_bytes = [default_op(*args).clone()]
+            args[3].copy_(alternate_topk_idx)
+            default_bytes.append(default_op(*args).clone())
+            args[3].copy_(original_topk_idx)
+            torch.cuda.synchronize(device)
+        dist.barrier(group=ep_group)
+        config["inference_tuning"] = MoeEpTuningConfig(**tuning_kwargs)
     op = MoeEp(_moe_ep_config(**config))
     try:
         actual = op(*args)
@@ -189,11 +208,29 @@ def _run_forward_output_case(
                 assert op.ep_global_ranks == expected_global_ranks
             _assert_matches_reference(actual_snapshot, expected)
             _assert_matches_reference(alternate_snapshot, alternate_expected)
+            if default_bytes is not None:
+                # Tuning knobs change scheduling and transport only: raw bytes must match.
+                assert torch.equal(actual.view(torch.int16), default_bytes[0].view(torch.int16))
+                assert torch.equal(alternate.view(torch.int16), default_bytes[1].view(torch.int16))
         except BaseException as error:
             assertion_error = error
         dist.barrier(group=ep_group)
         if assertion_error is not None:
             raise assertion_error
+
+        if tuning_kwargs is not None:
+            args[3].copy_(original_topk_idx)
+            _replay_cuda_graph(
+                op,
+                args,
+                original_topk_idx,
+                expected,
+                device,
+                alternate_topk_idx=alternate_topk_idx,
+                alternate_expected=alternate_expected,
+                synchronize_ranks=lambda: dist.barrier(group=ep_group),
+            )
+            dist.barrier(group=ep_group)
 
         op.close()
         op = None
@@ -208,6 +245,8 @@ def _distributed_output_worker(
     world_size: int,
     init_file: str,
     combine_format: str = "bf16",
+    hidden: int = 128,
+    tuning_kwargs: dict | None = None,
 ) -> None:
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -227,6 +266,8 @@ def _distributed_output_worker(
             ep_size=world_size,
             combine_format=combine_format,
             expected_global_ranks=tuple(range(world_size)),
+            hidden=hidden,
+            tuning_kwargs=tuning_kwargs,
         )
     finally:
         if dist.is_initialized():
@@ -587,6 +628,7 @@ def _run_backward_reference_case(
     expected_global_ranks: tuple[int, ...] | None = None,
     native_weight_storage_mode: str = "contiguous",
     uneven_token_input: bool = False,
+    forward_tuning_kwargs: dict | None = None,
 ) -> None:
     """Run stateless training after the independent distributed oracle."""
 
@@ -594,6 +636,7 @@ def _run_backward_reference_case(
         MoeEp,
         MoeEpFc1WeightLayout,
         MoeEpNativeWeightStorageMode,
+        MoeEpTuningConfig,
     )
 
     if uneven_token_input:
@@ -663,6 +706,7 @@ def _run_backward_reference_case(
             gate_up_clamp=gate_up_clamp,
             fc1_weight_layout=(MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
             training_weight_storage_mode=MoeEpNativeWeightStorageMode(native_weight_storage_mode),
+            training_forward_tuning=MoeEpTuningConfig(**(forward_tuning_kwargs or {})),
         )
     )
     try:
@@ -775,6 +819,7 @@ def _distributed_backward_worker(
     world_size: int,
     init_file: str,
     native_weight_storage_mode: str = "contiguous",
+    forward_tuning_kwargs: dict | None = None,
 ) -> None:
     """Run one WORLD-scoped distributed training parity case."""
 
@@ -796,6 +841,7 @@ def _distributed_backward_worker(
             ep_size=world_size,
             expected_global_ranks=tuple(range(world_size)),
             native_weight_storage_mode=native_weight_storage_mode,
+            forward_tuning_kwargs=forward_tuning_kwargs,
         )
     finally:
         if dist.is_initialized():
