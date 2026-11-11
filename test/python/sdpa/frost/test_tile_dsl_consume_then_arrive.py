@@ -77,7 +77,7 @@ ACCEPTED = {"dynamic_regions": 4, "across_jit": 4, "mixed_types": 8}
 _PROBE_SRC = textwrap.dedent('''
     """Child of test_tile_dsl_consume_then_arrive.py: argv = <dump dir> <test/python dir> <arch,...>.  Renders the ring forms for
     every listed target, then traces the misuse and accepted call shapes of the helper on a small site kernel (sm_100a)."""
-    import glob, os, shutil, sys
+    import glob, os, re, shutil, sys
 
     dump, test_python, archs = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
     sys.path.insert(0, test_python)
@@ -113,8 +113,16 @@ _PROBE_SRC = textwrap.dedent('''
             print("UNKNOWN", arch, flush=True)
             continue
         for form in list(ring.CONTROL_FORMS) + list(ring.HELPER_FORMS):
-            cute.compile(ring.warm_stress_ring_launch, x, out, cutlass.Int32(0), cutlass.Int32(0), form, True, ring.cluster_of(form), stream,
-                         options=f"--enable-tvm-ffi --gpu-arch {arch} --keep-cubin --keep-ptx")
+            try:
+                cute.compile(ring.warm_stress_ring_launch, x, out, cutlass.Int32(0), cutlass.Int32(0), form, True, ring.cluster_of(form), stream,
+                             options=f"--enable-tvm-ffi --gpu-arch {arch} --keep-cubin --keep-ptx")
+            except Exception as exc:
+                # a target the DSL lists but its compiler flavour does not build (sm_107a with the CUDA 12 flavour)
+                if "Unsupported GPU architecture" not in str(exc):
+                    raise
+                print("UNKNOWN", arch, flush=True)
+                print("WHY", arch, "::", " ".join(re.sub(re.escape(chr(27) + "[") + "[0-9;]*m", "", str(exc)).split())[:300], flush=True)
+                break
             keep(f"{arch}__{form}")
             print("COMPILED", arch, form, flush=True)
 
@@ -232,7 +240,8 @@ class _Renders:
 
     def require(self, arch, form):
         if f"UNKNOWN {arch}" in self.lines:
-            pytest.skip(f"this CuTe DSL has no {arch} target")
+            why = next((ln for ln in self.lines if ln.startswith(f"WHY {arch} ")), "")
+            pytest.skip(f"this CuTe DSL has no {arch} target" + (f" ({why})" if why else ""))
         assert self.has(arch, form), f"the {form} ring did not compile for {arch}:\n" + "\n".join(self.lines[-20:]) + "\n" + self.stderr[-3000:]
 
 
@@ -374,6 +383,19 @@ def test_accepted_call_shapes_keep_the_dependence(renders, case):
 device_tier = [requires_blackwell, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
+def _build_ring(form):
+    """The ring under test, compiled in front of the cell's watchdog.  A DSL whose compiler flavour has no target for this
+    GPU skips the cell (a coverage gap), as the control does through ``stress_validation``."""
+    import warm_stress_ring
+
+    try:
+        return warm_stress_ring.Ring(form)
+    except Exception as exc:
+        if "Unsupported GPU architecture" not in str(exc):
+            raise
+        pytest.skip(f"this CuTe DSL does not build the ring for this GPU: {' '.join(str(exc).split())[:300]}")
+
+
 def _ring_case(ring):
     import warm_stress_ring
 
@@ -405,9 +427,7 @@ def test_unsafe_twin_is_seen(cluster):
 def test_helper_ring_reads_zero(form):
     """3,000 back-to-back + 3,000 poisoned launches of the ring released through the helper, uses pushed behind the release: no
     differing byte against the independent reference, in the process where the twin of the same launch shape failed."""
-    import warm_stress_ring
-
-    ring = warm_stress_ring.Ring(form)
+    ring = _build_ring(form)
     warm_stress.build_launchers(cluster=ring.cluster)
     with process_watchdog(420, f"the consume ring ({form})"):
         validation = warm_stress.stress_validation(cluster=ring.cluster)
@@ -420,9 +440,7 @@ def test_helper_ring_reads_zero(form):
 def test_the_stress_sees_a_lost_dependence(form):
     """Where the twin fails, the ring whose mask the toolchain can see through fails as well: the stress has power against a
     dependence that was lost without any error.  It passes or skips, never fails."""
-    import warm_stress_ring
-
-    ring = warm_stress_ring.Ring(form)
+    ring = _build_ring(form)
     warm_stress.build_launchers(cluster=1)
     with process_watchdog(300, f"the lost-dependence control ({form})"):
         validation = warm_stress.stress_validation(cluster=1)
