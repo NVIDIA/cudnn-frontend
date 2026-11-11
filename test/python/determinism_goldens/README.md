@@ -3032,3 +3032,50 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
 ```
+
+
+### SM120 FP8/MXFP8 shared-memory synchronization — 2026-11-11
+
+`test_sdpa_fp8_v_tail_sync_sm120.py` adds eight replay/batch cases, eight
+runtime goldens and four CPU scale-layout controls. Coverage is per-tensor
+FP8 and MXFP8, D128/D512, E4M3/E5M2, BF16 output, Q33 with KV capacity80
+and live length17, and poisoned padding. Exact split1/unpacked plans retain
+quantized payloads and logical scales across standalone, reordered, duplicated
+and changed-neighbor batches. O/Stats are compared bytewise; global Amax is
+checked for identical-input replay and against each whole-batch reference.
+
+RTX PRO 6000 Blackwell Server Edition (SM120,188SM), driver595.84.01,
+Torch2.14.0+cu130, cuDNN9.24.0.43, DSL4.8.0/compiler13.4 and
+cuda-bindings13.0.3: **45 functional/strict checks passed** in76.38s without
+skips. The existing dense/THD cases include multiple KV tiles and persistent
+work units. **19 cases each passed memcheck, racecheck and synccheck**
+in22.48s/16.95s/4.05s, with zero errors and zero race warnings. Memcheck
+was unfiltered; race/sync used the `cudnn_kernel_` name filter with API errors
+enabled, under Compute Sanitizer2026.3.0.
+
+All eight goldens under `812f98809d9324c5` were recorded from unchanged parent
+`8e31a5725` after independent references and byte checks passed, then checked
+strictly by the candidate with recording unset. No existing baseline or
+numerical tolerance changed. The parent passes four selected numerical cases
+but reports924race errors; this negative control prevents numerical success
+from hiding the synchronization defect. Earlier fixture and sanitizer failures
+were retained during development. The supplemental performance script stopped
+after qualification on a missing test-helper import; its failure did not
+produce a performance result or bypass any qualification check.
+
+From `test/python`, after checking that `cudnn.__file__` names the intended
+checkout, the functional qualification command is:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -v -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_fp8_v_tail_sync_sm120.py \
+  sdpa/frost/test_sdpa_fwd_fp8_sm120.py \
+  sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py \
+  -k 'v_tail or thd_poisoned_pad or d512_thd or thd_multi_unit_per_cta or padded_kv_poisoned_tail or d512_persistent_units or thd_head_dims'
+```
+
+For the sanitizer subset, replace the selection with
+`(replay_and_batch and e4m3) or thd_poisoned_pad or d512_thd or thd_multi_unit_per_cta`.
+SM121 execution, cross-runtime identity and independent physical THD origins
+for quantized inputs remain unverified by this addition.

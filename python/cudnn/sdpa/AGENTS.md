@@ -1548,6 +1548,12 @@ the same reuse hazard with TMA. Keep those separate from old-tool RAW reports:
 on SM121, sanitizer2025.3.1 also flags the already synchronized paged exchange;
 the identical cached binary is clean with sanitizer2026.3.0. Confirm active
 instrumentation before interpreting a newer-tool run as a pass.
+The quantized siblings need the same ownership rules: FP8/MXFP8 V-tail
+zeroing has one compute-warp owner, wide-head score exchange has a post-read
+pair barrier, and the MXFP8 D512 K-scale producer drains its copy group
+before arrival. Run `test_sdpa_fp8_v_tail_sync_sm120.py` together with the
+existing FP8/MXFP8 multi-tile THD cases under racecheck; the short tail test
+alone does not exercise score-buffer reuse.
 The mixed-FP8 page loader writes ordinary shared vectors after exact widening;
 it publishes those stores with release arrivals, while uniform half retains
 copy-tracked arrivals. Do not select the publication operation by the output
