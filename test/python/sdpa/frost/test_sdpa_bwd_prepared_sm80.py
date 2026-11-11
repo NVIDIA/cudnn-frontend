@@ -89,6 +89,7 @@ def _case(
     padding=None,
     bias_batch=1,
     scale=None,
+    engine="sdpa_bwd_sm80",
 ):
     dv = d if dv is None else dv
     scale = d**-0.5 if scale is None else scale
@@ -147,7 +148,7 @@ def _case(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_bwd_sm80")
+    select_engine(graph, engine)
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(0xBD)

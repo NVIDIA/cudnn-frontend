@@ -441,6 +441,19 @@ validation also covers the wide deterministic path. These are runtime-specific
 results; they do not guarantee bitwise identity across GPUs or software
 versions, or extend the generally unordered through-D256 THD path above.
 
+## SM89 half backward
+
+On SM89 (Ada), `sdpa_bwd_sm89` runs the SM80 FP16/BF16 backward chain and
+accepts `use_deterministic_algorithm=True` with the same scope as the SM80 row:
+eight-aligned `D_V <= D_QK <= 256`, dense and THD layouts, MHA/GQA,
+causal/bottom-right/window masks, padding, sinks and bias/dBias (a bias
+broadcast over B > 1 is declined, since its dBias reduces through unordered
+atomics). On an L40S,
+repeat execution preserves dQ/dK/dV raw bytes for dense and THD-with-origins
+graphs, and CUDA Graph replay after changing the input payload in place matches
+the reference. Batch reordering/duplication and cross-GPU identity are not
+covered by these checks.
+
 ## SM120 D576 forward
 
 D576/V512 dense, compact THD and paged forward preserves O/Stats bytes in

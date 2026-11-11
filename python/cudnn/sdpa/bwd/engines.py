@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -35,6 +35,7 @@ from cudnn.sdpa import graph_analyzer as ga
 # importing them here would drag the CuTe DSL into every support check.
 _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
+_SM89 = "SdpaBwdDslSm89"
 _SM100 = "SdpaBwdDslSm100"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
@@ -53,6 +54,10 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM89:
+        from cudnn.sdpa.bwd.api_dsl_sm89 import SdpaBwdDslSm89
+
+        return SdpaBwdDslSm89
     if name == _SM100_D128:
         from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
@@ -1131,6 +1136,23 @@ def _sm80_spec() -> EngineSpec:
             strided_stats=True,
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM80),
+    )
+
+
+def _sm89_spec() -> EngineSpec:
+    """SM89 (Ada) backward row: the SM80 row's mma.sync chain (``_sm80_spec``)
+    on ``SdpaBwdDslSm89``, which fits the 99 KiB opt-in SMEM of an SM89 part with
+    one Q/dO stage, direct dQ atomics and a 64x64 (D <= 128) or 32x32 tile.
+    The cuDNN backend serves Ada backward only up to D128, so above it this
+    row is the only provider; it trails the backend everywhere
+    (``heuristics.TRAIL_ONLY_ROWS``). Same capability claim as the SM80 row.
+    cc 8.6 has the same budget but has not been measured, so it stays out.
+    """
+    base = _sm80_spec()
+    return EngineSpec(
+        name="sdpa_bwd_sm89",
+        capabilities=replace(base.capabilities, sm_lo=89, sm_hi=89),
+        lower=partial(lower_dsl_bwd, api_type=_SM89),
     )
 
 
@@ -2381,6 +2403,7 @@ ENGINE_SPECS = (
     _d512_mxfp8_spec(),
     _sm120_fp8_spec(),
     _sm120_mxfp8_spec(),
+    _sm89_spec(),
 )
 
 __all__ = [

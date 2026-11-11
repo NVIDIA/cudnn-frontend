@@ -1,5 +1,17 @@
 # FROST SDPA — support matrix
 
+**SM89 half backward:** `sdpa_bwd_sm89` runs the `sdpa_bwd_sm80` mma.sync chain
+on cc 8.9 through `SdpaBwdDslSm89`, which fits the 99 KiB opt-in SMEM with one
+Q/dO stage, direct FP32 dQ atomics and a 64x64 (envelope <= D128) or 32x32 tile
+(the SM120 packed adapter's rule). The capability claim is the SM80 row's:
+FP16/BF16, eight-aligned D_QK >= D_V up to 256, dense and THD with physical
+origins, GQA, causal / bottom-right / window masks, padding, bias / dBias,
+sinks, zero scale and deterministic dQ. The cuDNN backend serves Ada backward
+only up to D128, so above it this row is the only provider; it trails the
+backend everywhere (a prototype of this row ran 1.3-2.9x slower than the
+backend at D128). Validated on an L40S; cc 8.6 has the same budget but is
+not measured and stays declined.
+
 **SM80 half PackGQA:** dense queries may pack heads sharing a KV head into
 native MMA rows, including groups that cross tile boundaries. Dense/paged KV,
 split-KV, masks, sinks, bias and independent Q/O/Stats strides use the existing
@@ -2911,7 +2923,8 @@ on the 80-wide tile.
 ## SM80 (Ampere A100, cc 8.0 exactly)
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
-tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
+tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined
+(the backward runs on cc 8.9 as `sdpa_bwd_sm89`, see the top of this file).
 The backward serves packed THD graphs (ᵏ); the forward serves packed THD graphs
 with per-batch or cumulative Q/KV lengths, token-major Q/K/V/O with independent
 8-element-aligned head/token strides (padding and gaps allowed), and packed

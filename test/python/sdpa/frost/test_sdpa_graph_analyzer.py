@@ -150,12 +150,13 @@ def test_zero_attn_scale_declined_where_the_kernel_cannot_run_it(attn_scale):
 
 def test_zero_attn_scale_claims():
     """The rows claiming zero_scale are those qualified at zero scale on GPU, masked and unmasked: SM80 / SM90 forward
-    (score_sign / SCALE_ZERO) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
+    (score_sign / SCALE_ZERO) and the SM80 / SM89 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
     assert fwd == {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"}
     assert bwd == {
         "sdpa_bwd_sm80",
+        "sdpa_bwd_sm89",
         "sdpa_bwd_sm100",
         "sdpa_bwd_sm107",
         "sdpa_bwd_sm107_fp8",
