@@ -14,6 +14,7 @@ the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (
 the four-layer one (three + one)."""
 
 import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,8 +31,10 @@ SCRIPT = MODELS / "qwen_dense" / "00_decode.py"
 
 
 @pytest.fixture()
-def sample():
-    """The sample script as a module; its ``sys.path`` entry and every ``model_samples`` module leave with the test."""
+def sample(monkeypatch):
+    """The sample script as a module; its ``sys.path`` entry, every ``model_samples`` module and the default it sets for the
+    profiler's log level leave with the test."""
+    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))
     paths = list(sys.path)
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode", SCRIPT)
     module = importlib.util.module_from_spec(spec)

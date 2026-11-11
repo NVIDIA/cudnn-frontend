@@ -38,7 +38,8 @@ import time
 _START = time.perf_counter()
 # The traced pass of the report runs under the PyTorch profiler, whose tracing library writes to stderr when it starts and
 # stops and once for every kernel it cannot rate on a GPU it does not know.  Unless a level is set in the environment, keep that out of
-# the sample's output; when the records are missing the report says so itself.  (Read once, when PyTorch is first imported.)
+# the sample's output; when the records are missing the report says so itself.  (The tracing library reads the level when
+# the first profiler pass starts, so setting it here is early enough whether or not PyTorch is already imported.)
 os.environ.setdefault("KINETO_LOG_LEVEL", "6")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HELPERS = os.path.normpath(os.path.join(_HERE, ".."))  # samples/models: the home of the model_samples package
@@ -50,6 +51,13 @@ STACKS = ("fe-cublas", "reference")
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_STEPS = 16  # with a checkpoint the checks cover the first steps of every prompt
 TRACED_STEPS = 32
+
+
+def _reason(error) -> str:
+    """The text of an error for an ``ERROR`` line: a file is named by its own name, never by a path."""
+    if isinstance(error, OSError) and error.filename:
+        return f"{os.path.basename(os.path.normpath(str(error.filename)))}: {error.strerror or type(error).__name__}"
+    return str(error)
 
 
 def _arguments(argv):
@@ -156,10 +164,20 @@ def main(argv=None) -> int:
     checkpoint, requests = None, []
     try:
         overrides = parse_overrides(args.provider)
+        if args.dump_tokens:  # a file that cannot be written is an error before the run, not after it
+            target = os.path.abspath(args.dump_tokens)
+            there = os.path.exists(target)
+            if os.path.isdir(target) or not os.access(target if there else os.path.dirname(target), os.W_OK):
+                raise ValueError(f"--dump-tokens {os.path.basename(os.path.normpath(args.dump_tokens))}: cannot be written there")
         if real:  # the text side and the description of the checkpoint: config and shard headers, no weights
             text = model_samples.TextIO.from_checkpoint(args.model)
             checkpoint = model_samples.Checkpoint.describe(args.model)
             model = QwenDense.describe(checkpoint)
+            if text.vocab_size > model.geometry.vocab:
+                raise ValueError(
+                    f"--model {os.path.basename(os.path.normpath(args.model)) or '.'}: the tokenizer has {text.vocab_size:,} ids, the model's "
+                    f"embedding table {model.geometry.vocab:,} rows: not the tokenizer of this checkpoint"
+                )
             requests = [([{"role": "user", "content": prompt}], None, {}) for prompt in args.prompt]
             requests += [text_io.load_messages(path) for path in args.messages]
             requests = requests or [([{"role": "user", "content": DEFAULT_PROMPT}], None, {})]
@@ -170,7 +188,7 @@ def main(argv=None) -> int:
         print(f"{TAG} SKIP {error}")
         return 0
     except (ValueError, OSError) as error:
-        print(f"{TAG} ERROR {error}")
+        print(f"{TAG} ERROR {_reason(error)}")
         return 1
     facts = DeviceFacts.probe(device)
     rule = model_samples.StopRule(text.eos_ids, max_new_tokens=args.max_new_tokens, force_tokens=args.force_tokens)
@@ -294,18 +312,23 @@ def main(argv=None) -> int:
             print(
                 f"{TAG} first launch of {name}, device memory outside PyTorch's pool: {forms} (measured in this process, other processes' changes included; {allowed})"
             )
+    unwritten = ""
     if args.dump_tokens:
-        with open(args.dump_tokens, "w", encoding="utf-8") as f:
-            json.dump({"sample": "qwen_dense/00_decode", "stack": args.stack, "greedy": True, "runs": dumped}, f)
-        print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
+        try:
+            with open(args.dump_tokens, "w", encoding="utf-8") as f:
+                json.dump({"sample": "qwen_dense/00_decode", "stack": args.stack, "greedy": True, "runs": dumped}, f)
+            print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
+        except OSError as error:
+            unwritten = f"--dump-tokens {_reason(error)}"
     if real:
         print(f"{TAG} checkpoint weights, greedy decoding; ids hash {digest.hexdigest()[:12]}")
     else:
         print(f"{TAG} seeded weights: the output is not language; ids hash {digest.hexdigest()[:12]}")
-    if args.stack == "reference":
-        print(f"{TAG} RAN reference stack (no provider checked)")
-        return 0
-    print(f"{TAG} {'PASS' if passed else 'FAIL'}")
+    verdict = "RAN reference stack (no provider checked)" if args.stack == "reference" else ("PASS" if passed else "FAIL")
+    if unwritten:  # the run is done and its verdict stands, but what was asked for is not there
+        print(f"{TAG} ERROR {unwritten} (the run itself: {verdict})")
+        return 1
+    print(f"{TAG} {verdict}")
     return 0 if passed else 1
 
 

@@ -275,7 +275,16 @@ def read_header(path: str) -> tuple:
         header = json.loads(raw)
     except ValueError as error:
         raise ValueError(f"{os.path.basename(path)} is not a safetensors file ({error})") from error
-    return {name: (entry["dtype"], tuple(entry["shape"])) for name, entry in header.items() if name != "__metadata__"}, raw
+    if not isinstance(header, dict):
+        raise ValueError(f"{os.path.basename(path)} is not a safetensors file (its header is not a JSON object)")
+    tensors = {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get("dtype"), str) or not isinstance(entry.get("shape"), list):
+            raise ValueError(f"{os.path.basename(path)} is not a safetensors file (header entry {name!r} has no dtype and shape)")
+        tensors[name] = (entry["dtype"], tuple(entry["shape"]))
+    return tensors, raw
 
 
 class Checkpoint:
@@ -310,8 +319,13 @@ class Checkpoint:
         config_path = os.path.join(directory, "config.json")
         if not os.path.isfile(config_path):
             raise ValueError(f"--model {shown}: no config.json there; pass a checkpoint directory on local disk (nothing is downloaded)")
-        with open(config_path, encoding="utf-8") as f:
-            config = json.load(f)
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except ValueError as error:
+            raise ValueError(f"--model {shown}: config.json is not a JSON file ({error})") from None
+        if not isinstance(config, dict):
+            raise ValueError(f"--model {shown}: config.json does not hold a JSON object")
         shards = sorted(name for name in os.listdir(directory) if name.endswith(".safetensors"))
         if not shards:
             raise ValueError(f"--model {shown}: no *.safetensors shard there")

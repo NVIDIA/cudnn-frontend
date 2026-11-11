@@ -539,10 +539,105 @@ def test_the_token_check_has_a_declared_band_and_can_fail():
     assert not held and "NON-FINITE LOGITS" in text, text
 
 
-def _checked_run(sequences, step_defect=None, multiply_defect=None):
+def test_a_model_without_a_declared_band_reports_its_token_line_and_fails_only_on_logits_that_are_not_finite():
+    """A checkpoint read from local disk declares no logits band (``configs.CHECKPOINT_LOGITS_BAND_UNITS``): no band both
+    passes two correct stacks and fails a wrong one there.  Its token line is reported: a finite distance of any size holds
+    and is printed, a logit that is not finite fails."""
+    from model_samples import tie_out
+    from model_samples.qwen_dense import configs
+    from model_samples.sampling import greedy
+
+    assert configs.CHECKPOINT_LOGITS_BAND_UNITS is None
+    logits = torch.tensor([[[12.0, 1.0, 0.0, -3.0]], [[2.0, 11.0, 10.5, 0.0]]], dtype=torch.bfloat16)  # the largest logit is 12: one unit is 1/16
+    ids = torch.stack([greedy(step) for step in logits])
+
+    def moved(by, step=0, at=1):
+        out = logits.clone()
+        out[step, 0, at] += by
+        return out
+
+    held, text = tie_out.token_check(moved(8.75), logits, ids, ids, None)
+    assert held and "largest logit distance 8.75 = 140.00 bf16 units of the largest logit" in text, text
+    assert "[no band is declared for this model: reported, gated on finite logits]" in text and "decidable" not in text, text
+    # why there is no band: 128 units are 8 logits at this largest logit and 16 one binade higher, the distance of two correct stacks follows neither
+    higher, apart = 2 * logits, 2 * logits
+    apart[0, 0, 1] += 8.75
+    assert not tie_out.token_check(moved(8.75), logits, ids, ids, 128.0)[0] and tie_out.token_check(apart, higher, ids, ids, 128.0)[0]
+    assert tie_out.token_check(torch.zeros_like(logits), logits, ids, ids, None)[0], "reported: a finite stack is not judged here, the block check judges it"
+    for unusable in (moved(float("nan")), moved(float("inf"), step=1)):
+        held, text = tie_out.token_check(unusable, logits, ids, ids, None)
+        assert not held and "NON-FINITE LOGITS" in text, text
+    held, text = tie_out.token_check(logits, moved(float("nan")), ids, ids, None)
+    assert not held and "NON-FINITE LOGITS" in text, "a reference that is not finite fails the line too"
+
+    clean = _checked_run(2, band=None)
+    line = _line(clean, "tokens")
+    assert clean.ok and line.endswith("REPORTED") and "[no band is declared for this model: reported, gated on finite logits]" in line, clean.text()
+    assert "greedy tokens equal to the reference stack's" in line and "decidable" not in line
+
+    def nan_in_the_down_projection(product, weight):
+        if weight.data.shape == (64, 96):
+            product = product.clone()
+            product[-1, 3] = float("nan")
+        return product
+
+    checks = _checked_run(2, multiply_defect=nan_in_the_down_projection, band=None)
+    assert not checks.ok and "NON-FINITE LOGITS" in _line(checks, "tokens") and _line(checks, "tokens").endswith("FAIL"), checks.text()
+
+
+def test_the_traced_pass_tells_a_failure_of_the_profiler_from_a_failure_of_a_step(monkeypatch):
+    """Where the profiler cannot start or stop, the report says why and the run goes on.  An error raised by a step under
+    the profiler is the step's: it leaves the traced pass as it is, and is never printed as a missing trace."""
+    import torch.profiler
+    from model_samples import timing
+
+    events = []
+
+    class Profile:
+        def __init__(self, activities=None, fail=""):
+            self.fail = fail
+
+        def __enter__(self):
+            if self.fail == "start":
+                raise RuntimeError("the tracing library could not start\nsecond line")
+            events.append("start")
+            return self
+
+        def __exit__(self, *exc):
+            events.append("stop")
+            if self.fail == "stop":
+                raise RuntimeError("the tracing library could not stop")
+            return False
+
+        def events(self):
+            return []
+
+    monkeypatch.setattr(torch.profiler, "supported_activities", lambda: {torch.profiler.ProfilerActivity.CUDA})
+    monkeypatch.setattr(torch.profiler, "profile", Profile)
+    ran = []
+    assert timing.trace_steps(ran.append, 3) == (None, "the profiler recorded no kernel activity on this GPU") and ran == [0, 1, 2]
+    assert events == ["start", "stop"]
+
+    def out_of_memory(i):
+        raise RuntimeError("CUDA out of memory in step %d" % i)
+
+    del events[:]
+    with pytest.raises(RuntimeError, match="CUDA out of memory in step 0"):
+        timing.trace_steps(out_of_memory, 3)
+    assert events == ["start", "stop"], "the profiler is stopped, and the step's error is the one that is raised"
+    for fail in ("start", "stop"):
+        monkeypatch.setattr(torch.profiler, "profile", lambda activities=None, fail=fail: Profile(fail=fail))
+        trace, reason = timing.trace_steps(lambda i: None, 2)
+        assert trace is None and reason == f"the profiler failed (the tracing library could not {fail})", reason
+    monkeypatch.setattr(torch.profiler, "supported_activities", lambda: set())
+    assert timing.trace_steps(out_of_memory, 1) == (None, "this PyTorch build records no kernel activity")
+
+
+def _checked_run(sequences, step_defect=None, multiply_defect=None, band="declared"):
     """One decode of the tiny geometry on the CPU through the ``fe-cublas`` rows and the sample's checks of it.  Every provider
     of that stack is replaced by a stand-in that runs the reference's own arithmetic under another type -- the tie-out then
-    judges it with the row's band, and a clean run is exact on any host -- plus a deliberate defect."""
+    judges it with the row's band, and a clean run is exact on any host -- plus a deliberate defect.  ``band`` replaces the
+    model's declared logits band (``None``: a model that declares none)."""
     import model_samples
     from model_samples import blocks, tie_out
     from model_samples.providers import factories, torch_ref
@@ -564,6 +659,8 @@ def _checked_run(sequences, step_defect=None, multiply_defect=None):
 
     stand_ins = {"fe.gdn_decode_fused": Step, "cublas.bf16_dequantized": Multiply, "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": GateUp}
     model = _tiny_model()
+    if band != "declared":
+        model.logits_band_units = band
     text = model_samples.TextIO.synthetic(model.geometry.vocab)
     session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)  # a class on which the fused step's batch invariance is a gate

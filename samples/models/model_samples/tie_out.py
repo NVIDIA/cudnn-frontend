@@ -311,25 +311,31 @@ class BlockTap:
         stats.ok = stats.ok and stats.finite
 
 
-def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: float) -> Tuple[bool, str]:
+def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:
     """The end-to-end check of a run's greedy tokens against the reference stack's: ``(held, the text of its line)``.
 
     ``band_units`` is the declared logits band in bf16 units of the largest reference logit of the run.  The check holds when
     every logit is finite, the largest distance between the two stacks' logits is inside the band, and the token equals the
-    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band."""
+    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band.
+
+    ``band_units=None`` is a model whose family declares no band: the line is then a reported one.  It holds when every
+    logit of both stacks is finite; the distance is printed and judged against nothing."""
     a, r = logits.float(), ref_logits.float()
     finite = bool(torch.isfinite(a).all()) and bool(torch.isfinite(r).all())
     top = float(r.abs().amax()) if finite else float("nan")
     unit = 2.0 ** (math.frexp(top)[1] - 8) if top > 0.0 else float("nan")  # False for a NaN
-    band = band_units * unit
     distance = float((a - r).abs().amax())
+    measured = f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit"
+    if band_units is None:
+        return finite, measured + "  [no band is declared for this model: reported, gated on finite logits]" + ("" if finite else "; NON-FINITE LOGITS")
+    band = band_units * unit
     decidable = margin(ref_logits) > LOGITS_FACTOR * band  # nowhere when the band is not a number
     wrong = int((decidable & ~(ids == ref_ids)).sum())
     count, near = int(decidable.sum()), int((~decidable).sum())
     held = finite and distance <= band and wrong == 0
     text = (
         f"{count - wrong} of {count} decidable greedy tokens equal to the reference; {near} near-ties (margin not above {LOGITS_FACTOR:g} x the band); "
-        f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit  [band: {band_units:g} units = {band:.4g}, declared]"
+        f"{measured}  [band: {band_units:g} units = {band:.4g}, declared]"
     )
     return held, text + ("" if finite else "; NON-FINITE LOGITS")
 
@@ -388,7 +394,8 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     reference.reset(fresh=True)
     for t in range(steps):
         reference._advance(inputs[t])
-    band_units = float(session.model.logits_band_units)  # declared by the family, in its configs.py
+    band_units = session.model.logits_band_units  # declared by the family, in its configs.py; None: the token line is reported
+    band_units = None if band_units is None else float(band_units)
     ref_logits, ref_ids = reference.record.logits[:steps], reference.record.outputs[:steps]
     tokens_ok, tokens_text = token_check(logits, ref_logits, ids, ref_ids, band_units)
     tokens_text = f"{int((ids == ref_ids).sum())} of {ids.numel()} greedy tokens equal to the reference stack's; " + tokens_text
@@ -416,7 +423,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
             if kept is not None:
                 matmul.fp32_precision = kept
         _, scale_text = token_check(second.record.logits[:steps], ref_logits, second.record.outputs[:steps], ref_ids, band_units)
-        distance = scale_text.split("largest logit distance ", 1)[1].split("  [band", 1)[0]
+        distance = scale_text.split("largest logit distance ", 1)[1].split("  [", 1)[0]
         tokens_text += (
             f"; for scale, the reference stack with {other} accumulation is {distance} from the one with {session.reference_precision} "
             f"and agrees with it on {int((second.record.outputs[:steps] == ref_ids).sum())} of {ids.numel()} greedy tokens (printed, not gated)"
@@ -436,7 +443,7 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     )
     for name, s in judged.items():
         lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {BANDS[s.band]}]  {_verdict(s.ok)}")
-    lines.append(f"  tokens            {tokens_text}    {_verdict(tokens_ok)}")
+    lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
     batch_ok = True
     if session.sequences > 1:
         cls = f"cc{facts.cc[0]}.{facts.cc[1]}"

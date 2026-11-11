@@ -47,37 +47,57 @@ class TextStream:
 
 
 class LibraryStream:
-    """Incremental decoder of one sequence over a ``tokenizers`` tokenizer: the same ``push`` / ``close`` as :class:`TextStream`."""
+    """Incremental decoder of one sequence over a ``tokenizers`` tokenizer: the same ``push`` / ``close`` as :class:`TextStream`.
+
+    The library's stream returns nothing for a character whose bytes are not complete, and has no call that flushes one
+    when the sequence stops there.  ``close`` therefore decodes the pushed ids once more in full and returns what the pieces
+    have not covered: nothing for complete text, the replacement character for a cut one, as the full decode writes it."""
 
     def __init__(self, tokenizer):
         from tokenizers.decoders import DecodeStream
 
         self._tokenizer = tokenizer
         self._stream = DecodeStream(skip_special_tokens=True)
+        self._ids: list = []
+        self._pieces: list = []
 
     def push(self, token_id: int) -> str:
-        return self._stream.step(self._tokenizer, int(token_id)) or ""
+        self._ids.append(int(token_id))
+        piece = self._stream.step(self._tokenizer, int(token_id)) or ""
+        self._pieces.append(piece)
+        return piece
 
     def close(self) -> str:
-        return ""
+        full, pushed = self._tokenizer.decode(self._ids, skip_special_tokens=True), "".join(self._pieces)
+        return full[len(pushed) :] if full.startswith(pushed) else ""
 
 
 def load_messages(path: str) -> tuple:
     """A chat request from a JSON file: ``(messages, tools, template options)``.  The file holds a list of messages, or an
     object with ``messages`` and optionally ``tools`` (JSON tool schemas) and ``chat_template_kwargs`` (options the
-    checkpoint's template understands).  A file of another shape is a ``ValueError``."""
-    with open(path, encoding="utf-8") as f:
-        body = json.load(f)
+    checkpoint's template understands).  A file that cannot be read, is not JSON or has another shape is a ``ValueError``
+    that names the file by its own name, never by its path."""
+    shown = os.path.basename(path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            body = json.load(f)
+    except OSError as error:
+        raise ValueError(f"--messages {shown}: cannot be read ({error.strerror or type(error).__name__})") from None
+    except ValueError as error:  # not JSON, or not UTF-8
+        raise ValueError(f"--messages {shown}: not a JSON file ({error})") from None
     if isinstance(body, list):
         body = {"messages": body}
     messages = body.get("messages") if isinstance(body, dict) else None
     if not isinstance(messages, list) or not messages or not all(isinstance(m, dict) and "role" in m for m in messages):
-        raise ValueError(f'--messages {os.path.basename(path)}: needs a list of messages, or an object with "messages"; every message has a "role"')
+        raise ValueError(f'--messages {shown}: needs a list of messages, or an object with "messages"; every message has a "role"')
     tools, options = body.get("tools"), body.get("chat_template_kwargs") or {}
     if tools is not None and not isinstance(tools, list):
-        raise ValueError(f'--messages {os.path.basename(path)}: "tools" is a list of JSON tool schemas')
+        raise ValueError(f'--messages {shown}: "tools" is a list of JSON tool schemas')
     if not isinstance(options, dict):
-        raise ValueError(f'--messages {os.path.basename(path)}: "chat_template_kwargs" is an object')
+        raise ValueError(f'--messages {shown}: "chat_template_kwargs" is an object')
+    own = sorted(set(options) & {"messages", "tools"})
+    if own:
+        raise ValueError(f'--messages {shown}: "chat_template_kwargs" may not hold {" or ".join(own)}; each has its own entry in the file')
     return messages, tools, options
 
 
@@ -104,7 +124,8 @@ class TextIO:
         """The tokenizer, the chat template and the end tokens of a checkpoint directory on local disk.  No weights are read.
 
         Raises ``NotImplementedError`` (a SKIP that names the fix) when ``tokenizers`` or ``jinja2`` is not installed, and
-        ``ValueError`` when the directory lacks a file this needs."""
+        ``ValueError`` when ``directory`` is not a directory, lacks a file this needs or holds one that cannot be read as
+        what it is.  Every message names the directory and the file by their own names, never by a path."""
         try:
             import jinja2
             import jinja2.ext
@@ -115,6 +136,8 @@ class TextIO:
                 f"a checkpoint's text is read with the tokenizers and jinja2 packages ({error}): pip install -r {REQUIREMENTS}"
             ) from error
         shown = os.path.basename(os.path.normpath(directory)) or "."
+        if not os.path.isdir(directory):
+            raise ValueError(f"--model {shown}: not a directory on local disk; pass a checkpoint directory (a hub name is not fetched: nothing is downloaded)")
 
         def read(name, required=True):
             path = os.path.join(directory, name)
@@ -125,18 +148,30 @@ class TextIO:
             with open(path, encoding="utf-8") as f:
                 return f.read()
 
-        if read("tokenizer.json") is None:  # read once for the error text; the library reads the file itself
-            raise ValueError(f"--model {shown}: no tokenizer.json there")
-        tokenizer = tokenizers.Tokenizer.from_file(os.path.join(directory, "tokenizer.json"))
-        settings = json.loads(read("tokenizer_config.json", required=False) or "{}")
+        def read_object(name):
+            body = read(name, required=False)
+            try:
+                value = json.loads(body or "{}")
+            except ValueError as error:
+                raise ValueError(f"--model {shown}: {name} is not a JSON file ({error})") from None
+            if not isinstance(value, dict):
+                raise ValueError(f"--model {shown}: {name} does not hold a JSON object")
+            return value
+
+        read("tokenizer.json")  # for the error text of a missing file; the library reads the file itself
+        try:
+            tokenizer = tokenizers.Tokenizer.from_file(os.path.join(directory, "tokenizer.json"))
+        except Exception as error:  # the library raises a plain Exception for a file it cannot parse
+            raise ValueError(f"--model {shown}: tokenizer.json is not a tokenizer the tokenizers package reads ({str(error)[:160]})") from None
+        settings = read_object("tokenizer_config.json")
         source = read("chat_template.jinja", required=False) or settings.get("chat_template")
         if not isinstance(source, str):
             raise ValueError(f"--model {shown}: no chat template there (chat_template.jinja, or chat_template in tokenizer_config.json)")
-        generation = json.loads(read("generation_config.json", required=False) or "{}")
+        generation = read_object("generation_config.json")
         eos = generation.get("eos_token_id")
         if eos is None:
-            config = json.loads(read("config.json", required=False) or "{}")
-            eos = config.get("eos_token_id", config.get("text_config", {}).get("eos_token_id"))
+            config = read_object("config.json")
+            eos = config.get("eos_token_id", (config.get("text_config") or {}).get("eos_token_id"))
         if eos is None:
             raise ValueError(f"--model {shown}: no end-token id there (eos_token_id in generation_config.json or config.json)")
 
@@ -155,12 +190,16 @@ class TextIO:
         environment.filters["tojson"] = tojson
         environment.globals["raise_exception"] = raise_exception
         environment.globals["strftime_now"] = strftime_now
+        try:
+            template = environment.from_string(source)
+        except jinja2.TemplateError as error:  # a syntax error, or a tag this environment does not have
+            raise ValueError(f"--model {shown}: the chat template does not compile ({error})") from None
         self = cls(
             (),
             [eos] if isinstance(eos, int) else eos,
             f"tokenizer and chat template of checkpoint {shown} (tokenizers {tokenizers.__version__}, jinja2 {jinja2.__version__})",
         )
-        self.synthetic_text, self._tokenizer, self._template = False, tokenizer, environment.from_string(source)
+        self.synthetic_text, self._tokenizer, self._template = False, tokenizer, template
         for key, value in settings.items():  # the special tokens a template may refer to by name
             if key.endswith("_token") and isinstance(value, dict):
                 value = value.get("content")
@@ -192,10 +231,9 @@ class TextIO:
                 return self._template.render(
                     messages=list(messages), tools=list(tools) if tools else None, add_generation_prompt=add_generation_prompt, **context
                 )
-            except Exception as error:  # the template's own refusal (raise_exception) or a construct it cannot render
-                if type(error).__module__.partition(".")[0] != "jinja2":
-                    raise
-                raise ValueError(f"the checkpoint's chat template refused the messages: {error}") from error
+            except Exception as error:  # whatever the template raises is its refusal: its own raise_exception, an access
+                # the sandbox denies, a value of the messages it cannot use (a filter's TypeError), an option it cannot take
+                raise ValueError(f"the checkpoint's chat template refused the messages: {str(error) or type(error).__name__}") from error
         if options:
             raise ValueError(f"the synthetic tokenizer's template takes no options; got {sorted(options)}")
         parts = []

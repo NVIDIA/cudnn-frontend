@@ -16,6 +16,8 @@ not read; and the sample's memory sentence for a checkpoint, printed before a te
 or template file is committed.  No GPU, no weights."""
 
 import json
+import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -299,6 +301,9 @@ def test_a_safetensors_header_is_read_without_its_tensors(tmp_path):
         ("short.safetensors", b"abc"),
         ("text.safetensors", b"this is not a tensor file at all"),
         ("json.safetensors", struct.pack("<Q", 4) + b"nope"),
+        ("list.safetensors", struct.pack("<Q", 6) + b"[1, 2]"),  # JSON, but not a header
+        ("entry.safetensors", struct.pack("<Q", 24) + b'{"w": {"dtype": "F32"}} '),  # an entry without a shape
+        ("number.safetensors", struct.pack("<Q", 8) + b'{"w": 3}'),
     ):
         (tmp_path / name).write_bytes(content)
         with pytest.raises(ValueError, match=f"{name} is not a safetensors file") as refusal:
@@ -309,7 +314,7 @@ def test_a_safetensors_header_is_read_without_its_tensors(tmp_path):
 def test_a_checkpoint_on_disk_is_described_bound_and_read_bit_for_bit(tmp_path):
     pytest.importorskip("safetensors")
     import model_samples
-    from model_samples.qwen_dense import QwenDense
+    from model_samples.qwen_dense import QwenDense, configs
     from model_samples.tie_out import bytes_equal
     from model_samples.weights import BlockScaledTensor, ScaledTensor
 
@@ -326,6 +331,8 @@ def test_a_checkpoint_on_disk_is_described_bound_and_read_bit_for_bit(tmp_path):
 
     model = QwenDense.describe(disk)
     assert model.geometry == tiny.geometry and model.reductions == () and model.calls_per_step() == 20
+    assert tiny.logits_band_units == configs.LOGITS_BAND_UNITS == 4.0, "the seeded model's declared logits band"
+    assert model.logits_band_units is configs.CHECKPOINT_LOGITS_BAND_UNITS is None, "a described checkpoint declares none: its token line is reported"
     keys = model.checkpoint_keys(disk)
     assert keys["lm_head.weight"] == "lm_head.weight" and keys["embed_tokens.weight"] == PREFIX + "embed_tokens.weight"
     assert keys["layers.0.linear_attn.in_proj_qkv.input_scale"] == PREFIX + "layers.0.linear_attn.in_proj_qkv.input_scale"
@@ -391,6 +398,10 @@ def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, mon
     down = PREFIX + "layers.1.mlp.down_proj.weight"
     assert described(lambda t: t.update({down: t[down].flip(0)})).manifest_hash == reference, "the manifest pins names, formats, shapes and sizes, not values"
     assert described(lambda t: t.update({"extra.weight": torch.zeros(3)})).manifest_hash != reference
+    last = PREFIX + "norm.weight"  # the last name of the last shard: renamed to a name of the same length, every size and offset stays
+    renamed = described(lambda t: t.update({last[:-8] + "n.weight": t.pop(last)}), name="renamed")
+    good = model_samples.Checkpoint.describe(str(tmp_path / "good"))
+    assert renamed.files == good.files and renamed.manifest_hash != reference, "the manifest pins the header bytes, not only shard names and sizes"
 
     with pytest.raises(NotImplementedError, match=rf"checkpoint other \(local\) has no tensor '{down}_scale_2' \(the 4-bit global scale\)"):
         QwenDense.describe(described(lambda t: t.pop(down + "_scale_2")))
@@ -421,15 +432,23 @@ def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, mon
     (empty / "config.json").write_text("{}")
     with pytest.raises(ValueError, match=r"--model empty: no \*.safetensors shard there"):
         model_samples.Checkpoint.describe(str(empty))
+    for content, sentence in (
+        ("{not json", "--model empty: config.json is not a JSON file"),
+        ("[1]", "--model empty: config.json does not hold a JSON object"),
+    ):
+        (empty / "config.json").write_text(content)
+        with pytest.raises(ValueError, match=re.escape(sentence)) as refusal:
+            model_samples.Checkpoint.describe(str(empty))
+        assert str(tmp_path) not in str(refusal.value)
     monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
     with pytest.raises(NotImplementedError, match=r"safetensors package .*: pip install -r samples/models/requirements.txt"):
         model_samples.Checkpoint.describe(str(tmp_path / "good"))
 
 
-def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_tensor(tmp_path, monkeypatch, capsys):
-    """``--model`` on stated device facts: the checkpoint is described from its headers, every prompt is encoded, the plan and
-    the memory sentence are printed, and a GPU with too little free memory is a SKIP with exit code 0 -- all before a tensor
-    of a shard is read."""
+def _sample_on_stated_facts(tmp_path, monkeypatch, free):
+    """The sample script as a module on stated device facts with ``free[0]`` bytes free, beside a checkpoint directory
+    generated here with its text files: ``(sample, directory)``.  A tensor read or a load is an ``AssertionError``: what
+    these tests look at comes before both.  What the script changes in the process leaves with the test."""
     pytest.importorskip("safetensors")
     pytest.importorskip("jinja2")
     tokenizers = pytest.importorskip("tokenizers")
@@ -446,7 +465,7 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     tokenizer = tokenizers.Tokenizer(models.WordLevel(words, unk_token="[unk]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     tokenizer.save(str(directory / "tokenizer.json"))
-    (directory / "chat_template.jinja").write_text("{% for message in messages %}{{ message.content }} {% endfor %}")
+    (directory / "chat_template.jinja").write_text("{% for message in messages %}{{ message.content + ' ' }}{% endfor %}")
     (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": 7}))
 
     def no_read(checkpoint, key):
@@ -455,44 +474,108 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     def no_load(session):
         raise AssertionError("reached a load")
 
-    free = [1 * 1024**3]
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, free[0])))
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples.Checkpoint, "_read", no_read)
     monkeypatch.setattr(model_samples.Session, "load", no_load)
-    paths = list(sys.path)
+    monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
+    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # the script sets a default for the profiler's log level
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_with_a_checkpoint", MODELS / "qwen_dense" / "00_decode.py")
     sample = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(sample)
-        arguments = ["--model", str(directory), "--prompt", "why is the sky blue ?", "--prompt", "why ?", "--sequences", "1,2"]
+    spec.loader.exec_module(sample)
+    return sample, directory
+
+
+def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_tensor(tmp_path, monkeypatch, capsys):
+    """``--model`` on stated device facts: the checkpoint is described from its headers, every prompt is encoded, the plan and
+    the memory sentence are printed, and a GPU with too little free memory is a SKIP with exit code 0 -- all before a tensor
+    of a shard is read."""
+    free = [1 * 1024**3]
+    sample, directory = _sample_on_stated_facts(tmp_path, monkeypatch, free)
+    arguments = ["--model", str(directory), "--prompt", "why is the sky blue ?", "--prompt", "why ?", "--sequences", "1,2"]
+    code = sample.main(arguments)
+    out = capsys.readouterr().out
+    assert code == 0 and str(tmp_path) not in out, out
+    assert out.splitlines()[0].startswith("[00] qwen_dense decode | checkpoint tiny-checkpoint (local): 2 shards, ") and "manifest hash" in out
+    skip = "[00] SKIP stack fe-cublas needs about 2.0 GB on this GPU for 1 and 2 sequences, one count after the other; 1.0 GB are free: free memory on this GPU"
+    assert out.splitlines()[-1].startswith(skip), out
+    free[0] = 8 * 1024**3
+    with pytest.raises(AssertionError, match="reached a load"):
+        sample.main(arguments)
+    out = capsys.readouterr().out
+    assert "this stack needs about 2.0 GB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GB are free" in out and "SKIP" not in out
+    assert "stack fe-cublas, 1 sequence, cc 10.0" in out and "[00] tokenizer and chat template of checkpoint tiny-checkpoint" in out
+    monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
+    code = sample.main(arguments)
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert (
+        code == 0
+        and last.startswith("[00] SKIP a checkpoint is read through the safetensors package")
+        and last.endswith("pip install -r samples/models/requirements.txt")
+    )
+    for wrong in (["--prompt", "hi"], ["--messages", "chat.json"], ["--model", str(directory), "--layers", "4"]):
+        with pytest.raises(SystemExit):
+            sample.main(wrong)
+    capsys.readouterr()
+
+
+def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_traceback(tmp_path, monkeypatch, capsys):
+    """A directory that is not one, a hub name, a file that is not what its name says, messages the template cannot render,
+    options that are not options, a tokenizer of another model and a place that cannot be written: each is one ``[00] ERROR``
+    line with exit code 1, before the plan, and none names a local path."""
+    sample, directory = _sample_on_stated_facts(tmp_path, monkeypatch, [8 * 1024**3])
+    import tokenizers
+    from tokenizers import models
+
+    model = ["--model", str(directory)]
+
+    def last(arguments):
         code = sample.main(arguments)
         out = capsys.readouterr().out
-        assert code == 0 and str(tmp_path) not in out, out
-        assert out.splitlines()[0].startswith("[00] qwen_dense decode | checkpoint tiny-checkpoint (local): 2 shards, ") and "manifest hash" in out
-        skip = "[00] SKIP stack fe-cublas needs about 2.0 GB on this GPU for 1 and 2 sequences, one count after the other; 1.0 GB are free: free memory on this GPU"
-        assert out.splitlines()[-1].startswith(skip), out
-        free[0] = 8 * 1024**3
-        with pytest.raises(AssertionError, match="reached a load"):
-            sample.main(arguments)
-        out = capsys.readouterr().out
-        assert "this stack needs about 2.0 GB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GB are free" in out and "SKIP" not in out
-        assert "stack fe-cublas, 1 sequence, cc 10.0" in out and "[00] tokenizer and chat template of checkpoint tiny-checkpoint" in out
-        code = sample.main(["--model", str(tmp_path / "nowhere")])
-        assert code == 1 and capsys.readouterr().out.splitlines()[-1] == "[00] ERROR --model nowhere: no tokenizer.json there"
-        monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
-        code = sample.main(arguments)
-        last = capsys.readouterr().out.splitlines()[-1]
-        assert (
-            code == 0
-            and last.startswith("[00] SKIP a checkpoint is read through the safetensors package")
-            and last.endswith("pip install -r samples/models/requirements.txt")
-        )
-        for wrong in (["--prompt", "hi"], ["--messages", "chat.json"], ["--model", str(directory), "--layers", "4"]):
-            with pytest.raises(SystemExit):
-                sample.main(wrong)
-        capsys.readouterr()
-    finally:
-        sys.path[:] = paths
+        assert str(tmp_path) not in out and "served by" not in out, out
+        return code, out.splitlines()[-1]
+
+    nothing = "not a directory on local disk; pass a checkpoint directory (a hub name is not fetched: nothing is downloaded)"
+    assert last(["--model", str(tmp_path / "nowhere")]) == (1, f"[00] ERROR --model nowhere: {nothing}")
+    assert last(["--model", "some-org/Some-Model"]) == (1, f"[00] ERROR --model Some-Model: {nothing}")
+    assert last(model + ["--messages", str(tmp_path / "missing.json")]) == (1, "[00] ERROR --messages missing.json: cannot be read (No such file or directory)")
+    (tmp_path / "malformed.json").write_text("{not json")
+    code, line = last(model + ["--messages", str(tmp_path / "malformed.json")])
+    assert code == 1 and line.startswith("[00] ERROR --messages malformed.json: not a JSON file ("), line
+    (tmp_path / "options.json").write_text(json.dumps({"messages": [{"role": "user", "content": "why ?"}], "chat_template_kwargs": {"tools": []}}))
+    refused = '[00] ERROR --messages options.json: "chat_template_kwargs" may not hold tools; each has its own entry in the file'
+    assert last(model + ["--messages", str(tmp_path / "options.json")]) == (1, refused)
+    (tmp_path / "number.json").write_text(json.dumps([{"role": "user", "content": 3}]))  # the template adds text to the content
+    code, line = last(model + ["--messages", str(tmp_path / "number.json")])
+    assert code == 1 and line.startswith("[00] ERROR the checkpoint's chat template refused the messages: unsupported operand"), line
+    for target in (tmp_path / "no-such-folder" / "ids.json", tmp_path / "folder"):
+        (tmp_path / "folder").mkdir(exist_ok=True)
+        for arguments in (model, []):  # with a checkpoint and for the default run
+            assert last(arguments + ["--dump-tokens", str(target)]) == (1, f"[00] ERROR --dump-tokens {target.name}: cannot be written there")
+
+    (directory / "generation_config.json").write_text("{not json")
+    code, line = last(model)
+    assert code == 1 and line.startswith("[00] ERROR --model tiny-checkpoint: generation_config.json is not a JSON file ("), line
+    (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": 7}))
+    template = (directory / "chat_template.jinja").read_text()
+    (directory / "chat_template.jinja").write_text("{% generation %}{{ messages[0].content }}{% endgeneration %}")  # a tag this environment does not have
+    code, line = last(model)
+    assert code == 1 and line.startswith("[00] ERROR --model tiny-checkpoint: the chat template does not compile ("), line
+    (directory / "chat_template.jinja").write_text(template)
+    shard = sorted(directory.glob("*.safetensors"))[0]
+    kept = shard.read_bytes()
+    shard.write_bytes(struct.pack("<Q", 6) + b"[1, 2]")
+    assert last(model) == (1, f"[00] ERROR {shard.name} is not a safetensors file (its header is not a JSON object)")
+    shard.write_bytes(kept)
+    (directory / "a.safetensors").mkdir()  # a shard that cannot be opened: the system's error, with the file's own name
+    assert last(model) == (1, "[00] ERROR a.safetensors: Is a directory")
+    (directory / "a.safetensors").rmdir()
+    words = tokenizers.Tokenizer(models.WordLevel({f"w{index}": index for index in range(300)}, unk_token="w0"))
+    words.save(str(directory / "tokenizer.json"))
+    mismatch = "the tokenizer has 300 ids, the model's embedding table 272 rows: not the tokenizer of this checkpoint"
+    assert last(model) == (1, f"[00] ERROR --model tiny-checkpoint: {mismatch}")
+    (directory / "tokenizer.json").write_text("{}")
+    code, line = last(model)
+    assert code == 1 and line.startswith("[00] ERROR --model tiny-checkpoint: tokenizer.json is not a tokenizer the tokenizers package reads ("), line

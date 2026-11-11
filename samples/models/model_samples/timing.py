@@ -153,17 +153,33 @@ def trace_steps(step: Callable[[int], None], count: int) -> Tuple[Optional[Trace
 
     if ProfilerActivity.CUDA not in torch.profiler.supported_activities():
         return None, "this PyTorch build records no kernel activity"
+
+    def failed(error) -> Tuple[None, str]:
+        return None, f"the profiler failed ({(str(error).splitlines() or [type(error).__name__])[0][:120]})"
+
     periods = []
+    profiler = profile(activities=[ProfilerActivity.CUDA])
     try:
-        with profile(activities=[ProfilerActivity.CUDA]) as profiler:
-            for i in range(count):
-                start = now()
-                step(i)
-                periods.append((now() - start) * 1e3)
+        profiler.__enter__()
+    except RuntimeError as error:  # the profiler could not start its kernel activity records
+        return failed(error)
+    try:  # an error of a step is the step's, not the profiler's: it is not caught here
+        for i in range(count):
+            start = now()
+            step(i)
+            periods.append((now() - start) * 1e3)
+    except BaseException:
+        try:
+            profiler.__exit__(None, None, None)
+        except RuntimeError:
+            pass
+        raise
+    try:
+        profiler.__exit__(None, None, None)
         device_type = torch.autograd.DeviceType.CUDA
         records = [(e.name, e.time_range.start / 1e3, e.time_range.end / 1e3) for e in profiler.events() if e.device_type == device_type]
-    except RuntimeError as error:  # the profiler could not start or stop its kernel activity records
-        return None, f"the profiler failed ({str(error).splitlines()[0][:120]})"
+    except RuntimeError as error:  # the profiler could not stop, or has no records to hand over
+        return failed(error)
     facts = step_facts(records)
     if not records:
         return None, "the profiler recorded no kernel activity on this GPU"

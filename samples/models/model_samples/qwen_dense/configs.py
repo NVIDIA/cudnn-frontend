@@ -113,7 +113,7 @@ LOGITS_BAND_UNITS = 4.0
 #: one.  If a correct stack is ever seen beyond it, the line becomes a reported one; the band is not widened.  What verifies
 #: a provider on a checkpoint is the per-block check; the run prints the second reference's distance beside the provider's
 #: so that the two can be read side by side
-CHECKPOINT_LOGITS_BAND_UNITS = 128.0
+CHECKPOINT_LOGITS_BAND_UNITS = None
 
 
 def readme_table(calls: dict) -> str:

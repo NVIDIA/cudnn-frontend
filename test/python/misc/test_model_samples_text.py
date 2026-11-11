@@ -116,11 +116,12 @@ def helper_layer():
         del sys.modules[name]
 
 
-def _text_directory(directory: Path, template: str = TEMPLATE) -> Path:
+def _text_directory(directory: Path, template: str = TEMPLATE, opens_with_a_marker: bool = False) -> Path:
     """The text files of a checkpoint directory, built here: a byte-level BPE tokenizer trained on a few sentences, with the
-    turn markers as special tokens and the reasoning markers as ordinary added tokens; a chat template; the end tokens."""
+    turn markers as special tokens and the reasoning markers as ordinary added tokens; a chat template; the end tokens.
+    ``opens_with_a_marker`` gives the tokenizer a post-processor that puts a turn marker in front of what it encodes."""
     tokenizers = pytest.importorskip("tokenizers")
-    from tokenizers import decoders, models, pre_tokenizers, trainers
+    from tokenizers import decoders, models, pre_tokenizers, processors, trainers
 
     tokenizer = tokenizers.Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -130,6 +131,10 @@ def _text_directory(directory: Path, template: str = TEMPLATE) -> Path:
     corpus = ["why is the sky blue", "the sky is blue because air scatters blue light", "system user assistant tool", "weather in the city today"]
     tokenizer.train_from_iterator(corpus * 4, trainer)
     tokenizer.add_tokens([tokenizers.AddedToken("<think>", special=False), tokenizers.AddedToken("</think>", special=False)])
+    if opens_with_a_marker:
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single="<|im_start|> $A", special_tokens=[("<|im_start|>", tokenizer.token_to_id("<|im_start|>"))]
+        )
     directory.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(directory / "tokenizer.json"))
     (directory / "chat_template.jinja").write_text(template, encoding="utf-8")
@@ -184,11 +189,21 @@ def test_a_chat_request_is_read_from_a_json_file(tmp_path):
         ("norole.json", [{"content": "hi"}], 'every message has a "role"'),
         ("tools.json", {"messages": chat, "tools": {"name": "x"}}, '"tools" is a list'),
         ("options.json", {"messages": chat, "chat_template_kwargs": [1]}, '"chat_template_kwargs" is an object'),
+        ("own.json", {"messages": chat, "chat_template_kwargs": {"tools": [WEATHER]}}, '"chat_template_kwargs" may not hold tools; each has its own entry'),
+        ("both.json", {"messages": chat, "chat_template_kwargs": {"tools": [], "messages": []}}, "may not hold messages or tools"),
+        ("malformed.json", None, "not a JSON file (Expecting"),
+        ("missing.json", None, "cannot be read (No such file or directory)"),
     ):
-        (tmp_path / name).write_text(json.dumps(wrong))
+        if wrong is not None:
+            (tmp_path / name).write_text(json.dumps(wrong))
+        elif name == "malformed.json":
+            (tmp_path / name).write_text('{"messages": [')
         with pytest.raises(ValueError, match=re.escape(sentence)) as refusal:
             load_messages(str(tmp_path / name))
         assert f"--messages {name}:" in str(refusal.value) and str(tmp_path) not in str(refusal.value), "the file's own name, never a path"
+    (tmp_path / "latin.json").write_bytes(json.dumps(chat).encode() + b"\xff")
+    with pytest.raises(ValueError, match="--messages latin.json: not a JSON file"):
+        load_messages(str(tmp_path / "latin.json"))
 
 
 def test_a_checkpoints_chat_template_renders_tools_reasoning_and_several_turns(tmp_path):
@@ -239,6 +254,41 @@ def test_a_checkpoints_chat_template_renders_tools_reasoning_and_several_turns(t
         text.render_chat([])
     named = _text_directory(tmp_path / "named", template="{{ eos_token }}|{{ pad_token }}|{{ messages[0].content }}")
     assert TextIO.from_checkpoint(str(named)).render_chat(user) == "<|im_end|>|<|endoftext|>|Why is the sky blue?", "a template may name the special tokens"
+    # a tool call as a serving API writes it, with its arguments as one JSON string: the template wants a mapping and says so
+    as_text = {"type": "function", "function": {"name": "weather", "arguments": '{"city": "Paris"}'}}
+    with pytest.raises(ValueError, match="chat template refused the messages: "):
+        text.render_chat(agent[:2] + [{"role": "assistant", "content": "", "tool_calls": [as_text]}])
+
+
+def test_the_template_environment_trims_blocks_and_is_an_immutable_sandbox(tmp_path):
+    """The settings of the template environment, each held by a template that needs it: a template written without
+    whitespace-control dashes renders as the reference library renders it (the line break after a block tag and the indent
+    before one are dropped), and a template cannot reach Python through an object it is handed or change what it is given."""
+    pytest.importorskip("jinja2")
+    from model_samples import TextIO
+
+    plain = (
+        "{% for message in messages %}\n"
+        "<{{ message.role }}>{{ message.content }}\n"
+        "{% endfor %}\n"
+        "    {% if add_generation_prompt %}\n"
+        "<assistant>\n"
+        "    {% endif %}\n"
+    )
+    user = [{"role": "user", "content": "hi"}]
+    text = TextIO.from_checkpoint(str(_text_directory(tmp_path / "plain", template=plain)))
+    assert text.render_chat(user) == "<user>hi\n<assistant>\n", "blocks trimmed, their indent stripped"
+    assert text.render_chat(user, add_generation_prompt=False) == "<user>hi\n"
+    for name, template in (
+        ("globals", "{{ raise_exception.__globals__['__builtins__'] }}"),  # a function's globals lead to every module
+        ("class", "{{ ''.__class__.__mro__[1].__subclasses__() }}"),
+        ("append", "{{ messages.append({'role': 'user', 'content': 'more'}) }}{{ messages | length }}"),  # a change to what it was given
+        ("update", "{{ messages[0].update({'content': 'other'}) }}{{ messages[0].content }}"),
+    ):
+        text = TextIO.from_checkpoint(str(_text_directory(tmp_path / name, template=template)))
+        with pytest.raises(ValueError, match="chat template refused the messages: "):
+            text.render_chat(user)
+    assert user == [{"role": "user", "content": "hi"}]
 
 
 def test_a_checkpoints_tokenizer_encodes_decodes_and_streams(tmp_path):
@@ -267,6 +317,13 @@ def test_a_checkpoints_tokenizer_encodes_decodes_and_streams(tmp_path):
     assert [stream.push(i) for i in text.encode("é").tolist()] == ["", "é"], "an open multi-byte character gives no text yet"
     stream = text.decoder()
     assert stream.push(end) == "" and stream.push(int(text.encode("blue")[0])) != "", "the end token adds nothing to the text"
+    cut = text.encode("sky 🙂").tolist()[:-1]  # generation stopped inside a character: its last byte never came
+    stream = text.decoder()
+    pushed = "".join(stream.push(i) for i in cut)
+    assert pushed == "sky " and stream.close() != "" and pushed + stream.close() == text.decode(cut), "close() hands over what the full decode writes for it"
+    marked = TextIO.from_checkpoint(str(_text_directory(tmp_path / "marked", opens_with_a_marker=True)))
+    assert marked._tokenizer.encode("the sky").ids[0] == start, "this tokenizer adds a turn marker by itself when asked to"
+    assert marked.encode("the sky").tolist() == text.encode("the sky").tolist(), "a rendered prompt is encoded as it is: the template wrote its markers"
     (directory / "generation_config.json").unlink()
     (directory / "config.json").write_text(json.dumps({"text_config": {"eos_token_id": 7}}))
     assert TextIO.from_checkpoint(str(directory)).eos_ids == (7,), "without a generation config the end token is the model config's"
@@ -283,12 +340,35 @@ def test_a_directory_without_its_text_files_and_a_missing_package_are_told_apart
     assert str(tmp_path) not in str(refusal.value), "the directory's own name, never a path"
     (directory / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages[0].content }}!"}))
     assert TextIO.from_checkpoint(str(directory)).render_chat([{"role": "user", "content": "hi"}]) == "hi!", "the template may live in the tokenizer's config"
+    (directory / "chat_template.jinja").write_text("{{ messages[0].content }}?")
+    assert (
+        TextIO.from_checkpoint(str(directory)).render_chat([{"role": "user", "content": "hi"}]) == "hi?"
+    ), "the template file comes first where both are there"
+    for content in ("{% if %}", "{% generation %}x{% endgeneration %}"):  # a syntax error; a tag this environment does not have
+        (directory / "chat_template.jinja").write_text(content)
+        with pytest.raises(ValueError, match=re.escape("--model checkpoint: the chat template does not compile (")):
+            TextIO.from_checkpoint(str(directory))
+    (directory / "chat_template.jinja").unlink()
+    (directory / "tokenizer_config.json").write_text("{not json")
+    with pytest.raises(ValueError, match=re.escape("--model checkpoint: tokenizer_config.json is not a JSON file (")):
+        TextIO.from_checkpoint(str(directory))
+    (directory / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages[0].content }}!"}))
     (directory / "generation_config.json").unlink()
     with pytest.raises(ValueError, match="no end-token id there"):
         TextIO.from_checkpoint(str(directory))
+    (directory / "tokenizer.json").write_text("{}")
+    with pytest.raises(ValueError, match=r"--model checkpoint: tokenizer.json is not a tokenizer the tokenizers package reads \(") as refusal:
+        TextIO.from_checkpoint(str(directory))
+    assert str(tmp_path) not in str(refusal.value)
     (directory / "tokenizer.json").unlink()
     with pytest.raises(ValueError, match="--model checkpoint: no tokenizer.json there"):
         TextIO.from_checkpoint(str(directory))
+    for missing in (tmp_path / "nowhere", directory / "generation_config.json", "some-org/Some-Model"):
+        with pytest.raises(
+            ValueError, match=r"not a directory on local disk; pass a checkpoint directory \(a hub name is not fetched: nothing is downloaded\)"
+        ) as refusal:
+            TextIO.from_checkpoint(str(missing))
+        assert str(tmp_path) not in str(refusal.value) and f"--model {Path(str(missing)).name}:" in str(refusal.value)
     monkeypatch.setitem(sys.modules, "tokenizers", None)  # as if the package were not installed
     with pytest.raises(NotImplementedError, match=r"tokenizers and jinja2 packages .*: pip install -r samples/models/requirements.txt"):
         TextIO.from_checkpoint(str(directory))
