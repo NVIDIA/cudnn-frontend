@@ -10,7 +10,9 @@ the session's and are updated in place.  Only the public API is used, and ``cudn
 whether it serves, never at module import.
 
 The entry compiles once per (rows, operand strides) per process; ``compile`` builds operands with the layout the session uses
-(``split_qkvz`` and ``state.RecurrentSlots``), so the first step of a run finds the kernel compiled.
+(``split_qkvz`` and ``state.RecurrentSlots``) and launches the compiled form once on them, so the first step of a run finds the
+kernel compiled and launched.  That first launch is measured: on some GPU classes it reserves device memory outside PyTorch's
+allocator (``first_launch``), which the plan's memory sentence allows for per class before anything is loaded.
 """
 
 from __future__ import annotations
@@ -34,8 +36,20 @@ DSL_FLOOR = (4, 8, 0)
 
 #: one entry per (device, geometry, epsilon) of the process: the entry compiles once per rows count, and every session shares it
 _ENTRIES: dict = {}
-#: whether a kernel of this adapter was compiled in this process (its first launch's reservation is then already on the device)
-_WARM: list = []
+#: rows -> device bytes the first launch of that form took outside PyTorch's allocator in this process, as measured
+_FIRST_LAUNCH: dict = {}
+
+
+def _outside_pool(device, launch) -> int:
+    """Device bytes one launch took outside PyTorch's allocator: what the device reports as newly used across it, less what
+    PyTorch's pool grew by.  Other processes on the GPU count in the first term."""
+    import torch
+
+    torch.cuda.synchronize(device)
+    free, pool = torch.cuda.mem_get_info(device)[0], torch.cuda.memory_reserved(device)
+    launch()
+    torch.cuda.synchronize(device)
+    return (free - torch.cuda.mem_get_info(device)[0]) - (torch.cuda.memory_reserved(device) - pool)
 
 
 class GdnDecodeFusedBlock(BlockBase):
@@ -74,11 +88,15 @@ class GdnDecodeFusedBlock(BlockBase):
             self._build(self.options["device"])  # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP
 
     def reserve_bytes(self) -> int:
-        """Device memory the kernel's first launch reserves outside PyTorch's allocator, as the family states it per GPU class."""
-        if _WARM:  # already launched in this process: the reservation is part of what the device reports as used
+        """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
+        class, until a form was launched in this process (the reservation is then part of what the device reports as used)."""
+        if _FIRST_LAUNCH:
             return 0
         reserve = getattr(self.model, "first_launch_reserve", {})
         return int(reserve.get(f"cc{self.facts.cc[0]}.x", 0))
+
+    def first_launch(self) -> dict:
+        return dict(_FIRST_LAUNCH)
 
     def _build(self, device):
         import torch
@@ -116,11 +134,13 @@ class GdnDecodeFusedBlock(BlockBase):
             1.0,
         )
         slot_ids = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
+        entry, operands = self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots)
         try:
-            self._build(device).compile(*self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots))
+            entry.compile(*operands)
+            if rows not in _FIRST_LAUNCH:
+                _FIRST_LAUNCH[rows] = _outside_pool(device, lambda: entry(*operands))
         except NotImplementedError as error:  # the plan found the part and the versions served: what is left is this adapter's own layout
             raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands this adapter built: {error}") from error
-        _WARM.append(rows)
 
     @staticmethod
     def _operands(x, z, hidden, slot_ids, p, slots):

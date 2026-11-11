@@ -33,6 +33,13 @@ with it that head's state, by up to a few 1e-3 of the state's largest value, whi
 rounding.  A state "within 1e-4 everywhere" therefore does not hold against this reference (measured by this sample: the
 largest distance of a default run is a few 1e-4 to a few 1e-3), and it is not what a wiring error looks like: that moves every
 element.  The cap is one unit for each of the two gates of a head.
+
+What the band tolerates: such moves of single heads, as long as they stay below 0.1 % of the state's elements over the run and
+below the cap.  What it still catches: a head that is wrong at every step (one value head of 48 is 2 % of the elements), any
+error of the wiring or of an operand's layout (with the beta and alpha rows exchanged, 28 % of the state was within 1e-4 and
+the largest distance was 0.99), and any element beyond the cap.  The line of the step also prints the state's rms ratio --
+the rms of the difference over the rms of the reference state, at the worst call -- as a second, averaged view of the same
+comparison: one flipped head barely moves it, an error of the wiring moves it to order one.  It is printed, not gated.
 """
 
 from __future__ import annotations
@@ -94,6 +101,12 @@ def bf16_units(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (a - r).abs() / torch.pow(2.0, exponent.float() - 8)  # not torch.exp2: that one is compiled at first use on the GPU
 
 
+def rms_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
+    """The rms of ``out - ref`` over the rms of ``ref``, both accumulated in fp64."""
+    out, ref = out.double(), ref.double()
+    return float((out - ref).square().mean().sqrt() / ref.square().mean().sqrt().clamp_min(1e-12))
+
+
 @dataclass
 class BlockStats:
     band: str
@@ -106,6 +119,7 @@ class BlockStats:
     total_bytes: int = 0
     worst_call: float = 1.0
     state_error: float = 0.0
+    state_rms: float = 0.0
     state_inside: int = 0
     state_elements: int = 0
     conv_equal: bool = True
@@ -120,7 +134,7 @@ class BlockStats:
             inside = self.state_inside / max(self.state_elements, 1)
             return (
                 f"{share:.3%} of 8-bit bytes equal (worst call {self.worst_call:.3%}); {inside:.4%} of the state within {GDN_STATE_BAND:g}, "
-                f"largest distance {self.state_error:.1e}; conv history {conv}"
+                f"largest distance {self.state_error:.1e}, rms ratio {self.state_rms:.1e} at the worst call (printed, not gated); conv history {conv}"
             )
         share = self.off_by_one / max(self.elements, 1)
         return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit"
@@ -188,6 +202,7 @@ class BlockTap:
             (recurrent, conv), (ref_recurrent, ref_conv) = state[0], ref_state[0]
             distance = (recurrent - ref_recurrent).abs() / max(1.0, float(ref_recurrent.abs().amax()))
             stats.state_error = max(stats.state_error, float(distance.amax()))
+            stats.state_rms = max(stats.state_rms, rms_ratio(recurrent, ref_recurrent))
             stats.state_inside += int((distance <= GDN_STATE_BAND).sum())
             stats.state_elements += distance.numel()
             stats.conv_equal = stats.conv_equal and bytes_equal(conv, ref_conv)

@@ -176,6 +176,16 @@ def main(argv=None) -> int:
         f"{TAG} GPU memory: PyTorch peak {torch.cuda.max_memory_allocated(device) / gib:.2f} GB allocated, {torch.cuda.max_memory_reserved(device) / gib:.2f} GB reserved; "
         f"in use on the device grew by {grown:.2f} GB since the plan (PyTorch's pool, CUDA libraries and kernel reservations of this process; other processes' changes included)"
     )
+    mib = 2.0**20
+    allowance = getattr(model, "first_launch_reserve", {}).get(f"cc{facts.cc[0]}.x", 0)
+    for name, block in shared.plan.items():
+        launches = block.first_launch()  # measured by the block: rows -> device bytes outside PyTorch's pool
+        if launches:
+            forms = " | ".join(f"{rows} row{'s' if rows > 1 else ''} {taken / mib:,.0f} MiB" for rows, taken in launches.items())
+            allowed = f"the plan allowed {allowance / mib:,.0f} MiB on this class" if allowance else "the plan allows none on this class"
+            print(
+                f"{TAG} first launch of {name}, device memory outside PyTorch's pool: {forms} (measured in this process, other processes' changes included; {allowed})"
+            )
     print(f"{TAG} seeded weights: the output is not language; ids hash {digest.hexdigest()[:12]}")
     if args.stack == "reference":
         print(f"{TAG} RAN reference stack (no provider checked)")

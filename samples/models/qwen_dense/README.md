@@ -78,7 +78,21 @@ Against the plain-PyTorch reference of every block, which keeps the chain's cast
 
 The state band has a share and a cap because a state "within 1e-4 everywhere" does not hold against an fp64-accumulated
 reference: the fused step rounds its gates and conv taps to bf16 as a serving chain does, and where its fp32 sum falls on the
-other side of a rounding midpoint one head's state moves by up to a few 1e-3 while the rest agrees to fp32 rounding.
+other side of a rounding midpoint one head's state moves by up to a few 1e-3 while the rest agrees to fp32 rounding. The
+band tolerates such moves of single heads: fewer than 0.1 % of the state's elements over the run, none beyond the cap. It
+still catches a head that is wrong at every step (one value head of 48 is 2 % of the elements), any error of the wiring or
+of an operand's layout, and any element beyond the cap. The step's line also prints the state's rms ratio (the rms of the
+difference over the rms of the reference state, at the worst call) as a second view of the same comparison; it is printed,
+not gated.
+
+The multiplies of this stack ask cuBLAS for the fp32 accumulator throughout: `model_samples/providers/library.py` switches
+`torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction` off for its call and restores it. With PyTorch's
+default, cuBLAS may reduce the partial sums of a bf16 multiply in bf16; on compute capability 12.0 it did so for two of
+this model's multiplies at 4 sequences, which put them more than a hundred bf16 units from the reference.
+
+The determinism page (`docs/operations/determinism.md`) has no column for compute capability 12.x: the batch-invariance
+gate of the fused step on 12.0 rests on this sample's own run there. On that class the two projection multiplies of
+sequence 0 differ in bytes between 1 and 4 sequences, inside their band; the run prints it. On 10.7 every block was equal.
 
 ## Support per GPU class
 
@@ -89,14 +103,17 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 | compute capability | the default run of this sample |
 |---|---|
 | 10.0 (data-center Blackwell) | `[00] PASS`, verified |
-| 10.3 | not yet verified |
+| 10.3 | not run |
 | 10.7 | runs (`[00] PASS`), unverified: batch invariance of the fused step is reported on this class, not gated |
-| 12.0 | not yet verified by this sample |
+| 12.0 | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal |
 | any other | `[00] SKIP`, by design |
 
 Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GB at its peak and
 reserved 3.7 GB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GB free there. On compute capability 12.x
-it adds an allowance of 3 GiB for the fused step's first launch; that allowance is not yet measured by this sample.
+it adds an allowance of 3 GiB and asks for about 6.7 GB: the first launch of the fused step reserves device memory outside
+PyTorch's pool on that class. The run measures that launch and prints what it took. Measured by this sample on a compute
+capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
+6.9 GB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
 Blackwell GPU: about 5 s to draw the weights, 1 to 2 s to compile the fused step per sequence count, the rest for the decode
 and its checks. These are orientation values of one run, not measurements of record.

@@ -90,7 +90,8 @@ BLOCK_TITLES = {
 }
 
 #: device memory the first launch of the fused linear-attention step reserves outside PyTorch's allocator, per GPU class: an
-#: allowance for the memory sentence of the plan, not a measurement of this sample
+#: allowance for the memory sentence of the plan, which is printed before anything is launched.  The run then measures the
+#: launch and prints what it took (this sample on one compute capability 12.0 GPU: 3,124 MiB at the first form, none after)
 FIRST_LAUNCH_RESERVE = {"cc12.x": 3 * GIB}
 
 

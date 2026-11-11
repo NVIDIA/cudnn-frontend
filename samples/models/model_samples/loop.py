@@ -5,9 +5,9 @@
 
 A session decides everything before it loads anything: ``plan_table()`` resolves the family's provider table for this GPU, the
 number of sequences and the stack, and states the memory the run needs.  ``load()`` then reads (or draws), merges and
-dequantises the weights, compiles what a provider compiles and runs one warm-up step, each as a timed stage.  ``prefill``
-feeds the prompts and ``step`` advances every sequence by one token; the chosen ids stay on the GPU, and the one host read of a
-step is the caller's (``read``), in the sample's own loop -- there is no ``generate()`` here.
+dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one warm-up step, each
+as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the chosen ids stay on the
+GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is no ``generate()`` here.
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -146,7 +146,7 @@ class Session:
             self.weights = self.model.load(self.checkpoint, self.device, self.stages, self.merge_rule)
         for name, block in plan.items():
             if getattr(block, "compiles", False):
-                with self.stages.stage(f"compile {name} ({self.sequences} row{'s' if self.sequences > 1 else ''})"):
+                with self.stages.stage(f"compile and first launch {name} ({self.sequences} row{'s' if self.sequences > 1 else ''})"):
                     block.compile(self.sequences, 1)
         self.reset(fresh=True)
         with self.stages.stage("warm-up"):

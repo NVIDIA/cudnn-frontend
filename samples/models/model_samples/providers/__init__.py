@@ -101,6 +101,11 @@ class BlockBase:
     def reserve_bytes(self) -> int:
         return 0
 
+    def first_launch(self) -> dict:
+        """Rows -> device bytes the first launch of that form took outside PyTorch's allocator in this process, for a block
+        that measures it; empty otherwise."""
+        return {}
+
     def compared(self, out):
         """What the tie-out compares of a call's result against the reference block: the result itself, unless the block
         ends in a chain it shares with the reference (then the tensor that enters that chain)."""

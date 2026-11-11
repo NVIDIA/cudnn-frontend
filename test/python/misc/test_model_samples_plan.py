@@ -3,8 +3,9 @@
 
 """Host-only tests of the model samples' helper layer (``samples/models/model_samples``): the provider and regime tables against
 the family README, the plan's row selection and its typed declines, the memory sentence on stated device facts, the
-environment check on stated metadata, token choice, the stop rules, the call counts of a decode step, the import boundary of a
-dry plan, and one decode on the CPU: a tiny geometry on the reference stack, replayed byte for byte.  No GPU, no weights."""
+precision setting of the fallback multiply, the environment check on stated metadata, token choice, the stop rules, the call
+counts of a decode step, the import boundary of a dry plan, and one decode on the CPU: a tiny geometry on the reference stack,
+replayed byte for byte.  No GPU, no weights."""
 
 import subprocess
 import sys
@@ -153,10 +154,36 @@ def test_memory_sentence_on_stated_device_facts():
     assert _plan().memory(need).startswith("this stack needs about 3.") and "80.0 GB are free" in _plan().memory(need)
     reserve = configs.FIRST_LAUNCH_RESERVE["cc12.x"]
     assert _plan(cc=(12, 0)).reserve_bytes() == reserve and _plan().reserve_bytes() == 0
+    assert _plan(cc=(12, 0))["linear_attention.step"].first_launch() == {}, "nothing is launched by a plan: no measurement yet"
+    assert _plan()["mlp.down"].first_launch() == {}, "a block that measures no launch reports none"
     small = _plan(cc=(12, 0))
     small.facts = _facts((12, 0), free=5 * GIB)
     with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 6\.\d GB on this GPU; 5.0 GB are free: free memory"):
         small.memory(need)
+
+
+def test_the_fallback_multiply_asks_for_the_fp32_accumulator_and_restores_the_setting(monkeypatch):
+    """PyTorch lets cuBLAS reduce the partial sums of a bf16 multiply in bf16 by default; the fallback multiply switches that
+    off for its own call and leaves the caller's setting as it found it."""
+    from model_samples.providers import library
+    from model_samples.weights import Dequantized, quantize_fp8
+
+    flags = torch.backends.cuda.matmul
+    seen = []
+
+    def matmul(a, b):
+        seen.append(flags.allow_bf16_reduced_precision_reduction)
+        return (a.float() @ b.float()).to(torch.bfloat16)
+
+    monkeypatch.setattr(library.torch, "matmul", matmul)
+    qx = quantize_fp8(torch.tensor([[1.0, -2.0, 0.5, 4.0]]), 0.5)
+    weight = Dequantized(torch.tensor([[2.0, 1.0, 0.0, -1.0], [1.0, 1.0, 1.0, 1.0]], dtype=torch.bfloat16), 0.25)
+    for allowed in (True, False):
+        monkeypatch.setattr(flags, "allow_bf16_reduced_precision_reduction", allowed)
+        out = library.matmul_bf16(qx, weight)
+        assert flags.allow_bf16_reduced_precision_reduction is allowed, "the caller's setting is restored"
+        assert out.dtype == torch.bfloat16 and out.tolist() == [[-1.0, 0.875]]
+    assert seen == [False, False], "the partial sums stay in the fp32 accumulator during the call"
 
 
 def test_check_environment_on_stated_metadata():

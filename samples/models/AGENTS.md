@@ -57,6 +57,10 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
   an end-to-end token comparison can only be as sharp as the margins of the model.
 - A multiply that returns bf16 and applies its scales afterwards differs from a once-rounded fp64 reference by exactly one
   bf16 unit on about a quarter of its elements. That is the band, not an error.
+- A bf16 multiply through PyTorch may reduce its partial sums in bf16: cuBLAS has that licence by default
+  (`torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction`) and uses it by shape, row count and GPU. The same
+  call was within one bf16 unit at 1 row and more than a hundred units off at 4 rows on compute capability 12.0. A provider
+  that claims fp32 accumulation switches the licence off for its own call; the band is not what gives.
 - The fused linear-attention step against an fp64-accumulated reference: its 8-bit bytes agree on more than 99.9 % of a run,
   but its recurrent state is not within 1e-4 everywhere, because a one-unit difference in a gate or a key column moves one
   head by up to a few 1e-3. The band therefore has a share and a cap (`tie_out.py`).
