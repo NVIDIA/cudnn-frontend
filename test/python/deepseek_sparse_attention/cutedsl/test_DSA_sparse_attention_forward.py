@@ -26,6 +26,14 @@ _SUPPORTED_FORWARD_INSTANCES = (
     (64, 576, 512),
     (64, 576, 1024),
     (64, 576, 2048),
+    (96, 512, 0),
+    (96, 512, 512),
+    (96, 512, 1024),
+    (96, 512, 2048),
+    (96, 576, 0),
+    (96, 576, 512),
+    (96, 576, 1024),
+    (96, 576, 2048),
     (128, 512, 0),
     (128, 512, 512),
     (128, 512, 1024),
@@ -501,7 +509,7 @@ def test_DSA_sparse_attention_forward_head128_softmax_exchange_scratch_reuse():
 
 
 @pytest.mark.L2
-@pytest.mark.parametrize("num_heads", [64, 128])
+@pytest.mark.parametrize("num_heads", [64, 96, 128])
 def test_DSA_sparse_attention_forward_threshold_rescale_is_warp_group_uniform(num_heads):
     """Lock down the threshold=6 vote-based rescale semantics."""
 
@@ -539,7 +547,7 @@ def test_DSA_sparse_attention_forward_threshold_rescale_is_warp_group_uniform(nu
 @pytest.mark.L1
 @pytest.mark.parametrize(
     "num_heads,head_dim",
-    [(64, 512), (64, 576), (128, 512)],
+    [(64, 512), (64, 576), (96, 512), (96, 576), (128, 512)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_DSA_sparse_attention_forward_matches_gather_reference(num_heads, head_dim, dtype):
@@ -593,6 +601,23 @@ def test_DSA_sparse_attention_forward_matches_gather_reference(num_heads, head_d
     assert torch.isposinf(result["lse"][2]).all()
     assert result["lse_indexer"] is None
 
+    if num_heads == 96:
+        # H96 runs the H64 kernel on heads [0, 64) and [32, 96); both launches
+        # must write the same bytes to the overlap, so each window equals an H64
+        # run on a contiguous copy of its heads.
+        for start in (0, 32):
+            heads = slice(start, start + 64)
+            window = DSA.sparse_attention_forward_wrapper(
+                q[:, heads].contiguous(),
+                kv,
+                topk_idxs,
+                attn_sink=attn_sink[heads].contiguous(),
+                topk_length=topk_length,
+                softmax_scale=softmax_scale,
+            )
+            for name in ("out", "max_logits", "lse"):
+                assert torch.equal(result[name][:, heads], window[name]), f"{name}, heads [{start}, {start + 64})"
+
     no_sink_result = DSA.sparse_attention_forward_wrapper(
         q,
         kv,
@@ -620,8 +645,8 @@ def test_DSA_sparse_attention_forward_matches_gather_reference(num_heads, head_d
 @pytest.mark.L2
 @pytest.mark.parametrize(
     "num_heads,head_dim",
-    [(64, 512), (64, 576), (128, 512)],
-    ids=["H64-D512", "H64-D576", "H128-D512"],
+    [(64, 512), (64, 576), (96, 576), (128, 512)],
+    ids=["H64-D512", "H64-D576", "H96-D576", "H128-D512"],
 )
 def test_DSA_sparse_attention_forward_reuses_compilation_across_dynamic_extents(num_heads, head_dim, monkeypatch):
     """One specialization must handle simultaneous Q, KV, and padded-K growth."""
