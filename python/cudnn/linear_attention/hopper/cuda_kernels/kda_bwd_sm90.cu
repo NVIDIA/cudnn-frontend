@@ -549,7 +549,7 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                                       bf16* __restrict__ wneg,
                                       bf16* __restrict__ uu,
                                       bf16* __restrict__ kg,
-                                      bf16* __restrict__ Pg,
+                                      float* __restrict__ Pg,
                                       float* __restrict__ gn2,
                                       bf16* __restrict__ dvl,
                                       int T,
@@ -989,7 +989,10 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
             }
         }
         __syncthreads();  // sQ (qg) and sB1 released
-        bf16* sP = sQ;    // [128][128], spans sQ + sK
+        // P is added to an FP32 state gradient, not used as an MMA operand.
+        // Preserve its accumulator directly in global memory: rounding it to
+        // BF16 here can erase a residual before cancellation with that state.
+        float* const dst = Pg + ((size_t)cs * H + h) * DH * DH;
 #pragma unroll
         for (int j = 0; j < TL2::TPW; ++j) {
             const int c0 = TL2::ni(warp, j) * 8 + ((lane & 3) << 1);
@@ -999,11 +1002,11 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                 *reinterpret_cast<uint32_t*>(sB1 + o0 + rp * (8 * 128)) = bf2(acc[j][rp * 2], acc[j][rp * 2 + 1]);
 #pragma unroll
             for (int u = 0; u < 2; ++u) {
-                const int p0 = swz((2 * dmi + u) * 16 + (lane >> 2), c0, 128);
+                const int pr = (2 * dmi + u) * 16 + (lane >> 2);
 #pragma unroll
                 for (int rp = 0; rp < 2; ++rp)
-                    *reinterpret_cast<uint32_t*>(sP + p0 + rp * (8 * 128)) =
-                        bf2(pac[u][j][rp * 2], pac[u][j][rp * 2 + 1]);
+                    *reinterpret_cast<float2*>(dst + (pr + rp * 8) * DH + c0) =
+                        make_float2(pac[u][j][rp * 2], pac[u][j][rp * 2 + 1]);
             }
         }
         __syncthreads();
@@ -1013,14 +1016,6 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
                 *reinterpret_cast<uint4*>(dvl + base + e8g + (size_t)(m * 32) * gs) =
                     *reinterpret_cast<const uint4*>(sB1 + e8o + m * (32 * 128));
         }
-        bf16* dst    = Pg + ((size_t)cs * H + h) * DH * DH;
-        const int pr = tid >> 4, pc = (tid & 15) << 3;
-        const int po = swz(pr, pc, 128);
-#pragma unroll
-        for (int m = 0; m < 4; ++m) {
-            *reinterpret_cast<uint4*>(dst + (size_t)(pr + m * 32) * DH + pc) =
-                *reinterpret_cast<const uint4*>(sP + po + m * (32 * 128));
-        }
     }
 }
 
@@ -1028,22 +1023,19 @@ __launch_bounds__(PNT, 1) void k_prep(const bf16* __restrict__ q,
 #pragma once
 
 static constexpr int PCV = 64;  // physical swizzle width of the V tiles
-// one prefetch stage: w, kg (128-wide) + P (128 x BV) + a (BV-wide) + gn.
-// P = qg^T dO is precomputed by the parallel prep pass, so the reverse
-// direction no longer streams the 128-wide qg operand or the dO slice.
-static constexpr int STAGE = 3 * 64 * 128 * 2 + 64 * PCV * 2 + 512;
+// One prefetch stage: w, kg (128-wide) + a (BV-wide) + gn.
+// P = qg^T dO is precomputed in FP32 by the parallel prep pass and loaded
+// directly into registers in the reverse direction; it needs no shared stage.
+static constexpr int STAGE = 2 * 64 * 128 * 2 + 64 * PCV * 2 + 512;
 // Three operand stages instead of two: each chunk's copies then get two full
-// iterations to land rather than one.  The serial scan runs at 12.5%
-// occupancy with an elapsed IPC of 0.82, so its per-chunk stall is the
-// operand wait at the top of the loop, and the extra 56 KB costs nothing --
-// shared memory already pinned the kernel at one CTA per SM.
+// iterations to land rather than one. Shared memory still limits this scan
+// to one CTA per SM; removing the P stages saves 48 KiB per CTA.
 static constexpr int SMEM_SCAN = 128 * PCV * 2 + 64 * PCV * 2 + 3 * STAGE;
 
 // byte offsets of the operand tiles inside one prefetch stage
 static constexpr uint32_t O_W  = 0;
 static constexpr uint32_t O_KG = 64 * 128 * 2;
-static constexpr uint32_t O_P  = 2 * 64 * 128 * 2;  // [128][PCV]
-static constexpr uint32_t O_A  = 3 * 64 * 128 * 2;
+static constexpr uint32_t O_A  = 2 * 64 * 128 * 2;
 static constexpr uint32_t O_GN = O_A + 64 * PCV * 2;
 
 // ---------------------------------------------------------------------------
@@ -1064,7 +1056,7 @@ __global__
 __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
                                        const bf16* __restrict__ uu,
                                        const bf16* __restrict__ kg,
-                                       const bf16* __restrict__ Pg,
+                                       const float* __restrict__ Pg,
                                        const bf16* __restrict__ dvl,
                                        const bf16* __restrict__ dO,
                                        const float* __restrict__ gn2,
@@ -1110,7 +1102,6 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
     const int cV     = (tid % C8V) * 8;
     const int sVo    = swz(rV, cV, PCV);
     const size_t gVo = (size_t)rV * gs + cV;
-    const size_t gPo = (size_t)rV * DH + vb * BV + cV;  // P slab, stride DH
 
     // ---- accumulator staging offsets (loop invariant) --------------------
     int oS[TS::TPW], rS[TS::TPW];
@@ -1145,6 +1136,14 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         for (int j = 0; j < TS::TPW; ++j)
 #pragma unroll
             for (int r = 0; r < 4; ++r) acc[j][r] = sF[TS::row(warp, lane, j, r) * 65 + TS::col(warp, lane, j, r)];
+        // Consume every seed load before the prefetch reuses sF's storage.
+        // This is the first iteration's existing BF16 MMA-operand staging;
+        // the recurrent accumulator itself stays FP32 in registers.
+#pragma unroll
+        for (int j = 0; j < TS::TPW; ++j) {
+            *reinterpret_cast<uint32_t*>(sS + oS[j])           = bf2(acc[j][0], acc[j][1]);
+            *reinterpret_cast<uint32_t*>(sS + oS[j] + 8 * PCV) = bf2(acc[j][2], acc[j][3]);
+        }
         __syncthreads();
     }
 
@@ -1159,10 +1158,6 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
             if (actV) cpasync16z(sb + O_A + 2 * sVo, uu + bs + vb * BV + gVo, rV < L);
         } else {
             if (actV) cpasync16z(sb + O_A + 2 * sVo, dvl + bs + vb * BV + gVo, rV < L);
-            // P is a full [128][BV] slab: no tail rows, so no predicate.
-            const bf16* pb = Pg + ((size_t)cs * H + h) * DH * DH + gPo;
-#pragma unroll
-            for (int i = 0; i < 2; ++i) cpasync16(sb + O_P + 2 * sVo + i * (64u * PCV * 2), pb + (size_t)(i * 64) * DH);
         }
         if (tid < 32) cpasync16(sb + O_GN + tid * 16, gn2 + ((size_t)cs * H + h) * DH + tid * 4);
     };
@@ -1189,10 +1184,12 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         // read of the buffer being overwritten, so the loop needs two barriers
         // per chunk instead of three and the prefetch still gets a full
         // iteration of latency to hide in.
+        if (it > 0) {  // the seed was staged before the first prefetch
 #pragma unroll
-        for (int j = 0; j < TS::TPW; ++j) {
-            *reinterpret_cast<uint32_t*>(sS + oS[j])           = bf2(acc[j][0], acc[j][1]);
-            *reinterpret_cast<uint32_t*>(sS + oS[j] + 8 * PCV) = bf2(acc[j][2], acc[j][3]);
+            for (int j = 0; j < TS::TPW; ++j) {
+                *reinterpret_cast<uint32_t*>(sS + oS[j])           = bf2(acc[j][0], acc[j][1]);
+                *reinterpret_cast<uint32_t*>(sS + oS[j] + 8 * PCV) = bf2(acc[j][2], acc[j][3]);
+            }
         }
         cpasync_wait<1>();  // this chunk landed; the next may still be in flight
         __syncthreads();    // publishes sS and this chunk's staged operands
@@ -1206,8 +1203,20 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         buf              = (buf == 2) ? 0 : (buf + 1);
         const bf16* pW   = stb;
         const bf16* pKG  = stb + 64 * 128;
-        const bf16* pA   = stb + 3 * 64 * 128;
+        const bf16* pA   = stb + 2 * 64 * 128;
         const float* pGn = reinterpret_cast<const float*>(reinterpret_cast<const char*>(stb) + O_GN);
+        // k_prep completed on this stream. Fetch P into registers before the
+        // projections so their MMA work can hide the FP32 global-load latency.
+        float2 pv[TS::TPW][2];
+        if (dir == 1) {
+            const float* pP = Pg + ((size_t)cs * H + h) * DH * DH + vb * BV;
+#pragma unroll
+            for (int j = 0; j < TS::TPW; ++j) {
+                const int col = TS::col(warp, lane, j, 0);
+                pv[j][0]      = *reinterpret_cast<const float2*>(pP + rS[j] * DH + col);
+                pv[j][1]      = *reinterpret_cast<const float2*>(pP + (rS[j] + 8) * DH + col);
+            }
+        }
         // pGn and the staged `a` tile are published by the barrier above and are
         // not consumed until after the first GEMM pair, so reading them here
         // puts a whole 64x(2*BV)x64 product between the loads and their uses.
@@ -1263,16 +1272,6 @@ __launch_bounds__(NT, 1) void k_scan_t(const bf16* __restrict__ wneg,
         if (dir == 0) {
             gemm_acc<128, BV, 64, NW, 1, 1, 128, PCV>(acc, pKG, sB, warp, lane);
         } else {
-            // The P slab was staged a whole iteration ago; reading it before the
-            // 128 x BV x 64 product instead of after leaves the loads nothing
-            // to wait on.
-            const bf16* pP = stb + 2 * 64 * 128;  // precomputed qg^T dO slab
-            float2 pv[TS::TPW][2];
-#pragma unroll
-            for (int j = 0; j < TS::TPW; ++j) {
-                pv[j][0] = un2(*reinterpret_cast<const uint32_t*>(pP + oS[j]));
-                pv[j][1] = un2(*reinterpret_cast<const uint32_t*>(pP + oS[j] + 8 * PCV));
-            }
             gemm_acc<128, BV, 64, NW, 1, 1, 128, PCV>(acc, pW, sB, warp, lane);
 #pragma unroll
             for (int j = 0; j < TS::TPW; ++j) {

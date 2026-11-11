@@ -1,0 +1,40 @@
+{
+  "source": "/root/cudnn-sm90-fp32-p/python/cudnn/__init__.py",
+  "baseline_host": "/root/cudnn-sm90-la-precision-audit/python/cudnn/linear_attention/hopper/cuda_bwd_host.py",
+  "torch": "2.9.1+cu128",
+  "mode": "baseline",
+  "rows": [
+    {
+      "case": "16k-h8",
+      "inputs_resident_bytes": 202899968,
+      "peak_allocated_bytes": 996147712,
+      "peak_additional_bytes": 793247744,
+      "live_after_bytes": 405799424,
+      "with_graph_live_bytes": 405800448
+    },
+    {
+      "case": "128k-h8",
+      "inputs_resident_bytes": 1615856128,
+      "peak_allocated_bytes": 7942456320,
+      "peak_additional_bytes": 6326600192,
+      "live_after_bytes": 3231711744,
+      "with_graph_live_bytes": 3231712768
+    },
+    {
+      "case": "128k-h32",
+      "inputs_resident_bytes": 6463422976,
+      "peak_allocated_bytes": 31769773056,
+      "peak_additional_bytes": 25306350080,
+      "live_after_bytes": 12926845440,
+      "with_graph_live_bytes": 12926846464
+    },
+    {
+      "case": "128k-thd22-h8",
+      "inputs_resident_bytes": 1637876224,
+      "peak_allocated_bytes": 8016364032,
+      "peak_additional_bytes": 6378487808,
+      "live_after_bytes": 3275751936,
+      "with_graph_live_bytes": 3278898688
+    }
+  ]
+}

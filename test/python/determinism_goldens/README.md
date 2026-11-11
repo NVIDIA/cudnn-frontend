@@ -34,6 +34,57 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM90 CUDA KDA FP32 P — H20 validation, 2026-11-11
+
+`linear_attention/hopper/test_kda_sm90_precision.py` adds **23 L0 cases** for
+`plan_name="kda_hopper_cuda"`, `batch_invariant=True`, BF16 Q/K/V and FP32
+gates/beta/state, K=V=128. Every replay/reference/batch check includes O,
+final state, dQ, dK, dV, dG, dBeta and dInitialState. The two scan widths,
+full/partial chunks, empty documents, fresh allocations, changed neighbors,
+isolation/reordering/duplication, a 17,001-token sequence, and concurrent work
+are covered. FP16 and grouped-head backward are outside this provider's
+contract; composed CP summaries and safe-gate backward are not added.
+
+H20-3e, PyTorch 2.9.1+cu128, CUDA Toolkit 12.8, driver 570.133.20,
+cuDNN 91002, CuTe DSL 4.8.1. Baseline is `8348887bd`; CUDA source/host hashes
+were checked before comparing. Other GPUs and distributed training are
+unverified for this change; SM100 kernels are unchanged.
+
+```bash
+cd test/python
+CUDA_HOME=/usr/local/cuda-12.8 CUDNN_TEST_NO_ISOLATION=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -o addopts= -q -rs \
+  linear_attention/hopper/test_kda_sm90_precision.py \
+  linear_attention/hopper/test_kda_sm90_cuda.py \
+  linear_attention/hopper/test_hopper_marshal_stream.py
+```
+
+Result: **47 passed, 1 skipped** in 10.73 s. The skip is the existing optional
+`cuda.tile` routing case; it is not a pass for cuTile. Five warnings are the
+existing `xdist_group` markers without pytest-xdist on this host. The new
+23-case suite passes completely. The cancellation regression alone produced
+**10 failures on the baseline and 10 passes with FP32 P**: an exact `2^-10`
+state-gradient residual is zeroed by BF16 P storage.
+
+The new `32cb2f58db95235f/kda-sm90-fp32-p-fwd-bwd-bf16.json` golden was recorded
+in a new directory only after its independent FP64 recurrence check, then
+strictly checked without recording enabled. Its numerical reason is retaining
+P in FP32 until state-gradient addition. It records all forward results and
+all six gradients, not only the precision regression's selected element.
+
+Warm stress: 256 scan CTAs (3.28 per SM), 14 stage refills on the longest
+sequence, **0 wrong / 3,000 warm** and **0 wrong / 3,000 shared-memory-poisoned**
+launches. The unsafe control failed **200 / 200** launches on the same GPU.
+This is a stability check against a cold byte reference; numerical accuracy is
+checked separately against FP64. The unchanged input and output byte checks
+also pass with concurrent GPU work.
+
+The prepared-launch sanitizer harness and the full precision/performance/memory
+comparison are in the [H20 report](../../../benchmark/linear_attention/sm90_kda_fp32_p_results.md).
+The public provider's determinism status is qualified only for these tested
+configurations; no cross-runtime or cross-provider byte equivalence is claimed.
+
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 
 `test_DSA_indexer_compressed_sm90_determinism.py` now covers the public

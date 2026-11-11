@@ -1419,6 +1419,13 @@ def kimi_delta_attention(
     upgrade the MMA operands, chunk inverse, or checkpoint storage to FP32;
     FP16 retains the existing packed residual arithmetic.
 
+    The SM90 ``kda_hopper_cuda`` backward preserves ``P = Q_g^T dO`` in FP32
+    through its addition into the FP32 recurrent state gradient. Its BF16
+    Tensor Core inputs and other BF16 intermediates are unchanged. Relative
+    to BF16 P storage, the backward workspace grows by 32 KiB per allocated
+    64-token chunk slot per head; query the plan's workspace size when reusing
+    caller-owned storage.
+
     Args:
         g: per-key-channel decay: log-space by default (``alpha = exp(g) in
             (0, 1]^K``), the linear decay ``alpha`` itself when

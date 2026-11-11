@@ -50,7 +50,7 @@ DH = 128  # head dim (K == V == 128)
 PNT = 512  # k_prep threads
 BNT = 512  # k_bwd threads
 SMEM_PREP = 220160
-SMEM_SCAN = 198144
+SMEM_SCAN = 148992
 SMEM_BWD = 230656
 
 # What the artifact requests for k_prep/k_scan_t -- a flat cap above both
@@ -270,8 +270,11 @@ def _chunk_slots(total_tokens: int, n_seqs: int) -> int:
 
 
 def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
-    """The workspace arena, in the artifact's exact order. Returns the sub-buffer
-    addresses and the total size."""
+    """Return sub-buffer addresses and total bytes for the backward arena.
+
+    ``pmat`` retains the FP32 accumulator of ``Q_g^T dO`` until its addition
+    into the FP32 state gradient. The other matrix intermediates remain BF16.
+    """
     ncs = _chunk_slots(total_tokens, n_seqs)
     a = _Arena(workspace)
     cs_t0 = a.take(ncs, _I32)
@@ -288,7 +291,7 @@ def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
     dv2 = a.take(total_tokens * n_heads * DH, _BF16)
     hst = a.take(ncs * n_heads * DH * DH, _BF16)
     dhst = a.take(ncs * n_heads * DH * DH, _BF16)
-    pmat = a.take(ncs * n_heads * DH * DH, _BF16)
+    pmat = a.take(ncs * n_heads * DH * DH, _F32)
     return (
         dict(
             cs_t0=cs_t0,
@@ -313,7 +316,11 @@ def _layout(workspace: int, total_tokens: int, n_heads: int, n_seqs: int):
 
 
 def workspace_bytes(total_tokens: int, n_heads: int, n_seqs: int) -> int:
-    """Scratch the backward needs, mirroring ``kda_bwd_workspace_bytes``."""
+    """Caller-owned scratch bytes, including FP32 ``Q_g^T dO`` per chunk/head.
+
+    Chunk slots use a shape-only upper bound for packed sequence tails; no
+    device sequence lengths are read. Sub-buffers are aligned to 256 bytes.
+    """
     _, _, size = _layout(0, total_tokens, n_heads, n_seqs)
     return size
 
