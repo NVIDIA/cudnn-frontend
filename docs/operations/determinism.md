@@ -464,6 +464,14 @@ to nonpaged, unsplit uniform FP16/BF16; other supported paths retain their
 existing setup. Measurement details and runtime goldens are in the coverage
 report. This adds no backward or cross-runtime byte guarantee.
 
+
+Native SM107 D512 split forward also retains exact O/Stats bytes with the
+coalesced partial-store path for packing groups32/64. FP16/BF16 tests hold the
+split count fixed while comparing replay, standalone requests, reordered and
+duplicated batches, changed neighbors, and changed-input CUDA Graph replay.
+Sixteen unchanged-parent runtime goldens cover the new cases and existing
+D512/D576 half/mixed controls; other runtimes remain unverified by this check.
+
 ## SM120 half THD physical origins
 
 Native FP16/BF16 THD forward preserves O/Stats bytes across repeat execution,
