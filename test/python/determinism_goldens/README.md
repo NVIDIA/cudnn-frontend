@@ -2808,8 +2808,11 @@ All16records under `de01ba4cf30a4c9b` were recorded from unchanged parent
 `8e31a5725` after its references and replay/batch checks passed, then checked
 strictly by the candidate. No previous baseline or tolerance changed.
 
-From `test/python`, use the preceding D512/D576 qualification command; its
-existing test-file selection includes the new cases. The sanitizer subset is
+From `test/python`, use the preceding D512/D576 qualification command and add
+`sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_coalesced_split_replay_batch_golden`.
+The four coalesced cases live in that explicit SM107 CI entry, so the architecture
+lane retains the new coverage without duplicate collection in directory sweeps.
+The sanitizer subset is
 `test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged::test_boundaries`
 plus `test_sdpa_d512_pack_split_sm107.py`, selected with
 `test_boundaries or g64_split or g128_split or g32_split or g16_split or keyless`.
