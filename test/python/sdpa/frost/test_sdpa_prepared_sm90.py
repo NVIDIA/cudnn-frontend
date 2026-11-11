@@ -178,6 +178,74 @@ def test_prepared_d128_causal_persistent_rebind_capture_no_sync_no_alloc(monkeyp
         graph.reset()
 
 
+@torch_fork_set_rng(seed=0)
+def test_prepared_d128_claim_counter_rebind_capture_no_sync_no_alloc(monkeypatch):
+    """A claim-counter record (api_dsl.D128_CAUSAL_CLAIM 1 past a gate patched to 0) on the prepared launch: warm executes
+    with fresh buffers and a caller workspace never re-enter the tensor/JIT path, never synchronize (the native binder's
+    counter reset is an async memset on the launch stream) and never allocate (Rules 1, 3 and 8 of python/cudnn/AGENTS.md),
+    and a CUDA-graph replay reads the current bytes at the captured pointers and zeroes the counter again each time, after
+    the workspace is refilled with 0x7F (b4 h16/4 S 1152 causal: 576 items, L 5, the walk's record the route keeps)."""
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 0)
+    b, h_q, h_kv, sq, skv = 4, 16, 4, 1152, 1152
+    q, o = (_bhsd(b, h_q, sq, 128, torch.float16) for _ in range(2))
+    k, v = (_bhsd(b, h_kv, skv, 128, torch.float16) for _ in range(2))
+    api = SdpaFwdDslSm90(q, k, v, o, is_causal=True)
+    api.compile()
+    assert (api._k_mod.PERSISTENT, api._k_mod.CAUSAL_WALK, api._k_mod.CAUSAL_CLAIM) == (True, 0, 1), api.params
+    assert api.scratch_workspace_bytes() == 128 and api._dense_spec.claim_counter
+    assert api._dense_spec is not None and all("tensor" not in slot for slot in api._dense_spec.order)
+    workspace = torch.full((256,), 0x7F, dtype=torch.uint8, device="cuda")
+    items = 9 * h_q * b
+    run = lambda q, k, v, o: api.execute(q, k, v, o, workspace=workspace)
+    run(q, k, v, o)
+    fresh = tuple(torch.randn_like(t) for t in (q, k, v))
+    fresh_o = torch.full_like(o, float("nan"))
+    ref = _ref_sdpa_full(*fresh, scale=128**-0.5, is_causal=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("warm prepared execution called the tensor/JIT path")
+
+    try:
+        with monkeypatch.context() as guard:
+            guard.setattr(cute, "compile", forbidden)
+            guard.setattr(cute.runtime, "from_dlpack", forbidden)
+            guard.setattr(api, "_compiled_kernel", forbidden)
+            for name in ("view", "as_strided", "transpose", "contiguous"):
+                guard.setattr(torch.Tensor, name, forbidden)
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                for _ in range(3):
+                    run(*fresh, fresh_o)
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            with torch.cuda.graph(graph, stream=stream):
+                run(*fresh, fresh_o)
+            graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(fresh_o, ref, atol=5e-2, rtol=3e-2)
+        assert int(workspace[:4].view(torch.int32).item()) == items
+        # Replay must read the current bytes at the captured pointers and zero the counter again.
+        fresh[2].mul_(0.5)
+        fresh_o.fill_(float("nan"))
+        workspace.fill_(0x7F)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(fresh_o, ref * 0.5, atol=5e-2, rtol=3e-2)
+        assert int(workspace[:4].view(torch.int32).item()) == items
+    finally:
+        graph.reset()
+
+
 def test_prepared_thd_rejects_smaller_batch_and_misaligned_workspace():
     """Reject runtime metadata that violates the fixed Hopper scheduler or tensor-map ABI."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90

@@ -1363,7 +1363,9 @@ def _sm107_cluster_waves(facts) -> float:
 def _sm90_d128_causal_walks(facts) -> bool:
     """Whether check_support gives a causal SM90 D128 graph of ``facts`` the walk's record (persistent, causal_walk 1,
     the NATURAL order unless pinned) rather than the one-tile record (the causal order): the choice a check_support
-    without a pinned order makes, mirrored here because a graph-route plan carries its proposal as a pin. The walk's
+    without a pinned order makes, mirrored here because a graph-route plan carries its proposal as a pin. A record
+    check_support then hands to the claim counter (api_dsl.D128_CAUSAL_CLAIM, past its gate) is persistent and NATURAL
+    too, so the counter's switches do not move this answer. The walk's
     record needs api_dsl's switches at the walk (D128_INTRA_WG_OVERLAP, D128_PERSISTENT, D128_PERSISTENT_CAUSAL_WALK 2,
     as api_dsl._sm90_d128_persistence reads them) and a plan the route keeps (config_sm90.d128_causal_route, while
     D128_CAUSAL_WALK_ROUTE is on) at the device's SM count, the CTA count compile() gives the record. The switches are

@@ -41,6 +41,9 @@ from cudnn.frost.tile_dsl.constants import (
 from cudnn.sdpa.fwd.config_sm90 import (
     BAND_COORDINATE_LIMIT as _SM90_BAND_COORDINATE_LIMIT,
     D128_FLAVOR as _SM90_D128_FLAVOR,
+    D128_CLAIM_NATURAL as _SM90_D128_CLAIM_NATURAL,
+    D128_CLAIM_OFF as _SM90_D128_CLAIM_OFF,
+    D128_CLAIM_WORKSPACE_BYTES as _SM90_D128_CLAIM_WORKSPACE_BYTES,
     D128_ROUTE_MAX_L as _D128_ROUTE_MAX_L,
     D512_FLAVOR as _SM90_D512_FLAVOR,
     FLAVORS as _SM90_FLAVORS,
@@ -315,6 +318,26 @@ D128_PERSISTENT_CAUSAL_WALK: int = 2
 # or more on MHA); those cutoffs are retired: on the strides they routed, all below L 48, the NATURAL stride ran 0.985
 # to 1.077 of cuDNN and the one-tile kernel 0.830 to 0.978.
 D128_CAUSAL_WALK_ROUTE: bool = True
+# The claim counter of a causal D128 record (TemplateParams.causal_claim, config_sm90.D128_CLAIM_*): 0 keeps the static
+# schedules above on every record; 1 (the counter, a group's Q tiles in NATURAL order) hands out the items of a causal
+# persistent record of the walk's rule that the route keeps, whose order is NATURAL (the graph route's proposal, or no
+# pin), and which has more than D128_CLAIM_MIN_ROUNDS items per CTA. The record then needs
+# config_sm90.D128_CLAIM_WORKSPACE_BYTES of caller workspace (scratch_workspace_bytes), which the native dense binder
+# zeroes on the launch stream before every launch; an extension whose binder lacks that role
+# (_SdpaDenseBinder.supports_claim_counter) keeps the static record. A CALL-TIME module constant read by check_support. A
+# speed choice: every value computes the one-tile kernel's O and Stats bit for bit. Why a counter (design/beat-cudnn
+# FINDINGS s27/s28): on H100 SXM the static NATURAL stride read K/V 1.24 to 1.46 times the read-once floor on large
+# causal plans (H36 b203 h32/32 S 768, H4 b82 h32/16 S 1024, H8 b203 h32/8 S 768), the CTAs drifting apart over hundreds
+# of rounds, while the same order handed out dynamically (the one-tile grid) read 1.000 times.
+D128_CAUSAL_CLAIM: int = 0
+# The counter's gate in rounds of items per CTA (items > D128_CLAIM_MIN_ROUNDS x CTAs). s33 set it (H100 SXM, cuDNN
+# 9.27, 45 causal shapes on ten batch ladders, under a rule frozen before the run): the smallest ladder point from which
+# every larger one has the counter at least R14's static rules within the band (the larger of 1% and the twin runs' gap)
+# and faster in the median, 93.1 rounds (MHA h32/32 S 1024 b48). Below it the static rules stay ahead on square prefill
+# (h24/2 S 3584 b16, 81.5 rounds: the counter 2.2% behind) and on short items (MHA h32/32 S 768 b16, 23 rounds: 1.7%);
+# above it the counter is 1 to 14% faster on MHA and GQA (MHA h32/32 S 768 b203: R14 0.872 of cuDNN, the counter 1.000)
+# and within 1% on square prefill, chunked prefill and MQA.
+D128_CLAIM_MIN_ROUNDS: int = 93
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -550,6 +573,17 @@ def _sm90_d128_persistence(flavor: tuple[int, int], causal: bool) -> tuple[bool,
         raise ValueError(f"api_dsl.D128_PERSISTENT_CAUSAL_WALK must be 0, 1 or 2; got {walk!r}")
     persistent = flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP and D128_PERSISTENT and (not causal or walk > 0)
     return persistent, int(persistent and causal and walk == 2)
+
+
+def _sm90_claim_binder_ready() -> bool:
+    """Whether this extension's native dense binder has the claim counter's role (_SdpaDenseBinder.supports_claim_counter):
+    it binds the caller's workspace as the counter and zeroes it before every launch. Without it a counter record's meta
+    pointer would stay 0, so check_support keeps the static record (D128_CAUSAL_CLAIM)."""
+    try:
+        from cudnn import _pybind_module
+    except ImportError:
+        return False
+    return bool(getattr(getattr(_pybind_module, "_SdpaDenseBinder", None), "supports_claim_counter", False))
 
 
 # The route (D128_CAUSAL_WALK_ROUTE: _sm90_d128_causal_route, its L cutoff _D128_ROUTE_MAX_L and the KV tile count it
@@ -5964,6 +5998,17 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 self._persistent_ctas(self.q_desc.device),
             ):
                 self.params = replace(self.params, persistent=False, causal_walk=0, sched_policy=causal_sched)
+        claim = D128_CAUSAL_CLAIM
+        if type(claim) is not int or claim not in (_SM90_D128_CLAIM_OFF, _SM90_D128_CLAIM_NATURAL):
+            raise ValueError(f"api_dsl.D128_CAUSAL_CLAIM must be 0 or 1; got {claim!r}")
+        if claim and self.params.causal_walk and self.params.sched_policy == SCHED_NATURAL and _sm90_claim_binder_ready():
+            # A causal persistent record of the walk's rule the route kept, in NATURAL order: past the gate its items go
+            # out from the workspace counter instead (D128_CAUSAL_CLAIM); the counter numbers them itself, so the walk's
+            # plan is not built.
+            ctas = self._persistent_ctas(self.q_desc.device)
+            items = -(-s_q // tile_m) * h_q * b
+            if items > D128_CLAIM_MIN_ROUNDS * ctas:
+                self.params = replace(self.params, causal_walk=0, causal_claim=claim)
         self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max = b, h_q, h_kv, s_q, s_kv
         self.head_dim_qk, self.head_dim_v = d_qk, d_v
         self.dtype = self.q_desc.dtype
@@ -6021,10 +6066,13 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """THD: the metadata, then the tensor maps (and, with physical offsets, the per-port origins),
-        bound as ``seq_kv_lens``; a dense split plan holds O/Stats partials."""
+        bound as ``seq_kv_lens``; a dense split plan holds O/Stats partials, and a dense claim-counter record
+        (causal_claim) its work-item counter (config_sm90.D128_CLAIM_WORKSPACE_BYTES, word 0)."""
         self._ensure_support_checked()
         if not self.thd:
-            return self._split_workspace_bytes() if self.split_kv > 1 else 0
+            if self.split_kv > 1:
+                return self._split_workspace_bytes()
+            return _SM90_D128_CLAIM_WORKSPACE_BYTES if self.params.causal_claim else 0
         from cudnn.sdpa.fwd.config_sm90 import thd_meta_words
 
         return thd_meta_words(self.batch_size, getattr(self, "_thd_origin_specs", None) is not None) * 4
@@ -6105,6 +6153,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 if workspace.device != q_tensor.device or not workspace.is_contiguous():
                     raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
                 ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90 (split)")
+            elif self.params.causal_claim:
+                # The claim counter's word: an int-only address (no tensor views on the hot path); the native binder
+                # checks it against the operands and zeroes it on the launch stream before the launch.
+                if workspace is None:
+                    raise ValueError(f"SdpaFwdDslSm90 requires a {_SM90_D128_CLAIM_WORKSPACE_BYTES}-byte workspace; pass scratch_workspace_bytes() bytes")
+                if workspace.device != q_tensor.device or not workspace.is_contiguous():
+                    raise ValueError("cudnn.sdpa: the claim counter's workspace must be contiguous and on the Q tensor's CUDA device")
+                ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90", _SM90_D128_CLAIM_WORKSPACE_BYTES)
             execute_native_dense_tensors(spec, buffers, stream, scale, ws_ptr)
         self._logger.debug("execute completed")
 

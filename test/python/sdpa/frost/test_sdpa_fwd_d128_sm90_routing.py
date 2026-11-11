@@ -124,6 +124,10 @@ def test_sm90_d128_proposal_mirrors_the_record_check_support_picks(monkeypatch):
         {"D128_CAUSAL_WALK_ROUTE": False},
         {"D128_PERSISTENT": False},
         {"D128_INTRA_WG_OVERLAP": False},
+        # The claim counter hands out only records check_support keeps persistent and NATURAL: the proposal stays, with
+        # the counter on and with it on at a gate of 0.
+        {"D128_CAUSAL_CLAIM": 1},
+        {"D128_CAUSAL_CLAIM": 1, "D128_CLAIM_MIN_ROUNDS": 0},
     )
     for setting in settings:
         with monkeypatch.context() as m:
@@ -805,6 +809,31 @@ def test_d128_claim_hand_out_runs_every_item_once_and_leaves_the_item_count():
             else:
                 current[cta] = nxt
         assert sorted(ran) == list(range(items)) and ends == n and counter == items, (items, ctas)
+
+
+def test_d128_claim_counter_contract_is_one_in_python_and_the_binder():
+    """The claim counter's workspace contract has one value on every side: config_sm90.D128_CLAIM_WORKSPACE_BYTES (the
+    adapter's scratch_workspace_bytes), the native dense binder's kClaimWorkspaceBytes (its ordered path's check and
+    ordered_workspace_bytes), and the binder's roles the Python side probes (supports_claim_counter) or the plan reads
+    (ordered_workspace_bytes); the prepared spec carries the flag (DenseLaunchSpec.claim_counter) and the binder's reset
+    is the driver memset resolved natively, never cuda-python's. The switch ships off; its gate is 93 rounds per CTA
+    (s33)."""
+    import pathlib
+    import re
+
+    from cudnn.sdpa.fwd import config_sm90 as c
+    from cudnn.sdpa.fwd import prepared
+
+    root = pathlib.Path(__file__).resolve().parents[4]  # the source tree this test file sits in
+    binder = (root / "python" / "pygraph" / "sdpa_dense_binding.cpp").read_text()
+    assert re.search(r"constexpr int64_t kClaimWorkspaceBytes = (\d+);", binder).group(1) == str(c.D128_CLAIM_WORKSPACE_BYTES) == "128"
+    for name in ('"supports_claim_counter"', '"ordered_workspace_bytes"', 'get_driver_entry_point("cuMemsetD32Async")', 'flag("claim_counter")'):
+        assert name in binder, name
+    reset = binder[binder.index("reset_claim_counter(int64_t workspace") :]
+    assert "fill_word_" not in reset[: reset.index("first_scalar_role")]
+    assert "claim_counter" in prepared.DenseLaunchSpec.__slots__
+    api_src = (root / "python" / "cudnn" / "sdpa" / "fwd" / "api_dsl.py").read_text()
+    assert re.search(r"^D128_CAUSAL_CLAIM: int = 0$", api_src, re.M) and re.search(r"^D128_CLAIM_MIN_ROUNDS: int = 93$", api_src, re.M)
 
 
 def test_each_causal_claim_is_its_own_module_and_digest():

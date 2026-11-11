@@ -19,6 +19,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -68,15 +69,18 @@ def _inputs(b, h_q, h_kv, s_q, s_kv, dtype):
     return _bhsd(b, h_q, s_q, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype)
 
 
-# The overlap, persistent and causal walk switch fields (config_sm90.TemplateParams). A variant names the ones it turns
-# on; _plan sets every other one off (False, or 0 for the causal walk), so a variant never inherits the adapter's
-# shipped values.
-_SWITCHES = ("intra_wg_overlap", "persistent", "causal_walk")
+# The overlap, persistent, causal walk and claim counter switch fields (config_sm90.TemplateParams). A variant names the
+# ones it turns on; _plan sets every other one off (False, or 0 for the causal walk and the claim counter), so a variant
+# never inherits the adapter's shipped values.
+_SWITCHES = ("intra_wg_overlap", "persistent", "causal_walk", "causal_claim")
 _VARIANTS = {"v1": (), "ov": ("intra_wg_overlap",), "pa": ("intra_wg_overlap", "persistent")}
 # The persistent variants: each must compute ov's O and Stats bit for bit.
 _PERSISTENT = ("pa",)
 # Variants of causal records only: the paired walk (causal_walk 1), which validate_params refuses on a dense record.
 _CAUSAL_VARIANTS = {"pw": ("intra_wg_overlap", "persistent", "causal_walk")}
+# The claim counter's variant, causal NATURAL records only (causal_claim 1: a group's Q tiles in NATURAL order):
+# persistent under overlap, the walk off. A claim record needs the caller workspace (_claim_run).
+_CLAIM_VARIANTS = {"pc1": 1}
 # Forced persistent CTA counts: one CTA crossing every item boundary, two and three wrapping the K/V rings and the Q phase
 # at uneven parities, 131 leaving one SM's worth of items over. A cross-item bug shows only when a CTA runs more than one
 # item (python/cudnn/sdpa/AGENTS.md, the THD re-seed lesson): at the adapter's count every small case runs one item per CTA.
@@ -85,15 +89,17 @@ _FORCED_GRIDS = (1, 2, 3, 131)
 
 def _switches(variant):
     """``variant``'s whole switch record: each _SWITCHES field on exactly when the variant names it (True, or 1 for the
-    causal walk's int)."""
+    causal walk's int); a claim variant is the persistent overlap record with its causal_claim value and the walk off."""
+    if variant in _CLAIM_VARIANTS:
+        return dict(intra_wg_overlap=True, persistent=True, causal_walk=0, causal_claim=_CLAIM_VARIANTS[variant])
     names = {**_VARIANTS, **_CAUSAL_VARIANTS}[variant]
-    return {name: int(name in names) if name == "causal_walk" else name in names for name in _SWITCHES}
+    return {name: int(name in names) if name in ("causal_walk", "causal_claim") else name in names for name in _SWITCHES}
 
 
 def _counts(variant):
     """The watchdog child's persistent CTA counts: the adapter's (0), and for a persistent variant 1 and 2 (one CTA crossing
     every item boundary; two wrapping the K/V rings and the Q phase at uneven parities)."""
-    return [0, 1, 2] if "persistent" in {**_VARIANTS, **_CAUSAL_VARIANTS}[variant] else [0]
+    return [0, 1, 2] if variant in _CLAIM_VARIANTS or "persistent" in {**_VARIANTS, **_CAUSAL_VARIANTS}[variant] else [0]
 
 
 def _plan(q, k, v, *, stats=False, variant=None, grid=None, **kw):
@@ -1002,6 +1008,283 @@ def test_d128_paired_walk_repeats_and_replays_bitwise(grid):
         graph.reset()
 
 
+# The claim counter (TemplateParams.causal_claim): every item after a CTA's first comes from the Int32 counter at the
+# caller's workspace base, which the native dense binder zeroes on the launch stream before every launch. The cases take
+# causal top-left and bottom-right, MHA, GQA and MQA, and T 1, 2, 6, 8, 9, 17 and 32; each runs at the adapter's CTA
+# count (where only t17-br-mqa, 136 items, has more items than an H100's SMs) and at forced counts far below its items,
+# where one CTA claims many items of different lengths. Sanitizer recipe for the dev session, one cell each:
+#   compute-sanitizer --tool racecheck python -m pytest -q -p no:cacheprovider test_sdpa_fwd_d128_sm90.py -k "claim_counter_is_bitwise_ov and pc1 and t8-br-gqa-grid3"
+#   compute-sanitizer --tool synccheck (same selection); compute-sanitizer --tool memcheck (same selection)
+_CLAIM_CASES = {  # id: (b, h_q, h_kv, s_q, s_kv, dtype, adapter keywords)
+    "t1-br-gqa": (2, 8, 2, 100, 300, torch.float16, dict(is_causal=True, causal_bottom_right=True)),
+    "t2-tl-mqa": (1, 4, 1, 256, 512, torch.bfloat16, dict(is_causal=True)),
+    "t6-tl-mha": (2, 4, 4, 768, 768, torch.bfloat16, dict(is_causal=True)),
+    "t8-br-gqa": (1, 8, 2, 1024, 1280, torch.bfloat16, dict(is_causal=True, causal_bottom_right=True)),
+    "t9-tl-mha": (1, 4, 4, 1152, 1152, torch.float16, dict(is_causal=True)),
+    "t17-br-mqa": (2, 4, 1, 2148, 2300, torch.float16, dict(is_causal=True, causal_bottom_right=True)),  # partial Q tile
+    "t32-tl-gqa": (1, 4, 2, 4096, 4096, torch.bfloat16, dict(is_causal=True)),
+}
+_CLAIM_GRIDS = (None, 1, 3)
+
+
+def _claim_items(case):
+    b, h_q, _, s_q, *_ = _CLAIM_CASES[case]
+    return math.ceil(s_q / 128) * h_q * b
+
+
+def _poisoned_workspace(nbytes=256):
+    """A caller workspace whose counter word reads 0x7F7F7F7F: the binder's reset must zero it before the launch."""
+    return torch.full((nbytes,), 0x7F, dtype=torch.uint8, device="cuda")
+
+
+def _counter(workspace):
+    """The claim counter's word after a launch: the item count (every CTA's claims, its one end marker included)."""
+    return int(workspace[:4].view(torch.int32).item())
+
+
+def _claim_plan(q, k, v, variant, *, grid=None, **kw):
+    """A claim record (``variant`` in _CLAIM_VARIANTS) over NaN-filled O and Stats, with NATURAL pinned (the counter
+    numbers its items itself; validate_params refuses it on another order). It reserves the counter's 128 bytes and its
+    prepared spec carries the binder's flag."""
+    api, o, lse = _plan(q, k, v, stats=True, variant=variant, grid=grid, **dict(kw, sched_policy=SCHED_NATURAL))
+    assert api.params.causal_claim == _CLAIM_VARIANTS[variant] and api._k_mod.CAUSAL_CLAIM == _CLAIM_VARIANTS[variant]
+    assert api.scratch_workspace_bytes() == 128
+    assert api._dense_spec.claim_counter
+    return api, o, lse
+
+
+def _claim_run(api, q, k, v, o, lse, workspace):
+    o.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=workspace)
+    torch.cuda.synchronize()
+    return o.clone(), lse.clone()
+
+
+@pytest.mark.L0
+def test_d128_claim_counter_cases_take_every_t_mask_and_head_layout():
+    """The claim cases take T = 1, 2, 6, 8, 9, 17 and 32, both masks, MHA, GQA and MQA, a partial Q tile, and one case
+    with more items than an H100's 132 SMs at the adapter's count; every forced count is below its case's items."""
+    tiles = {case: math.ceil(c[3] / 128) for case, c in _CLAIM_CASES.items()}
+    assert set(tiles.values()) == {1, 2, 6, 8, 9, 17, 32}, tiles
+    layouts = {"-mha": lambda h_q, h_kv: h_q == h_kv, "-gqa": lambda h_q, h_kv: 1 < h_kv < h_q, "-mqa": lambda h_q, h_kv: h_kv == 1}
+    for case, (_, h_q, h_kv, s_q, _, _, kw) in _CLAIM_CASES.items():
+        assert sum(layouts[word](h_q, h_kv) for word in layouts if word in case) == 1, case
+        assert kw.get("causal_bottom_right", False) is ("-br-" in case), case
+        assert all(grid < _claim_items(case) for grid in _CLAIM_GRIDS if grid), case
+    assert {word for word in ("-tl-", "-br-") if any(word in case for case in _CLAIM_CASES)} == {"-tl-", "-br-"}
+    assert any(_claim_items(case) > 132 for case in _CLAIM_CASES) and any(c[3] % 128 for c in _CLAIM_CASES.values())
+
+
+@pytest.mark.parametrize(
+    "case, grid", [pytest.param(c, g, id=f"{c}-grid{g or 'sm'}", marks=_level(c in _L0_CLAIM)) for c in _CLAIM_CASES for g in _CLAIM_GRIDS]
+)
+@pytest.mark.parametrize("variant", list(_CLAIM_VARIANTS))
+@torch_fork_set_rng(seed=0)
+def test_d128_claim_counter_is_bitwise_ov(variant, case, grid):
+    """A claim record computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit from a poisoned workspace,
+    with a group's Q tiles in NATURAL order, and leaves the counter at the item count: every item ran once, and every
+    CTA took its one end marker."""
+    b, h_q, h_kv, s_q, s_kv, dtype, kw = _CLAIM_CASES[case]
+    q, k, v = _inputs(b, h_q, h_kv, s_q, s_kv, dtype)
+    base = _run(q, k, v, stats=True, variant="ov", **kw)
+    api, o, lse = _claim_plan(q, k, v, variant, grid=grid, **kw)
+    workspace = _poisoned_workspace()
+    got = _claim_run(api, q, k, v, o, lse, workspace)
+    _assert_bitwise(variant, f"{case} at grid {grid or 'sm'}", got, base, "ov")
+    assert _counter(workspace) == _claim_items(case), (case, grid, _counter(workspace))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", list(_CLAIM_VARIANTS))
+@torch_fork_set_rng(seed=0)
+def test_d128_claim_counter_resets_repeats_and_replays(variant):
+    """The binder zeroes the counter before every launch, so a claim record gives ov's bits from 0x7F bytes, from a
+    stale count and from the previous launch's count, launch after launch; and a captured graph zeroes it on every
+    replay (a memset node before the kernel), after the workspace is refilled with 0x7F, on a second graph captured
+    over another workspace pointer too (bottom-right causal, partial Q tile and ragged KV, GQA 2, at 3 CTAs)."""
+    q, k, v = _inputs(1, 4, 2, 1175, 1275, torch.bfloat16)
+    mask = dict(is_causal=True, causal_bottom_right=True)
+    items = math.ceil(1175 / 128) * 4
+    base = _run(q, k, v, stats=True, variant="ov", **mask)
+    api, o, lse = _claim_plan(q, k, v, variant, grid=3, **mask)
+    ws_a, ws_b = _poisoned_workspace(), _poisoned_workspace(512)
+    for start in (None, items // 2, items, -1):  # 0x7F bytes, a stale count, the previous launch's count, all ones
+        if start is not None:
+            ws_a[:4].view(torch.int32).fill_(start)
+        _assert_bitwise(variant, f"eager from {start}", _claim_run(api, q, k, v, o, lse, ws_a), base, "ov")
+        assert _counter(ws_a) == items, (start, _counter(ws_a))
+
+    def run(workspace):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=workspace)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs = (torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph())
+    try:
+        with torch.cuda.stream(stream):
+            run(ws_a)
+            with torch.cuda.graph(graphs[0], stream=stream):
+                run(ws_a)
+            with torch.cuda.graph(graphs[1], stream=stream):
+                run(ws_b)
+        stream.synchronize()
+        for name, graph, workspace in (("A", graphs[0], ws_a), ("B", graphs[1], ws_b)):
+            for step in range(2):
+                workspace.fill_(0x7F)
+                o.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                _assert_bitwise(variant, f"replay {step} over workspace {name}", (o, lse), base, "ov")
+                assert _counter(workspace) == items, (name, step, _counter(workspace))
+    finally:
+        for graph in graphs:
+            graph.reset()
+
+
+# The claim ring's warm stress (Rule 11's run-time detector): t32-tl-gqa, 128 items, at 16 forced CTAs, so each CTA
+# claims about eight items and refills the ring's two slots about six times in every launch (KV tiles per Q tile 1
+# to 32).
+_CLAIM_STRESS = ("t32-tl-gqa", 16)
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=0)
+def test_d128_claim_ring_warm_stress():
+    """python/cudnn/AGENTS.md Rule 11 and python/cudnn/sdpa/AGENTS.md S15 at run time, for the claim counter's id ring:
+    a claim record whose CTAs each publish several ids, so the producer refills each slot inside one launch,
+    launched back to back and behind a shared-memory poison launch (warm_stress.assert_warm_stress), every O and Stats
+    byte compared with the one-tile-per-CTA overlap kernel's (ov, which has no id ring), and the counter left at the
+    item count. A zero is a rate bound on this GPU behind the positive control, and the kernel runs one thread block
+    per SM (its shared memory), which the report flags; the proof of the order is the rendering pin
+    (test_d128_register_split_no_spills_and_no_wgmma_serialization[pc1-causal])."""
+    from warm_stress import StressCase, assert_warm_stress
+
+    case, grid = _CLAIM_STRESS
+    b, h_q, h_kv, s_q, s_kv, dtype, kw = _CLAIM_CASES[case]
+    q, k, v = _inputs(b, h_q, h_kv, s_q, s_kv, dtype)
+    base = _run(q, k, v, stats=True, variant="ov", **kw)
+    api, o, lse = _claim_plan(q, k, v, "pc1", grid=grid, **kw)
+    workspace = _poisoned_workspace()
+    items = _claim_items(case)
+    # A CTA publishes one id per item it runs (the next item's, the last its end marker); its first two fill the two
+    # fresh slots, every later one refills a slot the compute warps released.
+    refills = items - 2 * grid
+    assert refills > 0, (items, grid)
+
+    def launch():
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=workspace)
+
+    _assert_bitwise("pc1", f"{case} at grid {grid}", _claim_run(api, q, k, v, o, lse, workspace), base, "ov")
+    assert _counter(workspace) == items, (case, grid, _counter(workspace))
+    assert_warm_stress(
+        StressCase(
+            f"SM90 D128 claim counter id ring ({case}, {grid} CTAs)",
+            launch,
+            {"o_storage": o.transpose(1, 2), "stats": lse},
+            thread_blocks=grid,
+            refills_per_launch=refills,
+            reference={"o_storage": base[0].transpose(1, 2).contiguous(), "stats": base[1].contiguous()},
+        ),
+        warm=256,
+        poisoned=256,
+    )
+    assert _counter(workspace) == items, (case, grid, _counter(workspace))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_claim_counter_workspace_is_required_and_checked_before_launch():
+    """A claim record refuses a missing, short, misaligned or host workspace, and one that overlaps an operand (the
+    binder: the counter word would be zeroed under O), each before any launch: O keeps its NaN fill."""
+    q, k, v = _inputs(1, 4, 2, 1024, 1024, torch.bfloat16)
+    api, o, lse = _claim_plan(q, k, v, "pc1", grid=3, is_causal=True)
+    spare = torch.empty(512, dtype=torch.uint8, device="cuda")
+    o_storage = o.transpose(1, 2)  # O's BSHD storage under its BHSD view
+    assert o_storage.is_contiguous()
+    cases = [
+        (None, "requires a 128-byte workspace"),
+        (spare[:64], "requires a 128-byte workspace; the provided buffer has 64 bytes"),
+        (spare[4:260], "16-byte aligned"),
+        (torch.empty(256, dtype=torch.uint8), "on the Q tensor's CUDA device"),
+        (o_storage.reshape(-1).view(torch.uint8)[:256], "workspace overlaps o$"),
+    ]
+    for workspace, why in cases:
+        o.fill_(float("nan"))
+        with pytest.raises(ValueError, match=why):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, workspace=workspace)
+        torch.cuda.synchronize()
+        assert torch.isnan(o).all(), f"a refused launch ({why}) wrote O"
+
+
+@pytest.mark.L0
+def test_d128_adapter_gives_the_claim_counter_only_past_its_gate(monkeypatch):
+    """check_support gives the claim record (persistent, the walk off, causal_claim D128_CAUSAL_CLAIM, NATURAL, 128
+    bytes of workspace) only to a causal record of the walk's rule the route keeps, in NATURAL order, with more items
+    than D128_CLAIM_MIN_ROUNDS x CTAs (the switch shipped off, set on here; the gate 93 rounds); never on a routed or
+    dense plan or a pinned LPT_L2 order, nor with the switch at 0, and an out of range switch (2, the heaviest-first
+    numbering s29 dropped, or 3) raises. The CTA count is patched to 132 so the gate does not move with the board."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    def record(shape, mask, **kw):
+        q, k, v = _inputs(*shape, torch.bfloat16)
+        api = api_dsl.SdpaFwdDslSm90(q, k, v, torch.empty_like(q), **mask, **kw)
+        api._persistent_ctas = lambda device: 132
+        assert api.check_support()
+        return api
+
+    kept, routed, causal = (4, 16, 4, 1152, 1152), (1, 4, 4, 1024, 1024), dict(is_causal=True)  # 576 items L 5; 32 items
+    assert (api_dsl.D128_CAUSAL_CLAIM, api_dsl.D128_CLAIM_MIN_ROUNDS) == (0, 93)
+    assert record(kept, causal).params.causal_claim == 0, "the switch ships off"
+    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
+    assert record(kept, causal).params.causal_claim == 0, "576 items is below the shipped gate's 93 x 132"
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 4)  # 576 > 528
+    api = record(kept, causal)
+    p = api.params
+    assert (p.persistent, p.causal_walk, p.causal_claim, p.sched_policy) == (True, 0, 1, SCHED_NATURAL), p
+    assert api.scratch_workspace_bytes() == 128
+    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 0)
+    assert record(kept, causal).params.causal_claim == 0 and record(kept, causal).scratch_workspace_bytes() == 0
+    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 5)  # 576 <= 660
+    assert record(kept, causal).params.causal_claim == 0
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 0)
+    routed_params = record(routed, causal).params
+    assert (routed_params.persistent, routed_params.causal_claim) == (False, 0), routed_params
+    assert record(kept, causal, sched_policy=SCHED_LPT_L2).params.causal_claim == 0
+    assert record(kept, {}).params.causal_claim == 0 and record(kept, {}).scratch_workspace_bytes() == 0
+    for bad in (2, 3):
+        monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", bad)
+        with pytest.raises(ValueError, match="D128_CAUSAL_CLAIM must be 0 or 1"):
+            record(kept, causal)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_reports_and_binds_the_claim_counter_workspace(graph_d128, monkeypatch):
+    """Through the graph route a claim record reports its 128 bytes (graph.get_workspace_size), keeps the ordered
+    native path (the binder's ordered_workspace_bytes matches), and computes O from the runner's uninitialized workspace
+    (b4 h8/8 S 1152 causal: 288 items, L 5, the walk's record the route keeps, at the counter's gate patched to 0)."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 0)
+    graphs, pin = [], graph_d128._select_engine
+    monkeypatch.setattr(graph_d128, "_select_engine", lambda graph, name, **kw: graphs.append(graph) or pin(graph, name, **kw))
+    q, k, v = _inputs(4, 8, 8, 1152, 1152, torch.bfloat16)
+    o = graph_d128._run_dsl_graph(q, k, v, scale=_SCALE, dtype=torch.bfloat16, sdpa_kwargs=dict(use_causal_mask=True))
+    torch.testing.assert_close(o, _ref_sdpa_full(q, k, v, scale=_SCALE, is_causal=True), atol=5e-2, rtol=3e-2)
+    (graph,) = graphs
+    plan = graph._compiled_plans[graph._plan_index]
+    assert plan._compiled.kernel_module.CAUSAL_CLAIM == 1
+    assert graph.get_workspace_size() >= 128 and plan.get_workspace_size() == 128
+    assert plan._ordered_native is not None, "the claim plan lost the ordered native path"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 @torch_fork_set_rng(seed=0)
@@ -1166,7 +1449,8 @@ def test_d128_adapter_applies_the_shipped_switches(monkeypatch):
         on = overlap and persistent and (not causal or walk > 0)
         paired = on and causal and walk == 2
         got = {name: getattr(api.params, name) for name in _SWITCHES}
-        want = dict(intra_wg_overlap=overlap, persistent=on and not (paired and route), causal_walk=int(paired and not route))
+        # causal_claim: 0, the two-item plan far below the claim counter's gate (api_dsl.D128_CLAIM_MIN_ROUNDS x CTAs).
+        want = dict(intra_wg_overlap=overlap, persistent=on and not (paired and route), causal_walk=int(paired and not route), causal_claim=0)
         assert got == want, (causal, walk, route, got)
         order = SCHED_NATURAL if not causal or (paired and not route) else api_dsl._causal_sched_policy(128, 128, 128, 2)
         assert api.params.sched_policy == order, (causal, walk, route, api.params.sched_policy)
@@ -1514,7 +1798,9 @@ _SPILL_PIN = {"STL": 0, "LDL": 0}
 # pin): the stride by the grid at 132 CTAs (b8 h24/8 S_q 256 S_kv 2048) and the paired walk at 3 CTAs (b8 h24/8 S_q
 # 1280 S_kv 3072, T 10: pairs alone, five per group), the records on which NVVM had recomputed the FP64 log2 scale
 # inside the KV loop (softmax_setup's comment). The paired walk's one-Q-tile case (middle tiles only) is gone: the T
-# cut keeps a T 1 plan on the stride, which compiles pa-causal-t1's code.
+# cut keeps a T 1 plan on the stride, which compiles pa-causal-t1's code. The claim counter's record
+# (causal_claim 1) on the probe's causal body at 64 CTAs (128 items, two per CTA), held to the rules every case is
+# held to; its FP64 guard, loop and body counts are measured on the first H100 that compiles it (not pinned yet).
 _SASS_CASES = {
     "v1": ("v1", True),
     "ov": ("ov", True),
@@ -1525,6 +1811,7 @@ _SASS_CASES = {
     "pw-causal-chunked": ("pw", True),
     "pn-causal-snake": ("pw", True),
     "pn-causal-straight": ("pw", True),
+    "pc1-causal": ("pc1", True),
 }
 # The NATURAL stride a causal record of the walk's rule keeps below CAUSAL_WALK_MIN_TILES, on the probe's causal body
 # (T 8, NATURAL, TemplateParams' order) under each deal: at 64 CTAs a CTA's two items take one Q tile position under the
@@ -1601,14 +1888,45 @@ def _ptxas():
     return next((c for c in cands if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
 
 
-@pytest.mark.parametrize("case", list(_SASS_CASES))
+def _assert_claim_release_rendering(case, switches, dump):
+    """Rule 11's rendering pin on the probe's PTX (the kernel's, the newest file in ``dump``, as the probe reads it).
+    The id ring's EMPTY arrive is the template's one release of a stage that ordinary loads read; tile_dsl.consume's
+    elected form spells it ``@%p mbarrier.arrive.shared::cta.b64 _, [addr]`` (the native arrive writes a state
+    register), and the optimizer may copy it with the walk's loop, so every copy is counted and each must be computed
+    from at least one loaded shared-memory register through an ``and`` with the kernel's LAST parameter
+    (release_zero_arg)."""
+    import warm_stress
+
+    ptxs = sorted(dump.rglob("*.ptx"), key=os.path.getmtime)
+    assert ptxs, f"{case}: no PTX dumped into {dump}"
+    ptx = ptxs[-1].read_text(encoding="utf-8", errors="replace")
+    sites = warm_stress.release_dependence(ptx)
+    helper = [site for site in sites if re.search(r"mbarrier\.arrive\.shared::cta\.b64\s+_\s*,", site.text)]
+    listing = "\n".join(f"  line {s.line}: dependent={s.dependent} loaded registers={s.loaded_registers} param={s.parameter} :: {s.text}" for s in sites)
+    if not switches["causal_claim"]:
+        assert not helper and not any(site.dependent for site in sites), f"{case}: a release-zero arrive on a record without the claim ring:\n{listing}"
+        return
+    assert helper, f"{case}: no tile_dsl.consume arrive in the claim record's PTX:\n{listing}"
+    assert all(site.text.startswith("@%p") for site in helper), f"{case}: the id ring's EMPTY arrive must be the elected (predicated) form:\n{listing}"
+    warm_stress.assert_release_dependence(ptx, sites=len(helper), words=1)
+    entry = re.search(r"\.entry\s+(\w+)", ptx)
+    indices = [int(i) for i in re.findall(rf"\b{re.escape(entry.group(1))}_param_(\d+)\b", ptx)] if entry else []
+    last = f"{entry.group(1)}_param_{max(indices)}" if indices else None
+    assert last is not None and all(site.parameter == last for site in helper), f"{case}: the mask is not the kernel's last parameter ({last}):\n{listing}"
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, marks=_level(c in _L0_SASS)) for c in _SASS_CASES])
 def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case):
     """The (24, 240, 240) setmaxnreg split survives into SASS (min_blocks_per_mp=1 on the launch;
     python/cudnn/AGENTS.md: ptxas otherwise drops it silently), the compute body does not spill and stays
     under the 240-register budget, and ptxas keeps the QK and PV WGMMA groups pipelined (no C7511/C7513
     serialization advisory), for every switch record and body in _SASS_CASES. The switch must really
     compile: a wait_group(1) appears exactly under overlap. A causal persistent case (_FP64_GUARD) holds no FP64
-    instruction on the narrow path of its compute KV loop, in the loops _KV_LOOPS counts."""
+    instruction on the narrow path of its compute KV loop, in the loops _KV_LOOPS counts. The rendering pin of
+    python/cudnn/AGENTS.md Rule 11 (python/cudnn/sdpa/AGENTS.md S15) reads the same PTX: the claim record's id-ring
+    EMPTY arrives (tile_dsl.consume, the predicated ``mbarrier.arrive.shared::cta.b64 _, [...]``) are each computed
+    from the loaded id through an ``and`` with the kernel's last parameter, the release-zero
+    (warm_stress.assert_release_dependence); every other record has no such arrive and no dependent site."""
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
@@ -1622,6 +1940,7 @@ def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, case
     arg = json.dumps({"switches": switches, "causal": causal, "ctas": ctas, "shape": shape, **order})
     proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), arg, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({case}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    _assert_claim_release_rendering(case, switches, dump)
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))

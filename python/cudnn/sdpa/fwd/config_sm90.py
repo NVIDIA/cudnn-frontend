@@ -539,8 +539,9 @@ class TemplateParams:
     # c, and every later one is the CTA count plus a ticket the producer warp takes from an Int32 counter at the meta
     # pointer (word 0 of the caller's workspace, which the launcher zeroes on the launch stream before every launch),
     # the items numbered group-major (d128_claim_coords). It requires persistent and causal, causal_walk 0 and
-    # sched_policy NATURAL, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. No adapter sets
-    # it yet: a launch must first bind the counter's workspace. D512 refuses it.
+    # sched_policy NATURAL, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. SdpaFwdDslSm90
+    # sets it from api_dsl.D128_CAUSAL_CLAIM on causal persistent records the route keeps, above
+    # api_dsl.D128_CLAIM_MIN_ROUNDS rounds of items per CTA. D512 refuses it.
     causal_claim: int = 0
 
 
