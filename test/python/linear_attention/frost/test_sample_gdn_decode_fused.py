@@ -4,9 +4,10 @@
 """The numbered sample of the fused GDN decode step (``samples/frost/linear_attention/26_gdn_decode_fused.py``), loaded by path and run
 through its ``main()``: on a device the entry serves (compute capability 10.x or 12.x with the CuTe DSL at its floor) the sample must
 print ``[26] PASS`` -- its own checks against the fp64-accumulated PyTorch step, the replay and the batch-invariance comparison -- and the
-line is recorded for the job log; on any other CUDA device it must print the entry's typed decline after ``[26] SKIP``; without a CUDA
-device, and with a cuDNN Frontend that does not carry the entry, it must print its own ``SKIP`` sentence (both patched in: no kernel is
-involved, so these two cases run on every GPU class)."""
+line is recorded for the job log; where the entry does not serve the device, ``NOT RUN`` with the reason is recorded in its place, so a
+job log never reads the same with and without the self-check.  On any other CUDA device the sample must print the entry's typed decline
+after ``[26] SKIP``; without a CUDA device, and with a cuDNN Frontend that does not carry the entry, it must print its own ``SKIP``
+sentence (both patched in: no kernel is involved, so these two cases run on every GPU class)."""
 
 import importlib.util
 from pathlib import Path
@@ -24,6 +25,7 @@ from cudnn.linear_attention.frost import gdn_decode_fused as entry  # noqa: E402
 pytestmark = [pytest.mark.L0]
 
 SAMPLE = Path(__file__).resolve().parents[4] / "samples/frost/linear_attention/26_gdn_decode_fused.py"
+RECORD = "sample 26 gdn decode fused"  # the key of the job-log record: the sample's PASS line, or NOT RUN with the reason
 
 
 def _load_sample():
@@ -49,6 +51,22 @@ def _served_or_reason():
     return entry._dsl_version_error()
 
 
+def _served_or_skip():
+    """Skip unless the entry serves this device.  The reason is recorded first: the CI jobs run without ``-r``, so a skip reason never
+    reaches the job log by itself."""
+    reason = _served_or_reason()
+    if reason is not None:
+        frost_routing.measured(RECORD, f"NOT RUN: {reason}")
+        pytest.skip(reason)
+
+
+def _verdict(out: str) -> str:
+    """The one ``[26] PASS`` line of a run that did not skip."""
+    verdict = [line for line in out.splitlines() if line.startswith("[26] PASS")]
+    assert len(verdict) == 1 and "[26] SKIP" not in out, out
+    return verdict[0]
+
+
 def test_sample_skips_by_name_without_a_cuda_device(monkeypatch, capsys):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert _run_sample(capsys).splitlines() == ["[26] SKIP  needs a CUDA GPU"]
@@ -71,11 +89,27 @@ def test_sample_prints_the_typed_decline_on_an_unserved_device(capsys):
     assert len(lines) == 1 and lines[0].startswith("[26] SKIP  ") and len(lines[0]) > len("[26] SKIP  "), lines
 
 
+def test_a_skipped_self_check_is_recorded_for_the_job_log(monkeypatch):
+    """A job whose device the entry does not serve must not read like one that ran the sample (the same counts, no line): the skip
+    leaves ``NOT RUN`` with the reason under the key the PASS line is recorded under."""
+    recorded = {}
+    monkeypatch.setattr(frost_routing, "measured", recorded.__setitem__)
+    monkeypatch.setattr(entry, "cc_supported", lambda cc: False)
+    with pytest.raises(pytest.skip.Exception):
+        _served_or_skip()
+    assert list(recorded) == [RECORD] and recorded[RECORD].startswith("NOT RUN: the fused GDN decode step serves compute capability "), recorded
+
+
 def test_sample_checks_itself_on_a_served_device(capsys):
-    reason = _served_or_reason()
-    if reason is not None:
-        pytest.skip(reason)
-    out = _run_sample(capsys)
-    verdict = [line for line in out.splitlines() if line.startswith("[26] PASS")]
-    assert len(verdict) == 1 and "[26] SKIP" not in out, out
-    frost_routing.measured("sample 26 gdn decode fused", f"cc {torch.cuda.get_device_capability()} {verdict[0]}")
+    _served_or_skip()
+    verdict = _verdict(_run_sample(capsys))
+    assert verdict.endswith("replay bitwise, batch invariance bitwise)"), verdict  # the default run compares 1 row with 4
+    frost_routing.measured(RECORD, f"cc {torch.cuda.get_device_capability()} {verdict}")
+
+
+def test_sample_claims_batch_invariance_only_after_comparing_row_counts(capsys):
+    """With a single row count no run is compared with another, and the PASS line must say so instead of claiming the comparison."""
+    _served_or_skip()
+    _load_sample().main(row_counts=(2,))
+    verdict = _verdict(capsys.readouterr().out)
+    assert verdict.endswith("replay bitwise, batch invariance not checked (one row count))"), verdict

@@ -25,15 +25,33 @@ alone) and at 4 rows, and checks:
 * the 8-bit output and the state against a plain PyTorch step that keeps every bf16 / fp32 cast of the fused
   step and accumulates in fp64, chained over all steps on its own pool;
 * a replay from the pool's snapshot, byte for byte;
-* sequence 0 alone against sequence 0 among 4, byte for byte, and that a step touches only the slots it names.
+* sequence 0 alone against sequence 0 among 4, byte for byte (only when more than one row count runs), and that a
+  step touches only the slots it names.
+
+The pool has six slots for the 4 sequences and names them out of row order (slots 2, 4, 1, 3), so the null slot
+and a spare slot stay untouched in every run and a step that used the row number in place of the slot id would
+read and advance the wrong state.
 
 The comparison with the reference is a band, not byte equality: the fused step accumulates in fp32 with its own
 exp / SiLU forms and the reference in fp64, so a value next to the midpoint of two bf16 neighbours is now and then
-rounded to the other one, which changes a few 8-bit output bytes or, in a gate value, moves one head's state by up
-to a bf16 step until the decay removes it.  The script gates the share of equal 8-bit bytes (above 99.9 %) and the
-rms ratio of the state (below 1e-3), which tolerate such isolated flips and fail when an operand is wired wrongly
-or a head reads another head's parameters, and beside the rms ratio it prints the largest error of a state element
-and the share of the state's elements within 1e-4.
+rounded to the other one.  Such a flip changes a few 8-bit output bytes, or most bytes of one head at a step where
+that head's output is nearly zero (the 8-bit codes are dense there), or, in a gate value, it moves one head's state
+by up to a bf16 step until the decay removes it.  The script gates
+
+* over the run: the share of equal 8-bit bytes (above 99.9 %) and the rms ratio of the state after the last step
+  (below 1e-3);
+* per output: its distance from the reference, at most a quarter of the reference's magnitude or, for a value
+  smaller than the rms of the reference's outputs, of that rms (one 8-bit code is at most an eighth of a value);
+* per head of each row: the differing bytes among its outputs away from zero (at least a quarter of that rms in
+  the reference), at most max(32, steps) over the run.
+
+The two gates over the run fail when an operand is wired wrongly or a head reads another head's parameters at every
+step.  The other two resolve one head of one row at one step: they fail when a head reads another head's ``z`` for
+a single step or has a few wrong bytes at every step, and in most cases when it loses one state update or reads
+another head's gate parameters for a single step.  What stays below them is as small as the rounding itself: an
+error of one bf16 unit in one head's bias, a wrong byte that lies within the tolerance, a single-step fault whose
+effect the decay removes within a step or two.  Beside the state's rms ratio the script prints the largest error of
+a state element and the share of the state's elements within 1e-4.
 
 It prints the compile time of each row count and the memory the run took.  The entry serves compute capability
 10.x and 12.x GPUs with nvidia-cutlass-dsl >= 4.8.0; elsewhere it declines by type and the script prints that
@@ -70,15 +88,23 @@ def _draw(steps, seqs, K, V, hidden, device, seed):
         out_scale=torch.tensor([0.05], device=device),
         ba_weight=rn(2 * V, hidden, std=hidden**-0.5).bfloat16(),  # the b row of every V head, then the a rows
     )
-    pool = dict(  # slot 0 is the null slot; sequence n owns slot n + 1
-        state=rn(seqs + 1, V, D, D, std=0.1),
-        conv_state=rn(seqs + 1, TAPS, C).bfloat16().transpose(-1, -2),  # [slots, C, 3] over channel-innermost storage
+    pool = dict(  # slot 0 is the null slot; one slot more than the sequences need, so a spare slot stays unnamed (see _slot_ids)
+        state=rn(seqs + 2, V, D, D, std=0.1),
+        conv_state=rn(seqs + 2, TAPS, C).bfloat16().transpose(-1, -2),  # [slots, C, 3] over channel-innermost storage
     )
     inputs = SimpleNamespace(
         qkvz=rn(steps, seqs, C + V * D).bfloat16(),  # the in-projection's output row: x = [:C], z = [C:]
         hidden=rn(steps, seqs, hidden).bfloat16(),  # the normed hidden the b / a projection reads
     )
     return weights, pool, inputs
+
+
+def _slot_ids(seqs, device):
+    """The slot of every sequence: the even slots first, then the odd ones ([2, 4, 1, 3] for 4 sequences).  The ids are out of row order,
+    none is its row number + 1 and, past row 0, none is the first id plus the row number, so a step that addressed the pool by the row
+    instead of the id it was given would read and advance other slots; one slot beside the null slot is named by no sequence."""
+    order = list(range(2, seqs + 2, 2)) + list(range(1, seqs + 2, 2))
+    return torch.tensor(order[:seqs], dtype=torch.int32, device=device)
 
 
 def _operands(rows, t, w, pool, inputs, slots):
@@ -135,12 +161,6 @@ def _rms_ratio(out, ref):
     return ((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-12)).item()
 
 
-def _codes(q):
-    """e4m3 bytes as signed integers: neighbouring representable values are one apart."""
-    b = q.view(torch.uint8).to(torch.int16)
-    return torch.where(b >= 128, 128 - b, b)
-
-
 def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: int = 5120, eps: float = 1e-6, seed: int = 0) -> None:
     if not torch.cuda.is_available():
         print("[26] SKIP  needs a CUDA GPU")
@@ -155,7 +175,7 @@ def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: i
     torch.cuda.reset_peak_memory_stats(device)
     seqs = max(row_counts)
     weights, pool, inputs = _draw(steps, seqs, K, V, hidden, device, seed)
-    slots = torch.arange(1, seqs + 1, dtype=torch.int32, device=device)
+    slots = _slot_ids(seqs, device)
     snapshot = {name: t.clone() for name, t in pool.items()}
 
     def restore():
@@ -182,46 +202,57 @@ def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: i
         replay = _run(step, rows, steps, weights, pool, inputs, slots)
         torch.cuda.synchronize()
         assert _same_bytes(run["q"], replay) and all(_same_bytes(pool[name], run["pool"][name]) for name in pool), f"rows={rows}: the replay differs"
-        for name, t in run["pool"].items():  # the null slot and the slots of the sequences that did not step are untouched
-            untouched = _same_bytes(t[0], snapshot[name][0]) and _same_bytes(t[rows + 1 :], snapshot[name][rows + 1 :])
-            assert untouched, f"rows={rows}: {name} moved in a slot the steps did not name"
+        idle = torch.ones(seqs + 2, dtype=torch.bool, device=device)  # the null slot, the spare slot and the sequences that did not step
+        idle[slots[:rows].long()] = False
+        for name, t in run["pool"].items():
+            assert _same_bytes(t[idle], snapshot[name][idle]), f"rows={rows}: {name} moved in a slot the steps did not name"
 
     # ---- the plain PyTorch step, chained over every step on its own pool ----------------------------------------
-    # Gated: the share of equal 8-bit bytes and the rms ratio of the state (see the docstring: a bf16 midpoint flip moves a few bytes
-    # or one head's state, and a bound on the largest element would pass or fail by which element flips).  Printed beside the rms
-    # ratio: the largest error of a state element and the share of elements within 1e-4, both relative to the state's largest entry
-    # (to 1 when that is smaller).
+    # Gated over the run: the share of equal 8-bit bytes and the rms ratio of the state.  Gated per output and per head of each row, so
+    # that a fault confined to one head or to one step is seen (see the docstring): the error of an output in units of the reference's
+    # magnitude (of the rms of the reference's outputs where the value is smaller), and the differing bytes of a head of a row among its
+    # outputs away from zero (at least a quarter of that rms).  Printed beside the state's rms ratio: the largest error of a state
+    # element and the share of elements within 1e-4, both relative to the state's largest entry (to 1 when that is smaller).
     ref_pool = {name: t.clone() for name, t in snapshot.items()}
     q_ref = torch.stack([_reference_step(seqs, t, weights, ref_pool, inputs, slots, eps) for t in range(steps)])
-    worst_equal, worst_rms, worst_element, worst_inside = 1.0, 0.0, 0.0, 1.0
+    head_bound = max(32, steps)
+    worst_equal, worst_output, worst_head, worst_rms, worst_element, worst_inside = 1.0, 0.0, 0, 0.0, 0.0, 1.0
     for rows, run in runs.items():
-        live = slice(1, rows + 1)
+        live = slots[:rows].long()
         q, state, state_ref = run["q"], run["pool"]["state"][live], ref_pool["state"][live]
-        differ = (q.view(torch.uint8) != q_ref[:, :rows].view(torch.uint8)).sum().item()
+        unequal = q.view(torch.uint8) != q_ref[:, :rows].view(torch.uint8)  # [steps, rows, V, 128]
+        out, ref = q.double(), q_ref[:, :rows].double()  # the 8-bit values
+        rms = ref.pow(2).mean().sqrt()
+        off = (out - ref).abs() / ref.abs().clamp_min(rms)
+        head_bytes = (unequal & (ref.abs() >= rms / 4)).sum(-1).sum(0)  # of each head of each row over the run: [rows, V]
+        differ, e_output, e_head = unequal.sum().item(), off.max().item(), head_bytes.max().item()
         equal = 1 - differ / q.numel()
-        apart = (_codes(q) - _codes(q_ref[:, :rows])).abs().max().item()
         r_state = _rms_ratio(state, state_ref)
         distance = (state.double() - state_ref.double()).abs() / state_ref.abs().max().clamp_min(1.0)
         e_state, inside = distance.max().item(), (distance <= 1e-4).double().mean().item()
+        at_step, at_row, at_head, _ = (int(i) for i in torch.unravel_index(off.argmax(), off.shape))
+        row, head = divmod(head_bytes.argmax().item(), V)
         assert _same_bytes(run["pool"]["conv_state"][live], ref_pool["conv_state"][live]), f"rows={rows}: the conv history is not the last three tokens"
         assert equal > 0.999, f"rows={rows}: {equal:.4%} of the 8-bit outputs equal the reference"
+        assert e_output <= 0.25, f"rows={rows}: an output of head {at_head} of row {at_row} at step {at_step} is {e_output:.3g} units from the reference"
+        assert e_head <= head_bound, f"rows={rows}: head {head} of row {row} differs from the reference in {e_head} bytes away from zero over the {steps} steps"
         assert r_state < 1e-3, f"rows={rows}: state rms ratio {r_state:.3g}"
-        worst_equal, worst_rms = min(worst_equal, equal), max(worst_rms, r_state)
-        worst_element, worst_inside = max(worst_element, e_state), min(worst_inside, inside)
+        worst_equal, worst_output, worst_head = min(worst_equal, equal), max(worst_output, e_output), max(worst_head, e_head)
+        worst_rms, worst_element, worst_inside = max(worst_rms, r_state), max(worst_element, e_state), min(worst_inside, inside)
         print(
-            f"[26] rows={rows}  8-bit outputs equal {equal:.3%} ({differ} of {q.numel()} differ, largest code distance {apart})  "
+            f"[26] rows={rows}  8-bit outputs equal {equal:.3%} ({differ} of {q.numel()} differ; largest error of one output {e_output:.3f}; "
+            f"away from zero, one head of one row differs in at most {e_head} of its bytes)  "
             f"state rms {r_state:.1e} (largest element {e_state:.1e}, {inside:.4%} of the elements within 1e-4)  replay bitwise"
         )
 
-    # ---- a sequence's bytes do not depend on its neighbours: every run against the widest one ------------------------
-    wide = runs[seqs]
-    for rows, run in runs.items():
-        if rows == seqs:
-            continue
-        live = slice(1, rows + 1)
+    # ---- a sequence's bytes do not depend on its neighbours: every narrower run against the widest one ---------------
+    wide, narrower = runs[seqs], [rows for rows in runs if rows != seqs]
+    for rows in narrower:
+        run, live = runs[rows], slots[:rows].long()
         same_slots = all(_same_bytes(run["pool"][name][live], wide["pool"][name][live]) for name in pool)
         assert _same_bytes(run["q"], wide["q"][:, :rows]), f"rows={rows}: the 8-bit outputs differ from the same sequences among {seqs}"
         assert same_slots, f"rows={rows}: the slots differ from the same sequences among {seqs}"
+    invariance = "batch invariance bitwise" if narrower else "batch invariance not checked (one row count)"
 
     mib = 2**20
     taken = (free_start - torch.cuda.mem_get_info(device)[0]) / mib
@@ -229,8 +260,8 @@ def main(steps: int = 32, row_counts=(1, 4), K: int = 16, V: int = 48, hidden: i
     print(f"[26] memory: tensors peak {peak:.0f} MiB (allocator {reserved:.0f} MiB); device {taken:+.0f} MiB since the start (other processes count)")
     print(
         f"[26] PASS  gdn decode step (fused)     K={K} V={V} hidden={hidden} steps={steps} rows={list(row_counts)} "
-        f"(8-bit equal {worst_equal:.3%}, state rms {worst_rms:.1e}, largest element {worst_element:.1e}, {worst_inside:.4%} within 1e-4, "
-        f"replay and batch invariance bitwise)"
+        f"(8-bit equal {worst_equal:.3%}, largest output error {worst_output:.3f}, away from zero one head differs in at most {worst_head} of its bytes, "
+        f"state rms {worst_rms:.1e}, largest element {worst_element:.1e}, {worst_inside:.4%} within 1e-4, replay bitwise, {invariance})"
     )
 
 
