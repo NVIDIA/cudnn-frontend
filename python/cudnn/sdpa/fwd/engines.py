@@ -3884,7 +3884,7 @@ def lower_dsl_prefill(
                         )
                     )
                 )
-                or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
+                or (facts.is_fp8 and (facts.has_paged_kv or (facts.d_qk, facts.d_v) == (128, 128)) and api.split_kv == 1)
             )
         )
         or (
@@ -4153,13 +4153,7 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
-        if facts.thd and (
-            "sample_ragged_q" in _ctor_params
-            or (
-                spec.name in ("sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8")
-                and getattr(api, "_thd_origin_specs", None) is not None
-            )
-        ):
+        if facts.thd and ("sample_ragged_q" in _ctor_params or getattr(api, "_thd_origin_specs", None) is not None):
             for name in ("q", "k", "v", "o", "stats"):
                 offsets = getattr(binding, "ragged_" + name)
                 execute_kwargs["ragged_" + ("lse" if name == "stats" else name)] = (

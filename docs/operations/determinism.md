@@ -82,6 +82,7 @@ arbitrary user callbacks.
 | FROST native D64 dense/THD paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
@@ -516,3 +517,17 @@ also doubles live O exactly while leaving Stats and padding unchanged.
 This is fixed-runtime forward evidence. SM121 physical-gap execution,
 other runtime combinations and backward are unverified by this suite.
 See the coverage report for numerical, golden and sanitizer results.
+
+## SM100 per-tensor FP8 THD physical origins
+
+Native D128 E4M3/E5M2 forward preserves O/Stats bytes across repeated
+execution, batch reordering/duplication, an isolated sequence, changed
+neighbors and retained CUDA Graph replay on the tested SM100 runtime.
+The unsplit, unpacked CGA2 cases bind independent Q/K/V/O/Stats origins,
+including mixed offset widths and multipliers, physical padding, changed
+strides, and empty/keyless transitions. Token/head-major Stats and BF16
+output are covered. The prepared and standalone graph routes agree.
+
+SM103 lowering compiles, but its GPU execution remains unverified. This
+suite does not qualify wider heads, MXFP8, SM107 or backward. See the
+coverage report for exact configurations and validation receipts.

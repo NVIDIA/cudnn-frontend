@@ -416,6 +416,15 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         s.origin_specs is not None
         and s.quant is not None
         and not s.paged
+        and not s.quant.sf_sizes
+        and "thd_origin_caps" not in s.index
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_fp8_origin_maps", False)
+    ):
+        raise NotImplementedError("nonpaged FP8 physical THD tensor maps require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.quant is not None
+        and not s.paged
         and s.quant.sf_sizes
         and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_mxfp8_physical_origins", False)
     ):

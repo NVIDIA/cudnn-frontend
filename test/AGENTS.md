@@ -530,7 +530,10 @@ Packing, reference unpacking and output masks must all use the selected port's
 origins; masking everything after `sum(seq_lens)` drops valid gapped outputs.
 `test_mhas_v2.py::test_sdpa_physical_origins_L0` exercises the shared harness,
 and `frost/test_sdpa_physical_origins_shared.py` pins the native SM120 route so
-backend fallback cannot hide a missing kernel repair.
+backend fallback cannot hide a missing kernel repair. The SM100 selected entry
+`test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
+FP8 D128 cases and checks both prepared and standalone graph execution.
+Default-provider passes alone cannot qualify an advertised native path.
 
 ### CUDA Graph test lifetimes
 
