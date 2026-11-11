@@ -1428,3 +1428,8 @@ origins. Uniform lengths hide a lowering that substitutes compact prefixes
 for the graph's Q/O/Stats offsets. `TestPagedD64PhysicalOrigins` covers both
 unsplit and packed/unpacked split plans, changed offsets and strides, poisoned
 padding, and retained capture; D128/D256 coverage cannot prove D64 forwarding.
+
+For D64, a CGA1 knob does not uniquely identify the body: short query envelopes
+select the decode tile, while larger THD queries select prefill. Physical-origin
+coverage must straddle that envelope boundary and assert the actual template.
+`TestPagedD64PhysicalOrigins` retains both bodies, changed bindings and empty replay.
