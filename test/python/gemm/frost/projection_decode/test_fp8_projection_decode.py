@@ -8,13 +8,15 @@ the entry against an fp64 reference of the E4M3 operands under a per-element bou
 the edge rows (zeros, NaN, overflow), the output rows it must not touch, every performance arm bitwise with the default, a row alone
 against the same row in a batch, CUDA-graph replay, the warm call (a cache hit that reads nothing to the host and allocates nothing),
 the launch matrix in a child process with a stage-aware deadline, and a warm stress with byte references.
-The operand builders, the reference and the device gate live in ``fp8_projection_decode_utils.py`` beside this module."""
+The operand builders, the reference and the device gate live in ``fp8_projection_decode_utils.py`` beside this module; replay, batch
+invariance per row count, the pick's byte neutrality and the goldens live in ``test_fp8_projection_decode_determinism.py``."""
 
 import inspect
 import subprocess
 import sys
 import textwrap
 from dataclasses import fields, replace
+from pathlib import Path
 
 import pytest
 
@@ -49,6 +51,7 @@ pytestmark = [pytest.mark.L0, pytest.mark.no_workspace_shim]
 
 Form, Numerics, Geometry = kcfg.Form, kcfg.Numerics, kcfg.Geometry
 C_IN4, C_IN2, C_OUT2 = CLASSES
+REPO = Path(__file__).resolve().parents[5]  # <repo>/test/python/gemm/frost/projection_decode/<this file>
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -252,6 +255,29 @@ def test_served_classes_decline_every_other_pair_by_name():
         kcfg.check_numerics((4608, 8192))
 
 
+def test_a_split_that_does_not_cut_the_k_tiles_evenly_is_declined_by_value(monkeypatch):
+    """Every served geometry has a K tile count that 1 / 2 / 4 all divide, so the uneven-cut decline is shown on a modelled geometry of
+    three K tiles admitted for this test only."""
+    odd = Geometry(64, 3 * kcfg.K_TILE)
+    monkeypatch.setattr(kcfg, "SERVED_GEOMETRIES", kcfg.SERVED_GEOMETRIES + (odd,))
+    with pytest.raises(ValueError, match="split_k 2 does not cut the 3 K tiles"):
+        kcfg.check_numerics(odd, 2)
+    with pytest.raises(NotImplementedError, match="validated"):
+        kcfg.check_numerics(odd)  # split 1 by the geometry rule: a legal cut, not a served class
+
+
+def test_validator_declines_a_geometry_of_another_type_and_the_pick_an_unmeasured_class():
+    with pytest.raises(TypeError, match="Cfg.GEOM must be a Geometry"):
+        kcfg.validate_cfg(_cfg(GEOM=(4608, 8192)))
+    with pytest.raises(ValueError, match="STAGES must be a positive int"):
+        kcfg.validate_cfg(_cfg(STAGES=7.0))
+    with pytest.raises(NotImplementedError, match="no measured form for out features 4608, in features 8192, split_k 1"):
+        kcfg.pick(Numerics(G_IN, 1), 1, **SM100_READING)
+    for bad in (dict(sm_count=0), dict(smem_per_sm=-1), dict(smem_optin=True)):
+        with pytest.raises(ValueError, match="positive int"):
+            kcfg.pick(C_IN4, 1, **dict(SM100_READING, **bad))
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # host-only: the entry's typed declines (CPU tensors)
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -345,6 +371,74 @@ def test_binding_check_requires_every_operand_on_the_given_device():
         entry.check_binding(ops["weight"], ops["activation"], ops["scale"], ops["out"], device="cuda:0" if torch.cuda.is_available() else "meta")
 
 
+def test_binding_declines_a_flat_weight_misaligned_operands_and_operands_on_two_devices():
+    """The remaining rows of the binding table: a weight that is not 2-D when no geometry is given, an activation and a scale that do
+    not start at an aligned address, and -- without an entry's device -- operands that do not share the weight's device."""
+    ops = _host_ops()
+    with pytest.raises(ValueError, match=r"weight must be \[out features, in features\]"):
+        entry.check_binding(ops["weight"].reshape(-1), ops["activation"], ops["scale"], ops["out"])
+    odd_activation = from_codes(torch.zeros(3 * 2048 + 1, dtype=torch.uint8))[1:].view(3, 2048)
+    with pytest.raises(ValueError, match="activation must start at a 32-byte aligned address"):
+        call_check(dict(ops, activation=odd_activation))
+    odd_scale = torch.frombuffer(bytearray(16), dtype=torch.float32, count=1, offset=1)
+    assert odd_scale.data_ptr() % 4
+    with pytest.raises(ValueError, match="scale must start at a 4-byte aligned address"):
+        call_check(dict(ops, scale=odd_scale))
+    elsewhere = torch.empty(3, 2048, dtype=E4M3, device="meta")
+    with pytest.raises(ValueError, match="weight's .*activation is on meta"):
+        entry.check_binding(ops["weight"], elsewhere, ops["scale"], ops["out"])
+
+
+def _modelled_cuda_entry(monkeypatch, readings, cc=(10, 3), **kw):
+    """An entry for ``cuda:0`` on MODELLED part facts -- ``readings`` = (shared memory per SM, per-CTA opt-in, multiprocessors) and the
+    compute capability -- so the declines of a part are reachable on any host; no device is touched (construction is host work)."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: cc)
+    monkeypatch.setattr(entry, "device_readings", lambda device: readings)
+    return entry.Fp8ProjectionDecode("cuda:0", **kw)
+
+
+def test_an_unserved_cuda_part_declines_at_construction_by_name(monkeypatch):
+    for cc in ((12, 0), (9, 0), (8, 0)):
+        with pytest.raises(NotImplementedError, match=rf"10\.x.*{cc[0]}\.{cc[1]}"):
+            _modelled_cuda_entry(monkeypatch, (233472, 232448, 152), cc=cc, geometry=G_IN)
+    for cc in ((10, 0), (10, 3), (10, 7)):
+        assert _modelled_cuda_entry(monkeypatch, (233472, 232448, 152), cc=cc, geometry=G_IN).device_cc == cc
+
+
+def test_part_facts_decline_by_type_at_construction_and_the_pick_adapts_where_it_can(monkeypatch):
+    """A part whose per-CTA opt-in cannot hold a one-stage CTA is the pick's ``NotImplementedError``; a GIVEN form the part cannot hold
+    while the SM100-class reference part can is a ``NotImplementedError`` too (a part fact, not a knob error); on a part with 100 KB per
+    SM the pick lowers the ring depth instead of declining, and every row count stays one wave."""
+    with pytest.raises(NotImplementedError, match="does not serve this part: a one-stage CTA"):
+        _modelled_cuda_entry(monkeypatch, (16 * 1024, 15 * 1024, 152), geometry=G_IN)
+    with pytest.raises(NotImplementedError, match="does not serve this part at 1 rows"):
+        _modelled_cuda_entry(monkeypatch, (100 * 1024, 99 * 1024, 152), geometry=G_IN, form=Form(STAGES=11))
+    k = _modelled_cuda_entry(monkeypatch, (100 * 1024, 99 * 1024, 152), geometry=G_IN)
+    assert k.readings == dict(SMEM_PER_SM_BYTES=100 * 1024, SMEM_OPTIN_BYTES=99 * 1024, SM_COUNT=152)
+    assert (k.cfg_for(1).STAGES, k.cfg_for(9).STAGES, k.cfg_for(17).STAGES) == (4, 3, 2) and all(c.WAVES == 1 for c in k.cfgs.values())
+    assert {c.SPLIT_K for c in k.cfgs.values()} == {4}, "a smaller part changes the form, never the split"
+
+
+def test_compile_declines_by_name_before_the_kernel_module_is_imported(monkeypatch):
+    """The DSL gate at the plan-time compile of a CUDA entry: not installed, below the floor, and a cc 10.7 part with a DSL that has no
+    ``sm_107a`` target -- each a ``NotImplementedError`` that names what is missing, raised before the kernel module is imported."""
+    from cudnn.frost import buffers
+
+    k = _modelled_cuda_entry(monkeypatch, (233472, 232448, 152), geometry=G_OUT)
+    monkeypatch.setattr(buffers, "_DSL_STATE", (False, None))
+    with pytest.raises(NotImplementedError, match="not installed"):
+        k.compile(1)
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.7.1")))
+    with pytest.raises(NotImplementedError, match=r"4\.8\.0.*4\.7\.1|4\.7\.1.*4\.8\.0"):
+        k.compile()
+    rubin = _modelled_cuda_entry(monkeypatch, (233472, 232448, 212), cc=(10, 7), geometry=G_OUT)
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    with pytest.raises(NotImplementedError, match="sm_107a"):
+        rubin.compile(1)
+    assert not k.compiled and not rubin.compiled and k._kernel_module is None and rubin._kernel_module is None
+
+
 def test_host_entry_keeps_the_reference_readings_and_a_given_form_overrides_the_pick():
     k = entry.Fp8ProjectionDecode("cpu", G_IN)
     assert k.split_k == 4 and k.numerics == C_IN4 and k.form is None and k.device_cc is None
@@ -423,6 +517,36 @@ def test_cudnn_level_export_resolves_to_the_entry():
     assert pkg.Fp8ProjectionDecode is entry.Fp8ProjectionDecode and pkg.Geometry is Geometry and pkg.Form is Form
     assert "Fp8ProjectionDecode" in cudnn._LAZY_OPTIONAL_IMPORTS and "Fp8ProjectionDecode" in cudnn._OPTIONAL_DEPENDENCY_INSTALL_HINTS
     assert {"Fp8ProjectionDecode", "ProjectionGeometry", "ProjectionForm"} <= set(gemm.__all__)
+
+
+def test_docs_rows_exist_for_the_api():
+    """The determinism status page carries the API's row -- SM90 unsupported (declined by type); SM100/103 verified on cc 10.3 only, so
+    the cell names the cc 10.0 gap inside the shared column; SM107 supported (verified on cc 10.7) -- and its required-settings bullet;
+    the goldens README carries the suite's row and section; the operation page, its navigation entry, the overview line and the
+    ``llms.txt`` line exist; and the page's byte-class table names exactly the classes the entry serves."""
+    det = (REPO / "docs" / "operations" / "determinism.md").read_text()
+    row = [line for line in det.splitlines() if line.startswith("| `Fp8ProjectionDecode`")]
+    assert len(row) == 1, "one Fp8ProjectionDecode row on the status page"
+    cells = [c.strip() for c in row[0].strip("|").split("|")]
+    assert cells[1] == "fprop (inference step)" and cells[3] == "Unsupported", cells
+    assert cells[4] == "SM100: Unverified; SM103: Supported" and cells[5] == "Supported", cells
+    assert "FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism" in det
+    readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
+    assert "`Fp8ProjectionDecode`" in readme and "test_fp8_projection_decode_determinism.py" in readme
+    assert "### FP8 projection for decode rows" in readme
+    page = REPO / "docs" / "operations" / "gemm_fusions" / "fp8_projection_decode.md"
+    assert page.exists()
+    text = page.read_text()
+    served = [line for line in text.splitlines() if line.startswith("| `ProjectionGeometry(")]
+    assert len(served) == len(kcfg.SERVED_CLASSES)
+    for numerics, line in zip(kcfg.SERVED_CLASSES, served):
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        assert cells[0] == f"`ProjectionGeometry({numerics.GEOM.OUT_FEATURES}, {numerics.GEOM.IN_FEATURES})`" and cells[1] == str(numerics.SPLIT_K), cells
+    for token in ("rows 1 .. 32", "compute capability 10.x", f"nvidia-cutlass-dsl >= {entry.DSL_FLOOR_TEXT}", "HOLD_TMEM", "FlashInfer"):
+        assert token in text, token
+    assert "fp8_projection_decode" in (REPO / "docs" / "fern" / "versions" / "latest.yml").read_text()
+    assert "fp8_projection_decode" in (REPO / "docs" / "operations" / "overview.md").read_text()
+    assert "fp8_projection_decode" in (REPO / "llms.txt").read_text()
 
 
 def test_import_cudnn_does_not_import_the_kernel_or_torch():
@@ -557,6 +681,34 @@ def test_edge_rows_zero_nan_and_overflow(numerics):
     ops = dict(weight=from_codes(big_w).to(dev), activation=from_codes(big_x).to(dev), scale=torch.tensor([1.0e30], dtype=torch.float32, device=dev))
     out = _run(k, ops, 1).float()
     assert bool(torch.isinf(out).all()) and bool((out[0, 0::2] > 0).all()) and bool((out[0, 1::2] < 0).all())
+
+
+@pytest.mark.parametrize("numerics", CLASSES, ids=cid)
+def test_extreme_and_subnormal_codes_write_the_host_bytes(numerics):
+    """Edge rows whose every partial sum is exact in fp32 in any order, byte for byte against the host: the largest code everywhere
+    (the largest accumulator the format can reach), the largest code with alternating signs (exact cancellation: zeros), subnormal
+    codes (1 .. 7 units of 2^-9) with and without alternating signs, the smallest magnitude and the largest negative subnormal --
+    against weight rows of the largest code (both signs) and of subnormal codes.  Each row holds one family of codes, so every product
+    of a (row, weight row) pair is a small integer multiple of one unit and every sum stays below 2^24 units."""
+    dev = device_or_skip()
+    g = numerics.GEOM
+    n, kdim = g.OUT_FEATURES, g.IN_FEATURES
+    ki = torch.arange(kdim)
+    alternate = ((ki % 2) << 7).to(torch.uint8)  # + - + - along K
+    subnormal = (1 + ki % 7).to(torch.uint8)  # codes 1 .. 7
+    largest = torch.full((kdim,), MAX_CODE, dtype=torch.uint8)
+    x = torch.stack([largest, largest | alternate, subnormal, subnormal | alternate, torch.full_like(largest, 0x01), torch.full_like(largest, 0x87)])
+    w = torch.empty(n, kdim, dtype=torch.uint8)
+    w[0::4], w[1::4], w[2::4], w[3::4] = largest, largest | 0x80, subnormal.flip(0), subnormal | alternate
+    ops = dict(weight=from_codes(w).to(dev), activation=from_codes(x).to(dev), scale=torch.tensor([2.0**-6], dtype=torch.float32, device=dev))
+    out = _run(_entry(dev, numerics), ops, x.shape[0])
+    torch.cuda.synchronize()
+    exact = ops["activation"].float().double() @ ops["weight"].float().double().t()
+    want = (exact * ops["scale"].double().reshape(())).float().to(torch.bfloat16)
+    assert bool(torch.isfinite(want.float()).all()) and float(exact.abs().max()) == 448.0 * 448.0 * kdim
+    assert int((want[2:].float() != 0).sum()) > 0.75 * want[2:].numel(), "the subnormal rows of the host result are not a zero test"
+    assert_same_bytes(out, want, f"{cid(numerics)} extreme and subnormal codes")
+    assert int((out[1, 0::4].float() != 0).sum()) == 0 and int((out[1, 1::4].float() != 0).sum()) == 0, "exact cancellation"
 
 
 @pytest.mark.parametrize("numerics", CLASSES, ids=cid)
