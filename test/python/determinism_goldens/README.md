@@ -16,6 +16,7 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -33,6 +34,54 @@ pytest core/test_determinism_utils.py
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
+
+### GLU + Hadamard + quant column-scale packing — SM100, 2026-11-11
+
+The shared columnwise scale store now writes standard GEMM 128x4 scale atoms.
+The existing reference decoder independently gathers those physical bytes
+before checking scales and dequantized RHT values. A negative-control run of
+the updated column-scale test against pristine `683f294b` failed: 3626 of 4096
+scale elements mismatched, with maximum absolute error 93. The legacy decoder
+was self-consistent with the old producer; this fixes its GEMM consumer contract.
+
+Qualification used the edited `683f294b` checkout on NVIDIA GB200 (SM100,
+152 SMs), driver 580.126.20, PyTorch 2.13.0a0+8145d630e8.nv26.06 / CUDA 13.3,
+cuDNN backend 92600, and CuTe DSL 4.8.0 compiling with CUDA 13.4. Import-path
+and source-hash checks confirmed the tested checkout. Results:
+
+- Existing Torch quantization suite: **17 passed, 6 Rubin-only skips**, 17.24 s.
+- New determinism suite: **5 passed**, 11.93 s. The default 32-channel interleaved
+  input uses expert M=[256,0,512], N=256/2048, K=512. Separate independent
+  GEMM/SwiGLU/H16/dequantization checks accompany raw-byte comparisons of every
+  output across fresh allocations, concurrent work, changed-weight/scale graph
+  replay, and expert isolation/reordering/duplication/removal/changed neighbors.
+- JAX selection: **16 passed, 196 deselected**, 45.53 s, using isolated JAX 0.11.1
+  and NumPy 2.2.6. Columnwise cases use an independent input dequantization and
+  GEMM/SwiGLU/H16 reference as well as Torch byte parity and compiled replay.
+  The fixture's RHT maximum 25984 exceeds the 10752 range at encode scale 0.25;
+  columnwise RHT therefore uses 1/64 (range 172032), with finite/per-block scale
+  representability assertions. Inputs and numerical tolerances are unchanged.
+
+The warm-stress case uses M=[1024,0,2048], N=2048, K=4096, crossing the staged
+input ring and reusing epilogue buffers. The unsafe control failed 200/200
+launches. The actual kernel had **0 mismatches in 3000 warm and 3000 poisoned
+launches**. These are cold-reference stability checks; the independent numerical
+reference runs separately, not as an exact-byte stress reference. The kernel
+launches 152 blocks (one per SM), below the control's three blocks per SM.
+Each 3000-launch arm bounds the observed per-launch failure rate below 0.0998%
+at 95% confidence for this tested configuration; it does not establish race
+freedom or transfer the control's geometry to this kernel.
+
+SM103, SM107, CUDA 12 compilation and JAX batch invariance remain unverified.
+This is a forward-only fusion; no backward API is claimed. No runtime golden
+or numerical tolerance was changed. From `test/python`, with the edited source
+on the import path:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py -m L0 -q -rs -s
+python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -k glu_hadamard_quant -m L0 -q -rs
+```
 
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 

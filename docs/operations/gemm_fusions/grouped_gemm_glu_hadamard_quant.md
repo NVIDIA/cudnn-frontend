@@ -48,7 +48,26 @@ Let `N_out = N / 2` for `act_func="swiglu"` or `"geglu"` and `N_out = N` for `ac
 
 For packed NVFP4 output tensors (`torch.float4_e2m1fn_x2`), the physical tensor stores two logical values per byte along the innermost dimension. The wrapper therefore allocates packed `D` and rowwise `RHT` tensors with physical second dimension `N_out / 2`. Raw `torch.uint8` tensors are not accepted as a packed FP4 container by this fusion.
 
-Colwise `RHT` is NVFP4-only. Its data tensor is a flat physical tensor of length `valid_m * N_out / 2`; after FP4 unpacking, each expert segment is logical `(N_out, expert_m)` with adjacent token values packed together. Expert segments are concatenated in expert order. `SFRHT colwise` is flat length `valid_m * N_out / sf_vec_size`; each expert segment is `SF(N_out, expert_m)` flattened in expert order, so the scale segment for an expert starts at `N_out * expert_m_prefix / sf_vec_size`.
+Colwise `RHT` is NVFP4-only. Its data tensor is a flat physical tensor of length `valid_m * N_out / 2`; after FP4 unpacking, each expert segment is logical `(N_out, expert_m)` with adjacent token values packed together. Expert segments are concatenated in expert order. `SFRHT colwise` is flat length `valid_m * N_out / sf_vec_size`; each expert segment contains standard GEMM-blocked scale bytes, starting at `N_out * expert_m_prefix / sf_vec_size`.
+
+For logical column scales `S[r, q]`, where `r` indexes features and `q`
+indexes 16-token blocks, let `C = expert_m / 64`. The byte offset within
+one expert's scale segment is:
+
+```text
+512 * ((r / 128) * C + q / 4) + 16 * (r % 32) + 4 * ((r / 32) % 4) + q % 4
+```
+
+Divisions are integer divisions. Physical row-major axes are
+`(N_out/128, expert_m/64, 32, 4, 4)`. Torch and JAX use this contract on both
+Blackwell and Rubin; the kernel writes these bytes directly without a repack.
+
+**Output-format migration:** earlier versions flattened the logical CuTe axes
+`(32, 4, N_out/128, 4, expert_m/64)` in row-major order. That format was
+decodable by its matching reference but differed from GEMM consumers' scale
+packing. Callers decoding that old order must now consume standard GEMM-blocked
+bytes. Public API signatures, tensor lengths, logical scale values, RHT data
+and rowwise outputs are unchanged.
 
 `L` is the expert count. `valid_m` is the `M` extent of `a_tensor`; by contract it must match the final cumulative padded offset in `padded_offsets`.
 
@@ -305,7 +324,7 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
   - NVFP4 colwise `RHT` always requires `SFRHT colwise`
 - Output tensor **SFRHT colwise** (present with colwise `RHT`)
   - Shape: `(valid_m * N_out / sf_vec_size,)`
-  - Layout: flattened per-expert `SF(N_out, expert_m)` segments in expert order
+  - Layout: standard GEMM 128x4 blocked scale bytes per expert, concatenated in expert order; see the physical offset formula above
   - Dtype: `float8_e4m3fn`, independent of `SFA`/`SFB` dtype
 
 ### Configuration
