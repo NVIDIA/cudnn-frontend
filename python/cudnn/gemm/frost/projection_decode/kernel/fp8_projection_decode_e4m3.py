@@ -68,9 +68,11 @@ BARRIER TABLE (all ``cta_group::1``; ``SUM(issuing lanes) == init`` on every pat
                             after their accumulator read and its ``tcgen05.wait`` (the read is complete before the columns can be
                             deallocated) or, under ``HOLD_TMEM``, as the LAST instruction of their role, after every use of the
                             registers that read filled (the remote stores on ranks >= 1; the reduction, the scale and the output
-                            store on rank 0).  Waited by warp 2, which then deallocates.  Warp 2's phase-1
-                            wait is a parity wait: it is correct because the epilogue's 128 entry arrivals (the first instructions of
-                            their role) land long before warp 2 has issued its last K tile.
+                            store on rank 0).  Waited by warp 2, which then deallocates.  Warp 2 waits for
+                            phase 0 in front of its phase-1 arrive: a parity-1 wait issued while phase 0 is still open returns at once,
+                            so the order of the two phases is enforced by that wait and does not rest on when the epilogue threads
+                            enter.  Phase 0 then holds exactly warp 2's first 32 arrivals and the 128 entry arrivals, phase 1 warp 2's
+                            second 32 and the 128 release arrivals.
   bar_reduce (SPLIT_K > 1)  init REDUCE_BAR_ARRIVERS = 1 in every CTA, waited on rank 0 only.  Arrive: rank 0, epilogue thread 0,
                             ``arrive.expect_tx((SPLIT_K - 1) x MMA_M x token tile x 4 B)``, the FIRST instruction of its role (above
                             every shared- and tensor-memory read of the role, and normally before any peer ships); the bytes by every
@@ -488,6 +490,10 @@ class Fp8ProjectionDecodeKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release rendezvous is phase 1 of this barrier, and a parity-1 wait issued while phase 0 is still open returns at once.
+        # Wait for phase 0 first (this warp's 32 arrivals after the allocation + the 128 epilogue entry arrivals): the 32 arrivals
+        # below then belong to phase 1 by construction, and the wait behind them is the wait for the 128 release arrivals.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)

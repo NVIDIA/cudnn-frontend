@@ -174,6 +174,36 @@ def test_smem_mirror_and_barrier_constants():
             assert cfg.K_TILES_PER_SLICE * numerics.SPLIT_K == numerics.GEOM.K_TILES
 
 
+def test_tensor_memory_barrier_phases_are_ordered_by_a_wait():
+    """``bar_tmem_alloc`` is ONE barrier with two phases: phase 0 publishes the tensor-memory base pointer, phase 1 releases the columns.
+    A parity-1 wait issued while phase 0 is still open returns at once, so nothing but a wait may order the two phases: the MMA warp
+    waits for phase 0 in front of its phase-1 arrive (arrive, wait 0, arrive, wait 1, deallocate), and an epilogue thread waits for
+    phase 0 behind its entry arrive and in front of its one release arrive (one site per ``HOLD_TMEM`` arm).  Pinned in the source of
+    the two roles: a role that arrives twice on this barrier without a phase-0 wait between the two arrives fails here."""
+    from cudnn.gemm.frost.projection_decode.kernel import fp8_projection_decode_e4m3 as kernel
+
+    def trace(role):
+        fn = next(n for n in ast.walk(ast.parse(Path(kernel.__file__).read_text())) if isinstance(n, ast.FunctionDef) and n.name == role)
+        ops = []
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            name, args = node.func.attr, node.args
+            on_barrier = bool(args) and isinstance(args[0], ast.Name) and args[0].id == "bar_tmem_alloc"
+            if name == "mbarrier_arrive" and on_barrier:
+                ops.append((node.lineno, "arrive"))
+            elif name == "mbarrier_wait" and on_barrier:
+                assert isinstance(args[1], ast.Constant), f"{role}: the phase of a wait on this barrier is a literal"
+                ops.append((node.lineno, f"wait {args[1].value}"))
+            elif name == "dealloc_tmem":
+                ops.append((node.lineno, "deallocate"))
+        return [op for _, op in sorted(ops)]
+
+    assert trace("mma_warp") == ["arrive", "wait 0", "arrive", "wait 1", "deallocate"]
+    # the epilogue: the entry arrive, the phase-0 wait, then its release arrive -- written once per ``HOLD_TMEM`` arm, one compiled
+    assert trace("epilog_warp") == ["arrive", "wait 0", "arrive", "arrive"]
+
+
 def test_tensor_memory_ledger_declines_a_parked_form_by_name():
     """What the launcher places (shared memory alone) times the columns a CTA allocates must fit an SM's 512: three CTAs of 71,040 B with
     256 columns each do not, and the validator says so; 64 and 128 columns fit beside three, 256 beside two."""
@@ -609,8 +639,6 @@ def test_kernel_module_reads_no_deprecated_name_off_a_dsl_module():
 
 
 def test_cudnn_level_export_resolves_to_the_entry():
-    import importlib
-
     assert cudnn.Fp8ProjectionDecode is entry.Fp8ProjectionDecode
     gemm, pkg = importlib.import_module("cudnn.gemm"), importlib.import_module("cudnn.gemm.frost.projection_decode")
     assert gemm.Fp8ProjectionDecode is entry.Fp8ProjectionDecode and gemm.ProjectionGeometry is Geometry and gemm.ProjectionForm is Form
@@ -722,6 +750,46 @@ def _run(k, ops, rows, out=None):
     got = k(ops["weight"], ops["activation"][:rows], ops["scale"], out)
     assert got is out
     return out
+
+
+def test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current():
+    """An entry built for a device that is NOT the caller's current one compiles and launches on ITS device and leaves the caller's
+    current device as it found it: on the first call (compile + launch), on a warm call, and on a side stream of the entry's device
+    entered while the caller's device is current.  The operand views of a launch are built under the entry's device, like the launch
+    itself.  The bytes are those of the same call made with the entry's device current.  Needs two CUDA devices the kernel serves."""
+    dev = device_or_skip()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    other = torch.device("cuda", (dev.index + 1) % torch.cuda.device_count())
+    cc = torch.cuda.get_device_capability(other)
+    if not entry.cc_supported(cc) or entry.dsl_error(cc) is not None:
+        pytest.skip(f"the second CUDA device ({other}, compute capability {cc[0]}.{cc[1]}) is not one the kernel serves")
+    rows = 5
+    ops = make_operands(G_OUT, rows, other, seed=77, kind="wide")
+    with torch.cuda.device(other):  # the reference: the same call with the entry's device current
+        want = _run(entry.Fp8ProjectionDecode(other, G_OUT), ops, rows).clone()
+        torch.cuda.synchronize(other)
+    assert torch.cuda.current_device() == dev.index
+    k = entry.Fp8ProjectionDecode(other, G_OUT)  # built, compiled and launched while the CALLER's device is current
+    assert k.device == other
+    first = _run(k, ops, rows)  # the first call: compile + launch
+    assert torch.cuda.current_device() == dev.index, "the first call (compile + launch) left the entry's device current"
+    assert first.device == other
+    assert_same_bytes(first, want, "the first call on the entry's device")
+    warm = _run(k, ops, rows)  # a warm call: the launch alone
+    assert torch.cuda.current_device() == dev.index, "a warm call left the entry's device current"
+    assert_same_bytes(warm, want, "a warm call on the entry's device")
+    mine = new_out(G_OUT, rows, other)
+    side = torch.cuda.Stream(device=other)
+    side.wait_stream(torch.cuda.current_stream(other))  # the operands and the fill were produced on the entry's device's current stream
+    with torch.cuda.stream(side):  # the entry's device current, ``side`` its current stream ...
+        with torch.cuda.device(dev):  # ... then the caller's device current again: ``side`` stays the entry's device's current stream
+            _run(k, ops, rows, mine)
+            assert torch.cuda.current_device() == dev.index, "a launch on a side stream of the entry's device left that device current"
+    torch.cuda.current_stream(other).wait_stream(side)
+    assert_same_bytes(mine, want, "the side-stream launch on the entry's device")
+    assert torch.cuda.current_device() == dev.index
+    assert torch.empty(1, device="cuda").device == dev, "the caller's next default-device allocation landed on another device"
 
 
 @pytest.mark.parametrize("kind", ("random", "wide", "structured"))
