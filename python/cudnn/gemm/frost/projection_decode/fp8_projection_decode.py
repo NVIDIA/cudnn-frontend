@@ -342,5 +342,6 @@ class Fp8ProjectionDecode:
         if cfg not in self.compiled:
             self.compile(rows)
         args = self._kernel_module.launch_args(weight.view(torch.uint8), activation.view(torch.uint8), out, scale.reshape(1))
-        self.compiled[cfg](*args, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
+        with torch.cuda.device(self.device):  # a compiled launchable belongs to its device's context: launch under the one it was compiled in
+            self.compiled[cfg](*args, cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream))
         return out
