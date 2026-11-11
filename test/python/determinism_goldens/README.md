@@ -2929,3 +2929,59 @@ The sanitizer subset selects independent-origin token/E4M3/D128 and
 head/E5M2/D512, plus omitted-total-bound E5M2/D128 and E4M3/D512. Each
 uses fixed split1/unpacked execution. SM121, MXFP8 physical gaps, backward
 and cross-runtime byte identity remain outside this qualification.
+
+### SM120 MXFP8 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_thd_origins_mxfp8_sm120.py` adds28 L0 functional cases and
+eight golden cases. E4M3/E5M2 inputs with BF16 output cover independent
+Q/K/V/O/Stats origins, mixed INT32/INT64 offsets and multipliers,
+token/head-major Stats, fresh pointers/pitches, empty/keyless transitions
+and retained capture. Head shapes are D64,D128,D192/V128,D256,D512 and
+D384/V512, with fixed split1/unpacked plans. An independent CPU FP64
+reference checks values; exact-byte comparisons cover replay, batch
+reordering/duplication, a sequence alone and changed neighbors. Batch
+changes preserve raw payloads and repack existing logical scale bytes.
+The fallback-adapter and hot-path checks retain their existing contracts.
+
+RTX5090 SM120 (170SMs), driver620.62, Torch2.14.0+cu130, cuDNN9.24.0.43,
+DSL4.8.0/compiler13.4:28 functional cases and12 unchanged-parent strict
+controls pass on source288043149. Runtime sources are unchanged since
+49c628af6. Four shared default MXFP8 cases and four native-route twins
+also pass; the FP8-fixed/MXFP8-old parent fails all four origin detectors.
+The combined shared suite passes10 native and11 public cases, including
+retained half/FP8 and explicit BF16 backend controls.
+
+The shared D512 V-scale fixture previously reshaped plane-major scales.
+Both fixtures now use a byte permutation checked against independent
+per-head/128-token quantization:8 controls pass, with4 old D512 failures
+and4 old D128 passes. The production scale-load arithmetic is unchanged.
+An earlier replay test doubled V without scaling its absolute reference
+budget and failed15 cases with1–2 mismatches each. The final test first
+checks the exact replay inputs at the original scale, then requires doubled
+O and unchanged Stats/padding bytewise. It compares the doubled result in
+original V units using the same reference error constants. All28 cases
+pass; no existing tolerance or golden is replaced.
+
+All eight new records under `dee7499a23a43ab6` were recorded after the
+reference/replay/batch checks, then strictly verified with recording unset.
+Four cases each pass memcheck, racecheck and synccheck in20.98s/285.20s/13.63s,
+with zero errors and zero race warnings. These include D128/E4M3 and
+D512/E5M2 full replay plus D128/E5M2 and D512/E4M3 without total hints.
+No kernel-name filter is used. API diagnostics use `--report-api-errors explicit`;
+the extended-mode runtime warning was independently reproduced by a Torch-only
+control in the preceding per-tensor qualification. The first recording attempt
+set both record/check variables and failed their mutual-exclusion precondition;
+it produced no records and was corrected before the successful strict run.
+SM121, backward, other runtimes and performance remain unverified here.
+
+```bash
+# From test/python with the isolated import path verified.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -m L0 \
+  sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py \
+  -k 'not golden'
+# Record only after reference/replay checks; then run with RECORD unset.
+CUDNN_DETERMINISM_RECORD=/tmp/new-mxfp8-goldens pytest -m L0 \
+  sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py -k golden
+CUDNN_DETERMINISM_GOLDENS=/tmp/new-mxfp8-goldens pytest -m L0 \
+  sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py -k golden
+```

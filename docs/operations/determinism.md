@@ -453,3 +453,20 @@ lengths, origins and scalar scales against an independent reference.
 This is fixed-runtime forward evidence. SM121 physical-gap execution,
 MXFP8 physical origins and backward are not qualified by this suite. The
 coverage report records the numerical, strict-golden and sanitizer results.
+
+## SM120 MXFP8 THD physical origins
+
+Native E4M3/E5M2 MXFP8 THD forward preserves per-sequence O/Stats bytes
+across repeat execution, batch reordering/duplication, a sequence alone,
+changed neighbors, fresh storage and retained CUDA Graph replay in the
+tested RTX 5090 configurations. Q/K/V/O/Stats retain independent physical
+origins, pitches and capacities; scale tiles remain packed by logical
+sequence lengths. Coverage includes BF16 output, token/head-major Stats,
+D64, D128, D192/V128, D256, D512 and D384/V512 with fixed split1/unpacked
+plans. Batch comparisons preserve quantized payloads and logical scale
+bytes. Replay checks changed lengths and origins; doubling V scale factors
+also doubles live O exactly while leaving Stats and padding unchanged.
+
+This is fixed-runtime forward evidence. SM121 physical-gap execution,
+other runtime combinations and backward are unverified by this suite.
+See the coverage report for numerical, golden and sanitizer results.
