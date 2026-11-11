@@ -228,8 +228,10 @@ messages name:
   `floor((2F - 4P) / 4) * 2` fallback clusters, `P + fallback / 2`
   preferred-cluster slots in total. When no fallback cluster fits, the launch
   is a uniform (4, 1, 1) launch. Training backward keeps (2, 1, 1) clusters.
-  Upstream covers this geometry at EP1; MoeEp's inference and training
-  tests also cover EP2 and EP4 within one node and EP8 across two nodes.
+  Upstream covers this geometry at EP1; MoeEp's tests also compare
+  mixed-CGA outputs with the reference for inference at EP4, EP8, EP12 and
+  EP16 and for training at EP4, EP8, EP16 and EP32, and replay training
+  CUDA Graphs with mixed CGA at EP2, EP4, EP8, EP16 and EP32.
 
 The forward kernel is persistent: every launched CTA must be co-resident.
 The backend sizes the launch from the device's occupancy, so MoeEp requires
