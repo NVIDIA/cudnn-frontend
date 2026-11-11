@@ -180,7 +180,7 @@ def test_prepared_d128_causal_persistent_rebind_capture_no_sync_no_alloc(monkeyp
 
 @torch_fork_set_rng(seed=0)
 def test_prepared_d128_claim_counter_rebind_capture_no_sync_no_alloc(monkeypatch):
-    """A claim-counter record (api_dsl.D128_CAUSAL_CLAIM 1 past a gate patched to 0) on the prepared launch: warm executes
+    """A claim-counter record (api_dsl.D128_CAUSAL_CLAIM 1, the shipped switch, past a gate patched to 0) on the prepared launch: warm executes
     with fresh buffers and a caller workspace never re-enter the tensor/JIT path, never synchronize (the native binder's
     counter reset is an async memset on the launch stream) and never allocate (Rules 1, 3 and 8 of python/cudnn/AGENTS.md),
     and a CUDA-graph replay reads the current bytes at the captured pointers and zeroes the counter again each time, after
@@ -189,7 +189,6 @@ def test_prepared_d128_claim_counter_rebind_capture_no_sync_no_alloc(monkeypatch
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
     monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 0)
     b, h_q, h_kv, sq, skv = 4, 16, 4, 1152, 1152
     q, o = (_bhsd(b, h_q, sq, 128, torch.float16) for _ in range(2))

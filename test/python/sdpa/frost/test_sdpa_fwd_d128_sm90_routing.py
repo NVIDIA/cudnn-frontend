@@ -125,9 +125,9 @@ def test_sm90_d128_proposal_mirrors_the_record_check_support_picks(monkeypatch):
         {"D128_PERSISTENT": False},
         {"D128_INTRA_WG_OVERLAP": False},
         # The claim counter hands out only records check_support keeps persistent and NATURAL: the proposal stays, with
-        # the counter on and with it on at a gate of 0.
-        {"D128_CAUSAL_CLAIM": 1},
-        {"D128_CAUSAL_CLAIM": 1, "D128_CLAIM_MIN_ROUNDS": 0},
+        # the counter off and with its gate at 0.
+        {"D128_CAUSAL_CLAIM": 0},
+        {"D128_CLAIM_MIN_ROUNDS": 0},
     )
     for setting in settings:
         with monkeypatch.context() as m:
@@ -816,8 +816,8 @@ def test_d128_claim_counter_contract_is_one_in_python_and_the_binder():
     adapter's scratch_workspace_bytes), the native dense binder's kClaimWorkspaceBytes (its ordered path's check and
     ordered_workspace_bytes), and the binder's roles the Python side probes (supports_claim_counter) or the plan reads
     (ordered_workspace_bytes); the prepared spec carries the flag (DenseLaunchSpec.claim_counter) and the binder's reset
-    is the driver memset resolved natively, never cuda-python's. The switch ships off; its gate is 93 rounds per CTA
-    (s33)."""
+    is the driver memset resolved natively, never cuda-python's. The switch and its gate are typed module constants
+    (api_dsl's comment gives the measurement behind their values)."""
     import pathlib
     import re
 
@@ -833,7 +833,7 @@ def test_d128_claim_counter_contract_is_one_in_python_and_the_binder():
     assert "fill_word_" not in reset[: reset.index("first_scalar_role")]
     assert "claim_counter" in prepared.DenseLaunchSpec.__slots__
     api_src = (root / "python" / "cudnn" / "sdpa" / "fwd" / "api_dsl.py").read_text()
-    assert re.search(r"^D128_CAUSAL_CLAIM: int = 0$", api_src, re.M) and re.search(r"^D128_CLAIM_MIN_ROUNDS: int = 93$", api_src, re.M)
+    assert re.search(r"^D128_CAUSAL_CLAIM: int = [01]$", api_src, re.M) and re.search(r"^D128_CLAIM_MIN_ROUNDS: int = \d+$", api_src, re.M)
 
 
 def test_each_causal_claim_is_its_own_module_and_digest():

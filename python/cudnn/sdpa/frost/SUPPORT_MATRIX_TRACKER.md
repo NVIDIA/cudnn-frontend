@@ -653,7 +653,14 @@ whichever leaves the busiest CTA lighter. A plan-time route
 of at most one item per CTA, or of at least 48 KV tiles per Q tile on average,
 one work item per CTA. The rule was chosen on 88 causal shapes timed on H100 SXM
 GPUs against cuDNN 9.27, its head limit and route cutoff on 56 fresh ones, and
-checked on 48 fresh shapes (2026-11-06). The online
+checked on 48 fresh shapes (2026-11-06) and 48 more (2026-11-11), where it ran
+faster than cuDNN beyond the run-to-run band on 44 of the 45 scored (the other:
+causal MHA h24 S 1280 b9, 0.962). A causal plan with more than 93 work items per
+CTA (`api_dsl.D128_CLAIM_MIN_ROUNDS`) takes its items from an Int32 counter
+instead (`api_dsl.D128_CAUSAL_CLAIM`), so the CTAs keep a head's Q tiles
+together however far they drift: the plan reports 128 bytes of workspace, which
+the native dense binder zeroes on the launch stream before each launch (one
+memset, 3.4 to 3.8 us per call under CUDA graphs). The online
 softmax, the sign-aware row anchor, the FP64 path for extreme scales and the
 reverse KV walk are D512's arithmetic (shared helpers in
 `sm90/_common_hopper.py`). Dense only: a direct caller's

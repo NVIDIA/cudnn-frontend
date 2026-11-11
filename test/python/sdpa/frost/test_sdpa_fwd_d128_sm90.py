@@ -1222,11 +1222,11 @@ def test_d128_claim_counter_workspace_is_required_and_checked_before_launch():
 
 @pytest.mark.L0
 def test_d128_adapter_gives_the_claim_counter_only_past_its_gate(monkeypatch):
-    """check_support gives the claim record (persistent, the walk off, causal_claim D128_CAUSAL_CLAIM, NATURAL, 128
-    bytes of workspace) only to a causal record of the walk's rule the route keeps, in NATURAL order, with more items
-    than D128_CLAIM_MIN_ROUNDS x CTAs (the switch shipped off, set on here; the gate 93 rounds); never on a routed or
-    dense plan or a pinned LPT_L2 order, nor with the switch at 0, and an out of range switch (2, the heaviest-first
-    numbering s29 dropped, or 3) raises. The CTA count is patched to 132 so the gate does not move with the board."""
+    """check_support gives the claim record (persistent, the walk off, causal_claim D128_CAUSAL_CLAIM, NATURAL, 128 bytes
+    of workspace) only to a causal record of the walk's rule the route keeps, in NATURAL order, with more items than
+    D128_CLAIM_MIN_ROUNDS x CTAs (the switch and the gate are set here, not read as shipped); never on a routed or dense
+    plan or a pinned LPT_L2 order, nor with the switch at 0, and an out of range switch (2 or 3) raises. The CTA count is
+    patched to 132 so the gate does not move with the board."""
     from cudnn.sdpa.fwd import api_dsl
 
     def record(shape, mask, **kw):
@@ -1237,10 +1237,9 @@ def test_d128_adapter_gives_the_claim_counter_only_past_its_gate(monkeypatch):
         return api
 
     kept, routed, causal = (4, 16, 4, 1152, 1152), (1, 4, 4, 1024, 1024), dict(is_causal=True)  # 576 items L 5; 32 items
-    assert (api_dsl.D128_CAUSAL_CLAIM, api_dsl.D128_CLAIM_MIN_ROUNDS) == (0, 93)
-    assert record(kept, causal).params.causal_claim == 0, "the switch ships off"
     monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
-    assert record(kept, causal).params.causal_claim == 0, "576 items is below the shipped gate's 93 x 132"
+    monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 10)  # 576 <= 1320
+    assert record(kept, causal).params.causal_claim == 0, "576 items is below a gate of 10 x 132"
     monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 4)  # 576 > 528
     api = record(kept, causal)
     p = api.params
@@ -1270,7 +1269,6 @@ def test_d128_graph_reports_and_binds_the_claim_counter_workspace(graph_d128, mo
     (b4 h8/8 S 1152 causal: 288 items, L 5, the walk's record the route keeps, at the counter's gate patched to 0)."""
     from cudnn.sdpa.fwd import api_dsl
 
-    monkeypatch.setattr(api_dsl, "D128_CAUSAL_CLAIM", 1)
     monkeypatch.setattr(api_dsl, "D128_CLAIM_MIN_ROUNDS", 0)
     graphs, pin = [], graph_d128._select_engine
     monkeypatch.setattr(graph_d128, "_select_engine", lambda graph, name, **kw: graphs.append(graph) or pin(graph, name, **kw))

@@ -325,18 +325,18 @@ D128_CAUSAL_WALK_ROUTE: bool = True
 # config_sm90.D128_CLAIM_WORKSPACE_BYTES of caller workspace (scratch_workspace_bytes), which the native dense binder
 # zeroes on the launch stream before every launch; an extension whose binder lacks that role
 # (_SdpaDenseBinder.supports_claim_counter) keeps the static record. A CALL-TIME module constant read by check_support. A
-# speed choice: every value computes the one-tile kernel's O and Stats bit for bit. Why a counter (design/beat-cudnn
-# FINDINGS s27/s28): on H100 SXM the static NATURAL stride read K/V 1.24 to 1.46 times the read-once floor on large
-# causal plans (H36 b203 h32/32 S 768, H4 b82 h32/16 S 1024, H8 b203 h32/8 S 768), the CTAs drifting apart over hundreds
-# of rounds, while the same order handed out dynamically (the one-tile grid) read 1.000 times.
-D128_CAUSAL_CLAIM: int = 0
-# The counter's gate in rounds of items per CTA (items > D128_CLAIM_MIN_ROUNDS x CTAs). s33 set it (H100 SXM, cuDNN
-# 9.27, 45 causal shapes on ten batch ladders, under a rule frozen before the run): the smallest ladder point from which
-# every larger one has the counter at least R14's static rules within the band (the larger of 1% and the twin runs' gap)
-# and faster in the median, 93.1 rounds (MHA h32/32 S 1024 b48). Below it the static rules stay ahead on square prefill
-# (h24/2 S 3584 b16, 81.5 rounds: the counter 2.2% behind) and on short items (MHA h32/32 S 768 b16, 23 rounds: 1.7%);
-# above it the counter is 1 to 14% faster on MHA and GQA (MHA h32/32 S 768 b203: R14 0.872 of cuDNN, the counter 1.000)
-# and within 1% on square prefill, chunked prefill and MQA.
+# speed choice: every value computes the one-tile kernel's O and Stats bit for bit. Why a counter (Nsight Compute,
+# H100 SXM): the static NATURAL stride read K/V 1.24 to 1.46 times the read-once floor on large causal plans (b203
+# h32/32 S 768, b82 h32/16 S 1024, b203 h32/8 S 768), the CTAs drifting apart over hundreds of rounds, while the same
+# order handed out dynamically (the one-tile grid) read 1.000 times.
+D128_CAUSAL_CLAIM: int = 1
+# The counter's gate in rounds of items per CTA (items > D128_CLAIM_MIN_ROUNDS x CTAs), set by a timing study (H100
+# SXM, cuDNN 9.27, 45 causal shapes on ten batch ladders, under a rule frozen before the run): the smallest ladder
+# point from which every larger one has the counter at least the static schedules within the band (the larger of 1%
+# and the twin runs' gap) and faster in the median, 93.1 rounds (MHA h32/32 S 1024 b48). Below it the static schedules
+# stay ahead on square prefill (h24/2 S 3584 b16, 81.5 rounds: the counter 2.2% behind) and on short items (MHA h32/32
+# S 768 b16, 23 rounds: 1.7%); above it the counter is 1 to 14% faster on MHA and GQA (MHA h32/32 S 768 b203: the
+# static schedules 0.872 of cuDNN, the counter 1.000) and within 1% on square prefill, chunked prefill and MQA.
 D128_CLAIM_MIN_ROUNDS: int = 93
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
