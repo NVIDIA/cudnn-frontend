@@ -434,9 +434,11 @@ def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch,
 @pytest.mark.parametrize("group, expected", [(8, placement.LEAD), (16, placement.TRAIL)], ids=["gqa8", "gqa16"])
 def test_sm107_paged_packed_prefill_shard_keeps_its_measured_groups(group, expected):
     """The paged packed-GQA prefill shard (Q 64-128, page 16, no sink) was timed on GQA 4 / 8; GQA16 now packs by default
-    on cc 10.7 paged THD (issue #1472's paged table) but keeps the backend first here until that band is measured."""
+    on cc 10.7 paged THD (issue #1472's paged table) but the shard keeps the backend first there. An exact bf16 graph is
+    answered first by study sm107_thd_prefill_20261111, which leads both groups."""
     from types import SimpleNamespace
 
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
@@ -455,7 +457,9 @@ def test_sm107_paged_packed_prefill_shard_keeps_its_measured_groups(group, expec
         device_cc=(10, 7),
         device_sm_count=216,
     )
-    assert placement.place(spec, facts) == expected
+    assert placement._place_sm107_f16(spec.capabilities, facts) == expected
+    assert placement.place(spec, facts) == placement.LEAD
+    assert placement_table.matched_entry(spec.name, facts).study == "sm107_thd_prefill_20261111"
 
 
 @pytest.mark.L0
@@ -916,14 +920,18 @@ def test_sm107_paged_d256_mtp_rows_follow_the_generated_table(heads, s_q, b, s_k
 def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     """Past the MTP rows (s_q >= 5) FlashInfer's paged decode graph with the bottom-right diagonal is the paged prefill class, which
     study sm107_paged_prefill_20261109 leads: on this dense-Q graph FROST measured 0.03-0.61 of the backend's plan at s_q 5 / 8 / 16 (216
-    cells, d256 and D192xV128, 208-SM cc 10.7, cuDNN 9.30.0.2), as on the THD prefill graph the study fit. Without the diagonal, or with a
-    window, the graph is another class and keeps the backend first."""
+    cells, d256 and D192xV128, 208-SM cc 10.7, cuDNN 9.30.0.2), as on the THD prefill graph the study fit. Without the diagonal the
+    graph is the mask-free paged prefill class: study sm107_thd_prefill_20261111 leads d256 there and has no D192 entry (the backend
+    failed to build it), which keeps the backend first; with a window it keeps the backend first too."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
     shape = dict(b=32, s_q=s_q, s_kv=8192, d_qk=d[0], d_v=d[1])
     assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, **shape)) == placement.LEAD
-    assert placement.place(spec, _sm107_paged_d256_decode_facts(**shape)) == placement.TRAIL
+    mask_free = _sm107_paged_d256_decode_facts(**shape)
+    assert placement.place(spec, mask_free) == (placement.LEAD if d == (256, 256) else placement.TRAIL)
+    assert (placement_table.matched_entry(spec.name, mask_free) is None) == (d != (256, 256))
     assert placement.place(spec, _sm107_paged_d256_decode_facts(causal=True, bottom_right=True, window_left=128, **shape)) == placement.TRAIL
 
 
@@ -1077,11 +1085,15 @@ def _sm107_paged_facts(**over):
 @pytest.mark.L0
 def test_sm107_paged_gqa_prefill_leads_inside_its_box():
     """Rubin paged bf16 d128 GQA 4/8/16 prefill chunks (exact or bounded) and full squares lead; MHA, group 2,
-    short queries and out-of-box batches keep the backend."""
+    short queries and out-of-box batches keep the backend. The box is the hand rule; an exact graph is answered first by
+    study sm107_thd_prefill_20261111, so the box below is read through the row's hand rules."""
+    from cudnn.sdpa import placement_table
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    place = lambda **over: placement.place(spec, _sm107_paged_facts(**over))
+    assert placement_table.matched_entry(spec.name, _sm107_paged_facts()).study == "sm107_thd_prefill_20261111"
+    assert placement_table.matched_entry(spec.name, _sm107_paged_facts(shape_overrides=True)) is None
+    place = lambda **over: placement._place_sm107_f16(spec.capabilities, _sm107_paged_facts(**over))
     assert place() == placement.LEAD
     assert place(h_q=32, h_kv=8, b=4, s_q=751, s_kv=21650, max_total_seq_len_q=4 * 751) == placement.LEAD
     assert place(h_q=64, h_kv=64, s_q=628, s_kv=28240) == placement.TRAIL
