@@ -2809,7 +2809,7 @@ All16records under `de01ba4cf30a4c9b` were recorded from unchanged parent
 strictly by the candidate. No previous baseline or tolerance changed.
 
 From `test/python`, use the preceding D512/D576 qualification command and add
-`sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_coalesced_split_replay_batch_golden`.
+`sdpa/frost/test_sdpa_fp8_sm107.py::test_coalesced_split_replay_batch_golden`.
 The four coalesced cases live in that explicit SM107 CI entry, so the architecture
 lane retains the new coverage without duplicate collection in directory sweeps.
 The sanitizer subset is

@@ -8840,22 +8840,3 @@ class TestD192LptContract:
 
     test_work_order = staticmethod(_checks.test_thd_work_order)
     test_admission = staticmethod(_checks.test_native_admission)
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
-@pytest.mark.parametrize("group", [32, 64])
-def test_coalesced_split_replay_batch_golden(dtype_name, group):
-    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
-    from native_d128_dense_paged_determinism import _runner
-
-    run, inputs = _runner(dtype_name, dtype_name, 2, 4, 128, head_dim=512, num_q_heads=2 * group)
-    target = assert_replays(lambda: run([0]), repeats=4)
-    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 16 + [0] + [2] * 16):
-        actual = snapshot(run(order))
-        for row, sequence in enumerate(order):
-            if sequence == 0:
-                assert_bitwise({name: actual[name][row : row + 1] for name in target}, target, f"batch row {row}")
-    run([0, 1, 2, 3, 4], capture=True)
-    actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
-    assert_golden(f"sdpa-half-d512-paged-coalesced-{dtype_name}-g{group}-split4", inputs, actual)
