@@ -667,10 +667,11 @@ def qsa_bwd_sparse_query_kernel(
         c_s = scale * F32(LOG2E)
         gc = I32(0)
         nq = I32(0)
+        # dS^T row of this key inside its K-step, in the key order of the TMEM K^T columns (see the copy warps)
         if cutlass.const_expr(PAIR):
-            ds_off = (OFF_DS + jrow * 384 + (hrow * 4 + trow) * 16) // 4
+            ds_off = (OFF_DS + jrow * 384 + ((trow >> 1) * 4 + hrow * 2 + (trow & 1)) * 16) // 4
         else:
-            ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
+            ds_off = (OFF_DS + (jrow >> 1) * 768 + (trow >> 1) * 384 + ((trow & 1) * 4 + (jrow & 1) * 2 + hrow) * 16) // 4
         for pp in cutlass.range(NP, unroll=1):
             for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
                 o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
@@ -980,11 +981,15 @@ def qsa_bwd_sparse_query_kernel(
                                 prims.mbarrier_arrive(b_ve)
                         gc = gc + nchunks
         else:
-            # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3. Tiles 0 / 1 take the keys 4p + {0, 1} and tiles 2 / 3
-            # the keys 4p + {2, 3} of a 16-key K-step at this warp's dim chunks, so one fragment is one 16x256b store in key order.
+            # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3. A tile's eight rows sit in distinct SW128 bank groups
+            # (the phase is the token): a pair tile takes one query of both slots of the K-step, a plain tile one block. One
+            # fragment is one 16x256b store, and the softmax writes the dS^T rows in the same key order.
             ldm_tile = lane >> 3
             ldm_row = lane & 7
-            kstep_row = 4 * (ldm_row >> 1) + 2 * (ldm_tile & 1) + (ldm_row & 1)
+            if cutlass.const_expr(PAIR):
+                kstep_row = 8 * (ldm_row >> 2) + 4 * (ldm_tile & 1) + (ldm_row & 3)
+            else:
+                kstep_row = 8 * (ldm_tile & 1) + ldm_row
             ldm_off = []
             for h2 in cutlass.range_constexpr(2):
                 dim_slab = 2 * h2 + (qd >> 1)
