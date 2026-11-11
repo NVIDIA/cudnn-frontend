@@ -1407,3 +1407,10 @@ independent Q/O/Stats gaps, changed-input graph replay and packed batches with
 empty/quiet sequences. `TestPagedD256PackedSplit` detects token-tile/head-index
 confusion; `test_native_d256_paged_split_frames` compares both binders and rejects
 partial buffers overlapping physical-origin metadata before launch.
+
+Host-frame fixtures that derive runtime arguments from a Python AST must retain
+unannotated arguments. Check `argument.annotation is None` before calling
+`ast.unparse`; only an explicit `Constexpr` annotation removes a runtime slot.
+The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
+exercise appended untyped origin arguments and compare native frames with
+the independent Python reference.
