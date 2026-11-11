@@ -4965,3 +4965,17 @@ remain independent of physical data gaps. No eligibility row or knob domain
 changes. `TestMidwidthPhysicalOrigins` in both architecture suites covers
 both admitted D192 cluster widths and D256 CGA1, numerical references,
 changed bindings, capture, concurrent work and batch byte invariance.
+
+### Native SM107 D128 per-tensor FP8 THD physical addressing
+
+The existing unsplit, unpacked D128 FP8 THD route forwards independent
+Q/K/V/O/Stats origins through the common prepared binder. Its existing setup
+launch builds sequence-local maps that clip each live K/V segment; persistent
+loaders acquire the current sequence's maps. Logical lengths and physical
+addresses remain distinct. Eligibility rows and knob domains are unchanged.
+`TestD128Fp8PhysicalOrigins` in `test_sdpa_fp8_sm107.py` pins the native CGA2
+body and covers both FP8 encodings, BF16 O, token/head Stats, changed bindings,
+retained replay and batch invariance. Native SM107 passes all12 strict cases
+with four new byte goldens under CUDA 13.4. Directed memory, race and
+synchronization checks each pass four cases. Ten origin/dense variants also
+compile offline. Other native quantized widths are not qualified by this suite.

@@ -34,6 +34,18 @@ class TestNativeHalfRegisterRelease:
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
 
 
+@requires_rubin
+class TestD128Fp8PhysicalOrigins:
+    """Exercise native data maps and independent Stats through the CI entry."""
+
+    from sdpa.frost import native_fp8_origins_sm107_checks as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake

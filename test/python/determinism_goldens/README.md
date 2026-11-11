@@ -3186,3 +3186,40 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestMidwidthPhysicalOrigins \
   sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestMidwidthPhysicalOrigins
 ```
+
+### Native SM107 D128 FP8 THD origins — 2026-11-11
+
+`test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins` collects 12 L0 cases:
+two shared public-graph regressions, four independent-origin replay cases,
+two missing-total-hint cases and four golden cases. Both E4M3/E5M2 inputs
+write BF16 O and token/head-major Stats. The expanded cases pin two persistent
+clusters, the native SM107 module and the prepared binder, then check references,
+independent address/stride rebinding, retained live/empty capture, batch
+reordering/duplication/neighbor isolation and raw-byte replay with concurrent work.
+
+All ten offline CUDA 13.4 variants compile: two encodings with token, head,
+padded or omitted Stats under physical origins, plus their dense controls.
+Native SM107 under actual CuTe DSL CUDA13.4, DSL4.8.0, Torch2.14.1+cu130
+and cuDNN9.24.0.43 passes all12 strict cases with zero failures/skips and
+four new byte goldens. Functional checks pass before recording; recording
+and strict comparison run in separate processes. Directed memcheck4,
+racecheck4 and synccheck4 pass with zero errors/hazards/warnings. The native
+binder is rebuilt with CUDA13.4.92 and Python3.12.12. Production source is
+identical to the tested snapshot; the parent stack's later test-only optional
+reference initialization does not change numerical operations.
+
+The two shared regressions fail against the unfixed parent at the Stats
+comparison, then pass with this change. The four existing `test_fp8_thd`
+neighbors report three passes and one existing causal E5M2 numerical failure
+on this SM107 part (`0.043079853 > 0.04`). A same-device parent/candidate
+comparison records identical quantized input payloads/scales, O/reference
+bytes and Amax for all four cases, including that failure. Its tolerance and
+existing device-specific edge marker are unchanged; it is not counted as a
+passing case. Other native SM107 widths and backward remain unverified here.
+
+```bash
+cd test/python
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 sdpa/frost/test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins
+```
