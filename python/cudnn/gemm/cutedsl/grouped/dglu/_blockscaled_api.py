@@ -21,8 +21,10 @@ from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
+from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..canonical import (
+    b_nkl,
     canonical_b_fake,
     canonical_mx_fake,
     canonical_prob_fake,
@@ -99,6 +101,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         api.execute(...)
     """
 
+    supports_glu_layouts = GLU_LAYOUTS
+
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -145,6 +149,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
         _deterministic: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -198,6 +203,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             ``act_func == "dswiglu"``.
         :param situ_beta1: Compile-time gate tanh scale for dSiTU-GLU.
         :param situ_beta2: Compile-time up-branch tanh scale for dSiTU-GLU.
+        :param glu_layout: Branch order for C, D and dbias. ``gate_then_up``
+            keeps gate/up halves contiguous, including both output scale directions.
         """
         from cudnn.tensor_adapter import detect_framework
 
@@ -282,6 +289,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             )
 
         # ---- Configuration ----
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.acc_dtype = acc_dtype
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -361,7 +369,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 weight_mode=self.weight_mode,
                 act_func=self.act_func,
                 use_dynamic_sched=self.use_dynamic_sched,
-                **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+                **({"situ_beta1": self.situ_beta1, "glu_layout": self.glu_layout} if not self._is_rubin_kernel else {}),
                 **({"deterministic": True} if self._deterministic else {}),
                 **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
                 # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
@@ -433,6 +441,21 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             l = self.expert_cnt  # for shape checks that use l
 
         n_out = 2 * n
+        if self.glu_layout == "gate_then_up":
+            if self.act_func != "dswiglu":
+                raise NotImplementedError("gate_then_up dGLU currently supports dswiglu only")
+            if self._is_rubin_kernel:
+                raise NotImplementedError("gate_then_up dGLU is implemented only for SM100/103")
+            canonical_mxfp8 = self.a_desc.dtype == torch.float8_e4m3fn and self.sf_vec_size == 32 and self.sfa_desc.dtype == torch.float8_e8m0fnu
+            canonical_nvfp4 = (
+                self.a_desc.dtype in (torch.float4_e2m1fn_x2, torch.uint8) and self.sf_vec_size == 16 and self.sfa_desc.dtype == torch.float8_e4m3fn
+            )
+            if not (canonical_mxfp8 or canonical_nvfp4):
+                raise NotImplementedError("gate_then_up dGLU requires E4M3/E8M0 MXFP8 or E2M1/E4M3 NVFP4")
+            expected_d_dtype = torch.float8_e4m3fn if canonical_mxfp8 else torch.bfloat16
+            if self.c_desc.dtype != torch.bfloat16 or self.d_row_desc.dtype != expected_d_dtype:
+                raise NotImplementedError("gate_then_up dGLU requires BF16 C, E4M3 D for MXFP8, and BF16 D for NVFP4")
+            self._value_error_if(n % 128 != 0, f"gate_then_up dGLU requires each gate/up branch N to be divisible by 128, got N={n}")
 
         self._value_error_if(
             n % 32 != 0,
@@ -790,6 +813,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
+        if self.glu_layout == "gate_then_up" and (major, minor) not in ((10, 0), (10, 3)):
+            raise NotImplementedError(f"gate_then_up dGLU is implemented only for SM100/103, found SM{compute_capability}")
         if not has_tcgen05(major):
             raise RuntimeError(
                 f"GroupedGemmDglu requires SM100+ compute capability with tcgen05 (not cc 12.x), " f"but found SM{compute_capability} on device {device}"
@@ -923,8 +948,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                     )
         else:
             valid_m = cute.sym_int(divisibility=256)
-            n_sym = cute.sym_int()
-            n_out_sym = cute.sym_int()
+            n_sym = cute.sym_int(divisibility=128) if self.glu_layout == "gate_then_up" else cute.sym_int()
+            n_out_sym = cute.sym_int(divisibility=256) if self.glu_layout == "gate_then_up" else cute.sym_int()
             k_sym = cute.sym_int()
             l_sym = cute.sym_int()
 
@@ -1412,6 +1437,14 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             128-byte aligned, that the launch carves (recipe R2). Required.
         """
         self._logger.debug("Entering execute")
+        if self.glu_layout == "gate_then_up":
+            n_weight = (
+                b_nkl(b_tensor, self.b_major)[0]
+                if b_tensor is not None
+                else self.b_shape[0] if self.weight_mode == MoEWeightMode.DISCRETE else self.b_desc.shape[0]
+            )
+            if n_weight % 128 or c_tensor.shape[1] % 256:
+                raise ValueError("gate_then_up dGLU requires each gate/up half to be divisible by 128; padding is not implicit")
         current_stream = self._get_default_stream(current_stream)
 
         if a_tensor.shape[0] == 0:

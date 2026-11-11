@@ -16,6 +16,11 @@ pytest core/test_determinism_utils.py
 
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
+| `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
+| `gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py` | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | — | D in both directions, both scale planes, dprob; dbias numerical reference |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D/RHT payloads and scales, including standard GEMM-blocked column scales | — |
+| `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -126,6 +131,96 @@ CUDNN_TEST_TIMEOUT=1800 CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -q -s \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_compressed_sm90_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py \
   -k "prepared_plan or sm90_compressed or api_is_split_from_top_k"
+```
+
+### Canonical grouped GLU branch storage — SM100, 2026-11-10 UTC
+
+The new BF16, NVFP4 and MXFP8 suites exercise conventional `[gate | up]`
+storage in the existing SM100/103 GLU and dGLU kernels. They distinguish branch ordering
+from the APIs' existing natural-rank tensor support. Comparisons against the
+legacy interleaved path use independently permuted test data; independent
+numerical references separately check the GEMM/activation results. Quantized
+payloads and scale bytes remain fixed for replay and batch comparisons.
+Packed and discrete expert weights are covered, including empty experts.
+
+MXFP8/NVFP4 backward uses `deterministic=True` for dprob byte comparisons.
+BF16 dprob byte qualification is limited to the single-N-tile F=128 case. dbias
+retains the existing atomic reduction, so its check is numerical rather than
+a bitwise-determinism claim. The option does not remove the existing 256-row
+expert-token alignment or change the default interleaved layout.
+
+Run from `test/python` with the modified checkout imported:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py \
+  gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py -m L0 -q -rs
+```
+
+Measured on NVIDIA GB200 SM100 (152 SMs), Torch
+`2.13.0a0+8145d630e8.nv26.06`, CUDA 13.3, driver API 13030,
+cuDNN 92600, CuTe DSL 4.8.0 with its CUDA 13.4 compiler, and TVM FFI 0.1.11.
+The modified frontend 1.33.0 source and matching rebuilt Python extension
+were imported. The initial qualification passed 66 forward and 35 backward
+cases without skips, including runtime-hash comparisons. Those snapshots are
+kept as external validation artifacts rather than committed fixtures. The
+corresponding tests retain their reference, replay and batch-invariance checks
+without requiring a runtime-specific baseline. Existing runtime records are unchanged.
+SM103 remains unverified; the option is unavailable on SM90 and SM107.
+
+The final source also passes ten allocator-poison CUDA Graph regressions:
+six forward cases (three precisions, one- and two-CTA tiles), and four
+block-scaled backward cases (NVFP4/MXFP8, both branch layouts). These exercise runtime TMA
+descriptor reuse after scale-buffer allocations change; the shared descriptor
+helper now publishes and acquires descriptors through the tensormap proxy.
+The original interleaved path reproduced the failure before this fix.
+
+The NVFP4 GLU+Hadamard sibling passed 13 cases. Its checks include
+dense/discrete weights, SMEM RHT, dense TMEM RHT, independent numerical
+references, replay, batch invariance and explicit rejection of
+canonical discrete weights with `use_tmem_post_rht_amax=True` (a compiler
+limitation; callers can select the existing SMEM path).
+
+GLU+Hadamard+quant covers BF16 row RHT and NVFP4 row/column RHT for
+both GLU input layouts. Columnwise scales use the shared standard GEMM-blocked
+output contract documented above. The 28-case branch-layout suite checks exact
+payload/scale bytes, independent GEMM/activation/Hadamard/dequantization
+references, changed-input graph replay and expert reorder/duplication.
+
+### GLU+Hadamard+quant natural tensor ranks — SM100, 2026-11-11
+
+The 52-case `test_grouped_gemm_glu_hadamard_quant_canonical.py` L0 suite
+qualifies the natural-rank adapter independently of GLU branch order. It covers
+`gate_then_up` and `interleaved_32`, dense/discrete NVFP4 E2M1 weights with E4M3
+MMA-packed scales, BF16/NVFP4 D and rowwise RHT, and standard GEMM-blocked
+colwise scales. Primary GEMMs use logical K=512, N=256/2048, and
+expert M=[256, 0, 512]; batch and dynamic-M cases vary those token counts.
+
+All output payload and scale bytes must equal the existing kernel-facing API.
+Independent GEMM/SwiGLU/Hadamard/dequantization references retain their previous
+tolerances. The suite separately checks three fresh-allocation/noise-stream
+replays, expert-alone/reorder/duplication/removal/changed-neighbor invariance,
+and changed A/B/scale CUDA Graph replay. These replay invocations are internal
+to the 52 pytest cases, not additional collected cases. Caller-owned flat and
+contiguous rank-six scale outputs, prepared execute without framework tensor
+view operations, malformed packed-scale spans, empty experts, entirely empty
+batches and no-RHT calls are also covered. The adapter does not change kernel
+arithmetic, and no runtime-specific golden was created or rewritten.
+
+The qualification of the edited `e0f75a6e` checkout with the column-scale
+correction passed **97 cases with 6 Rubin-only skips**, in 150.63 seconds:
+17 passes / 6 skips in the existing quantization suite, 28 passes in the
+branch-layout suite, and 52 passes in the natural-rank suite. Runtime was NVIDIA
+GB200 SM100, driver 580.126.20, Torch 2.13.0a0+8145d630e8.nv26.06 / CUDA 13.3,
+cuDNN backend 92600, and CuTe DSL 4.8.0 compiling with CUDA 13.4.
+The independent default-output qualification above records the later isolated
+scale fix separately. SM103, SM107 and CUDA 12 compilation remain unverified
+for this revised feature suite; earlier alternate-format counts do not qualify
+its current scale contract. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py \
+  gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py \
+  gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py -m L0 -q -rs
 ```
 
 ### Custom reduction — SM100 validation, 2026-11-09 (UTC)

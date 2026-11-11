@@ -17,6 +17,8 @@ import logging
 import os
 from typing import Tuple, Optional
 
+from cudnn.gemm.cutedsl.grouped.glu_layout import GLU_LAYOUTS, validate_glu_layout
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
@@ -55,6 +57,9 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         >>> api.execute(b_ptrs=b_ptrs_tensor, sfb_ptrs=sfb_ptrs_tensor, ...)
     """
 
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("nvfp4", "mxfp8")
+
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -86,6 +91,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         b_major: str = "k",
         epilogue_op: Optional[str] = None,
         use_dynamic_sched: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         """Initialize the DiscreteGroupedGemmDswigluSm100 API.
 
@@ -117,8 +123,50 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param act_func: Activation function, one of "dswiglu" or "dgeglu"
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param epilogue_op: Optional epilogue operation ("relu", "srelu", or None)
+        :param glu_layout: "interleaved_32" (default), or "gate_then_up" for canonical gate/up halves.
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        self.glu_layout = validate_glu_layout(glu_layout)
+        self._canonical_dglu = None
+        if glu_layout == "gate_then_up":
+            from cudnn.gemm.cutedsl.grouped.dglu.api import GroupedGemmDgluSm100
+
+            if detect_framework(sample_a) != "torch":
+                raise NotImplementedError("gate_then_up requires actual torch sample tensors; TensorDesc and other frameworks are unsupported")
+            super().__init__()
+            self._canonical_dglu = GroupedGemmDgluSm100(
+                sample_a=sample_a,
+                sample_c=sample_c,
+                sample_d_row=sample_d_row,
+                sample_d_col=sample_d_col,
+                sample_sfa=sample_sfa,
+                sample_padded_offsets=sample_padded_offsets,
+                sample_alpha=sample_alpha,
+                sample_beta=sample_beta,
+                sample_prob=sample_prob,
+                sample_dprob=sample_dprob,
+                sample_sfd_row=sample_sfd_row,
+                sample_sfd_col=sample_sfd_col,
+                sample_amax=sample_amax,
+                sample_norm_const=sample_norm_const,
+                acc_dtype=acc_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sf_vec_size=sf_vec_size,
+                vector_f32=vector_f32,
+                m_aligned=m_aligned,
+                discrete_col_sfd=discrete_col_sfd,
+                epilogue_op=epilogue_op,
+                glu_layout=glu_layout,
+                num_experts=num_experts,
+                b_shape=b_shape,
+                b_dtype=b_dtype,
+                sample_dbias=sample_dbias,
+                act_func=act_func,
+                b_major=b_major,
+                use_dynamic_sched=use_dynamic_sched,
+            )
+            return
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
 
@@ -230,6 +278,9 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
 
     def check_support(self) -> bool:
         """Check if the kernel configuration is supported."""
+        if self._canonical_dglu is not None:
+            self._is_supported = self._canonical_dglu.check_support()
+            return self._is_supported
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -495,6 +546,11 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the backward kernel from tensor descriptors captured in __init__."""
+        if self._canonical_dglu is not None:
+            self._canonical_dglu.compile()
+            self._is_supported = self._canonical_dglu._is_supported
+            self._compiled_kernel = self._canonical_dglu._compiled_kernel
+            return
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -778,6 +834,10 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         self._compiled_kernel = tensor_api
         self._logger.debug("Kernel compiled successfully")
 
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-owned scratch required by the canonical layout; zero for the legacy kernel."""
+        return self._canonical_dglu.scratch_workspace_bytes() if self._canonical_dglu is not None else 0
+
     def execute(
         self,
         a_tensor: torch.Tensor,
@@ -802,6 +862,8 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Execute the compiled backward kernel (CUDA-graph-safe).
 
@@ -828,7 +890,30 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             chosen based on ``act_func`` for backwards compatibility:
             ``1.0`` for ``"dgeglu"`` and ``0.0`` for ``"dswiglu"``.
         :param current_stream: CUDA stream
+        :param workspace: Caller-owned scratch from scratch_workspace_bytes(), required for gate_then_up.
         """
+        if self._canonical_dglu is not None:
+            return self._canonical_dglu.execute(
+                a_tensor=a_tensor,
+                c_tensor=c_tensor,
+                d_row_tensor=d_row_tensor,
+                d_col_tensor=d_col_tensor,
+                sfa_tensor=sfa_tensor,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                beta_tensor=beta_tensor,
+                prob_tensor=prob_tensor,
+                dprob_tensor=dprob_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                amax_tensor=amax_tensor,
+                norm_const_tensor=norm_const_tensor,
+                current_stream=current_stream,
+                workspace=workspace,
+                b_ptrs=b_ptrs,
+                sfb_ptrs=sfb_ptrs,
+                dbias_tensor=dbias_tensor,
+            )
         self._logger.debug("Entering execute")
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
@@ -914,8 +999,11 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     glu_clamp_min: float = -7.0,
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    glu_layout: str = "interleaved_32",
 ) -> TupleDict:
     """Convenience wrapper for discrete-weight grouped GEMM dGLU backward.
+
+    ``glu_layout="gate_then_up"`` delegates to the unified dGLU kernel.
 
     Args:
         a_tensor: Input A tensor (gradient input)
@@ -955,6 +1043,45 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
             amax_tensor, sfd_row_tensor, sfd_col_tensor
     """
+    validate_glu_layout(glu_layout)
+    if glu_layout == "gate_then_up":
+        from cudnn.gemm.cutedsl.grouped.dglu.api import grouped_gemm_dglu_wrapper_sm100
+
+        return grouped_gemm_dglu_wrapper_sm100(
+            a_tensor=a_tensor,
+            b_ptrs=b_ptrs,
+            c_tensor=c_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_ptrs=sfb_ptrs,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            n=n,
+            b_dtype=b_dtype,
+            generate_dbias=generate_dbias,
+            norm_const_tensor=norm_const_tensor,
+            acc_dtype=acc_dtype,
+            d_dtype=d_dtype,
+            cd_major=cd_major,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            discrete_col_sfd=discrete_col_sfd,
+            act_func=act_func,
+            b_major=b_major,
+            epilogue_op=epilogue_op,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            use_dynamic_sched=use_dynamic_sched,
+            current_stream=current_stream,
+            glu_layout=glu_layout,
+        )
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for discrete_grouped_gemm_dswiglu_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -1193,3 +1320,7 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
     )
+
+
+discrete_grouped_gemm_dswiglu_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+discrete_grouped_gemm_dswiglu_wrapper_sm100.supports_gate_then_up_precisions = ("nvfp4", "mxfp8")

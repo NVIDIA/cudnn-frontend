@@ -33,6 +33,7 @@ from ..backend_utils import (
 from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
 from ..scheduler_counter import validate_scheduler_counter
+from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 from cuda.bindings import driver as cuda
 import logging
 import os
@@ -130,10 +131,15 @@ class GluCall:
     b_shape: Optional[Tuple[int, ...]] = None
     num_experts: Optional[int] = None
     scheduler_counter_tensor: Optional[torch.Tensor] = None
+    glu_layout: str = "interleaved_32"
 
 
 class GroupedGemmGluSm100(APIBase):
     """Stable public facade that selects the GLU backend during support checking."""
+
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("bf16", "nvfp4", "mxfp8")
+    preferred_gate_then_up_mma_tiler = (256, 256)
 
     # BF16 implementation
     @overload
@@ -201,12 +207,16 @@ class GroupedGemmGluSm100(APIBase):
         generate_c: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        glu_layout: str = "interleaved_32",
     ) -> None:
         super().__init__()
+        validate_glu_layout(glu_layout)
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
         framework = detect_framework(sample_a)
+        if glu_layout == "gate_then_up" and framework != "torch":
+            raise NotImplementedError("gate_then_up GLU currently supports torch inputs only")
         if sample_a is not None and framework not in ("torch", "jax"):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmGluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
@@ -245,6 +255,7 @@ class GroupedGemmGluSm100(APIBase):
                 )
                 self._implementation = GroupedGemmGluBf16API(
                     sample_a=kwargs["sample_a"],
+                    glu_layout=kwargs["glu_layout"],
                     sample_c=kwargs["sample_c"],
                     sample_d=kwargs["sample_d"],
                     sample_padded_offsets=kwargs["sample_padded_offsets"],
@@ -646,6 +657,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             weight_mode,
             act_func,
             situ_beta1_cache_signature,
+            call.glu_layout,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
             l if use_full_dynamic else tuple(b_tensor.shape),
@@ -691,6 +703,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             weight_mode,
             act_func,
             situ_beta1_cache_signature,
+            call.glu_layout,
             a_tensor.shape[1:],
             stride_order(a_tensor),
             a_tensor.dtype,
@@ -754,6 +767,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             api = GroupedGemmGluSm100(
                 sample_a=a_tensor,
                 sample_scheduler_counter=call.scheduler_counter_tensor,
+                glu_layout=call.glu_layout,
                 sample_c=c_tensor_out,
                 sample_d=d_tensor,
                 sample_sfa=sfa_tensor,
@@ -785,6 +799,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
             api = GroupedGemmGluSm100(
                 sample_a=a_tensor,
                 sample_scheduler_counter=call.scheduler_counter_tensor,
+                glu_layout=call.glu_layout,
                 sample_c=c_tensor_out,
                 sample_d=d_tensor,
                 sample_sfa=sfa_tensor,
@@ -944,6 +959,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         b_dtype=_convert_to_cutlass_data_type(call.b_dtype) if call.b_dtype is not None else None,
     )
 
+    validate_glu_layout(call.glu_layout)
     if call.act_func not in ("swiglu", "geglu", "situglu"):
         raise ValueError(f"act_func must be 'swiglu', 'geglu', or 'situglu', got {call.act_func}")
     if call.act_func == "situglu":
@@ -1142,6 +1158,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
     cache_key = backend_cache_key(
         GroupedGemmBackend.BF16,
+        call.glu_layout,
         call.weight_mode,
         call.act_func,
         _glu_tensor_signature(call.a_tensor, dynamic_m=True),
@@ -1175,6 +1192,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     else:
         api = GroupedGemmGluSm100(
             sample_a=call.a_tensor,
+            glu_layout=call.glu_layout,
             sample_c=c_tensor,
             sample_d=d_tensor,
             sample_sfa=None,
@@ -1285,6 +1303,7 @@ def grouped_gemm_glu_wrapper_sm100(
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     *,
     scheduler_counter_tensor: Optional[torch.Tensor] = None,
+    glu_layout: str = "interleaved_32",
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU with metadata caching.
 
@@ -1295,10 +1314,20 @@ def grouped_gemm_glu_wrapper_sm100(
     Canonical MXFP8 JAX arrays and tracers (dense b_tensor with sfa_tensor)
     dispatch to grouped_gemm_glu_jax_sm100, including under jax.jit. Set
     sf_vec_size=32 and an explicit FP8 d_dtype; unsupported options raise.
+    glu_layout selects persistent branch order for B, bias, SFB, and saved C.
+    The default interleaved_32 preserves the existing layout. gate_then_up accepts
+    contiguous gate and up halves and remaps them inside the SM100/103 kernel.
     scheduler_counter_tensor optionally supplies a caller-owned CUDA int32 counter
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
     """
+    validate_glu_layout(glu_layout)
+    if glu_layout != "interleaved_32" and detect_framework(a_tensor) != "torch":
+        raise NotImplementedError("gate_then_up GLU currently supports torch inputs only")
+    if glu_layout == "gate_then_up":
+        n_full = b_nkl(b_tensor)[0] if b_tensor is not None else n
+        if n_full is not None and n_full % 256:
+            raise NotImplementedError("gate_then_up GLU requires each gate/up branch N divisible by 128; padding is not implicit")
     if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_glu_jax_sm100
@@ -1386,6 +1415,7 @@ def grouped_gemm_glu_wrapper_sm100(
         use_dynamic_sched,
         use_single_group_runtime_offsets,
         generate_c,
+        glu_layout,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
         os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
     )
@@ -1453,6 +1483,7 @@ def grouped_gemm_glu_wrapper_sm100(
         )
 
     call = GluCall(
+        glu_layout=glu_layout,
         a_tensor=a_tensor,
         scheduler_counter_tensor=scheduler_counter_tensor,
         sfa_tensor=sfa_tensor,
@@ -1512,6 +1543,8 @@ def grouped_gemm_glu_wrapper_sm100(
     return _grouped_gemm_glu_block_scaled_call(call, memo_key)
 
 
+grouped_gemm_glu_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_glu_wrapper_sm100.supports_gate_then_up_precisions = GroupedGemmGluSm100.supports_gate_then_up_precisions
 grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts = True
 grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True
 
@@ -1519,3 +1552,5 @@ grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]
 
 grouped_gemm_glu_wrapper_sm100.supports_external_scheduler_counter = True
+
+grouped_gemm_glu_wrapper_sm100.preferred_gate_then_up_mma_tiler = GroupedGemmGluSm100.preferred_gate_then_up_mma_tiler

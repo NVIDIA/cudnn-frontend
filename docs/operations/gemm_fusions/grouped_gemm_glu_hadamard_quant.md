@@ -22,7 +22,58 @@ This kernel performs:
 3. **Optional NVFP4 quantization** of the post-activation `D` output
 4. **Optional RHT output** in bf16 or NVFP4 form
 
-### Shapes
+### Gate/up branch storage
+
+Both the wrapper and class accept an append-only `glu_layout` option. The
+existing `"interleaved_32"` default keeps its 256x256 two-CTA geometry.
+`"gate_then_up"` accepts conventional `[gate | up]` weights, matching bias
+and saved C, without a persistent weight repack. It uses the existing kernel
+with a nested TMA view and a local scale-quarter permutation before MMA.
+D, RHT and their scale tensors retain their natural post-activation feature order.
+
+The canonical branch option currently requires Torch on SM100/SM103,
+`act_func="swiglu"`, NVFP4 E2M1 operands with E4M3 scales, `sf_vec_size=16`,
+K-major weights, BF16 saved C, and `N/2` divisible by 128. Set
+`mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)` for this option.
+Both dense and discrete expert weights are supported. The existing output
+modes remain available: BF16 or NVFP4 D, BF16/NVFP4 rowwise RHT, and NVFP4
+colwise RHT. Expert token offsets still require 256-row alignment.
+JAX, Rubin and UE5M3 input-scale overrides do not gain this branch option.
+
+Capability metadata is explicit:
+`supports_glu_layouts=("interleaved_32", "gate_then_up")`,
+`supports_gate_then_up_precisions=("nvfp4",)`, and
+`supports_gate_then_up_mma_tilers=((128, 256),)`.
+These branch-order capabilities are separate from tensor rank/stride support.
+
+### Natural tensor ranks (Torch)
+
+The wrapper and class advertise `supports_canonical_layouts=True` and accept
+contiguous A `(M, K/2)`, dense B `(L, N, K/2)`, and prob `(M,)` for packed NVFP4.
+The shapes use physical bytes for FP4; logical K is twice the last extent.
+Discrete weights keep the existing pointer-array contract.
+
+SFA and dense SFB can be contiguous buffers containing the **already MMA-packed
+scale bytes**, at any rank. Their lengths are respectively
+`512 * ceil_div(M, 128) * ceil_div(K, 4 * sf_vec_size)` and
+`512 * ceil_div(N, 128) * ceil_div(K, 4 * sf_vec_size) * L`.
+Flat storage does not mean logical row-major scale order: the caller must provide
+the same packed bytes as the legacy six-dimensional view. No scale repacking,
+weight permutation, or arithmetic change is performed by this adapter.
+
+For rank-two A, the wrapper returns C `(M, N)`, D and rowwise RHT `(M, N_out)`
+(or `(M, N_out/2)` for packed NVFP4), and flat contiguous rowwise scale buffers.
+Colwise RHT and its scales keep their existing flat per-expert representation.
+The class similarly accepts caller-owned natural-rank outputs; contiguous
+rowwise scale output buffers may have any rank. Trace-time views normalize
+these tensors for the existing kernel, without per-execution tensor reshapes.
+
+Natural tensor ranks work with both `glu_layout="interleaved_32"` and
+`glu_layout="gate_then_up"`. Colwise RHT scales use the same standard
+GEMM-blocked output order for either branch layout. Legacy input ranks and
+their wrapper output shapes remain supported.
+
+### Legacy kernel-facing shapes
 
 Let `N_out = N / 2` for `act_func="swiglu"` or `"geglu"` and `N_out = N` for `act_func="srelu"`. Let `SF(rows, cols)` denote the swizzled scale-factor layout `(32, 4, ceil_div(rows, 128), 4, ceil_div(ceil_div(cols, sf_vec_size), 4), 1)`.
 
@@ -81,7 +132,10 @@ $$
 
 The `bias` term is omitted when `bias_tensor=None`. `C` stores this unclamped GEMM-plus-bias value.
 
-Split the `N` dimension into consecutive 32-column gate/up blocks:
+With the default `glu_layout="interleaved_32"`, split the `N` dimension into
+consecutive 32-column gate/up blocks. For `"gate_then_up"`, use the first
+`N/2` columns as gate and the remaining `N/2` columns as up; the activation
+equations below are unchanged. The default block indexing is:
 
 $$
 G_b = C[:, 2bG:(2b+1)G], \quad U_b = C[:, (2b+1)G:(2b+2)G], \quad G = 32

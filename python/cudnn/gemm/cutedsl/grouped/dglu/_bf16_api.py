@@ -44,6 +44,7 @@ from ..backend_utils import debug_validate_offsets, debug_validate_pointer_value
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
+from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 
 
 def _output_dtypes():
@@ -52,6 +53,8 @@ def _output_dtypes():
 
 class GroupedGemmDgluBf16API(APIBase):
     """Descriptor-first lifecycle API for the source BF16 dGLU kernel."""
+
+    supports_glu_layouts = GLU_LAYOUTS
 
     def __init__(
         self,
@@ -81,6 +84,7 @@ class GroupedGemmDgluBf16API(APIBase):
         glu_clamp_min: float = -7.0,
         round_dgrad_to_input_dtype: bool = False,
         sample_activation: Optional[torch.Tensor] = None,
+        glu_layout: str = "interleaved_32",
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -163,6 +167,7 @@ class GroupedGemmDgluBf16API(APIBase):
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.act_func = act_func
         self.geglu_alpha = float(geglu_alpha)
         self.glu_clamp_max = float(glu_clamp_max)
@@ -377,6 +382,13 @@ class GroupedGemmDgluBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         capability = major * 10 + minor
+        if self.glu_layout == "gate_then_up":
+            if (major, minor) not in ((10, 0), (10, 3)) or self._framework != "torch":
+                raise NotImplementedError("gate_then_up BF16 dGLU requires torch tensors on SM100/103")
+            if self.act_func != "dswiglu" or self.c_desc.dtype != cutlass.BFloat16 or self.d_row_desc.dtype != cutlass.BFloat16:
+                raise NotImplementedError("gate_then_up BF16 dGLU requires dswiglu with BF16 C/D")
+            if self.c_desc.shape[1] % 256 != 0:
+                raise ValueError("gate_then_up BF16 dGLU requires each gate/up branch N divisible by 128")
         if not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
@@ -398,6 +410,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 glu_clamp_max=self.glu_clamp_max,
                 glu_clamp_min=self.glu_clamp_min,
                 round_dgrad_to_input_dtype=self.round_dgrad_to_input_dtype,
+                glu_layout=self.glu_layout,
             )
         return self._kernel_obj
 

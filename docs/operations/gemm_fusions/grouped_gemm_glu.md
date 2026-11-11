@@ -110,6 +110,137 @@ always `None`; `c_tensor` is `None` unless `generate_c=True`.
 
 ## Block-scaled contract
 
+### Gate/up storage order (BF16 and block-scaled)
+
+The Torch wrapper and class accept `glu_layout="interleaved_32"` (the default)
+or `glu_layout="gate_then_up"`. The latter keeps FC1 weights, bias and saved
+preactivation C in conventional `[gate | up]` order. D and its row/column
+scale buffers keep the ordinary activated-channel order in either mode.
+`supports_glu_layouts` on the public wrapper/class advertises this option;
+`supports_canonical_layouts` only describes tensor ranks and strides.
+
+`gate_then_up` requires SM100/SM103, Torch tensors, SwiGLU, K-major FC1
+weights, and `N/2` divisible by 128. Both packed expert weights and discrete
+expert pointers are supported. The supported precision contracts are:
+
+| A/B | Input scales | Saved C | D |
+| --- | --- | --- | --- |
+| BF16 | None | BF16 | BF16 |
+| NVFP4 E2M1 | E4M3, `sf_vec_size=16` | BF16 | BF16 |
+| MXFP8 E4M3 | E8M0, `sf_vec_size=32` | BF16 | E4M3 with row/column scales |
+
+`supports_gate_then_up_precisions` advertises these precision names
+(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX, SM107 and other precision/activation
+combinations do not acquire canonical branch support from this option.
+The wrapper and public class advertise `preferred_gate_then_up_mma_tiler=(256, 256)`
+for the optimized two-CTA canonical path. Consumers may use this preference for
+regular block-scaled GLU, while keeping `(128, 256)` as a fallback with older
+frontends that support canonical storage but do not expose the preference.
+Specialized GLU + Hadamard kernels have their own supported tile metadata.
+
+This is a separate constraint from the existing token alignment: expert
+token counts still follow the 256-row padded-offset contract.
+
+The existing GEMM uses a nested TMA view to address canonical weights as
+32-channel gate/up pairs. Scale-factor loads pair complete 128-row scale
+atoms, then rearrange their four-byte quarters in shared memory before the
+scale transfer to tensor memory. The one-CTA kernel performs this work in
+the MMA warp. In the two-CTA kernel, each CTA waits for its own scale-factor
+TMA loads and reorders the scales with a dedicated warp. The peer publishes
+these shared-memory writes with a shared-restricted release fence and a
+relaxed cluster barrier arrival; the consuming warp uses a matching cluster
+acquire. This avoids ordering unrelated global-memory work at every K stage.
+The existing GEMM pipeline still controls stage reuse and waits for A, B and
+SFA separately, so a completed scale reorder cannot release a stage early.
+BF16 needs only the operand/output views. Bias loads and saved-C stores
+use the matching view. No persistent weight permutation or additional global
+repacking kernel is required. Pair this forward option with
+`glu_layout="gate_then_up"` in [dGLU](grouped_gemm_dglu.md), which consumes C
+and writes FC1 gradients in the same canonical order.
+
+The remaining block-scaled examples use the default interleaved layout unless
+they explicitly select `gate_then_up`.
+
+#### Measured canonical-layout cost
+
+On GB200 SM100 (2026-11-10 UTC), a balanced DeepSeek-V3 MoE workload with
+H=7168, F=2048, 256 experts, top-8, EP8/TP1 and one 4096-token microbatch per
+EP rank has 32 local groups, each with M=1024. FC1 has `(M,N,K)=(1024,4096,7168)`;
+FC2 dgrad plus dSwiGLU has `(1024,2048,7168)`. Total local rows are 32768.
+No token or channel padding is added for this shape.
+
+The following captured-device measurements include the descriptor fence fix
+described below and use preallocated outputs, saved BF16 C and identical
+logical payloads/scales. All rows use `(256,256)` tiles and `(2,1)` clusters
+in both layouts. Each comparison has 24 paired repetitions of 30-call graph
+bundles with alternating forward/reverse variant order. Times are medians in microseconds;
+changes are medians of the per-repetition ratios, rather than ratios of the
+reported median times. Deterministic payload and scale bytes match before
+and after graph timing; backward's atomic dprob reduction is checked with
+numerical tolerances (`rtol=1e-5`, `atol=1e-6`).
+
+| Precision | Operation | Weight storage | Interleaved32 (us) | Gate-then-up (us) | Paired change |
+| --- | --- | --- | ---: | ---: | ---: |
+| BF16 | FC1 + SwiGLU | dense | 1399.3 | 1391.1 | -0.3% |
+| BF16 | FC2 dgrad + dSwiGLU | dense | 763.4 | 756.5 | -0.1% |
+| BF16 | FC1 + SwiGLU | discrete | 1398.0 | 1401.3 | +0.1% |
+| BF16 | FC2 dgrad + dSwiGLU | discrete | 762.4 | 763.0 | +0.1% |
+| NVFP4 | FC1 + SwiGLU | dense | 361.6 | 382.4 | +4.9% |
+| NVFP4 | FC2 dgrad + dSwiGLU | dense | 249.0 | 247.7 | -0.4% |
+| NVFP4 | FC1 + SwiGLU | discrete | 375.2 | 381.5 | +3.6% |
+| NVFP4 | FC2 dgrad + dSwiGLU | discrete | 253.0 | 250.5 | -1.2% |
+| MXFP8 | FC1 + SwiGLU | dense | 738.2 | 738.8 | -1.0% |
+| MXFP8 | FC2 dgrad + dSwiGLU | dense | 474.6 | 477.7 | +0.9% |
+| MXFP8 | FC1 + SwiGLU | discrete | 760.7 | 743.8 | -3.9% |
+| MXFP8 | FC2 dgrad + dSwiGLU | discrete | 474.7 | 479.4 | +1.0% |
+
+The optimized canonical forward reduces latency by 29–30% relative to the
+previous one-CTA canonical configuration on these quantized cases. The remaining
+canonical overhead relative to the current interleaved32 kernel is 3.6–4.9%
+for NVFP4; MXFP8 is within approximately 4% and is faster in these samples.
+BF16 and backward results remain within about 1.2% of their corresponding
+interleaved32 results. These are kernel measurements, excluding routing,
+weight quantization, RHT and FC2 forward. They do not establish end-to-end
+training throughput or performance on other shapes.
+
+Profiling isolated the earlier threefold two-CTA slowdown to scale-factor
+synchronization, rather than the canonical B TMA view. With uniform scale
+factors, a diagnostic that omitted only their reorder matched interleaved32
+time. Local scale-load completion and the shared-restricted publication
+sequence above remove the expensive cross-CTA notification and broad release
+ordering while retaining the required memory-ordering guarantees.
+
+The default interleaved32 arithmetic and layout are preserved. The forward
+optimization leaves legacy dense/discrete NVFP4 and MXFP8 normalized PTX
+unchanged, as verified with CUDA 13.4 AOT compilation; canonical one-CTA PTX
+is also unchanged. Paired legacy controls against the frozen implementation
+from before this optimization ranged from -1.5% to +2.7% in this run, so
+small timing differences should not be interpreted as code-generation gains.
+
+Separately, runtime TMA descriptor publication uses release/acquire proxy
+fences: stream ordering alone does not invalidate the tensormap cache when
+graph replay reuses scale allocations. This correctness fix also applies to
+the ordinary grouped GEMM used by FC2 and changes descriptor-handling
+instructions relative to the original implementation. Against that original
+frozen source, the discrete NVFP4 backward control retained about 1.9%
+overhead (approximately 254 to 259 us); a single release publishes B and SFB
+together in its descriptor helper. The optimization baseline above already
+contains this fix. A strict zero-performance-regression claim against the
+original implementation is therefore not supported. SM103 has not been
+measured.
+
+Reproduce the dense selected-tile comparison from the repository root:
+
+```bash
+python benchmark/gemm/benchmark_grouped_glu_layouts.py \
+  --ep 8 --context 4096 --precision all --direction both \
+  --tile-m 256 --canonical-forward-tile-m 256 --repeats 24 --bundle 30 \
+  --json grouped-glu-layouts.json
+```
+
+Runtime: Torch `2.13.0a0+8145d630e8.nv26.06`, CUDA 13.3, driver API 13030,
+CuTe DSL 4.8.0 with its CUDA 13.4 compiler, source frontend 1.33.0.
+
 The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
 2. **GLU activation**: Fused SwiGLU, GeGLU, or SiTU-GLU activation applied to the GEMM output
