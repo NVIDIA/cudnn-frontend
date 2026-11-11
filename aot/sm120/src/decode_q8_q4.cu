@@ -777,11 +777,12 @@ cudnn_fe_aot_sm120_decode_prewarm(int head_dim, int kv_type) {
     if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
     if (cc != 120) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int first = choose_config(head_dim, kv_type, 1);
+    cudaFuncAttributes attr{};
     for (int cfg = first; cfg < first + 3; ++cfg)
         for (int mode = 0; mode < 3; ++mode)
-            if (kConfigs[cfg].kern[mode] && !kernel_occupancy(cfg, mode, dev))
+            if (kConfigs[cfg].kern[mode] && (cudaFuncGetAttributes(&attr, kConfigs[cfg].kern[mode]) != cudaSuccess ||
+                                             !kernel_occupancy(cfg, mode, dev)))
                 return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
-    cudaFuncAttributes attr{};
     void (*combine)(KParams) =
         head_dim == 128 ? cudnn_fe_aot_sm120_decode_combine_f16_d128 : cudnn_fe_aot_sm120_decode_combine_f16_d256;
     return cudaFuncGetAttributes(&attr, combine) == cudaSuccess ? CUDNN_FE_AOT_SM120_DECODE_SUCCESS
