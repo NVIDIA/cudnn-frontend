@@ -153,7 +153,7 @@ a row alone and inside a batch under the entry's own picks.
   replay and batch invariance; SM103 is unverified.
   The GLU+Hadamard+quant natural-rank adapter additionally checks exact
   equality with legacy tensor ranks for both GLU branch orders, dense/discrete
-  NVFP4 weights, BF16/NVFP4 rowwise outputs, and both colwise scale layouts.
+  NVFP4 weights, BF16/NVFP4 rowwise outputs, and standard GEMM-blocked colwise scales.
   Its replay and expert batch-invariance tests include payload and scale bytes,
   empty experts, reordered/duplicated/changed neighbors, and changed-input
   CUDA graph replay. These claims cover the tested SM100 shapes; natural-rank

@@ -260,6 +260,25 @@ python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py \
   gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py -m L0 -q -rs
 ```
 
+### Rebased grouped GLU stack — SM100, 2026-11-11
+
+The feature was rebuilt on develop `683f294b` with the default NVFP4 column-scale
+packing fix as a separate prerequisite. The tested stack `c6e49e62` passed
+**102 Torch cases with 6 Rubin-only skips**: 97 from the three quantization,
+branch-layout and natural-rank suites above (149.01 s), plus all 5 default-layout
+determinism cases (11.93 s). The JAX selection passed **16 cases** (45.26 s).
+Subsequent history cleanup moved API documentation into the prerequisite fix
+and clarified documentation; the tested feature source and tests are unchanged.
+The runtime was the same GB200 / CUDA 13.4 compiler environment documented above.
+
+Separate processes imported the standalone fix and feature stack, generated
+identical inputs, and compared raw-byte hashes of C, D, columnwise RHT and its
+scales. All outputs matched for the default `interleaved_32` path at expert
+M=[256,0,512], N=256/2048, K=512. Each process also checked an independent
+numerical reference. The 15-case TE integration selection passed (48.64 s)
+using TE Python source `21d47d4d` and its previously built native libraries;
+this was not a fresh full native rebuild. SM103/SM107 remain unverified.
+
 ### Custom reduction — SM100 validation, 2026-11-09 (UTC)
 
 The new `test_custom_reduction_determinism.py` L0 suite has **seven cases**:

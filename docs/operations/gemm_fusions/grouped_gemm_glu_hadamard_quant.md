@@ -385,8 +385,8 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 
 - `act_func`: `"swiglu"`, `"geglu"`, or `"srelu"`
 - `cd_major`: must be `"n"`
-- `mma_tiler_mn`: must be `(256, 256)`
-- `cluster_shape_mn`: cluster dimensions; for this fixed 2-CTA tiler, `cluster_shape_mn[0]` must be `2` and `cluster_shape_mn[1]` must be a positive power of two no larger than `4`
+- `mma_tiler_mn`: `(256, 256)` for the default `glu_layout="interleaved_32"`; `(128, 256)` for `"gate_then_up"`
+- `cluster_shape_mn`: for `"interleaved_32"`, the 2-CTA tiler requires the first dimension to be `2` and the second to be a positive power of two no larger than `4`; `"gate_then_up"` requires `(1, 1)`
 - `sf_vec_size`: must be `16`
 - `sf_fp8_dtype_override`: `None` uses the scale format implied by `SFA`/`SFB` dtype. `"e5m3"` reinterprets `torch.float8_e4m3fn` SFA/SFB storage as UE5M3 input scale factors; this is Rubin-only and does not convert tensor contents.
 - `m_aligned`: must be `256`
