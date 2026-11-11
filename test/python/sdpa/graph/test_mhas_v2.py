@@ -1001,6 +1001,108 @@ def test_ragged_stride_gaps_stable_under_stride_overrides():
         assert all(getattr(cfg, f"stride_{n}") == packed[n] for n in names), override
 
 
+# Fixed public-contract regressions complement the seeded compact-origin sweeps.
+_PHYSICAL_ORIGIN_CASES = [
+    ("bfloat16", 128), ("float16", 512),
+    ("float8_e4m3fn", 128), ("float8_e4m3fn", 512),
+    ("float8_e5m2", 128), ("float8_e5m2", 512),
+]
+
+
+def _physical_origin_cfg(dtype_name, width):
+    cfg = ExecConfig(
+        data_type=getattr(torch, dtype_name), output_type=torch.bfloat16,
+        rng_geom_seed=2451, rng_data_seed=2452,
+        is_infer=True, is_padding=True, is_ragged=True,
+        is_cu_seq_len=dtype_name == "float16", is_bias=False,
+        is_alibi=False, is_block_mask=False, is_dropout=False,
+        is_determin=False, batches=3, h_q=4, h_k=2, h_v=2,
+        s_q=129, s_kv=147, d_qk=width, d_v=width,
+        seq_len_q=[33, 65, 17], seq_len_kv=[17, 147, 80],
+        fwd_stats=True, right_bound=0,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        declare_total_seq_len=True,
+        ragged_origin_rows={
+            "q": [16, 80, 192, 224], "k": [32, 96, 288, 384],
+            "v": [64, 192, 384, 480], "o": [0, 64, 160, 224],
+            "stats": [8, 64, 192, 224],
+        },
+    )
+    cfg.fill_derived_fields()
+    if dtype_name == "float16":
+        cfg.ragged_stats_layout = "head_major"
+        cfg.stride_stats = (cfg.s_q, cfg.total_q, 1, 1)
+    return cfg
+
+
+def _exec_physical_origin_case(cfg, request, cudnn_handle):
+    print(cfg.to_repro_cmd(request.module.__file__), flush=True)
+    runner = exec_sdpa_fp8 if cfg.data_type.itemsize == 1 else exec_sdpa
+    runner(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name,width", _PHYSICAL_ORIGIN_CASES)
+def test_sdpa_physical_origins_L0(dtype_name, width, request, cudnn_handle):
+    """Logical lengths never specify Q/K/V/O/Stats physical row placement."""
+    _exec_physical_origin_case(_physical_origin_cfg(dtype_name, width), request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float8_e4m3fn"])
+def test_sdpa_physical_origins_backend_L0(dtype_name, request, cudnn_handle):
+    cfg = _physical_origin_cfg(dtype_name, 128)
+    cfg.plan_pin = {"engine": "backend"}
+    _exec_physical_origin_case(cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+def test_physical_origin_pack_reference_and_repro():
+    """A wrong compact interpretation must disagree even in the host oracle."""
+    from sdpa.helpers import convert_uniform_to_packed, convert_packed_to_uniform, ragged_live_rows
+
+    cfg = _physical_origin_cfg("bfloat16", 128)
+    restored = ExecConfig.deserialize(cfg.serialize())
+    assert restored.serialize() == cfg.serialize()
+    for port in ("q", "k", "v", "o", "stats"):
+        lengths = cfg.seq_len_kv if port in ("k", "v") else cfg.seq_len_q
+        rows = cfg.ragged_origin_rows[port]
+        capacity = cfg.total_kv if port in ("k", "v") else cfg.total_q
+        lens = torch.tensor(lengths, dtype=torch.int32)
+        uniform = torch.arange(3 * 2 * 147 * 8, dtype=torch.float32).reshape(3, 2, 147, 8)
+        packed = convert_uniform_to_packed(uniform, lens, capacity, origins=rows)
+        expected = uniform.clone()
+        for i, length in enumerate(lengths):
+            expected[i, :, length:] = 0
+        torch.testing.assert_close(convert_packed_to_uniform(packed, lens, 147, origins=rows), expected, rtol=0, atol=0)
+        assert not torch.equal(convert_packed_to_uniform(packed, lens, 147), expected), port
+        live = ragged_live_rows(lengths, capacity, rows)
+        assert int(live.sum()) == sum(lengths)
+        assert torch.isnan(packed[~live]).all(), port
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("port", ["q", "k", "v", "o", "stats"])
+def test_physical_origin_capacity_covers_each_port(port):
+    cfg = _physical_origin_cfg("bfloat16", 128)
+    cfg.ragged_origin_rows[port] = [row + 1024 for row in cfg.ragged_origin_rows[port]]
+    field = "total_kv" if port in ("k", "v") else "total_q"
+    with pytest.raises(AssertionError, match=field):
+        cfg.fill_derived_fields()
+    setattr(cfg, field, None)
+    cfg.fill_derived_fields()
+    assert getattr(cfg, field) >= cfg.ragged_origin_rows[port][-1]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("rows", [[0, 16, 192, 224], [0, 64, 160], [0, -1, 160, 224]])
+def test_physical_origin_rejects_invalid_storage(rows):
+    cfg = _physical_origin_cfg("bfloat16", 128)
+    cfg.ragged_origin_rows["q"] = rows
+    with pytest.raises(AssertionError, match="q:"):
+        cfg.fill_derived_fields()
+
+
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
 def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_handle):

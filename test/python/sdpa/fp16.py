@@ -191,6 +191,7 @@ def _fold_attn_scale_into_q(cfg, q):
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}
+    origins = cfg.ragged_origin_rows or {}
     # total_q/total_kv are first-class capacities: honor explicit (possibly
     # slack-fuzzed) totals, falling back to the minimal packed capacity.
     max_t_q = (cfg.total_q or packed_token_capacity(cfg.seq_len_q)) if cfg.is_ragged else None
@@ -251,6 +252,20 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
             allocs[uid][0][total:] = float("nan")
         if cfg.is_train:
             allocs[TensorUid.dO][0][total_t_q:] = float("nan")
+        # Preserve the originally generated logical payload, then place it at
+        # each port's independent physical rows. Interior holes stay poisoned.
+        for name in ("q", "k", "v", "dO"):
+            port = "o" if name == "dO" else name
+            if port not in origins or (name == "dO" and not cfg.is_train) or (name in ("k", "v") and not kv_packed(cfg)):
+                continue
+            lengths = cfg.seq_len_kv if name in ("k", "v") else cfg.seq_len_q
+            tensor = allocs[getattr(TensorUid, name)][0]
+            payload = tensor[:sum(lengths)].clone()
+            tensor.fill_(float("nan"))
+            compact = 0
+            for start, length in zip(origins[port], lengths):
+                tensor[start:start + length].copy_(payload[compact:compact + length])
+                compact += length
     else:
         allocs[TensorUid.q] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
@@ -295,14 +310,14 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         o_off_mult = cfg.d_v if cfg.with_ragged_offset_multiplier else 1
         # Offsets scale by each tensor's ACTUAL token stride (stride[2]), not an
         # assumed-packed h*d — K/V may carry a token-stride gap (kv-interleaved).
-        allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_q[2] // q_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.q_ragged_offset] = (((torch.tensor(origins["q"], device="cuda", dtype=torch.int64) if "q" in origins else prefix_sum(seq_len_q_gpu)) * cfg.stride_q[2] // q_off_mult).to(torch.int64), None, None)
         if kv_packed(cfg):
-            allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_k[2] // k_off_mult).to(torch.int64), None, None)
-            allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_v[2] // v_off_mult).to(torch.int64), None, None)
-        allocs[TensorUid.o_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_o[2] // o_off_mult).to(torch.int64), None, None)
+            allocs[TensorUid.k_ragged_offset] = (((torch.tensor(origins["k"], device="cuda", dtype=torch.int64) if "k" in origins else prefix_sum(seq_len_kv_gpu)) * cfg.stride_k[2] // k_off_mult).to(torch.int64), None, None)
+            allocs[TensorUid.v_ragged_offset] = (((torch.tensor(origins["v"], device="cuda", dtype=torch.int64) if "v" in origins else prefix_sum(seq_len_kv_gpu)) * cfg.stride_v[2] // v_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.o_ragged_offset] = (((torch.tensor(origins["o"], device="cuda", dtype=torch.int64) if "o" in origins else prefix_sum(seq_len_q_gpu)) * cfg.stride_o[2] // o_off_mult).to(torch.int64), None, None)
         # Stats offsets are in elements and scale by its token stride: h_q for token-major stats,
         # 1 for head-major.
-        allocs[TensorUid.stats_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_stats[2]).to(torch.int64), None, None)
+        allocs[TensorUid.stats_ragged_offset] = (((torch.tensor(origins["stats"], device="cuda", dtype=torch.int64) if "stats" in origins else prefix_sum(seq_len_q_gpu)) * cfg.stride_stats[2]).to(torch.int64), None, None)
 
     if cfg.is_bias:
         allocs[TensorUid.bias] = alloc_tensor((1, cfg.h_q, cfg.s_q, cfg.s_kv), cfg.data_type, rng=rng_data_gen, mean=0.0, std=1.0, sparse_int=si)
@@ -827,6 +842,7 @@ def execute_graph(graph, variant_pack, allocs, tensors, cudnn_handle, request, l
 
 
 def compute_and_compare_reference(cfg, allocs, tensors, diffs):
+    origins = cfg.ragged_origin_rows or {}
     cudnn_version = LooseVersion(cudnn.backend_version_string())
 
     q_gpu = tensors.get(TensorUid.q)
@@ -889,12 +905,12 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     sink_token_ref = sink_token_gpu.detach().float() if sink_token_gpu is not None else None
 
     if cfg.is_ragged:
-        q_ref = convert_packed_to_uniform(q_ref, seq_len_q_ref, cfg.s_q)
+        q_ref = convert_packed_to_uniform(q_ref, seq_len_q_ref, cfg.s_q, origins=origins.get("q"))
     if kv_packed(cfg):
-        k_ref = convert_packed_to_uniform(k_ref, seq_len_kv_ref, cfg.s_kv)
-        v_ref = convert_packed_to_uniform(v_ref, seq_len_kv_ref, cfg.s_kv)
+        k_ref = convert_packed_to_uniform(k_ref, seq_len_kv_ref, cfg.s_kv, origins=origins.get("k"))
+        v_ref = convert_packed_to_uniform(v_ref, seq_len_kv_ref, cfg.s_kv, origins=origins.get("v"))
     if cfg.is_ragged and cfg.is_train:
-        dO_ref = convert_packed_to_uniform(dO_ref, seq_len_q_ref, cfg.s_q)
+        dO_ref = convert_packed_to_uniform(dO_ref, seq_len_q_ref, cfg.s_q, origins=origins.get("o"))
 
     # Must match the allocation capacity: first-class total_q/total_kv when
     # set, else the guaranteed-surplus packed capacity (GitHub #624).
@@ -995,18 +1011,18 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
             dV_ref[i, :, n:, :] = 0
 
     if cfg.is_ragged:
-        o_ref = convert_uniform_to_packed(o_ref, seq_len_q_ref, max_t_q)
+        o_ref = convert_uniform_to_packed(o_ref, seq_len_q_ref, max_t_q, origins=origins.get("o"))
         if cfg.with_score_max:
-            score_max_ref = convert_uniform_to_packed(score_max_ref, seq_len_q_ref, max_t_q)
+            score_max_ref = convert_uniform_to_packed(score_max_ref, seq_len_q_ref, max_t_q, origins=origins.get("stats"))
         if cfg.with_score_sum_exp:
-            score_sum_exp_ref = convert_uniform_to_packed(score_sum_exp_ref, seq_len_q_ref, max_t_q)
+            score_sum_exp_ref = convert_uniform_to_packed(score_sum_exp_ref, seq_len_q_ref, max_t_q, origins=origins.get("stats"))
     if cfg.is_train and cfg.is_ragged:
-        dQ_ref = convert_uniform_to_packed(dQ_ref, seq_len_q_ref, max_t_q)
-        dK_ref = convert_uniform_to_packed(dK_ref, seq_len_kv_ref, max_t_kv)
-        dV_ref = convert_uniform_to_packed(dV_ref, seq_len_kv_ref, max_t_kv)
+        dQ_ref = convert_uniform_to_packed(dQ_ref, seq_len_q_ref, max_t_q, origins=origins.get("q"))
+        dK_ref = convert_uniform_to_packed(dK_ref, seq_len_kv_ref, max_t_kv, origins=origins.get("k"))
+        dV_ref = convert_uniform_to_packed(dV_ref, seq_len_kv_ref, max_t_kv, origins=origins.get("v"))
     if fwd_stats(cfg) and cfg.is_ragged:
         # Packed Stats whenever the forward produced them (training or an explicit fwd_stats request).
-        stats_ref = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
+        stats_ref = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q, origins=origins.get("stats"))
 
     # Print hash and stats BEFORE comparison (approx_equal destroys tensor contents)
     print_tensor_stats(allocs[TensorUid.o][0], tag="o_gpu")
