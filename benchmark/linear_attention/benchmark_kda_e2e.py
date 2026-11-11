@@ -228,7 +228,13 @@ def main():
             _, unit_chunks = auto_choose_pieces(**kwargs)
             return args.force_pieces, unit_chunks
 
+        def choose_kda_pieces_override(**kwargs):
+            kwargs.pop("enable_ragged_fallback")
+            _, unit_chunks = auto_choose_pieces(**kwargs)
+            return args.force_pieces, unit_chunks, bool(args.force_pieces and args.batch_invariant)
+
         piece_chain.choose_pieces = choose_pieces_override
+        piece_chain.choose_kda_pieces = choose_kda_pieces_override
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_stream(stream)
