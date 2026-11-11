@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -347,10 +347,18 @@ def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
 
 
-def run_checks(session: Session, prompt_tokens: int) -> Checks:
-    """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded.  Leaves the session reset."""
+def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False) -> Checks:
+    """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
+    ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
+
+    ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
+    reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
+    on how many greedy tokens the two agree.  It is a scale, printed and not gated: on a trained checkpoint with 4-bit
+    activations two stacks that differ only in rounding end up tens of bf16 units apart (see the family's logits band)."""
     main = session.record
     steps = min(main.count, main.inputs.shape[0])
+    if max_steps is not None:
+        steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
     facts = session.plan.facts
     reference = Session(
@@ -362,6 +370,7 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
         reference_precision=session.reference_precision,
         capacity=session.capacity,
         share=session,
+        record_steps=steps,
     )
     reference.load()
 
@@ -380,12 +389,44 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
     for t in range(steps):
         reference._advance(inputs[t])
     band_units = float(session.model.logits_band_units)  # declared by the family, in its configs.py
-    tokens_ok, tokens_text = token_check(logits, reference.record.logits[:steps], ids, reference.record.outputs[:steps], band_units)
+    ref_logits, ref_ids = reference.record.logits[:steps], reference.record.outputs[:steps]
+    tokens_ok, tokens_text = token_check(logits, ref_logits, ids, ref_ids, band_units)
+    tokens_text = f"{int((ids == ref_ids).sum())} of {ids.numel()} greedy tokens equal to the reference stack's; " + tokens_text
+    if second_reference:
+        other = "ieee-fp32" if session.reference_precision == "fp64" else "fp64"
+        second = Session(
+            session.model,
+            session.text,
+            session.sequences,
+            stack="reference",
+            device=session.device,
+            reference_precision=other,
+            capacity=session.capacity,
+            share=session,
+            record_steps=steps,
+        )
+        matmul = torch.backends.cuda.matmul
+        kept = getattr(matmul, "fp32_precision", None)  # a session with IEEE fp32 accumulation sets it for the process
+        try:
+            second.load()
+            second.reset(fresh=True)
+            for t in range(steps):
+                second._advance(inputs[t])
+        finally:
+            if kept is not None:
+                matmul.fp32_precision = kept
+        _, scale_text = token_check(second.record.logits[:steps], ref_logits, second.record.outputs[:steps], ref_ids, band_units)
+        distance = scale_text.split("largest logit distance ", 1)[1].split("  [band", 1)[0]
+        tokens_text += (
+            f"; for scale, the reference stack with {other} accumulation is {distance} from the one with {session.reference_precision} "
+            f"and agrees with it on {int((second.record.outputs[:steps] == ref_ids).sum())} of {ids.numel()} greedy tokens (printed, not gated)"
+        )
 
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
     lines = [
-        f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {steps} steps: {prompt_tokens} prompt + {steps - prompt_tokens} decode)"
+        f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {'the first ' if steps < main.count else ''}{steps} steps: "
+        f"{min(prompt_tokens, steps)} prompt + {max(steps - prompt_tokens, 0)} decode)"
     ]
     lines.append(f"  replay            ids and logits byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     inside = sum(s.ok for s in judged.values())

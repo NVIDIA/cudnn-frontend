@@ -4,16 +4,18 @@ Each folder runs one open-weight model family end to end in a single process: te
 out. The samples are not a serving engine. They show which kernel serves each block of the model, check the whole path
 against a reference, and make the cost of every step visible. Every sample prints a block table before it runs: block,
 provider (cuDNN Frontend, cuBLAS, FlashInfer or PyTorch) and the rows that provider serves. By default a sample builds the
-model at its published layer widths with two layers and seeded weights. The samples never download weights or tokenizer
-files. The cuDNN Frontend APIs used here are experimental. Timings printed by a sample are for orientation only.
+model at its published layer widths with two layers and seeded weights; pass `--model /path/to/checkpoint` to run a real
+checkpoint from local disk. The samples never download weights or tokenizer files. The cuDNN Frontend APIs used here are
+experimental. Timings printed by a sample are for orientation only.
 
 **Where this area stands.** The first family is the dense Qwen 3.5-architecture model ([qwen_dense](qwen_dense/)), and its
-first sample is the plain decode on the reduced seeded model: token ids in, token ids out, self-checking. Reading a real
-checkpoint from local disk (`--model`, with the checkpoint's own tokenizer and chat template) is the next step; kernels on
-the stored 8-bit and 4-bit formats, FlashInfer where it has the block, and a captured decode step follow as a second
-stack (`native`). The destination is a runnable performance reference. Until a sample reaches it, its README says what the
-sample measures and what it does not, and no README here carries a performance table: numbers are published through the
-formal mode of the `benchmark/` folder.
+first sample is the plain decode: by default on the reduced seeded model, self-checking; with `--model`, text in and text
+out on a checkpoint from local disk, with the checkpoint's own tokenizer and chat template. Both run on the stack
+`fe-cublas`, which is a reference path: it holds every quantised weight as a bf16 copy and issues every launch from Python.
+Kernels on the stored 8-bit and 4-bit formats, FlashInfer where it has the block, and a captured decode step follow as a
+second stack (`native`). The destination is a runnable performance reference. Until a sample reaches it, its README says
+what the sample measures and what it does not, and no README here carries a performance table: numbers are published
+through the formal mode of the `benchmark/` folder.
 
 ## What a model sample is, and what it is not
 
@@ -38,7 +40,17 @@ or newer and a C++17 compiler. Install PyTorch first so the build finds the cuDN
 pip install --group torch
 pip install -e .                                   # the decode entries are newer than the last released wheel
 python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint, no extra package
+
+pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors: only for a checkpoint
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
 ```
+
+`samples/models/requirements.txt` holds sample-only dependencies with lower bounds; none of them is a dependency of the
+`nvidia-cudnn-frontend` package, and the default run of every sample needs none of them. They are imported in two places
+only: `tokenizers` and `jinja2` where a checkpoint's text is read, `safetensors` where its weights are. Where one is
+missing, a run with `--model` prints a `SKIP` that names the file. The family README states which checkpoint the sample
+was last run with, how much disk and GPU memory it needs and where the checkpoint comes from; a sample reads it from the
+directory it is given and from nowhere else.
 
 A sample checks the GPU, the library versions and the free memory before it loads anything, for every sequence count of
 the run at once: a `SKIP` comes before the first load or not at all. It ends in one of:
@@ -48,7 +60,7 @@ the run at once: a `SKIP` comes before the first load or not at all. It ends in 
 | `[00] PASS` | 0 | every check of the run held |
 | `[00] SKIP <requirement>` | 0 | this GPU, library version or free-memory budget is not served; the sentence names the fix |
 | `[00] RAN reference stack (no provider checked)` | 0 | `--stack reference`: every block ran on the reference, so nothing was verified |
-| `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key, or an installed distribution that disagrees with the imported `cudnn` |
+| `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key, a `--model` directory that is not a checkpoint, messages the checkpoint's chat template refuses, or an installed distribution that disagrees with the imported `cudnn` |
 | `[00] FAIL` | 1 | a check did not hold; the check lines above it say which |
 
 The first lines of a run state the environment: the `cudnn` version, whether it is an editable checkout or a wheel, a hash of
@@ -60,12 +72,12 @@ it prints its `SKIP`, whatever is installed.
 ## The helper layer
 
 `model_samples/` is one importable package shared by every family. It is sample code: not installed, not part of the wheel,
-and it imports nothing beyond cuDNN Frontend, PyTorch and the standard library.
+and for a default run it imports nothing beyond cuDNN Frontend, PyTorch and the standard library.
 
 | module | what it holds |
 |---|---|
-| `text_io.py` | text in, token ids; token ids, streamed text out (a synthetic byte-level tokenizer for the seeded run) |
-| `weights.py` | the three storage formats (bf16; 8-bit E4M3 with a scale; packed 4-bit with block scales and a global scale), the merge rule, dequantisation, seeded checkpoints built in memory |
+| `text_io.py` | text in, token ids; token ids, streamed text out: a synthetic byte-level tokenizer for the seeded run; a checkpoint's own tokenizer and chat template (messages, tool schemas, template options) from local disk |
+| `weights.py` | the three storage formats (bf16; 8-bit E4M3 with a scale; packed 4-bit with block scales and a global scale), the merge rule, dequantisation; seeded checkpoints built in memory; a checkpoint on local disk, described from its shard headers and read tensor by tensor without pickle |
 | `state.py` | the key/value cache of the attention layers; the recurrent-state and conv-history pool of the linear-attention layers, by slot id |
 | `blocks.py` | provider rows as data, the plan for (GPU class, sequences, tokens per sequence, stack), the served-by table, the memory sentence, typed declines |
 | `providers/fe.py` | adapters to cuDNN Frontend entries |
@@ -73,18 +85,43 @@ and it imports nothing beyond cuDNN Frontend, PyTorch and the standard library.
 | `providers/torch_ref.py` | every block in plain PyTorch with fp64 accumulation: the reference of the tie-out |
 | `loop.py` | `Session`: plan, load, prefill, step for a fixed set of sequences; stop rules |
 | `sampling.py` | greedy token choice on the GPU |
-| `timing.py` | host timestamps, stage lines, the report's text |
+| `timing.py` | host timestamps, stage lines, the traced pass (GPU busy, idle, launches per step from kernel activity records), the report's text |
 | `tie_out.py` | bands, the replay check, the per-block and token checks, batch invariance |
 | `<family>/` | what is specific to a model: geometry, layer order, block wiring, the provider table and the regime table as data |
+
+## What a run reports
+
+Every line below is printed by every run; a run on the reduced model prefixes its times with "reduced model" and prints
+no rate. None of it is a measurement of record: no clock is locked, and the stack is launched from Python.
+
+| line | definition |
+|---|---|
+| header | the model (the reductions of the default run, or the checkpoint's directory name, shard count, size and manifest hash), the GPU, the sequence counts, the stack; the `cudnn` version, editable checkout or wheel, a source hash, the installed distribution; the reference's accumulation precision |
+| `served by` | per block: calls per step, provider, entry, the rows the entry serves, and whether the row has a published measurement or is a fallback; then the memory the run needs against what is free. Decided and printed before anything is loaded |
+| `stage` | seconds of import, plan, read (or draw), merge, dequantise, compile and first launch of each compiled form, warm-up |
+| `text path` | render = chat messages to prompt text; tokenize = prompt text to ids, also per prompt token; ids to GPU = the copy of the prompt's ids to the device; text out = ids to text per produced token, inside the loop. With a checkpoint, the first call of the process and the same call repeated |
+| `first token` | the prefill route and its time. While the prompt goes through the decode step, one step per token, this is not a time to first token of record |
+| `steps` | period = from one step's first launch to the next step's, median and mean; in the step = from the first launch to the ids on the host; turnaround = from the ids on the host to the next launch (detokenise, stop check); block calls per step |
+| `traced pass` | the first 32 steps again, from a zero state, under the PyTorch profiler with kernel activity records only. GPU busy = the union of the intervals of the step's kernels and copies; idle inside the step = the step's span on the GPU less GPU busy; host-exposed = period - GPU busy; kernel launches and copies per step; the period under the profiler beside the untraced one. Where the records cannot be had the line says why |
+| `rate` | tokens produced / wall time of the decode loop, per sequence |
+| `bytes per step` | arithmetic on the model's tensor list: the bytes of the weights a step reads in their stored formats plus the state it reads and writes, against the same with the weights as this stack holds them |
+| `note` | what bounds a step of this stack |
+| `text out` | the text of sequence 0 and why it ended |
+| `checks` | replay, blocks, tokens, batch invariance (the family README has the bands); with a checkpoint, on the first 16 steps of every prompt |
+| `GPU memory`, `first launch` | PyTorch's peak, the growth on the device since the plan, and what the first launch of a compiled form took outside PyTorch's pool |
 
 ## What is verified where
 
 | what | by | where |
 |---|---|---|
 | the helper layer without a GPU: tables, plan, declines, memory sentence, environment check, token choice, stop rules, a decode of a tiny geometry on the CPU; the tie-out itself on stated tensors and through stand-in providers with deliberate defects (a NaN, one wrong value head, a row that reads its neighbour) | `test/python/misc/test_model_samples_plan.py` | any host, level L0 |
-| the weight formats: the bf16 copies both stacks read against a decode written from the format definitions, the quantisers, both merge rules, the reference multiply | `test/python/misc/test_model_samples_weights.py` | any host, level L0 |
+| the weight formats: the bf16 copies both stacks read against a decode written from the format definitions, the quantisers, both merge rules, the reference multiply; a checkpoint directory generated in the test: described from its headers, bound through the family's name map, read back bit for bit, decoded on the CPU to the bytes the same tensors give from memory; the declines of a checkpoint the family does not read; the memory sentence of `--model` before a tensor is read | `test/python/misc/test_model_samples_weights.py` | any host, level L0; the checkpoint tests skip visibly without `safetensors` |
+| the text side: the synthetic tokenizer and its stream; chat requests from JSON files; a chat template with the constructs of a checkpoint's own (tool schemas, a reasoning block, tool calls and results, several turns, an option, a refusal) against stored strings; a tokenizer trained in the test, encoded, decoded and streamed; the requirement file | `test/python/misc/test_model_samples_text.py` | any host, level L0; the checkpoint tests skip visibly without `jinja2` or `tokenizers` |
 | the default run of each sample: `[NN] PASS` with its own checks | `test/python/linear_attention/frost/test_model_sample_qwen_dense.py` | one GPU the family serves; L0 runs two layers, L1 four |
-| a real checkpoint | not yet read by any sample | -- |
+| a real checkpoint: text out, and the sample's checks on the first 16 steps of every prompt | by hand, with a run record; the family README states the checkpoint, the versions and the GPU class of the last run | a GPU with room for the stack; never in CI |
 
-A default run that skips on a GPU class is uncovered there, not passing. The family README lists, per GPU class, whether the
-default run has been verified.
+No tokenizer, template or weight file of a real checkpoint is committed. A default run that skips on a GPU class is
+uncovered there, not passing. The family README lists, per GPU class, whether the default run has been verified.
+
+Dependency alerts on `samples/models/requirements.txt` are raised by the `pip` entry for `/samples/models` in
+`.github/dependabot.yml` and are handled by the maintainers of this repository, as for its other requirement files.

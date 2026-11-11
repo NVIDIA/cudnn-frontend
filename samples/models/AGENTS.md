@@ -31,6 +31,10 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    A block's `__call__` launches on the current stream and neither reads the device nor synchronises.
 5. **No downloads.** Weights and tokenizer files come from a local path and are read without pickle. Every reduction (depth,
    vocabulary, seeded weights) is printed; a seeded run prints a hash of the produced ids and "the output is not language".
+   A checkpoint is described from its `config.json` and shard headers first (`Checkpoint.describe`, the family's
+   `describe`): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
+   a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
+   the tests generate what they read.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `--stack
    reference` reports `[NN] RAN reference stack (no provider checked)`, never `PASS`.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
@@ -53,6 +57,18 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
 11. **No performance table in a sample README.** Timings a sample prints are for orientation only; numbers are published
     through the `benchmark/` folder's formal mode. A licence header on every file; the repository's formatter settings; no
     absolute local path in any output.
+12. **Sample-only packages stay at the edge.** `samples/models/requirements.txt` holds them with lower bounds, never pins,
+    and a "Validated with" line; none is a dependency of the package. Each is imported inside the one function that needs it
+    (`TextIO.from_checkpoint`: `tokenizers`, `jinja2`; `Checkpoint.describe` and its reads: `safetensors`), never at module
+    import, and a missing one is a `SKIP` that names the requirement file. A lower bound is a version the host tests of the
+    text and weight readers were run against; raise it with evidence, in the same change as the code that needs it. The
+    family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
+    package versions and the GPU class of the last run with a checkpoint. Dependency alerts come through the `pip` entry for
+    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.
+13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events.** An event is stamped
+    when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
+    (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
+    host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
 
 ## What the first GPU run of this area taught
 
@@ -89,3 +105,19 @@ defect that shows it.
   against the format definitions in a test of their own.
 - A `SKIP` printed after a check has failed turns a failure into a skip for whoever reads the last line. Plan everything
   that can decline before the first load.
+
+## What the first run on a real checkpoint taught
+
+- An end-to-end comparison of logits or tokens is weak on a model with 4-bit activations, and no band makes it sharp. On
+  the published checkpoint two reference stacks that differ only in accumulation precision (fp64 against IEEE fp32) were up
+  to 52 bf16 units of the largest logit apart within 80 steps and disagreed on the greedy token at 13 of them, at margins of
+  up to several logits. A band that two correct stacks pass can only catch a path that has failed outright. Verify providers per block,
+  teacher-forced; print a second reference's distance beside the provider's instead of pretending the token check gates more
+  than it does.
+- The first call of a tokenizer and of a compiled chat template pays for caches the libraries build, tens of times the
+  repeated call. A sample that times one call times the caches; print the first call and the repeated call apart.
+- A streaming decoder is a library feature with its own history: the incremental decoder of `tokenizers` 0.21.0 fails on
+  inputs 0.21.1 decodes. A lower bound in the requirement file is a version the host tests ran against, not a guess.
+- The profiler's tracing library logs to stderr at start and stop, and once per kernel it cannot rate on a GPU it does not
+  know. The sample sets its log level before PyTorch is imported unless one is set in the environment; the report says itself when the
+  records are missing.

@@ -6,7 +6,9 @@
 fp64-accumulated reference (replay, every provider block teacher-forced, the greedy tokens, each sequence alone against the
 same sequence in the batch).  The run must print ``[00] PASS`` and the environment line; on a GPU, a library version or a
 free-memory budget the sample does not serve it prints ``[00] SKIP <requirement>`` and the cell is reported as skipped with
-that sentence -- unless a check failed before it: a skip never covers a failure.  The
+that sentence -- unless a check failed before it: a skip never covers a failure.  Each sequence count also reports its
+traced pass (GPU busy, idle and launches per step from kernel activity records, or the reason there are none) and the
+bytes of a step.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
 the four-layer one (three + one)."""
@@ -60,6 +62,7 @@ def _run(sample, capsys, arguments):
     for check in ("replay", "blocks", "tokens"):
         assert out.count(f"  {check} ") == 2 and f"  {check} " in out, f"the {check} check ran at both sequence counts"
     assert "linear_attention.step equal (gated)" in out or "REPORTED" in out, "batch invariance was checked at 4 sequences"
+    assert out.count("\ntraced pass ") == 2 and out.count("\nbytes per step ") == 2, "each count reports its traced pass (or why there is none) and its bytes"
     assert " FAIL" not in out
     return out
 

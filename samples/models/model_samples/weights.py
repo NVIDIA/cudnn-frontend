@@ -19,15 +19,32 @@ The quantisers follow the public arithmetic of the two formats (round to nearest
 make the midpoint choices of another quantiser.
 
 ``Checkpoint.synthetic`` draws every tensor on the CPU generator from a seed and the tensor's name, so a tensor's values depend
-on neither the device nor the load order.  Reading a real checkpoint from local disk arrives with the next pull request of this
-area.
+on neither the device nor the load order.
+
+``Checkpoint.describe(directory)`` reads a checkpoint from local disk in two steps.  The description reads ``config.json``
+and the header of every ``*.safetensors`` shard -- names, dtypes, shapes -- and no tensor, so a sample can plan, state its
+memory need and decline before it reads a byte of weights.  A family then binds its tensor list to the description
+(``bind``), which checks every tensor's presence, storage format and shape; ``load`` reads one tensor through the
+``safetensors`` library (no pickle, nothing executed), imported here and nowhere else.  The layout read is the one the
+quantised open-weight checkpoints of this family use:
+
+* 8-bit: ``<name>.weight`` as E4M3 codes ``[out, in]`` and ``<name>.weight_scale``, one fp32 scalar;
+* 4-bit: ``<name>.weight`` as packed codes ``[out, in / 2]`` (``uint8``), ``<name>.weight_scale`` as E4M3 block scales
+  ``[out, in / 16]`` and ``<name>.weight_scale_2``, one fp32 global scale;
+* ``<name>.input_scale``: the static scale of the activations the weight is multiplied with, one fp32 scalar.
+
+Nothing is downloaded: a directory that is not on local disk is an error.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import struct
 import zlib
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Union
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -229,13 +246,142 @@ class TensorSpec:
         return self.numel * (2 if self.fmt == "bf16" else 4)
 
 
+@dataclass(frozen=True)
+class DiskTensor:
+    """One tensor of a described checkpoint, from its shard's header: nothing of it is read."""
+
+    dtype: str  # as the header spells it: "BF16", "F32", "F8_E4M3", "U8", ...
+    shape: tuple
+    file: str  # the shard's file name
+
+
+#: what a described checkpoint may hold for each format of a family's tensor list: header dtype of the tensor itself
+_DISK_DTYPE = {"bf16": "BF16", "fp32": "F32", "fp8": "F8_E4M3", "nvfp4": "U8", "scalar": "F32"}
+REQUIREMENTS = "samples/models/requirements.txt"
+
+
+def read_header(path: str) -> tuple:
+    """The header of one safetensors file: ``(tensors, raw header bytes)`` with ``tensors`` name -> ``(dtype, shape)``.
+    The format is public: eight bytes of little-endian header length, then that many bytes of JSON; no tensor is read."""
+    with open(path, "rb") as f:
+        first = f.read(8)
+        if len(first) != 8:
+            raise ValueError(f"{os.path.basename(path)} is not a safetensors file")
+        (length,) = struct.unpack("<Q", first)
+        if not 2 <= length <= 100 * 1024 * 1024:
+            raise ValueError(f"{os.path.basename(path)} is not a safetensors file (header length {length})")
+        raw = f.read(length)
+    try:
+        header = json.loads(raw)
+    except ValueError as error:
+        raise ValueError(f"{os.path.basename(path)} is not a safetensors file ({error})") from error
+    return {name: (entry["dtype"], tuple(entry["shape"])) for name, entry in header.items() if name != "__metadata__"}, raw
+
+
 class Checkpoint:
-    """The tensors of one model by name.  ``Checkpoint.synthetic(model, seed)`` builds them in memory from ``model.tensor_specs()``."""
+    """The tensors of one model by name.  ``Checkpoint.synthetic(model, seed)`` builds them in memory from
+    ``model.tensor_specs()``; ``Checkpoint.describe(directory)`` describes a checkpoint on local disk, which a family then
+    binds its tensor list to."""
 
     def __init__(self, specs: Iterable[TensorSpec], seed: int, formats: str, label: str):
         self.specs = {s.name: s for s in specs}
         self.seed, self.formats, self.label = int(seed), formats, label
         self.synthetic_weights = True
+        self.config: dict = {}
+        self.tensors: Dict[str, DiskTensor] = {}  # a described checkpoint: every tensor of every shard, by its own name
+        self.files: Dict[str, int] = {}  # shard file name -> bytes
+        self.manifest_hash = ""
+        self._directory = ""
+        self._keys: Dict[str, str] = {}  # a family's tensor name -> the checkpoint's
+        self._open: dict = {}
+
+    @classmethod
+    def describe(cls, directory: str) -> "Checkpoint":
+        """``config.json`` and the shard headers of a checkpoint directory on local disk; no tensor is read.
+
+        Raises ``NotImplementedError`` (a SKIP that names the fix) when the ``safetensors`` package is missing, and
+        ``ValueError`` when the directory is not a checkpoint.  ``manifest_hash`` identifies the checkpoint's layout: a
+        SHA-256 over every shard's name, size and header bytes (tensor names, dtypes, shapes, offsets), not over its values."""
+        try:
+            import safetensors  # noqa: F401  the reader of ``load``; imported here so that its absence declines before the plan
+        except ImportError as error:
+            raise NotImplementedError(f"a checkpoint is read through the safetensors package ({error}): pip install -r {REQUIREMENTS}") from error
+        shown = os.path.basename(os.path.normpath(directory)) or "."
+        config_path = os.path.join(directory, "config.json")
+        if not os.path.isfile(config_path):
+            raise ValueError(f"--model {shown}: no config.json there; pass a checkpoint directory on local disk (nothing is downloaded)")
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+        shards = sorted(name for name in os.listdir(directory) if name.endswith(".safetensors"))
+        if not shards:
+            raise ValueError(f"--model {shown}: no *.safetensors shard there")
+        self = cls((), 0, "native", f"checkpoint {shown} (local)")
+        self.synthetic_weights, self.config, self._directory = False, config, directory
+        digest = hashlib.sha256()
+        for shard in shards:
+            path = os.path.join(directory, shard)
+            tensors, raw = read_header(path)
+            size = os.path.getsize(path)
+            self.files[shard] = size
+            digest.update(shard.encode() + b"\0" + str(size).encode() + b"\0" + raw)
+            for name, (dtype, shape) in tensors.items():
+                if name in self.tensors:
+                    raise ValueError(f"--model {shown}: tensor {name!r} is in {self.tensors[name].file} and in {shard}")
+                self.tensors[name] = DiskTensor(dtype, shape, shard)
+        self.manifest_hash = digest.hexdigest()[:12]
+        return self
+
+    def summary(self) -> str:
+        """What was described, for a sample's header: no path, the directory's own name only."""
+        total = sum(self.files.values())
+        return f"{self.label}: {len(self.files)} shards, {len(self.tensors):,} tensors, {total / 1e9:.1f} GB, manifest hash {self.manifest_hash}"
+
+    def bind(self, specs: Iterable[TensorSpec], keys: Mapping[str, str]) -> None:
+        """Attach a family's tensor list to a described checkpoint.  ``keys`` maps each spec's name to the checkpoint's own
+        tensor name.  Every tensor must be there in the storage format and shape of its spec; the first that is not raises
+        ``NotImplementedError`` naming it: the checkpoint is not one this family reads."""
+
+        def need(key, dtype, shape, what):
+            found = self.tensors.get(key)
+            if found is None:
+                raise NotImplementedError(f"{self.label} has no tensor {key!r} ({what}): not a checkpoint this sample reads")
+            if found.dtype != dtype or (shape is not None and tuple(found.shape) != tuple(shape)):
+                wanted = f"{dtype} {list(shape)}" if shape is not None else dtype
+                raise NotImplementedError(
+                    f"{self.label}: tensor {key!r} is {found.dtype} {list(found.shape)} where this sample reads {wanted} ({what}): "
+                    "it reads the build with 8-bit projections and a 4-bit MLP and output head"
+                )
+
+        bound, names = {}, {}
+        for spec in specs:
+            key = keys[spec.name]
+            if spec.fmt == "scalar":
+                need(key, "F32", (), "a static activation scale")
+            elif spec.fmt == "fp8":
+                need(key, "F8_E4M3", spec.shape, "8-bit codes")
+                need(key + "_scale", "F32", (), "the 8-bit weight scale")
+            elif spec.fmt == "nvfp4":
+                need(key, "U8", (*spec.shape[:-1], spec.shape[-1] // 2), "packed 4-bit codes")
+                need(key + "_scale", "F8_E4M3", (*spec.shape[:-1], spec.shape[-1] // BLOCK), "4-bit block scales")
+                need(key + "_scale_2", "F32", (), "the 4-bit global scale")
+            else:
+                need(key, _DISK_DTYPE[spec.fmt], spec.shape, "a plain tensor")
+            bound[spec.name], names[spec.name] = spec, key
+        self.specs, self._keys = bound, names
+
+    def _read(self, key: str) -> torch.Tensor:
+        """One tensor of a described checkpoint on the CPU, through ``safetensors`` (memory-mapped shard, no pickle)."""
+        from safetensors import safe_open
+
+        shard = self.tensors[key].file
+        handle = self._open.get(shard)
+        if handle is None:
+            handle = self._open[shard] = safe_open(os.path.join(self._directory, shard), framework="pt", device="cpu")
+        return handle.get_tensor(key)
+
+    def close(self) -> None:
+        """Drop the memory-mapped shards of a described checkpoint."""
+        self._open.clear()
 
     @classmethod
     def synthetic(cls, model, seed: int = 0, formats: str = "native") -> "Checkpoint":
@@ -274,6 +420,18 @@ class Checkpoint:
         spec = self.specs.get(name)
         if spec is None:
             raise KeyError(f"no tensor named {name!r} in this checkpoint")
+        if not self.synthetic_weights:
+            key = self._keys[name]
+            if spec.fmt == "scalar":
+                return float(self._read(key))
+            if spec.fmt == "fp8":
+                stored = ScaledTensor(self._read(key).view(torch.uint8).to(device), float(self._read(key + "_scale")))
+            elif spec.fmt == "nvfp4":
+                blocks = self._read(key + "_scale").view(torch.uint8).to(device)
+                stored = BlockScaledTensor(self._read(key).to(device), blocks, float(self._read(key + "_scale_2")))
+            else:
+                stored = self._read(key).to(device)
+            return dequantize(stored) if as_format == "dequantized" else stored
         if spec.fmt == "scalar":
             return float(spec.mean)
         x = self._draw(spec).to(device)

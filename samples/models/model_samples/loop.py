@@ -9,7 +9,8 @@ follow it on its weights, so that nothing can decline once the first of them has
 merges and dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one
 warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
 chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
-no ``generate()`` here.
+no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
+lines (``timing``); it leaves the run's state and record as they were.
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -25,7 +26,7 @@ import torch
 from . import blocks
 from .sampling import GREEDY
 from .state import DecodeState
-from .timing import Report, Stages, now
+from .timing import Report, Stages, now, trace_steps
 
 STACKS = ("fe-cublas", "reference")
 PREFILL_ROUTES = ("decode-step",)
@@ -83,9 +84,11 @@ class Session:
         seed: int = 0,
         merge_rule: str = "largest_scale",
         share: Optional["Session"] = None,
+        record_steps: Optional[int] = None,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
-        model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out)."""
+        model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
+        ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step)."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if prefill not in PREFILL_ROUTES:
@@ -96,6 +99,7 @@ class Session:
         self.device = torch.device(device)
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
+        self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
         self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
         self.plan: Optional[blocks.Plan] = None
         self.weights = None
@@ -169,7 +173,7 @@ class Session:
         """Back to the start of a prompt set: zero state at position 0 and an empty record; ``fresh`` allocates both anew."""
         if fresh or self.state is None:
             self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
-            self.record = Record(self.capacity, self.sequences, self.model.geometry.vocab, self.device)
+            self.record = Record(self.record_steps, self.sequences, self.model.geometry.vocab, self.device)
         else:
             self.state.position = 0
             for layer in self.state.layers:
@@ -226,5 +230,29 @@ class Session:
             self._report.clock.mark_ids()
         return tokens
 
+    def trace(self, steps: int = 32) -> None:
+        """The traced pass of the report: replay the first ``steps`` recorded inputs of this run from a zero state under the
+        profiler, each step ending in the host read of its ids, as in the loop.  The run's own state and record are put
+        back afterwards.  Where kernel activity records cannot be had the report says why."""
+        count = min(steps, self.record.count, self.record.inputs.shape[0])
+        if count < 1 or self.device.type != "cuda":
+            self._report.trace_missing = "needs a recorded step on a CUDA device"
+            return
+        inputs, kept, calls = self.record.inputs[:count], (self.state, self.record), self._calls
+        self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
+        self.record = Record(0, self.sequences, self.model.geometry.vocab, self.device)
+        try:
+            self._report.trace, self._report.trace_missing = trace_steps(lambda i: self._advance(inputs[i]).tolist(), count)
+        finally:
+            (self.state, self.record), self._calls = kept, calls
+
+    def new_report(self) -> None:
+        """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
+        calls = self._report.calls_per_step
+        self._report = Report(self.model.name, reduced=bool(getattr(self.model, "reductions", ())))
+        self._report.calls_per_step = calls
+
     def report(self) -> Report:
+        if hasattr(self.model, "bytes_per_step") and self.state is not None:
+            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position)
         return self._report

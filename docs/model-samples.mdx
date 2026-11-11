@@ -1,0 +1,48 @@
+---
+title: "Model Samples"
+---
+Model samples run one open-weight model family end to end in a single process: text in, tokens, prefill, decode steps, text out. They are not a serving engine. Each sample prints which provider serves every block of the model before it runs, checks the whole path against a plain-PyTorch reference, and reports what a decode step costs on the host and on the GPU. The cuDNN Frontend APIs they use are experimental, and the timings they print are for orientation only.
+
+## Source Code
+
+[Model samples](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/models) on GitHub: the area README describes what a model sample is and is not, the shared helper layer, what every run reports and what is verified where.
+
+| Family | Sample | What it runs |
+|---|---|---|
+| [Dense Qwen 3.5 architecture](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/models/qwen_dense) | `00_decode.py` | Plain greedy decode. By default: the model at its published layer widths with two layers and seeded weights, token ids in and out, self-checking. With `--model`: text in and text out on a checkpoint from local disk, with the checkpoint's own tokenizer and chat template. The linear-attention step runs on [`cudnn.GdnDecodeFused`](/operations/LinearAttention/gdn_decode_flashinfer_backend). |
+
+## Run
+
+The decode entries are newer than the last released wheel, so install cuDNN Frontend from the checkout. Building it needs a CUDA toolkit with its compiler, cuDNN 9 headers and libraries, CMake 3.26 or newer and a C++17 compiler. Install PyTorch first so the build finds the cuDNN headers of its wheel, or set `CUDNN_PATH`.
+
+```bash
+pip install --group torch
+pip install -e .
+python samples/models/qwen_dense/00_decode.py
+```
+
+The default run needs no checkpoint and no extra package. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. The fused linear-attention step serves compute capability 10.x and 12.x.
+
+To run a checkpoint from local disk, install the sample-only packages and pass the directory. Nothing is downloaded: fetching a checkpoint is your own step, and its weights carry their own licence.
+
+```bash
+pip install -r samples/models/requirements.txt
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
+```
+
+`--messages FILE` takes chat messages as JSON, with tool schemas and options of the checkpoint's chat template; `--dump-tokens FILE` writes the prompt ids and the produced ids. The [family README](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/models/qwen_dense/README.md) lists every flag, the checkpoint and package versions the sample was last run with, and the disk and GPU memory it needs.
+
+## What a Run Prints
+
+- **Header**: the model or the checkpoint (directory name, shards, size, a manifest hash), the GPU, the stack, the versions, and whether `cudnn` is an editable checkout or a wheel.
+- **Served by**: per block, the calls per step, the provider (cuDNN Frontend, cuBLAS or PyTorch), the entry and the rows it serves, then the memory the run needs against what is free. It is decided and printed before anything is loaded.
+- **Stages**: seconds to read, merge and dequantise the weights, to compile, and to warm up.
+- **Text path**: render, tokenize, ids to the GPU, text out per token.
+- **Steps**: period, time in the step, turnaround; from one traced pass of 32 steps under the profiler: GPU busy, idle inside the step, host-exposed time, kernel launches per step; the bytes a step moves against the bytes the model needs in its stored formats.
+- **Text out** and the **checks**: replay, every provider block against the reference, the greedy tokens, each sequence alone against the same sequence in a batch.
+
+The stack of the first sample, `fe-cublas`, is a reference path: every quantised weight is held as a bf16 copy and every launch is issued from Python. It claims no number; performance numbers are published through the formal mode of the `benchmark/` folder.
+
+## Tests
+
+The helper layer is tested without a GPU under `test/python/misc/` (`test_model_samples_plan.py`, `test_model_samples_weights.py`, `test_model_samples_text.py`), and the default run of each sample is a GPU test (`test/python/linear_attention/frost/test_model_sample_qwen_dense.py`). A run with a real checkpoint is made by hand; no checkpoint, tokenizer or template file is part of the repository.

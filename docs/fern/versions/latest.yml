@@ -9,6 +9,9 @@ navigation:
   - page: Samples
     path: ../../samples.mdx
     slug: samples
+  - page: Model Samples
+    path: ../../model-samples.mdx
+    slug: model-samples
   - link: Release Notes
     href: https://github.com/NVIDIA/cudnn-frontend/releases
   - section: API Reference

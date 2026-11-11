@@ -615,3 +615,108 @@ def test_batch_invariance_covers_every_sequence_of_the_batch():
     line = _line(checks, "batch invariance")
     assert not checks.ok and "one sequence alone vs among 3 (step t: sequence t mod 3)" in line, checks.text()
     assert "linear_attention.step DIFFERS (gated)" in line and "linear_attention.step (2 of 7 calls)" in line and line.endswith("FAIL"), line
+
+
+def test_the_traced_pass_is_read_from_kernel_activity_records():
+    """A step of the loop ends in its one host read, which the records show as a device-to-host copy: the records up to
+    and including it are one step.  GPU busy is the union of the intervals, idle the rest of the step's span."""
+    from model_samples.timing import Report, Trace, step_facts
+
+    records = [
+        ("kernel_a", 0.0, 2.0),
+        ("kernel_b", 1.0, 3.0),  # overlaps kernel_a: the union counts the overlap once
+        ("Memcpy HtoD (Pageable -> Device)", 5.0, 5.5),
+        ("kernel_c", 5.25, 5.4),  # inside the copy
+        ("Memcpy DtoH (Device -> Pageable)", 9.0, 10.0),  # the host read: the step ends here
+        ("Memset (Device)", 20.0, 20.5),
+        ("kernel_a", 21.0, 22.0),
+        ("Memcpy DtoH (Device -> Pinned)", 22.0, 22.25),
+        ("kernel_a", 30.0, 31.0),  # after the last host read: belongs to no step
+    ]
+    assert step_facts(list(reversed(records))) == [
+        (4.5, 5.5, 3, 2),
+        (1.75, 0.5, 1, 2),
+    ], "(GPU busy, idle inside the step, kernels, copies) per step, in start order"
+    assert step_facts([("kernel_a", 0.0, 1.0)]) == [] and step_facts([]) == []
+
+    report = Report("qwen_dense", reduced=False)
+    report.prompt_tokens, report.calls_per_step = 58, 484
+    for t in range(4):
+        report.clock.launch.append(0.1 * t)
+        report.clock.ids.append(0.1 * t + 0.09)
+    report.trace = Trace(steps=32, busy=40.0, idle=55.0, kernels=11750, copies=1016, period=125.0)
+    report.bytes = {"weights": 17_610_000_000, "copies": 51_250_000_000, "state": 310_000_000}
+    text = report.text()
+    assert "steps (4)            period 100.000 ms median / 100.000 mean | in the step 90.000 ms | turnaround 10.000 ms | 484 block calls per step" in text
+    traced = "traced pass (32)      GPU busy 40.000 ms | idle inside the step 55.000 ms | host-exposed 60.000 ms = period - GPU busy (60% of the period) | "
+    assert traced + "11750 kernel launches + 1016 copies per step | period under the profiler 125.000 ms (+25 %)" in text
+    assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in text
+    assert "bytes per step        model 17.92 GB (weights 17.61 in their stored formats, state and cache 0.31); this stack moves 51.56 GB (2.88x)" in text
+    assert "first token           prefill route: decode step, 58 tokens x one step; not a time to first token of record" in text
+    report.trace, report.trace_missing = None, "the profiler recorded no kernel activity on this GPU"
+    assert "traced pass           not available: the profiler recorded no kernel activity on this GPU" in report.text()
+    reduced = Report("qwen_dense", reduced=True)
+    reduced.bytes = report.bytes
+    assert "rate                  not printed for a reduced model" in reduced.text() and "bytes per step        reduced model: model 17.92 GB" in reduced.text()
+
+
+def test_a_session_traces_only_what_it_recorded_and_keeps_its_run():
+    session, text = _tiny_session(sequences=1)
+    session.trace()
+    assert session.report().trace is None and session.report().trace_missing == "needs a recorded step on a CUDA device", "nothing recorded, and no GPU here"
+    assert "traced pass           not available: needs a recorded step on a CUDA device" in session.report().text()
+    ids = session.prefill([text.encode("abc")])
+    state, record, position = session.state, session.record, session.state.position
+    session.trace(2)
+    assert session.state is state and session.record is record and session.state.position == position == 3 and session.record.count == 3
+    assert session.report().bytes == session.model.bytes_per_step(1, 3), "the report carries the bytes of a step at the position the run reached"
+    session.new_report()
+    assert session.report().trace_missing == "" and session.report().calls_per_step == 20 and not session.report().text_path, "a fresh report per prompt set"
+    assert ids.shape == (1,)
+
+
+def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
+    """The published geometry by arithmetic on its tensor list: what a step reads in the stored formats, what this stack
+    moves instead, and the memory sentence of a run with every weight held as a bf16 copy -- on a GPU that has less, a
+    SKIP before anything is loaded."""
+    import model_samples
+    from model_samples import blocks
+    from model_samples.qwen_dense import QwenDense
+
+    model = QwenDense()
+    step = model.bytes_per_step(sequences=1, positions=343)
+    assert 17.60e9 < step["weights"] < 17.62e9, "8-bit projections, a 4-bit MLP and a 4-bit output head, as stored"
+    assert 51.2e9 < step["copies"] < 51.3e9 and 2.90 < step["copies"] / step["weights"] < 2.92, "the bf16 copies: 2 bytes per weight element"
+    assert 0.30e9 < step["state"] < 0.36e9, "48 recurrent states read and written, 16 key/value caches read"
+    assert model.bytes_per_step(4, 343)["state"] == 4 * step["state"] and model.bytes_per_step(4, 343)["copies"] - step["copies"] == 3 * 2 * 5120
+    need = model.memory_bytes(sequences=1, capacity=343)
+    assert 52 * GIB < need < 53 * GIB, "50.1 GiB of bf16 copies incl. the embedding table, the state of one sequence, 2 GiB of working memory"
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    free = [31 * GIB]
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, free[0])))
+    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 55\.\d GB on this GPU; 31.0 GB are free: free memory on this GPU"):
+        model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
+    free[0] = 80 * GIB
+    table = model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
+    assert "this stack needs about 55." in table and "80.0 GB are free" in table and "add_norm_quantize        129" in table and "48 / 16" in table
+
+
+def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_reference():
+    import model_samples
+    from model_samples import tie_out
+
+    session, text = _tiny_session(sequences=1)
+    ids = session.prefill([text.encode("abcd")])
+    for _ in range(4):
+        ids = session.step(ids)
+    assert session.record.count == 8
+    checks = tie_out.run_checks(session, prompt_tokens=4, max_steps=3, second_reference=True)
+    assert checks.ok and checks.lines[0] == "checks (1 sequence, the first 3 steps: 3 prompt + 0 decode)", checks.text()
+    tokens = _line(checks, "tokens").strip()
+    assert tokens.startswith("tokens            3 of 3 greedy tokens equal to the reference stack's; ") and tokens.endswith("PASS")
+    assert "for scale, the reference stack with ieee-fp32 accumulation is " in tokens and "agrees with it on " in tokens and "(printed, not gated)" in tokens
+    bounded = model_samples.Session(session.model, text, sequences=1, stack="reference", device="cpu", capacity=32, record_steps=5)
+    bounded.load()
+    assert bounded.record.inputs.shape[0] == 5 and bounded.record.logits.shape[0] == 5, "a long run keeps the ids and logits of its first steps only"
+    ids = bounded.prefill([text.encode("abcdefg")])
+    assert bounded.record.count == 7 and tie_out.run_checks(bounded, prompt_tokens=7).lines[0] == "checks (1 sequence, the first 5 steps: 5 prompt + 0 decode)"

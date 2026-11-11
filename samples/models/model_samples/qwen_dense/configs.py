@@ -100,6 +100,16 @@ FIRST_LAUNCH_RESERVE = {"cc12.x": 3 * GIB}
 #: logit.  It is declared for the reduced seeded model (measured by this sample: 1.0 unit with two layers, 1.2 with four, 1.4
 #: with eight); a real checkpoint declares its own
 LOGITS_BAND_UNITS = 4.0
+#: the logits band for a checkpoint read from local disk (the published depth, trained weights): wide, and wide by nature.
+#: The model quantises its MLP inputs to 4 bits per element and its projection inputs to 8, so a difference of one bf16
+#: rounding in a multiply becomes a different code in the next quantiser, 64 layers deep.  Measured by this sample on the
+#: published 27B-class checkpoint: two REFERENCE stacks that differ only in their accumulation precision (fp64 against IEEE
+#: fp32) were up to 52 units apart over 80 steps and chose another greedy token at 13 of them; the provider stack was up to
+#: 54 units from the fp64 reference over the same steps (69 units in a window whose largest logit was in a lower binade).
+#: A band below that would fail two correct stacks; at this width the check catches a path that has failed outright (logits unrelated
+#: to the reference's, a NaN) and nothing finer.  What verifies a provider on a checkpoint is the per-block check; the run
+#: prints the second reference's distance beside the provider's so that the two can be read side by side
+CHECKPOINT_LOGITS_BAND_UNITS = 128.0
 
 
 def readme_table(calls: dict) -> str:
