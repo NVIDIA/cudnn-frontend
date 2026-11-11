@@ -2125,36 +2125,36 @@ def _sm100_d128_spec() -> EngineSpec:
 
 
 def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    """The Hopper pair serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
+    """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
     import re
 
     from .d128_contract import validate_dense_bounds
 
     if facts.thd or facts.padded:
-        return "the SM90 backward pair serves dense graphs without padding masks"
+        return "the SM90 backward chain serves dense graphs without padding masks"
     if facts.bottom_right or facts.window_left is not None:
-        return "the SM90 backward pair serves unmasked or top-left causal attention"
+        return "the SM90 backward chain serves unmasked or top-left causal attention"
     if facts.has_bias or facts.has_sink or facts.has_dropout:
-        return "the SM90 backward pair serves graphs without bias, sinks or dropout"
+        return "the SM90 backward chain serves graphs without bias, sinks or dropout"
     if facts.h_kv <= 0 or facts.h_q % facts.h_kv:
-        return "the SM90 backward pair requires an integral head ratio"
+        return "the SM90 backward chain requires an integral head ratio"
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
     if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
-        return f"the SM90 backward pair requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+        return f"the SM90 backward chain requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
     scale = facts.d_qk**-0.5 if facts.scale is None else facts.scale
     if not (scale > 0 and scale < float("inf")):
-        return "the SM90 backward pair requires a positive finite attn_scale"
+        return "the SM90 backward chain requires a positive finite attn_scale"
     try:
         validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, None)
     except ValueError as error:
-        return "the SM90 backward pair: " + str(error)
+        return "the SM90 backward chain: " + str(error)
     return None
 
 
 def _sm90_spec() -> EngineSpec:
-    """Hopper dense d64 / d128 backward: the deterministic dK / dV + dQ kernel pair (cc 9.0 only).
+    """Hopper dense d64 / d128 backward: the key-owner kernel with the ordered dQ relay (cc 9.0 only).
 
-    Every request runs the pair, so the row claims ``deterministic`` for free; placement trails the backend
+    Every request runs the same ordered chain, so the row claims ``deterministic`` for free; placement trails the backend
     (``heuristics.TRAIL_ONLY_ROWS``).
     """
     return EngineSpec(

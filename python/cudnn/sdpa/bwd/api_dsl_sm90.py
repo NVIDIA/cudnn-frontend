@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Hopper dense d64 / d128 backward: the deterministic dK / dV + dQ kernel pair behind one prepared pointer entry."""
+"""Hopper dense d64 / d128 backward: the key-owner kernel with the ordered dQ relay behind one prepared pointer entry."""
 
 import math
 from contextlib import nullcontext
@@ -8,16 +8,17 @@ from contextlib import nullcontext
 import torch
 
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from .d128_contract import PAIR, pair_workspace_layout, validate_dense_bounds
+from .d128_contract import RELAY, relay_workspace_layout, validate_dense_bounds
 
-PAIR_CC = (9, 0)
+SM90_CC = (9, 0)
 
 
 class SdpaBwdDslSm90(SdpaBwdDsl):
     """Dense compact-BSHD MHA / GQA / MQA at D64 / D128 on cc 9.0: unmasked or top-left causal, BF16 / FP16.
 
-    Both kernels of the pair own their output tiles and reduce in a fixed order, so every request, deterministic or
-    not, runs the same bitwise-repeatable chain; the workspace holds the FP32 delta rows only.
+    The key-owner kernel accumulates dK / dV in registers and adds its dQ partials in a fixed per-query-tile turn
+    order, so every request, deterministic or not, runs the same bitwise-repeatable chain; the workspace holds the
+    FP32 dQ accumulator, the delta rows and the turn counters.
     """
 
     _NAME = "sdpa_bwd_sm90"
@@ -104,7 +105,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
         require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
-        require(tuple(cc) == PAIR_CC, f"requires SM90 (cc 9.0); got {cc}")
+        require(tuple(cc) == SM90_CC, f"requires SM90 (cc 9.0); got {cc}")
         arch_error = cutedsl_arch_requirement_error(cc)
         require(arch_error is None, arch_error)
         binder = getattr(_pybind_module, "_SdpaBwdBinder", None)
@@ -114,7 +115,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
         require(not self.causal_bottom_right, "bottom-right causal is not supported")
         require(self.window_size_left is None and self.window_size_right is None, "sliding windows are not supported")
         require(all(d is None for d in (self.sink_desc, self.dsink_desc, self.bias_desc, self.dbias_desc)), "sink / dSink and bias / dBias are not supported")
-        require(self.tile_m is None and self.tile_n is None, "the kernel pair has fixed tile geometry")
+        require(self.tile_m is None and self.tile_n is None, "the kernel has fixed tile geometry")
         for role in ROLES[:9]:
             desc = getattr(self, role + "_desc")
             require(desc.ndim == 4 and all(int(n) > 0 for n in desc.shape), f"{role} requires positive rank-four dimensions")
@@ -147,7 +148,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax > 0, "attn_scale must be finite and positive")
-        self._implementation = PAIR
+        self._implementation = RELAY
         self._is_supported = True
         return True
 
@@ -160,7 +161,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
 
     def scratch_workspace_bytes(self):
         self._ensure_support_checked()
-        return pair_workspace_layout(self.batch_size, self.h_q, self.s_q_max)[1]
+        return relay_workspace_layout(self.batch_size, self.h_q, self.s_q_max, self.head_dim_qk)[1]
 
     def execute(
         self,

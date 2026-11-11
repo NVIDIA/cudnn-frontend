@@ -144,6 +144,7 @@ def dot_do_o_kernel(
     dot_factor: cutlass.Float32,
     lanes_per_row: cutlass.Constexpr[int] = LANES_PER_ROW,
     rows_per_cta: cutlass.Constexpr[int] = ROWS_PER_CTA,
+    turns: Optional[cute.Tensor] = None,
 ):
     """``rows_per_cta`` rows per CTA, FP32 FTZ pair reduction, and dQ initialization when a dQ scratch is given."""
     block, batch, head = cute.arch.block_idx()
@@ -173,6 +174,12 @@ def dot_do_o_kernel(
         zero4 = cutlass.Vector.from_elements((cutlass.Float32(0.0), cutlass.Float32(0.0), cutlass.Float32(0.0), cutlass.Float32(0.0)), cutlass.Float32)
         (dq_accum.iterator.raw_ptr() + dq_offset).store(zero4, alignment=16)
         (dq_accum.iterator.raw_ptr() + dq_offset + 4).store(zero4, alignment=16)
+    if cutlass.const_expr(turns is not None):
+        if tid % lanes_per_row == 0 and row % 64 == 0:
+            turn_base = cutlass.Int64(batch) * cutlass.Int64(turns.stride[0]) + cutlass.Int64(head) * cutlass.Int64(turns.stride[1])
+            (turns.iterator.raw_ptr() + turn_base + (row // 64) * cutlass.Int64(turns.stride[2])).store(cutlass.Int32(0))
+            if row == 0:
+                (turns.iterator.raw_ptr() + turn_base + cutlass.Int64(turns.shape[2] - 1) * cutlass.Int64(turns.stride[2])).store(cutlass.Int32(0))
     do_values = (do.iterator.raw_ptr() + do_offset).load(count=ELEMENTS_PER_LANE, alignment=16)
     o_values = (o.iterator.raw_ptr() + o_offset).load(count=ELEMENTS_PER_LANE, alignment=16)
     pairs = []
@@ -200,6 +207,16 @@ def delta_zero_host(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, dq_accu
     lanes = o.shape[3] // ELEMENTS_PER_LANE
     rows = THREADS // lanes
     dot_do_o_kernel(o, do, delta, dq_accum, cutlass.Float32(1.0), lanes, rows).launch(
+        grid=(dq_accum.shape[1] // rows, o.shape[0], o.shape[2]), block=(THREADS, 1, 1), stream=stream
+    )
+
+
+@cute.jit
+def delta_zero_turns_host(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, dq_accum: cute.Tensor, turns: cute.Tensor, stream: cuda_driver.CUstream):
+    """One dense launch over dQ's rounded rows that also resets the per-query-tile turn counters and the key-tile tickets."""
+    lanes = o.shape[3] // ELEMENTS_PER_LANE
+    rows = THREADS // lanes
+    dot_do_o_kernel(o, do, delta, dq_accum, cutlass.Float32(1.0), lanes, rows, turns).launch(
         grid=(dq_accum.shape[1] // rows, o.shape[0], o.shape[2]), block=(THREADS, 1, 1), stream=stream
     )
 

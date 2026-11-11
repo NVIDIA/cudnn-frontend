@@ -377,10 +377,15 @@ tensors or tensor-launch fallback.
 Backward: `sdpa_bwd_sm90` (manifest slot 18, a default candidate ranked behind the backend --
 `TRAIL_ONLY_ROWS`) serves dense compact-BSHD **D64 / D128** half graphs (MHA, or GQA / MQA with an
 integral head ratio; unmasked or top-left causal; any sequence lengths; FP32 contiguous Stats) through
-a deterministic kernel pair: the key-owner dK / dV kernel (a 128-row key tile, Q / dO streamed through a
-three-stage TMA ring, P and dS kept in registers as WGMMA A operands) and the query-owner dQ kernel (a
-128-row query tile, K / V streamed), three launches with the row delta, workspace = the FP32 delta rows
-(`d128_contract.pair_workspace_layout`). Both requests (deterministic or not) run the same bitwise-
+one key-owner kernel with an ordered dQ relay: a CTA claims a 128-row key tile from its head's ticket, Q / dO
+stream through a three-stage TMA ring with their Stats staged by a loader warp, P and dS stay in registers
+as the WGMMA A operands of dV and dK, each warpgroup stages its dS half in shared memory and contracts it with
+its own key rows into the step's fp32 dQ partial, the second warpgroup folds its partial onto the first's, and a
+relay warp adds the sum into the fp32 dQ accumulator with a TMA reduction in key-tile order per query tile
+(causal CTAs walk the query tiles from the sequence end down to the diagonal, unmasked CTAs upward, the
+group's query heads interleaved inside the walk).
+Three launches: the delta / scratch-reset kernel, the key-owner kernel, the dQ cast; workspace = the fp32
+dQ accumulator, the delta rows, the turn counters and the tickets (`d128_contract.relay_workspace_layout`). Both requests (deterministic or not) run the same bitwise-
 repeatable chain; THD, padding masks, bottom-right causal, sliding windows, bias, sinks, dropout and
 other head dimensions are declined by name. Page: `docs/operations/attention/sdpa_bwd_sm90.md`.
 Forward: Q/K/V/O all use FP16 or all BF16. The shared body has native **D128, D256 and D512**
