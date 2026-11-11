@@ -928,12 +928,16 @@ o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_k
   misaligned base pointer is repaired by one copy (warned as slow path); the
   dense path declares the given strides as-is.
 - One io dtype per call (`fp16` or `bf16`); mixed-dtype inputs are rejected.
-- `sdpa_bwd` serves the **THD/varlen** path. Dense backward and sink backward
-  (dSink) are follow-ups and raise `NotImplementedError`. It consumes a
-  **padded** `(B, H, max_seqlen_q, 1)` fp32 LSE (backend restriction: bprop
-  THD rejects ragged LSE on SM8X/SM12X).
+- `sdpa_bwd` serves **THD/varlen** and unpadded **BHSD** backward. Padded
+  dense backward and sink backward (dSink) remain unsupported. THD accepts
+  fp32 LSE in packed `(T, H)` / `(T, H, 1)` or legacy padded
+  `(B, H, max_seqlen_q)` / `(B, H, max_seqlen_q, 1)` form. If `T == B` and
+  `max_seqlen_q == 1`, the shared three-dimensional shape retains its legacy
+  **padded** meaning; pass packed Stats as `(T, H)` to distinguish it.
+  The ordinary planner selects the engine. Packed Stats are converted to
+  padded storage only if planning explicitly declines the packed graph.
 - Autograd (`register_autograd`) requires `return_lse=True` on the forward;
-  the glue converts the packed TH1 stats to the padded layout device-side.
+  the glue passes packed TH1 Stats through their unambiguous `(T, H)` view.
 - Both ops ship `register_fake` meta kernels. `cudnn::sdpa_fwd` passes
   `torch.library.opcheck` on the dense and varlen paths, including
   dynamic-shape AOT dispatch (`torch.compile`-ready); the opcheck autograd

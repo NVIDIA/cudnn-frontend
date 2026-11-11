@@ -608,6 +608,51 @@ class TestSdpaVarlen:
         assert (v.grad[:live].float() - rdv[:live]).abs().max().item() < TOL
 
     @pytest.mark.L0
+    @pytest.mark.parametrize("leading_empty", [True, False])
+    @pytest.mark.parametrize("stats_layout", ["padded3d", "padded4d", "packed2d", "autograd"])
+    def test_thd_backward_ambiguous_stats_with_empty_sequence(self, leading_empty, stats_layout):
+        """Legacy BHS Stats stay padded when T capacity == B and maxS == 1."""
+        torch.manual_seed(959)
+        B, H, D = 2, 2, 128
+        live_batch = 1 if leading_empty else 0
+        kv_start = 2 if leading_empty else 0
+        cu_q = torch.tensor([0, 0, 1] if leading_empty else [0, 1, 1], dtype=torch.int32, device="cuda")
+        cu_kv = torch.tensor([0, 2, 5] if leading_empty else [0, 3, 5], dtype=torch.int32, device="cuda")
+        q = torch.randn(B, H, D, dtype=torch.bfloat16, device="cuda")
+        q[1:] = float("nan")  # unused capacity must not become another query
+        k, v = (torch.randn(5, H, D, dtype=q.dtype, device="cuda") for _ in range(2))
+        for operand in (q, k, v):
+            operand.requires_grad_(True)
+        grad = torch.full_like(q, float("nan"))
+        grad[:1] = torch.randn_like(grad[:1])
+        kwargs = dict(cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, max_seqlen_q=1, max_seqlen_kv=3)
+        o, stats = torch.ops.cudnn.sdpa_fwd(q, k, v, D**-0.5, return_lse=True, **kwargs)
+        if stats_layout == "autograd":
+            o.backward(grad)
+            actual = (q.grad, k.grad, v.grad)
+        else:
+            if stats_layout == "packed2d":
+                lse = stats.squeeze(-1)
+            else:
+                # Distinguish the empty batch's row from the live packed row.
+                lse = torch.full((B, H, 1, 1), 13.0, device=q.device, dtype=torch.float32)
+                lse[live_batch, :, 0, 0] = stats[0, :, 0]
+                if stats_layout == "padded3d":
+                    lse = lse.squeeze(-1)
+            actual = torch.ops.cudnn.sdpa_bwd(grad, q, k, v, o, lse, D**-0.5, **kwargs)
+
+        # Independent FP64 attention on the sole live sequence. The two
+        # batches have different Q/KV prefixes; unused Q capacity is excluded.
+        qr = q[:1].detach().double().requires_grad_(True)
+        kr, vr = (t[kv_start : kv_start + 3].detach().double().requires_grad_(True) for t in (k, v))
+        scores = torch.einsum("qhd,khd->hqk", qr, kr) * D**-0.5
+        ref = torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), vr)
+        ref.backward(grad[:1].double())
+        torch.testing.assert_close(o[:1].double(), ref, rtol=0, atol=TOL)
+        for got, expected, start in zip(actual, (qr.grad, kr.grad, vr.grad), (0, kv_start, kv_start)):
+            torch.testing.assert_close(got[start : start + expected.shape[0]].double(), expected, rtol=0, atol=TOL)
+
+    @pytest.mark.L0
     @pytest.mark.parametrize("decline", ["unsupported", "not_implemented", "bug"])
     def test_thd_autograd_adapts_only_explicit_declines(self, monkeypatch, decline):
         """Legacy Stats adaptation is cached; implementation errors propagate."""

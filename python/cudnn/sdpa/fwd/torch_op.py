@@ -25,8 +25,10 @@ engines) per config.
 Backward contract: ``sdpa_bwd`` serves the THD/varlen path and the unpadded
 dense BHSD path (sink backward, and dense backward with per-batch lengths,
 are follow-ups and raise ``NotImplementedError``). On THD it accepts either
-the forward's packed ``(T, H, 1)`` fp32 LSE or the legacy backend's padded
-``(B, H, max_seqlen_q, 1)`` form. ``sdpa_fwd`` is differentiable on the
+packed ``(T, H[, 1])`` fp32 LSE or the legacy backend's padded
+``(B, H, max_seqlen_q[, 1])`` form. The shared 3-D shape when ``T == B``
+and ``max_seqlen_q == 1`` retains its legacy padded meaning; packed callers
+use ``(T, H)``. ``sdpa_fwd`` is differentiable on the
 varlen path via ``torch.library.register_autograd`` when called with
 ``return_lse=True``; autograd preserves the packed result and ``sdpa_bwd``
 repads internally only when the serving path needs the legacy layout.
@@ -979,7 +981,10 @@ def _sdpa_bwd_impl(
         raise ValueError(f"lse must be float32, got {lse.dtype}")
     packed_shapes = {(T_q, H_q), (T_q, H_q, 1)}
     padded_shapes = {(B, H_q, S_q), (B, H_q, S_q, 1)}
-    stats_is_packed = tuple(lse.shape) in packed_shapes
+    # (T_q,H_q,1) and legacy (B,H_q,S_q) overlap when T_q == B and S_q == 1.
+    # Preserve the established padded interpretation; packed callers use the
+    # unambiguous (T_q,H_q) view, including the registered autograd below.
+    stats_is_packed = tuple(lse.shape) in packed_shapes and tuple(lse.shape) not in padded_shapes
     if not stats_is_packed and tuple(lse.shape) not in padded_shapes:
         raise ValueError(
             "THD lse must be packed (T_q, H_q[, 1]) or padded "
@@ -1233,6 +1238,9 @@ def _sdpa_backward(ctx, grad_o, _grad_stats):  # stats marked non-differentiable
 
     deterministic = torch.are_deterministic_algorithms_enabled()
 
+    # Forward returns packed (T,H,1). Its 2-D view cannot be mistaken for the
+    # legacy padded (B,H,S) input when capacity T == B and maxS == 1.
+    stats = stats.squeeze(-1)
     dq, dk, dv = torch.ops.cudnn.sdpa_bwd(
         grad_o,
         q,
