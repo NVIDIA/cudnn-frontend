@@ -56,6 +56,10 @@ target_include_directories(
 
 target_compile_features(cudnn_frontend INTERFACE cxx_std_17)
 
+# Optional C++ AOT loader; linking cudnn_frontend alone adds no dynamic-loader dependency.
+add_library(cudnn_frontend_aot_loader INTERFACE)
+target_link_libraries(cudnn_frontend_aot_loader INTERFACE cudnn_frontend ${CMAKE_DL_LIBS})
+
 # Make PCH for targets to link against
 add_library(_cudnn_frontend_pch INTERFACE)
 target_precompile_headers(_cudnn_frontend_pch INTERFACE ${PROJECT_SOURCE_DIR}/include/cudnn_frontend.h)
@@ -87,7 +91,7 @@ include(CMakePackageConfigHelpers)
 
 # Install the components
 install(
-    TARGETS cudnn_frontend
+    TARGETS cudnn_frontend cudnn_frontend_aot_loader
     EXPORT cudnn_frontend_targets FILE_SET HEADERS
 )
 

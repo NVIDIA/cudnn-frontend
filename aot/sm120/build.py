@@ -223,20 +223,69 @@ def _entry_symbols(obj: Path, cuobjdump: str):
     return syms
 
 
-def run_export(records, out: Path, jobs: int, cuda: Path, reuse: bool):
+def source_fingerprint(cuda: Path):
+    """Include transitive FE helpers and the actual DSL/toolchain, not just the top-level template."""
+    import cutlass
+    from cutlass.base_dsl.version_info import CUDA_VERSION
+
+    digest = hashlib.sha256()
+    paths = sorted((REPO / "python" / "cudnn").rglob("*.py")) + sorted(HERE.glob("*.py"))
+    for path in paths:
+        digest.update(str(path.relative_to(REPO)).encode())
+        digest.update(path.read_bytes())
+    digest.update(str((cutlass.__version__, str(CUDA_VERSION), sys.implementation.cache_tag)).encode())
+    for tool in ("nvcc", "cuobjdump"):
+        digest.update(subprocess.check_output([str(cuda / "bin" / tool), "--version"]))
+    return digest.hexdigest()
+
+
+def _export_files(out, name):
+    return (out / "obj" / (name + ".o"), out / "include" / (name + ".h"))
+
+
+def run_export(records, out: Path, jobs: int, cuda: Path, reuse: bool, fingerprint=None):
+    fingerprint = fingerprint or source_fingerprint(cuda)
     cuobjdump = str(cuda / "bin" / "cuobjdump")
-    todo = [r for r in records if not (reuse and (out / "obj" / (r["name"] + ".o")).exists() and (out / "include" / (r["name"] + ".h")).exists())]
+    cache_path = out / "exports.json"
+    cached = json.loads(cache_path.read_text()) if reuse and cache_path.exists() else {}
+    if cached.get("fingerprint") != fingerprint:
+        cached = {}
+    entries = cached.get("entries", {})
+
+    def reusable(rec):
+        entry = entries.get(rec["name"], {})
+        files = _export_files(out, rec["name"])
+        return (
+            entry.get("record") == rec
+            and all(p.is_file() for p in files)
+            and entry.get("hashes") == [hashlib.sha256(p.read_bytes()).hexdigest() for p in files]
+        )
+
+    todo = [r for r in records if not reusable(r)]
     print(f"export: {len(records)} objects ({len(records) - len(todo)} reused), {jobs} jobs", flush=True)
     results = {r["name"]: {**r, "ok": True, "reused": True} for r in records if r not in todo}
+    # Invalidate each pending entry before writing either half of its object/header pair.
+    for rec in todo:
+        entries.pop(rec["name"], None)
+    cache_path.write_text(json.dumps({"fingerprint": fingerprint, "entries": entries}))
     t0 = time.time()
     ctx = multiprocessing.get_context("spawn")
-    with cf.ProcessPoolExecutor(max_workers=jobs, initializer=_export_init, initargs=(str(REPO / "python"),), mp_context=ctx, max_tasks_per_child=16) as ex:
-        futs = [ex.submit(_export_one, r, str(out), cuobjdump) for r in todo]
-        for n, f in enumerate(cf.as_completed(futs), 1):
-            r = f.result()
-            results[r["name"]] = r
-            if not r["ok"] or n % 50 == 0 or n == len(futs):
-                print(f"  [{n}/{len(futs)}] {'ok  ' if r['ok'] else 'FAIL'} {r['name']} {r.get('error', '')}", flush=True)
+    # Bounded fresh pools cap compiler memory without max_tasks_per_child (missing in 3.10,
+    # and worker replacement can deadlock in affected newer interpreters).
+    batch_size = max(1, jobs) * 16
+    for offset in range(0, len(todo), batch_size):
+        batch = todo[offset : offset + batch_size]
+        with cf.ProcessPoolExecutor(max_workers=jobs, initializer=_export_init, initargs=(str(REPO / "python"),), mp_context=ctx) as ex:
+            futs = [ex.submit(_export_one, r, str(out), cuobjdump) for r in batch]
+            for n, f in enumerate(cf.as_completed(futs), offset + 1):
+                r = f.result()
+                results[r["name"]] = r
+                if r["ok"]:
+                    rec = next(rec for rec in batch if rec["name"] == r["name"])
+                    entries[r["name"]] = {"record": rec, "hashes": [hashlib.sha256(p.read_bytes()).hexdigest() for p in _export_files(out, r["name"])]}
+                    cache_path.write_text(json.dumps({"fingerprint": fingerprint, "entries": entries}))
+                if not r["ok"] or n % 50 == 0 or n == len(todo):
+                    print(f"  [{n}/{len(todo)}] {'ok  ' if r['ok'] else 'FAIL'} {r['name']} {r.get('error', '')}", flush=True)
     for r in results.values():
         if r.get("reused"):
             r["obj_bytes"] = (out / "obj" / (r["name"] + ".o")).stat().st_size
@@ -391,6 +440,8 @@ def main():
     ap.add_argument("--runtime", choices=("shim", "cute-dsl"), default="shim")
     ap.add_argument("--reuse", action="store_true", help="reuse selection.json and exported objects already in --out")
     args = ap.parse_args()
+    if args.jobs < 1:
+        ap.error("--jobs must be positive")
     check_cutedsl()
     out = args.out.resolve()
     for sub in ("obj", "include", "gen", "lib"):
@@ -404,7 +455,7 @@ def main():
         sys.exit(f"--classes {args.classes} matches none of {[key(c) for c in V.CLASSES]}")
 
     sel_path = out / "selection.json"
-    fingerprint = hashlib.sha256((HERE / "variants.py").read_bytes() + (REPO / "python/cudnn/sdpa/fwd/heuristics.py").read_bytes()).hexdigest()
+    fingerprint = source_fingerprint(args.cuda)
     cached = json.loads(sel_path.read_text()) if (args.reuse and sel_path.exists()) else {}
     if cached.get("fingerprint") == fingerprint and all(f"{ci}/{V.SM_COUNTS[0]}/1" in cached["picks"] for ci in class_ids):
         selection = cached["picks"]
@@ -429,7 +480,7 @@ def main():
         for k in class_knobs[ci]
     ]
     records += [{"kind": "combine", "name": V.combine_name(dt, s), "dtype": dt, "sink": s} for dt in V.DTYPES for s in (False, True)]
-    results, failed = run_export(records, out, args.jobs, args.cuda, args.reuse)
+    results, failed = run_export(records, out, args.jobs, args.cuda, args.reuse, fingerprint)
     if failed:
         (out / "failed.json").write_text(json.dumps(failed, indent=1))
         sys.exit(f"{len(failed)} exports failed; see {out / 'failed.json'}")

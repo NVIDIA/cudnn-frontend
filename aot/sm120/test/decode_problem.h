@@ -38,6 +38,7 @@ enum MaskKind {
     MASK_KIND_NONE       = 0,
     MASK_KIND_RANDOM     = 1,  // uniform(-1, 1), row pitch = n_kv (as test-backend-ops)
     MASK_KIND_PADDED     = 2,  // uniform(-1, 1), row pitch padded to 64 elements
+    MASK_KIND_ALL_INF    = 4,  // every row has zero softmax mass
     MASK_KIND_CAUSAL_INF = 3,  // -inf over a prefix and a token-dependent suffix, else uniform(-1, 1)
 };
 
@@ -181,6 +182,7 @@ struct Problem {
                         float m = U(rng);
                         if (c.mask == MASK_KIND_CAUSAL_INF && (pos < c.kv / 3 || pos >= c.kv - (c.nq - 1 - t)))
                             m = -INFINITY;
+                        if (c.mask == MASK_KIND_ALL_INF) m = -INFINITY;
                         mraw[((size_t)s * c.nq + t) * pitch + pos] = __float2half(m);
                         if (host_ref) maskf[((size_t)s * c.nq + t) * c.kv + pos] = __half2float(__float2half(m));
                     }
@@ -259,7 +261,7 @@ struct Problem {
                     for (int j = 0; j < c.D; ++j) {
                         double o = 0;
                         for (int pos = 0; pos < c.kv; ++pos) o += sc[pos] * v_ref[ki(s, h, pos, j)];
-                        o /= L;
+                        o               = L > 0 ? o / L : 0;
                         const float got = out[(((size_t)s * c.nq + t) * Hq + qh) * c.D + j];
                         if (!std::isfinite(got)) ++*nonfinite;
                         *maxerr = std::max(*maxerr, std::abs(o - got));

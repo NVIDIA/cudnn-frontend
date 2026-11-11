@@ -15,8 +15,11 @@ motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 3
 - **Plan build loads code; execute() launches.** `plan_create` loads every kernel module the plan can launch (a few ms for
   the first plan of a class in a process). `execute()` validates its arguments, looks up the kernel and launches it: no
   allocation, no synchronization, no module loading.
-- **Caller-owned workspace.** Split-KV launches need a 256-byte aligned device workspace (`workspace_size()`); other launches
-  need none.
+- **Caller-owned workspace.** Split-KV FROST launches and every q8_0 / q4_0 launch need a 256-byte aligned device
+  workspace of `workspace_size()` bytes; unsplit f16/bf16 launches need none. The size query works before binding pointers.
+  `query()` on a quantized plan needs the actual pointer values to report its alignment-specific copy mode.
+- **C++ loader.** Link the opt-in `cudnn_frontend_aot_loader` CMake target, which supplies the platform loader library.
+  Plans retain their loaded entry points and may outlive a caller-supplied `Library`; modules remain resident.
 - **Streams and CUDA graphs.** A plan is immutable once built. One plan may be executed concurrently from several threads and
   streams, each call with its own workspace, and `execute()` can be captured in a CUDA graph.
 

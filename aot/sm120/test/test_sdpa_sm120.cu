@@ -580,7 +580,7 @@ run_decode_case(const Case& c, uint32_t seed) {
     const bool ok = !st && nonfinite == 0 && err < 1e-2 * std::max(1.0, ref);
     record(ok);
     static const char* lay[] = {"ggml-test", "kv-cache"};
-    static const char* msk[] = {"none", "random", "padded", "causal-inf"};
+    static const char* msk[] = {"none", "random", "padded", "causal-inf", "all-inf"};
     std::printf(
         "%s decode  %s D=%d Hkv=%d G=%d kv=%d nq=%d nseq=%d layout=%s mask=%s err=%.2e (|o|max %.2e) [%s]%s%s\n",
         ok ? "PASS" : "FAIL",
@@ -600,6 +600,76 @@ run_decode_case(const Case& c, uint32_t seed) {
         st ? plan.last_error().c_str() : "");
     if (wsp) CK(cudaFree(wsp));
     pr.release();
+}
+
+static void
+run_decode_contracts(const char* lib_path) {
+    for (int type : {CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0}) {
+        for (int d : {128, 256}) {
+            Case c{d, 2, 4, 512, 2, 1, type, LAYOUT_GGML_TEST, MASK_KIND_PADDED};
+            Problem pr;
+            pr.build(c, 51, true);
+            aot::SdpaPlan plan;
+            // A plan must remain usable after the supplied Library wrapper is destroyed.
+            {
+                aot::Library local;
+                CK(cudaDeviceSynchronize());
+                if (local.load(lib_path) || plan.build(decode_desc(c), nullptr, -1, &local)) {
+                    record(false);
+                    pr.release();
+                    continue;
+                }
+            }
+            auto a            = decode_args(pr);
+            size_t aligned_ws = 0, unbound_ws = 0, view_ws = 0;
+            bool ok      = !plan.workspace_size(a, &aligned_ws);
+            auto unbound = a;
+            unbound.q = unbound.k = unbound.v = unbound.mask = nullptr;
+            unbound.o                                        = nullptr;
+            ok           = ok && !plan.workspace_size(unbound, &unbound_ws) && aligned_ws == unbound_ws;
+            void *k_view = nullptr, *v_view = nullptr, *mask_view = nullptr, *ws = nullptr;
+            const size_t kv_bytes   = pr.p.k_nb[3] * c.nseq;
+            const size_t mask_bytes = pr.p.mask_nb[3] * c.nseq;
+            CK(cudaMalloc(&k_view, kv_bytes + 8));
+            CK(cudaMalloc(&v_view, kv_bytes + 8));
+            CK(cudaMalloc(&mask_view, mask_bytes + 2));
+            a.k    = static_cast<char*>(k_view) + 8;
+            a.v    = static_cast<char*>(v_view) + 8;
+            a.mask = static_cast<char*>(mask_view) + 2;
+            CK(cudaMemcpy(const_cast<void*>(a.k), pr.p.k, kv_bytes, cudaMemcpyDeviceToDevice));
+            CK(cudaMemcpy(const_cast<void*>(a.v), pr.p.v, kv_bytes, cudaMemcpyDeviceToDevice));
+            CK(cudaMemcpy(const_cast<void*>(a.mask), pr.p.mask, mask_bytes, cudaMemcpyDeviceToDevice));
+            ok               = ok && !plan.workspace_size(a, &view_ws) && view_ws == aligned_ws;
+            const char* name = nullptr;
+            ok               = ok && !plan.query(a, nullptr, &name) && name && std::strstr(name, "rows8");
+            CK(cudaMalloc(&ws, aligned_ws + 256));
+            ok = ok &&
+                 plan.execute(a, static_cast<char*>(ws) + 4, aligned_ws, 0) == CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
+            ok = ok && !plan.execute(a, ws, aligned_ws, 0);
+            CK(cudaDeviceSynchronize());
+            std::vector<float> out((size_t)c.nseq * c.nq * pr.Hq * c.D);
+            CK(cudaMemcpy(out.data(), pr.dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            double err = 0, ref = 0;
+            int nonfinite = 0;
+            pr.check(out, {0, 1, 4, 7}, &err, &ref, &nonfinite);
+            ok = ok && !nonfinite && err < 1e-2 * std::max(1.0, ref);
+            record(ok);
+            std::printf("%s contracts decode %s D=%d: unbound workspace, 8B KV/2B mask views, loader lifetime\n",
+                        ok ? "PASS" : "FAIL",
+                        type_name(type),
+                        d);
+            CK(cudaFree(ws));
+            CK(cudaFree(k_view));
+            CK(cudaFree(v_view));
+            CK(cudaFree(mask_view));
+            pr.release();
+            for (int kv : {64, 513})
+                run_decode_case({d, 2, 4, kv, 2, 1, type, LAYOUT_GGML_TEST, MASK_KIND_ALL_INF}, 52);
+        }
+    }
+    const bool ok = aot::knob_sets(aot::make_desc(), nullptr, nullptr, 0) == CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
+    record(ok);
+    std::printf("%s contracts null knob count rejected\n", ok ? "PASS" : "FAIL");
 }
 
 static void
@@ -636,6 +706,9 @@ run_decode(int nrand, uint32_t sd) {
         cases.push_back(c);
     }
     uint32_t seed = sd * 1000;
+    for (int t : {Q8, Q4})
+        for (int d : {128, 256})
+            for (int kv : {64, 513}) cases.push_back({d, 2, 4, kv, 2, 1, t, LAYOUT_GGML_TEST, MASK_KIND_ALL_INF});
     for (const Case& c : cases) run_decode_case(c, ++seed);
 }
 
@@ -648,9 +721,6 @@ capture_matches(const aot::SdpaPlan& plan, const aot::SdpaArgs& a, void* out, si
     std::vector<char> ref(out_bytes), got(out_bytes);
     CK(cudaMemset(
         out, 0xff, out_bytes));  // the same bytes before every run: padding the kernel never writes compares equal
-    if (plan.execute(a, ws, ws_n, 0)) return false;
-    CK(cudaDeviceSynchronize());
-    CK(cudaMemcpy(ref.data(), out, out_bytes, cudaMemcpyDeviceToHost));
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     cudaGraph_t g;
@@ -659,7 +729,10 @@ capture_matches(const aot::SdpaPlan& plan, const aot::SdpaArgs& a, void* out, si
     const aot::Status st = plan.execute(a, ws, ws_n, s);
     CK(cudaStreamEndCapture(s, &g));
     const bool inst = !st && cudaGraphInstantiate(&ge, g, 0) == cudaSuccess;
-    bool same       = inst;
+    if (plan.execute(a, ws, ws_n, 0)) return false;
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(ref.data(), out, out_bytes, cudaMemcpyDeviceToHost));
+    bool same = inst;
     for (int i = 0; i < 3 && same; ++i) {
         CK(cudaMemsetAsync(out, 0xff, out_bytes, s));
         CK(cudaGraphLaunch(ge, s));
@@ -949,8 +1022,8 @@ main(int argc, char** argv) {
     CK(cudaSetDevice(dev));
     aot::Library& lib = aot::Library::instance();
     if (lib.load(lib_path)) {
-        std::printf("SKIPPED: %s\n", lib.error().c_str());
-        return 0;
+        std::printf("FAIL: %s\n", lib.error().c_str());
+        return 1;
     }
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, dev));
@@ -971,6 +1044,7 @@ main(int argc, char** argv) {
     if (want("decode")) run_decode(quick ? 4 : nrand, 1);
     if (want("graph")) run_graph_and_streams();
     if (want("reject")) run_rejections();
+    if (want("contracts")) run_decode_contracts(lib_path);
     std::printf("SUMMARY: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

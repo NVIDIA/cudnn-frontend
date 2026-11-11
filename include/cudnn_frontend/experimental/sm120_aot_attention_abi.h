@@ -132,7 +132,8 @@ cudnn_fe_aot_sm120_sdpa_execute(const cudnn_fe_aot_sdpa_plan_t* plan,
                                 size_t workspace_size,
                                 cudaStream_t stream);
 
-/* What execute() would launch for these extents: the knob set (FROST plans) and the main kernel's name. */
+/* What execute() would launch: the knob set (FROST plans) and main kernel name. Quantized plans require
+ * bound pointer values to report the alignment-specific copy mode; device memory is never read. */
 cudnn_fe_aot_status_t
 cudnn_fe_aot_sm120_sdpa_query(const cudnn_fe_aot_sdpa_plan_t* plan,
                               const cudnn_fe_aot_sdpa_args_t* args,

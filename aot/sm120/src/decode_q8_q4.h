@@ -69,6 +69,10 @@ typedef struct {
     float logit_softcap;  // must be 0 (unsupported)
 } cudnn_fe_aot_sm120_decode_params_t;
 
+// Load all configurations/copy modes and the combine kernel on the current device at plan creation.
+cudnn_fe_aot_sm120_decode_status_t
+cudnn_fe_aot_sm120_decode_prewarm(int head_dim, int kv_type);
+
 // Validates the inputs without launching anything.
 cudnn_fe_aot_sm120_decode_status_t
 cudnn_fe_aot_sm120_decode_check(const cudnn_fe_aot_sm120_decode_params_t* p);

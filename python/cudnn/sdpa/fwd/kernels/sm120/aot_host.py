@@ -6,7 +6,7 @@ The prepared pointer host (``prepared_host.host``) binds batch, sequence lengths
 as plan constants. The AOT host below also takes ``h_q`` and ``h_kv`` at run time, so one exported object serves every head
 count (PackGQA kernels still bake the ratio G = h_q / h_kv). Exports go through ``cute.compile(..., options=...)`` and
 ``export_to_c``: a plain C ABI with the cubin embedded, no tvm-ffi and no FE runtime at the call site. ``aot/`` at the repository
-root builds ``libcudnn_frontend_aot_sm120.so`` from these objects; see ``docs/fe-oss-apis/aot_sm120_attention.md``.
+root builds ``libcudnn_frontend_aot_sm120.so`` from these objects; see ``docs/operations/attention/aot_sm120_attention.md``.
 
 The kernel object is the one the template's own ``compile()`` constructs (captured, not rebuilt), so an exported kernel is the
 kernel the Python FROST engine runs for the same TemplateParams and knobs.

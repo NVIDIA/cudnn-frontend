@@ -362,6 +362,15 @@ cudnn_fe_aot_sm120_sdpa_plan_create(const cudnn_fe_aot_sdpa_desc_t* desc_in,
     int sms = 0;
     if (cudnn_fe_aot_status_t s = check_device(device, &sms)) return s;
 
+    struct DeviceGuard {
+        int previous;
+        ~DeviceGuard() { (void)cudaSetDevice(previous); }
+    };
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess)
+        return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR, "setting plan device failed");
+    const DeviceGuard guard{previous};
+
     cudnn_fe_aot_sdpa_plan_s p{};
     p.desc      = d;
     p.fixed     = -1;
@@ -377,6 +386,9 @@ cudnn_fe_aot_sm120_sdpa_plan_create(const cudnn_fe_aot_sdpa_desc_t* desc_in,
                         "q8_0/q4_0 KV supports mask NONE or ADDITIVE_F16, no window and no sinks: " + desc_string(d));
         if (d.mask != CUDNN_FE_AOT_MASK_NONE && d.mask != CUDNN_FE_AOT_MASK_ADDITIVE_F16)
             return fail(CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT, "unknown mask " + std::to_string(d.mask));
+        const int kv_type = d.kv_dtype == CUDNN_FE_AOT_DTYPE_Q8_0 ? CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0
+                                                                  : CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0;
+        if (cudnn_fe_aot_status_t s = decode_status(cudnn_fe_aot_sm120_decode_prewarm(d.head_dim, kv_type))) return s;
     } else {
         if (cudnn_fe_aot_status_t s = resolve_frost(d, &p.dtype, &p.cls)) return s;
         p.base      = kClassBase[p.dtype][p.cls];
@@ -451,11 +463,11 @@ cudnn_fe_aot_sm120_sdpa_workspace_size(const cudnn_fe_aot_sdpa_plan_t* p,
     if (p->quantized) {
         cudnn_fe_aot_sm120_decode_params_t d;
         to_decode(*p, a, &d);
-        // The size depends only on extents; stand-in pointers keep the decode validator's null checks quiet.
-        static const int64_t dummy[64] = {};
+        // Only metadata determines capacity, including the plan's mask when pointers are not yet bound.
+        alignas(16) static const int64_t dummy[64] = {};
         d.q = reinterpret_cast<const float*>(dummy), d.k = dummy, d.v = dummy,
         d.o = reinterpret_cast<float*>(const_cast<int64_t*>(dummy));
-        if (d.mask) d.mask = dummy;
+        if (p->desc.mask == CUDNN_FE_AOT_MASK_ADDITIVE_F16) d.mask = dummy;
         if (cudnn_fe_aot_status_t s = decode_status(cudnn_fe_aot_sm120_decode_check(&d))) return s;
         *bytes = cudnn_fe_aot_sm120_decode_get_workspace_size(&d);
         return CUDNN_FE_AOT_STATUS_SUCCESS;
@@ -546,10 +558,9 @@ cudnn_fe_aot_sm120_sdpa_query(const cudnn_fe_aot_sdpa_plan_t* p,
         static thread_local char buf[192];
         cudnn_fe_aot_sm120_decode_params_t d;
         to_decode(*p, a, &d);
-        static const int64_t dummy[64] = {};
-        d.q = reinterpret_cast<const float*>(dummy), d.k = dummy, d.v = dummy,
-        d.o = reinterpret_cast<float*>(const_cast<int64_t*>(dummy));
-        if (d.mask) d.mask = dummy;
+        // Query reports the actual copy mode. Pointer values are inspected, never dereferenced.
+        if (p->desc.mask == CUDNN_FE_AOT_MASK_ADDITIVE_F16 && !a.mask)
+            return fail(CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT, "query needs the declared mask pointer");
         if (cudnn_fe_aot_status_t s = decode_status(cudnn_fe_aot_sm120_decode_describe(&d, buf, sizeof(buf)))) return s;
         if (knobs) std::memset(knobs, 0, sizeof(*knobs)), knobs->struct_size = sizeof(*knobs);
         if (kernel_name) *kernel_name = buf;

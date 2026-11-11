@@ -554,7 +554,8 @@ combine_body(const KParams& p) {
             Lt += redl[i];
         }
         const int hkv = gr / p.R, r = gr % p.R, t = r / p.G, qh = hkv * p.G + r % p.G;
-        *reinterpret_cast<float*>(p.out + (size_t)t * p.o_nbt + (size_t)qh * p.o_nbh + (size_t)(c0 + tid) * 4) = a / Lt;
+        *reinterpret_cast<float*>(p.out + (size_t)t * p.o_nbt + (size_t)qh * p.o_nbh + (size_t)(c0 + tid) * 4) =
+            Lt > 0.f ? a / Lt : 0.f;
     }
 }
 
@@ -738,7 +739,12 @@ make_plan(const cudnn_fe_aot_sm120_decode_params_t* p, Plan* out) {
         mode = KV_ROWS16;
     else
         mode = KV_ROWS8;
-    const int occ = kernel_occupancy(cfg, mode, dev);
+    int occ              = kernel_occupancy(cfg, KV_ROWS8, dev);
+    const bool strides16 = p->k_nb[2] % 16 == 0 && p->k_nb[3] % 16 == 0 && p->v_nb[2] % 16 == 0 && p->v_nb[3] % 16 == 0;
+    if (strides16 && p->k_nb[1] == RB && p->v_nb[1] == RB)
+        occ = std::min(occ, kernel_occupancy(cfg, KV_CONTIG16, dev));
+    else if (strides16 && RB % 16 == 0 && p->k_nb[1] % 16 == 0 && p->v_nb[1] % 16 == 0)
+        occ = std::min(occ, kernel_occupancy(cfg, KV_ROWS16, dev));
     if (!occ) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
     // At most one wave of CTAs (a partial second wave costs a whole CTA duration), split tile-balanced so any count
     // works; every split gets >= 1 tile.
@@ -757,13 +763,30 @@ make_plan(const cudnn_fe_aot_sm120_decode_params_t* p, Plan* out) {
     out->ml_bytes       = ((size_t)nsplit * rows * 2 * 4 + 255) / 256 * 256;
     out->mask_pitch     = ((size_t)p->n_kv + 7) / 8 * 16;  // bytes per repacked mask row
     out->mask_direct    = p->mask && aligned(p->mask, 16) && p->mask_nb[1] % 16 == 0 && p->mask_nb[3] % 16 == 0;
-    out->ws = out->o_bytes + out->ml_bytes + (p->mask && !out->mask_direct ? (size_t)p->n_q * out->mask_pitch : 0);
+    out->ws             = out->o_bytes + out->ml_bytes + (p->mask ? (size_t)p->n_q * out->mask_pitch : 0);
     return CUDNN_FE_AOT_SM120_DECODE_SUCCESS;
 }
 
 }  // namespace
 
 extern "C" {
+
+cudnn_fe_aot_sm120_decode_status_t
+cudnn_fe_aot_sm120_decode_prewarm(int head_dim, int kv_type) {
+    int dev = 0, sms = 0, cc = 0;
+    if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+    if (cc != 120) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
+    const int first = choose_config(head_dim, kv_type, 1);
+    for (int cfg = first; cfg < first + 3; ++cfg)
+        for (int mode = 0; mode < 3; ++mode)
+            if (kConfigs[cfg].kern[mode] && !kernel_occupancy(cfg, mode, dev))
+                return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+    cudaFuncAttributes attr{};
+    void (*combine)(KParams) =
+        head_dim == 128 ? cudnn_fe_aot_sm120_decode_combine_f16_d128 : cudnn_fe_aot_sm120_decode_combine_f16_d256;
+    return cudaFuncGetAttributes(&attr, combine) == cudaSuccess ? CUDNN_FE_AOT_SM120_DECODE_SUCCESS
+                                                                : CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+}
 
 cudnn_fe_aot_sm120_decode_status_t
 cudnn_fe_aot_sm120_decode_check(const cudnn_fe_aot_sm120_decode_params_t* p) {
@@ -798,6 +821,7 @@ cudnn_fe_aot_sm120_decode_run(const cudnn_fe_aot_sm120_decode_params_t* p,
     if (st != CUDNN_FE_AOT_SM120_DECODE_SUCCESS) return st;
     if (!workspace) return CUDNN_FE_AOT_SM120_DECODE_ERROR_NULL_POINTER;
     if (workspace_size < pl.ws) return CUDNN_FE_AOT_SM120_DECODE_ERROR_WORKSPACE_TOO_SMALL;
+    if (!aligned(workspace, 256)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
     const Config& c = kConfigs[pl.cfg];
 
     KParams k{};

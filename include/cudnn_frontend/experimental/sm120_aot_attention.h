@@ -228,12 +228,12 @@ class SdpaPlan {
     SdpaPlan&
     operator=(const SdpaPlan&) = delete;
     SdpaPlan(SdpaPlan&& o) noexcept
-        : lib_(o.lib_), plan_(std::exchange(o.plan_, nullptr)), error_(std::move(o.error_)) {}
+        : api_(o.api_), plan_(std::exchange(o.plan_, nullptr)), error_(std::move(o.error_)) {}
     SdpaPlan&
     operator=(SdpaPlan&& o) noexcept {
         if (this != &o) {
             reset();
-            lib_   = o.lib_;
+            api_   = o.api_;
             plan_  = std::exchange(o.plan_, nullptr);
             error_ = std::move(o.error_);
         }
@@ -246,13 +246,14 @@ class SdpaPlan {
     Status
     build(const SdpaDesc& desc, const SdpaKnobs* knobs = nullptr, int device = -1, Library* lib = nullptr) {
         reset();
-        lib_ = lib ? lib : &Library::instance();
-        if (Status s = lib_->load()) {
-            error_ = lib_->error();
+        Library& source = lib ? *lib : Library::instance();
+        if (Status s = source.load()) {
+            error_ = source.error();
             return s;
         }
-        const Status s = lib_->plan_create(&desc, knobs, device, &plan_);
-        if (s) error_ = lib_->last_error();
+        api_           = {source.plan_destroy, source.workspace_size, source.execute, source.query, source.last_error};
+        const Status s = source.plan_create(&desc, knobs, device, &plan_);
+        if (s) error_ = api_.last_error();
         return s;
     }
 
@@ -263,37 +264,45 @@ class SdpaPlan {
 
     Status
     workspace_size(const SdpaArgs& args, size_t* bytes) const {
-        return plan_ ? lib_->workspace_size(plan_, &args, bytes) : CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
+        return plan_ ? api_.workspace_size(plan_, &args, bytes) : CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
     }
 
     /* Launches on `stream`; no allocation, synchronization or code loading. On failure, last_error() says why. */
     Status
     execute(const SdpaArgs& args, void* workspace, size_t workspace_size, cudaStream_t stream) const {
-        return plan_ ? lib_->execute(plan_, &args, workspace, workspace_size, stream)
+        return plan_ ? api_.execute(plan_, &args, workspace, workspace_size, stream)
                      : CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
     }
 
     /* The knob set and kernel execute() would launch for these extents. */
     Status
     query(const SdpaArgs& args, SdpaKnobs* knobs, const char** kernel_name) const {
-        return plan_ ? lib_->query(plan_, &args, knobs, kernel_name) : CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
+        return plan_ ? api_.query(plan_, &args, knobs, kernel_name) : CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
     }
 
     /* The library's message for this thread's last failed call, or the build()/loader message. */
     std::string
     last_error() const {
-        if (lib_ && lib_->loaded() && *lib_->last_error()) return lib_->last_error();
+        if (api_.last_error && *api_.last_error()) return api_.last_error();
         return error_;
     }
 
    private:
     void
     reset() {
-        if (plan_ && lib_) lib_->plan_destroy(plan_);
+        if (plan_) api_.plan_destroy(plan_);
         plan_ = nullptr;
+        api_  = {};
+        error_.clear();
     }
 
-    Library* lib_                   = nullptr;
+    struct EntryPoints {
+        Library::PlanDestroyFn plan_destroy = nullptr;
+        Library::WorkspaceFn workspace_size = nullptr;
+        Library::ExecuteFn execute          = nullptr;
+        Library::QueryFn query              = nullptr;
+        Library::LastErrorFn last_error     = nullptr;
+    } api_;
     cudnn_fe_aot_sdpa_plan_t* plan_ = nullptr;
     std::string error_;
 };
@@ -301,6 +310,7 @@ class SdpaPlan {
 /* The prebuilt knob sets serving a shape class, to tune over (build one SdpaPlan per set). */
 inline Status
 knob_sets(const SdpaDesc& desc, int32_t* count, SdpaKnobs* out, int32_t capacity, Library* lib = nullptr) {
+    if (!count) return CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT;
     Library& l = lib ? *lib : Library::instance();
     if (Status s = l.load()) return s;
     *count = l.num_knob_sets(&desc);
