@@ -248,8 +248,9 @@ def _check_colwise_rht(
         sf = ue5m3_bytes_to_fp32(sf)
 
     start_m = 0
-    sf_col_offset = 0
     for expert_idx, group_m in enumerate(inputs["aligned_group_m_list"]):
+        if not group_m:
+            continue
         end_m = start_m + group_m
         ref_e = rht_ref[start_m:end_m].float().t().contiguous()
         value_offset = n_out * start_m
@@ -258,14 +259,15 @@ def _check_colwise_rht(
         sf_offset = n_out * start_m // HADAMARD_SIZE
         sf_count = n_out * group_m // HADAMARD_SIZE
         sf_e = sf[sf_offset : sf_offset + sf_count]
-        sf_e = sf_e.reshape(32, 4, ceil_div(n_out, 128), 4, ceil_div(group_m, 64), 1)
-        sf_flat_e = _swizzled_sf_to_flat(sf_e, n_out, group_m)
+        # Decode the physical GEMM-blocked buffer independently of its store.
+        sf_e = sf_e.reshape(n_out, group_m // HADAMARD_SIZE)
         _check_nvfp4_output(
             values_e,
             sf_e,
             ref_e,
             rht_norm_const,
             f"RHT colwise expert {expert_idx}",
+            sf_layout="blocked",
             # RHT is performed on BF16-quantized values, so loosen
             # tols to handle extra accumulated error.
             rtol=0.5,

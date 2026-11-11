@@ -223,7 +223,8 @@ def grouped_gemm_glu_hadamard_quant_jax_forward(
     6-D E4M3 SFD. ``rht_rowwise_dtype`` (BF16 or NVFP4) adds the rowwise
     Hadamard output in the same layouts; ``rht_colwise_dtype`` (NVFP4 only)
     adds flat per-expert packed data (m*n_out/2,) and scales
-    (m*n_out/sf_vec_size,). At most one RHT output may be requested. n_out is
+    (m*n_out/sf_vec_size,) in standard GEMM 128x4 block order within each
+    expert segment. At most one RHT output may be requested. n_out is
     n/2, or n for ``act_func="srelu"``. ``norm_const``, ``rht_norm_const`` and
     the GLU scalars are compile-time constants of the traced call: pass Python
     numbers, since a traced JAX value raises ConcretizationTypeError. Returns a

@@ -487,7 +487,10 @@ def test_canonical_jax_glu_hadamard_quant_parity(d_quant, rht, shared_wrapper):
     arrays["sfa_tensor"] = arrays["sfa_tensor"].reshape(1, m // 128, -1, 32, 4, 4)
     arrays["sfb_tensor"] = arrays["sfb_tensor"].reshape(experts, n // 128, -1, 32, 4, 4)
     # Packed NVFP4 outputs are requested with the cutlass dtype from JAX and the packed torch dtype from torch.
-    jax_options = dict(sf_vec_size=sf_vec_size, norm_const=0.5, rht_norm_const=0.25)
+    # This fixture's RHT magnitude exceeds 10752, the FP4/E4M3 range at
+    # rht_norm_const=0.25. Keep the same inputs and select a nonsaturating
+    # global RHT scale before applying the numerical error bound.
+    jax_options = dict(sf_vec_size=sf_vec_size, norm_const=0.5, rht_norm_const=1.0 / 64.0 if rht == "colwise" else 0.25)
     torch_options = dict(jax_options)
     if d_quant:
         jax_options["d_dtype"], torch_options["d_dtype"] = cutlass.Float4E2M1FN, torch.float4_e2m1fn_x2
@@ -499,10 +502,54 @@ def test_canonical_jax_glu_hadamard_quant_parity(d_quant, rht, shared_wrapper):
     bridge = cudnn.grouped_gemm_glu_hadamard_quant_wrapper_sm100 if shared_wrapper else cudnn.grouped_gemm_glu_hadamard_quant_jax_forward
     bridge = partial(bridge, **jax_options)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    if rht == "colwise":
+        from gemm.graph.test_low_precision_matmul import float4_e2m1fn_x2_to_float32
+        from gemm.cutedsl.test_grouped_gemm_glu_hadamard_quant import _check_colwise_rht, _rht_ref
+
+        # Reconstruct FP32 pre-activation independently from the input bytes;
+        # saved BF16 C has already discarded precision used by SwiGLU.
+        k = 2 * arrays["a_tensor"].shape[1]
+        sa = torch.from_numpy(arrays["sfa_tensor"].view(np.uint8)).view(torch.float8_e4m3fn)
+        sb = torch.from_numpy(arrays["sfb_tensor"].view(np.uint8)).view(torch.float8_e4m3fn)
+        # Input scale backing is (expert, row/128, K/64, row%32, row/32%4, K/16%4).
+        sa = sa.permute(0, 1, 4, 3, 2, 5).reshape(1, m, k // 16).float()
+        sb = sb.permute(0, 1, 4, 3, 2, 5).reshape(experts, n, k // 16).float()
+        a = float4_e2m1fn_x2_to_float32(torch.from_numpy(arrays["a_tensor"])) * sa[0].repeat_interleave(16, dim=-1)
+        b = float4_e2m1fn_x2_to_float32(torch.from_numpy(arrays["b_tensor"])) * sb.repeat_interleave(16, dim=-1)
+        counts = np.diff(np.concatenate(([0], arrays["padded_offsets"]))).tolist()
+        c = torch.empty((m, n), dtype=torch.float32)
+        start = 0
+        for expert, count in enumerate(counts):
+            c[start : start + count] = ((a[start : start + count].double() @ b[expert].double().t()) * float(arrays["alpha_tensor"][expert])).float()
+            start += count
+        c = c.reshape(m, n // 64, 2, 32)
+        d = (torch.nn.functional.silu(c[:, :, 0]) * c[:, :, 1]).reshape(m, n // 2)
+        d *= torch.from_numpy(arrays["prob_tensor"]).reshape(m, 1)
+        rht_reference = _rht_ref(d.unsqueeze(-1), rowwise=False)
+        requested_scales = rht_reference.float().abs().reshape(m // 16, 16, n // 2).amax(dim=1) * (jax_options["rht_norm_const"] / 6.0)
+        assert torch.isfinite(requested_scales).all()
+        assert requested_scales.max().item() <= torch.finfo(torch.float8_e4m3fn).max
+
+    def check(result):
+        assert_outputs(result, reference)
+        if rht == "colwise":
+            # Torch/JAX parity alone could preserve the same wrong scale-byte
+            # order in both frontends. Independently consume the JAX output as
+            # GEMM-blocked scales and reconstruct its quantized RHT values.
+            outputs = {
+                "rht_rowwise_tensor": None,
+                "sfrht_rowwise_tensor": None,
+                "rht_colwise_tensor": torch.from_numpy(np.array(result["rht_colwise_tensor"], copy=True)),
+                "sfrht_colwise_tensor": torch.from_numpy(np.array(result["sfrht_colwise_tensor"], copy=True).view(np.uint8)).view(torch.float8_e4m3fn),
+            }
+            _check_colwise_rht({"aligned_group_m_list": counts}, outputs, rht_reference, jax_options["rht_norm_const"], None)
+
     poison_allocator()
-    assert_outputs(bridge(**inputs), reference)
+    check(bridge(**inputs))
     compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
-    assert_outputs(compiled(**inputs), reference)
+    check(compiled(**inputs))
+    if rht == "colwise":
+        check(compiled(**inputs))
 
 
 def test_canonical_jax_glu_hadamard_quant_delayed_act(monkeypatch):

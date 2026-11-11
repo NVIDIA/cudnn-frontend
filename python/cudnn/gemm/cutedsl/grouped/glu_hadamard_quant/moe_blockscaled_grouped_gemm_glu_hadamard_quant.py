@@ -2607,7 +2607,6 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                     pitch16=rht_t_cnt // HADAMARD_SIZE,
                                     feat0=mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1],
                                     tok16=(sf_row - epi_tidx) // HADAMARD_SIZE,
-                                    row_blocks=cute.ceil_div(mD_mnl.shape[1], 128),
                                     gSf=mSfRht_mnl,
                                 )
                             elif cutlass.const_expr(self.rht_quant):
