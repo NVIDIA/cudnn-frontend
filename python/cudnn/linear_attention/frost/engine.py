@@ -42,6 +42,43 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         raise NotImplementedError(f"{engine}: 'g' must be fp32/fp16/bf16, got {facts.g_dtype}")
     if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
         raise NotImplementedError(f"{engine}: 'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
+    if facts.has_composed_state and facts.composed_state_port_dtype not in (None, cudnn.data_type.FLOAT):
+        raise NotImplementedError(f"{engine}: composed_initial_state must be fp32 (the fold's one-row result), got {facts.composed_state_port_dtype}")
+    if facts.has_composed_summaries:
+        for port, got in (("state", facts.composed_state_dtype), ("transition", facts.composed_transition_dtype)):
+            if got not in (cudnn.data_type.FLOAT, None):
+                raise NotImplementedError(f"{engine}: the composed summaries' {port} must be fp32 (the summary ops' output), got {got}")
+
+
+def context_gate(engine: str, facts, *, b_t: int, expand_num: int = 1, min_tokens: int = 0) -> None:
+    """Decline a one-sequence backward whose context's per-piece tables were cut by its summary differently from the
+    way this backward cuts the same tokens: the summary chains with ``compose_tail`` and no floor, the backward with
+    ``min_tokens``; both cut alike whenever both get the same ``checkpoint_every_n_tokens``.  An uncut backward has no
+    leaf pass and ignores the tables, and so does a multi-sequence slab."""
+    if not facts.is_bwd or facts.op.endswith("_SUMMARY") or not facts.input_context or facts.n_seq != 1:
+        return
+    from cudnn.frost.device import current_device, multiprocessor_count
+
+    from .common.piece_chain import choose_pieces
+
+    geometry = dict(
+        num_seqs=1,
+        heads_out=facts.h_o,
+        num_sm=multiprocessor_count(current_device()),
+        total_tokens=facts.total_t,
+        b_t=int(b_t),
+        cadence_tokens=facts.checkpoint_every_n_tokens,
+        batch_invariant=facts.batch_invariant,
+        expand_num=int(expand_num),
+        reverse=True,
+    )
+    backward = choose_pieces(**geometry, min_tokens=min_tokens)
+    summary = choose_pieces(**geometry, compose_tail=True)
+    if backward[0] and summary != backward:
+        raise NotImplementedError(
+            f"{engine}: the backward summary cut these tokens into {summary[0]} pieces of {summary[1]} chunk units, this backward cuts them into "
+            f"{backward[0]} of {backward[1]}; give the summary the backward's checkpoint_every_n_tokens"
+        )
 
 
 def summary_support_gates(engine: str, facts, graph) -> None:
@@ -56,12 +93,12 @@ def summary_support_gates(engine: str, facts, graph) -> None:
         if got not in gate_param_dtypes + (None,):
             raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
     (node,) = list(graph.nodes)
-    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16)
+    state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_ports = [(name, node.inputs.get(name)) for name in ("initial_state", "d_final_state")]
     state_ports += [(name, node.outputs.get(name)) for name in ("final_state", "transition", "d_initial_state")]
     for port, tensor in state_ports:
         if tensor is not None and tensor.get_data_type() not in state_dtypes:
-            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16, got {tensor.get_data_type()}")
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {tensor.get_data_type()}")
     if not facts.state_pair_match:
         raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
     d_final_state = node.inputs.get("d_final_state")
@@ -93,9 +130,13 @@ class FrostLaPlan(CompiledPlan):
         self.compiled = compiled
         self.ports = None
         self.indices = None
+        self.context_size = int(getattr(compiled, "context_size", 0))
 
     def get_workspace_size(self) -> int:
         return self.compiled.workspace_bytes()
+
+    def get_context_size(self) -> int:
+        return self.context_size
 
     def execute(self, graph, variant_pack, ctx) -> None:
         launch_device = variant_pack.device
@@ -115,4 +156,19 @@ class FrostLaPlan(CompiledPlan):
             raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender))
         views = variant_pack.operands(self.indices)
         workspace = Workspace.over(variant_pack, self.compiled.workspace_size, type(self.compiled).__name__)
-        self.compiled.run(views, workspace, ctx.stream)
+        if not self.context_size:
+            if ctx.context is not None:
+                raise ValueError(f"{self.compiled.plan_name}: this plan has no context (get_context_size() is 0)")
+            self.compiled.run(views, workspace, ctx.stream)
+            return
+        if ctx.context is None:
+            raise ValueError(
+                f"{self.compiled.plan_name} requires a {self.context_size}-byte context but execute() received none; "
+                f"allocate graph.get_context_size() bytes and pass the buffer as context= to execute()"
+            )
+        context = Workspace(ctx.context, 0, type(self.compiled).__name__)
+        if context.nbytes != self.context_size:
+            raise ValueError(
+                f"{self.compiled.plan_name}: the context must be {self.context_size} bytes (the summary's context for these tokens), got {context.nbytes}"
+            )
+        self.compiled.run(views, workspace, ctx.stream, context)

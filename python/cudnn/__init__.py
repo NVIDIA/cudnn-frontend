@@ -24,6 +24,7 @@ symbols_to_import = [
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
+    "cuda_graph_retention",
     "knob_type",
     "FRONTEND_KNOB_TYPE_BASE",
     "is_frontend_knob_type",
@@ -42,6 +43,7 @@ symbols_to_import = [
     "moe_grouped_matmul_mode",
     "scalar_type",
     "reshape_mode",
+    "custom_reduction_identity",
 ]
 
 for symbol_name in symbols_to_import:
@@ -72,6 +74,25 @@ for _optional_symbol in [
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
+
+
+def sdpa_capabilities() -> frozenset:
+    """Names of the SDPA binding capabilities this build of cudnn-frontend provides, as a frozenset of ``str``.
+
+    Each name ``<cap>`` is a ``supports_<cap>`` flag of the native SDPA binder (``_SdpaThdBinder``): a packed (THD)
+    split or stride contract the compiled extension honors -- ``"stats_stride_override"``, ``"nonpaged_packed_split"``,
+    ``"paged_split_sink"``, ... A caller that needs one asks ``"<cap>" in cudnn.sdpa_capabilities()``; the binder's
+    flags stay as they are, so a caller written against them keeps working. The set is append-only: a capability is
+    never renamed or removed. Empty on a build without the binder. Host Python only: no device, no framework import.
+    """
+    binder = getattr(_pybind_module, "_SdpaThdBinder", None)
+    if binder is None:
+        return frozenset()
+    names = []
+    for attr in dir(binder):
+        if attr.startswith("supports_") and getattr(binder, attr, False) is True:
+            names.append(attr[len("supports_") :])
+    return frozenset(names)
 
 
 from ._handle import Handle, DeviceInfo
@@ -151,7 +172,10 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.32.0"
+__version__ = "1.33.0"
+# Keep in sync with the JAX dependency minimum in pyproject.toml.
+CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
+CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
 
 
 def _tensor(
@@ -276,6 +300,7 @@ from ._pygraph import pygraph, GraphContext
 from .nodes import Node
 
 from .graph import graph, jit, graph_cache
+from . import reduction_modifiers
 
 from typing import Any
 
@@ -310,6 +335,8 @@ _EAGER_PUBLIC_NAMES = (
     "Handle",
     "DeviceInfo",
     "__version__",
+    "CUTEDSL_MIN_JAX_VERSION",
+    "CUTEDSL_MIN_JAX_VERSION_STR",
     "NodeType",
     "Tensor",
     "pygraph",
@@ -318,6 +345,8 @@ _EAGER_PUBLIC_NAMES = (
     "graph",
     "jit",
     "graph_cache",
+    "reduction_modifiers",
+    "sdpa_capabilities",
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
@@ -368,10 +397,27 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "engram_gate_saved_backward": "Install nvidia-cudnn-frontend[triton] and a CUDA-enabled torch build",
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "gated_attention_block": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "GdnDecodeFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "GdnVerifyFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    # the gated attention block (its package had no entry here, so `from cudnn import gated_attention_block_forward` failed)
+    "gated_attention_block_forward": (".gated_attention_block", "gated_attention_block_forward"),
+    "gated_attention_block_backward": (".gated_attention_block", "gated_attention_block_backward"),
+    "GatedAttentionBlockFwd": (".gated_attention_block", "GatedAttentionBlockFwd"),
+    "GatedAttentionBlockBwd": (".gated_attention_block", "GatedAttentionBlockBwd"),
+    # the fused GDN decode / MTP verify step entries for SM100- and SM120-class parts: direct-call kernels with the FlashInfer Qwen 3.5 GDN block's
+    # argument contract (also `cudnn.linear_attention.frost.GdnDecodeFused` / `GdnVerifyFused`); their FlashInfer backend registration is
+    # the explicit import of `cudnn.linear_attention.frost.flashinfer_gdn_backend`, never reached from here
+    "GdnDecodeFused": (".linear_attention.frost.gdn_decode_fused", "GdnDecodeFused"),
+    "GdnVerifyFused": (".linear_attention.frost.gdn_verify_fused", "GdnVerifyFused"),
+    # the shared-expert decode kernel pair (bf16 shared expert next to a routed MoE, SM100-class parts): a direct-call entry like the GDN
+    # steps (also `cudnn.moe.frost.SharedExpertDecode`)
+    "SharedExpertDecode": (".moe.frost.shared_expert_decode", "SharedExpertDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -384,6 +430,9 @@ _LAZY_OPTIONAL_IMPORTS = {
     "EngramGateSavedBackward": (".engram", "EngramGateSavedBackward"),
     "engram_gate_saved_forward": (".engram", "engram_gate_saved_forward"),
     "engram_gate_saved_backward": (".engram", "engram_gate_saved_backward"),
+    # The gated attention block (a model-level FROST API): `import cudnn; cudnn.gated_attention_block.<name>` resolves the
+    # package on first attribute access, like `gnn` / `moe_ep` below; it imports torch and cuda-python, so never eagerly here.
+    "gated_attention_block": (".gated_attention_block", None),
     "gnn": (".gnn", None),
     "moe_ep": (".moe_ep", None),
     "BlockScaledTensor": (".moe_ep", "BlockScaledTensor"),
@@ -439,6 +488,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "kpage_prepare_layout": (".block_sparse_attention", "kpage_prepare_layout"),
+    "KPageLayout": (".block_sparse_attention", "KPageLayout"),
     "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
@@ -572,6 +623,22 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm_wgrad_jax_sm100": (
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wgrad_jax_sm100",
+    ),
+    "grouped_gemm_quant_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_quant_jax_forward",
+    ),
+    "grouped_gemm_srelu_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_srelu_jax_forward",
+    ),
+    "grouped_gemm_glu_hadamard_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_jax_forward",
+    ),
+    "grouped_gemm_glu_hadamard_quant_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_glu_hadamard_quant_jax_forward",
     ),
     "discrete_grouped_gemm_swiglu_jax_sm100": (
         ".gemm.cutedsl.discrete_grouped",
@@ -743,7 +810,7 @@ def __getattr__(name: str) -> Any:
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
         # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax

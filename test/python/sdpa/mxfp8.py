@@ -130,6 +130,21 @@ def compare_amax(actual, expected, rtol=0.02, tag="amax"):
     print(f"amax: gpu={amax_gpu:.6e}, ref={amax_ref:.6e}, diff={amax_diff:.2e}, tol={amax_atol:.2e} for '{tag}'")
     return amax_diff < amax_atol
 
+def assert_close_mxfp8_grad(actual, expected, atol, rtol, tag, keys):
+    """Keep the FP8 mismatch-count budget, with the same 4*atol magnitude cap on EVERY budgeted element.
+
+    The shared comparison caps its row-budget arm only; its element-budget arm can admit an arbitrarily large
+    error. Preserve the ordinary elementwise tolerance and cap any extra mismatch before either budget can accept
+    it. This bounded allowance does not attribute an error to a code flip; lifting the cap would require reference
+    intermediate evidence. Non-finite values on either side are never allowed.
+    """
+    actual_f32, expected_f32 = actual.detach().float(), expected.detach().float()
+    diff = (actual_f32 - expected_f32).abs()
+    ordinary = diff <= atol + rtol * expected_f32.abs()
+    bounded = torch.isfinite(actual_f32) & torch.isfinite(expected_f32) & (ordinary | (diff <= 4 * atol))
+    assert bool(bounded.all()), f"{tag}: gradient error exceeds the ordinary tolerance and 4*atol budget cap ({4 * atol}); max |diff|={diff.max().item()}"
+    assert_close_fp8_grad(actual, expected, atol, rtol, tag=tag, keys=keys)
+
 def assert_o_within_one_p_code_flip(o_cmp, o_ref, atol, rtol, *, v_absmax, torch_itype, tag):
     """Magnitude cap for the budgeted O compare (assert_close_fp8_grad): its element-count branch admits a few elements
     with NO bound on their deviation, so cap every element first.  The kernel and the reference quantize P independently
@@ -795,17 +810,19 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     if getattr(graph, "selected_engine", None) is None:
         pytest.skip("MXFP8 THD graph fell back to the native backend (FROST engine declined); native cannot execute THD mxfp8")
 
-    # Bind the flat packed storages directly: the graph reads only the base
-    # pointer, and a dense (b, h, s_max, d) view need not fit in a
-    # total-token-capacity buffer.
+    # Bind packed (T, H, D) views so the THD binder can observe token/head
+    # strides without requiring a dense (b, h, s_max, d) allocation. These
+    # zero-copy views retain the full capacity, including NaN-poisoned tails.
     variant_pack = {
-        tq: q_stor, tk: k_stor, tv: v_stor,
+        tq: q_stor.view(max_t_q, h_q, d_qk),
+        tk: k_stor.view(max_t_kv, h_k, d_qk),
+        tv: v_stor.view(max_t_kv, h_v, d_vo),
         sf_q_t: sfq_pk, sf_k_t: sfk_pk, sf_v_t: sfv_pk,
         len_q_t: cu_q_gpu if cfg.is_cu_seq_len else seq_len_q_gpu,
         len_kv_t: cu_kv_gpu if cfg.is_cu_seq_len else seq_len_kv_gpu,
         t_ro_q: ro_q, t_ro_k: ro_k, t_ro_v: ro_v, t_ro_o: ro_o,
         t_ro_stats: ro_stats,
-        o_t: o_stor,
+        o_t: o_stor.view(max_t_q, h_q, d_vo),
         stats_t: stats_stor,
         amax_o_t: amax_o_gpu,
     }
@@ -869,26 +886,28 @@ def _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align):
     return s_qo + right_bound <= s_kv
 
 
-def _mxfp8_block_scaled_engine_covers(sm):
-    """Whether a FROST MXFP8 forward engine row that carries the block-scaled O
-    epilogue serves this arch (``engines.py`` is the source of truth: the SM100
-    and SM107 lines today; SM120 has no MXFP8 kernel, so a draw there must fold)."""
+def _mxfp8_block_scaled_engine_covers(sm, o_block_scale):
+    """Whether a FROST MXFP8 forward engine row serves this block-scaled O on this arch
+    (``engines.py`` is the source of truth: both block sizes on the SM100 and SM107
+    lines; the 32-element MXFP8 O only on SM120, so an NVFP4 draw there must fold)."""
     from cudnn.sdpa.fwd import engines
 
     return any(
-        c.is_mxfp8 and c.phase == "prefill" and {16, 32} <= set(c.o_block_scales) and c.sm_lo <= sm <= c.sm_hi
+        c.is_mxfp8 and c.phase == "prefill" and o_block_scale in c.o_block_scales and c.sm_lo <= sm <= c.sm_hi
         for c in (spec.capabilities for spec in engines.ENGINE_SPECS)
     )
 
 
 def _mxfp8_frost_row_offered(sm):
-    """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 row is a
-    default candidate; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
-    on this device: on cc 10.7 the row additionally needs a CuTe DSL build with the sm_107a target
-    (python/cudnn/AGENTS.md Rule 7 -- the public 4.7.0 wheel lacks it, and the row then declines through
-    ``cutedsl_arch_requirement_error``), so the mirror requires it too.  sf_o has no backend lowering, so a draw is
-    admitted only where a row that can serve it is actually on offer; an admitted draw the row declines is a FAILURE."""
+    """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 and SM120 rows
+    are default candidates; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
+    on this device: every row needs a CuTe DSL at the FROST floor (python/cudnn/AGENTS.md Rule 7 -- without one the row
+    declines), and on cc 10.7 the row additionally needs a build with the sm_107a target (the public 4.7.0 wheel lacks
+    it, and the row then declines through ``cutedsl_arch_requirement_error``), so the mirror requires both.  sf_o has no
+    backend lowering, so a draw is admitted only where a row that can serve it is actually on offer; an admitted draw
+    the row declines is a FAILURE."""
     from cudnn.engines.manifest import MANIFEST
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
     from cudnn.sdpa.fwd import engines
 
     offered = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
@@ -897,11 +916,10 @@ def _mxfp8_frost_row_offered(sm):
         for s in engines.ENGINE_SPECS
     ):
         return False
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        return False  # no usable DSL: the row declines before any target question is asked
     if sm == 107:
-        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state
-
-        if not cutedsl_state()[0]:
-            return False  # no DSL at all: the row declines before the target question is asked
         return cutedsl_arch_requirement_error((10, 7)) is None
     return True
 
@@ -923,7 +941,7 @@ def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fm
     has_fp4 = hasattr(torch, "float4_e2m1fn_x2") if has_fp4 is None else has_fp4
     if not (
         engines_enabled
-        and _mxfp8_block_scaled_engine_covers(sm)
+        and _mxfp8_block_scaled_engine_covers(sm, o_block_scale)
         and is_infer
         and not is_paged
         and not with_unfuse_fma
@@ -1448,14 +1466,17 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
                 stats=stats_bwd,
             )
 
-            for actual, expected, name in (
-                (dQ_gpu, dQ_ref, "dQ"),
-                (dK_gpu, dK_ref, "dK"),
-                (dV_gpu, dV_ref, "dV"),
+            for actual, expected, name, keys in (
+                (dQ_gpu, dQ_ref, "dQ", s_kv),
+                (dK_gpu, dK_ref, "dK", s_qo),
+                (dV_gpu, dV_ref, "dV", s_qo),
             ):
-                # dV carries the largest magnitudes, so it needs one wider step than fp8.
-                error = compare_tensors(actual, expected, 0.125, 0.20, name)
-                assert error == 0, f"{name} mismatch: {error} elements differ"
+                # dV carries the largest magnitudes, so it needs one wider step than fp8.  The kernel and
+                # the reference round P and dS to E4M3 independently; a value on a code midpoint moves the
+                # d-row it feeds by one code step times the operand (assert_close_fp8_grad), e.g. one dS
+                # flip against a constant |Q| = 16 column shifted a whole dK row by 0.25 on SM103
+                # (bprop.mxfp8.dense test236).
+                assert_close_mxfp8_grad(actual, expected, 0.125, 0.20, tag=name, keys=keys)
 
             if with_sink_token and dSink_token_ref is not None:
                 dSink_err = compare_tensors(dSink_token_gpu, dSink_token_ref, 0.08, 0.20, "dSink_token")

@@ -51,17 +51,21 @@ Backward:
   carry static token-capacity padding) are written as exact zeros by the kernel
   itself — each such slot has a unique natural owner (see the kernel docstring) — so
   ``dKV``/``dScore`` buffers need no zero-initialization and no separate fill kernels,
-  matching autograd output exactly. ``dAPE`` is accumulated in registers over ``rows_per_cta`` blocks and
-  then reduced with one fp32 atomic per ``(k, dim)`` per CTA into a buffer the caller
-  must still zero-initialize; ``dAPE`` is therefore not bitwise run-to-run deterministic
-  (forward, ``dKV`` and ``dScore`` are). When ``total_comp == 0`` no kernel is launched
-  and the buffers are left untouched (the wrapper falls back to allocating zeros).
+  matching autograd output exactly. The default path accumulates ``dAPE`` in registers
+  over ``rows_per_cta`` blocks and then uses one fp32 atomic per ``(k, dim)`` per CTA.
+  The opt-in deterministic path instead writes those CTA-local sums to caller-owned
+  workspace and launches fixed-order reduction stages which fully overwrite ``dAPE``.
+  Ratio 4 uses a hierarchical two-kernel fold and a long-context 24-row CTA schedule
+  so packed sequences retain enough parallelism with fewer partial planes; ratios 2
+  and 128 keep their serial fold. When ``total_comp == 0``
+  no kernel is launched and the buffers are left
+  untouched (the wrapper falls back to allocating zeros).
 
 Static-capacity padding (``total_comp > cu_seqlens_comp[-1]``):
-  Forward computes the padding rows exactly like the eager code: they gather the window
-  from token 0 with first-in-segment semantics (requires ``total_tokens >= ratio``, like
-  the eager gather). Backward ignores incoming gradients on padding rows (they are tail
-  padding for CUDA-graph static shapes and are not consumed downstream).
+  Forward writes exact zeros without loading APE/KV/score or evaluating softmax.
+  Backward ignores incoming gradients on padding rows (they are tail padding for
+  CUDA-graph static shapes and are not consumed downstream). This also makes a positive
+  static output capacity safe when every segment is shorter than ``ratio``.
 
 CUDA graphs:
   The launch path is capture-compatible once the kernels for a given
@@ -79,9 +83,11 @@ import ctypes
 import os
 import threading
 
-import torch
+try:  # Torch is needed only by the eager wrapper; JAX imports the pure DSL kernels.
+    import torch
+except ImportError:  # pragma: no cover - exercised by JAX-only installs
+    torch = None
 import cuda.bindings.driver as cuda_driver
-
 import cutlass
 import cutlass.base_dsl.typing as _cutlass_typing
 import cutlass.cute as cute
@@ -90,12 +96,14 @@ import cutlass.cute.math as cute_math
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.runtime import make_ptr
 
+from cudnn._cutlass_compat import SmemAllocator
+
 _ENV_FAST_LAUNCH = "CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH"
 
-# The kernels use no architecture-specific features beyond the SM100 baseline (plain
-# loads/stores, fp32 atomics, pinned mul/fma PTX), so admit SM100 and newer GPU
-# families. ``cute.compile`` resolves the concrete SASS target from the active device.
-MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
+# The generic ratio-2/4 kernels use only CUDA-core operations available on SM90
+# (plain loads/stores, fp32 atomics, barriers, and pinned mul/fma PTX).
+# ``cute.compile`` resolves the concrete SASS target from the active device.  The
+# ratio-128 family has a separately validated architecture envelope in ``api.py``.
 
 
 # =============================================================================
@@ -112,11 +120,13 @@ MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
 # torch's raw current-stream query (~0.5 us) vs `torch.cuda.current_stream` object
 # construction (~2-3 us). Same handle the slow path ends up passing. Private API: guard
 # the bind so module import survives torch builds that do not expose it.
-_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) if torch is not None else None
 if _raw_stream is None:  # pragma: no cover - older/stripped torch builds
 
     def _raw_stream(device_index=None):
         """Fallback raw-stream query via the public torch API."""
+        if torch is None:
+            raise ImportError("The eager CSA compressor launcher requires torch")
         return torch.cuda.current_stream(device_index).cuda_stream
 
 
@@ -363,32 +373,32 @@ def _compressor_fwd_kernel(
     if col < ncol:
         cvec = col * vec  # first head-dim column of this thread's lane group
 
-        # Hoist APE loads: constant per (k, lane) across all rows.
-        ape_k = []
-        for k in cutlass.range_constexpr(win):
-            if cutlass.const_expr(coff == 2 and k < ratio):
-                colbase = cvec
-            else:
-                colbase = (d + cvec) if cutlass.const_expr(coff == 2) else cvec
-            fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
-            aoff = cute.assume((k % ratio) * W + colbase, divby=vec)
-            gA = cute.make_tensor(mAPE.iterator + aoff, cute.make_layout(vec))
-            cute.autovec_copy(gA, fr_a)
-            for j in cutlass.range_constexpr(vec):
-                ape_k.append(cutlass.Float32(fr_a[j]))
-
-        # True compressed row count; rows in [nb_valid, nb_total) are static-capacity
-        # padding and gather the window from token 0 with first-in-segment semantics,
-        # like the eager code.
+        # True compressed row count. Capacity-only rows write exact zeros without
+        # loading APE/KV/score or evaluating softmax. The predicate is uniform for
+        # every thread in a CTA because one CTA owns one output row.
         nb_valid = mCuComp[n_seq]
 
         for rr in cutlass.range_constexpr(rows_per_cta):
             bb = bidx * rows_per_cta + rr
             if bb < nb_total:
-                # Per-segment boundary scan (n_seq is small).
-                seq_idx = cutlass.Int32(0)
-                bis = cutlass.Int32(0)
+                fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                 if bb < nb_valid:
+                    # Hoist APE loads once per valid row/lane group.
+                    ape_k = []
+                    for k in cutlass.range_constexpr(win):
+                        if cutlass.const_expr(coff == 2 and k < ratio):
+                            colbase = cvec
+                        else:
+                            colbase = (d + cvec) if cutlass.const_expr(coff == 2) else cvec
+                        fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
+                        aoff = cute.assume((k % ratio) * W + colbase, divby=vec)
+                        gA = cute.make_tensor(mAPE.iterator + aoff, cute.make_layout(vec))
+                        cute.autovec_copy(gA, fr_a)
+                        for j in cutlass.range_constexpr(vec):
+                            ape_k.append(cutlass.Float32(fr_a[j]))
+
+                    # Per-segment boundary scan (n_seq is small).
+                    seq_idx = cutlass.Int32(0)
                     bis = cutlass.Int32(bb)
                     for s in cutlass.range(n_seq):
                         cs = mCuComp[s]
@@ -397,60 +407,62 @@ def _compressor_fwd_kernel(
                             if bb < ce:
                                 seq_idx = s
                                 bis = bb - cs
-                tok0 = mCu[seq_idx] + bis * ratio
+                    tok0 = mCu[seq_idx] + bis * ratio
 
-                sv = []
-                kvv = []
-                for k in cutlass.range_constexpr(win):
-                    fr_s = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                    fr_k = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                    if cutlass.const_expr(coff == 2 and k < ratio):
-                        if bis > 0:
-                            off = cute.assume((tok0 - ratio + k) * W + cvec, divby=vec)
+                    sv = []
+                    kvv = []
+                    for k in cutlass.range_constexpr(win):
+                        fr_s = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                        fr_k = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                        if cutlass.const_expr(coff == 2 and k < ratio):
+                            if bis > 0:
+                                off = cute.assume((tok0 - ratio + k) * W + cvec, divby=vec)
+                                gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
+                                gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
+                                cute.autovec_copy(gS, fr_s)
+                                cute.autovec_copy(gK, fr_k)
+                            # Same value construction as the scalar kernel: the invalid
+                            # window contributes the CONSTANT -inf score (no APE add —
+                            # APE values are not required to be finite) and a zero kv.
+                            for j in cutlass.range_constexpr(vec):
+                                v = cutlass.Float32(_NEG_INF)
+                                u = cutlass.Float32(0.0)
+                                if bis > 0:
+                                    v = cutlass.Float32(fr_s[j]) + ape_k[k * vec + j]
+                                    u = cutlass.Float32(fr_k[j])
+                                sv.append(v)
+                                kvv.append(u)
+                        else:
+                            if cutlass.const_expr(coff == 2):
+                                off = cute.assume((tok0 + k - ratio) * W + d + cvec, divby=vec)
+                            else:
+                                off = cute.assume((tok0 + k) * W + cvec, divby=vec)
                             gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
                             gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
                             cute.autovec_copy(gS, fr_s)
                             cute.autovec_copy(gK, fr_k)
-                        # Same value construction as the scalar kernel: the invalid
-                        # window contributes the CONSTANT -inf score (no APE add — APE
-                        # values are not required to be finite) and a zero kv lane.
-                        for j in cutlass.range_constexpr(vec):
-                            v = cutlass.Float32(_NEG_INF)
-                            u = cutlass.Float32(0.0)
-                            if bis > 0:
-                                v = cutlass.Float32(fr_s[j]) + ape_k[k * vec + j]
-                                u = cutlass.Float32(fr_k[j])
-                            sv.append(v)
-                            kvv.append(u)
-                    else:
-                        if cutlass.const_expr(coff == 2):
-                            off = cute.assume((tok0 + k - ratio) * W + d + cvec, divby=vec)
-                        else:
-                            off = cute.assume((tok0 + k) * W + cvec, divby=vec)
-                        gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
-                        gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
-                        cute.autovec_copy(gS, fr_s)
-                        cute.autovec_copy(gK, fr_k)
-                        for j in cutlass.range_constexpr(vec):
-                            sv.append(cutlass.Float32(fr_s[j]) + ape_k[k * vec + j])
-                            kvv.append(cutlass.Float32(fr_k[j]))
+                            for j in cutlass.range_constexpr(vec):
+                                sv.append(cutlass.Float32(fr_s[j]) + ape_k[k * vec + j])
+                                kvv.append(cutlass.Float32(fr_k[j]))
 
-                fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
-                for j in cutlass.range_constexpr(vec):
-                    mx = sv[j]
-                    for k in cutlass.range_constexpr(1, win):
-                        if sv[k * vec + j] > mx:
-                            mx = sv[k * vec + j]
-                    den = cutlass.Float32(0.0)
-                    ex = []
-                    for k in cutlass.range_constexpr(win):
-                        e = cute_math.exp(sv[k * vec + j] - mx)
-                        den = den + e
-                        ex.append(e)
-                    acc = cutlass.Float32(0.0)
-                    for k in cutlass.range_constexpr(win):
-                        acc = acc + _fmul_rn(kvv[k * vec + j], ex[k] / den)
-                    fr_o[j] = cutlass.BFloat16(acc)
+                    for j in cutlass.range_constexpr(vec):
+                        mx = sv[j]
+                        for k in cutlass.range_constexpr(1, win):
+                            if sv[k * vec + j] > mx:
+                                mx = sv[k * vec + j]
+                        den = cutlass.Float32(0.0)
+                        ex = []
+                        for k in cutlass.range_constexpr(win):
+                            e = cute_math.exp(sv[k * vec + j] - mx)
+                            den = den + e
+                            ex.append(e)
+                        acc = cutlass.Float32(0.0)
+                        for k in cutlass.range_constexpr(win):
+                            acc = acc + _fmul_rn(kvv[k * vec + j], ex[k] / den)
+                        fr_o[j] = cutlass.BFloat16(acc)
+                else:
+                    for j in cutlass.range_constexpr(vec):
+                        fr_o[j] = cutlass.BFloat16(0.0)
                 ooff = cute.assume(bb * d + cvec, divby=vec)
                 gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
                 cute.autovec_copy(fr_o, gO)
@@ -466,7 +478,7 @@ def _compressor_bwd_kernel(
     mGO: cute.Tensor,  # flat [nb_total * d] bf16
     mGKV: cute.Tensor,  # flat [T * W] bf16 (fully written; may be uninitialized)
     mGS: cute.Tensor,  # flat [T * W] bf16 (fully written; may be uninitialized)
-    mGAPE: cute.Tensor,  # flat [ratio * W] fp32 (zero-initialized)
+    mDAPEOut: cute.Tensor,  # atomic: [ratio * W]; deterministic: [gridDim.x * ratio * W]
     nb_total: cutlass.Int32,
     n_seq: cutlass.Int32,
     total_tokens: cutlass.Int32,
@@ -475,8 +487,9 @@ def _compressor_bwd_kernel(
     coff: cutlass.Constexpr,
     rows_per_cta: cutlass.Constexpr,
     threads: cutlass.Constexpr,
+    deterministic: cutlass.Constexpr,
 ):
-    """Backward: recompute window probs, disjoint ``dKV``/``dScore`` stores, ``dAPE`` atomics.
+    """Backward with disjoint dKV/dScore stores and selectable dAPE reduction.
 
     ``dKV``/``dScore`` are FULLY written by the kernel: consumed positions get their
     gradients, and every never-consumed position gets an exact zero from its unique
@@ -493,9 +506,11 @@ def _compressor_bwd_kernel(
       - tokens beyond ``cu_seqlens[-1]`` (static token-capacity padding of the
         gradient buffers) — grid-strided across the CTA columns.
 
-    ``dAPE`` is still accumulated into a caller-zero-initialized buffer with one fp32
-    atomic per ``(k, dim)`` per CTA. Rows in ``[cu_seqlens_comp[-1], nb_total)`` are
-    static-capacity padding; their incoming gradients are ignored.
+    The default dAPE epilogue uses one fp32 atomic per ``(k, dim)`` per CTA into a
+    caller-zeroed buffer. The deterministic specialization writes one complete
+    CTA-local partial plane for a fixed-order follow-up reduction. Rows in
+    ``[cu_seqlens_comp[-1], nb_total)`` are static-capacity padding; their incoming
+    gradients are ignored.
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
@@ -552,18 +567,31 @@ def _compressor_bwd_kernel(
                     mGKV[t * W + d + dim] = ZERO_BF16
                     mGS[t * W + d + dim] = ZERO_BF16
 
+        # ``mCuComp`` is monotonic, so locate this CTA's first compressed row with
+        # an upper-bound search and carry the owning segment forward across the
+        # remaining consecutive rows.  The former row-by-row linear scan made a
+        # packed backward O(nb_valid * n_seq), which dominates long, highly ragged
+        # packs.  This changes metadata lookup only; the floating-point expression
+        # and dAPE partial/reduction trees below remain unchanged.
+        seq_idx = cutlass.Int32(0)
+        first_bb = bidx * rows_per_cta
+        if first_bb < nb_valid:
+            lower = cutlass.Int32(0)
+            upper = n_seq
+            while lower + cutlass.Int32(1) < upper:
+                middle = (lower + upper) // cutlass.Int32(2)
+                if first_bb < cutlass.Int32(mCuComp[middle]):
+                    upper = middle
+                else:
+                    lower = middle
+            seq_idx = lower
+
         for rr in cutlass.range_constexpr(rows_per_cta):
             bb = bidx * rows_per_cta + rr
             if bb < nb_valid:
-                seq_idx = cutlass.Int32(0)
-                bis = cutlass.Int32(bb)
-                for s in cutlass.range(n_seq):
-                    cs = mCuComp[s]
-                    ce = mCuComp[s + 1]
-                    if bb >= cs:
-                        if bb < ce:
-                            seq_idx = s
-                            bis = bb - cs
+                while seq_idx + cutlass.Int32(1) < n_seq and bb >= cutlass.Int32(mCuComp[seq_idx + cutlass.Int32(1)]):
+                    seq_idx = seq_idx + cutlass.Int32(1)
+                bis = bb - cutlass.Int32(mCuComp[seq_idx])
                 tok0 = mCu[seq_idx] + bis * ratio
 
                 # Recompute window probs (same order as forward).
@@ -647,13 +675,148 @@ def _compressor_bwd_kernel(
                             mGKV[(tail0 + tt) * W + d + dim] = ZERO_BF16
                             mGS[(tail0 + tt) * W + d + dim] = ZERO_BF16
 
-        # One fp32 atomic per (k, dim) per CTA (amortized over rows_per_cta rows).
-        for k in cutlass.range_constexpr(win):
-            if cutlass.const_expr(coff == 2 and k < ratio):
-                col = dim
-            else:
-                col = (d + dim) if cutlass.const_expr(coff == 2) else dim
-            cute_arch.atomic_add(mGAPE.iterator + ((k % ratio) * W + col), dape[k])
+        # Default: one fp32 atomic per (k, dim) per CTA. Deterministic: every CTA
+        # writes a disjoint partial plane; the fixed-order reduction kernels consume
+        # those planes through its ratio-specific fixed tree and overwrites dAPE.
+        if cutlass.const_expr(deterministic):
+            for k in cutlass.range_constexpr(win):
+                if cutlass.const_expr(coff == 2 and k < ratio):
+                    col = dim
+                else:
+                    col = (d + dim) if cutlass.const_expr(coff == 2) else dim
+                out_idx = (k % ratio) * W + col
+                mDAPEOut[bidx * ratio * W + out_idx] = dape[k]
+        else:
+            for k in cutlass.range_constexpr(win):
+                if cutlass.const_expr(coff == 2 and k < ratio):
+                    col = dim
+                else:
+                    col = (d + dim) if cutlass.const_expr(coff == 2) else dim
+                cute_arch.atomic_add(mDAPEOut.iterator + ((k % ratio) * W + col), dape[k])
+
+
+@cute.kernel
+def _dape_reduce_serial_kernel(
+    mDAPEPartial: cute.Tensor,  # [npartials, nelems] fp32
+    mGAPE: cute.Tensor,  # [nelems] fp32, fully overwritten
+    npartials: cutlass.Int32,
+    nelems: cutlass.Int32,
+):
+    """Reduce CTA partial planes serially, one thread per dAPE element."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    idx = bidx * 256 + tidx
+    if idx < nelems:
+        acc = cutlass.Float32(0.0)
+        for p in cutlass.range(npartials):
+            acc = acc + cutlass.Float32(mDAPEPartial[p * nelems + idx])
+        mGAPE[idx] = acc
+
+
+_DAPE_REDUCTION_OUTPUTS = 32
+_DAPE_REDUCTION_SPLITS = 8
+_DAPE_REDUCTION_GROUP_PARTIALS = 32
+
+
+@cute.kernel
+def _dape_reduce_stage1_kernel(
+    mDAPEPartial: cute.Tensor,  # [npartials, nelems] fp32
+    mDAPEStage: cute.Tensor,  # [ceil(npartials / 32), nelems] fp32
+    npartials: cutlass.Int32,
+    nelems: cutlass.Int32,
+):
+    """Reduce groups of 32 ratio-4 dAPE partials in parallel.
+
+    A CTA owns 32 adjacent outputs from one fixed 32-partial group. Its eight
+    warps each sum four contiguous partials in ascending order, then warp 0 merges
+    the eight sums in ascending interval order. The flattened grid exposes enough
+    independent groups to occupy the GPU on long packed sequences without imposing
+    CUDA's 65535-block ``gridDim.y`` limit.
+
+    All lanes publish a value before the barrier. The final group and output tile
+    are zero-padded, so the fixed tree is bitwise deterministic for every shape.
+    """
+    output_lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    split_lane = cutlass.Int32(cute.arch.thread_idx()[1])
+    output_tiles = (nelems + cutlass.Int32(_DAPE_REDUCTION_OUTPUTS - 1)) // cutlass.Int32(_DAPE_REDUCTION_OUTPUTS)
+    cta = cutlass.Int32(cute.arch.block_idx()[0])
+    group = cta // output_tiles
+    output_tile = cta - group * output_tiles
+    idx = output_tile * cutlass.Int32(_DAPE_REDUCTION_OUTPUTS) + output_lane
+    partials_per_split = cutlass.Int32(_DAPE_REDUCTION_GROUP_PARTIALS // _DAPE_REDUCTION_SPLITS)
+    begin = group * cutlass.Int32(_DAPE_REDUCTION_GROUP_PARTIALS) + split_lane * partials_per_split
+
+    acc = cutlass.Float32(0.0)
+    if idx < nelems:
+        for offset in cutlass.range_constexpr(_DAPE_REDUCTION_GROUP_PARTIALS // _DAPE_REDUCTION_SPLITS):
+            partial = begin + offset
+            if partial < npartials:
+                acc = acc + cutlass.Float32(mDAPEPartial[partial * nelems + idx])
+
+    smem = SmemAllocator()
+    split_partials = smem.allocate_tensor(
+        cutlass.Float32,
+        cute.make_layout(
+            (_DAPE_REDUCTION_SPLITS, _DAPE_REDUCTION_OUTPUTS),
+            stride=(_DAPE_REDUCTION_OUTPUTS, 1),
+        ),
+        byte_alignment=16,
+    )
+    split_partials[(split_lane, output_lane)] = acc
+    cute.arch.barrier()
+
+    if split_lane == 0 and idx < nelems:
+        result = cutlass.Float32(0.0)
+        for split in cutlass.range_constexpr(_DAPE_REDUCTION_SPLITS):
+            result = result + cutlass.Float32(split_partials[(split, output_lane)])
+        mDAPEStage[group * nelems + idx] = result
+
+
+@cute.kernel
+def _dape_reduce_stage2_kernel(
+    mDAPEStage: cute.Tensor,  # [ngroups, nelems] fp32
+    mGAPE: cute.Tensor,  # [nelems] fp32, fully overwritten
+    ngroups: cutlass.Int32,
+    nelems: cutlass.Int32,
+):
+    """Fold stage-1 group sums with a fixed eight-way contiguous tree."""
+    output_lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    split_lane = cutlass.Int32(cute.arch.thread_idx()[1])
+    idx = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(_DAPE_REDUCTION_OUTPUTS) + output_lane
+
+    interval = ngroups // cutlass.Int32(_DAPE_REDUCTION_SPLITS)
+    remainder = ngroups % cutlass.Int32(_DAPE_REDUCTION_SPLITS)
+    begin = split_lane * interval
+    count = interval
+    if split_lane < remainder:
+        begin = begin + split_lane
+        count = count + cutlass.Int32(1)
+    else:
+        begin = begin + remainder
+
+    acc = cutlass.Float32(0.0)
+    if idx < nelems:
+        for offset in cutlass.range(count, unroll=1):
+            group = begin + offset
+            acc = acc + cutlass.Float32(mDAPEStage[group * nelems + idx])
+
+    smem = SmemAllocator()
+    split_partials = smem.allocate_tensor(
+        cutlass.Float32,
+        cute.make_layout(
+            (_DAPE_REDUCTION_SPLITS, _DAPE_REDUCTION_OUTPUTS),
+            stride=(_DAPE_REDUCTION_OUTPUTS, 1),
+        ),
+        byte_alignment=16,
+    )
+    split_partials[(split_lane, output_lane)] = acc
+    cute.arch.barrier()
+
+    if split_lane == 0 and idx < nelems:
+        result = cutlass.Float32(0.0)
+        for split in cutlass.range_constexpr(_DAPE_REDUCTION_SPLITS):
+            result = result + cutlass.Float32(split_partials[(split, output_lane)])
+        mGAPE[idx] = result
 
 
 _EXT = (1 << 31) - 1  # flat extent placeholder (int32 offsets, no bounds checks)
@@ -716,7 +879,7 @@ def _compressor_bwd_launch(
     go_ptr: cute.Pointer,
     gkv_ptr: cute.Pointer,
     gs_ptr: cute.Pointer,
-    gape_ptr: cute.Pointer,
+    dape_out_ptr: cute.Pointer,
     nb_total: cutlass.Int32,
     n_seq: cutlass.Int32,
     total_tokens: cutlass.Int32,
@@ -726,6 +889,7 @@ def _compressor_bwd_launch(
     coff: cutlass.Constexpr,
     rows_per_cta: cutlass.Constexpr,
     threads: cutlass.Constexpr,
+    deterministic: cutlass.Constexpr,
 ):
     """JIT entry point that wraps raw pointers into tensors and launches backward."""
     lay = cute.make_layout(_EXT)
@@ -737,7 +901,7 @@ def _compressor_bwd_launch(
     mGO = cute.make_tensor(go_ptr, lay)
     mGKV = cute.make_tensor(gkv_ptr, lay)
     mGS = cute.make_tensor(gs_ptr, lay)
-    mGAPE = cute.make_tensor(gape_ptr, lay)
+    mDAPEOut = cute.make_tensor(dape_out_ptr, lay)
     gx = (nb_total + rows_per_cta - 1) // rows_per_cta
     gy = (d + threads - 1) // threads
     _compressor_bwd_kernel(
@@ -749,7 +913,7 @@ def _compressor_bwd_launch(
         mGO,
         mGKV,
         mGS,
-        mGAPE,
+        mDAPEOut,
         nb_total,
         n_seq,
         total_tokens,
@@ -758,7 +922,40 @@ def _compressor_bwd_launch(
         coff,
         rows_per_cta,
         threads,
+        deterministic,
     ).launch(grid=(gx, gy, 1), block=(threads, 1, 1), stream=stream)
+
+
+@cute.jit
+def _dape_reduce_launch(
+    dape_partial_ptr: cute.Pointer,
+    dape_stage_ptr: cute.Pointer,
+    gape_ptr: cute.Pointer,
+    npartials: cutlass.Int32,
+    nelems: cutlass.Int32,
+    stream: cuda_driver.CUstream,
+    split: cutlass.Constexpr,
+):
+    """JIT entry point for the deterministic fixed-order dAPE reduction."""
+    lay = cute.make_layout(_EXT)
+    mDAPEPartial = cute.make_tensor(dape_partial_ptr, lay)
+    mDAPEStage = cute.make_tensor(dape_stage_ptr, lay)
+    mGAPE = cute.make_tensor(gape_ptr, lay)
+    if cutlass.const_expr(split):
+        ngroups = (npartials + _DAPE_REDUCTION_GROUP_PARTIALS - 1) // _DAPE_REDUCTION_GROUP_PARTIALS
+        output_tiles = (nelems + _DAPE_REDUCTION_OUTPUTS - 1) // _DAPE_REDUCTION_OUTPUTS
+        _dape_reduce_stage1_kernel(mDAPEPartial, mDAPEStage, npartials, nelems).launch(
+            grid=(output_tiles * ngroups, 1, 1),
+            block=(_DAPE_REDUCTION_OUTPUTS, _DAPE_REDUCTION_SPLITS, 1),
+            stream=stream,
+        )
+        _dape_reduce_stage2_kernel(mDAPEStage, mGAPE, ngroups, nelems).launch(
+            grid=((nelems + _DAPE_REDUCTION_OUTPUTS - 1) // _DAPE_REDUCTION_OUTPUTS, 1, 1),
+            block=(_DAPE_REDUCTION_OUTPUTS, _DAPE_REDUCTION_SPLITS, 1),
+            stream=stream,
+        )
+    else:
+        _dape_reduce_serial_kernel(mDAPEPartial, mGAPE, npartials, nelems).launch(grid=((nelems + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream)
 
 
 _COMPILED = {}
@@ -766,6 +963,48 @@ _COMPILED = {}
 # kernel twice (the compiled-function cache itself is a plain dict guarded by the GIL).
 _COMPILE_LOCK = threading.Lock()
 _BWD_ROWS, _BWD_THREADS = 8, 128
+_BWD_ROWS_SM90_R2 = 16
+_BWD_ROWS_R4_DETERMINISTIC = 24
+_BWD_ROWS_R4_DETERMINISTIC_MIN_COMPRESSED_ROWS = 65536
+_BWD_ROWS_SM90_R2_MIN_COMPRESSED_ROWS = {
+    (False, 128): 8192,
+    (False, 512): 4096,
+    (True, 128): 4096,
+    (True, 512): 2048,
+}
+_BWD_ROWS_SM90_R2_MAX_COMPRESSED_ROWS = {
+    # Keep the d512 atomic tuning inside its measured [4096, 5121) safe bucket;
+    # larger capacities encounter unfavorable grid-wave occupancy crossovers.
+    # Deterministic reduction still benefits from rows=16 at every larger measured
+    # capacity.
+    (False, 512): 5121,
+}
+_BWD_ROWS_ALLOWED = frozenset((_BWD_ROWS, _BWD_ROWS_SM90_R2, _BWD_ROWS_R4_DETERMINISTIC))
+
+
+def _validate_bwd_rows(rows_per_cta):
+    """Reject schedule values outside the finite compile-artifact domain."""
+    if rows_per_cta not in _BWD_ROWS_ALLOWED:
+        raise ValueError(f"rows_per_cta must be one of {sorted(_BWD_ROWS_ALLOWED)}, got {rows_per_cta}")
+
+
+def _bwd_rows(ratio, deterministic, nb_total, d=None, coff=None, is_sm90=False):
+    """Rows accumulated by one generic backward CTA for this prepared plan.
+
+    SM90 ratio-2 plans use one additional, finite schedule bucket at the two
+    production head dimensions. All other generic configurations preserve the
+    architecture-independent schedule. Consequently ``rows_per_cta`` remains in
+    the bounded set ``{8, 16, 24}`` and runtime packed lengths never specialize an
+    artifact beyond the plan-capacity bucket.
+    """
+    if is_sm90 and ratio == 2 and coff == 2:
+        threshold = _BWD_ROWS_SM90_R2_MIN_COMPRESSED_ROWS.get((bool(deterministic), d))
+        upper = _BWD_ROWS_SM90_R2_MAX_COMPRESSED_ROWS.get((bool(deterministic), d))
+        if threshold is not None and nb_total >= threshold and (upper is None or nb_total < upper):
+            return _BWD_ROWS_SM90_R2
+    if deterministic and ratio == 4 and nb_total >= _BWD_ROWS_R4_DETERMINISTIC_MIN_COMPRESSED_ROWS:
+        return _BWD_ROWS_R4_DETERMINISTIC
+    return _BWD_ROWS
 
 
 def _fwd_schedule(d):
@@ -805,6 +1044,11 @@ def _f32_ptr(t):
     return make_ptr(cutlass.Float32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
 
 
+def _f32_address_ptr(address):
+    """Wrap a 16-byte-aligned byte address as an fp32 DSL pointer."""
+    return make_ptr(cutlass.Float32, address, cute.AddressSpace.gmem, assumed_align=16)
+
+
 def _i32_ptr(t):
     """Wrap an int32 tensor's data pointer for the DSL."""
     return make_ptr(cutlass.Int32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
@@ -826,7 +1070,7 @@ def _compile_fwd(key, args, ratio, d, coff):
     return fn
 
 
-def _compile_bwd(key, args, ratio, d, coff):
+def _compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic=False):
     """JIT-compile the backward launch entry for ``key`` (capture-guarded)."""
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
@@ -837,9 +1081,42 @@ def _compile_bwd(key, args, ratio, d, coff):
                     "graph capture (JIT compilation is not capture-safe); compile() or "
                     "run one eager step for this configuration before capturing."
                 )
-            fn = cute.compile(_compressor_bwd_launch, *args, ratio, d, coff, _BWD_ROWS, _BWD_THREADS)
+            fn = cute.compile(_compressor_bwd_launch, *args, ratio, d, coff, rows_per_cta, _BWD_THREADS, deterministic)
             _COMPILED[key] = fn
     return fn
+
+
+def _compile_dape_reduce(key, args, split=False):
+    """JIT-compile the shared fixed-order dAPE reduction (capture-guarded)."""
+    with _COMPILE_LOCK:
+        fn = _COMPILED.get(key)
+        if fn is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "CSA compressor: first deterministic dAPE reduction call happened " "under CUDA graph capture; compile() or run one eager step first."
+                )
+            fn = cute.compile(_dape_reduce_launch, *args, split)
+            _COMPILED[key] = fn
+    return fn
+
+
+def precompile_dape_reduce(device, split=False):
+    """Ensure the shared deterministic dAPE reduction is JIT-compiled."""
+    key = ("dape_reduce", bool(split), device.index)
+    if key in _COMPILED:
+        return
+    with torch.cuda.device(device):
+        scratch_f32 = torch.zeros(16, device=device, dtype=torch.float32)
+        stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+        args = (
+            _f32_ptr(scratch_f32),
+            _f32_ptr(scratch_f32),
+            _f32_ptr(scratch_f32),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            stream,
+        )
+        _compile_dape_reduce(key, args, split)
 
 
 def precompile_fwd(ratio, d, coff, device):
@@ -870,10 +1147,14 @@ def precompile_fwd(ratio, d, coff, device):
         _compile_fwd(key, args, ratio, d, coff)
 
 
-def precompile_bwd(ratio, d, coff, device):
-    """Ensure the backward kernel for ``(ratio, d, coff, device)`` is JIT-compiled."""
-    key = ("bwd", ratio, d, coff, device.index)
-    if key in _COMPILED:
+def precompile_bwd(ratio, d, coff, device, deterministic=False, nb_total=0, rows_per_cta=None):
+    """Compile the backward schedule selected from the plan-time ``nb_total`` capacity."""
+    if rows_per_cta is None:
+        rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    _validate_bwd_rows(rows_per_cta)
+    key = ("bwd", ratio, d, coff, bool(deterministic), rows_per_cta, device.index)
+    reduce_key = ("dape_reduce", ratio == 4, device.index)
+    if key in _COMPILED and (not deterministic or reduce_key in _COMPILED):
         return
     with torch.cuda.device(device):
         scratch_bf16 = torch.zeros(16, device=device, dtype=torch.bfloat16)
@@ -895,7 +1176,9 @@ def precompile_bwd(ratio, d, coff, device):
             cutlass.Int32(0),
             stream,
         )
-        _compile_bwd(key, args, ratio, d, coff)
+        _compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic)
+        if deterministic:
+            precompile_dape_reduce(device, split=ratio == 4)
 
 
 def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_handle=None):
@@ -946,15 +1229,84 @@ def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_h
         _FAST.put(key, fn, args)
 
 
-def run_bwd(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, coff, stream_handle=None):
+def bwd_dape_workspace_bytes(nb_total, ratio, d, coff, rows_per_cta=None):
+    """Caller-owned deterministic dAPE partial and reduction-stage bytes."""
+    if nb_total <= 0:
+        return 0
+    if rows_per_cta is None:
+        rows_per_cta = _bwd_rows(ratio, True, nb_total)
+    _validate_bwd_rows(rows_per_cta)
+    npartials = (nb_total + rows_per_cta - 1) // rows_per_cta
+    nelems = ratio * coff * d
+    stage_elems = 0
+    if ratio == 4:
+        stage_elems = ((npartials + _DAPE_REDUCTION_GROUP_PARTIALS - 1) // _DAPE_REDUCTION_GROUP_PARTIALS) * nelems
+    return (npartials * nelems + stage_elems) * 4
+
+
+def _run_dape_reduce(workspace, gape, npartials, nelems, stream_handle, split=False):
+    """Launch the shared fixed-order reduction on the caller's stream."""
+    dev = gape.device.index
+    key = ("dape_reduce", bool(split), dev)
+    stage_address = workspace.data_ptr() + (npartials * nelems * 4 if split else 0)
+    launcher = _FAST.get(key)
+    if launcher is not None:
+        slots = launcher.slots
+        slots[0].value = workspace.data_ptr()
+        slots[1].value = stage_address
+        slots[2].value = gape.data_ptr()
+        slots[3].value = npartials
+        slots[4].value = nelems
+        slots[5].value = stream_handle
+        launcher.launch()
+        return
+    stream = cuda_driver.CUstream(stream_handle)
+    args = (
+        _f32_ptr(workspace),
+        _f32_address_ptr(stage_address),
+        _f32_ptr(gape),
+        cutlass.Int32(npartials),
+        cutlass.Int32(nelems),
+        stream,
+    )
+    fn = _COMPILED.get(key)
+    if fn is None:
+        fn = _compile_dape_reduce(key, args, split)
+    fn(*args)
+    _FAST.put(key, fn, args)
+
+
+def run_bwd(
+    kv,
+    score,
+    ape,
+    cu_i,
+    cuc_i,
+    go,
+    gkv,
+    gs,
+    gape,
+    nb_total,
+    ratio,
+    d,
+    coff,
+    stream_handle=None,
+    deterministic=False,
+    workspace=None,
+    rows_per_cta=None,
+):
     """Launch the backward kernel (cached fast path -> compiled slow path -> JIT).
 
     Device-context anchoring as in :func:`run_fwd`. The gradient-buffer token capacity
     (for the kernel's padding-token zero sweep) is derived from ``kv``'s element count.
     """
     dev = kv.device.index
-    key = ("bwd", ratio, d, coff, dev)
+    if rows_per_cta is None:
+        rows_per_cta = _bwd_rows(ratio, deterministic, nb_total)
+    _validate_bwd_rows(rows_per_cta)
+    key = ("bwd", ratio, d, coff, bool(deterministic), rows_per_cta, dev)
     total_tokens = kv.numel() // (coff * d)
+    partial_buffer = workspace if deterministic else gape
     if stream_handle is None:
         stream_handle = _raw_stream(dev)
     with torch.cuda.device(dev):
@@ -969,31 +1321,34 @@ def run_bwd(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, 
             slots[5].value = go.data_ptr()
             slots[6].value = gkv.data_ptr()
             slots[7].value = gs.data_ptr()
-            slots[8].value = gape.data_ptr()
+            slots[8].value = partial_buffer.data_ptr()
             slots[9].value = nb_total
             slots[10].value = cu_i.numel() - 1
             slots[11].value = total_tokens
             slots[12].value = stream_handle
             launcher.launch()
-            return
-        stream = cuda_driver.CUstream(stream_handle)
-        args = (
-            _bf16_ptr(kv),
-            _bf16_ptr(score),
-            _f32_ptr(ape),
-            _i32_ptr(cu_i),
-            _i32_ptr(cuc_i),
-            _bf16_ptr(go),
-            _bf16_ptr(gkv),
-            _bf16_ptr(gs),
-            _f32_ptr(gape),
-            cutlass.Int32(nb_total),
-            cutlass.Int32(cu_i.numel() - 1),
-            cutlass.Int32(total_tokens),
-            stream,
-        )
-        fn = _COMPILED.get(key)
-        if fn is None:
-            fn = _compile_bwd(key, args, ratio, d, coff)
-        fn(*args)
-        _FAST.put(key, fn, args)
+        else:
+            stream = cuda_driver.CUstream(stream_handle)
+            args = (
+                _bf16_ptr(kv),
+                _bf16_ptr(score),
+                _f32_ptr(ape),
+                _i32_ptr(cu_i),
+                _i32_ptr(cuc_i),
+                _bf16_ptr(go),
+                _bf16_ptr(gkv),
+                _bf16_ptr(gs),
+                _f32_ptr(partial_buffer),
+                cutlass.Int32(nb_total),
+                cutlass.Int32(cu_i.numel() - 1),
+                cutlass.Int32(total_tokens),
+                stream,
+            )
+            fn = _COMPILED.get(key)
+            if fn is None:
+                fn = _compile_bwd(key, args, ratio, d, coff, rows_per_cta, deterministic)
+            fn(*args)
+            _FAST.put(key, fn, args)
+        if deterministic:
+            partials = (nb_total + rows_per_cta - 1) // rows_per_cta
+            _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle, split=ratio == 4)

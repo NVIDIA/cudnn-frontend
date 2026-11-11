@@ -4,7 +4,7 @@
 
 The MoE Grouped Matmul operation computes a grouped matrix multiplication across experts, as used in Mixture-of-Experts (MoE) layers. Each expert has its own weight matrix, and tokens are routed to experts via `first_token_offset`.
 
-Four routing modes are defined; COMBINE currently requires the FROST SM100 engine:
+Four routing modes are defined; COMBINE currently requires the FROST `frost_gemm` engine (see FROST COMBINE support below):
 
 **None mode** (tokens already routed per expert):
 
@@ -68,10 +68,10 @@ both forward and backward APIs.
 
 ### FROST GATHER support
 
-The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER in
-both SM100 orientations, token-by-weight and weight-by-token (`SWAP_AB=1`),
-and in the SM120 token-by-weight path. Enable it with
-`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning.
+The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER on
+SM100 and SM120, in both orientations: token-by-weight and weight-by-token
+(`SWAP_AB=1`). Enable it with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+planning.
 
 Let `T` be the source token count and `R` the routed row count. Supply token
 `[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
@@ -88,6 +88,15 @@ uses source-token order and is gathered with the same `token_index` as the
 token data. Token SFA in `F8_128x4` is not supported for GATHER. Weight scale
 factors (SFB) retain the per-expert `F8_128x4` layout. These public operand
 roles and layout requirements also apply with `SWAP_AB=1`.
+
+For all block-scaled FROST MoE modes, bind weight SF as a rank-3 byte buffer
+with E as its outermost axis. Each expert plane must be a dense packed
+`F8_128x4` blob containing at least
+`512 * ceil(N/128) * ceil((K/block)/4)` bytes. Its two inner axes may be
+permuted. The expert stride must be a multiple of 16 bytes and at least the
+full inner-plane byte span; padding between experts is supported. The base
+pointer must also be 16-byte aligned. Views that interleave experts, overlap
+planes, or expose insufficient plane capacity raise `ValueError` before launch.
 
 ```python
 fc1 = graph.moe_grouped_matmul(
@@ -107,16 +116,16 @@ needed. With `SWAP_AB=1`, tokens are the internal B operand and GATHER4 loads
 the token columns of the transposed matmul; the public tensors and routed
 output order stay the same. SM120 uses the `shared::cta` GATHER4 instruction
 with its existing warp-MMA mainloop and STG epilogue; its workspace remains
-the 128-byte scheduler counter. SM100 supports parallel GEMMs, including the
-gate/up pair for SwiGLU, sharing the same offsets and indices. SM120 retains
-its existing single-GEMM fusion support, including activation epilogues.
+the 128-byte scheduler counter. Both SM100 and SM120 support parallel GEMMs,
+including the gate/up pair for SwiGLU, sharing the same offsets and indices,
+in both orientations and for ordinary and block-scaled inputs.
 Output rows and row-wise epilogue auxiliaries use routed order.
 The existing dtype, layout, alignment, and fusion support gates still apply.
 
 ### FROST SCATTER support
 
-FROST supports SCATTER for ordinary and block-scaled MoE in both SM100
-orientations (`SWAP_AB=0/1`) and the SM120 token-by-weight path. The input and
+FROST supports SCATTER for ordinary and block-scaled MoE on SM100 and SM120,
+in both orientations (`SWAP_AB=0/1`). The input and
 its block scales keep their expert-grouped layout. The epilogue writes each
 routed row `r` to the expanded token slot:
 
@@ -160,9 +169,9 @@ the final `[1,S,N]` result.
 ### FROST COMBINE support
 
 `cudnn.moe_grouped_matmul_mode.COMBINE` fuses FC2 with weighted scatter-add.
-It is supported only by the opt-in `frost_gemm` SM100 source family, for
-ordinary and block-scaled inputs and both `SWAP_AB=0/1` orientations. Native
-cuDNN engines and the SM120 source family decline this mode.
+It is supported only by the opt-in `frost_gemm` engine, whose SM100 and SM120
+source families both run it for ordinary and block-scaled inputs and both
+`SWAP_AB=0/1` orientations. Native cuDNN engines decline this mode.
 
 Let `R` be routed input capacity, `T` the original token count, and `k=top_k`.
 Supply token `[1,R,K]`, weight `[E,K,N]`, contiguous INT32 `token_index` and
@@ -183,6 +192,24 @@ The output is `[1,T,N]`; every execution starts from zero, including empty
 groups and repeated CUDA Graph replays. Out-of-range token/slot indices are
 ignored. Repeated destinations accumulate; destinations without contributions
 are zero. N-major and M-major output layouts, including padding, are supported.
+
+For NVFP4 on SM107, the non-swap, single-CTA/singleton-cluster FROST path can
+read compact token rows through immutable tensor maps. Expert token counts do
+not need additional padding: COMBINE masks group-tail rows before reading
+routing metadata or accumulating outputs. Token scales retain their existing
+per-group 128-row blocked layout and use independent scale-block offsets. The
+scale tensor map is bounded by the declared segmented-capacity contract,
+including when the last TMA box extends beyond that capacity. Other layouts
+and configurations retain their existing descriptor path.
+
+The SM107 NVFP4 swapped `256x256x128`, `128x256x64` MMA, cluster `2x1`,
+2-CTA tile also reuses immutable B/SFB maps with BF16 feature-contiguous output.
+It transposes weighted fragments into a 128-token by 256-feature shared tile,
+then bulk-reduces each token's contiguous feature segment. Warp-shared routing
+loads and 64-column TMEM loads limit metadata traffic and live registers. The
+compiler reserves this staging space before sizing the AB pipeline. Partial
+feature segments or unaligned destinations use scalar reductions. This path
+does not require expert token counts or output widths to match the tile.
 
 ```python
 output = graph.moe_grouped_matmul(
@@ -211,10 +238,25 @@ it does not materialize `[T*k,N]` results or launch a separate finalizer.
 For token-by-weight GEMM with contiguous output features, each lane packs up to
 eight BF16/FP16 or four FP32 contributions into a 16-byte vector atomic add.
 The destination address selects narrower accesses when the output pointer or
-row stride is unaligned. Weight-by-token (`SWAP_AB`) and M-major outputs retain
+row stride is unaligned. Single-CTA SM100-family block-scaled token-by-weight
+kernels with 128-row MMA slices instead stage weighted feature tiles in shared memory
+and issue `cp.reduce.async.bulk` once per row. Unaligned destinations and partial
+feature tiles retain vector/scalar atomics. Shared-memory staging is included
+in the GEMM pipeline budget. Normal 2-CTA configurations retain the existing
+atomic path pending memory-safety qualification. Outside the SM107 swapped bulk
+path described above, weight-by-token (`SWAP_AB`) and M-major outputs retain
 scalar atomics because adjacent registers do not address adjacent features of
-the same token. Vectorization preserves per-element atomicity and output-dtype
+the same token. All paths preserve per-element atomicity and output-dtype
 accumulation.
+
+Bulk reduction trades shared-memory staging and synchronization for fewer
+global atomics; it does not guarantee a speedup for every workload. A
+[review spot check](https://github.com/NVIDIA/cudnn-frontend/pull/1942#pullrequestreview-5671615964)
+on SM100 with NVFP4, two experts, top-k 2 and a single-CTA 128x256
+tile measured BF16 COMBINE at 18.96 us versus 18.33 us for forced atomics at
+S/N/K = 258/256/256, and 59.57 us versus 66.37 us at 8192/2048/2048.
+These warmed CUDA Graph measurements include output zeroing and compare fixed
+configurations, rather than end-to-end serving performance.
 Output zeroing uses `cudaMemsetAsync` for contiguous storage and
 `cudaMemset2DAsync` for padded row/column-major storage, preserving padding.
 The execute-time stream orders output memset, the existing scheduler-counter

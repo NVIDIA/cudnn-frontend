@@ -84,6 +84,36 @@ def load_a_frag_transposed(
 
 
 @cute.jit
+def zero_tile_rows(
+    sbuf,
+    row_lo,
+    lane,
+    *,
+    rows: cutlass.Constexpr[int],
+    cols: cutlass.Constexpr[int],
+    chunk_elems: cutlass.Constexpr[int],
+    dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+):
+    """Zero rows ``[row_lo, rows)`` of one chunked/swizzled ``(rows, cols)`` tile.
+
+    Runtime padding (``seq_len_q`` / ``seq_len_kv``) lies inside the declared
+    extents, so TMA loads those rows as they are: unread data that may hold NaN,
+    and ``0 * NaN`` in a GEMM poisons valid outputs. The swizzle permutes 16-byte
+    segments only within a row, so ``tile_ptr`` over every segment clears the
+    whole row. Every warp redundantly zeroes the full overhang (identical zero
+    stores race benignly) and syncs itself, so its own ``ldmatrix`` lanes observe
+    the zeros.
+    """
+    zero = cutlass.Vector.from_elements(tuple(dtype(0.0) for _ in range(_COPY_ELEMS)), dtype)
+    for r_it in cutlass.range_constexpr(rows // 32):
+        row = cutlass.Int32(r_it * 32) + lane
+        if row >= row_lo:
+            for seg in cutlass.range_constexpr(cols // _COPY_ELEMS):
+                tile_ptr(sbuf, row, seg * _COPY_ELEMS, chunk_elems=chunk_elems, rows=rows).store(zero, alignment=16)
+    prims.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
 def copy16_smem_to_gmem(sptr, gptr):
     """One 16-byte smem->gmem chunk."""
     v = sptr.load(count=8)

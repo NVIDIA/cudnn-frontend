@@ -28,11 +28,12 @@ from cutlass.cute.runtime import from_dlpack
 from .host import get_dtype
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 USE_PDL = True
 
 BLOCK = 256
+ROW_CHUNKS = 16  # 16-byte chunks of a 128-element 16-bit row
 
 
 @cute.kernel
@@ -62,22 +63,24 @@ def frost_head_reduce(
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Float32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Float32)
             acc = cutlass.Float32(0.0)
+            addr = base
             for i in cutlass.range(r):
-                v = (in_p + (base + cutlass.Int64(i) * cutlass.Int64(inner_words))).load()
+                v = (in_p + addr).load()
                 acc = v if i == 0 else acc + v
+                addr = addr + cutlass.Int64(inner_words)
             (out_p + out_off).store(acc)
         else:
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Int32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Int32)
             acc_lo = cutlass.Float32(0.0)
             acc_hi = cutlass.Float32(0.0)
+            addr = base
             for i in cutlass.range(r):
-                lo, hi = f16x2_to_f32((in_p + (base + cutlass.Int64(i) * cutlass.Int64(inner_words))).load(), dtype=io_dtype)
+                lo, hi = f16x2_to_f32((in_p + addr).load(), dtype=io_dtype)
                 acc_lo = lo if i == 0 else acc_lo + lo
                 acc_hi = hi if i == 0 else acc_hi + hi
+                addr = addr + cutlass.Int64(inner_words)
             (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit

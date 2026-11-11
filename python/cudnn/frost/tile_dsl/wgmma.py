@@ -3,8 +3,7 @@
 
 """SM90 WGMMA helpers for SW128 shared memory and FP32 accumulators.
 
-The supported forms are SS ``m64n64k16``/``m64n256k16`` and RS
-``m64n256k16`` with F16 or BF16 inputs. For warpgroup-local thread ``t``, C
+The supported forms are SS and RS ``m64n{64,128,256}k16`` with F16 or BF16 inputs. For warpgroup-local thread ``t``, C
 slot ``i`` maps to row ``16*(t//32) + (t%32)//4 + 8*((i//2)%2)`` and column
 ``2*(t%4) + i%2 + 8*(i//4)``; RS A words use the same rows. Callers frame the
 instructions with the WGMMA fence, commit, and wait primitives and keep every
@@ -54,10 +53,10 @@ def _field(name, byte_offset):
 
 @dsl_user_op
 def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_b=False, accumulate=True, loc=None, ip=None) -> cutlass.Vector:
-    """Dispatch one ``m64n{64|256}k16`` WGMMA and return its FP32 C vector.
+    """Dispatch one ``m64n{64|128|256}k16`` WGMMA and return its FP32 C vector.
 
-    SS A is a SMEM descriptor/value and accepts 32 C slots (n64) or 128
-    slots (n256). RS A is a four-word ``Vector`` and accepts only 128 C slots.
+    SS A is a SMEM descriptor/value; RS A is a four-word ``Vector``.
+    Both forms accept 32, 64 or 128 C slots (n64, n128 or n256).
     B is always a SMEM descriptor/value; ``transpose_b`` selects its major
     layout. The caller owns the surrounding fence/commit/wait and operand
     lifetime.
@@ -65,13 +64,11 @@ def wgmma_m64nNk16_f32(c, a, b_desc, ab_dtype, *, transpose_b=False, accumulate=
     if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
         raise TypeError(f"A/B dtype must be Float16 or BFloat16, got {ab_dtype}")
     register_a = isinstance(a, cutlass.Vector)
+    if cutlass.const_expr(c.shape[0] not in (32, 64, 128)):
+        raise ValueError(f"wgmma_m64nNk16_f32: C must hold 32, 64 or 128 slots, got {c.shape[0]}")
     if cutlass.const_expr(register_a):
-        if cutlass.const_expr(c.shape[0] != 128):
-            raise ValueError(f"wgmma_m64nNk16_f32: RS A requires 128 C slots (m64n256), got {c.shape[0]}")
         if cutlass.const_expr(a.shape != (4,)):
             raise ValueError(f"wgmma_m64nNk16_f32: RS A must be four packed words, got shape {a.shape}")
-    elif cutlass.const_expr(c.shape[0] not in (32, 128)):
-        raise ValueError(f"wgmma_m64nNk16_f32: SS C must hold 32 or 128 slots, got {c.shape[0]}")
     kind = nvvm.WGMMATypes.f16 if cutlass.const_expr(ab_dtype == cutlass.Float16) else nvvm.WGMMATypes.bf16
     return _tied(_wgmma_rs if cutlass.const_expr(register_a) else _wgmma_ss, c, a, b_desc, kind, transpose_b, accumulate, loc=loc, ip=ip)
 
@@ -114,17 +111,18 @@ def _wgmma_ss(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, i
 
 
 def _wgmma_rs(acc_type, acc, a, b_desc, kind, transpose_b, accumulate, *, loc, ip):
-    """Issue the RS ``m64n256k16`` form through LLVM inline assembly."""
-    # C outputs $0..$127 match the accumulator inputs; A is $256..$259 and B is
-    # $260. Side effects keep the instruction between the caller's fence/commit.
-    registers = "{" + ",".join(f"${i}" for i in range(128)) + "}, {$256,$257,$258,$259}, $260"
+    """Issue the native-width RS form through LLVM inline assembly."""
+    # Each C output has one tied input; A/B follow both sets of operands.
+    # Side effects keep the instruction between the caller's fence/commit.
+    count = len(acc)
+    registers = "{" + ",".join(f"${i}" for i in range(count)) + "}, {" + ",".join(f"${2 * count + i}" for i in range(4)) + f"}}, ${2 * count + 4}"
     accumulate_bit = int(cutlass.const_expr(accumulate))
     transpose_bit = int(cutlass.const_expr(transpose_b))
     return llvm.inline_asm(
         acc_type,
         acc + [v.ir_value(loc=loc, ip=ip) for v in (*a.to_elements(), b_desc)],
-        f"wgmma.mma_async.sync.aligned.m64n256k16.f32.{kind}.{kind} {registers}, {accumulate_bit}, 1, 1, {transpose_bit};",
-        ",".join(["=f"] * 128 + [str(i) for i in range(128)] + ["r"] * 4 + ["l"]),
+        f"wgmma.mma_async.sync.aligned.m64n{2 * count}k16.f32.{kind}.{kind} {registers}, {accumulate_bit}, 1, 1, {transpose_bit};",
+        ",".join(["=f"] * count + [str(i) for i in range(count)] + ["r"] * 4 + ["l"]),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

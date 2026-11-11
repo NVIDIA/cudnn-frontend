@@ -2,14 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-JAX coverage for the SM100 grouped GEMM Quant wrapper.
+JAX rejections for the SM100 grouped GEMM Quant wrapper.
 
-JAX contract: every configuration of this kernel is block-scaled and consumes the
-scale-factor tensor sfa (and, in dense mode, sfb; plus the sfd outputs for FP8 configs)
-as MMA-tiled (32, 4, m//128, 4, rest_k, l) strided views built via torch .permute().
-Those layouts are not expressible as row-major JAX arrays, so JAX inputs are rejected
-with a clear ValueError at both the wrapper and the API class — in dense AND discrete
-(b_ptrs) weight modes, since sfa is required in both. Torch behavior is unchanged.
+Canonical MXFP8 dense weights run through grouped_gemm_quant_jax_forward (covered in
+test_grouped_gemm_canonical_jax.py). Discrete (b_ptrs) weights and the API class take
+MMA-tiled (32, 4, m//128, 4, rest_k, l) strided scale-factor views, which are not
+expressible as row-major JAX arrays, so those stay rejected with a clear ValueError.
 """
 
 import numpy as np

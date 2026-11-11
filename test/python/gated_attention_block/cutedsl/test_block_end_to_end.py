@@ -30,7 +30,7 @@ pytestmark = pytest.mark.L0
 
 import sys  # noqa: E402
 
-from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, SavedForBackward  # noqa: E402
+from cudnn.gated_attention_block import DENSE_SERVING_CCS, GatedAttentionBlockFwd, GatedAttentionBlockGeometry, SavedForBackward  # noqa: E402
 from cudnn.gated_attention_block.api import _FusedQkvProjection  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +45,15 @@ def _cc():
     return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
 
 
-requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
+requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"a Rubin (SM107) accept test; found {_cc()}")
+# 2026-10-29: the dense bf16 / f16 inference form runs on every part of DENSE_SERVING_CCS (cc 10.7 and cc 10.0); the cells both parts run
+# take this marker, the Rubin-only cells (the fused projection fork, the fused gate, the quantized pipelines, training) keep requires_rubin
+requires_dense_part = pytest.mark.skipif(
+    _cc() not in DENSE_SERVING_CCS, reason=f"an accept test of the dense form on a served part {DENSE_SERVING_CCS}; found {_cc()}"
+)
+requires_blackwell = pytest.mark.skipif(
+    not (_cc() in DENSE_SERVING_CCS and _cc() != _SM107), reason=f"a cc 10.0 (admitted Blackwell-line part) cell; found {_cc()}"
+)
 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 _QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
@@ -127,7 +135,7 @@ def test_workspace_layout_is_the_declared_composition():
         assert (ws - lay.total_bytes) % _WS_ALIGN == 0 and ws % _WS_ALIGN == 0, "the engine region and the total must keep the carve alignment"
 
 
-@requires_rubin
+@requires_dense_part
 @_QK_NORM
 @pytest.mark.parametrize("seq_len", [256, 512])
 def test_matches_the_fp32_oracle(seq_len, qk_norm):
@@ -139,7 +147,7 @@ def test_matches_the_fp32_oracle(seq_len, qk_norm):
     assert (ref.rstd_q is None) is (not qk_norm)
 
 
-@requires_rubin
+@requires_dense_part
 def test_rope_only_passthrough_dims_are_bit_exact_through_the_block():
     """Out-of-place (``inplace_qkv=False``) keeps the pre-RoPE slab AND the compact
     rotated Q/K in the workspace, so the block-level proof of the RoPE-only
@@ -169,14 +177,14 @@ def test_rope_only_passthrough_dims_are_bit_exact_through_the_block():
     assert torch.isfinite(out.float()).all()
 
 
-@requires_rubin
+@requires_dense_part
 def test_non_causal_arm():
     """Mask arms are ``const_expr``-folded: a causal PASS proves nothing here."""
     out, ref, _ = _run_block({**_COMMON, "is_causal": False}, batch=1, seq_len=512)
     assert _cos(out, ref.out) > 0.999
 
 
-@requires_rubin
+@requires_dense_part
 def test_dead_rows_do_not_poison_the_gate():
     """The ordering hazard the whole pipeline is arranged around.
 
@@ -194,7 +202,7 @@ def test_dead_rows_do_not_poison_the_gate():
     assert _cos(out[0], ref.out[0]) > 0.999
 
 
-@requires_rubin
+@requires_dense_part
 def test_a_second_execute_reuses_the_plan_and_agrees():
     """No per-execute compile, no per-execute allocation: the same block object
     run twice must give bit-identical output (Rule 4's cache-hit contract, and a
@@ -209,7 +217,7 @@ def test_a_second_execute_reuses_the_plan_and_agrees():
     torch.testing.assert_close(out1, out2, rtol=0, atol=0)
 
 
-@requires_rubin
+@requires_dense_part
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_a_caller_stream_orders_every_stage(how):
     """Every stage -- the CuTe-DSL kernels AND the two FROST GEMMs -- launches on
@@ -489,7 +497,7 @@ def test_inplace_qkv_drops_the_three_compact_buffers_from_the_workspace():
         assert saved_ws >= want * 0.99, f"expected ~{want} bytes saved post-compile, got {saved_ws}"
 
 
-@requires_rubin
+@requires_dense_part
 def test_inplace_qkv_matches_out_of_place_bit_for_bit():
     """Same math, one fewer copy: IDENTICAL outputs, not merely close.
 
@@ -665,6 +673,30 @@ def test_fuse_gate_declines_a_head_dim_the_gate_rows_do_not_serve():
     with pytest.raises(NotImplementedError, match="256") as ei:
         blk.check_support()
     assert "fuse_gate" in str(ei.value)
+
+
+@requires_blackwell
+def test_on_cc_10_0_the_dense_form_declines_the_rubin_only_knobs_by_name():
+    """On the part itself (cc 10.0, 2026-10-29): the fused projection fork (``fuse_norm_rope=True`` past decode row counts) is the
+    sm_107a rendering's typed decline, ``fuse_gate=True`` the SM100 row's (no gate epilogue on the SM100 d256 kernels), training
+    (``save_for_backward=True``) the block's part row naming the Rubin SDPA backward -- each at ``check_support``, before any stage
+    that would compile; the plain dense inference block passes the part rows (the oracle cells above run it)."""
+    fork, _, _ = _make_block(geom_kw=_COMMON, fuse_norm_rope=True)
+    assert fork.fuse_norm_rope_effective and fork._norm_rope is None
+    with pytest.raises(NotImplementedError, match=rf"rendered for sm_107a \(Rubin\); this device is SM{_cc()[0]}{_cc()[1]}"):
+        fork.check_support()
+    gated, _, _ = _make_block(geom_kw=_COMMON, fuse_gate=True)
+    with pytest.raises(NotImplementedError, match="fuse_gate=True is not served by the f16/bf16 SM100 SDPA engine row") as e:
+        gated.check_support()
+    assert f"cc {_cc()[0]}.{_cc()[1]}" in str(e.value) and "fuse_gate=False" in str(e.value)
+    train, _, _ = _make_block(geom_kw=_COMMON, save_for_backward=True)
+    with pytest.raises(NotImplementedError, match=rf"save_for_backward=True on cc {_cc()[0]}\.{_cc()[1]}") as e:
+        train.check_support()
+    assert "SdpaBwdDslSm107" in str(e.value)
+    plain, _, _ = _make_block(geom_kw=_COMMON)
+    plain._check_declaration()
+    plain._check_part_support()
+    assert plain._sdpa._device_row_arch() == "sm100" and plain._sdpa.fuse_gate is False
 
 
 def _make_gate_block(**kw):
@@ -847,7 +879,7 @@ def _check_against_both_oracles(label, out, ref_same, ref_hf):
     assert c_hf > 0.999, f"{label}: block output cos {c_hf} against the HF-faithful oracle"
 
 
-@requires_rubin
+@requires_dense_part
 @pytest.mark.parametrize("seq_len", _QWEN38_SEQ_LENS)
 @pytest.mark.parametrize("geom_kw,batch,norm_impl,tile_rows", _QWEN38_FAMILY)
 def test_qwen38_family_matches_the_fp32_oracle(geom_kw, batch, norm_impl, tile_rows, seq_len):
@@ -871,3 +903,35 @@ def test_qwen38_flash_next_fully_fused_matches_the_fp32_oracle(seq_len):
     out, blk, ref_same, ref_hf = _run_hf_block(_FLASH_NEXT_KW, 2, seq_len, fuse_norm_rope=True, fuse_gate=True)
     assert blk.fuse_norm_rope and blk.fuse_gate and blk._norm_rope is None and blk._gate is None and len(blk._stages) == 3
     _check_against_both_oracles(f"24/2 fully fused B=2 S={seq_len}", out, ref_same, ref_hf)
+
+
+# ---------------------------------------------------------------------------
+# The Qwen3.5-397B tensor-parallel shards (d_model 4096, d_head 256, rope_dim 64): the query heads divided across the ranks,
+# the two KV heads divided at TP 2 and replicated from TP 4 on.  The layout contract (test_layout_contract.py) pins their
+# N-axis maps and fitted norm tiles; these are the dense end-to-end cells, one per shard, on HF-form weights.
+# ---------------------------------------------------------------------------
+
+_Q35_TP2_KW = dict(d_model=4096, h_q=16, h_kv=1, d_head=256, rope_dim=64)  # TP 2
+_Q35_TP4_KW = dict(d_model=4096, h_q=8, h_kv=1, d_head=256, rope_dim=64)  # TP 4: the serving deployment's shard
+_Q35_TP8_KW = dict(d_model=4096, h_q=4, h_kv=1, d_head=256, rope_dim=64)  # TP 8
+
+# (geometry, batch, the norm kernel the stage must resolve to, its fitted tile_rows): every shard fits a TMA tile (16 / 8 / 4 rows)
+_QWEN35_SHARDS = [
+    pytest.param(_Q35_TP2_KW, 1, "tma", 16, id="q35_397b_tp2_16_1"),
+    pytest.param(_Q35_TP4_KW, 1, "tma", 8, id="q35_397b_tp4_8_1"),
+    pytest.param(_Q35_TP8_KW, 1, "tma", 4, id="q35_397b_tp8_4_1"),
+]
+_QWEN35_SEQ_LEN = 512  # four KV tiles at the dense prefill tile; the serving forms' cells for the same shards sit in the serving modules
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw,batch,norm_impl,tile_rows", _QWEN35_SHARDS)
+def test_qwen35_shards_match_the_fp32_oracle(geom_kw, batch, norm_impl, tile_rows):
+    """The unfused bf16 pipeline at each 397B shard (16 / 1, 8 / 1, 4 / 1 over d_model 4096) against BOTH fp32 oracles under the
+    dense suite's budget, and the norm stage on the TMA kernel at the fitted tile the layout contract names for it (16 / 8 / 4
+    rows -- the 4-row tile is one row per warp, a tiling no other pinned geometry reaches)."""
+    out, blk, ref_same, ref_hf = _run_hf_block(geom_kw, batch, _QWEN35_SEQ_LEN)
+    _check_against_both_oracles(f"{geom_kw['h_q']}/{geom_kw['h_kv']} d_model={geom_kw['d_model']} B={batch} S={_QWEN35_SEQ_LEN}", out, ref_same, ref_hf)
+    assert blk._norm_rope._impl == norm_impl, f"the norm stage ran {blk._norm_rope._impl!r}, the geometry's kernel is {norm_impl!r}"
+    assert blk._norm_rope.resolve_tile_rows() == tile_rows
+    assert blk._norm_rope._recipe.apply_norm is True

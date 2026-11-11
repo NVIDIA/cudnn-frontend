@@ -1084,7 +1084,7 @@ def _mxfp8_graph(
 ):
     """An ``sdpa_mxfp8_backward`` graph over BSHD-physical tensors (the SM100 suite's builder: 17 inputs incl. the seven F8_128x4 SF
     tensors, dQ / dK / dV in ``out_dt``, the amax ports virtual unless ``declare_amax``).  Returns ``(graph, tensors, outputs)``."""
-    from test_sdpa_bwd_mxfp8_sm100 import _build_graph, _bshd_stride
+    import test_sdpa_bwd_mxfp8_sm100 as mx100
 
     hkv = hq if hkv is None else hkv
     skv = sq if skv is None else skv
@@ -1104,7 +1104,7 @@ def _mxfp8_graph(
         bb, h, s, d = shape
         return [h * s * d, s * d, d, 1]
 
-    return _build_graph(
+    return mx100._build_graph(
         b,
         hq,
         hkv,
@@ -1114,7 +1114,7 @@ def _mxfp8_graph(
         out_dt=out_dt,
         scale=(1.0 / math.sqrt(_D) if scale == "default" else scale),
         fp8=fp8,
-        stride_fn=_bhsd if bhsd else _bshd_stride,
+        stride_fn=_bhsd if bhsd else mx100._bshd_stride,
         declare_amax=declare_amax,
         with_sink=with_sink,
         seq_len_dims=((b, 1, 1, 1) if padded else None),

@@ -34,7 +34,7 @@ CONFIG = BenchmarkConfig(
         (4096, 4096),
         (2048, 2048),
     ],
-    backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
+    backends=["cudnn", "cudnn_oss", "cudnn_auto", "flash_attention_4"] + fa2_on_ampere(),
     # Blackwell at head_dim=256: fa4's sm100 forward kernel asserts on tmem
     # exhaustion regardless of batch (rows kept, they fail, to document the
     # limitation). mxfp8 backward has no native cuDNN plan at this head dim;
@@ -44,6 +44,6 @@ CONFIG = BenchmarkConfig(
     profile_pass="both",
     deterministic_bwd=[False, True],
     batch_size=1,
-    num_iterations=10,
+    num_iterations=20,
     output_dir="results",
 )

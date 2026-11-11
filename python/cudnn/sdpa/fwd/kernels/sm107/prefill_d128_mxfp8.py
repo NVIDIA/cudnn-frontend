@@ -981,6 +981,10 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # === Warp-group functions ===
 
 
+# This kernel uses common CLC for both dense and THD work.
+from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _paged_page(block_table_tensor, batch_idx, slot, n_pages_b):
     """Slots past the live pages read page -1 so TMA zero-fills instead of reading a stale page."""

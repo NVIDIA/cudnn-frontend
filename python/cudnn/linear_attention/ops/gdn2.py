@@ -35,12 +35,25 @@ from typing import Dict, Optional, Tuple
 import torch
 import cudnn
 
-from .common import get_handle, graph_workspace, make_summary_cache_key, select_plan, summary_backward, summary_setup_context, torch_dtype_to_cudnn
+from .common import (
+    check_composed_state,
+    check_composed_summaries,
+    check_context,
+    execute_graph,
+    make_execution_resources,
+    make_summary_cache_key,
+    select_plan,
+    summary_backward,
+    summary_setup_context,
+    torch_dtype_to_cudnn,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
 
+
+CHECKPOINT_CHUNK = 16
 
 fprop_cache: Dict[tuple, tuple] = {}
 bprop_cache: Dict[tuple, tuple] = {}
@@ -88,10 +101,12 @@ def make_fprop_cache_key(
     dt_bias_dtype,
     state_dtype,
     checkpoint,
+    checkpoint_dtype,
     device,
     plan_name,
     overwrite_initial_state,
     state_pool_rows=None,
+    composed_rows=None,
 ):
     return (
         "fprop",
@@ -123,10 +138,12 @@ def make_fprop_cache_key(
         dt_bias_dtype,
         state_dtype,
         checkpoint,
+        checkpoint_dtype,
         device,
         plan_name,
         bool(overwrite_initial_state),
         state_pool_rows,
+        composed_rows,
     )
 
 
@@ -149,6 +166,7 @@ def make_bprop_cache_key(
     state_dtype,
     dstate_in_dtype,
     checkpoint_rows,
+    checkpoint_dtype,
     checkpoint_every_n_tokens,
     scale,
     use_qk_l2norm,
@@ -163,6 +181,8 @@ def make_bprop_cache_key(
     dt_bias_dtype,
     device,
     plan_name,
+    composed_rows=None,
+    composed_state=False,
 ):
     return (
         "bprop",
@@ -184,6 +204,7 @@ def make_bprop_cache_key(
         state_dtype,
         dstate_in_dtype,
         checkpoint_rows,
+        checkpoint_dtype,
         int(checkpoint_every_n_tokens),
         float(scale),
         bool(use_qk_l2norm),
@@ -198,6 +219,8 @@ def make_bprop_cache_key(
         dt_bias_dtype,
         device,
         plan_name,
+        composed_rows,
+        bool(composed_state),
     )
 
 
@@ -226,6 +249,7 @@ def build_fprop_graph(
     safe_gate,
     gate_lower_bound,
     checkpoint,
+    checkpoint_dtype,
     use_beta_sigmoid=False,
     allow_neg_eigval=False,
     beta_guard=False,
@@ -235,6 +259,7 @@ def build_fprop_graph(
     overwrite_initial_state=False,
     state_indices_dtype=None,
     state_pool_rows=None,
+    composed_rows=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -253,13 +278,19 @@ def build_fprop_graph(
     if state_indices_dtype is not None:
         state_indices_t = graph.tensor([N], data_type=state_indices_dtype, name="state_indices")
     pool_ports = {"state_indices": state_indices_t} if state_indices_t is not None else {}
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            preceding_state_update=graph.tensor([composed_rows, HO, V, K], data_type=cudnn.data_type.FLOAT, name="preceding_state_update"),
+            preceding_transition=graph.tensor([composed_rows, HO, K, K], data_type=cudnn.data_type.FLOAT, name="preceding_transition"),
+        )
     a_log_t = None
     dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
     if dt_bias_dtype is not None:
         dt_bias_t = graph.tensor([HO, K], data_type=dt_bias_dtype, name="dt_bias")
-    O_t, fs_t, state_checkpoints_t = graph.gdn2(
+    O_t, fs_t, state_checkpoints_t, composed_t = graph.gdn2(
         q=q_t,
         k=k_t,
         v=v_t,
@@ -269,6 +300,7 @@ def build_fprop_graph(
         cu_seqlens=cu_t,
         initial_state=state0_t,
         **pool_ports,
+        **composed_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         scale=scale,
@@ -285,6 +317,10 @@ def build_fprop_graph(
         checkpoint_every_n_tokens=checkpoint,
         name="gdn2",
     )
+    if state_checkpoints_t is not None:
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
+    if composed_t is not None:
+        composed_t.set_data_type(cudnn.data_type.FLOAT)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -300,6 +336,8 @@ def build_fprop_graph(
         O=O_t,
         fs=fs_t,
         state_checkpoints=state_checkpoints_t,
+        composed_initial_state=composed_t,
+        **composed_ports,
     )
 
 
@@ -330,10 +368,13 @@ def run_gdn2_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDN-2 forward over a cached single-node GDN2 pygraph in THD layout.
 
     Returns ``(o, final_state, state_checkpoints)``; ``final_state`` / ``state_checkpoints`` are zero-size
@@ -341,7 +382,12 @@ def run_gdn2_fwd(
     ``checkpoint_every_n_tokens`` is ``0``.
     ``final_state_out`` binds the final_state output to a caller buffer (the in-place op passes ``initial_state``);
     ``state_indices`` (int32 ``[N]``) makes ``initial_state`` a pool whose row ``state_indices[i]`` seeds sequence ``i``
-    and receives its final state.
+    and receives its final state.  ``preceding_state_update`` / ``preceding_transition`` (fp32 ``[P, HO, V, K]`` /
+    ``[P, HO, K, K]``, the forward summaries of the ``P`` preceding context-parallel ranks in rank order) are folded on
+    the device into the one-row ``composed_initial_state`` (fp32 ``[1, HO, V, K]``, the fourth output) that the first
+    local sequence starts from; the caller's ``initial_state`` row 0, when given, is the state beyond the farthest rank
+    and the other rows stay the other sequences' starts (zero without one).  Zero-size without summaries, as with an
+    empty ``P = 0`` pair.
     """
     total, H, K = q.shape
     HK = k.shape[1]
@@ -387,7 +433,7 @@ def run_gdn2_fwd(
             raise ValueError("gated_delta_net_v2: state_indices requires a pool whose rows are dense [HO, V, K] blocks on a 16-byte aligned slot stride")
         state_pool_rows = int(initial_state.shape[0])
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if state_indices is None and initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     beta_io = beta
@@ -407,7 +453,27 @@ def run_gdn2_fwd(
         if tensor is not None and tensor.device != device:
             raise ValueError(f"gated_delta_net_v2: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
+    composed_rows = check_composed_summaries(
+        "gated_delta_net_v2",
+        "preceding_state_update",
+        "preceding_transition",
+        preceding_state_update,
+        preceding_transition,
+        (max(H, HV), V, K),
+        (max(H, HV), K, K),
+        device,
+    )
+    composed = torch.empty(0, dtype=torch.float32, device=device)
+    if composed_rows:
+        if state_indices is not None or final_state_out is not None:
+            raise ValueError("gated_delta_net_v2: preceding summaries cannot combine with state_indices or overwrite_initial_state")
+        composed = torch.empty(1, max(H, HV), V, K, dtype=torch.float32, device=device)
+    state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
+    if checkpoint_dtype not in (None, torch.float32, q.dtype):
+        raise ValueError(f"gated_delta_net_v2: checkpoint_dtype must be None, torch.float32 or the io dtype ({q.dtype}), got {checkpoint_dtype}")
+    if checkpoint_dtype is None:
+        checkpoint_dtype = q.dtype
 
     cache_key = make_fprop_cache_key(
         total,
@@ -438,10 +504,12 @@ def run_gdn2_fwd(
         dt_bias.dtype if dt_bias is not None else None,
         state0.dtype if state0 is not None else None,
         checkpoint,
+        checkpoint_dtype,
         device,
         plan_name,
         final_state_out is not None,
         state_pool_rows,
+        composed_rows=composed_rows or None,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -464,6 +532,7 @@ def run_gdn2_fwd(
             bool(safe_gate),
             float(gate_lower_bound) if gate_lower_bound is not None else None,
             checkpoint,
+            checkpoint_dtype,
             use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
             allow_neg_eigval=bool(allow_neg_eigval),
             beta_guard=bool(beta_guard),
@@ -473,6 +542,7 @@ def run_gdn2_fwd(
             overwrite_initial_state=final_state_out is not None,
             state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
             state_pool_rows=state_pool_rows,
+            composed_rows=composed_rows or None,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -493,6 +563,10 @@ def run_gdn2_fwd(
         variant_pack[t["state0"]] = state0
     if state_indices is not None:
         variant_pack[t["state_indices"]] = state_indices
+    if composed_rows:
+        variant_pack[t["preceding_state_update"]] = preceding_state_update
+        variant_pack[t["preceding_transition"]] = preceding_transition
+        variant_pack[t["composed_initial_state"]] = composed
     if a_log is not None:
         variant_pack[t["a_log"]] = a_log
     if dt_bias is not None:
@@ -508,10 +582,11 @@ def run_gdn2_fwd(
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total // checkpoint + N, 1)
-        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
-    return o, final_state, state_checkpoints
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
+    return o, final_state, state_checkpoints, composed
 
 
 @torch.library.custom_op("cudnn::gated_delta_net_v2_fwd", mutates_args=())
@@ -537,8 +612,11 @@ def gdn2_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional GDN-2 forward: :func:`run_gdn2_fwd` with fresh outputs; the autograd formula registers below."""
     return run_gdn2_fwd(
         q=q,
@@ -562,7 +640,10 @@ def gdn2_fwd(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
+        preceding_state_update=preceding_state_update,
+        preceding_transition=preceding_transition,
     )
 
 
@@ -588,6 +669,7 @@ def gdn2_fwd_overwrite_state(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
@@ -596,7 +678,7 @@ def gdn2_fwd_overwrite_state(
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
     never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
-    o, _, state_checkpoints = run_gdn2_fwd(
+    o, _, state_checkpoints, _ = run_gdn2_fwd(
         q=q,
         k=k,
         v=v,
@@ -617,6 +699,7 @@ def gdn2_fwd_overwrite_state(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
         final_state_out=initial_state if output_final_state else None,
@@ -648,7 +731,10 @@ def gdn2_fwd_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
     plan_name: Optional[str] = None,
+    preceding_state_update=None,
+    preceding_transition=None,
 ):
     total, H, K = q.shape
     HK = k.shape[1]
@@ -669,13 +755,23 @@ def gdn2_fwd_fake(
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     o = q.new_empty(total, HO, V)
     state_dtype = initial_state.dtype if initial_state is not None else torch.float32
+    composed_rows = check_composed_summaries(
+        "gated_delta_net_v2", "preceding_state_update", "preceding_transition", preceding_state_update, preceding_transition, (HO, V, K), (HO, K, K), q.device
+    )
+    composed = q.new_empty((1, HO, V, K) if composed_rows else (0,), dtype=torch.float32)
     final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total // int(checkpoint_every_n_tokens) + N, 1)
-        state_checkpoints = q.new_empty(total_checkpoints, HO, V, K)
+        state_checkpoints = q.new_empty(
+            total_checkpoints,
+            HO,
+            V,
+            K,
+            dtype=torch.float32 if checkpoint_dtype == torch.float32 else q.dtype,
+        )
     else:
         state_checkpoints = q.new_empty(0)
-    return o, final, state_checkpoints
+    return o, final, state_checkpoints, composed
 
 
 @gdn2_fwd_overwrite_state.register_fake
@@ -700,11 +796,12 @@ def gdn2_fwd_overwrite_state_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
     plan_name=None,
     state_indices=None,
     output_final_state=True,
 ):
-    o, _, state_checkpoints = gdn2_fwd_fake(
+    o, _, state_checkpoints, _ = gdn2_fwd_fake(
         q=q,
         k=k,
         v=v,
@@ -725,6 +822,7 @@ def gdn2_fwd_overwrite_state_fake(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        checkpoint_dtype=checkpoint_dtype,
         plan_name=plan_name,
         output_final_state=bool(output_final_state),
     )
@@ -763,6 +861,10 @@ def build_bprop_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     checkpoint_every_n_tokens=0,
+    checkpoint_dtype=None,
+    composed_rows=None,
+    has_composed_state=False,
+    input_context=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -774,6 +876,7 @@ def build_bprop_graph(
     w_t = graph.tensor([total, HO, V], data_type=gate_dtype, name="w")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     dO_t = graph.tensor([total, HO, V], data_type=io_dtype, name="dO")
+    composed_state_t = graph.tensor([1, HO, V, K], data_type=cudnn.data_type.FLOAT, name="composed_initial_state") if has_composed_state else None
     state0_t = None
     if state_dtype is not None:
         state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
@@ -782,7 +885,13 @@ def build_bprop_graph(
         dfs_t = graph.tensor([N, HO, V, K], data_type=dstate_in_dtype, name="d_final_state")
     checkpoints_t = None
     if checkpoint_rows is not None:
-        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
+        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            following_state_grad=graph.tensor([composed_rows, HO, V, K], data_type=cudnn.data_type.FLOAT, name="following_state_grad"),
+            following_transition=graph.tensor([composed_rows, HO, K, K], data_type=cudnn.data_type.FLOAT, name="following_transition"),
+        )
     a_log_t = None
     dt_bias_t = None
     if a_log_dtype is not None:
@@ -801,6 +910,8 @@ def build_bprop_graph(
         state_checkpoints=checkpoints_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
         a_log=a_log_t,
         dt_bias=dt_bias_t,
         scale=scale,
@@ -813,6 +924,7 @@ def build_bprop_graph(
         safe_gate=safe_gate or None,
         gate_domain=None if gate_domain == "log" else gate_domain,
         gate_lower_bound=gate_lower_bound,
+        input_context=input_context or None,
         name="gdn2_bwd",
     )
     return graph, dict(
@@ -838,6 +950,8 @@ def build_bprop_graph(
         d_a_log=dA_t,
         d_dt_bias=dDt_t,
         checkpoints=checkpoints_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
     )
 
 
@@ -872,13 +986,23 @@ def gdn2_bwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     plan_name: Optional[str] = None,
+    following_state_grad: Optional[torch.Tensor] = None,
+    following_transition: Optional[torch.Tensor] = None,
+    composed_initial_state: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDN-2 backward over a cached single-node GDN2_BWD pygraph in THD layout.
 
-    ``state_checkpoints`` is the forward's per-chunk state series (io dtype,
-    chunk cadence); when given, the engine consumes it instead of running
-    the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta, dw,
-    d_initial_state, d_a_log, d_dt_bias)``.
+    ``state_checkpoints`` is the forward's state series (io dtype or fp32 at the forward's cadence); when given, the
+    engine reuses io-dtype rows at the chunk cadence and regenerates the dense series from any other rows instead of
+    running the checkpoint recompute pass.  ``following_state_grad`` / ``following_transition`` (fp32 ``[P, HO, V, K]`` /
+    ``[P, HO, K, K]``, the backward summaries of the ``P`` following context-parallel ranks in rank order) are folded on
+    the device into a one-row gradient state that the last local sequence starts from (the caller's ``d_final_state``
+    row, when given, is the gradient beyond the farthest rank; every other sequence starts from its ``d_final_state``
+    row, or zero).  ``composed_initial_state`` (fp32 ``[1, HO, V, K]``, the forward's fourth output) is the first local
+    sequence's initial state under context parallelism, beside the caller's optional ``initial_state``.
+    ``context`` is the backward summary's context over the same tokens (``output_context``); a zero-size tensor is
+    none.  Returns ``(dq, dk, dv, dg, dbeta, dw, d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
     if 0 in dO.stride():
@@ -913,16 +1037,16 @@ def gdn2_bwd(
     if gate_domain == "linear" and safe_gate:
         raise ValueError("gated_delta_net_v2: gate_domain='linear' cannot combine with safe_gate=True")
     if initial_state is not None:
-        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16))
+        check_dtype("initial_state", initial_state, (torch.float32, torch.bfloat16, torch.float16))
         if initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None:
-        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16))
+        check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16, torch.float16))
         if d_final_state.dtype != dstate_dtype:
             raise TypeError(f"gated_delta_net_v2: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
     if state_checkpoints is not None:
-        check_dtype("state_checkpoints", state_checkpoints, q.dtype)
+        check_dtype("state_checkpoints", state_checkpoints, (torch.float32, q.dtype))
     for tensor_name, tensor in (
         ("k", k),
         ("v", v),
@@ -940,6 +1064,18 @@ def gdn2_bwd(
             raise ValueError(f"gated_delta_net_v2: {tensor_name} must be on q's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
     dstate_in = d_final_state if d_final_state is not None else None
+    composed_rows = check_composed_summaries(
+        "gated_delta_net_v2",
+        "following_state_grad",
+        "following_transition",
+        following_state_grad,
+        following_transition,
+        (max(H, HV), V, K),
+        (max(H, HV), K, K),
+        device,
+    )
+    composed_state = check_composed_state("gated_delta_net_v2", composed_initial_state, (max(H, HV), V, K), device)
+    has_context = context is not None and context.numel() > 0
 
     cache_key = make_bprop_cache_key(
         total,
@@ -960,6 +1096,7 @@ def gdn2_bwd(
         state0.dtype if state0 is not None else None,
         dstate_in.dtype if dstate_in is not None else None,
         state_checkpoints.shape[0] if state_checkpoints is not None else None,
+        state_checkpoints.dtype if state_checkpoints is not None else None,
         checkpoint_every_n_tokens,
         scale,
         use_qk_l2norm_in_kernel,
@@ -974,7 +1111,9 @@ def gdn2_bwd(
         dt_bias.dtype if dt_bias is not None else None,
         device,
         plan_name,
-    )
+        composed_rows=composed_rows or None,
+        composed_state=composed_state is not None,
+    ) + (has_context,)
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
             total,
@@ -1003,6 +1142,10 @@ def gdn2_bwd(
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=torch_dtype_to_cudnn(state_checkpoints.dtype) if state_checkpoints is not None else None,
+            composed_rows=composed_rows or None,
+            has_composed_state=composed_state is not None,
+            input_context=has_context,
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1037,6 +1180,11 @@ def gdn2_bwd(
         variant_pack[t["dstate0"]] = dstate0
     if dstate_in is not None:
         variant_pack[t["dfs"]] = dstate_in
+    if composed_rows:
+        variant_pack[t["following_state_grad"]] = following_state_grad
+        variant_pack[t["following_transition"]] = following_transition
+    if composed_state is not None:
+        variant_pack[t["composed_initial_state"]] = composed_state
     if state_checkpoints is not None:
         variant_pack[t["checkpoints"]] = state_checkpoints
     d_a_log = torch.empty(0, dtype=torch.float32, device=device)
@@ -1049,7 +1197,9 @@ def gdn2_bwd(
         variant_pack[t["dt_bias"]] = dt_bias
         d_dt_bias = torch.empty_like(dt_bias)
         variant_pack[t["d_dt_bias"]] = d_dt_bias
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    context = check_context("gated_delta_net_v2", context, graph, device) if has_context else None
+    execute_graph(graph, variant_pack, workspace, handle, context)
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
     return dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias
@@ -1081,6 +1231,10 @@ def gdn2_bwd_fake(
     a_log=None,
     dt_bias=None,
     plan_name=None,
+    following_state_grad=None,
+    following_transition=None,
+    composed_initial_state=None,
+    context=None,
 ):
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if d_final_state is not None and d_final_state.dtype != dstate_dtype:
@@ -1089,12 +1243,12 @@ def gdn2_bwd_fake(
     d_a_log = torch.empty_like(a_log) if a_log is not None else q.new_empty(0, dtype=torch.float32)
     d_dt_bias = torch.empty_like(dt_bias) if dt_bias is not None else q.new_empty(0, dtype=torch.float32)
     return (
-        torch.empty_like(q),
-        torch.empty_like(k),
-        torch.empty_like(v),
-        torch.empty_like(g),
-        torch.empty_like(beta),
-        torch.empty_like(w),
+        q.new_empty(q.shape),
+        q.new_empty(k.shape),
+        q.new_empty(v.shape),
+        g.new_empty(g.shape),
+        beta.new_empty(beta.shape),
+        w.new_empty(w.shape),
         dstate0,
         d_a_log,
         d_dt_bias,
@@ -1129,10 +1283,13 @@ def gdn2_setup_context(ctx, inputs, output):
         a_log,
         dt_bias,
         checkpoint_every_n_tokens,
+        checkpoint_dtype,
         plan_name,
+        preceding_state_update,
+        preceding_transition,
     ) = inputs
     saved = [q, k, v, g, beta, w, cu_seqlens]
-    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 16 == 0 and output[2].numel() > 0
+    ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % CHECKPOINT_CHUNK == 0 and output[2].numel() > 0
     ctx.checkpoint_every_n_tokens = checkpoint_every_n_tokens if ctx.checkpoint_reuse else 0
     if ctx.checkpoint_reuse:
         saved.append(output[2])
@@ -1143,7 +1300,11 @@ def gdn2_setup_context(ctx, inputs, output):
     if ctx.has_dt_bias:
         saved.append(dt_bias)
     ctx.save_for_backward(*saved)
+    # under context parallelism the backward starts from the composed state, and the caller's initial_state (the
+    # state beyond the farthest preceding rank) gets no gradient
+    ctx.composed = output[3].numel() > 0
     ctx.initial_state = initial_state
+    ctx.composed_state = output[3] if ctx.composed else None
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
     ctx.batch_invariant = batch_invariant
@@ -1155,10 +1316,10 @@ def gdn2_setup_context(ctx, inputs, output):
     ctx.gate_domain = str(gate_domain)
     ctx.gate_lower_bound = gate_lower_bound
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(output[2])
+    ctx.mark_non_differentiable(output[2], output[3])
 
 
-def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
+def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
     if ctx.checkpoint_reuse:
@@ -1187,6 +1348,7 @@ def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
         ctx.scale,
         initial_state=initial_state,
         d_final_state=dstate_in,
+        composed_initial_state=ctx.composed_state,
         state_checkpoints=state_checkpoints,
         checkpoint_every_n_tokens=ctx.checkpoint_every_n_tokens,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
@@ -1210,7 +1372,7 @@ def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
         dw,
         None,
         None,
-        dstate0 if initial_state is not None else None,
+        dstate0 if initial_state is not None and not ctx.composed else None,
         None,
         None,
         None,
@@ -1222,6 +1384,9 @@ def gdn2_backward(ctx, dO, dFinal, dstate_checkpoints):
         None,
         d_a_log if ctx.has_a_log else None,
         d_dt_bias if ctx.has_dt_bias else None,
+        None,
+        None,
+        None,
         None,
         None,
     )
@@ -1261,9 +1426,12 @@ def gated_delta_net_v2(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_dtype: Optional[torch.dtype] = None,
     plan_name: Optional[str] = None,
     overwrite_initial_state: bool = False,
     state_indices: Optional[torch.Tensor] = None,
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
 ):
     """Gated DeltaNet v2 (GDN-2) linear attention.
 
@@ -1282,6 +1450,11 @@ def gated_delta_net_v2(
     ``g`` is float32, bfloat16 or float16 and ``dG`` comes back in the same
     dtype.  ``initial_state`` is float32 or bfloat16 and ``final_state`` and
     the state gradients follow it.
+
+    FROST BF16 paths form the Y operand ``W .* V - K_decay @ S`` in FP32 and
+    round it once; the backward's Y regeneration follows the same rule. The
+    MMA operands, the chunk inverse and the checkpoint storage are unchanged,
+    and FP16 keeps its packed residual arithmetic.
 
     Args:
         g: per-key-channel decay: log-space by default (``alpha = exp(g)``),
@@ -1339,10 +1512,12 @@ def gated_delta_net_v2(
             float16; ``d_dt_bias`` comes back in the same dtype), or ``None``
             for zero bias.
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk
-            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]`` io dtype,
+            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]``, dtype per ``checkpoint_dtype``,
             one entry per N tokens strictly before each sequence end; the
             FROST engine requires a positive multiple of the kernel chunk size, 16). The series is
             a non-differentiable dump.
+        checkpoint_dtype: ``None`` stores io-dtype rows; ``torch.float32`` stores fp32 rows (the backward reuses io rows at the
+            chunk cadence and regenerates the dense series from any other rows).
 
         plan_name: optionally pin one execution plan by name (the plan
             API's ``get_plan_name_at_index`` names, e.g. ``gdn2_frost``); a
@@ -1355,9 +1530,24 @@ def gated_delta_net_v2(
             call.  Implies ``overwrite_initial_state``.  Forward only; cannot
             combine with ``checkpoint_every_n_tokens``.
 
+        preceding_state_update: context parallelism: the ``final_state`` outputs of
+            :func:`gated_delta_net_v2_summary` over the preceding ranks, stacked in
+            rank order as fp32 ``[P, HO, V, K]`` (``P = 0`` for the first rank).
+            The op folds them, with ``preceding_transition``, into row 0 of a
+            copy of ``initial_state`` (zeros without one): sequence 0 of this
+            rank continues the sequence that crosses the rank boundary.  The
+            backward starts from that composed state, which the op returns;
+            ``initial_state`` itself then gets no gradient.
+        preceding_transition: the matching ``transition`` outputs, fp32
+            ``[P, HO, K, K]``.
+
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or
-        ``(o, final_state, state_checkpoints)`` when ``checkpoint_every_n_tokens > 0``.
+        ``(o, final_state, state_checkpoints)`` when ``checkpoint_every_n_tokens > 0``, or
+        ``(o, final_state, state_checkpoints, composed_initial_state)`` when
+        ``preceding_state_update`` is given (the composed state is fp32
+        ``[N, HO, V, K]``, the forward's starting state; pass it as
+        ``initial_state`` to ``torch.ops.cudnn.gated_delta_net_v2_bwd``).
         ``final_state`` is empty unless ``output_final_state=True``; under
         ``overwrite_initial_state`` or ``state_indices`` it is the caller's buffer.
     """
@@ -1370,6 +1560,8 @@ def gated_delta_net_v2(
     if overwrite_initial_state or state_indices is not None:
         if initial_state is None:
             raise ValueError("gated_delta_net_v2: overwrite_initial_state requires initial_state")
+        if preceding_state_update is not None or preceding_transition is not None:
+            raise ValueError("gated_delta_net_v2: preceding summaries cannot combine with overwrite_initial_state or state_indices")
         o, state_checkpoints = torch.ops.cudnn.gated_delta_net_v2_fwd_overwrite_state(
             q,
             k,
@@ -1391,13 +1583,14 @@ def gated_delta_net_v2(
             a_log=a_log,
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
             state_indices=state_indices,
             output_final_state=bool(output_final_state) or bool(overwrite_initial_state),
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints = torch.ops.cudnn.gated_delta_net_v2_fwd(
+        o, final_state, state_checkpoints, composed_initial_state = torch.ops.cudnn.gated_delta_net_v2_fwd(
             q,
             k,
             v,
@@ -1419,8 +1612,13 @@ def gated_delta_net_v2(
             a_log=a_log,
             dt_bias=dt_bias,
             checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+            checkpoint_dtype=checkpoint_dtype,
             plan_name=plan_name,
+            preceding_state_update=preceding_state_update,
+            preceding_transition=preceding_transition,
         )
+        if preceding_state_update is not None:
+            return o, final_state, state_checkpoints, composed_initial_state
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
     return o, final_state
@@ -1666,7 +1864,8 @@ def gdn2_summary(
     if output_transition:
         transition = torch.empty(N, HO, K, K, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return final_state, transition
 
 
@@ -1740,6 +1939,8 @@ def build_gdn2_summary_bwd_graph(
     a_log_dtype=None,
     dt_bias_dtype=None,
     output_transition=False,
+    output_context=False,
+    checkpoint_every_n_tokens=0,
 ):
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, HQ, K], data_type=io_dtype, name="q")
@@ -1776,6 +1977,8 @@ def build_gdn2_summary_bwd_graph(
         beta_guard=beta_guard or None,
         safe_gate=safe_gate,
         gate_domain=None if gate_domain == "log" else gate_domain,
+        output_context=output_context or None,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens or None,
         name="gdn2_summary_bwd",
     )
     d_initial_state_t.set_data_type(cudnn.data_type.FLOAT)
@@ -1822,12 +2025,17 @@ def gdn2_summary_bwd(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    output_context: bool = False,
+    checkpoint_every_n_tokens: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal GDN-2 backward summary over a cached single-node GDN2_SUMMARY_BWD pygraph; no ``w`` input (the reverse
     recurrence never reads it).  Returns ``d_initial_state`` float32 ``[N, HO, V, K]`` (``G`` with no ``d_final_state``,
-    the full ``dh0`` otherwise) and ``transition`` float32 ``[N, HO, K, K]`` in the backward's stored-domain orientation
-    (``M_buf^T``), zero-size unless ``output_transition``."""
+    the full ``dh0`` otherwise), ``transition`` float32 ``[N, HO, K, K]`` in the backward's stored-domain orientation
+    (``M_buf^T``), zero-size unless ``output_transition``, and ``context``, the uint8 context for the backward over the
+    same tokens, zero-size unless ``output_context``."""
     total, HQ, K = q.shape
+    if output_context and not output_transition:
+        raise ValueError("gated_delta_net_v2_summary_bwd: output_context requires output_transition")
     HK = k.shape[1]
     HV, V = dO.shape[1], dO.shape[2]
     HO = g.shape[1]
@@ -1907,7 +2115,7 @@ def gdn2_summary_bwd(
         do_dtype=dO.dtype,
         do_shape=tuple(dO.shape),
         q_shape=tuple(q.shape),
-    )
+    ) + (bool(output_context), int(checkpoint_every_n_tokens))
     if cache_key not in summary_cache:
         summary_cache[cache_key] = build_gdn2_summary_bwd_graph(
             total,
@@ -1934,6 +2142,8 @@ def gdn2_summary_bwd(
             output_transition=bool(output_transition),
             a_log_dtype=torch_dtype_to_cudnn(a_log.dtype) if a_log is not None else None,
             dt_bias_dtype=torch_dtype_to_cudnn(dt_bias.dtype) if dt_bias is not None else None,
+            output_context=bool(output_context),
+            checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
         )
         select_plan(summary_cache[cache_key][0], plan_name)
 
@@ -1959,8 +2169,10 @@ def gdn2_summary_bwd(
     if output_transition:
         transition = torch.empty(N, HO, K, K, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
-    return d_initial_state, transition
+    workspace, handle = make_execution_resources(graph, device)
+    context = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
+    execute_graph(graph, variant_pack, workspace, handle, context if context.numel() else None)
+    return d_initial_state, transition, context
 
 
 @gdn2_summary_bwd.register_fake
@@ -1984,6 +2196,8 @@ def gdn2_summary_bwd_fake(
     dt_bias=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    output_context=False,
+    checkpoint_every_n_tokens=0,
 ):
     HV, V = dO.shape[1], dO.shape[2]
     K = k.shape[2]
@@ -1999,9 +2213,12 @@ def gdn2_summary_bwd_fake(
         raise ValueError("gated_delta_net_v2_summary_bwd: gate_domain='linear' cannot combine with safe_gate=True")
     if d_final_state is not None and tuple(d_final_state.shape) != (N, HO, V, K):
         raise ValueError(f"gated_delta_net_v2_summary_bwd: d_final_state must be [N, HO, V, K] = [{N}, {HO}, {V}, {K}]; got {tuple(d_final_state.shape)}")
+    if output_context and not output_transition:
+        raise ValueError("gated_delta_net_v2_summary_bwd: output_context requires output_transition")
     d_initial_state = dO.new_empty((N, HO, V, K), dtype=torch.float32)
     transition = dO.new_empty((N, HO, K, K) if output_transition else (0,), dtype=torch.float32)
-    return d_initial_state, transition
+    context = dO.new_empty(torch.library.get_ctx().new_dynamic_size() if output_context else 0, dtype=torch.uint8)
+    return d_initial_state, transition, context
 
 
 # ---------------------------------------------------------------------------
@@ -2052,6 +2269,9 @@ def gated_delta_net_v2_summary(
     M_buf + X_H`` and ``X_dh0 = X_dht @ M_buf^T + X_G``.  Both outputs are non-differentiable.  THD layout and gate
     semantics match :func:`gated_delta_net_v2` (k ``[total_tokens, HK, K]``, v ``[total_tokens, HV, V]``, g/beta
     ``[total_tokens, HO, K]`` per-key-channel gates, w ``[total_tokens, HO, V]``, cu_seqlens ``[N+1]``); ``initial_state`` is float32.
+
+    FROST BF16 H paths form ``W .* V - K_decay @ S`` in FP32 before rounding the Y operand; the M chain (``0 - K_decay @ M``)
+    rounds once as before, and FP16 keeps its packed arithmetic.
 
     Args:
         safe_gate: ``g`` is read as ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``; ``a_log`` ``[HO]`` and
@@ -2105,6 +2325,8 @@ def gated_delta_net_v2_summary_bwd(
     dt_bias: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    output_context: bool = False,
+    checkpoint_every_n_tokens: int = 0,
 ):
     """Gated DeltaNet v2 (GDN-2) per-span backward summary for context parallelism: the reverse state-gradient recurrence
     over each sequence, returning ``G`` ``[N, HO, V, K]`` float32, the incoming state gradient ``d_initial_state`` under
@@ -2120,12 +2342,15 @@ def gated_delta_net_v2_summary_bwd(
             ``dt_bias`` ``[HO, K]`` (fp32/bf16/fp16) default to unit amplitude / zero bias and require ``safe_gate=True``.
         gate_domain: ``"log"`` (``g = ln(alpha)``) or ``"linear"`` (``g = alpha in (0, 1]``, 1e-10 floor); not with ``safe_gate``.
         plan_name: pin one execution plan by name (e.g. ``gdn2_summary_frost``).
+        output_context: with ``output_transition``, also return the backward's context as a third value, for
+            ``torch.ops.cudnn.gated_delta_net_v2_bwd(..., context=context)``; prepared at ``checkpoint_every_n_tokens``, which must
+            equal the backward's.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    d_initial_state, transition = torch.ops.cudnn.gated_delta_net_v2_summary_bwd(
+    d_initial_state, transition, context = torch.ops.cudnn.gated_delta_net_v2_summary_bwd(
         dO,
         q,
         k,
@@ -2145,5 +2370,9 @@ def gated_delta_net_v2_summary_bwd(
         batch_invariant=bool(batch_invariant),
         output_transition=bool(output_transition),
         plan_name=plan_name,
+        output_context=bool(output_context),
+        checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
     )
+    if output_context:
+        return d_initial_state, transition, context
     return (d_initial_state, transition) if output_transition else d_initial_state

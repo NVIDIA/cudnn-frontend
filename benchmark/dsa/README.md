@@ -9,8 +9,9 @@ run them:
   per run. Arranged like [`../attention_training`](../attention_training/README.md)
   and [`../attention_inference`](../attention_inference/README.md).
 - **Single scripts** (`benchmark_dsa_sparse_attention_forward.py`,
-  `benchmark_dsa_sparse_attention_backward.py`) — ad-hoc shapes, execute-vs-
-  wrapper split, `profile` mode for nsys/ncu.
+  `benchmark_dsa_sparse_attention_backward.py`,
+  `benchmark_dsa_indexer_h32.py`) — ad-hoc shapes, execute-vs-wrapper split,
+  compact-H32 adapter comparisons, and `profile` mode for nsys/ncu.
 
 ## Contents
 
@@ -18,9 +19,11 @@ run them:
   - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
   - `deepseek_v41.py` - DeepSeek-V4.1 Flash (H64, K=640, same per-query gather as V4), 2k..32k
   - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048), 2k..32k
+  - `qsa.py` - Query Sparse Attention (24Q/2KV, d=256, 512 four-token blocks per query) at TP 1/2/4/8, 2k..32k
 - `runner.py` - Configuration-based benchmark runner (one subprocess per case)
-- `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
-- `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
+- `benchmark_single_dsa.py` - Single-case worker the runner calls for `kind="dsa"` presets; prints a `RESULT,` line
+- `benchmark_single_qsa.py` - The same for `kind="qsa"` presets (`cudnn.ops.qsa_forward` / `qsa_backward`)
+- `config_types.py` - `ModelPreset`, `with_tp_shards`, `DsaBenchmarkConfig`, `BenchmarkResult`
 - `charts.py` - Chart generation
 - `run_all.sh` - Runs configs and lands results in `results/<config>/<gpu>/`
 - `results/` - Benchmark outputs (CSV and charts)
@@ -105,14 +108,35 @@ indexer selects 512 four-token pools = 2048 raw tokens (the incomplete tail
 pool, <= 3 tokens, is omitted). Like every preset here, the rows are
 gathered as independent random rows, not as 4-row pools.
 
+`qsa` (`configs/qsa.py`, `kind="qsa"`): Query Sparse Attention, the
+block-sparse attention of the packed Miles training interface
+([docs](../../docs/operations/sparse_attention/qsa.md)). Unlike the DSA
+presets it is GQA over per-head K/V (no shared record), `d = 256`, and the
+selection is a bitmap of four-token blocks: each query gets up to 512 random
+complete causal blocks plus its partial tail block, i.e. the indexer's block
+budget, so early queries gather fewer blocks than the budget. The case is one
+packed sequence (`s_kv == s_q`), timed as the public `qsa_forward` /
+`qsa_backward` call (allocation, selection compaction and kernels — QSA has no
+preallocated execute path); TFLOPS count the tokens actually gathered. The
+24Q/2KV model is swept across tensor-parallel shards with
+`with_tp_shards(..., [1, 2, 4, 8])`, the same rule as
+[`../attention_inference`](../attention_inference/README.md): q heads divide,
+the two KV heads divide at TP 2 and replicate from TP 4 on, so the per-rank
+shapes are 24/2, 12/1, 6/1 and 3/1 (`qsa`, `qsa-tp2`, `qsa-tp4`, `qsa-tp8`).
+The kernels serve the first three; `qsa-tp8` is declined by the QSA contract
+and lands as a `skipped=True` row.
+
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
 `has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
 `deterministic_bwd`, iteration counts), and run `--config <name>`. Supported
 forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
 `indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
-head count with `d_qk` in `{512, 576}` and a deterministic mode on SM100 for
-H16/H32/H64/H96/H128.
+head count with `d_qk` in `{512, 576}` and a deterministic mode on SM90/SM100 for
+H16/H32/H64/H96/H128. A QSA preset (`kind="qsa"`, `num_kv_heads`,
+`block_size=4`, `head_dim_qk = head_dim_vo = 256`) is served for 24/2, 12/1
+and 6/1 query/KV heads on SM100-family GPUs; wrap either kind in
+`with_tp_shards` to sweep tensor-parallel shards.
 
 ### Output
 
@@ -128,6 +152,24 @@ results/<config>/<gpu>/
 
 ![DeepSeek-V4 DSA on B200](results/deepseek_v4/b200/deepseek_v4.webp)
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
+
+#### SM100 (development part) - QSA at TP 1/2/4/8
+
+![QSA at TP 1/2/4/8 on an SM100 development part](results/qsa/sm100/qsa.webp)
+- `qsa: H24/2`, `qsa-tp2: H12/1`, `qsa-tp4: H6/1`; `d=256`, bf16, up to 512
+  complete causal four-token blocks + the tail block per query, one packed
+  sequence per case; `qsa-tp8` (H3/1) is in the CSV as `skipped`.
+- Measured on a 68-SM, 33 MB-L2 compute-capability 10.0 development part
+  (`gpu_name` in the CSV), not a B200: read the rows as a functional reference
+  and for the shard-to-shard ratios, not as the architecture's throughput.
+  Entries for production GPUs land in `results/qsa/<arch>/` from
+  `run_all.sh <arch> "" qsa`.
+- Ratios that carry over: at 16k+ the TP 4 forward costs about the TP 2
+  forward (six valid columns of the same 16-column tile), and the TP 4
+  backward is ~0.85x the TP 2 backward per token at 32k (four 6-head queries
+  batched per CTA against two 12-head queries). On this part the TFLOPS fall
+  beyond 8k although the gathered tokens per query are flat (~1.8k at 8k,
+  ~2.0k at 32k); a production run decides how much of that is the part.
 
 ## Single Scripts
 
@@ -179,6 +221,33 @@ length, and `--cp-rank` must be valid for every selected case. `--tokens`,
 SM90+ is required; memory admission is an
 estimate and does not guarantee allocation success.
 
+### Compact-H32 Indexer Backward
+
+`benchmark_dsa_indexer_h32.py` measures the SM100 indexer-backward wrapper
+with compact H32 tensors against caller-side `torch.nn.functional.pad` to H64
+(fp32 `d_index_k` by default; `--d-index-k-dtype bf16` measures the BF16
+scratch path with a preallocated workspace). Outputs are preallocated, H64 output slicing
+is excluded, case order is rotated, and L2 is flushed before each CUDA-event
+sample. The script validates the H64 result against the compact path before
+timing. Profile mode also exposes already-padded H64 inputs as a kernel-only
+sanity control.
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_h32
+python -m benchmark.dsa.benchmark_dsa_indexer_h32 profile --profile-case compact_h32
+```
+
+Add `--deterministic` to benchmark the fixed-owner dK path with its reported
+caller-owned workspace. Add `--topk-indices-global` for the flat KV-id contract
+used by packed DSA forward. For example, a 1M-context/r4 indexer at CP64 has
+16K local query rows and 256K compressed KV rows:
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_h32 \
+  --seqlen-q 16384 --seqlen-k 262144 --topk 512 \
+  --topk-indices-global --deterministic
+```
+
 ### Sparse Attention Forward
 
 `benchmark_dsa_sparse_attention_forward.py` benchmarks the public SM100
@@ -219,10 +288,9 @@ cuDNN Frontend `[cutedsl]` dependencies.
 ### Sparse Attention Backward
 
 Microbenchmark for the DeepSeek Sparse Attention (DSA) backward kernel in the
-cuDNN Frontend CuTe DSL package, driven through the public
-`cudnn.DSA.sparse_attention_backward_wrapper` API. The wrapper dispatches to
-the Hopper (SM90) or Blackwell (SM100) implementation based on the active
-CUDA device.
+cuDNN Frontend CuTe DSL package, driven through a compiled
+`DSA.SparseAttentionBackward` plan. Setup compiles the plan, and timed
+iterations call `plan.execute(...)` directly.
 
 #### What is measured
 
@@ -233,10 +301,10 @@ Inputs are flat MQA tensors: `q (S_q, H, d_qk)`, a shared
 reference so that this benchmark isolates backward and does not include a
 forward launch.
 
-Each timed iteration is one full wrapper call — gradient-buffer zeroing,
-workspace allocation, and the preprocess/backward/convert kernels — i.e. the
-cost a training step pays per backward invocation. Timing uses a single
-CUDA-event window around `--repeat` iterations and reports the average.
+The benchmark allocates the compiled plan, gradient buffers, and workspace
+during setup. Each timed iteration reuses those buffers and executes the
+compiled backward plan. Timing uses a single CUDA-event window around
+`--repeat` iterations and reports the average.
 
 Reported TFLOPS use the 5-matmul model of the backward pass (recompute S, dV,
 dP, dQ, dK):
@@ -272,9 +340,10 @@ python benchmark_dsa_sparse_attention_backward.py --nheads 128  # SM100/SM103 BF
 python benchmark_dsa_sparse_attention_backward.py --nheads 128 --head-dim 576 --csv d576_2cta.csv  # SM100/SM103 BF16 H128/D576 two-CTA backend
 ```
 
-The H128/D576 two-CTA route uses the same public-wrapper measurement, including
-workspace allocation and initialization. Add `--no-topk-length` to cover the
-variant without a lengths tensor; the default passes a full-length tensor.
+The H128/D576 two-CTA route uses the same compiled-plan measurement, with
+workspace allocation during setup and buffer reuse in timed calls. Add
+`--no-topk-length` to cover the variant without a lengths tensor; the default
+passes a full-length tensor.
 The existing benchmark arguments and CSV format apply to both variants.
 
 Options:
@@ -290,6 +359,19 @@ Options:
   without `topk_length` are different compiled variants; the default
   benchmarks the `topk_length` variant with every row at the full top-k
   count.
+- `--deterministic` — benchmark deterministic execution `off`, `on`, or
+  `both` (default `off`).
+- `--deterministic-relay-cluster-size` — force logical C4/C8/C16/C32/C64.
+  SM90 defaults to C16; SM100 keeps its automatic large-context policy. C32
+  and C64 use two/four ordered physical C16 phases and reduce the dominant
+  FP32 relay planes to four/two.
+- `--deterministic-dkv-mode` — `deterministic_dkv_mode` of deterministic
+  plans: `records` (default), `chain` or `shards` (see the deterministic dKV
+  storage section of `docs/operations/sparse_attention/dsa.md`). It selects
+  the dKV storage of SM100 generic M64 and H128 two-CTA plans (`shards` keeps
+  the two-CTA private-plane layout); `chain` is rejected on SM90, on the
+  two-CTA routes, on devices other than SM100/SM103 (where `records` runs as
+  `shards`), and together with `--deterministic-relay-cluster-size`.
 - `--warmup` / `--repeat` — iterations per config (defaults 10 / 50; the
   first warmup iteration also triggers kernel compilation).
 - `--csv` — write results to a CSV file.
@@ -316,6 +398,107 @@ supported DSL.
 |     8192 |      8192 |  512 |  2.489 |     552.16 |
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
+
+##### SM90 deterministic relay scheduling (2026-11-02)
+
+Measured on NVIDIA H200 (SM90) with BF16 H64/Dqk576/Dv512, KV=65536,
+top-k 2048, full runtime lengths, synthetic forward statistics, five warm-ups,
+and 20 allocation-free calls. The environment used PyTorch 2.12.1+cu130,
+CuTe DSL 4.8.1 (CUDA 13.4 lowering), and cuDNN 9.20.0. Each explicit relay
+width was run in a separate process with `--deterministic both`; the small
+non-deterministic variation between rows is measurement noise.
+
+| Q | Logical relay | Non-det ms | Det ms | Det / non-det | Non-det workspace GiB | Det workspace GiB |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | C4  | 3.996 | 7.672 | 1.920x | 0.141 | 4.508 |
+| 1024 | C8  | 3.988 | 6.745 | 1.691x | 0.141 | 2.258 |
+| 1024 | C16 | 3.988 | 6.153 | 1.543x | 0.141 | 1.133 |
+| 1024 | C32 | 3.987 | **5.457** | **1.369x** | 0.141 | 0.571 |
+| 1024 | C64 | 3.983 | 9.158 | 2.299x | 0.141 | **0.290** |
+| 4096 | C4  | 15.390 | 23.904 | 1.553x | 0.143 | 4.533 |
+| 4096 | C8  | 15.331 | 23.494 | 1.532x | 0.143 | 2.283 |
+| 4096 | C16 | 15.334 | 22.686 | 1.479x | 0.143 | 1.158 |
+| 4096 | C32 | 15.362 | **20.601** | **1.341x** | 0.143 | 0.596 |
+| 4096 | C64 | 15.364 | 35.813 | 2.331x | 0.143 | **0.314** |
+| 16384 | C4  | 60.093 | 88.537 | 1.473x | 0.148 | 4.633 |
+| 16384 | C8  | 60.126 | 90.433 | 1.504x | 0.148 | 2.383 |
+| 16384 | C16 | 60.133 | 88.509 | 1.472x | 0.148 | 1.258 |
+| 16384 | C32 | 60.105 | **81.453** | **1.355x** | 0.148 | 0.695 |
+| 16384 | C64 | 60.098 | 142.370 | 2.369x | 0.148 | **0.414** |
+
+C32 is the best time/memory point in this workload: it lowers deterministic
+overhead to 1.34--1.37x while using about half the C16 workspace. C64 is the
+memory-first endpoint, but its four serialized physical C16 phases raise the
+overhead to 2.30--2.37x. C16 remains the conservative SM90 default; C32/C64
+are explicit plan-time choices.
+
+##### SM100 deterministic relay scheduling (2026-10-30)
+
+Against merged commit `1dea4471a6e6c05e29d3bf281281fd156d345a84`, the
+deterministic H64/D576 relay path improved from 6.957 to 4.466 ms at Q=1K,
+KV=64K and from 101.409 to 64.426 ms at Q=16K, KV=512K with the same
+10.008 GiB workspace.
+Inputs were BF16 with top-k 2048, full runtime lengths, synthetic forward
+statistics, five warm-ups, and 40 allocation-free calls on the SM100 test
+environment (PyTorch 2.14.1+cu130, CuTe DSL 4.8.1, cuDNN 9.24.0).
+
+The automatic policy keeps the conservative eight-CTA relay below Q=8K
+because the earlier cluster-4 crossover did not generalize across SM100
+devices. An explicit Q=4K cluster-4 profiling experiment attributed its local
+gain primarily to the 32 main-kernel waves, whose total fell from 22.941 to
+9.696 ms; this is implementation evidence, not the portable automatic policy.
+Use `--deterministic-relay-cluster-size {4,8,16,32,64}` with `--deterministic on`
+to benchmark an exact relay specialization. The option applies only to
+deterministic cases when `--deterministic both` is selected; omitted means the
+automatic policy. Under the default `--deterministic-dkv-mode records`,
+large-context plans whose conflict-rank records fit the relay workspace store
+dKV in records instead; the relay measurements in this section correspond to
+`--deterministic-dkv-mode shards`. The relay size option is valid only for
+large-context generic-M64 cases and may
+request more workspace than the automatic memory-first budget. The logical
+cluster-32 option uses two ordered 16-CTA hardware-cluster phases and four
+FP32 planes, halving the dominant data-plane workspace from cluster-16.
+Cluster-64 is an explicit emergency memory-first option with four ordered
+16-CTA phases, two FP32 planes, and a 64-bit packed row mask; the automatic
+policy never selects it.
+On the SM100 test environment, a CP64-sized Q=16K/KV=1M H64/D576 case with
+BF16 and top-k 64 reduced complete scratch from 20.008 GiB to 11.008 GiB and
+changed warmed `execute()` latency from 10.915 ms to 8.303 ms. At
+Q=4K/KV=65537 H64/D512 and top-k 129, complete scratch fell from 1.033 GiB to
+0.533 GiB and latency changed from 2.101 ms to 2.052 ms. Both measurements use
+three timed calls after warm-up; the option remains workload-specific rather
+than part of the automatic policy.
+
+An explicit cluster-64 experiment shows the remaining tradeoff. All rows use
+the same SM100 BF16 input generator and ten warm-ups; top-k 129 and 64 use 50
+timed calls, while top-k 2048 uses 30.
+
+| Shape | Top-k | Logical CTAs/group | Workspace GiB | Latency ms | TFLOPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4096 / KV65537 / H64 / D512 | 129 | 16 | 1.033 | 2.095 | 82.64 |
+| Q4096 / KV65537 / H64 / D512 | 129 | 32 | 0.533 | **2.050** | **84.47** |
+| Q4096 / KV65537 / H64 / D512 | 129 | 64 | **0.283** | 3.478 | 49.78 |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 16 | 20.008 | 11.129 | 33.19 |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 32 | 11.008 | **8.258** | **44.73** |
+| Q16384 / KV1048576 / H64 / D576 | 64 | 64 | **6.508** | 10.971 | 33.67 |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 16 | 20.008 | 73.000 | 161.92 |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 32 | 11.008 | **68.901** | **171.55** |
+| Q16384 / KV1048576 / H64 / D576 | 2048 | 64 | **6.508** | 126.322 | 93.57 |
+
+Cluster-64 saves another 40.9% of complete CP64-sized scratch relative to
+cluster-32, but regresses latency by 32.9% at top-k 64 and 83.3% at top-k
+2048. Four serialized phases expose only 32 CTAs per phase, compared with two
+64-CTA phases for cluster-32, and the row protocol uses 64-bit rather than
+32-bit atomics. Prefer cluster-32 unless the 11.008 GiB allocation does not fit.
+The optimized trace has no separate dKV prefold kernel; fixed-order conversion
+takes 1.452 ms and workspace clearing 0.658 ms.
+
+NCU reports 96 registers per thread and 231.42 KiB dynamic shared memory for
+the cluster-4 main kernel, limiting residency to one CTA per SM; achieved
+occupancy is 26.33%, with 57.37% DRAM and 35.07% compute throughput. A
+144-CTA-wave experiment was rejected: 36 four-CTA clusters spill beyond one
+resident cluster wave and regress Q=4K from 12.017 ms/4.533 GiB to
+14.932 ms/5.096 GiB. The 128-CTA, 32-cluster wave is therefore intentional.
 
 #### Profiling
 

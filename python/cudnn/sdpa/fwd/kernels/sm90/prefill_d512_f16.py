@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: MIT
 
 """
-A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D=512 heads on NVIDIA
+A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D128/D256/D512 on NVIDIA
 Hopper SM90 (sm_90a), on WGMMA tensor cores.
 
-The CTA tile is (64, 64) over the (512, 512) head tile, which fixes both GEMM shapes. QK
-is m64n64k512, one commit group of 32 k16 instructions. PV is m64n256k64 per compute
-warpgroup, one group of 4. A 64-row FP32 O accumulator over 512 columns costs 256
-registers per thread, and a WGMMA N is at most 256. Two compute warpgroups therefore
-split the head dim, each owning one 256-column V/O half.
+The CTA tile is (64, 64). QK contracts the specialized 128/256/512-column
+head tile in one group of k16 instructions. Two compute warpgroups split
+V/O into 64/128/256-column halves, each using four k16 PV instructions.
+The D512 specialization retains its original arithmetic and geometry.
 
 The kernel implements:
 - Three warpgroups per CTA. WG0 issues the TMA loads. WG1 runs QK (SS), the online
@@ -25,7 +24,7 @@ The kernel implements:
   lengths, THD (ragged / packed) batches, PackGQA, per-Q-head sinks, and per-row LSE
   (Stats) in natural log or, under ``stats_log2``, base 2.
 
-Storage: Q, K and V/O are single-stage 64 x 512 regions of eight SW128 slabs, V and O
+Storage: Q, K and V/O are single-stage regions of two/four/eight SW128 slabs, V and O
 aliasing one of them. Single-stage K and V mean the producer cannot run a KV tile ahead:
 the next K lands only after QK releases the current one. P is the one multi-stage
 region, crossing WG1 to WG2 through a three-stage ring; the alpha and inverse row
@@ -38,7 +37,7 @@ Constraints:
 - Q/K/V/O keep their declared strides: D contiguous, the rest 16-byte multiples.
 - ``SdpaFwdDslSm90.check_support`` owns the served set.
 
-WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the D512 tile
+WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the tile
 operations and softmax arithmetic in ``sm90/_common_hopper.py``.
 """
 
@@ -60,19 +59,23 @@ from cudnn.frost.tile_dsl.mask import compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.scheduler import SCHED_LPT_L2, SCHED_NATURAL, lpt_l2_tile_coords, lpt_tile_coords
-from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_META_WORDS, THD_MAPS_OFF
+from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF, thd_port_origin
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
+from cudnn.sdpa.fwd.config_sm100 import pack_gqa_group_size
 from cudnn.sdpa.fwd.config_sm90 import (
-    D_TILE,
     SCALE_POSITIVE,
     SCALE_ZERO,
     TILE_M,
     TILE_N,
     TemplateParams,
     head_dims_mismatch,
+    thd_meta_words,
+    thd_origin_maps,
+    thd_origins_off,
     validate_params,
 )
 from cudnn.sdpa.fwd.kernels.sm90.prepared_host import host as _host, compile_host
+from cudnn.sdpa.fwd.kernels.sm90.thd_origins import ROW_Q, ROW_STATS, build_thd_origin_setup_kernel, origin_row
 from cudnn.sdpa.fwd.kernels.thd_helpers import THD_SETUP_THREADS, build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     FLT_MAX_F64,
@@ -89,6 +92,7 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     score_prefix_mask,
     store_fragment,
     wgmma_descriptor,
+    zero_v_tail_rows,
 )
 
 # The FROST loader injects one immutable specialization before executing this module. A
@@ -119,9 +123,9 @@ class Bars(NamedTuple):
     - ``mb_tma_v_empty``: the 8 warps of WG1 and WG2, each after its PV half.
     - ``mb_p_xfer_{full,empty}``: the P_STAGES-deep P ring; WG1's 4 warps publish, WG2's
       4 release.
-    - ``mb_alpha_xfer_{full,empty}``: one alpha pair per non-first KV tile, WG1's 4
-      warps -> WG2's 4.
-    - ``mb_inv_sum_xfer_full``: WG1's 4 warps publish the inverse row sums once per work
+    - ``mb_alpha_xfer_{full,empty}``: one alpha pair per non-first KV tile, all 128 threads in WG1
+      publish and all 128 in WG2 release.
+    - ``mb_inv_sum_xfer_full``: WG1's 128 threads publish the inverse row sums once per work
       tile, so it has no EMPTY partner.
 
     Consumers wait FULL from phase 0, producers EMPTY from phase 1, which passes at once
@@ -143,19 +147,18 @@ class Bars(NamedTuple):
 
 
 class SM90FusedMultiHeadAttentionForward:
-    """Configure and launch the SM90 FP16/BF16 D512 FMHA prefill kernel.
+    """Configure and launch the native-width SM90 FP16/BF16 FMHA prefill kernel.
 
-    Each CTA runs one work tile through three warpgroups. Three SM120 constructor
-    parameters are omitted: ``engines._sm90_spec()`` declares no capability behind
-    ``split_kv`` or ``thd_lse_padded``, and ``thd_lse_head_major`` has nothing left to
-    select once Stats stay packed -- the declared strides of the packed
-    ``(1, H_q, T_q)`` view choose token-major or head-major.
+    Each CTA runs one query tile and its assigned KV interval through three
+    warpgroups. Dense splits write normalized half O and natural-log FP32 Stats
+    for the shared fixed-order combine. THD stays unsplit with packed Stats;
+    declared strides select token-major or head-major storage.
     """
 
     # The CTA tile: Q_TILE rows by KV_TILE keys over the HEAD_TILE-column D envelope.
     Q_TILE = TILE_M
     KV_TILE = TILE_N
-    HEAD_TILE = D_TILE
+    HEAD_TILE = PARAMS.head_tile
     PV_HALF = HEAD_TILE // 2
     P_STAGES = 3  # Slots of the WG1-to-WG2 P ring.
     # setmaxnreg budgets per warpgroup: 128 * (24 + 240 + 240) fits the SM's 65,536.
@@ -179,6 +182,8 @@ class SM90FusedMultiHeadAttentionForward:
         qh_per_kh: int = 1,
         scale_mode: int = SCALE_POSITIVE,
         stats_log2: bool = False,
+        thd_origins: tuple | None = None,
+        split_kv: int = 1,
     ):
         """Initialize the SM90 D512 FMHA prefill kernel configuration.
 
@@ -214,12 +219,12 @@ class SM90FusedMultiHeadAttentionForward:
             ``sinks`` operand.
         :param thd_varlen: THD (ragged / packed) mode. Q/K/V/O and LSE are packed
             batch-1 views, and ``__call__`` first launches the shared THD setup kernel.
-        :param pack_gqa: Pack ``Q_TILE // qh_per_kh`` tokens x ``qh_per_kh`` query heads
-            sharing one KV head into each Q tile: row ``r`` is token ``r // qh_per_kh``,
-            head ``r % qh_per_kh``.
+        :param pack_gqa: Pack ``gcd(Q_TILE, qh_per_kh)`` query heads per token.
+            Each work head owns one subgroup, and adjacent subgroups may share
+            a KV head (e.g. two 64-head subgroups for a 128:1 MQA group).
         :param qh_per_kh: The GQA ratio, refused unless ``h_q == h_kv * qh_per_kh``. Q
             head ``h`` reads KV head ``h // qh_per_kh``. Under ``pack_gqa`` it must
-            divide ``Q_TILE``.
+            share a factor with ``Q_TILE``.
         :param scale_mode: The sign of the softmax scale: ``SCALE_POSITIVE``,
             ``SCALE_ZERO`` or ``SCALE_NEGATIVE``. Each sign compiles its own probability
             path, and a negative scale anchors each row at its minimum raw score. The
@@ -227,6 +232,11 @@ class SM90FusedMultiHeadAttentionForward:
         :param stats_log2: Store Stats in base 2. The store multiplies each natural-log
             row LSE by ``log2(e)`` after normalization; ``-inf`` stays ``-inf``, and
             ``lse`` None removes it.
+        :param thd_origins: THD only: ``config_sm90.TemplateParams.thd_origins``, the
+            ports whose bound ragged offsets give each sequence's origin in the caller's
+            buffer. ``None`` keeps the packed layout.
+        :param split_kv: Dense-only KV partitions. The producer writes sink-free
+            partials; the shared combine folds sinks and the final Stats log base.
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -250,7 +260,10 @@ class SM90FusedMultiHeadAttentionForward:
         # is inert there and True is the value it keeps.
         self.kv_loop_bottom_right = self.bottom_right if self.banded else True
         self.has_sink = has_sink
+        self.fold_sink = has_sink and split_kv == 1
+        self.split_kv = split_kv
         self.thd_varlen = thd_varlen
+        self.thd_origins = thd_origins if thd_varlen else None
         # Dense graphs clamp per-sequence device lengths to the declared envelope; THD
         # reads its lengths from the setup launch's metadata instead.
         self.dense_q_lengths = not thd_varlen and seq_q_lens_present
@@ -258,14 +271,14 @@ class SM90FusedMultiHeadAttentionForward:
 
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
-        # Rows of a Q tile per token (PackGQA packs qh_per_kh heads per token).
-        self.heads_per_tile = qh_per_kh if pack_gqa else 1
+        # Split a GQA group into equal subgroups that divide the 64-row tile.
+        self.heads_per_tile = pack_gqa_group_size(qh_per_kh, self.Q_TILE, partial=True) if pack_gqa else 1
         self.scale_mode = scale_mode
         # The anchor is the raw-score extremum that maximizes the scaled score: the
         # maximum for a non-negative scale, the minimum for a negative one, with the
         # sentinel as its identity.
         self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
-        self.stats_log2 = stats_log2
+        self.stats_log2 = stats_log2 and split_kv == 1
 
         # Named-barrier ids. The init publish takes barrier_cta_sync's default id 0, so
         # the named ones start at 1. Id 1 is the V/O alias rendezvous of the 256 PV
@@ -273,6 +286,8 @@ class SM90FusedMultiHeadAttentionForward:
         # store.
         self.bar_vo = 1
         self.bar_o_half_base = 2
+        # Ids 4 and 5 order each compute warpgroup's V-tail zeroing before its PV.
+        self.bar_v_tail_base = 4
 
         self.threads_per_cta = len(self.REG_BUDGETS) * cute.arch.THREADS_PER_WARPGROUP
 
@@ -328,7 +343,8 @@ class SM90FusedMultiHeadAttentionForward:
         The coordinates are listed in the map's own axis order. A dense box reads the
         grid-constant ``tma_desc`` with ``desc_ptr`` None. Under THD a runtime
         ``desc_ptr`` overrides it: O reads its own sequence's map, K and V the one
-        clamped map every sequence shares, and Q keeps the grid-constant map. THD maps
+        clamped map every sequence shares (their own sequence's maps under caller-buffer
+        origins), and Q keeps the grid-constant map. THD maps
         drop the batch axis. A PackGQA Q/O box spans ``heads_per_tile`` heads from
         ``head_idx``. ``tma_order`` is the port's ``self.tma_orders`` entry, the view
         modes ``__call__`` listed innermost first.
@@ -387,7 +403,8 @@ class SM90FusedMultiHeadAttentionForward:
         :param tma_desc: The port's grid-constant map.
         :param mbar: The port's FULL barrier.
         :param work: The decoded work tile, read for its KV head, batch, THD token
-            origin and, under THD, the clamped map every sequence shares on this port.
+            origin and, under THD, the clamped map every sequence shares on this port
+            (this sequence's own map under caller-buffer origins).
         :param kv_seq_idx: The first token of the box, from the caller's reverse KV
             walk.
         :param is_v: Select the V port over the K one: its THD map pointer and map axis
@@ -399,7 +416,8 @@ class SM90FusedMultiHeadAttentionForward:
         kv_coord = kv_seq_idx + work.kv_offset if cutlass.const_expr(self.thd_varlen) else kv_seq_idx
         source = self.tma_slice(tma_desc, desc_ptr, work.kv_head, kv_coord, work.batch, self.tma_orders[2 if is_v else 1])
         mbar.arrive(n_bytes=tma_desc.global_tx_bytes() * s_dst.tma_loads_per_tile, pred=prims.elect_sync())
-        tma_load_tile(s_dst, source, mbar.smem_ptr)
+        # Caller-origin maps were acquired once at the top of tmaldg_warp_group.
+        tma_load_tile(s_dst, source, mbar.smem_ptr, acquire=self.thd_origins is None)
 
     @cute.jit
     def tmaldg_warp_group(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work):
@@ -417,6 +435,13 @@ class SM90FusedMultiHeadAttentionForward:
                 # needs no branch. One state serves K and V, which refill together.
                 q_empty_state = PipelineState.start(phase=1)
                 kv_empty_state = PipelineState.start(phase=1)
+                if cutlass.const_expr(self.thd_origins is not None):
+                    # This sequence's own K/V maps: acquire each once for this warp and
+                    # start their fetch before the Q load, so the K/V loads below need no
+                    # per-tile acquire (with shared maps every CTA hits one cached map).
+                    for desc_ptr in (work.k_desc_ptr, work.v_desc_ptr):
+                        prims.fence_proxy_acquire(prims.MemScope.GPU, desc_ptr, 128, from_proxy=prims.Proxy.GENERIC, to_proxy=prims.Proxy.TENSORMAP)
+                        prims.prefetch_tensormap(desc_ptr)
                 bars.mb_tma_q_empty.wait(q_empty_state.phase)
                 q_empty_state = advance(q_empty_state, 1)
                 self.load_q_tile_tma(sQ, tma_q_desc, bars.mb_tma_q_full, work)
@@ -603,6 +628,21 @@ class SM90FusedMultiHeadAttentionForward:
         return s_regs
 
     @cute.jit
+    def sanitize_v_tail(self, sV_raw, work, local_tid, half: cutlass.Constexpr):
+        """Zero this warpgroup's V-half rows past the batch's runtime KV length.
+
+        A dense graph's pad rows lie inside the declared S_kv, so TMA loads them as they
+        are: the score mask zeroes P there, but ``0 * NaN = NaN`` would still reach O.
+        Only the first visited tile can hold such rows, because the reverse walk starts at
+        the tile that holds ``kv_len - 1``. Runtime padding is unread data, as in the
+        SM80 (#2135) and SM120 bodies.
+        """
+        row_lo = work.kv_len - (work.kv_right - 1) * self.KV_TILE
+        zero_v_tail_rows(sV_raw.subview(half * self.vo_half_elements), row_lo, local_tid, self.storage_dtype, self.PV_HALF)
+        prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+        prims.barrier_cta_sync(self.bar_v_tail_base + half, thread_count=cute.arch.THREADS_PER_WARPGROUP)
+
+    @cute.jit
     def compute_one_kv_tile(
         self,
         basic_params: SimpleNamespace,
@@ -631,7 +671,7 @@ class SM90FusedMultiHeadAttentionForward:
         sP_xfer_raw, sAlpha_xfer_raw = basic_params.sP_xfer_raw, basic_params.sAlpha_xfer_raw
         kv_seq_idx = (work.kv_right - 1 - kv_step) * self.KV_TILE
         bars.mb_tma_k_full.wait(kv_full_state.phase)
-        mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype)
+        mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype, head_tile=self.HEAD_TILE)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_k_empty.arrive()
@@ -642,9 +682,9 @@ class SM90FusedMultiHeadAttentionForward:
             if local_tid % 4 == 0:
                 for row_half in cutlass.range_constexpr(2):
                     sAlpha_xfer_raw.subview(2 * owned_row(local_tid, row_half)).store(softmax_params.alpha[row_half])
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.mb_alpha_xfer_full.arrive()
+            # Every participating lane arrives directly: the release/acquire
+            # edge includes every factor writer, without elected-lane relay.
+            bars.mb_alpha_xfer_full.arrive()
             alpha_state = advance(alpha_state, 1)
         # Both consumers read P in RS operand order: word 2*k_frag+row_half is score
         # slot 4*k_frag+2*row_half.
@@ -666,6 +706,8 @@ class SM90FusedMultiHeadAttentionForward:
             rescale_output(output, alpha)
         if not v_ready:
             bars.mb_tma_v_full.wait(kv_full_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths and is_first_kv_tile):
+            self.sanitize_v_tail(basic_params.sV_raw, work, local_tid, half=0)
         mma_pv(mma_params, probability_words, is_first_kv_tile, ab_dtype=self.storage_dtype)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
@@ -700,9 +742,8 @@ class SM90FusedMultiHeadAttentionForward:
             # All four lanes consume the same pair, at the existing alpha handoff.
             row0_slot, row1_slot = (sAlpha_xfer_raw.subview(2 * owned_row(local_tid, row_half)) for row_half in range(2))
             alpha = cutlass.Vector.from_elements((row0_slot.load(), row1_slot.load()), cutlass.Float32)
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.mb_alpha_xfer_empty.arrive()
+            # Release only after every lane has completed both factor reads.
+            bars.mb_alpha_xfer_empty.arrive()
             alpha_state = advance(alpha_state, 1)
         # A single-shot probe of this V generation, not a wait loop: a miss falls back
         # to the blocking wait below. The result cannot outlive the generation, because
@@ -714,6 +755,8 @@ class SM90FusedMultiHeadAttentionForward:
         bars.mb_p_xfer_full[p_state.idx].wait(p_state.phase)
         if not v_ready:
             bars.mb_tma_v_full.wait(v_full_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths and is_first_kv_tile):
+            self.sanitize_v_tail(basic_params.sV_raw, basic_params.work, local_tid, half=1)
         mma_pv(mma_params, p_desc + p_state.idx * (self.p_xfer_elems * self.storage_dtype.bytes // 16), is_first_kv_tile, ab_dtype=self.storage_dtype)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
@@ -762,7 +805,7 @@ class SM90FusedMultiHeadAttentionForward:
                         work.o_desc_ptr,
                         work.head * self.heads_per_tile,
                         work.q_base,
-                        work.batch,
+                        work.output_batch,
                         self.tma_orders[3],
                         d_coord=cutlass.Int32(half * self.PV_HALF),
                     ),
@@ -815,6 +858,7 @@ class SM90FusedMultiHeadAttentionForward:
         # the TMA coordinate of every port but O, and anchor packed Stats.
         k_desc_ptr, v_desc_ptr, o_desc_ptr = None, None, None
         q_offset, kv_offset = cutlass.Int32(0), cutlass.Int32(0)
+        lse_offset = cutlass.Int32(0)
         if cutlass.const_expr(self.thd_varlen):
             # seq_kv_lens is the setup launch's metadata, Int32 [seq_kv(B), cu_q(B+1),
             # cu_k(B+1), remap(B), live, ctr], then the tensor maps at THD_MAPS_OFF.
@@ -837,6 +881,22 @@ class SM90FusedMultiHeadAttentionForward:
             o_desc_ptr = base + batch * TENSOR_MAP_QWORDS
             k_desc_ptr = base + (self.b + 1) * TENSOR_MAP_QWORDS
             v_desc_ptr = base + (self.b + 2) * TENSOR_MAP_QWORDS
+            lse_offset = q_offset
+            if cutlass.const_expr(self.thd_origins is not None):
+                # Caller-buffer origins: O, K and V read their own sequence's map, based at
+                # the port's origin and clipped to the sequence (slots 0..B-1, B+1..2B,
+                # 2B+1..3B), so K/V tiles address from the sequence start and a tile tail
+                # is TMA-OOB zeros, never the gap after it. Q keeps the grid-constant map at
+                # its clamped origin (an overhanging Q tile lands rows O's clip discards),
+                # and Stats rows start at theirs.
+                k_desc_ptr = base + (self.b + 1 + batch) * TENSOR_MAP_QWORDS
+                v_desc_ptr = base + (2 * self.b + 1 + batch) * TENSOR_MAP_QWORDS
+                kv_offset = cutlass.Int32(0)
+                org = cute.make_tensor(
+                    cute.recast_ptr(seq_kv_lens.iterator + thd_origins_off(self.b), dtype=cutlass.Int64), cute.make_layout((5, self.b), stride=(self.b, 1))
+                )
+                q_offset = cutlass.Int32(thd_port_origin(org, origin_row(self.thd_origins, ROW_Q), batch, q_offset))
+                lse_offset = cutlass.Int32(thd_port_origin(org, origin_row(self.thd_origins, ROW_STATS), batch, lse_offset))
         # Dense device lengths are clamped to the declared envelopes, so an
         # out-of-contract value can neither address past the TMA descriptors nor move a
         # written row outside O or Stats.
@@ -868,10 +928,21 @@ class SM90FusedMultiHeadAttentionForward:
         # Step kv_step visits tile kv_right - 1 - kv_step. Without a left bound the walk
         # ends at tile 0, so its exclusive upper tile is its length.
         kv_right = bounds.right if cutlass.const_expr(self.mask_flags & MASK_SWA) else iterations
-        kv_head = head if self.pack_gqa else head // self.qh_per_kh
+        output_batch = batch
+        if cutlass.const_expr(self.split_kv > 1):
+            split = cute.arch.block_idx()[2]
+            # Partition the already clipped interval. Empty splits still execute
+            # the normal epilogue and publish O=0/LSE=-inf before combination.
+            span = (iterations + self.split_kv - 1) // self.split_kv
+            skip = cute.math.min(split * span, iterations)
+            kv_right = kv_right - skip
+            iterations = cute.math.min(span, iterations - skip)
+            output_batch = batch + split * self.b
+        kv_head = head * self.heads_per_tile // self.qh_per_kh
         q_output_limit = cutlass.Int32(self.s_q) if cutlass.const_expr(self.dense_q_lengths) else q_len
         work = SimpleNamespace(
             batch=batch,
+            output_batch=output_batch,
             head=head,
             kv_head=kv_head,
             q_base=q_base,
@@ -879,6 +950,7 @@ class SM90FusedMultiHeadAttentionForward:
             kv_len=kv_len,
             q_offset=q_offset,
             kv_offset=kv_offset,
+            lse_offset=lse_offset,
             q_output_limit=q_output_limit,
             iterations=iterations,
             k_desc_ptr=k_desc_ptr,
@@ -951,6 +1023,7 @@ class SM90FusedMultiHeadAttentionForward:
                     basic_params = SimpleNamespace(
                         sP_xfer_raw=sP_xfer_raw,
                         sAlpha_xfer_raw=sAlpha_xfer_raw,
+                        sV_raw=sV.base,
                         bars=bars,
                         local_tid=local_tid,
                         work=work,
@@ -1019,7 +1092,7 @@ class SM90FusedMultiHeadAttentionForward:
                     # inverse to WG2. Keep it in the live-KV arm; moving it past the
                     # join changes code generation. Load both sink logits before
                     # normalizing either row.
-                    if cutlass.const_expr(self.has_sink):
+                    if cutlass.const_expr(self.fold_sink):
                         logits = cutlass.Array(cutlass.Float32, 2, alignment=8)
                         if cutlass.const_expr(self.dense_q_lengths):
                             trimmed = cutlass.Array(cutlass.Boolean, 2)
@@ -1032,11 +1105,11 @@ class SM90FusedMultiHeadAttentionForward:
                                 trimmed[row_half] = token + work.q_base >= work.q_len
                     for row_half in cutlass.range_constexpr(2):
                         total = quad_reduce(softmax_params.partial_sum[row_half], "sum")
-                        if cutlass.const_expr(self.has_sink):
+                        if cutlass.const_expr(self.fold_sink):
                             inv, value = normalize_sink_row(softmax_params.anchor[row_half], softmax_params.scale, total, logits[row_half], self.scale_mode)
                         else:
                             inv, value = normalize_row(softmax_params.anchor[row_half], softmax_params.scale, softmax_params.scale_log2, total, self.scale_mode)
-                        if cutlass.const_expr(self.has_sink and self.dense_q_lengths):
+                        if cutlass.const_expr(self.fold_sink and self.dense_q_lengths):
                             inv = cutlass.Float32(0.0) if trimmed[row_half] else inv
                             value = cutlass.Float32(-cutlass.Float32.inf) if trimmed[row_half] else value
                         row_sum_inv[row_half], row_lse[row_half] = inv, value
@@ -1046,14 +1119,12 @@ class SM90FusedMultiHeadAttentionForward:
                     if local_tid % 4 == 0:
                         for row_half in cutlass.range_constexpr(2):
                             sInvSum_xfer_raw.subview(2 * owned_row(local_tid, row_half)).store(row_sum_inv_values[row_half])
-                    prims.bar_warp_sync(cute.arch.FULL_MASK)
-                    if prims.elect_sync():
-                        bars.mb_inv_sum_xfer_full.arrive()
+                    bars.mb_inv_sum_xfer_full.arrive()
                 else:
                     # Finalization without KV work: an empty mask interval, zero KV or
                     # trimmed rows. The inverse stays zero, and only requested Stats
                     # need the sink logits.
-                    if cutlass.const_expr(self.has_sink and lse is not None):
+                    if cutlass.const_expr(self.fold_sink and lse is not None):
                         logits = cutlass.Array(cutlass.Float32, 2, alignment=8)
                         if cutlass.const_expr(self.dense_q_lengths):
                             trimmed = cutlass.Array(cutlass.Boolean, 2)
@@ -1086,12 +1157,17 @@ class SM90FusedMultiHeadAttentionForward:
                             token, subhead = row // self.heads_per_tile + work.q_base, row % self.heads_per_tile
                             # Trimmed dense rows are declared rows, and receive -inf
                             # past q_len.
-                            if token < work.q_output_limit:
+                            # Caller-origin Stats rows also stop at the buffer's end: the
+                            # origin is clamped into it, the sequence may still overrun it.
+                            live = token < work.q_output_limit
+                            if cutlass.const_expr(self.thd_origins is not None):
+                                live = live & (cutlass.Int64(work.lse_offset) + cutlass.Int64(token) < cutlass.Int64(lse.shape[2]))
+                            if live:
                                 q_head = work.head * self.heads_per_tile + subhead
                                 if cutlass.const_expr(not self.thd_varlen):
-                                    origin = cutlass.Int64(work.batch) * cutlass.Int64(lse.stride[0])
+                                    origin = cutlass.Int64(work.output_batch) * cutlass.Int64(lse.stride[0])
                                 else:
-                                    origin = cutlass.Int64(work.q_offset) * cutlass.Int64(lse.stride[2])
+                                    origin = cutlass.Int64(work.lse_offset) * cutlass.Int64(lse.stride[2])
                                 # Base-2 Stats fold at the store: finalization without
                                 # KV work writes a sink logit or -inf without
                                 # normalizing. -inf stays -inf.
@@ -1121,6 +1197,7 @@ class SM90FusedMultiHeadAttentionForward:
                     # is mutable.
                     basic_params = SimpleNamespace(
                         sAlpha_xfer_raw=sAlpha_xfer_raw,
+                        sV_raw=sV.base,
                         bars=bars,
                         local_tid=local_tid,
                         work=work,
@@ -1230,19 +1307,19 @@ class SM90FusedMultiHeadAttentionForward:
             mb_alpha_xfer_full=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
                 stages=1,
-                init_count=cute.arch.WARPS_PER_WARPGROUP,
+                init_count=cute.arch.THREADS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
             mb_alpha_xfer_empty=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
                 stages=1,
-                init_count=cute.arch.WARPS_PER_WARPGROUP,
+                init_count=cute.arch.THREADS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
             mb_inv_sum_xfer_full=MBarrier(
                 cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
                 stages=1,
-                init_count=cute.arch.WARPS_PER_WARPGROUP,
+                init_count=cute.arch.THREADS_PER_WARPGROUP,
                 producer=Producer.THREAD,
             ),
         )
@@ -1332,6 +1409,10 @@ class SM90FusedMultiHeadAttentionForward:
             )
         elif cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             tile, head, batch = lpt_tile_coords(tile, cutlass.Int32(self.heads), cutlass.Int32(self.b), cutlass.Int32(self.q_tiles))
+        elif cutlass.const_expr(self.split_kv > 1):
+            batch = tile // (self.q_tiles * self.heads)
+            head = tile // self.q_tiles % self.heads
+            tile = tile % self.q_tiles
         wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
         self._run_unit(
             tma_q_desc,
@@ -1375,6 +1456,11 @@ class SM90FusedMultiHeadAttentionForward:
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
         thd_lens_form: Optional[cutlass.Int32],
+        thd_ro_q: Optional[cute.Tensor],
+        thd_ro_k: Optional[cute.Tensor],
+        thd_ro_v: Optional[cute.Tensor],
+        thd_ro_o: Optional[cute.Tensor],
+        thd_ro_lse: Optional[cute.Tensor],
         stream: cuda_driver.CUstream,
     ) -> None:
         """Build the port maps, run the THD setup when packed, and launch the kernel.
@@ -1397,7 +1483,8 @@ class SM90FusedMultiHeadAttentionForward:
             ``has_sink``.
         :param seq_q_lens: Int32 ``(B,)`` Q lengths, or a dead null view.
         :param seq_kv_lens: Int32 ``(B,)`` KV lengths, or a dead null view. Under THD, the
-            128-byte-aligned ``THD_MAPS_META_WORDS(B)`` scratch: metadata, then maps.
+            128-byte-aligned ``config_sm90.thd_meta_words(B, origins)`` scratch: metadata,
+            then maps (then the token origins).
         :param scale: The host softmax scale in natural units; the kernel folds
             ``log2(e)`` itself. Its sign must match ``scale_mode``.
         :param thd_max_sq: THD only: the declared S_q envelope, which sizes the grid.
@@ -1405,6 +1492,9 @@ class SM90FusedMultiHeadAttentionForward:
             sums. ``None`` when dense.
         :param thd_kv_lens: THD only: the same for KV.
         :param thd_lens_form: THD only: bit 0: Q is cu, bit 1: KV is cu.
+        :param thd_ro_q: Caller-origin THD only: Q's bound ``(B+1,)`` ragged offsets, or
+            ``None`` for a port without them; likewise ``thd_ro_k`` .. ``thd_ro_lse``.
+            Each THD view's token extent is then that port's own capacity.
         :param stream: CUDA stream of the THD setup launch and the attention launch.
         """
 
@@ -1429,13 +1519,55 @@ class SM90FusedMultiHeadAttentionForward:
         # The LPT policies launch the same tiles on one axis, which kernel unflattens.
         # THD is NATURAL, over ceil(thd_max_sq / tokens_per_tile) tiles.
         grid = (self.q_tiles, self.heads, self.b)
-        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
-            grid = (self.q_tiles * self.heads * self.b, 1, 1)
+        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL or self.split_kv > 1):
+            grid = (self.q_tiles * self.heads * self.b, 1, self.split_kv)
         if cutlass.const_expr(self.thd_varlen):
-            if cutlass.const_expr(tuple(seq_kv_lens.shape) != (THD_MAPS_META_WORDS(self.b),)):
-                raise ValueError(f"prefill_d512_f16_sm90: THD seq_kv_lens must be the ({THD_MAPS_META_WORDS(self.b)},) metadata tensor")
+            meta_words = thd_meta_words(self.b, self.thd_origins is not None)
+            if cutlass.const_expr(tuple(seq_kv_lens.shape) != (meta_words,)):
+                raise ValueError(f"prefill_d512_f16_sm90: THD seq_kv_lens must be the ({meta_words},) metadata tensor")
             q_tiles = (thd_max_sq + self.tokens_per_tile - 1) // self.tokens_per_tile
             grid = (q_tiles, cutlass.Int32(self.heads), cutlass.Int32(self.b))
+        if cutlass.const_expr(self.thd_origins is not None):
+            # Caller-buffer origins: metadata, the clamped per-port token origins and one
+            # map per sequence for O, K and V, released to the tensor-map proxy exactly as
+            # the shared setup launch does (thd_origins.py).
+            capacities = (q.shape[2], k.shape[2], v.shape[2], o.shape[2], lse.shape[2] if cutlass.const_expr(lse is not None) else cutlass.Int32(0))
+            token_strides = (
+                cutlass.Int64(q.stride[2]),
+                cutlass.Int64(k.stride[2]),
+                cutlass.Int64(v.stride[2]),
+                cutlass.Int64(o.stride[2]),
+                cutlass.Int64(lse.stride[2]) if cutlass.const_expr(lse is not None) else cutlass.Int64(1),
+            )
+            build_thd_origin_setup_kernel(
+                k,
+                v,
+                o,
+                tma_o_desc,
+                tma_k_desc,
+                tma_v_desc,
+                cute.make_tensor(
+                    cute.recast_ptr(seq_kv_lens.iterator + THD_MAPS_OFF(self.b), dtype=cutlass.Int64),
+                    cute.make_layout((thd_origin_maps(self.b) * TENSOR_MAP_QWORDS,), stride=(1,)),
+                ),
+                cute.make_tensor(
+                    cute.recast_ptr(seq_kv_lens.iterator + thd_origins_off(self.b), dtype=cutlass.Int64), cute.make_layout((5, self.b), stride=(self.b, 1))
+                ),
+                seq_kv_lens,
+                thd_q_lens,
+                thd_kv_lens,
+                thd_lens_form,
+                cutlass.Int32(self.b),
+                thd_ro_q,
+                thd_ro_k,
+                thd_ro_v,
+                thd_ro_o,
+                thd_ro_lse,
+                token_strides,
+                capacities,
+                self.thd_origins,
+            ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        elif cutlass.const_expr(self.thd_varlen):
             # The shared THD setup launch: one elected thread writes the metadata, the
             # per-sequence O maps and the two clamped K/V maps, then issues one
             # GENERIC->TENSORMAP release fence. Stream order publishes all of it before
@@ -1476,7 +1608,7 @@ class SM90FusedMultiHeadAttentionForward:
         if cutlass.const_expr(lse is not None):
             ports = (*ports, ("LSE", lse, self.h_q, self.s_q))
         for name, tensor, heads, tokens in ports:
-            declared = (batch, heads, tokens)
+            declared = (batch * (self.split_kv if name in ("O", "LSE") else 1), heads, tokens)
             if cutlass.const_expr(any(isinstance(extent, int) and extent != size for extent, size in zip(tensor.shape, declared))):
                 raise ValueError(f"prefill_d512_f16_sm90: {name} shape {tuple(tensor.shape)} disagrees with the declared (B, H, S) = {declared}")
         # Only a length tensor some role reads reaches the kernel; THD's is the metadata.
@@ -1512,15 +1644,17 @@ def compile(  # noqa: A001
     ``(B, H, S, D)`` mode order, with a zero batch stride under THD, and ``lse_stride``
     the ``(B, H_q, S_q)`` Stats strides of a ``has_lse`` template. The result exposes the positional pointer ABI in ``prepared_host.host``.
 
-    ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). They size only the
-    GMEM descriptors: the compute tile stays 512 wide, so a smaller D still pays the
-    D512 tile cost. This front coerces them to plain ints: ``template_key`` refuses a
+    ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). The adapter
+    selects their covering native head tile in ``PARAMS``; these dimensions
+    also bound the GMEM maps. This front coerces them to plain ints: ``template_key`` refuses a
     non-plain argument, which would drop the persisted cache entry.
     """
     reason = head_dims_mismatch(d_qk, d_v)
     if reason is not None:
         raise ValueError(f"prefill_d512_f16_sm90: {reason}")
     d_qk, d_v = int(d_qk), int(d_v)
+    if max(d_qk, d_v) > PARAMS.head_tile:
+        raise ValueError("SM90 declared dimensions exceed the specialized head tile")
     if PARAMS.thd_varlen:
         s_q = s_kv = 0
     return _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, lse_stride, target=target, d_qk=d_qk, d_v=d_v)
@@ -1554,6 +1688,8 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         qh_per_kh=PARAMS.qh_per_kh,
         scale_mode=PARAMS.scale_mode,
         stats_log2=PARAMS.stats_log2,
+        thd_origins=PARAMS.thd_origins,
+        split_kv=PARAMS.split_kv,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel

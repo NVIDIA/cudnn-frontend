@@ -88,6 +88,26 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
             pass
 
 
+@cute.jit
+def wait_cluster_acquire(mb, phase):
+    """:func:`wait` (the hint-less spin form) with a CLUSTER-scope acquire: ``mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64``.
+
+    For a barrier whose phase is completed by a PEER CTA's ``st.async ... mbarrier::complete_tx::bytes`` (or any cross-CTA DSMEM write
+    that completes tx bytes): PTX gives the complete-tx operation release semantics at CLUSTER scope, and a ``.acquire.cta`` wait does
+    not include the remote CTA's thread in its synchronizes-with relation, so this CTA's generic ``ld.shared`` of the shipped bytes is
+    formally ordered only by the cluster-scope acquire.  The GDN decode pair (``gdn_decode_fused_f16.py``, ``mb_norm``) runs the
+    ``.acquire.cta`` form bitwise in production, so this closes a formal gap, not an observed one; the shared-expert decode pair's
+    ``mb_kred`` (``moe/frost/kernel/shared_expert_decode_f16.py``) is the first caller.  One-time end-of-kernel waits only: a
+    cluster-scope acquire on a per-iteration path is a per-wait drain (``frost-tile-dsl.md`` section 3).  Same spin shape and labels as
+    :func:`wait` (``spin=True``); no ``predicate=`` (branch around it instead, see :func:`arrive_expect_tx`)."""
+    nvvm.inline_ptx(
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
+        "@P1 bra.uni DONE;\n\tbra.uni LAB_WAIT;\n\tDONE:\n\t}",
+        read_only_args=[mb, cutlass.Int32(phase)],
+    )
+
+
 # wait_poll shape: POLL_TIGHT_ITERS back-to-back test_wait's (~1 us), then a plain TIMER ``nanosleep.u32 POLL_SLEEP_NS``
 # between tests.  The sleep is the timer form (SASS NANOSLEEP), NOT the event-sleep of a parked try_wait (NANOSLEEP.SYNCS) --
 # the warp still never hands itself to the barrier unit.  MEASURED (d512 2x2 backward, B200 2026-10-01): a TIGHT test_wait
@@ -214,10 +234,49 @@ def launch_dependent_grids():
 
 
 @cute.jit
-def mbar_arrive_on_peer(mb, peer_cta_id, pred=None):
+def mbar_arrive_on_peer(mb, peer_cta_id, pred=None, release_cta: cutlass.Constexpr[bool] = False):
+    """One arrive per calling lane on the PEER CTA's copy of ``mb`` (``mapa``; nothing here elects -- the caller counts lanes).
+
+    ``release_cta=False`` (the default; every call site that predates this kwarg compiles to the same cubin as before it existed):
+    ``mbarrier.arrive.relaxed.cluster`` -- RIGHT for a COUNT-ONLY credit whose data an async proxy already ordered (a ``tcgen05_st``
+    completed by ``tcgen05_wait(STORE)``, a TMA ``complete_tx``, a TMA store drained by ``tma_store_wait``) and for a one-shot
+    notification (``mb_tmem_dealloc``).  The default is what those callers COMPILED TO, not a statement that each of them is such a
+    credit: the d512 forwards' per-iteration cross-sub-group ``mb_alpha_xfer_empty`` credit follows the thread's own generic
+    ``alpha_addr.load()`` of the slot it frees and still takes the default -- a read-then-credit shape that is an OPEN family audit,
+    not a verified exemption (the d512 backward's ``mb_s_xfer_empty`` credit is not one: a named barrier performs the four warps' reads
+    before the elected arrive).  Static detector for any caller: name the last generic load of the stage before the arrive; if there
+    is one and nothing between them performs it (a ``bar.sync`` of every reading warp counts, a relaxed arrive does not), the site
+    belongs to the ``release_cta=True`` case below.
+
+    ``release_cta=True``: ``mbarrier.arrive.release.cta.shared::cluster`` -- for a READ-then-credit across CTAs: the credit that
+    lets the PEER refill a stage THIS thread has just read with generic loads (the multicast bias ring's ``_empty``: the peer's next
+    ``.multicast::cluster`` load overwrites that very stage in this CTA's SMEM).  A relaxed arrive does not order the issuing
+    thread's prior ``ld.shared`` before the credit becomes visible, so ptxas may hoist it above an independent load and the refill
+    lands under the read -- the same shape as the ``tcgen05_wait(LOAD)`` arrive-between-loads incident.  The CTA-scope release
+    is the scheduler credit's form (``scheduler.read_tile_id_arrive``: "a relaxed arrive would let the refill race a
+    still-in-flight decode") and CUTLASS's ``consumer_release``; on sm_107a the flip changes NO SASS text and costs nothing: the
+    relaxed and the release form lower to the same ``USYNCS.ARRIVE.TRANS64.RED.*`` instruction whose suffix is the LOWERING SHAPE,
+    not the memory order -- ``.RED.A1T0`` for the predicated inline-PTX credit (the multicast bias ring's four ring credits are the
+    same ``USYNCS.ARRIVE.TRANS64.RED.A1T0`` at the same positions before and after the flip, 3640 instructions identical, 16 cubin
+    bytes = the arrive's ordering bits), ``.RED.ACT0`` for the unpredicated DSL arrive (:func:`arrive_on_leader_release` and the
+    unpredicated arm here; a local arrive is the non-``RED`` ``USYNCS.ARRIVE.TRANS64.ACT0``) -- with no ``CGAERRBAR`` /
+    ``MEMBAR.ALL.GPU`` on either form; every mnemonic is pinned and printed by ``test_tile_dsl_release_arrive.py``.  Never
+    ``.release.cluster`` (a GPU-scope drain per arrive).  The predicated arms are inline PTX with one REGISTER operand (the
+    ``inline_ptx(predicate=)`` hazard needs an immediate operand, which these templates do not have).  Both ``release_cta=True`` arms are
+    pinned by ``test_tile_dsl_release_arrive.py`` (forms ``peer_release`` / ``peer_release_pred``: the PTX form, the SASS no-drain pins, a
+    2-CTA publish-then-read on Rubin); the unpredicated arm has no kernel caller yet -- the pin is what keeps it from rotting unseen."""
     peer_mb = nvvm.mapa(mb, peer_cta_id)
     if cutlass.const_expr(pred is None):
-        nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+        if cutlass.const_expr(release_cta):
+            nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA, relaxed=False)
+        else:
+            nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+    elif cutlass.const_expr(release_cta):
+        nvvm.inline_ptx(
+            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [{$r0}];",
+            read_only_args=[peer_mb.ir_value()],
+            predicate=pred,
+        )
     else:
         nvvm.inline_ptx(
             "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [{$r0}];",
@@ -421,5 +480,6 @@ class MBarrier:
                 )
             arrive_on_leader(self.smem_ptr, leader_cta_id, cta_group)
 
-    def arrive_on_peer(self, peer_cta_id, pred=None):
-        mbar_arrive_on_peer(self.smem_ptr, peer_cta_id, pred=pred)
+    def arrive_on_peer(self, peer_cta_id, pred=None, release_cta: bool = False):
+        # release_cta=True = the .release.cta cluster arrive of a READ-then-credit across CTAs (see mbar_arrive_on_peer); appended, default off.
+        mbar_arrive_on_peer(self.smem_ptr, peer_cta_id, pred=pred, release_cta=release_cta)

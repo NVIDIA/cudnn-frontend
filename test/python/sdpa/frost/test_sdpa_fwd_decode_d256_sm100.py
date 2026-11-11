@@ -346,10 +346,10 @@ def test_decode_graph_dense_padded_no_stats():
 @pytest.mark.L0
 def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     """b=32 x 2 KV heads over 4096 keys (Qwen3.5 serving) at S_q=1: the LEADING
-    plan does not split -- split 2 saves ~6 us of GPU time but costs an eager
-    caller ~30 us of host time per execute -- and the captured caller's split-2
-    plan is the runner-up, reachable by select_plan.  Both run and match the
-    reference.
+    plan does not split -- split 2 measured 8 % slower than unsplit on B200 once
+    the native binder removed the host-launch cost the model used to charge --
+    and the captured caller's split-2 plan is the runner-up, reachable by
+    select_plan.  Both run and match the reference.
     The literal splits are the 148-SM fit (test_split_kv_heuristic pins the
     policy); on another part the plans must still agree with the model."""
     from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
@@ -357,8 +357,8 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
     lead = _run_graph(**shape)
-    assert lead.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), lead.knobs
-    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    assert lead.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, device_cc=(10, 0)), lead.knobs
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, device_cc=(10, 0))
     runner = _run_graph(**shape, split_kv=captured)
     assert runner.knobs.split_kv == captured, runner.knobs
     if sm == 148:
@@ -373,7 +373,7 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     # Its 16-row sibling (Qwen3-Next 16/2: 8:1 packing at S_q=2) is decode-shaped
     # and follows the serving shape's policy: unsplit lead, split-2 runner-up.
     mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
-    assert mtp16.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), mtp16.knobs
+    assert mtp16.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, device_cc=(10, 0)), mtp16.knobs
 
 
 @pytest.mark.L0
@@ -387,9 +387,9 @@ def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
     lead = _run_graph(**shape)
-    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0, device_cc=(10, 0))
     assert lead.knobs.split_kv == captured, lead.knobs
-    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm)
+    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, device_cc=(10, 0))
     runner = _run_graph(**shape, split_kv=eager)
     assert runner.knobs.split_kv == eager, runner.knobs
     if sm == 148:
@@ -406,9 +406,30 @@ def test_decode_graph_small_batch_splits_and_recombines():
 
     sm = torch.cuda.get_device_properties(0).multi_processor_count
     plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16)
-    assert plan.knobs.split_kv == choose_decode_tile_split_kv(units=16, kv_tiles=32, sm_count=sm), plan.knobs
+    assert plan.knobs.split_kv == choose_decode_tile_split_kv(units=16, kv_tiles=32, sm_count=sm, device_cc=(10, 0)), plan.knobs
     if sm == 148:
         assert plan.knobs.split_kv == 8, plan.knobs
+
+
+@pytest.mark.L0
+def test_decode_graph_sink_small_batch_splits_and_recombines():
+    """b=8 x 2 KV heads WITH per-head sinks: the decode model splits a sink graph
+    like a sink-free one (the tile's partials are sink-free and the combine
+    folds the sink once), and O / LSE over mixed lengths including an empty
+    batch match the virtual-column reference."""
+    plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 0, 2048, 4096, 300, 77], page=16, sink=True, dtype=torch.bfloat16)
+    assert plan.knobs.split_kv > 1, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink_logit", [-100.0, -2.0], ids=["sink_-100", "sink_-2"])
+def test_decode_graph_sink_deep_split_keyless_rows(sink_logit):
+    """A deep split next to a sink: the 0- and 129-key batches leave most split
+    ranges empty, and a keyless row's splits are ALL dead, so the combine must
+    land on LSE = sink exactly (not -inf) with O := 0 -- for a sink far below
+    zero as well."""
+    plan = _run_graph(B=3, H=32, KH=2, s_q=1, lens=[4096, 0, 129], page=16, sink=sink_logit)
+    assert plan.knobs.split_kv >= 2, plan.knobs
 
 
 @pytest.mark.L0
@@ -427,7 +448,8 @@ def test_decode_graph_deep_split_empty_ranges():
 @pytest.mark.L0
 def test_decode_q_tile_rule():
     """The routing rule: 16 rows ride the decode tile; the 32-column tile is a
-    valid config (D256_DECODE_MAX_Q_ROWS) the adapter does not select."""
+    valid config (D256_DECODE_MAX_Q_ROWS) the adapter selects only for a launch
+    big enough to be HBM-bound (test_decode_q_tile_rule_wide_launch)."""
     from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, D256_DECODE_ROUTED_MAX_Q_ROWS, decode_d256_q_tile
 
     assert (D256_DECODE_ROUTED_MAX_Q_ROWS, D256_DECODE_MAX_Q_ROWS) == (16, 32)
@@ -435,7 +457,7 @@ def test_decode_q_tile_rule():
     assert decode_d256_q_tile(1, 12) == 16  # a group that does not divide the tile still fits it
     assert decode_d256_q_tile(2, 8) == 16
     assert decode_d256_q_tile(16, 1) == 16
-    # (16, 32] rows: the unrouted 32-column tile -- the prefill tile serves these.
+    # (16, 32] rows: the 32-column tile, which a small launch does not take -- the prefill tile serves these.
     assert decode_d256_q_tile(2, 16) == 0
     assert decode_d256_q_tile(1, 32) == 0
     assert decode_d256_q_tile(17, 1) == 0
@@ -444,6 +466,99 @@ def test_decode_q_tile_rule():
     assert decode_d256_q_tile(33, 1) == 0
     assert decode_d256_q_tile(1, 64) == 0
     assert decode_d256_q_tile(0, 16) == 0
+
+
+@pytest.mark.L0
+def test_decode_q_tile_rule_wide_launch():
+    """A launch big enough to be HBM-bound rides the 32-column tile for the (16, 32]
+    row counts the 16-column tile cannot take; one token unit at most on this line."""
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_tile
+
+    assert decode_d256_q_tile(2, 16, wide_launch=True) == 32
+    assert decode_d256_q_tile(1, 32, wide_launch=True) == 32
+    assert decode_d256_q_tile(4, 8, wide_launch=True) == 32
+    assert decode_d256_q_tile(17, 1, wide_launch=True) == 32
+    assert decode_d256_q_tile(2, 12, wide_launch=True) == 32  # 24 rows
+    assert decode_d256_q_tile(1, 16, wide_launch=True) == 16  # what fits the narrow tile keeps it
+    assert decode_d256_q_tile(3, 16, wide_launch=True) == 0  # two token units: not admitted on this line
+    assert decode_d256_q_tile(33, 1, wide_launch=True) == 0
+    assert decode_d256_q_tile(1, 64, wide_launch=True) == 0
+    assert decode_d256_q_tile(0, 16, wide_launch=True) == 0
+    assert decode_d256_q_tile(2, 16) == 0 and decode_d256_q_tile(2, 16, wide_launch=False) == 0
+
+
+@pytest.mark.L0
+def test_decode_wide_launch_boundary():
+    """The launch size the Blackwell line's wide-tile route starts at: units (batch x
+    KV-head groups) and the 128-key KV tiles they stream, never a windowed graph."""
+    from cudnn.sdpa.fwd.config_sm100 import D256_WIDE_DECODE_MIN_KV_TILES, D256_WIDE_DECODE_MIN_UNITS, d256_wide_decode_launch
+
+    assert (D256_WIDE_DECODE_MIN_UNITS, D256_WIDE_DECODE_MIN_KV_TILES) == (8, 4096)
+    assert d256_wide_decode_launch(8, 1, 65536)  # 8 units x 512 tiles
+    assert d256_wide_decode_launch(8, 1, 65535)  # the tail tile counts
+    assert d256_wide_decode_launch(4, 2, 65536)  # units = batch x groups
+    assert d256_wide_decode_launch(128, 2, 2048)  # 256 units x 16 tiles
+    assert not d256_wide_decode_launch(8, 1, 65408)  # 511 tiles: 4088 in all
+    assert not d256_wide_decode_launch(7, 1, 1 << 24)  # too few units however long the KV
+    assert not d256_wide_decode_launch(1, 2, 1 << 24)
+    assert not d256_wide_decode_launch(32, 2, 2048)  # 64 units x 16 tiles
+    assert not d256_wide_decode_launch(32, 2, 4096)  # 64 units x 32 tiles
+    assert not d256_wide_decode_launch(128, 2, 131072, windowed=True)
+    assert not d256_wide_decode_launch(0, 2, 65536) and not d256_wide_decode_launch(8, 0, 65536) and not d256_wide_decode_launch(8, 1, 0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(("page", "sink"), [(0, False), (64, False), (64, True)], ids=["dense", "paged", "paged_sink"])
+def test_decode_graph_wide_tile_routed_launch(page, sink):
+    """A launch past the wide-tile boundary (8 units x 64K keys) lowers its S_q = 4
+    step at 8:1 (32 packed rows) onto the 32-column decode tile and matches the
+    reference: mixed lengths including a one-key row and a tile-unaligned tail, and
+    per-batch query lengths down to a row with no live query (with a sink too: the
+    padded rows stay O := 0 / LSE := -inf, the live ones fold the sink logit)."""
+    import cudnn.sdpa.fwd.api_dsl as api_dsl
+
+    seen = []
+    real = api_dsl.decode_d256_q_tile
+
+    def spy(*args, **kwargs):
+        seen.append(real(*args, **kwargs))
+        return seen[-1]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(api_dsl, "decode_d256_q_tile", spy)
+        _run_graph(
+            B=8,
+            H=8,
+            KH=1,
+            s_q=4,
+            lens=[65536, 40000, 1, 129, 65000, 777, 33333, 20000],
+            q_lens=[4, 3, 4, 2, 4, 1, 4, 0],
+            page=page,
+            causal_br=True,
+            sink=sink,
+        )
+    assert 32 in seen, seen
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 0, 2048, 4096, 300, 77], q_lens=[1, 0, 1, 1, 1, 1, 1, 1], page=16, sink=0.7),
+        dict(B=4, H=16, KH=2, s_q=2, lens=[4096, 600, 0, 129], q_lens=[2, 1, 0, 2], page=16, causal_br=True, sink=True),
+        dict(B=2, H=32, KH=2, s_q=3, lens=[16384, 9000], q_lens=[3, 1], page=16, causal_br=True, sink=0.7, expect=PREFILL),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect="decode_d128_f16", split_kv=2),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=64, expect="decode_d128_f16", split_kv=2),
+    ],
+    ids=["d256_decode_empty_batch", "d256_decode_mtp2_trim", "d256_prefill_tile_trim", "d128_decode_split2", "d64_decode_split2"],
+)
+def test_split_sink_keeps_padded_query_rows_dead(case):
+    """Through the graph API on a SPLIT plan with a sink: a batch entry with no live query (Q length 0) or a row past its batch's Q length
+    keeps O := 0 / LSE := -inf, while a VALID row with no key in range (the empty-cache batch) lands on O := 0 / LSE := sink -- the split
+    partials of the two are the same (every split dead), so the combine takes the per-batch Q lengths.  The d256 and d128 / d64 decode
+    tiles and the d256 prefill tile (S_q x G = 48 rows) all feed it, with an auto-selected or a pinned split."""
+    plan = _run_graph(dtype=torch.bfloat16, **case)
+    assert plan.knobs.split_kv > 1, plan.knobs
 
 
 @pytest.mark.L0

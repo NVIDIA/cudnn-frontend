@@ -14,6 +14,44 @@ from frost_test_utils import launch_f16, requires_blackwell, requires_dsl, requi
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 
+@pytest.mark.parametrize(
+    "host_attr,flag", [("_host", None), ("_host_prepared", "_prepared_fp8"), ("_host_prepared", "_prepared_mxfp8"), ("_host_thd_split", "packed_thd_split")]
+)
+def test_host_order_reused_but_each_compiled_wrapper_still_checked(monkeypatch, host_attr, flag):
+    """Template metadata may be shared; mutable plan lists and compiled ABI checks may not."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import prepared
+
+    def host(q, tile: "Constexpr", stream):
+        pass
+
+    def compiled(q, stream):
+        pass
+
+    def new_entry(q, extra, stream):
+        pass
+
+    km = SimpleNamespace(__name__="test_host", _host=host, _host_prepared=host, _host_thd_split=host)
+    api = SimpleNamespace(_k_mod=km, _compiled_kernel=compiled, **({flag: True} if flag else {}))
+    monkeypatch.setattr(prepared, "positional_entry", lambda fn: fn)
+    _, _, order = prepared._positional_order(api)
+    order.clear()
+    signature = prepared.inspect.signature
+
+    def no_repeat_host(entry):
+        assert entry is not host, "Repeated immutable template-host inspection"
+        return signature(entry)
+
+    monkeypatch.setattr(prepared.inspect, "signature", no_repeat_host)
+    assert prepared._positional_order(api) == (compiled, compiled, ["q", "stream"])
+    api._compiled_kernel = new_entry
+    with pytest.raises(NotImplementedError, match="disagrees with the compiled wrapper"):
+        prepared._positional_order(api)
+    setattr(km, host_attr, new_entry)
+    assert prepared._positional_order(api) == (new_entry, new_entry, ["q", "extra", "stream"])
+
+
 def _load(arch, template, d_qk, d_v, **overrides):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
@@ -27,22 +65,69 @@ def _load(arch, template, d_qk, d_v, **overrides):
     return load_template(str(path), TemplateParams(**values), tag=f"pointer_abi_{arch}_{template}_{d_qk}_{d_v}")
 
 
+# The f16/bf16 hosts the direct tests drive through ``launch_f16``: (arch tree, kernel file, d_qk, d_v).
+_F16_HOSTS = [
+    ("sm100", "decode_d128_f16", 128, 128),
+    ("sm100", "decode_d256_f16", 256, 256),
+    ("sm100", "prefill_d128_f16", 128, 128),
+    ("sm100", "prefill_d192_d128_f16", 192, 128),
+    ("sm100", "prefill_d256_f16", 256, 256),
+    ("sm100", "prefill_d512_f16", 512, 512),
+    ("sm107", "prefill_d128_f16", 128, 128),
+    ("sm107", "prefill_d192_d128_f16", 192, 128),
+    ("sm107", "prefill_d512_f16", 512, 512),
+    ("sm107", "decode_d256_f16", 256, 256),
+]
+
+
+@pytest.mark.parametrize("arch,template,d_qk,d_v", _F16_HOSTS)
+def test_direct_launcher_fills_every_required_slot_of_the_host(arch, template, d_qk, d_v):
+    """``launch_f16`` is the direct tests' binder for the explicit host ABI.  Its signature filter DROPS a keyword the host
+    does not carry, but it cannot invent one the host requires: a slot appended to a host without a Python default (the
+    d128 prefill hosts' ten score / bias / kv_mask / inv_scale slots, explicit so the compiled host persists) is a
+    ``TypeError`` at the call unless the launcher names it.  Pinned on the host for every f16 host of both arch trees:
+    the keyword set is captured through a recorder standing in for the compiled callable (CPU tensors supply the strides
+    and addresses; nothing is compiled or launched) and compared with the host's required runtime slots."""
+    import inspect
+
+    try:
+        mod = _load(arch, template, d_qk, d_v)
+    except NotImplementedError as e:
+        if "sm_107a" in str(e):
+            pytest.skip(str(e))  # Rule 7: below the sm_107a DSL floor the Rubin host declines typed; the pin runs where it loads
+        raise
+    host_params = inspect.signature(mod._host).parameters
+    required = [n for n, p in host_params.items() if "Constexpr" not in str(p.annotation) and p.default is inspect.Parameter.empty]
+    b, h, sq, skv = 1, 2, 4, 256  # the decode tiles' row guard: S_q x HEADS_PER_TILE <= N_Q
+    q = torch.zeros((b, sq, h, d_qk), dtype=torch.float16)
+    k = torch.zeros((b, skv, h, d_qk), dtype=torch.float16)
+    v = torch.zeros((b, skv, h, d_v), dtype=torch.float16)
+    o = torch.zeros((b, sq, h, d_v), dtype=torch.float16)
+    lse = torch.zeros((b, h, sq), dtype=torch.float32)
+    captured = {}
+    launch_f16(
+        lambda **kw: captured.update(kw),
+        q,
+        k,
+        v,
+        o,
+        lse,
+        torch.zeros(h, dtype=torch.float32),
+        torch.zeros(b, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int64),
+        (b, h, h, sq, skv, 0),
+        1.0,
+        0,
+        0,
+        host=mod._host,
+    )
+    assert set(captured) <= set(host_params), sorted(set(captured) - set(host_params))  # the filter passes nothing the host lacks
+    missing = [n for n in required if n not in captured]
+    assert not missing, f"{arch}/{template}: launch_f16 names no value for the host's required slots {missing}"
+
+
 @requires_blackwell
-@pytest.mark.parametrize(
-    "arch,template,d_qk,d_v",
-    [
-        ("sm100", "decode_d128_f16", 128, 128),
-        ("sm100", "decode_d256_f16", 256, 256),
-        ("sm100", "prefill_d128_f16", 128, 128),
-        ("sm100", "prefill_d192_d128_f16", 192, 128),
-        ("sm100", "prefill_d256_f16", 256, 256),
-        ("sm100", "prefill_d512_f16", 512, 512),
-        ("sm107", "prefill_d128_f16", 128, 128),
-        ("sm107", "prefill_d192_d128_f16", 192, 128),
-        ("sm107", "prefill_d512_f16", 512, 512),
-        ("sm107", "decode_d256_f16", 256, 256),
-    ],
-)
+@pytest.mark.parametrize("arch,template,d_qk,d_v", _F16_HOSTS)
 def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
     """An unused singleton stride above int32 is legal without a huge allocation.
 

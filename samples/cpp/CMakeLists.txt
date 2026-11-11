@@ -65,6 +65,8 @@ add_executable(
     misc/slice.cpp
     misc/sm_carveout.cpp
     misc/cudagraphs.cpp
+    misc/cudagraph_topology.cpp
+    misc/localized_tensors.cpp
     misc/deviceless_aot_compilation.cpp
     misc/compile_time_constant_example.cpp
 
@@ -74,6 +76,10 @@ add_executable(
     membound/concat.cpp
     membound/membound_fusion.cpp
     membound/boolean_fusion.cpp
+    membound/custom_reduction.cpp
+    membound/custom_reduction_argmax.cpp
+    membound/custom_reduction_sampling.cpp
+    membound/custom_reduction_xla.cpp
 
     causal_conv1d/causal_conv1d.cpp
     causal_conv1d/causal_conv1d_nwh.cpp

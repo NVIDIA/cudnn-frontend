@@ -841,7 +841,14 @@ def test_mxfp8_fusion_params_are_inference_only_and_keep_every_other_key():
     spelled identically.  Under MXFP8 there is no rstd, no ``off`` arm, and not both quant flags; ``weight_fp4`` (the e2m1-B
     arm) needs ``quant_mxfp8`` and refuses ``quant_fp8``."""
     assert NormRopeFusionParams() == NormRopeFusionParams(quant_mxfp8=False) == NormRopeFusionParams(weight_fp4=False)
-    assert [f.name for f in dataclasses.fields(NormRopeFusionParams)][-4:] == ["quant_fp8", "qk_norm", "quant_mxfp8", "weight_fp4"]
+    assert [f.name for f in dataclasses.fields(NormRopeFusionParams)][-6:] == [
+        "quant_fp8",
+        "qk_norm",
+        "quant_mxfp8",
+        "weight_fp4",
+        "kv_pool_page_size",
+        "kv_slot_i64",
+    ]
     p = _fused_mx_params()
     validate_norm_rope_params(p)
     validate_norm_rope_params(_fused_mx_params(qk_norm=False))

@@ -4,6 +4,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <cudnn_frontend.h>
 
@@ -31,6 +32,8 @@ struct PlanMetadata {
 };
 
 struct InspectableGraph : fe::graph::Graph {
+    using fe::graph::Graph::plans;
+
     PlanMetadata
     metadata(int64_t index) const {
         PlanMetadata result;
@@ -145,6 +148,16 @@ TEST_CASE("Graph autotune requires a built candidate", "[graph][autotune]") {
 }
 
 TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[graph][autotune]") {
+    bool const legacy_callback = GENERATE(false, true);
+    auto tune = [legacy_callback](InspectableGraph& graph, cudnnHandle_t handle, auto& bindings, void* workspace) {
+        if (!legacy_callback) return graph.autotune(handle, bindings, workspace);
+        graph.plans.autotune_impl = [](auto& entries, auto, auto const&, auto, auto) {
+            entries.erase(std::remove(entries.begin(), entries.end(), nullptr), entries.end());
+            std::reverse(entries.begin(), entries.end());
+            return fe::error_t{fe::error_code_t::OK, ""};
+        };
+        return graph.plans.autotune(handle, bindings, workspace);
+    };
     Handle handle;
     auto graph = make_matmul(handle.value);
     REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
@@ -182,7 +195,7 @@ TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[gr
     REQUIRE_FALSE(original.empty());
     Bindings bindings;
     DeviceBuffer workspace(static_cast<size_t>(graph->get_autotune_workspace_size()));
-    REQUIRE(graph->autotune(handle.value, bindings.pointers, workspace.value).is_good());
+    REQUIRE(tune(*graph, handle.value, bindings.pointers, workspace.value).is_good());
     REQUIRE(graph->selected_index() == 0);
     REQUIRE(graph->get_execution_plan_count() == static_cast<int64_t>(original.size()));
     for (int64_t i = 0; i < graph->get_execution_plan_count(); ++i) {
@@ -219,7 +232,7 @@ TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[gr
     REQUIRE(graph->serialize(blob).is_good());
     InspectableGraph reloaded;
     REQUIRE(reloaded.deserialize(handle.value, blob, false, false).is_good());
-    REQUIRE(reloaded.autotune(handle.value, bindings.pointers, workspace.value).is_good());
+    REQUIRE(tune(reloaded, handle.value, bindings.pointers, workspace.value).is_good());
     std::vector<fe::BehaviorNote_t> reloaded_notes;
     REQUIRE(reloaded.get_behavior_notes(reloaded_notes).is_good());
     CHECK(reloaded_notes == expected_winner.behavior);
@@ -240,4 +253,23 @@ TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[gr
     REQUIRE(graph->build_plan_at_index(count).is_good());
     REQUIRE(graph->execute(handle.value, bindings.pointers, workspace.value).is_good());
     bindings.check_output();
+}
+
+TEST_CASE("Failed legacy autotune preserves plans and selection", "[graph][autotune]") {
+    bool const callback_error = GENERATE(false, true);
+    Handle handle;
+    auto graph = make_three_candidates(handle.value);
+    REQUIRE(graph->build_plan_at_index(2).is_good());
+    auto const original        = graph->built_plans();
+    auto const notes           = graph->plans.behavior_notes;
+    auto const numeric         = graph->plans.numeric_notes;
+    graph->plans.autotune_impl = [callback_error](auto& entries, auto, auto const&, auto, auto) {
+        entries.clear();
+        return fe::error_t{callback_error ? fe::error_code_t::GRAPH_EXECUTION_FAILED : fe::error_code_t::OK, ""};
+    };
+    REQUIRE(graph->plans.autotune(handle.value, {}, nullptr).is_bad());
+    REQUIRE(graph->built_plans() == original);
+    REQUIRE(graph->selected_index() == 2);
+    REQUIRE(graph->plans.behavior_notes == notes);
+    REQUIRE(graph->plans.numeric_notes == numeric);
 }

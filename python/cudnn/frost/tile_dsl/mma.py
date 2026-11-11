@@ -93,6 +93,68 @@ def mma_m16n8k32_f32(
 
 
 @cute.jit
+def mma_m16n8k32_mxf8_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+    c0: cutlass.Float32,
+    c1: cutlass.Float32,
+    c2: cutlass.Float32,
+    c3: cutlass.Float32,
+    sf_a: cutlass.Int32,
+    sf_b: cutlass.Int32,
+    sf_a_byte: cutlass.Constexpr[int],
+    sf_b_byte: cutlass.Constexpr[int],
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """Block-scaled ``mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32`` (UE8M0 scales).
+
+    One E8M0 scale per row of A and per column of B covers the whole k32 step.
+    ``sf_a`` / ``sf_b`` are 32-bit registers holding up to four scale bytes;
+    ``sf_a_byte`` / ``sf_b_byte`` select one (immediate byte selectors, thread
+    selector 0). Lane ``t`` supplies the A scale of row ``t // 4 + 8 * (t % 2)``
+    and the B scale of column ``t // 4`` (the ``m16n8`` C-fragment rows and the
+    B-fragment column).
+    """
+    if cutlass.const_expr(ab_dtype != cutlass.Float8E4M3FN and ab_dtype != cutlass.Float8E5M2):
+        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
+    if cutlass.const_expr(sf_a_byte not in (0, 1, 2, 3) or sf_b_byte not in (0, 1, 2, 3)):
+        raise ValueError(f"scale byte selectors must be in [0, 4); got {sf_a_byte}, {sf_b_byte}")
+    ab_tag = "e4m3" if cutlass.const_expr(ab_dtype == cutlass.Float8E4M3FN) else "e5m2"
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 fc<4>; .reg .b32 sfa_data, sfb_data; "
+        "mov.b32 fc0, {$r6}; mov.b32 fc1, {$r7}; mov.b32 fc2, {$r8}; mov.b32 fc3, {$r9}; "
+        "mov.b32 sfa_data, {$r10}; mov.b32 sfb_data, {$r11}; "
+        f"mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.{ab_tag}.{ab_tag}.f32.ue8m0 "
+        "{{$w0},{$w1},{$w2},{$w3}}, {{$r0},{$r1},{$r2},{$r3}}, {{$r4},{$r5}}, {fc0,fc1,fc2,fc3}, "
+        f"sfa_data, {{{sf_a_byte}, 0}}, sfb_data, {{{sf_b_byte}, 0}}; }}",
+        write_only_types=[
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+        ],
+        read_only_args=[
+            a0,
+            a1,
+            a2,
+            a3,
+            b0,
+            b1,
+            c0.bitcast(cutlass.Int32),
+            c1.bitcast(cutlass.Int32),
+            c2.bitcast(cutlass.Int32),
+            c3.bitcast(cutlass.Int32),
+            sf_a,
+            sf_b,
+        ],
+    )
+
+
+@cute.jit
 def desc_opaque(value, anchor=None):
     """Identity mov.b64 so LLVM cannot reassociate a descriptor base into per-k-step 64-bit literals.
 

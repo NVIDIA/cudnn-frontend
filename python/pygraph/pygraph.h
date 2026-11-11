@@ -3,20 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <array>
+#include <functional>
+#include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <unordered_map>
 #include <vector>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/functional.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
 
 #include "cudnn_frontend.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 
@@ -58,7 +58,21 @@ class PyGraph {
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
 
-    PyGraph(Graph_t graph_) : graph(graph_) {};
+    struct CustomCallbackState {
+        py::callable reducer;
+        py::object owner_weakref;
+    };
+    // Each callable has one native owner. Only the root visits it for cyclic GC; child proxies
+    // hold a real Python lease to that root, including proxies whose native graph outlives them.
+    std::vector<std::weak_ptr<CustomCallbackState>> custom_callback_states;
+    py::object callback_gc_owner;
+
+    py::object
+    callback_root_owner() const {
+        return callback_gc_owner ? callback_gc_owner : py::borrow<py::object>(py::find(*this));
+    }
+
+    PyGraph(Graph_t graph_, py::object owner = {}) : graph(graph_), callback_gc_owner(std::move(owner)) {};
 
     PyGraph(std::string const&,
             cudnn_frontend::DataType_t io_data_type,
@@ -70,7 +84,8 @@ class PyGraph {
             std::shared_ptr<KernelCache> kernel_cache,
             std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties,
             bool is_dynamic_shape_enabled,
-            bool is_override_shape_enabled)
+            bool is_override_shape_enabled,
+            std::optional<cudnn_frontend::CudaGraphRetention_t> cuda_graph_retention = std::nullopt)
         : graph(std::make_shared<cudnn_frontend::graph::Graph>()) {
         graph->set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
@@ -91,11 +106,15 @@ class PyGraph {
         }
 
         if (sm_count.is(py::none()) == false) {
-            graph->set_sm_count(sm_count.cast<int32_t>());
+            graph->set_sm_count(py::cast<int32_t>(sm_count));
+        }
+
+        if (cuda_graph_retention.has_value()) {
+            graph->set_cuda_graph_retention(*cuda_graph_retention);
         }
 
         if (sm_version.is(py::none()) == false) {
-            graph->set_sm_version(sm_version.cast<int32_t>());
+            graph->set_sm_version(py::cast<int32_t>(sm_version));
         }
 
         if (is_dynamic_shape_enabled) {
@@ -152,7 +171,7 @@ class PyGraph {
     }
 
     std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function = [this](Graph_t graph, Tensor_t q_kt) {
-        auto py_graph = std::make_shared<PyGraph>(graph);
+        auto py_graph = std::make_shared<PyGraph>(graph, callback_root_owner());
 
         if (callback_fn.has_value()) {
             q_kt = this->callback_fn.value()(*py_graph, q_kt);
@@ -162,7 +181,7 @@ class PyGraph {
     };
 
     std::function<Tensor_t(Graph_t, Tensor_t)> wrapper_function_bprop = [this](Graph_t graph, Tensor_t q_kt) {
-        auto py_graph = std::make_shared<PyGraph>(graph);
+        auto py_graph = std::make_shared<PyGraph>(graph, callback_root_owner());
 
         if (callback_fn_bprop.has_value()) {
             q_kt = this->callback_fn_bprop.value()(*py_graph, q_kt);
@@ -379,6 +398,16 @@ class PyGraph {
               cudnn_frontend::DataType_t const& compute_data_type,
               std::string const& name,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> group_offset = nullptr);
+
+    std::vector<Tensor_t>
+    custom_reduction(std::vector<Tensor_t> inputs,
+                     py::callable reducer,
+                     std::string const& reducer_semantic_key,
+                     std::vector<int64_t> reduction_dims,
+                     std::vector<cudnn_frontend::graph::Custom_reduction_identity> identity_values,
+                     std::optional<std::vector<cudnn_frontend::DataType_t>> compute_data_types,
+                     std::optional<cudnn_frontend::DataType_t> compute_data_type,
+                     std::string const& name);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     reshape(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& input,
@@ -790,7 +819,7 @@ class PyGraph {
     }
 
     // Takes a pointer to a contiguous array of device pointers, ordered as
-    // get_variant_pack_uids_sorted() reports — no pybind11 container copy and no
+    // get_variant_pack_uids_sorted() reports — no nanobind container copy and no
     // per-operand uid->pointer hash lookup. ``plan_index`` selects the plan;
     // -1 means the graph's own candidate.
     void
@@ -934,5 +963,7 @@ class PyGraph {
                   bool const unfuse_fma                                               = false,
                   bool const stats_use_log2                                           = false);
 };
+
+using PyGraphClass = py::class_<PyGraph>;
 
 }  // namespace cudnn_frontend::python_bindings

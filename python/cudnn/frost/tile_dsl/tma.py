@@ -3,6 +3,7 @@
 
 
 from cutlass.experimental import primitives as nvvm
+from cutlass._mlir.dialects import arith
 import cutlass
 import cutlass.cute as cute
 
@@ -93,6 +94,70 @@ def tma_load_tile(
                     group=nvvm.CTAGroup.CTA_2,
                     l2_cache_hint=l2_cache_hint,
                 )
+
+
+@cute.jit
+def tma_load_tile_multicast(
+    smem_tile,
+    gmem_slice,
+    mbar,
+    mcast_mask,
+    *,
+    acquire: cutlass.Constexpr[bool] = True,
+    l2_cache_hint=None,
+):
+    """ONE issuer, EVERY CTA of the cluster receives the tile: the ``cta_group::1`` ``.multicast::cluster`` tensor load.
+
+    Same tile walk as :func:`tma_load_tile` (``tma_loads_per_tile`` subtiles, one elected lane per subtile), but the op is
+    ``cp.async.bulk.tensor.<N>d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster`` WITHOUT a
+    ``.cta_group`` qualifier: the bytes land at the SAME CTA-relative SMEM offset in every CTA named by ``mcast_mask``
+    (a 16-bit rank mask), and the ``complete_tx`` is delivered to EACH destination CTA's OWN mbarrier at the same
+    CTA-relative offset (PTX ISA; the DSL primitive's "per-CTA local mbars" topology).  So the protocol is: every
+    receiving CTA initialises its own mbarrier and arms it with ``expect_tx = the tile's bytes`` (``tma_subtile`` boxes,
+    OOB rows / cols zero-filled AND counted), ONLY the issuing CTA calls this, every CTA waits on its own mbarrier.  A
+    ``complete_tx`` that lands before a peer's own arm leaves that peer's tx-count transiently negative, which the
+    mbarrier permits (the CUTLASS multicast-TMA pipelines rely on it); keep at most ONE fill per stage in flight so the
+    magnitude stays inside one tile.
+
+    NOT :func:`tma_load_tile`'s ``cta_group=2`` path, whose bytes complete on the 2-SM-group LEADER's mbarrier only
+    (``mbarrier-patterns.md`` P9 -- that is the collective-MMA operand form); the two forms differ in WHICH CTA's
+    barrier sees the bytes, which no numerics test shows: a peer waiting its own barrier under the cta_group::2 form
+    hangs.  ``mcast_mask`` is a VALUE (the native op keeps it in a register; a folded immediate would be the
+    ``commit_mma`` hazard of ``barrier.py``).  First consumer: the sm107 f16/bf16 prefill kernel's
+    ``streamed_multicast`` bias ring (``config_sm107.BIAS_MODE_STREAMED_MULTICAST``): two independent CTAs of a cluster
+    that read the same bias tile sequence."""
+    num_iters = smem_tile.tma_loads_per_tile
+    granu_elems = smem_tile.tma_granu_elems
+    sub_stride = smem_tile.tma_subtile_stride_elems
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        tma_desc_ptr = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                tma_desc_ptr,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        tma_desc_ptr = gmem_slice.tma_desc.get_ptr()
+    coord_d = gmem_slice.coord_d
+    outer_coords = tuple(gmem_slice.coords[1:])
+    for i in cutlass.range_constexpr(num_iters):
+        d = coord_d + cutlass.Int32(i * granu_elems)
+        smem_chunk = smem_tile.base.subview(i * sub_stride)
+        if nvvm.elect_sync():
+            coords = [d] + list(outer_coords)
+            # group=None: the cta_group::1 multicast (every destination CTA's own mbarrier), never CTAGroup.CTA_2.
+            nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                smem_chunk,
+                tma_desc_ptr,
+                coords,
+                mbar,
+                [],
+                multicast_mask=mcast_mask,
+                l2_cache_hint=l2_cache_hint,
+            )
 
 
 @cute.jit
@@ -253,6 +318,36 @@ def tma_store_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *,
 
 
 @cute.jit
+def tma_reduce_add_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *, acquire: cutlass.Constexpr[bool] = True):
+    """One elected tensor-map add from a source-sized SMEM subtile.
+
+    Both grid-constant and runtime maps follow the load/store slice contract.
+    The caller supplies a full issuing warp, publishes generic SMEM writes to
+    the async proxy, and owns bulk commit/wait plus source-reuse credits.
+    Runtime maps can be acquired once by the caller and passed with
+    ``acquire=False`` for subsequent subtiles of the same work item.
+    """
+    if cutlass.const_expr(subtile < 0 or subtile >= smem_tile.tma_loads_per_tile):
+        raise ValueError("tma_reduce_add_subtile: subtile outside the source tile")
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        desc = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                desc,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        desc = gmem_slice.tma_desc.get_ptr()
+    coords = [gmem_slice.coord_d + cutlass.Int32(subtile * smem_tile.tma_granu_elems)] + list(gmem_slice.coords[1:])
+    source = smem_tile.base.subview(subtile * smem_tile.tma_subtile_stride_elems)
+    if nvvm.elect_sync():
+        nvvm.cp_async_bulk_tensor_reduce(desc, source, "add", coords)
+
+
+@cute.jit
 def bulk_copy(smem_dst, gmem_src, n_bytes, mbar):
     if nvvm.elect_sync():
         nvvm.cp_async_bulk_shared_cluster_global(
@@ -294,6 +389,25 @@ def cp_async_commit():
 @cute.jit
 def cp_async_wait(num_remaining: cutlass.Constexpr[int] = 0):
     nvvm.cp_async_wait_group(num_remaining)
+
+
+@cute.jit
+def cp_async_gather_row16(smem_dst, gmem_src, live):
+    """ONE 16-byte ``cp.async.cg.shared.global`` of a GATHERED row chunk with a per-copy ZERO-FILL predicate.
+
+    ``live`` (a ``cutlass.Boolean``) selects ``src-size = 16`` (the 16 bytes at ``gmem_src`` land in ``smem_dst``) or ``src-size = 0``
+    (nothing is read; the 16 destination bytes are ZERO-FILLED -- PTX fills the bytes past ``src-size`` with zeros).  ``gmem_src`` must
+    be a VALID address on either arm (a dead row passes the operand's base pointer), ``smem_dst`` the 16-B-aligned destination (an
+    ``Array`` subview or a ``Pointer``).  The copy joins the calling thread's CURRENT ``cp.async`` group: the caller commits
+    (:func:`cp_async_commit`) and waits (:func:`cp_async_wait`) -- every lane commits, a lane with nothing live included (an empty
+    group completes at once), so a group ledger stays uniform across the CTA.
+
+    Why a helper and not :func:`load_tile_2d`: that loader's ``valid_rows`` / ``valid_cols`` predicate is a DENSE tile's bounds (row
+    index below a count); an index-list gather decides per ROW whether the row exists (a -1 block id, a block past the sequence's
+    length, a dead item, a -1 page) -- a different predicate with the same zero-fill mechanics.  The SM107 lean block-sparse decode
+    tile (``sm107/sparse_lean_d256_f16.py``) is its first caller (K + V, dense and paged pools, one spelling)."""
+    size = cutlass.Int32(arith.select(live.ir_value(), cutlass.Int32(16).ir_value(), cutlass.Int32(0).ir_value()))
+    nvvm.cp_async_shared_global(smem_dst, gmem_src, 16, nvvm.LoadCacheModifier.CG, cp_size=size)
 
 
 @cute.jit
@@ -463,6 +577,15 @@ def st_global_v4(addr, values, dtype):
     )
 
 
+def ld_shared(addr, dtype):
+    """32-bit shared load: one register of ``dtype`` from the shared-window address ``addr`` (the twin of :func:`ld_global`)."""
+    return nvvm.inline_ptx(
+        f"ld.shared.{ptx_type_suffix(dtype)} $0, [$1];",
+        write_only_types=[dtype],
+        read_only_args=[addr],
+    )
+
+
 def ld_shared_v2(addr, dtype):
     """64-bit shared load: two 32-bit registers of ``dtype`` from ``addr``."""
     return nvvm.inline_ptx(
@@ -494,6 +617,37 @@ def st_shared_v4(addr, values, dtype):
     nvvm.inline_ptx(
         f"st.shared.v4.{ptx_type_suffix(dtype)} [$0], {{$1, $2, $3, $4}};",
         read_only_args=[addr, values[0], values[1], values[2], values[3]],
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSMEM st.async: a register value into a PEER CTA's shared memory, completing tx bytes on the peer's mbarrier.
+# The shape of the fused GDN step kernels' private ``_mapa_u32`` / ``_st_async_f32`` (``linear_attention/frost/kernel/gdn_decode_fused_f16.py``,
+# ``gdn_verify_fused_f16.py``: the one-value norm exchange of their two-CTAs-per-head forms), here as the shared helpers for the shared-expert
+# decode pair's cluster K-reduction, which ships a lane's four fp32 accumulators as ONE 16-byte ``st.async.v4`` and a gate-logit leaf as one
+# 4-byte ``st.async.f32``.  The GDN kernels keep their own scalar copies until their next kernel change (their cubins are pinned by md5;
+# swapping an import is that PR's job, not this one's).  Both the destination and the mbarrier are 32-bit shared-window
+# addresses translated by ``mapa`` (translating only the data address fires the SENDER's barrier: ``frost-tile-dsl.md`` section 4).  The
+# sender owes no drain (a register source); the RECEIVER's mbarrier wait is the drain, and it takes the cluster-scope acquire
+# (``barrier.wait_cluster_acquire``).  Lane ledger: one store per calling lane -- nothing here elects.
+
+
+def mapa_u32(addr32, rank):
+    """``mapa.shared::cluster.u32``: this CTA's shared-window address translated to the same offset in cluster CTA ``rank``'s window."""
+    return nvvm.inline_ptx("mapa.shared::cluster.u32 $0, $1, $2;", write_only_types=[cutlass.Int32], read_only_args=[addr32, rank])
+
+
+def st_async_f32(peer_addr32, value, peer_mbar32):
+    """One fp32 (4 bytes) into a peer CTA's shared memory by ``st.async``, completing 4 tx bytes on the peer's mbarrier."""
+    nvvm.inline_ptx("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];", read_only_args=[peer_addr32, value, peer_mbar32])
+
+
+def st_async_v4_f32(peer_addr32, values, peer_mbar32):
+    """Four fp32 (``values[0..3]``, 16 bytes, a 16-B-aligned peer address) into a peer CTA's shared memory by ONE ``st.async.v4``,
+    completing 16 tx bytes on the peer's mbarrier -- a quarter of the DSMEM transactions of four scalar ships."""
+    nvvm.inline_ptx(
+        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [$0], {$1, $2, $3, $4}, [$5];",
+        read_only_args=[peer_addr32, values[0], values[1], values[2], values[3], peer_mbar32],
     )
 
 
@@ -667,6 +821,41 @@ def tma_gather4(desc, dst_smem, mbar, col, r0, r1, r2, r3, *, cta_group: int = 1
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+_PREFETCH_TEMPLATES = {
+    2: "cp.async.bulk.prefetch.tensor.2d.L2.global.tile [$0, {$1, $2}];",
+    3: "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {$1, $2, $3}];",
+    4: "cp.async.bulk.prefetch.tensor.4d.L2.global.tile [$0, {$1, $2, $3, $4}];",
+    5: "cp.async.bulk.prefetch.tensor.5d.L2.global.tile [$0, {$1, $2, $3, $4, $5}];",
+}
+
+
+@cute.jit
+def tma_prefetch_boxes(gmem_slice, num_iters: int, granu_elems: int):
+    """Prefetch into L2 the ``num_iters`` TMA boxes a tiled load of ``gmem_slice`` issues (innermost coordinate stepped
+    by ``granu_elems``).  One elected lane issues; nothing lands in SMEM and no mbarrier is involved."""
+    from cutlass._mlir.dialects import llvm
+
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        desc = _desc_addr_i64(gmem_slice.desc_ptr)
+    else:
+        desc = _desc_addr_i64(gmem_slice.tma_desc)
+    rank = len(gmem_slice.coords)
+    outer = [cutlass.Int32(c) for c in gmem_slice.coords[1:]]
+    coord_d = cutlass.Int32(gmem_slice.coord_d)
+    if nvvm.elect_sync():
+        for i in cutlass.range_constexpr(num_iters):
+            d = coord_d + cutlass.Int32(i * granu_elems)
+            llvm.inline_asm(
+                None,
+                [desc.ir_value(), d.ir_value()] + [c.ir_value() for c in outer],
+                _PREFETCH_TEMPLATES[rank],
+                "l" + ",r" * rank,
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
 
 
 def ldg_int32x4(addr):

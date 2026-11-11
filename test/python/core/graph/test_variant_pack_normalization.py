@@ -160,7 +160,7 @@ def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
     gate = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="g")
     beta = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="beta")
     cu = g.tensor([nseq + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
-    out, _fs, _h = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
+    out, _fs, _h, _composed = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
     out.set_output(True).set_data_type(dt)
     try:
         g.build()
@@ -442,6 +442,13 @@ def test_override_many_matches_the_per_operand_path():
         (([1, 8, 8], [64, 8, 1]), fp4, (1, 8, 4), (), [1, 4, 8], [32, 8, 1]),  # fp4: unit-stride extent halves, other strides halve
         (([2, 1, 8], [8, 8, 1]), bf16, (2, 1, 8), (8, 8, 1), [1, 1, 8], [8, 8, 1]),  # singleton / tied-stride axis
         (None, bf16, (8, 8), (8, 1), [4, 8], [8, 1]),  # dtype-only declaration (no storage geometry)
+        # Equal axis order need not mean equal strides or equal tie groups.
+        (None, bf16, (2, 3, 4), (1, 1, 0), [2, 3, 4], [8, 4, 0]),
+        # Breaking a stable tie in the opposite order must still permute.
+        (None, bf16, (2, 3, 4), (1, 1, 0), [2, 3, 4], [4, 8, 0]),
+        (None, bf16, (2, 3, 4), (1, 4, 8), [2, 3, 4], [4, 8, 1]),  # non-self-inverse permutation
+        (None, bf16, (2,) * 8, (4, 4, 3, 2, 1, 1, 0, 0), list(range(2, 10)), [16, 8, 7, 6, 5, 4, 2, 1]),
+        (None, bf16, (2,) * 9, (4, 4, 3, 2, 1, 1, 0, 0, 0), list(range(2, 11)), [1, 2, 4, 5, 6, 7, 8, 16, 32]),
     ]
     for decl, dtype, pshape, pstride, oshape, ostride in cases:
         dl = (*_dlpack_code_bits(dtype), _dlpack_lanes(dtype))

@@ -52,7 +52,7 @@ CONFIG = BenchmarkConfig(
         (48360, 48360),  # 480p, 121 frames
         (75600, 75600),  # 720p, 81 frames
     ],
-    backends=["cudnn", "cudnn_oss", "flash_attention_4"] + fa2_on_ampere(),
+    backends=["cudnn", "cudnn_oss", "cudnn_auto", "flash_attention_4"] + fa2_on_ampere(),
     # bf16 = the released/trained precision. The fp8 / mxfp8 rows model quantized
     # inference: per-tensor fp8 in/out, block-scale mxfp8 in, and the block-scaled-
     # output modes over either input (FP4 O + E4M3/16 scales, E4M3 O + UE8M0/32
@@ -62,6 +62,6 @@ CONFIG = BenchmarkConfig(
     profile_pass="both",  # forward + backward for training
     deterministic_bwd=[False, True],
     batch_size=1,
-    num_iterations=10,
+    num_iterations=20,
     output_dir="results",
 )

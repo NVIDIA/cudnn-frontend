@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Make ``cudnn.gemm.frost`` importable: overlay the source ``python/cudnn``
-dir onto the installed ``cudnn.__path__`` and the nested ``cudnn.gemm.__path__``.
-Unnecessary once the engine ships in the built frontend package."""
+"""Run this checkout's ``cudnn.gemm.frost`` (and ``cudnn.frost``): overlay the
+source ``python/cudnn`` dir AHEAD of the installed ``cudnn.__path__`` and the
+nested ``cudnn.gemm.__path__``, so a built frontend package that also ships the
+engine does not shadow the tree under test. The compiled binder module and the
+package ``__init__`` still come from the installed package."""
 
 from __future__ import annotations
 
@@ -17,12 +19,12 @@ import cudnn
 _SRC_CUDNN = Path(__file__).resolve().parents[4] / "python" / "cudnn"
 if _SRC_CUDNN.is_dir():
     if str(_SRC_CUDNN) not in cudnn.__path__:
-        cudnn.__path__.append(str(_SRC_CUDNN))
+        cudnn.__path__.insert(0, str(_SRC_CUDNN))
     import cudnn.gemm
 
     _src_gemm = str(_SRC_CUDNN / "gemm")
     if _src_gemm not in cudnn.gemm.__path__:
-        cudnn.gemm.__path__.append(_src_gemm)
+        cudnn.gemm.__path__.insert(0, _src_gemm)
 
 
 @pytest.fixture(autouse=True)

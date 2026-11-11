@@ -7,23 +7,20 @@ documented in the parent backend `README.md`.
 ## Upstream
 
 - **Project**: `cutedsl_megamoe` (NVIDIA-internal repository; URL omitted).
-- **Source tree**: `cutedsl_megamoe/next/sources`.
 - **Current synchronized commit**:
-  `1667b47a3c911ecade464ab524baf192a0bf5962`.
-- **Discrete-weight implementation**:
+  `e8df888670a44b099e9d7009d5338a4ab45bf848`.
+- **Discrete-weight implementation ancestor**:
   `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
-- **Last synced**: 2026-09-17.
+- **Last synced**: 2026-09-22.
 - **Vendored subset**: the exact export closure produced for
   `RubinTrainingFwdGluMegaMoE` and `RubinTrainingBwdDgluMegaMoE`, including
   materialized source-copy modules.
-
-The export command is:
-
-```bash
-python next/export_src.py \
-  --kernels RubinTrainingFwdGluMegaMoE RubinTrainingBwdDgluMegaMoE \
-  --dst_dir <empty-directory>
-```
+- **Raw exported source files**: 37 (plus 15 generated package markers).
+- **Expected vendored Python files**: 48 after the local overlay.
+- **Expected vendored Python tree SHA256**:
+  `5c000a4c2824b71ea669415a35c27f0ac678a076b6b3d4f586595d6b2d1796d4`.
+  This uses the same relative-path-and-content algorithm as
+  `_megamoe_backend.mxfp8._fingerprint.source_tree_sha256`.
 
 ## Policy
 
@@ -53,6 +50,10 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   always supplies its exact caller-prescribed pool rows. Upstream topology
   clamps remain intact, and the component rejects physical capacity below the
   padded requirement for the clamped logical limit.
+- Overflow policy is group-consistent without a post-kernel collective:
+  every rank derives the same group-wide overflow bit from the replicated
+  pre-truncation destination totals, while only the overflowing destination
+  truncates its local expert sizes.
 - The materialized Rubin training TMEM helper replaces two unused Blackwell
   swap-AB extension annotations with `Any`; the extension and its now-empty
   local `kernel_src/blackwell` package tree are omitted from the vendored

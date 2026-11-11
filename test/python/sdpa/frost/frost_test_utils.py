@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,23 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+
+
+def requires_bwd_engine_row(name):
+    """``skipif`` off the sm range the named FROST backward engine row DECLARES (``Capabilities.sm_lo`` / ``sm_hi`` in
+    sdpa/bwd/engines.py), read from the row at import -- never a per-file copy of the range.  For the rows whose bodies are
+    compiled per device (the ``sdpa_bwd_sm100_d128`` family: ``--gpu-arch sm_{cc}a`` from the device cc, cc 10.0 / 10.3 and,
+    since the Rubin admission, cc 10.7) a suite gated on ``requires_pre_rubin_blackwell`` would skip exactly the lane that
+    needs to run; this marker follows the row instead."""
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    caps = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+    return pytest.mark.skipif(
+        _SM is None or not (caps.sm_lo <= _SM <= caps.sm_hi),
+        reason=f"needs a GPU in the {name} row's range (SM{caps.sm_lo}-{caps.sm_hi}), have " + ("none" if _SM is None else f"sm_{_SM}"),
+    )
+
+
 # Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
 # sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
 # marker mirrors that range rather than pinning (10, 7)).
@@ -130,14 +148,14 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
-def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
+def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
     """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 
     The FIRST entry for that engine is the heuristics' own best guess for this
-    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` pin a different one, so a test can run a
-    config the best guess would not choose. Filters match the STRUCTURED knobs,
+    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` / ``sched_policy`` pin a different one, so a
+    test can run a config the best guess would not choose. Filters match the STRUCTURED knobs,
     not the rendered plan name: substring matching a name would let a request
     for tile_n=128 select a tile_n=1280 plan, and the test would pass having
     run something else. Every filter — and each ``tiles`` component — is
@@ -154,11 +172,13 @@ def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
             return False
         return all(
             want is None or getattr(graph.plans[i].knobs, field, None) == want
-            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv))
+            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv), ("sched_policy", sched_policy))
         )
 
     index = next((i for i in range(len(names)) if _wanted(i)), None)
-    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv}; plans={names}"
+    assert (
+        index is not None
+    ), f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv} sched_policy={sched_policy}; plans={names}"
     graph.select_plan(index)
     return graph.plans[index]
 
@@ -285,12 +305,40 @@ def launch_f16(
         block_table_ptr=P(block_table_tensor, 4),
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
+        table_v_strides=(tuple(block_table_v_tensor.stride()) if block_table_v_tensor is not None else t_st) if paged else None,
         n_pages=n_pages,
         # The d128 decode tile's ragged-Q leg slots (dense launches leave them
         # dead: RAGGED_Q is off in every direct test's params); filtered out for
         # hosts that do not carry them.
         ragged_q_addr=0,
         ragged_q_div=1,
+        # The d256 half bodies' epilogue-gate slots (a pointer + a runtime stride triple, required by their host ABI): the gate is a
+        # module specialization no direct test enables, so this is the no-gate pair the binders fill; filtered out for hosts that
+        # do not carry them.
+        gate_ptr=None,
+        gate_strides=(0, 0, 0),
+        # The d128 prefill hosts' ten APPENDED operand slots (both arch trees): the score side outputs, the additive bias, the
+        # per-key kv_mask and the pre-scale bias divisor.  They are explicit on the production ABI (the prepared binder fills
+        # them from the frame, compile()'s fakes shape them; a Python default would leave the compiled host un-persistable), so
+        # a direct launch fills them too -- with the values of a plan WITHOUT the arms: None pointers, zero strides, unit
+        # broadcast extents, inv_scale 1.0 (CFG.BIAS_MODE / KV_MASK_FORM fold the paths out of every direct test's rendering;
+        # the stride / divisor slots are then unread).  Filtered out for hosts that do not carry them.
+        score_max_ptr=None,
+        score_sum_exp_ptr=None,
+        score_max_strides=(0, 0, 0),
+        score_sum_exp_strides=(0, 0, 0),
+        bias_ptr=None,
+        bias_strides=(0, 0, 0),
+        bias_extents=(1, 1),
+        kv_mask_ptr=None,
+        kv_mask_batch_stride=0,
+        inv_scale_softmax=1.0,
+        # Direct template tests request split partials, leaving the optional
+        # in-kernel final-output reduction disabled.
+        final_o_ptr=None,
+        final_lse_ptr=None,
+        final_o_strides=(0, 0, 0),
+        final_lse_strides=(0, 0, 0),
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
@@ -607,3 +655,64 @@ def run_d512_delayed_observer(tmp_path, engine):
     )
     (tmp_path / "delayed_observer.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     assert proc.returncode == 0 and "DELAYED_OBSERVER_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+
+
+# ------------------------------------------------------------------------------------------------------------ per-kernel PTX md5 records
+# A chain's dumped PTX module holds one `.visible .entry` per kernel it launches.  A rendering record pins each kernel the module under test
+# OWNS by the md5 of that kernel's entry region alone, so a change to a kernel SHARED with other chains (listed below) never reddens the rows
+# of every chain that launches it: #1925 changed the grouped THD dK / dV fold and reddened the chain-wide records of three unrelated modules.
+# The module preamble (compiler banner, `.version` / `.target`, the dynamic-SMEM declaration) is the DSL build's -- the record's ``dsl=``
+# line -- and is not a kernel: not recorded.  Record row: ``<token> <arch> <variant> kernel=<name> rc=0 ptx_md5=<32 hex>``.
+D128_THD_SHARED_KERNELS = ("dkv_reduce_thd_origins_kernel",)  # the dK / dV group fold launched by the one-CTA AND the pair grouped THD chains
+_PTX_ENTRY = re.compile(r"^(?:\.visible )?\.entry (\S+?)\(", re.M)
+_KERNEL_NAME = re.compile(r"^cudnn_kernel_(\w+?_kernel)(?:_|$)")
+_RECORD_ROW = re.compile(r"^(\S+) (sm_\w+) (\S+) kernel=(\S+) rc=0 ptx_md5=([0-9a-f]{32})$")
+
+
+def ptx_kernel_name(mangled: str) -> str:
+    """The DSL function's name from a mangled entry symbol: ``cudnn_kernel_<name>_kernel<type mangling>`` -> ``<name>_kernel``."""
+    m = _KERNEL_NAME.match(mangled)
+    return m.group(1) if m else mangled
+
+
+def ptx_kernel_md5s(text: str) -> dict:
+    """{kernel: md5} over the entry regions of ONE dumped PTX module (text), in entry order: a region runs from its ``.entry`` line to the next
+    entry (or the end of the module); the preamble before the first entry is not a kernel and is not hashed."""
+    entries = list(_PTX_ENTRY.finditer(text))
+    out = {}
+    for i, m in enumerate(entries):
+        end = entries[i + 1].start() if i + 1 < len(entries) else len(text)
+        name = ptx_kernel_name(m.group(1))
+        assert name not in out, f"two entries named {name} in one module"
+        out[name] = hashlib.md5(text[m.start() : end].encode()).hexdigest()
+    return out
+
+
+def read_kernel_record(path, token: str, arch: str = "sm_100a") -> tuple:
+    """(dsl line or None, {variant: {kernel: md5}}) of a per-kernel record file for ``token`` / ``arch``; `#` lines are comments."""
+    dsl, want = None, {}
+    with open(path) as f:
+        for ln in f.read().splitlines():
+            if ln.startswith("dsl="):
+                dsl = ln[len("dsl=") :].strip()
+                continue
+            m = _RECORD_ROW.match(ln)
+            if m and m.group(1) == token and m.group(2) == arch:
+                want.setdefault(m.group(3), {})[m.group(4)] = m.group(5)
+    return dsl, want
+
+
+def kernel_record_rows(token: str, variant: str, kernels: dict, excluded=(), arch: str = "sm_100a") -> list:
+    """The record rows of a rendering (every kernel outside ``excluded``, in entry order): what a deliberate re-pin pastes into the file."""
+    return [f"{token} {arch} {variant} kernel={k} rc=0 ptx_md5={v}" for k, v in kernels.items() if k not in excluded]
+
+
+def assert_kernel_record(kernels: dict, want: dict, *, token: str, variant: str, excluded=(), what: str = "the rendering") -> None:
+    """Every recorded kernel renders the recorded md5 and every rendered kernel outside ``excluded`` is recorded (a new launch in a chain is a
+    protocol change, re-pinned deliberately); a shared kernel in ``excluded`` is never compared.  The message names the moved / new / missing
+    kernels and carries the rows a deliberate re-pin pastes into the record."""
+    own = {k: v for k, v in kernels.items() if k not in excluded}
+    moved = {k: (want[k], own[k]) for k in want if k in own and own[k] != want[k]}
+    new, missing = sorted(set(own) - set(want)), sorted(set(want) - set(own))
+    rows = "\n".join(kernel_record_rows(token, variant, kernels, excluded))
+    assert not moved and not new and not missing, f"{what}: moved (record -> rendered) {moved}; new {new}; missing {missing}; rendered rows:\n{rows}"

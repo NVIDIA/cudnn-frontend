@@ -24,6 +24,13 @@ mbar; the leader waits and reads the FOLLOWER's slab over DSMEM):
   form, the relaxed control and the cga1 form (a single-launch smoke of the publish-then-read shape; the 12-process x
   {relaxed, release} x {follower delay} micro-probe under an async-proxy consumer belongs with the first kernel that
   consumes the release arrive).
+
+The two ``mbar_arrive_on_peer(..., release_cta=True)`` arms ride the same probe (forms ``peer_release`` / ``peer_release_pred``): the
+UNPREDICATED arm (``mbarrier_arrive(mapa(mb, peer), scope=CTA, relaxed=False)``, no kernel calls it today -- pinned here so it cannot
+rot unseen) and the predicated inline-PTX arm (the multicast bias ring's cross-CTA stage credit, one elected lane per warp; its kernel
+module pins the rendering, this module pins the helper).  Both must read exactly one ``.release.cta.shared::cluster`` arrive, zero
+relaxed, zero ``.release.cluster``, and no GPU-scope drain in SASS; the probe also prints every ``SYNCS.ARRIVE`` mnemonic it decodes
+(``SASS_ARRIVE_MNEMONICS``), because the suffix is the lowering shape, not the memory order.
 """
 
 import glob
@@ -40,8 +47,9 @@ from frost_test_utils import arch_known_to_the_dsl, nvdisasm_candidates, require
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-FORM_RELEASE, FORM_RELAXED, FORM_CGA1 = 0, 1, 2
-FORMS = {"release": FORM_RELEASE, "relaxed": FORM_RELAXED, "cga1": FORM_CGA1}
+FORM_RELEASE, FORM_RELAXED, FORM_CGA1, FORM_PEER_RELEASE, FORM_PEER_RELEASE_PRED = 0, 1, 2, 3, 4
+FORMS = {"release": FORM_RELEASE, "relaxed": FORM_RELAXED, "cga1": FORM_CGA1, "peer_release": FORM_PEER_RELEASE, "peer_release_pred": FORM_PEER_RELEASE_PRED}
+RELEASE_FORMS = (FORM_RELEASE, FORM_PEER_RELEASE, FORM_PEER_RELEASE_PRED)
 LANES = 32
 
 _PROBE_SRC = textwrap.dedent('''
@@ -56,19 +64,21 @@ _PROBE_SRC = textwrap.dedent('''
     from cudnn.frost.tile_dsl.tma import st_global
 
     LANES = 32
-    FORM_RELEASE, FORM_RELAXED, FORM_CGA1 = 0, 1, 2
+    FORM_RELEASE, FORM_RELAXED, FORM_CGA1, FORM_PEER_RELEASE, FORM_PEER_RELEASE_PRED = 0, 1, 2, 3, 4
 
 
     @cute.kernel
     def probe(mOut: cute.Tensor, form: cutlass.Constexpr[int]):
         cta_group = 1 if form == FORM_CGA1 else 2
-        producer = Producer.LEADER_RELEASE if form == FORM_RELEASE else Producer.LEADER
+        producer = Producer.LEADER if form in (FORM_RELAXED, FORM_CGA1) else Producer.LEADER_RELEASE
+        # the predicated peer form fires ONE elected lane per warp (one warp per CTA here); every other form arrives bare on all 32 lanes
+        arrivers = 1 if form == FORM_PEER_RELEASE_PRED else LANES
         tidx = cutlass.Int32(cute.arch.thread_idx()[0])
         cta = cutlass.Int32(cute.arch.block_idx_in_cluster()) if cutlass.const_expr(cta_group == 2) else cutlass.Int32(0)
         slab = cutlass.Array(cutlass.Int32, LANES, alignment=16, space=cutlass.AddressSpace.smem)
         bar_raw = cutlass.Array(cutlass.Int64, 1, alignment=8, space=cutlass.AddressSpace.smem)
-        # init count = SUM(issuing lanes): 32 lanes x cta_group CTAs, every lane arrives bare (no elect)
-        bar = MBarrier(base_ptr=bar_raw, stages=1, init_count=LANES * cta_group, producer=int(producer), scope=int(Scope.LEADER))
+        # init count = SUM(issuing lanes): arrivers x cta_group CTAs (32 bare lanes, or the one elected lane of the predicated peer form)
+        bar = MBarrier(base_ptr=bar_raw, stages=1, init_count=arrivers * cta_group, producer=int(producer), scope=int(Scope.LEADER))
         if tidx == 0:
             bar.init()
         nvvm.fence_mbarrier_init()
@@ -79,7 +89,14 @@ _PROBE_SRC = textwrap.dedent('''
         # the follower's generic store of "its MMA operand", then the production recipe: fence into the async proxy, arrive
         slab.subview(tidx).store(cta * cutlass.Int32(1000) + tidx * cutlass.Int32(7) + cutlass.Int32(1))
         nvvm.fence_proxy("async.shared", space="cta")
-        bar.arrive(cta_group=cta_group, leader_cta_id=cutlass.Int32(0))
+        if cutlass.const_expr(form == FORM_PEER_RELEASE):
+            # mbar_arrive_on_peer(release_cta=True) UNPREDICATED = mbarrier_arrive(mapa(mb, 0), scope=CTA, relaxed=False); no kernel caller today
+            bar.arrive_on_peer(cutlass.Int32(0), release_cta=True)
+        elif cutlass.const_expr(form == FORM_PEER_RELEASE_PRED):
+            # the multicast bias ring's stage credit: the predicated inline-PTX .release.cta arrive from one elected lane per warp
+            bar.arrive_on_peer(cutlass.Int32(0), pred=nvvm.elect_sync(), release_cta=True)
+        else:
+            bar.arrive(cta_group=cta_group, leader_cta_id=cutlass.Int32(0))
         if cta == 0:
             bar.wait(0)
             # the leader reads the PEER's slab (cga2: CTA 1; cga1: mapa(self, 0) is the local slab)
@@ -144,6 +161,9 @@ _PROBE_SRC = textwrap.dedent('''
         print("SASS MEMBAR", sum(1 for ln in sass if "MEMBAR" in ln))
         print("SASS ARRIVE", sum(1 for ln in sass if "SYNCS.ARRIVE" in ln))
         print("SASS LINES", len(sass))
+        import re
+        mnem = sorted({m.group(0) for ln in sass for m in [re.search(r"U?SYNCS\\.ARRIVE[\\w.]*", ln)] if m})
+        print("SASS_ARRIVE_MNEMONICS", " ".join(mnem) if mnem else "none")
     ''')
 
 
@@ -174,9 +194,11 @@ def _parse(lines):
 
 @pytest.mark.parametrize("form_name", list(FORMS))
 def test_sm107a_release_arrive_ptx_form_and_no_gpu_drain(tmp_path, form_name):
-    """release -> exactly one ``mbarrier.arrive.release.cta.shared::cluster.b64`` and NO ``.release.cluster``; relaxed ->
-    the ``.relaxed.cluster`` form (the ``arrive_on_leader`` control, untouched); cga1 -> a plain local arrive and no
-    cluster arrive at all.  With a decoding nvdisasm: ``CGAERRBAR == 0`` and ``MEMBAR.ALL.GPU == 0`` for every form."""
+    """release / peer_release / peer_release_pred -> exactly one ``mbarrier.arrive.release.cta.shared::cluster.b64`` and NO
+    ``.release.cluster`` (the two ``mbar_arrive_on_peer(release_cta=True)`` arms, unpredicated and predicated, read the same form as
+    ``arrive_on_leader_release``); relaxed -> the ``.relaxed.cluster`` form (the ``arrive_on_leader`` control, untouched); cga1 -> a
+    plain local arrive and no cluster arrive at all.  With a decoding nvdisasm: ``CGAERRBAR == 0`` and ``MEMBAR.ALL.GPU == 0`` for
+    every form, and the decoded ``SYNCS.ARRIVE`` mnemonics are printed (``-s``) for the record."""
     if not arch_known_to_the_dsl("sm_107a"):
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
     form = FORMS[form_name]
@@ -185,9 +207,10 @@ def test_sm107a_release_arrive_ptx_form_and_no_gpu_drain(tmp_path, form_name):
     lines = proc.stdout.splitlines()
     assert any(ln.startswith("COMPILED sm_107a") for ln in lines), proc.stdout[-2000:]
     ptx, sass = _parse(lines)
-    print(f"\n[{form_name}] PTX {ptx} SASS {sass}")
+    mnem = [ln for ln in lines if ln.startswith("SASS_ARRIVE_MNEMONICS")]
+    print(f"\n[{form_name}] PTX {ptx} SASS {sass} {mnem[0] if mnem else ''}")
     assert ptx["RELEASE_CLUSTER_CLUSTER"] == 0, f"a .release.cluster arrive is a MEMBAR.ALL.GPU + CGAERRBAR drain per arrive -- {ptx}"
-    if form == FORM_RELEASE:
+    if form in RELEASE_FORMS:
         assert ptx["RELEASE_CTA_CLUSTER"] == 1 and ptx["RELAXED_CLUSTER_CLUSTER"] == 0, ptx
     elif form == FORM_RELAXED:
         assert ptx["RELAXED_CLUSTER_CLUSTER"] == 1 and ptx["RELEASE_CTA_CLUSTER"] == 0, ptx
@@ -208,8 +231,9 @@ def test_sm107a_release_arrive_ptx_form_and_no_gpu_drain(tmp_path, form_name):
 @requires_rubin
 @pytest.mark.parametrize("form_name", list(FORMS))
 def test_leader_reads_the_followers_slab_after_the_arrive(tmp_path, form_name):
-    """The leader's 32 lanes read the follower's pattern ``1000 + 7 * lane + 1`` exactly (cga2), or their own
-    ``7 * lane + 1`` at cga1; the follower's control row is its own slab."""
+    """The leader's 32 lanes read the follower's pattern ``1000 + 7 * lane + 1`` exactly (cga2 -- the release form, the relaxed
+    control and both ``arrive_on_peer(release_cta=True)`` arms), or their own ``7 * lane + 1`` at cga1; the follower's control row is
+    its own slab."""
     import cuda.bindings.driver as _cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack

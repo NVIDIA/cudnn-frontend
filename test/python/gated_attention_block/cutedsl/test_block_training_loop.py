@@ -43,10 +43,17 @@ And the TRAINING LOOP over the toy decoder of ``gated_block_train`` (the converg
   while a graph that captured the block's FIRST execute replays its capture-time scalars (the documented limitation);
 * the harness core imports only from the standard library, torch, the ``cudnn`` package and this test tree.
 
+The ``L1`` half (every arm compiles its own forward + backward pair, so these stay out of the fast tier): three steps of EVERY
+trajectory arm -- the fp8 recipes (static-unit, recal1, delayed16, recal1-margin2) and the four fp4 weight modes on MXFP8 -- finite
+with the recipe's invariants (``amax * scale <= 448`` on every in-kernel gradient scale, the forward saturation counters present, the
+fp4 code statistics present and in [0, 1], the delayed recipe's counters present); the two-run digest pin for every arm; and the
+``delayed`` recipe fed a ``current`` run's logged per-step scales reproducing its gradients bitwise over three steps.
+
 Accept tests are ``requires_rubin`` (the block targets SM107 only); the refusal tests, the torch-control pin and the import
 detector carry no marker and run on any CUDA device.
 """
 
+import array
 import ast
 import dataclasses
 import importlib
@@ -65,7 +72,8 @@ requirement_error = cutedsl_requirement_error("Gated attention block training-lo
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
-pytestmark = pytest.mark.L0
+# Per-test levels (no module-wide mark): the fast cells are L0, the every-arm cells (one compiled block pair per arm) are L1.
+_L0 = pytest.mark.L0
 
 from cudnn.gated_attention_block import (  # noqa: E402
     GatedAttentionBlockBwd,
@@ -112,6 +120,9 @@ _NORM_W_BOUND_CEIL = 2.0
 _LOSS_REL_BOUND = 1e-4
 # The row keys a feed-less delayed run's step 0 must share with the current recipe's step 0 (the ladder seeds the kernels' own rule).
 _STEP0_KEYS = ("grad_sha256", "loss", "grad_norm_total", "quant_scalars", "grad_norms", "spec", "scale_dp", "act_amax", "sat", "n_clip")
+# The L1 matrix: every trajectory arm of the convergence study (the fp8 recipes and the fp4 weight modes compile their own block pair).
+_EVERY_ARM = [n for n in gbt.TIER_A + gbt.TIER_B]
+_L1 = pytest.mark.L1
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +214,7 @@ def _grads_differ(got: dict, other: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@_L0
 def test_the_recalibration_surface_is_appended_and_keyword_only():
     """Host: the two methods' signatures, and ``grad_scale_margin_log2`` as the LAST parameter of ``GatedAttentionBlockBwd.__init__``
     and of the convenience wrapper (keyword-only, defaulted to the module constant); ``_QuantEpilogue(margin_log2=)`` appended and
@@ -229,6 +241,7 @@ def test_the_recalibration_surface_is_appended_and_keyword_only():
 # ---------------------------------------------------------------------------
 
 
+@_L0
 def test_update_quant_scales_refusals():
     """Every refusal of both methods fires BEFORE any write, typed, on DECLARED blocks: a bf16 block (``ValueError``), a spec of the
     other class (``TypeError``), a differing plan fact (``ValueError`` naming ``dtype`` / ``block_size`` / ``w_qkvg_dtype`` / ``o_fp4``),
@@ -278,6 +291,7 @@ def test_update_quant_scales_refusals():
     assert d.blk.quant is d.spec and d.blk._quant_vals is None
 
 
+@_L0
 def test_grad_scale_margin_refusals_and_plumbing():
     """Host: ``grad_scale_margin_log2`` is validated at declaration -- an int in [0, 8] (a float, a bool, a negative value, 9 and a
     string are ``ValueError``), refused non-default without ``quant`` (a bf16 block quantizes nothing) and under
@@ -299,6 +313,7 @@ def test_grad_scale_margin_refusals_and_plumbing():
     assert default.grad_scale_margin_log2 == _API_CONST == default._quant_dy.margin_log2 == default._quant_do.margin_log2 == default._epilogue.margin_log2
 
 
+@_L0
 def test_the_backward_wrapper_cache_keys_the_margin_by_type(monkeypatch):
     """Host: the convenience wrapper caches compiled blocks by a key that tells the margin ``1`` from ``True`` and from ``1.0`` (Python
     compares the three equal), so a block cached at an int margin is never handed to a caller passing a bool or a float -- they reach
@@ -353,6 +368,7 @@ def test_the_backward_wrapper_cache_keys_the_margin_by_type(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@_L0
 @requires_rubin
 @_FAMILY
 @pytest.mark.parametrize("pipeline", ["unfused_training", "fused_inference"])
@@ -399,6 +415,7 @@ def test_update_quant_scales_rewrites_the_device_scalars(family, pipeline):
         assert torch.equal(saved_ab.o, saved_b.o) and torch.equal(saved_ab.lse, saved_b.lse), "the record after the update differs from the B block's"
 
 
+@_L0
 @requires_rubin
 def test_update_quant_scales_under_o_fp4_records_the_spec():
     """Under ``MxQuantSpec.o_fp4`` both per-tensor scales of the out projection are pinned to 1.0 and the block holds NO device scalar
@@ -431,6 +448,7 @@ def test_update_quant_scales_under_o_fp4_records_the_spec():
     assert blk.quant is b
 
 
+@_L0
 @requires_rubin
 @_FAMILY
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
@@ -474,6 +492,7 @@ def test_update_quant_scales_is_stream_ordered(family, how):
     assert torch.equal(saved2.o, saved_b.o) and torch.equal(saved2.lse, saved_b.lse), f"the record written on the side stream differs ({how})"
 
 
+@_L0
 @requires_rubin
 @_FAMILY
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
@@ -539,6 +558,7 @@ def test_first_execute_writes_the_scales_on_its_launch_stream(family, how, tmp_p
     assert torch.equal(out2, ref.out)
 
 
+@_L0
 @requires_rubin
 @_FAMILY
 @pytest.mark.parametrize("pipeline", ["unfused_training", "fused_inference"])
@@ -617,6 +637,7 @@ def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family,
 # ---------------------------------------------------------------------------
 
 
+@_L0
 @requires_rubin
 @_FAMILY
 def test_bwd_update_quant_scales_changes_the_prologue_constants(family):
@@ -663,6 +684,7 @@ def test_bwd_update_quant_scales_changes_the_prologue_constants(family):
     assert res.blk._quant_vals == res.blk._quant_const_values() and res.blk.quant is res.spec
 
 
+@_L0
 @requires_rubin
 @_FAMILY
 def test_grad_scale_margin_reaches_every_quantize_launch(family):
@@ -754,6 +776,7 @@ def _assert_rows_bitwise(a, b, what: str) -> None:
     assert a.manifest["deterministic_algorithms"] is True and a.manifest["cublas_workspace_config"] in gbt.DETERMINISTIC_CUBLAS_CONFIGS
 
 
+@_L0
 def test_the_training_loop_imports_only_from_the_test_tree_and_the_package():
     """Host: the harness core is a TRACKED helper of this test tree, so every module it imports is the standard library, torch, the
     ``cudnn`` package or a sibling of the tree (resolved by import, not by name) -- a helper reaching into an untracked directory
@@ -787,6 +810,7 @@ def test_the_training_loop_imports_only_from_the_test_tree_and_the_package():
     assert not os.path.basename(path).startswith("test_"), "the helper would be collected as a test module"
 
 
+@_L0
 def test_training_loop_torch_control_two_runs_are_bitwise(deterministic_cublas):
     """Any CUDA device: the pure-torch control arm (the reference block under autograd) trained three steps twice from one seed digests
     equal -- every row, ``grad_sha256`` included -- and its twin driven through the ``GatedBlockFn`` plumbing (the reference block's
@@ -804,6 +828,7 @@ def test_training_loop_torch_control_two_runs_are_bitwise(deterministic_cublas):
     print(f"torch control: losses {[round(r['loss'], 6) for r in a.rows]} run_digest {a.manifest['run_digest'][:16]} ({deterministic_cublas})")
 
 
+@_L0
 @requires_rubin
 def test_training_loop_bf16_matches_the_torch_reference_model(deterministic_cublas):
     """Three steps of the bf16 block model and of the torch reference model from ONE seed (same init, data and optimizer): the step-0
@@ -843,6 +868,7 @@ def test_training_loop_bf16_matches_the_torch_reference_model(deterministic_cubl
     assert max(rel) <= _LOSS_REL_BOUND, f"loss relative difference {max(rel):.3e} > {_LOSS_REL_BOUND:.0e}"
 
 
+@_L0
 @requires_rubin
 @pytest.mark.parametrize("arm_name", ["bf16", "mxfp8"])
 def test_training_loop_three_steps_bf16_and_mxfp8_finite(arm_name, deterministic_cublas):
@@ -876,6 +902,7 @@ def test_training_loop_three_steps_bf16_and_mxfp8_finite(arm_name, deterministic
     print(f"bf16: losses {[round(r['loss'], 6) for r in res.rows]}; the knob run bitwise on every numeric key")
 
 
+@_L0
 @requires_rubin
 @pytest.mark.parametrize("arm_name", ["bf16", "mxfp8"])
 def test_training_loop_two_runs_are_bitwise(arm_name, deterministic_cublas):
@@ -891,6 +918,7 @@ def test_training_loop_two_runs_are_bitwise(arm_name, deterministic_cublas):
     print(f"{arm_name}: run_digest {a.manifest['run_digest']} x2, last loss {a.rows[-1]['loss']:.6f}")
 
 
+@_L0
 @requires_rubin
 @pytest.mark.parametrize("arm_name", ["fp8-recal1", "mxfp8"])
 def test_training_loop_feedless_delayed_step0_is_bitwise_the_current_recipe(arm_name, deterministic_cublas):
@@ -926,6 +954,98 @@ def test_training_loop_feedless_delayed_step0_is_bitwise_the_current_recipe(arm_
     )
 
 
+@_L1
+@requires_rubin
+@pytest.mark.parametrize("arm_name", _EVERY_ARM)
+def test_training_loop_three_steps_every_arm_finite(arm_name, deterministic_cublas):
+    """Three steps of every trajectory arm: every logged value finite, every per-layer list of length ``n_layers``; the quantized
+    arms keep ``amax * scale <= 448`` on every gradient scale the kernel derives (``current``) and COUNT it under ``delayed``
+    (``grad_sat`` present, never asserted); the fp8 arms carry the forward saturation counters (``sat`` / ``n_clip`` per tensor and
+    layer, reported) and a ``scale_dp`` per layer with ``amax_dp * scale_dp <= 448``; the fp4 arms carry their code statistics on the
+    sampled steps (``fp4_stats`` per layer: shares in [0, 1], the dy4 keys live under an NVFP4 ``W_o`` only, the ``w_qkvg_t`` keys under
+    an MXFP4 ``W_qkvg`` only) and declare the fp4 facts in the recipe."""
+    arm = gbt.ARMS[arm_name]
+    res = _train(arm, fp4_stats_every=1)
+    L = _SMOKE.n_layers
+    for r in res.rows:
+        assert _finite(r), f"step {r['step']}: a non-finite logged value"
+        assert all(len(v) == L for v in r["grad_norms"].values())
+        assert all(v > 0.0 for vals in r["grad_norms"].values() for v in vals)
+        assert r["recipe"]["w_qkvg_fp4"] == arm.w_qkvg_fp4 and r["recipe"]["o_fp4"] == arm.o_fp4
+    if not arm.quantized:
+        return
+    for r in res.rows:
+        assert all(len(v) == L for v in r["quant_scalars"].values())
+        for name in arm.grad_scale_names:
+            what = name[len("scale_") :]
+            for l in range(L):
+                prod = r["quant_scalars"]["amax_" + what][l] * r["quant_scalars"][name][l]
+                if arm.grad_scaling == "current":
+                    assert 0.0 < prod <= 448.0, (r["step"], name, l, prod)
+                else:
+                    assert name in r["grad_sat"] and len(r["grad_sat"][name]) == L
+        if arm.family == "fp8":
+            assert len(r["scale_dp"]) == L and all(s > 0.0 for s in r["scale_dp"])
+            for l in range(L):
+                assert r["quant_scalars"]["amax_dp"][l] * r["scale_dp"][l] <= 448.0, (r["step"], l)
+            assert set(r["sat"]) == set(r["n_clip"]) == {"q", "k", "v", "o"} and all(len(v) == L for v in r["n_clip"].values())
+            if arm.act_window == 0:
+                assert all(v == [1.0] * L for k, v in r["spec"].items() if k in ("scale_q", "scale_k", "scale_v", "scale_o")), r["spec"]
+        if arm.fp4:
+            stats = r["fp4_stats"]
+            assert stats is not None and len(stats) == L
+            for st in stats:
+                assert set(st) == set(gbt._FP4_STAT_KEYS)
+                for k, v in st.items():
+                    live = (
+                        (k.startswith("w_qkvg_t") and arm.w_qkvg_fp4)
+                        or (k.startswith("w_o_t") and arm.o_fp4 is not None)
+                        or (k.startswith("dy4") and arm.o_fp4 == "nvfp4")
+                    )
+                    assert (v is not None) == live, (k, v, arm_name)
+                    if v is not None:
+                        assert 0.0 <= v <= 1.0, (k, v)
+        else:
+            assert "fp4_stats" not in r
+    sat = {x: sum(r["sat"][x][l] for r in res.rows for l in range(L)) for x in ("q", "k", "v", "o")} if arm.family == "fp8" else None
+    fp4 = res.rows[-1].get("fp4_stats")
+    print(f"{arm_name}: losses {[round(r['loss'], 6) for r in res.rows]}; forward saturation counts {sat}; fp4 stats (last step) {fp4}")
+
+
+@_L1
+@requires_rubin
+@pytest.mark.parametrize("arm_name", [n for n in _EVERY_ARM if n not in ("bf16", "mxfp8")])
+def test_training_loop_two_runs_are_bitwise_every_arm(arm_name, deterministic_cublas):
+    """The deterministic-replay pin over the arms the L0 twin does not cover: two three-step runs from one seed digest equal on
+    every row (``grad_sha256`` and every per-layer list included), the fp4 artifacts and the delayed recipe's bootstrap included."""
+    a = _train(gbt.ARMS[arm_name])
+    b = _train(gbt.ARMS[arm_name], replica=1)
+    _assert_rows_bitwise(a, b, arm_name)
+    print(f"{arm_name}: run_digest {a.manifest['run_digest']} x2, last loss {a.rows[-1]['loss']:.6f}")
+
+
+@_L1
+@requires_rubin
+@pytest.mark.parametrize("arm_name", ["fp8-recal1", "mxfp8"])
+def test_training_loop_fp8_delayed_replays_current_bitwise(arm_name, deterministic_cublas):
+    """The ``delayed`` recipe fed the ``current`` run's logged per-step gradient scales (``scale_feed_from_rows``) reproduces its block
+    gradients BITWISE over three steps -- ``grad_sha256``, ``quant_scalars`` and ``grad_norms`` equal row by row -- the harness-level
+    form of the suites' single-step replay pin; the fed scales are what the feed-less ladder would also have seeded at step 0."""
+    arm = gbt.ARMS[arm_name]
+    cur = _train(arm)
+    feed = gbt.scale_feed_from_rows(cur.rows, arm.grad_scale_names)
+    dl = _train(arm.with_(grad_scaling="delayed"), name=f"{arm_name}_replay", scale_feed=feed)
+    assert dl.manifest["bootstrap_rungs"] == (["scale_dp"] if arm.family == "fp8" else [])
+    for c, d in zip(cur.rows, dl.rows):
+        assert c["grad_sha256"] == d["grad_sha256"], f"step {c['step']}: the replayed gradients differ"
+        for k in ("quant_scalars", "grad_norms", "loss", "grad_norm_total"):
+            assert gbt.canonical_json(c[k]) == gbt.canonical_json(d[k]), (c["step"], k)
+        for name in arm.grad_scale_names:
+            assert d["given_scales"][name] == c["quant_scalars"][name], (c["step"], name)
+    print(f"{arm_name}: the delayed replay of the current run is bitwise over {_STEPS} steps ({[round(r['loss'], 6) for r in cur.rows]})")
+
+
+@_L0
 @requires_rubin
 @_FAMILY
 def test_update_quant_scales_reaches_a_captured_execute_of_a_warmed_up_block(family):
@@ -1014,3 +1134,64 @@ def test_update_quant_scales_reaches_a_captured_execute_of_a_warmed_up_block(fam
         graph.reset()
         if graph2 is not None:
             graph2.reset()
+
+
+@_L1
+@requires_rubin
+def test_a_validation_step_row_records_the_training_steps_quantization(tmp_path, deterministic_cublas):
+    """A row of a step that also scores the validation windows digests the TRAINING step's ``spec`` -- the descales the logged
+    forward quantized ``h`` and the weights with -- and not the evaluation forward's, which runs after the update on other tokens
+    and rewrites every layer's ``spec`` / activation scales: with ``val_every=1`` the per-layer spec read in the ``on_grads``
+    hook (after the backward, before the update) is the row's on every step,
+    ``val_loss`` is present and finite, and the row digest seals the row as written."""
+    arm = gbt.ARMS["fp8-recal1"]
+    geom = _SMOKE
+    # the validation windows' token file: ``batch`` windows of synthetic tokens (uint16, every id < vocab), as the data path reads it
+    flat = gbt.SyntheticTokens(geom, 7).batch().reshape(-1).tolist()
+    path = tmp_path / "val_tokens.bin"
+    path.write_bytes(array.array("H", flat).tobytes())
+    val = gbt.ValidationWindows(geom, str(path), n_windows=geom.batch)
+    seen = {}
+
+    def on_grads(run, step, inp, tgt):
+        spec0 = run.layers[0].spec
+        fields = [f.name for f in dataclasses.fields(type(spec0)) if isinstance(getattr(spec0, f.name), float)]
+        seen[step] = {f: [float(getattr(st.spec, f)) for st in run.layers] for f in fields}
+
+    res = gbt.run_training(arm, geom, steps=2, seed=0, val_windows=val, val_every=1, on_grads=on_grads)
+    assert len(res.rows) == 2 and set(seen) == {0, 1}
+    for r in res.rows:
+        assert r["val_loss"] is not None and math.isfinite(r["val_loss"]), r["step"]
+        assert r["spec"] == seen[r["step"]], (r["step"], r["spec"], seen[r["step"]])
+        assert r["row_digest"] == gbt.row_digest(r)
+
+
+@_L0
+def test_validation_windows_refuse_an_out_of_vocabulary_id(tmp_path):
+    """``ValidationWindows`` applies ``TokenWindows``' vocabulary check: a window file carrying an id >= ``vocab`` is refused at
+    construction, by the name of the offending id (the embedding table would index out of range at the first validation step);
+    the same file with the id inside the table builds its batches."""
+    geom = _SMOKE
+    flat = gbt.SyntheticTokens(geom, 11).batch().reshape(-1).tolist()
+    flat[5] = geom.vocab  # one id past the table
+    path = tmp_path / "val_tokens_bad.bin"
+    path.write_bytes(array.array("H", flat).tobytes())
+    with pytest.raises(ValueError, match=f"token id {geom.vocab} is outside the model's vocabulary of {geom.vocab}"):
+        gbt.ValidationWindows(geom, str(path), n_windows=geom.batch)
+    flat[5] = geom.vocab - 1
+    path.write_bytes(array.array("H", flat).tobytes())
+    assert len(gbt.ValidationWindows(geom, str(path), n_windows=geom.batch).batches) == 1
+
+
+@_L0
+def test_validation_windows_refuse_fewer_windows_than_a_batch(tmp_path):
+    """A window count below one batch (``0``, or a negative multiple of the batch) is refused at construction: an empty window
+    set has no batch to score, and the first validation step would otherwise fail on the mean of nothing."""
+    geom = _SMOKE
+    flat = gbt.SyntheticTokens(geom, 13).batch().reshape(-1).tolist()
+    path = tmp_path / "val_tokens.bin"
+    path.write_bytes(array.array("H", flat).tobytes())
+    for n in (0, -geom.batch):
+        with pytest.raises(ValueError, match="at least one batch"):
+            gbt.ValidationWindows(geom, str(path), n_windows=n)
+    assert len(gbt.ValidationWindows(geom, str(path), n_windows=geom.batch).batches) == 1

@@ -71,10 +71,27 @@ EXACTLY ZERO, with no crash (``mma-tma-matrix.md`` § 6). That is why
 non-zero explicitly rather than only a cosine, which would be NaN against a zero
 tensor.
 
-**The FROST GEMM engine is opt-in**: ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``
-must be set BEFORE ``import cudnn`` or the graph silently runs a cuDNN backend
-plan instead. :func:`build_proj_gemm` checks for the plan by name and raises
-rather than letting that happen quietly.
+**The FROST GEMM engine is opt-in**: without ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``
+in the environment the backend's ranked list has no ``frost_gemm`` plan.  The flag is
+read LIVE, when the ranked list is built (``engines/manifest.py``: ``opt_in_engines_enabled``),
+not once at ``import cudnn`` -- so it has to be set before :func:`build_proj_gemm` runs,
+and a host module must NEVER set it for the process: it flips every opt-in engine into
+every FE graph the process builds.  :func:`build_proj_gemm` checks for the plan by name
+and raises rather than letting an unpinned graph run a cuDNN backend plan quietly; a
+dense bf16 / f16 projection whose N the forced 256-wide tile divides needs no flag at
+all -- it takes the forced-tile JIT-only route (``plan.route == "jit-only"``, no backend
+plan, no cuDNN handle at execute), which is what a serving stack compiles under.
+
+**CUDA-graph capture** (``cudnn.frost.capture``): :func:`build_proj_gemm` is refused
+under capture (it builds a cuDNN graph -- a handle in the ``pygraph`` constructor -- and
+JIT-compiles a kernel), and so is the GRAPH route's lazy cuDNN handle creation
+(:func:`handle_for_stream`, the first execute per (device, stream)); both are typed
+``RuntimeError``s naming the route and the remedy.  ``build_proj_gemm(capture_safe=True)``
+is the serving declaration: the plan never enters the ranked list (the graph is built only
+to be analyzed -- no heuristics query, no backend plan, no FROST-engine compile, whatever
+the opt-in flag says), so it ends on the forced-tile JIT route by construction, and a
+refused forced compile is a typed ``NotImplementedError`` at compile time, never the
+warning + graph-heuristic fallback the plain declaration takes.
 
 **The BACKWARD's four projection GEMMs -- transposed operands as VIEWS.** The
 ``nn.Linear`` orientation (``api_bwd.py``: ``dW = dY^T @ X``, ``dX = dY @ W``) needs
@@ -279,6 +296,15 @@ class NormRopeFusionParams:
     weight_fp4: bool = (
         False  # e2m1 W_qkvg (torch.float4_e2m1fn_x2) on the MXFP8 fork: the catalog's mixed row at K32, the padded E2M1 SMEM form; appended, keys unchanged
     )
+    # The paged KV-cache WRITE-THROUGH arm of the bf16 fork (appended; 0 = every existing key spelled identically): the epilogue
+    # also stores every K / V tile's post-norm, post-RoPE row into the pools ``[P, H_kv, kv_pool_page_size, D]`` at
+    # ``slot_mapping[token]`` (a negative slot or one past the pools writes nothing) -- the gated attention block's serving
+    # cache write folded into stage (1): one more st.global.v4 stream per row from the registers the slab store reads, a
+    # per-row slot read before the accumulator wait; no new barrier, no new SMEM.  The page size is a compile key (the
+    # in-kernel divide), the slot dtype too (``kv_slot_i64``: int64 slots as two 32-bit halves), exactly as in the separate
+    # ``cache_write.py`` kernel the arm replaces bitwise.  bf16 fork only, ``norm_source`` in ("ldg", "ldg_early").
+    kv_pool_page_size: int = 0
+    kv_slot_i64: bool = False
 
     @property
     def offsets(self) -> tuple[int, int, int, int]:
@@ -356,6 +382,16 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
             raise ValueError(
                 "quant_mxfp8: norm_source='off' has no meaning on the MXFP8 fork (no single bf16 slab to degenerate to); use 'const' for the floor"
             )
+    if p.kv_pool_page_size or p.kv_slot_i64:
+        if p.kv_pool_page_size < 1:
+            raise ValueError(f"kv_slot_i64 belongs to the write-through arm; set kv_pool_page_size > 0 (got {p.kv_pool_page_size})")
+        if p.quant_fp8 or p.quant_mxfp8:
+            raise NotImplementedError(
+                "kv_pool_page_size: the paged KV-cache write-through arm is wired on the bf16 fork only (the pools are bf16 / f16, the activation dtype); the "
+                "quantizing forks keep the separate cache-write launch"
+            )
+        if p.norm_source not in ("ldg", "ldg_early"):
+            raise ValueError(f"kv_pool_page_size needs the production epilogue arm (norm_source 'ldg' / 'ldg_early'), got {p.norm_source!r}")
     if p.weight_fp4:
         if p.quant_fp8:
             raise ValueError(
@@ -464,6 +500,12 @@ def run_fused_proj_gemm(
     rstd_k: Optional[torch.Tensor] = None,  # [M, H_kv] fp32
     *,
     stream,
+    # APPENDED (the write-through arm, params.kv_pool_page_size > 0 -- all three REQUIRED there, REFUSED otherwise): the K / V pools
+    # [P, H_kv, page_size, D] (D contiguous, the other three strides free: HND compact, NHD, a unified row's half) and the [M] int32 /
+    # int64 slot map (its dtype = the artifact's kv_slot_i64).
+    k_cache: Optional[torch.Tensor] = None,
+    v_cache: Optional[torch.Tensor] = None,
+    slot_mapping: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch.  No allocation, no conversion; every check is cheap host arithmetic.
 
@@ -478,6 +520,23 @@ def run_fused_proj_gemm(
     if plan.mxfp8:
         raise ValueError("this plan is the MXFP8 fork (q8/k8/v8/gate16 + sf_q/sf_k/sf_v outputs); launch it with run_fused_proj_gemm_mxfp8")
     p = plan.params
+    pools = (k_cache, v_cache, slot_mapping)
+    if p.kv_pool_page_size:
+        from cudnn.gated_attention_block.cache_write_contract import check_pool, check_slot_mapping
+
+        if any(x is None for x in pools):
+            raise ValueError(
+                "this artifact folds the paged KV-cache write-through into its epilogue: k_cache, v_cache and slot_mapping are required (Rule 1: no silent fallback)"
+            )
+        m_rows = int(_rank3(a, "a").shape[1])
+        check_pool(k_cache, "k_cache", h=p.h_kv, page_size=p.kv_pool_page_size, d=p.d_head, dtype=a.dtype)
+        check_pool(v_cache, "v_cache", h=p.h_kv, page_size=p.kv_pool_page_size, d=p.d_head, dtype=a.dtype)
+        check_slot_mapping(slot_mapping, "slot_mapping", t=m_rows)
+        want = torch.int64 if p.kv_slot_i64 else torch.int32
+        if slot_mapping.dtype != want:
+            raise ValueError(f"slot_mapping is {slot_mapping.dtype} but this artifact was compiled for {want}; the slot dtype is a compile key (kv_slot_i64)")
+    elif any(x is not None for x in pools):
+        raise ValueError("k_cache / v_cache / slot_mapping are consumed by the write-through arm only (params.kv_pool_page_size > 0); this artifact has none")
     a3, w3, o3 = _rank3(a, "a"), _rank3(w, "w"), _rank3(out, "out")
     m, k = int(a3.shape[1]), int(a3.shape[2])
     n = int(w3.shape[1])
@@ -515,6 +574,7 @@ def run_fused_proj_gemm(
         rstd_q,
         rstd_k,
         cuda.CUstream(int(stream)),
+        *((k_cache, v_cache, slot_mapping) if p.kv_pool_page_size else ()),
     )
 
 
@@ -819,7 +879,11 @@ def _why_no_frost_plan() -> str:
                 + f", and this device is sm_{arch} -- so FROST cannot serve this graph here at all"
             )
     if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").strip().lower() not in ("1", "true", "yes", "on"):
-        reasons.append("CUDNN_FRONTEND_ENABLE_FROST_ENGINES is not set -- it is an opt-in engine and the flag must be set BEFORE 'import cudnn'")
+        reasons.append(
+            "CUDNN_FRONTEND_ENABLE_FROST_ENGINES is not set -- frost_gemm is an opt-in engine; the flag is read live when the ranked list is "
+            "built, so it must be in the environment before compile() (a dense bf16 / f16 plan whose N the forced 256-wide tile divides needs "
+            "no flag: it takes the forced-tile JIT-only route)"
+        )
     if not reasons:
         reasons.append("the engine declined this shape/dtype; run with CUDNN_FRONTEND_LOG_INFO=1 CUDNN_FRONTEND_LOG_FILE=stderr for its reason")
     return (
@@ -1033,6 +1097,20 @@ def handle_for_stream(device, stream) -> Any:
     key = (idx, int(stream))
     h = _GRAPH_HANDLES.get(key)
     if h is None:
+        # The FIRST execute of a graph-route plan on a stream creates its handle HERE (cudnnCreate: host and device
+        # resources) -- illegal inside a CUDA-graph capture, and a serving stack captures the first execute on a fresh
+        # stream with no eager warm-up.  Refused typed, naming the route and the remedy, before the driver sees it.
+        from cudnn.frost.capture import check_not_capturing
+
+        check_not_capturing(
+            int(stream),
+            f"frost gemm graph route (cuDNN handle creation for device {idx}, stream {int(stream):#x})",
+            remedy=(
+                "run one eager execute of the block on the capture stream before capturing (it creates the handle this route binds), "
+                "or declare the block's GEMMs capture-safe (build_proj_gemm(capture_safe=True)) so they take the forced-tile JIT route, "
+                "which needs no handle"
+            ),
+        )
         # create_handle() binds to the CURRENT device -- pin it so a tensor on
         # cuda:1 never gets a handle created against cuda:0.
         with torch.cuda.device(idx):
@@ -1040,6 +1118,22 @@ def handle_for_stream(device, stream) -> Any:
         cudnn.set_stream(handle=h, stream=int(stream))
         _GRAPH_HANDLES[key] = h
     return h
+
+
+def _refuse_compile_under_capture(label: str) -> None:
+    """``build_proj_gemm`` under a CUDA-graph capture is refused typed: it builds a cuDNN graph (a cuDNN handle in the
+    handle-less ``cudnn.pygraph`` constructor) and JIT-compiles a kernel -- neither can happen inside a capture, and a serving
+    stack that compiles lazily at its first (captured) execute would otherwise see the driver's error from the middle of it.
+    The stream asked is torch's current one on the current device: the stream a ``torch.cuda.graph`` capture makes current."""
+    if not torch.cuda.is_available():
+        return  # nothing can be capturing without a device; the host-only probes build plans here too
+    from cudnn.frost.capture import check_not_capturing
+
+    check_not_capturing(
+        torch.cuda.current_stream().cuda_stream,
+        f"{label}: FROST GEMM compile (build_proj_gemm builds the cuDNN graph and JIT-compiles the kernel)",
+        remedy="compile() at warm-up, before the capture begins; a capture holds launches only",
+    )
 
 
 @dataclass
@@ -1071,10 +1165,13 @@ class ProjGemmPlan:
     #                resolved tile config is what `run_proj_gemm` launches;
     #   "jit-only"   the backend declined the graph (a typed cudnnGraphNotSupportedError,
     #                or no `frost_gemm` in its ranked list -- `_NoFrostPlan`); the JIT
-    #                never touches the backend, so the kernel still runs.  Any OTHER
-    #                backend error propagates (it is a bug: e.g. the unpadded F8_128x4
-    #                declaration this driver used to make, which read as "declined" until
-    #                the catch was narrowed);
+    #                never touches the backend, so the kernel still runs.  Taken by the
+    #                block-scale plans, and by a DENSE bf16 / f16 plan with a forced (or
+    #                explicitly named) tile -- the route a serving stack compiles under with
+    #                CUDNN_FRONTEND_ENABLE_FROST_ENGINES unset (no backend plan, no cuDNN
+    #                handle at execute).  Any OTHER backend error propagates (it is a bug:
+    #                e.g. the unpadded F8_128x4 declaration this driver used to make, which
+    #                read as "declined" until the catch was narrowed);
     #   "graph"      dense, no forced tile: the graph engine's own plan runs.
     block_scale: bool = False
     sfa: Any = None
@@ -1098,6 +1195,10 @@ class ProjGemmPlan:
     a_major: str = "k"
     b_major: str = "k"
     split_k: int = 0
+    # Serving-declaration addition (append-only): True = the plan was built `capture_safe` -- it never entered the ranked list
+    # (no backend plan, no FROST-engine compile, whatever the opt-in flag said) and ends on the forced-tile JIT route by
+    # construction (never the graph route, which creates a cuDNN handle at the first execute per (device, stream)).
+    capture_safe: bool = False
     # The forced-tile JIT route's pack resolution (`_resolved_pack`): `(jit, {id(graph tensor key): id(bound tensor)})`, taken
     # once BY ROLE (the graph tensors the plan declares, never the buffers of a call) and OWNED BY THE PLAN, so it lives exactly
     # as long as the JIT it describes.  A cache slot, not a plan fact: no constructor argument (init=False), outside eq / repr.
@@ -1166,6 +1267,260 @@ def _forced_tile_config(n: int) -> Optional[str]:
     return None
 
 
+# The SMALL-M route: the serving DECODE / MTP projections (T = B x S_q <= SMALL_M_MAX rows).
+#
+# At T <= 128 a projection GEMM is a weight-streaming problem, not an MMA one: the forced 256-wide tile pads every M tile to
+# 256 rows (128 per CTA of the pair), launches ONE M tile (N / 256 cluster pairs: 52 for the 24/2 fused slab, 10 for its
+# out projection) and spends 4-5x cuBLAS's time at T 1..128 (measured on the Rubin perf class, 212 SMs: 25.2 vs 8.4 us at
+# T 1 on the 24/2 fused slab).  The catalog already carries the two axes that fix it, so no new kernel: ``swap_ab``
+# computes ``C^T = W A^T`` with the WEIGHT rows on the MMA M axis (every 64- or 128-row weight tile is a CTA, so the
+# machine is filled by N / tile_m CTAs) and the TOKENS on the MMA N axis, sized to T (the catalog's N tiles run 8..256 in
+# steps of 8, so an 8-token step issues 64x8 / 128x8 MMAs instead of 256x256 ones); the two-kernel ``split_k_slices``
+# fills the machine where the weight has too few rows for one wave (the out projection).  Measured on the Rubin perf
+# class (one process, shuffled A/B/A x 3 x 100, CUPTI device time, control pair <= 0.6 %):
+#
+#   24/2 fused slab (N 13312, K 2560):    T 1   cuBLAS 8.4 | forced 25.3 | 64x8 cluster2x1 swapAB   6.1 us
+#                                         T 4          7.1 |        16.1 | 64x8 cluster2x1 swapAB   6.1
+#                                         T 32         7.2 |        13.5 | 64x32 cluster2x1 swapAB  6.3
+#                                         T 128        9.7 |        13.7 | 128x64 (plain)           9.0
+#   24/2 out projection (N 2560, K 6144): T 1   cuBLAS 7.3 | forced 24.6 | 128x8 splitK8 swapAB    6.3
+#                                         T 4          7.2 |        24.6 | 128x8 splitK8 swapAB    6.4
+#                                         T 32         7.6 |        24.5 | 128x32 splitK8 swapAB   7.0
+#                                         T 128        8.4 |        24.5 | 64x32 (plain)           9.3
+#
+#   32/2 fused slab (N 17408, K 4096):    T 1   cuBLAS 13.3 | forced 45.6 | 128x8 swapAB            13.1
+#                                         T 32        15.8 |        19.9 | 128x32 swapAB           13.3
+#                                         T 128       21+  |        20.3 | 128x128 swapAB          15.5
+#   32/2 out projection (N 4096, K 8192): T 1   cuBLAS 9.5  | forced 32.2 | 128x8 splitK6 swapAB    7.7
+#                                         T 128       14.1 |        32.1 | 128x128 splitK6 swapAB  16.1
+#   8/1 fused slab (N 4608, K 4096):      T 1   cuBLAS 5.8  | forced 21.4 | 64x8 cluster1x1 swapAB  6.6
+#   8/1 out projection (N 4096, K 2048):  T 1   cuBLAS 3.9  | forced 11.2 | 64x8 swapAB (no split)  4.9   (cuBLAS stays ahead on this shard)
+#
+# The rule below spells those picks from the shape and the SM count alone (one-wave arithmetic, no measurement at plan
+# time): the token tile is the power of two >= T; a NARROW weight (fewer than a third of a wave of 64-row tiles) takes
+# 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least eight K tiles) up to
+# 64 tokens and the plain 64x32 tile past it while that grid fits one wave -- a shallow K (fewer than 64 K tiles) takes the
+# 64-row swap-AB tile instead of any split; a weight whose 64-row tiles fit one wave takes
+# them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
+# overflow a wave takes 128-row weight tiles (one wave).  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two
+# projections; everything else keeps today's resolution.  N is a multiple of 256 (the forced tile's grid) on every branch but
+# the last: a weight whose 64-row tiles overflow a wave is admitted at N % 128 == 0 too, because its 128-row tiles divide such an
+# N exactly -- the indexer band's slab (QsaSpec.index_band: 13312 + 640 = 13952 = 109 x 128 columns at the 24/2 geometry, whose
+# 218 64-row tiles overflow every served part) is the case, and it takes the SAME 128-row swap-AB names the 32/2 slab does (109
+# CTAs: the half-wave launch a band padded to 768 columns would make, with no pad in the weight).  An N that 128 divides but 256
+# does not whose 64-row tiles FIT one wave keeps today's resolution at these row counts (the narrow and one-wave branches are
+# unmeasured off the 256 grid).  PAST ``SMALL_M_MAX`` the 128 grid is the large-M rule's (``large_m_tile_config`` below: the GEMM
+# engine's own baseline pick, so the band slab rides the JIT route at every row count).
+SMALL_M_MAX = 128
+_SMALL_M_SPLIT_K_MAX = 8
+_SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
+_SMALL_M_SPLIT_K_MIN_K_TILES = 64  # split K only past this depth (K 4096 at 2 bytes): below it the reducer costs more than it buys
+_SMALL_M_MIN_K_TILES_PER_SLICE = 8
+
+
+def small_m_tile_config(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    dtype: torch.dtype,
+    a_major: str = "k",
+    b_major: str = "k",
+    block_scale: bool = False,
+    alpha: bool = False,
+    sm_count: Optional[int] = None,
+) -> Optional[str]:
+    """The catalog config name of the small-M route for a ``[m, k] x [k, n]`` projection, or None when the route does not
+    apply (a non-positive extent, ``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major
+    operand, an extent the TMA 16-byte rule refuses, an N off the route's tile grids: 256 must divide N, or 128 where the 64-row
+    tiles overflow a wave -- the indexer band's 13952-column slab).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
+    to the same name on every part of one SM-count class, so a recorded plan name replays."""
+    if m <= 0 or n <= 0 or k <= 0:
+        # a non-positive extent never reaches the one-wave arithmetic below (``n = 0`` would divide by a zero CTA count, ``m`` or
+        # ``k`` at 0 would still spell a tile): the route declines and ``build_proj_gemm``'s own extent check names the extent
+        return None
+    if m > SMALL_M_MAX or block_scale or alpha:
+        return None
+    if dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if a_major != "k" or b_major != "k":
+        return None
+    if n % 8 or k % 8:
+        # The swapped problem reads the weight as the K-contiguous A operand and stores the output M-major: both extents
+        # fall under TMA's 16-byte contiguous-extent rule at 2 bytes per element.
+        return None
+    if n % 128:
+        # An N that 128 does not divide keeps today's resolution (the graph route; under ``capture_safe`` the typed refusal at
+        # compile): the overflow branch's 128-row tiles would leave a partial tile, and the 64-row-tile branches below are gated
+        # to the 256 grid (``n % 256`` and one wave), so 13376 = 209 x 64 is declined as well.
+        return None
+    if sm_count is None:
+        from cudnn.gemm.frost.tile_config import _sm_count
+
+        sm_count = _sm_count()
+    tn = 8
+    while tn < m:
+        tn *= 2
+    ctas_64 = -(-n // 64)
+    ctas_128 = -(-n // 128)
+    if n % 256 and ctas_64 <= sm_count:
+        # An N that 128 divides but 256 does not, whose 64-row tiles FIT one wave: the narrow and the one-wave branches below were
+        # measured on 256-multiples only, so it keeps today's resolution at decode row counts (the graph route; under ``capture_safe``
+        # the typed refusal at compile; past ``SMALL_M_MAX`` the large-M rule names the engine's baseline for the 128 grid).  The one
+        # served off-grid N -- the indexer band's slab, ``QsaSpec.index_band``: 13312 + 640 = 13952 = 109 x 128
+        # -- overflows the wave on every served part (218 64-row tiles) and takes the overflow branch's 128-row tiles, which divide
+        # it exactly (no partial tile).
+        return None
+    if 3 * ctas_64 < sm_count:
+        # NARROW weight (fewer than a third of a wave of 64-row tiles).  With a DEEP K (>= 64 K tiles) 128-row weight tiles
+        # and the split-K slice count that fills ONE wave (a slice count that overflows the wave loses its tail: 32/2 out
+        # projection, 32 tiles, S 6 = 192 CTAs 7.7 us vs S 7 = 224 CTAs 9.0 us; every slice at least 8 K tiles); past 64
+        # tokens the plain 64x32 tile where its grid fits one wave, else the same 128x128 split.  With a SHALLOW K the reducer's
+        # fixed cost outweighs the split (8/1 out projection, K 2048: 4.9 us unsplit vs 5.9 split) -- the 64-row swap-AB tile.
+        k_tiles = -(-k // _SMALL_M_CTA_K_ELEMS)
+        slices = (
+            max(1, min(_SMALL_M_SPLIT_K_MAX, sm_count // ctas_128, k_tiles // _SMALL_M_MIN_K_TILES_PER_SLICE)) if k_tiles >= _SMALL_M_SPLIT_K_MIN_K_TILES else 1
+        )
+        if m > 64 and (slices == 1 or -(-m // 64) * -(-n // 32) <= sm_count):
+            return "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
+        if slices > 1:
+            return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_splitK{slices}_swapAB"
+        cluster = "2x1" if 2 * ctas_64 >= sm_count else "1x1"
+        return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster{cluster}_1ctamma_swapAB"
+    if ctas_64 <= sm_count:
+        # The 64-row weight tile fits one wave.  The 2x1 cluster (the token tile multicast across the pair) pays on a FULL
+        # machine only (24/2 slab, 208 CTAs: +18 %; 8/1 slab, 72 CTAs: -10 %).
+        if m <= 64:
+            cluster = "2x1" if 2 * ctas_64 >= sm_count else "1x1"
+            return f"CONFIG_sm100_64x{tn}x128_64x{tn}x32_cluster{cluster}_1ctamma_swapAB"
+        # 65..128 tokens: the plain 128-token x 64-weight tile (full-rate MMA M) while its grid fits one wave.
+        if -(-m // 128) * ctas_64 <= sm_count:
+            return "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
+        return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+    # The 64-row tiles overflow a wave: 128-row weight tiles (one wave up to N = 128 x SMs; 32/2 slab, 136 CTAs; the indexer
+    # band's 13952-column slab, 109 CTAs -- the one N off the 256 grid the route names a tile for).
+    if m <= 64:
+        return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_swapAB"
+    return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+
+
+# The LARGE-M rule, past the small-M route: the indexer band's slab (N 13312 + 640 = 13952 = 109 x 128 at the 24/2 geometry; 14336 + 640
+# = 14976 = 117 x 128 at 24/4) at prefill / extend / chunked row counts.  The 256 grid is the forced tile's (`_forced_tile_config`) and
+# the 128 grid up to 128 rows is the small-M route's; between them the band slab past 128 rows had NO name, which made it the GRAPH
+# route -- the plan the backend's ranked list serves, whose first execute per (device, stream) creates a cuDNN handle (never inside a
+# CUDA-graph capture) and whose compile needs the opt-in flag.  The graph route runs a FROST GEMM JIT of its own: the engine's
+# `plan_config` / `plan_configs` (gemm/frost/sm100/compiler.py) take `_baseline_config` = `select_config(M, N, 1, K=K)` +
+# `preferred_strategy` + `_auto_split_k`, then `planning.select_strategies`, which returns that baseline wherever no cost profile
+# claims the shape.  So the rule below names THAT pick -- the kernel the graph route runs for the same (M, N, K, dtype, SM count) --
+# and names it only where the identity holds: `preferred_strategy` is the identity for a dense bf16 / f16 chain on the sm100 family
+# (pipeline "sm100", MMA K 32 = the catalog's own spelling), the planner's cost profiles decline the shape (`_planner_may_replan`: the
+# planner envelope `tile_config` publishes, so this resolver imports no graph-route module), and `_auto_split_k` leaves the pick unsplit
+# (`_auto_split_k_slices`).  The name moves the ROUTE (JIT-only: no ranked list, no
+# backend plan, no cuDNN handle at execute, capture-safe, flag-free) and not the kernel.  The pick follows the part's SM count (at
+# M 2048 x N 13952: 128x224 cluster2x1 on 212 SMs, 128x224 cluster2x4 on 204), so a recorded plan name replays within ONE SM-count
+# class -- the small-M route's existing rule.  Shape-only, no device sync: `_Projection.resolves_a_jit_tile` reads it at declaration.
+
+
+def _planner_may_replan(m: int, n: int, k: int) -> bool:
+    """Whether the GEMM engine's device-aware planner could serve ``[m, k] x [k, n]`` with a strategy OTHER than its baseline pick:
+    ``planning.select_strategies`` ranks candidates only under a cost profile, and a profile claims a shape only inside the planner
+    envelope the catalog module publishes (``tile_config.planner_may_claim``: ``PLANNER_MN_BOUNDS`` on both M and N, ``PLANNER_K_BOUNDS``;
+    the block's chain is batch 1) -- read THERE, never from the planner module, which a JIT-only deployment of this driver does not carry
+    (an import of it at declaration would be a bare ``ModuleNotFoundError``, not a typed decline).  A shape outside the envelope is served
+    by the baseline alone (the planner's ``[baseline]``)."""
+    from cudnn.gemm.frost.tile_config import planner_may_claim
+
+    return planner_may_claim(m, n, k, batch=1)
+
+
+def _auto_split_k_slices(m: int, n: int, k: int, cfg, sm_count: int, elem_bits: int = 16) -> int:
+    """The split-K slice count the engine's ``_auto_split_k`` (``gemm/frost/sm100/compiler.py``) layers onto ``cfg`` for a dense
+    ``[m, k] x [k, n]`` GEMM of ``elem_bits``-bit operands at ``sm_count`` SMs -- its arithmetic mirrored on the shape alone: a pick
+    already split is kept; a shallow K (under 2048 bytes) is never split; an output grid of at least one wave is never split; else the
+    slice count is one full wave of CTAs, floored by the per-slice K floor, the reducer's 32-slice unroll and the grid.z limit, and one
+    or two slices are not worth the reducer.  1 = the pick runs unsplit.  The compiler's remaining exit (``_splitk_reject_reason`` on a
+    two-slice probe) never fires for a plain dense bf16 / f16 chain and could only keep the pick unsplit, so this mirror is conservative:
+    it never reads "unsplit" where the compiler would split."""
+    if cfg.split_k_slices != 1:
+        return int(cfg.split_k_slices)
+    if k * elem_bits < 2048 * 8:
+        return 1
+    output_tiles = -(-m // cfg.cta_tile_m) * -(-n // cfg.cta_tile_n)
+    if output_tiles >= sm_count:
+        return 1
+    cta_k_elems = cfg.cta_tile_k_bytes * 8 // elem_bits
+    num_k_tiles = -(-k // cta_k_elems)
+    min_k_tiles_per_slice = max(-(-64 // cta_k_elems), 2)
+    slices = min(sm_count // output_tiles, num_k_tiles // min_k_tiles_per_slice, 32, 65535)
+    return slices if slices > 2 else 1
+
+
+def large_m_tile_config(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    dtype: torch.dtype,
+    a_major: str = "k",
+    b_major: str = "k",
+    block_scale: bool = False,
+    alpha: bool = False,
+    sm_count: Optional[int] = None,
+) -> Optional[str]:
+    """The GEMM engine's OWN baseline pick (``tile_config.select_config``) for a dense bf16 / f16 K-major ``[m, k] x [k, n]``
+    projection past ``SMALL_M_MAX`` whose N the 128 grid divides and the 256 grid does not -- the indexer band's slabs -- or None
+    where the graph route's plan could differ from that pick (a shape the planner's cost profiles claim, or one ``_auto_split_k``
+    would split), so that every name given here is the kernel the graph route runs for the same shape on the same part (the
+    comment block above).  Declines like the small-M route (a non-positive extent, a dtype other than bf16 / f16, a block-scale or
+    alpha plan, an MN-major operand, an extent the TMA 16-byte rule refuses) and at ``m <= SMALL_M_MAX`` (the small-M route's
+    rows).  ``sm_count`` is the target's SM count (the active device when None); the pick follows it, so a recorded plan name
+    replays within one SM-count class."""
+    if m <= SMALL_M_MAX or n <= 0 or k <= 0 or block_scale or alpha:
+        return None
+    if dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if a_major != "k" or b_major != "k":
+        return None
+    if n % 8 or k % 8:
+        return None
+    if n % 128 or n % 256 == 0:
+        # the 256 grid is the forced tile's (`_forced_tile_config`); an N off the 128 grid keeps the graph route
+        return None
+    if _planner_may_replan(m, n, k):
+        return None
+    from cudnn.gemm.frost.tile_config import _sm_count, select_config
+
+    sm = sm_count if sm_count is not None else _sm_count()
+    # the call `_baseline_config` makes for this chain: one GEMM, no block scale, a K-major B of 2-byte elements, no forced CTA group
+    cfg = select_config(m, n, 1, K=k, sm_count=sm)
+    if _auto_split_k_slices(m, n, k, cfg, sm) != 1:
+        return None
+    return cfg.name
+
+
+def _auto_tile_name(
+    m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool, sm_count: Optional[int] = None
+) -> Optional[str]:
+    """``tile_config="auto"``: the small-M route where it applies (:func:`small_m_tile_config`; on the ``sm100`` compiler family
+    only -- its names are the tcgen05 tree's catalog, so a process on the ``sm120`` family keeps the family-aware fallback below),
+    else the large-M rule past it (:func:`large_m_tile_config`, the same family: the engine's own baseline pick for a dense bf16 / f16
+    K-major projection on the 128 grid off the 256 grid -- the indexer band's slab past 128 rows), else the forced 256-wide tile where
+    256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile).  A None here IS the graph route:
+    ``build_proj_gemm(capture_safe=True)`` declines it typed, and the block sets ``capture_safe`` on a projection stage only where this
+    resolver names a tile for the stage's own shape (``_Projection.resolves_a_jit_tile``) -- so the indexer band's slab (N 13952, off
+    the 256 grid) resolves at every row count: the small-M route's 128-row swap-AB tile at ``m <= SMALL_M_MAX``, the engine's baseline
+    past it.  ``sm_count`` (appended) is the target's SM count for a host query of another part; None reads the active device."""
+    from cudnn.gemm.frost import arch_family
+
+    name = None
+    if arch_family.active_family() == "sm100":
+        kw = dict(dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha, sm_count=sm_count)
+        name = small_m_tile_config(m, n, k, **kw)
+        if name is None:
+            name = large_m_tile_config(m, n, k, **kw)
+    return name if name is not None else _forced_tile_config(n)
+
+
 def build_proj_gemm(
     *,
     m: int,
@@ -1185,6 +1540,7 @@ def build_proj_gemm(
     a_major: str = "k",
     b_major: str = "k",
     split_k: int = 0,
+    capture_safe: bool = False,
 ) -> ProjGemmPlan:
     """Compile one projection GEMM and pin the FROST plan.
 
@@ -1310,6 +1666,39 @@ def build_proj_gemm(
     why ``split_k >= 1`` needs ``pin_frost=True``: with the FROST engine deselected there
     is no JIT to pin, and the combination is a ``ValueError`` (a knob is honoured or
     refused, never silently dropped).
+
+    **The dense bf16 / f16 JIT-only route (no opt-in flag).** ``frost_gemm`` is an
+    opt-in engine: without ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` the backend's ranked
+    list has no FROST plan and the pin raises ``_NoFrostPlan``.  A dense bf16 / f16 plan
+    whose tile is forced (``tile_config="auto"`` with ``N % 256 == 0``) or named
+    explicitly then takes the SAME ``jit-only`` route the block-scale plans take: the
+    graph is built only to be analyzed, ``jit_from_cudnn_graph`` never asks the backend,
+    and ``run_proj_gemm`` launches the JIT before any handle exists -- so the block
+    compiles with the flag UNSET (a host module must never set it: the flag is read live
+    and flips every opt-in engine into every FE graph of the process).  Without a forced
+    tile the graph route IS the plan, so that decline stays; the per-tensor fp8 dense
+    plans keep it too (their alpha epilogue is validated on the pinned ``graph+jit``
+    route).  When the flag IS set nothing changes for a PLAIN declaration: the backend
+    admits the graph, the plan is pinned by name (``graph+jit``) and the same JIT runs.
+
+    **CUDA-graph capture.** ``build_proj_gemm`` is refused under capture (a typed
+    ``RuntimeError`` naming the route and the remedy, before the ``cudnn.pygraph``
+    constructor creates its handle), and so is the GRAPH route's first execute on a
+    stream (:func:`handle_for_stream`: no cuDNN handle is created inside a capture).
+    ``capture_safe=True`` is the serving declaration (appended, default off): the plan
+    NEVER ENTERS THE RANKED LIST -- the graph is validated and built only to be analyzed;
+    ``create_execution_plans`` (the heuristics query that reads the flag), ``check_support``
+    and ``build_plans`` are never called, so there is no backend plan and no FROST-engine
+    compile whatever the flag says, and the plan is ``jit-only`` by construction.  A shape
+    the forced tile does not divide, or ``pin_frost=False``, is a typed decline at compile
+    time, and a forced compile the compiler refuses is a typed ``NotImplementedError``
+    naming the tile and the reason, NEVER the warning + graph-heuristic fallback the plain
+    declaration takes (a fallback would turn a capture-safe plan into one that creates a
+    handle inside the capture).  The pin is skipped on purpose: with the flag set, a plain
+    declaration's ``build_plans`` compiles the same ``jit_from_cudnn_graph`` inside the
+    FROST GEMM engine, and a refusal there is neither typed for the tile nor caught by the
+    fallback arm -- the driver's forced-tile compile has to be the ONLY compile for the
+    refusal to be the typed one on every host, under either flag state.
     """
     import cudnn
 
@@ -1328,6 +1717,23 @@ def build_proj_gemm(
             f"{label}: split_k={split_k} pins a FROST JIT config and cannot be combined with pin_frost=False (the deselected-FROST graph route "
             "has no JIT to pin, so the knob would be silently dropped)"
         )
+    _refuse_compile_under_capture(label)
+    if capture_safe and not pin_frost:
+        raise ValueError(
+            f"{label}: capture_safe=True needs the forced-tile JIT route, and pin_frost=False is the graph route by request (its first execute "
+            "per stream creates a cuDNN handle, which cannot happen inside a CUDA-graph capture); drop one of the two"
+        )
+    # The tile the JIT route runs: the small-M route at m <= SMALL_M_MAX on a dense bf16 / f16 K-major plan, past it the large-M
+    # rule's name on the 128 grid off the 256 grid (the engine's own baseline pick -- the kernel the graph route runs for that shape),
+    # else the forced 256-wide config when it divides N, an explicit name as given, else None (the graph heuristic's own tile -- no
+    # JIT unless a split or an MMA K width is pinned below).
+    name = (
+        _auto_tile_name(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha) if tile_config == "auto" else tile_config
+    )
+    if capture_safe and name is None and not (block_scale or split_k >= 1 or mma_tile_k_bytes is not None):
+        # No JIT would be built: the plan would run the GRAPH route, whose first execute per (device, stream) creates a cuDNN
+        # handle -- inside the capture a serving stack records with no warm-up.  Typed, before any graph or backend call.
+        raise NotImplementedError(_capture_safe_graph_route_message(label, m, k, n, tile_config, "the graph heuristic's tile"))
     if mma_tile_k_bytes is not None:
         # The MMA K width's contract, checked ONCE and up front for the block-scale and the dense path alike, so an invalid
         # value is always named as such whatever else the call combines it with.  (1) 32 or 64, the tcgen05 MMA K widths.
@@ -1548,19 +1954,55 @@ def build_proj_gemm(
         g.check_support()
         g.build_plans()
 
-    if block_scale and pin_frost:
+    # A DENSE bf16 / f16 plan with a forced (or named) tile may run with no backend plan at all: the JIT never asks the
+    # backend, `run_proj_gemm` launches it before any handle, so an unset CUDNN_FRONTEND_ENABLE_FROST_ENGINES (frost_gemm is
+    # opt-in; a host module never sets the flag) is not a decline here.  Without a forced tile the graph route IS the plan,
+    # so the decline stays; the per-tensor fp8 plans keep it too (their alpha epilogue is validated on the pinned route).
+    dense_jit_only_ok = pin_frost and not block_scale and name is not None and dtype in (torch.bfloat16, torch.float16)
+    backend_decline: Optional[BaseException] = None
+    if capture_safe:
+        # The SERVING declaration never enters the ranked list.  The graph is validated and built only to be ANALYZED (the
+        # analyzer reads the tensor metadata the build fills in); `create_execution_plans` -- the heuristics query that reads
+        # the opt-in flag and would put `frost_gemm` on the list -- `check_support` and `build_plans` are never called, so
+        # there is no backend plan and no FROST-engine compile WHATEVER the flag says.  With the flag set, a plain
+        # declaration's `build_plans` compiles the SAME `jit_from_cudnn_graph` inside the FROST GEMM engine, and a refusal
+        # there reaches the caller as the engine's own error (or a bare one): neither typed for the tile nor caught by the
+        # fallback arm below.  Skipping the pin makes the driver's forced-tile compile below the ONLY compile, so its refusal
+        # is the one typed decline, on every host, under either flag state.  `workspace_bytes` reads the JIT's own number on
+        # this route (there is no backend plan to ask).
+        g.validate()
+        g.build_operation_graph()
+        plan.route = "jit-only"
+        _LOG.info(
+            "%s: capture_safe declaration -- no ranked list, no backend plan, no engine-side compile; the forced-tile JIT-only route at %s",
+            label,
+            name if name else "the engine's auto-picked config",
+        )
+    elif pin_frost and (block_scale or dense_jit_only_ok):
         # A backend that does not admit the e4m3 + E8M0 two-dequant graph is a typed decline
         # (cudnnGraphNotSupportedError), and "no frost_gemm in the list" is the `_NoFrostPlan`
         # above; both leave the JIT-only route, which never asks the backend.  Anything else --
         # a backend failure inside check_support / build_plans, a bare RuntimeError -- is a
         # bug and PROPAGATES (engine contract rule 2); the catch is deliberately this narrow.
-        # WARNING, not INFO: on this route the plan-name pin is absent and `workspace_bytes`
-        # is the JIT artifact's, which a caller reading the perf table should see without -v.
+        # WARNING, not INFO, on the block-scale route: there the plan-name pin is absent and `workspace_bytes`
+        # is the JIT artifact's, which a caller reading the perf table should see without -v.  INFO on the
+        # dense route: compiling without the opt-in flag is the serving stack's intended path, not a surprise.
         try:
             _backend_pin()
         except (cudnn.cudnnGraphNotSupportedError, _NoFrostPlan) as exc:
             plan.route = "jit-only"
-            _LOG.warning("%s: backend declined the block-scale graph (%s: %s); taking the JIT-only route", label, type(exc).__name__, str(exc)[:200])
+            backend_decline = exc
+            if block_scale:
+                _LOG.warning("%s: backend declined the block-scale graph (%s: %s); taking the JIT-only route", label, type(exc).__name__, str(exc)[:200])
+            else:
+                _LOG.info(
+                    "%s: no backend plan for the dense %s graph (%s: %s); taking the forced-tile JIT-only route at %s (no backend plan, no cuDNN handle at execute)",
+                    label,
+                    _dtype_word(dtype),
+                    type(exc).__name__,
+                    str(exc)[:200],
+                    name,
+                )
     else:
         _backend_pin()
 
@@ -1573,7 +2015,6 @@ def build_proj_gemm(
     # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.  So does
     # an explicit `mma_tile_k_bytes`: the width lives on a JIT config, and a dense shape
     # outside the forced tile's N would otherwise drop the knob on the graph route.
-    name = _forced_tile_config(n) if tile_config == "auto" else tile_config
     pinned_split = split_k >= 1  # split_k=1 pins ONE slice (and refuses the fallback); S >= 2 splits
     if pin_frost and (name or block_scale or pinned_split or mma_tile_k_bytes is not None):
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
@@ -1612,6 +2053,15 @@ def build_proj_gemm(
         try:
             compiled = jit_from_cudnn_graph(g, config=cfg)
         except Exception as exc:
+            if capture_safe:
+                # The serving declaration: the graph-heuristic fallback would create a cuDNN handle at the first execute per
+                # stream -- inside the capture a serving stack records with no warm-up -- so a refused forced compile is a
+                # typed decline naming the tile and the compiler's reason, never a warning and a silent route change.
+                raise NotImplementedError(
+                    f"{label}: capture_safe=True pins the forced-tile JIT route at {cfg.name!r}, and that compile was refused "
+                    f"({type(exc).__name__}: {str(exc)[:300]}); the graph-heuristic fallback is refused too -- its first execute on a stream "
+                    "creates a cuDNN handle, which cannot happen inside a CUDA-graph capture"
+                ) from exc
             if tile_config != "auto" or block_scale or mma_tile_k_bytes is not None:
                 raise  # explicit requests (and the block-scale path, which has no graph fallback) surface their reason
             if pinned_split:
@@ -1630,6 +2080,13 @@ def build_proj_gemm(
                     "the graph heuristic's tile is not validated for e4m3 MN-major operands, so the fallback the bf16 / f16 and K-major fp8 plans "
                     "take is refused too"
                 ) from exc
+            if plan.route == "jit-only":
+                # The dense jit-only route has NO backend plan to fall back onto (the pin above raised): today's typed decline
+                # stands, with the compiler's refusal chained -- nothing can serve this plan without the opt-in flag.
+                raise _NoFrostPlan(
+                    f"{label}: {backend_decline}; and the forced-tile JIT compile at {cfg.name!r} was refused too "
+                    f"({type(exc).__name__}: {str(exc)[:300]}) -- no route can serve this plan"
+                ) from exc
             compiled = None
             # WARNING, not DEBUG (like the block-scale twin above): the fallback changes the tile config, the
             # route and possibly the slice count (`_auto_split_k`), under a different plan name -- a perf table
@@ -1647,7 +2104,23 @@ def build_proj_gemm(
             plan.mma_tile_k_bytes = getattr(compiled.config, "mma_tile_k_bytes", None)
             if plan.route == "graph":
                 plan.route = "graph+jit"
+    plan.capture_safe = bool(capture_safe)
+    if capture_safe and plan.jit is None:
+        # Unreachable by the checks above (the graph route was declined up front, a refused compile raised typed); kept so the
+        # invariant the serving stack relies on -- a capture_safe plan HAS a JIT -- is asserted where the plan is finished.
+        raise NotImplementedError(_capture_safe_graph_route_message(label, m, k, n, tile_config, str(plan.tile_config_name)))
     return plan
+
+
+def _capture_safe_graph_route_message(label: str, m: int, k: int, n: int, tile_config, resolved: str) -> str:
+    return (
+        f"{label}: capture_safe=True needs the forced-tile JIT route, but this plan resolves to the graph route ({resolved}; m={m}, k={k}, "
+        f"n={n}, tile_config={tile_config!r}): the graph route creates a cuDNN handle at the first execute per stream, which cannot happen "
+        f"inside a CUDA-graph capture -- use an N that 256 divides (the forced tile {_FORCED_TILE_NAME!r}), a shape the small-M route "
+        f"names a tile for (m <= {SMALL_M_MAX} on a dense bf16 / f16 K-major projection), a 128-grid N past {SMALL_M_MAX} rows the "
+        "large-M rule names the engine's baseline for (the same dense projection, a shape the engine's planner does not re-plan), or "
+        "name a tile_config explicitly"
+    )
 
 
 def _auto_tile_config(g):
@@ -1798,8 +2271,14 @@ def run_proj_gemm(
         return
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
+    if plan.capture_safe:
+        raise RuntimeError(
+            f"{plan.label}: a capture_safe plan reached the graph route (route={plan.route!r}, no JIT) -- build_proj_gemm refuses that at "
+            "compile time, so this plan was altered after it was built"
+        )
     # The graph route names its stream through the handle: the plan's engine
     # reads `ExecutionContext.stream` off it (`_pygraph.execute` -> `cudnn.get_stream`).
+    # Creating that handle inside a CUDA-graph capture is refused typed in `handle_for_stream`.
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)

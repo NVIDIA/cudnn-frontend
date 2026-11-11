@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 
 """
-A fused multi-head attention (FMHA) FP16/BF16 kernel for D=512 heads on the
-NVIDIA Blackwell SM120 family (SM120 and SM121) using TMA K/V loads.
+A fused multi-head attention (FMHA) FP16/BF16 kernel for D512 and D576/V512 on the
+NVIDIA Blackwell SM120 family (SM120 and SM121) using dense TMA or paged K/V loads.
 
 This is the D=512 variant of ``prefill_f16.py``: the same fused Q*K^T,
 softmax, and softmax(Q*K^T)*V pipeline on SM80-era ``mma.sync.aligned.m16n8k16``
@@ -19,7 +19,8 @@ the largest K plus V tile that fits SMEM next to the staged Q fragments and the
 exchange buffer.
 
 The kernel implements key optimizations including:
-- All warps compute; an elected lane of warp 0 also issues the K/V TMA loads
+- All warps compute; warp 0 loads K/V with dense TMA or predicated paged
+  cp.async copies. Paged K/V barriers expect all 32 lane arrivals
 - Dense Q tiles arrive by one TMA copy into the K/V slab (free until the first
   K/V tile); each warp reads its A fragments with ``ldmatrix`` and a CTA
   barrier hands the slab to the K/V pipeline. PackGQA tiles use a G-heads x
@@ -32,9 +33,8 @@ The kernel implements key optimizations including:
 - Twelve of each warp's sixteen Q d-fragments live in registers, the other four
   in shared memory and are reloaded once per KV tile
 - One fp32 partial-S exchange per KV tile between the two warps of a slab,
-  single-buffered: the write follows the V-tile wait, and the next V tile is
-  issued only after every warp has consumed the current one, so the partner
-  has always finished reading before the buffer is rewritten
+  single-buffered: dense TMA orders reuse through the V-tile handoff; paged
+  copies use an explicit warp-pair barrier after both partners finish reading
 - Lazy O rescale: the running row max only moves when a tile raises it by more
   than ``RESCALE_THRESHOLD``, so most KV tiles skip the O correction
 - Online softmax fused into the main loop, with per-lane registers and intra-warp
@@ -49,13 +49,23 @@ The kernel implements key optimizations including:
   with no per-sequence descriptors: Q/O use direct addressing and K/V bias a
   single TMA descriptor's seq coordinate
 
+The D576/V512 flavor reuses this pipeline with 288 Q/K columns per warp.
+Q/K use a 64-byte swizzle that divides that half-head, while V retains its
+128-byte swizzle. Direct Q loads keep fifteen fragments in registers and
+three in SMEM. O stages through the drained K/V slab because the reduced
+Q/exchange allocation cannot hold the epilogue. Dense D512 retains Q TMA
+and overlap with its original epilogue storage.
+
 Constraints:
 - Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
 - Head tiles are (512, 512): each runtime head dimension is independently in
   (256, 512], in multiples of 8 (TMA 16-byte global-stride rule); TMA zero-fills
-  the pad columns
+  the pad columns. The wider flavor accepts QK in (512, 576] and V in
+  (256, 512], also in multiples of 8
 - Q heads must be divisible by the number of K/V heads
-- Q/K/V/O use compact BSHD storage
+- Q/O use aligned BSHD storage; dense K/V use the same layout contract.
+  Paged K/V use independent HND/NHD pools and tables, with device KV lengths;
+  paged THD Q is not supported
 - The one supported CTA (Q, KV) tile is (64, 32) (``config_sm120.D512_TILE``)
 - K/V pipeline, staged Q, exchange, and output staging storage must fit within
   the target SM120 SMEM capacity
@@ -72,7 +82,7 @@ import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3, DTYPE_E5M2
 from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
@@ -85,19 +95,26 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     build_thd_meta_kernel,
     sanitize_v_tail,
     thd_claim_next,
-    thd_decode_unit,
+    THD_BATCH_OF_WORK_META_WORDS,
+    THD_WORK_META_WORDS,
+    thd_decode_unit_prefix,
     THD_SETUP_THREADS,
 )
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    load_paged_half_tile,
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
     pack_to_i32,
+    zero_dead_q_rows,
 )
 from cudnn.sdpa.fwd.config_sm100 import rescale_threshold
 from cudnn.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
+    D576_FLAVOR,
+    WIDE_F16_FLAVORS,
+    wide_q_smem_frags,
     D512_TILE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
@@ -107,7 +124,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     validate_params,
 )
 
-from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, compile_host as _compile_prepared_host
+from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _dense_host, paged_host as _paged_host, compile_host as _compile_prepared_host
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
@@ -116,9 +133,11 @@ from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _host, compile_ho
 PREPARED_KV_TAIL_NATIVE = True
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-validate_params(PARAMS)
+validate_params(PARAMS, allow_paged=True, allow_paged_split=True)
+_host = _paged_host if PARAMS.page_size else _dense_host
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+KV_STORAGE_DTYPE = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_E5M2: cutlass.Float8E5M2}.get(PARAMS.dtype_kv, STORAGE_DTYPE)
 
 # THD only: pull units from a device-side counter over a machine-sized grid
 # instead of launching the plan-time envelope as a padded rectangle. The
@@ -152,7 +171,6 @@ class SM120FusedMultiHeadAttentionForward:
     # Q d-fragments (of each warp's 16) kept in shared memory: with the warp's
     # O half (128 fp32) resident, 12 register-resident fragments fit under the
     # 255-register cap; 4 x 512 B per warp is what SMEM has left.
-    Q_SMEM_FRAGS = 4
     # Lazy rescale: a tile max at most this far (log2 units of the scaled scores)
     # above the running row max is not adopted, so the O correction stays 1.0.
     RESCALE_THRESHOLD = rescale_threshold(PARAMS.dtype_qkv)
@@ -210,9 +228,11 @@ class SM120FusedMultiHeadAttentionForward:
         pack_gqa: bool = False,
         qh_per_kh: int = 1,
         stats_log2: bool = False,
+        page_size: int = 0,
     ):
         """Initialize the FMHA prefill kernel configuration.
 
+        :param page_size: Tokens per K/V page; zero selects dense K/V.
         :param in_dtype: Q/K/V element type (Float16 or BFloat16).
         :param out_dtype: O element type. Must match ``in_dtype``.
         :param is_causal: Apply an upper causal bound to QK.
@@ -226,8 +246,9 @@ class SM120FusedMultiHeadAttentionForward:
         :param seq_q_lens_present: Read per-batch query lengths at runtime.
         :param seq_kv_lens_present: Read per-batch key/value lengths at runtime.
         :param has_sink: Fold the per-Q-head sink logit from the ``sinks``
-            tensor into the softmax denominator; when ``False`` the ``sinks``
-            argument is an unused dummy.
+            tensor into the softmax denominator (unsplit; a split writes
+            sink-free partials and the combine folds it once); when
+            ``False`` the ``sinks`` argument is an unused dummy.
         :param thd_varlen: THD (ragged) mode — Q/K/V/O and LSE are fully
             packed batch-1 views, ``seq_kv_lens`` is the
             ``[seq_kv(B) | cu_q(B+1) | cu_k(B+1)]`` metadata tensor, and the
@@ -246,11 +267,12 @@ class SM120FusedMultiHeadAttentionForward:
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
-        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile/qh_per_kh``
-            tokens x qh_per_kh query heads sharing one KV head, token-major
-            (row r ↔ token ``r // G``, head ``r % G``).
-        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; must divide
-            ``q_tile`` when ``pack_gqa`` is enabled, and is validated against
+        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile // qh_per_kh``
+            whole tokens x qh_per_kh query heads sharing one KV head, token-major
+            (row r ↔ token ``r // G``, head ``r % G``); rows past
+            ``(q_tile // G) * G`` are dead (zero Q, never stored).
+        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; at most
+            ``q_tile`` when ``pack_gqa`` is enabled, and validated against
             the runtime Q/K head extents at ``__call__``.
         """
 
@@ -258,12 +280,15 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("out_dtype must match in_dtype")
         if qh_per_kh < 1:
             raise ValueError(f"qh_per_kh ({qh_per_kh}) must be >= 1")
-        if pack_gqa and q_tile % qh_per_kh != 0:
-            raise ValueError(f"qh_per_kh ({qh_per_kh}) must divide q_tile ({q_tile}) when pack_gqa is enabled")
+        if pack_gqa and qh_per_kh > q_tile:
+            raise ValueError(f"qh_per_kh ({qh_per_kh}) must not exceed q_tile ({q_tile}) when pack_gqa is enabled")
         if pack_gqa and thd_varlen:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
         if thd_varlen and thd_batch < 1:
             raise ValueError("thd_varlen requires thd_batch >= 1")
+        if page_size and (thd_varlen or not seq_kv_lens_present):
+            raise ValueError("SM120 D512 paged KV requires dense queries and device KV lengths")
+        self.page_size = page_size
         self.in_dtype = in_dtype
         self.out_dtype = in_dtype
         self.is_causal = is_causal
@@ -274,9 +299,6 @@ class SM120FusedMultiHeadAttentionForward:
         # maps window_right -> is_causal), so the masking sites key off
         # is_causal and add the (compile-time) widening. 0 = plain causal.
         self.window_right = window_size_right if window_size_right is not None else 0
-        # A translated diagonal (bottom-right anchoring or a right band) can
-        # straddle one more KV tile than the tile-aligned top-left one.
-        self.diag_shifted = bottom_right or self.window_right > 0
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
@@ -296,17 +318,25 @@ class SM120FusedMultiHeadAttentionForward:
         # G-heads x T-tokens box whose token-major landing order is the packed
         # row order. THD rows ride the packed token base and keep the per-lane
         # global loads.
-        self.tma_q = not thd_varlen
-        # Rows of a Q tile per token (PackGQA packs qh_per_kh heads per token).
+        # The D576 Q tile is larger than the aliased K/V slab.
+        self.tma_q = not thd_varlen and (head_tile_qk, head_tile_v) == D512_FLAVOR
+        # A packed tile holds q_tile // G whole tokens; when G does not divide
+        # the tile, its rows past that many tokens x G are dead: zero Q, never
+        # stored (G = 6 at 64 rows: 10 tokens, 60 live rows).
         self.q_tile_tokens = q_tile // qh_per_kh if pack_gqa else q_tile
+        self.live_rows = self.q_tile_tokens * qh_per_kh if pack_gqa else q_tile
+        self.dead_rows = self.live_rows != q_tile
+        # The diagonal can straddle one more KV tile when translated
+        # (bottom-right or a right band) or when Q tiles start off the KV grid.
+        self.diag_shifted = bottom_right or self.window_right > 0 or (self.q_tile_tokens % kv_tile != 0 and kv_tile % self.q_tile_tokens != 0)
         # KV split: SPLIT_KV CTAs per (q_tile, batch, head), each covering a
         # contiguous slice of that tile's KV-tile range.  1 = off (folds away).
         self.split_kv = split_kv
 
         if (self.q_tile, self.kv_tile) != D512_TILE:
             raise ValueError(f"SM120 SDPA d512 kernel: (q_tile, kv_tile) must be {D512_TILE}; got {(self.q_tile, self.kv_tile)}")
-        if (self.head_tile_qk, self.head_tile_v) != D512_FLAVOR:
-            raise ValueError(f"SM120 SDPA d512 kernel: head tiles must be {D512_FLAVOR}; got {(self.head_tile_qk, self.head_tile_v)}")
+        if (self.head_tile_qk, self.head_tile_v) not in WIDE_F16_FLAVORS:
+            raise ValueError(f"SM120 SDPA d512 kernel: head tiles must be in {WIDE_F16_FLAVORS}; got {(self.head_tile_qk, self.head_tile_v)}")
 
         # Warp roles: every warp computes; HEAD_SPLIT warps share each 16-row Q
         # slab, one head-dim half each.
@@ -343,7 +373,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.k_half_elems = self.k_tile_elems // self.HEAD_SPLIT
         self.v_half_elems = self.v_tile_elems // self.HEAD_SPLIT
         # Q d-fragments past q_reg_frags stay in shared memory.
-        self.q_smem_frags = self.Q_SMEM_FRAGS
+        self.q_smem_frags = wide_q_smem_frags((self.head_tile_qk, self.head_tile_v))
         self.q_reg_frags = self.qk_d_frags - self.q_smem_frags
         # SMEM: the K + V tile, the staged Q fragments ([warp][frag][lane][4]
         # Int32) and the partial-S exchange ([warp][k_frag][lane][4] fp32) --
@@ -361,7 +391,8 @@ class SM120FusedMultiHeadAttentionForward:
                 (cuda.TensorMapSwizzle.s64b, 64),
                 (cuda.TensorMapSwizzle.s32b, 32),
             ):
-                if head_bytes % span == 0:
+                # Each warp half must begin on a whole swizzle chunk.
+                if (head_bytes // self.HEAD_SPLIT) % span == 0:
                     return swizzle, head_bytes // span, head_tile // (head_bytes // span)
             raise ValueError(f"Unsupported TMA inner dimension: {head_bytes} B")
 
@@ -372,13 +403,16 @@ class SM120FusedMultiHeadAttentionForward:
     def load_one_kv_tile(
         self,
         s_dst: cutlass.Array,
-        tma_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
         mbar: cutlass.Array,
         batch_idx: cutlass.Int32,
         head_idx: cutlass.Int32,
         seq_coord: cutlass.Int32,
         is_v: cutlass.Constexpr[bool],
         envelope: cutlass.Constexpr[bool],
+        pool: cute.Tensor,
+        page_table,
+        seqlen_k: cutlass.Int32,
     ) -> None:
         """Launch the TMA load(s) for a complete K/V tile into swizzled SMEM.
 
@@ -408,31 +442,47 @@ class SM120FusedMultiHeadAttentionForward:
             (the two carry independent head tiles and swizzle spans).
         :param envelope: Actual head dim < compile-time tile (zero-padded).
         """
-        chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
-        chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
-        if prims.elect_sync():
-            if cutlass.const_expr(envelope):
-                # Every copy completes with its full box (OOB regions arrive as
-                # zeros but still count), so the expected transaction total is
-                # simply chunks x the per-copy box bytes.
-                prims.mbarrier_arrive_expect_tx(mbar, chunks * tma_desc.global_tx_bytes())
-                for i in cutlass.range_constexpr(chunks):
+        if cutlass.const_expr(self.page_size > 0):
+            load_paged_half_tile(
+                s_dst,
+                mbar,
+                pool,
+                page_table,
+                batch_idx,
+                head_idx,
+                seq_coord,
+                seqlen_k,
+                self.page_size,
+                self.kv_tile,
+                self.head_tile_v if is_v else self.head_tile_qk,
+                self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
+            )
+        else:
+            chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
+            chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
+            if prims.elect_sync():
+                if cutlass.const_expr(envelope):
+                    # Every copy completes with its full box (OOB regions arrive as
+                    # zeros but still count), so the expected transaction total is
+                    # simply chunks x the per-copy box bytes.
+                    prims.mbarrier_arrive_expect_tx(mbar, chunks * tma_desc.global_tx_bytes())
+                    for i in cutlass.range_constexpr(chunks):
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            s_dst.subview(i * self.kv_tile * chunk_elems),
+                            tma_desc.get_ptr(),
+                            (i * chunk_elems, seq_coord, head_idx, batch_idx),
+                            mbar,
+                        )
+                else:
+                    # Rank-5 coordinates (c, seq, i, head, batch): one copy covers
+                    # every head chunk of the tile.
+                    prims.mbarrier_arrive_expect_tx(mbar, tma_desc.global_tx_bytes())
                     prims.cp_async_bulk_tensor_shared_cta_global(
-                        s_dst.subview(i * self.kv_tile * chunk_elems),
+                        s_dst,
                         tma_desc.get_ptr(),
-                        (i * chunk_elems, seq_coord, head_idx, batch_idx),
+                        (0, seq_coord, 0, head_idx, batch_idx),
                         mbar,
                     )
-            else:
-                # Rank-5 coordinates (c, seq, i, head, batch): one copy covers
-                # every head chunk of the tile.
-                prims.mbarrier_arrive_expect_tx(mbar, tma_desc.global_tx_bytes())
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    s_dst,
-                    tma_desc.get_ptr(),
-                    (0, seq_coord, 0, head_idx, batch_idx),
-                    mbar,
-                )
 
     @cute.jit
     def load_q_tile_tma(
@@ -451,7 +501,9 @@ class SM120FusedMultiHeadAttentionForward:
         chunks = self.k_tma_swizzle_chunks
         chunk_elems = self.k_swizzle_chunk_elems
         if prims.elect_sync():
-            if cutlass.const_expr(envelope):
+            # A packed box with dead rows holds only the live rows: one copy per
+            # chunk keeps the slab's q_tile-row chunk stride.
+            if cutlass.const_expr(envelope or self.dead_rows):
                 prims.mbarrier_arrive_expect_tx(mbar, chunks * tma_desc.global_tx_bytes())
                 for i in cutlass.range_constexpr(chunks):
                     # Packed descriptors place head before sequence.
@@ -513,6 +565,8 @@ class SM120FusedMultiHeadAttentionForward:
             physical_row = chunk * self.q_tile + row_in_cta
             q_ptr = half_base + physical_row * chunk_elems + swizzle_xor(physical_row, col_in_chunk, chunk_elems, self.in_dtype.bytes)
             frag = prims.ldmatrix(q_ptr, 4, prims.MMALayout.ROW)
+            if cutlass.const_expr(self.dead_rows):
+                frag = zero_dead_q_rows(frag, basic_params.q_warp_row0 + basic_params.lane // 4, self.live_rows)
             if cutlass.const_expr(d_frag < self.q_reg_frags):
                 q_regs[d_frag * 4 : 4] = frag
             else:
@@ -574,7 +628,7 @@ class SM120FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
                     q_row_off = q_row_off + (row_in_cta % self.qh_per_kh) * basic_params.q_head_stride
                 q_packed = cutlass.Int32(0)
-                if cur_q_seq_idx < basic_params.seqlen_q and col_in_cta < basic_params.head_dim_qk:
+                if cur_q_seq_idx < basic_params.seqlen_q and col_in_cta < basic_params.head_dim_qk and row_in_cta < self.live_rows:
                     q_pair = (basic_params.q_ptr + basic_params.q_head_off + q_row_off + col_in_cta).load(count=2, alignment=4)
                     q_packed = q_pair.bitcast(cutlass.Int32)[0]
                 if cutlass.const_expr(d_frag >= self.q_reg_frags):
@@ -915,10 +969,9 @@ class SM120FusedMultiHeadAttentionForward:
         Each warp publishes its partial scores in its own ``sX`` slots
         (``[warp][k_frag][lane][4]``, one 16-byte store per fragment), meets its
         partner on the slab's named barrier, and adds the partner's slots in
-        place. The buffer is single-buffered: the caller runs this after the V
-        tile's mbarrier wait, and the next V tile is issued only after every
-        warp has consumed the current one, so the partner has finished reading
-        this tile's partials before anyone writes the next tile's.
+        place. The buffer is single-buffered. Both loaders need an explicit
+        pair barrier after the generic shared reads: a K/V copy's completion
+        does not complete the partner warp's reads of these score slots.
 
         :param basic_params: Lane mapping, warp-pair indices, and ``sX``.
         :param s_regs: This warp's partial QK scores; the full scores on return.
@@ -941,6 +994,10 @@ class SM120FusedMultiHeadAttentionForward:
             partner = (partner_base + k_frag * 32 * 4).load(count=4, alignment=16).bitcast(cutlass.Float32)
             for i in cutlass.range_constexpr(4):
                 s_regs[s_off + i] = s_regs[s_off + i] + partner[i]
+        # Complete both partner reads before either warp reuses sX. This is
+        # necessary for dense/THD TMA as well as paged cp.async: a producer
+        # handoff orders its K/V slab, not this separate single-buffered tile.
+        prims.barrier_cta_sync(self.bar_pair_base + basic_params.slab, thread_count=self.HEAD_SPLIT * cute.arch.WARP_SIZE)
 
     @cute.jit
     def compute_one_kv_tile(
@@ -990,6 +1047,9 @@ class SM120FusedMultiHeadAttentionForward:
                     basic_params.kv_row_base + (kv_tile_idx - 1) * self.kv_tile,
                     is_v=False,
                     envelope=basic_params.k_envelope,
+                    pool=basic_params.k_pool,
+                    page_table=basic_params.block_table,
+                    seqlen_k=basic_params.seqlen_k,
                 )
         else:
             prims.barrier_cta_arrive(self.bar_k_consumed, self.threads_kv_pipeline)
@@ -997,8 +1057,8 @@ class SM120FusedMultiHeadAttentionForward:
         while not prims.mbarrier_try_wait_parity(basic_params.v_tma_mbar, tma_phase):
             pass
 
-        # Full scores = this warp's head-dim half + the partner's. After the V
-        # wait on purpose: see exchange_partial_s for why that keeps sX race-free.
+        # Full scores = this warp's head-dim half + the partner's. The exchange
+        # explicitly releases both reads before the next iteration reuses sX.
         self.exchange_partial_s(basic_params, s_regs)
 
         p_regs = self.online_softmax(
@@ -1011,17 +1071,23 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
-        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+        # Paged copies already zero-fill dead rows. Compute-warp tail stores
+        # would race the partner warps' PV reads, even when writing zero.
+        if cutlass.const_expr(self.page_size == 0 and (self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
+            # One warp owns the zero fill. Repeated zero stores from all
+            # compute warps still race another warp's ldmatrix reads.
+            if basic_params.compute_warp_idx == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs)
         if basic_params.compute_warp_idx == 0:
             prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
@@ -1035,6 +1101,9 @@ class SM120FusedMultiHeadAttentionForward:
                     basic_params.kv_row_base + (kv_tile_idx - 1) * self.kv_tile,
                     is_v=True,
                     envelope=basic_params.v_envelope,
+                    pool=basic_params.v_pool,
+                    page_table=basic_params.block_table_v,
+                    seqlen_k=basic_params.seqlen_k,
                 )
         else:
             prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
@@ -1124,6 +1193,8 @@ class SM120FusedMultiHeadAttentionForward:
         q,
         k,
         v,
+        block_table,
+        block_table_v,
         o,
         lse,
         sinks,
@@ -1158,7 +1229,7 @@ class SM120FusedMultiHeadAttentionForward:
         belongs to the CTA and is reused across units; dense units prefetch
         the next Q tile while storing the current output.
         """
-        q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
+        q_seq_idx = q_tile_idx * self.q_tile_tokens
 
         seqlen_q = cutlass.Int32(q.shape[1])
         seqlen_k = cutlass.Int32(k.shape[1])
@@ -1169,7 +1240,7 @@ class SM120FusedMultiHeadAttentionForward:
             # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr].
             # Per-sequence lengths come from the prefix sums; the bases offset
             # every packed (1, T, H, D) access below.
-            n_batch = (seq_kv_lens.shape[0] - 4) // 4
+            n_batch = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
             meta = cutlass.make_array_view(seq_kv_lens)
             # batch_idx is a real batch index here: whichever dispatch produced
             # it has already resolved the longest-first batch_remap.
@@ -1223,7 +1294,7 @@ class SM120FusedMultiHeadAttentionForward:
             if q_seq_idx >= seqlen_q:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            causal_k_end = q_seq_idx + (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.window_right
+            causal_k_end = q_seq_idx + self.q_tile_tokens + self.window_right
             if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))
@@ -1336,6 +1407,10 @@ class SM120FusedMultiHeadAttentionForward:
             min_kv_tile=min_kv_tile,
             k_envelope=k_envelope,
             v_envelope=v_envelope,
+            k_pool=k,
+            v_pool=v,
+            block_table=block_table,
+            block_table_v=block_table_v,
         )
         mma_params = SimpleNamespace(
             sK=sK,
@@ -1372,8 +1447,32 @@ class SM120FusedMultiHeadAttentionForward:
         if warp == 0 and has_kv_work:
             if cutlass.const_expr(not self.tma_q):
                 kv_seq_idx = (num_kv_tiles - 1) * self.kv_tile
-            self.load_one_kv_tile(sK, tma_k_desc, k_tma_mbar, tma_batch_idx, kv_head_idx, kv_row_base + kv_seq_idx, is_v=False, envelope=k_envelope)
-            self.load_one_kv_tile(sV, tma_v_desc, v_tma_mbar, tma_batch_idx, kv_head_idx, kv_row_base + kv_seq_idx, is_v=True, envelope=v_envelope)
+            self.load_one_kv_tile(
+                sK,
+                tma_k_desc,
+                k_tma_mbar,
+                tma_batch_idx,
+                kv_head_idx,
+                kv_row_base + kv_seq_idx,
+                is_v=False,
+                envelope=k_envelope,
+                pool=k,
+                page_table=block_table,
+                seqlen_k=seqlen_k,
+            )
+            self.load_one_kv_tile(
+                sV,
+                tma_v_desc,
+                v_tma_mbar,
+                tma_batch_idx,
+                kv_head_idx,
+                kv_row_base + kv_seq_idx,
+                is_v=True,
+                envelope=v_envelope,
+                pool=v,
+                page_table=block_table_v,
+                seqlen_k=seqlen_k,
+            )
 
         # Load Q into registers.
         if cutlass.const_expr(not self.tma_q):
@@ -1384,16 +1483,14 @@ class SM120FusedMultiHeadAttentionForward:
         # Main attention loop.
         mask_steps = 1
         if cutlass.const_expr(self.is_causal):
-            mask_steps = ceil_div(self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile, self.kv_tile)
+            mask_steps = ceil_div(self.q_tile_tokens, self.kv_tile)
             if cutlass.const_expr(self.diag_shifted):
-                # A translated diagonal (bottom-right anchoring or a right
-                # band) can straddle one additional KV tile; the frontier
-                # width itself is R-independent — the band only translates
-                # the diagonal.
-                mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+                # A shifted diagonal (see diag_shifted) can straddle one
+                # additional KV tile; the frontier width itself is R-independent.
+                mask_steps = ceil_div(self.q_tile_tokens + self.kv_tile - 1, self.kv_tile)
         left_mask_steps = 1
         if cutlass.const_expr(self.window_size_left is not None):
-            left_mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
+            left_mask_steps = ceil_div(self.q_tile_tokens + self.kv_tile - 1, self.kv_tile)
 
         kv_tile_idx = num_kv_tiles - 1
         # Phase 1: potentially masked iterations.
@@ -1466,12 +1563,13 @@ class SM120FusedMultiHeadAttentionForward:
         # With has_sink, the per-head sink logit joins the softmax denominator
         # as a virtual column with no V row: it rescales O, enters the LSE,
         # and gives a row with no visible key a finite LSE (the sink alone).
+        # A split writes sink-free partials: the combine folds the sink once.
         LN2 = cutlass.Float32(0.6931471805599453)
         row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
         row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
         for row_half in cutlass.range_constexpr(2):
             row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-            if cutlass.const_expr(self.has_sink):
+            if cutlass.const_expr(self.has_sink and self.split_kv == 1):
                 sinks_arr = cutlass.make_array_view(sinks)
                 _sink_head = q_head_base if cutlass.const_expr(not self.pack_gqa) else q_head_base + (q_warp_row0 + (lane // 4) + row_half * 8) % self.qh_per_kh
                 sink_logit = cutlass.Float32(sinks_arr[_sink_head])
@@ -1483,6 +1581,14 @@ class SM120FusedMultiHeadAttentionForward:
                 new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
                 row_sum_inv[row_half] = alpha / new_sum
                 row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
+                # Endpoint sinks must not propagate exp(inf - inf). Preserve
+                # the finite-sink arithmetic and the keyless-row convention.
+                if sink_logit == cutlass.Float32.inf:
+                    row_sum_inv[row_half] = 0.0
+                    row_lse[row_half] = cutlass.Float32.inf
+                elif sink_logit == -cutlass.Float32.inf and row_sum[row_half] <= 0.0:
+                    row_sum_inv[row_half] = 0.0
+                    row_lse[row_half] = -cutlass.Float32.inf
             else:
                 inv = cutlass.Float32(0.0)
                 if row_sum[row_half] > 0.0:
@@ -1527,12 +1633,15 @@ class SM120FusedMultiHeadAttentionForward:
                         # Rows at/past this batch's Q length trim to -inf.
                         if lse_q_idx >= seqlen_q:
                             lse_out = -cutlass.Float32.inf
-                        if lse_q_idx < q.shape[1]:
+                        lse_row_live = lse_q_idx < q.shape[1]
+                        if cutlass.const_expr(self.dead_rows):
+                            lse_row_live = lse_row_live and _lse_row_in_cta < self.live_rows
+                        if lse_row_live:
                             lse_arr[o_batch_idx, _lse_head, lse_q_idx] = lse_out
 
         prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
 
-        if cutlass.const_expr(self.tma_q):
+        if cutlass.const_expr(not self.thd_varlen):
             # Every warp is past its last K/V wait and no K/V copy is in flight, so
             # the K/V mbarriers are re-armed for the next unit: its tile parity
             # restarts at 0 and no phase count crosses the unit boundary. The
@@ -1541,9 +1650,10 @@ class SM120FusedMultiHeadAttentionForward:
                 if prims.elect_sync():
                     prims.mbarrier_inval(k_tma_mbar)
                     prims.mbarrier_inval(v_tma_mbar)
-                    prims.mbarrier_init(k_tma_mbar, 1)
-                    prims.mbarrier_init(v_tma_mbar, 1)
+                    prims.mbarrier_init(k_tma_mbar, 32 if self.page_size else 1)
+                    prims.mbarrier_init(v_tma_mbar, 32 if self.page_size else 1)
                 prims.fence_mbarrier_init()
+        if cutlass.const_expr(self.tma_q):
             next_unit = self._next_dense_unit(unit_idx)
             _n_batch, _n_qh, n_units = self._dense_unit_count(q, n_q_tiles)
             if compute_warp_idx == 0 and next_unit < n_units:
@@ -1559,7 +1669,12 @@ class SM120FusedMultiHeadAttentionForward:
         # rounds of half the d-fragment pairs (16 x 16 elements = 128 words per
         # pair, 4 per lane).
         pairs_per_round = self.pv_d_frags // 4
-        sO = sQ.data_ptr() + compute_warp_idx * (pairs_per_round * 16 * 16 // 2)
+        sO_base = sQ.data_ptr()
+        if cutlass.const_expr((self.head_tile_qk, self.head_tile_v) == D576_FLAVOR):
+            # Wide Q uses direct loads. Its smaller Q/exchange allocation cannot
+            # hold O, but the drained K/V slab remains idle through the epilogue.
+            sO_base = cutlass.Pointer(sKV.data_ptr(), dtype=cutlass.Int32)
+        sO = sO_base + compute_warp_idx * (pairs_per_round * 16 * 16 // 2)
         row_sum_inv_vec = cutlass.Vector.from_elements(
             (
                 row_sum_inv[0],
@@ -1580,6 +1695,9 @@ class SM120FusedMultiHeadAttentionForward:
         store_head_off = o_head_off
         if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
             store_head_off = store_head_off + (_store_row_in_cta % self.qh_per_kh) * o_head_stride
+        store_row_live = store_q_seq_idx < q.shape[1]
+        if cutlass.const_expr(self.dead_rows):
+            store_row_live = store_row_live and _store_row_in_cta < self.live_rows
         for o_round in cutlass.range_constexpr(2):
             for j in cutlass.range_constexpr(pairs_per_round):
                 d_frag_pair = o_round * pairs_per_round + j
@@ -1604,7 +1722,7 @@ class SM120FusedMultiHeadAttentionForward:
                     if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim_v:
                         gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                         gO_ptr.store(sO_ptr.load(count=4, alignment=16).bitcast(o.dtype), alignment=16)
-                elif store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim_v:
+                elif store_row_live and store_col_in_cta < head_dim_v:
                     gO_ptr = o_ptr + store_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                     if store_q_seq_idx < seqlen_q:
                         gO_ptr.store(sO_ptr.load(count=4, alignment=16).bitcast(o.dtype), alignment=16)
@@ -1637,14 +1755,16 @@ class SM120FusedMultiHeadAttentionForward:
         q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
+        block_table,
+        block_table_v,
         o: cute.Tensor,
         lse: Optional[cute.Tensor],
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
-        tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
-        tma_q_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_k_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
+        tma_v_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
+        tma_q_desc: Optional[cutlass.GridConstant[cuda.TensorMap]],
         softmax_scale_log2: cutlass.Float32,
         n_q_tiles: cutlass.Int32,
     ) -> None:
@@ -1680,7 +1800,7 @@ class SM120FusedMultiHeadAttentionForward:
         # The epilogue stages O through sAux (in two rounds) while the K/V
         # storage may already be receiving the next unit's Q tile.
         sKV = cutlass.Array(
-            k.dtype,
+            self.in_dtype,
             self.k_tile_elems + self.v_tile_elems,
             space=cutlass.AddressSpace.smem,
             alignment=128,
@@ -1704,12 +1824,13 @@ class SM120FusedMultiHeadAttentionForward:
         # can touch the K/V pipeline.
         if warp == 0:
             if prims.elect_sync():
-                prims.prefetch_tensormap(tma_k_desc.get_ptr())
-                prims.prefetch_tensormap(tma_v_desc.get_ptr())
+                if cutlass.const_expr(not self.page_size):
+                    prims.prefetch_tensormap(tma_k_desc.get_ptr())
+                    prims.prefetch_tensormap(tma_v_desc.get_ptr())
                 if cutlass.const_expr(self.tma_q):
                     prims.prefetch_tensormap(tma_q_desc.get_ptr())
-                prims.mbarrier_init(k_tma_mbar, 1)
-                prims.mbarrier_init(v_tma_mbar, 1)
+                prims.mbarrier_init(k_tma_mbar, 32 if self.page_size else 1)
+                prims.mbarrier_init(v_tma_mbar, 32 if self.page_size else 1)
                 prims.mbarrier_init(q_tma_mbar, 1)
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync(0)
@@ -1723,14 +1844,14 @@ class SM120FusedMultiHeadAttentionForward:
             # more CTAs than there is work is harmless — the extra ones fail the
             # loop test and retire.
             _meta = cutlass.make_array_view(seq_kv_lens)
-            _nb = (seq_kv_lens.shape[0] - 4) // 4
+            _nb = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0])
             _live = cutlass.Int32(_meta[4 * _nb + 2])
             _slot = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=16)
             _bidx, _, _ = cute.arch.block_idx()
             _uid = cutlass.Int32(_bidx)
             _phase = cutlass.Int32(0)
             while _uid < _live:
-                _qt, _b, _h = thd_decode_unit(
+                _qt, _b, _h = thd_decode_unit_prefix(
                     _meta,
                     cutlass.Int32(_nb),
                     _uid,
@@ -1742,6 +1863,8 @@ class SM120FusedMultiHeadAttentionForward:
                     q,
                     k,
                     v,
+                    block_table,
+                    block_table_v,
                     o,
                     lse,
                     sinks,
@@ -1796,6 +1919,8 @@ class SM120FusedMultiHeadAttentionForward:
                     q,
                     k,
                     v,
+                    block_table,
+                    block_table_v,
                     o,
                     lse,
                     sinks,
@@ -1847,6 +1972,8 @@ class SM120FusedMultiHeadAttentionForward:
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
         prepared: cutlass.Constexpr[bool] = False,
+        block_table=None,
+        block_table_v=None,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
 
@@ -1884,7 +2011,7 @@ class SM120FusedMultiHeadAttentionForward:
         head_dim_qk = q.shape[3]
         head_dim_v = v.shape[3]
         if cutlass.const_expr(head_dim_qk != k.shape[3] or not GENERAL_HEAD_TILE_MAX < head_dim_qk <= self.head_tile_qk):
-            raise ValueError("runtime Q/K head dimensions must match and be in (256, 512]")
+            raise ValueError("runtime Q/K head dimensions must match and fit the selected wide tile above 256")
         if cutlass.const_expr(head_dim_v != o.shape[3] or not GENERAL_HEAD_TILE_MAX < head_dim_v <= self.head_tile_v):
             raise ValueError("runtime V/O head dimensions must match and be in (256, 512]")
         if cutlass.const_expr(head_dim_qk % 8 != 0 or head_dim_v % 8 != 0):
@@ -1951,8 +2078,8 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(self.thd_varlen):
                 if cutlass.const_expr(q.shape[0] != 1):
                     raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-                if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
-                    raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
+                if cutlass.const_expr(seq_kv_lens.shape != (THD_WORK_META_WORDS(self.thd_batch),)):
+                    raise ValueError("THD seq_kv_lens must be the (THD_WORK_META_WORDS(B),) metadata tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
         # per-tensor TMA descriptor over the compact (B, S, H, D) storage.
@@ -1996,8 +2123,12 @@ class SM120FusedMultiHeadAttentionForward:
                 swizzle=swizzle,
             )
 
-        tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
-        tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
+        tma_k_desc = None
+        if cutlass.const_expr(not self.page_size):
+            tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
+        tma_v_desc = None
+        if cutlass.const_expr(not self.page_size):
+            tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
         # Dense Q shares K's head tile and swizzle geometry, with all chunks in
         # one box. Unpacked: q_tile rows of one head. PackGQA:
         # a G-heads x T-tokens box whose dims are ordered (C, H, S, I, B) so it
@@ -2006,7 +2137,7 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.tma_q and self.pack_gqa):
             _q_chunks = self.k_tma_swizzle_chunks
             _q_chunk_elems = self.k_swizzle_chunk_elems
-            if cutlass.const_expr(head_dim_qk == self.head_tile_qk):
+            if cutlass.const_expr(head_dim_qk == self.head_tile_qk and not self.dead_rows):
                 _q_layout = cute.make_layout(
                     (q.shape[0], _q_chunks, q.shape[1], q.shape[2], _q_chunk_elems),
                     stride=(q.stride[0], _q_chunk_elems, q.stride[1], q.stride[2], 1),
@@ -2035,7 +2166,7 @@ class SM120FusedMultiHeadAttentionForward:
         # Prepared THD carries the current batch in the metadata extent; tensor
         # entries retain their compile-time batch. Device readers already derive
         # the same batch from this layout, so setup and consumers stay in step.
-        thd_batch = (seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
+        thd_batch = THD_BATCH_OF_WORK_META_WORDS(seq_kv_lens.shape[0]) if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
         if cutlass.const_expr(self.thd_varlen):
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
@@ -2049,18 +2180,15 @@ class SM120FusedMultiHeadAttentionForward:
                 cutlass.Int32(q.shape[2]),
                 cutlass.Int32(self.q_tile),
                 thd_n_ctas,
+                True,  # work_prefix: the unit decode binary-searches the prefix (THD_WORK_META_WORDS(B) metadata)
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
         # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
         # sequence's length drain without work. NOTE thd_max_sq is a __call__
         # argument in this base, not a member.
-        # PackGQA: S_q*G packed rows per packed head, H_q/G packed heads on the
-        # head axis (THD is always unpacked).
-        n_q_tiles = (
-            ceil_div(thd_max_sq, self.q_tile)
-            if cutlass.const_expr(self.thd_varlen)
-            else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
-        )
+        # Dense: ceil(S_q / q_tile_tokens) Q tiles per head; PackGQA puts H_q/G packed
+        # heads on the head axis (THD is always unpacked).
+        n_q_tiles = ceil_div(thd_max_sq, self.q_tile) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile_tokens)
         n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]
         # Dense: a flat grid over the units, capped at thd_n_ctas — the persistent
@@ -2082,6 +2210,8 @@ class SM120FusedMultiHeadAttentionForward:
             q,
             k,
             v,
+            block_table,
+            block_table_v,
             o,
             lse,
             sinks,
@@ -2127,8 +2257,9 @@ def compile(  # noqa: A001
     _cache_key = _template_key(globals(), locals(), "compile")
     if not prepared or any(st is not None for st in (q_stride, k_stride, v_stride, o_stride)):
         raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
-    if pick_flavor(d_qk, d_v, fp8=False) != D512_FLAVOR:
-        raise ValueError(f"SM120 SDPA d512 kernel: head dimensions must both be in (256, 512]; got ({d_qk}, {d_v})")
+    flavor = pick_flavor(d_qk, d_v, fp8=False)
+    if flavor not in WIDE_F16_FLAVORS:
+        raise ValueError(f"SM120 SDPA wide kernel: head dimensions must fit D512 or D576/V512; got ({d_qk}, {d_v})")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,
@@ -2145,12 +2276,15 @@ def compile(  # noqa: A001
         thd_batch=b,
         thd_lse_head_major=lse_head_major,
         thd_lse_padded=bool(lse_padded_rows),
-        head_tile_qk=D512_FLAVOR[0],
-        head_tile_v=D512_FLAVOR[1],
+        head_tile_qk=flavor[0],
+        head_tile_v=flavor[1],
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
         split_kv=PARAMS.split_kv,
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
+        page_size=PARAMS.page_size,
     )
-    return _compile_prepared_host(kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0)
+    return _compile_prepared_host(
+        kernel, STORAGE_DTYPE, qh, kh, d_qk, d_v, has_lse, persistent_ctas, _cache_key, thd_max_sq=sq if PARAMS.thd_varlen else 0, kv_dtype=KV_STORAGE_DTYPE
+    )

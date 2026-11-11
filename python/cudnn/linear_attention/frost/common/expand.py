@@ -12,7 +12,7 @@ import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.device import current_device
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global_v4
 
 USE_PDL = True
@@ -91,8 +91,6 @@ def pack_bwd_kernel(
         chunk = chunk_idx - q_chunks
         if chunk < cutlass.Int64(mDox.shape[0]) * cutlass.Int64(do_heads.divisor) * cutlass.Int64(do_inner // 4):
             expand_rows(mDo, mDox, chunk, do_heads, do_inner, num_householder, num_householder - 1)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.kernel
@@ -110,8 +108,6 @@ def gather_dq_kernel(
     chunk_idx = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(cutlass.Int32(tidx))
     if chunk_idx < cutlass.Int64(mDq.shape[0]) * cutlass.Int64(dq_heads.divisor) * cutlass.Int64(dq_inner // 4):
         gather_rows(mDqx, mDq, chunk_idx, dq_heads, dq_inner, num_householder, num_householder - 1)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit

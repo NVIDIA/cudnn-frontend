@@ -21,8 +21,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import torch
-
 # (compute_capability) → cute DSL --gpu-arch flag value.
 # H100, B200/B300, and sm_100f require architecture-specific variants because
 # the kernels use TMA / tcgen05 instructions that are only guaranteed to lower
@@ -38,15 +36,7 @@ _ARCH_MAP = {
 
 
 @lru_cache(maxsize=None)
-def gpu_arch_flag() -> str:
-    """Return the ``sm_XXX`` value for the current CUDA device.
-
-    Cached because torch.cuda.get_device_capability() is cheap but the
-    function gets called inside every cute.compile site.
-    """
-    if not torch.cuda.is_available():
-        raise RuntimeError("cute.compile requires CUDA; no GPU available")
-    cap = torch.cuda.get_device_capability()
+def _arch_for_capability(cap: tuple) -> str:
     arch = _ARCH_MAP.get(cap)
     if arch is None:
         raise RuntimeError(
@@ -55,16 +45,32 @@ def gpu_arch_flag() -> str:
     return arch
 
 
-def compile_options(extra: str = "") -> str:
+def gpu_arch_flag(device=None) -> str:
+    """Return the ``sm_XXX`` value for ``device`` (default: the current CUDA device).
+
+    The device is read on every call: one process may drive an SM100 and an SM103
+    GPU, so only the capability-to-target mapping is cached. A compile cache that
+    keeps CuTe artifacts must key them by this value as well.
+    """
+    import torch  # lazy: the JAX bindings import the kernel modules without torch installed
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("cute.compile requires CUDA; no GPU available")
+    return _arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
+
+
+def compile_options(extra: str = "", *, gpu_arch: str | None = None) -> str:
     """Build the ``options=`` string for ``cute.compile``.
 
     Always emits ``--enable-tvm-ffi`` and a runtime-chosen ``--gpu-arch``;
     pass any kernel-specific knobs (``--opt-level 3`` etc.) via ``extra``.
+    A separately qualified kernel may pass ``gpu_arch`` without extending
+    the shared architecture map, which also gates unrelated DSA kernels.
 
     Example:
         cute.compile(..., options=compile_options("--opt-level 3"))
     """
-    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag()}"]
+    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch if gpu_arch is not None else gpu_arch_flag()}"]
     if extra:
         parts.append(extra)
     return " ".join(parts)

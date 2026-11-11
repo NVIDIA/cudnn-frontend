@@ -17,7 +17,11 @@ PER SEQUENCE on the packed rows: ``dh`` packed back row by row, every weight gra
 masses combined as ``sqrt(sum mass_i^2)``, ``amax_dP`` the max over the sequences.  Tolerances are the dense fp8 suite's,
 imported and never re-literalled: the fp8 SDPA row's recipe on the SDPA stage per sequence (``_row_tol``: ``_FP8_GRAD_TOL`` with
 ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under ``_AMAX_DS_TOL``) plus the bf16 block's bound form on the stage's bf16
-output, the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg``, the seeded oracle under the
+output in the e4m3 FLIP-STRUCTURED shape (``_assert_sdpa_stage_flip_structured``: a d-row outside the bound must be ONE proven fp8 flip
+of the reference's own P / dS intermediates -- a valid position of its reduction, within 1/32 of a code spacing of a midpoint, the exact
+rank-1 term reproducing the row within the UNCHANGED bound, the fit 1 +- 1/2 -- the flipped rows under the row recipe's budget, the
+residual after the term inside the bound on every cell; measured: one dV d-row of one 128-token sequence of the dense GQA cell on a
+212-SM part's dataset, 1.357 of the bound, two bf16 ulps at |ref| 0.33, 0 rows on the 204-SM dataset), the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg``, the seeded oracle under the
 bf16 block's bound on ``dh / dW_norm``, ``dw_o`` on both layers in the dense suite's e4m3 FLIP-CLASS form (``_assert_dw_o_flip_structured``:
 every cell outside the bf16 bound in a column an ``og8`` flip touched, the residual after the flips' exact rank-1 term inside the bound,
 the flip class itself capped -- the og8 cast's one-code flips are COLUMN events a row count at a short reduction does not describe; a
@@ -92,6 +96,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _assert_dw_o_flip_structured,
     _assert_dw_qkvg_floor_guard,
     _assert_quantizers_scalars_delta_bitwise,
+    _assert_sdpa_stage_flip_structured,
     _assert_seeded_dw_qkvg_row_budgeted,
     _calibrated_scale_dp,
     _declare_fp8_bwd,
@@ -420,8 +425,11 @@ def _row_reference_seq(res, v: dict, lo: int, hi: int):
 def _assert_sdpa_stage_per_sequence(res, v: dict) -> None:
     """The SDPA stage's bf16 ``dq / dk / dv`` rows of EVERY sequence against the fp8 row's reference over the sequence's own operands
     under the row's recipe (``_FP8_GRAD_TOL`` + ``assert_close_fp8_grad``'s flip budget, the flip proof fed the sequence's operands)
-    AND under the bf16 block's bound form (the stricter pin: the row recipe's absolute ``atol 0.08`` cannot reject an all-zero dQ / dK
-    at this geometry); ``amax_dP`` -- the max over the sequences of ``max |dS|`` -- under ``_AMAX_DS_TOL``."""
+    AND under the bf16 block's bound form in its flip-structured shape (``_assert_sdpa_stage_flip_structured``; the stricter pin: the
+    row recipe's absolute ``atol 0.08`` cannot reject an all-zero dQ / dK at this geometry, and the per-cell bound cannot describe one
+    e4m3 flip of a P / dS value, which moves a whole d-row by one code step times an operand row -- a d-row outside the bound must be
+    ONE proven flip of the reference's own intermediates, the bound unchanged); ``amax_dP`` -- the max over the sequences of
+    ``max |dS|`` -- under ``_AMAX_DS_TOL``."""
     g, sc, sp, d = res.geom, res.scalars, res.spec, res.geom.d_head
     grad_tol, amax_tol, assert_close_fp8_grad = _row_tol()
     s_scale = 2.0 ** _api_const("FP8_SCALE_S_LOG2")
@@ -455,7 +463,16 @@ def _assert_sdpa_stage_per_sequence(res, v: dict) -> None:
                 out_dtype=torch.bfloat16,
             )
             _report_stage_difference(got, refs[name], f"{tag} seq {i} [{lo}:{hi}]")
-            _assert_grad_close(got, refs[name].double(), f"{tag} seq {i} [{lo}:{hi}] vs the row's reference (the bf16 bound form)")
+            _assert_sdpa_stage_flip_structured(
+                got,
+                refs[name],
+                f"{tag} seq {i} [{lo}:{hi}] vs the row's reference (the bf16 bound form)",
+                kind=tag,
+                keys=n,
+                operand=operands[name],
+                flip_unit=flip_unit[name],
+                intermediates=lambda sel, rb=ref_bwd: rb(sel)[8],
+            )
     amax_dp = sc["amax_dp"]
     print(f"amax_dP {amax_dp:.6g} vs the reference's max over the sequences of max|dS| {amax_ref:.6g} (scale_dp {res.scale_dp:g})")
     assert abs(amax_dp - amax_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ref, (amax_dp, amax_ref)

@@ -4,6 +4,7 @@
  */
 
 #pragma once
+#include <numeric>
 
 #include <memory>
 #include <vector>
@@ -30,6 +31,27 @@ namespace cudnn_frontend {
 
 namespace graph {
 
+// uid -> (byte alignment, element bytes) that execute() enforces on the caller's pointer and override strides.
+using AlignedOperands = std::unordered_map<Tensor_attributes::uid_t, std::pair<int64_t, int64_t>>;
+
+// First dimension (extent > 1, stride != 1) whose byte stride is not a multiple of `alignment`, or -1.
+inline int64_t
+misaligned_stride_dimension(std::vector<int64_t> const& dim,
+                            std::vector<int64_t> const& stride,
+                            int64_t element_bytes,
+                            int64_t alignment) {
+    if (element_bytes <= 0 || alignment <= 1) {
+        return -1;
+    }
+    for (size_t i = 0; i < dim.size() && i < stride.size(); ++i) {
+        auto const stride_multiple = alignment / std::gcd(alignment, element_bytes);
+        if (dim[i] > 1 && stride[i] != 1 && stride[i] % stride_multiple != 0) {
+            return static_cast<int64_t>(i);
+        }
+    }
+    return -1;
+}
+
 class BatchNormNode;
 class DBNNode;
 class ConcatenateNode;
@@ -37,6 +59,7 @@ class MatmulNode;
 class MatmulFP8Node;
 class PointwiseNode;
 class ReductionNode;
+class CustomReductionNode;
 class ResampleNode;
 class ReshapeNode;
 class RngNode;
@@ -50,6 +73,21 @@ class SliceNode;
 
 // Interface for all nodes to follow.
 class INode {
+    friend class CustomReductionNode;
+    // Set on a reducer body. A node other than pointwise can run user code when it expands (a reducer, an SDPA
+    // score_mod), so a body build refuses such a node before any node expands, also on another thread.
+    bool is_reducer_body = false;
+
+    error_t
+    refuse_non_pointwise_sub_nodes() const {
+        for (auto const& sub_node : sub_nodes) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(sub_node->getType() != Type::POINTWISE,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "A reducer body may contain only pointwise operations.");
+        }
+        return {error_code_t::OK, ""};
+    }
+
    public:
     // A closed set of types that are allowed to be passed by value today
     using pass_by_values_t = Tensor_attributes::pass_by_values_t;
@@ -137,6 +175,12 @@ class INode {
         return {error_code_t::OK, ""};
     }
 
+    // Operands whose pointer and override strides execute() checks against the declared alignment.
+    virtual error_t
+    collect_aligned_operands_node(AlignedOperands&) const {
+        return {error_code_t::OK, ""};
+    }
+
    protected:
     // Type of each node. Nodes can either be a composite (value COMPOSITE) or
     // one of the other primitive types. Primitives types are nothing but
@@ -179,8 +223,9 @@ class INode {
         MOE_GROUPED_MATMUL_BWD,
         DIAGONAL_BAND_MASK,
         SOFTMAX,
+        CUSTOM_REDUCTION,
     };
-    Type tag;
+    Type tag = Type::COMPOSITE;
 
     inline void
     matmul(std::shared_ptr<Tensor_attributes> a,
@@ -312,6 +357,9 @@ class INode {
 
     error_t
     expand_subtree() {
+        if (is_reducer_body) {
+            CHECK_CUDNN_FRONTEND_ERROR(refuse_non_pointwise_sub_nodes());
+        }
         // Validate self
         CHECK_CUDNN_FRONTEND_ERROR(pre_validate_node());
         CHECK_CUDNN_FRONTEND_ERROR(infer_properties_node());
@@ -349,6 +397,15 @@ class INode {
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_node(tensor_to_pass_by_value));
         for (auto const& sub_node : sub_nodes) {
             CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_subtree(AlignedOperands& aligned_operands) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_node(aligned_operands));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_aligned_operands_subtree(aligned_operands));
         }
         return {error_code_t::OK, ""};
     }
@@ -421,6 +478,12 @@ class INode {
     virtual Type
     getType() = 0;
 
+    // A backend engine config this node needs that the backend heuristics do not propose (returned first in the plan
+    // list, ahead of the heuristics' own configs; -1 = none). Keep this rare: before adding a case, check whether it
+    // can live in the Python FE heuristics (the layer that ranks backend and FROST candidates, python/cudnn/engines/
+    // and python/cudnn/sdpa/). It belongs here only when the backend omits the config outright and C++ callers, which
+    // never reach the Python layer, need it -- and only as a graph-fact rule, not a shape list. Keep it even after a
+    // backend fix: a newer frontend still meets older backends.
     virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
         return {-1, {}};
@@ -443,6 +506,8 @@ class INode {
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>,
                                                  std::shared_ptr<Tensor_attributes>,
                                                  Reduction_attributes);
+    std::vector<std::shared_ptr<Tensor_attributes>> custom_reduction(std::vector<std::shared_ptr<Tensor_attributes>>,
+                                                                     Custom_reduction_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
     std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
     std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);

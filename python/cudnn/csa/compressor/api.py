@@ -18,21 +18,22 @@ The framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.
 that calls the forward wrapper in ``forward()`` and the backward wrapper in
 ``backward()``); these APIs are pure kernels-plus-validation.
 
-Validated envelope (``check_support``): compute capability major >= 10 (SM100+), BF16 ``kv``/``score``/
-``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
+Validated envelope (``check_support``): SM90 or compute capability major >= 10,
+BF16 ``kv``/``score``/``out``, FP32 ``ape``, int32
+``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
 (``total_tokens * coff * head_dim < 2**31``), and per ratio:
 
 - ``ratio in {2, 4}``, ``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA
   configuration, ``coff == 1`` the own-block window form) — served by the generic
   kernels in ``compressor_sm100.py`` (whole window in registers; optimal at small
-  ratios, register-bound beyond ``ratio = 32``);
+  ratios, register-bound beyond ``ratio = 32``) on SM90 and newer GPUs;
 - ``ratio == 128``, ``coff in {1, 2}``, ``head_dim in {128, 512}`` — served by the
   dedicated kernels in ``compressor_sm100_r128.py`` (bucketed-schedule chunked-softmax
-  forward; staged smem backward with fused per-chunk reductions). The wrappers route
-  by ``ratio`` transparently. NOTE: the numerics contracts differ per family — see
-  below.
+  forward; staged smem backward with fused per-chunk reductions) on SM100 and newer
+  GPUs. The wrappers route by ``ratio`` transparently. NOTE: the numerics contracts
+  differ per family — see below.
 
-Numerics contract (see the kernel modules and docs/fe-oss-apis/csa.md for details):
+Numerics contract (see the kernel modules and docs/operations/sparse_attention/csa.md for details):
 fp32 arithmetic with one final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX.
 Forward, ``dKV`` and ``dScore`` are bitwise run-to-run deterministic in BOTH families.
 At ``ratio in {2, 4}`` dKV/dScore are additionally bit-identical to the fp32-intermediate
@@ -46,9 +47,11 @@ inputs whose fp32 intermediates stay finite those outputs additionally carry
 fp64-oracle parity (at least as close to an fp64 oracle as the eager reference). That
 is the approved deterministic tolerance contract (reduction reorders + fast-exp
 buckets).
-``dAPE`` uses one fp32 atomic per ``(k, dim)`` per CTA in both families and is not
-run-to-run deterministic (the backward APIs refuse to run under
-``torch.use_deterministic_algorithms(True)``).
+The default ``dAPE`` path uses one fp32 atomic per ``(k, dim)`` per CTA and is not
+run-to-run deterministic. ``deterministic=True`` replaces those atomics with
+CTA-local partial planes in caller-owned workspace plus fixed-order reduction stages,
+making the complete backward bitwise run-to-run deterministic and valid
+under ``torch.use_deterministic_algorithms(True)``.
 """
 
 from __future__ import annotations
@@ -59,23 +62,26 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
+import cuda.bindings.driver as cuda
 import torch
 
 from cudnn._torch_stream import as_torch_stream, stream_context
-import cuda.bindings.driver as cuda
-
+from cudnn._device import device_info
 from cudnn.api_base import APIBase, TupleDict
 
 from .compressor_sm100 import (
     CU_ALIGN_BYTES,
-    MINIMUM_COMPUTE_CAPABILITY_MAJOR,
     PTR_ALIGN_BYTES,
+    _bwd_rows,
+    bwd_dape_workspace_bytes,
     precompile_bwd,
     precompile_fwd,
     run_bwd,
     run_fwd,
 )
 from .compressor_sm100_r128 import (
+    bwd_dape_workspace_bytes_r128,
+    bwd_smem_bytes_r128,
     precompile_bwd_r128,
     precompile_fwd_r128,
     run_bwd_r128,
@@ -90,6 +96,7 @@ _INT32_LIMIT = 2**31
 _MAX_HEAD_DIM = 128 * 65535
 # Bound + eviction policy follow python/cudnn/graph.py's graph_cache precedent.
 _API_CACHE_MAXSIZE = 256
+_SM90_CAPABILITY = (9, 0)
 
 
 class _LruDict:
@@ -132,17 +139,17 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         yield
 
 
-def _reject_deterministic_backward() -> None:
-    """The backward accumulates ``dAPE`` with fp32 atomics and is not deterministic.
+def _reject_deterministic_backward(deterministic: bool = False) -> None:
+    """Reject torch deterministic mode only when the atomic dAPE path is selected.
 
-    Mirrors torch's deterministic-mode semantics: strict mode raises, warn-only mode
-    warns and runs.
+    Mirrors torch's semantics: strict mode raises, warn-only mode warns and runs.
     """
-    if torch.are_deterministic_algorithms_enabled():
+    if not deterministic and torch.are_deterministic_algorithms_enabled():
         message = (
             "CSA compressor backward accumulates dAPE with fp32 atomics and is not "
-            "deterministic; torch.use_deterministic_algorithms(True) is set. Use a "
-            "deterministic (eager) implementation instead."
+            "deterministic; torch.use_deterministic_algorithms(True) is set. Construct "
+            "CSACompressorBackward with deterministic=True (and pass its reported "
+            "workspace) or call csa_compressor_backward_wrapper(..., deterministic=True)."
         )
         if torch.is_deterministic_algorithms_warn_only_enabled():
             warnings.warn(message, RuntimeWarning, stacklevel=2)
@@ -188,6 +195,7 @@ class _CSACompressorBase(APIBase):
         self.head_dim = None
         self.n_seg = None
         self.target_device: Optional[torch.device] = None
+        self._compute_capability = None
 
     def check_support(self) -> bool:
         """Validate the configuration against the kernels' validated envelope.
@@ -281,12 +289,6 @@ class _CSACompressorBase(APIBase):
                 head_dim not in (128, 512),
                 f"CSA compressor at ratio=128 is validated for head_dim in {{128, 512}} only, got head_dim={head_dim}",
             )
-        # Rows (including static-capacity padding rows) gather a window of `ratio`
-        # tokens; the eager gather has the same requirement.
-        self._value_error_if(
-            total_comp > 0 and total_tokens < self.ratio,
-            f"total_comp={total_comp} > 0 requires at least ratio={self.ratio} tokens, got {total_tokens}",
-        )
         for desc, name in (
             (self.kv_desc, "kv"),
             (self.score_desc, "score"),
@@ -318,18 +320,21 @@ class _CSACompressorBase(APIBase):
         else:
             target = torch.device("cuda", torch.cuda.current_device())
 
-        capability = torch.cuda.get_device_capability(target)
+        capability = tuple(torch.cuda.get_device_capability(target))
         self._runtime_error_if(
-            capability[0] < MINIMUM_COMPUTE_CAPABILITY_MAJOR,
-            f"CSA compressor requires compute capability major >= {MINIMUM_COMPUTE_CAPABILITY_MAJOR} "
-            f"(SM100+), found SM{capability[0]}.{capability[1]} on {target}",
+            capability != _SM90_CAPABILITY and capability[0] < 10,
+            f"CSA compressor ratio {self.ratio} requires SM90 or compute capability " f"major >= 10, found SM{capability[0]}.{capability[1]} on {target}",
         )
-
+        self._runtime_error_if(
+            capability == _SM90_CAPABILITY and self.ratio == 128,
+            "CSA compressor ratio 128 is not yet supported on SM90; use ratio 2 or 4",
+        )
         self.total_tokens = total_tokens
         self.total_comp = total_comp
         self.head_dim = head_dim
         self.n_seg = self.cu_desc.shape[0] - 1
         self.target_device = target
+        self._compute_capability = capability
         self._is_supported = True
         return True
 
@@ -368,9 +373,11 @@ class _CSACompressorBase(APIBase):
 class CSACompressorForward(_CSACompressorBase):
     """Fused CSA compressor forward: one kernel over the whole THD pack.
 
-    Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding (for
-    CUDA-graph static shapes) and are computed with first-in-segment semantics from
-    token 0, exactly like the eager gather.
+    Ratio 2/4 plans support SM90 and compute-capability major >= 10. Ratio 128
+    remains compute-capability major >= 10 only.
+
+    Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding and are
+    written as exact zeros on every supported architecture.
     """
 
     def compile(self) -> None:
@@ -383,7 +390,7 @@ class CSACompressorForward(_CSACompressorBase):
         # and cache pattern with the generic kernels (JIT cache keyed per
         # (ratio, head_dim, coff, device) plus the compile-time schedule); the
         # numerics contracts intentionally DIFFER per family — see the module
-        # docstring and docs/fe-oss-apis/csa.md.
+        # docstring and docs/operations/sparse_attention/csa.md.
         if self.ratio == 128:
             precompile_fwd_r128(self.ratio, self.head_dim, self.coff, self.target_device)
             run = run_fwd_r128
@@ -431,6 +438,9 @@ class CSACompressorForward(_CSACompressorBase):
 class CSACompressorBackward(_CSACompressorBase):
     """Fused CSA compressor backward: recompute window probs, write grads in one kernel.
 
+    Ratio 2/4 plans support SM90 and compute-capability major >= 10. Ratio 128
+    remains compute-capability major >= 10 only.
+
     ``grad_kv``/``grad_score`` may be UNINITIALIZED: the kernel writes every position —
     consumed positions get their gradients (disjoint, atomic-free stores), and every
     never-consumed position (segment-tail tokens; for ``coff == 2`` the first-half
@@ -440,52 +450,200 @@ class CSACompressorBackward(_CSACompressorBase):
     separate zero-fill kernels. Exception: when ``total_comp == 0`` the kernel is not
     launched and the buffers are left untouched, so a caller that needs autograd-exact
     zeros in that case must zero them itself (the high-level wrapper does).
-    ``grad_ape`` must be zero-initialized by the caller before EVERY ``execute`` call
-    and before every CUDA-graph replay that reuses the buffer: the kernel only
-    ACCUMULATES into it (fp32 atomics, not bitwise run-to-run deterministic —
-    ``grad_kv``/``grad_score`` are) and never clears it, so a reused buffer otherwise
-    carries the previous invocation's sums. (The high-level wrapper allocates a fresh
-    zeroed buffer per call; because that zero-fill is captured together with the
-    kernel, wrapper graph replays re-zero automatically.)
-    ``execute`` raises under ``torch.use_deterministic_algorithms(True)``. Incoming
-    gradients on static-capacity padding rows (``[cu_seqlens_comp[-1], total_comp)``)
-    are ignored.
+    The default atomic path requires caller-zeroed ``grad_ape`` before every execute
+    or graph replay and raises under strict torch deterministic mode. With
+    ``deterministic=True``, ``scratch_workspace_bytes()`` reports the required
+    caller-owned same-device contiguous uint8 scratch. The buffer must be 16-byte
+    aligned, must not overlap any operand, and must have at least the reported
+    capacity. ``execute(..., workspace=...)`` launches fixed-order reduction stages,
+    and ``grad_ape`` is fully overwritten (so it need not be initialized
+    and graph replays do not accumulate). The atomic plan requires ``workspace=None``;
+    supplying deterministic scratch to it is rejected rather than changing the
+    compiled reduction. Incoming gradients on static-capacity padding rows
+    (``[cu_seqlens_comp[-1], total_comp)``) are ignored.
     """
 
+    def __init__(
+        self,
+        sample_kv: torch.Tensor,
+        sample_score: torch.Tensor,
+        sample_ape: torch.Tensor,
+        sample_cu_seqlens: torch.Tensor,
+        sample_cu_seqlens_comp: torch.Tensor,
+        sample_out: torch.Tensor,
+        ratio: int = 4,
+        coff: int = 2,
+        deterministic: bool = False,
+    ):
+        """Capture descriptors and choose atomic or deterministic dAPE reduction."""
+        self.deterministic = bool(deterministic)
+        self._scratch_bytes: Optional[int] = None
+        self._rows_per_cta: Optional[int] = None
+        super().__init__(
+            sample_kv,
+            sample_score,
+            sample_ape,
+            sample_cu_seqlens,
+            sample_cu_seqlens_comp,
+            sample_out,
+            ratio,
+            coff,
+        )
+
+    def check_support(self) -> bool:
+        """Validate the common envelope plus deterministic workspace indexing."""
+        super().check_support()
+        self._is_supported = False
+        if self.ratio == 128 and self.total_comp > 0:
+            # The r128 schedule is sized against SM100's 227 KiB per-CTA ceiling; a device with less (cc 12.x has ~99 KiB)
+            # would reject the launch with CUDA_LAUNCH_INVALID_CONFIG, so decline here with the actual numbers. An empty
+            # output (every sequence shorter than the ratio) launches no kernel and stays supported.
+            smem_bytes = bwd_smem_bytes_r128(self.ratio, self.head_dim, self.coff, self.total_comp)
+            smem_limit = device_info(self.target_device.index).shared_memory_per_block_optin
+            self._not_implemented_error_if(
+                smem_bytes > smem_limit,
+                f"CSA compressor backward (ratio=128, head_dim={self.head_dim}, coff={self.coff}) needs {smem_bytes} B of shared "
+                f"memory per CTA; {self.target_device} allows {smem_limit} B",
+            )
+        if self.ratio != 128:
+            self._rows_per_cta = _bwd_rows(
+                self.ratio,
+                self.deterministic,
+                self.total_comp,
+                self.head_dim,
+                self.coff,
+                self._compute_capability == _SM90_CAPABILITY,
+            )
+        if self.deterministic:
+            if self.ratio == 128:
+                self._scratch_bytes = bwd_dape_workspace_bytes_r128(
+                    self.total_comp,
+                    self.ratio,
+                    self.head_dim,
+                    self.coff,
+                    self.target_device.index,
+                )
+            else:
+                self._scratch_bytes = bwd_dape_workspace_bytes(
+                    self.total_comp,
+                    self.ratio,
+                    self.head_dim,
+                    self.coff,
+                    rows_per_cta=self._rows_per_cta,
+                )
+            workspace_elems = self._scratch_bytes // 4
+            self._value_error_if(
+                workspace_elems >= _INT32_LIMIT,
+                f"deterministic dAPE workspace elements must be < 2**31 for int32 flat offsets, got {workspace_elems}",
+            )
+        else:
+            self._scratch_bytes = 0
+        self._is_supported = True
+        return True
+
+    def scratch_workspace_bytes(self) -> int:
+        """Required caller-owned uint8 scratch; zero for the default atomic path."""
+        if self._scratch_bytes is None:
+            raise RuntimeError("call check_support() before scratch_workspace_bytes()")
+        return self._scratch_bytes
+
+    def _validate_workspace(self, workspace: Optional[torch.Tensor], operands) -> None:
+        """Validate caller-owned deterministic scratch without creating tensor views."""
+        required = self.scratch_workspace_bytes()
+        if workspace is None:
+            raise ValueError(f"workspace is required: need {required} bytes of contiguous uint8 on {self.target_device}")
+        if (
+            not isinstance(workspace, torch.Tensor)
+            or workspace.dtype != torch.uint8
+            or not workspace.is_cuda
+            or workspace.device != self.target_device
+            or not workspace.is_contiguous()
+        ):
+            got = f"{workspace.dtype} on {workspace.device}" if isinstance(workspace, torch.Tensor) else type(workspace).__name__
+            raise ValueError(f"workspace must be contiguous uint8 on {self.target_device}, got {got}")
+        if workspace.numel() < required:
+            raise ValueError(f"workspace is {workspace.numel()} bytes, need {required}")
+        if workspace.data_ptr() % PTR_ALIGN_BYTES:
+            raise ValueError(f"workspace base pointer must be {PTR_ALIGN_BYTES}-byte aligned, got 0x{workspace.data_ptr():x}")
+        workspace_start = workspace.data_ptr()
+        workspace_end = workspace_start + required
+        for name, tensor in operands:
+            tensor_start = tensor.data_ptr()
+            tensor_end = tensor_start + tensor.numel() * tensor.element_size()
+            if workspace_start < tensor_end and tensor_start < workspace_end:
+                raise ValueError(f"workspace must not overlap {name}")
+
     def compile(self) -> None:
-        """JIT-compile the backward kernel for this ``(ratio, head_dim, coff, device)`` (idempotent)."""
+        """JIT-compile the backward kernel and its plan-capacity schedule (idempotent)."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
         # Route by ratio, as in the forward.
         if self.ratio == 128:
-            precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device)
+            precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device, deterministic=self.deterministic)
             run = run_bwd_r128
         else:
-            precompile_bwd(self.ratio, self.head_dim, self.coff, self.target_device)
+            precompile_bwd(
+                self.ratio,
+                self.head_dim,
+                self.coff,
+                self.target_device,
+                deterministic=self.deterministic,
+                nb_total=self.total_comp,
+                rows_per_cta=self._rows_per_cta,
+            )
             run = run_bwd
 
-        ratio, head_dim, coff = self.ratio, self.head_dim, self.coff
+        ratio, head_dim, coff, deterministic = self.ratio, self.head_dim, self.coff, self.deterministic
+        rows_per_cta = self._rows_per_cta
 
-        def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, stream_handle):
-            """Per-config closure: invoke the routed backward with the bound ``(ratio, head_dim, coff)``."""
-            run(
-                kv,
-                score,
-                ape,
-                cu_seqlens,
-                cu_seqlens_comp,
-                grad_out,
-                grad_kv,
-                grad_score,
-                grad_ape,
-                grad_out.shape[0],
-                ratio,
-                head_dim,
-                coff,
-                stream_handle=stream_handle,
-            )
+        if rows_per_cta is None:
+
+            def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, stream_handle):
+                """Invoke the ratio-128 backward with its internally selected schedule."""
+                run(
+                    kv,
+                    score,
+                    ape,
+                    cu_seqlens,
+                    cu_seqlens_comp,
+                    grad_out,
+                    grad_kv,
+                    grad_score,
+                    grad_ape,
+                    grad_out.shape[0],
+                    ratio,
+                    head_dim,
+                    coff,
+                    stream_handle=stream_handle,
+                    deterministic=deterministic,
+                    workspace=workspace,
+                )
+
+        else:
+
+            def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, stream_handle):
+                """Invoke generic backward with its plan-bound capacity schedule."""
+                run(
+                    kv,
+                    score,
+                    ape,
+                    cu_seqlens,
+                    cu_seqlens_comp,
+                    grad_out,
+                    grad_kv,
+                    grad_score,
+                    grad_ape,
+                    grad_out.shape[0],
+                    ratio,
+                    head_dim,
+                    coff,
+                    stream_handle=stream_handle,
+                    deterministic=deterministic,
+                    workspace=workspace,
+                    rows_per_cta=rows_per_cta,
+                )
 
         self._compiled_kernel = tensor_api
         self._logger.debug("Kernel compiled successfully")
@@ -500,14 +658,15 @@ class CSACompressorBackward(_CSACompressorBase):
         grad_out: torch.Tensor,  # (total_comp, head_dim) BF16, contiguous
         grad_kv: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
         grad_score: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
-        grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32, zero-initialized before EVERY call/replay (kernel accumulates)
+        grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32; caller-zeroed for atomic mode, fully overwritten for deterministic mode
         current_stream: Optional[cuda.CUstream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
-        """Run the compiled backward kernel into the gradient buffers (see class docs)."""
+        """Run the compiled backward kernel with workspace matching the compiled reduction (see class docs)."""
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("CSACompressorBackward kernel not compiled")
-        _reject_deterministic_backward()
+        _reject_deterministic_backward(self.deterministic)
         device = self.target_device
         width = self.coff * self.head_dim
         self._validate_runtime_tensor(kv, "kv", (self.total_tokens, width), torch.bfloat16, device, PTR_ALIGN_BYTES)
@@ -519,26 +678,49 @@ class CSACompressorBackward(_CSACompressorBase):
         self._validate_runtime_tensor(grad_kv, "grad_kv", (self.total_tokens, width), torch.bfloat16, device, PTR_ALIGN_BYTES)
         self._validate_runtime_tensor(grad_score, "grad_score", (self.total_tokens, width), torch.bfloat16, device, PTR_ALIGN_BYTES)
         self._validate_runtime_tensor(grad_ape, "grad_ape", (self.ratio, width), torch.float32, device, PTR_ALIGN_BYTES)
+        if not self.deterministic and workspace is not None:
+            raise ValueError("workspace was provided, but this CSACompressorBackward plan uses the atomic dAPE path (deterministic=False)")
         if grad_out.numel() == 0:
             return
-        self._compiled_kernel(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, _resolve_stream_handle(current_stream))
-        self._record_streams((kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape), current_stream, device)
+        if self.deterministic:
+            self._validate_workspace(
+                workspace,
+                (
+                    ("kv", kv),
+                    ("score", score),
+                    ("ape", ape),
+                    ("cu_seqlens", cu_seqlens),
+                    ("cu_seqlens_comp", cu_seqlens_comp),
+                    ("grad_out", grad_out),
+                    ("grad_kv", grad_kv),
+                    ("grad_score", grad_score),
+                    ("grad_ape", grad_ape),
+                ),
+            )
+        self._compiled_kernel(
+            kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, _resolve_stream_handle(current_stream)
+        )
+        tensors = (kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape)
+        if workspace is not None:
+            tensors = (*tensors, workspace)
+        self._record_streams(tensors, current_stream, device)
 
 
 # module-level bounded LRU cache of compiled API instances (thread-safe):
-#   (kind, ratio, head_dim, coff, total_tokens, total_comp, n_seg, device) -> api
-# The compiled kernel underneath is shared per (ratio, head_dim, coff, device) through
-# compressor_sm100's compile cache, so shape changes only rebuild the cheap wrapper
-# object, never the JIT.
+#   (kind, ratio, coff, deterministic, head_dim, kv_shape, total_comp, n_seg, device) -> api
+# The compiled kernel underneath is shared per
+# (ratio, head_dim, coff, deterministic, rows_per_cta, device) through
+# compressor_sm100's compile cache. Shape changes within one schedule only rebuild the
+# cheap wrapper object, while crossing a schedule boundary selects its own JIT artifact.
 _api_cache = _LruDict()
 # serializes verdict construction + JIT so concurrent same-config callers cannot
 # compile the same kernel twice
 _api_build_lock = threading.Lock()
 
 
-def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio, coff):
+def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio, coff, deterministic=False):
     """Build (or fetch) a compiled forward/backward API instance for these tensors."""
-    key = (kind, int(ratio), int(coff), out_shape[1], tuple(kv.shape), out_shape[0], cu_seqlens.shape[0], kv.device.index)
+    key = (kind, int(ratio), int(coff), bool(deterministic), out_shape[1], tuple(kv.shape), out_shape[0], cu_seqlens.shape[0], kv.device.index)
     api = _api_cache.get(key)
     if api is not None:
         return api
@@ -548,7 +730,7 @@ def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio
             return api
         sample_out = torch.empty(out_shape, dtype=torch.bfloat16, device="meta")
         cls = CSACompressorForward if kind == "fwd" else CSACompressorBackward
-        api = cls(
+        kwargs = dict(
             sample_kv=kv,
             sample_score=score,
             sample_ape=ape,
@@ -558,6 +740,9 @@ def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio
             ratio=ratio,
             coff=coff,
         )
+        if kind == "bwd":
+            kwargs["deterministic"] = deterministic
+        api = cls(**kwargs)
         api.check_support()
         api.compile()
         _api_cache.put(key, api)
@@ -598,7 +783,9 @@ def csa_compressor_forward_wrapper(
         cu_seqlens_comp: ``(B + 1,)`` int32 cumulative compressed-block counts,
             ``cu_seqlens_comp[b + 1] - cu_seqlens_comp[b] == seqlen_b // ratio``.
         ratio: compression ratio (tokens per output block); validated envelope:
-            {2, 4, 128} (the wrappers route to the matching kernel family by ratio).
+            {2, 4} on SM90 or compute-capability major >= 10, and 128 on
+            compute-capability major >= 10 (the wrappers route to the matching kernel
+            family by ratio).
         head_dim: output feature dimension; inferred from ``kv`` width when omitted.
         coff: 1 for the own-block window form (window = ``ratio`` tokens, no overlap) or
             2 for the overlapping-window form (window = ``2 * ratio``); validated
@@ -606,11 +793,13 @@ def csa_compressor_forward_wrapper(
             in {128, 512}).
         total_comp: output row count. Defaults to ``cu_seqlens_comp[-1]`` (synchronizes);
             pass it explicitly (e.g. a static CUDA-graph capacity, which must be
-            ``>= cu_seqlens_comp[-1]``) to stay capture-safe.
+            ``>= cu_seqlens_comp[-1]``) to stay capture-safe. Rows beyond the
+            device-side true count are written as exact zeros.
         stream: CUDA stream for allocation and kernel launch (None -> current stream).
 
     Returns:
-        ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm).
+        ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm), with
+        exact zeros in static-capacity padding rows.
     """
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if total_comp is None:
@@ -636,19 +825,23 @@ def csa_compressor_backward_wrapper(
     head_dim: Optional[int] = None,
     coff: int = 2,
     stream: Optional[cuda.CUstream] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
     """High-level backward wrapper. Allocates the grad buffers and fills them.
+
+    Ratio 2/4 is supported on SM90 and compute-capability major >= 10; ratio 128
+    remains compute-capability major >= 10 only.
 
     ``grad_out`` is ``(total_comp, head_dim)`` BF16 (the incoming gradient of the
     forward wrapper's ``out``); gradients on static-capacity padding rows are ignored.
     ``grad_kv``/``grad_score`` are allocated UNINITIALIZED — the kernel writes every
     position, storing exact zeros to never-consumed positions itself, so no zero-fill
-    kernels run; ``grad_ape`` is allocated zeroed (fp32 atomic accumulation). When
-    ``total_comp == 0`` the kernel is not launched and all three grads are allocated as
-    zeros instead, preserving autograd's exact-zero semantics.
-    Raises ``RuntimeError`` under ``torch.use_deterministic_algorithms(True)`` because
-    ``grad_ape`` is accumulated with fp32 atomics (``grad_kv``/``grad_score`` are
-    deterministic and bitwise reproducible).
+    kernels run. By default ``grad_ape`` is zeroed for fp32 atomic accumulation. With
+    ``deterministic=True`` it is uninitialized and fully overwritten through an
+    internally allocated partial workspace plus fixed-order reduction; the complete
+    backward is then bitwise reproducible and accepted by strict torch deterministic
+    mode.
+    When ``total_comp == 0`` no kernel is launched and all three grads are zeroed.
 
     Returns:
         ``{'grad_kv': (total_tokens, coff * head_dim) BF16,
@@ -658,7 +851,7 @@ def csa_compressor_backward_wrapper(
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if grad_out.ndim != 2:
         raise ValueError(f"grad_out must be 2-D (total_comp, head_dim), got {tuple(grad_out.shape)}")
-    api = _get_api("bwd", kv, score, ape, cu_seqlens, cu_seqlens_comp, tuple(grad_out.shape), ratio, coff)
+    api = _get_api("bwd", kv, score, ape, cu_seqlens, cu_seqlens_comp, tuple(grad_out.shape), ratio, coff, deterministic)
     with torch.cuda.device(kv.device), _torch_stream_context(stream, kv.device):
         if grad_out.shape[0] == 0:
             # No kernel launch below -> the buffers must carry autograd's exact zeros.
@@ -667,7 +860,20 @@ def csa_compressor_backward_wrapper(
         else:
             grad_kv = torch.empty_like(kv)
             grad_score = torch.empty_like(score)
-        grad_ape = torch.zeros_like(ape, dtype=torch.float32)
+        grad_ape = torch.empty_like(ape, dtype=torch.float32) if deterministic and grad_out.shape[0] else torch.zeros_like(ape, dtype=torch.float32)
+        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=kv.device) if deterministic and grad_out.shape[0] else None
     with torch.cuda.nvtx.range("csa_compressor_bwd_kernel"):
-        api.execute(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, current_stream=stream)
+        api.execute(
+            kv,
+            score,
+            ape,
+            cu_seqlens,
+            cu_seqlens_comp,
+            grad_out,
+            grad_kv,
+            grad_score,
+            grad_ape,
+            current_stream=stream,
+            workspace=workspace,
+        )
     return TupleDict(grad_kv=grad_kv, grad_score=grad_score, grad_ape=grad_ape)

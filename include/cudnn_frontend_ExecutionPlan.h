@@ -156,9 +156,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     cudaError_t
     retain_on_capturing_stream(cudaStream_t stream) const {
         if (!needs_cuda_graph_retention()) {
-            // Nothing to retain, but still the moment to release what destroyed graphs of other
-            // plans left queued.
-            return detail::CudaGraphRetainedResource::drain_deferred_releases_on_stream(stream);
+            return cudaSuccess;
         }
         return cuda_graph_retention.retain_on_capturing_stream(stream,
                                                                [this] { return make_graph_retention_payload(); });
@@ -167,12 +165,11 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     //! Whether a CUDA graph recorded from this plan has to keep the plan alive: true for engines that
     //! compile their kernels at runtime (CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION), whose code is
     //! released with the plan. Precompiled kernels are part of the cuDNN library, so recording those
-    //! costs no retention (and no capture-status query per execute, unless released
-    //! references are waiting to be freed). Defaults to true until the
+    //! costs no retention (and no capture-status query per execute). Defaults to true until the
     //! engine's behavior notes are known.
     bool
     needs_cuda_graph_retention() const {
-        return runtime_compiled;
+        return runtime_compiled && retain_for_cuda_graphs;
     }
 
    private:
@@ -195,6 +192,13 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
+            return;
+        }
         numeric_notes_vec.resize(static_cast<size_t>(elem_count));
         status = detail::get_attribute(extractedEngine_,
                                        CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
@@ -202,6 +206,13 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        numeric_notes_vec.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
+            return;
+        }
         ptrdiff_t end =
             static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
         std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
@@ -209,18 +220,19 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             std::fill_n(numeric_notes.begin() + static_cast<size_t>(elem_count),
                         numeric_notes.size() - static_cast<size_t>(elem_count),
                         CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
-        if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(this,
-                                          status,
-                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
-                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
-        }
         status = detail::get_attribute(extractedEngine_,
                                        CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
                                        CUDNN_TYPE_BEHAVIOR_NOTE,
                                        CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
+            return;
+        }
         behavior_notes_vec.resize(static_cast<size_t>(elem_count));
         status = detail::get_attribute(extractedEngine_,
                                        CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
@@ -228,7 +240,14 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
                                        &elem_count,
                                        behavior_notes_vec.data());
-        end    = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
+            return;
+        }
+        end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
         std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
         runtime_compiled = status != CUDNN_STATUS_SUCCESS ||
                            std::find(behavior_notes_vec.begin(),
@@ -238,12 +257,6 @@ class ExecutionPlan_v8 : public BackendDescriptor {
             std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count),
                         behavior_notes.size() - static_cast<size_t>(elem_count),
                         CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
-        if (status != CUDNN_STATUS_SUCCESS) {
-            set_error_and_throw_exception(this,
-                                          status,
-                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
-                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
-        }
     }
 
     void
@@ -352,7 +365,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::vector<cudnnBackendNumericalNote_t> numeric_notes_vec;
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> behavior_notes;
     std::vector<cudnnBackendBehaviorNote_t> behavior_notes_vec;
-    bool runtime_compiled = true;  // see needs_cuda_graph_retention()
+    bool runtime_compiled       = true;  // see needs_cuda_graph_retention()
+    bool retain_for_cuda_graphs = true;  // false under CudaGraphRetention_t::NONE
 
     float execution_time_ms                   = 0.0f;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
@@ -400,6 +414,14 @@ class ExecutionPlanBuilder_v8 {
     auto
     setKernelCache(std::shared_ptr<KernelCache> kernel_cache) -> ExecutionPlanBuilder_v8 & {
         m_execution_plan.kernel_cache = kernel_cache;
+        return *this;
+    }
+
+    //! How CUDA graphs recorded from the plan keep its resources alive (see CudaGraphRetention_t). Unset: the
+    //! CUDNN_CUDA_GRAPH_RETENTION environment variable decides, for the frontend and the backend alike.
+    auto
+    setCudaGraphRetention(std::optional<CudaGraphRetention_t> retention) -> ExecutionPlanBuilder_v8 & {
+        cuda_graph_retention = retention;
         return *this;
     }
 
@@ -474,6 +496,14 @@ class ExecutionPlanBuilder_v8 {
             }
         }
 #endif
+        status = apply_cuda_graph_retention_();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION Failed");
+            return std::move(m_execution_plan);
+        }
         // Finalizing the descriptor
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
@@ -509,6 +539,9 @@ class ExecutionPlanBuilder_v8 {
 
         m_execution_plan.buildTag(extractedEngine);
         m_execution_plan.fetchNotes(extractedEngine);
+        if (m_execution_plan.get_status() != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_execution_plan);
+        }
         m_execution_plan.computeWorkSpaceSize();
 
         CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
@@ -603,6 +636,14 @@ class ExecutionPlanBuilder_v8 {
             }
         }
 
+        status = apply_cuda_graph_retention_();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION Failed");
+            return std::move(m_execution_plan);
+        }
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
@@ -665,6 +706,9 @@ class ExecutionPlanBuilder_v8 {
 
         m_execution_plan.buildTag(extractedEngine);
         m_execution_plan.fetchNotes(extractedEngine);
+        if (m_execution_plan.get_status() != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_execution_plan);
+        }
         m_execution_plan.computeWorkSpaceSize();
 
         CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
@@ -679,6 +723,30 @@ class ExecutionPlanBuilder_v8 {
     operator=(ExecutionPlanBuilder_v8 const &) = delete;
 
    private:
+    std::optional<CudaGraphRetention_t> cuda_graph_retention;
+
+    // Applies the retention mode to the plan: the frontend's own retention, and, when set explicitly and both the
+    // headers and the backend are cuDNN 9.28+, the backend's (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION).
+    // Unset, the backend reads CUDNN_CUDA_GRAPH_RETENTION itself.
+    cudnnStatus_t
+    apply_cuda_graph_retention_() {
+        CudaGraphRetention_t const retention    = detail::effective_cuda_graph_retention(cuda_graph_retention);
+        m_execution_plan.retain_for_cuda_graphs = retention != CudaGraphRetention_t::NONE;
+#if (CUDNN_VERSION >= 92800)
+        if (cuda_graph_retention.has_value() && detail::get_backend_version() >= 92800) {
+            cudnnCudaGraphRetention_t backend_retention = retention == CudaGraphRetention_t::NONE
+                                                              ? CUDNN_CUDA_GRAPH_RETENTION_NONE
+                                                              : CUDNN_CUDA_GRAPH_RETENTION_PER_GRAPH;
+            return detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                         CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION,
+                                         CUDNN_TYPE_CUDA_GRAPH_RETENTION,
+                                         1,
+                                         &backend_retention);
+        }
+#endif
+        return CUDNN_STATUS_SUCCESS;
+    }
+
     ExecutionPlan_v8 m_execution_plan;
     std::shared_ptr<const DeviceProperties> device_properties = nullptr;
 };

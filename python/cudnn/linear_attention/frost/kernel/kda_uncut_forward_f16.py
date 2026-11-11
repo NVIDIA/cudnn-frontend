@@ -27,7 +27,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.compiled_cache import compile_cached
+
 from ..common.host import get_dtype
+from ..common.state_snapshot import snapshot_states
 from . import kda_prefill_f16, kda_prep_f16, kda_prep_prefill_f16
 
 uncut_forward_cache = {}
@@ -52,6 +55,7 @@ def uncut_forward_host(
     o: cute.Tensor,
     cu_seqlens: cute.Tensor,
     state_in: Optional[cute.Tensor],
+    composed: Optional[cute.Tensor],
     state_out: Optional[cute.Tensor],
     seed_indices: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
@@ -70,8 +74,14 @@ def uncut_forward_host(
     prep_words: Optional[cute.Tensor],
     prep_rows: Optional[cute.Tensor],
     prep_row_count: Optional[cute.Tensor],
+    state_snapshot: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
+    seed_state, seed_rows = state_in, seed_indices
+    if cutlass.const_expr(state_snapshot is not None):
+        # The prefill's final state overwrites the seeds its exact twin would reread: seed both from a copy.
+        snapshot_states(state_in, state_snapshot, seed_indices, stream)
+        seed_state, seed_rows = state_snapshot, None
     if cutlass.const_expr(prep):
         kda_prep_prefill_f16.prologue(
             io_dtype,
@@ -118,6 +128,7 @@ def uncut_forward_host(
             prep_diag,
             prep_rows,
             prep_row_count,
+            scheduler,
             stream,
         )
     else:
@@ -151,10 +162,11 @@ def uncut_forward_host(
         dt_bias,
         beta,
         cu_seqlens,
-        state_in,
+        seed_state,
+        composed,
         o,
         state_out,
-        seed_indices,
+        seed_rows,
         final_indices,
         work_items,
         work_count,
@@ -166,15 +178,32 @@ def uncut_forward_host(
     )
 
 
-def build_configs(io_dtype, state_dtype, gate_dtype, *, use_initial_state, store_final_state, enable_checkpoints, tiles_per_head, prep, **flags):
+def build_configs(
+    io_dtype,
+    state_dtype,
+    gate_dtype,
+    *,
+    use_initial_state,
+    store_final_state,
+    enable_checkpoints,
+    checkpoint_dtype=None,
+    tiles_per_head,
+    prep,
+    state_table=None,
+    has_composed=False,
+    **flags,
+):
     prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
     prefill_cfg = prefill_module.build_cfg(
         io_dtype,
         state_dtype,
         gate_dtype,
         use_initial_state=use_initial_state,
+        state_table=state_table,
+        has_composed=has_composed,
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
+        checkpoint_dtype=checkpoint_dtype,
         tiles_per_head=tiles_per_head,
         **dict(flags, d_v=flags["d_v"] // tiles_per_head),
     )
@@ -201,6 +230,7 @@ def build_uncut_forward(
     o,
     cu_seqlens,
     state_in,
+    composed=None,
     state_out,
     seed_indices,
     final_indices,
@@ -231,6 +261,7 @@ def build_uncut_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    state_snapshot=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the d_v split, state and checkpoint
     presence, device) the uncut forward launch over the buffers of one plan.  The placeholders repeat the marks of the
@@ -266,21 +297,27 @@ def build_uncut_forward(
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         state_in is not None,
+        composed is not None,
         state_out is not None,
         seed_indices is not None,
         final_indices is not None,
         int(checkpoint_every_n_tokens) > 0,
+        str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
         int(tiles_per_head),
         bool(prep),
+        state_snapshot is not None,
     )
     if key not in uncut_forward_cache:
         prefill_cfg, prep_cfg = build_configs(
             io_dtype,
             state_dtype,
             gate_dtype,
-            use_initial_state=state_in is not None,
+            use_initial_state=state_in is not None or composed is not None,
+            state_table=state_in is not None,
+            has_composed=composed is not None,
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+            checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
@@ -304,7 +341,7 @@ def build_uncut_forward(
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        uncut_forward_cache[key] = cute.compile(
+        uncut_forward_cache[key] = compile_cached(
             uncut_forward_host,
             int(b_t),
             int(num_sm),
@@ -323,6 +360,7 @@ def build_uncut_forward(
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
             from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_in is not None else None,
+            from_dlpack(composed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if composed is not None else None,
             from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_out is not None else None,
             from_dlpack(seed_indices, assumed_align=4).mark_layout_dynamic() if seed_indices is not None else None,
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
@@ -334,7 +372,10 @@ def build_uncut_forward(
             bool(prep),
             prep_cfg,
             *prep_placeholders,
+            from_dlpack(state_snapshot, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_snapshot is not None else None,
             cuda.CUstream(int(stream)),
+            cache_key=repr((__name__, key)),
+            symbol="frost_la_kda_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_forward_cache[key]
@@ -353,6 +394,7 @@ def run_uncut_forward(
     o,
     cu_seqlens,
     state_in,
+    composed=None,
     state_out,
     seed_indices,
     final_indices,
@@ -372,6 +414,7 @@ def run_uncut_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    state_snapshot=None,
 ) -> None:
     """Replay the uncut forward: one crossing into the DSL for the prologue and prefill launches.  The plan validated the
     contract at build, so nothing here raises."""
@@ -388,6 +431,7 @@ def run_uncut_forward(
         o,
         cu_seqlens,
         state_in,
+        composed,
         state_out,
         seed_indices,
         final_indices,
@@ -404,5 +448,6 @@ def run_uncut_forward(
         prep_words,
         prep_rows,
         prep_row_count,
+        state_snapshot,
         cuda.CUstream(int(stream)),
     )

@@ -200,8 +200,7 @@ _QWEN38_FAMILY = [
 ]
 
 
-@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN38_FAMILY)
-def test_qwen38_family_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows):
+def _check_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio):
     """Every number a caller concatenates its checkpoint into, by name, per geometry."""
     geom.validate()
     assert geom.n_qkvg == n_qkvg
@@ -215,10 +214,8 @@ def test_qwen38_family_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio, _til
     assert all(w % 256 == 0 for w in widths)
 
 
-@pytest.mark.parametrize("tile_n", [64, 128, 256])
-@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN38_FAMILY)
-def test_qwen38_family_tile_plans_are_well_defined(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows, tile_n):
-    """No stage-(1) output tile straddles two of Q / GATE / K / V at any supported TILE_N."""
+def _check_tile_plan(geom, n_qkvg, widths, tile_n):
+    """No stage-(1) output tile straddles two of Q / GATE / K / V at ``tile_n``."""
     plan = geom.qkvg_tile_plan(tile_n)
     assert len(plan) == n_qkvg // tile_n
     for block, width in zip(geom.qkvg_blocks, widths):
@@ -227,14 +224,12 @@ def test_qwen38_family_tile_plans_are_well_defined(geom, n_qkvg, widths, offsets
     assert runs == list(geom.qkvg_blocks) == [ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V]
 
 
-@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows", _QWEN38_FAMILY)
-def test_qwen38_family_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows):
-    """The TMA norm+RoPE kernel's fitted ``tile_rows`` (the largest r <= 16 dividing h_q, a multiple of h_kv and of
-    the CTA's 4 warps): 12 at 24/2, 12/1 and 24/4, 16 at 64/4 -- and NONE at 6/1, where the typed verdict names the
-    LDG kernel as the one that serves the geometry (so ``impl="auto"`` resolves to it instead of raising)."""
+def _check_fitted_norm_tile_rows(geom, tile_rows):
+    """The TMA norm+RoPE kernel's fitted ``tile_rows`` is ``tile_rows`` (0 = no tile fits: the typed verdict names the LDG
+    kernel as the one that serves the geometry, so ``impl="auto"`` resolves to it instead of raising)."""
     from cudnn.gated_attention_block.api import _QK_NORM_ROPE_THREADS, _QkNormRope
 
-    # The kernel module imports the CuTe DSL at top level: below FROST's DSL floor these five cells SKIP with the
+    # The kernel module imports the CuTe DSL at top level: below FROST's DSL floor these cells SKIP with the
     # version-naming message (never fail), while the rest of this module stays DSL-free and runs everywhere.
     requirement_error = cutedsl_requirement_error("the TMA norm kernel's shape validator (kernels.qk_norm_rope_tma)")
     if requirement_error:
@@ -249,6 +244,72 @@ def test_qwen38_family_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_
             validate_shape(geom.d_head, geom.rope_dim, geom.h_q, geom.h_kv, fitted, _QK_NORM_ROPE_THREADS)
     else:
         validate_shape(geom.d_head, geom.rope_dim, geom.h_q, geom.h_kv, fitted, _QK_NORM_ROPE_THREADS)
+
+
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN38_FAMILY)
+def test_qwen38_family_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows):
+    """Every number a caller concatenates its checkpoint into, by name, per geometry."""
+    _check_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio)
+
+
+@pytest.mark.parametrize("tile_n", [64, 128, 256])
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN38_FAMILY)
+def test_qwen38_family_tile_plans_are_well_defined(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows, tile_n):
+    """No stage-(1) output tile straddles two of Q / GATE / K / V at any supported TILE_N."""
+    _check_tile_plan(geom, n_qkvg, widths, tile_n)
+
+
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows", _QWEN38_FAMILY)
+def test_qwen38_family_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows):
+    """The TMA norm+RoPE kernel's fitted ``tile_rows`` (the largest r <= 16 dividing h_q, a multiple of h_kv and of
+    the CTA's 4 warps): 12 at 24/2, 12/1 and 24/4, 16 at 64/4 -- and NONE at 6/1, where the typed verdict names the
+    LDG kernel as the one that serves the geometry (so ``impl="auto"`` resolves to it instead of raising)."""
+    _check_fitted_norm_tile_rows(geom, tile_rows)
+
+
+# ---------------------------------------------------------------------------
+# The Qwen3.5-397B tensor-parallel shards: one full-attention layer (32 / 2 at TP 1, d_model 4096, d_head 256, rope_dim 64)
+# as the serving stacks shard it -- the query heads divided across the ranks, the two KV heads divided at TP 2 and REPLICATED
+# from TP 4 on (one KV head per rank).  The POC deployment is the TP 4 shard (8 / 1).  CPU arithmetic only -- the Rubin
+# end-to-end cells for these geometries live in test_block_end_to_end.py (dense), test_block_serving_extend.py (EXTEND) and
+# test_block_serving_decode.py (DECODE).
+# ---------------------------------------------------------------------------
+
+GEOM_397B_TP2 = GatedAttentionBlockGeometry(d_model=4096, h_q=16, h_kv=1, d_head=256, rope_dim=64)
+GEOM_397B_TP4 = GatedAttentionBlockGeometry(d_model=4096, h_q=8, h_kv=1, d_head=256, rope_dim=64)
+GEOM_397B_TP8 = GatedAttentionBlockGeometry(d_model=4096, h_q=4, h_kv=1, d_head=256, rope_dim=64)
+
+# (geometry, n_qkvg, block widths, block offsets, gqa_ratio, fitted tile_rows of the TMA norm kernel): every shard fits a TMA
+# tile -- 16 rows at 16 / 1, 8 at 8 / 1, 4 at 4 / 1 (one row per warp) -- unlike the 3.8 family's 6 / 1, which takes the LDG kernel.
+_QWEN35_SHARDS = [
+    pytest.param(GEOM_397B, 17408, (8192, 8192, 512, 512), (0, 8192, 16384, 16896), 16, 16, id="q35_397b_tp1_32_2"),
+    pytest.param(GEOM_397B_TP2, 8704, (4096, 4096, 256, 256), (0, 4096, 8192, 8448), 16, 16, id="q35_397b_tp2_16_1"),
+    pytest.param(GEOM_397B_TP4, 4608, (2048, 2048, 256, 256), (0, 2048, 4096, 4352), 8, 8, id="q35_397b_tp4_8_1"),
+    pytest.param(GEOM_397B_TP8, 2560, (1024, 1024, 256, 256), (0, 1024, 2048, 2304), 4, 4, id="q35_397b_tp8_4_1"),
+]
+
+
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN35_SHARDS)
+def test_qwen35_shard_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows):
+    """The 397B layer at TP 1 / 2 / 4 / 8: ``n_qkvg`` 17408 / 8704 / 4608 / 2560, every band a whole number of 256-column
+    tiles (the forced 256-wide GEMM tile of the serving route holds at every shard), the GQA group 16 / 16 / 8 / 4."""
+    _check_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio)
+    assert n_qkvg % 256 == 0
+
+
+@pytest.mark.parametrize("tile_n", [64, 128, 256])
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN35_SHARDS)
+def test_qwen35_shard_tile_plans_are_well_defined(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows, tile_n):
+    """``qkvg_tile_plan(64 / 128 / 256)`` is well defined at every shard: no stage-(1) output tile straddles two bands."""
+    _check_tile_plan(geom, n_qkvg, widths, tile_n)
+
+
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows", _QWEN35_SHARDS)
+def test_qwen35_shard_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows):
+    """The norm kernel's fitted tile per shard, named: 16 rows at 32 / 2 and 16 / 1, 8 at 8 / 1, 4 at 4 / 1 -- every shard rides
+    the TMA kernel (a tile of ``tile_rows`` consecutive heads of one token must divide ``h_q``, be a multiple of ``h_kv`` and
+    spread over the CTA's 4 warps; the replicated single KV head makes every power-of-two head count fit)."""
+    _check_fitted_norm_tile_rows(geom, tile_rows)
 
 
 def test_index_band_tile_arithmetic():
