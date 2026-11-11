@@ -49,6 +49,7 @@ def _case(
     sdpa_kwargs=None,
     heads=(4, 2),
     seq_lens=None,
+    independent_o_offsets=False,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -123,12 +124,14 @@ def _case(
         buffers["o_storage"] = storage
         o.set_stride(out.stride())
     if thd:
-        if dv == d:
+        if dv == d and not independent_o_offsets:
             o.set_ragged_offset(tensors["off_q"])
         else:
-            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_o")
+            offset_type = cudnn.data_type.INT64 if independent_o_offsets else cudnn.data_type.INT32
+            offset_dtype = torch.int64 if independent_o_offsets else torch.int32
+            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=offset_type, name="off_o")
             o.set_ragged_offset(off_o)
-            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=torch.int32) * sq * hq * dv
+            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=offset_dtype) * sq * hq * dv
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
@@ -418,7 +421,7 @@ def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv, thd=True):
     row_stride = 2**32 + 4 * dv
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("wide physical row-stride regression needs 9 GiB free")
-    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=thd, override=True, dtype=dtype, sq=1, skv=64)
+    g, vp, ws, bufs, tensors = _case(d=d, dv=dv, thd=thd, override=True, dtype=dtype, sq=1, skv=64, independent_o_offsets=thd)
     plan = g._compiled_plans[g._plan_index]
     assert plan._prepared is not None
     owner = plan._prepared.spec.owner
@@ -431,6 +434,9 @@ def test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv, thd=True):
         # Numerical failures and launch errors remain outside this guard.
         pytest.skip("wide physical row-stride storage unavailable under current GPU memory pressure")
     vp[tensors["o"]] = bufs["o"]
+    if thd:
+        # Origins count physical elements; Q keeps its compact offsets when O moves.
+        vp[tensors["off_o"]] = torch.arange(3, device="cuda", dtype=torch.int64) * row_stride
     overrides = dict(
         override_uids=[tensors["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1] if thd else list(strides)]
     )
