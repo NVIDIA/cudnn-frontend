@@ -601,9 +601,9 @@ def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats(stage2_datapath
     THD backward engine decline the graph, leaving a feature that is tested
     internally but unreachable by a user.
     """
-    from cudnn.torch import served_plan_names
+    import cudnn.torch as provider
 
-    frost_before = sum(_ENGINE in name for name in served_plan_names())
+    frost_before = sum(_ENGINE in name for name in provider.served_plan_names())
     # Both totals are in the same 128-row private delta bucket.  Buffer capacities are
     # exact graph attributes, so the second call must not reuse the first
     # call's plan merely because their private workspaces round alike.
@@ -633,7 +633,7 @@ def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats(stage2_datapath
         for name, grad in (("dQ", q.grad), ("dK", k.grad), ("dV", v.grad)):
             assert grad is not None and torch.isfinite(grad).all(), f"{name} is missing or non-finite"
         _check(case, q.grad.unsqueeze(0), k.grad.unsqueeze(0), v.grad.unsqueeze(0), hkv=case.hkv)
-    assert sum(_ENGINE in name for name in served_plan_names()) == frost_before + 2
+    assert sum(_ENGINE in name for name in provider.served_plan_names()) == frost_before + 2
 
 
 def test_torch_varlen_provider_thd_gqa_autograd_preserves_packed_stats(stage2_datapath, autograd_determinism):
