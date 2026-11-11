@@ -113,10 +113,11 @@ def load(paths):
     splits from separate driver runs (each counting idx from 0) never overwrite each other."""
     rows = collections.defaultdict(dict)
     for path in [paths] if isinstance(paths, str) else paths:
-        for line in open(path):
-            r = json.loads(line)
-            if r.get("ms") is not None:
-                rows[(path, r["idx"])][r["leg"]] = r
+        with open(path) as fh:
+            for line in fh:
+                r = json.loads(line)
+                if r.get("ms") is not None:
+                    rows[(path, r["idx"])][r["leg"]] = r
     return [d for d in rows.values() if "cudnn" in d and "cudnn_oss" in d]
 
 
